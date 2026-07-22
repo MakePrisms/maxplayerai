@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/mobee-core",
+    "crates/mobee-desktop",
     "crates/mobee-evals",
     "crates/mobee",
 ]
