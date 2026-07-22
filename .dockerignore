@@ -19,6 +19,7 @@ docs/
 
 # Local dev / secrets — never ship these into a build context
 *.log
+*.env
 key
 .mobee/
 data/

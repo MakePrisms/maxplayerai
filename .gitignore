@@ -12,3 +12,7 @@
 # Editor / OS
 .DS_Store
 *.swp
+
+# Local Claude Code session state (memory dir). Scoped to projects/ so dev's
+# tracked .claude/skills/ is unaffected (a broad .claude/ would risk hiding it).
+.claude/projects/
