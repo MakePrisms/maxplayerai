@@ -1,0 +1,29 @@
+{
+  "name": "failed-turn",
+  "job_id": "job-1",
+  "script": {
+    "session_id": "session-1",
+    "updates": [
+      {
+        "type": "agent_message",
+        "data": [
+          {
+            "type": "text",
+            "data": {
+              "text": "could not finish"
+            }
+          }
+        ]
+      },
+      {
+        "type": "turn_ended",
+        "data": "failed"
+      }
+    ],
+    "artifacts": []
+  },
+  "permission_outcomes": [],
+  "expected_terminal": "failed",
+  "expect_run_error": false,
+  "snapshot": "failed-turn.json"
+}

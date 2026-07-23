@@ -1,0 +1,3263 @@
+//! Buyer job lifecycle over the mobee relay (kinds offer / feedback / result).
+//!
+//! - [`post_job`] publishes a real offer-kind offer (targeted p-tag = documented default).
+//! - [`get_job`] reads claim/result state from relay events (not local invent).
+//! - [`accept_claim`] publishes feedback-kind `accepted` and records a local pay-bind for
+//!   [`authorize_pay`](crate::authorize_pay) (seller / result / commit). Claims/results
+//!   themselves remain relay-truth.
+//!
+//! Local bind under `~/.mobee/jobs/<job_id>.json` is accept-state only.
+
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::gateway::{
+    self, award_draft, parse_git_result_delivery, parse_offer, EventDraft, OfferDraft, TagSpec,
+    JOB_CLAIM_KIND, JOB_FEEDBACK_KIND, JOB_OFFER_KIND, JOB_RESULT_KIND,
+};
+use crate::home::{self, HomeError, MobeeHome};
+#[cfg(feature = "wallet")]
+use crate::{buyer_fund, payment_wallet};
+
+const JOBS_DIR: &str = "jobs";
+/// Per-relay-fetch budget. Kept well under [`WAIT_FOR_CAP_SECS`] / MCP tool deadline.
+const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 5;
+/// Cap for `get_job(wait_for=…)` long-poll. Must stay < MCP tool deadline (~15s) so
+/// cap-hit returns PENDING for re-poll instead of starving the client read-timeout (~60s).
+const WAIT_FOR_CAP_SECS: u64 = 10;
+const DEFAULT_DEADLINE_SECS: u64 = 3_600;
+/// Derived claim status surfaced when a `processing` claim is past its offer deadline.
+/// Never a relay status value — it is computed by [`derive_claim_liveness`] from `now`.
+pub const CLAIM_STATUS_EXPIRED: &str = "expired";
+
+/// Inputs for posting a offer-kind offer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostJobRequest {
+    pub task: String,
+    pub output: String,
+    pub amount_sats: u64,
+    /// Targeted seller hex pubkey. Required unless `untargeted` is true.
+    pub seller_pubkey: Option<String>,
+    /// When true, omit the p-tag (open offer). Documented default is targeted.
+    pub untargeted: bool,
+    pub deadline_unix: Option<u64>,
+    /// Optional git delivery bind tags on the offer (repo + branch).
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    /// Job class, explicit at the type level. `FromScratch` emits no contribution tags
+    /// (byte-identical to a non-contribution offer); `Contribution` carries the required target +
+    /// base pins. See [`JobKind`].
+    pub job: JobKind,
+}
+
+/// Job class of a posted offer. Making this an enum (rather than an all-or-nothing cluster of
+/// `Option`s) makes a partial contribution spec unrepresentable: the flat MCP tool args are
+/// validated into this at the tool layer, so the core never sees a half-specified contribution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JobKind {
+    /// No contribution pins — a plain offer, byte-identical to a non-contribution offer.
+    FromScratch,
+    /// A `job-class=contribution` offer carrying the required target + base pins.
+    Contribution(ContributionSpec),
+}
+
+/// Required contribution-offer pins. The four target/base fields are REQUIRED (a partial set is
+/// unrepresentable); `accepts` is optional and defaults to `["fork"]` — fork is the only supported
+/// delivery, so a supplied `accepts` MUST include `"fork"`. The owner/branch/oid formats and the
+/// clone-URL transport allowlist are validated by [`contribution_offer_from_spec`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContributionSpec {
+    pub target_repo_owner: String,
+    pub target_repo_url: String,
+    pub base_branch: String,
+    pub base_oid: String,
+    pub accepts: Option<Vec<String>>,
+}
+
+/// Outcome of a successful `post_job`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PostJobOutcome {
+    pub job_id: String,
+    pub job_hash: String,
+    pub offer_kind: u16,
+    pub targeted: bool,
+    pub seller_pubkey: Option<String>,
+    pub amount_sats: u64,
+    pub relay_url: String,
+    pub task: String,
+    pub output: String,
+}
+
+/// Inputs for reading job state from the relay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GetJobRequest {
+    pub job_id: String,
+    /// Optional long-poll: `claim` or `result`. Preference — not required for freeze.
+    pub wait_for: Option<WaitFor>,
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WaitFor {
+    Claim,
+    Result,
+}
+
+impl WaitFor {
+    pub fn parse(raw: &str) -> Result<Self, JobLifecycleError> {
+        match raw {
+            "claim" => Ok(Self::Claim),
+            "result" => Ok(Self::Result),
+            other => Err(JobLifecycleError::Input(format!(
+                "wait_for must be claim|result, got {other:?}"
+            ))),
+        }
+    }
+}
+
+/// Relay-truth view of a job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct JobView {
+    pub job_id: String,
+    pub offer: Option<OfferView>,
+    pub claims: Vec<ClaimView>,
+    pub results: Vec<ResultView>,
+    pub live_claim_id: Option<String>,
+    pub accepted: Option<AcceptedBind>,
+    /// True when `wait_for` was set and the wait cap hit before the condition —
+    /// buyer should re-poll (PENDING), not treat as failure.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct OfferView {
+    pub event_id: String,
+    pub created_at: u64,
+    pub author_pubkey: String,
+    /// Cosmetic kind-0 `name` for `author_pubkey` (untrusted; never replaces hex).
+    pub author_display_name: Option<String>,
+    pub task: String,
+    pub output: String,
+    pub amount_sats: u64,
+    pub deadline_unix: u64,
+    pub seller_pubkey: Option<String>,
+    /// Cosmetic kind-0 `name` for targeted `seller_pubkey` (untrusted; never replaces hex).
+    pub seller_display_name: Option<String>,
+    pub targeted: bool,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    /// Raw `job-class` tag value. `Some("contribution")` ⇒ a contribution offer; absent
+    /// ⇒ from-scratch. Carried raw so a `contribution`-class offer whose pins failed to parse is
+    /// visible as `job_class=Some, contribution=None` and REFUSED at accept (never run from-scratch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_class: Option<String>,
+    /// Parsed, well-formed contribution pins (target + base + accepts). `None` when not a
+    /// contribution OR when a `contribution`-class offer's pins were malformed (fail-closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contribution: Option<ContributionOfferView>,
+}
+
+/// Serializable view of a well-formed contribution offer's pins.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ContributionOfferView {
+    pub target_owner_pubkey: String,
+    pub target_clone_url: String,
+    pub base_branch: String,
+    pub base_oid: String,
+    pub accepts: Vec<String>,
+}
+
+/// Serializable view of a seller result's contribution echo + authorship signature.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ContributionResultView {
+    pub target_owner_pubkey: String,
+    pub target_clone_url: String,
+    pub base_branch: String,
+    pub base_oid: String,
+    /// Seller schnorr signature (hex) over the signed-result authorship tuple (`sig/seller-contribution`).
+    pub tuple_signature: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ClaimView {
+    pub claim_id: String,
+    pub created_at: u64,
+    pub seller_pubkey: String,
+    /// Cosmetic kind-0 `name` for this claim's `seller_pubkey` (untrusted).
+    pub display_name: Option<String>,
+    pub status: String,
+    pub live: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The seller-authored NUT-18 payment request (`creqA…`) string read from the
+    /// claim's `["creq", …]` tag, when present. `None` for a claim that carries none — the
+    /// accept-bind then records no `creq_hash` and binding behaves identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creq: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ResultView {
+    pub result_id: String,
+    pub created_at: u64,
+    pub seller_pubkey: String,
+    /// Cosmetic kind-0 `name` for this result's `seller_pubkey` (untrusted).
+    pub display_name: Option<String>,
+    pub job_hash: Option<String>,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    pub commit_oid: Option<String>,
+    pub amount_sats: Option<u64>,
+    /// Seller schnorr signature (hex) from the result's `["sig","seller",..]` tag — the
+    /// buyer counter-signs the same receipt preimage to co-sign the kind-3400.
+    pub seller_signature: Option<String>,
+    /// Contribution echo + authorship signature. `Some` iff the result carries a
+    /// well-formed `job-class=contribution` echo AND a `sig/seller-contribution` tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contribution: Option<ContributionResultView>,
+}
+
+/// Local accept-bind recorded by [`accept_claim`] for authorize_pay.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedBind {
+    pub job_id: String,
+    pub claim_id: String,
+    pub result_id: String,
+    pub seller_pubkey: String,
+    pub commit_oid: String,
+    pub repo: String,
+    pub branch: String,
+    pub job_hash: String,
+    pub amount_sats: u64,
+    pub accept_event_id: String,
+    pub accepted_at: u64,
+    /// Seller schnorr signature (hex) over the receipt preimage, captured from the
+    /// accepted result's `sig/seller` tag. Empty when the result carries no such tag.
+    #[serde(default)]
+    pub seller_signature: String,
+    /// SHA-256 hex of the accepted claim's seller-authored `creq` (`creqA…`) string,
+    /// recorded at accept so authorize_pay binds the attempt id + receipt preimage to it. `None`
+    /// for a claim that carries no `creq` — binding then behaves byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creq_hash: Option<String>,
+    /// The accepted claim's `creq` accepted-mint list (`m`), recorded at accept so
+    /// the buyer pay path chooses the realized mint from it. Empty for a claim with no `creq`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_mints: Vec<String>,
+    /// The realized paying mint the buyer SELECTED for this job, frozen at accept from the buyer's
+    /// then-configured default mint (validated against `accepted_mints` + the real-mint fence). The
+    /// pay path derives the realized mint from THIS on every attempt — including retries — so a
+    /// config-default change between attempts can never shift the mint and mint a second
+    /// [`crate::payment::AttemptId`] (double-pay). `None` only on a legacy bind serialized before
+    /// this field existed; the pay path then falls back to the live config default (legacy behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realized_mint: Option<String>,
+    /// Contribution binds, recorded at accept when the OFFER is a contribution (authority
+    /// = the buyer's signed offer; the result echo is equality-checked, never trusted). Absent ⇒
+    /// from-scratch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contribution: Option<AcceptedContribution>,
+}
+
+/// Contribution binds captured in the accept-bind. `target_*` / `base_*` come from the
+/// buyer's SIGNED offer (authority); `tuple_signature` is the seller's signed-result authorship sig
+/// from the accepted result; `store_ref` is the buyer-controlled ref the fork tip is
+/// retained under (buyer-store retention; merge uses THIS, never the live fork branch).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedContribution {
+    pub target_owner_pubkey: String,
+    pub target_clone_url: String,
+    pub base_branch: String,
+    pub base_oid: String,
+    pub tuple_signature: String,
+    pub store_ref: String,
+}
+
+/// Inputs for accepting a seller claim (and binding the matching result).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptClaimRequest {
+    pub job_id: String,
+    pub claim_id: String,
+    /// Optional explicit result id; otherwise the newest git result from the claim seller.
+    pub result_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AcceptClaimOutcome {
+    pub accept_event_id: String,
+    pub bind: AcceptedBind,
+}
+
+pub struct AwardClaimRequest {
+    pub job_id: String,
+    pub claim_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AwardClaimOutcome {
+    pub award_event_id: String,
+    pub job_id: String,
+    pub claim_id: String,
+    pub seller_pubkey: String,
+    /// The accepted mints the awarded claim's `creq` quotes. Surfaced so the buyer sees which mints
+    /// the award commits it to paying at — awarding a claim it cannot settle is visible here, not a
+    /// surprise at pay time. Empty when the claim carried no parseable `creq`.
+    pub quoted_mints: Vec<String>,
+}
+
+#[derive(Debug)]
+pub enum JobLifecycleError {
+    Input(String),
+    Home(HomeError),
+    Relay(String),
+    NotFound(String),
+    Targeting(String),
+    Io(String),
+}
+
+impl fmt::Display for JobLifecycleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Input(message) => write!(formatter, "job lifecycle input: {message}"),
+            Self::Home(error) => write!(formatter, "{error}"),
+            Self::Relay(message) => write!(formatter, "job lifecycle relay: {message}"),
+            Self::NotFound(message) => write!(formatter, "job lifecycle not found: {message}"),
+            Self::Targeting(message) => write!(formatter, "job lifecycle targeting: {message}"),
+            Self::Io(message) => write!(formatter, "job lifecycle io: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for JobLifecycleError {}
+
+impl From<HomeError> for JobLifecycleError {
+    fn from(value: HomeError) -> Self {
+        Self::Home(value)
+    }
+}
+
+/// Publish a offer-kind offer to the configured relay. Returns the offer event id as `job_id`.
+/// Sync entry for CLI/tests — nested call fails fast; MCP uses [`post_job_async`].
+pub fn post_job(home: &MobeeHome, request: PostJobRequest) -> Result<PostJobOutcome, JobLifecycleError> {
+    crate::runtime_guard::refuse_nested_block_on("post_job")
+        .map_err(JobLifecycleError::Relay)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| JobLifecycleError::Relay(error.to_string()))?;
+    runtime.block_on(post_job_async(home, request))
+}
+
+/// Async `post_job` for callers already on a Tokio runtime (MCP dispatch).
+/// Avoids nested `block_on` when publishing the offer over the relay.
+pub async fn post_job_async(
+    home: &MobeeHome,
+    request: PostJobRequest,
+) -> Result<PostJobOutcome, JobLifecycleError> {
+    if request.task.trim().is_empty() {
+        return Err(JobLifecycleError::Input("task must be non-empty".into()));
+    }
+    if request.output.trim().is_empty() {
+        return Err(JobLifecycleError::Input("output must be non-empty".into()));
+    }
+    if request.untargeted && request.seller_pubkey.is_some() {
+        return Err(JobLifecycleError::Input(
+            "untargeted=true cannot also set seller_pubkey".into(),
+        ));
+    }
+    if !request.untargeted && request.seller_pubkey.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true)
+    {
+        return Err(JobLifecycleError::Input(
+            "post_job requires seller_pubkey (targeted default) or untargeted=true".into(),
+        ));
+    }
+    match (&request.repo, &request.branch) {
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(JobLifecycleError::Input(
+                "repo and branch must be supplied together".into(),
+            ));
+        }
+        _ => {}
+    }
+    // Validate the contribution spec up front (fail-closed, before the wallet opens). From-scratch
+    // ⇒ `None` (no additive tags). Emission happens in `build_offer_draft`.
+    let contribution = match &request.job {
+        JobKind::FromScratch => None,
+        JobKind::Contribution(spec) => Some(contribution_offer_from_spec(spec)?),
+    };
+    let deadline_unix = resolve_post_deadline(request.deadline_unix, now_unix_secs()?)?;
+
+    // Refuse a post whose amount exceeds the per-job budget cap AT POST — a job you
+    // can post but can never pay (authorize_pay refuses at the SAME cap) is a UX trap. Read the
+    // cap from the SAME config the budget gate uses (`home.config.per_job_budget_sats`).
+    assert_amount_within_budget_cap(request.amount_sats, home.config.per_job_budget_sats)?;
+
+    // Dust guard: live keyset N=1 floor, fail-closed (no hardcoded fee=1). Bounded
+    // and mint-unreachable-aware: a dead mint degrades to the cached
+    // keyset fee floor, and only refuses (fast, `mint_unreachable`) when no fee can
+    // be read at all — posting needs no funds, so it must not hang on a dead mint.
+    #[cfg(feature = "wallet")]
+    {
+        let wallet = buyer_fund::open_wallet_async(home)
+            .await
+            .map_err(|error| JobLifecycleError::Input(error.to_string()))?;
+        payment_wallet::require_fee_safe_amount_for_post(
+            &wallet,
+            cashu::Amount::from(request.amount_sats),
+        )
+        .await
+        .map_err(|error| JobLifecycleError::Input(error.to_string()))?;
+    }
+
+    let draft = build_offer_draft(&request, deadline_unix, contribution.as_ref())?;
+
+    let keys = buyer_keys(home)?;
+    let event_id = publish_draft_async(home, &keys, &draft).await?;
+    let job_hash = job_hash_for_offer(&event_id, &request.task, request.amount_sats);
+
+    Ok(PostJobOutcome {
+        job_id: event_id,
+        job_hash,
+        offer_kind: JOB_OFFER_KIND,
+        targeted: !request.untargeted,
+        seller_pubkey: request.seller_pubkey,
+        amount_sats: request.amount_sats,
+        relay_url: home.config.relay_url.clone(),
+        task: request.task,
+        output: request.output,
+    })
+}
+
+fn now_unix_secs() -> Result<u64, JobLifecycleError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|error| JobLifecycleError::Input(format!("current unix time unavailable: {error}")))
+}
+
+fn resolve_post_deadline(
+    deadline_unix: Option<u64>,
+    now_unix: u64,
+) -> Result<u64, JobLifecycleError> {
+    match deadline_unix {
+        Some(given) if given <= now_unix => Err(JobLifecycleError::Input(format!(
+            "post_job refused: deadline_unix must be greater than current unix time; given={given}, current={now_unix}"
+        ))),
+        Some(given) => Ok(given),
+        None => Ok(now_unix.saturating_add(DEFAULT_DEADLINE_SECS)),
+    }
+}
+
+/// Refuse a post whose `amount_sats` exceeds the per-job budget cap. Mirrors the
+/// budget gate's refuse condition (`amount > per_job_cap`; see [`crate::budget`]) at POST time so a
+/// buyer never posts a job that can never be paid. At-cap and under-cap pass unchanged. The message
+/// NAMES the config key + both numbers + the remedy; it never auto-raises — the cap is a safety
+/// control.
+fn assert_amount_within_budget_cap(
+    amount_sats: u64,
+    per_job_cap: u64,
+) -> Result<(), JobLifecycleError> {
+    if amount_sats > per_job_cap {
+        return Err(JobLifecycleError::Input(format!(
+            "post_job refused: amount {amount_sats} sat exceeds the per-job budget cap \
+             {per_job_cap} sat (config key `per_job_budget_sats`). A job posted over the cap can \
+             never be paid — authorize_pay refuses at the same cap. Raise `per_job_budget_sats` in \
+             config.toml and RESTART the process (config is read at startup); the cap is a safety \
+             control and is never auto-raised."
+        )));
+    }
+    Ok(())
+}
+
+/// Build the offer-kind offer event draft. The optional git-delivery tags **and** the
+/// contribution tags are emitted HERE so the post path and its round-trip test share ONE
+/// tag-emission seam (pure — no publish, no wallet). `contribution` is the pre-validated canonical
+/// offer from [`contribution_offer_from_spec`]; `None` ⇒ from-scratch, so NO additive
+/// contribution tags are emitted (byte-identical to a non-contribution offer).
+fn build_offer_draft(
+    request: &PostJobRequest,
+    deadline_unix: u64,
+    contribution: Option<&crate::contribution::ContributionOffer>,
+) -> Result<EventDraft, JobLifecycleError> {
+    let offer = if request.untargeted {
+        OfferDraft::untargeted(
+            request.task.clone(),
+            request.output.clone(),
+            request.amount_sats,
+            deadline_unix,
+        )
+    } else {
+        OfferDraft::new(
+            request.task.clone(),
+            request.output.clone(),
+            request.amount_sats,
+            deadline_unix,
+            request.seller_pubkey.clone().ok_or_else(|| {
+                JobLifecycleError::Input(
+                    "post_job requires seller_pubkey (targeted default) or untargeted=true".into(),
+                )
+            })?,
+        )
+    };
+
+    let mut draft = offer.to_event_draft();
+    if let (Some(repo), Some(branch)) = (&request.repo, &request.branch) {
+        draft.tags.push(TagSpec::new(["delivery", "git"]));
+        draft.tags.push(TagSpec::new(["repo", repo]));
+        draft.tags.push(TagSpec::new(["branch", branch]));
+    }
+    // Emit contribution tags via the CANONICAL constructor (never hand-rolled) — the buyer offer
+    // and the seller echo therefore serialize the same shape.
+    if let Some(contribution) = contribution {
+        for tag in crate::contribution::contribution_offer_tags(contribution) {
+            draft.tags.push(tag);
+        }
+    }
+    Ok(draft)
+}
+
+/// Validate a [`ContributionSpec`] and build the canonical
+/// [`ContributionOffer`](crate::contribution::ContributionOffer).
+///
+/// owner (64-hex) + branch/oid are validated by the canonical constructors
+/// ([`TargetRepoPin`](crate::contribution::TargetRepoPin) /
+/// [`ContributionBase`](crate::contribution::ContributionBase)), and the clone URL additionally
+/// passes the SAME transport allowlist the pay path fetches under — `ext::`/file/ssh are refused
+/// at POST time so a buyer never publishes an offer nobody can safely verify. `accepts` defaults
+/// to `["fork"]` and MUST include `"fork"` (fork is the only supported delivery).
+fn contribution_offer_from_spec(
+    spec: &ContributionSpec,
+) -> Result<crate::contribution::ContributionOffer, JobLifecycleError> {
+    use crate::contribution::{ContributionBase, ContributionOffer, TargetRepoPin, ACCEPTS_FORK};
+
+    let owner = spec.target_repo_owner.trim().to_owned();
+    let url = spec.target_repo_url.trim().to_owned();
+    let branch = spec.base_branch.trim().to_owned();
+    let oid = spec.base_oid.trim().to_owned();
+    let accepts: Vec<String> = spec
+        .accepts
+        .as_ref()
+        .map(|values| {
+            values
+                .iter()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Transport allowlist at POST time (https + relay-git only; ext::/file/ssh/local refused) —
+    // don't let a buyer publish an offer nobody can safely verify. The pay-path verifier re-checks
+    // under the SAME allowlist (defense in depth).
+    crate::delivery_transport::assert_allowed_repo_locator(&url).map_err(|refusal| {
+        JobLifecycleError::Input(format!("contribution target_repo_url refused: {refusal}"))
+    })?;
+
+    let target =
+        TargetRepoPin::new(owner, url).map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+    let base =
+        ContributionBase::new(branch, oid).map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+    let accepts = if accepts.is_empty() {
+        vec![ACCEPTS_FORK.to_owned()]
+    } else {
+        accepts
+    };
+    if !accepts.iter().any(|a| a == ACCEPTS_FORK) {
+        return Err(JobLifecycleError::Input(format!(
+            "contribution accepts must include \"fork\" (fork is the only supported delivery); got {accepts:?}"
+        )));
+    }
+
+    Ok(ContributionOffer {
+        target,
+        base,
+        accepts,
+    })
+}
+
+/// Read offer / claims / results from the relay. Local accept-bind is attached if present.
+/// Sync entry for CLI/tests — nested call fails fast; MCP uses [`get_job_async`].
+pub fn get_job(home: &MobeeHome, request: GetJobRequest) -> Result<JobView, JobLifecycleError> {
+    crate::runtime_guard::refuse_nested_block_on("get_job")
+        .map_err(JobLifecycleError::Relay)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| JobLifecycleError::Relay(error.to_string()))?;
+    runtime.block_on(get_job_async(home, request))
+}
+
+/// Async `get_job` for callers already on a Tokio runtime (MCP dispatch).
+///
+/// `wait_for` is capped at [`WAIT_FOR_CAP_SECS`]. Cap-hit with condition unmet returns
+/// `pending: true` (re-poll) — never an error.
+pub async fn get_job_async(
+    home: &MobeeHome,
+    request: GetJobRequest,
+) -> Result<JobView, JobLifecycleError> {
+    let keys = buyer_keys(home)?;
+    let fetch_timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
+
+    let Some(wait_for) = request.wait_for else {
+        let mut view =
+            fetch_job_view_async(home, &keys, &request.job_id, fetch_timeout, now_unix()).await?;
+        view.pending = false;
+        return Ok(view);
+    };
+
+    let wait_cap_secs = request
+        .timeout_secs
+        .unwrap_or(WAIT_FOR_CAP_SECS)
+        .min(WAIT_FOR_CAP_SECS);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_cap_secs);
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            let mut view =
+                fetch_job_view_async(home, &keys, &request.job_id, fetch_timeout, now_unix())
+                    .await?;
+            let ready = match wait_for {
+                WaitFor::Claim => view.live_claim_id.is_some(),
+                WaitFor::Result => !view.results.is_empty(),
+            };
+            view.pending = !ready;
+            return Ok(view);
+        }
+        let this_fetch = fetch_timeout.min(remaining);
+        let mut view =
+            fetch_job_view_async(home, &keys, &request.job_id, this_fetch, now_unix()).await?;
+        let ready = match wait_for {
+            WaitFor::Claim => view.live_claim_id.is_some(),
+            WaitFor::Result => !view.results.is_empty(),
+        };
+        if ready {
+            view.pending = false;
+            return Ok(view);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            view.pending = true;
+            return Ok(view);
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+}
+
+/// Accept a live claim: publish feedback-kind `accepted` and persist the pay-bind.
+/// Sync entry for CLI/tests — nested call fails fast; MCP uses [`accept_claim_async`].
+pub fn accept_claim(
+    home: &MobeeHome,
+    request: AcceptClaimRequest,
+) -> Result<AcceptClaimOutcome, JobLifecycleError> {
+    crate::runtime_guard::refuse_nested_block_on("accept_claim")
+        .map_err(JobLifecycleError::Relay)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| JobLifecycleError::Relay(error.to_string()))?;
+    runtime.block_on(accept_claim_async(home, request))
+}
+
+/// Publish the buyer's kind-award AWARD selecting `claim_id` for `job_id` BEFORE the seller runs.
+/// The awarded seller executes; every other claimant releases its claim without spending compute.
+///
+/// This is the pre-work counterpart to [`accept_claim_async`], which runs AFTER delivery to bind
+/// payment to a verified result. The award carries no pay-bind — it only names the winning claim.
+/// The claim must be present and still `processing`, and (for a targeted offer) authored by the
+/// targeted seller; otherwise the award is refused.
+pub async fn award_claim_async(
+    home: &MobeeHome,
+    request: AwardClaimRequest,
+) -> Result<AwardClaimOutcome, JobLifecycleError> {
+    let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
+    let keys = buyer_keys(home)?;
+    // Injected `now` derives claim liveness — a claim past the offer deadline surfaces as
+    // non-processing and is refused below.
+    let view = fetch_job_view_async(home, &keys, &request.job_id, timeout, now_unix()).await?;
+    let offer = view
+        .offer
+        .as_ref()
+        .ok_or_else(|| JobLifecycleError::NotFound(format!("offer {}", request.job_id)))?;
+    let claim = view
+        .claims
+        .iter()
+        .find(|claim| claim.claim_id == request.claim_id)
+        .ok_or_else(|| JobLifecycleError::NotFound(format!("claim {}", request.claim_id)))?;
+    if claim.status != "processing" {
+        return Err(JobLifecycleError::Input(format!(
+            "claim {} status is {}, expected processing",
+            claim.claim_id, claim.status
+        )));
+    }
+    if let Some(target) = &offer.seller_pubkey {
+        if target != &claim.seller_pubkey {
+            return Err(JobLifecycleError::Targeting(format!(
+                "offer targets seller {target}, claim seller is {}",
+                claim.seller_pubkey
+            )));
+        }
+    }
+
+    // Surface the mints the claim's creq quotes so an incompatible award is visible before the
+    // buyer commits (informational — the pay path's mint checks remain the settlement authority).
+    let quoted_mints = claim
+        .creq
+        .as_deref()
+        .and_then(|creq| crate::gateway::creq::parse_creq(creq).ok())
+        .map(|request| request.mints.iter().map(|mint| mint.to_string()).collect())
+        .unwrap_or_default();
+
+    let buyer_pubkey = keys.public_key().to_hex();
+    let draft = award_draft(
+        &request.job_id,
+        &request.claim_id,
+        &buyer_pubkey,
+        &claim.seller_pubkey,
+    );
+    let award_event_id = publish_draft_async(home, &keys, &draft).await?;
+    Ok(AwardClaimOutcome {
+        award_event_id,
+        job_id: request.job_id,
+        claim_id: request.claim_id,
+        seller_pubkey: claim.seller_pubkey.clone(),
+        quoted_mints,
+    })
+}
+
+/// Async `accept_claim` for callers already on a Tokio runtime (MCP dispatch).
+pub async fn accept_claim_async(
+    home: &MobeeHome,
+    request: AcceptClaimRequest,
+) -> Result<AcceptClaimOutcome, JobLifecycleError> {
+    let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
+    let keys = buyer_keys(home)?;
+    // Injected `now` derives expiry: an expired claim surfaces as non-processing and is
+    // refused below (cannot accept a claim past its deadline).
+    let view = fetch_job_view_async(home, &keys, &request.job_id, timeout, now_unix()).await?;
+    let offer = view
+        .offer
+        .as_ref()
+        .ok_or_else(|| JobLifecycleError::NotFound(format!("offer {}", request.job_id)))?;
+
+    let claim = view
+        .claims
+        .iter()
+        .find(|claim| claim.claim_id == request.claim_id)
+        .ok_or_else(|| JobLifecycleError::NotFound(format!("claim {}", request.claim_id)))?;
+    if claim.status != "processing" {
+        return Err(JobLifecycleError::Input(format!(
+            "claim {} status is {}, expected processing",
+            claim.claim_id, claim.status
+        )));
+    }
+
+    if let Some(target) = &offer.seller_pubkey {
+        if target != &claim.seller_pubkey {
+            return Err(JobLifecycleError::Targeting(format!(
+                "offer targets seller {target}, claim seller is {}",
+                claim.seller_pubkey
+            )));
+        }
+    }
+
+    let result = select_result(&view.results, &claim.seller_pubkey, request.result_id.as_deref())?;
+
+    // Finding W: hold a per-job advisory lock across the single-settlement check→durable-bind-write
+    // so two concurrent accepts for DIFFERENT results of one job cannot both observe "no bind" and
+    // both write (the unlocked TOCTOU that would let two distinct AttemptIds each become payable).
+    // Same pattern as the budget flock (`budget.rs::acquire_lock`): blocks until any other accept on
+    // THIS job releases. Held until the function returns (past the pending + finalized bind writes),
+    // so the loser re-reads the winner's bind and refuses at `assert_single_settlement`.
+    let _job_lock = acquire_job_lock(home, &request.job_id)?;
+
+    // Interim single-settlement guard (P): a job binds at most ONE result. If an accept-bind
+    // already exists for this job pinned to a DIFFERENT result, refuse — a second/different
+    // result_id must not mint a second buyer attempt/payment for one job. Re-accepting the SAME
+    // result stays idempotent (the durability re-publish/finalize below rewrites the same bind).
+    // TEMPORARY: the full job-scoped settlement-key refactor (which would let a job legitimately
+    // re-bind a corrected result) is tracked separately; until then one settlement per job.
+    assert_single_settlement(
+        load_accepted_bind(home, &request.job_id)?.as_ref(),
+        &request.job_id,
+        &result.result_id,
+    )?;
+
+    let repo = result
+        .repo
+        .clone()
+        .ok_or_else(|| JobLifecycleError::Input("result missing repo".into()))?;
+    let branch = result
+        .branch
+        .clone()
+        .ok_or_else(|| JobLifecycleError::Input("result missing branch".into()))?;
+    let commit_oid = result
+        .commit_oid
+        .clone()
+        .ok_or_else(|| JobLifecycleError::Input("result missing commit_oid".into()))?;
+    // Bind the OFFER's amount (buyer-signed authority) — NEVER the seller-authored result
+    // amount, which a malicious seller could inflate.
+    let amount_sats = offer.amount_sats;
+    // Recompute the canonical job-hash from the buyer's signed offer and REQUIRE the seller's
+    // result to echo it exactly; never trust the result's self-authored job-hash. The seller
+    // co-signs the receipt preimage over THIS hash, so an offer-derived hash that the result
+    // does not match means the result quoted a different task/amount — refuse.
+    let expected_job_hash = job_hash_for_offer(&request.job_id, &offer.task, offer.amount_sats);
+    let result_job_hash = result
+        .job_hash
+        .clone()
+        .ok_or_else(|| JobLifecycleError::Input("result missing job-hash".into()))?;
+    if result_job_hash != expected_job_hash {
+        return Err(JobLifecycleError::Input(format!(
+            "result job-hash {result_job_hash} does not match offer-derived job-hash \
+             {expected_job_hash} (seller quoted a different task/amount) — refused"
+        )));
+    }
+    let job_hash = expected_job_hash;
+
+    // Resolve contribution binds from the buyer's SIGNED OFFER (authority), refusing a
+    // malformed contribution offer and equality-checking the seller echo — never trusting
+    // the echo. From-scratch offers (no `job-class=contribution`) leave `contribution = None`.
+    let contribution = resolve_accepted_contribution(offer, result, &commit_oid)?;
+
+    // Fail-closed STRICT verification of the accepted claim's seller-authored creq: creq is
+    // REQUIRED and its payment-terms (payment_id, amount, unit, mints) are verified field by
+    // field before the bind is written (see [`verify_accepted_claim_creq`]).
+    let accepted_mints =
+        verify_accepted_claim_creq(claim.creq.as_deref(), &request.job_id, offer.amount_sats)?;
+
+    // FREEZE the realized paying mint at accept from the buyer's then-configured default (validated
+    // against the accepted set + the real-mint fence). Sealing the SELECTION here — not just the
+    // accepted SET (finding V) — is what makes the pay-path attempt id stable across retries: a
+    // config-default change after accept can no longer shift the mint into a different attempt id and
+    // mint a second payment for one job (double-pay). A buyer whose configured mint is not payable
+    // for this claim is refused HERE (fail-closed), never accepted into an unpayable bind.
+    let realized_mint = crate::authorize_pay::resolve_realized_mint(
+        home.config.default_mint(),
+        &accepted_mints,
+        home.config.allow_real_mints,
+    )
+    .map_err(|error| JobLifecycleError::Input(error.to_string()))?
+    .to_string();
+
+    let buyer_pubkey = keys.public_key().to_hex();
+    let draft = award_draft(
+        &request.job_id,
+        &request.claim_id,
+        &buyer_pubkey,
+        &claim.seller_pubkey,
+    );
+
+    // Durability ordering: write the pay-bind BEFORE publishing the accept, so a crash between
+    // publish and bind-write can never leave a PUBLIC accepted state on the relay with NO local
+    // bind (which would strand the buyer — unable to pay, at risk of re-accepting). The pending
+    // bind carries an empty `accept_event_id` (the pay path never reads that field — it is a
+    // record only), then we publish and finalize the bind with the real id + timestamp.
+    let mut bind = AcceptedBind {
+        job_id: request.job_id.clone(),
+        claim_id: request.claim_id.clone(),
+        result_id: result.result_id.clone(),
+        seller_pubkey: claim.seller_pubkey.clone(),
+        commit_oid,
+        repo,
+        branch,
+        job_hash,
+        amount_sats,
+        // Pending marker until the accept is published + finalized below.
+        accept_event_id: String::new(),
+        accepted_at: 0,
+        // Capture sig/seller so authorize_pay can co-sign the receipt preimage.
+        seller_signature: result.seller_signature.clone().unwrap_or_default(),
+        // Hash the seller-authored creq from the accepted claim (when present) so the
+        // pay path binds the attempt + receipt to the exact request the seller quoted. A claim
+        // that carries no creq ⇒ `None` ⇒ binding behaves identically.
+        creq_hash: claim.creq.as_deref().map(crate::gateway::creq_hash_hex),
+        // The creq's accepted-mint list (validated + parsed above, fail-closed).
+        accepted_mints,
+        // The realized paying mint SELECTED for this job, frozen from the buyer's configured default
+        // above. Sealing the choice makes the pay-path attempt id stable across retries.
+        realized_mint: Some(realized_mint),
+        contribution,
+    };
+    write_accepted_bind(home, &bind)?;
+
+    let accept_event_id = publish_draft_async(home, &keys, &draft).await?;
+    let accepted_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Finalize: stamp the published id + timestamp and re-persist. A crash before this leaves the
+    // pending bind on disk (accept may or may not be public); a subsequent accept re-publishes
+    // idempotently and re-finalizes.
+    bind.accept_event_id = accept_event_id.clone();
+    bind.accepted_at = accepted_at;
+    write_accepted_bind(home, &bind)?;
+
+    Ok(AcceptClaimOutcome {
+        accept_event_id,
+        bind,
+    })
+}
+
+/// Accept-time contribution resolution. Authority is the buyer's SIGNED OFFER:
+/// - not a contribution offer (`job_class != contribution`) ⇒ `Ok(None)` (from-scratch);
+/// - a `contribution`-class offer whose pins failed to parse ⇒ REFUSE (fail-closed — never
+///   silently run from-scratch);
+/// - a contribution offer whose accepted result carries no valid echo+sig ⇒ REFUSE;
+/// - the seller-echoed `{target_repo, base_oid}` are EQUALITY-CHECKED against the offer (a
+///   cross-check input, never authority) — a mismatch REFUSES.
+///
+/// The recorded binds (`target_*`, `base_*`) come from the OFFER; the fork is the result's
+/// repo/branch; `store_ref` is derived from the fork-tip `commit_oid`.
+/// Fail-closed STRICT verification of the accepted claim's seller-authored NUT-18 `creq`,
+/// mirroring the seller-side field-by-field rebind ([`crate::seller_daemon`]'s
+/// `reconstruct_delivered_bind`). The buyer must not accept-then-pay a claim whose payment
+/// terms it did not fully verify, so before the accept-bind is written this requires:
+///
+/// - a creq is PRESENT (a claim carrying none is refused — every seller claim authors one);
+/// - the creq PARSES as a NUT-18 payment request;
+/// - `payment_id == job_id`;
+/// - `amount == offer.amount_sats` (the buyer-signed offer amount, never the result's echo);
+/// - `unit == sat`;
+/// - the accepted-mint list (`m`) is NON-EMPTY.
+///
+/// Returns the normalized accepted-mint list (`m`) on success. Any failure REFUSES the accept.
+fn verify_accepted_claim_creq(
+    creq: Option<&str>,
+    job_id: &str,
+    offer_amount_sats: u64,
+) -> Result<Vec<String>, JobLifecycleError> {
+    let creq = creq.ok_or_else(|| {
+        JobLifecycleError::Input(
+            "accepted claim carries no creq (cannot verify payment terms) — refused".into(),
+        )
+    })?;
+    let request = crate::gateway::creq::parse_creq(creq).map_err(|error| {
+        JobLifecycleError::Input(format!(
+            "accepted claim carries an unparseable creq (refusing accept, fail-closed): {error}"
+        ))
+    })?;
+    if request.payment_id.as_deref() != Some(job_id) {
+        return Err(JobLifecycleError::Input(format!(
+            "accepted claim creq payment id {:?} != job_id {job_id} — refused",
+            request.payment_id
+        )));
+    }
+    if request.amount != Some(cashu::Amount::from(offer_amount_sats)) {
+        return Err(JobLifecycleError::Input(format!(
+            "accepted claim creq amount {:?} != offer amount {offer_amount_sats} — refused",
+            request.amount
+        )));
+    }
+    if request.unit.as_ref() != Some(&cashu::CurrencyUnit::Sat) {
+        return Err(JobLifecycleError::Input(format!(
+            "accepted claim creq unit {:?} != sat — refused",
+            request.unit
+        )));
+    }
+    if request.mints.is_empty() {
+        return Err(JobLifecycleError::Input(
+            "accepted claim creq carries no accepted mints (m) — refused".into(),
+        ));
+    }
+    Ok(request.mints.iter().map(|mint| mint.to_string()).collect())
+}
+
+fn resolve_accepted_contribution(
+    offer: &OfferView,
+    result: &ResultView,
+    commit_oid: &str,
+) -> Result<Option<AcceptedContribution>, JobLifecycleError> {
+    use crate::contribution::JOB_CLASS_CONTRIBUTION;
+    let offer_contribution = match &offer.contribution {
+        Some(c) => c,
+        None => {
+            // Fail-closed: a contribution-class offer whose pins didn't parse must NOT run as
+            // from-scratch. Only a genuinely non-contribution offer resolves to None.
+            if offer.job_class.as_deref() == Some(JOB_CLASS_CONTRIBUTION) {
+                return Err(JobLifecycleError::Input(
+                    "offer is job-class=contribution but its target-repo/base pins are malformed — \
+                     refused (a malformed contribution offer is never run as from-scratch)"
+                        .into(),
+                ));
+            }
+            return Ok(None);
+        }
+    };
+    let echo = result.contribution.as_ref().ok_or_else(|| {
+        JobLifecycleError::Input(
+            "contribution offer requires a contribution result (job-class echo + \
+             sig/seller-contribution); the accepted result carries none — refused"
+                .into(),
+        )
+    })?;
+    // Equality-check: seller-echoed target/base MUST equal the buyer's signed offer.
+    if echo.target_owner_pubkey != offer_contribution.target_owner_pubkey
+        || echo.target_clone_url != offer_contribution.target_clone_url
+    {
+        return Err(JobLifecycleError::Targeting(format!(
+            "contribution result echoes target-repo (owner {}, {}) but the signed offer pins \
+             (owner {}, {}) — echo mismatch refused (base/target resolved from the PIN, never the echo)",
+            echo.target_owner_pubkey,
+            echo.target_clone_url,
+            offer_contribution.target_owner_pubkey,
+            offer_contribution.target_clone_url
+        )));
+    }
+    if echo.base_branch != offer_contribution.base_branch
+        || echo.base_oid != offer_contribution.base_oid
+    {
+        return Err(JobLifecycleError::Targeting(format!(
+            "contribution result echoes base ({}, {}) but the signed offer pins ({}, {}) — echo \
+             mismatch refused",
+            echo.base_branch, echo.base_oid, offer_contribution.base_branch, offer_contribution.base_oid
+        )));
+    }
+    Ok(Some(AcceptedContribution {
+        // Authority = the OFFER (buyer-signed), never the echo.
+        target_owner_pubkey: offer_contribution.target_owner_pubkey.clone(),
+        target_clone_url: offer_contribution.target_clone_url.clone(),
+        base_branch: offer_contribution.base_branch.clone(),
+        base_oid: offer_contribution.base_oid.clone(),
+        tuple_signature: echo.tuple_signature.clone(),
+        store_ref: crate::delivery_git::PayPathDeliveryVerifier::store_ref_for(commit_oid),
+    }))
+}
+
+/// Load the local accept-bind for a job, if any.
+pub fn load_accepted_bind(
+    home: &MobeeHome,
+    job_id: &str,
+) -> Result<Option<AcceptedBind>, JobLifecycleError> {
+    let path = bind_path(home, job_id);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let mut file = File::open(&path).map_err(|error| JobLifecycleError::Io(error.to_string()))?;
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)
+        .map_err(|error| JobLifecycleError::Io(error.to_string()))?;
+    let bind: AcceptedBind = serde_json::from_str(&raw)
+        .map_err(|error| JobLifecycleError::Io(format!("accept bind parse: {error}")))?;
+    Ok(Some(bind))
+}
+
+/// Refuse authorize_pay fields that disagree with a recorded accept-bind.
+pub fn assert_authorize_matches_bind(
+    bind: &AcceptedBind,
+    seller_pubkey: &str,
+    result_id: &str,
+    commit_oid: &str,
+) -> Result<(), JobLifecycleError> {
+    if seller_pubkey != bind.seller_pubkey {
+        return Err(JobLifecycleError::Targeting(format!(
+            "authorize_pay seller_pubkey {} does not match accepted seller {}",
+            seller_pubkey, bind.seller_pubkey
+        )));
+    }
+    if result_id != bind.result_id {
+        return Err(JobLifecycleError::Targeting(format!(
+            "authorize_pay result_id {} does not match accepted result {}",
+            result_id, bind.result_id
+        )));
+    }
+    if commit_oid != bind.commit_oid {
+        return Err(JobLifecycleError::Targeting(format!(
+            "authorize_pay commit_oid {} does not match accepted commit {}",
+            commit_oid, bind.commit_oid
+        )));
+    }
+    Ok(())
+}
+
+/// Interim single-settlement guard (P): a job binds at most one result. An existing accept-bind
+/// pinned to a DIFFERENT result refuses (a second/different result_id must not mint a second
+/// buyer attempt/payment for one job); re-accepting the SAME result is idempotent (the durability
+/// re-publish/finalize rewrites the same bind). No existing bind ⇒ allowed. Non-secret error.
+fn assert_single_settlement(
+    existing: Option<&AcceptedBind>,
+    job_id: &str,
+    new_result_id: &str,
+) -> Result<(), JobLifecycleError> {
+    if let Some(existing) = existing {
+        if existing.result_id != new_result_id {
+            return Err(JobLifecycleError::Input(format!(
+                "job {job_id} already accepted result {}; refusing to bind a different result \
+                 {new_result_id} (one settlement per job)",
+                existing.result_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Build an [`AuthorizePayRequest`](crate::authorize_pay::AuthorizePayRequest) from the
+/// accept-bind + buyer-supplied tip-match.
+///
+/// Rules:
+/// - `delivery_integrity_hash` is a **required** buyer arg (never defaulted/derived from
+///   claim feedback or result oid).
+/// - Compare it to the seller's advertised `commit_oid` and **refuse on mismatch**.
+/// - Matching is fine when the buyer independently tip-matched the same oid; auto-fill
+///   from the seller advertisement is the circular-bind failure mode.
+pub fn authorize_request_from_bind(
+    bind: &AcceptedBind,
+    amount_sats: u64,
+    delivery_integrity_hash: String,
+) -> Result<crate::authorize_pay::AuthorizePayRequest, JobLifecycleError> {
+    if delivery_integrity_hash.trim().is_empty() {
+        return Err(JobLifecycleError::Input(
+            "authorize_pay(job_id) requires buyer-supplied delivery_integrity_hash (tip-match); never auto-filled from claim oid".into(),
+        ));
+    }
+    if delivery_integrity_hash != bind.commit_oid {
+        return Err(JobLifecycleError::Targeting(format!(
+            "authorize_pay(job_id) delivery_integrity_hash {} does not match accepted seller commit_oid {} (buyer tip-match required; refuse mismatch)",
+            delivery_integrity_hash, bind.commit_oid
+        )));
+    }
+    // The caller-supplied amount must equal the accept-bind amount (which was itself bound from
+    // the buyer's signed offer at accept). Refuse any drift so the pay amount can never diverge
+    // from the amount the buyer authorized.
+    if amount_sats != bind.amount_sats {
+        return Err(JobLifecycleError::Input(format!(
+            "authorize_pay(job_id) amount_sats {amount_sats} does not match accepted bind amount {} — refused",
+            bind.amount_sats
+        )));
+    }
+    Ok(crate::authorize_pay::AuthorizePayRequest {
+        job_id: bind.job_id.clone(),
+        result_id: bind.result_id.clone(),
+        // Sound because accept is fail-closed: a contribution-class offer with malformed pins is
+        // refused at accept, so `bind.contribution == None` iff the offer was from-scratch.
+        job_class: if bind.contribution.is_some() {
+            crate::authorize_pay::JobClass::Contribution
+        } else {
+            crate::authorize_pay::JobClass::FromScratch
+        },
+        delivery_integrity_hash,
+        job_hash: bind.job_hash.clone(),
+        seller_pubkey: bind.seller_pubkey.clone(),
+        amount_sats,
+        repo: bind.repo.clone(),
+        branch: bind.branch.clone(),
+        commit_oid: bind.commit_oid.clone(),
+        seller_signature: bind.seller_signature.clone(),
+        // Thread the recorded creq hash so the attempt + receipt bind the seller's
+        // request. `None` ⇒ a claim with no creq.
+        creq_hash: bind.creq_hash.clone(),
+        // Thread the creq's accepted-mint list so the buyer chooses the realized
+        // mint. Empty ⇒ a claim with no creq (pay from the pinned default mint).
+        accepted_mints: bind.accepted_mints.clone(),
+        // Thread the SEALED realized-mint selection so the pay path derives the paying mint from the
+        // bind, not the live config default — stable attempt id across retries. `None` ⇒ legacy bind.
+        realized_mint: bind.realized_mint.clone(),
+        // Thread the contribution binds so authorize_pay runs the contribution
+        // verify-path + authorship seam. `None` ⇒ from-scratch.
+        contribution: bind.contribution.as_ref().map(|c| {
+            crate::authorize_pay::ContributionPayBinds {
+                target_owner_pubkey: c.target_owner_pubkey.clone(),
+                target_clone_url: c.target_clone_url.clone(),
+                base_branch: c.base_branch.clone(),
+                base_oid: c.base_oid.clone(),
+                tuple_signature: c.tuple_signature.clone(),
+            }
+        }),
+    })
+}
+
+/// Fill an explicit-form [`AuthorizePayRequest`](crate::authorize_pay::AuthorizePayRequest) from
+/// the accept-bind so it builds the SAME co-signed receipt preimage as
+/// [`authorize_request_from_bind`]. Call AFTER [`assert_authorize_matches_bind`].
+///
+/// `job_hash` feeds the receipt preimage and is taken from the bind unconditionally: it was
+/// recorded at accept from the seller's own result, so the bind is authoritative. It is the only
+/// preimage field neither asserted against nor otherwise filled from the bind, so a caller whose
+/// `job_hash` diverged from the bind would build a preimage the seller never co-signed and the pay
+/// would refuse "pre-pay seller co-signature invalid"; sourcing it from the bind keeps the explicit
+/// form byte-identical to the bind-first form. `seller_signature`, `creq_hash`,
+/// and the contribution binds fill from the bind only when the explicit caller left them
+/// empty/absent.
+///
+/// `accepted_mints` is taken from the bind UNCONDITIONALLY, overwriting any caller-supplied value
+/// (finding V). The co-signed receipt preimage binds only `creq_hash` (which pins the accepted SET),
+/// not the realized mint, so the seller cosig does not pin `accepted_mints`; a caller-supplied list
+/// could otherwise substitute a mint outside the bound set. Deriving it solely from the sealed bind
+/// closes that: the realized-mint selection ([`crate::authorize_pay::resolve_realized_mint`]) can
+/// only pick the buyer's own mint from within the bound set.
+pub fn fill_explicit_request_from_bind(
+    request: &mut crate::authorize_pay::AuthorizePayRequest,
+    bind: &AcceptedBind,
+) {
+    request.job_hash = bind.job_hash.clone();
+    // The bind is authoritative for the job class (resolved from the signed offer at accept), so
+    // the explicit form matches the bind form and cannot declare a divergent class.
+    request.job_class = if bind.contribution.is_some() {
+        crate::authorize_pay::JobClass::Contribution
+    } else {
+        crate::authorize_pay::JobClass::FromScratch
+    };
+    if request.seller_signature.is_empty() {
+        request.seller_signature = bind.seller_signature.clone();
+    }
+    if request.creq_hash.is_none() {
+        request.creq_hash = bind.creq_hash.clone();
+    }
+    // Finding V: derive the accepted-mint set SOLELY from the sealed bind, overwriting any
+    // caller-supplied value. The seller cosig does not pin the realized mint (the preimage binds
+    // only creq_hash), so a caller list must never be trusted to select the paying mint.
+    request.accepted_mints = bind.accepted_mints.clone();
+    // Finding CC: same seal for the realized-mint SELECTION — derived SOLELY from the sealed bind,
+    // overwriting any caller value. A caller must not be able to pick the paying mint (which would
+    // shift the attempt id); the frozen selection makes retries dedup.
+    request.realized_mint = bind.realized_mint.clone();
+    // Same seal for the delivery locator: repo/branch identify WHERE the paid commit is fetched
+    // from, so they must come from the sealed bind (which `authorize_request_from_bind` already
+    // does), never caller input — a caller must not be able to redirect the fetch to a different
+    // locator for the accepted commit.
+    request.repo = bind.repo.clone();
+    request.branch = bind.branch.clone();
+    if request.contribution.is_none() {
+        request.contribution = bind.contribution.as_ref().map(|c| {
+            crate::authorize_pay::ContributionPayBinds {
+                target_owner_pubkey: c.target_owner_pubkey.clone(),
+                target_clone_url: c.target_clone_url.clone(),
+                base_branch: c.base_branch.clone(),
+                base_oid: c.base_oid.clone(),
+                tuple_signature: c.tuple_signature.clone(),
+            }
+        });
+    }
+}
+
+fn write_accepted_bind(home: &MobeeHome, bind: &AcceptedBind) -> Result<(), JobLifecycleError> {
+    let dir = home.root.join(JOBS_DIR);
+    fs::create_dir_all(&dir).map_err(|error| JobLifecycleError::Io(error.to_string()))?;
+    let path = bind_path(home, &bind.job_id);
+    let raw = serde_json::to_string_pretty(bind)
+        .map_err(|error| JobLifecycleError::Io(format!("accept bind encode: {error}")))?;
+    // Crash-atomic rewrite (temp → sync → rename → dir-fsync): a crash between the relay publish and
+    // the bind-write can never leave a truncated/empty bind, which would let the daemon re-accept a
+    // job and pay a SECOND time. Serialized per-job by `acquire_job_lock`.
+    crate::durable::write_atomic(&dir, &path, raw.as_bytes())
+        .map_err(|error| JobLifecycleError::Io(error.to_string()))
+}
+
+fn bind_path(home: &MobeeHome, job_id: &str) -> PathBuf {
+    // Event ids are hex — safe as a single path segment.
+    home.root.join(JOBS_DIR).join(format!("{job_id}.json"))
+}
+
+/// Acquire the per-job exclusive advisory lock guarding the accept-bind check→write section
+/// (finding W). Blocks until any other accept holding this job's lock releases; the returned
+/// handle holds the `flock` until it drops. Separate lock file per job (`<job_id>.lock`) so
+/// accepts on DIFFERENT jobs never contend. Mirrors `budget.rs::acquire_lock`.
+fn acquire_job_lock(home: &MobeeHome, job_id: &str) -> Result<File, JobLifecycleError> {
+    let dir = home.root.join(JOBS_DIR);
+    fs::create_dir_all(&dir).map_err(|error| JobLifecycleError::Io(error.to_string()))?;
+    // Event ids are hex — safe as a single path segment.
+    let lock_path = dir.join(format!("{job_id}.lock"));
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| JobLifecycleError::Io(error.to_string()))?;
+    // Blocks until any other accept process/task holding this job's lock releases it.
+    file.lock()
+        .map_err(|error| JobLifecycleError::Io(error.to_string()))?;
+    Ok(file)
+}
+
+/// Canonical job-hash for offer/result signing (buyer + seller share this).
+pub fn job_hash_for_offer(job_id: &str, task: &str, amount_sats: u64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(job_id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(task.as_bytes());
+    hasher.update(b"|");
+    hasher.update(amount_sats.to_string().as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn buyer_keys(home: &MobeeHome) -> Result<nostr_sdk::Keys, JobLifecycleError> {
+    let secret = home::read_secret_key_hex(home)?;
+    nostr_sdk::Keys::parse(&secret)
+        .map_err(|error| JobLifecycleError::Home(HomeError::Key(format!("buyer key parse: {error}"))))
+}
+
+#[allow(dead_code)] // guarded sync twin for non-async callers; MCP uses `_async`
+fn publish_draft(
+    home: &MobeeHome,
+    keys: &nostr_sdk::Keys,
+    draft: &EventDraft,
+) -> Result<String, JobLifecycleError> {
+    crate::runtime_guard::refuse_nested_block_on("publish_draft")
+        .map_err(JobLifecycleError::Relay)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| JobLifecycleError::Relay(error.to_string()))?;
+    runtime.block_on(publish_draft_async(home, keys, draft))
+}
+
+async fn publish_draft_async(
+    home: &MobeeHome,
+    keys: &nostr_sdk::Keys,
+    draft: &EventDraft,
+) -> Result<String, JobLifecycleError> {
+    use nostr_sdk::prelude::{Client, Kind};
+
+    let builder = gateway::nostr::event_builder(draft)
+        .map_err(|error| JobLifecycleError::Relay(format!("event builder: {error}")))?;
+    let event = builder
+        .sign_with_keys(keys)
+        .map_err(|error| JobLifecycleError::Relay(format!("sign offer: {error}")))?;
+    // Keep Kind::Custom visible for readers of the draft path.
+    let _ = Kind::Custom(draft.kind);
+
+    let client = Client::new(keys.clone());
+    client
+        .add_relay(&home.config.relay_url)
+        .await
+        .map_err(|error| JobLifecycleError::Relay(format!("add relay: {error}")))?;
+    client.connect().await;
+    let output = client
+        .send_event_to([&home.config.relay_url], &event)
+        .await;
+    client.disconnect().await;
+    let output = output.map_err(|error| JobLifecycleError::Relay(format!("send event: {error}")))?;
+    if output.success.is_empty() {
+        let failed: Vec<String> = output
+            .failed
+            .into_iter()
+            .map(|(url, err)| format!("{url}: {err}"))
+            .collect();
+        return Err(JobLifecycleError::Relay(format!(
+            "no relay accepted event ({})",
+            failed.join("; ")
+        )));
+    }
+    Ok(output.val.to_hex())
+}
+
+#[allow(dead_code)] // guarded sync twin for non-async callers; MCP uses `_async`
+fn fetch_job_view(
+    home: &MobeeHome,
+    keys: &nostr_sdk::Keys,
+    job_id: &str,
+    timeout: Duration,
+) -> Result<JobView, JobLifecycleError> {
+    crate::runtime_guard::refuse_nested_block_on("fetch_job_view")
+        .map_err(JobLifecycleError::Relay)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| JobLifecycleError::Relay(error.to_string()))?;
+    runtime.block_on(fetch_job_view_async(home, keys, job_id, timeout, now_unix()))
+}
+
+/// Current unix time (seconds). Wall-clock lives ONLY at call sites; the derivation
+/// ([`derive_claim_liveness`]) takes `now` as input so the pure path stays testable.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Derive claim liveness from status + offer deadline + the injected `now`.
+///
+/// A `processing` claim whose offer deadline has passed (`now > deadline`) is EXPIRED:
+/// its status is surfaced as [`CLAIM_STATUS_EXPIRED`], it is marked `live = false`, and it
+/// is excluded from `live_claim_id`. Expiry is DERIVED — never stored, never read from the
+/// wall clock inside this function (tests pass a fixed `now`). `claims` must be pre-sorted
+/// newest-first; the newest still-`processing` claim becomes the live one.
+///
+/// `offer_deadline_unix == None` (offer not yet on the relay) means expiry cannot be derived,
+/// so status-based liveness is preserved unchanged.
+fn derive_claim_liveness(
+    claims: &mut [ClaimView],
+    offer_deadline_unix: Option<u64>,
+    now: u64,
+) -> Option<String> {
+    if let Some(deadline) = offer_deadline_unix {
+        for claim in claims.iter_mut() {
+            if claim.status == "processing" && now > deadline {
+                claim.status = CLAIM_STATUS_EXPIRED.to_string();
+            }
+        }
+    }
+    let live_claim_id = claims
+        .iter()
+        .find(|claim| claim.status == "processing")
+        .map(|claim| claim.claim_id.clone());
+    for claim in claims.iter_mut() {
+        claim.live = live_claim_id.as_deref() == Some(claim.claim_id.as_str());
+    }
+    live_claim_id
+}
+
+/// Read one job's offer + claims + results from the relay, with claim liveness derived
+/// against `now` (a `processing` claim past the offer deadline is EXPIRED, not live). Exposed
+/// `pub(crate)` so the seller daemon can run the backfill money-safety pre-claim check
+/// (already-delivered / live-claimed-by-another) without duplicating the relay read.
+pub(crate) async fn fetch_job_view_async(
+    home: &MobeeHome,
+    keys: &nostr_sdk::Keys,
+    job_id: &str,
+    timeout: Duration,
+    now: u64,
+) -> Result<JobView, JobLifecycleError> {
+    use nostr_sdk::prelude::{Client, EventId, Filter, Kind};
+
+    let offer_id = EventId::from_hex(job_id)
+        .map_err(|error| JobLifecycleError::Input(format!("job_id: {error}")))?;
+
+    let client = Client::new(keys.clone());
+    client
+        .add_relay(&home.config.relay_url)
+        .await
+        .map_err(|error| JobLifecycleError::Relay(format!("add relay: {error}")))?;
+    client.connect().await;
+
+    // Every fetch filter carries the `#t=mobee` namespace guard so a foreign event
+    // squatting a mobee kind is never returned.
+    let offer_filter = Filter::new()
+        .id(offer_id)
+        .kind(Kind::Custom(JOB_OFFER_KIND))
+        .hashtag(gateway::MOBEE_TAG);
+    // Claims (processing) and feedback (error) are distinct kinds — fetch both so the claim
+    // view surfaces both.
+    let feedback_filter = Filter::new()
+        .kinds([
+            Kind::Custom(JOB_CLAIM_KIND),
+            Kind::Custom(JOB_FEEDBACK_KIND),
+        ])
+        .hashtag(gateway::MOBEE_TAG)
+        .event(offer_id);
+    let result_filter = Filter::new()
+        .kind(Kind::Custom(JOB_RESULT_KIND))
+        .hashtag(gateway::MOBEE_TAG)
+        .event(offer_id);
+
+    let offer_events = client
+        .fetch_events(offer_filter, timeout)
+        .await
+        .map_err(|error| JobLifecycleError::Relay(format!("fetch offer: {error}")))?;
+    let feedback_events = client
+        .fetch_events(feedback_filter, timeout)
+        .await
+        .map_err(|error| JobLifecycleError::Relay(format!("fetch feedback: {error}")))?;
+    let result_events = client
+        .fetch_events(result_filter, timeout)
+        .await
+        .map_err(|error| JobLifecycleError::Relay(format!("fetch results: {error}")))?;
+    client.disconnect().await;
+
+    let offer = offer_events.into_iter().next().map(|event| {
+        let draft = event_to_draft(&event);
+        let parsed = parse_offer(&draft).ok();
+        OfferView {
+            event_id: event.id.to_hex(),
+            created_at: event.created_at.as_secs(),
+            author_pubkey: event.pubkey.to_hex(),
+            author_display_name: None,
+            task: parsed
+                .as_ref()
+                .map(|p| p.task.clone())
+                .unwrap_or_default(),
+            output: parsed
+                .as_ref()
+                .map(|p| p.output.clone())
+                .unwrap_or_default(),
+            amount_sats: parsed.as_ref().map(|p| p.amount).unwrap_or(0),
+            deadline_unix: parsed.as_ref().map(|p| p.deadline_unix).unwrap_or(0),
+            seller_pubkey: parsed.as_ref().and_then(|p| p.seller_pubkey.clone()),
+            seller_display_name: None,
+            targeted: parsed.as_ref().map(|p| p.is_targeted()).unwrap_or(false),
+            repo: first_tag_value(&draft.tags, "repo").map(str::to_owned),
+            branch: first_tag_value(&draft.tags, "branch").map(str::to_owned),
+            // Raw job-class + parsed pins. A malformed contribution offer parses to
+            // `contribution=None` while `job_class=Some("contribution")` — accept refuses it
+            // (fail-closed; never silently from-scratch).
+            job_class: first_tag_value(&draft.tags, crate::contribution::TAG_JOB_CLASS)
+                .map(str::to_owned),
+            contribution: contribution_offer_view(&draft.tags),
+        }
+    });
+
+    let mut claims = Vec::new();
+    for event in feedback_events {
+        let draft = event_to_draft(&event);
+        let status = first_tag_value(&draft.tags, "status")
+            .unwrap_or("")
+            .to_owned();
+        if status != "processing" && status != "error" {
+            // accepts are buyer-authored; skip for claim list
+            continue;
+        }
+        claims.push(ClaimView {
+            claim_id: event.id.to_hex(),
+            created_at: event.created_at.as_secs(),
+            seller_pubkey: event.pubkey.to_hex(),
+            display_name: None,
+            status,
+            live: false,
+            reason_code: first_tag_value(&draft.tags, "reason_code").map(str::to_owned),
+            reason: (!draft.content.is_empty()).then_some(draft.content.clone()),
+            // Capture the seller-authored creq tag; absent on claims with no creq.
+            creq: first_tag_value(&draft.tags, "creq").map(str::to_owned),
+        });
+    }
+    claims.sort_by_key(|c| std::cmp::Reverse(c.created_at));
+    // Liveness is DERIVED from `now` vs the offer deadline — a processing claim past its
+    // deadline is EXPIRED and must not read live.
+    let offer_deadline_unix = offer.as_ref().map(|o| o.deadline_unix);
+    let live_claim_id = derive_claim_liveness(&mut claims, offer_deadline_unix, now);
+
+    let mut results = Vec::new();
+    for event in result_events {
+        let draft = event_to_draft(&event);
+        let delivery = parse_git_result_delivery(&draft).ok();
+        let amount_sats = first_tag(&draft.tags, "amount")
+            .and_then(|tag| tag.0.get(1))
+            .and_then(|value| value.parse().ok());
+        results.push(ResultView {
+            result_id: event.id.to_hex(),
+            created_at: event.created_at.as_secs(),
+            seller_pubkey: event.pubkey.to_hex(),
+            display_name: None,
+            job_hash: first_tag_value(&draft.tags, "job-hash").map(str::to_owned),
+            repo: delivery.as_ref().map(|d| d.repo().to_owned()),
+            branch: delivery.as_ref().map(|d| d.branch().to_owned()),
+            commit_oid: delivery
+                .as_ref()
+                .map(|d| d.commit_oid().as_str().to_owned()),
+            amount_sats,
+            seller_signature: sig_seller_value(&draft.tags),
+            contribution: contribution_result_view(&draft.tags),
+        });
+    }
+    results.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+
+    let accepted = load_accepted_bind(home, job_id)?;
+
+    let mut view = JobView {
+        job_id: job_id.to_owned(),
+        offer,
+        claims,
+        results,
+        live_claim_id,
+        accepted,
+        pending: false,
+    };
+    attach_display_names_async(home, &mut view).await;
+    Ok(view)
+}
+
+/// Collect hex pubkeys for cosmetic kind-0 enrichment (never for pay/targeting).
+fn display_name_pubkeys(view: &JobView) -> Vec<String> {
+    let mut pubkeys: Vec<String> = Vec::new();
+    if let Some(offer) = &view.offer {
+        pubkeys.push(offer.author_pubkey.clone());
+        if let Some(seller) = &offer.seller_pubkey {
+            pubkeys.push(seller.clone());
+        }
+    }
+    for claim in &view.claims {
+        pubkeys.push(claim.seller_pubkey.clone());
+    }
+    for result in &view.results {
+        pubkeys.push(result.seller_pubkey.clone());
+    }
+    pubkeys
+}
+
+fn apply_display_names(view: &mut JobView, names: &std::collections::HashMap<String, Option<String>>) {
+    let lookup = |hex: &str| -> Option<String> {
+        names
+            .get(&hex.to_ascii_lowercase())
+            .and_then(|value| value.clone())
+    };
+
+    if let Some(offer) = &mut view.offer {
+        offer.author_display_name = lookup(&offer.author_pubkey);
+        offer.seller_display_name = offer
+            .seller_pubkey
+            .as_ref()
+            .and_then(|seller| lookup(seller));
+    }
+    for claim in &mut view.claims {
+        claim.display_name = lookup(&claim.seller_pubkey);
+    }
+    for result in &mut view.results {
+        result.display_name = lookup(&result.seller_pubkey);
+    }
+}
+
+/// Cosmetic kind-0 enrichment only — never feeds accept-bind / targeting / pay.
+/// Async so `get_job`'s existing runtime does not nest `block_on` (panic).
+async fn attach_display_names_async(home: &MobeeHome, view: &mut JobView) {
+    let pubkeys = display_name_pubkeys(view);
+    let mut unique = std::collections::HashSet::new();
+    for key in pubkeys {
+        let hex = key.trim().to_ascii_lowercase();
+        if hex.len() == 64 && hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            unique.insert(hex);
+        }
+    }
+    if unique.is_empty() {
+        return;
+    }
+    let names = match crate::profile::fetch_names_async(home, &unique).await {
+        Ok(map) => map,
+        Err(_) => unique.into_iter().map(|k| (k, None)).collect(),
+    };
+    apply_display_names(view, &names);
+}
+
+fn select_result<'a>(
+    results: &'a [ResultView],
+    seller_pubkey: &str,
+    result_id: Option<&str>,
+) -> Result<&'a ResultView, JobLifecycleError> {
+    if let Some(id) = result_id {
+        let result = results
+            .iter()
+            .find(|result| result.result_id == id)
+            .ok_or_else(|| JobLifecycleError::NotFound(format!("result {id}")))?;
+        // CROSS-BIND TOOTH: a result is bindable to this claim ONLY if the result's author
+        // (its result-kind event pubkey) IS the claim seller. NEVER trust an operator-supplied
+        // `result_id` to override this — accepting seller A's claim with seller B's result is
+        // the live 21-sat cross-bind (the buyer pays A, who is p2pk-locked into the token, for
+        // B's artifact). The `result_id == None` branch below already author-filters; this
+        // closes the explicit-id hole. Refuse naming BOTH public keys (public keys only).
+        if result.seller_pubkey != seller_pubkey {
+            return Err(JobLifecycleError::Targeting(format!(
+                "result {id} is authored by seller {} but the accepted claim's seller is {} — \
+                 cross-authored result refused (the buyer must not pay one seller for another \
+                 seller's result)",
+                result.seller_pubkey, seller_pubkey
+            )));
+        }
+        return Ok(result);
+    }
+    results
+        .iter()
+        .find(|result| result.seller_pubkey == seller_pubkey && result.commit_oid.is_some())
+        .ok_or_else(|| {
+            JobLifecycleError::NotFound(format!(
+                "no git result from seller {seller_pubkey} for this job"
+            ))
+        })
+}
+
+/// Convert a relay event into an [`EventDraft`] (tag/content only — no secrets).
+pub fn event_to_draft(event: &nostr_sdk::Event) -> EventDraft {
+    let tags = event
+        .tags
+        .iter()
+        .map(|tag| TagSpec(tag.as_slice().to_vec()))
+        .collect();
+    EventDraft::new(event.kind.as_u16(), tags, event.content.clone())
+}
+
+fn first_tag<'a>(tags: &'a [TagSpec], name: &str) -> Option<&'a TagSpec> {
+    tags.iter()
+        .find(|tag| tag.0.first().map(String::as_str) == Some(name))
+}
+
+fn first_tag_value<'a>(tags: &'a [TagSpec], name: &str) -> Option<&'a str> {
+    first_tag(tags, name).and_then(TagSpec::value)
+}
+
+/// Parse a well-formed contribution offer's pins into a serializable view. A malformed
+/// `contribution`-class offer yields `None` (surfaced as `job_class=Some, contribution=None`, which
+/// accept refuses — fail-closed, never run from-scratch).
+fn contribution_offer_view(tags: &[TagSpec]) -> Option<ContributionOfferView> {
+    match crate::contribution::parse_contribution_offer(tags) {
+        Ok(Some(offer)) => Some(ContributionOfferView {
+            target_owner_pubkey: offer.target.owner_pubkey().to_owned(),
+            target_clone_url: offer.target.clone_url().to_owned(),
+            base_branch: offer.base.branch().to_owned(),
+            base_oid: offer.base.oid().to_owned(),
+            accepts: offer.accepts,
+        }),
+        _ => None,
+    }
+}
+
+/// Parse a seller result's contribution echo + authorship signature into a serializable view.
+fn contribution_result_view(tags: &[TagSpec]) -> Option<ContributionResultView> {
+    match crate::contribution::parse_contribution_result_echo(tags) {
+        Ok(Some((echo, tuple_signature))) => Some(ContributionResultView {
+            target_owner_pubkey: echo.target.owner_pubkey().to_owned(),
+            target_clone_url: echo.target.clone_url().to_owned(),
+            base_branch: echo.base.branch().to_owned(),
+            base_oid: echo.base.oid().to_owned(),
+            tuple_signature,
+        }),
+        _ => None,
+    }
+}
+
+/// Value of the `["sig","seller",<hex>]` tag, if present (co-signature capture).
+fn sig_seller_value(tags: &[TagSpec]) -> Option<String> {
+    tags.iter()
+        .find(|tag| {
+            tag.0.first().map(String::as_str) == Some("sig")
+                && tag.0.get(1).map(String::as_str) == Some("seller")
+        })
+        .and_then(|tag| tag.0.get(2))
+        .map(String::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::home;
+
+    // Finding A: accept-side creq verification is STRICT and fail-closed. A well-formed creq
+    // whose payment terms match the job+offer yields its `m` mints; every other shape refuses.
+    #[test]
+    fn accept_verify_creq_is_strict_and_fail_closed() {
+        let seller = nostr_sdk::Keys::generate().public_key().to_hex();
+        let mint = "https://testnut.cashudevkit.org".to_string();
+        let good = crate::gateway::creq::build_seller_creq("job", 7, "sat", &[mint.clone()], &seller)
+            .expect("build creq");
+
+        // Matching terms → accepted, returns the m list.
+        assert_eq!(
+            verify_accepted_claim_creq(Some(&good), "job", 7).unwrap(),
+            vec![mint.clone()]
+        );
+
+        // No creq at all → REFUSE (was previously the silent empty/default path).
+        let err = verify_accepted_claim_creq(None, "job", 7).unwrap_err();
+        assert!(err.to_string().contains("no creq"), "got: {err}");
+
+        // Present but garbage → REFUSE.
+        let err = verify_accepted_claim_creq(Some("creqAnot-valid-cbor"), "job", 7).unwrap_err();
+        assert!(err.to_string().contains("unparseable creq"), "got: {err}");
+
+        // payment_id != job_id → REFUSE.
+        let err = verify_accepted_claim_creq(Some(&good), "other-job", 7).unwrap_err();
+        assert!(err.to_string().contains("payment id"), "got: {err}");
+
+        // amount != offer amount → REFUSE (the load-bearing money check).
+        let err = verify_accepted_claim_creq(Some(&good), "job", 8).unwrap_err();
+        assert!(err.to_string().contains("amount"), "got: {err}");
+
+        // Non-sat unit → REFUSE.
+        let usd = crate::gateway::creq::build_seller_creq("job", 7, "usd", &[mint.clone()], &seller)
+            .expect("build usd creq");
+        let err = verify_accepted_claim_creq(Some(&usd), "job", 7).unwrap_err();
+        assert!(err.to_string().contains("unit"), "got: {err}");
+
+        // Empty accepted-mint list → REFUSE.
+        let no_mints = crate::gateway::creq::build_seller_creq("job", 7, "sat", &[], &seller)
+            .expect("build no-mint creq");
+        let err = verify_accepted_claim_creq(Some(&no_mints), "job", 7).unwrap_err();
+        assert!(err.to_string().contains("accepted mints"), "got: {err}");
+    }
+
+    // Finding B: authorize_request_from_bind refuses a caller amount that drifts from the bind.
+    #[test]
+    fn authorize_from_bind_refuses_amount_drift() {
+        let bind = AcceptedBind {
+            job_id: "aa".repeat(32),
+            claim_id: "bb".repeat(32),
+            result_id: "cc".repeat(32),
+            seller_pubkey: "dd".repeat(32),
+            commit_oid: "ee".repeat(20),
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 5,
+            accept_event_id: "11".repeat(32),
+            accepted_at: 1,
+            seller_signature: "ab".repeat(32),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            realized_mint: None,
+            contribution: None,
+        };
+        // Drifted amount → refuse.
+        let err = authorize_request_from_bind(&bind, 6, bind.commit_oid.clone())
+            .expect_err("amount drift");
+        assert!(
+            err.to_string().contains("does not match accepted bind amount"),
+            "got: {err}"
+        );
+        // Matching amount → ok.
+        let req = authorize_request_from_bind(&bind, 5, bind.commit_oid.clone()).expect("ok");
+        assert_eq!(req.amount_sats, 5);
+    }
+
+    // Fix P — interim single-settlement guard: a second accept binding a DIFFERENT result for a
+    // job that already has an accept-bind is refused, so a second result_id cannot mint a second
+    // buyer attempt/payment for one job. Re-accepting the SAME result is idempotent; no prior bind
+    // is allowed.
+    #[test]
+    fn single_settlement_refuses_different_result_and_is_idempotent_on_same() {
+        let existing = AcceptedBind {
+            job_id: "aa".repeat(32),
+            claim_id: "bb".repeat(32),
+            result_id: "res-A".into(),
+            seller_pubkey: "dd".repeat(32),
+            commit_oid: "ee".repeat(20),
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 5,
+            accept_event_id: "11".repeat(32),
+            accepted_at: 1,
+            seller_signature: "ab".repeat(32),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            realized_mint: None,
+            contribution: None,
+        };
+        // A different result for the already-bound job → refused (one settlement per job).
+        let err = assert_single_settlement(Some(&existing), &existing.job_id, "res-B")
+            .expect_err("different result refused");
+        assert!(
+            err.to_string().contains("already accepted result res-A")
+                && err.to_string().contains("res-B"),
+            "unexpected error: {err}"
+        );
+        // Re-accepting the SAME result is idempotent (durability re-publish/finalize).
+        assert_single_settlement(Some(&existing), &existing.job_id, "res-A")
+            .expect("same result idempotent");
+        // No prior bind → allowed.
+        assert_single_settlement(None, &existing.job_id, "res-B").expect("first accept allowed");
+    }
+
+    // Load-bearing: the explicit 9-field form (with bind-fill applied) and the
+    // bind-first form must build the IDENTICAL AuthorizePayRequest over the same accept-bind —
+    // identical requests ⇒ identical PaymentKey ⇒ identical co-signed receipt preimage/digest, so
+    // both forms pass the seller's pre-pay cosig. `fill_explicit_request_from_bind` sources
+    // `job_hash` from the bind so the explicit form does not keep a caller's divergent job_hash.
+    #[test]
+    fn explicit_and_bind_forms_build_identical_request() {
+        let bind = AcceptedBind {
+            job_id: "2a195bece5f6".into(),
+            claim_id: "0a8bbc5284e8".into(),
+            result_id: "058886d7b19e".into(),
+            seller_pubkey: "aa".repeat(32),
+            commit_oid: "bb".repeat(20),
+            repo: "https://example.invalid/repo.git".into(),
+            branch: "mobee/job".into(),
+            job_hash: "cc".repeat(32),
+            amount_sats: 5,
+            accept_event_id: "accept-x".into(),
+            accepted_at: 1,
+            seller_signature: "dd".repeat(64),
+            creq_hash: Some("2ad9b34cbf8c".to_string()),
+            accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
+            realized_mint: None,
+            contribution: None,
+        };
+
+        // The bind-first request (always sources preimage fields from the bind).
+        let from_bind =
+            authorize_request_from_bind(&bind, 5, bind.commit_oid.clone()).expect("bind form");
+
+        // The explicit request as mcp.rs builds it, with a job_hash that DIVERGES from the bind
+        // (the real-trade failure) and creq_hash/accepted_mints/seller_signature left for the fill.
+        let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            job_id: bind.job_id.clone(),
+            result_id: bind.result_id.clone(),
+            job_class: crate::authorize_pay::JobClass::FromScratch,
+            delivery_integrity_hash: bind.commit_oid.clone(),
+            job_hash: "ff".repeat(32), // caller-supplied, DIFFERENT from bind.job_hash
+            seller_pubkey: bind.seller_pubkey.clone(),
+            amount_sats: 5,
+            repo: bind.repo.clone(),
+            branch: bind.branch.clone(),
+            commit_oid: bind.commit_oid.clone(),
+            seller_signature: String::new(),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            realized_mint: None,
+            contribution: None,
+        };
+        fill_explicit_request_from_bind(&mut explicit, &bind);
+
+        assert_eq!(
+            explicit, from_bind,
+            "explicit-form and bind-form requests must be identical so both build the same \
+             co-signed receipt preimage"
+        );
+    }
+
+    // Finding BB: repo/branch identify WHERE the paid commit is fetched, so the explicit form must
+    // seal them from the bind and never keep a caller's divergent locator.
+    #[test]
+    fn explicit_form_seals_repo_and_branch_from_bind() {
+        let bind = AcceptedBind {
+            job_id: "2a195bece5f6".into(),
+            claim_id: "0a8bbc5284e8".into(),
+            result_id: "058886d7b19e".into(),
+            seller_pubkey: "aa".repeat(32),
+            commit_oid: "bb".repeat(20),
+            repo: "https://bound.invalid/repo.git".into(),
+            branch: "mobee/bound-branch".into(),
+            job_hash: "cc".repeat(32),
+            amount_sats: 5,
+            accept_event_id: "accept-x".into(),
+            accepted_at: 1,
+            seller_signature: "dd".repeat(64),
+            creq_hash: Some("2ad9b34cbf8c".to_string()),
+            accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
+            realized_mint: None,
+            contribution: None,
+        };
+        let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            job_id: bind.job_id.clone(),
+            result_id: bind.result_id.clone(),
+            job_class: crate::authorize_pay::JobClass::FromScratch,
+            delivery_integrity_hash: bind.commit_oid.clone(),
+            job_hash: bind.job_hash.clone(),
+            seller_pubkey: bind.seller_pubkey.clone(),
+            amount_sats: 5,
+            // Caller supplies a DIFFERENT allowlisted locator for the same commit.
+            repo: "https://caller.invalid/mirror.git".into(),
+            branch: "mobee/caller-branch".into(),
+            commit_oid: bind.commit_oid.clone(),
+            seller_signature: String::new(),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            realized_mint: None,
+            contribution: None,
+        };
+        fill_explicit_request_from_bind(&mut explicit, &bind);
+        assert_eq!(explicit.repo, bind.repo, "repo must be sealed from the bind");
+        assert_eq!(explicit.branch, bind.branch, "branch must be sealed from the bind");
+    }
+
+    // Incident diagnosis: the LIVE failure had the explicit call's job_hash BYTE-EQUAL
+    // to the bind (per the failed-run logs). Reproduce that exact shape — ALL explicit fields
+    // byte-equal to the bind — and confirm the two constructed requests are identical EVEN without
+    // the job_hash fix mattering. If this passes, the incident's divergence was NOT in request
+    // construction (it points at the next layer: the bind on disk / re-accept rewrite / config).
+    #[test]
+    fn byte_equal_explicit_matches_bind_request() {
+        let bind = AcceptedBind {
+            job_id: "2a195bece5f6".into(),
+            claim_id: "0a8bbc5284e8".into(),
+            result_id: "058886d7b19e".into(),
+            seller_pubkey: "aa".repeat(32),
+            commit_oid: "5ce37eeb".repeat(5),
+            repo: "https://example.invalid/repo.git".into(),
+            branch: "mobee/job".into(),
+            job_hash: "699c9230".repeat(8),
+            amount_sats: 5,
+            accept_event_id: "accept-x".into(),
+            accepted_at: 1,
+            seller_signature: "dd".repeat(64),
+            creq_hash: Some("2ad9b34c".repeat(8)),
+            accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
+            realized_mint: None,
+            contribution: None,
+        };
+        let from_bind =
+            authorize_request_from_bind(&bind, 5, bind.commit_oid.clone()).expect("bind form");
+
+        // Explicit form with EVERY field byte-equal to the bind (the incident's inputs).
+        let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            job_id: bind.job_id.clone(),
+            result_id: bind.result_id.clone(),
+            job_class: crate::authorize_pay::JobClass::FromScratch,
+            delivery_integrity_hash: bind.commit_oid.clone(),
+            job_hash: bind.job_hash.clone(), // byte-equal, as in the live failure
+            seller_pubkey: bind.seller_pubkey.clone(),
+            amount_sats: 5,
+            repo: bind.repo.clone(),
+            branch: bind.branch.clone(),
+            commit_oid: bind.commit_oid.clone(),
+            seller_signature: bind.seller_signature.clone(),
+            creq_hash: bind.creq_hash.clone(),
+            accepted_mints: bind.accepted_mints.clone(),
+            realized_mint: None,
+            contribution: None,
+        };
+        fill_explicit_request_from_bind(&mut explicit, &bind);
+
+        assert_eq!(
+            explicit, from_bind,
+            "with byte-equal inputs the two forms already produce identical requests — the live \
+             incident was NOT request construction"
+        );
+    }
+
+    // Finding V: the explicit-pay form must NOT retain a caller-supplied accepted_mints. The
+    // co-signed receipt preimage binds only creq_hash (the accepted SET), not the realized mint, so
+    // a caller list is unpinned by the seller cosig; `fill_explicit_request_from_bind` overwrites it
+    // from the sealed bind unconditionally. Here the caller passes a mint OUTSIDE the bind's set;
+    // after fill the request carries ONLY the bind's set, so realized-mint selection can never pick
+    // the substituted mint (`resolve_realized_mint` accepts only a buyer mint within that set).
+    #[test]
+    fn fill_explicit_overwrites_caller_accepted_mints_with_bind() {
+        let bound_mint = "https://mint.minibits.cash/Bitcoin".to_string();
+        let attacker_mint = "https://evil.example/attacker".to_string();
+        let bind = AcceptedBind {
+            job_id: "aa".repeat(32),
+            claim_id: "bb".repeat(32),
+            result_id: "cc".repeat(32),
+            seller_pubkey: "dd".repeat(32),
+            commit_oid: "ee".repeat(20),
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 5,
+            accept_event_id: "11".repeat(32),
+            accepted_at: 1,
+            seller_signature: "ab".repeat(32),
+            creq_hash: Some("2ad9b34c".repeat(8)),
+            accepted_mints: vec![bound_mint.clone()],
+            // The realized-mint SELECTION is sealed in the bind (finding CC).
+            realized_mint: Some(bound_mint.clone()),
+            contribution: None,
+        };
+        let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            job_id: bind.job_id.clone(),
+            result_id: bind.result_id.clone(),
+            job_class: crate::authorize_pay::JobClass::FromScratch,
+            delivery_integrity_hash: bind.commit_oid.clone(),
+            job_hash: bind.job_hash.clone(),
+            seller_pubkey: bind.seller_pubkey.clone(),
+            amount_sats: bind.amount_sats,
+            repo: bind.repo.clone(),
+            branch: bind.branch.clone(),
+            commit_oid: bind.commit_oid.clone(),
+            seller_signature: bind.seller_signature.clone(),
+            creq_hash: bind.creq_hash.clone(),
+            // Caller substitutes a mint OUTSIDE the bound set — for BOTH the accepted set and the
+            // realized-mint selection.
+            accepted_mints: vec![attacker_mint.clone()],
+            realized_mint: Some(attacker_mint.clone()),
+            contribution: None,
+        };
+        fill_explicit_request_from_bind(&mut explicit, &bind);
+        assert_eq!(
+            explicit.accepted_mints, bind.accepted_mints,
+            "caller accepted_mints must be overwritten by the sealed bind"
+        );
+        assert!(
+            !explicit.accepted_mints.contains(&attacker_mint),
+            "substituted mint must not survive into the pay request"
+        );
+        // Finding CC: the caller-supplied realized-mint selection is likewise overwritten by the
+        // sealed bind — a caller must not be able to pick the paying mint (which would shift the
+        // attempt id).
+        assert_eq!(
+            explicit.realized_mint,
+            bind.realized_mint,
+            "caller realized_mint must be overwritten by the sealed bind"
+        );
+        assert_eq!(explicit.realized_mint.as_deref(), Some(bound_mint.as_str()));
+    }
+
+    // Finding CC (end-to-end double-pay regression): the exact retry-stability scenario the
+    // mint-freeze closes. The accept-bind seals realized_mint = A (the buyer's then-configured
+    // default, A in the accepted set). The buyer THEN flips its configured default to B (also
+    // accepted) and RE-RUNS the pay authorization (retry). Because the pay path derives the realized
+    // mint from the SEALED bind — not the live config — the retry's PaymentKey/attempt id is
+    // byte-identical to the first attempt (the config flip did NOT shift it) and still targets the
+    // frozen mint A, so the budget/journal idempotency dedups it instead of minting a SECOND payment
+    // identity for one job. Drives the REAL seal path (`authorize_request_from_bind`) and mirrors
+    // `authorize_pay`'s exact mint-selection + attempt-id derivation over the resulting request.
+    #[tokio::test(flavor = "current_thread")]
+    async fn config_default_flip_after_accept_does_not_shift_attempt_id() {
+        use crate::authorize_pay::{resolve_realized_mint, wallet_open_mint_url};
+        use crate::payment::{
+            DeliveryIntegrityHash, JobHash, JobId, PaymentKey, PaymentTerms, ResultId,
+        };
+        use cashu::{Amount, CurrencyUnit, MintUrl, PublicKey as CashuPublicKey};
+        use std::str::FromStr;
+
+        // A and B are BOTH in the accepted set; A is the buyer's default at accept, B the flipped
+        // default on retry. `allow_real_mints` is on so two distinct mints both pass the fence.
+        let mint_a = "https://mint-a.example";
+        let mint_b = "https://mint-b.example";
+
+        // A buyer home whose LIVE config default is B (the buyer flipped it after accept) — the value
+        // the pre-fix wallet-open used. The frozen mint A must win over this.
+        let root = std::env::temp_dir().join(format!(
+            "mobee-cc-walletopen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = home::bootstrap(&root).expect("home");
+        home.config.accepted_mints = vec![mint_b.to_string()]; // default_mint() = B
+        home.config.allow_real_mints = true;
+        assert_eq!(home.config.default_mint(), mint_b, "live config default is B (flipped)");
+
+        let seller_nostr = nostr_sdk::Keys::generate().public_key();
+        let seller_p2pk =
+            CashuPublicKey::from_str(&format!("02{}", seller_nostr.to_hex())).expect("p2pk");
+
+        let bind = AcceptedBind {
+            job_id: "job-cc".into(),
+            claim_id: "bb".repeat(32),
+            result_id: "res-cc".into(),
+            seller_pubkey: seller_nostr.to_hex(),
+            commit_oid: "ee".repeat(20),
+            repo: "https://example.invalid/repo.git".into(),
+            branch: "master".into(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 7,
+            accept_event_id: "11".repeat(32),
+            accepted_at: 1,
+            seller_signature: String::new(),
+            creq_hash: Some("2ad9b34c".repeat(8)),
+            accepted_mints: vec![mint_a.to_string(), mint_b.to_string()],
+            // Sealed at accept from the buyer's then-configured default (A).
+            realized_mint: Some(mint_a.to_string()),
+            contribution: None,
+        };
+
+        // The pay request built through the REAL seal path threads the frozen mint.
+        let request =
+            authorize_request_from_bind(&bind, bind.amount_sats, bind.commit_oid.clone())
+                .expect("request from bind");
+        assert_eq!(
+            request.realized_mint.as_deref(),
+            Some(mint_a),
+            "seal must thread the frozen mint into the pay request"
+        );
+
+        // Reproduce authorize_pay's mint selection + attempt-id derivation + wallet-open target for a
+        // given LIVE config default (the value that changes between the two attempts). Returns the
+        // attempt id, the resolved realized mint, and the payment terms (whose `mint` is what the
+        // wallet-open seam consumes).
+        let attempt_for = |config_default: &str| -> (String, MintUrl, PaymentTerms) {
+            let selected = request.realized_mint.as_deref().unwrap_or(config_default);
+            let mint = resolve_realized_mint(selected, &request.accepted_mints, true)
+                .expect("resolve realized mint");
+            let terms = PaymentTerms::new(
+                mint.clone(),
+                Amount::from(request.amount_sats),
+                CurrencyUnit::Sat,
+                seller_nostr,
+                seller_p2pk,
+            );
+            let key = PaymentKey::new(
+                JobId::new(&request.job_id).expect("job id"),
+                ResultId::new(&request.result_id).expect("result id"),
+                DeliveryIntegrityHash::from_hex(&request.delivery_integrity_hash).expect("oid"),
+                JobHash::from_hex(&request.job_hash).expect("job hash"),
+                &terms,
+                request.creq_hash.clone(),
+            );
+            (key.attempt_id().as_str().to_owned(), mint, terms)
+        };
+
+        let (first_attempt, first_mint, _first_terms) = attempt_for(mint_a); // accept-time default
+        let (retry_attempt, retry_mint, retry_terms) = attempt_for(mint_b); // flipped to B, retries
+
+        // (a) attempt id / PaymentKey identity is preserved across the config-default flip.
+        assert_eq!(
+            first_attempt, retry_attempt,
+            "config-default flip after accept must NOT shift the attempt id (no second payment identity)"
+        );
+        // (b) both attempts target the FROZEN mint A, never the flipped default B.
+        assert_eq!(first_mint, MintUrl::from_str(mint_a).unwrap());
+        assert_eq!(retry_mint, MintUrl::from_str(mint_a).unwrap());
+        assert_ne!(retry_mint, MintUrl::from_str(mint_b).unwrap());
+
+        // (c) THE WALLET-OPEN HALF OF CC. Drive the EXACT production wallet-open expression from
+        // authorize_pay's :381 seam — `open_wallet_at_mint_async(home, &wallet_open_mint_url(home,
+        // &terms))` — over the retry (home's LIVE default is now B) and observe the REAL opened
+        // Wallet's bound mint. It MUST be the frozen mint A, never the flipped default B. Pre-fix
+        // (:381 = `open_wallet_async(home)`) the wallet bound to B → budget appended, then the send
+        // refuses on mint mismatch and strands the reservation. Reverting `wallet_open_mint_url` to
+        // the live default flips this observed mint B↔A (red-on-revert).
+        let opened = crate::buyer_fund::open_wallet_at_mint_async(
+            &home,
+            &wallet_open_mint_url(&home, &retry_terms),
+        )
+        .await
+        .expect("open pay wallet");
+        assert_eq!(
+            opened.mint_url.to_string(),
+            mint_a,
+            "pay wallet must open at the FROZEN mint A even though the live config default is B"
+        );
+        assert_ne!(
+            opened.mint_url.to_string(),
+            home.config.default_mint(),
+            "pay wallet must NOT open at the flipped live config default (B)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn accept_bind_round_trips_on_disk() {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-jobs-bind-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let bind = AcceptedBind {
+            job_id: "aa".repeat(32),
+            claim_id: "bb".repeat(32),
+            result_id: "cc".repeat(32),
+            seller_pubkey: "dd".repeat(32),
+            commit_oid: "ee".repeat(20),
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 1,
+            accept_event_id: "11".repeat(32),
+            accepted_at: 1,
+            seller_signature: "ab".repeat(32),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            realized_mint: None,
+            contribution: None,
+        };
+        write_accepted_bind(&home, &bind).expect("write");
+        let loaded = load_accepted_bind(&home, &bind.job_id)
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded, bind);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Finding CC (back-compat): the `realized_mint` field is serde-defaulted, so a LEGACY bind JSON
+    // serialized before the field existed still deserializes — into `None`, the legacy pay-path
+    // fallback (live config default). Confirms the AcceptedBind change is not a wire break.
+    #[test]
+    fn accept_bind_deserializes_legacy_json_without_realized_mint() {
+        let legacy = r#"{
+            "job_id":"aa","claim_id":"bb","result_id":"cc","seller_pubkey":"dd",
+            "commit_oid":"ee","repo":"https://example.invalid/repo.git","branch":"master",
+            "job_hash":"ff","amount_sats":5,"accept_event_id":"11","accepted_at":1,
+            "seller_signature":"","accepted_mints":["https://mint.example"]
+        }"#;
+        let bind: AcceptedBind = serde_json::from_str(legacy).expect("legacy bind deserializes");
+        assert_eq!(bind.realized_mint, None, "missing field defaults to None (legacy)");
+        assert_eq!(bind.accepted_mints, vec!["https://mint.example".to_string()]);
+        // And a bind with realized_mint = None does not serialize the field (skip_serializing_if),
+        // so the on-disk shape is unchanged for legacy-equivalent binds.
+        let json = serde_json::to_string(&bind).expect("serialize");
+        assert!(!json.contains("realized_mint"), "None must not emit the field: {json}");
+    }
+
+    // Z1 (crash-safe durable bind write): the accept-bind is written via temp-file + sync + atomic
+    // rename, so a completed write leaves the full bind at the target and NO leftover temp file, and
+    // an overwrite of an existing bind is durable and leaves exactly one file. A truncating write
+    // that crashed mid-flush could leave an empty/partial bind → the daemon re-accepts and pays a
+    // SECOND time; the atomic path forbids that intermediate state.
+    #[test]
+    fn accept_bind_write_is_atomic_no_temp_leftover_and_durable_overwrite() {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-jobs-bind-atomic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let mut bind = AcceptedBind {
+            job_id: "aa".repeat(32),
+            claim_id: "bb".repeat(32),
+            result_id: "cc".repeat(32),
+            seller_pubkey: "dd".repeat(32),
+            commit_oid: "ee".repeat(20),
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 1,
+            // Pending marker first (the pre-publish write), then finalize below.
+            accept_event_id: String::new(),
+            accepted_at: 0,
+            seller_signature: "ab".repeat(32),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            realized_mint: None,
+            contribution: None,
+        };
+        write_accepted_bind(&home, &bind).expect("write pending");
+        // Finalize (the second write in accept_claim) — overwrites the same target atomically.
+        bind.accept_event_id = "11".repeat(32);
+        bind.accepted_at = 42;
+        write_accepted_bind(&home, &bind).expect("write finalized");
+
+        let loaded = load_accepted_bind(&home, &bind.job_id)
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded, bind, "finalized bind must be durable and complete");
+
+        // No temp remnant and exactly one bind file (target only) — proves the rename replaced,
+        // never left a partial temp beside it.
+        let dir = home.root.join(JOBS_DIR);
+        let mut json_files = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("read jobs dir") {
+            let name = entry.expect("entry").file_name().to_string_lossy().into_owned();
+            assert!(!name.ends_with(".tmp"), "leftover temp file: {name}");
+            if name.ends_with(".json") {
+                json_files += 1;
+            }
+        }
+        assert_eq!(json_files, 1, "exactly one bind json expected");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Finding W: two overlapping accepts for DIFFERENT results of one job must resolve to exactly
+    // one durable bind — the loser observes the winner's bind and refuses. Models the accept
+    // check→write critical section (acquire_job_lock → load → assert_single_settlement → write)
+    // run concurrently from two threads against one shared home. The per-job flock serializes the
+    // two, so the second thread reads the first's bind and `assert_single_settlement` refuses; on
+    // disk exactly one result stays bound. Without the lock both could observe no bind and both
+    // write.
+    #[test]
+    fn concurrent_accepts_for_different_results_bind_exactly_one() {
+        use std::sync::{Arc, Barrier};
+        let root = std::env::temp_dir().join(format!(
+            "mobee-jobs-bind-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = Arc::new(home::bootstrap(&root).expect("home"));
+        let job_id = "aa".repeat(32);
+
+        let bind_for = |result_id: &str| AcceptedBind {
+            job_id: job_id.clone(),
+            claim_id: "bb".repeat(32),
+            result_id: result_id.to_owned(),
+            seller_pubkey: "dd".repeat(32),
+            commit_oid: "ee".repeat(20),
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 1,
+            accept_event_id: "11".repeat(32),
+            accepted_at: 1,
+            seller_signature: "ab".repeat(32),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            realized_mint: None,
+            contribution: None,
+        };
+
+        // The accept check→write critical section, guarded by the per-job lock.
+        let attempt = |home: Arc<MobeeHome>, job_id: String, result_id: String, bind: AcceptedBind| {
+            let _lock = acquire_job_lock(&home, &job_id)?;
+            let existing = load_accepted_bind(&home, &job_id)?;
+            assert_single_settlement(existing.as_ref(), &job_id, &result_id)?;
+            write_accepted_bind(&home, &bind)?;
+            Ok::<(), JobLifecycleError>(())
+        };
+
+        let barrier = Arc::new(Barrier::new(2));
+        let results = ["cc".repeat(32), "dd".repeat(32)];
+        let handles: Vec<_> = results
+            .iter()
+            .map(|result_id| {
+                let home = Arc::clone(&home);
+                let barrier = Arc::clone(&barrier);
+                let job_id = job_id.clone();
+                let result_id = result_id.clone();
+                let bind = bind_for(&result_id);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    attempt(home, job_id, result_id, bind)
+                })
+            })
+            .collect();
+
+        let outcomes: Vec<Result<(), JobLifecycleError>> =
+            handles.into_iter().map(|h| h.join().expect("thread")).collect();
+
+        let ok = outcomes.iter().filter(|r| r.is_ok()).count();
+        let err = outcomes.iter().filter(|r| r.is_err()).count();
+        assert_eq!(ok, 1, "exactly one accept must bind");
+        assert_eq!(err, 1, "the other accept must refuse");
+        let refusal = outcomes
+            .iter()
+            .find_map(|r| r.as_ref().err())
+            .expect("one refusal")
+            .to_string();
+        assert!(
+            refusal.contains("refusing to bind a different result"),
+            "loser must refuse via single-settlement guard, got: {refusal}"
+        );
+
+        // Exactly one bind on disk, and it is one of the two contested results.
+        let bound = load_accepted_bind(&home, &job_id)
+            .expect("load")
+            .expect("present");
+        assert!(results.contains(&bound.result_id));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Finding L: accept writes a PENDING bind before publishing, then finalizes with the accept
+    // event id. This models the two-phase durability primitive: a crash after the pending write
+    // (but before/after publish) always leaves a local bind on disk, so a public accept can never
+    // exist with no local record. Simulates the sequence write-pending → (publish) → finalize.
+    #[test]
+    fn accept_bind_pending_then_finalize_durability() {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-jobs-bind-pending-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let mut bind = AcceptedBind {
+            job_id: "aa".repeat(32),
+            claim_id: "bb".repeat(32),
+            result_id: "cc".repeat(32),
+            seller_pubkey: "dd".repeat(32),
+            commit_oid: "ee".repeat(20),
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 1,
+            // Pending marker: written BEFORE publish (empty id, ts 0).
+            accept_event_id: String::new(),
+            accepted_at: 0,
+            seller_signature: "ab".repeat(32),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            realized_mint: None,
+            contribution: None,
+        };
+        // Phase 1: pending write is durable and reloads with the empty-id marker.
+        write_accepted_bind(&home, &bind).expect("write pending");
+        let pending = load_accepted_bind(&home, &bind.job_id)
+            .expect("load")
+            .expect("present after pending write");
+        assert!(
+            pending.accept_event_id.is_empty(),
+            "pending bind must carry the empty accept_event_id marker"
+        );
+
+        // Phase 2: finalize with the published id + timestamp overwrites the same record.
+        bind.accept_event_id = "11".repeat(32);
+        bind.accepted_at = 1;
+        write_accepted_bind(&home, &bind).expect("finalize");
+        let finalized = load_accepted_bind(&home, &bind.job_id)
+            .expect("load")
+            .expect("present after finalize");
+        assert_eq!(finalized, bind);
+        assert!(!finalized.accept_event_id.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn authorize_from_bind_requires_buyer_tip_match_hash() {
+        let bind = AcceptedBind {
+            job_id: "aa".repeat(32),
+            claim_id: "bb".repeat(32),
+            result_id: "cc".repeat(32),
+            seller_pubkey: "dd".repeat(32),
+            commit_oid: "ee".repeat(20),
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 1,
+            accept_event_id: "11".repeat(32),
+            accepted_at: 1,
+            seller_signature: "ab".repeat(32),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            realized_mint: None,
+            contribution: None,
+        };
+        let err = authorize_request_from_bind(&bind, 1, String::new()).expect_err("empty hash");
+        assert!(err.to_string().contains("delivery_integrity_hash"));
+
+        // Buyer-supplied hash that disagrees with seller advertised commit_oid → refuse.
+        let mismatch =
+            authorize_request_from_bind(&bind, 1, "aa".repeat(20)).expect_err("mismatch");
+        assert!(
+            mismatch.to_string().contains("does not match accepted seller commit_oid"),
+            "got: {mismatch}"
+        );
+
+        // Matching is allowed only when the buyer independently supplies that oid.
+        let req = authorize_request_from_bind(&bind, 1, bind.commit_oid.clone()).expect("ok");
+        assert_eq!(req.delivery_integrity_hash, bind.commit_oid);
+        assert_eq!(req.seller_pubkey, bind.seller_pubkey);
+        assert_eq!(req.commit_oid, bind.commit_oid);
+    }
+
+    #[test]
+    fn assert_authorize_matches_bind_refuses_seller_mismatch() {
+        let bind = AcceptedBind {
+            job_id: "aa".repeat(32),
+            claim_id: "bb".repeat(32),
+            result_id: "cc".repeat(32),
+            seller_pubkey: "dd".repeat(32),
+            commit_oid: "ee".repeat(20),
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 1,
+            accept_event_id: "11".repeat(32),
+            accepted_at: 1,
+            seller_signature: "ab".repeat(32),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            realized_mint: None,
+            contribution: None,
+        };
+        let bad_seller = "00".repeat(32);
+        let err = assert_authorize_matches_bind(&bind, &bad_seller, &bind.result_id, &bind.commit_oid)
+            .expect_err("mismatch");
+        assert!(err.to_string().contains("seller"));
+    }
+
+    fn result_view(result_id: &str, seller_pubkey: &str) -> ResultView {
+        ResultView {
+            result_id: result_id.to_owned(),
+            created_at: 100,
+            seller_pubkey: seller_pubkey.to_owned(),
+            display_name: None,
+            job_hash: Some("ff".repeat(32)),
+            repo: Some("https://github.com/bitcoin/bips.git".into()),
+            branch: Some("master".into()),
+            commit_oid: Some("ee".repeat(20)),
+            amount_sats: Some(1),
+            seller_signature: Some("ab".repeat(64)),
+            contribution: None,
+        }
+    }
+
+    // CROSS-BIND TOOTH (accept path): an explicit `result_id` authored by a DIFFERENT seller
+    // than the accepted claim's seller is REFUSED (the tool must not trust operator input) —
+    // the live 21-sat cross-bind fixture shape (claim A + result B). An own-authored result,
+    // selected explicitly OR auto, is unchanged.
+    #[test]
+    fn select_result_refuses_cross_authored_explicit_result_id() {
+        let seller_a = "aa".repeat(32);
+        let seller_b = "bb".repeat(32);
+        let results = vec![
+            result_view("result-b", &seller_b),
+            result_view("result-a", &seller_a),
+        ];
+
+        // Claim seller A, explicit result authored by B → refuse, naming BOTH pubkeys.
+        let err = select_result(&results, &seller_a, Some("result-b"))
+            .expect_err("cross-authored explicit result_id must refuse");
+        let message = err.to_string();
+        assert!(
+            message.contains(&seller_a) && message.contains(&seller_b),
+            "refusal must name both the claim seller and the result author: {message}"
+        );
+        assert!(
+            message.contains("cross-authored"),
+            "refusal must be a clear cross-authored refusal: {message}"
+        );
+
+        // A's own result, selected explicitly → accepted unchanged.
+        let own = select_result(&results, &seller_a, Some("result-a")).expect("own result ok");
+        assert_eq!(own.result_id, "result-a");
+        assert_eq!(own.seller_pubkey, seller_a);
+
+        // Auto-select (no explicit id) → author-filtered to A, unchanged.
+        let auto = select_result(&results, &seller_a, None).expect("auto own result ok");
+        assert_eq!(auto.seller_pubkey, seller_a);
+    }
+
+    fn claim_view(claim_id: &str, created_at: u64, status: &str) -> ClaimView {
+        ClaimView {
+            claim_id: claim_id.to_owned(),
+            created_at,
+            seller_pubkey: "dd".repeat(32),
+            display_name: None,
+            status: status.to_owned(),
+            live: false,
+            reason_code: None,
+            reason: None,
+            creq: None,
+        }
+    }
+
+    // A processing claim past its offer deadline surfaces as EXPIRED and is not
+    // live. REAL claim/deadline path — a fixed `now` (injected), no relay, no wall-clock.
+    #[test]
+    fn processing_claim_past_deadline_is_expired_not_live() {
+        let deadline = 1_700_000_000u64;
+        let mut claims = vec![claim_view("orphan-claim", 100, "processing")];
+        // now well past the deadline (still "processing" 25 min later).
+        let live = derive_claim_liveness(&mut claims, Some(deadline), deadline + 1_500);
+        assert_eq!(live, None, "an expired claim must never be the live claim");
+        assert_eq!(
+            claims[0].status, CLAIM_STATUS_EXPIRED,
+            "past-deadline processing claim must surface as EXPIRED"
+        );
+        assert!(!claims[0].live, "expired claim must not read live/processing");
+    }
+
+    #[test]
+    fn processing_claim_before_deadline_is_live_newest_wins() {
+        let deadline = 1_700_000_000u64;
+        let mut claims = vec![
+            claim_view("newest", 200, "processing"),
+            claim_view("older", 100, "processing"),
+        ];
+        let live = derive_claim_liveness(&mut claims, Some(deadline), deadline - 10);
+        assert_eq!(live.as_deref(), Some("newest"), "newest processing claim is live");
+        assert!(claims[0].live && !claims[1].live);
+        assert_eq!(claims[0].status, "processing", "not expired before the deadline");
+    }
+
+    // The SAME fixture flips live→expired purely by advancing the injected `now` — proves
+    // expiry is derived from `now`, never stored (and that `now` is load-bearing input).
+    #[test]
+    fn liveness_flips_with_injected_now_only() {
+        let deadline = 1_700_000_000u64;
+        let make = || vec![claim_view("c1", 100, "processing")];
+
+        let mut before = make();
+        let live_before = derive_claim_liveness(&mut before, Some(deadline), deadline - 1);
+        assert_eq!(live_before.as_deref(), Some("c1"));
+        assert!(before[0].live && before[0].status == "processing");
+
+        let mut after = make();
+        let live_after = derive_claim_liveness(&mut after, Some(deadline), deadline + 1);
+        assert_eq!(live_after, None);
+        assert!(!after[0].live && after[0].status == CLAIM_STATUS_EXPIRED);
+    }
+
+    // No offer deadline known ⇒ expiry cannot be derived; status-based liveness preserved.
+    // An `error` claim is never live regardless.
+    #[test]
+    fn no_deadline_preserves_status_and_error_never_live() {
+        let mut claims = vec![
+            claim_view("proc", 200, "processing"),
+            claim_view("err", 100, "error"),
+        ];
+        let live = derive_claim_liveness(&mut claims, None, 9_999_999_999);
+        assert_eq!(live.as_deref(), Some("proc"));
+        assert!(claims[0].live, "processing claim stays live when no deadline is known");
+        assert!(!claims[1].live, "error claim is never live");
+        assert_eq!(claims[0].status, "processing");
+    }
+
+    #[test]
+    fn post_job_refuses_missing_seller_without_untargeted() {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-jobs-post-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let err = post_job(
+            &home,
+            PostJobRequest {
+                task: "t".into(),
+                output: "text/plain".into(),
+                amount_sats: 1,
+                seller_pubkey: None,
+                untargeted: false,
+                deadline_unix: Some(1_800_000_000),
+                repo: None,
+                branch: None,
+                job: JobKind::FromScratch,
+            },
+        )
+        .expect_err("seller required");
+        assert!(err.to_string().contains("seller_pubkey"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn temp_job_home(label: &str) -> (std::path::PathBuf, crate::home::MobeeHome) {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-jobs-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        (root, home)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_job_sync_refuses_inside_runtime() {
+        let (root, home) = temp_job_home("nested-post");
+        let err = post_job(
+            &home,
+            PostJobRequest {
+                task: "t".into(),
+                output: "text/plain".into(),
+                amount_sats: 1,
+                seller_pubkey: Some("aa".repeat(32)),
+                untargeted: false,
+                deadline_unix: Some(1_800_000_000),
+                repo: None,
+                branch: None,
+                job: JobKind::FromScratch,
+            },
+        )
+        .expect_err("must refuse nested block_on");
+        assert!(
+            err.to_string().contains("nested block_on refused"),
+            "unexpected: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_job_sync_refuses_inside_runtime() {
+        let (root, home) = temp_job_home("nested-get");
+        let err = get_job(
+            &home,
+            GetJobRequest {
+                job_id: "aa".repeat(32),
+                wait_for: None,
+                timeout_secs: None,
+            },
+        )
+        .expect_err("must refuse nested block_on");
+        assert!(
+            err.to_string().contains("nested block_on refused"),
+            "unexpected: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn accept_claim_sync_refuses_inside_runtime() {
+        let (root, home) = temp_job_home("nested-accept");
+        let err = accept_claim(
+            &home,
+            AcceptClaimRequest {
+                job_id: "aa".repeat(32),
+                claim_id: "bb".repeat(32),
+                result_id: None,
+            },
+        )
+        .expect_err("must refuse nested block_on");
+        assert!(
+            err.to_string().contains("nested block_on refused"),
+            "unexpected: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_draft_sync_refuses_inside_runtime() {
+        let (root, home) = temp_job_home("nested-publish-draft");
+        let keys = nostr_sdk::Keys::generate();
+        let draft = EventDraft::new(JOB_OFFER_KIND, Vec::new(), "nested-guard");
+        let err = publish_draft(&home, &keys, &draft).expect_err("must refuse nested block_on");
+        assert!(
+            err.to_string().contains("nested block_on refused"),
+            "unexpected: {err}"
+        );
+        assert!(
+            err.to_string().contains("publish_draft"),
+            "op name missing: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_job_view_sync_refuses_inside_runtime() {
+        let (root, home) = temp_job_home("nested-fetch-job");
+        let keys = nostr_sdk::Keys::generate();
+        let err = fetch_job_view(&home, &keys, &"aa".repeat(32), Duration::from_secs(1))
+            .expect_err("must refuse nested block_on");
+        assert!(
+            err.to_string().contains("nested block_on refused"),
+            "unexpected: {err}"
+        );
+        assert!(
+            err.to_string().contains("fetch_job_view"),
+            "op name missing: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Accept-path: contribution resolution (echo-equality + fail-closed) ─────
+    fn offer_view_contribution(owner: &str, url: &str, base_branch: &str, base_oid: &str) -> OfferView {
+        OfferView {
+            event_id: "of".repeat(16),
+            created_at: 1,
+            author_pubkey: "aa".repeat(32),
+            author_display_name: None,
+            task: "t".into(),
+            output: "o".into(),
+            amount_sats: 1,
+            deadline_unix: 10,
+            seller_pubkey: None,
+            seller_display_name: None,
+            targeted: false,
+            repo: None,
+            branch: None,
+            job_class: Some(crate::contribution::JOB_CLASS_CONTRIBUTION.to_owned()),
+            contribution: Some(ContributionOfferView {
+                target_owner_pubkey: owner.to_owned(),
+                target_clone_url: url.to_owned(),
+                base_branch: base_branch.to_owned(),
+                base_oid: base_oid.to_owned(),
+                accepts: vec!["fork".into()],
+            }),
+        }
+    }
+
+    fn result_view_contribution(owner: &str, url: &str, base_branch: &str, base_oid: &str, sig: &str) -> ResultView {
+        let mut r = result_view(&"cc".repeat(32), &"dd".repeat(32));
+        r.contribution = Some(ContributionResultView {
+            target_owner_pubkey: owner.to_owned(),
+            target_clone_url: url.to_owned(),
+            base_branch: base_branch.to_owned(),
+            base_oid: base_oid.to_owned(),
+            tuple_signature: sig.to_owned(),
+        });
+        r
+    }
+
+    #[test]
+    fn accept_contribution_records_offer_authority_and_store_ref() {
+        let owner = "aa".repeat(32);
+        let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
+        let base_oid = "77".repeat(20);
+        let offer = offer_view_contribution(&owner, url, "main", &base_oid);
+        let result = result_view_contribution(&owner, url, "main", &base_oid, "sigbytes");
+        let bind = resolve_accepted_contribution(&offer, &result, &"ee".repeat(20))
+            .expect("resolve ok")
+            .expect("is contribution");
+        // Authority = the OFFER, not the echo.
+        assert_eq!(bind.target_owner_pubkey, owner);
+        assert_eq!(bind.base_oid, base_oid);
+        assert_eq!(bind.tuple_signature, "sigbytes");
+        assert_eq!(
+            bind.store_ref,
+            crate::delivery_git::PayPathDeliveryVerifier::store_ref_for(&"ee".repeat(20))
+        );
+    }
+
+    #[test]
+    fn accept_contribution_refuses_echo_target_mismatch() {
+        let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
+        let base_oid = "77".repeat(20);
+        let offer = offer_view_contribution(&"aa".repeat(32), url, "main", &base_oid);
+        // Result echoes a DIFFERENT target owner — equality-check refuses.
+        let result = result_view_contribution(&"bb".repeat(32), url, "main", &base_oid, "s");
+        let err = resolve_accepted_contribution(&offer, &result, &"ee".repeat(20))
+            .expect_err("echo target mismatch must refuse");
+        assert!(err.to_string().contains("echo mismatch"), "got {err}");
+    }
+
+    #[test]
+    fn accept_contribution_refuses_echo_base_mismatch() {
+        let owner = "aa".repeat(32);
+        let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
+        let offer = offer_view_contribution(&owner, url, "main", &"77".repeat(20));
+        // Result echoes a DIFFERENT base_oid.
+        let result = result_view_contribution(&owner, url, "main", &"88".repeat(20), "s");
+        let err = resolve_accepted_contribution(&offer, &result, &"ee".repeat(20))
+            .expect_err("echo base mismatch must refuse");
+        assert!(err.to_string().contains("echo mismatch"), "got {err}");
+    }
+
+    #[test]
+    fn accept_malformed_contribution_offer_fails_closed_not_from_scratch() {
+        // job_class=contribution but pins failed to parse (contribution=None) ⇒ REFUSE.
+        let mut offer = offer_view_contribution(&"aa".repeat(32), "https://x/r.git", "main", &"77".repeat(20));
+        offer.contribution = None; // simulate a malformed contribution offer
+        let result = result_view(&"cc".repeat(32), &"dd".repeat(32));
+        let err = resolve_accepted_contribution(&offer, &result, &"ee".repeat(20))
+            .expect_err("malformed contribution offer must refuse (fail-closed)");
+        assert!(err.to_string().contains("malformed"), "got {err}");
+    }
+
+    #[test]
+    fn accept_contribution_requires_a_contribution_result() {
+        let owner = "aa".repeat(32);
+        let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
+        let offer = offer_view_contribution(&owner, url, "main", &"77".repeat(20));
+        // A from-scratch result (no contribution echo) against a contribution offer ⇒ refuse.
+        let result = result_view(&"cc".repeat(32), &"dd".repeat(32));
+        assert!(resolve_accepted_contribution(&offer, &result, &"ee".repeat(20)).is_err());
+    }
+
+    #[test]
+    fn from_scratch_offer_resolves_to_no_contribution() {
+        let mut offer = offer_view_contribution(&"aa".repeat(32), "https://x/r.git", "main", &"77".repeat(20));
+        offer.job_class = None;
+        offer.contribution = None;
+        let result = result_view(&"cc".repeat(32), &"dd".repeat(32));
+        assert_eq!(
+            resolve_accepted_contribution(&offer, &result, &"ee".repeat(20)).expect("ok"),
+            None
+        );
+    }
+
+    #[test]
+    fn authorize_request_from_bind_threads_contribution() {
+        let mut bind = AcceptedBind {
+            job_id: "aa".repeat(32),
+            claim_id: "bb".repeat(32),
+            result_id: "cc".repeat(32),
+            seller_pubkey: "dd".repeat(32),
+            commit_oid: "ee".repeat(20),
+            repo: "https://mobee-relay.orveth.dev/git/seller/fork.git".into(),
+            branch: "mobee/contribution/x".into(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 1,
+            accept_event_id: "11".repeat(32),
+            accepted_at: 1,
+            seller_signature: "ab".repeat(32),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            realized_mint: None,
+            contribution: Some(AcceptedContribution {
+                target_owner_pubkey: "aa".repeat(32),
+                target_clone_url: "https://mobee-relay.orveth.dev/git/owner/repo.git".into(),
+                base_branch: "main".into(),
+                base_oid: "77".repeat(20),
+                tuple_signature: "cafe".into(),
+                store_ref: "refs/mobee/deliveries/eeee".into(),
+            }),
+        };
+        let req = authorize_request_from_bind(&bind, 1, bind.commit_oid.clone()).expect("ok");
+        let c = req.contribution.expect("threaded");
+        assert_eq!(c.target_owner_pubkey, "aa".repeat(32));
+        assert_eq!(c.base_oid, "77".repeat(20));
+        assert_eq!(c.tuple_signature, "cafe");
+        // From-scratch bind ⇒ None threaded.
+        bind.contribution = None;
+        let req2 = authorize_request_from_bind(&bind, 1, bind.commit_oid.clone()).expect("ok");
+        assert!(req2.contribution.is_none());
+    }
+
+    #[test]
+    fn contribution_offer_view_parses_pins_and_malformed_is_none() {
+        // A well-formed contribution offer's tags parse into the view.
+        let offer = crate::contribution::ContributionOffer {
+            target: crate::contribution::TargetRepoPin::new(
+                "aa".repeat(32),
+                "https://mobee-relay.orveth.dev/git/owner/repo.git",
+            )
+            .unwrap(),
+            base: crate::contribution::ContributionBase::new("main", "77".repeat(20)).unwrap(),
+            accepts: vec!["fork".into()],
+        };
+        let tags = crate::contribution::contribution_offer_tags(&offer);
+        let view = contribution_offer_view(&tags).expect("parsed");
+        assert_eq!(view.target_owner_pubkey, "aa".repeat(32));
+        assert_eq!(view.base_oid, "77".repeat(20));
+        // A contribution offer missing the base tag ⇒ view None (surfaced as job_class-present +
+        // contribution-None, which accept refuses).
+        let malformed = vec![crate::gateway::TagSpec::new([
+            crate::contribution::TAG_JOB_CLASS,
+            crate::contribution::JOB_CLASS_CONTRIBUTION,
+        ])];
+        assert!(contribution_offer_view(&malformed).is_none());
+    }
+
+    // ── Buyer POST-path: contribution offer spec (validation + tag emission) ─────
+    fn contribution_spec(
+        owner: &str,
+        url: &str,
+        branch: &str,
+        oid: &str,
+        accepts: Option<Vec<String>>,
+    ) -> ContributionSpec {
+        ContributionSpec {
+            target_repo_owner: owner.into(),
+            target_repo_url: url.into(),
+            base_branch: branch.into(),
+            base_oid: oid.into(),
+            accepts,
+        }
+    }
+
+    fn contribution_post_request(
+        owner: &str,
+        url: &str,
+        branch: &str,
+        oid: &str,
+        accepts: Option<Vec<String>>,
+    ) -> PostJobRequest {
+        PostJobRequest {
+            task: "t".into(),
+            output: "text/plain".into(),
+            amount_sats: 1,
+            seller_pubkey: None,
+            untargeted: true,
+            deadline_unix: Some(10),
+            repo: None,
+            branch: None,
+            job: JobKind::Contribution(contribution_spec(owner, url, branch, oid, accepts)),
+        }
+    }
+
+    #[test]
+    fn post_job_contribution_round_trip_offer_tags_bind_to_offer_values() {
+        // The load-bearing round-trip: post_job contribution params -> BUILT event tags ->
+        // parse_contribution_offer yields exactly {owner,url,branch,oid} -> emitted tags ARE the
+        // canonical constructor output (no drift) -> the accept-path binds to the OFFER's values.
+        let owner = "aa".repeat(32);
+        let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
+        let base_oid = "77".repeat(20);
+        let request = contribution_post_request(&owner, url, "main", &base_oid, None);
+
+        let spec = match &request.job {
+            JobKind::Contribution(spec) => spec,
+            JobKind::FromScratch => panic!("built a contribution request"),
+        };
+        let contribution =
+            contribution_offer_from_spec(spec).expect("valid contribution params");
+        let draft =
+            build_offer_draft(&request, 10, Some(&contribution)).expect("draft built");
+
+        // (a) canonical parse of the BUILT tags yields exactly the pinned values.
+        let parsed = crate::contribution::parse_contribution_offer(&draft.tags)
+            .expect("parse ok")
+            .expect("is a contribution");
+        assert_eq!(parsed.target.owner_pubkey(), owner);
+        assert_eq!(parsed.target.clone_url(), url);
+        assert_eq!(parsed.base.branch(), "main");
+        assert_eq!(parsed.base.oid(), base_oid);
+        assert!(parsed.accepts_fork());
+
+        // (b) emitted tags ARE the canonical constructor output (no drift).
+        let expected_tags = crate::contribution::contribution_offer_tags(&contribution);
+        assert!(
+            draft.tags.ends_with(&expected_tags),
+            "emitted contribution tags must equal the canonical constructor output"
+        );
+
+        // (c) the accept-path binds to the OFFER's values, threaded from the EMITTED tags.
+        let mut offer_view = offer_view_contribution(&owner, url, "main", &base_oid);
+        offer_view.contribution = contribution_offer_view(&draft.tags);
+        let result = result_view_contribution(&owner, url, "main", &base_oid, "sigbytes");
+        let bind = resolve_accepted_contribution(&offer_view, &result, &"ee".repeat(20))
+            .expect("resolve ok")
+            .expect("is a contribution");
+        assert_eq!(bind.target_owner_pubkey, owner);
+        assert_eq!(bind.target_clone_url, url);
+        assert_eq!(bind.base_branch, "main");
+        assert_eq!(bind.base_oid, base_oid);
+    }
+
+    #[test]
+    fn post_job_from_scratch_emits_byte_identical_tags() {
+        // No contribution params ⇒ Ok(None) ⇒ built tags are byte-identical to the bare offer.
+        let request = PostJobRequest {
+            task: "t".into(),
+            output: "text/plain".into(),
+            amount_sats: 3,
+            seller_pubkey: Some("bb".repeat(32)),
+            untargeted: false,
+            deadline_unix: Some(10),
+            repo: None,
+            branch: None,
+            job: JobKind::FromScratch,
+        };
+        let contribution: Option<crate::contribution::ContributionOffer> = match &request.job {
+            JobKind::FromScratch => None,
+            JobKind::Contribution(spec) => Some(contribution_offer_from_spec(spec).expect("ok")),
+        };
+        assert!(contribution.is_none(), "from-scratch ⇒ no contribution offer");
+        let draft = build_offer_draft(
+            &request,
+            10,
+            contribution.as_ref(),
+        )
+        .expect("draft");
+        let expected = OfferDraft::new(
+            "t",
+            "text/plain",
+            3,
+            10,
+            "bb".repeat(32),
+        )
+        .to_event_draft();
+        assert_eq!(draft, expected, "from-scratch draft must be byte-identical");
+        assert!(!crate::contribution::is_contribution_tags(&draft.tags));
+        // The budget guard fires ONLY over-cap and does NOT touch tag emission — a normal
+        // within-cap post (amount 3 <= default cap 21) passes the guard, so emitted tags for a
+        // normal post are unchanged (byte-identical, asserted above).
+        assert!(
+            assert_amount_within_budget_cap(3, crate::home::DEFAULT_PER_JOB_BUDGET_SATS).is_ok(),
+            "a within-cap post must pass the budget guard"
+        );
+    }
+
+    // Partial-param (all-or-nothing) refusal moved to the flat-args → `JobKind` mapping in the MCP
+    // tool layer: a partial contribution set is now unrepresentable in `PostJobRequest`, so the core
+    // no longer has a partial case to refuse (the type enforces it at compile time).
+
+    #[test]
+    fn post_job_contribution_bad_fields_refuse() {
+        let owner = "aa".repeat(32);
+        let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
+        let oid = "77".repeat(20);
+        // bad owner (not 64-hex)
+        assert!(
+            contribution_offer_from_spec(&contribution_spec("nothex", url, "main", &oid, None))
+                .is_err()
+        );
+        // bad oid (not 40/64-hex)
+        assert!(
+            contribution_offer_from_spec(&contribution_spec(&owner, url, "main", "xyz", None))
+                .is_err()
+        );
+        // bad base branch (leading dash)
+        assert!(
+            contribution_offer_from_spec(&contribution_spec(&owner, url, "-x", &oid, None)).is_err()
+        );
+        // bad url (forbidden scheme via the transport allowlist)
+        assert!(contribution_offer_from_spec(&contribution_spec(
+            &owner,
+            "file:///tmp/repo.git",
+            "main",
+            &oid,
+            None
+        ))
+        .is_err());
+        // accepts present but without "fork" (fork is the only supported delivery) ⇒ refuse.
+        assert!(contribution_offer_from_spec(&contribution_spec(
+            &owner,
+            url,
+            "main",
+            &oid,
+            Some(vec!["patch".into()])
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn post_job_contribution_refuses_ext_url_at_post() {
+        // ext:: clone URL refused at POST time — a buyer must not publish an unverifiable offer.
+        let owner = "aa".repeat(32);
+        let oid = "77".repeat(20);
+        let err = contribution_offer_from_spec(&contribution_spec(
+            &owner,
+            "ext::sh -c evil",
+            "main",
+            &oid,
+            None,
+        ))
+        .expect_err("ext refused at post");
+        assert!(err.to_string().contains("refused"), "{err}");
+    }
+
+    // ── Post-time per-job budget-cap validation ───────────────────────────────────
+    #[test]
+    fn budget_cap_guard_over_cap_refuses_at_and_under_cap_pass() {
+        // over-cap ⇒ refuse, naming the config key + BOTH numbers + the restart remedy.
+        let err = assert_amount_within_budget_cap(40, 21).expect_err("over-cap refused");
+        let msg = err.to_string();
+        assert!(msg.contains("per_job_budget_sats"), "names the config key: {msg}");
+        assert!(msg.contains("40"), "names the amount: {msg}");
+        assert!(msg.contains("21"), "names the cap: {msg}");
+        assert!(msg.contains("RESTART"), "names the remedy: {msg}");
+        // at-cap ⇒ passes (mirrors the budget gate's `amount > cap` refuse condition).
+        assert!(assert_amount_within_budget_cap(21, 21).is_ok(), "at-cap must pass");
+        // under-cap ⇒ passes, unchanged.
+        assert!(assert_amount_within_budget_cap(20, 21).is_ok(), "under-cap must pass");
+    }
+
+    #[test]
+    fn post_job_deadline_past_refused_names_field_and_values() {
+        let err = resolve_post_deadline(Some(1_700_000_000), 1_700_000_001)
+            .expect_err("past deadline must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("deadline_unix"), "names the field: {msg}");
+        assert!(msg.contains("given=1700000000"), "shows given value: {msg}");
+        assert!(msg.contains("current=1700000001"), "shows current value: {msg}");
+    }
+
+    #[test]
+    fn post_job_deadline_zero_refused() {
+        let err = resolve_post_deadline(Some(0), 1_700_000_001)
+            .expect_err("zero deadline must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("deadline_unix"), "{msg}");
+        assert!(msg.contains("given=0"), "{msg}");
+        assert!(msg.contains("current=1700000001"), "{msg}");
+    }
+
+    #[test]
+    fn post_job_deadline_omitted_defaults_to_one_hour_from_now() {
+        assert_eq!(
+            resolve_post_deadline(None, 1_700_000_001).expect("omitted deadline defaults"),
+            1_700_003_601
+        );
+    }
+
+    #[test]
+    fn post_job_deadline_future_accepted() {
+        assert_eq!(
+            resolve_post_deadline(Some(1_700_000_002), 1_700_000_001)
+                .expect("future deadline accepted"),
+            1_700_000_002
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_job_over_budget_cap_refused_before_wallet_or_publish() {
+        // An over-cap post refuses AT POST (before the wallet opens / anything publishes), so this
+        // runs fully offline. Field case: amount 40 with per_job_budget_sats = 21.
+        let (root, mut home) = temp_job_home("over-cap");
+        home.config.per_job_budget_sats = 21;
+        let err = post_job_async(
+            &home,
+            PostJobRequest {
+                task: "t".into(),
+                output: "text/plain".into(),
+                amount_sats: 40,
+                seller_pubkey: Some("aa".repeat(32)),
+                untargeted: false,
+                deadline_unix: Some(1_800_000_000),
+                repo: None,
+                branch: None,
+                job: JobKind::FromScratch,
+            },
+        )
+        .await
+        .expect_err("over-cap post must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("per_job_budget_sats"), "{msg}");
+        assert!(msg.contains("40") && msg.contains("21"), "{msg}");
+        assert!(msg.contains("RESTART"), "{msg}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

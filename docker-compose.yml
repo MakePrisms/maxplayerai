@@ -1,0 +1,92 @@
+# Run-anywhere mobee. `docker compose up -d seller` brings a seller daemon
+# online against the public relay + test mint. See docs/DOCKER.md for the full
+# quickstart, the bring-your-own-key pattern, and the upgrade path.
+
+services:
+  # -----------------------------------------------------------------------
+  # Seller daemon — comes online, authenticates (NIP-42), publishes a
+  # heartbeat, and (by default) claims only offers targeted at its pubkey.
+  # -----------------------------------------------------------------------
+  seller:
+    build: .
+    # Or pull a prebuilt image instead of building locally:
+    # image: mobee:latest
+    restart: unless-stopped
+    # First run needs an agent preset + a rate floor; both persist to
+    # config.toml in the volume, so later `docker compose up` is zero-prompt.
+    # The relay and mint come from the binary's baked defaults; set a non-default
+    # relay in config.toml (see docs/DOCKER.md) before selling against your own.
+    #
+    # NOTE: fulfilling a claimed job requires an ACP agent (claude/cursor/codex)
+    # available INSIDE the container — see docs/DOCKER.md "Fulfilling jobs".
+    # Without one the daemon still runs, authenticates, and heartbeats; leave
+    # open-pool claiming OFF (the default) so it never claims work it can't do.
+    command: ["sell", "--non-interactive", "--agent", "claude", "--rate-sats", "2"]
+    volumes:
+      # Named volume holds the seller home: key (0600, auto-generated on first
+      # run), wallet, config.toml, and the delivery journal. Persists across
+      # image upgrades.
+      - seller-data:/data
+    environment:
+      # MOBEE_HOME defaults to /data in the image; shown here for clarity.
+      - MOBEE_HOME=/data
+      #
+      # --- Config: file + CLI flags. ---
+      # Non-default relay/mint/rate go in config.toml on the volume (see
+      # docs/DOCKER.md) or as `command:` flags above.
+      #
+      # --- Key handling. ---
+      # By default the seller AUTO-GENERATES its key into the volume on first
+      # run (0600, never printed, never baked into the image). To bring your own
+      # identity instead, mount a key file — see the commented volume line below
+      # and docs/DOCKER.md "Bring your own key".
+      #   - ./secrets/key:/data/key:ro   # 64-hex-char secret, chmod 600
+      #
+      # This tree's seller does NOT read NOSTR_PRIVATE_KEY — identity is the
+      # /data/key file. (NOSTR_PRIVATE_KEY only matters if you drive raw git by
+      # hand with git-credential-nostr, which mobee no longer needs.)
+    # Optional: surface a quick health signal via the built-in self-check.
+    # healthcheck:
+    #   test: ["CMD", "mobee", "doctor"]
+    #   interval: 5m
+    #   timeout: 60s
+    #   retries: 3
+
+  # -----------------------------------------------------------------------
+  # Second seller (commented) — run multiple sellers by giving each its OWN
+  # volume so they hold distinct keys/identities. Never share one /data volume
+  # between two daemons.
+  # -----------------------------------------------------------------------
+  # seller-2:
+  #   build: .
+  #   restart: unless-stopped
+  #   command: ["sell", "--non-interactive", "--agent", "codex", "--rate-sats", "3"]
+  #   volumes:
+  #     - seller-2-data:/data
+  #   environment:
+  #     - MOBEE_HOME=/data
+
+  # -----------------------------------------------------------------------
+  # Buyer MCP (commented) — `mobee mcp` is a STDIO server for an MCP client
+  # (e.g. Claude Code / Cursor), not a network service, so it is not a
+  # long-running compose service. Run it attached instead:
+  #
+  #   docker run -i --rm -v buyer-data:/data mobee:latest mcp
+  #
+  # and point your MCP client at that command. It shares the same home layout
+  # (key + wallet in /data). Fund the buyer wallet with test ecash before
+  # posting jobs — see docs/DOCKER.md.
+  # -----------------------------------------------------------------------
+  # buyer-mcp:
+  #   build: .
+  #   stdin_open: true
+  #   command: ["mcp"]
+  #   volumes:
+  #     - buyer-data:/data
+  #   environment:
+  #     - MOBEE_HOME=/data
+
+volumes:
+  seller-data:
+  # seller-2-data:
+  # buyer-data:

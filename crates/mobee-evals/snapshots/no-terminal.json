@@ -1,0 +1,60 @@
+{
+  "log_payloads": [
+    {
+      "type": "driver.ready",
+      "data": {
+        "runtime_id": "mock"
+      }
+    },
+    {
+      "type": "job.execution_changed",
+      "data": {
+        "job_id": "job-1",
+        "status": "queued"
+      }
+    },
+    {
+      "type": "job.execution_changed",
+      "data": {
+        "job_id": "job-1",
+        "status": "running"
+      }
+    },
+    {
+      "type": "agent.message",
+      "data": {
+        "job_id": "job-1",
+        "text": "partial progress"
+      }
+    },
+    {
+      "type": "job.execution_changed",
+      "data": {
+        "job_id": "job-1",
+        "status": "failed"
+      }
+    }
+  ],
+  "updates": [
+    {
+      "type": "agent_message",
+      "data": [
+        {
+          "type": "text",
+          "data": {
+            "text": "partial progress"
+          }
+        }
+      ]
+    },
+    {
+      "type": "plan",
+      "data": {
+        "entries": [
+          "still running"
+        ]
+      }
+    }
+  ],
+  "permissions": []
+}

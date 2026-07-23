@@ -1,0 +1,73 @@
+{
+  "name": "happy-path-artifact",
+  "job_id": "job-1",
+  "script": {
+    "session_id": "session-1",
+    "updates": [
+      {
+        "type": "agent_message",
+        "data": [
+          {
+            "type": "text",
+            "data": {
+              "text": "working"
+            }
+          }
+        ]
+      },
+      {
+        "type": "plan",
+        "data": {
+          "entries": [
+            "inspect",
+            "edit",
+            "verify"
+          ]
+        }
+      },
+      {
+        "type": "tool_call",
+        "data": {
+          "id": "call-1",
+          "name": "shell",
+          "input": {
+            "cmd": "cargo test"
+          }
+        }
+      },
+      {
+        "type": "tool_result",
+        "data": {
+          "id": "call-1",
+          "output": {
+            "status": "ok"
+          }
+        }
+      },
+      {
+        "type": "ext",
+        "data": {
+          "method": "mobee.note",
+          "params": {
+            "text": "ready"
+          }
+        }
+      },
+      {
+        "type": "turn_ended",
+        "data": "completed"
+      }
+    ],
+    "artifacts": [
+      {
+        "uri_or_path": "out/result.txt",
+        "mime": "text/plain",
+        "bytes": null
+      }
+    ]
+  },
+  "permission_outcomes": [],
+  "expected_terminal": "completed",
+  "expect_run_error": false,
+  "snapshot": "happy-path-artifact.json"
+}

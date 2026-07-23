@@ -1,0 +1,55 @@
+[package]
+name = "mobee-core"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+acp = []
+gateway = ["dep:nostr-sdk"]
+# All git legs (seller push/fetch, buyer verify-fetch, ref-advertisement probes) run in-process
+# via libgit2 — NO system `git` on any product path (issue #55). Needs nostr-sdk (NIP-98 signing)
+# so it composes gateway; git2 (rustls-backed) + reqwest + base64 carry the smart-HTTP transport.
+git-delivery = ["gateway", "dep:git2", "dep:reqwest", "dep:base64"]
+wallet = ["git-delivery", "gateway", "dep:cashu", "dep:cdk", "dep:cdk-sqlite", "dep:nostr-sdk", "tokio/sync", "tokio/time"]
+test-support = []
+
+[dependencies]
+base64 = { workspace = true, optional = true }
+cashu = { version = "=0.17.2", optional = true }
+config.workspace = true
+git2 = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+cdk = { version = "=0.17.2", default-features = false, features = ["wallet"], optional = true }
+cdk-sqlite = { version = "=0.17.2", optional = true }
+getrandom = "0.3"
+hex = "0.4.3"
+nostr-sdk = { version = "0.44.1", features = ["nip59", "nip98"], optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.11.0"
+tokio = { version = "1.52.0", default-features = false, features = ["rt", "macros"] }
+toml = "0.8"
+
+# seller_git (the code path under test) is gated behind `git-delivery`; run with
+# `cargo test -p mobee-core --features git-delivery --test relay_git_http_auth`.
+[[test]]
+name = "relay_git_http_auth"
+required-features = ["git-delivery"]
+
+[dev-dependencies]
+async-trait = "0.1.89"
+cdk-sqlite = "=0.17.2"
+# In-process NIP-01 relay for the seller-daemon live-delivery integration test. Same nostr 0.44
+# line as `nostr-sdk` above, so its `Event`/`Filter` types unify with the daemon's.
+nostr-relay-builder = "0.44"
+# Local git-over-HTTPS auth fixture (tests/git_http_fixture): rustls server with an
+# rcgen self-signed cert. ring-backed on both — aws-lc-rs is not in the workspace lock.
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio = { version = "1.52.0", features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
+url = "2.5.8"
+uuid = "1.23.5"

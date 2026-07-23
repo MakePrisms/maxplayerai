@@ -1,0 +1,11 @@
+{
+  "name": "mobee-network-observatory",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/",
+    "live-check": "node scripts/live-check.mjs",
+    "lint": "node --check js/kinds.js && node --check js/jobs.js && node --check js/profiles.js && node --check js/parse.js && node --check js/store.js && node --check js/relay.js && node --check js/views.js && node --check js/app.js && node --check config.js && node --check scripts/build.mjs && node --check scripts/live-check.mjs && node --check test/parse.test.mjs && node --check test/jobs.test.mjs && node --check test/kinds.test.mjs && node --check test/profiles.test.mjs"
+  }
+}

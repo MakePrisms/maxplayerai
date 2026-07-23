@@ -1,0 +1,75 @@
+{
+  "log_payloads": [
+    {
+      "type": "driver.ready",
+      "data": {
+        "runtime_id": "mock"
+      }
+    },
+    {
+      "type": "job.execution_changed",
+      "data": {
+        "job_id": "job-1",
+        "status": "queued"
+      }
+    },
+    {
+      "type": "job.execution_changed",
+      "data": {
+        "job_id": "job-1",
+        "status": "running"
+      }
+    },
+    {
+      "type": "job.execution_changed",
+      "data": {
+        "job_id": "job-1",
+        "status": "completed"
+      }
+    }
+  ],
+  "updates": [
+    {
+      "type": "permission_request",
+      "data": {
+        "tool": "write",
+        "detail": {
+          "path": "out/allowed.txt"
+        }
+      }
+    },
+    {
+      "type": "permission_request",
+      "data": {
+        "tool": "shell",
+        "detail": {
+          "cmd": "rm out/denied.txt"
+        }
+      }
+    },
+    {
+      "type": "turn_ended",
+      "data": "completed"
+    }
+  ],
+  "permissions": [
+    {
+      "request": {
+        "tool": "write",
+        "detail": {
+          "path": "out/allowed.txt"
+        }
+      },
+      "outcome": "allow"
+    },
+    {
+      "request": {
+        "tool": "shell",
+        "detail": {
+          "cmd": "rm out/denied.txt"
+        }
+      },
+      "outcome": "deny"
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "name": "no-terminal",
+  "job_id": "job-1",
+  "script": {
+    "session_id": "session-1",
+    "updates": [
+      {
+        "type": "agent_message",
+        "data": [
+          {
+            "type": "text",
+            "data": {
+              "text": "partial progress"
+            }
+          }
+        ]
+      },
+      {
+        "type": "plan",
+        "data": {
+          "entries": [
+            "still running"
+          ]
+        }
+      }
+    ],
+    "artifacts": []
+  },
+  "permission_outcomes": [],
+  "expected_terminal": "failed",
+  "expect_run_error": true,
+  "snapshot": "no-terminal.json"
+}

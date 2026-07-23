@@ -1,0 +1,27 @@
+{
+  "session_id": "session-1",
+  "updates": [
+    {
+      "type": "agent_message",
+      "data": [
+        {
+          "type": "text",
+          "data": {
+            "text": "working"
+          }
+        }
+      ]
+    },
+    {
+      "type": "turn_ended",
+      "data": "completed"
+    }
+  ],
+  "artifacts": [
+    {
+      "uri_or_path": "out/result.txt",
+      "mime": "text/plain",
+      "bytes": null
+    }
+  ]
+}

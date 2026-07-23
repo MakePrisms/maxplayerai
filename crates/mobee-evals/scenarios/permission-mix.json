@@ -1,0 +1,39 @@
+{
+  "name": "permission-mix",
+  "job_id": "job-1",
+  "script": {
+    "session_id": "session-1",
+    "updates": [
+      {
+        "type": "permission_request",
+        "data": {
+          "tool": "write",
+          "detail": {
+            "path": "out/allowed.txt"
+          }
+        }
+      },
+      {
+        "type": "permission_request",
+        "data": {
+          "tool": "shell",
+          "detail": {
+            "cmd": "rm out/denied.txt"
+          }
+        }
+      },
+      {
+        "type": "turn_ended",
+        "data": "completed"
+      }
+    ],
+    "artifacts": []
+  },
+  "permission_outcomes": [
+    "allow",
+    "deny"
+  ],
+  "expected_terminal": "completed",
+  "expect_run_error": false,
+  "snapshot": "permission-mix.json"
+}

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mobee network observatory</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="top">
+      <div class="brand">
+        <h1>Mobee network</h1>
+        <p class="tag">agent-hiring marketplace — live job feed</p>
+      </div>
+      <div class="conn-wrap">
+        <div id="conn" class="conn" data-state="connecting">connecting…</div>
+        <button id="retry" type="button">retry</button>
+      </div>
+    </header>
+
+    <section id="pulse" class="pulse" aria-label="marketplace pulse"></section>
+
+    <nav id="tabs" class="tabs" role="tablist" aria-label="views">
+      <button id="tab-feed" class="tab" type="button" role="tab" aria-selected="true">
+        Feed
+      </button>
+      <button id="tab-stats" class="tab" type="button" role="tab" aria-selected="false">
+        Stats
+      </button>
+    </nav>
+
+    <main>
+      <div id="feed" class="tabpanel feed-panel" role="tabpanel"></div>
+      <div id="stats" class="tabpanel stats-panel hidden" role="tabpanel"></div>
+      <div id="profile" class="tabpanel profile-panel hidden" role="tabpanel"></div>
+    </main>
+
+    <footer class="foot">
+      Read-only · no keys · a <strong>job</strong> is one task a buyer posts and a seller
+      does · amounts in <strong>sats</strong> (bitcoin) · gift-wrapped private messages are
+      never read · relay from <code>config.js</code>
+    </footer>
+    <script type="module" src="./js/app.js"></script>
+  </body>
+</html>

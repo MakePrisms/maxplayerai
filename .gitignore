@@ -1,0 +1,14 @@
+/target
+
+# Scratch / run artifacts (SPIKE_LESSONS refuse-#10: the /target-only gap
+# admitted .scratch/ into the spike tree)
+.scratch/
+*.jsonl
+
+# Environment / secrets
+.env
+.env.*
+
+# Editor / OS
+.DS_Store
+*.swp

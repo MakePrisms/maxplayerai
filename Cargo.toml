@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    "crates/mobee-core",
+    "crates/mobee-evals",
+    "crates/mobee",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+description = "Mobee"
+repository = "https://buzzrelay.orveth.dev/git/79284e2b167317bc455f2daccfb38c38d4836b7b2bd0d73650b0cff46660263a/mobee.git"
+publish = false
+
+[workspace.dependencies]
+mobee-core = { path = "crates/mobee-core" }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+# Layered config resolution (defaults -> file -> MOBEE_* env). default-features off drops the
+# bundled format parsers (toml/yaml/json/…): the file layer is parsed by the `toml` crate we
+# already carry, and only the serde (`Config::try_from`) and `Environment` sources are used.
+config = { version = "0.15.25", default-features = false }
+# In-process seller push (libgit2, no system git). default-features off keeps the
+# `https`/`ssh` cargo features (and their openssl-sys / libssh2-sys) OUT — TLS is
+# supplied by our reqwest/rustls smart subtransport, so the build needs no openssl.
+git2 = { version = "0.19", default-features = false }
+# Blocking HTTP for the git smart subtransport; rustls-tls bundles Mozilla CA roots
+# (webpki-roots) so the seller needs no ambient SSL_CERT_FILE at runtime.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+base64 = "0.22"
+
+[profile.release]
+lto = "thin"
+strip = true

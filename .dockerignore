@@ -1,0 +1,24 @@
+# Keep the build context small and the image free of host artifacts.
+# Only the crates + workspace manifests are needed to build `mobee`.
+
+# Rust build output (rebuilt inside the image)
+target/
+
+# Version control
+.git/
+.gitignore
+
+# The web frontend is not part of the seller/buyer binary
+web/
+
+# Docs, editor, and CI cruft
+docs/
+*.md
+.github/
+.claude/
+
+# Local dev / secrets — never ship these into a build context
+*.log
+key
+.mobee/
+data/
