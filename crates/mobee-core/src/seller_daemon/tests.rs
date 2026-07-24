@@ -1089,6 +1089,33 @@
         builder.sign_with_keys(buyer).expect("sign offer")
     }
 
+    /// Offer event whose `v` tag is an unsupported protocol version (cross-version reject fixture).
+    fn offer_event_with_version(
+        buyer: &nostr_sdk::Keys,
+        seller_pubkey: &str,
+        amount: u64,
+        deadline: u64,
+        version: &str,
+    ) -> nostr_sdk::Event {
+        let offer = crate::gateway::OfferDraft::new(
+            "do a task",
+            "text/plain",
+            amount,
+            deadline,
+            seller_pubkey,
+        );
+        let mut draft = offer.to_event_draft();
+        // Replace the protocol version tag; leave every other tag intact so the only parse
+        // failure is UnsupportedVersion (not a generic missing-tag / malformed-shape error).
+        for tag in &mut draft.tags {
+            if tag.0.first().map(String::as_str) == Some("v") {
+                tag.0 = vec!["v".to_owned(), version.to_owned()];
+            }
+        }
+        let builder = gateway::nostr::event_builder(&draft).expect("event builder");
+        builder.sign_with_keys(buyer).expect("sign offer")
+    }
+
     fn contribution_offer_event(
         buyer: &nostr_sdk::Keys,
         seller_pubkey: &str,
@@ -1257,6 +1284,77 @@
         // Idempotent: a second restart finds nothing to release.
         let again = daemon.reconcile_journal(2_000_000_000).expect("reconcile again");
         assert!(again.is_empty(), "released orphan is terminal: {again:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Cross-version / unsupported protocol version must NOT collapse into Unparseable.
+    // `OfferParseError::UnsupportedVersion` maps to a dedicated OfferSkip so the refusal
+    // reason-code is distinguishable from genuinely malformed offer tags.
+    #[test]
+    fn classify_unsupported_protocol_version_is_distinct_from_unparseable() {
+        let (root, daemon) = test_daemon("unsupported-version");
+        let seller_pk = daemon.seller_pubkey().to_owned();
+        let buyer = nostr_sdk::Keys::generate();
+        let now = 1_000_000u64;
+        // Protocol version this seller does not speak (current wire version is "0").
+        let wrong_version = "999";
+        let ev = offer_event_with_version(&buyer, &seller_pk, 5, now + 3600, wrong_version);
+
+        match daemon.classify_offer(&ev, now).expect("classify") {
+            OfferDisposition::Skip(skip) => {
+                assert!(
+                    matches!(
+                        &skip,
+                        OfferSkip::UnsupportedVersion { version } if version == wrong_version
+                    ),
+                    "wrong-protocol-version offer must yield UnsupportedVersion, got {skip:?}"
+                );
+                assert_eq!(
+                    skip.code(),
+                    "UnsupportedVersion",
+                    "reason-code must be the distinct UnsupportedVersion code, not Unparseable"
+                );
+                assert_ne!(
+                    skip.code(),
+                    "Unparseable",
+                    "cross-version reject must not collapse into Unparseable"
+                );
+                let reason = skip.reason();
+                assert!(
+                    !reason.is_empty() && reason.contains(wrong_version),
+                    "skip reason must name the unsupported version: {reason}"
+                );
+            }
+            other => panic!("unsupported-version offer must be SKIPPED, got {other:?}"),
+        }
+
+        // Sanity: a genuinely malformed offer (missing required tags via empty content shape)
+        // still maps to Unparseable — proves the two paths remain distinct.
+        let mut malformed_draft = crate::gateway::OfferDraft::new(
+            "do a task",
+            "text/plain",
+            5,
+            now + 3600,
+            &seller_pk,
+        )
+        .to_event_draft();
+        // Strip the amount tag so parse fails for a reason other than version.
+        malformed_draft
+            .tags
+            .retain(|tag| tag.0.first().map(String::as_str) != Some("amount"));
+        let malformed = gateway::nostr::event_builder(&malformed_draft)
+            .expect("event builder")
+            .sign_with_keys(&buyer)
+            .expect("sign malformed offer");
+        assert!(
+            matches!(
+                daemon.classify_offer(&malformed, now).expect("classify malformed"),
+                OfferDisposition::Skip(OfferSkip::Unparseable)
+            ),
+            "genuinely malformed offer must remain Unparseable"
+        );
+        assert_eq!(OfferSkip::Unparseable.code(), "Unparseable");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

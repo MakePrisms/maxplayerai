@@ -24,7 +24,7 @@ use crate::driver::UsageMetadata;
 use crate::episode::{Episode, EpisodeKind, EpisodeLog, EpisodeOutcome, UsageRecord};
 use crate::gateway::{
     self, claim_draft, error_draft, git_result_draft, parse_award, parse_offer, EventDraft,
-    ParsedAward, ParsedOffer, TagSpec, JOB_AWARD_KIND, JOB_OFFER_KIND,
+    OfferParseError, ParsedAward, ParsedOffer, TagSpec, JOB_AWARD_KIND, JOB_OFFER_KIND,
 };
 use crate::home::{self, HomeError, MobeeHome, DEFAULT_MINT_URL};
 use crate::job_lifecycle::{event_to_draft, job_hash_for_offer};
@@ -388,6 +388,11 @@ pub enum OfferSkip {
     NotAnOffer { kind: u16 },
     /// Offer tags did not parse.
     Unparseable,
+    /// Offer carried a protocol version this seller does not speak (`OfferParseError::UnsupportedVersion`).
+    /// Distinct from [`Self::Unparseable`]: a cross-version offer is well-formed under another
+    /// version, not malformed tags. Surfaces as a stable `refusal_reason_code` so operators and
+    /// buyers can tell version skew from genuine parse failure.
+    UnsupportedVersion { version: String },
     /// Offer's own deadline (`param deadline`, absolute unix) has already passed at `now`.
     /// Money-safety: a lapsed offer is REFUSED so a backfilled (stored) offer can never be
     /// resurrected with a fresh `now + timeout` deadline (the pre-backfill hazard in
@@ -420,6 +425,7 @@ impl OfferSkip {
         match self {
             Self::NotAnOffer { .. } => "NotAnOffer",
             Self::Unparseable => "Unparseable",
+            Self::UnsupportedVersion { .. } => "UnsupportedVersion",
             Self::DeadlineExpired { .. } => "DeadlineExpired",
             Self::RateGate { .. } => "RateGate",
             Self::AlreadyProcessed => "AlreadyProcessed",
@@ -436,6 +442,9 @@ impl OfferSkip {
         match self {
             Self::NotAnOffer { kind } => format!("not a kind-{JOB_OFFER_KIND} offer (kind {kind})"),
             Self::Unparseable => "offer tags did not parse".to_string(),
+            Self::UnsupportedVersion { version } => {
+                format!("unsupported mobee protocol version {version:?}")
+            }
             Self::DeadlineExpired { deadline_unix, now } => format!(
                 "offer deadline {deadline_unix} already passed at now={now} (expired; refused — a lapsed offer is never claimed or resurrected)"
             ),
@@ -849,6 +858,14 @@ impl SellerDaemon {
         let draft = event_to_draft(event);
         let offer = match parse_offer(&draft) {
             Ok(offer) => offer,
+            // Cross-version / unsupported protocol version is a distinct refusal, not a
+            // generic parse failure — buyers and operators must be able to tell version skew
+            // from genuinely malformed offer tags.
+            Err(OfferParseError::UnsupportedVersion(version)) => {
+                return Ok(OfferDisposition::Skip(OfferSkip::UnsupportedVersion {
+                    version,
+                }));
+            }
             Err(_) => return Ok(OfferDisposition::Skip(OfferSkip::Unparseable)),
         };
         // The offer no longer names a mint that the seller must match — the
