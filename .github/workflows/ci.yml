@@ -22,10 +22,13 @@ jobs:
       - name: Test mobee-core (default features)
         run: cargo test -p mobee-core --locked
 
-  # The acp feature gates the seller-execute path and is off by default, so it rots
-  # silently unless CI compiles it explicitly (issue #108). Build BOTH crates with acp on.
+  # The acp feature gates the seller-execute path and is off by default, so it rots silently unless
+  # CI compiles it explicitly (issue #108). Build BOTH crates with acp on — mobee-core with the full
+  # shipped feature combo — and run the money-path test suite. The default-feature test job above
+  # runs the featureless tests only and carries zero money teeth, so the gateway/git-delivery/wallet
+  # tests (the money path) never run there.
   build-acp:
-    name: Build (acp feature)
+    name: Build (acp) + money-path tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,5 +36,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build mobee (acp + wallet, release)
         run: cargo build -p mobee --release --features acp,wallet --locked
-      - name: Build mobee-core (acp)
-        run: cargo build -p mobee-core --features acp --locked
+      - name: Build mobee-core (full shipped feature combo)
+        run: cargo build -p mobee-core --features acp,gateway,git-delivery,wallet --locked
+      # Release build: the money-path suite is run in release (as the local money gate is), which
+      # also sidesteps a debug-only latent bug in the git-delivery HTTP transport
+      # (git_transport::client_short builds a nested tokio runtime inside the async collect path and
+      # panics on drop under debug). That transport-lifecycle bug is tracked separately; the money
+      # assertions here (tip-match refusal, zero-burn, no journal/materialization) hold in release.
+      - name: Test mobee-core (money-path suite)
+        run: cargo test -p mobee-core --release --no-default-features --features gateway,git-delivery,wallet --locked
