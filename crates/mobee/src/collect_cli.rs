@@ -60,10 +60,13 @@ fn usage(err: &mut dyn Write) {
 }
 
 /// Entry from `cli::run` for `mobee collect ...`.
+///
+/// Money ops are owned by the buyer daemon (exclusive home lock, single wallet + budget + reservation
+/// ledger). This command routes `collect` over the daemon socket (connect-or-spawn) rather than
+/// opening the wallet itself — so a CLI collect can never pay outside the daemon path or race a
+/// concurrent MCP/daemon melt.
 #[cfg(feature = "wallet")]
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    use mobee_core::budget::BudgetGate;
-    use mobee_core::collect::{self, CollectRequest};
     use mobee_core::home;
 
     let opts = match parse(args) {
@@ -92,42 +95,18 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             return RUNTIME_ERROR;
         }
     };
-    let mut gate = match BudgetGate::from_home(&home) {
-        Ok(gate) => gate,
-        Err(error) => {
-            let _ = writeln!(err, "{error}");
+
+    let params = serde_json::json!({ "job_id": opts.job_id, "out": opts.out });
+    let body = match crate::daemon::ensure_then_call(&home, "collect", params) {
+        Ok(body) => body,
+        Err(message) => {
+            let _ = writeln!(err, "{message}");
             return RUNTIME_ERROR;
         }
     };
 
-    let outcome = match collect::collect_blocking(
-        &home,
-        &mut gate,
-        CollectRequest {
-            job_id: opts.job_id,
-            out: opts.out,
-        },
-    ) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            let _ = writeln!(err, "{error}");
-            return RUNTIME_ERROR;
-        }
-    };
-
-    let body = serde_json::json!({
-        "ok": true,
-        "amount_sats": outcome.pay.amount_sats,
-        "attempt_id": outcome.pay.attempt_id,
-        "spent_total_sats": outcome.pay.spent_total_sats,
-        "remaining_sats": outcome.pay.remaining_sats,
-        "state": outcome.pay.state,
-        "commit": outcome.commit_oid,
-        "path": outcome.path,
-        "files": outcome.files,
-    });
     let rendered = body.to_string();
-    // Defense in depth: never let the secret key appear on stdout.
+    // Defense in depth: never let the secret key appear on stdout (the daemon never returns it).
     if let Ok(secret) = home::read_secret_key_hex(&home) {
         if !secret.is_empty() && rendered.contains(&secret) {
             let _ = writeln!(err, "collect refused: response would echo secret key");

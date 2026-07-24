@@ -3,6 +3,8 @@ mod agent_presets;
 mod buyer;
 mod cli;
 mod collect_cli;
+#[cfg(feature = "wallet")]
+mod daemon;
 mod doctor;
 mod exec;
 mod mcp;

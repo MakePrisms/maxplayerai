@@ -45,7 +45,7 @@ use crate::buyer_fund::{self, FundError};
 use crate::collect::{self, CollectRequest};
 use crate::home::{self, HomeError, MobeeHome};
 use crate::job_lifecycle::{
-    self, AwardClaimRequest, GetJobRequest, JobKind, PostJobRequest, WaitFor,
+    self, AwardClaimRequest, ContributionSpec, GetJobRequest, JobKind, PostJobRequest, WaitFor,
 };
 use crate::payment::{PaymentMachine, PaymentRecord, PaymentState};
 use lifecycle::{AwardError, AwardFilters, PaymentProgress, SettleError};
@@ -261,8 +261,9 @@ async fn dispatch(context: &BuyerContext, request: Request) -> Response {
     }
 }
 
-/// Params for the `post_job` RPC — a from-scratch offer's fields (the daemon's default flow;
-/// contribution offers stay on the CLI/MCP path). `job_id` returned is the offer event id.
+/// Params for the `post_job` RPC. From-scratch by default; the four contribution pins
+/// (`target_repo_owner`/`target_repo_url`/`base_branch`/`base_oid`) are ALL-OR-NOTHING — all four
+/// select a contribution offer, a partial set is refused. `job_id` returned is the offer event id.
 #[derive(Debug, Deserialize)]
 struct PostJobParams {
     task: String,
@@ -278,14 +279,55 @@ struct PostJobParams {
     repo: Option<String>,
     #[serde(default)]
     branch: Option<String>,
+    #[serde(default)]
+    target_repo_owner: Option<String>,
+    #[serde(default)]
+    target_repo_url: Option<String>,
+    #[serde(default)]
+    base_branch: Option<String>,
+    #[serde(default)]
+    base_oid: Option<String>,
+    #[serde(default)]
+    accepts: Option<Vec<String>>,
 }
 
-/// Publish a from-scratch offer (reuses [`job_lifecycle::post_job_async`], the same money-checked
-/// post path the CLI/MCP use). No reservation is taken at post — funds are reserved at award.
+/// Resolve the offer kind from the contribution pins: all four present ⇒ contribution; none ⇒
+/// from-scratch; a partial set is refused so the core never sees a half-specified contribution.
+fn post_job_kind(params: &PostJobParams) -> Result<JobKind, String> {
+    match (
+        &params.target_repo_owner,
+        &params.target_repo_url,
+        &params.base_branch,
+        &params.base_oid,
+    ) {
+        (None, None, None, None) => Ok(JobKind::FromScratch),
+        (Some(owner), Some(url), Some(branch), Some(oid)) => {
+            Ok(JobKind::Contribution(ContributionSpec {
+                target_repo_owner: owner.clone(),
+                target_repo_url: url.clone(),
+                base_branch: branch.clone(),
+                base_oid: oid.clone(),
+                accepts: params.accepts.clone(),
+            }))
+        }
+        _ => Err(
+            "post_job contribution mode requires ALL of target_repo_owner, target_repo_url, \
+             base_branch, base_oid (a partial set is refused)"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Publish an offer (reuses [`job_lifecycle::post_job_async`], the same money-checked post path the
+/// CLI/MCP use). No reservation is taken at post — funds are reserved at award.
 async fn post_job(context: &BuyerContext, id: Value, params: Value) -> Response {
     let params: PostJobParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(error) => return Response::err(id, CODE_METHOD_NOT_FOUND, format!("post_job params: {error}")),
+    };
+    let job = match post_job_kind(&params) {
+        Ok(job) => job,
+        Err(message) => return Response::err(id, CODE_METHOD_NOT_FOUND, message),
     };
     let request = PostJobRequest {
         task: params.task,
@@ -296,7 +338,7 @@ async fn post_job(context: &BuyerContext, id: Value, params: Value) -> Response 
         deadline_unix: params.deadline_unix,
         repo: params.repo,
         branch: params.branch,
-        job: JobKind::FromScratch,
+        job,
     };
     match job_lifecycle::post_job_async(&context.home, request).await {
         Ok(outcome) => Response::ok(id, json!(outcome)),
@@ -668,6 +710,7 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
             "version": crate::version(),
             "home": context.home.root.display().to_string(),
             "socket": context.home.root.join(SOCKET_FILE).display().to_string(),
+            "pid": std::process::id(),
             "pubkey": context.signer.public_key_hex(),
             "started_at_unix": context.started_at_unix,
             "wallet": wallet,
