@@ -51,7 +51,7 @@ use crate::payment::{PaymentMachine, PaymentRecord, PaymentState};
 use lifecycle::{AwardError, AwardFilters, PaymentProgress, SettleError};
 use lock::{HomeLock, LockError};
 use protocol::{CODE_INTERNAL, CODE_METHOD_NOT_FOUND, CODE_NOT_IMPLEMENTED, Request, Response};
-use reservations::Dispositions;
+use reservations::{Dispositions, ReconcileReport};
 use signer::SignerHandle;
 use store::{BuyerStore, StoreError};
 use wallet_actor::WalletHandle;
@@ -124,6 +124,9 @@ struct BuyerContext {
     /// reservation's balance/spent snapshot is never read while a concurrent collect is melting.
     /// The wallet actor's balance reads run independently (reads never race a serialized send).
     money_lock: Mutex<()>,
+    /// The last reconcile-on-start report, surfaced in `status` so kept-uncertain reservations
+    /// (funds committed to an ambiguous payment) are visible rather than silently discarded.
+    last_reconcile: Mutex<Option<ReconcileReport>>,
 }
 
 fn now_unix() -> i64 {
@@ -161,6 +164,7 @@ async fn bootstrap(home: MobeeHome) -> Result<(HomeLock, Arc<BuyerContext>, Path
         signer,
         started_at_unix,
         money_lock: Mutex::new(()),
+        last_reconcile: Mutex::new(None),
     });
     Ok((lock, context, socket_path))
 }
@@ -191,8 +195,11 @@ pub async fn run(home: MobeeHome) -> Result<(), BuyerError> {
     // daemon starts from a converged ledger. A failure is logged, not fatal — an unreachable relay
     // must not keep the daemon from coming up (the stale reservation is conservative until the next
     // reconcile).
-    if let Err(error) = reconcile_on_start(&context).await {
-        eprintln!("buyer: reconcile-on-start did not complete ({error}); serving with the ledger as-is");
+    match reconcile_on_start(&context).await {
+        Ok(report) => *context.last_reconcile.lock().await = Some(report),
+        Err(error) => eprintln!(
+            "buyer: reconcile-on-start did not complete ({error}); serving with the ledger as-is"
+        ),
     }
     let listener = bind_socket(&socket_path)?;
     accept_loop(listener, context).await
@@ -426,28 +433,33 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
     };
     let offer_amount = offer.amount_sats;
     let max_sats = params.max_sats.unwrap_or(offer_amount);
+    let filters = AwardFilters {
+        offer_amount_sats: offer_amount,
+        max_sats,
+        buyer_mint: context.home.config.default_mint(),
+        allow_real_mints: context.home.config.allow_real_mints,
+    };
 
-    // Manual award names the claim; auto-award selects the first payable one.
+    // Manual award names the claim but applies the SAME hard filters (max_sats, price, mint) as
+    // auto-award — max_sats is enforced, not ignored, on the manual path. Auto-award selects the
+    // first live payable claim.
     let claim_id = match params.claim_id {
-        Some(claim_id) => claim_id,
-        None => {
-            let filters = AwardFilters {
-                offer_amount_sats: offer_amount,
-                max_sats,
-                buyer_mint: context.home.config.default_mint(),
-                allow_real_mints: context.home.config.allow_real_mints,
-            };
-            match lifecycle::select_awardable_claim(&view, &filters) {
-                Some(claim_id) => claim_id,
-                None => {
-                    return Response::err(
-                        id,
-                        CODE_REFUSED,
-                        format!("no awardable claim for job {} (none live/payable/mint-compatible)", params.job_id),
-                    );
-                }
+        Some(claim_id) => {
+            if let Err(refused) = lifecycle::named_claim_awardable(&view, &claim_id, &filters) {
+                return Response::err(id, CODE_REFUSED, refused.to_string());
             }
+            claim_id
         }
+        None => match lifecycle::select_awardable_claim(&view, &filters) {
+            Some(claim_id) => claim_id,
+            None => {
+                return Response::err(
+                    id,
+                    CODE_REFUSED,
+                    format!("no awardable claim for job {} (none live/payable/mint-compatible)", params.job_id),
+                );
+            }
+        },
     };
 
     let (balance, total_cap, spent) = match money_snapshot(context).await {
@@ -574,27 +586,31 @@ fn buyer_keys(home: &MobeeHome) -> Result<nostr_sdk::Keys, String> {
 /// a `Closed` attempt is converted to `spent`; an ambiguous (Sent-not-Closed) payment is KEPT (the
 /// phase-3 saga owns it). Pure classification is [`lifecycle::classify_disposition`]; this gathers
 /// its inputs and applies the batch through [`BuyerStore::reconcile`].
-async fn reconcile_on_start(context: &BuyerContext) -> Result<(), String> {
+async fn reconcile_on_start(context: &BuyerContext) -> Result<ReconcileReport, String> {
     let reserved = context
         .store
         .reserved_job_ids()
         .map_err(|error| error.to_string())?;
     if reserved.is_empty() {
-        return Ok(());
+        return Ok(ReconcileReport::default());
     }
     let keys = buyer_keys(&context.home)?;
     let progress = scan_payment_progress(&context.home);
 
-    let mut dispositions: Dispositions = BTreeMap::new();
-    for job_id in reserved {
-        let payment = progress.get(&job_id).copied().unwrap_or(PaymentProgress::None);
-        // Relay liveness: is a claim still live/deliverable for this job? An unreachable relay is
-        // treated as still-payable (conservative — never release a reservation we cannot verify is
-        // dead). A Closed/Uncertain payment ignores liveness in the classifier anyway.
-        let claim_payable = match job_lifecycle::fetch_job_view_async(
+    // Gather each reserved job's "still payable" signal (the only I/O). A job is payable if a claim
+    // is still live on the relay OR a local delivery bind exists (#140: a delivered job whose relay
+    // events expired is not dead — its bind + retained git objects still let collect settle it). An
+    // unreachable relay is treated as still-payable (conservative — never release what we cannot
+    // verify is dead).
+    let mut payable: BTreeMap<String, bool> = BTreeMap::new();
+    for job_id in &reserved {
+        let has_bind = job_lifecycle::load_accepted_bind(&context.home, job_id)
+            .map(|bind| bind.is_some())
+            .unwrap_or(false);
+        let claim_live = match job_lifecycle::fetch_job_view_async(
             &context.home,
             &keys,
-            &job_id,
+            job_id,
             RELAY_TIMEOUT,
             now_unix() as u64,
         )
@@ -603,14 +619,35 @@ async fn reconcile_on_start(context: &BuyerContext) -> Result<(), String> {
             Ok(view) => view.live_claim_id.is_some(),
             Err(_) => true,
         };
-        dispositions.insert(job_id, lifecycle::classify_disposition(payment, claim_payable));
+        payable.insert(job_id.clone(), claim_live || has_bind);
     }
 
+    let dispositions = plan_reconcile(&reserved, &progress, &payable);
     context
         .store
         .reconcile(&dispositions, now_unix())
-        .map_err(|error| error.to_string())?;
-    Ok(())
+        .map_err(|error| error.to_string())
+}
+
+/// Pure reconcile planning: map each reserved job to a disposition from its folded payment progress
+/// and whether it is still payable. Kept pure (no relay/disk I/O) so the reserved-job → disposition
+/// mapping is exhaustively testable; [`reconcile_on_start`] gathers the inputs. A job absent from
+/// `payable` defaults to payable (conservative — never release without positive evidence of death).
+fn plan_reconcile(
+    reserved: &[String],
+    progress: &BTreeMap<String, PaymentProgress>,
+    payable: &BTreeMap<String, bool>,
+) -> Dispositions {
+    let mut dispositions: Dispositions = BTreeMap::new();
+    for job_id in reserved {
+        let payment = progress.get(job_id).copied().unwrap_or(PaymentProgress::None);
+        let claim_payable = payable.get(job_id).copied().unwrap_or(true);
+        dispositions.insert(
+            job_id.clone(),
+            lifecycle::classify_disposition(payment, claim_payable),
+        );
+    }
+    dispositions
 }
 
 /// Fold every payment-journal attempt under the home into a `job_id → progress` map. Each record
@@ -703,6 +740,16 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
         Err(error) => json!({ "mint": mint, "error": error.to_string() }),
     };
 
+    // Surface the last reconcile-on-start outcome so kept-uncertain reservations (funds committed to
+    // an ambiguous payment the crash-safe saga still owns) are visible, not silently discarded.
+    let reconcile = context.last_reconcile.lock().await.as_ref().map(|report| {
+        json!({
+            "released": report.released,
+            "converted": report.converted,
+            "kept": report.kept,
+        })
+    });
+
     Response::ok(
         id,
         json!({
@@ -718,6 +765,7 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
                 "schema_version": schema_version,
                 "jobs": jobs,
             },
+            "reconcile": reconcile,
         }),
     )
 }
@@ -817,5 +865,145 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- reconcile plumbing (scan_payment_progress / plan_reconcile / merge_progress) ----------
+
+    use std::str::FromStr;
+    use crate::payment::{
+        DeliveryIntegrityHash, JobHash, JobId, PaymentKey, PaymentRecord, PaymentState, PaymentTerms,
+        ResultId,
+    };
+
+    fn payment_key(job_id: &str) -> PaymentKey {
+        let cashu_pk = cashu::SecretKey::from_slice(&[7u8; 32]).expect("secret").public_key();
+        let nostr_pk = nostr_sdk::PublicKey::from_hex(&cashu_pk.to_string()[2..]).expect("nostr pk");
+        let terms = PaymentTerms::new(
+            cashu::MintUrl::from_str("https://testnut.cashu.space").expect("mint"),
+            cashu::Amount::from(7),
+            cashu::CurrencyUnit::Sat,
+            nostr_pk,
+            cashu_pk,
+        );
+        PaymentKey::new(
+            JobId::new(job_id).expect("job id"),
+            ResultId::new("result").expect("result id"),
+            DeliveryIntegrityHash::from_hex("11".repeat(32)).expect("dih"),
+            JobHash::from_hex("22".repeat(32)).expect("job hash"),
+            &terms,
+            None,
+        )
+    }
+
+    fn write_journal(root: &std::path::Path, filename: &str, records: &[PaymentRecord]) {
+        let dir = root.join("payment-journal");
+        std::fs::create_dir_all(&dir).expect("journal dir");
+        let mut body = String::new();
+        for record in records {
+            body.push_str(&serde_json::to_string(record).expect("record json"));
+            body.push('\n');
+        }
+        std::fs::write(dir.join(filename), body).expect("write journal");
+    }
+
+    // No payment-journal directory ⇒ no payments (empty map). scan must never fabricate progress.
+    #[test]
+    fn scan_payment_progress_absent_journal_is_empty() {
+        let root = temp_home("scan-absent");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("home dir");
+        assert!(scan_payment_progress_at(&root).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // An Intent-only journal folds to Intent ⇒ no funds have left ⇒ PaymentProgress::None. Proves
+    // scan walks the dir, parses real PaymentRecords, folds them, and maps by job id.
+    #[test]
+    fn scan_payment_progress_folds_intent_to_none() {
+        let root = temp_home("scan-intent");
+        let _ = std::fs::remove_dir_all(&root);
+        let job = "a".repeat(64);
+        let key = payment_key(&job);
+        write_journal(
+            &root,
+            "attempt.jsonl",
+            &[PaymentRecord { key: key.clone(), value: PaymentState::Intent { attempt_id: key.attempt_id() } }],
+        );
+        let progress = scan_payment_progress_at(&root);
+        assert_eq!(progress.get(&job), Some(&PaymentProgress::None));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // A journal that does not fold (a lone Locked with no preceding Intent is an illegal transition)
+    // is treated as Uncertain — reconcile must KEEP such a reservation, never release it on ambiguous
+    // evidence. This is the fail-safe the money path depends on.
+    #[test]
+    fn scan_payment_progress_unfoldable_journal_is_uncertain() {
+        let root = temp_home("scan-uncertain");
+        let _ = std::fs::remove_dir_all(&root);
+        let job = "b".repeat(64);
+        let key = payment_key(&job);
+        write_journal(
+            &root,
+            "attempt.jsonl",
+            &[PaymentRecord { key: key.clone(), value: PaymentState::Locked { attempt_id: key.attempt_id() } }],
+        );
+        let progress = scan_payment_progress_at(&root);
+        assert_eq!(progress.get(&job), Some(&PaymentProgress::Uncertain));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// scan_payment_progress reads `<home>/payment-journal`; the fn takes a `MobeeHome`, so drive it
+    /// through a bootstrapped home rooted at `root`.
+    fn scan_payment_progress_at(root: &std::path::Path) -> BTreeMap<String, PaymentProgress> {
+        let home = bootstrap_home(root).expect("home");
+        scan_payment_progress(&home)
+    }
+
+    // plan_reconcile maps each reserved job by (payment progress, still-payable) via the classifier:
+    // Closed ⇒ Paid; Uncertain ⇒ Payable (kept); None+payable ⇒ Payable; None+not-payable ⇒ Dead.
+    #[test]
+    fn plan_reconcile_maps_each_reserved_job() {
+        let paid = "a".repeat(64);
+        let uncertain = "b".repeat(64);
+        let live = "c".repeat(64);
+        let dead = "d".repeat(64);
+        let reserved = vec![paid.clone(), uncertain.clone(), live.clone(), dead.clone()];
+
+        let mut progress = BTreeMap::new();
+        progress.insert(paid.clone(), PaymentProgress::Closed);
+        progress.insert(uncertain.clone(), PaymentProgress::Uncertain);
+        // `live` and `dead` have no payment progress (None).
+
+        let mut payable = BTreeMap::new();
+        payable.insert(paid.clone(), false); // a Closed payment is Paid regardless of liveness
+        payable.insert(uncertain.clone(), false); // Uncertain is kept regardless of liveness
+        payable.insert(live.clone(), true);
+        payable.insert(dead.clone(), false);
+
+        let dispositions = plan_reconcile(&reserved, &progress, &payable);
+        assert_eq!(dispositions[&paid], reservations::JobDisposition::Paid);
+        assert_eq!(dispositions[&uncertain], reservations::JobDisposition::Payable);
+        assert_eq!(dispositions[&live], reservations::JobDisposition::Payable);
+        assert_eq!(dispositions[&dead], reservations::JobDisposition::Dead);
+    }
+
+    // A job missing from `payable` defaults to payable — never released without positive evidence of
+    // death (the #140 conservative posture: a relay re-read that lost the job is not proof it died).
+    #[test]
+    fn plan_reconcile_missing_payable_defaults_to_kept() {
+        let job = "e".repeat(64);
+        let dispositions = plan_reconcile(&[job.clone()], &BTreeMap::new(), &BTreeMap::new());
+        assert_eq!(dispositions[&job], reservations::JobDisposition::Payable);
+    }
+
+    // merge_progress keeps the MORE-advanced progress so a Closed attempt is never masked by an
+    // earlier Intent/Uncertain (Closed > Uncertain > None).
+    #[test]
+    fn merge_progress_keeps_the_more_advanced() {
+        assert_eq!(merge_progress(Some(PaymentProgress::None), PaymentProgress::Closed), PaymentProgress::Closed);
+        assert_eq!(merge_progress(Some(PaymentProgress::Closed), PaymentProgress::None), PaymentProgress::Closed);
+        assert_eq!(merge_progress(Some(PaymentProgress::Uncertain), PaymentProgress::None), PaymentProgress::Uncertain);
+        assert_eq!(merge_progress(None, PaymentProgress::Uncertain), PaymentProgress::Uncertain);
     }
 }

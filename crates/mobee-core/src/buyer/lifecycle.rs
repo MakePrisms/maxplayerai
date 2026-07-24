@@ -55,6 +55,69 @@ pub fn select_awardable_claim(view: &JobView, filters: &AwardFilters) -> Option<
         .map(|claim| claim.claim_id.clone())
 }
 
+/// Why a specifically-named (manual) award was refused. The manual path names a `claim_id` instead
+/// of auto-selecting, so it must apply the SAME hard filters `select_awardable_claim` applies —
+/// otherwise `max_sats` and mint/price compatibility would be dead input on the manual path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamedAwardRefused {
+    /// The offer price exceeds the buyer's `max_sats` ceiling for this award.
+    OverMax { offer_amount_sats: u64, max_sats: u64 },
+    /// No claim with that id is on the relay for this job.
+    NotFound { claim_id: String },
+    /// The named claim is not live (expired / superseded / past deadline) — nothing to award.
+    NotLive { claim_id: String },
+    /// The named claim cannot be paid (missing/malformed creq, price ≠ offer amount, wrong unit, or
+    /// no mutually-payable mint) — awarding it would commit to something the buyer cannot settle.
+    Unpayable { claim_id: String },
+}
+
+impl std::fmt::Display for NamedAwardRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OverMax { offer_amount_sats, max_sats } => write!(
+                formatter,
+                "award refused: offer price {offer_amount_sats} sat exceeds max_sats {max_sats}"
+            ),
+            Self::NotFound { claim_id } => write!(formatter, "award refused: claim {claim_id} not found for this job"),
+            Self::NotLive { claim_id } => write!(formatter, "award refused: claim {claim_id} is not live"),
+            Self::Unpayable { claim_id } => write!(
+                formatter,
+                "award refused: claim {claim_id} is not payable (price/mint/creq incompatible — the buyer could not settle it)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NamedAwardRefused {}
+
+/// Verify a specifically-named claim is awardable under the hard filters — the manual-award
+/// counterpart of [`select_awardable_claim`], so `max_sats` and mint/price compatibility are applied
+/// on the manual path rather than ignored. Pure: relay truth + filters in, verdict out.
+pub fn named_claim_awardable(
+    view: &JobView,
+    claim_id: &str,
+    filters: &AwardFilters,
+) -> Result<(), NamedAwardRefused> {
+    if filters.offer_amount_sats > filters.max_sats {
+        return Err(NamedAwardRefused::OverMax {
+            offer_amount_sats: filters.offer_amount_sats,
+            max_sats: filters.max_sats,
+        });
+    }
+    let claim = view
+        .claims
+        .iter()
+        .find(|claim| claim.claim_id == claim_id)
+        .ok_or_else(|| NamedAwardRefused::NotFound { claim_id: claim_id.to_owned() })?;
+    if !claim.live {
+        return Err(NamedAwardRefused::NotLive { claim_id: claim_id.to_owned() });
+    }
+    if !claim_is_payable(&view.job_id, claim.creq.as_deref(), filters) {
+        return Err(NamedAwardRefused::Unpayable { claim_id: claim_id.to_owned() });
+    }
+    Ok(())
+}
+
 /// True when a claim's `creq` is present, well-formed, priced at the offer amount within the
 /// budget ceiling, denominated in sats for this job, and quotes a mint the buyer can pay from.
 fn claim_is_payable(job_id: &str, creq: Option<&str>, filters: &AwardFilters) -> bool {
@@ -347,6 +410,70 @@ mod tests {
         let job = "a".repeat(64);
         let view = view_with(&job, 10, vec![claim(&job, true, 11, &[DEFAULT_MINT_URL.into()])]);
         assert_eq!(select_awardable_claim(&view, &filters(10, 100)), None);
+    }
+
+    // MANUAL-AWARD max_sats tooth: a named claim applies the SAME hard filters as auto-award, so
+    // max_sats is enforced (not dead input) on the manual path.
+    #[test]
+    fn named_claim_awardable_accepts_live_payable_within_max() {
+        let job = "a".repeat(64);
+        let claim_id = "c".repeat(64);
+        let view = view_with(&job, 10, vec![claim(&job, true, 10, &[DEFAULT_MINT_URL.into()])]);
+        assert_eq!(named_claim_awardable(&view, &claim_id, &filters(10, 100)), Ok(()));
+    }
+
+    // Over the ceiling: a manual award of a claim whose offer price exceeds max_sats is refused —
+    // the check that was missing (max_sats was ignored) on the manual path.
+    #[test]
+    fn named_claim_over_max_sats_refused() {
+        let job = "a".repeat(64);
+        let claim_id = "c".repeat(64);
+        let view = view_with(&job, 50, vec![claim(&job, true, 50, &[DEFAULT_MINT_URL.into()])]);
+        assert_eq!(
+            named_claim_awardable(&view, &claim_id, &filters(50, 40)),
+            Err(NamedAwardRefused::OverMax { offer_amount_sats: 50, max_sats: 40 })
+        );
+    }
+
+    // A named claim that is not on the relay is refused as NotFound.
+    #[test]
+    fn named_claim_not_found_refused() {
+        let job = "a".repeat(64);
+        let view = view_with(&job, 10, vec![claim(&job, true, 10, &[DEFAULT_MINT_URL.into()])]);
+        let missing = "d".repeat(64);
+        assert_eq!(
+            named_claim_awardable(&view, &missing, &filters(10, 100)),
+            Err(NamedAwardRefused::NotFound { claim_id: missing })
+        );
+    }
+
+    // A named but non-live claim is refused (nothing live to award).
+    #[test]
+    fn named_claim_not_live_refused() {
+        let job = "a".repeat(64);
+        let claim_id = "c".repeat(64);
+        let view = view_with(&job, 10, vec![claim(&job, false, 10, &[DEFAULT_MINT_URL.into()])]);
+        assert_eq!(
+            named_claim_awardable(&view, &claim_id, &filters(10, 100)),
+            Err(NamedAwardRefused::NotLive { claim_id })
+        );
+    }
+
+    // A named claim quoting only a mint the buyer cannot settle at is refused as Unpayable — the
+    // manual path never awards a claim it cannot pay.
+    #[test]
+    fn named_claim_unpayable_mint_refused() {
+        let job = "a".repeat(64);
+        let claim_id = "c".repeat(64);
+        let view = view_with(
+            &job,
+            10,
+            vec![claim(&job, true, 10, &["https://foreign.testnut.example".into()])],
+        );
+        assert_eq!(
+            named_claim_awardable(&view, &claim_id, &filters(10, 100)),
+            Err(NamedAwardRefused::Unpayable { claim_id })
+        );
     }
 
     // AWARD-REFUSED tooth: when the reservation is refused, `publish` is NEVER called and NO
