@@ -23,6 +23,17 @@ const SUCCESS: i32 = 0;
 const USAGE_ERROR: i32 = 1;
 const RUNTIME_ERROR: i32 = 2;
 
+/// Decide whether `mobee sell` may proceed past the startup readiness gate. `gate` is `None` when
+/// `--skip-doctor` bypassed the checks (the gate was never run), `Some(Ok)` when every blocking
+/// check passed, and `Some(Err)` when one failed. Only a run gate that failed aborts startup —
+/// `--skip-doctor` always proceeds. Pure so the run_sell wiring is unit-tested both ways.
+fn readiness_decision(gate: Option<Result<(), ()>>) -> Result<(), i32> {
+    match gate {
+        None | Some(Ok(())) => Ok(()),
+        Some(Err(())) => Err(RUNTIME_ERROR),
+    }
+}
+
 #[derive(Debug, Default)]
 struct SellOptions {
     /// Force fail-closed naming of missing fields (no TTY prompts).
@@ -123,18 +134,21 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
     ensure_seller_config(&mut home, &options, out, err)?;
 
     // Auto-doctor (issue #107): refuse to boot a box that cannot sell. Runs the SAME readiness
-    // checks as `mobee doctor` and blocks only on FAILs (agent unresolvable, no mint reachable,
-    // seller key missing, relay unreachable); WARNs are advisory. Runs AFTER ensure_seller_config
-    // so the agent-preset check sees the just-resolved [seller], and BEFORE any network mutation
-    // (NIP-34 announce / discoverability publish) so we fail fast without side effects.
-    if options.skip_doctor {
+    // checks as `mobee doctor` and blocks only on FAILs (agent unresolvable, no accepted mint
+    // reachable, seller key missing, relay unreachable); WARNs are advisory. Runs AFTER
+    // ensure_seller_config so the agent-preset check sees the just-resolved [seller], and BEFORE
+    // any network mutation (NIP-34 announce / discoverability publish) so we fail fast without
+    // side effects. `--skip-doctor` bypasses the gate entirely (the checks are never run).
+    let gate = if options.skip_doctor {
         let _ = writeln!(
             err,
             "mobee sell --skip-doctor: startup readiness checks bypassed (box may be unable to sell)"
         );
-    } else if crate::doctor::sell_readiness_gate(&home, out, err).is_err() {
-        return Err(RUNTIME_ERROR);
-    }
+        None
+    } else {
+        Some(crate::doctor::sell_readiness_gate(&home, out, err))
+    };
+    readiness_decision(gate)?;
 
     if let Some(name) = options.name.as_ref() {
         // set_profile publishes kind-0 over the relay (async); this sync CLI drives it on a
@@ -639,6 +653,27 @@ mod tests {
         ])
         .expect("parse");
         assert!(skipped.skip_doctor, "--skip-doctor bypasses the gate");
+    }
+
+    // The readiness wiring run_sell uses: a failed gate refuses startup; a passed gate proceeds;
+    // and --skip-doctor (gate never run ⇒ None) proceeds even though the box may be unable to sell.
+    #[test]
+    fn readiness_decision_refuses_on_fail_and_skip_bypasses() {
+        assert_eq!(
+            readiness_decision(Some(Err(()))),
+            Err(RUNTIME_ERROR),
+            "a failed readiness gate must refuse run_sell"
+        );
+        assert_eq!(
+            readiness_decision(Some(Ok(()))),
+            Ok(()),
+            "a passed readiness gate proceeds"
+        );
+        assert_eq!(
+            readiness_decision(None),
+            Ok(()),
+            "--skip-doctor bypasses the gate and proceeds"
+        );
     }
 
     #[test]

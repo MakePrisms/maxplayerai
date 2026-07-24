@@ -81,6 +81,12 @@ fn exit_code(results: &[Check]) -> i32 {
     }
 }
 
+/// Boot-readiness verdict over a completed check set: the seller may start only when NO check
+/// FAILed. WARN is advisory and never blocks. The pure core of [`sell_readiness_gate`].
+fn readiness_ok(results: &[Check]) -> bool {
+    !results.iter().any(|c| c.status == Status::Fail)
+}
+
 
 #[cfg(feature = "wallet")]
 mod checks {
@@ -166,18 +172,55 @@ mod checks {
         }
     }
 
-    pub(super) fn check_mint(mint_url: String) -> Check {
-        let outcome = match build_runtime() {
-            Ok(runtime) => runtime.block_on(doctor::probe_mint(&mint_url, MINT_TIMEOUT)),
-            Err(error) => Err(error),
-        };
-        match outcome {
-            Ok(()) => Check::pass(MINT_CHECK, format!("{mint_url}: /v1/info reachable")),
-            Err(error) => Check::fail(
+    /// Aggregate reachability across the seller's accept-policy mints. The boot question is "can
+    /// this seller settle *anywhere*", so it BLOCKS (`Fail`) only when EVERY accepted mint is
+    /// unreachable; a single mint down while another is reachable is an advisory `Warn`, never a
+    /// boot-blocker. The pure verdict lives in [`fold_mint_reachability`].
+    pub(super) fn check_mints(mint_urls: Vec<String>) -> Check {
+        let probes: Vec<(String, Result<(), String>)> = mint_urls
+            .into_iter()
+            .map(|url| {
+                let outcome = match build_runtime() {
+                    Ok(runtime) => runtime.block_on(doctor::probe_mint(&url, MINT_TIMEOUT)),
+                    Err(error) => Err(error),
+                };
+                (url, outcome.map_err(|error| error.to_string()))
+            })
+            .collect();
+        fold_mint_reachability(&probes)
+    }
+
+    /// Pure "can I settle anywhere?" verdict over already-probed accept-policy mints (no I/O — the
+    /// testable core of [`check_mints`]). All reachable ⇒ `Pass`; some reachable ⇒ `Warn` (degraded
+    /// but can still settle); none reachable (or none configured) ⇒ `Fail` (blocks boot).
+    pub(super) fn fold_mint_reachability(probes: &[(String, Result<(), String>)]) -> Check {
+        if probes.is_empty() {
+            return Check::fail(
                 MINT_CHECK,
-                format!("{mint_url}: {error}"),
-                "check the mint URL and network availability",
-            ),
+                "no accepted mints configured — the seller cannot settle anywhere",
+                "set [accepted_mints] in config.toml (it defaults to the testnut mint)",
+            );
+        }
+        let total = probes.len();
+        let reachable = probes.iter().filter(|(_, result)| result.is_ok()).count();
+        let down: Vec<String> = probes
+            .iter()
+            .filter_map(|(url, result)| result.as_ref().err().map(|error| format!("{url}: {error}")))
+            .collect();
+        if down.is_empty() {
+            Check::pass(MINT_CHECK, format!("all {total} accepted mint(s) reachable"))
+        } else if reachable == 0 {
+            Check::fail(
+                MINT_CHECK,
+                format!("no accepted mint reachable — cannot settle anywhere ({})", down.join("; ")),
+                "check the mint URLs in [accepted_mints] and network availability",
+            )
+        } else {
+            Check::warn(
+                MINT_CHECK,
+                format!("{reachable}/{total} accepted mint(s) reachable; degraded: {}", down.join("; ")),
+                "an accepted mint is unreachable but the seller can still settle at another — check the degraded mint(s)",
+            )
         }
     }
 
@@ -297,9 +340,10 @@ fn build_checks(home: &mobee_core::home::MobeeHome) -> Vec<Box<dyn FnOnce() -> C
     let relay_url = home.config.relay_url.clone();
     let secret = mobee_core::home::read_secret_key_hex(home).ok();
     let key_present = mobee_core::home::key_file_present(home);
-    let mint_urls: Vec<String> = std::iter::once(home.config.default_mint().to_string())
-        .chain(home.config.extra_mints.clone())
-        .collect();
+    // The seller accept-policy mints (`accepted_mints`) — the list this seller will settle at.
+    // `extra_mints` is a BUYER wallet field (see `MobeeConfig` in home.rs) and has no place in a
+    // seller boot gate, so it is deliberately NOT consulted here.
+    let accepted_mints = home.config.accepted_mints.clone();
     let seller = home.config.seller.clone();
     let custom_agents = home.config.agents.clone();
     let telemetry = home.config.telemetry.clone();
@@ -308,10 +352,9 @@ fn build_checks(home: &mobee_core::home::MobeeHome) -> Vec<Box<dyn FnOnce() -> C
         Box::new(checks::check_credential_helper),
         Box::new(move || checks::check_seller_key(key_present)),
         Box::new(move || checks::check_relay(relay_url, secret)),
+        // One aggregate mint check across the accept-policy: "can I settle anywhere?".
+        Box::new(move || checks::check_mints(accepted_mints)),
     ];
-    for mint_url in mint_urls {
-        checks.push(Box::new(move || checks::check_mint(mint_url)));
-    }
     checks.push(Box::new(move || checks::check_agent_preset(seller, custom_agents)));
     checks.push(Box::new(move || checks::check_telemetry(telemetry)));
     checks
@@ -356,10 +399,11 @@ fn run_doctor(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 /// (`Status::Fail`) fails, echoing each failure's one-line fix hint. WARN checks are advisory: they
 /// print but never block. Returns `Ok(())` when the box can sell, `Err(())` when it must not start.
 ///
-/// The required (blocking) checks per the issue — agent adapter resolvable, a mint reachable, seller
-/// key present, relay reachable — each already reports `Fail` on its own failure path, so the gate
-/// needs no separate severity table. Non-critical checks (credential helper, telemetry) report
-/// `Pass`/`Warn` and never block.
+/// The required (blocking) checks per the issue — agent adapter resolvable, at least one accepted
+/// mint reachable, seller key present, relay reachable — each reports `Fail` on its own failure
+/// path, so the gate needs no separate severity table. The mint check is deliberately aggregate:
+/// it blocks only when EVERY accepted mint is unreachable (a single degraded mint is a `Warn`).
+/// Non-critical checks (credential helper, telemetry) report `Pass`/`Warn` and never block.
 #[cfg(feature = "wallet")]
 pub fn sell_readiness_gate(
     home: &mobee_core::home::MobeeHome,
@@ -374,9 +418,8 @@ pub fn sell_readiness_gate(
     for result in &results {
         let _ = writeln!(out, "{}", result.render());
     }
-    let failures: Vec<&Check> = results.iter().filter(|c| c.status == Status::Fail).collect();
-    let warns = results.iter().filter(|c| c.status == Status::Warn).count();
-    if failures.is_empty() {
+    if readiness_ok(&results) {
+        let warns = results.iter().filter(|c| c.status == Status::Warn).count();
         let _ = writeln!(
             out,
             "readiness OK — {} check(s), {warns} warning(s); starting seller",
@@ -384,6 +427,7 @@ pub fn sell_readiness_gate(
         );
         return Ok(());
     }
+    let failures: Vec<&Check> = results.iter().filter(|c| c.status == Status::Fail).collect();
     let _ = writeln!(
         err,
         "\nmobee sell REFUSING to start: {} blocking readiness check(s) failed —",
@@ -463,5 +507,42 @@ mod tests {
         let missing = checks::check_seller_key(false);
         assert_eq!(missing.status, Status::Fail, "a missing key must block boot");
         assert!(missing.render().contains("fix:"), "must give a fix hint");
+    }
+
+    // The mint gate answers "can I settle anywhere". It must Fail ONLY when every accepted mint is
+    // down; a single degraded mint (with another reachable) is an advisory WARN, never a boot block.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn mint_reachability_blocks_only_when_every_mint_is_down() {
+        let ok = |u: &str| (u.to_owned(), Ok(()));
+        let down = |u: &str| (u.to_owned(), Err("connection refused".to_owned()));
+
+        // All reachable ⇒ Pass (boots).
+        assert_eq!(
+            checks::fold_mint_reachability(&[ok("https://a"), ok("https://b")]).status,
+            Status::Pass,
+        );
+        // One of two down ⇒ Warn (degraded but can still settle — must NOT block boot).
+        let partial = checks::fold_mint_reachability(&[ok("https://a"), down("https://b")]);
+        assert_eq!(partial.status, Status::Warn, "single mint down must not block boot");
+        assert!(partial.render().contains("https://b"), "names the degraded mint");
+        // Every mint down ⇒ Fail (cannot settle anywhere — blocks boot).
+        let all_down = checks::fold_mint_reachability(&[down("https://a"), down("https://b")]);
+        assert_eq!(all_down.status, Status::Fail, "no reachable mint must block boot");
+        // No accepted mints configured ⇒ Fail.
+        assert_eq!(checks::fold_mint_reachability(&[]).status, Status::Fail);
+    }
+
+    // The boot gate refuses (readiness_ok == false) iff some check FAILed; WARN alone still boots.
+    #[test]
+    fn readiness_refuses_on_fail_and_boots_on_warn() {
+        assert!(
+            readiness_ok(&[Check::pass("a", "ok"), Check::warn("b", "meh", "fix")]),
+            "only Pass/Warn ⇒ the seller may boot"
+        );
+        assert!(
+            !readiness_ok(&[Check::pass("a", "ok"), Check::fail("b", "bad", "fix")]),
+            "any Fail ⇒ the seller must be refused"
+        );
     }
 }
