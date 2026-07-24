@@ -2078,6 +2078,26 @@ Anything not committed to git will not be delivered.";
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// An over-bound `MEMORY.md` is refused at the injection site: the daemon gets no
+    /// read-on-start section (the job runs memoryless) instead of a bloated prompt. Goes red if
+    /// the size check in `seller_memory::read_on_start_section` is removed.
+    #[tokio::test]
+    async fn oversized_index_is_refused_not_injected() {
+        let (root, daemon) = test_daemon("mem-overbound");
+        let dir = crate::seller_memory::memory_dir(&daemon.home().root);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join(crate::seller_memory::MEMORY_INDEX_FILE),
+            "z".repeat(crate::seller_memory::MAX_MEMORY_INDEX_BYTES + 1),
+        )
+        .expect("write oversized index");
+        assert!(
+            daemon.read_on_start_section().is_none(),
+            "over-bound index must be refused, never inlined into the prompt"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The read-on-start template seam overrides the in-repo default when
     /// `read_on_start_template_path` is set (daemon path).
     #[tokio::test]

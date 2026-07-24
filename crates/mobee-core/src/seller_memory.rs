@@ -17,6 +17,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Sub-directory of `MOBEE_HOME` holding the distilled memory.
 pub const MEMORY_DIR_NAME: &str = "memory";
+/// Upper bound, in bytes, on the `MEMORY.md` index injected into the job prompt (issue #81).
+/// Steady state is ~1–5 KB and the observed worst case ~10 KB; 16 KiB is generous headroom for a
+/// healthy index while still catching runaway growth. An index over this bound is REFUSED at the
+/// injection site — [`read_on_start_section`] returns `InvalidData` instead of inlining it, and
+/// the daemon degrades to running the job without memory (the seam never blocks a job).
+pub const MAX_MEMORY_INDEX_BYTES: usize = 16 * 1024;
 /// The index file loaded at job start.
 pub const MEMORY_INDEX_FILE: &str = "MEMORY.md";
 /// The always-operator-owned topic file, seeded on first creation.
@@ -134,6 +140,9 @@ fn render(template: &str, substitutions: &[(&str, &str)]) -> String {
 
 /// Render the read-on-start memory section to inline into the job prompt, or `None` when there is
 /// no non-empty index to inline. `template_path` overrides the in-repo default (read-on-start seam).
+///
+/// An index over [`MAX_MEMORY_INDEX_BYTES`] is refused with `InvalidData` — never silently
+/// injected — so a runaway `MEMORY.md` cannot bloat every job prompt unnoticed.
 pub fn read_on_start_section(
     memory_dir: &Path,
     template_path: Option<&Path>,
@@ -145,6 +154,18 @@ pub fn read_on_start_section(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+    if index.len() > MAX_MEMORY_INDEX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "memory index {} is {} bytes, over the {MAX_MEMORY_INDEX_BYTES}-byte injection \
+                 bound — refusing to inject; trim MEMORY.md (one line per topic, detail in topic \
+                 files)",
+                index_path.display(),
+                index.len()
+            ),
+        ));
+    }
     let template = load_template(template_path, DEFAULT_READ_ON_START_TEMPLATE);
     let rendered = render(
         &template,
@@ -330,6 +351,49 @@ mod tests {
             "absolute memory dir named"
         );
         assert!(section.contains("Seller memory index"), "index text inlined");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An index a single byte over [`MAX_MEMORY_INDEX_BYTES`] is REFUSED (`InvalidData`), not
+    /// silently injected. This test goes red if the bound check is removed — the call would
+    /// then return `Ok(Some(..))`.
+    #[test]
+    fn read_on_start_refuses_index_over_size_bound() {
+        let root = temp_dir("ros-overbound");
+        let dir = memory_dir(&root);
+        fs::create_dir_all(&dir).expect("mkdir");
+        let oversized = "x".repeat(MAX_MEMORY_INDEX_BYTES + 1);
+        fs::write(dir.join(MEMORY_INDEX_FILE), &oversized).expect("write index");
+
+        let error = read_on_start_section(&dir, None).expect_err("over-bound index must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let message = error.to_string();
+        assert!(
+            message.contains(&MAX_MEMORY_INDEX_BYTES.to_string()),
+            "error names the bound: {message}"
+        );
+        assert!(
+            message.contains(&(MAX_MEMORY_INDEX_BYTES + 1).to_string()),
+            "error names the actual size: {message}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An index at exactly the bound is still injected — the cap is `>`, not `>=`.
+    #[test]
+    fn read_on_start_accepts_index_at_exact_bound() {
+        let root = temp_dir("ros-atbound");
+        let dir = memory_dir(&root);
+        fs::create_dir_all(&dir).expect("mkdir");
+        let mut index = String::from("# index\n");
+        index.push_str(&"y".repeat(MAX_MEMORY_INDEX_BYTES - index.len()));
+        assert_eq!(index.len(), MAX_MEMORY_INDEX_BYTES);
+        fs::write(dir.join(MEMORY_INDEX_FILE), &index).expect("write index");
+
+        let section = read_on_start_section(&dir, None)
+            .expect("at-bound index is accepted")
+            .expect("some section");
+        assert!(section.contains("# index"), "index text inlined");
         let _ = fs::remove_dir_all(&root);
     }
 
