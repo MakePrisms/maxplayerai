@@ -4,6 +4,10 @@
 //! Everything else defaults (relay, mint, key 0600, relay-git delivery) and persists to
 //! `config.toml` so subsequent launches are zero-prompt.
 //!
+//! On startup it runs the `doctor` readiness gate (issue #107) and REFUSES to boot when a blocking
+//! check fails (agent unresolvable, no mint reachable, seller key missing, relay unreachable),
+//! printing a per-failure fix hint. Pass `--skip-doctor` to bypass the gate (default: checks-on).
+//!
 //! Never accepts `--key` (key stays in `~/.mobee/key`; never argv).
 
 use std::io::{self, Write};
@@ -37,6 +41,9 @@ struct SellOptions {
     offer_backfill_secs: Option<u64>,
     name: Option<String>,
     home: Option<PathBuf>,
+    /// Bypass the startup doctor readiness gate (issue #107). Default is checks-ON; this is a
+    /// documented escape hatch for operators who knowingly want to boot without passing checks.
+    skip_doctor: bool,
 }
 
 /// Entry from `cli::run` for `mobee sell ...`.
@@ -114,6 +121,20 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
     );
 
     ensure_seller_config(&mut home, &options, out, err)?;
+
+    // Auto-doctor (issue #107): refuse to boot a box that cannot sell. Runs the SAME readiness
+    // checks as `mobee doctor` and blocks only on FAILs (agent unresolvable, no mint reachable,
+    // seller key missing, relay unreachable); WARNs are advisory. Runs AFTER ensure_seller_config
+    // so the agent-preset check sees the just-resolved [seller], and BEFORE any network mutation
+    // (NIP-34 announce / discoverability publish) so we fail fast without side effects.
+    if options.skip_doctor {
+        let _ = writeln!(
+            err,
+            "mobee sell --skip-doctor: startup readiness checks bypassed (box may be unable to sell)"
+        );
+    } else if crate::doctor::sell_readiness_gate(&home, out, err).is_err() {
+        return Err(RUNTIME_ERROR);
+    }
 
     if let Some(name) = options.name.as_ref() {
         // set_profile publishes kind-0 over the relay (async); this sync CLI drives it on a
@@ -485,6 +506,7 @@ impl SellOptions {
         while index < args.len() {
             match args[index].as_str() {
                 "--non-interactive" => options.non_interactive = true,
+                "--skip-doctor" => options.skip_doctor = true,
                 "--claim-open-pool" => options.claim_open_pool = Some(true),
                 "--no-claim-open-pool" => options.claim_open_pool = Some(false),
                 "--key" | "--secret-key" | "--private-key" => {
@@ -574,7 +596,7 @@ impl SellOptions {
 fn sell_usage(err: &mut dyn Write) {
     let _ = writeln!(
         err,
-        "Usage:\n  mobee sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>]\n  mobee sell   # zero-prompt relaunch from config.toml\n  mobee sell --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://mobee-relay.orveth.dev mint=testnut git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - open-pool claiming is OFF by default; pass --claim-open-pool to opt in\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)"
+        "Usage:\n  mobee sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>] [--skip-doctor]\n  mobee sell   # zero-prompt relaunch from config.toml\n  mobee sell --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://mobee-relay.orveth.dev mint=testnut git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint\n  - --skip-doctor: bypass the startup readiness gate (default: checks-on; not recommended)\n  - open-pool claiming is OFF by default; pass --claim-open-pool to opt in\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)"
     );
 }
 
@@ -601,6 +623,22 @@ mod tests {
         assert_eq!(options.agent.as_deref(), Some("claude"));
         assert_eq!(options.rate_sats, Some(2));
         assert_eq!(options.claim_open_pool, Some(true));
+    }
+
+    #[test]
+    fn skip_doctor_defaults_off_and_parses_on() {
+        let default = SellOptions::parse(&["--agent".into(), "claude".into(), "--rate-sats".into(), "2".into()])
+            .expect("parse");
+        assert!(!default.skip_doctor, "doctor gate is on by default");
+        let skipped = SellOptions::parse(&[
+            "--agent".into(),
+            "claude".into(),
+            "--rate-sats".into(),
+            "2".into(),
+            "--skip-doctor".into(),
+        ])
+        .expect("parse");
+        assert!(skipped.skip_doctor, "--skip-doctor bypasses the gate");
     }
 
     #[test]

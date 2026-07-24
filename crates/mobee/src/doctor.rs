@@ -99,6 +99,7 @@ mod checks {
     const MINT_TIMEOUT: Duration = Duration::from_secs(10);
 
     const CREDENTIAL_HELPER_CHECK: &str = "credential helper";
+    const KEY_CHECK: &str = "seller key";
     const RELAY_CHECK: &str = "relay reachability";
     const MINT_CHECK: &str = "mint reachability";
     const AGENT_CHECK: &str = "agent preset";
@@ -118,6 +119,22 @@ mod checks {
                 CREDENTIAL_HELPER_CHECK,
                 "git-credential-nostr not found — OK, not required (seller signs NIP-98 in-process via libgit2)",
             ),
+        }
+    }
+
+    // Blocking (issue #107): a seller can neither sign offers nor NIP-98-authenticate delivery
+    // pushes without its key, so `mobee sell` refuses to boot when this FAILs. `present` is
+    // `home::key_file_present` (the ~/.mobee/key file). The key material itself is never read here
+    // and never appears in any Check detail.
+    pub(super) fn check_seller_key(present: bool) -> Check {
+        if present {
+            Check::pass(KEY_CHECK, "~/.mobee/key present")
+        } else {
+            Check::fail(
+                KEY_CHECK,
+                "~/.mobee/key missing — seller has no signing key",
+                "ensure ~/.mobee/key exists and is readable (mode 0600) — it is auto-generated on first run",
+            )
         }
     }
 
@@ -271,6 +288,35 @@ pub fn run(_args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     }
 }
 
+/// Build the full check registry from a bootstrapped home. Shared by `mobee doctor` and the
+/// `mobee sell` boot-readiness gate (issue #107) so the two never drift and no check logic is
+/// duplicated. The seller key is read once only to probe NIP-42 relay auth; it is NEVER placed in
+/// any Check detail.
+#[cfg(feature = "wallet")]
+fn build_checks(home: &mobee_core::home::MobeeHome) -> Vec<Box<dyn FnOnce() -> Check>> {
+    let relay_url = home.config.relay_url.clone();
+    let secret = mobee_core::home::read_secret_key_hex(home).ok();
+    let key_present = mobee_core::home::key_file_present(home);
+    let mint_urls: Vec<String> = std::iter::once(home.config.default_mint().to_string())
+        .chain(home.config.extra_mints.clone())
+        .collect();
+    let seller = home.config.seller.clone();
+    let custom_agents = home.config.agents.clone();
+    let telemetry = home.config.telemetry.clone();
+
+    let mut checks: Vec<Box<dyn FnOnce() -> Check>> = vec![
+        Box::new(checks::check_credential_helper),
+        Box::new(move || checks::check_seller_key(key_present)),
+        Box::new(move || checks::check_relay(relay_url, secret)),
+    ];
+    for mint_url in mint_urls {
+        checks.push(Box::new(move || checks::check_mint(mint_url)));
+    }
+    checks.push(Box::new(move || checks::check_agent_preset(seller, custom_agents)));
+    checks.push(Box::new(move || checks::check_telemetry(telemetry)));
+    checks
+}
+
 #[cfg(feature = "wallet")]
 fn run_doctor(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     use mobee_core::home;
@@ -292,27 +338,7 @@ fn run_doctor(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 
     let _ = writeln!(out, "mobee doctor — seller environment self-check (home={})", home.root.display());
 
-    let relay_url = home.config.relay_url.clone();
-    // Read the seller key only to test NIP-42 auth; it is NEVER printed or put in any Check detail.
-    let secret = home::read_secret_key_hex(&home).ok();
-    let mint_urls: Vec<String> = std::iter::once(home.config.default_mint().to_string())
-        .chain(home.config.extra_mints.clone())
-        .collect();
-    let seller = home.config.seller.clone();
-    let custom_agents = home.config.agents.clone();
-    let telemetry = home.config.telemetry.clone();
-
-    let mut checks: Vec<Box<dyn FnOnce() -> Check>> = vec![
-        Box::new(checks::check_credential_helper),
-        Box::new(move || checks::check_relay(relay_url, secret)),
-    ];
-    for mint_url in mint_urls {
-        checks.push(Box::new(move || checks::check_mint(mint_url)));
-    }
-    checks.push(Box::new(move || checks::check_agent_preset(seller, custom_agents)));
-    checks.push(Box::new(move || checks::check_telemetry(telemetry)));
-
-    let results = run_checks(checks);
+    let results = run_checks(build_checks(&home));
     for result in &results {
         let _ = writeln!(out, "{}", result.render());
     }
@@ -323,6 +349,54 @@ fn run_doctor(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         results.len()
     );
     code
+}
+
+/// `mobee sell` startup readiness gate (issue #107 — auto-doctor, NOT a first-run wizard). Runs the
+/// SAME registry as `mobee doctor` via [`build_checks`] and REFUSES to boot when any BLOCKING check
+/// (`Status::Fail`) fails, echoing each failure's one-line fix hint. WARN checks are advisory: they
+/// print but never block. Returns `Ok(())` when the box can sell, `Err(())` when it must not start.
+///
+/// The required (blocking) checks per the issue — agent adapter resolvable, a mint reachable, seller
+/// key present, relay reachable — each already reports `Fail` on its own failure path, so the gate
+/// needs no separate severity table. Non-critical checks (credential helper, telemetry) report
+/// `Pass`/`Warn` and never block.
+#[cfg(feature = "wallet")]
+pub fn sell_readiness_gate(
+    home: &mobee_core::home::MobeeHome,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<(), ()> {
+    let _ = writeln!(
+        out,
+        "mobee sell — startup readiness checks (auto-doctor; pass --skip-doctor to bypass)"
+    );
+    let results = run_checks(build_checks(home));
+    for result in &results {
+        let _ = writeln!(out, "{}", result.render());
+    }
+    let failures: Vec<&Check> = results.iter().filter(|c| c.status == Status::Fail).collect();
+    let warns = results.iter().filter(|c| c.status == Status::Warn).count();
+    if failures.is_empty() {
+        let _ = writeln!(
+            out,
+            "readiness OK — {} check(s), {warns} warning(s); starting seller",
+            results.len()
+        );
+        return Ok(());
+    }
+    let _ = writeln!(
+        err,
+        "\nmobee sell REFUSING to start: {} blocking readiness check(s) failed —",
+        failures.len()
+    );
+    for failure in &failures {
+        let _ = writeln!(err, "  {}", failure.render());
+    }
+    let _ = writeln!(
+        err,
+        "resolve the item(s) above, then re-run `mobee sell`. To bypass these checks (NOT recommended), pass --skip-doctor."
+    );
+    Err(())
 }
 
 #[cfg(test)]
@@ -379,5 +453,15 @@ mod tests {
         assert!(!Check::pass("x", "ok").render().contains("fix:"));
         assert!(Check::fail("x", "bad", "do this").render().contains("(fix: do this)"));
         assert!(Check::warn("x", "hmm", "do this").render().contains("(fix: do this)"));
+    }
+
+    // Issue #107: a missing seller key must BLOCK `mobee sell` (Fail, not Warn) and carry a fix hint.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn seller_key_check_blocks_when_absent() {
+        assert_eq!(checks::check_seller_key(true).status, Status::Pass);
+        let missing = checks::check_seller_key(false);
+        assert_eq!(missing.status, Status::Fail, "a missing key must block boot");
+        assert!(missing.render().contains("fix:"), "must give a fix hint");
     }
 }
