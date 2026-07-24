@@ -30,6 +30,11 @@ pub const HEARTBEAT_INTERVAL_ENV: &str = "MOBEE_HEARTBEAT_INTERVAL_SECS";
 /// Takes precedence over `[seller_heartbeat] enabled`; intended for tests.
 pub const HEARTBEAT_ENABLED_ENV: &str = "MOBEE_HEARTBEAT_ENABLED";
 
+/// Env override for the relay-stall watchdog threshold (missed heartbeat intervals). Takes
+/// precedence over `[seller_heartbeat] stall_missed_intervals`; intended for tests that cannot
+/// wait several 5-minute intervals for the watchdog to trip.
+pub const HEARTBEAT_STALL_MISSED_INTERVALS_ENV: &str = "MOBEE_HEARTBEAT_STALL_MISSED_INTERVALS";
+
 /// A heartbeat ready to sign + publish. Build from live daemon state via [`heartbeat_for_state`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeartbeatDraft {
@@ -240,6 +245,21 @@ pub fn resolve_enabled(config: &crate::home::SellerHeartbeatConfig) -> bool {
     }
 }
 
+/// Effective relay-stall watchdog threshold (missed heartbeat intervals): env override
+/// ([`HEARTBEAT_STALL_MISSED_INTERVALS_ENV`]) wins over the `[seller_heartbeat]
+/// stall_missed_intervals` config. A `0` or unparseable value is ignored (falls back to config).
+/// Clamped to at least 1 so a misconfiguration can never make the watchdog trip on the first tick.
+pub fn resolve_stall_missed_intervals(config: &crate::home::SellerHeartbeatConfig) -> u32 {
+    let configured = match std::env::var(HEARTBEAT_STALL_MISSED_INTERVALS_ENV) {
+        Ok(raw) => match raw.trim().parse::<u32>() {
+            Ok(n) if n > 0 => n,
+            _ => config.stall_missed_intervals,
+        },
+        Err(_) => config.stall_missed_intervals,
+    };
+    configured.max(1)
+}
+
 fn first_tag<'a>(tags: &'a [TagSpec], name: &str) -> Option<&'a TagSpec> {
     tags.iter()
         .find(|tag| tag.0.first().map(String::as_str) == Some(name))
@@ -381,6 +401,7 @@ mod tests {
         let custom = SellerHeartbeatConfig {
             enabled: true,
             interval_secs: 42,
+            ..SellerHeartbeatConfig::default()
         };
         assert_eq!(resolve_interval_secs(&custom), 42);
 
@@ -404,6 +425,7 @@ mod tests {
         let enabled_cfg = SellerHeartbeatConfig {
             enabled: true,
             interval_secs: 300,
+            ..SellerHeartbeatConfig::default()
         };
         assert!(resolve_enabled(&enabled_cfg));
         unsafe { std::env::set_var(HEARTBEAT_ENABLED_ENV, "0") };
@@ -411,6 +433,42 @@ mod tests {
         unsafe { std::env::set_var(HEARTBEAT_ENABLED_ENV, "true") };
         assert!(resolve_enabled(&enabled_cfg));
         unsafe { std::env::remove_var(HEARTBEAT_ENABLED_ENV) };
+    }
+
+    #[test]
+    fn stall_missed_intervals_respects_env_and_clamps() {
+        // SAFETY (edition 2024): serialized by ENV_LOCK; see `interval_respects_config`.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        unsafe { std::env::remove_var(HEARTBEAT_STALL_MISSED_INTERVALS_ENV) };
+
+        // Default is 3.
+        let default_cfg = SellerHeartbeatConfig::default();
+        assert_eq!(default_cfg.stall_missed_intervals, 3);
+        assert_eq!(resolve_stall_missed_intervals(&default_cfg), 3);
+
+        // Config override (no env) is honoured.
+        let custom = SellerHeartbeatConfig {
+            stall_missed_intervals: 5,
+            ..SellerHeartbeatConfig::default()
+        };
+        assert_eq!(resolve_stall_missed_intervals(&custom), 5);
+
+        // Env override wins over config.
+        unsafe { std::env::set_var(HEARTBEAT_STALL_MISSED_INTERVALS_ENV, "2") };
+        assert_eq!(resolve_stall_missed_intervals(&custom), 2);
+        // Zero/garbage env falls back to config.
+        unsafe { std::env::set_var(HEARTBEAT_STALL_MISSED_INTERVALS_ENV, "0") };
+        assert_eq!(resolve_stall_missed_intervals(&custom), 5);
+        unsafe { std::env::set_var(HEARTBEAT_STALL_MISSED_INTERVALS_ENV, "nonsense") };
+        assert_eq!(resolve_stall_missed_intervals(&custom), 5);
+        unsafe { std::env::remove_var(HEARTBEAT_STALL_MISSED_INTERVALS_ENV) };
+
+        // A config of 0 is clamped up to 1 (never trips on the first tick).
+        let zero = SellerHeartbeatConfig {
+            stall_missed_intervals: 0,
+            ..SellerHeartbeatConfig::default()
+        };
+        assert_eq!(resolve_stall_missed_intervals(&zero), 1);
     }
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

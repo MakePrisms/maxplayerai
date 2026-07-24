@@ -341,6 +341,12 @@ pub struct SellerHeartbeatConfig {
     /// Cadence in seconds. Default **300** (~5 min).
     #[serde(default = "default_heartbeat_interval_secs")]
     pub interval_secs: u64,
+    /// Relay-stall watchdog threshold, in **missed heartbeat intervals**. Default **3**. When no
+    /// own heartbeat has round-tripped on the live subscription for this many intervals, the daemon
+    /// treats the subscription as silently dead and reconnects + resubscribes (issue #142). The
+    /// watchdog rides the heartbeat mechanism, so it is inert when `enabled` is false.
+    #[serde(default = "default_heartbeat_stall_missed_intervals")]
+    pub stall_missed_intervals: u32,
 }
 
 impl Default for SellerHeartbeatConfig {
@@ -348,6 +354,7 @@ impl Default for SellerHeartbeatConfig {
         Self {
             enabled: default_heartbeat_enabled(),
             interval_secs: default_heartbeat_interval_secs(),
+            stall_missed_intervals: default_heartbeat_stall_missed_intervals(),
         }
     }
 }
@@ -368,6 +375,11 @@ pub fn default_heartbeat_enabled() -> bool {
 /// serde default for [`SellerHeartbeatConfig::interval_secs`] — 300s (~5 min).
 pub fn default_heartbeat_interval_secs() -> u64 {
     300
+}
+
+/// serde default for [`SellerHeartbeatConfig::stall_missed_intervals`] — 3 missed intervals.
+pub fn default_heartbeat_stall_missed_intervals() -> u32 {
+    3
 }
 
 /// Boot-time push-preflight config (`[seller_preflight]` section). Gates the seller daemon's
@@ -846,6 +858,7 @@ const RESERVED_ENV_VARS: &[&str] = &[
     "MOBEE_HOME",
     "MOBEE_HEARTBEAT_INTERVAL_SECS",
     "MOBEE_HEARTBEAT_ENABLED",
+    "MOBEE_HEARTBEAT_STALL_MISSED_INTERVALS",
     "MOBEE_WRAP_BACKFILL_INTERVAL_SECS",
     "MOBEE_AWARD_SWEEP_INTERVAL_SECS",
     "MOBEE_SELLER_BOOT_PUSH_PREFLIGHT",

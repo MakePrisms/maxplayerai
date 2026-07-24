@@ -2508,3 +2508,28 @@ Anything not committed to git will not be delivered.";
         assert!(msg.starts_with("mobee delivery: "));
         assert_eq!(msg.len(), "mobee delivery: ".len() + 72);
     }
+
+    // ── Relay-stall watchdog staleness detector (#142), fake clock ──────────────────────────────
+
+    #[test]
+    fn stall_threshold_is_interval_times_missed_intervals() {
+        assert_eq!(stall_threshold_secs(300, 3), 900);
+        assert_eq!(stall_threshold_secs(1, 3), 3);
+        // Each factor clamps to >= 1, so the product is always positive (never trips on tick 0).
+        assert_eq!(stall_threshold_secs(0, 3), 3);
+        assert_eq!(stall_threshold_secs(300, 0), 300);
+        assert_eq!(stall_threshold_secs(0, 0), 1);
+        // Saturating: a pathological product cannot overflow/panic.
+        assert_eq!(stall_threshold_secs(u64::MAX, 2), u64::MAX);
+    }
+
+    #[test]
+    fn subscription_stalled_fires_only_at_or_past_threshold() {
+        let threshold = stall_threshold_secs(1, 3); // 3s
+        // Fresh + within the window: healthy (own heartbeat still round-tripping).
+        assert!(!subscription_stalled(0, threshold));
+        assert!(!subscription_stalled(2, threshold));
+        // At the threshold and beyond: the subscription is presumed dead.
+        assert!(subscription_stalled(3, threshold));
+        assert!(subscription_stalled(60, threshold));
+    }
