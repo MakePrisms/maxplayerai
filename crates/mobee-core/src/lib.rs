@@ -48,6 +48,13 @@ pub mod runtime_guard;
 pub mod seller;
 #[cfg(feature = "wallet")]
 pub mod seller_daemon;
+/// Persistent per-home seller node (exclusive lock, receiving wallet + identity behind serialized
+/// actors, durable lifecycle store with a nostr event outbox, single relay ingester, agent roster).
+/// The durable substrate the live seller loop moves onto; mirrors the buyer daemon's shape. The
+/// wallet/node feature-flag structure is under review in issue #133 — do not restructure the flags
+/// here (that is #133's job).
+#[cfg(feature = "wallet")]
+pub mod seller_node;
 pub mod seller_memory;
 pub mod telemetry;
 #[cfg(feature = "git-delivery")]
