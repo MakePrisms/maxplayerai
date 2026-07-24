@@ -327,4 +327,100 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    // TOOTH 3 (#143) — ACROSS-RESTART AWARD RE-BIND. The #141 drop class: a claim parked BEFORE a
+    // restart must re-bind when its award (kind-3405) arrives AFTER the restart. Distinct from
+    // TOOTH 1, which takes the award pre-crash and resumes an already-awarded job. Here the award is
+    // delivered ONLY to the reopened node, so re-binding can succeed only by reading the parked
+    // claim from the durable claims table — no in-memory claim handle survives the drop.
+    //
+    // Red-on-revert / bite: the pre-crash node (store, connection, every in-memory handle) is
+    // dropped entirely and a FRESH SellerNode is opened on the same home. If the parked claim were
+    // memory-only, the reopened store would hold no claim row, `record_award` would return
+    // `Awarded::NoClaim` and create no job — the `Awarded::New` and `job_state == Awarded`
+    // assertions would fail. (Confirmed by pointing the reopened node at an empty home: the award
+    // then returns `NoClaim` and this test goes red.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_then_award_rebinds_the_parked_claim() {
+        let root = temp_home("restart-award");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap_home(&root).expect("home");
+
+        let job = "j".repeat(64);
+        let offer = "o".repeat(64);
+        let award = "w".repeat(64);
+        let buyer = "b".repeat(64);
+        let publisher = FakePublisher { calls: RefCell::new(vec![]) };
+
+        // ---- Pre-crash: park the claim and publish it. NO award yet — the claim is only parked.
+        {
+            let node = SellerNode::open(home.clone()).await.expect("open");
+            let store = node.store();
+            assert_eq!(
+                store
+                    .claim_and_enqueue(&job, &offer, &claim_draft(), 1000, 9_999, 1)
+                    .expect("claim"),
+                store::Claimed::New
+            );
+            let confirmed = drain_once(store, &publisher, 2).await.expect("drain");
+            assert_eq!(confirmed.confirmed, 1, "the claim was published pre-crash");
+            // node drops here — hard restart; the award has NOT arrived. The DB persists the claim.
+        }
+        assert_eq!(publisher.calls.borrow().len(), 1, "exactly one claim published pre-crash");
+
+        // ---- Restart on the SAME home: the parked claim must come back from sqlite.
+        let node = SellerNode::open(home).await.expect("reopen");
+
+        // Reconcile in the restart window must NOT release the parked claim: it is still open, and
+        // with no award yet there is no job to resume.
+        let report = node.reconcile_on_start(3).expect("reconcile");
+        assert!(report.resumed_jobs.is_empty(), "no job yet — the award has not arrived");
+        assert_eq!(
+            node.store().health().expect("health").open_claims,
+            1,
+            "reconcile_on_start must not release the parked claim"
+        );
+
+        // ---- Award arrives AFTER the restart. It re-binds the durable parked claim: a job is born.
+        assert_eq!(
+            node.store().record_award(&award, &job, &buyer, 4).expect("award"),
+            store::Awarded::New,
+            "award re-binds the claim read from the durable table — a fresh Awarded::New job"
+        );
+        assert_eq!(
+            node.store().job_state(&job).expect("state"),
+            Some(JobState::Awarded),
+            "the re-bound claim produced an Awarded job row"
+        );
+        assert_eq!(
+            node.store().health().expect("health").open_claims,
+            0,
+            "the claim moved claimed -> awarded (not released)"
+        );
+
+        // REBIND-OK proceeds: the awarded job is now picked up on a subsequent reconcile.
+        let after_award = node.reconcile_on_start(5).expect("reconcile2");
+        assert_eq!(
+            after_award.resumed_jobs,
+            vec![(job.clone(), JobState::Awarded)],
+            "the re-bound job resumes from durable state"
+        );
+
+        // No duplicate claim on the wire: re-enqueue is a dedup no-op and a fresh drain publishes
+        // nothing new — journal dedup held across the restart.
+        assert_eq!(
+            node.store()
+                .claim_and_enqueue(&job, &offer, &claim_draft(), 1000, 9_999, 6)
+                .expect("replay claim"),
+            store::Claimed::Idempotent
+        );
+        let after = drain_once(node.store(), &publisher, 7).await.expect("drain2");
+        assert_eq!(after.confirmed, 0, "nothing new to publish");
+        assert_eq!(
+            publisher.calls.borrow().len(),
+            1,
+            "no duplicate claim published across the restart — journal dedup held"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
