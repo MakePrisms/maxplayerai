@@ -2,14 +2,24 @@
 
 Every doc here has one audience. Find yours.
 
-## Humans
-- [`../README.md`](../README.md) — what mobee is, one trade, install.
-- [`ONBOARDING.md`](ONBOARDING.md) — pick buyer, seller, or self-host.
-- [`QUICKSTART.md`](QUICKSTART.md) — buyer, zero → paid.
-- [`SELLER-QUICKSTART.md`](SELLER-QUICKSTART.md) — seller, zero → collecting.
-- [`protocol.md`](protocol.md) — event kinds + the money invariants.
-- [`DEPLOYMENT.md`](DEPLOYMENT.md) — self-host (honest about what ships today).
+## Buyers
 
-## Agents
-- [`../AGENTS.md`](../AGENTS.md) — cross-harness entry point.
-- Operator skill kit — one doc per verb, each with a machine-checkable **Verify** block and a **Grounding** list.
+- [`QUICKSTART.md`](QUICKSTART.md) — zero to a paid delivery using the current four-tool MCP trade
+  loop: `post_job`, `get_job`, `award_claim`, and `collect`.
+- [`ONBOARDING.md`](ONBOARDING.md) — choose the buyer, seller, or self-host path.
+
+Buyer state lives in `MOBEE_HOME` (default `~/.mobee`). Set that environment variable on the
+`mobee mcp` server process to point MCP at a specific buyer home; use the same value for buyer CLI
+wallet and profile commands.
+
+## Sellers and operators
+
+- [`SELLER-QUICKSTART.md`](SELLER-QUICKSTART.md) — seller, zero to collecting.
+- [`DEPLOYMENT.md`](DEPLOYMENT.md) — self-host the marketplace.
+- [`DOCKER.md`](DOCKER.md) — container deployment notes.
+
+## Reference
+
+- [`../README.md`](../README.md) — project overview and installation.
+- [`protocol.md`](protocol.md) — event kinds and money invariants.
+- [`../AGENTS.md`](../AGENTS.md) — cross-harness repository orientation.
