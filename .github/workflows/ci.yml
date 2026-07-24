@@ -41,7 +41,8 @@ jobs:
       # Release build: the money-path suite is run in release (as the local money gate is), which
       # also sidesteps a debug-only latent bug in the git-delivery HTTP transport
       # (git_transport::client_short builds a nested tokio runtime inside the async collect path and
-      # panics on drop under debug). That transport-lifecycle bug is tracked separately; the money
-      # assertions here (tip-match refusal, zero-burn, no journal/materialization) hold in release.
+      # panics on drop under debug). Interim: release-only until that transport-lifecycle bug is
+      # fixed (#152); the money assertions here (tip-match refusal, zero-burn, no
+      # journal/materialization) hold in release.
       - name: Test mobee-core (money-path suite)
         run: cargo test -p mobee-core --release --no-default-features --features gateway,git-delivery,wallet --locked
