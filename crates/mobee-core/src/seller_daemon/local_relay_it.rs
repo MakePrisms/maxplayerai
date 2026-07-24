@@ -187,6 +187,8 @@
             wrap_backfill_done: None,
             awarded: None,
             released: None,
+            relay_reconnect: None,
+            stall_recovered: None,
         }
     }
 
@@ -205,6 +207,51 @@
                 .expect("daemon runtime");
             let _ = rt.block_on(run_forever_hooked(daemon, hooks(ready)));
         })
+    }
+
+    /// Like [`spawn_daemon_thread`] but runs with a caller-supplied [`RunHooks`] — used by the
+    /// relay-stall watchdog test to disable SDK auto-reconnect and observe the recovery hook.
+    fn spawn_daemon_thread_with_hooks(
+        daemon: SellerDaemon,
+        run_hooks: RunHooks,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("daemon runtime");
+            let _ = rt.block_on(run_forever_hooked(daemon, run_hooks));
+        })
+    }
+
+    /// Grab a currently-free localhost TCP port by binding to `:0` and reading the assignment. The
+    /// listener is dropped immediately; the relay-stall test rebinds the SAME port so the daemon's
+    /// fixed relay URL survives an R1→R2 relay swap (reproducing "reconnect to the same endpoint").
+    fn free_localhost_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind ephemeral port")
+            .local_addr()
+            .expect("local addr")
+            .port()
+    }
+
+    /// Start an in-process relay bound to a FIXED `port`, retrying `run()` briefly so a just-freed
+    /// port (from a prior relay's shutdown) has a moment to release before R2 rebinds it.
+    async fn start_relay_on_port(port: u16) -> (LocalRelay, String) {
+        for attempt in 0..40 {
+            let relay = LocalRelay::new(RelayBuilder::default().port(port));
+            match relay.run().await {
+                Ok(()) => {
+                    let url = relay.url().await.to_string();
+                    return (relay, url);
+                }
+                Err(_) if attempt < 39 => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("relay run on fixed port {port} failed: {e}"),
+            }
+        }
+        unreachable!("relay start ret/ry loop exhausted")
     }
 
     /// Like [`spawn_daemon_thread`] but also wires the PERIODIC wrap-backfill hook, so the
@@ -227,6 +274,8 @@
                     wrap_backfill_done: Some(backfill_done),
                     awarded: None,
                     released: None,
+                    relay_reconnect: None,
+                    stall_recovered: None,
                 },
             ));
         })
@@ -1079,6 +1128,8 @@
                     wrap_backfill_done: None,
                     awarded: Some(awarded),
                     released: Some(released),
+                    relay_reconnect: None,
+                    stall_recovered: None,
                 },
             ));
         })
@@ -1255,4 +1306,120 @@
             std::env::remove_var(AWARD_SWEEP_INTERVAL_ENV);
         }
         relay.shutdown();
+    }
+
+    // ── #142: silent relay-stall self-recovery (detect via own heartbeat → reconnect → ingest) ──
+    //
+    // Reproduces the field incident: the seller's relay subscription dies silently — the process
+    // stays alive but stops seeing awards/offers/payments. Here the daemon runs against R1 with SDK
+    // auto-reconnect DISABLED (`relay_reconnect: false`), so shutting R1 down leaves the daemon with
+    // a dead subscription the SDK will NOT re-establish — exactly the field's no-SDK-recovery shape.
+    // The daemon subscribes to its OWN heartbeat, so once R1 is gone its heartbeats stop
+    // round-tripping; past the stall threshold the in-process watchdog reconnects to R2 (same port)
+    // and resubscribes with a `since` overlap. We then prove an OFFER published during the outage is
+    // CLAIMED after recovery — an event the periodic wrap-backfill can NEVER recover, so the claim
+    // isolates the watchdog. RED-ON-REVERT: without the watchdog reconnect, the daemon never returns
+    // and the offer is never claimed (asserted below within the timeout).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn silent_relay_stall_is_detected_and_recovered() {
+        let _serial = FLIGHT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        SellerDaemon::end_flight();
+
+        // Fast heartbeat + tight stall threshold so the watchdog trips in seconds, not minutes.
+        // Held under the FLIGHT guard so no concurrent daemon test observes these process envs.
+        unsafe {
+            std::env::set_var(crate::heartbeat::HEARTBEAT_ENABLED_ENV, "1");
+            std::env::set_var(crate::heartbeat::HEARTBEAT_INTERVAL_ENV, "1");
+            std::env::set_var(crate::heartbeat::HEARTBEAT_STALL_MISSED_INTERVALS_ENV, "3");
+        }
+
+        // R1 on a fixed port; the daemon binds to this URL and later reconnects to the SAME port.
+        let port = free_localhost_port();
+        let (relay1, relay_url) = start_relay_on_port(port).await;
+
+        let home = seller_home(&unique_root("relay-stall"), &relay_url, true, 0);
+        let daemon = SellerDaemon::open(home).expect("open seller daemon");
+        let seller_pk = PublicKey::parse(daemon.seller_pubkey()).expect("seller pubkey");
+        let seller_hex = daemon.seller_pubkey().to_string();
+
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (recovered_tx, mut recovered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let run_hooks = RunHooks {
+            ready: Some(ready_tx),
+            auth_wait: Some(Duration::from_millis(500)),
+            wrap_backfill_done: None,
+            awarded: None,
+            released: None,
+            // Disable SDK auto-reconnect: the watchdog must be the SOLE recovery path (field shape).
+            relay_reconnect: Some(false),
+            stall_recovered: Some(recovered_tx),
+        };
+        let _daemon = spawn_daemon_thread_with_hooks(daemon, run_hooks);
+
+        // Online against R1.
+        let ready = tokio::time::timeout(Duration::from_secs(10), ready_rx.recv()).await;
+        assert!(
+            matches!(ready, Ok(Some(()))),
+            "daemon must reach READY against R1 (got {ready:?})"
+        );
+        // Let a couple of own-heartbeats round-trip so the watchdog clock is fresh before the stall.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Kill R1: the subscription goes silently dead (SDK will NOT reconnect). Immediately stand
+        // R2 up on the same port so the watchdog's reconnect has an endpoint to return to.
+        relay1.shutdown();
+        let (relay2, _relay_url2) = start_relay_on_port(port).await;
+
+        // Observer on R2 for the seller's claims — created before the daemon reconnects so the
+        // post-recovery claim is not missed.
+        let observer = connect_client(&relay_url).await;
+        observer
+            .subscribe(
+                Filter::new()
+                    .kinds([
+                        Kind::Custom(gateway::JOB_CLAIM_KIND),
+                        Kind::Custom(gateway::JOB_FEEDBACK_KIND),
+                    ])
+                    .author(seller_pk),
+                None,
+            )
+            .await
+            .expect("observer subscribe on R2");
+        let claims = spawn_claim_collector(&observer, seller_pk);
+
+        // Publish a FRESH TARGETED offer to R2 DURING the outage (before the daemon reconnects), so
+        // only the watchdog's since-overlap resubscribe can deliver it. It sits stored on R2 until
+        // the daemon returns.
+        let buyer = Keys::generate();
+        let seeder = connect_client(&relay_url).await;
+        let outage_offer_id = publish_offer(&seeder, &buyer, &offer_draft(Some(&seller_hex)), None)
+            .await
+            .to_hex();
+
+        // The watchdog must FIRE (stall detected → reconnect + resubscribe).
+        let recovered = tokio::time::timeout(Duration::from_secs(30), recovered_rx.recv()).await;
+        assert!(
+            matches!(recovered, Ok(Some(()))),
+            "the relay-stall watchdog must detect the dead subscription and reconnect (got {recovered:?})"
+        );
+
+        // And the offer published during the outage must be CLAIMED after recovery — proving the
+        // reconnect resubscribed and ingested an event that arrived while the subscription was dead.
+        let claimed = wait_until(Duration::from_secs(20), || {
+            claims_contain(&claims, &outage_offer_id, "processing")
+        })
+        .await;
+        assert!(
+            claimed,
+            "after relay-stall recovery the seller must CLAIM the offer published during the outage \
+             (claim-kind processing e={outage_offer_id}) — reconnect + since-overlap resubscribe"
+        );
+
+        wait_until(Duration::from_secs(8), || !SellerDaemon::in_flight()).await;
+        unsafe {
+            std::env::remove_var(crate::heartbeat::HEARTBEAT_ENABLED_ENV);
+            std::env::remove_var(crate::heartbeat::HEARTBEAT_INTERVAL_ENV);
+            std::env::remove_var(crate::heartbeat::HEARTBEAT_STALL_MISSED_INTERVALS_ENV);
+        }
+        relay2.shutdown();
     }

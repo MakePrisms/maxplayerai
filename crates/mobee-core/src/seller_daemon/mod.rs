@@ -3231,6 +3231,137 @@ fn award_subscription_filter(seller_pubkey: nostr_sdk::PublicKey) -> nostr_sdk::
         .pubkey(seller_pubkey)
 }
 
+/// The seller's OWN heartbeat subscription: kind-30340 authored by this seller, `d=mobee-seller`.
+///
+/// The relay-stall watchdog (#142) subscribes to this on the LIVE loop client so every heartbeat
+/// the daemon publishes round-trips back through the SAME subscription that ingests awards and
+/// payments. The round-trip is the in-process liveness probe of the RECEIVE path — the exact thing
+/// the silent stall breaks — so its absence past the stall threshold means the subscription died
+/// and the daemon must reconnect. Keyed by author + kind + `d` (never by event id): an addressable
+/// event is superseded in place, but each republish still arrives as a fresh delivery on the sub.
+fn self_heartbeat_subscription_filter(seller_pubkey: nostr_sdk::PublicKey) -> nostr_sdk::Filter {
+    nostr_sdk::Filter::new()
+        .kind(nostr_sdk::prelude::Kind::Custom(
+            crate::heartbeat::SELLER_HEARTBEAT_KIND,
+        ))
+        .author(seller_pubkey)
+        .identifier(crate::heartbeat::SELLER_HEARTBEAT_D)
+}
+
+/// Relay-stall watchdog threshold in seconds: `interval_secs * missed_intervals`, each clamped to
+/// at least 1 so the product is always positive (the watchdog can never trip on the first tick).
+/// Pure so the arithmetic is unit-testable without a live daemon.
+fn stall_threshold_secs(interval_secs: u64, missed_intervals: u32) -> u64 {
+    interval_secs
+        .max(1)
+        .saturating_mul(u64::from(missed_intervals.max(1)))
+}
+
+/// Whether the live subscription is presumed dead: no own heartbeat has round-tripped for at least
+/// `threshold_secs`. Pure over an elapsed-seconds reading so the staleness decision is unit-testable
+/// with a fake clock (the caller supplies `Instant::elapsed().as_secs()` in production).
+fn subscription_stalled(elapsed_secs: u64, threshold_secs: u64) -> bool {
+    elapsed_secs >= threshold_secs
+}
+
+/// Overlap margin (seconds) subtracted from the last-known-good heartbeat timestamp when computing
+/// the `since` cursor for the post-stall resubscribe. The window backfills events published during
+/// the stall; the idempotent handlers (in-loop offer dedup + durable journal `has_claim`, wrap
+/// pay-once guard, award match against still-parked claims) absorb the overlap re-delivery.
+const STALL_OVERLAP_MARGIN_SECS: u64 = 60;
+
+/// Tear down the silently-dead relay connection and rebuild it: reconnect, re-run the NIP-42
+/// handshake, and resubscribe ALL filters with `since = overlap` so awards/offers/payment-wraps
+/// published during the stall are re-delivered and ingested. Returns the fresh offer subscription
+/// id(s) so the caller can keep tracking the Loud-Closed fallback. On any reconnect/auth/subscribe
+/// error it returns `Err` WITHOUT clearing the existing subscriptions, so the daemon stays
+/// recoverable (the caller retries on the next heartbeat tick, and production auto-reconnect keeps
+/// the old subs live if the relay returns on its own).
+#[allow(clippy::too_many_arguments)]
+async fn reconnect_and_resubscribe(
+    client: &nostr_sdk::Client,
+    relay: &nostr_sdk::prelude::Relay,
+    seller_pubkey: nostr_sdk::PublicKey,
+    claim_enabled: bool,
+    claim_open_pool: bool,
+    heartbeat_enabled: bool,
+    overlap_since: nostr_sdk::Timestamp,
+    auth_wait: Duration,
+) -> Result<Vec<nostr_sdk::prelude::SubscriptionId>, DaemonError> {
+    use nostr_sdk::prelude::{Filter, Kind, SubscribeOptions};
+
+    // Fresh receiver BEFORE the reconnect so the `Authenticated` notification can't be missed.
+    let mut relay_notifications = relay.notifications();
+    // Drop the dead connection and dial again. `connect()` spawns a fresh connection task
+    // regardless of the relay's auto-reconnect option, so this drives recovery even when the
+    // silent half-open socket never tripped the SDK's own reconnection.
+    client.disconnect().await;
+    client.connect().await;
+    client.wait_for_connection(Duration::from_secs(20)).await;
+    // Re-run NIP-42: the kind-1059 resubscribe below is p-gated on it (same constraint as boot).
+    let _ = wait_for_nip42_auth(&mut relay_notifications, auth_wait).await?;
+    // Replace the stale pool subscriptions wholesale — clear them only AFTER a successful
+    // reconnect+auth so a failed recovery never leaves the daemon reconnected-but-deaf.
+    client.unsubscribe_all().await;
+
+    let mut offer_sub_ids = Vec::new();
+    if claim_enabled {
+        // Offers ride ONE grouped REQ (targeted + open-pool), each with `since=overlap` so an offer
+        // posted during the stall backfills. On a RECONNECT (unlike boot) the targeted filter also
+        // carries the window: we only need the stall gap, and the backfill pre-claim money-safety
+        // check + journal `has_claim` still gate whether any backfilled offer is actually claimed.
+        let mut offer_filters = vec![Filter::new()
+            .kind(Kind::Custom(JOB_OFFER_KIND))
+            .hashtag(gateway::MOBEE_TAG)
+            .pubkey(seller_pubkey)
+            .since(overlap_since)];
+        if claim_open_pool {
+            offer_filters.push(
+                Filter::new()
+                    .kind(Kind::Custom(JOB_OFFER_KIND))
+                    .hashtag(gateway::MOBEE_TAG)
+                    .since(overlap_since)
+                    .limit(OFFER_BACKFILL_LIMIT),
+            );
+        }
+        let output = client
+            .pool()
+            .subscribe(offer_filters, SubscribeOptions::default())
+            .await
+            .map_err(|error| DaemonError::Relay(format!("resubscribe offers: {error}")))?;
+        offer_sub_ids.push(output.val);
+        // Awards WITH `since=overlap`: the missed-award leg of #142 (no 3405 ingested for 60+ min).
+        // An award re-delivered for a claim we already executed/released no longer matches an
+        // outstanding parked claim, so `on_award_event` ignores it — the overlap is safe.
+        client
+            .subscribe(
+                award_subscription_filter(seller_pubkey).since(overlap_since),
+                None,
+            )
+            .await
+            .map_err(|error| DaemonError::Relay(format!("resubscribe awards: {error}")))?;
+    }
+    // Payment wraps WITH `since=overlap` so a kind-1059 that landed during the stall re-delivers and
+    // redeems through the idempotent `ingest_gift_wrap` path (pay-once journal guard absorbs re-see).
+    client
+        .subscribe(
+            wrap_subscription_filter(seller_pubkey).since(overlap_since),
+            None,
+        )
+        .await
+        .map_err(|error| DaemonError::Relay(format!("resubscribe 1059: {error}")))?;
+    // Own-heartbeat watchdog subscription, so round-trip detection resumes on the fresh sub.
+    if heartbeat_enabled {
+        client
+            .subscribe(self_heartbeat_subscription_filter(seller_pubkey), None)
+            .await
+            .map_err(|error| {
+                DaemonError::Relay(format!("resubscribe self-heartbeat: {error}"))
+            })?;
+    }
+    Ok(offer_sub_ids)
+}
+
 /// Cap on the number of most-recently-seen offer ids retained for in-loop dedup.
 ///
 /// The dedup set is DEFENSE-IN-DEPTH only (see [`offer_event_should_process`]): it collapses an
@@ -3320,6 +3451,15 @@ pub(crate) struct RunHooks {
     /// Fires with `(job_id, reason)` when a parked claim is released without executing — the buyer
     /// awarded another claim, or the offer deadline passed with no award. `None` in production.
     pub released: Option<tokio::sync::mpsc::UnboundedSender<(String, String)>>,
+    /// Override the relay's auto-reconnect option (`None` = production default, `true`). The
+    /// relay-stall integration test sets this `false` so a killed connection is NOT silently
+    /// re-established by the SDK — reproducing the field's dead-subscription-with-no-SDK-recovery
+    /// so the in-process watchdog is the ONLY path back to a live subscription.
+    pub relay_reconnect: Option<bool>,
+    /// Fires once each time the relay-stall watchdog completes a reconnect + resubscribe. The
+    /// integration test awaits it to prove recovery fired without scraping stderr. `None` in
+    /// production.
+    pub stall_recovered: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 /// Long-running seller loop: NIP-42 AUTH, then subscribe offers+1059 from START.
@@ -3502,8 +3642,16 @@ pub(crate) async fn run_forever_hooked(
     client.automatic_authentication(true);
 
     let relay_url_str = daemon.home.config.relay_url.clone();
+    // Add via the pool so the relay-stall watchdog test can disable SDK auto-reconnect; production
+    // keeps the default (true) so a genuine TCP drop is still re-established by the SDK, with the
+    // watchdog as the backstop for the SILENT half-open stall the SDK cannot see (#142).
+    let relay_reconnect = hooks.relay_reconnect.unwrap_or(true);
     client
-        .add_relay(&relay_url_str)
+        .pool()
+        .add_relay(
+            &relay_url_str,
+            nostr_sdk::prelude::RelayOptions::default().reconnect(relay_reconnect),
+        )
         .await
         .map_err(|error| DaemonError::Relay(format!("add relay: {error}")))?;
 
@@ -3605,6 +3753,17 @@ pub(crate) async fn run_forever_hooked(
     let subscribe_now = Timestamp::now();
     let daemon_start_unix = subscribe_now.as_secs();
     let mut offer_sub_ids: Vec<SubscriptionId> = Vec::new();
+    // Heartbeat + relay-stall watchdog config, resolved BEFORE the subscription section so the
+    // self-heartbeat watchdog subscription can be registered alongside the offer/award/wrap subs.
+    // Env overrides config for tests. The watchdog rides the heartbeat mechanism (own heartbeats
+    // round-tripping on the live sub), so it is inert when heartbeats are disabled.
+    let heartbeat_enabled =
+        crate::heartbeat::resolve_enabled(&daemon.home.config.seller_heartbeat);
+    let heartbeat_interval_secs =
+        crate::heartbeat::resolve_interval_secs(&daemon.home.config.seller_heartbeat);
+    let stall_missed_intervals =
+        crate::heartbeat::resolve_stall_missed_intervals(&daemon.home.config.seller_heartbeat);
+    let stall_threshold = stall_threshold_secs(heartbeat_interval_secs, stall_missed_intervals);
     // Receive-only degraded mode (unreadable journal): skip the offer subscription entirely so the
     // daemon claims NO new work, while the wrap subscription + backfill below still run to settle
     // recoverable pending payments.
@@ -3641,6 +3800,18 @@ pub(crate) async fn run_forever_hooked(
         .await
         .map_err(|error| DaemonError::Relay(format!("subscribe 1059: {error}")))?;
 
+    // Relay-stall watchdog subscription (#142): subscribe to our OWN heartbeat so each published
+    // heartbeat round-trips back on this live subscription. If none round-trips within the stall
+    // threshold the receive path is presumed dead and the heartbeat-tick watchdog below reconnects.
+    // Only meaningful when heartbeats are enabled (the round-trip source); otherwise inert.
+    if heartbeat_enabled {
+        client
+            .subscribe(self_heartbeat_subscription_filter(seller_pubkey), None)
+            .await
+            .map_err(|error| {
+                DaemonError::Relay(format!("subscribe self-heartbeat (watchdog): {error}"))
+            })?;
+    }
 
     // Status line: never echo secrets.
     eprintln!(
@@ -3726,18 +3897,26 @@ pub(crate) async fn run_forever_hooked(
     let mut offer_fallback_done = false;
     // `notifications` was created up front (before the REQs) so no backfilled event is dropped.
 
-    // Heartbeat cadence. Env overrides config for tests. `interval()`'s
-    // first `tick()` completes immediately, so an enabled seller advertises liveness right after
-    // going online, then every `interval_secs`.
-    let heartbeat_enabled =
-        crate::heartbeat::resolve_enabled(&daemon.home.config.seller_heartbeat);
-    let heartbeat_interval_secs =
-        crate::heartbeat::resolve_interval_secs(&daemon.home.config.seller_heartbeat);
+    // Heartbeat cadence (resolved above). `interval()`'s first `tick()` completes immediately, so
+    // an enabled seller advertises liveness right after going online, then every `interval_secs`.
     let mut heartbeat_interval =
         tokio::time::interval(Duration::from_secs(heartbeat_interval_secs.max(1)));
     if heartbeat_enabled {
         eprintln!(
             "seller heartbeat enabled: kind-30340 d=mobee-seller every {heartbeat_interval_secs}s"
+        );
+    }
+    // Relay-stall watchdog state (#142): the wall-clock + monotonic instant of the last own
+    // heartbeat that round-tripped on the live subscription. Seeded to "now" at online so a healthy
+    // seller never trips before its first heartbeat round-trips; the monotonic `Instant` drives the
+    // staleness measure (robust to wall-clock jumps) and the unix stamp drives the resubscribe
+    // `since` cursor. The watchdog check rides the heartbeat tick (below) so it needs no extra timer.
+    let mut last_self_heartbeat_seen = tokio::time::Instant::now();
+    let mut last_self_heartbeat_seen_unix = now_unix();
+    if heartbeat_enabled {
+        eprintln!(
+            "seller relay-stall watchdog enabled: reconnect if no own heartbeat round-trips within \
+             {stall_threshold}s ({stall_missed_intervals} missed intervals)"
         );
     }
 
@@ -3779,6 +3958,60 @@ pub(crate) async fn run_forever_hooked(
             // timeout-bounded + log-and-continue, so it can NEVER wedge or crash offer/payment
             // handling. Disabled ⇒ the branch is inert and select only waits on the relay stream.
             _ = heartbeat_interval.tick(), if heartbeat_enabled => {
+                // Relay-stall watchdog (#142): the daemon subscribes to its OWN heartbeat, so each
+                // published heartbeat round-trips back on this live subscription. If none has for at
+                // least the stall threshold the subscription died silently — reconnect + resubscribe
+                // with a `since` overlap so awards/offers/wraps published during the stall ingest.
+                // Checked BEFORE publishing (evaluating whether prior heartbeats round-tripped) so it
+                // rides the existing timer with no extra select branch.
+                let stall_elapsed = last_self_heartbeat_seen.elapsed().as_secs();
+                if subscription_stalled(stall_elapsed, stall_threshold) {
+                    let overlap_since = Timestamp::from(
+                        last_self_heartbeat_seen_unix.saturating_sub(STALL_OVERLAP_MARGIN_SECS),
+                    );
+                    eprintln!(
+                        "seller RELAY-STALL detected: no own heartbeat round-tripped in {stall_elapsed}s \
+                         (threshold {stall_threshold}s); subscription presumed dead — reconnecting + \
+                         resubscribing with since={} overlap",
+                        overlap_since.as_secs()
+                    );
+                    match reconnect_and_resubscribe(
+                        &client,
+                        &relay,
+                        seller_pubkey,
+                        claim_enabled,
+                        claim_open_pool,
+                        heartbeat_enabled,
+                        overlap_since,
+                        auth_wait,
+                    )
+                    .await
+                    {
+                        Ok(new_ids) => {
+                            offer_sub_ids = new_ids;
+                            // Fresh subscription ⇒ the Loud-Closed fallback may fire again.
+                            offer_fallback_done = false;
+                            // Grace: reset the watchdog clock so it does not immediately re-fire
+                            // before the first post-reconnect heartbeat round-trips.
+                            last_self_heartbeat_seen = tokio::time::Instant::now();
+                            last_self_heartbeat_seen_unix = now_unix();
+                            eprintln!(
+                                "seller RELAY-STALL recovered: reconnected + resubscribed \
+                                 (offers+awards+1059+heartbeat, since={} overlap)",
+                                overlap_since.as_secs()
+                            );
+                            if let Some(tx) = &hooks.stall_recovered {
+                                let _ = tx.send(());
+                            }
+                        }
+                        Err(error) => {
+                            // Leave the watchdog clock untouched so the next heartbeat tick retries.
+                            eprintln!(
+                                "seller RELAY-STALL recovery FAILED (will retry next heartbeat tick): {error}"
+                            );
+                        }
+                    }
+                }
                 publish_heartbeat(&daemon).await;
                 continue;
             }
@@ -3823,6 +4056,17 @@ pub(crate) async fn run_forever_hooked(
         };
         match notification {
             RelayPoolNotification::Event { event, .. } => {
+                // Own-heartbeat round-trip (relay-stall watchdog, #142): our own kind-30340 event
+                // coming back on this subscription proves the RECEIVE path is alive. Refresh the
+                // liveness clocks and drop it — heartbeats are diagnostic and never route to offer,
+                // award, or payment handling.
+                if event.kind.as_u16() == crate::heartbeat::SELLER_HEARTBEAT_KIND
+                    && event.pubkey == seller_pubkey
+                {
+                    last_self_heartbeat_seen = tokio::time::Instant::now();
+                    last_self_heartbeat_seen_unix = now_unix();
+                    continue;
+                }
                 if event.kind == Kind::GiftWrap {
                     match ingest_gift_wrap(&mut daemon, &event).await {
                         Ok(Some(receipt)) => {
