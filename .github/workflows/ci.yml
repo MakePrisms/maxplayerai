@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Default-feature builds + the canonical core test suite (AGENTS.md "Build & test").
+  build-default:
+    name: Build & test (default features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build workspace (default features)
+        run: cargo build --workspace --locked
+      - name: Test mobee-core (default features)
+        run: cargo test -p mobee-core --locked
+
+  # The acp feature gates the seller-execute path and is off by default, so it rots
+  # silently unless CI compiles it explicitly (issue #108). Build BOTH crates with acp on.
+  build-acp:
+    name: Build (acp feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build mobee (acp + wallet, release)
+        run: cargo build -p mobee --release --features acp,wallet --locked
+      - name: Build mobee-core (acp)
+        run: cargo build -p mobee-core --features acp --locked
