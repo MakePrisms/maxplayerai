@@ -176,6 +176,83 @@ text in that workdir, and on completion pushes the tree and publishes kind-3403 
 
 ---
 
+## 3b. Setup gotchas — two environment prerequisites that silently break `execute`
+
+The two failures below are **environment/setup issues, not core bugs** — the daemon and
+`acp_driver` are fine; they spawn the agent and publish failure feedback exactly as designed. They
+surfaced in end-to-end seller testing. If your `execute` leg never produces a tree, check these two
+things **first**.
+
+### Gotcha 1 — the agent adapter binary MUST be resolvable on `PATH`
+
+`--agent claude|cursor|codex` resolves to a **fixed adapter command** and spawns it as the ACP
+stdio agent. **Post-R4 there is no auto-`npx` fallback:** if that adapter binary is not found on the
+daemon's `PATH`, `mobee sell` errors up front with an install hint and does **no** work — it does
+not silently reach for `npx`.
+
+Each preset needs a specific binary on `PATH`:
+
+| `--agent` | Adapter binary that must be on `PATH` | Install |
+|-----------|----------------------------------------|---------|
+| `claude`  | `claude-agent-acp`                     | `npm i -g @agentclientprotocol/claude-agent-acp` |
+| `cursor`  | `cursor-agent` (or `agent`), `acp` appended | install Cursor's agent CLI |
+| `codex`   | `codex-acp`                            | `npm i -g @agentclientprotocol/codex-acp` |
+
+**Verify** (the daemon's own lookup — must print an absolute path):
+
+```bash
+command -v claude-agent-acp    # claude preset
+command -v cursor-agent        # cursor preset (or: command -v agent)
+command -v codex-acp           # codex preset
+```
+
+**Fix** — pick one:
+
+- **Install the adapter globally** with the `npm i -g …` line above, and make sure the npm global
+  bin dir (`npm bin -g` / `npm prefix -g`/bin) is on the **daemon's** `PATH`. A systemd unit, a
+  Docker/`ENTRYPOINT`, or a `cron` job usually starts with a **minimal `PATH`** that omits your
+  interactive shell's — export the full `PATH` into the environment the daemon actually runs under,
+  not just your login shell.
+- **Or use the `--agent-argv` hatch** to point straight at a resolvable program instead of relying
+  on the preset lookup, e.g.:
+
+  ```bash
+  "$MOBEE_BIN" sell \
+    --agent-argv npx --agent-argv @agentclientprotocol/claude-agent-acp \
+    --rate-sats 2
+  ```
+
+### Gotcha 2 — on NixOS the agent path is dead without `CLAUDE_CODE_EXECUTABLE`
+
+On **NixOS**, having the adapter on `PATH` (Gotcha 1) is **not enough**. The `claude-agent-acp`
+adapter in turn shells out to a `claude` executable, and the npm-shipped `claude` is a
+**dynamically-linked** binary that expects an FHS loader (`/lib64/ld-linux-*`) that NixOS does not
+provide. So the adapter starts, tries to launch `claude`, and the exec dies — a `PATH` shim alone
+cannot fix this because the problem is the interpreter/loader, not name resolution.
+
+**Symptom:** the `execute` leg fails to start (or spawns and immediately dies); `acp_driver`
+publishes failure feedback. Nothing is wrong with the marketplace/claim/deliver/collect legs — it is
+purely the agent process failing to exec on this host.
+
+**Fix — set `CLAUDE_CODE_EXECUTABLE` to a real, NixOS-runnable `claude` binary.** Point it at a
+`claude` that was built/patched for the system (e.g. one installed into the system profile) rather
+than the dynamically-linked npm build:
+
+```bash
+# use the system-provided, NixOS-compatible claude
+export CLAUDE_CODE_EXECUTABLE=/run/current-system/sw/bin/claude
+
+# verify it actually runs on this host before starting the daemon
+"$CLAUDE_CODE_EXECUTABLE" --version
+```
+
+Export `CLAUDE_CODE_EXECUTABLE` into the **same environment the daemon runs under** (systemd
+`Environment=`, Docker `-e` / `ENV`, or the shell that launches `mobee sell`) — not just an
+interactive shell. With it set, the adapter runs the working `claude` and the ACP/`execute` path
+comes alive.
+
+---
+
 ## 4. Delivery — relay-git default, or BYO
 
 **Default (mobee-hosted relay-git).** With no `--git-remote`, the daemon delivers to a self-owned
@@ -323,6 +400,8 @@ Optional: BYO delivery + custom agent (power-user hatch):
 → fresh MOBEE_HOME (key 0600, auto-generated, never echoed, never --key)
 → mint https://testnut.cashudevkit.org (the default test mint)
 → --agent claude|cursor|codex resolves ACP internally; --agent-argv is the power-user hatch
+→ gotcha 1: the adapter binary (claude-agent-acp / cursor-agent / codex-acp) is resolvable on the daemon's PATH (`command -v …`), else execute errors up front — no auto-npx fallback (§3b)
+→ gotcha 2 (NixOS): CLAUDE_CODE_EXECUTABLE points at a NixOS-runnable claude; a PATH shim alone leaves the ACP/agent path dead (§3b)
 → delivery defaults to relay-git (NIP-34 announce → in-process NIP-98 push, no external git/helper); --git-remote for BYO https
 → discoverability: kind-0 profile + NIP-89 (kind 31990) published on start
 → targeted-only by default; --claim-open-pool to opt into the open pool
