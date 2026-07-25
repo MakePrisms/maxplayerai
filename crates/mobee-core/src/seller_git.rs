@@ -345,6 +345,25 @@ pub fn push_branch_with_auth(
     Ok(oid)
 }
 
+/// Push `branch` with an already-resolved NIP-98 `Authorization` header instead of a raw secret. The
+/// durable seller node builds the header through its signer actor (which owns the seller key), so the
+/// push path never re-reads the secret — the key stays confined to the actor + the authenticated
+/// relay client. `header` is `None` for a public/anonymous https remote. Returns the pushed OID.
+pub fn push_branch_with_header(
+    workdir: &Path,
+    remote_url: &str,
+    branch: &str,
+    header: Option<String>,
+) -> Result<String, SellerGitError> {
+    assert_allowed_repo_locator(remote_url)?;
+    if branch.trim().is_empty() {
+        return Err(SellerGitError::Io("branch must be non-empty".into()));
+    }
+    let oid = git_transport::push_branch_with_header(workdir, remote_url, branch, header)?;
+    eprintln!("seller push path=inprocess remote={remote_url} branch={branch} ok");
+    Ok(oid)
+}
+
 /// Boot-time WRITE-auth probe: connect to `remote_url` in the PUSH direction and read the
 /// receive-pack ref advertisement (the auth-gated leg) WITHOUT transferring a pack or mutating the
 /// remote. Surfaces a broken write path — missing/invalid credential, unannounced/unreachable

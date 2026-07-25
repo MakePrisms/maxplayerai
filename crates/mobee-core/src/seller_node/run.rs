@@ -27,7 +27,7 @@ use crate::seller_exec::{
     compose_agent_prompt, delivery_message, job_workdir, run_agent_job, run_agent_with_retry,
     seller_delivery_kind, seller_exec_metadata, unified_job_timeout,
 };
-use crate::seller_git::{self, DeliveryAgentIdentity, PushAuth};
+use crate::seller_git::{self, DeliveryAgentIdentity};
 
 use super::outbox::drain_once;
 use super::publisher::RelayPublisher;
@@ -616,30 +616,38 @@ impl SellerNodeRunner {
             return;
         }
 
-        // Push under the seller's NIP-98 auth. The secret is read into PushAuth for the in-process
-        // push and dropped immediately after — never handed to the agent, logged, or put on argv.
-        let commit = {
-            let secret = match home::read_secret_key_hex(self.node.home()) {
-                Ok(secret) => secret,
-                Err(error) => {
-                    eprintln!("seller node execute fail job_id={job_id}: push key read failed ({error})");
+        // Push under the seller's NIP-98 auth. The push authorization is signed THROUGH the signer
+        // actor (which owns the seller key), so the push path is NOT a third custody site — the key
+        // stays confined to the actor + the authenticated relay client, never re-read here. A
+        // public/anonymous https remote takes no header (auth applies to relay-git remotes only).
+        let push_header = if crate::delivery_transport::is_relay_git_locator(&seller.git_remote) {
+            match self.node.signer().http_auth_header(seller.git_remote.clone()).await {
+                Ok(Ok(header)) => Some(header),
+                Ok(Err(error)) => {
+                    eprintln!("seller node execute fail job_id={job_id}: push auth sign failed ({error})");
                     self.fail_job(job_id).await;
                     return;
                 }
-            };
-            let push_auth = PushAuth {
-                secret_key_hex: secret,
-            };
-            let pushed =
-                seller_git::push_branch_with_auth(&workdir, &seller.git_remote, &branch, Some(&push_auth));
-            drop(push_auth);
-            match pushed {
-                Ok(oid) => oid,
                 Err(error) => {
-                    eprintln!("seller node execute fail job_id={job_id}: git push failed ({error})");
+                    eprintln!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
                     self.fail_job(job_id).await;
                     return;
                 }
+            }
+        } else {
+            None
+        };
+        let commit = match seller_git::push_branch_with_header(
+            &workdir,
+            &seller.git_remote,
+            &branch,
+            push_header,
+        ) {
+            Ok(oid) => oid,
+            Err(error) => {
+                eprintln!("seller node execute fail job_id={job_id}: git push failed ({error})");
+                self.fail_job(job_id).await;
+                return;
             }
         };
 

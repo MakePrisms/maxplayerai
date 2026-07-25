@@ -38,6 +38,13 @@ enum Command {
         digest_hex: String,
         reply: oneshot::Sender<Result<String, String>>,
     },
+    /// Build the NIP-98 (`kind:27235`) `Authorization` header for a relay-git push to `remote_url`,
+    /// signed with the seller key. Routing the push authorization through the actor keeps the secret
+    /// confined to this task + the authenticated relay client — the push path never re-reads the key.
+    HttpAuthHeader {
+        remote_url: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
 }
 
 /// A cheap, cloneable handle to the signer actor.
@@ -101,6 +108,21 @@ impl SignerHandle {
         rx.await.map_err(|_| SignerActorGone)
     }
 
+    /// Build the NIP-98 push `Authorization` header for `remote_url` through the actor — the seller
+    /// key never leaves the actor, so the push path is not a third custody site. Returns the header
+    /// string, or the inner `Err` when the remote url / signing fails.
+    pub async fn http_auth_header(
+        &self,
+        remote_url: String,
+    ) -> Result<Result<String, String>, SignerActorGone> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::HttpAuthHeader { remote_url, reply })
+            .await
+            .map_err(|_| SignerActorGone)?;
+        rx.await.map_err(|_| SignerActorGone)
+    }
+
     /// The seller public key (hex), routed through the actor queue (proves the serialized path).
     pub async fn public_key_via_actor(&self) -> Result<String, SignerActorGone> {
         let (reply, rx) = oneshot::channel();
@@ -139,6 +161,12 @@ pub fn spawn(home: &MobeeHome) -> Result<SignerHandle, HomeError> {
                 Command::SignReceiptHash { digest_hex, reply } => {
                     let result = crate::seller::sign_receipt_hash(&keys, &digest_hex)
                         .map_err(|error| error.to_string());
+                    let _ = reply.send(result);
+                }
+                Command::HttpAuthHeader { remote_url, reply } => {
+                    let result =
+                        crate::git_transport::nip98_authorization_header_with_keys(&remote_url, &keys)
+                            .map_err(|error| error.to_string());
                     let _ = reply.send(result);
                 }
             }
@@ -240,6 +268,29 @@ mod tests {
         let _ = digest;
         // A malformed digest (not 32 bytes) fails closed rather than signing garbage.
         assert!(signer.sign_receipt_hash("zz".to_owned()).await.expect("actor").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The push authorization is signed THROUGH the actor: the header is a valid "Nostr <base64>"
+    // NIP-98 token and never contains the secret. This is what keeps the push off a third custody
+    // site — the seller key is used only inside the actor to sign it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn builds_nip98_push_header_through_the_actor_never_leaking_the_secret() {
+        let root = temp_home("httpauth");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        let secret = home::read_secret_key_hex(&home).expect("secret");
+        let signer = spawn(&home).expect("spawn");
+
+        let header = signer
+            .http_auth_header("https://relay.example/git/o/r.git".to_owned())
+            .await
+            .expect("actor")
+            .expect("header");
+        assert!(header.starts_with("Nostr "), "NIP-98 auth scheme: {header}");
+        assert!(!header.contains(&secret), "push header must not leak the secret");
+        // A malformed remote url fails cleanly rather than signing garbage.
+        assert!(signer.http_auth_header("not a url".to_owned()).await.expect("actor").is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 
