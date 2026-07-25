@@ -21,6 +21,7 @@
 pub mod ingester;
 pub mod lock;
 pub mod outbox;
+pub mod publisher;
 pub mod roster;
 pub mod signer;
 pub mod store;
