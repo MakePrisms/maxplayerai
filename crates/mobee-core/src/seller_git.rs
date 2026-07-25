@@ -708,15 +708,17 @@ mod snapshot_tests {
     fn tooth_delivery_snapshot_uses_journaled_date_and_is_deterministic() {
         const DATE: i64 = 1_700_000_000; // fixed, in the past — never equals the wall clock.
 
-        let dir_a = workdir("determinism-a");
-        let base_a = init_with_base(&dir_a, "mobee/job");
-        write(&dir_a, "src/feature.rs", "identical agent output\n");
+        let dir = workdir("determinism");
+        let base = init_with_base(&dir, "mobee/job");
+        write(&dir, "src/feature.rs", "identical agent output\n");
         let id = identity();
-        let oid_a = snapshot_delivery_at(&dir_a, &id, Some(&base_a), "mobee/job", "msg", DATE)
+        let oid_a = snapshot_delivery_at(&dir, &id, Some(&base), "mobee/job", "msg", DATE)
             .expect("snapshot a");
 
-        // The committed author/committer time IS the journaled date (not now()).
-        let c = commit(&dir_a, &oid_a);
+        // The committed author/committer time IS the journaled date (not now()). This is the
+        // load-bearing bite: reverting to `Signature::now()` stamps the wall clock (year 2026+),
+        // which can never equal the fixed 2023 test date, so the revert turns this red.
+        let c = commit(&dir, &oid_a);
         assert_eq!(
             c.author().when().seconds(),
             DATE,
@@ -724,22 +726,19 @@ mod snapshot_tests {
         );
         assert_eq!(c.committer().when().seconds(), DATE);
 
-        // A second, independent workdir with the SAME base + tree + identity + date snapshots to the
-        // SAME oid — the property that makes a post-crash re-push idempotent.
-        let dir_b = workdir("determinism-b");
-        let base_b = init_with_base(&dir_b, "mobee/job");
-        write(&dir_b, "src/feature.rs", "identical agent output\n");
-        let oid_b = snapshot_delivery_at(&dir_b, &id, Some(&base_b), "mobee/job", "msg", DATE)
-            .expect("snapshot b");
-        assert_eq!(oid_a, oid_b, "same inputs + journaled date ⇒ identical delivery commit oid");
+        // Re-snapshotting the SAME base + tree + identity at the SAME date re-creates the SAME oid —
+        // the property that makes a post-crash re-push idempotent (deterministic, so not a divergent
+        // second tip). Same base commit on both passes, so the parent is fixed.
+        let oid_a2 = snapshot_delivery_at(&dir, &id, Some(&base), "mobee/job", "msg", DATE)
+            .expect("snapshot a2");
+        assert_eq!(oid_a, oid_a2, "same inputs + journaled date ⇒ identical delivery commit oid");
 
         // And the date is genuinely folded into the oid: a different date ⇒ a different commit.
-        let oid_b2 = snapshot_delivery_at(&dir_b, &id, Some(&base_b), "mobee/job", "msg", DATE + 1)
-            .expect("snapshot b2");
-        assert_ne!(oid_a, oid_b2, "a different authored-at must change the delivery oid");
+        let oid_b = snapshot_delivery_at(&dir, &id, Some(&base), "mobee/job", "msg", DATE + 1)
+            .expect("snapshot b");
+        assert_ne!(oid_a, oid_b, "a different authored-at must change the delivery oid");
 
-        let _ = fs::remove_dir_all(&dir_a);
-        let _ = fs::remove_dir_all(&dir_b);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // ── Agent scratch commits (foreign identity, extra commits) are ignored ────────────────────
