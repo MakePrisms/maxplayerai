@@ -2,9 +2,12 @@
 //!
 //! - [`post_job`] publishes a real offer-kind offer (targeted p-tag = documented default).
 //! - [`get_job`] reads claim/result state from relay events (not local invent).
-//! - [`accept_claim`] publishes feedback-kind `accepted` and records a local pay-bind for
-//!   [`authorize_pay`](crate::authorize_pay) (seller / result / commit). Claims/results
-//!   themselves remain relay-truth.
+//! - [`accept_claim`] records a local pay-bind for
+//!   [`authorize_pay`](crate::authorize_pay) (seller / result / commit) — written BEFORE the
+//!   publish, so a crash cannot leave a public accept with no bind — then publishes an
+//!   `accepted` AWARD (kind-3405 via [`award_draft`]; the same kind [`award_claim_async`]
+//!   publishes at selection, so an already-awarded claim gets a second kind-3405 on the
+//!   relay). Claims/results themselves remain relay-truth.
 //!
 //! Local bind under `~/.mobee/jobs/<job_id>.json` is accept-state only.
 
@@ -669,7 +672,7 @@ pub async fn get_job_async(
     }
 }
 
-/// Accept a live claim: publish feedback-kind `accepted` and persist the pay-bind.
+/// Accept a live claim: persist the pay-bind, then publish the `accepted` AWARD (kind-3405).
 /// Sync entry for CLI/tests — nested call fails fast; MCP uses [`accept_claim_async`].
 pub fn accept_claim(
     home: &MobeeHome,
@@ -1457,22 +1460,6 @@ async fn publish_draft_async(
         )));
     }
     Ok(output.val.to_hex())
-}
-
-#[allow(dead_code)] // guarded sync twin for non-async callers; MCP uses `_async`
-fn fetch_job_view(
-    home: &MobeeHome,
-    keys: &nostr_sdk::Keys,
-    job_id: &str,
-    timeout: Duration,
-) -> Result<JobView, JobLifecycleError> {
-    crate::runtime_guard::refuse_nested_block_on("fetch_job_view")
-        .map_err(JobLifecycleError::Relay)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| JobLifecycleError::Relay(error.to_string()))?;
-    runtime.block_on(fetch_job_view_async(home, keys, job_id, timeout, now_unix()))
 }
 
 /// Current unix time (seconds). Wall-clock lives ONLY at call sites; the derivation
@@ -3276,23 +3263,6 @@ mod tests {
         );
         assert!(
             err.to_string().contains("publish_draft"),
-            "op name missing: {err}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn fetch_job_view_sync_refuses_inside_runtime() {
-        let (root, home) = temp_job_home("nested-fetch-job");
-        let keys = nostr_sdk::Keys::generate();
-        let err = fetch_job_view(&home, &keys, &"aa".repeat(32), Duration::from_secs(1))
-            .expect_err("must refuse nested block_on");
-        assert!(
-            err.to_string().contains("nested block_on refused"),
-            "unexpected: {err}"
-        );
-        assert!(
-            err.to_string().contains("fetch_job_view"),
             "op name missing: {err}"
         );
         let _ = std::fs::remove_dir_all(&root);
