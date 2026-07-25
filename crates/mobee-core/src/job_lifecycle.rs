@@ -251,7 +251,8 @@ pub struct AcceptedBind {
     pub accept_event_id: String,
     pub accepted_at: u64,
     /// Seller schnorr signature (hex) over the receipt preimage, captured from the
-    /// accepted result's `sig/seller` tag. Empty when the result carries no such tag.
+    /// accepted result's `sig/seller` tag. Accept refuses a missing/empty sig so it never
+    /// occupies the single-settlement slot (issue #93); empty only appears on legacy binds.
     #[serde(default)]
     pub seller_signature: String,
     /// SHA-256 hex of the accepted claim's seller-authored `creq` (`creqA…`) string,
@@ -791,6 +792,12 @@ pub async fn accept_claim_async(
     // so the loser re-reads the winner's bind and refuses at `assert_single_settlement`.
     let _job_lock = acquire_job_lock(home, &request.job_id)?;
 
+    // Issue #93: refuse a missing/empty seller co-signature BEFORE any durable bind write so an
+    // incomplete result never occupies the single-settlement slot. A later result (or re-publish)
+    // carrying a valid `sig/seller` can then bind. Checked before the single-settlement guard so
+    // empty presentation is a pure no-op on the bind file.
+    let seller_signature = require_seller_signature(&result.seller_signature)?;
+
     // Interim single-settlement guard (P): a job binds at most ONE result. If an accept-bind
     // already exists for this job pinned to a DIFFERENT result, refuse — a second/different
     // result_id must not mint a second buyer attempt/payment for one job. Re-accepting the SAME
@@ -886,8 +893,8 @@ pub async fn accept_claim_async(
         // Pending marker until the accept is published + finalized below.
         accept_event_id: String::new(),
         accepted_at: 0,
-        // Capture sig/seller so authorize_pay can co-sign the receipt preimage.
-        seller_signature: result.seller_signature.clone().unwrap_or_default(),
+        // Capture non-empty sig/seller (required above) so authorize_pay can co-sign the receipt.
+        seller_signature,
         // Hash the seller-authored creq from the accepted claim (when present) so the
         // pay path binds the attempt + receipt to the exact request the seller quoted. A claim
         // that carries no creq ⇒ `None` ⇒ binding behaves identically.
@@ -1176,6 +1183,24 @@ fn assert_single_settlement(
         }
     }
     Ok(())
+}
+
+/// Require a non-empty seller co-signature (`sig/seller`) at accept-time (issue #93).
+///
+/// A missing or empty signature must NOT be recorded as `""` on the accept-bind: that would
+/// permanently occupy the single-settlement slot and block a later valid sig for the same claim.
+/// Refuse instead so the bind file is never written and the slot stays free.
+fn require_seller_signature(
+    seller_signature: &Option<String>,
+) -> Result<String, JobLifecycleError> {
+    match seller_signature {
+        Some(sig) if !sig.trim().is_empty() => Ok(sig.clone()),
+        _ => Err(JobLifecycleError::Input(
+            "result missing non-empty seller signature (sig/seller); refusing to bind so the \
+             single-settlement slot stays free for a later valid sig"
+                .into(),
+        )),
+    }
 }
 
 /// Build an [`AuthorizePayRequest`](crate::authorize_pay::AuthorizePayRequest) from the
@@ -1943,6 +1968,100 @@ mod tests {
             .expect("same result idempotent");
         // No prior bind → allowed.
         assert_single_settlement(None, &existing.job_id, "res-B").expect("first accept allowed");
+    }
+
+    // Issue #93: an empty/missing seller co-signature must be refused at accept-time and must NOT
+    // write an accept-bind (which would permanently occupy the single-settlement slot with `""`).
+    // After empty presentation, a later VALID sig for the same claim must still be able to bind.
+    #[test]
+    fn empty_seller_sig_does_not_occupy_settlement_slot_later_valid_binds() {
+        // Missing / empty / whitespace-only → refuse (no bind written).
+        for bad in [
+            None,
+            Some(String::new()),
+            Some("   ".to_owned()),
+            Some("\t\n".to_owned()),
+        ] {
+            let err = require_seller_signature(&bad).expect_err("empty/missing seller sig must refuse");
+            let message = err.to_string();
+            assert!(
+                message.contains("seller signature") && message.contains("sig/seller"),
+                "refusal must name the missing sig/seller gate: {message}"
+            );
+            assert!(
+                message.contains("single-settlement") || message.contains("later valid"),
+                "refusal must explain the slot stays free: {message}"
+            );
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "mobee-jobs-empty-sig-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let job_id = "aa".repeat(32);
+
+        // Model accept after empty presentation: refuse ⇒ do NOT write. Slot stays free.
+        let empty_presented = require_seller_signature(&None);
+        assert!(empty_presented.is_err(), "empty presentation refuses");
+        assert!(
+            load_accepted_bind(&home, &job_id)
+                .expect("load")
+                .is_none(),
+            "empty presentation must leave no accept-bind on disk"
+        );
+        assert_single_settlement(None, &job_id, "res-valid")
+            .expect("slot free after empty presentation");
+
+        // Later VALID sig for the same claim → bind successfully.
+        let valid_sig =
+            require_seller_signature(&Some("ab".repeat(64))).expect("valid non-empty sig accepted");
+        assert_eq!(valid_sig, "ab".repeat(64));
+        let bind = AcceptedBind {
+            job_id: job_id.clone(),
+            claim_id: "bb".repeat(32),
+            result_id: "res-valid".into(),
+            seller_pubkey: "dd".repeat(32),
+            commit_oid: "ee".repeat(20),
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 5,
+            accept_event_id: "11".repeat(32),
+            accepted_at: 1,
+            seller_signature: valid_sig.clone(),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            realized_mint: None,
+            contribution: None,
+        };
+        // Single-settlement still free (no prior bind), then durable write of the valid sig.
+        assert_single_settlement(
+            load_accepted_bind(&home, &job_id).expect("load").as_ref(),
+            &job_id,
+            &bind.result_id,
+        )
+        .expect("valid sig may bind after empty was presented");
+        write_accepted_bind(&home, &bind).expect("write valid bind");
+        let loaded = load_accepted_bind(&home, &job_id)
+            .expect("load")
+            .expect("valid bind present");
+        assert_eq!(loaded.seller_signature, valid_sig);
+        assert!(!loaded.seller_signature.is_empty());
+        assert_eq!(loaded.result_id, "res-valid");
+        // Slot is now occupied by the valid result (different result refused).
+        let err = assert_single_settlement(Some(&loaded), &job_id, "res-other")
+            .expect_err("after valid bind, different result refused");
+        assert!(
+            err.to_string().contains("already accepted result res-valid"),
+            "got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // Load-bearing: the explicit 9-field form (with bind-fill applied) and the
