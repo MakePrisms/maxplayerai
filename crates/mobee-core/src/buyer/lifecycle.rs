@@ -20,7 +20,7 @@ use cashu::{Amount, CurrencyUnit};
 use crate::authorize_pay::resolve_realized_mint;
 use crate::job_lifecycle::{AwardClaimOutcome, JobLifecycleError, JobView};
 
-use super::reservations::{Converted, JobDisposition, ReserveRefused};
+use super::reservations::{Converted, JobDisposition, ReservationState, ReserveRefused};
 use super::store::{BuyerStore, StoreError};
 
 /// Hard filters an awardable claim must pass (issue #126). Grounded in the wire the offer/claim
@@ -267,6 +267,35 @@ pub enum PaymentProgress {
     Uncertain,
     /// No payment attempt has left funds for this job (no journal, or only `Intent`/`Locked`).
     None,
+}
+
+/// Whether re-arming a pending auto-award should re-attempt the reserve-then-award, or skip because
+/// the job is already awarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RearmAction {
+    /// The job is already awarded — do not award again.
+    Skip,
+    /// No award exists yet — run the reserve-then-award path.
+    Attempt,
+}
+
+/// The idempotent re-arm decision (#126/#127 invariant A: never award twice). A job is already
+/// awarded iff a buyer AWARD (3405) is on the relay OR its reservation is already `Spent` (collect
+/// paid it). A `Reserved` row with NO relay award is the crash window between reserve and publish —
+/// the award never went out, so it must be re-attempted (republished); [`award_with_reservation`]'s
+/// reserve is idempotent for the same amount, so the re-attempt reserves once and publishes.
+///
+/// Checking BOTH the relay AND the local ledger is load-bearing: the relay catches a 3405 that
+/// published before a crash (local ledger alone would miss it → double award); the `Spent` check
+/// catches an already-paid job.
+pub fn plan_rearm(award_on_relay: bool, reservation: Option<ReservationState>) -> RearmAction {
+    if award_on_relay {
+        return RearmAction::Skip;
+    }
+    if matches!(reservation, Some(ReservationState::Spent)) {
+        return RearmAction::Skip;
+    }
+    RearmAction::Attempt
 }
 
 /// Classify a reserved job for [`BuyerStore::reconcile`] from its payment progress + relay
@@ -675,5 +704,24 @@ mod tests {
         assert_eq!(report.released, vec![job.clone()]);
         assert_eq!(store.available(100, u64::MAX, 0).expect("avail"), 100, "dead job's funds reclaimed");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // IDEMPOTENT RE-ARM tooth (invariant A): never award twice. An award already on the relay ⇒
+    // Skip regardless of local state; an already-`Spent` reservation ⇒ Skip. No relay award ⇒
+    // Attempt — including the `Reserved`-but-not-published crash window (republish) and the
+    // Released/None cases.
+    #[test]
+    fn plan_rearm_skips_only_when_already_awarded() {
+        // Relay award present ⇒ Skip regardless of local reservation state.
+        assert_eq!(plan_rearm(true, None), RearmAction::Skip);
+        assert_eq!(plan_rearm(true, Some(ReservationState::Reserved)), RearmAction::Skip);
+        assert_eq!(plan_rearm(true, Some(ReservationState::Spent)), RearmAction::Skip);
+        // Already paid ⇒ Skip.
+        assert_eq!(plan_rearm(false, Some(ReservationState::Spent)), RearmAction::Skip);
+        // Crash window: reserved but no relay award ⇒ Attempt (republish, reserve is idempotent).
+        assert_eq!(plan_rearm(false, Some(ReservationState::Reserved)), RearmAction::Attempt);
+        // Released or never reserved, no relay award ⇒ Attempt.
+        assert_eq!(plan_rearm(false, Some(ReservationState::Released)), RearmAction::Attempt);
+        assert_eq!(plan_rearm(false, None), RearmAction::Attempt);
     }
 }

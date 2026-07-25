@@ -48,7 +48,7 @@ use crate::job_lifecycle::{
     self, AwardClaimRequest, ContributionSpec, GetJobRequest, JobKind, PostJobRequest, WaitFor,
 };
 use crate::payment::{PaymentMachine, PaymentRecord, PaymentState};
-use lifecycle::{AwardError, AwardFilters, PaymentProgress, SettleError};
+use lifecycle::{AwardError, AwardFilters, PaymentProgress, RearmAction, SettleError};
 use lock::{HomeLock, LockError};
 use protocol::{CODE_INTERNAL, CODE_METHOD_NOT_FOUND, CODE_NOT_IMPLEMENTED, Request, Response};
 use reservations::{Dispositions, ReconcileReport};
@@ -60,6 +60,9 @@ use wallet_actor::WalletHandle;
 pub const CODE_REFUSED: i64 = -32002;
 /// Timeout for the daemon's relay fetches (job view / auto-award selection / reconcile liveness).
 const RELAY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the background auto-award task re-checks the relay for a payable claim, until one
+/// appears or the offer deadline passes. Bounded polling (no tight spin on a live-but-unpayable claim).
+const AUTO_AWARD_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Lock file leaf under the home.
 pub const LOCK_FILE: &str = "buyer.lock";
@@ -201,6 +204,17 @@ pub async fn run(home: MobeeHome) -> Result<(), BuyerError> {
             "buyer: reconcile-on-start did not complete ({error}); serving with the ledger as-is"
         ),
     }
+    // Re-arm pending auto-awards left by a prior run: a job posted before a crash still gets its
+    // award with zero manual commands. Each task re-checks the relay for an existing award first
+    // (invariant A), so re-arming never double-awards.
+    match context.store.list_pending_awards() {
+        Ok(pending) => {
+            for intent in pending {
+                spawn_auto_award(context.clone(), intent.job_id, intent.max_sats);
+            }
+        }
+        Err(error) => eprintln!("buyer: could not list pending auto-awards to re-arm: {error}"),
+    }
     let listener = bind_socket(&socket_path)?;
     accept_loop(listener, context).await
 }
@@ -248,7 +262,7 @@ async fn handle_connection(stream: UnixStream, context: Arc<BuyerContext>) -> st
 /// Map a request to a response. `status`/`health` is live; the buyer trade
 /// methods are recognized but deferred to later phases (they return a structured
 /// not-implemented error rather than silently succeeding).
-async fn dispatch(context: &BuyerContext, request: Request) -> Response {
+async fn dispatch(context: &Arc<BuyerContext>, request: Request) -> Response {
     let id = request.id.clone();
     match request.method.as_str() {
         "status" | "health" => status(context, id).await,
@@ -296,6 +310,16 @@ struct PostJobParams {
     base_oid: Option<String>,
     #[serde(default)]
     accepts: Option<Vec<String>>,
+    /// Per-job spend ceiling for the background auto-award (defaults to `amount_sats`). The daemon
+    /// never auto-awards a claim it cannot pay or priced above this.
+    #[serde(default)]
+    max_sats: Option<u64>,
+    /// Auto-award preferences recorded with the intent. Not yet hard filters — no offer/claim wire
+    /// field carries harness/model, so they are stored, not matched (added when the wire does).
+    #[serde(default)]
+    harness: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// Resolve the offer kind from the contribution pins: all four present ⇒ contribution; none ⇒
@@ -326,8 +350,10 @@ fn post_job_kind(params: &PostJobParams) -> Result<JobKind, String> {
 }
 
 /// Publish an offer (reuses [`job_lifecycle::post_job_async`], the same money-checked post path the
-/// CLI/MCP use). No reservation is taken at post — funds are reserved at award.
-async fn post_job(context: &BuyerContext, id: Value, params: Value) -> Response {
+/// CLI/MCP use), record its auto-award intent, and spawn the background auto-award task — the
+/// daemon-drives-the-award half of the 2-call trade loop (post_job → collect). No reservation is
+/// taken at post — funds are reserved at award.
+async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Response {
     let params: PostJobParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(error) => return Response::err(id, CODE_METHOD_NOT_FOUND, format!("post_job params: {error}")),
@@ -336,6 +362,9 @@ async fn post_job(context: &BuyerContext, id: Value, params: Value) -> Response 
         Ok(job) => job,
         Err(message) => return Response::err(id, CODE_METHOD_NOT_FOUND, message),
     };
+    let max_sats = params.max_sats.unwrap_or(params.amount_sats);
+    let harness = params.harness.clone();
+    let model = params.model.clone();
     let request = PostJobRequest {
         task: params.task,
         output: params.output,
@@ -348,7 +377,24 @@ async fn post_job(context: &BuyerContext, id: Value, params: Value) -> Response 
         job,
     };
     match job_lifecycle::post_job_async(&context.home, request).await {
-        Ok(outcome) => Response::ok(id, json!(outcome)),
+        Ok(outcome) => {
+            // Record the intent BEFORE spawning so a crash right after post still re-arms on restart.
+            if let Err(error) = context.store.put_pending_award(
+                &outcome.job_id,
+                max_sats,
+                harness.as_deref(),
+                model.as_deref(),
+                now_unix(),
+            ) {
+                eprintln!(
+                    "buyer: could not record auto-award intent for {}: {error}",
+                    outcome.job_id
+                );
+            } else {
+                spawn_auto_award(context.clone(), outcome.job_id.clone(), max_sats);
+            }
+            Response::ok(id, json!(outcome))
+        }
         Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
     }
 }
@@ -581,6 +627,144 @@ fn buyer_keys(home: &MobeeHome) -> Result<nostr_sdk::Keys, String> {
     nostr_sdk::Keys::parse(&secret).map_err(|error| format!("buyer key parse: {error}"))
 }
 
+/// Spawn the background auto-award task for a posted job — the daemon-drives-the-award half of the
+/// 2-call trade loop. A task failure never affects the daemon; the intent stays `pending` and is
+/// re-armed on the next start.
+fn spawn_auto_award(context: Arc<BuyerContext>, job_id: String, max_sats: u64) {
+    tokio::spawn(async move {
+        if let Err(error) = drive_auto_award(&context, &job_id, max_sats).await {
+            eprintln!("buyer: auto-award for {job_id} did not complete ({error}); left pending for re-arm");
+        }
+    });
+}
+
+/// Drive one posted job's award under the hood: wait (bounded by the offer deadline) for a payable
+/// claim, then reserve-then-award. Honors both #126/#127 invariants:
+///
+/// - **A (idempotent re-arm):** before doing anything, skip if a buyer AWARD is already on the relay
+///   OR the reservation is already `Spent` — never award twice (see [`lifecycle::plan_rearm`]). This
+///   is why re-arming on restart is safe: the task re-checks the relay first.
+/// - **B (reserve-then-award only):** the award goes exclusively through
+///   [`lifecycle::award_with_reservation`] (reserve first, publish second). A refused reservation
+///   (e.g. funds shrank) PARKS the intent with a surfaced reason — never a silent drop.
+///
+/// Returns `Err` only on a transient relay/wallet failure; the intent then stays `pending` and is
+/// re-armed on the next start.
+async fn drive_auto_award(
+    context: &Arc<BuyerContext>,
+    job_id: &str,
+    max_sats: u64,
+) -> Result<(), String> {
+    let keys = buyer_keys(&context.home)?;
+
+    // Invariant A: never award twice. A relay error is "unknown" (unwrap_or false) — do not skip;
+    // the reserve-then-award path below is itself idempotent on the reserve.
+    let award_on_relay = job_lifecycle::has_award_async(&context.home, &keys, job_id, RELAY_TIMEOUT)
+        .await
+        .unwrap_or(false);
+    let reservation = context
+        .store
+        .reservation(job_id)
+        .ok()
+        .flatten()
+        .map(|(state, _)| state);
+    if lifecycle::plan_rearm(award_on_relay, reservation) == RearmAction::Skip {
+        let _ = context.store.mark_award_awarded(job_id, now_unix());
+        return Ok(());
+    }
+
+    loop {
+        let view = job_lifecycle::fetch_job_view_async(
+            &context.home,
+            &keys,
+            job_id,
+            RELAY_TIMEOUT,
+            now_unix() as u64,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let Some(offer) = view.offer.as_ref() else {
+            let _ = context
+                .store
+                .mark_award_parked(job_id, "offer no longer on the relay", now_unix());
+            return Ok(());
+        };
+        if now_unix() as u64 > offer.deadline_unix {
+            let _ = context.store.mark_award_parked(
+                job_id,
+                "offer deadline passed before an awardable claim appeared",
+                now_unix(),
+            );
+            return Ok(());
+        }
+
+        let filters = AwardFilters {
+            offer_amount_sats: offer.amount_sats,
+            max_sats,
+            buyer_mint: context.home.config.default_mint(),
+            allow_real_mints: context.home.config.allow_real_mints,
+        };
+        if let Some(claim_id) = lifecycle::select_awardable_claim(&view, &filters) {
+            return finalize_auto_award(context, job_id, offer.amount_sats, claim_id).await;
+        }
+
+        // No awardable claim yet — re-check after a bounded interval (no tight spin on a
+        // live-but-unpayable claim). The deadline check above bounds the total wait.
+        tokio::time::sleep(AUTO_AWARD_POLL_INTERVAL).await;
+    }
+}
+
+/// Reserve-then-award a selected claim (invariant B), serialized on the money lock so the reserve
+/// snapshot never races a collect melt. Marks the intent `awarded` on success, or `parked` (with a
+/// surfaced reason) on a refused reservation / publish failure — never a silent drop.
+async fn finalize_auto_award(
+    context: &Arc<BuyerContext>,
+    job_id: &str,
+    offer_amount: u64,
+    claim_id: String,
+) -> Result<(), String> {
+    let _guard = context.money_lock.lock().await;
+    let (balance, total_cap, spent) = money_snapshot(context).await?;
+    let home = context.home.clone();
+    let job = job_id.to_owned();
+    let publish_claim = claim_id.clone();
+    let result = lifecycle::award_with_reservation(
+        &context.store,
+        job_id,
+        offer_amount,
+        balance,
+        total_cap,
+        spent,
+        now_unix(),
+        move || async move {
+            job_lifecycle::award_claim_async(&home, AwardClaimRequest { job_id: job, claim_id: publish_claim })
+                .await
+        },
+    )
+    .await;
+
+    match result {
+        Ok(_) => {
+            let _ = context.store.mark_award_awarded(job_id, now_unix());
+            Ok(())
+        }
+        Err(AwardError::Reserve(refused)) => {
+            let _ = context.store.mark_award_parked(
+                job_id,
+                &format!("reservation refused: {refused}"),
+                now_unix(),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            let _ = context
+                .store
+                .mark_award_parked(job_id, &format!("award failed: {error}"), now_unix());
+            Ok(())
+        }
+    }
+}
+
 /// Reconcile every still-`Reserved` job against relay + payment-journal truth: a job the relay no
 /// longer shows payable (and that has left no funds) is released; a job whose payment journal shows
 /// a `Closed` attempt is converted to `spent`; an ambiguous (Sent-not-Closed) payment is KEPT (the
@@ -750,6 +934,16 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
         })
     });
 
+    // Surface parked auto-awards (a claim could not be awarded — e.g. funds shrank) so a buyer sees
+    // jobs whose award was not placed rather than silently losing them.
+    let parked_awards: Vec<Value> = context
+        .store
+        .parked_awards()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(job_id, reason)| json!({ "job_id": job_id, "reason": reason }))
+        .collect();
+
     Response::ok(
         id,
         json!({
@@ -766,6 +960,7 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
                 "jobs": jobs,
             },
             "reconcile": reconcile,
+            "parked_awards": parked_awards,
         }),
     )
 }
