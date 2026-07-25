@@ -165,8 +165,10 @@ impl SellerNode {
         &self.store
     }
 
-    /// The serialized signer actor (owns the seller key).
-    pub fn signer(&self) -> &SignerHandle {
+    /// The serialized signer actor (owns the seller key). Crate-internal: only the run loop reaches
+    /// it (to share it with the publisher and to sign receipts / push-auth / heartbeats / decode
+    /// wraps), and the seller key never leaves the actor.
+    pub(crate) fn signer(&self) -> &SignerHandle {
         &self.signer
     }
 

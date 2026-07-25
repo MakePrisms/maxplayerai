@@ -50,13 +50,11 @@ pub mod receipt;
 pub mod relay_auth;
 pub mod runtime_guard;
 pub mod seller;
-/// Agent-run + delivery-shaping helpers (run the awarded agent, compose its delivery prompt, derive
-/// the delivery kind, shape the public exec-metadata block), neutral to any single seller lifecycle
-/// so the in-memory daemon and the durable node share them without depending on each other's errors.
+/// Agent-run + delivery-shaping helpers for the seller node: run the awarded agent, compose its
+/// delivery prompt, derive the delivery kind, and shape the public exec-metadata block. Kept in its
+/// own module (with a neutral error) so the run loop stays focused on the relay surface.
 #[cfg(feature = "wallet")]
 pub mod seller_exec;
-#[cfg(feature = "wallet")]
-pub mod seller_daemon;
 /// Persistent per-home seller node (exclusive lock, receiving wallet + identity behind serialized
 /// actors, durable lifecycle store with a nostr event outbox, single relay ingester, agent roster).
 /// The durable substrate the live seller loop moves onto; mirrors the buyer daemon's shape. The

@@ -864,7 +864,7 @@ mod tests {
             })]
         };
 
-        // The live default (seller_daemon: PermissionOutcome::Allow) MUST resolve — this is the
+        // The live default (the seller node: PermissionOutcome::Allow) MUST resolve — this is the
         // case that hung. Deny/AllowAlways selected by kind too.
         assert_eq!(
             codex_request(&PermissionOutcome::Allow),

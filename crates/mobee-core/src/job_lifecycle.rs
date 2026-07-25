@@ -1013,8 +1013,7 @@ fn select_deliverable_claim(view: &JobView) -> Result<String, JobLifecycleError>
 /// The recorded binds (`target_*`, `base_*`) come from the OFFER; the fork is the result's
 /// repo/branch; `store_ref` is derived from the fork-tip `commit_oid`.
 /// Fail-closed STRICT verification of the accepted claim's seller-authored NUT-18 `creq`,
-/// mirroring the seller-side field-by-field rebind ([`crate::seller_daemon`]'s
-/// `reconstruct_delivered_bind`). The buyer must not accept-then-pay a claim whose payment
+/// mirroring the seller-side field-by-field creq rebind. The buyer must not accept-then-pay a claim whose payment
 /// terms it did not fully verify, so before the accept-bind is written this requires:
 ///
 /// - a creq is PRESENT (a claim carrying none is refused — every seller claim authors one);

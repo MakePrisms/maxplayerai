@@ -225,9 +225,9 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
         disco.pubkey
     );
 
-    // Boot the durable seller node (sqlite store + outbox + reconcile_on_start) as `mobee sell`'s
-    // real path. `run_sell` is synchronous, so it owns a current-thread runtime here — the same
-    // bridge the legacy `run_forever_blocking` used — and block_on's the async boot + run loop.
+    // Boot the durable seller node (sqlite store + outbox + reconcile_on_start) as the seller path.
+    // run_sell is synchronous, so it owns a current-thread runtime here and block_on's the async boot
+    // + run loop.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
