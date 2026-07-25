@@ -16,7 +16,7 @@ use nostr_sdk::prelude::{
     Client, Filter, Keys, Kind, RelayOptions, RelayPoolNotification, RelayUrl,
 };
 
-use crate::gateway::{self, claim_draft, parse_offer, ParsedOffer};
+use crate::gateway::{self, claim_draft, parse_award, parse_offer, ParsedOffer};
 use crate::home::{self, MobeeHome};
 use crate::job_lifecycle::event_to_draft;
 use crate::kinds::{JOB_AWARD_KIND, JOB_OFFER_KIND};
@@ -44,6 +44,41 @@ enum ClaimDecision {
     Claim { deadline_unix: u64 },
     /// Skip it, with a named reason (never a silent drop).
     Skip(&'static str),
+}
+
+/// The pure award-match decision over a parked claim — no I/O, so the security-critical rule is
+/// unit-testable. An award binds our claim ONLY when its author is the offer's buyer (a third party
+/// can never drive execute or release) AND it names OUR published claim id; if it names a different
+/// claim the buyer picked another seller and we release; if our claim is not yet on the wire, or the
+/// author is not the buyer, we ignore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AwardMatch {
+    /// The award names our claim — bind it and execute.
+    Execute,
+    /// The award names a different claim — the buyer picked another seller; release ours.
+    Release,
+    /// Not ours / not the buyer / our claim not yet published — do nothing.
+    Ignore,
+}
+
+/// Match an award against our parked claim. `our_claim_id` is the published id of our claim for this
+/// offer (`None` until it has been confirmed on the relay). Pure over its inputs.
+fn match_award(
+    award_claim_id: &str,
+    our_claim_id: Option<&str>,
+    award_author: &str,
+    offer_buyer: &str,
+) -> AwardMatch {
+    // Authorization: only the offer's buyer may award. A spoofed award (author != buyer) can never
+    // drive execute OR release.
+    if award_author != offer_buyer {
+        return AwardMatch::Ignore;
+    }
+    match our_claim_id {
+        Some(id) if id == award_claim_id => AwardMatch::Execute,
+        Some(_) => AwardMatch::Release,
+        None => AwardMatch::Ignore,
+    }
 }
 
 /// Decide whether to claim `offer`, applying the always-on money-safety gates in the legacy order:
@@ -220,9 +255,8 @@ impl SellerNodeRunner {
                         k if k.as_u16() == JOB_OFFER_KIND => {
                             self.on_offer(&event).await;
                         }
-                        // PORT: match_award over parked claims → store.record_award → execute.
                         k if k.as_u16() == JOB_AWARD_KIND => {
-                            eprintln!("seller node award seen id={} (bind PORT pending)", event.id);
+                            self.on_award(&event).await;
                         }
                         // PORT: gift-wrap unwrap → import-before-receipt-row → store.collect_receipt.
                         Kind::GiftWrap => {
@@ -365,6 +399,83 @@ impl SellerNodeRunner {
         }
     }
 
+    /// Handle one award event: authorize it (author must be the offer's buyer), decide whether it
+    /// names OUR claim, and bind or release accordingly. Binding records the award (which moves the
+    /// claim → awarded and creates the job row); execution of the awarded job is the next port step.
+    async fn on_award(&self, event: &nostr_sdk::Event) {
+        let draft = event_to_draft(event);
+        let Some(award) = parse_award(&draft) else {
+            return;
+        };
+        let job_id = award.offer_id.clone();
+
+        // Only an offer we recorded can be awarded to us; its buyer is the sole authorized awarder.
+        let buyer = match self.node.store().offer_facts(&job_id) {
+            Ok(Some((buyer, _, _))) => buyer,
+            Ok(None) => {
+                eprintln!("seller node award ignore job_id={job_id}: no offer of ours recorded");
+                return;
+            }
+            Err(error) => {
+                eprintln!("seller node award ignore job_id={job_id}: offer read failed ({error})");
+                return;
+            }
+        };
+        // We must hold a parked claim for this job (journaled creq present ⇒ we claimed).
+        match self.node.store().job_creq(&job_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                eprintln!("seller node award ignore job_id={job_id}: no claim of ours");
+                return;
+            }
+            Err(error) => {
+                eprintln!("seller node award ignore job_id={job_id}: claim read failed ({error})");
+                return;
+            }
+        }
+
+        // Ensure our claim is on the wire, then read its published id for the win check.
+        self.drain().await;
+        let our_claim_id = match self.node.store().outbox_row(&format!("claim:{job_id}")) {
+            Ok(Some((_, _, published))) => published,
+            _ => None,
+        };
+        let award_author = event.pubkey.to_hex();
+        match match_award(&award.claim_id, our_claim_id.as_deref(), &award_author, &buyer) {
+            AwardMatch::Execute => {
+                match self
+                    .node
+                    .store()
+                    .record_award(&event.id.to_hex(), &job_id, &buyer, now_unix())
+                {
+                    Ok(super::store::Awarded::New) => {
+                        eprintln!("seller node awarded job_id={job_id} buyer={buyer} — execute PORT pending");
+                        // PORT: execute the awarded job store-backed (agent run + delivery, signing
+                        // the STORED creq's hash) — the next arm.
+                    }
+                    Ok(super::store::Awarded::Duplicate) => {
+                        eprintln!("seller node award dedup job_id={job_id} (already recorded)")
+                    }
+                    Ok(super::store::Awarded::NoClaim) => {
+                        eprintln!("seller node award job_id={job_id}: no claim to bind")
+                    }
+                    Err(error) => eprintln!("seller node award record failed job_id={job_id}: {error}"),
+                }
+            }
+            AwardMatch::Release => {
+                match self.node.store().release_claim(&job_id, now_unix()) {
+                    Ok(()) => eprintln!(
+                        "seller node released claim job_id={job_id}: buyer picked another seller's claim"
+                    ),
+                    Err(error) => eprintln!("seller node release failed job_id={job_id}: {error}"),
+                }
+            }
+            AwardMatch::Ignore => eprintln!(
+                "seller node award ignore job_id={job_id}: author not the offer buyer, or our claim not yet published"
+            ),
+        }
+    }
+
     /// One outbox drain pass over the shared authenticated client. Log-and-continue: a publish
     /// failure leaves the row pending for the next tick (never wedges the loop).
     async fn drain(&self) {
@@ -431,6 +542,27 @@ mod tests {
     fn refuses_below_rate() {
         let decision = classify_offer(&offer(1, Some(SELLER), NOW + 600), &seller_cfg(5, false), SELLER, NOW);
         assert!(matches!(decision, ClaimDecision::Skip(_)));
+    }
+
+    // AWARD AUTHORIZATION (security-critical): only the offer's buyer may drive execute or release.
+    #[test]
+    fn award_from_non_buyer_is_ignored_even_when_claim_matches() {
+        // Author != buyer ⇒ Ignore, regardless of a matching claim id — a third party can neither
+        // execute nor release our claim.
+        assert_eq!(
+            match_award("claim1", Some("claim1"), "attacker", "buyer"),
+            AwardMatch::Ignore
+        );
+    }
+
+    #[test]
+    fn award_binds_our_claim_and_releases_on_a_different_one() {
+        // Buyer awards OUR published claim ⇒ Execute.
+        assert_eq!(match_award("claim1", Some("claim1"), "buyer", "buyer"), AwardMatch::Execute);
+        // Buyer awards a DIFFERENT claim ⇒ Release ours (another seller won).
+        assert_eq!(match_award("claim2", Some("claim1"), "buyer", "buyer"), AwardMatch::Release);
+        // Our claim not yet on the wire ⇒ Ignore (never act on an unpublished claim).
+        assert_eq!(match_award("claim1", None, "buyer", "buyer"), AwardMatch::Ignore);
     }
 
     // Untargeted offers are refused unless open-pool is opted in; with it, they claim.
