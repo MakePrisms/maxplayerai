@@ -22,6 +22,7 @@ pub mod ingester;
 pub mod lock;
 pub mod outbox;
 pub mod publisher;
+pub mod run;
 pub mod roster;
 pub mod signer;
 pub mod store;
@@ -48,6 +49,8 @@ pub enum NodeError {
     Store(StoreError),
     Wallet(FundError),
     Identity(HomeError),
+    /// A live relay-surface failure (connect, NIP-42 auth, subscribe) raised by the run loop.
+    Relay(String),
 }
 
 impl std::fmt::Display for NodeError {
@@ -57,6 +60,7 @@ impl std::fmt::Display for NodeError {
             Self::Store(error) => write!(formatter, "{error}"),
             Self::Wallet(error) => write!(formatter, "seller node wallet error: {error}"),
             Self::Identity(error) => write!(formatter, "seller node identity error: {error}"),
+            Self::Relay(message) => write!(formatter, "seller node relay error: {message}"),
         }
     }
 }

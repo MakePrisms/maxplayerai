@@ -7,9 +7,10 @@
 //! deterministic, so a re-publish after a crash is idempotent at the relay (the store's `dedup_key`
 //! stops a second enqueue; this stops a second on-wire event).
 //!
-//! One long-lived client per node (reconnect handled by nostr-sdk), matching the node's
-//! one-process/one-identity shape rather than the legacy connect-per-send. The event is signed
-//! before it reaches the client, so the client's own signer is never used and never sees the key.
+//! It shares the run loop's ONE authenticated relay client (a cheap `Arc` clone) rather than
+//! opening its own, so there is a single connection and a single NIP-42 session per node. The event
+//! is signed by the signer actor before it reaches the client, so the client's own signer is never
+//! used to sign an outbox event.
 
 use nostr_sdk::prelude::*;
 
@@ -17,7 +18,8 @@ use super::outbox::EventPublisher;
 use super::signer::SignerHandle;
 use super::store::OutboxItem;
 
-/// Signs outbox drafts through the signer actor and publishes them to the seller's relay.
+/// Signs outbox drafts through the signer actor and publishes them to the seller's relay over the
+/// run loop's shared authenticated client.
 pub struct RelayPublisher {
     signer: SignerHandle,
     client: Client,
@@ -25,25 +27,15 @@ pub struct RelayPublisher {
 }
 
 impl RelayPublisher {
-    /// Connect a publisher to `relay_url`. The client only ever sends PRE-SIGNED events, so it is
-    /// built with a throwaway identity — the seller secret stays inside the signer actor.
-    pub async fn connect(signer: SignerHandle, relay_url: &str) -> Result<Self, String> {
-        let client = Client::new(Keys::generate());
-        client
-            .add_relay(relay_url)
-            .await
-            .map_err(|error| format!("add relay: {error}"))?;
-        client.connect().await;
-        Ok(Self {
+    /// Build a publisher over the run loop's already-connected, NIP-42-authenticated `client` (an
+    /// `Arc` clone — same connection). The seller Keys live in that client's single construction
+    /// site in the runner, never here.
+    pub fn new(signer: SignerHandle, client: Client, relay_url: &str) -> Self {
+        Self {
             signer,
             client,
             relay_url: relay_url.to_owned(),
-        })
-    }
-
-    /// Disconnect the underlying relay client (node shutdown).
-    pub async fn disconnect(&self) {
-        self.client.disconnect().await;
+        }
     }
 }
 
