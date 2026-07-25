@@ -8,6 +8,7 @@ mod exec;
 mod mcp;
 mod profile_cli;
 mod sell;
+#[cfg(feature = "stub-pay")]
 mod stub_pay_cli;
 mod wallet_cli;
 

@@ -10,6 +10,9 @@ publish.workspace = true
 default = ["wallet"]
 acp = ["mobee-core/acp"]
 wallet = ["mobee-core/wallet", "dep:git2"]
+# Dev-only: exposes `mobee stub-pay` (budget-gate exercise). Not on the settlement
+# path and not part of the default user CLI surface.
+stub-pay = []
 
 [dependencies]
 mobee-core = { workspace = true }
