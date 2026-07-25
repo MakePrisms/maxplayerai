@@ -115,6 +115,8 @@ pub struct GetJobRequest {
     /// Optional long-poll: `claim` or `result`. Preference — not required for freeze.
     pub wait_for: Option<WaitFor>,
     pub timeout_secs: Option<u64>,
+    /// Opt in to cosmetic kind-0 display-name enrichment. Disabled by default at tool/RPC edges.
+    pub include_display_names: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -622,6 +624,7 @@ pub async fn get_job_async(
         let mut view =
             fetch_job_view_async(home, &keys, &request.job_id, fetch_timeout, now_unix()).await?;
         view.pending = false;
+        maybe_attach_display_names_async(home, &mut view, request.include_display_names).await;
         return Ok(view);
     };
 
@@ -642,6 +645,7 @@ pub async fn get_job_async(
                 WaitFor::Result => !view.results.is_empty(),
             };
             view.pending = !ready;
+            maybe_attach_display_names_async(home, &mut view, request.include_display_names).await;
             return Ok(view);
         }
         let this_fetch = fetch_timeout.min(remaining);
@@ -653,10 +657,12 @@ pub async fn get_job_async(
         };
         if ready {
             view.pending = false;
+            maybe_attach_display_names_async(home, &mut view, request.include_display_names).await;
             return Ok(view);
         }
         if tokio::time::Instant::now() >= deadline {
             view.pending = true;
+            maybe_attach_display_names_async(home, &mut view, request.include_display_names).await;
             return Ok(view);
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -1679,7 +1685,7 @@ pub(crate) async fn fetch_job_view_async(
 
     let accepted = load_accepted_bind(home, job_id)?;
 
-    let mut view = JobView {
+    let view = JobView {
         job_id: job_id.to_owned(),
         offer,
         claims,
@@ -1688,7 +1694,6 @@ pub(crate) async fn fetch_job_view_async(
         accepted,
         pending: false,
     };
-    attach_display_names_async(home, &mut view).await;
     Ok(view)
 }
 
@@ -1734,6 +1739,16 @@ fn apply_display_names(view: &mut JobView, names: &std::collections::HashMap<Str
 
 /// Cosmetic kind-0 enrichment only — never feeds accept-bind / targeting / pay.
 /// Async so `get_job`'s existing runtime does not nest `block_on` (panic).
+async fn maybe_attach_display_names_async(
+    home: &MobeeHome,
+    view: &mut JobView,
+    include_display_names: bool,
+) {
+    if include_display_names {
+        attach_display_names_async(home, view).await;
+    }
+}
+
 async fn attach_display_names_async(home: &MobeeHome, view: &mut JobView) {
     let pubkeys = display_name_pubkeys(view);
     let mut unique = std::collections::HashSet::new();
@@ -3091,6 +3106,100 @@ mod tests {
         (root, home)
     }
 
+    #[derive(Debug)]
+    struct CountMetadataQueries(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl nostr_relay_builder::prelude::QueryPolicy for CountMetadataQueries {
+        fn admit_query<'a>(
+            &'a self,
+            query: &'a nostr_sdk::Filter,
+            _addr: &'a std::net::SocketAddr,
+        ) -> nostr_relay_builder::prelude::BoxedFuture<
+            'a,
+            nostr_relay_builder::prelude::PolicyResult,
+        > {
+            Box::pin(async move {
+                if query
+                    .kinds
+                    .as_ref()
+                    .is_some_and(|kinds| kinds.contains(&nostr_sdk::Kind::Metadata))
+                {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                nostr_relay_builder::prelude::PolicyResult::Accept
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_job_default_skips_kind_zero_fetch() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let metadata_queries =
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let relay = LocalRelay::new(
+            RelayBuilder::default()
+                .query_policy(CountMetadataQueries(std::sync::Arc::clone(&metadata_queries))),
+        );
+        relay.run().await.expect("relay run");
+
+        let (root, mut home) = temp_job_home("display-name-opt-in");
+        home.config.relay_url = relay.url().await.to_string();
+        let posted = post_job_async(
+            &home,
+            PostJobRequest {
+                task: "test display-name opt-in".into(),
+                output: "text/plain".into(),
+                amount_sats: 2,
+                seller_pubkey: Some(nostr_sdk::Keys::generate().public_key().to_hex()),
+                untargeted: false,
+                deadline_unix: Some(now_unix() + 3_600),
+                repo: None,
+                branch: None,
+                job: JobKind::FromScratch,
+            },
+        )
+        .await
+        .expect("post job");
+
+        let default_view = get_job_async(
+            &home,
+            GetJobRequest {
+                job_id: posted.job_id.clone(),
+                wait_for: None,
+                timeout_secs: None,
+                include_display_names: false,
+            },
+        )
+        .await
+        .expect("default get_job");
+        assert!(default_view.offer.is_some(), "fixture offer must be fetched");
+        assert_eq!(
+            metadata_queries.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "default get_job must not issue a kind-0 profile query"
+        );
+
+        get_job_async(
+            &home,
+            GetJobRequest {
+                job_id: posted.job_id,
+                wait_for: None,
+                timeout_secs: None,
+                include_display_names: true,
+            },
+        )
+        .await
+        .expect("opt-in get_job");
+        assert!(
+            metadata_queries.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "include_display_names=true must issue a kind-0 profile query"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        relay.shutdown();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn post_job_sync_refuses_inside_runtime() {
         let (root, home) = temp_job_home("nested-post");
@@ -3125,6 +3234,7 @@ mod tests {
                 job_id: "aa".repeat(32),
                 wait_for: None,
                 timeout_secs: None,
+                include_display_names: false,
             },
         )
         .expect_err("must refuse nested block_on");

@@ -313,6 +313,8 @@ struct GetJobParams {
     wait_for: Option<String>,
     #[serde(default)]
     timeout_secs: Option<u64>,
+    #[serde(default)]
+    include_display_names: bool,
 }
 
 async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
@@ -328,6 +330,7 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
         job_id: params.job_id,
         wait_for,
         timeout_secs: params.timeout_secs,
+        include_display_names: params.include_display_names,
     };
     match job_lifecycle::get_job_async(&context.home, request).await {
         Ok(view) => Response::ok(id, json!(view)),
