@@ -236,23 +236,28 @@ mod tests {
     fn sink_failure_does_not_block_or_lose_episodes_jsonl_append() {
         // Ordering + fail-soft guarantee: the caller appends the episode (source of truth) FIRST,
         // THEN emits. A hung sink (`sleep 300`) must neither block emit nor corrupt/lose the
-        // episodes.jsonl line. The mirror still lands (independent of the sink).
+        // episodes.jsonl line, and the mirror still lands independently of the sink.
         let root = temp_root("failsoft");
         let log = EpisodeLog::open(&root);
         let ep = populated_episode();
         // 1) Source of truth: durable episode append happens first and completes.
         log.append(&ep).expect("episode append is the source of truth");
 
-        // 2) Emit into a hung sink + a mirror, with a short bound.
-        let mirror = root.join("telemetry.jsonl");
-        let config = TelemetryConfig {
+        // 2) A hung sink must never block emit. Measured with NO mirror configured, so emit's timed
+        // window holds ONLY the sink dispatch (a detached thread) — never the mirror's synchronous
+        // `sync_all` fsync, whose latency is disk-dependent and unbounded by design. Timing that
+        // fsync here is what made this assertion flake under full-suite parallel I/O load (the
+        // fsync, not the sink, occasionally crossed the bound); the sink dispatch itself is a
+        // thread spawn that completes in microseconds. If dispatch ever blocked on the sink, emit
+        // would take the full 200ms timeout — well over the 150ms bound below.
+        let sink_only = TelemetryConfig {
             enabled: true,
             command: vec!["sleep".to_owned(), "300".to_owned()],
             timeout_ms: 200,
-            mirror_file: Some(mirror.clone()),
+            mirror_file: None,
         };
         let started = Instant::now();
-        emit(&config, &TelemetryEvent::episode(1, &ep));
+        emit(&sink_only, &TelemetryEvent::episode(1, &ep));
         let elapsed = started.elapsed();
         assert!(
             elapsed < Duration::from_millis(150),
@@ -264,7 +269,19 @@ mod tests {
         assert_eq!(entries.len(), 1, "the source-of-truth append must survive a sink failure");
         assert_eq!(entries[0], ep);
 
-        // 4) The mirror landed despite the hung sink (bounded wait).
+        // 4) The mirror tap still lands the event despite a hung sink. A SEPARATE emit WITH a mirror
+        // configured — kept out of the timing window above so the mirror's synchronous fsync can
+        // never be mistaken for the sink blocking. The mirror write is synchronous, so the line is
+        // present as soon as emit returns; the bounded retry only rides out filesystem visibility
+        // latency and never weakens the assertion.
+        let mirror = root.join("telemetry.jsonl");
+        let with_mirror = TelemetryConfig {
+            enabled: true,
+            command: vec!["sleep".to_owned(), "300".to_owned()],
+            timeout_ms: 200,
+            mirror_file: Some(mirror.clone()),
+        };
+        emit(&with_mirror, &TelemetryEvent::episode(1, &ep));
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut mirrored = false;
         while Instant::now() < deadline {
@@ -277,6 +294,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(mirrored, "mirror_file must land the event even when the sink hangs");
+
+        // The source-of-truth log is still intact after BOTH emits — neither blocked nor lost it.
+        let entries = log.entries().expect("episode entries after emits");
+        assert_eq!(entries.len(), 1, "episodes.jsonl must survive both emits");
     }
 
     #[test]
