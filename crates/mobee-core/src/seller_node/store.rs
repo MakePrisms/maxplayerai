@@ -180,6 +180,13 @@ impl SellerStore {
                  job_id          TEXT PRIMARY KEY,
                  offer_id        TEXT NOT NULL,
                  state           TEXT NOT NULL CHECK (state IN ('claimed','awarded','released')),
+                 -- The seller creq (NUT-18 payment request) authored from the offer terms at CLAIM
+                 -- time (audit N-4). It is the single source of truth for the trade's payment terms:
+                 -- the delivery cosignature signs ITS hash (never a rebuild from live config, so a
+                 -- config change between claim and delivery cannot break the buyer/seller cosig), and
+                 -- the restart redeem-guard settles against the mints IT lists (Fix Q — original terms,
+                 -- not current config).
+                 creq            TEXT NOT NULL,
                  created_at_unix INTEGER NOT NULL,
                  updated_at_unix INTEGER NOT NULL
              );
@@ -291,11 +298,16 @@ impl SellerStore {
     ///
     /// `draft` is the full claim nostr event to publish (kind + content + protocol/routing tags);
     /// `created_at_unix` is its fixed authored-at second; `expires_at_unix` bounds how long the
-    /// publisher retries before giving up.
+    /// publisher retries before giving up. `creq` is the seller creq (NUT-18 payment request)
+    /// authored from the offer terms at claim time (audit N-4) — journaled here so the delivery
+    /// cosignature signs its stored hash and the restart redeem-guard settles against its stored
+    /// mints, never a rebuild from live config.
+    #[allow(clippy::too_many_arguments)]
     pub fn claim_and_enqueue(
         &self,
         job_id: &str,
         offer_id: &str,
+        creq: &str,
         draft: &EventDraft,
         created_at_unix: i64,
         expires_at_unix: i64,
@@ -308,9 +320,9 @@ impl SellerStore {
             return Ok(Claimed::Idempotent);
         }
         tx.execute(
-            "INSERT INTO claims (job_id, offer_id, state, created_at_unix, updated_at_unix)
-             VALUES (?1, ?2, 'claimed', ?3, ?3)",
-            params![job_id, offer_id, now_unix],
+            "INSERT INTO claims (job_id, offer_id, state, creq, created_at_unix, updated_at_unix)
+             VALUES (?1, ?2, 'claimed', ?3, ?4, ?4)",
+            params![job_id, offer_id, creq, now_unix],
         )?;
         enqueue_event(
             &tx,
@@ -637,6 +649,20 @@ impl SellerStore {
         }
     }
 
+    /// The creq journaled for a job at claim time (audit N-4). The delivery path signs its hash into
+    /// the receipt preimage and the restart redeem-guard reads its mints, so a config change between
+    /// claim and delivery can never alter the cosigned terms or the settlement mint set. `None` when
+    /// the node never parked a claim for this job.
+    pub fn job_creq(&self, job_id: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.lock()?;
+        let creq: Option<String> = conn
+            .query_row("SELECT creq FROM claims WHERE job_id = ?1", [job_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(creq)
+    }
+
     /// The assigned agent for a job, if any. Inspection/tests.
     pub fn job_agent(&self, job_id: &str) -> Result<Option<String>, StoreError> {
         let conn = self.lock()?;
@@ -827,7 +853,7 @@ mod tests {
         let offer = "o".repeat(64);
         assert_eq!(
             store
-                .claim_and_enqueue(&job, &offer, &claim(), 500, 999, 1)
+                .claim_and_enqueue(&job, &offer, "creqA", &claim(), 500, 999, 1)
                 .expect("claim"),
             Claimed::New
         );
@@ -864,14 +890,21 @@ mod tests {
         let job = "j".repeat(64);
         let offer = "o".repeat(64);
         assert_eq!(
-            store.claim_and_enqueue(&job, &offer, &claim(), 1, 999, 1).expect("first"),
+            store.claim_and_enqueue(&job, &offer, "creqA", &claim(), 1, 999, 1).expect("first"),
             Claimed::New
         );
+        // A replay carrying a DIFFERENT creq is a no-op: neither the outbox nor the journaled
+        // claim-time creq is overwritten. The first creq — the one that was on the wire — stands.
         assert_eq!(
-            store.claim_and_enqueue(&job, &offer, &claim(), 1, 999, 2).expect("replay"),
+            store.claim_and_enqueue(&job, &offer, "creqB", &claim(), 1, 999, 2).expect("replay"),
             Claimed::Idempotent
         );
         assert_eq!(store.pending_outbox(3).expect("pending").len(), 1, "no second enqueue");
+        assert_eq!(
+            store.job_creq(&job).expect("creq").as_deref(),
+            Some("creqA"),
+            "the claim-time creq is immutable across replays"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -882,7 +915,7 @@ mod tests {
         let offer = "o".repeat(64);
         let award = "w".repeat(64);
         let buyer = "b".repeat(64);
-        store.claim_and_enqueue(&job, &offer, &claim(), 1, 999, 1).expect("claim");
+        store.claim_and_enqueue(&job, &offer, "creqA", &claim(), 1, 999, 1).expect("claim");
 
         assert_eq!(
             store.record_award(&award, &job, &buyer, 2).expect("award"),
@@ -914,7 +947,7 @@ mod tests {
         let job = "j".repeat(64);
         let offer = "o".repeat(64);
         let buyer = "b".repeat(64);
-        store.claim_and_enqueue(&job, &offer, &claim(), 1, 999, 1).expect("claim");
+        store.claim_and_enqueue(&job, &offer, "creqA", &claim(), 1, 999, 1).expect("claim");
         store.record_award(&"w".repeat(64), &job, &buyer, 2).expect("award");
         store.mark_executing(&job, 3).expect("exec");
 
@@ -940,7 +973,7 @@ mod tests {
         let job = "j".repeat(64);
         let offer = "o".repeat(64);
         let receipt = "r".repeat(64);
-        store.claim_and_enqueue(&job, &offer, &claim(), 1, 999, 1).expect("claim");
+        store.claim_and_enqueue(&job, &offer, "creqA", &claim(), 1, 999, 1).expect("claim");
         store.record_award(&"w".repeat(64), &job, &"b".repeat(64), 2).expect("award");
 
         assert_eq!(
@@ -960,7 +993,7 @@ mod tests {
     fn expire_outbox_stops_the_publisher_from_sending() {
         let (store, path) = fresh_store("expire");
         let job = "j".repeat(64);
-        store.claim_and_enqueue(&job, &"o".repeat(64), &claim(), 1, 100, 1).expect("claim");
+        store.claim_and_enqueue(&job, &"o".repeat(64), "creqA", &claim(), 1, 100, 1).expect("claim");
         // now=200 is past expires_at=100.
         assert_eq!(store.expire_outbox(200).expect("expire"), 1);
         assert!(store.pending_outbox(200).expect("pending").is_empty());
