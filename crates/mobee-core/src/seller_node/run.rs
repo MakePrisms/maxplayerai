@@ -98,6 +98,7 @@ fn match_award(
 /// cannot break the buyer/seller cosignature (audit N-4 / invariant 8). The specific realized mint is
 /// deliberately NOT in the preimage (the seller signs at delivery, before the buyer picks a mint); the
 /// accepted-mint SET is bound via this creq hash, so buyer/seller cosigs agree for ANY accepted mint.
+#[allow(clippy::too_many_arguments)]
 fn delivery_receipt_preimage(
     job_id: &str,
     task: &str,
@@ -212,6 +213,20 @@ fn classify_redeem_outcome(
 /// can never pay-once and close someone else's job.
 fn seal_sender_is_bound_buyer(seal_sender: &str, offer_buyer: &str) -> bool {
     seal_sender == offer_buyer
+}
+
+/// Whether a job resumed from durable state on (re)start must be re-driven to execution (charter
+/// invariant 4, fallback form): a job left `awarded` (award seen, delivery not started) or
+/// `executing` (interrupted mid-run) is re-executed, so a process that dies mid-job resumes rather
+/// than losing the award. `delivered` jobs are left for the pay path; terminal (`paid`/`failed`)
+/// never re-run. Pure so the selection is unit-testable. Re-execution is idempotent: the delivery
+/// snapshot is deterministic (stored award-date) and `deliver_and_enqueue` dedups, so a re-created
+/// delivery lands exactly once.
+fn should_resume_execution(state: super::store::JobState) -> bool {
+    matches!(
+        state,
+        super::store::JobState::Awarded | super::store::JobState::Executing
+    )
 }
 
 /// Decide whether to claim `offer`, applying the always-on money-safety gates in the legacy order:
@@ -414,6 +429,26 @@ impl SellerNodeRunner {
 
         // Drain anything reconcile left pending before the first tick.
         self.drain().await;
+
+        // Resume execution for jobs a process restart left mid-flight (invariant 4, fallback form):
+        // an `awarded`/`executing` job is re-driven through execute_job so a crash mid-job resumes
+        // instead of losing the award. Idempotent — a re-created delivery lands exactly once
+        // (deterministic snapshot + deliver_and_enqueue dedup). Runs once at boot, before the loop.
+        match self.node.store().resumable_jobs() {
+            Ok(jobs) => {
+                for (job_id, state) in jobs {
+                    if should_resume_execution(state) {
+                        eprintln!(
+                            "seller node resume: re-driving execution for job_id={job_id} (state={state:?})"
+                        );
+                        self.execute_job(&job_id).await;
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("seller node resume: resumable_jobs read failed (continuing): {error}")
+            }
+        }
 
         let mut drain_tick = tokio::time::interval(DRAIN_INTERVAL);
         let mut heartbeat_tick =
@@ -1637,6 +1672,70 @@ mod tests {
             "a replayed wrap id never credits the job twice"
         );
         assert!(store.has_receipt(&job).expect("read"), "paid after the first collect");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Resume execution across a process restart (invariant 4, fallback form) ───────────────────
+
+    // TOOTH (invariant 4) — the resume selection re-drives only jobs left mid-flight (awarded /
+    // executing); a delivered job is left for the pay path and terminal jobs never re-run.
+    #[test]
+    fn resume_selects_awarded_or_executing_not_delivered_or_terminal() {
+        use crate::seller_node::store::JobState;
+        assert!(should_resume_execution(JobState::Awarded));
+        assert!(should_resume_execution(JobState::Executing));
+        assert!(!should_resume_execution(JobState::Delivered));
+        assert!(!should_resume_execution(JobState::Paid));
+        assert!(!should_resume_execution(JobState::Failed));
+    }
+
+    // TOOTH (invariant 4) — boot with a journaled awarded-but-undelivered job: it is resume-eligible
+    // (the field-test promise — nous's Mac kills processes mid-job), and the re-execution's delivery
+    // lands EXACTLY ONCE (deliver_and_enqueue is idempotent on the job), so a resumed job never
+    // double-publishes.
+    #[test]
+    fn boot_resume_re_drives_awarded_undelivered_job_delivery_lands_once() {
+        let seller = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let creq = gateway::creq::build_seller_creq(
+            &"a".repeat(64),
+            21,
+            "sat",
+            &["https://testnut.cashudevkit.org".to_owned()],
+            &seller,
+        )
+        .expect("creq");
+        let job = "a".repeat(64);
+        let buyer = "b".repeat(64);
+        let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
+
+        // Awarded + undelivered ⇒ the boot resume pass selects it.
+        let resumable = store.resumable_jobs().expect("resumable");
+        assert!(
+            resumable
+                .iter()
+                .any(|(id, state)| id == &job && should_resume_execution(*state)),
+            "the awarded, undelivered job is resume-eligible: {resumable:?}"
+        );
+        assert_eq!(
+            store.job_state(&job).expect("state"),
+            Some(crate::seller_node::store::JobState::Awarded)
+        );
+
+        // Re-execution delivers exactly once: deliver_and_enqueue is idempotent on the job.
+        let draft = claim_draft(&job, &buyer, &seller, &creq);
+        let now = 5000;
+        assert!(
+            store
+                .deliver_and_enqueue(&job, &"c".repeat(40), &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
+                .expect("deliver"),
+            "first (resumed) delivery lands"
+        );
+        assert!(
+            !store
+                .deliver_and_enqueue(&job, &"c".repeat(40), &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
+                .expect("re-deliver"),
+            "a resumed re-execution delivers at most once"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
