@@ -16,7 +16,10 @@ use nostr_sdk::prelude::{
     Client, Filter, Keys, Kind, RelayOptions, RelayPoolNotification, RelayUrl,
 };
 
-use crate::gateway::{self, claim_draft, git_result_draft, parse_award, parse_offer, ParsedOffer};
+use crate::gateway::{
+    self, claim_draft, error_draft, git_result_draft, parse_award, parse_offer, OfferParseError,
+    ParsedOffer,
+};
 use crate::home::{self, MobeeHome};
 use crate::job_lifecycle::{event_to_draft, job_hash_for_offer};
 use crate::kinds::{JOB_AWARD_KIND, JOB_OFFER_KIND};
@@ -45,6 +48,10 @@ const MAX_AGENT_ATTEMPTS: u32 = 3;
 /// How long (seconds) the outbox publisher keeps retrying a result event before it expires. Longer
 /// than the claim window — the delivery is the earned artifact and must survive a slow/absent buyer.
 const RESULT_PUBLISH_WINDOW_SECS: i64 = 86_400;
+/// Buyer-facing reason on any post-award execution failure: generic (never leaks internal paths or
+/// error detail — the operator log carries the specifics) but enough that the buyer learns the job
+/// failed instead of waiting on a delivery that will never come.
+const EXEC_FAILURE_FEEDBACK: &str = "seller could not complete the job (execution failed before delivery)";
 
 /// The pure claim/skip decision over a parsed offer — no I/O, so the money-safety ordering
 /// (targeting, deadline-expiry, rate floor) is unit-testable. Mirrors the legacy `classify_offer`
@@ -55,7 +62,28 @@ enum ClaimDecision {
     /// Claim it — carries the job deadline resolved for execution.
     Claim { deadline_unix: u64 },
     /// Skip it, with a named reason (never a silent drop).
-    Skip(&'static str),
+    Skip(SkipReason),
+}
+
+/// Why an offer was skipped. A typed reason (not a bare string) so the caller can act on the
+/// *kind* of refusal — specifically, only a rate-gate refusal (never a lapsed offer) is eligible for
+/// the targeted under-rate buyer feedback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipReason {
+    /// The offer's own absolute deadline already passed — dead, never resurrected.
+    Lapsed,
+    /// Rate-gate refused: untargeted without open-pool opt-in, or below the seller's rate floor.
+    RateGate,
+}
+
+impl SkipReason {
+    /// The machine-readable log/feedback reason (same string the legacy path logged).
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Lapsed => "offer deadline already passed (lapsed; never resurrected)",
+            Self::RateGate => "rate-gate refused (untargeted without opt-in / below rate)",
+        }
+    }
 }
 
 /// The pure award-match decision over a parked claim — no I/O, so the security-critical rule is
@@ -215,6 +243,18 @@ fn seal_sender_is_bound_buyer(seal_sender: &str, offer_buyer: &str) -> bool {
     seal_sender == offer_buyer
 }
 
+/// Whether a skipped offer earns a buyer-facing under-rate refusal (a feedback-kind `status=error`):
+/// ONLY a rate-gate refusal (never a lapsed offer) that is targeted to THIS seller and priced below
+/// its floor. Open-pool under-rate stays log-only (spam guard). Pure so the gate is unit-testable.
+fn should_publish_under_rate_feedback(
+    skip: SkipReason,
+    targeted_to_self: bool,
+    amount: u64,
+    rate_sats: u64,
+) -> bool {
+    skip == SkipReason::RateGate && targeted_to_self && amount < rate_sats
+}
+
 /// Whether a job resumed from durable state on (re)start must be re-driven to execution (charter
 /// invariant 4, fallback form): a job left `awarded` (award seen, delivery not started) or
 /// `executing` (interrupted mid-run) is re-executed, so a process that dies mid-job resumes rather
@@ -241,10 +281,10 @@ fn classify_offer(
     // Offer-freshness (money-safety): an offer whose own absolute deadline already passed is dead,
     // refused here before `job_deadline_unix` could hand it a fresh window.
     if offer.deadline_unix <= now_unix {
-        return ClaimDecision::Skip("offer deadline already passed (lapsed; never resurrected)");
+        return ClaimDecision::Skip(SkipReason::Lapsed);
     }
     if rate_gate_allows(offer, seller_pubkey, seller.rate_sats, seller.claim_open_pool).is_err() {
-        return ClaimDecision::Skip("rate-gate refused (untargeted without opt-in / below rate)");
+        return ClaimDecision::Skip(SkipReason::RateGate);
     }
     ClaimDecision::Claim {
         deadline_unix: crate::seller::job_deadline_unix(offer, seller, now_unix),
@@ -543,6 +583,44 @@ impl SellerNodeRunner {
         Ok(())
     }
 
+    /// Publish a feedback-kind (`status=error`) event to the buyer explaining why the seller will not
+    /// deliver — so the buyer learns the reason instead of getting silence. Best-effort: signed
+    /// through the signer actor and sent on the shared client; a failure is logged, never wedges the
+    /// loop. Used for both the targeted under-rate refusal and an execution failure.
+    async fn publish_buyer_feedback(&self, offer_id: &str, buyer_pubkey: &str, reason: &str) {
+        let draft = error_draft(offer_id, buyer_pubkey, &self.seller_pubkey.to_hex(), reason);
+        match self.node.signer().sign(draft, now_unix()).await {
+            Ok(Ok(signed)) => {
+                use nostr_sdk::JsonUtil as _;
+                match nostr_sdk::Event::from_json(&signed.json) {
+                    Ok(feedback) => match self.client.send_event_to([&self.relay_url], &feedback).await {
+                        Ok(_) => eprintln!(
+                            "seller node buyer feedback surfaced: offer={offer_id} reason={reason}"
+                        ),
+                        Err(error) => eprintln!(
+                            "seller node WARN: buyer feedback publish failed offer={offer_id} ({error})"
+                        ),
+                    },
+                    Err(error) => {
+                        eprintln!("seller node buyer feedback encode failed (continuing): {error}")
+                    }
+                }
+            }
+            Ok(Err(error)) => {
+                eprintln!("seller node buyer feedback sign failed (continuing): {error}")
+            }
+            Err(error) => {
+                eprintln!("seller node signer actor gone at buyer feedback (continuing): {error}")
+            }
+        }
+    }
+
+    /// The targeted under-rate refusal feedback (see [`should_publish_under_rate_feedback`]).
+    async fn publish_under_rate_feedback(&self, event: &nostr_sdk::Event, reason: &str) {
+        self.publish_buyer_feedback(&event.id.to_hex(), &event.pubkey.to_hex(), reason)
+            .await;
+    }
+
     /// Publish one own-heartbeat (kind-30340) — best-effort liveness/discovery + the watchdog's
     /// round-trip probe. Signed through the signer actor and sent on the shared client; a failure is
     /// logged and never wedges the loop. No-op without `[seller]` config.
@@ -641,6 +719,17 @@ impl SellerNodeRunner {
         let draft = event_to_draft(event);
         let offer = match parse_offer(&draft) {
             Ok(offer) => offer,
+            // A cross-version / unsupported protocol version is a DISTINCT refusal, not a generic
+            // parse failure: a version-skew offer is well-formed under another version, not malformed
+            // tags. Kept distinct so operators and buyers can tell version skew from a genuine parse
+            // failure (refusal taxonomy — #146 / #117).
+            Err(OfferParseError::UnsupportedVersion(version)) => {
+                eprintln!(
+                    "seller node offer skip id={}: unsupported mobee protocol version {version:?}",
+                    event.id
+                );
+                return;
+            }
             Err(error) => {
                 eprintln!("seller node offer skip id={}: unparseable ({error})", event.id);
                 return;
@@ -667,8 +756,17 @@ impl SellerNodeRunner {
         let now = now_unix();
         let deadline_unix = match classify_offer(&offer, &seller, &seller_pubkey, now as u64) {
             ClaimDecision::Claim { deadline_unix } => deadline_unix,
-            ClaimDecision::Skip(reason) => {
-                eprintln!("seller node offer skip id={}: {reason}", event.id);
+            ClaimDecision::Skip(skip) => {
+                eprintln!("seller node offer skip id={}: {}", event.id, skip.reason());
+                // Buyer-visibility: a TARGETED-to-self under-rate refusal also emits a feedback-kind
+                // `status=error` so the buyer learns WHY (distinguishes rate-refusal from a crash /
+                // silence). Open-pool under-rate stays log-only (spam guard); a lapsed offer never
+                // emits (only RateGate). Mirrors the legacy under-rate feedback dropped at cutover.
+                let targeted_to_self = offer.seller_pubkey.as_deref() == Some(seller_pubkey.as_str());
+                if should_publish_under_rate_feedback(skip, targeted_to_self, offer.amount, seller.rate_sats)
+                {
+                    self.publish_under_rate_feedback(event, skip.reason()).await;
+                }
                 return;
             }
         };
@@ -833,6 +931,29 @@ impl SellerNodeRunner {
     /// in one transaction. Every failure path fails the job with a named reason and publishes nothing
     /// partial; the delivery journal is idempotent, so a resumed job never double-publishes.
     async fn execute_job(&self, job_id: &str) {
+        // Idempotency guard: only a job still `awarded`/`executing` runs. A REDUNDANT award (a second
+        // award event with a different award_id for a job already delivered/paid — seen live in the
+        // smoke) or any re-drive must NOT re-run the agent: a duplicate execute burns operator compute
+        // for nothing and its push is rejected non-fast-forward. It must also never clobber a terminal
+        // state (delivered/paid/failed). Delivered/paid/failed ⇒ early-return, no second execute.
+        match self.node.store().job_state(job_id) {
+            Ok(Some(state)) if should_resume_execution(state) => {}
+            Ok(Some(state)) => {
+                eprintln!(
+                    "seller node execute skip job_id={job_id}: job already {state:?} (idempotent — not re-run)"
+                );
+                return;
+            }
+            Ok(None) => {
+                eprintln!("seller node execute skip job_id={job_id}: no job row (idempotent)");
+                return;
+            }
+            Err(error) => {
+                eprintln!("seller node execute job_id={job_id}: job_state read failed ({error}); not executing");
+                return;
+            }
+        }
+
         let Some(seller) = self.node.home().config.seller.clone() else {
             eprintln!("seller node execute skip job_id={job_id}: no [seller] config");
             self.fail_job(job_id).await;
@@ -858,7 +979,7 @@ impl SellerNodeRunner {
             Ok(Some(creq)) => creq,
             _ => {
                 eprintln!("seller node execute fail job_id={job_id}: stored creq missing");
-                self.fail_job(job_id).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
                 return;
             }
         };
@@ -879,7 +1000,7 @@ impl SellerNodeRunner {
         let workdir = job_workdir(self.node.home(), job_id);
         if let Err(error) = seller_git::init_empty_delivery_workdir(&workdir, &identity) {
             eprintln!("seller node execute fail job_id={job_id}: workdir init failed ({error})");
-            self.fail_job(job_id).await;
+            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
             return;
         }
 
@@ -903,7 +1024,7 @@ impl SellerNodeRunner {
             Ok(usage) => usage,
             Err(error) => {
                 eprintln!("seller node execute fail job_id={job_id}: agent run failed ({error})");
-                self.fail_job(job_id).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
                 return;
             }
         };
@@ -921,7 +1042,7 @@ impl SellerNodeRunner {
             author_date,
         ) {
             eprintln!("seller node execute fail job_id={job_id}: delivery snapshot refused ({error})");
-            self.fail_job(job_id).await;
+            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
             return;
         }
 
@@ -934,12 +1055,12 @@ impl SellerNodeRunner {
                 Ok(Ok(header)) => Some(header),
                 Ok(Err(error)) => {
                     eprintln!("seller node execute fail job_id={job_id}: push auth sign failed ({error})");
-                    self.fail_job(job_id).await;
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
                     return;
                 }
                 Err(error) => {
                     eprintln!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
-                    self.fail_job(job_id).await;
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
                     return;
                 }
             }
@@ -955,7 +1076,7 @@ impl SellerNodeRunner {
             Ok(oid) => oid,
             Err(error) => {
                 eprintln!("seller node execute fail job_id={job_id}: git push failed ({error})");
-                self.fail_job(job_id).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
                 return;
             }
         };
@@ -966,7 +1087,7 @@ impl SellerNodeRunner {
             Ok(kind) => kind,
             Err(error) => {
                 eprintln!("seller node execute fail job_id={job_id}: delivery kind typing failed ({error})");
-                self.fail_job(job_id).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
                 return;
             }
         };
@@ -984,12 +1105,12 @@ impl SellerNodeRunner {
             Ok(Ok(sig)) => sig,
             Ok(Err(error)) => {
                 eprintln!("seller node execute fail job_id={job_id}: receipt sign refused ({error})");
-                self.fail_job(job_id).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
                 return;
             }
             Err(error) => {
                 eprintln!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
-                self.fail_job(job_id).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
                 return;
             }
         };
@@ -1033,7 +1154,7 @@ impl SellerNodeRunner {
             ),
             Err(error) => {
                 eprintln!("seller node execute fail job_id={job_id}: deliver journal failed ({error})");
-                self.fail_job(job_id).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
                 return;
             }
         }
@@ -1261,6 +1382,14 @@ impl SellerNodeRunner {
         }
     }
 
+    /// Fail the job AND tell the buyer why (a feedback-kind `status=error`), so an execution failure
+    /// is not silent on the wire (the buyer waits on a delivery that will never come otherwise). Used
+    /// at the post-offer execute fail points where the offer buyer is known.
+    async fn fail_job_with_feedback(&self, job_id: &str, buyer_pubkey: &str, reason: &str) {
+        self.fail_job(job_id).await;
+        self.publish_buyer_feedback(job_id, buyer_pubkey, reason).await;
+    }
+
     /// One outbox drain pass over the shared authenticated client. Log-and-continue: a publish
     /// failure leaves the row pending for the next tick (never wedges the loop).
     async fn drain(&self) {
@@ -1319,14 +1448,14 @@ mod tests {
     #[test]
     fn refuses_lapsed_offer_before_rate() {
         let decision = classify_offer(&offer(100, Some(SELLER), NOW), &seller_cfg(2, false), SELLER, NOW);
-        assert!(matches!(decision, ClaimDecision::Skip(reason) if reason.contains("lapsed")));
+        assert_eq!(decision, ClaimDecision::Skip(SkipReason::Lapsed));
     }
 
     // Below the rate floor ⇒ skip (never claim work priced under the seller's floor).
     #[test]
     fn refuses_below_rate() {
         let decision = classify_offer(&offer(1, Some(SELLER), NOW + 600), &seller_cfg(5, false), SELLER, NOW);
-        assert!(matches!(decision, ClaimDecision::Skip(_)));
+        assert_eq!(decision, ClaimDecision::Skip(SkipReason::RateGate));
     }
 
     // TOOTH (invariant 8 / audit N-4) — the delivery cosignature signs the hash of the STORED
@@ -1384,14 +1513,110 @@ mod tests {
     // Untargeted offers are refused unless open-pool is opted in; with it, they claim.
     #[test]
     fn untargeted_needs_open_pool_opt_in() {
-        assert!(matches!(
+        assert_eq!(
             classify_offer(&offer(5, None, NOW + 600), &seller_cfg(2, false), SELLER, NOW),
-            ClaimDecision::Skip(_)
-        ));
+            ClaimDecision::Skip(SkipReason::RateGate)
+        );
         assert_eq!(
             classify_offer(&offer(5, None, NOW + 600), &seller_cfg(2, true), SELLER, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 }
         );
+    }
+
+    // TOOTH (#146 / #117 refusal taxonomy) — a cross-version offer is a DISTINCT refusal, not the
+    // generic "unparseable" bucket. Build a well-formed offer, then swap ONLY its `v` tag so the sole
+    // parse failure is version skew; the node's on_offer routes that to the unsupported-version skip.
+    #[test]
+    fn unsupported_version_offer_is_a_distinct_parse_refusal() {
+        let offer = gateway::OfferDraft::new("do a task", "text/plain", 5, NOW + 600, &"a".repeat(64));
+        let mut draft = offer.to_event_draft();
+        for tag in &mut draft.tags {
+            if tag.0.first().map(String::as_str) == Some("v") {
+                tag.0 = vec!["v".to_owned(), "99".to_owned()];
+            }
+        }
+        assert!(
+            matches!(parse_offer(&draft), Err(OfferParseError::UnsupportedVersion(v)) if v == "99"),
+            "version skew must parse as a distinct UnsupportedVersion, not generic unparseable"
+        );
+    }
+
+    // TOOTH (buyer-facing feedback) — a TARGETED under-rate refusal surfaces a 3404 to the buyer;
+    // open-pool under-rate, an at/above-rate offer, and a lapsed skip never do.
+    #[test]
+    fn under_rate_feedback_only_for_targeted_under_rate_rate_gate() {
+        // Targeted-to-self + under-rate + RateGate ⇒ publish (buyer learns why).
+        assert!(should_publish_under_rate_feedback(SkipReason::RateGate, true, 1, 5));
+        // Open-pool (not targeted-to-self) under-rate ⇒ log-only (spam guard).
+        assert!(!should_publish_under_rate_feedback(SkipReason::RateGate, false, 1, 5));
+        // Targeted but at/above rate ⇒ no refusal feedback.
+        assert!(!should_publish_under_rate_feedback(SkipReason::RateGate, true, 5, 5));
+        // A lapsed skip never emits under-rate feedback, even if targeted + under-rate.
+        assert!(!should_publish_under_rate_feedback(SkipReason::Lapsed, true, 1, 5));
+    }
+
+    // TOOTH (idempotency, live-caught) — the execute guard keys on job_state: a job already DELIVERED
+    // or PAID is not re-execute-eligible, so a DUPLICATE award (a second award_id for the same job —
+    // seen live in the smoke) does no second agent run (no wasted operator compute) and never clobbers
+    // the terminal state. Bite: were should_resume_execution to admit Delivered/Paid, execute_job
+    // would re-run the agent — the assertions here go red (and so does the resume-selection tooth).
+    #[test]
+    fn delivered_or_paid_job_is_not_re_executed() {
+        use crate::seller_node::store::{Collected, JobState};
+        let seller = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let creq = gateway::creq::build_seller_creq(
+            &"a".repeat(64),
+            21,
+            "sat",
+            &["https://testnut.cashudevkit.org".to_owned()],
+            &seller,
+        )
+        .expect("creq");
+        let job = "a".repeat(64);
+        let buyer = "b".repeat(64);
+        let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
+        let draft = claim_draft(&job, &buyer, &seller, &creq);
+
+        // Deliver ⇒ state Delivered ⇒ NOT re-execute-eligible (the guard early-returns).
+        assert!(store
+            .deliver_and_enqueue(&job, &"c".repeat(40), &draft, 5000, 5000 + RESULT_PUBLISH_WINDOW_SECS, 5000)
+            .expect("deliver"));
+        assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Delivered));
+        assert!(
+            !should_resume_execution(store.job_state(&job).expect("s").expect("s")),
+            "a delivered job must not re-execute on a duplicate award"
+        );
+
+        // Pay ⇒ state Paid ⇒ likewise not re-execute-eligible (terminal never clobbered).
+        assert_eq!(
+            store.collect_receipt(&"e".repeat(64), &job, 21, 6000).expect("collect"),
+            Collected::New
+        );
+        assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Paid));
+        assert!(
+            !should_resume_execution(store.job_state(&job).expect("s").expect("s")),
+            "a paid job must not re-execute"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // TOOTH (buyer-facing feedback) — an execution failure produces a buyer-addressed feedback-kind
+    // `status=error` carrying the (path-free) reason, so the buyer learns the job failed instead of
+    // waiting on a delivery that never comes (the silence the live smoke's first attempt exposed).
+    #[test]
+    fn execution_failure_feedback_is_a_buyer_addressed_error() {
+        let draft = error_draft("offer1", "buyerpk", &"s".repeat(64), EXEC_FAILURE_FEEDBACK);
+        assert_eq!(draft.kind, crate::kinds::JOB_FEEDBACK_KIND);
+        assert_eq!(draft.content, EXEC_FAILURE_FEEDBACK);
+        let has = |name: &str, val: &str| {
+            draft.tags.iter().any(|tag| {
+                tag.0.first().map(String::as_str) == Some(name)
+                    && tag.0.get(1).map(String::as_str) == Some(val)
+            })
+        };
+        assert!(has("status", "error"), "feedback carries status=error");
+        assert!(has("p", "buyerpk"), "addressed to the buyer");
+        assert!(has("e", "offer1"), "references the offer");
     }
 
     // ── Execute-body delivery contract (invariants 2 & 8), no network ────────────────────────────
