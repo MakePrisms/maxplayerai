@@ -212,13 +212,14 @@ fn tools() -> Value {
         },
         {
             "name": "get_job",
-            "description": "Read job state from the relay (offer + claims + results). Surfaces claim created_at and flags the most-recent LIVE claim. Best-effort kind-0 display_name alongside each pubkey (claims[].display_name, results[].display_name, offer.seller_display_name) — cosmetic only; hex pubkey remains authoritative. Optional wait_for=claim|result long-poll. Local accept-bind attached if present. Never invents claims/results.",
+            "description": "Read job state from the relay (offer + claims + results). Surfaces claim created_at and flags the most-recent LIVE claim. Optional include_display_names=true adds best-effort cosmetic kind-0 names; the default skips that extra network fetch and hex pubkeys remain authoritative. Optional wait_for=claim|result long-poll. Local accept-bind attached if present. Never invents claims/results.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "job_id": { "type": "string", "description": "Offer event id (hex)" },
                     "wait_for": { "type": "string", "enum": ["claim", "result"] },
-                    "timeout_secs": { "type": "integer", "minimum": 1 }
+                    "timeout_secs": { "type": "integer", "minimum": 1 },
+                    "include_display_names": { "type": "boolean", "description": "Opt in to an additional kind-0 profile fetch for cosmetic display names (default false)." }
                 },
                 "required": ["job_id"],
                 "additionalProperties": false
@@ -517,12 +518,17 @@ async fn get_job_tool_async(state: &McpState, arguments: &Value) -> Result<Value
         None => None,
     };
     let timeout_secs = arguments.get("timeout_secs").and_then(Value::as_u64);
+    let include_display_names = arguments
+        .get("include_display_names")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let view = job_lifecycle::get_job_async(
         &state.home,
         GetJobRequest {
             job_id,
             wait_for,
             timeout_secs,
+            include_display_names,
         },
     )
     .await
