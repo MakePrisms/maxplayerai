@@ -24,7 +24,7 @@ use crate::driver::UsageMetadata;
 use crate::episode::{Episode, EpisodeKind, EpisodeLog, EpisodeOutcome, UsageRecord};
 use crate::gateway::{
     self, claim_draft, error_draft, git_result_draft, parse_award, parse_offer, EventDraft,
-    OfferParseError, ParsedAward, ParsedOffer, TagSpec, JOB_AWARD_KIND, JOB_OFFER_KIND,
+    OfferParseError, ParsedAward, ParsedOffer, JOB_AWARD_KIND, JOB_OFFER_KIND,
 };
 use crate::home::{self, HomeError, MobeeHome, DEFAULT_MINT_URL};
 use crate::job_lifecycle::{event_to_draft, job_hash_for_offer};
@@ -34,6 +34,11 @@ use crate::seller::{
     cashu_secret_from_nostr_hex, job_deadline_unix, plan_orphaned_claims, rate_gate_allows,
     require_seller_config, sign_receipt_hash, unwrap_own_payment_gift_wrap, ClaimLiveness,
     OrphanClaim, SellerError, SellerJournal,
+};
+use crate::seller_exec::{
+    compose_agent_prompt, delivery_message, harness_and_transport, job_workdir, run_agent_job,
+    run_agent_with_retry, seller_delivery_kind, seller_exec_metadata, unified_job_timeout,
+    ExecError,
 };
 use crate::seller_git::{self, SellerGitError};
 
@@ -129,6 +134,19 @@ impl std::fmt::Display for DaemonError {
 }
 
 impl std::error::Error for DaemonError {}
+
+/// Map the neutral agent-run / delivery-shaping error into the daemon's error, variant-for-variant,
+/// so relocating the exec helpers to [`crate::seller_exec`] is behavior-identical at every call site.
+impl From<ExecError> for DaemonError {
+    fn from(value: ExecError) -> Self {
+        match value {
+            ExecError::Config(message) => Self::Config(message),
+            ExecError::Agent(message) => Self::Agent(message),
+            ExecError::Policy(message) => Self::Policy(message),
+            ExecError::AcpRequired => Self::AcpRequired,
+        }
+    }
+}
 
 /// Whether a pay-path error is an EXPECTED idempotent re-see of an already-redeemed kind-1059
 /// (the payment landed on an earlier delivery — a relay re-delivery of the gift-wrap, or a
@@ -1695,7 +1713,8 @@ impl SellerDaemon {
                 )
             },
         )
-        .await;
+        .await
+        .map_err(DaemonError::from);
         // Wall-time is always measurable; token/model/cost ride out on `usage` only when the
         // ACP driver actually surfaced them (absent-stays-absent → `None`).
         let wall_time_ms = run_started.elapsed().as_millis() as u64;
@@ -2315,242 +2334,11 @@ fn run_completion_check(workdir: &Path, check: Option<&str>) -> Result<(), Daemo
     Ok(())
 }
 
-/// A concise, single-line delivery-commit message derived from the offer task: the first non-empty
-/// line, whitespace-collapsed and length-capped. Falls back to a fixed label for an empty task.
-fn delivery_message(task: &str) -> String {
-    let summary: String = task
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if summary.is_empty() {
-        return "mobee delivery".to_owned();
-    }
-    let capped: String = summary.chars().take(72).collect();
-    format!("mobee delivery: {capped}")
-}
-
-/// Delivery discriminator for the seller's commit/fork delivery, derived from the SAME typed
-/// [`GitDelivery`](crate::delivery::GitDelivery) the buyer's pay path uses — NOT a hardcoded
-/// label — so buyer and seller derive it from one abstraction (`"fork"`). Fails closed if the
-/// just-pushed fields somehow do not type (impossible on the success path — a git push returns
-/// a canonical oid); never silently relabels or emits a bogus kind.
-fn seller_delivery_kind(
-    git_remote: &str,
-    branch: &str,
-    commit_oid: &str,
-) -> Result<crate::receipt::DeliveryKind, DaemonError> {
-    let delivery = crate::delivery::GitDelivery::new(
-        git_remote.to_owned(),
-        branch.to_owned(),
-        crate::delivery::CommitOid::parse(commit_oid.to_owned())
-            .map_err(|error| DaemonError::Policy(format!("delivery oid: {error}")))?,
-    )
-    .map_err(|error| DaemonError::Policy(format!("delivery typing: {error}")))?;
-    Ok(delivery.delivery_kind())
-}
-
-/// Build the seller-claimed PUBLIC usage block for a result-kind result.
-///
-/// This block is PUBLIC and harness-generic. It is **opportunistic**:
-/// emit only fields the seller can source. `harness` is resolved from the configured preset
-/// label (else the agent command), `wall_time` is measured, and
-/// `metadata_trust=seller-claimed` is required whenever any field is present (anchor rule).
-///
-/// `usage_transport` is the harness/adapter's declared capture axis (`acp-native` for the
-/// codex adapter, `side-channel` otherwise), resolved from the configured harness identity.
-///
-/// Token / model / cost tags are appended **only where the driver surfaced them**
-/// (absent-stays-absent, never zero-filled — a fabricated `0` is worse than a rendered dash).
-/// `total` = `input + output + reasoning` (locked rule); cache siblings are evidence and are
-/// NEVER summed into `total`. When `usage` is `None` the block is exactly the four base
-/// tags — no-capture trades stay honestly dashed.
-fn seller_exec_metadata(
-    agent_command: &[String],
-    agent_preset: Option<&str>,
-    wall_time_ms: u64,
-    usage: Option<&UsageMetadata>,
-) -> Vec<TagSpec> {
-    let (harness, transport) = harness_and_transport(agent_command, agent_preset);
-    let wall = wall_time_ms.to_string();
-
-    let mut tags = vec![
-        TagSpec::new(["harness", harness.as_str()]),
-        TagSpec::new(["usage_transport", transport]),
-        TagSpec::new(["metadata_trust", "seller-claimed"]),
-        TagSpec::new(["wall_time", wall.as_str(), "ms"]),
-    ];
-
-    if let Some(u) = usage {
-        if let Some(model) = &u.model {
-            tags.push(TagSpec::new(["model", model.as_str()]));
-        }
-        // Own the string renders so the borrows outlive each `TagSpec::new` call.
-        let total = u.total_tokens().map(|n| n.to_string());
-        let input = u.input_tokens.map(|n| n.to_string());
-        let output = u.output_tokens.map(|n| n.to_string());
-        let reasoning = u.reasoning_tokens.map(|n| n.to_string());
-        let cache_read = u.cache_read_tokens.map(|n| n.to_string());
-        let cache_write = u.cache_write_tokens.map(|n| n.to_string());
-        if let Some(v) = &total {
-            tags.push(TagSpec::new(["tokens", v.as_str(), "total"]));
-        }
-        if let Some(v) = &input {
-            tags.push(TagSpec::new(["tokens", v.as_str(), "input"]));
-        }
-        if let Some(v) = &output {
-            tags.push(TagSpec::new(["tokens", v.as_str(), "output"]));
-        }
-        if let Some(v) = &reasoning {
-            tags.push(TagSpec::new(["tokens", v.as_str(), "reasoning"]));
-        }
-        if let Some(v) = &cache_read {
-            tags.push(TagSpec::new(["tokens", v.as_str(), "cache_read"]));
-        }
-        if let Some(v) = &cache_write {
-            tags.push(TagSpec::new(["tokens", v.as_str(), "cache_write"]));
-        }
-        if let Some(cost) = &u.cost {
-            tags.push(TagSpec::new([
-                "cost",
-                cost.amount.as_str(),
-                "usd",
-                cost.basis.as_str(),
-            ]));
-        }
-    }
-
-    tags
-}
-
-/// Best-effort harness id + usage transport.
-///
-/// The configured **preset label** (`claude`|`cursor`|`codex`, [`SellerConfig::agent`]) is the
-/// authoritative harness/adapter identity and is preferred over argv inspection: presets launch
-/// the ACP adapter via `npx <adapter-package>` (argv0 = `npx`), so an argv0-naive id emitted
-/// `npx` — which a downstream harness-family classifier maps to `harness_family="other"`, hiding
-/// real claude/codex/cursor jobs. When no preset label is present (raw
-/// `--agent-argv` power-user hatch) fall back to scanning the FULL adapter argv (not just argv0):
-/// the adapter package name (e.g. `@agentclientprotocol/claude-agent-acp`) still carries the
-/// family. Unknown ⇒ the command basename + the conservative `side-channel`.
-fn harness_and_transport(
-    agent_command: &[String],
-    agent_preset: Option<&str>,
-) -> (String, &'static str) {
-    // Preset label is authoritative — resolve from the adapter identity, never argv0.
-    // A non-built-in label is a config-defined `[agents]` preset: the preset name IS the
-    // harness identity (conservative `side-channel` transport — nothing is known about it).
-    if let Some(preset) = agent_preset {
-        match preset.trim().to_ascii_lowercase().as_str() {
-            "claude" => return ("claude-agent-acp".to_owned(), "side-channel"),
-            "codex" => return ("codex-acp-ng".to_owned(), "acp-native"),
-            "cursor" => return ("cursor-agent".to_owned(), "side-channel"),
-            "" => {}
-            _ => return (preset.trim().to_owned(), "side-channel"),
-        }
-    }
-    // Hatch fallback: scan the FULL argv (adapter identity), not just argv0.
-    let joined = agent_command.join(" ").to_ascii_lowercase();
-    if joined.contains("codex") {
-        ("codex-acp-ng".to_owned(), "acp-native")
-    } else if joined.contains("cursor") {
-        ("cursor-agent".to_owned(), "side-channel")
-    } else if joined.contains("claude") {
-        ("claude-agent-acp".to_owned(), "side-channel")
-    } else {
-        let program = agent_command.first().map(String::as_str).unwrap_or("");
-        let basename = program.rsplit('/').next().unwrap_or(program);
-        let harness = if basename.is_empty() {
-            "unknown".to_owned()
-        } else {
-            basename.to_owned()
-        };
-        (harness, "side-channel")
-    }
-}
-
-fn job_workdir(home: &MobeeHome, job_id: &str) -> PathBuf {
-    home.root.join("seller-jobs").join(job_id)
-}
-
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// The ONE coherent job timeout. The ACP driver's idle/response timeout is
-/// derived from the job's own deadline (`--job-timeout-secs` → offer deadline → default, via
-/// [`job_deadline_unix`]) so a job has a single predictable deadline. Before this the driver
-/// used a hardcoded 300s idle-timeout that silently conflicted with `--job-timeout-secs`
-/// (a live codex seller hung ~300s on an ACP request while the job deadline said otherwise).
-/// Saturating: a non-positive remaining window yields `Duration::ZERO`, which fails the run
-/// cleanly at the deadline rather than hanging.
-fn unified_job_timeout(deadline_unix: u64, now_unix: u64) -> Duration {
-    Duration::from_secs(deadline_unix.saturating_sub(now_unix))
-}
-
-/// Run the agent with bounded retries that stay WITHIN the job deadline.
-///
-/// A transient agent error is retried until either the attempt budget (`max_attempts`) is
-/// spent OR the deadline (`deadline_unix`, checked against injected `now`) passes. The error
-/// is surfaced to the caller — which then publishes the feedback-kind error exactly once — ONLY
-/// after one of those limits is reached. This stops a transient failure from immediately
-/// burning the claim while the deadline still has room. `run` is invoked with the 1-based
-/// attempt number and awaited to completion before
-/// any retry, so attempts never overlap.
-async fn run_agent_with_retry<F, Fut>(
-    deadline_unix: u64,
-    max_attempts: u32,
-    now: impl Fn() -> u64,
-    mut run: F,
-) -> Result<Option<UsageMetadata>, DaemonError>
-where
-    F: FnMut(u32) -> Fut,
-    Fut: std::future::Future<Output = Result<Option<UsageMetadata>, DaemonError>>,
-{
-    let mut attempt: u32 = 0;
-    loop {
-        attempt += 1;
-        match run(attempt).await {
-            Ok(usage) => return Ok(usage),
-            // Retry only while BOTH an attempt and the deadline remain; otherwise surface the
-            // error so the caller publishes feedback-kind exactly once (past deadline / exhausted).
-            Err(_) if attempt < max_attempts && now() < deadline_unix => continue,
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-/// Daemon-owned delivery. The daemon appends explicit, secret-free delivery
-/// instructions to the agent's task prompt so the agent delivers by committing its work to
-/// the git repository in its working directory — rather than guessing a delivery channel.
-/// The daemon performs the authenticated push of the committed branch to the bound remote
-/// (NIP-98; the agent is never handed a key), so this text carries NO secret — it is public
-/// prompt text built only from the task and the (public) remote URL.
-fn compose_agent_prompt(task: &str, git_remote: &str, memory_section: Option<&str>) -> String {
-    let base = format!(
-        "{task}\n\n\
-         ---\n\
-         DELIVERY (required). Deliver your work by committing it with git in your current \
-         working directory:\n\
-         - Make one or more non-empty commits authored by you. Do not leave the deliverable \
-         uncommitted and do not only print it to the console.\n\
-         - You do NOT need to push and you are NOT handed any credentials: the daemon pushes \
-         your committed branch to the bound git remote ({git_remote}) on your behalf.\n\
-         Anything not committed to git will not be delivered."
-    );
-    // Read-on-start: when memory is enabled the rendered index section is appended.
-    // When `None` (memory_enabled=false, or no non-empty index) the output is byte-IDENTICAL to
-    // the memory-disabled prompt (golden invariant).
-    match memory_section {
-        Some(section) => format!("{base}\n\n{section}"),
-        None => base,
-    }
 }
 
 /// Kind-feedback `status=error` draft for a targeted under-rate refusal. Content carries the
@@ -2727,76 +2515,6 @@ async fn publish_heartbeat(daemon: &SellerDaemon) {
         }
         Err(_) => eprintln!("seller heartbeat publish timed out (continuing)"),
     }
-}
-
-#[cfg(feature = "acp")]
-async fn run_agent_job(
-    agent_command: &[String],
-    prompt: &str,
-    workdir: &Path,
-    identity: &seller_git::DeliveryAgentIdentity,
-    timeout: Duration,
-) -> Result<Option<UsageMetadata>, DaemonError> {
-    use crate::driver::{AcpDriver, AgentCommand, ContentBlock, PromptTurn, SessionConfig};
-    use crate::engine::{RunParams, run_job};
-    use crate::event::JobId;
-    use crate::log::EventLog;
-
-    if agent_command.is_empty() {
-        return Err(DaemonError::Config("agent_command empty".into()));
-    }
-    // The ACP idle/response timeout IS the unified job timeout — never a
-    // hardcoded 300s that could override or conflict with `--job-timeout-secs`.
-    let mut driver = AcpDriver::new(
-        AgentCommand::new(agent_command[0].clone(), agent_command[1..].to_vec()),
-        crate::driver::PermissionOutcome::Allow,
-        timeout,
-    );
-    let log_path = workdir.join("seller-run.jsonl");
-    let mut log = EventLog::open(&log_path)
-        .map_err(|error| DaemonError::Agent(error.to_string()))?;
-    let params = RunParams {
-        session_config: SessionConfig {
-            cwd: workdir.to_path_buf(),
-            mcp_servers: Vec::new(),
-            env: identity.git_env(),
-        },
-        prompt: PromptTurn {
-            input: vec![ContentBlock::Text {
-                text: prompt.to_owned(),
-            }],
-        },
-    };
-    let outcome = run_job(
-        &mut driver,
-        &mut log,
-        &JobId(format!("seller-{}", short_hash(prompt))),
-        params,
-        &mut |_| {},
-    )
-    .await
-    .map_err(|error| DaemonError::Agent(error.to_string()))?;
-    match outcome.terminal {
-        crate::event::JobExecutionStatus::Completed => Ok(outcome.usage),
-        other => Err(DaemonError::Agent(format!("agent terminal {other:?}"))),
-    }
-}
-
-#[cfg(not(feature = "acp"))]
-async fn run_agent_job(
-    _agent_command: &[String],
-    _prompt: &str,
-    _workdir: &Path,
-    _identity: &seller_git::DeliveryAgentIdentity,
-    _timeout: Duration,
-) -> Result<Option<UsageMetadata>, DaemonError> {
-    Err(DaemonError::AcpRequired)
-}
-
-#[cfg(feature = "acp")]
-fn short_hash(input: &str) -> String {
-    let digest = Sha256::digest(input.as_bytes());
-    hex::encode(&digest[..8])
 }
 
 /// Everything a retro turn needs, resolved WITHOUT a driver so it is testable and works

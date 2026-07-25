@@ -1,4 +1,5 @@
     use super::*;
+    use crate::gateway::TagSpec;
     use crate::home::SellerConfig;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -89,20 +90,6 @@
         unsafe {
             std::env::remove_var(WRAP_BACKFILL_INTERVAL_ENV);
         }
-    }
-
-    // The seller-side receipt-preimage delivery discriminator is DERIVED from the typed
-    // `GitDelivery` ("fork"), not a hardcoded label — buyer and seller agree by construction.
-    #[test]
-    fn seller_delivery_kind_derives_fork_from_typed_delivery() {
-        let kind = seller_delivery_kind(
-            "https://relay.example/git/job.git",
-            "mobee/abcd1234",
-            &"a".repeat(40),
-        )
-        .expect("commit delivery types");
-        assert_eq!(kind, crate::receipt::DeliveryKind::Fork);
-        assert_eq!(kind.as_str(), "fork");
     }
 
     #[test]
@@ -237,215 +224,6 @@
         SellerDaemon::end_flight();
         assert!(SellerDaemon::try_begin_flight());
         SellerDaemon::end_flight();
-    }
-
-    // The ACP timeout is unified with `--job-timeout-secs` — one deadline.
-    #[test]
-    fn unified_job_timeout_is_the_remaining_deadline_not_a_hardcoded_constant() {
-        // The effective timeout is strictly the remaining window to the job's deadline.
-        assert_eq!(unified_job_timeout(1_000, 940), Duration::from_secs(60));
-        assert_eq!(unified_job_timeout(1_000, 100), Duration::from_secs(900));
-        // Two different deadlines ⇒ two different timeouts — proves it is DERIVED from the
-        // deadline, not a fixed 300s that could override or conflict with `--job-timeout-secs`.
-        assert_ne!(
-            unified_job_timeout(1_000, 940),
-            unified_job_timeout(1_000, 100)
-        );
-        assert_ne!(unified_job_timeout(1_000, 940), Duration::from_secs(300));
-        // At/past the deadline ⇒ ZERO (fail cleanly at the deadline, never hang, never wrap).
-        assert_eq!(unified_job_timeout(1_000, 1_000), Duration::ZERO);
-        assert_eq!(unified_job_timeout(1_000, 5_000), Duration::ZERO);
-    }
-
-    // A transient agent error is retried WITHIN the deadline; feedback-kind is
-    // published only after the attempt budget or the deadline is spent.
-    #[tokio::test]
-    async fn retry_recovers_from_a_transient_error_within_the_deadline() {
-        use std::cell::Cell;
-        let attempts = Cell::new(0u32);
-        // Deadline far away ⇒ never the limiter; a transient first error must be retried,
-        // NOT burn the claim (publish feedback) while the deadline still has room.
-        let out = run_agent_with_retry(u64::MAX, 3, || 0, |attempt| {
-            attempts.set(attempt);
-            async move {
-                if attempt < 2 {
-                    Err(DaemonError::Agent("transient".into()))
-                } else {
-                    Ok::<Option<UsageMetadata>, DaemonError>(None)
-                }
-            }
-        })
-        .await;
-        assert!(out.is_ok(), "transient error retried within deadline, not fatal: {out:?}");
-        assert_eq!(attempts.get(), 2, "retried once, then succeeded");
-    }
-
-    #[tokio::test]
-    async fn retry_exhausts_bounded_attempts_then_surfaces_the_error() {
-        use std::cell::Cell;
-        let attempts = Cell::new(0u32);
-        // Deadline never the limiter (u64::MAX) — only the attempt budget stops the loop.
-        let out = run_agent_with_retry(u64::MAX, 3, || 0, |attempt| {
-            attempts.set(attempt);
-            async move {
-                Err::<Option<UsageMetadata>, DaemonError>(DaemonError::Agent("always".into()))
-            }
-        })
-        .await;
-        assert!(out.is_err(), "exhausted retries ⇒ error so caller publishes feedback-kind");
-        assert_eq!(attempts.get(), 3, "bounded to the attempt budget");
-    }
-
-    #[tokio::test]
-    async fn retry_past_deadline_makes_one_attempt_then_surfaces_the_error() {
-        use std::cell::Cell;
-        let attempts = Cell::new(0u32);
-        // `now` (5_000) is already past the deadline (1_000) ⇒ no retry budget at all: one
-        // attempt, then the error surfaces so the caller publishes feedback-kind.
-        let out = run_agent_with_retry(1_000, 3, || 5_000, |attempt| {
-            attempts.set(attempt);
-            async move {
-                Err::<Option<UsageMetadata>, DaemonError>(DaemonError::Agent("late".into()))
-            }
-        })
-        .await;
-        assert!(out.is_err(), "past deadline ⇒ error (caller publishes feedback-kind)");
-        assert_eq!(attempts.get(), 1, "no retry once the deadline has passed");
-    }
-
-    // The daemon appends explicit, secret-free delivery instructions.
-    #[test]
-    fn composed_prompt_carries_task_and_daemon_owned_delivery_instructions() {
-        let remote = "https://relay.example/git/abc.git";
-        let prompt = compose_agent_prompt("build a widget", remote, None);
-        // The original task stays up front.
-        assert!(prompt.starts_with("build a widget"), "task preserved: {prompt}");
-        // Explicit, daemon-owned delivery instructions are appended.
-        assert!(prompt.contains("DELIVERY"), "has a delivery section: {prompt}");
-        assert!(
-            prompt.contains("commit") || prompt.contains("Commit"),
-            "tells the agent to commit: {prompt}"
-        );
-        assert!(prompt.contains("git"), "delivery is via git: {prompt}");
-        assert!(
-            prompt.contains(remote),
-            "names the bound remote so delivery is not guessed: {prompt}"
-        );
-        // Public prompt text — never embeds a secret.
-        let lower = prompt.to_lowercase();
-        assert!(!prompt.contains("nsec"), "no nostr secret key");
-        assert!(!lower.contains("private key"), "no private key");
-        assert!(!lower.contains("secret"), "no secret material");
-    }
-
-    #[test]
-    fn seller_exec_metadata_is_harness_generic_public_and_absent_stays_absent() {
-        let value = |tags: &[TagSpec], name: &str| -> Option<String> {
-            tags.iter()
-                .find(|tag| tag.first() == Some(name))
-                .and_then(|tag| tag.value().map(str::to_owned))
-        };
-
-        // claude ⇒ side-channel; codex ⇒ acp-native; unknown ⇒ basename + side-channel.
-        // `None` usage: the pre-capture block — token/model/cost stay absent.
-        let claude = seller_exec_metadata(&["claude".into(), "--print".into()], None, 1234, None);
-        assert_eq!(value(&claude, "harness").as_deref(), Some("claude-agent-acp"));
-        assert_eq!(value(&claude, "usage_transport").as_deref(), Some("side-channel"));
-        // Anchor rule: metadata_trust present whenever any field is present.
-        assert_eq!(value(&claude, "metadata_trust").as_deref(), Some("seller-claimed"));
-        assert_eq!(value(&claude, "wall_time").as_deref(), Some("1234"));
-        // Absent-stays-absent: no zero-filled token/model/cost fields (not sourced this run).
-        assert!(value(&claude, "tokens").is_none());
-        assert!(value(&claude, "model").is_none());
-        assert!(value(&claude, "cost").is_none());
-
-        let codex = seller_exec_metadata(&["/nix/store/x/bin/codex-acp".into()], None, 5, None);
-        assert_eq!(value(&codex, "harness").as_deref(), Some("codex-acp-ng"));
-        assert_eq!(value(&codex, "usage_transport").as_deref(), Some("acp-native"));
-
-        let unknown = seller_exec_metadata(&["/opt/tools/mytool".into()], None, 5, None);
-        assert_eq!(value(&unknown, "harness").as_deref(), Some("mytool"));
-        assert_eq!(value(&unknown, "usage_transport").as_deref(), Some("side-channel"));
-    }
-
-    #[test]
-    fn claude_preset_resolves_harness_family_claude_despite_npx_argv0() {
-        // Mirror the downstream harness-family classifier:
-        // a family substring wins; present-but-unrecognized (e.g. "npx") → "other".
-        fn harness_family(id: &str) -> &'static str {
-            let s = id.to_ascii_lowercase();
-            if s.contains("claude") {
-                "claude"
-            } else if s.contains("cursor") {
-                "cursor"
-            } else if s.contains("codex") {
-                "codex"
-            } else {
-                "other"
-            }
-        }
-        let value = |tags: &[TagSpec], name: &str| -> Option<String> {
-            tags.iter()
-                .find(|tag| tag.first() == Some(name))
-                .and_then(|tag| tag.value().map(str::to_owned))
-        };
-
-        // The `claude` preset launches the ACP adapter via `npx` (argv0 = "npx"). An argv0-naive
-        // id emits "npx" → harness_family "other" (the dashboard bug). The preset
-        // label must drive resolution to "claude-agent-acp" → family "claude".
-        let npx_claude = vec![
-            "/usr/bin/npx".to_string(),
-            "-y".to_string(),
-            "@agentclientprotocol/claude-agent-acp".to_string(),
-        ];
-        let tags = seller_exec_metadata(&npx_claude, Some("claude"), 100, None);
-        let harness = value(&tags, "harness").expect("harness tag");
-        assert_eq!(harness, "claude-agent-acp");
-        assert_eq!(
-            harness_family(&harness),
-            "claude",
-            "claude preset must map to harness_family 'claude', not 'other'"
-        );
-
-        // Preset label is authoritative even when the argv carries no family hint at all.
-        let opaque = vec![
-            "/usr/bin/npx".to_string(),
-            "-y".to_string(),
-            "@acp/opaque-adapter".to_string(),
-        ];
-        let opaque_tags = seller_exec_metadata(&opaque, Some("claude"), 100, None);
-        assert_eq!(
-            harness_family(&value(&opaque_tags, "harness").expect("harness")),
-            "claude"
-        );
-
-        // Regression guard: bare argv0 = "npx" with NO preset label used to yield "other";
-        // the full-argv fallback now recovers "claude" from the adapter package name.
-        let hatch = seller_exec_metadata(&npx_claude, None, 100, None);
-        assert_eq!(
-            harness_family(&value(&hatch, "harness").expect("harness")),
-            "claude"
-        );
-    }
-
-    #[test]
-    fn custom_preset_label_is_the_reported_harness_identity() {
-        let value = |tags: &[TagSpec], name: &str| -> Option<String> {
-            tags.iter()
-                .find(|tag| tag.first() == Some(name))
-                .and_then(|tag| tag.value().map(str::to_owned))
-        };
-
-        // A config-defined `[agents]` preset (non-built-in label): the preset name IS the
-        // harness id — never argv0, never a family guess from the launch command.
-        let argv = vec!["/opt/adapters/grok-acp".to_string(), "stdio".to_string()];
-        let tags = seller_exec_metadata(&argv, Some("grok"), 42, None);
-        assert_eq!(value(&tags, "harness").as_deref(), Some("grok"));
-        assert_eq!(value(&tags, "usage_transport").as_deref(), Some("side-channel"));
-
-        // Built-in labels keep their adapter identities (custom seam must not regress them).
-        let builtin = seller_exec_metadata(&argv, Some("codex"), 42, None);
-        assert_eq!(value(&builtin, "harness").as_deref(), Some("codex-acp-ng"));
     }
 
     #[test]
@@ -833,63 +611,6 @@
             !lower.contains("token") && !lower.contains("secret") && !lower.contains("nsec"),
             "collect log must never carry token/key material"
         );
-    }
-
-    #[test]
-    fn seller_exec_metadata_emits_captured_usage_into_result_tags() {
-        use crate::driver::{UsageCost, UsageMetadata};
-
-        // A tag qualified by cell index 1 (value) + cell 2 (qualifier), e.g. ["tokens","140","total"].
-        let qualified = |tags: &[TagSpec], name: &str, qualifier: &str| -> Option<String> {
-            tags.iter()
-                .find(|tag| tag.first() == Some(name) && tag.0.get(2).map(String::as_str) == Some(qualifier))
-                .and_then(|tag| tag.value().map(str::to_owned))
-        };
-        let value = |tags: &[TagSpec], name: &str| -> Option<String> {
-            tags.iter()
-                .find(|tag| tag.first() == Some(name))
-                .and_then(|tag| tag.value().map(str::to_owned))
-        };
-
-        let usage = UsageMetadata {
-            model: Some("claude-opus-4-8".into()),
-            input_tokens: Some(100),
-            output_tokens: Some(40),
-            reasoning_tokens: None,
-            cache_read_tokens: Some(4096),
-            cache_write_tokens: Some(512),
-            cost: Some(UsageCost {
-                amount: "0.0123".into(),
-                basis: "harness-reported-usd".into(),
-            }),
-        };
-        // usage_transport is the harness's declared axis: a claude command is side-channel.
-        let tags = seller_exec_metadata(&["claude".into()], None, 4321, Some(&usage));
-
-        assert_eq!(value(&tags, "usage_transport").as_deref(), Some("side-channel"));
-        assert_eq!(value(&tags, "model").as_deref(), Some("claude-opus-4-8"));
-        // total = input + output (reasoning absent = unknown, not zero); cache NOT folded in.
-        assert_eq!(qualified(&tags, "tokens", "total").as_deref(), Some("140"));
-        assert_eq!(qualified(&tags, "tokens", "input").as_deref(), Some("100"));
-        assert_eq!(qualified(&tags, "tokens", "output").as_deref(), Some("40"));
-        assert_eq!(qualified(&tags, "tokens", "reasoning"), None);
-        assert_eq!(qualified(&tags, "tokens", "cache_read").as_deref(), Some("4096"));
-        assert_eq!(qualified(&tags, "tokens", "cache_write").as_deref(), Some("512"));
-        // cost tag: ["cost","<amount>","usd","<basis>"].
-        let cost = tags
-            .iter()
-            .find(|t| t.first() == Some("cost"))
-            .expect("cost tag");
-        assert_eq!(cost.0, vec!["cost", "0.0123", "usd", "harness-reported-usd"]);
-
-        // Partial capture (output only) → NO total tag (a partial never masquerades as complete).
-        let partial = UsageMetadata {
-            output_tokens: Some(40),
-            ..UsageMetadata::default()
-        };
-        let partial_tags = seller_exec_metadata(&["claude".into()], None, 1, Some(&partial));
-        assert_eq!(qualified(&partial_tags, "tokens", "total"), None);
-        assert_eq!(qualified(&partial_tags, "tokens", "output").as_deref(), Some("40"));
     }
 
     fn sample_offer(amount: u64, seller: &str) -> ParsedOffer {
@@ -1988,23 +1709,6 @@
         );
     }
 
-    #[cfg(not(feature = "acp"))]
-    #[tokio::test]
-    async fn agent_run_fail_closed_without_acp_feature() {
-        let identity = seller_git::DeliveryAgentIdentity::for_seller(&"aa".repeat(32));
-        let err = run_agent_job(
-            &["echo".into()],
-            "task",
-            Path::new("."),
-            &identity,
-            Duration::from_secs(1),
-        )
-        .await
-        .expect_err("acp required");
-        assert!(matches!(err, DaemonError::AcpRequired));
-        assert!(err.to_string().contains("acp"));
-    }
-
     // ── Layer-0 episode capture ────────────────────────────────────────────────────
 
     /// A delivered→paid job appends exactly ONE episode line with
@@ -2605,26 +2309,6 @@ Anything not committed to git will not be delivered.";
         // The check sees the workdir as its cwd.
         run_completion_check(&dir, Some("test -f marker")).expect("cwd is the job workdir");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn delivery_message_summarizes_the_task() {
-        assert_eq!(
-            delivery_message("Fix the parser\n\nmore detail"),
-            "mobee delivery: Fix the parser"
-        );
-        // Leading blank lines skipped; whitespace collapsed.
-        assert_eq!(
-            delivery_message("\n\n   add   retry   logic  "),
-            "mobee delivery: add retry logic"
-        );
-        // Empty task falls back to a fixed label.
-        assert_eq!(delivery_message("   \n  "), "mobee delivery");
-        // Long first line is capped.
-        let long = "x".repeat(200);
-        let msg = delivery_message(&long);
-        assert!(msg.starts_with("mobee delivery: "));
-        assert_eq!(msg.len(), "mobee delivery: ".len() + 72);
     }
 
     // ── Relay-stall watchdog staleness detector (#142), fake clock ──────────────────────────────

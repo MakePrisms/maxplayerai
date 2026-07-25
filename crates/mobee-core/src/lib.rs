@@ -50,6 +50,11 @@ pub mod receipt;
 pub mod relay_auth;
 pub mod runtime_guard;
 pub mod seller;
+/// Agent-run + delivery-shaping helpers (run the awarded agent, compose its delivery prompt, derive
+/// the delivery kind, shape the public exec-metadata block), neutral to any single seller lifecycle
+/// so the in-memory daemon and the durable node share them without depending on each other's errors.
+#[cfg(feature = "wallet")]
+pub mod seller_exec;
 #[cfg(feature = "wallet")]
 pub mod seller_daemon;
 /// Persistent per-home seller node (exclusive lock, receiving wallet + identity behind serialized
