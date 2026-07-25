@@ -16,13 +16,57 @@ use nostr_sdk::prelude::{
     Client, Filter, Keys, Kind, RelayOptions, RelayPoolNotification, RelayUrl,
 };
 
+use crate::gateway::{self, claim_draft, parse_offer, ParsedOffer};
 use crate::home::{self, MobeeHome};
+use crate::job_lifecycle::event_to_draft;
 use crate::kinds::{JOB_AWARD_KIND, JOB_OFFER_KIND};
 use crate::relay_auth::{self, AuthWait};
+use crate::seller::rate_gate_allows;
 
 use super::outbox::drain_once;
 use super::publisher::RelayPublisher;
 use super::{now_unix, NodeError, SellerNode};
+
+/// How long (seconds) the outbox publisher keeps retrying a claim event before it expires. Matches
+/// the legacy claim TTL: a claim outlives a slow relay but never lingers indefinitely.
+const CLAIM_PUBLISH_WINDOW_SECS: i64 = 3600;
+/// Upper bound on parked claims awaiting an award (bounded memory / back-pressure), mirroring the
+/// legacy AWAITING_AWARD_CAP: a claim is cheap (no compute until the award), so several may be held.
+const AWAITING_AWARD_CAP: i64 = 32;
+
+/// The pure claim/skip decision over a parsed offer — no I/O, so the money-safety ordering
+/// (targeting, deadline-expiry, rate floor) is unit-testable. Mirrors the legacy `classify_offer`
+/// gates that do not need durable state; the store-backed dedup + capacity checks ride on top in
+/// [`SellerNodeRunner::on_offer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClaimDecision {
+    /// Claim it — carries the job deadline resolved for execution.
+    Claim { deadline_unix: u64 },
+    /// Skip it, with a named reason (never a silent drop).
+    Skip(&'static str),
+}
+
+/// Decide whether to claim `offer`, applying the always-on money-safety gates in the legacy order:
+/// a lapsed offer is refused BEFORE its deadline is re-derived (never resurrect a stale offer with a
+/// fresh `now + timeout`), then the targeting/rate gate. Pure over (offer, config, now).
+fn classify_offer(
+    offer: &ParsedOffer,
+    seller: &crate::home::SellerConfig,
+    seller_pubkey: &str,
+    now_unix: u64,
+) -> ClaimDecision {
+    // Offer-freshness (money-safety): an offer whose own absolute deadline already passed is dead,
+    // refused here before `job_deadline_unix` could hand it a fresh window.
+    if offer.deadline_unix <= now_unix {
+        return ClaimDecision::Skip("offer deadline already passed (lapsed; never resurrected)");
+    }
+    if rate_gate_allows(offer, seller_pubkey, seller.rate_sats, seller.claim_open_pool).is_err() {
+        return ClaimDecision::Skip("rate-gate refused (untargeted without opt-in / below rate)");
+    }
+    ClaimDecision::Claim {
+        deadline_unix: crate::seller::job_deadline_unix(offer, seller, now_unix),
+    }
+}
 
 /// How long boot waits for the relay connection and the NIP-42 challenge.
 const CONNECT_WAIT: Duration = Duration::from_secs(20);
@@ -173,10 +217,8 @@ impl SellerNodeRunner {
             match notification {
                 RelayPoolNotification::Event { event, .. } => {
                     match event.kind {
-                        // PORT: classify_offer (rate/expiry/contribution/dedup over the store) →
-                        // build_seller_creq → claim_and_enqueue(creq) → drain.
                         k if k.as_u16() == JOB_OFFER_KIND => {
-                            eprintln!("seller node offer seen id={} (claim PORT pending)", event.id);
+                            self.on_offer(&event).await;
                         }
                         // PORT: match_award over parked claims → store.record_award → execute.
                         k if k.as_u16() == JOB_AWARD_KIND => {
@@ -200,6 +242,109 @@ impl SellerNodeRunner {
         Ok(())
     }
 
+    /// Consider one offer event: parse it, apply the money-safety gates, and — if admitted — journal
+    /// the claim (creq + claim event) into the store in one transaction, then drain so the claim is
+    /// published. Every non-claim path logs a named reason; there is no silent drop.
+    ///
+    /// The claim-time creq is authored here from the seller's OWN config (accepted mints + rate) and
+    /// journaled via `claim_and_enqueue`, so delivery later signs the STORED creq's hash (invariant
+    /// 8) and the restart redeem-guard reads its mints (Fix Q) — never a rebuild from live config.
+    async fn on_offer(&self, event: &nostr_sdk::Event) {
+        let Some(seller) = self.node.home().config.seller.clone() else {
+            eprintln!("seller node offer skipped: no [seller] config");
+            return;
+        };
+        let draft = event_to_draft(event);
+        let offer = match parse_offer(&draft) {
+            Ok(offer) => offer,
+            Err(error) => {
+                eprintln!("seller node offer skip id={}: unparseable ({error})", event.id);
+                return;
+            }
+        };
+        // Contribution offers are a later slice: refuse (never run a contribution as from-scratch),
+        // matching the legacy fail-closed posture. A malformed contribution is likewise refused.
+        match crate::contribution::parse_contribution_offer(&draft.tags) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                eprintln!(
+                    "seller node offer skip id={}: contribution offers not served by the node yet",
+                    event.id
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("seller node offer skip id={}: malformed contribution ({error})", event.id);
+                return;
+            }
+        }
+
+        let seller_pubkey = self.seller_pubkey.to_hex();
+        let now = now_unix();
+        let deadline_unix = match classify_offer(&offer, &seller, &seller_pubkey, now as u64) {
+            ClaimDecision::Claim { deadline_unix } => deadline_unix,
+            ClaimDecision::Skip(reason) => {
+                eprintln!("seller node offer skip id={}: {reason}", event.id);
+                return;
+            }
+        };
+
+        // Capacity back-pressure: never hold unbounded parked claims.
+        match self.node.store().health() {
+            Ok(health) if health.open_claims >= AWAITING_AWARD_CAP => {
+                eprintln!(
+                    "seller node offer skip id={}: awaiting-award backlog full (cap {AWAITING_AWARD_CAP})",
+                    event.id
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("seller node offer skip id={}: store health read failed ({error})", event.id);
+                return;
+            }
+        }
+
+        // The job id IS the offer event id (as on the legacy path); the buyer is its author.
+        let job_id = event.id.to_hex();
+        let buyer_pubkey = event.pubkey.to_hex();
+        let creq = match gateway::creq::build_seller_creq(
+            &job_id,
+            offer.amount,
+            &offer.unit,
+            &self.node.home().config.accepted_mints,
+            &seller_pubkey,
+        ) {
+            Ok(creq) => creq,
+            Err(error) => {
+                eprintln!("seller node offer skip id={job_id}: creq build failed ({error})");
+                return;
+            }
+        };
+        let claim = claim_draft(&job_id, &buyer_pubkey, &seller_pubkey, &creq);
+        match self.node.store().claim_and_enqueue(
+            &job_id,
+            &job_id,
+            &creq,
+            &claim,
+            now,
+            now + CLAIM_PUBLISH_WINDOW_SECS,
+            now,
+        ) {
+            Ok(super::store::Claimed::New) => {
+                eprintln!(
+                    "seller node claimed job_id={job_id} buyer={buyer_pubkey} amount={} deadline={deadline_unix} (awaiting award)",
+                    offer.amount
+                );
+                // The caller drains after dispatch, publishing the just-enqueued claim.
+            }
+            Ok(super::store::Claimed::Idempotent) => {
+                eprintln!("seller node offer id={job_id}: already claimed (dedup no-op)");
+            }
+            Err(error) => eprintln!("seller node claim failed job_id={job_id}: {error}"),
+        }
+    }
+
     /// One outbox drain pass over the shared authenticated client. Log-and-continue: a publish
     /// failure leaves the row pending for the next tick (never wedges the loop).
     async fn drain(&self) {
@@ -212,5 +357,72 @@ impl SellerNodeRunner {
             Ok(_) => {}
             Err(error) => eprintln!("seller node outbox drain error (continuing): {error}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SELLER: &str = "aa";
+    const NOW: u64 = 10_000;
+
+    fn seller_cfg(rate_sats: u64, claim_open_pool: bool) -> crate::home::SellerConfig {
+        crate::home::SellerConfig {
+            agent_command: vec!["claude".to_owned()],
+            rate_sats,
+            git_remote: "https://example.invalid/repo.git".to_owned(),
+            job_timeout_secs: None,
+            agent: Some("claude".to_owned()),
+            claim_open_pool,
+            offer_backfill_secs: 0,
+            contribution_enabled: true,
+        }
+    }
+
+    fn offer(amount: u64, targeted_to: Option<&str>, deadline_unix: u64) -> ParsedOffer {
+        ParsedOffer {
+            task: "do the thing".to_owned(),
+            output: String::new(),
+            amount,
+            unit: "sat".to_owned(),
+            deadline_unix,
+            seller_pubkey: targeted_to.map(str::to_owned),
+        }
+    }
+
+    // A fresh, in-rate, targeted offer is claimed and carries the resolved deadline.
+    #[test]
+    fn claims_fresh_targeted_offer_at_rate() {
+        let decision = classify_offer(&offer(5, Some(SELLER), NOW + 600), &seller_cfg(2, false), SELLER, NOW);
+        assert_eq!(decision, ClaimDecision::Claim { deadline_unix: NOW + 600 });
+    }
+
+    // MONEY-SAFETY ORDER: a lapsed offer (deadline already passed) is refused BEFORE the rate gate —
+    // it is never resurrected with a fresh window, even though it clears the rate floor.
+    #[test]
+    fn refuses_lapsed_offer_before_rate() {
+        let decision = classify_offer(&offer(100, Some(SELLER), NOW), &seller_cfg(2, false), SELLER, NOW);
+        assert!(matches!(decision, ClaimDecision::Skip(reason) if reason.contains("lapsed")));
+    }
+
+    // Below the rate floor ⇒ skip (never claim work priced under the seller's floor).
+    #[test]
+    fn refuses_below_rate() {
+        let decision = classify_offer(&offer(1, Some(SELLER), NOW + 600), &seller_cfg(5, false), SELLER, NOW);
+        assert!(matches!(decision, ClaimDecision::Skip(_)));
+    }
+
+    // Untargeted offers are refused unless open-pool is opted in; with it, they claim.
+    #[test]
+    fn untargeted_needs_open_pool_opt_in() {
+        assert!(matches!(
+            classify_offer(&offer(5, None, NOW + 600), &seller_cfg(2, false), SELLER, NOW),
+            ClaimDecision::Skip(_)
+        ));
+        assert_eq!(
+            classify_offer(&offer(5, None, NOW + 600), &seller_cfg(2, true), SELLER, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 }
+        );
     }
 }
