@@ -1707,20 +1707,14 @@ impl SellerDaemon {
                 return Err(error);
             }
         };
-        // Completion gate, then delivery. The agent edits files; it never commits (any commits it
-        // makes are scratch and ignored). First run the job-carried completion check, if any (a
-        // failing check refuses cleanly); then snapshot the final workdir tree into ONE commit under
-        // the delivery identity, parented on the pinned base (or a root commit for a from-scratch
-        // job). An empty tree — or one identical to the base — is refused with a precise reason.
+        // Delivery. The agent edits files; it never commits (any commits it makes are scratch and
+        // ignored). Snapshot the final workdir tree into ONE commit under the delivery identity,
+        // parented on the pinned base (or a root commit for a from-scratch job). An empty tree —
+        // or one identical to the base — is refused with a precise reason. The offer does not yet
+        // carry a completion-check command over the wire (adding an offer field is the open
+        // question flagged in the PR), so the snapshot's tree-diff gate is the sole completion
+        // signal; [`run_completion_check`] is the seam that gates delivery once the field exists.
         let base_oid = active.contribution.as_ref().map(|c| c.base.oid());
-        // The offer does not yet carry a completion-check command over the wire (adding an offer
-        // field is the open question flagged in the PR); until it does, the check is `None` and the
-        // snapshot's tree-diff gate is the sole completion signal.
-        if let Err(error) = run_completion_check(&active.workdir, None) {
-            self.fail_active(ErrorReasonCode::AgentRunFailed, &error.to_string())
-                .await?;
-            return Err(error.into());
-        }
         let message = delivery_message(&active.offer.task);
         if let Err(error) =
             seller_git::snapshot_delivery(&active.workdir, &identity, base_oid, &branch, &message)
@@ -2294,7 +2288,9 @@ fn fill_delivery_facts(episode: &mut Episode, delivery: &DeliveryRecord) {
 ///
 /// The check runs via the login shell (`sh -c`) in the job workdir — the same jailed directory the
 /// agent worked in. This is the completion seam; the wire field that carries the command is the
-/// open question flagged in the PR.
+/// open question flagged in the PR. Until that field exists the delivery path has no live call
+/// site (an offer-less check is always `None` ⇒ no-op), so the seam is kept under its tests only.
+#[cfg_attr(not(test), allow(dead_code))]
 fn run_completion_check(workdir: &Path, check: Option<&str>) -> Result<(), DaemonError> {
     let Some(command) = check.map(str::trim).filter(|c| !c.is_empty()) else {
         return Ok(());
