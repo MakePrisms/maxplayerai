@@ -311,6 +311,32 @@ impl SellerStore {
         Ok(row)
     }
 
+    /// The full recorded [`Offer`], if any. The execute arm needs the task (agent prompt + delivery
+    /// message) and the absolute deadline (the unified job timeout) on top of the buyer/amount/unit
+    /// that [`Self::offer_facts`] returns. `None` when the node never recorded this offer.
+    pub fn offer_row(&self, offer_id: &str) -> Result<Option<Offer>, StoreError> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted
+                 FROM offers WHERE offer_id = ?1",
+                [offer_id],
+                |row| {
+                    Ok(Offer {
+                        offer_id: row.get(0)?,
+                        buyer_pubkey: row.get(1)?,
+                        amount_sats: row.get::<_, i64>(2)? as u64,
+                        unit: row.get(3)?,
+                        task: row.get(4)?,
+                        deadline_unix: row.get(5)?,
+                        targeted: row.get::<_, i64>(6)? != 0,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     // ---- Claim (state change + outbox enqueue in one transaction) -------------------------------
 
     /// Park a claim and enqueue its claim event in ONE transaction: either both the claim row and

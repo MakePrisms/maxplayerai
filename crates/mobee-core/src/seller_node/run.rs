@@ -16,12 +16,18 @@ use nostr_sdk::prelude::{
     Client, Filter, Keys, Kind, RelayOptions, RelayPoolNotification, RelayUrl,
 };
 
-use crate::gateway::{self, claim_draft, parse_award, parse_offer, ParsedOffer};
+use crate::gateway::{self, claim_draft, git_result_draft, parse_award, parse_offer, ParsedOffer};
 use crate::home::{self, MobeeHome};
-use crate::job_lifecycle::event_to_draft;
+use crate::job_lifecycle::{event_to_draft, job_hash_for_offer};
 use crate::kinds::{JOB_AWARD_KIND, JOB_OFFER_KIND};
+use crate::receipt::{ReceiptPreimage, EXEC_METADATA_COMMITMENT_EMPTY};
 use crate::relay_auth::{self, AuthWait};
 use crate::seller::rate_gate_allows;
+use crate::seller_exec::{
+    compose_agent_prompt, delivery_message, job_workdir, run_agent_job, run_agent_with_retry,
+    seller_delivery_kind, seller_exec_metadata, unified_job_timeout,
+};
+use crate::seller_git::{self, DeliveryAgentIdentity, PushAuth};
 
 use super::outbox::drain_once;
 use super::publisher::RelayPublisher;
@@ -33,6 +39,12 @@ const CLAIM_PUBLISH_WINDOW_SECS: i64 = 3600;
 /// Upper bound on parked claims awaiting an award (bounded memory / back-pressure), mirroring the
 /// legacy AWAITING_AWARD_CAP: a claim is cheap (no compute until the award), so several may be held.
 const AWAITING_AWARD_CAP: i64 = 32;
+/// Bounded agent-run attempts within the job deadline before the claim is failed (mirrors the legacy
+/// MAX_AGENT_ATTEMPTS): a transient agent error is retried while the deadline still has room.
+const MAX_AGENT_ATTEMPTS: u32 = 3;
+/// How long (seconds) the outbox publisher keeps retrying a result event before it expires. Longer
+/// than the claim window — the delivery is the earned artifact and must survive a slow/absent buyer.
+const RESULT_PUBLISH_WINDOW_SECS: i64 = 86_400;
 
 /// The pure claim/skip decision over a parsed offer — no I/O, so the money-safety ordering
 /// (targeting, deadline-expiry, rate floor) is unit-testable. Mirrors the legacy `classify_offer`
@@ -78,6 +90,35 @@ fn match_award(
         Some(id) if id == award_claim_id => AwardMatch::Execute,
         Some(_) => AwardMatch::Release,
         None => AwardMatch::Ignore,
+    }
+}
+
+/// Build the delivery co-signature preimage. `creq_hash` is derived from the STORED claim-time creq
+/// (`stored_creq`) — never a rebuild from live config — so a config change between claim and delivery
+/// cannot break the buyer/seller cosignature (audit N-4 / invariant 8). The specific realized mint is
+/// deliberately NOT in the preimage (the seller signs at delivery, before the buyer picks a mint); the
+/// accepted-mint SET is bound via this creq hash, so buyer/seller cosigs agree for ANY accepted mint.
+fn delivery_receipt_preimage(
+    job_id: &str,
+    task: &str,
+    amount: u64,
+    buyer_pubkey: &str,
+    seller_pubkey: &str,
+    commit_oid: &str,
+    delivery_kind: &str,
+    stored_creq: &str,
+) -> ReceiptPreimage {
+    ReceiptPreimage {
+        job_hash: job_hash_for_offer(job_id, task, amount),
+        offer_id: job_id.to_owned(),
+        amount,
+        unit: "sat".to_owned(),
+        buyer_pubkey: buyer_pubkey.to_owned(),
+        seller_pubkey: seller_pubkey.to_owned(),
+        delivery_integrity_hash: commit_oid.to_owned(),
+        delivery_kind: delivery_kind.to_owned(),
+        exec_metadata_commitment: EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
+        creq_hash: Some(gateway::creq_hash_hex(stored_creq)),
     }
 }
 
@@ -449,9 +490,8 @@ impl SellerNodeRunner {
                     .record_award(&event.id.to_hex(), &job_id, &buyer, now_unix())
                 {
                     Ok(super::store::Awarded::New) => {
-                        eprintln!("seller node awarded job_id={job_id} buyer={buyer} — execute PORT pending");
-                        // PORT: execute the awarded job store-backed (agent run + delivery, signing
-                        // the STORED creq's hash) — the next arm.
+                        eprintln!("seller node awarded job_id={job_id} buyer={buyer} — executing");
+                        self.execute_job(&job_id).await;
                     }
                     Ok(super::store::Awarded::Duplicate) => {
                         eprintln!("seller node award dedup job_id={job_id} (already recorded)")
@@ -473,6 +513,221 @@ impl SellerNodeRunner {
             AwardMatch::Ignore => eprintln!(
                 "seller node award ignore job_id={job_id}: author not the offer buyer, or our claim not yet published"
             ),
+        }
+    }
+
+    /// Execute an awarded job end to end: run the agent in a fresh empty-base workdir, snapshot its
+    /// output into ONE delivery commit dated at the STORED award time (so a re-created commit after a
+    /// restart keeps the same oid — invariant 2), push it under the seller's NIP-98 auth, then bind
+    /// the trade + the delivered commit + the STORED claim-time creq's hash (audit N-4 / invariant 8)
+    /// into a co-signature the seller signs through its actor, and journal + enqueue the result event
+    /// in one transaction. Every failure path fails the job with a named reason and publishes nothing
+    /// partial; the delivery journal is idempotent, so a resumed job never double-publishes.
+    async fn execute_job(&self, job_id: &str) {
+        let Some(seller) = self.node.home().config.seller.clone() else {
+            eprintln!("seller node execute skip job_id={job_id}: no [seller] config");
+            self.fail_job(job_id).await;
+            return;
+        };
+        // Offer facts (task + amount + buyer + absolute deadline) were journaled at claim time.
+        let offer = match self.node.store().offer_row(job_id) {
+            Ok(Some(offer)) => offer,
+            Ok(None) => {
+                eprintln!("seller node execute fail job_id={job_id}: offer facts missing");
+                self.fail_job(job_id).await;
+                return;
+            }
+            Err(error) => {
+                eprintln!("seller node execute fail job_id={job_id}: offer read failed ({error})");
+                self.fail_job(job_id).await;
+                return;
+            }
+        };
+        // The claim-time creq is the single source of truth for the payment terms (audit N-4): the
+        // delivery cosignature signs ITS hash, never a rebuild from live config.
+        let stored_creq = match self.node.store().job_creq(job_id) {
+            Ok(Some(creq)) => creq,
+            _ => {
+                eprintln!("seller node execute fail job_id={job_id}: stored creq missing");
+                self.fail_job(job_id).await;
+                return;
+            }
+        };
+        // The delivery commit's author date is the STORED award time (stable across restarts), so a
+        // re-created delivery commit is byte-identical and the re-push is a no-op (invariant 2).
+        let author_date = match self.node.store().job_award_time(job_id) {
+            Ok(Some(award_time)) => award_time,
+            _ => now_unix(),
+        };
+
+        // Move awarded -> executing (idempotent). A failed mark is logged, never fatal.
+        if let Err(error) = self.node.store().mark_executing(job_id, now_unix()) {
+            eprintln!("seller node execute job_id={job_id}: mark_executing failed (continuing): {error}");
+        }
+
+        let seller_pubkey = self.seller_pubkey.to_hex();
+        let identity = DeliveryAgentIdentity::for_seller(&seller_pubkey);
+        let workdir = job_workdir(self.node.home(), job_id);
+        if let Err(error) = seller_git::init_empty_delivery_workdir(&workdir, &identity) {
+            eprintln!("seller node execute fail job_id={job_id}: workdir init failed ({error})");
+            self.fail_job(job_id).await;
+            return;
+        }
+
+        // Run the agent under the job's remaining deadline, retrying a transient error while the
+        // deadline has room. The agent edits files in `workdir`; the node owns commit + push.
+        let deadline = offer.deadline_unix.max(0) as u64;
+        let prompt = compose_agent_prompt(&offer.task, &seller.git_remote, None);
+        let run_started = std::time::Instant::now();
+        let run_result = run_agent_with_retry(
+            deadline,
+            MAX_AGENT_ATTEMPTS,
+            || now_unix() as u64,
+            |_attempt| {
+                let job_timeout = unified_job_timeout(deadline, now_unix() as u64);
+                run_agent_job(&seller.agent_command, &prompt, &workdir, &identity, job_timeout)
+            },
+        )
+        .await;
+        let wall_time_ms = run_started.elapsed().as_millis() as u64;
+        let usage = match run_result {
+            Ok(usage) => usage,
+            Err(error) => {
+                eprintln!("seller node execute fail job_id={job_id}: agent run failed ({error})");
+                self.fail_job(job_id).await;
+                return;
+            }
+        };
+
+        // Snapshot the agent's final workdir tree into ONE delivery commit at the stored author date.
+        // An empty / no-op tree is refused with a precise reason (nothing to deliver).
+        let branch = format!("mobee/{}", &job_id[..8.min(job_id.len())]);
+        let message = delivery_message(&offer.task);
+        if let Err(error) = seller_git::snapshot_delivery_at(
+            &workdir,
+            &identity,
+            None,
+            &branch,
+            &message,
+            author_date,
+        ) {
+            eprintln!("seller node execute fail job_id={job_id}: delivery snapshot refused ({error})");
+            self.fail_job(job_id).await;
+            return;
+        }
+
+        // Push under the seller's NIP-98 auth. The secret is read into PushAuth for the in-process
+        // push and dropped immediately after — never handed to the agent, logged, or put on argv.
+        let commit = {
+            let secret = match home::read_secret_key_hex(self.node.home()) {
+                Ok(secret) => secret,
+                Err(error) => {
+                    eprintln!("seller node execute fail job_id={job_id}: push key read failed ({error})");
+                    self.fail_job(job_id).await;
+                    return;
+                }
+            };
+            let push_auth = PushAuth {
+                secret_key_hex: secret,
+            };
+            let pushed =
+                seller_git::push_branch_with_auth(&workdir, &seller.git_remote, &branch, Some(&push_auth));
+            drop(push_auth);
+            match pushed {
+                Ok(oid) => oid,
+                Err(error) => {
+                    eprintln!("seller node execute fail job_id={job_id}: git push failed ({error})");
+                    self.fail_job(job_id).await;
+                    return;
+                }
+            }
+        };
+
+        // Bind the trade + delivered commit + STORED creq hash into the co-signature preimage and
+        // sign it through the signer actor (the seller key never leaves the actor).
+        let delivery_kind = match seller_delivery_kind(&seller.git_remote, &branch, &commit) {
+            Ok(kind) => kind,
+            Err(error) => {
+                eprintln!("seller node execute fail job_id={job_id}: delivery kind typing failed ({error})");
+                self.fail_job(job_id).await;
+                return;
+            }
+        };
+        let preimage = delivery_receipt_preimage(
+            job_id,
+            &offer.task,
+            offer.amount_sats,
+            &offer.buyer_pubkey,
+            &seller_pubkey,
+            &commit,
+            delivery_kind.as_str(),
+            &stored_creq,
+        );
+        let seller_sig = match self.node.signer().sign_receipt_hash(preimage.digest_hex()).await {
+            Ok(Ok(sig)) => sig,
+            Ok(Err(error)) => {
+                eprintln!("seller node execute fail job_id={job_id}: receipt sign refused ({error})");
+                self.fail_job(job_id).await;
+                return;
+            }
+            Err(error) => {
+                eprintln!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
+                self.fail_job(job_id).await;
+                return;
+            }
+        };
+
+        // Harness-generic PUBLIC seller-claimed usage block (opportunistic; absent fields stay
+        // absent). `usage` carries what the ACP driver surfaced this run — `None` when it exposed none.
+        let exec_metadata = seller_exec_metadata(
+            &seller.agent_command,
+            seller.agent.as_deref(),
+            wall_time_ms,
+            usage.as_ref(),
+        );
+        let draft = git_result_draft(
+            job_id,
+            &offer.buyer_pubkey,
+            &seller.git_remote,
+            &branch,
+            &commit,
+            offer.amount_sats,
+            &preimage.job_hash,
+            &seller_sig,
+            format!("delivery commit {commit}"),
+            &exec_metadata,
+        );
+        // Journal the delivery + enqueue the result in one transaction. Idempotent: a resumed job
+        // that already delivered re-enqueues nothing (invariant 2 — no divergent double-publish).
+        let now = now_unix();
+        match self.node.store().deliver_and_enqueue(
+            job_id,
+            &commit,
+            &draft,
+            now,
+            now + RESULT_PUBLISH_WINDOW_SECS,
+            now,
+        ) {
+            Ok(true) => {
+                eprintln!("seller node delivered job_id={job_id} commit={commit} result enqueued")
+            }
+            Ok(false) => eprintln!(
+                "seller node execute job_id={job_id}: delivery already journaled (dedup no-op)"
+            ),
+            Err(error) => {
+                eprintln!("seller node execute fail job_id={job_id}: deliver journal failed ({error})");
+                self.fail_job(job_id).await;
+                return;
+            }
+        }
+        self.drain().await;
+    }
+
+    /// Mark a job failed (best-effort; a fail-mark that itself errors is logged, never propagated —
+    /// the loop keeps serving).
+    async fn fail_job(&self, job_id: &str) {
+        if let Err(error) = self.node.store().fail_job(job_id, now_unix()) {
+            eprintln!("seller node job_id={job_id}: fail_job write error (continuing): {error}");
         }
     }
 
@@ -607,5 +862,173 @@ mod tests {
             classify_offer(&offer(5, None, NOW + 600), &seller_cfg(2, true), SELLER, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 }
         );
+    }
+
+    // ── Execute-body delivery contract (invariants 2 & 8), no network ────────────────────────────
+
+    use crate::seller_node::store::{Offer, SellerStore};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let id = NEXT.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("mobee-run-{label}-{}-{id}", std::process::id()))
+    }
+
+    // A store with a full offer → claim(creq) → award already journaled, so the execute-body readers
+    // (offer_row / job_creq / job_award_time) have real rows to answer from.
+    fn store_with_awarded_job(
+        creq: &str,
+        job: &str,
+        buyer: &str,
+        award_time: i64,
+    ) -> (SellerStore, std::path::PathBuf) {
+        let root = temp_dir("store");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mk root");
+        let store = SellerStore::open(root.join("seller.sqlite")).expect("open store");
+        store
+            .record_offer(
+                &Offer {
+                    offer_id: job.to_owned(),
+                    buyer_pubkey: buyer.to_owned(),
+                    amount_sats: 21,
+                    unit: "sat".to_owned(),
+                    task: "build a widget".to_owned(),
+                    deadline_unix: 2_000_000_000,
+                    targeted: true,
+                },
+                1,
+            )
+            .expect("record offer");
+        let draft = claim_draft(job, buyer, &"s".repeat(64), creq);
+        store
+            .claim_and_enqueue(job, job, creq, &draft, 1, 9_999_999_999, 1)
+            .expect("claim");
+        store
+            .record_award(&"w".repeat(64), job, buyer, award_time)
+            .expect("award");
+        (store, root)
+    }
+
+    // TOOTH (invariant 8 / audit N-4), NODE-level: the delivery cosignature the execute body signs
+    // binds the hash of the STORED claim-time creq read from the store — never a rebuild from live
+    // config. Author a creq under one accepted-mint set, journal it, then build the preimage the exec
+    // body builds (from `store.job_creq`): its creq_hash equals the STORED creq's hash and differs
+    // from the hash a drifted mint set would produce. Bite: if the exec body sourced the creq from
+    // live config instead of the store, the bound hash would be the drifted one and this goes red.
+    #[test]
+    fn delivery_preimage_binds_stored_creq_not_drifted_config() {
+        let seller = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let buyer = "b".repeat(64);
+        let job = "a".repeat(64);
+        let mints_claim = vec!["https://testnut.cashudevkit.org".to_owned()];
+        let creq_a =
+            gateway::creq::build_seller_creq(&job, 21, "sat", &mints_claim, &seller).expect("creq A");
+
+        let (store, root) = store_with_awarded_job(&creq_a, &job, &buyer, 4242);
+        let stored = store.job_creq(&job).expect("read").expect("present");
+        assert_eq!(stored, creq_a, "the stored creq is the claim-time creq");
+
+        let preimage = delivery_receipt_preimage(
+            &job,
+            "build a widget",
+            21,
+            &buyer,
+            &seller,
+            &"c".repeat(40),
+            "fork",
+            &stored,
+        );
+        assert_eq!(
+            preimage.creq_hash,
+            Some(gateway::creq_hash_hex(&creq_a)),
+            "delivery signs the STORED creq's hash"
+        );
+
+        // Config drifts to a different accepted-mint set after the claim: its creq hashes differently
+        // and the delivery must NOT bind it.
+        let mints_drifted = vec![
+            "https://testnut.cashudevkit.org".to_owned(),
+            "https://mint.example.invalid".to_owned(),
+        ];
+        let creq_b =
+            gateway::creq::build_seller_creq(&job, 21, "sat", &mints_drifted, &seller).expect("creq B");
+        assert_ne!(
+            preimage.creq_hash,
+            Some(gateway::creq_hash_hex(&creq_b)),
+            "a config-drifted creq hashes differently; the delivery must not sign it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // TOOTH (invariant 2), NODE-level: a re-created delivery commit is deterministic (identical tree
+    // + the STORED award-time author date ⇒ identical oid), and the durable delivery journal adopts
+    // the existing tip instead of double-publishing. Bite: if the snapshot used wall-clock now()
+    // instead of the journaled date, the two commits differ and the equality assert goes red; if
+    // `deliver_and_enqueue` did not dedup, the second call returns true and a SECOND result outbox
+    // row appears — the count assert goes red.
+    #[test]
+    fn resume_redelivery_is_deterministic_and_never_double_publishes() {
+        let seller = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let buyer = "b".repeat(64);
+        let job = "a".repeat(64);
+        let author_date = 4242_i64;
+        let branch = "mobee/aaaaaaaa";
+        let identity = DeliveryAgentIdentity::for_seller(&seller);
+
+        // Two independent workdirs with byte-identical trees, each snapshotted at the SAME journaled
+        // author date — the exact "crashed, re-created the commit on resume" shape.
+        let make_commit = |label: &str| -> String {
+            let wd = temp_dir(label);
+            let _ = std::fs::remove_dir_all(&wd);
+            seller_git::init_empty_delivery_workdir(&wd, &identity).expect("init workdir");
+            std::fs::write(wd.join("deliverable.txt"), b"the widget\n").expect("write file");
+            let commit =
+                seller_git::snapshot_delivery_at(&wd, &identity, None, branch, "mobee delivery: build a widget", author_date)
+                    .expect("snapshot");
+            let _ = std::fs::remove_dir_all(&wd);
+            commit
+        };
+        let commit_first = make_commit("wd1");
+        let commit_resume = make_commit("wd2");
+        assert_eq!(
+            commit_first, commit_resume,
+            "identical tree + stored author date ⇒ identical delivery oid (deterministic re-push)"
+        );
+
+        // The durable delivery journal: first delivery lands, a resumed re-delivery is a dedup no-op.
+        let creq = gateway::creq::build_seller_creq(
+            &job,
+            21,
+            "sat",
+            &["https://testnut.cashudevkit.org".to_owned()],
+            &seller,
+        )
+        .expect("creq");
+        let (store, root) = store_with_awarded_job(&creq, &job, &buyer, author_date);
+        let draft = claim_draft(&job, &buyer, &seller, &creq);
+        let now = 5000;
+        assert!(
+            store
+                .deliver_and_enqueue(&job, &commit_first, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
+                .expect("deliver"),
+            "first delivery journals + enqueues the result"
+        );
+        assert!(
+            !store
+                .deliver_and_enqueue(&job, &commit_resume, &draft, now, now + RESULT_PUBLISH_WINDOW_SECS, now)
+                .expect("re-deliver"),
+            "resume adopts the existing tip: a second delivery re-enqueues nothing"
+        );
+        let result_rows = store
+            .pending_outbox(now)
+            .expect("pending")
+            .into_iter()
+            .filter(|item| item.dedup_key == format!("result:{job}"))
+            .count();
+        assert_eq!(result_rows, 1, "exactly one result event enqueued across the resume");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
