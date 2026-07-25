@@ -31,6 +31,13 @@ enum Command {
         created_at: i64,
         reply: oneshot::Sender<Result<SignedEvent, String>>,
     },
+    /// Schnorr-sign a 32-byte receipt-preimage digest (hex) with the seller key — the seller's half
+    /// of the delivery co-signature. The digest is computed by the caller from the STORED creq
+    /// (audit N-4); the actor only signs, so the key never leaves this task.
+    SignReceiptHash {
+        digest_hex: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
 }
 
 /// A cheap, cloneable handle to the signer actor.
@@ -79,6 +86,21 @@ impl SignerHandle {
         rx.await.map_err(|_| SignerActorGone)
     }
 
+    /// Schnorr-sign a receipt-preimage digest (32-byte hex) through the actor — the delivery
+    /// co-signature. Returns the signature hex, or the inner `Err` when the digest is malformed. The
+    /// seller key never leaves the actor.
+    pub async fn sign_receipt_hash(
+        &self,
+        digest_hex: String,
+    ) -> Result<Result<String, String>, SignerActorGone> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::SignReceiptHash { digest_hex, reply })
+            .await
+            .map_err(|_| SignerActorGone)?;
+        rx.await.map_err(|_| SignerActorGone)
+    }
+
     /// The seller public key (hex), routed through the actor queue (proves the serialized path).
     pub async fn public_key_via_actor(&self) -> Result<String, SignerActorGone> {
         let (reply, rx) = oneshot::channel();
@@ -112,6 +134,11 @@ pub fn spawn(home: &MobeeHome) -> Result<SignerHandle, HomeError> {
                     reply,
                 } => {
                     let result = sign_event(&keys, &draft, created_at);
+                    let _ = reply.send(result);
+                }
+                Command::SignReceiptHash { digest_hex, reply } => {
+                    let result = crate::seller::sign_receipt_hash(&keys, &digest_hex)
+                        .map_err(|error| error.to_string());
                     let _ = reply.send(result);
                 }
             }
@@ -189,6 +216,30 @@ mod tests {
         let again = signer.sign(claim_draft(), 1000).await.expect("b").expect("sign");
         assert_eq!(first.id, again.id, "same draft + created_at ⇒ same event id");
         assert!(!first.json.contains(&secret), "signed json must not leak the secret");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The delivery co-signature: the actor schnorr-signs a receipt digest with the seller key and
+    // returns a 64-byte (128-hex) signature, never the secret; a malformed digest fails cleanly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn signs_receipt_hash_through_the_actor_never_leaking_the_secret() {
+        let root = temp_home("receipt");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        let secret = home::read_secret_key_hex(&home).expect("secret");
+        let signer = spawn(&home).expect("spawn");
+
+        let digest = "ab".repeat(32); // 32 bytes hex
+        let sig = signer
+            .sign_receipt_hash(digest.clone())
+            .await
+            .expect("actor")
+            .expect("sign");
+        assert_eq!(sig.len(), 128, "schnorr signature is 64 bytes / 128 hex");
+        assert_ne!(sig, secret, "signature is not the secret");
+        let _ = digest;
+        // A malformed digest (not 32 bytes) fails closed rather than signing garbage.
+        assert!(signer.sign_receipt_hash("zz".to_owned()).await.expect("actor").is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 
