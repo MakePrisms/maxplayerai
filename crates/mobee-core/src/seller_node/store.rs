@@ -290,6 +290,27 @@ impl SellerStore {
         Ok(changed == 1)
     }
 
+    /// The `(buyer_pubkey, amount_sats, unit)` of a recorded offer, if any. The award arm reads the
+    /// buyer to authorize an award (the award author MUST be the offer's buyer), and the pay path
+    /// reads amount/unit as the redeem terms. `None` when the node never recorded this offer.
+    pub fn offer_facts(&self, offer_id: &str) -> Result<Option<(String, u64, String)>, StoreError> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT buyer_pubkey, amount_sats, unit FROM offers WHERE offer_id = ?1",
+                [offer_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     // ---- Claim (state change + outbox enqueue in one transaction) -------------------------------
 
     /// Park a claim and enqueue its claim event in ONE transaction: either both the claim row and
@@ -836,6 +857,12 @@ mod tests {
         assert!(store.record_offer(&offer, 1).expect("first"));
         assert!(!store.record_offer(&offer, 2).expect("second"), "re-seen offer is a no-op");
         assert_eq!(store.health().expect("h").offers, 1);
+        // offer_facts serves the award-auth (buyer) and pay (amount/unit) reads.
+        assert_eq!(
+            store.offer_facts(&offer.offer_id).expect("facts"),
+            Some((offer.buyer_pubkey.clone(), offer.amount_sats, offer.unit.clone()))
+        );
+        assert_eq!(store.offer_facts(&"z".repeat(64)).expect("absent"), None);
         let _ = std::fs::remove_file(&path);
     }
 

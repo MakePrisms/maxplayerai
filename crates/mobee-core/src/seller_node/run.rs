@@ -308,6 +308,26 @@ impl SellerNodeRunner {
         // The job id IS the offer event id (as on the legacy path); the buyer is its author.
         let job_id = event.id.to_hex();
         let buyer_pubkey = event.pubkey.to_hex();
+
+        // Journal the offer facts BEFORE claiming: the award arm reads the buyer to authorize an
+        // award (author MUST be the offer's buyer), and the pay path reads amount/unit as the redeem
+        // terms. Idempotent — a re-seen offer is a no-op.
+        if let Err(error) = self.node.store().record_offer(
+            &super::store::Offer {
+                offer_id: job_id.clone(),
+                buyer_pubkey: buyer_pubkey.clone(),
+                amount_sats: offer.amount,
+                unit: offer.unit.clone(),
+                task: offer.task.clone(),
+                deadline_unix: offer.deadline_unix as i64,
+                targeted: offer.is_targeted(),
+            },
+            now,
+        ) {
+            eprintln!("seller node offer skip id={job_id}: record offer failed ({error})");
+            return;
+        }
+
         let creq = match gateway::creq::build_seller_creq(
             &job_id,
             offer.amount,
