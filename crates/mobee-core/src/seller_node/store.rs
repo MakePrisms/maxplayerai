@@ -670,6 +670,22 @@ impl SellerStore {
         }
     }
 
+    /// The unix second the award for `job_id` was recorded, if any. This is a durable, restart-STABLE
+    /// value (written once at `record_award`), so the execute path uses it as the delivery commit's
+    /// authored-at — a re-created delivery after a restart is then byte-identical (invariant 2). `None`
+    /// when the job was never awarded.
+    pub fn job_award_time(&self, job_id: &str) -> Result<Option<i64>, StoreError> {
+        let conn = self.lock()?;
+        let ts: Option<i64> = conn
+            .query_row(
+                "SELECT created_at_unix FROM awards WHERE job_id = ?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(ts)
+    }
+
     /// The creq journaled for a job at claim time (audit N-4). The delivery path signs its hash into
     /// the receipt preimage and the restart redeem-guard reads its mints, so a config change between
     /// claim and delivery can never alter the cosigned terms or the settlement mint set. `None` when
@@ -949,6 +965,9 @@ mod tests {
             Awarded::New
         );
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Awarded));
+        // The award time is the durable, restart-stable delivery author-date (invariant 2 source).
+        assert_eq!(store.job_award_time(&job).expect("award time"), Some(2));
+        assert_eq!(store.job_award_time(&"z".repeat(64)).expect("absent"), None);
 
         // A re-seen award id is a dedup no-op — no second job, state unchanged.
         assert_eq!(

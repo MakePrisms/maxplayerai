@@ -544,6 +544,37 @@ mod tests {
         assert!(matches!(decision, ClaimDecision::Skip(_)));
     }
 
+    // TOOTH (invariant 8 / audit N-4) — the delivery cosignature signs the hash of the STORED
+    // claim-time creq, never a rebuild from live config. Author a creq under one accepted-mint set
+    // (what the buyer read off the claim), then "drift" the config to a different mint set: the
+    // stored creq's hash is unchanged, and the drifted config would produce a DIFFERENT hash that
+    // delivery must NOT use. Signing the stored value is what keeps buyer/seller cosigs agreeing.
+    #[test]
+    fn delivery_hash_binds_stored_creq_not_drifted_config() {
+        let seller = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let mints_claim = vec!["https://testnut.cashudevkit.org".to_owned()];
+        let stored_creq =
+            gateway::creq::build_seller_creq("job-1", 21, "sat", &mints_claim, &seller).expect("creq");
+        let signed_hash = gateway::creq_hash_hex(&stored_creq);
+
+        // Config drifts to a different accepted-mint set after the claim.
+        let mints_drifted = vec![
+            "https://testnut.cashudevkit.org".to_owned(),
+            "https://mint.example.invalid".to_owned(),
+        ];
+        let drifted_creq =
+            gateway::creq::build_seller_creq("job-1", 21, "sat", &mints_drifted, &seller).expect("creq2");
+
+        // The stored creq's hash is stable; the drifted config yields a DIFFERENT hash — which the
+        // delivery path must never sign (it reads store.job_creq, not live config).
+        assert_eq!(gateway::creq_hash_hex(&stored_creq), signed_hash);
+        assert_ne!(
+            gateway::creq_hash_hex(&drifted_creq),
+            signed_hash,
+            "a config-drifted creq hashes differently; delivery must sign the STORED creq's hash"
+        );
+    }
+
     // AWARD AUTHORIZATION (security-critical): only the offer's buyer may drive execute or release.
     #[test]
     fn award_from_non_buyer_is_ignored_even_when_claim_matches() {
