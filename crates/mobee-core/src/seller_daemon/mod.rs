@@ -3045,72 +3045,14 @@ fn run_boot_push_preflight_for_daemon(daemon: &SellerDaemon) {
     }
 }
 
-/// Outcome of [`wait_for_nip42_auth`].
-pub(crate) enum AuthWait {
-    /// The relay issued a NIP-42 challenge and `automatic_authentication` completed it.
-    Authenticated,
-    /// The relay issued NO challenge within the window. NOT a failure (see the fn doc).
-    NoChallenge,
-}
+// NIP-42 relay-auth (AuthWait, wait_for_nip42_auth) now lives in the neutral `crate::relay_auth`
+// so it survives this module's deletion; a fatal RelayAuthError maps into a Relay DaemonError here.
+pub(crate) use crate::relay_auth::{wait_for_nip42_auth, AuthWait};
 
-/// Drain `notifications` until the relay's NIP-42 AUTH completes, the relay actively rejects
-/// auth (fatal), or the window elapses with no challenge (`NoChallenge`, non-fatal).
-///
-/// Shared by the seller receive path and the buyer receipt-publish path — mobee-relay requires
-/// NIP-42 AUTH for the p-gated kind-1059 subscribe AND for all writes, and the handshake shape is
-/// identical either way. Callers map the outcome to their own gate: the seller degrades on
-/// `NoChallenge`; the buyer fails closed on anything but `Authenticated`.
-///
-/// Caller must subscribe `relay.notifications()` **before** `connect` so the
-/// `Authenticated` event cannot be missed.
-///
-/// mobee-relay p-gates kind-1059: unauthenticated `REQ kinds:[1059] #p:self` is
-/// `CLOSED` with `restricted:` (not `auth-required:`). nostr-sdk 0.44 treats
-/// `restricted:` as `Remove` — the sub is dropped, so the post-auth
-/// `resubscribe()` never restores it. Auth **before** the 1059 subscribe is
-/// therefore load-bearing for seller receive, and mobee-relay challenges on connect so
-/// `Authenticated` arrives in milliseconds.
-///
-/// A window with NO challenge is reported as `NoChallenge` rather than a fatal error: a relay
-/// that challenges only lazily (on the first `REQ`/`EVENT`, e.g. the in-process test relay) will
-/// challenge when the daemon subscribes below, and `automatic_authentication` completes auth
-/// then. The caller logs the degrade loudly. An ACTIVE rejection (`AuthenticationFailed`) or a
-/// relay shutdown stays fatal (fail-closed), unchanged.
-pub(crate) async fn wait_for_nip42_auth(
-    notifications: &mut tokio::sync::broadcast::Receiver<nostr_sdk::pool::RelayNotification>,
-    timeout: std::time::Duration,
-) -> Result<AuthWait, DaemonError> {
-    use nostr_sdk::pool::RelayNotification;
-
-    let within_window = tokio::time::timeout(timeout, async {
-        loop {
-            match notifications.recv().await {
-                Ok(RelayNotification::Authenticated) => return Ok(AuthWait::Authenticated),
-                Ok(RelayNotification::AuthenticationFailed) => {
-                    return Err(DaemonError::Relay(
-                        "NIP-42 authentication failed (required for kind-1059 p-gated receive)"
-                            .into(),
-                    ));
-                }
-                Ok(RelayNotification::Shutdown) => {
-                    return Err(DaemonError::Relay(
-                        "relay shutdown before NIP-42 authentication".into(),
-                    ));
-                }
-                Ok(_) => {}
-                Err(_) => {
-                    return Err(DaemonError::Relay(
-                        "relay notification channel closed before NIP-42 authentication".into(),
-                    ));
-                }
-            }
-        }
-    })
-    .await;
-
-    // Elapsed with no challenge → NoChallenge (non-fatal). Within the window → the loop's result
-    // (Authenticated, or a fatal active failure).
-    within_window.unwrap_or(Ok(AuthWait::NoChallenge))
+impl From<crate::relay_auth::RelayAuthError> for DaemonError {
+    fn from(value: crate::relay_auth::RelayAuthError) -> Self {
+        DaemonError::Relay(value.0)
+    }
 }
 
 /// Cap on the number of STORED offers the UNTARGETED (open-pool) offer filter requests on

@@ -704,7 +704,7 @@ fn publish_receipt_event(
                     })?;
                     // Subscribe to the relay's notification stream BEFORE connect —
                     // `Authenticated` is emitted once and is not re-emitted (relay quirk; see
-                    // `seller_daemon::wait_for_nip42_auth`).
+                    // `relay_auth::wait_for_nip42_auth`).
                     let parsed_relay = RelayUrl::parse(relay_url).map_err(|error| {
                         EffectError::new(format!("receipt parse relay url: {error}"))
                     })?;
@@ -724,12 +724,12 @@ fn publish_receipt_event(
                     // (send not reached, never a forced success) — the designed-safe
                     // direction (no double-pay; payment holds at `Sent` and retries).
                     let relay_success = if matches!(
-                        crate::seller_daemon::wait_for_nip42_auth(
+                        crate::relay_auth::wait_for_nip42_auth(
                             &mut relay_notifications,
                             Duration::from_secs(20),
                         )
                         .await,
-                        Ok(crate::seller_daemon::AuthWait::Authenticated)
+                        Ok(crate::relay_auth::AuthWait::Authenticated)
                     ) {
                         let output = client.send_event_to([relay_url], event).await;
                         client.disconnect().await;
@@ -1404,13 +1404,13 @@ mod tests {
     // (proven by the coordinator's live re-run); the auth-ordering / fail-closed decision
     // is pure and is asserted here (red-on-revert: defeating the gate turns the
     // fail-closed cases green→red).
-    use crate::seller_daemon::{wait_for_nip42_auth, AuthWait};
+    use crate::relay_auth::{wait_for_nip42_auth, AuthWait, RelayAuthError};
     use nostr_sdk::pool::RelayNotification;
     use std::time::Duration;
 
     // The buyer receipt gate opens ONLY on `Authenticated`; every other outcome of the shared
     // `wait_for_nip42_auth` (the seller's `NoChallenge` degrade included) fails the buyer closed.
-    fn buyer_gate_open(outcome: Result<AuthWait, crate::seller_daemon::DaemonError>) -> bool {
+    fn buyer_gate_open(outcome: Result<AuthWait, RelayAuthError>) -> bool {
         matches!(outcome, Ok(AuthWait::Authenticated))
     }
 
