@@ -45,6 +45,21 @@ enum Command {
         remote_url: String,
         reply: oneshot::Sender<Result<String, String>>,
     },
+    /// NIP-44/NIP-17 unwrap of a kind-1059 gift-wrap addressed to the seller, decoded to its NUT-18
+    /// payment (or `None` when it is not a decodable own-payment wrap). The decrypt needs the seller
+    /// key, so it runs INSIDE the actor; only the buyer's decrypted payment (never the seller key)
+    /// leaves.
+    UnwrapPaymentWrap {
+        event: Box<nostr_sdk::Event>,
+        reply: oneshot::Sender<Result<Option<crate::payment_send::ReceivedPayment>, String>>,
+    },
+    /// Derive the cashu P2PK signing key from the seller key. cdk's `receive` witnesses P2PK-locked
+    /// proofs with the RAW key (no signature-only path), so the derived key is materialized here from
+    /// the seller key — which never leaves the actor — and handed out solely for that redeem. This is
+    /// a derived payment key, not the seller identity key.
+    CashuP2pkSecret {
+        reply: oneshot::Sender<Result<cashu::SecretKey, String>>,
+    },
 }
 
 /// A cheap, cloneable handle to the signer actor.
@@ -123,6 +138,36 @@ impl SignerHandle {
         rx.await.map_err(|_| SignerActorGone)
     }
 
+    /// Decode a gift-wrap to its NUT-18 payment through the actor (the NIP-44 decrypt needs the
+    /// seller key, which never leaves the actor). `Ok(None)` = not a decodable own-payment wrap.
+    pub async fn unwrap_payment_wrap(
+        &self,
+        event: nostr_sdk::Event,
+    ) -> Result<Result<Option<crate::payment_send::ReceivedPayment>, String>, SignerActorGone> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::UnwrapPaymentWrap {
+                event: Box::new(event),
+                reply,
+            })
+            .await
+            .map_err(|_| SignerActorGone)?;
+        rx.await.map_err(|_| SignerActorGone)
+    }
+
+    /// The cashu P2PK signing key derived from the seller key, for a cdk `receive` that must witness
+    /// P2PK-locked proofs with the raw key. The seller key never leaves the actor.
+    pub async fn cashu_p2pk_secret(
+        &self,
+    ) -> Result<Result<cashu::SecretKey, String>, SignerActorGone> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::CashuP2pkSecret { reply })
+            .await
+            .map_err(|_| SignerActorGone)?;
+        rx.await.map_err(|_| SignerActorGone)
+    }
+
     /// The seller public key (hex), routed through the actor queue (proves the serialized path).
     pub async fn public_key_via_actor(&self) -> Result<String, SignerActorGone> {
         let (reply, rx) = oneshot::channel();
@@ -166,6 +211,18 @@ pub fn spawn(home: &MobeeHome) -> Result<SignerHandle, HomeError> {
                 Command::HttpAuthHeader { remote_url, reply } => {
                     let result =
                         crate::git_transport::nip98_authorization_header_with_keys(&remote_url, &keys)
+                            .map_err(|error| error.to_string());
+                    let _ = reply.send(result);
+                }
+                Command::UnwrapPaymentWrap { event, reply } => {
+                    let result = crate::seller::unwrap_own_payment_gift_wrap(&keys, &event)
+                        .await
+                        .map_err(|error| error.to_string());
+                    let _ = reply.send(result);
+                }
+                Command::CashuP2pkSecret { reply } => {
+                    let result =
+                        crate::seller::cashu_secret_from_nostr_hex(&keys.secret_key().to_secret_hex())
                             .map_err(|error| error.to_string());
                     let _ = reply.send(result);
                 }

@@ -122,6 +122,60 @@ fn delivery_receipt_preimage(
     }
 }
 
+/// The seller-receive classification on the node redeem path (finding S, ported from the daemon).
+#[derive(Debug)]
+enum RedeemDecision {
+    /// Receive succeeded — finalize a receipt for this redeemed amount.
+    Finalize(u64),
+    /// Idempotent re-see: already spent AND a COMPLETED receipt exists — we already collected and
+    /// receipted it. No-op; never double-collect / re-receipt.
+    IdempotentNoOp,
+    /// Fail closed — do NOT finalize; refuse (buffer for manual reconcile), with a named reason.
+    Refuse(String),
+}
+
+/// True when a receive error is the mint reporting the token already spent — the one idempotent
+/// surface on the node redeem path (the node's receipt dedup lives in the store, so there is no
+/// journal "already receipted" string). Substring match: cdk surfaces no typed already-spent error.
+fn is_already_spent(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("already spent") || lower.contains("already redeemed")
+}
+
+/// Classify a seller-receive result (finding S). The load-bearing rule: NEVER infer "our swap already
+/// landed" from a pending-receive breadcrumb — the breadcrumb is written before EVERY swap, so it
+/// proves only intent. Inferring collection from it would let a malicious buyer replay an
+/// already-redeemed seller-locked token against a NEW same-value job and forge a receipt for zero new
+/// funds (theft-of-service). The ONLY positive proof of OUR OWN prior collection is a COMPLETED
+/// receipt for this job, read FAIL-CLOSED: already-spent + has_receipt(true) ⇒ idempotent no-op;
+/// already-spent + has_receipt(false) ⇒ refuse (replay/theft or a genuine interrupted redeem — both
+/// indistinguishable, so fail closed); has_receipt read error ⇒ refuse. Any non-already-spent error
+/// also refuses. `has_receipt` is a closure so the store is read only on the already-spent branch and
+/// the decision is unit-testable without a mint.
+fn classify_redeem_outcome(
+    receive_result: Result<u64, String>,
+    has_receipt: impl FnOnce() -> Result<bool, String>,
+) -> RedeemDecision {
+    match receive_result {
+        Ok(amount) => RedeemDecision::Finalize(amount),
+        Err(error) if !is_already_spent(&error) => RedeemDecision::Refuse(error),
+        Err(error) => match has_receipt() {
+            Ok(true) => RedeemDecision::IdempotentNoOp,
+            Ok(false) => RedeemDecision::Refuse(error),
+            Err(read_err) => {
+                RedeemDecision::Refuse(format!("receipt read failed (fail-closed): {read_err}"))
+            }
+        },
+    }
+}
+
+/// The seal-sender guard: a payment settles a job ONLY when the authenticated NIP-17 seal sender is
+/// the bound offer buyer (the pubkey folded into the seller-signed receipt preimage). A third party
+/// can never pay-once and close someone else's job.
+fn seal_sender_is_bound_buyer(seal_sender: &str, offer_buyer: &str) -> bool {
+    seal_sender == offer_buyer
+}
+
 /// Decide whether to claim `offer`, applying the always-on money-safety gates in the legacy order:
 /// a lapsed offer is refused BEFORE its deadline is re-derived (never resurrect a stale offer with a
 /// fresh `now + timeout`), then the targeting/rate gate. Pure over (offer, config, now).
@@ -299,9 +353,8 @@ impl SellerNodeRunner {
                         k if k.as_u16() == JOB_AWARD_KIND => {
                             self.on_award(&event).await;
                         }
-                        // PORT: gift-wrap unwrap → import-before-receipt-row → store.collect_receipt.
                         Kind::GiftWrap => {
-                            eprintln!("seller node gift-wrap seen id={} (pay PORT pending)", event.id);
+                            self.on_gift_wrap(&event).await;
                         }
                         _ => {}
                     }
@@ -731,6 +784,219 @@ impl SellerNodeRunner {
         self.drain().await;
     }
 
+    /// Settle one gift-wrapped payment: decode it (through the signer actor — the NIP-44 decrypt
+    /// needs the seller key, which never leaves the actor), authenticate the buyer by the seal,
+    /// enforce the money-safety guards (seal sender == bound buyer, realized mint ∈ the STORED
+    /// claim-time creq per Fix Q, `allow_real_mints` fence), then — in the invariant-3 order — write
+    /// the intent breadcrumb BEFORE swapping at the mint, classify the swap FAIL-CLOSED (never infer
+    /// collection from the breadcrumb), and only then record the receipt (deduped by the wrap id, so
+    /// a replayed wrap credits the job at most once). Every refusal is logged with a named reason.
+    async fn on_gift_wrap(&self, event: &nostr_sdk::Event) {
+        let event_id = event.id.to_hex();
+        // Log EVERY wrap seen — silence must mean "no wraps", never "lost money".
+        eprintln!("seller node wrap seen event={event_id}");
+
+        let received = match self.node.signer().unwrap_payment_wrap(event.clone()).await {
+            Ok(Ok(Some(received))) => received,
+            Ok(Ok(None)) => {
+                eprintln!("seller node wrap event={event_id}: not a decodable own-payment wrap (skipped)");
+                return;
+            }
+            Ok(Err(error)) => {
+                eprintln!("seller node wrap event={event_id}: decode failed ({error})");
+                return;
+            }
+            Err(error) => {
+                eprintln!("seller node wrap event={event_id}: signer actor gone ({error})");
+                return;
+            }
+        };
+        let job_id = received.payload.job_id().to_owned();
+        if job_id.is_empty() {
+            eprintln!("seller node wrap event={event_id}: payment carries no job id (skipped)");
+            return;
+        }
+
+        // Already-paid job: a re-see of consumed money — skip (do not re-redeem). Fail closed on a
+        // read error (never read an unreadable journal as "not paid ⇒ safe to redeem again").
+        match self.node.store().has_receipt(&job_id) {
+            Ok(true) => {
+                eprintln!("seller node wrap event={event_id}: job {job_id} already receipted, skipping");
+                return;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("seller node wrap event={event_id}: has_receipt read failed for {job_id} (fail-closed, skipping): {error}");
+                return;
+            }
+        }
+
+        // Bind to a job we recorded (offer facts). No offer ⇒ early pay for a still-unknown job or
+        // not ours — leave it (buffered by re-delivery), never misattribute.
+        let offer = match self.node.store().offer_row(&job_id) {
+            Ok(Some(offer)) => offer,
+            Ok(None) => {
+                eprintln!("seller node wrap event={event_id}: no offer recorded for job {job_id} (skipped)");
+                return;
+            }
+            Err(error) => {
+                eprintln!("seller node wrap event={event_id}: offer read failed for {job_id} ({error})");
+                return;
+            }
+        };
+
+        // Seal-sender guard: the authenticated buyer MUST be the bound offer buyer.
+        let buyer = received.buyer_pubkey.to_hex();
+        if !seal_sender_is_bound_buyer(&buyer, &offer.buyer_pubkey) {
+            eprintln!(
+                "seller node wrap event={event_id}: payment sender {buyer} is not the bound offer buyer {} for job {job_id} — refused",
+                offer.buyer_pubkey
+            );
+            return;
+        }
+
+        // Fix Q — settle against the mints the seller ORIGINALLY advertised (the STORED claim-time
+        // creq), never live config: a config change across the trade can neither strand this payment
+        // nor let a newly-added mint settle it.
+        let stored_creq = match self.node.store().job_creq(&job_id) {
+            Ok(Some(creq)) => creq,
+            _ => {
+                eprintln!("seller node wrap event={event_id}: no stored creq for job {job_id} (skipped)");
+                return;
+            }
+        };
+        let request = match crate::gateway::creq::parse_creq(&stored_creq) {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("seller node wrap event={event_id}: stored creq unparseable for job {job_id} ({error})");
+                return;
+            }
+        };
+        let payload_mint = received.payload.payload.mint.clone();
+        let mint_str = payload_mint.to_string();
+        // Redeem guard: the realized mint MUST be one the STORED creq advertised.
+        if !request.mints.contains(&payload_mint) {
+            eprintln!(
+                "seller node wrap event={event_id}: realized mint {mint_str} outside the stored creq's accepted mints for job {job_id} — refused"
+            );
+            return;
+        }
+        // Real-mint fence: a real mint can never settle unless the operator opted in.
+        if !crate::home::mint_allowed(&mint_str, self.node.home().config.allow_real_mints) {
+            eprintln!(
+                "seller node wrap event={event_id}: mint {mint_str} not allowed (allow_real_mints={}) for job {job_id} — refused",
+                self.node.home().config.allow_real_mints
+            );
+            return;
+        }
+
+        // Payment terms over the stored-creq accepted set (amount == offer.amount, unit == sat). The
+        // ParsedOffer is reconstructed from the stored offer; a targeted offer we hold was targeted to
+        // US, so its seller target is our own pubkey (open-pool = untargeted).
+        let seller_pubkey = self.seller_pubkey.to_hex();
+        let parsed_offer = ParsedOffer {
+            task: offer.task.clone(),
+            output: String::new(),
+            amount: offer.amount_sats,
+            unit: offer.unit.clone(),
+            deadline_unix: offer.deadline_unix.max(0) as u64,
+            seller_pubkey: offer.targeted.then(|| seller_pubkey.clone()),
+        };
+        let accepted_mints: std::collections::HashSet<cashu::MintUrl> =
+            request.mints.iter().cloned().collect();
+        let policy = crate::payment_wallet::PaymentPolicy::new(accepted_mints.iter().cloned());
+        let terms = match policy.terms_for_offer(payload_mint.clone(), &parsed_offer, &seller_pubkey) {
+            Ok(terms) => terms,
+            Err(error) => {
+                eprintln!("seller node wrap event={event_id}: payment terms refused for job {job_id} ({error})");
+                return;
+            }
+        };
+
+        // Derive the cashu P2PK key through the actor and open a wallet at the REALIZED mint (the
+        // buyer paid seller-locked ecash there; the wallet must be bound to that same mint).
+        let cashu_key = match self.node.signer().cashu_p2pk_secret().await {
+            Ok(Ok(key)) => key,
+            Ok(Err(error)) => {
+                eprintln!("seller node wrap event={event_id}: cashu key derive failed for job {job_id} ({error})");
+                return;
+            }
+            Err(error) => {
+                eprintln!("seller node wrap event={event_id}: signer actor gone ({error})");
+                return;
+            }
+        };
+        let wallet = match crate::buyer_fund::open_wallet_at_mint_async(self.node.home(), &mint_str).await {
+            Ok(wallet) => wallet,
+            Err(error) => {
+                eprintln!("seller node wrap event={event_id}: open wallet at {mint_str} failed for job {job_id} ({error})");
+                return;
+            }
+        };
+        let adapter = crate::payment_wallet::CdkSellerReceive::new(&wallet, cashu_key);
+        let token = received.payload.to_token();
+        let expected = offer.amount_sats;
+
+        // Intent-to-receive breadcrumb BEFORE the swap (invariant 3). token_hash is SHA-256 of the
+        // token string — no proof/secret material is stored.
+        let token_hash = {
+            use sha2::Digest as _;
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(token.to_string().as_bytes());
+            hex::encode(hasher.finalize())
+        };
+        if let Err(error) =
+            self.node
+                .store()
+                .append_pending_receive(&job_id, &token_hash, &buyer, &mint_str, expected, now_unix())
+        {
+            eprintln!("seller node wrap event={event_id}: breadcrumb write failed for job {job_id} ({error}) — refusing to receive");
+            return;
+        }
+
+        // Swap at the mint, then classify FAIL-CLOSED (never infer prior collection from the
+        // breadcrumb — the only proof is a COMPLETED receipt read fail-closed).
+        let receive_result = adapter
+            .receive(&token, &terms, &accepted_mints, &payload_mint)
+            .await
+            .map(|amount| amount.to_u64())
+            .map_err(|error| error.to_string());
+        let amount_received = match classify_redeem_outcome(receive_result, || {
+            self.node.store().has_receipt(&job_id).map_err(|error| error.to_string())
+        }) {
+            RedeemDecision::Finalize(amount) => amount,
+            RedeemDecision::IdempotentNoOp => {
+                eprintln!("seller node wrap event={event_id}: idempotent no-op (already spent AND a completed receipt exists) for job {job_id}");
+                return;
+            }
+            RedeemDecision::Refuse(reason) => {
+                eprintln!("seller node wrap event={event_id}: receive refused for job {job_id} ({reason}) — buffered for reconcile");
+                return;
+            }
+        };
+        eprintln!(
+            "seller node collect ok: job_id={job_id} amount_received={amount_received} expected={expected} mint={mint_str}"
+        );
+
+        // Record the receipt AFTER the money landed (invariant 3 order) — deduped on the wrap id, so a
+        // replayed wrap marks the job paid at most once.
+        match self
+            .node
+            .store()
+            .collect_receipt(&event_id, &job_id, amount_received, now_unix())
+        {
+            Ok(super::store::Collected::New) => {
+                eprintln!("seller node paid job_id={job_id} amount={amount_received} receipt={event_id}")
+            }
+            Ok(super::store::Collected::Duplicate) => eprintln!(
+                "seller node wrap event={event_id}: receipt already collected for job {job_id} (dedup no-op)"
+            ),
+            Err(error) => {
+                eprintln!("seller node wrap event={event_id}: receipt write failed for job {job_id} ({error})")
+            }
+        }
+    }
+
     /// Mark a job failed (best-effort; a fail-mark that itself errors is logged, never propagated —
     /// the loop keeps serving).
     async fn fail_job(&self, job_id: &str) {
@@ -1037,6 +1303,107 @@ mod tests {
             .filter(|item| item.dedup_key == format!("result:{job}"))
             .count();
         assert_eq!(result_rows, 1, "exactly one result event enqueued across the resume");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Pay arm money-safety (invariant 3), no mint ─────────────────────────────────────────────
+
+    // TOOTH (invariant 3 / finding S) — the redeem classification never forges a receipt from a
+    // pending-receive breadcrumb; the ONLY positive proof of our prior collection is a COMPLETED
+    // receipt, read fail-closed. Covers the replay-of-collected case (already-spent + has_receipt=true
+    // ⇒ no-op) and the crash-between-import-and-receipt-row case (already-spent + has_receipt=false ⇒
+    // refuse, never a forged receipt).
+    #[test]
+    fn redeem_classification_finalizes_and_never_forges_from_a_breadcrumb() {
+        // A clean successful receive finalizes exactly its amount; has_receipt is never consulted.
+        assert!(matches!(
+            classify_redeem_outcome(Ok(21), || panic!("has_receipt must not be read on success")),
+            RedeemDecision::Finalize(21)
+        ));
+        // Already-spent + a COMPLETED receipt ⇒ idempotent no-op (legit backfill/restart re-see).
+        assert!(matches!(
+            classify_redeem_outcome(Err("Token already spent".into()), || Ok(true)),
+            RedeemDecision::IdempotentNoOp
+        ));
+        // Already-spent + NO receipt (crash-between, or a replay/theft — indistinguishable) ⇒ refuse.
+        assert!(matches!(
+            classify_redeem_outcome(Err("Token already spent".into()), || Ok(false)),
+            RedeemDecision::Refuse(_)
+        ));
+        // has_receipt READ ERROR ⇒ refuse, FAIL CLOSED (never read unreadable as "no receipt ⇒ safe").
+        assert!(matches!(
+            classify_redeem_outcome(Err("already redeemed".into()), || Err("corrupt".into())),
+            RedeemDecision::Refuse(_)
+        ));
+        // A non-already-spent receive error refuses without consulting has_receipt.
+        assert!(matches!(
+            classify_redeem_outcome(Err("mint offline".into()), || panic!("must not read has_receipt")),
+            RedeemDecision::Refuse(_)
+        ));
+    }
+
+    // TOOTH (invariant 3, security) — a payment settles a job ONLY when the authenticated seal sender
+    // is the bound offer buyer; a third party can never pay-once and close someone else's job.
+    #[test]
+    fn seal_sender_must_be_the_bound_offer_buyer() {
+        assert!(seal_sender_is_bound_buyer("buyerpk", "buyerpk"));
+        assert!(!seal_sender_is_bound_buyer("attackerpk", "buyerpk"));
+    }
+
+    // TOOTH (invariant 3 / Fix Q) — the redeem guard settles only at a mint the STORED claim-time creq
+    // advertised; a realized mint outside that set is refused, so a config change across the trade can
+    // neither strand this payment nor introduce a settling mint.
+    #[test]
+    fn realized_mint_must_be_in_the_stored_creq() {
+        use std::str::FromStr as _;
+        let seller = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let advertised = "https://testnut.cashudevkit.org";
+        let creq = gateway::creq::build_seller_creq(
+            &"a".repeat(64),
+            21,
+            "sat",
+            &[advertised.to_owned()],
+            &seller,
+        )
+        .expect("creq");
+        let request = gateway::creq::parse_creq(&creq).expect("parse");
+        let advertised_mint = cashu::MintUrl::from_str(advertised).expect("mint");
+        let foreign_mint = cashu::MintUrl::from_str("https://mint.example.invalid").expect("mint");
+        assert!(request.mints.contains(&advertised_mint), "the advertised mint settles");
+        assert!(
+            !request.mints.contains(&foreign_mint),
+            "a mint outside the stored creq is refused"
+        );
+    }
+
+    // TOOTH (invariant 3) — the receipt row dedups a replayed payment on the wrap id: a job is marked
+    // paid at most once, so a re-delivered gift-wrap never double-credits.
+    #[test]
+    fn receipt_collect_dedups_a_replayed_payment() {
+        let seller = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let creq = gateway::creq::build_seller_creq(
+            &"a".repeat(64),
+            21,
+            "sat",
+            &["https://testnut.cashudevkit.org".to_owned()],
+            &seller,
+        )
+        .expect("creq");
+        let job = "a".repeat(64);
+        let buyer = "b".repeat(64);
+        let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
+        let wrap_id = "e".repeat(64);
+        assert!(!store.has_receipt(&job).expect("read"), "not paid before collect");
+        assert_eq!(
+            store.collect_receipt(&wrap_id, &job, 21, 5000).expect("collect"),
+            crate::seller_node::store::Collected::New
+        );
+        assert_eq!(
+            store.collect_receipt(&wrap_id, &job, 21, 5001).expect("replay"),
+            crate::seller_node::store::Collected::Duplicate,
+            "a replayed wrap id never credits the job twice"
+        );
+        assert!(store.has_receipt(&job).expect("read"), "paid after the first collect");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

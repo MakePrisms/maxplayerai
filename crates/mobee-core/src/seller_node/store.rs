@@ -223,6 +223,20 @@ impl SellerStore {
                  amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
                  received_at_unix INTEGER NOT NULL
              );
+             -- Intent-to-receive breadcrumbs, written BEFORE the mint swap (payment ordering,
+             -- invariant 3). A breadcrumb records ONLY that a swap was attempted for a token — it is
+             -- NEVER proof the swap landed (the mint reporting already-spent + a COMPLETED receipt is
+             -- the only proof of our own prior collection). `token_hash` is SHA-256 of the token
+             -- string; no proof/secret material is stored.
+             CREATE TABLE IF NOT EXISTS pending_receive (
+                 job_id          TEXT NOT NULL,
+                 token_hash      TEXT NOT NULL,
+                 buyer_pubkey    TEXT NOT NULL,
+                 mint            TEXT NOT NULL,
+                 amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
+                 created_at_unix INTEGER NOT NULL,
+                 PRIMARY KEY (job_id, token_hash)
+             );
              -- The nostr event outbox. `dedup_key` (UNIQUE) makes an enqueue idempotent; `draft_json`
              -- is the full serialized EventDraft (kind + content + all protocol/routing tags) so the
              -- publisher signs a wire-valid event. The publisher drains `pending` rows, signs with
@@ -552,6 +566,45 @@ impl SellerStore {
         )?;
         tx.commit()?;
         Ok(Collected::New)
+    }
+
+    /// Write the durable intent-to-receive breadcrumb BEFORE a mint swap (payment ordering, invariant
+    /// 3). Idempotent on `(job_id, token_hash)` — a replay is a no-op. A breadcrumb NEVER proves the
+    /// swap landed; it exists so a crash between swap and receipt is diagnosable and the re-see is
+    /// classified by the COMPLETED-receipt read, not by the breadcrumb.
+    pub fn append_pending_receive(
+        &self,
+        job_id: &str,
+        token_hash: &str,
+        buyer_pubkey: &str,
+        mint: &str,
+        amount_sats: u64,
+        now_unix: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO pending_receive
+                 (job_id, token_hash, buyer_pubkey, mint, amount_sats, created_at_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![job_id, token_hash, buyer_pubkey, mint, amount_sats as i64, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a COMPLETED receipt exists for `job_id`. This is the ONLY positive proof of our own
+    /// prior collection (finding S): on an already-spent re-see, `true` ⇒ idempotent no-op, `false` ⇒
+    /// refuse (never forge a receipt from a breadcrumb), and a read error fails CLOSED at the caller.
+    pub fn has_receipt(&self, job_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let found = conn
+            .query_row(
+                "SELECT 1 FROM receipts WHERE job_id = ?1 LIMIT 1",
+                [job_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(found)
     }
 
     // ---- Outbox ---------------------------------------------------------------------------------
