@@ -18,13 +18,11 @@ pub const EXEC_METADATA_COMMITMENT_EMPTY: &str = "none";
 /// Delivered git object kind bound (non-forgeably) into the co-signed receipt preimage.
 ///
 /// In the preimage the kind is a signed field, so an unsigned path cannot be flipped to
-/// reinterpret the same 40-hex as a commit vs a tree oid.
+/// reinterpret the same 40-hex as a different object kind. Live delivery is fork-only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeliveryKind {
-    /// Fork-tip `commit_oid` (git delivery — the only live kind today).
+    /// Fork-tip `commit_oid` (git delivery — the only live kind).
     Fork,
-    /// (Deferred) patch result `tree_oid`.
-    Patch,
 }
 
 impl DeliveryKind {
@@ -32,7 +30,6 @@ impl DeliveryKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Fork => "fork",
-            Self::Patch => "patch",
         }
     }
 }
@@ -71,7 +68,7 @@ pub struct ReceiptPreimage {
     /// Seller nostr x-only pubkey hex (== accepted-claim seller; the external anchor).
     pub seller_pubkey: String,
     pub delivery_integrity_hash: String,
-    /// `fork` | `patch` — see [`DeliveryKind`].
+    /// Wire label for the delivered object kind — see [`DeliveryKind`] (live: `fork`).
     pub delivery_kind: String,
     /// Commitment over the echoed exec-metadata tag set, or [`EXEC_METADATA_COMMITMENT_EMPTY`].
     pub exec_metadata_commitment: String,
@@ -173,8 +170,10 @@ mod tests {
         let base = preimage();
         let mut other_hash = base.clone();
         other_hash.delivery_integrity_hash = "ee".repeat(20);
+        // Live delivery is fork-only; the preimage still binds the kind wire label as a string,
+        // so a different label must change the signed digest (non-forgeable kind binding).
         let mut other_kind = base.clone();
-        other_kind.delivery_kind = DeliveryKind::Patch.as_str().into();
+        other_kind.delivery_kind = "other".into();
 
         assert_eq!(base.digest_hex().len(), 64);
         assert_ne!(base.digest_hex(), other_hash.digest_hex());
