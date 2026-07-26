@@ -175,18 +175,189 @@ const STALL_OVERLAP_MARGIN_SECS: u64 = 60;
 /// heartbeat tick (#162): a relay that drops the socket before completing NIP-42 is retried with a
 /// short backoff rather than waiting a whole stall interval.
 const RECOVERY_MAX_ATTEMPTS: u32 = 3;
-/// Short backoff between the bounded recovery attempts (#162).
+/// Base backoff between the bounded recovery attempts (#162), doubled per attempt by
+/// [`recovery_backoff`].
 const RECOVERY_BACKOFF: Duration = Duration::from_secs(2);
+/// Ceiling on the per-attempt backoff, so one bounded recovery still fits inside a single heartbeat
+/// interval and the watchdog stays on cadence.
+const RECOVERY_BACKOFF_MAX: Duration = Duration::from_secs(8);
 
-/// The own-heartbeat watchdog subscription: the seller's OWN kind-30340 addressable heartbeat, so
-/// each published heartbeat round-trips back on this live subscription and proves the receive path is
-/// alive. Keyed by author + kind + `d` (an addressable event is superseded in place, but each
-/// republish still arrives as a fresh delivery on the sub).
-fn self_heartbeat_subscription_filter(seller_pubkey: nostr_sdk::PublicKey) -> Filter {
-    Filter::new()
+/// Backoff to wait after a failed recovery `attempt` before the next one: exponential from
+/// [`RECOVERY_BACKOFF`], capped at [`RECOVERY_BACKOFF_MAX`].
+///
+/// A flat retry interval re-dials the relay as fast as the socket can be torn down — with #171 in
+/// the field that was every wedged node re-dialing shared infrastructure three times a minute,
+/// indefinitely. Backing off spaces the attempts; capping them keeps a whole recovery bounded.
+fn recovery_backoff(attempt: u32) -> Duration {
+    let factor = 1u32 << attempt.saturating_sub(1).min(16);
+    RECOVERY_BACKOFF
+        .saturating_mul(factor)
+        .min(RECOVERY_BACKOFF_MAX)
+}
+
+/// Upper bound on stored open-pool offers a backfilling REQ may return.
+const OFFER_BACKFILL_LIMIT: usize = 500;
+
+/// Stable per-role subscription ids. Named rather than generated so a relay `CLOSED` says WHICH
+/// subscription died — with anonymous ids a closed subscription is indistinguishable in the log,
+/// which is how a node could go silently deaf on one leg while heartbeating happily on another.
+const OFFER_SUB_ID: &str = "mobee-offers";
+const AWARD_SUB_ID: &str = "mobee-awards";
+const WRAP_SUB_ID: &str = "mobee-wraps";
+/// The liveness probe's subscription (see [`probe_relay_serves_our_reqs`]).
+const LIVENESS_PROBE_SUB_ID: &str = "mobee-liveness-probe";
+
+/// How long the liveness probe waits for its `EOSE`. A `limit(0)` REQ is answered in milliseconds by
+/// a healthy relay, so this is generous — it bounds the tick, and a single slow answer is not a stall
+/// on its own (it takes `stall_missed_intervals` consecutive failures to trip the watchdog).
+const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The human label for one of our subscription ids, for logging a relay `CLOSED`.
+fn subscription_label(id: &str) -> &'static str {
+    match id {
+        OFFER_SUB_ID => "offers",
+        AWARD_SUB_ID => "awards",
+        WRAP_SUB_ID => "payment gift-wraps (kind-1059)",
+        LIVENESS_PROBE_SUB_ID => "liveness probe",
+        _ => "unknown (not one of ours)",
+    }
+}
+
+/// Ask the relay to serve one trivial REQ on the CURRENT session and wait for its `EOSE`. True means
+/// the relay is answering OUR subscriptions on THIS authenticated connection — the exact property the
+/// #150 watchdog needs, and the one thing a heartbeat cannot demonstrate.
+///
+/// WHY NOT the own-heartbeat round-trip this replaced: a client cannot observe its own published
+/// event coming back. `RelayPool::send_event_to` saves every event it publishes into the client's own
+/// database (`pool/mod.rs:767`); when the relay echoes it, the inbound handler sees
+/// `DatabaseEventStatus::Saved` and returns without emitting a notification (`relay/inner.rs:1215`,
+/// notification only in the `NotExistent` arm). So the old probe could never succeed — the watchdog
+/// declared a stall every `stall_threshold` on every node, healthy or not, and then drove a recovery
+/// that could not succeed either (#171). A `limit(0)` REQ needs no cooperating publisher and no
+/// stored events: the `EOSE` alone carries the proof.
+async fn probe_relay_serves_our_reqs(
+    client: &Client,
+    seller_pubkey: nostr_sdk::PublicKey,
+    timeout: Duration,
+) -> bool {
+    // Receiver BEFORE the REQ — an EOSE that lands first would otherwise be missed.
+    let mut notifications = client.notifications();
+    let probe_id = nostr_sdk::SubscriptionId::new(LIVENESS_PROBE_SUB_ID);
+    // `limit(0)` asks for zero stored events, so the relay's only work is the EOSE. Scoped to our own
+    // heartbeat address so the filter is narrow and unambiguous even if it ever did match.
+    let probe = Filter::new()
         .kind(Kind::Custom(crate::heartbeat::SELLER_HEARTBEAT_KIND))
         .author(seller_pubkey)
         .identifier(crate::heartbeat::SELLER_HEARTBEAT_D)
+        .limit(0);
+    if let Err(error) = client.subscribe_with_id(probe_id, probe, None).await {
+        eprintln!("seller node liveness probe: REQ could not be sent ({error})");
+        return false;
+    }
+    tokio::time::timeout(timeout, async {
+        loop {
+            match notifications.recv().await {
+                Ok(RelayPoolNotification::Message {
+                    message: nostr_sdk::RelayMessage::EndOfStoredEvents(id),
+                    ..
+                }) if id.to_string() == LIVENESS_PROBE_SUB_ID => return true,
+                Ok(_) => continue,
+                // The stream ending is itself a loss of liveness.
+                Err(_) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// The seller's LIVE offer filters: the TARGETED (`#p == self`) filter always, plus — under
+/// `open_pool` — the un-pinned open-pool filter. BOTH carry the `#t=mobee` namespace guard, so a
+/// foreign event squatting the offer kind is never even delivered.
+///
+/// The two ride ONE subscription (a single REQ, OR-matched per NIP-01). Registered as a separate
+/// second subscription the un-pinned filter delivers stored events but never LIVE offers, so a
+/// running open-pool seller would ignore fresh untargeted offers — grouping them is load-bearing,
+/// not tidiness.
+///
+/// `since` bounds: on a post-stall resubscribe BOTH filters carry the overlap cursor (only the stall
+/// gap is missing). At boot the targeted filter is unbounded — stored offers addressed to this
+/// seller are always wanted — while the open-pool filter is bounded by `offer_backfill_secs`: `0` is
+/// live-only (`since(now)` + `limit(0)`), otherwise `since(now - window)` capped at
+/// [`OFFER_BACKFILL_LIMIT`]. The classify-level deadline-expiry refusal is the staleness guard on
+/// both paths, so a backfilled offer is never claimed just because it was returned.
+fn offer_subscription_filters(
+    seller_pubkey: nostr_sdk::PublicKey,
+    open_pool: bool,
+    offer_backfill_secs: u64,
+    since: Option<nostr_sdk::Timestamp>,
+    now: nostr_sdk::Timestamp,
+) -> Vec<Filter> {
+    let targeted = Filter::new()
+        .kind(Kind::Custom(JOB_OFFER_KIND))
+        .hashtag(crate::gateway::MOBEE_TAG)
+        .pubkey(seller_pubkey);
+    let mut filters = vec![match since {
+        Some(cursor) => targeted.since(cursor),
+        None => targeted,
+    }];
+    if open_pool {
+        let untargeted = Filter::new()
+            .kind(Kind::Custom(JOB_OFFER_KIND))
+            .hashtag(crate::gateway::MOBEE_TAG);
+        filters.push(match since {
+            Some(cursor) => untargeted.since(cursor).limit(OFFER_BACKFILL_LIMIT),
+            None if offer_backfill_secs > 0 => untargeted
+                .since(nostr_sdk::Timestamp::from(
+                    now.as_secs().saturating_sub(offer_backfill_secs),
+                ))
+                .limit(OFFER_BACKFILL_LIMIT),
+            None => untargeted.since(now).limit(0),
+        });
+    }
+    filters
+}
+
+/// Drop the live socket and bring a fresh authenticated one up, returning once NIP-42 has completed
+/// on the NEW connection.
+///
+/// ORDER IS LOAD-BEARING, and it is the whole of #171: `Relay::disconnect` emits
+/// `RelayNotification::Shutdown` on the relay's own notification channel. A receiver taken BEFORE
+/// the disconnect inherits that Shutdown, and [`relay_auth::wait_for_nip42_auth`] reads it as the
+/// fatal "relay shutdown before NIP-42 authentication" — on a socket that in fact authenticated
+/// fine. Recovery then failed 100% of the time (0 successes in 969 field attempts) while the node
+/// kept heartbeating with dead subscriptions, because that Shutdown is relay-internal and never
+/// reaches the pool notifications the run loop watches.
+///
+/// A `broadcast::Receiver` only observes sends made after it subscribes, so taking it AFTER the
+/// disconnect cannot inherit our own teardown — while still taking it BEFORE `connect`, so the
+/// one-shot `Authenticated` notification cannot be missed either. Both halves are required; this is
+/// a free function so a test can drive exactly this sequence.
+async fn reconnect_and_authenticate(
+    client: &Client,
+    relay: &nostr_sdk::prelude::Relay,
+) -> Result<AuthWait, crate::relay_auth::RelayAuthError> {
+    client.disconnect().await;
+    let mut relay_notifications = relay.notifications();
+    client.connect().await;
+    client.wait_for_connection(CONNECT_WAIT).await;
+    relay_auth::wait_for_nip42_auth(&mut relay_notifications, CONNECT_WAIT).await
+}
+
+/// The refusal reason `on_offer` logs when an offer fails to parse.
+///
+/// A cross-version offer is a DISTINCT refusal from a malformed one (#146 / #117 refusal taxonomy):
+/// it is well-formed under another protocol version, not broken tags, and an operator triaging a
+/// quiet seller has to be able to tell those apart. Routing every parse failure through this one
+/// function is what makes the taxonomy testable — collapsing the version arm back into the generic
+/// bucket changes what this returns, so the tooth goes red instead of quietly passing.
+fn offer_parse_refusal(error: &OfferParseError) -> String {
+    match error {
+        OfferParseError::UnsupportedVersion(version) => {
+            format!("unsupported mobee protocol version {version:?}")
+        }
+        other => format!("unparseable ({other})"),
+    }
 }
 
 /// The seller-receive classification on the node redeem path (finding S, ported from the daemon).
@@ -387,24 +558,53 @@ impl SellerNodeRunner {
         self.seller_pubkey.to_hex()
     }
 
-    /// Subscribe the marketplace filters (offers/awards/gift-wraps) plus, when heartbeat is enabled,
-    /// the own-heartbeat watchdog subscription. `since` is `Some(overlap)` on a post-stall resubscribe
-    /// so events published during the stall backfill; `None` at boot. Reused by boot and by the
-    /// watchdog's reconnect so both paths subscribe the SAME set.
-    async fn subscribe_all(
+    /// Subscribe (or re-subscribe) the offer REQ. `open_pool` false forces the targeted-only shape —
+    /// used by the boot/recovery path when the seller has not opted into the open pool, and by the
+    /// `CLOSED` degrade, which keeps targeted claiming alive after the relay refuses the grouped REQ.
+    async fn subscribe_offers(
         &self,
         since: Option<nostr_sdk::Timestamp>,
-        heartbeat_enabled: bool,
+        open_pool: bool,
     ) -> Result<(), NodeError> {
+        let filters = offer_subscription_filters(
+            self.seller_pubkey,
+            open_pool,
+            self.node
+                .home()
+                .config
+                .seller
+                .as_ref()
+                .map(|seller| seller.offer_backfill_secs)
+                .unwrap_or(0),
+            since,
+            nostr_sdk::Timestamp::from(now_unix().max(0) as u64),
+        );
+        self.client
+            .pool()
+            .subscribe_with_id(
+                nostr_sdk::SubscriptionId::new(OFFER_SUB_ID),
+                filters,
+                nostr_sdk::pool::SubscribeOptions::default(),
+            )
+            .await
+            .map_err(|error| NodeError::Relay(format!("subscribe offers: {error}")))?;
+        Ok(())
+    }
+
+    /// Subscribe the marketplace filters: offers, awards, and payment gift-wraps. `since` is
+    /// `Some(overlap)` on a post-stall resubscribe so events published during the stall backfill;
+    /// `None` at boot. Reused by boot and by the watchdog's reconnect so both paths subscribe the SAME
+    /// set — including re-arming the open-pool half after a `CLOSED` degrade.
+    ///
+    /// There is no own-heartbeat subscription: a client cannot be delivered its own published event
+    /// (see [`probe_relay_serves_our_reqs`]), so that REQ could only ever have returned nothing.
+    /// Liveness is asserted by the probe instead.
+    async fn subscribe_all(&self, since: Option<nostr_sdk::Timestamp>) -> Result<(), NodeError> {
         let apply = |filter: Filter| match since {
             Some(cursor) => filter.since(cursor),
             None => filter,
         };
-        let offer_filter = apply(
-            Filter::new()
-                .kind(Kind::Custom(JOB_OFFER_KIND))
-                .pubkey(self.seller_pubkey),
-        );
+        self.subscribe_offers(since, self.claim_open_pool()).await?;
         let award_filter = apply(
             Filter::new()
                 .kind(Kind::Custom(JOB_AWARD_KIND))
@@ -412,19 +612,23 @@ impl SellerNodeRunner {
                 .pubkey(self.seller_pubkey),
         );
         let wrap_filter = apply(Filter::new().kind(Kind::GiftWrap).pubkey(self.seller_pubkey));
-        for filter in [offer_filter, award_filter, wrap_filter] {
+        for (id, filter) in [(AWARD_SUB_ID, award_filter), (WRAP_SUB_ID, wrap_filter)] {
             self.client
-                .subscribe(filter, None)
+                .subscribe_with_id(nostr_sdk::SubscriptionId::new(id), filter, None)
                 .await
-                .map_err(|error| NodeError::Relay(format!("subscribe: {error}")))?;
-        }
-        if heartbeat_enabled {
-            self.client
-                .subscribe(self_heartbeat_subscription_filter(self.seller_pubkey), None)
-                .await
-                .map_err(|error| NodeError::Relay(format!("subscribe self-heartbeat: {error}")))?;
+                .map_err(|error| NodeError::Relay(format!("subscribe {id}: {error}")))?;
         }
         Ok(())
+    }
+
+    /// Whether this seller has opted into claiming untargeted (open-pool) offers.
+    fn claim_open_pool(&self) -> bool {
+        self.node
+            .home()
+            .config
+            .seller
+            .as_ref()
+            .is_some_and(|seller| seller.claim_open_pool)
     }
 
     /// Run the live loop until the relay pool closes: ingests offers/awards/gift-wraps, drains the
@@ -453,7 +657,7 @@ impl SellerNodeRunner {
             .ok_or_else(|| NodeError::Relay("relay missing in run loop".into()))?;
 
         let mut notifications = self.client.notifications();
-        self.subscribe_all(None, heartbeat_enabled).await?;
+        self.subscribe_all(None).await?;
         eprintln!(
             "seller node live: pubkey={} relay={}",
             self.seller_pubkey.to_hex(),
@@ -462,7 +666,7 @@ impl SellerNodeRunner {
         if heartbeat_enabled {
             eprintln!(
                 "seller node heartbeat+watchdog enabled: kind-30340 every {heartbeat_interval_secs}s; \
-                 reconnect if no own heartbeat round-trips within {stall_threshold}s \
+                 reconnect if the relay stops serving our REQs for {stall_threshold}s \
                  ({stall_missed_intervals} missed intervals)"
             );
         }
@@ -494,43 +698,96 @@ impl SellerNodeRunner {
         let mut heartbeat_tick =
             tokio::time::interval(Duration::from_secs(heartbeat_interval_secs.max(1)));
         // Watchdog liveness clocks: monotonic instant (staleness measure, robust to wall-clock jumps)
-        // + unix stamp (resubscribe `since` cursor). Seeded to "now" so a healthy node never trips
-        // before its first heartbeat round-trips.
-        let mut last_self_heartbeat_seen = tokio::time::Instant::now();
-        let mut last_self_heartbeat_seen_unix = now_unix();
+        // + unix stamp (resubscribe `since` cursor). Refreshed whenever the relay answers our liveness
+        // probe. Seeded to "now" so a healthy node never trips before its first probe.
+        let mut last_liveness_seen = tokio::time::Instant::now();
+        let mut last_liveness_seen_unix = now_unix();
+        // Whether the offer REQ is currently running in its degraded targeted-only shape after a
+        // relay `CLOSED` (re-armed by the next successful recovery).
+        let mut open_pool_degraded = false;
+        // A repair the CLOSED arm has asked for, run on the next heartbeat tick through the ONE
+        // paced recovery path rather than an off-cadence ad-hoc resubscribe.
+        let mut forced_recovery: Option<String> = None;
+        // Which path actually restored the receive leg. Manual recovery and the SDK's background
+        // reconnect were previously indistinguishable in the log — which is how a manual path that
+        // never once succeeded went unnoticed (#171). The next answered probe names it.
+        let mut stalled_since_recovery = false;
+        let mut manual_recovery_succeeded = false;
         loop {
             tokio::select! {
                 _ = drain_tick.tick() => {
                     self.drain().await;
                     continue;
                 }
-                // The heartbeat tick rides the SAME loop (never a blocking side-thread). The watchdog
-                // check runs BEFORE publishing (it evaluates whether PRIOR heartbeats round-tripped).
+                // The heartbeat tick rides the SAME loop (never a blocking side-thread). Probe first,
+                // then evaluate staleness: the probe is what proves the relay is still serving our
+                // REQs on this session, and it is bounded so the tick cannot hang on a dead link.
                 _ = heartbeat_tick.tick(), if heartbeat_enabled => {
-                    let stall_elapsed = last_self_heartbeat_seen.elapsed().as_secs();
-                    if subscription_stalled(stall_elapsed, stall_threshold) {
+                    if probe_relay_serves_our_reqs(
+                        &self.client,
+                        self.seller_pubkey,
+                        LIVENESS_PROBE_TIMEOUT,
+                    )
+                    .await
+                    {
+                        if stalled_since_recovery {
+                            if manual_recovery_succeeded {
+                                eprintln!(
+                                    "seller node subscription RESTORED via MANUAL recovery (relay \
+                                     is serving our REQs again)"
+                                );
+                            } else {
+                                eprintln!(
+                                    "seller node subscription RESTORED via SDK BACKGROUND reconnect \
+                                     — no manual recovery had succeeded (relay is serving our REQs \
+                                     again)"
+                                );
+                            }
+                            stalled_since_recovery = false;
+                            manual_recovery_succeeded = false;
+                        }
+                        last_liveness_seen = tokio::time::Instant::now();
+                        last_liveness_seen_unix = now_unix();
+                    }
+                    let stall_elapsed = last_liveness_seen.elapsed().as_secs();
+                    let stalled = subscription_stalled(stall_elapsed, stall_threshold);
+                    let forced = forced_recovery.take();
+                    if stalled || forced.is_some() {
                         let overlap_since = nostr_sdk::Timestamp::from(
-                            last_self_heartbeat_seen_unix
+                            last_liveness_seen_unix
                                 .saturating_sub(STALL_OVERLAP_MARGIN_SECS as i64)
                                 .max(0) as u64,
                         );
-                        eprintln!(
-                            "seller node RELAY-STALL detected: no own heartbeat round-tripped in \
-                             {stall_elapsed}s (threshold {stall_threshold}s); reconnecting + \
-                             resubscribing with since={} overlap",
-                            overlap_since.as_secs()
-                        );
-                        match self.recover_stall(&relay, overlap_since, heartbeat_enabled).await {
+                        if stalled {
+                            eprintln!(
+                                "seller node RELAY-STALL detected: relay has not served our REQs in \
+                                 {stall_elapsed}s (threshold {stall_threshold}s); reconnecting + \
+                                 resubscribing with since={} overlap",
+                                overlap_since.as_secs()
+                            );
+                        } else {
+                            eprintln!(
+                                "seller node RELAY-RECOVERY triggered: {}; reconnecting + \
+                                 resubscribing with since={} overlap",
+                                forced.unwrap_or_default(),
+                                overlap_since.as_secs()
+                            );
+                        }
+                        stalled_since_recovery = true;
+                        match self.recover_stall(&relay, overlap_since).await {
                             Ok(attempts) => {
-                                let outage = now_unix().saturating_sub(last_self_heartbeat_seen_unix);
+                                let outage = now_unix().saturating_sub(last_liveness_seen_unix);
                                 // Grace: reset the watchdog clock so it does not immediately re-fire
-                                // before the first post-reconnect heartbeat round-trips.
-                                last_self_heartbeat_seen = tokio::time::Instant::now();
-                                last_self_heartbeat_seen_unix = now_unix();
+                                // before the next tick's probe can answer.
+                                last_liveness_seen = tokio::time::Instant::now();
+                                last_liveness_seen_unix = now_unix();
+                                // The full set was re-subscribed, so the open-pool half is back.
+                                open_pool_degraded = false;
+                                manual_recovery_succeeded = true;
                                 eprintln!(
                                     "seller node RELAY-STALL recovery SUCCEEDED (attempts={attempts}, \
                                      outage={outage}s): reconnected + resubscribed \
-                                     (offers+awards+1059+heartbeat, since={} overlap)",
+                                     (offers+awards+1059, since={} overlap)",
                                     overlap_since.as_secs()
                                 );
                             }
@@ -548,16 +805,6 @@ impl SellerNodeRunner {
                 recv = notifications.recv() => {
                     match recv {
                         Ok(RelayPoolNotification::Event { event, .. }) => {
-                            // Own-heartbeat round-trip: our kind-30340 coming back proves the RECEIVE
-                            // path is alive. Refresh the liveness clocks and drop it — heartbeats are
-                            // diagnostic and never route to offer/award/payment handling.
-                            if event.kind.as_u16() == crate::heartbeat::SELLER_HEARTBEAT_KIND
-                                && event.pubkey == self.seller_pubkey
-                            {
-                                last_self_heartbeat_seen = tokio::time::Instant::now();
-                                last_self_heartbeat_seen_unix = now_unix();
-                                continue;
-                            }
                             match event.kind {
                                 k if k.as_u16() == JOB_OFFER_KIND => self.on_offer(&event).await,
                                 k if k.as_u16() == JOB_AWARD_KIND => self.on_award(&event).await,
@@ -569,6 +816,52 @@ impl SellerNodeRunner {
                         Ok(RelayPoolNotification::Shutdown) => {
                             eprintln!("seller node: relay pool shutdown; loop ending");
                             break;
+                        }
+                        // A relay `CLOSED` kills ONE subscription while the socket stays up, so the
+                        // heartbeat watchdog cannot see it: close the 1059 leg and the node keeps
+                        // heartbeating happily while every payment silently misses. Never fatal —
+                        // always loud, always repaired.
+                        Ok(RelayPoolNotification::Message {
+                            message: nostr_sdk::RelayMessage::Closed { subscription_id, message: reason },
+                            ..
+                        }) => {
+                            let id = subscription_id.to_string();
+                            let label = subscription_label(&id);
+                            eprintln!(
+                                "seller node RELAY-CLOSED: relay closed the {label} subscription \
+                                 (id={id}): {reason}"
+                            );
+                            // The offer REQ is the one subscription with a meaningful partial form:
+                            // drop the un-pinned open-pool filter and re-subscribe targeted-only, so
+                            // a relay that refuses the grouped REQ still leaves targeted claiming
+                            // alive rather than taking the whole offer leg down.
+                            if id == OFFER_SUB_ID && self.claim_open_pool() && !open_pool_degraded {
+                                match self.subscribe_offers(None, false).await {
+                                    Ok(()) => {
+                                        open_pool_degraded = true;
+                                        eprintln!(
+                                            "seller node RELAY-CLOSED DEGRADE: offer subscription \
+                                             re-armed TARGETED-ONLY (open-pool half dropped; \
+                                             re-armed on the next successful recovery)"
+                                        );
+                                    }
+                                    Err(error) => {
+                                        eprintln!(
+                                            "seller node RELAY-CLOSED degrade failed ({error}); \
+                                             forcing full recovery on the next heartbeat tick"
+                                        );
+                                        forced_recovery = Some(format!(
+                                            "offer subscription CLOSED and the targeted-only degrade failed: {error}"
+                                        ));
+                                    }
+                                }
+                            } else {
+                                // Awards / 1059 / heartbeat have no partial form — repair them
+                                // through the one paced recovery path so nothing re-dials the relay
+                                // off-cadence.
+                                forced_recovery =
+                                    Some(format!("relay CLOSED the {label} subscription: {reason}"));
+                            }
                         }
                         Ok(_) => {}
                         Err(error) => {
@@ -659,23 +952,23 @@ impl SellerNodeRunner {
         &self,
         relay: &nostr_sdk::prelude::Relay,
         overlap_since: nostr_sdk::Timestamp,
-        heartbeat_enabled: bool,
     ) -> Result<u32, NodeError> {
         let mut attempt = 0;
         loop {
             attempt += 1;
             match self
-                .reconnect_and_resubscribe(relay, overlap_since, heartbeat_enabled)
+                .reconnect_and_resubscribe(relay, overlap_since)
                 .await
             {
                 Ok(()) => return Ok(attempt),
                 Err(error) if attempt < RECOVERY_MAX_ATTEMPTS => {
+                    let backoff = recovery_backoff(attempt);
                     eprintln!(
                         "seller node RELAY-STALL recovery attempt {attempt} failed ({error}); \
                          retrying in {}s",
-                        RECOVERY_BACKOFF.as_secs()
+                        backoff.as_secs()
                     );
-                    tokio::time::sleep(RECOVERY_BACKOFF).await;
+                    tokio::time::sleep(backoff).await;
                 }
                 Err(error) => return Err(error),
             }
@@ -690,18 +983,12 @@ impl SellerNodeRunner {
         &self,
         relay: &nostr_sdk::prelude::Relay,
         overlap_since: nostr_sdk::Timestamp,
-        heartbeat_enabled: bool,
     ) -> Result<(), NodeError> {
-        // Fresh receiver BEFORE the reconnect so the `Authenticated` notification can't be missed.
-        let mut relay_notifications = relay.notifications();
-        self.client.disconnect().await;
-        self.client.connect().await;
-        self.client.wait_for_connection(CONNECT_WAIT).await;
-        relay_auth::wait_for_nip42_auth(&mut relay_notifications, CONNECT_WAIT)
+        reconnect_and_authenticate(&self.client, relay)
             .await
             .map_err(|error| NodeError::Relay(format!("reconnect NIP-42 auth: {error}")))?;
         self.client.unsubscribe_all().await;
-        self.subscribe_all(Some(overlap_since), heartbeat_enabled).await
+        self.subscribe_all(Some(overlap_since)).await
     }
 
     /// Consider one offer event: parse it, apply the money-safety gates, and — if admitted — journal
@@ -719,19 +1006,12 @@ impl SellerNodeRunner {
         let draft = event_to_draft(event);
         let offer = match parse_offer(&draft) {
             Ok(offer) => offer,
-            // A cross-version / unsupported protocol version is a DISTINCT refusal, not a generic
-            // parse failure: a version-skew offer is well-formed under another version, not malformed
-            // tags. Kept distinct so operators and buyers can tell version skew from a genuine parse
-            // failure (refusal taxonomy — #146 / #117).
-            Err(OfferParseError::UnsupportedVersion(version)) => {
-                eprintln!(
-                    "seller node offer skip id={}: unsupported mobee protocol version {version:?}",
-                    event.id
-                );
-                return;
-            }
             Err(error) => {
-                eprintln!("seller node offer skip id={}: unparseable ({error})", event.id);
+                eprintln!(
+                    "seller node offer skip id={}: {}",
+                    event.id,
+                    offer_parse_refusal(&error)
+                );
                 return;
             }
         };
@@ -1363,7 +1643,14 @@ impl SellerNodeRunner {
             .collect_receipt(&event_id, &job_id, amount_received, now_unix())
         {
             Ok(super::store::Collected::New) => {
-                eprintln!("seller node paid job_id={job_id} amount={amount_received} receipt={event_id}")
+                // `event_id` is the kind-1059 payment gift-wrap — the id this collection is
+                // journaled and deduped under. It is NOT the co-signed kind-3400 receipt (the buyer
+                // publishes that; the seller never sees its id on this path), so name it for what it
+                // is rather than inviting an operator to grep the relay for a 3400 that will not
+                // match.
+                eprintln!(
+                    "seller node paid job_id={job_id} amount={amount_received} payment_wrap={event_id}"
+                )
             }
             Ok(super::store::Collected::Duplicate) => eprintln!(
                 "seller node wrap event={event_id}: receipt already collected for job {job_id} (dedup no-op)"
@@ -1535,10 +1822,398 @@ mod tests {
                 tag.0 = vec!["v".to_owned(), "99".to_owned()];
             }
         }
+        let skew = parse_offer(&draft).expect_err("version skew must not parse");
         assert!(
-            matches!(parse_offer(&draft), Err(OfferParseError::UnsupportedVersion(v)) if v == "99"),
+            matches!(&skew, OfferParseError::UnsupportedVersion(v) if v == "99"),
             "version skew must parse as a distinct UnsupportedVersion, not generic unparseable"
         );
+
+        // The ROUTING is the thing under test: pinning `parse_offer`'s enum alone let a revert that
+        // collapsed on_offer's version arm into the generic bucket pass green. Assert on the refusal
+        // on_offer actually emits, and that a genuinely malformed offer emits a DIFFERENT one.
+        let mut malformed = draft.clone();
+        malformed.tags.clear();
+        let broken = parse_offer(&malformed).expect_err("a tagless offer must not parse");
+
+        let skew_reason = offer_parse_refusal(&skew);
+        let broken_reason = offer_parse_refusal(&broken);
+        assert!(
+            skew_reason.contains("unsupported mobee protocol version") && skew_reason.contains("99"),
+            "the version-skew refusal must say so and name the version, got {skew_reason:?}"
+        );
+        assert!(
+            broken_reason.contains("unparseable"),
+            "a malformed offer stays in the generic bucket, got {broken_reason:?}"
+        );
+        assert_ne!(
+            skew_reason, broken_reason,
+            "collapsing version skew into the generic unparseable bucket is the #146 regression"
+        );
+    }
+
+    // TOOTH (#171 layer 2 / #172) — the offer REQ carries the un-pinned open-pool filter IFF the
+    // seller opted in, and BOTH filters carry the `#t=mobee` namespace guard. The node subscribed
+    // targeted-only unconditionally, so a `claim_open_pool = true` seller ran a claim gate over
+    // offers its subscription could never deliver. Bite: drop the `claim_open_pool` branch and the
+    // two-filter assertions go red; drop the hashtag and the guard assertions go red.
+    #[test]
+    fn open_pool_filter_rides_the_offer_req_iff_opted_in() {
+        let seller = nostr_sdk::prelude::Keys::generate().public_key();
+        let now = nostr_sdk::Timestamp::from(NOW);
+
+        let targeted_only = offer_subscription_filters(seller, false, 1200, None, now);
+        assert_eq!(
+            targeted_only.len(),
+            1,
+            "a targeted-only seller subscribes exactly the pinned filter"
+        );
+        assert_eq!(
+            targeted_only[0].generic_tags.get(&nostr_sdk::SingleLetterTag::lowercase(
+                nostr_sdk::Alphabet::P
+            )),
+            Some(&[seller.to_hex()].into_iter().collect()),
+            "the targeted filter must stay pinned to this seller"
+        );
+
+        let open_pool = offer_subscription_filters(seller, true, 1200, None, now);
+        assert_eq!(
+            open_pool.len(),
+            2,
+            "an open-pool seller must ALSO subscribe the un-pinned filter — without it the \
+             claim_open_pool gate governs offers that never arrive"
+        );
+        assert!(
+            open_pool[1]
+                .generic_tags
+                .get(&nostr_sdk::SingleLetterTag::lowercase(nostr_sdk::Alphabet::P))
+                .is_none(),
+            "the open-pool filter is un-pinned by definition"
+        );
+
+        // The namespace guard rides BOTH filters: a foreign event squatting the offer kind is never
+        // even delivered.
+        let hashtag = nostr_sdk::SingleLetterTag::lowercase(nostr_sdk::Alphabet::T);
+        for (index, filter) in open_pool.iter().enumerate() {
+            assert_eq!(
+                filter.generic_tags.get(&hashtag),
+                Some(&[crate::gateway::MOBEE_TAG.to_owned()].into_iter().collect()),
+                "offer filter {index} must carry the #t=mobee namespace guard"
+            );
+        }
+
+        // `offer_backfill_secs = 0` is live-only: `since(now)` + `limit(0)` requests zero stored
+        // offers. A window asks for a bounded stored burst instead.
+        let live_only = offer_subscription_filters(seller, true, 0, None, now);
+        assert_eq!(live_only[1].limit, Some(0), "live-only requests no stored offers");
+        assert_eq!(live_only[1].since, Some(now));
+        let windowed = offer_subscription_filters(seller, true, 1200, None, now);
+        assert_eq!(windowed[1].limit, Some(OFFER_BACKFILL_LIMIT));
+        assert_eq!(windowed[1].since, Some(nostr_sdk::Timestamp::from(NOW - 1200)));
+
+        // On a post-stall resubscribe BOTH filters carry the overlap cursor — only the stall gap is
+        // missing, and the classify-level deadline refusal is the staleness guard.
+        let overlap = nostr_sdk::Timestamp::from(NOW - 60);
+        let resubscribed = offer_subscription_filters(seller, true, 1200, Some(overlap), now);
+        for filter in &resubscribed {
+            assert_eq!(filter.since, Some(overlap));
+        }
+    }
+
+    // TOOTH (#171 layer 1, THE fix) — an in-process reconnect re-authenticates and the receive path
+    // comes BACK, against a fixture that enforces NIP-42 before it will serve a REQ.
+    //
+    // The fixture parity matters: the previous watchdog teeth ran against a LocalRelay that served
+    // reads unauthenticated, so the auth step was decorative and the ordering bug shipped green. Here
+    // `RelayBuilderNip42Mode::Both` refuses a REQ from an unauthenticated session, so an event can
+    // only arrive if auth genuinely completed on the new socket.
+    //
+    // The assertion is DELIVERY, not a return code: a live socket happily coexists with dead
+    // subscriptions (that is exactly what wedged the field nodes — heartbeating, deaf), so a tooth
+    // that only checked `Ok(..)` would be the same false green.
+    //
+    // BITE: swap the two lines in `reconnect_and_authenticate` so `relay.notifications()` is taken
+    // before `client.disconnect()`, and this goes red — the auth wait reads our own Shutdown and
+    // returns "relay shutdown before NIP-42 authentication".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconnect_reauthenticates_and_delivery_resumes_in_process() {
+        use nostr_relay_builder::prelude::{
+            LocalRelay, RelayBuilder, RelayBuilderNip42, RelayBuilderNip42Mode,
+        };
+        use nostr_sdk::prelude::{Client, EventBuilder, Keys, RelayOptions, RelayUrl};
+
+        let wait = std::time::Duration::from_secs(10);
+
+        // Auth-enforcing fixture: it will not serve a REQ (nor accept an EVENT) until the session
+        // has completed NIP-42.
+        let relay_fixture = LocalRelay::new(RelayBuilder::default().nip42(RelayBuilderNip42 {
+            mode: RelayBuilderNip42Mode::Both,
+        }));
+        relay_fixture.run().await.expect("fixture relay run");
+        let relay_url = relay_fixture.url().await.to_string();
+
+        let seller = Keys::generate();
+        let client = Client::new(seller.clone());
+        client.automatic_authentication(true);
+        client
+            .pool()
+            .add_relay(&relay_url, RelayOptions::default().reconnect(true))
+            .await
+            .expect("add relay");
+        let relay = client
+            .relays()
+            .await
+            .get(&RelayUrl::parse(&relay_url).expect("relay url"))
+            .cloned()
+            .expect("relay handle");
+
+        // The beacon is published by a SEPARATE client, which is both the faithful shape (the node's
+        // receive path carries events from OTHERS — offers, awards, payment wraps) and a hard
+        // requirement: `RelayPool::send_event_to` saves every published event into the publishing
+        // client's own database (pool/mod.rs:767), and the inbound handler drops any event already
+        // present there without notifying (relay/inner.rs:1215-1218). A client therefore cannot
+        // observe its own event coming back — using this client to publish would test nothing.
+        let author = Keys::generate();
+        let author_pubkey = author.public_key();
+        let publisher = Client::new(author.clone());
+        publisher.automatic_authentication(true);
+        publisher
+            .pool()
+            .add_relay(&relay_url, RelayOptions::default())
+            .await
+            .expect("add relay (publisher)");
+        let publisher_relay = publisher
+            .relays()
+            .await
+            .get(&RelayUrl::parse(&relay_url).expect("relay url"))
+            .cloned()
+            .expect("publisher relay handle");
+        let mut publisher_notifications = publisher_relay.notifications();
+        publisher.connect().await;
+        publisher.wait_for_connection(wait).await;
+        // Writes are auth-gated too, and this fixture challenges on the first REQ — so probe once to
+        // get the publisher authenticated before it tries to publish anything.
+        publisher
+            .subscribe(Filter::new().kind(Kind::TextNote).limit(0), None)
+            .await
+            .expect("publisher probe subscribe");
+        relay_auth::wait_for_nip42_auth(&mut publisher_notifications, wait)
+            .await
+            .expect("publisher auth");
+
+        let beacon_filter = Filter::new().kind(Kind::TextNote).author(author_pubkey);
+        let beacon = |content: &str| {
+            EventBuilder::new(Kind::TextNote, content)
+                .sign_with_keys(&author)
+                .expect("sign beacon")
+        };
+        // Await one specific event on a pool receiver. Returns false on timeout — the failure this
+        // whole tooth exists to catch is silence.
+        async fn arrives(
+            notifications: &mut tokio::sync::broadcast::Receiver<RelayPoolNotification>,
+            id: nostr_sdk::EventId,
+            wait: std::time::Duration,
+        ) -> bool {
+            tokio::time::timeout(wait, async {
+                loop {
+                    match notifications.recv().await {
+                        Ok(RelayPoolNotification::Event { event, .. }) if event.id == id => {
+                            return true
+                        }
+                        Ok(_) => continue,
+                        Err(_) => return false,
+                    }
+                }
+            })
+            .await
+            .unwrap_or(false)
+        }
+        // EOSE is the relay confirming our REQ is registered. Waiting for it makes the test
+        // deterministic: publishing before the subscription lands would race, and a race here would
+        // read as the very silence the tooth is meant to detect.
+        async fn subscription_live(
+            notifications: &mut tokio::sync::broadcast::Receiver<RelayPoolNotification>,
+            wait: std::time::Duration,
+        ) -> bool {
+            tokio::time::timeout(wait, async {
+                loop {
+                    match notifications.recv().await {
+                        Ok(RelayPoolNotification::Message {
+                            message: nostr_sdk::RelayMessage::EndOfStoredEvents(_),
+                            ..
+                        }) => return true,
+                        Ok(_) => continue,
+                        Err(_) => return false,
+                    }
+                }
+            })
+            .await
+            .unwrap_or(false)
+        }
+
+        // Boot the way the node does: receiver before connect, then subscribe. This fixture
+        // challenges lazily (on the first REQ) where the deployed relay challenges on connect;
+        // either way auto-auth answers it and `Authenticated` is what the node waits for.
+        let mut boot_notifications = relay.notifications();
+        client.connect().await;
+        client.wait_for_connection(wait).await;
+        client
+            .subscribe(beacon_filter.clone(), None)
+            .await
+            .expect("boot subscribe");
+        assert_eq!(
+            relay_auth::wait_for_nip42_auth(&mut boot_notifications, wait)
+                .await
+                .expect("boot auth"),
+            AuthWait::Authenticated,
+            "the fixture must actually enforce NIP-42 — if it never challenges, this whole tooth \
+             is decorative (which is how the ordering bug shipped green)"
+        );
+
+        // Baseline: delivery works BEFORE the reconnect, so a post-reconnect silence is the code's
+        // fault and not the harness's. Re-subscribe post-auth exactly as the recovery path does —
+        // the boot REQ was refused pre-auth — and wait for the relay to confirm it.
+        let mut notifications = client.notifications();
+        client.unsubscribe_all().await;
+        client
+            .subscribe(beacon_filter.clone(), None)
+            .await
+            .expect("post-auth subscribe");
+        assert!(
+            subscription_live(&mut notifications, wait).await,
+            "harness check: the relay must confirm (EOSE) the post-auth subscription"
+        );
+        let before = beacon("pre-reconnect baseline");
+        publisher
+            .send_event(&before)
+            .await
+            .expect("publish baseline");
+        assert!(
+            arrives(&mut notifications, before.id, wait).await,
+            "harness check: the subscription must deliver before we induce the reconnect"
+        );
+
+        // THE PRODUCTION PATH under test: an in-process reconnect, no process restart.
+        let outcome = reconnect_and_authenticate(&client, &relay)
+            .await
+            .expect("in-process reconnect must re-authenticate — this is #171");
+        assert_eq!(
+            outcome,
+            AuthWait::Authenticated,
+            "the reconnect must complete NIP-42 on the NEW socket, not report a shutdown it caused"
+        );
+
+        // What the recovery path does next: replace the stale subscriptions AFTER auth.
+        let mut post = client.notifications();
+        client.unsubscribe_all().await;
+        client
+            .subscribe(beacon_filter, None)
+            .await
+            .expect("post-reconnect subscribe");
+        assert!(
+            subscription_live(&mut post, wait).await,
+            "the relay must serve the post-reconnect REQ — on this fixture that is only possible \
+             on an authenticated session"
+        );
+
+        let after = beacon("post-reconnect liveness beacon");
+        publisher.send_event(&after).await.expect("publish beacon");
+        assert!(
+            arrives(&mut post, after.id, wait).await,
+            "the receive path must be ALIVE after an in-process reconnect — a recovery that \
+             returns Ok while nothing is delivered is the silent wedge this fixes"
+        );
+
+        client.disconnect().await;
+        publisher.disconnect().await;
+    }
+
+    // TOOTH (#171 TRIGGER) — the liveness probe asserts the property the watchdog actually needs:
+    // "the relay is serving MY REQs on THIS authenticated session". Both halves, because a probe that
+    // can only ever answer one way is exactly the bug being fixed — the own-heartbeat round-trip it
+    // replaced could NEVER succeed (nostr-sdk saves published events into the client's own database
+    // and then swallows the relay's echo of them), so every node declared a stall every
+    // `stall_threshold` forever, healthy or not, and drove a recovery that could not succeed either.
+    //
+    // BITE (positive half): break the probe — wrong sub id in the EOSE match, or drop the `limit(0)`
+    // REQ — and the authenticated case goes red.
+    // BITE (negative half): make the probe return true on timeout, or accept any EOSE regardless of
+    // session, and the unauthenticated case goes red. That half is what pins "on THIS session":
+    // against this fixture an unauthenticated REQ is answered with CLOSED and never an EOSE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn liveness_probe_answers_only_on_an_authenticated_session() {
+        use nostr_relay_builder::prelude::{
+            LocalRelay, RelayBuilder, RelayBuilderNip42, RelayBuilderNip42Mode,
+        };
+        use nostr_sdk::prelude::{Client, Keys, RelayOptions};
+
+        let wait = std::time::Duration::from_secs(10);
+        let relay_fixture = LocalRelay::new(RelayBuilder::default().nip42(RelayBuilderNip42 {
+            mode: RelayBuilderNip42Mode::Both,
+        }));
+        relay_fixture.run().await.expect("fixture relay run");
+        let relay_url = relay_fixture.url().await.to_string();
+
+        // POSITIVE: an authenticated session. Auto-auth answers the fixture's challenge (raised on the
+        // probe's own REQ), the relay serves it, and the EOSE comes back.
+        let seller = Keys::generate();
+        let authed = Client::new(seller.clone());
+        authed.automatic_authentication(true);
+        authed
+            .pool()
+            .add_relay(&relay_url, RelayOptions::default())
+            .await
+            .expect("add relay (authed)");
+        authed.connect().await;
+        authed.wait_for_connection(wait).await;
+        assert!(
+            probe_relay_serves_our_reqs(&authed, seller.public_key(), wait).await,
+            "the probe must be answerable on a healthy authenticated session — otherwise the \
+             watchdog is back to a signal that can never arrive"
+        );
+
+        // NEGATIVE: same relay, same probe, but auto-auth OFF so the session never authenticates. The
+        // fixture answers the REQ with CLOSED instead of serving it, so no EOSE ever arrives and the
+        // probe must report the loss of liveness rather than assuming it.
+        let stranger = Keys::generate();
+        let unauthed = Client::new(stranger.clone());
+        unauthed.automatic_authentication(false);
+        unauthed
+            .pool()
+            .add_relay(&relay_url, RelayOptions::default())
+            .await
+            .expect("add relay (unauthed)");
+        unauthed.connect().await;
+        unauthed.wait_for_connection(wait).await;
+        assert!(
+            !probe_relay_serves_our_reqs(
+                &unauthed,
+                stranger.public_key(),
+                std::time::Duration::from_secs(2),
+            )
+            .await,
+            "a session the relay refuses to serve is NOT alive — reporting it alive is how the \
+             watchdog would go blind in the other direction"
+        );
+
+        authed.disconnect().await;
+        unauthed.disconnect().await;
+    }
+
+    // TOOTH (#171 layer 3) — recovery attempts back off instead of re-dialing at a flat interval,
+    // and the backoff is capped so one bounded recovery still fits inside a heartbeat interval.
+    #[test]
+    fn recovery_backoff_grows_and_stays_capped() {
+        assert_eq!(recovery_backoff(1), RECOVERY_BACKOFF);
+        assert!(
+            recovery_backoff(2) > recovery_backoff(1),
+            "a flat retry interval is what hammered shared relay infrastructure"
+        );
+        for attempt in 1..=64 {
+            assert!(
+                recovery_backoff(attempt) <= RECOVERY_BACKOFF_MAX,
+                "attempt {attempt} exceeded the cap"
+            );
+        }
     }
 
     // TOOTH (buyer-facing feedback) — a TARGETED under-rate refusal surfaces a 3404 to the buyer;
