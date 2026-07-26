@@ -31,6 +31,35 @@ enum Command {
         created_at: i64,
         reply: oneshot::Sender<Result<SignedEvent, String>>,
     },
+    /// Schnorr-sign a 32-byte receipt-preimage digest (hex) with the seller key — the seller's half
+    /// of the delivery co-signature. The digest is computed by the caller from the STORED creq
+    /// (audit N-4); the actor only signs, so the key never leaves this task.
+    SignReceiptHash {
+        digest_hex: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    /// Build the NIP-98 (`kind:27235`) `Authorization` header for a relay-git push to `remote_url`,
+    /// signed with the seller key. Routing the push authorization through the actor keeps the secret
+    /// confined to this task + the authenticated relay client — the push path never re-reads the key.
+    HttpAuthHeader {
+        remote_url: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    /// NIP-44/NIP-17 unwrap of a kind-1059 gift-wrap addressed to the seller, decoded to its NUT-18
+    /// payment (or `None` when it is not a decodable own-payment wrap). The decrypt needs the seller
+    /// key, so it runs INSIDE the actor; only the buyer's decrypted payment (never the seller key)
+    /// leaves.
+    UnwrapPaymentWrap {
+        event: Box<nostr_sdk::Event>,
+        reply: oneshot::Sender<Result<Option<crate::payment_send::ReceivedPayment>, String>>,
+    },
+    /// Derive the cashu P2PK signing key from the seller key. cdk's `receive` witnesses P2PK-locked
+    /// proofs with the RAW key (no signature-only path), so the derived key is materialized here from
+    /// the seller key — which never leaves the actor — and handed out solely for that redeem. This is
+    /// a derived payment key, not the seller identity key.
+    CashuP2pkSecret {
+        reply: oneshot::Sender<Result<cashu::SecretKey, String>>,
+    },
 }
 
 /// A cheap, cloneable handle to the signer actor.
@@ -79,6 +108,66 @@ impl SignerHandle {
         rx.await.map_err(|_| SignerActorGone)
     }
 
+    /// Schnorr-sign a receipt-preimage digest (32-byte hex) through the actor — the delivery
+    /// co-signature. Returns the signature hex, or the inner `Err` when the digest is malformed. The
+    /// seller key never leaves the actor.
+    pub async fn sign_receipt_hash(
+        &self,
+        digest_hex: String,
+    ) -> Result<Result<String, String>, SignerActorGone> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::SignReceiptHash { digest_hex, reply })
+            .await
+            .map_err(|_| SignerActorGone)?;
+        rx.await.map_err(|_| SignerActorGone)
+    }
+
+    /// Build the NIP-98 push `Authorization` header for `remote_url` through the actor — the seller
+    /// key never leaves the actor, so the push path is not a third custody site. Returns the header
+    /// string, or the inner `Err` when the remote url / signing fails.
+    pub async fn http_auth_header(
+        &self,
+        remote_url: String,
+    ) -> Result<Result<String, String>, SignerActorGone> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::HttpAuthHeader { remote_url, reply })
+            .await
+            .map_err(|_| SignerActorGone)?;
+        rx.await.map_err(|_| SignerActorGone)
+    }
+
+    /// Decode a gift-wrap to its NUT-18 payment through the actor (the NIP-44 decrypt needs the
+    /// seller key, which never leaves the actor). `Ok(None)` = not a decodable own-payment wrap.
+    pub async fn unwrap_payment_wrap(
+        &self,
+        event: nostr_sdk::Event,
+    ) -> Result<Result<Option<crate::payment_send::ReceivedPayment>, String>, SignerActorGone> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::UnwrapPaymentWrap {
+                event: Box::new(event),
+                reply,
+            })
+            .await
+            .map_err(|_| SignerActorGone)?;
+        rx.await.map_err(|_| SignerActorGone)
+    }
+
+    /// The cashu P2PK signing key derived from the seller key, for a cdk `receive` that must witness
+    /// P2PK-locked proofs with the raw key. The seller key never leaves the actor.
+    pub async fn cashu_p2pk_secret(
+        &self,
+    ) -> Result<Result<cashu::SecretKey, String>, SignerActorGone> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::CashuP2pkSecret { reply })
+            .await
+            .map_err(|_| SignerActorGone)?;
+        rx.await.map_err(|_| SignerActorGone)
+    }
+
     /// The seller public key (hex), routed through the actor queue (proves the serialized path).
     pub async fn public_key_via_actor(&self) -> Result<String, SignerActorGone> {
         let (reply, rx) = oneshot::channel();
@@ -112,6 +201,29 @@ pub fn spawn(home: &MobeeHome) -> Result<SignerHandle, HomeError> {
                     reply,
                 } => {
                     let result = sign_event(&keys, &draft, created_at);
+                    let _ = reply.send(result);
+                }
+                Command::SignReceiptHash { digest_hex, reply } => {
+                    let result = crate::seller::sign_receipt_hash(&keys, &digest_hex)
+                        .map_err(|error| error.to_string());
+                    let _ = reply.send(result);
+                }
+                Command::HttpAuthHeader { remote_url, reply } => {
+                    let result =
+                        crate::git_transport::nip98_authorization_header_with_keys(&remote_url, &keys)
+                            .map_err(|error| error.to_string());
+                    let _ = reply.send(result);
+                }
+                Command::UnwrapPaymentWrap { event, reply } => {
+                    let result = crate::seller::unwrap_own_payment_gift_wrap(&keys, &event)
+                        .await
+                        .map_err(|error| error.to_string());
+                    let _ = reply.send(result);
+                }
+                Command::CashuP2pkSecret { reply } => {
+                    let result =
+                        crate::seller::cashu_secret_from_nostr_hex(&keys.secret_key().to_secret_hex())
+                            .map_err(|error| error.to_string());
                     let _ = reply.send(result);
                 }
             }
@@ -189,6 +301,53 @@ mod tests {
         let again = signer.sign(claim_draft(), 1000).await.expect("b").expect("sign");
         assert_eq!(first.id, again.id, "same draft + created_at ⇒ same event id");
         assert!(!first.json.contains(&secret), "signed json must not leak the secret");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The delivery co-signature: the actor schnorr-signs a receipt digest with the seller key and
+    // returns a 64-byte (128-hex) signature, never the secret; a malformed digest fails cleanly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn signs_receipt_hash_through_the_actor_never_leaking_the_secret() {
+        let root = temp_home("receipt");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        let secret = home::read_secret_key_hex(&home).expect("secret");
+        let signer = spawn(&home).expect("spawn");
+
+        let digest = "ab".repeat(32); // 32 bytes hex
+        let sig = signer
+            .sign_receipt_hash(digest.clone())
+            .await
+            .expect("actor")
+            .expect("sign");
+        assert_eq!(sig.len(), 128, "schnorr signature is 64 bytes / 128 hex");
+        assert_ne!(sig, secret, "signature is not the secret");
+        let _ = digest;
+        // A malformed digest (not 32 bytes) fails closed rather than signing garbage.
+        assert!(signer.sign_receipt_hash("zz".to_owned()).await.expect("actor").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The push authorization is signed THROUGH the actor: the header is a valid "Nostr <base64>"
+    // NIP-98 token and never contains the secret. This is what keeps the push off a third custody
+    // site — the seller key is used only inside the actor to sign it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn builds_nip98_push_header_through_the_actor_never_leaking_the_secret() {
+        let root = temp_home("httpauth");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        let secret = home::read_secret_key_hex(&home).expect("secret");
+        let signer = spawn(&home).expect("spawn");
+
+        let header = signer
+            .http_auth_header("https://relay.example/git/o/r.git".to_owned())
+            .await
+            .expect("actor")
+            .expect("header");
+        assert!(header.starts_with("Nostr "), "NIP-98 auth scheme: {header}");
+        assert!(!header.contains(&secret), "push header must not leak the secret");
+        // A malformed remote url fails cleanly rather than signing garbage.
+        assert!(signer.http_auth_header("not a url".to_owned()).await.expect("actor").is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 

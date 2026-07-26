@@ -44,10 +44,17 @@ pub mod payment_send;
 #[cfg(feature = "wallet")]
 pub mod payment_wallet;
 pub mod receipt;
+/// Shared NIP-42 relay-auth handshake, neutral to any single consumer (seller receive + buyer
+/// receipt-publish both use it).
+#[cfg(feature = "gateway")]
+pub mod relay_auth;
 pub mod runtime_guard;
 pub mod seller;
+/// Agent-run + delivery-shaping helpers for the seller node: run the awarded agent, compose its
+/// delivery prompt, derive the delivery kind, and shape the public exec-metadata block. Kept in its
+/// own module (with a neutral error) so the run loop stays focused on the relay surface.
 #[cfg(feature = "wallet")]
-pub mod seller_daemon;
+pub mod seller_exec;
 /// Persistent per-home seller node (exclusive lock, receiving wallet + identity behind serialized
 /// actors, durable lifecycle store with a nostr event outbox, single relay ingester, agent roster).
 /// The durable substrate the live seller loop moves onto; mirrors the buyer daemon's shape. The

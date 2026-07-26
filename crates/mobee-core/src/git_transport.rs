@@ -174,17 +174,28 @@ pub fn nip98_authorization_header(
     remote_url: &str,
     secret_key_hex: &str,
 ) -> Result<String, TransportError> {
+    let keys = nostr_sdk::Keys::parse(secret_key_hex)
+        .map_err(|error| TransportError::Auth(format!("invalid key: {error}")))?;
+    nip98_authorization_header_with_keys(remote_url, &keys)
+}
+
+/// Build the NIP-98 `Authorization` header from an already-held [`Keys`](nostr_sdk::Keys) instead of
+/// a raw secret hex. This is the custody-preserving entry point: a caller that keeps its secret
+/// inside a signer actor signs the header THROUGH the actor (which owns the `Keys`) so the secret is
+/// never re-read into a third site. Identical header to [`nip98_authorization_header`].
+pub fn nip98_authorization_header_with_keys(
+    remote_url: &str,
+    keys: &nostr_sdk::Keys,
+) -> Result<String, TransportError> {
     use base64::Engine as _;
     use nostr_sdk::nips::nip98::{HttpData, HttpMethod};
     use nostr_sdk::prelude::{EventBuilder, Url};
-    use nostr_sdk::{JsonUtil, Keys};
+    use nostr_sdk::JsonUtil;
 
-    let keys = Keys::parse(secret_key_hex)
-        .map_err(|error| TransportError::Auth(format!("invalid key: {error}")))?;
     let url = Url::parse(remote_url)
         .map_err(|error| TransportError::Io(format!("invalid remote url: {error}")))?;
     let event = EventBuilder::http_auth(HttpData::new(url, HttpMethod::POST))
-        .sign_with_keys(&keys)
+        .sign_with_keys(keys)
         .map_err(|error| TransportError::Auth(format!("nip98 sign failed: {error}")))?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(event.as_json());
     Ok(format!("Nostr {encoded}"))
@@ -210,9 +221,23 @@ pub fn push_branch(
     branch: &str,
     auth: Option<&str>,
 ) -> Result<String, TransportError> {
+    let header = header_for(remote_url, auth)?;
+    push_branch_with_header(workdir, remote_url, branch, header)
+}
+
+/// Like [`push_branch`] but takes an already-resolved NIP-98 `Authorization` header instead of the
+/// raw secret. A custody-preserving caller builds the header through its signer actor
+/// ([`nip98_authorization_header_with_keys`]) and passes it here, so the secret never reaches this
+/// layer. `None` = no auth (public/anonymous https). The header is bound to the repo-root URL and
+/// reused for both the info/refs advertisement and the service POST, exactly as `push_branch` does.
+pub fn push_branch_with_header(
+    workdir: &Path,
+    remote_url: &str,
+    branch: &str,
+    header: Option<String>,
+) -> Result<String, TransportError> {
     assert_allowed_repo_locator(remote_url)?;
     ensure_registered();
-    let header = header_for(remote_url, auth)?;
 
     let repo = Repository::open(workdir)
         .map_err(|error| TransportError::Io(format!("open workdir repo: {error}")))?;

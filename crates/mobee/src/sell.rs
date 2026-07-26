@@ -225,20 +225,32 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
         disco.pubkey
     );
 
-    let daemon = mobee_core::seller_daemon::SellerDaemon::open(home).map_err(|error| {
-        let _ = writeln!(err, "{error}");
-        RUNTIME_ERROR
-    })?;
+    // Boot the durable seller node (sqlite store + outbox + reconcile_on_start) as the seller path.
+    // run_sell is synchronous, so it owns a current-thread runtime here and block_on's the async boot
+    // + run loop.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            let _ = writeln!(err, "tokio runtime: {error}");
+            RUNTIME_ERROR
+        })?;
+    let runner = runtime
+        .block_on(mobee_core::seller_node::run::SellerNodeRunner::boot(home))
+        .map_err(|error| {
+            let _ = writeln!(err, "{error}");
+            RUNTIME_ERROR
+        })?;
     let _ = writeln!(
         err,
-        "seller starting pubkey={} agent={} rate_sats={} claim_open_pool={} git_remote={} (never-echo: key omitted)",
-        daemon.seller_pubkey(),
+        "seller node starting pubkey={} agent={} rate_sats={} claim_open_pool={} git_remote={} (never-echo: key omitted)",
+        runner.seller_pubkey(),
         seller.agent.as_deref().unwrap_or("custom"),
         seller.rate_sats,
         seller.claim_open_pool,
         seller.git_remote
     );
-    mobee_core::seller_daemon::run_forever_blocking(daemon).map_err(|error| {
+    runtime.block_on(runner.run()).map_err(|error| {
         let _ = writeln!(err, "{error}");
         RUNTIME_ERROR
     })?;

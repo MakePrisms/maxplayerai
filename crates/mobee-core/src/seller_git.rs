@@ -221,6 +221,29 @@ pub fn snapshot_delivery(
     branch: &str,
     message: &str,
 ) -> Result<String, SellerGitError> {
+    // Wall-clock authored-at. The node's resume-safe path calls `snapshot_delivery_at` with a
+    // journaled date instead so a re-created delivery commit keeps the same oid across a restart.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    snapshot_delivery_at(workdir, identity, base_oid, branch, message, now)
+}
+
+/// Snapshot the delivery commit with an EXPLICIT authored-at second (`author_date_unix`) for both
+/// the author and committer signatures. This is what makes delivery re-push deterministic across a
+/// restart: the commit oid is a pure function of (tree, parents, message, identity, date), so a node
+/// that crashed after snapshotting but before recording the delivery re-creates the SAME commit and
+/// the re-push is a no-op instead of a divergent second tip. The seller node journals the date at
+/// claim/award time (a value stable across restarts) and passes it here.
+pub fn snapshot_delivery_at(
+    workdir: &Path,
+    identity: &DeliveryAgentIdentity,
+    base_oid: Option<&str>,
+    branch: &str,
+    message: &str,
+    author_date_unix: i64,
+) -> Result<String, SellerGitError> {
     let repo = Repository::open(workdir)
         .map_err(|error| SellerGitError::Io(format!("snapshot: open workdir: {error}")))?;
 
@@ -272,7 +295,10 @@ pub fn snapshot_delivery(
     index
         .write()
         .map_err(|_| SellerGitError::CommandFailed("snapshot-index-write"))?;
-    let signature = Signature::now(&identity.name, &identity.email)
+    // Fixed authored-at (not `Signature::now`) so the commit oid is deterministic and a re-created
+    // delivery commit after a restart is byte-identical — the invariant that makes re-push idempotent.
+    let when = git2::Time::new(author_date_unix, 0);
+    let signature = Signature::new(&identity.name, &identity.email, &when)
         .map_err(|_| SellerGitError::CommandFailed("snapshot-signature"))?;
     let parents: Vec<&Commit> = base.iter().collect();
     let commit = repo
@@ -315,6 +341,25 @@ pub fn push_branch_with_auth(
     }
     let oid =
         git_transport::push_branch(workdir, remote_url, branch, auth.map(|a| a.secret_key_hex.as_str()))?;
+    eprintln!("seller push path=inprocess remote={remote_url} branch={branch} ok");
+    Ok(oid)
+}
+
+/// Push `branch` with an already-resolved NIP-98 `Authorization` header instead of a raw secret. The
+/// durable seller node builds the header through its signer actor (which owns the seller key), so the
+/// push path never re-reads the secret — the key stays confined to the actor + the authenticated
+/// relay client. `header` is `None` for a public/anonymous https remote. Returns the pushed OID.
+pub fn push_branch_with_header(
+    workdir: &Path,
+    remote_url: &str,
+    branch: &str,
+    header: Option<String>,
+) -> Result<String, SellerGitError> {
+    assert_allowed_repo_locator(remote_url)?;
+    if branch.trim().is_empty() {
+        return Err(SellerGitError::Io("branch must be non-empty".into()));
+    }
+    let oid = git_transport::push_branch_with_header(workdir, remote_url, branch, header)?;
     eprintln!("seller push path=inprocess remote={remote_url} branch={branch} ok");
     Ok(oid)
 }
@@ -665,6 +710,53 @@ mod snapshot_tests {
         assert_eq!(c.author().email(), Some(id.email.as_str()));
         assert_eq!(c.committer().email(), Some(id.email.as_str()));
         assert!(tree_paths(&dir, &oid).contains(&"src/feature.rs".to_owned()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // TOOTH (charter invariant 2) — DELIVERY RE-PUSH DETERMINISM. The delivery commit's authored-at
+    // is the journaled date, not wall-clock, so a node that crashed after snapshotting re-creates a
+    // byte-identical commit on restart (same oid ⇒ re-push is a no-op, never a divergent second tip).
+    //
+    // Strong red-on-revert: the assertion pins the committed author/committer time to the value
+    // PASSED IN. Reverting `snapshot_delivery_at` to `Signature::now()` stamps the current wall clock
+    // (year 2026+) which can never equal the fixed 2023 test date, so the revert turns this red — and
+    // the determinism half (two identical workdirs → the same oid) fails too, since two now() reads
+    // differ. An empty-home/artifact-side proof is NOT what this checks: it neuters the production
+    // signing path and requires the produced commit red.
+    #[test]
+    fn tooth_delivery_snapshot_uses_journaled_date_and_is_deterministic() {
+        const DATE: i64 = 1_700_000_000; // fixed, in the past — never equals the wall clock.
+
+        let dir = workdir("determinism");
+        let base = init_with_base(&dir, "mobee/job");
+        write(&dir, "src/feature.rs", "identical agent output\n");
+        let id = identity();
+        let oid_a = snapshot_delivery_at(&dir, &id, Some(&base), "mobee/job", "msg", DATE)
+            .expect("snapshot a");
+
+        // The committed author/committer time IS the journaled date (not now()). This is the
+        // load-bearing bite: reverting to `Signature::now()` stamps the wall clock (year 2026+),
+        // which can never equal the fixed 2023 test date, so the revert turns this red.
+        let c = commit(&dir, &oid_a);
+        assert_eq!(
+            c.author().when().seconds(),
+            DATE,
+            "delivery author date must be the journaled value, not wall-clock"
+        );
+        assert_eq!(c.committer().when().seconds(), DATE);
+
+        // Re-snapshotting the SAME base + tree + identity at the SAME date re-creates the SAME oid —
+        // the property that makes a post-crash re-push idempotent (deterministic, so not a divergent
+        // second tip). Same base commit on both passes, so the parent is fixed.
+        let oid_a2 = snapshot_delivery_at(&dir, &id, Some(&base), "mobee/job", "msg", DATE)
+            .expect("snapshot a2");
+        assert_eq!(oid_a, oid_a2, "same inputs + journaled date ⇒ identical delivery commit oid");
+
+        // And the date is genuinely folded into the oid: a different date ⇒ a different commit.
+        let oid_b = snapshot_delivery_at(&dir, &id, Some(&base), "mobee/job", "msg", DATE + 1)
+            .expect("snapshot b");
+        assert_ne!(oid_a, oid_b, "a different authored-at must change the delivery oid");
+
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -180,6 +180,13 @@ impl SellerStore {
                  job_id          TEXT PRIMARY KEY,
                  offer_id        TEXT NOT NULL,
                  state           TEXT NOT NULL CHECK (state IN ('claimed','awarded','released')),
+                 -- The seller creq (NUT-18 payment request) authored from the offer terms at CLAIM
+                 -- time (audit N-4). It is the single source of truth for the trade's payment terms:
+                 -- the delivery cosignature signs ITS hash (never a rebuild from live config, so a
+                 -- config change between claim and delivery cannot break the buyer/seller cosig), and
+                 -- the restart redeem-guard settles against the mints IT lists (Fix Q — original terms,
+                 -- not current config).
+                 creq            TEXT NOT NULL,
                  created_at_unix INTEGER NOT NULL,
                  updated_at_unix INTEGER NOT NULL
              );
@@ -215,6 +222,20 @@ impl SellerStore {
                  job_id          TEXT NOT NULL,
                  amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
                  received_at_unix INTEGER NOT NULL
+             );
+             -- Intent-to-receive breadcrumbs, written BEFORE the mint swap (payment ordering,
+             -- invariant 3). A breadcrumb records ONLY that a swap was attempted for a token — it is
+             -- NEVER proof the swap landed (the mint reporting already-spent + a COMPLETED receipt is
+             -- the only proof of our own prior collection). `token_hash` is SHA-256 of the token
+             -- string; no proof/secret material is stored.
+             CREATE TABLE IF NOT EXISTS pending_receive (
+                 job_id          TEXT NOT NULL,
+                 token_hash      TEXT NOT NULL,
+                 buyer_pubkey    TEXT NOT NULL,
+                 mint            TEXT NOT NULL,
+                 amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
+                 created_at_unix INTEGER NOT NULL,
+                 PRIMARY KEY (job_id, token_hash)
              );
              -- The nostr event outbox. `dedup_key` (UNIQUE) makes an enqueue idempotent; `draft_json`
              -- is the full serialized EventDraft (kind + content + all protocol/routing tags) so the
@@ -283,6 +304,53 @@ impl SellerStore {
         Ok(changed == 1)
     }
 
+    /// The `(buyer_pubkey, amount_sats, unit)` of a recorded offer, if any. The award arm reads the
+    /// buyer to authorize an award (the award author MUST be the offer's buyer), and the pay path
+    /// reads amount/unit as the redeem terms. `None` when the node never recorded this offer.
+    pub fn offer_facts(&self, offer_id: &str) -> Result<Option<(String, u64, String)>, StoreError> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT buyer_pubkey, amount_sats, unit FROM offers WHERE offer_id = ?1",
+                [offer_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// The full recorded [`Offer`], if any. The execute arm needs the task (agent prompt + delivery
+    /// message) and the absolute deadline (the unified job timeout) on top of the buyer/amount/unit
+    /// that [`Self::offer_facts`] returns. `None` when the node never recorded this offer.
+    pub fn offer_row(&self, offer_id: &str) -> Result<Option<Offer>, StoreError> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted
+                 FROM offers WHERE offer_id = ?1",
+                [offer_id],
+                |row| {
+                    Ok(Offer {
+                        offer_id: row.get(0)?,
+                        buyer_pubkey: row.get(1)?,
+                        amount_sats: row.get::<_, i64>(2)? as u64,
+                        unit: row.get(3)?,
+                        task: row.get(4)?,
+                        deadline_unix: row.get(5)?,
+                        targeted: row.get::<_, i64>(6)? != 0,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     // ---- Claim (state change + outbox enqueue in one transaction) -------------------------------
 
     /// Park a claim and enqueue its claim event in ONE transaction: either both the claim row and
@@ -291,11 +359,16 @@ impl SellerStore {
     ///
     /// `draft` is the full claim nostr event to publish (kind + content + protocol/routing tags);
     /// `created_at_unix` is its fixed authored-at second; `expires_at_unix` bounds how long the
-    /// publisher retries before giving up.
+    /// publisher retries before giving up. `creq` is the seller creq (NUT-18 payment request)
+    /// authored from the offer terms at claim time (audit N-4) — journaled here so the delivery
+    /// cosignature signs its stored hash and the restart redeem-guard settles against its stored
+    /// mints, never a rebuild from live config.
+    #[allow(clippy::too_many_arguments)]
     pub fn claim_and_enqueue(
         &self,
         job_id: &str,
         offer_id: &str,
+        creq: &str,
         draft: &EventDraft,
         created_at_unix: i64,
         expires_at_unix: i64,
@@ -308,9 +381,9 @@ impl SellerStore {
             return Ok(Claimed::Idempotent);
         }
         tx.execute(
-            "INSERT INTO claims (job_id, offer_id, state, created_at_unix, updated_at_unix)
-             VALUES (?1, ?2, 'claimed', ?3, ?3)",
-            params![job_id, offer_id, now_unix],
+            "INSERT INTO claims (job_id, offer_id, state, creq, created_at_unix, updated_at_unix)
+             VALUES (?1, ?2, 'claimed', ?3, ?4, ?4)",
+            params![job_id, offer_id, creq, now_unix],
         )?;
         enqueue_event(
             &tx,
@@ -495,6 +568,45 @@ impl SellerStore {
         Ok(Collected::New)
     }
 
+    /// Write the durable intent-to-receive breadcrumb BEFORE a mint swap (payment ordering, invariant
+    /// 3). Idempotent on `(job_id, token_hash)` — a replay is a no-op. A breadcrumb NEVER proves the
+    /// swap landed; it exists so a crash between swap and receipt is diagnosable and the re-see is
+    /// classified by the COMPLETED-receipt read, not by the breadcrumb.
+    pub fn append_pending_receive(
+        &self,
+        job_id: &str,
+        token_hash: &str,
+        buyer_pubkey: &str,
+        mint: &str,
+        amount_sats: u64,
+        now_unix: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO pending_receive
+                 (job_id, token_hash, buyer_pubkey, mint, amount_sats, created_at_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![job_id, token_hash, buyer_pubkey, mint, amount_sats as i64, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a COMPLETED receipt exists for `job_id`. This is the ONLY positive proof of our own
+    /// prior collection (finding S): on an already-spent re-see, `true` ⇒ idempotent no-op, `false` ⇒
+    /// refuse (never forge a receipt from a breadcrumb), and a read error fails CLOSED at the caller.
+    pub fn has_receipt(&self, job_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let found = conn
+            .query_row(
+                "SELECT 1 FROM receipts WHERE job_id = ?1 LIMIT 1",
+                [job_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(found)
+    }
+
     // ---- Outbox ---------------------------------------------------------------------------------
 
     /// Every still-`pending` outbox row that has not yet expired (`expires_at_unix > now`),
@@ -635,6 +747,36 @@ impl SellerStore {
                 .map(Some)
                 .ok_or_else(|| StoreError(format!("unknown job state {state:?}"))),
         }
+    }
+
+    /// The unix second the award for `job_id` was recorded, if any. This is a durable, restart-STABLE
+    /// value (written once at `record_award`), so the execute path uses it as the delivery commit's
+    /// authored-at — a re-created delivery after a restart is then byte-identical (invariant 2). `None`
+    /// when the job was never awarded.
+    pub fn job_award_time(&self, job_id: &str) -> Result<Option<i64>, StoreError> {
+        let conn = self.lock()?;
+        let ts: Option<i64> = conn
+            .query_row(
+                "SELECT created_at_unix FROM awards WHERE job_id = ?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(ts)
+    }
+
+    /// The creq journaled for a job at claim time (audit N-4). The delivery path signs its hash into
+    /// the receipt preimage and the restart redeem-guard reads its mints, so a config change between
+    /// claim and delivery can never alter the cosigned terms or the settlement mint set. `None` when
+    /// the node never parked a claim for this job.
+    pub fn job_creq(&self, job_id: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.lock()?;
+        let creq: Option<String> = conn
+            .query_row("SELECT creq FROM claims WHERE job_id = ?1", [job_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(creq)
     }
 
     /// The assigned agent for a job, if any. Inspection/tests.
@@ -810,6 +952,12 @@ mod tests {
         assert!(store.record_offer(&offer, 1).expect("first"));
         assert!(!store.record_offer(&offer, 2).expect("second"), "re-seen offer is a no-op");
         assert_eq!(store.health().expect("h").offers, 1);
+        // offer_facts serves the award-auth (buyer) and pay (amount/unit) reads.
+        assert_eq!(
+            store.offer_facts(&offer.offer_id).expect("facts"),
+            Some((offer.buyer_pubkey.clone(), offer.amount_sats, offer.unit.clone()))
+        );
+        assert_eq!(store.offer_facts(&"z".repeat(64)).expect("absent"), None);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -827,7 +975,7 @@ mod tests {
         let offer = "o".repeat(64);
         assert_eq!(
             store
-                .claim_and_enqueue(&job, &offer, &claim(), 500, 999, 1)
+                .claim_and_enqueue(&job, &offer, "creqA", &claim(), 500, 999, 1)
                 .expect("claim"),
             Claimed::New
         );
@@ -864,14 +1012,21 @@ mod tests {
         let job = "j".repeat(64);
         let offer = "o".repeat(64);
         assert_eq!(
-            store.claim_and_enqueue(&job, &offer, &claim(), 1, 999, 1).expect("first"),
+            store.claim_and_enqueue(&job, &offer, "creqA", &claim(), 1, 999, 1).expect("first"),
             Claimed::New
         );
+        // A replay carrying a DIFFERENT creq is a no-op: neither the outbox nor the journaled
+        // claim-time creq is overwritten. The first creq — the one that was on the wire — stands.
         assert_eq!(
-            store.claim_and_enqueue(&job, &offer, &claim(), 1, 999, 2).expect("replay"),
+            store.claim_and_enqueue(&job, &offer, "creqB", &claim(), 1, 999, 2).expect("replay"),
             Claimed::Idempotent
         );
         assert_eq!(store.pending_outbox(3).expect("pending").len(), 1, "no second enqueue");
+        assert_eq!(
+            store.job_creq(&job).expect("creq").as_deref(),
+            Some("creqA"),
+            "the claim-time creq is immutable across replays"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -882,13 +1037,16 @@ mod tests {
         let offer = "o".repeat(64);
         let award = "w".repeat(64);
         let buyer = "b".repeat(64);
-        store.claim_and_enqueue(&job, &offer, &claim(), 1, 999, 1).expect("claim");
+        store.claim_and_enqueue(&job, &offer, "creqA", &claim(), 1, 999, 1).expect("claim");
 
         assert_eq!(
             store.record_award(&award, &job, &buyer, 2).expect("award"),
             Awarded::New
         );
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Awarded));
+        // The award time is the durable, restart-stable delivery author-date (invariant 2 source).
+        assert_eq!(store.job_award_time(&job).expect("award time"), Some(2));
+        assert_eq!(store.job_award_time(&"z".repeat(64)).expect("absent"), None);
 
         // A re-seen award id is a dedup no-op — no second job, state unchanged.
         assert_eq!(
@@ -914,7 +1072,7 @@ mod tests {
         let job = "j".repeat(64);
         let offer = "o".repeat(64);
         let buyer = "b".repeat(64);
-        store.claim_and_enqueue(&job, &offer, &claim(), 1, 999, 1).expect("claim");
+        store.claim_and_enqueue(&job, &offer, "creqA", &claim(), 1, 999, 1).expect("claim");
         store.record_award(&"w".repeat(64), &job, &buyer, 2).expect("award");
         store.mark_executing(&job, 3).expect("exec");
 
@@ -940,7 +1098,7 @@ mod tests {
         let job = "j".repeat(64);
         let offer = "o".repeat(64);
         let receipt = "r".repeat(64);
-        store.claim_and_enqueue(&job, &offer, &claim(), 1, 999, 1).expect("claim");
+        store.claim_and_enqueue(&job, &offer, "creqA", &claim(), 1, 999, 1).expect("claim");
         store.record_award(&"w".repeat(64), &job, &"b".repeat(64), 2).expect("award");
 
         assert_eq!(
@@ -960,7 +1118,7 @@ mod tests {
     fn expire_outbox_stops_the_publisher_from_sending() {
         let (store, path) = fresh_store("expire");
         let job = "j".repeat(64);
-        store.claim_and_enqueue(&job, &"o".repeat(64), &claim(), 1, 100, 1).expect("claim");
+        store.claim_and_enqueue(&job, &"o".repeat(64), "creqA", &claim(), 1, 100, 1).expect("claim");
         // now=200 is past expires_at=100.
         assert_eq!(store.expire_outbox(200).expect("expire"), 1);
         assert!(store.pending_outbox(200).expect("pending").is_empty());

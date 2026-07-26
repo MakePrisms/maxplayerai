@@ -103,7 +103,7 @@ mod tests {
     async fn drain_confirms_pending_and_is_a_noop_second_time() {
         let (store, path) = fresh_store("confirm");
         let job = "j".repeat(64);
-        store.claim_and_enqueue(&job, &"o".repeat(64), &claim_draft(), 1, 9_999, 1).expect("claim");
+        store.claim_and_enqueue(&job, &"o".repeat(64), "creqA", &claim_draft(), 1, 9_999, 1).expect("claim");
 
         let publisher = FakePublisher { calls: RefCell::new(vec![]), fail: false };
         let report = drain_once(&store, &publisher, 2).await.expect("drain");
@@ -125,7 +125,7 @@ mod tests {
     async fn failed_publish_stays_pending_and_bumps_attempts() {
         let (store, path) = fresh_store("retry");
         let job = "j".repeat(64);
-        store.claim_and_enqueue(&job, &"o".repeat(64), &claim_draft(), 1, 9_999, 1).expect("claim");
+        store.claim_and_enqueue(&job, &"o".repeat(64), "creqA", &claim_draft(), 1, 9_999, 1).expect("claim");
 
         let publisher = FakePublisher { calls: RefCell::new(vec![]), fail: true };
         let report = drain_once(&store, &publisher, 2).await.expect("drain");
@@ -140,7 +140,7 @@ mod tests {
     async fn expired_rows_are_not_published() {
         let (store, path) = fresh_store("expire");
         let job = "j".repeat(64);
-        store.claim_and_enqueue(&job, &"o".repeat(64), &claim_draft(), 1, 100, 1).expect("claim");
+        store.claim_and_enqueue(&job, &"o".repeat(64), "creqA", &claim_draft(), 1, 100, 1).expect("claim");
 
         let publisher = FakePublisher { calls: RefCell::new(vec![]), fail: false };
         // now=200 is past expires_at=100 ⇒ the row expires and is never handed to the publisher.

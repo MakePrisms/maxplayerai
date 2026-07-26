@@ -21,6 +21,8 @@
 pub mod ingester;
 pub mod lock;
 pub mod outbox;
+pub mod publisher;
+pub mod run;
 pub mod roster;
 pub mod signer;
 pub mod store;
@@ -47,6 +49,8 @@ pub enum NodeError {
     Store(StoreError),
     Wallet(FundError),
     Identity(HomeError),
+    /// A live relay-surface failure (connect, NIP-42 auth, subscribe) raised by the run loop.
+    Relay(String),
 }
 
 impl std::fmt::Display for NodeError {
@@ -56,6 +60,7 @@ impl std::fmt::Display for NodeError {
             Self::Store(error) => write!(formatter, "{error}"),
             Self::Wallet(error) => write!(formatter, "seller node wallet error: {error}"),
             Self::Identity(error) => write!(formatter, "seller node identity error: {error}"),
+            Self::Relay(message) => write!(formatter, "seller node relay error: {message}"),
         }
     }
 }
@@ -160,8 +165,10 @@ impl SellerNode {
         &self.store
     }
 
-    /// The serialized signer actor (owns the seller key).
-    pub fn signer(&self) -> &SignerHandle {
+    /// The serialized signer actor (owns the seller key). Crate-internal: only the run loop reaches
+    /// it (to share it with the publisher and to sign receipts / push-auth / heartbeats / decode
+    /// wraps), and the seller key never leaves the actor.
+    pub(crate) fn signer(&self) -> &SignerHandle {
         &self.signer
     }
 
@@ -292,7 +299,7 @@ mod tests {
             let node = SellerNode::open(home.clone()).await.expect("open");
             let store = node.store();
             store
-                .claim_and_enqueue(&job, &offer, &claim_draft(), 1000, 9_999, 1)
+                .claim_and_enqueue(&job, &offer, "creqA", &claim_draft(), 1000, 9_999, 1)
                 .expect("claim");
             let confirmed = drain_once(store, &publisher, 2).await.expect("drain");
             assert_eq!(confirmed.confirmed, 1, "the claim was published pre-crash");
@@ -315,7 +322,7 @@ mod tests {
         // Re-enqueuing the same claim is a dedup no-op; a fresh drain publishes nothing new.
         let replay = node
             .store()
-            .claim_and_enqueue(&job, &offer, &claim_draft(), 1000, 9_999, 6)
+            .claim_and_enqueue(&job, &offer, "creqA", &claim_draft(), 1000, 9_999, 6)
             .expect("replay claim");
         assert_eq!(replay, store::Claimed::Idempotent);
         let after = drain_once(node.store(), &publisher, 7).await.expect("drain2");
@@ -358,7 +365,7 @@ mod tests {
             let store = node.store();
             assert_eq!(
                 store
-                    .claim_and_enqueue(&job, &offer, &claim_draft(), 1000, 9_999, 1)
+                    .claim_and_enqueue(&job, &offer, "creqA", &claim_draft(), 1000, 9_999, 1)
                     .expect("claim"),
                 store::Claimed::New
             );
@@ -410,7 +417,7 @@ mod tests {
         // nothing new — journal dedup held across the restart.
         assert_eq!(
             node.store()
-                .claim_and_enqueue(&job, &offer, &claim_draft(), 1000, 9_999, 6)
+                .claim_and_enqueue(&job, &offer, "creqA", &claim_draft(), 1000, 9_999, 6)
                 .expect("replay claim"),
             store::Claimed::Idempotent
         );

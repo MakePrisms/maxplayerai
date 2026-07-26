@@ -139,7 +139,7 @@ mod tests {
         let job = "j".repeat(64);
         let offer_id = "o".repeat(64);
         let draft = crate::gateway::claim_draft(&offer_id, &"b".repeat(64), &"s".repeat(64), "creqA");
-        store.claim_and_enqueue(&job, &offer_id, &draft, 1, 9_999, 1).expect("claim");
+        store.claim_and_enqueue(&job, &offer_id, "creqA", &draft, 1, 9_999, 1).expect("claim");
 
         let mut stream = VecStream(
             vec![IngestEvent::Award {
