@@ -93,20 +93,26 @@ impl GitDeliveryVerifier {
     }
 
     fn fetch(&self, delivery: &GitDelivery) -> Result<CommitOid, DeliveryError> {
-        let repo = self.open_store()?;
-        let fetched_ref = format!("refs/mobee/deliveries/{}", delivery.commit_oid().as_str());
-        let refspec = format!("+refs/heads/{}:{fetched_ref}", delivery.branch());
-        // short_timeout=true: a hung fetch must not own the MCP stdio loop past the client timeout,
-        // and must fail CLOSED before authorize_pay burns budget (verify-before-pay).
-        git_transport::fetch_refspecs(&repo, delivery.repo(), &[&refspec], self.read_auth(), true)
-            .map_err(|_| DeliveryError::GitCommandFailed("fetch"))?;
+        // The git2 fetch drives the reqwest::blocking smart-HTTP subtransport, which must not run on
+        // a Tokio worker thread (reqwest's debug-only runtime-guard would panic — #152). The buyer
+        // verify-fetch is invoked synchronously inside `authorize_pay_async`, so run it off any
+        // ambient runtime, on a dedicated OS thread.
+        git_transport::off_runtime(|| {
+            let repo = self.open_store()?;
+            let fetched_ref = format!("refs/mobee/deliveries/{}", delivery.commit_oid().as_str());
+            let refspec = format!("+refs/heads/{}:{fetched_ref}", delivery.branch());
+            // short_timeout=true: a hung fetch must not own the MCP stdio loop past the client
+            // timeout, and must fail CLOSED before authorize_pay burns budget (verify-before-pay).
+            git_transport::fetch_refspecs(&repo, delivery.repo(), &[&refspec], self.read_auth(), true)
+                .map_err(|_| DeliveryError::GitCommandFailed("fetch"))?;
 
-        let fetched_object = format!("{fetched_ref}^{{commit}}");
-        let commit = repo
-            .revparse_single(&fetched_object)
-            .and_then(|object| object.peel_to_commit())
-            .map_err(|_| DeliveryError::MissingFetchedTip)?;
-        CommitOid::parse(commit.id().to_string()).map_err(|_| DeliveryError::MissingFetchedTip)
+            let fetched_object = format!("{fetched_ref}^{{commit}}");
+            let commit = repo
+                .revparse_single(&fetched_object)
+                .and_then(|object| object.peel_to_commit())
+                .map_err(|_| DeliveryError::MissingFetchedTip)?;
+            CommitOid::parse(commit.id().to_string()).map_err(|_| DeliveryError::MissingFetchedTip)
+        })
     }
 
     fn require_local_object(&self, oid: &CommitOid) -> Result<(), DeliveryError> {
@@ -130,16 +136,19 @@ impl GitDeliveryVerifier {
         base_oid: &CommitOid,
     ) -> Result<(), DeliveryError> {
         self.check_branch(base_branch)?;
-        let repo = self.open_store()?;
-        let fetched_ref = format!("refs/mobee/bases/{}", base_oid.as_str());
-        let refspec = format!("+refs/heads/{base_branch}:{fetched_ref}");
-        git_transport::fetch_refspecs(&repo, base_clone_url, &[&refspec], self.read_auth(), true)
-            .map_err(|_| DeliveryError::GitCommandFailed("fetch-base"))?;
-        // The pinned target MUST actually contain base_oid — resolve it as a commit in the store.
-        let parsed = Self::parse_oid(base_oid)?;
-        repo.find_commit(parsed)
-            .map(|_| ())
-            .map_err(|_| DeliveryError::MissingBaseObject)
+        // Same #152 constraint as `fetch`: run the git2 base fetch off any ambient async runtime.
+        git_transport::off_runtime(|| {
+            let repo = self.open_store()?;
+            let fetched_ref = format!("refs/mobee/bases/{}", base_oid.as_str());
+            let refspec = format!("+refs/heads/{base_branch}:{fetched_ref}");
+            git_transport::fetch_refspecs(&repo, base_clone_url, &[&refspec], self.read_auth(), true)
+                .map_err(|_| DeliveryError::GitCommandFailed("fetch-base"))?;
+            // The pinned target MUST actually contain base_oid — resolve it as a commit in the store.
+            let parsed = Self::parse_oid(base_oid)?;
+            repo.find_commit(parsed)
+                .map(|_| ())
+                .map_err(|_| DeliveryError::MissingBaseObject)
+        })
     }
 
     /// Contribution: refuse unless `commit_oid` descends from `base_oid`, in-process via

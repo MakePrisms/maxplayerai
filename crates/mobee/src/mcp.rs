@@ -8,19 +8,14 @@
 //! returns a graceful tool-error — the server never exits.
 
 use std::io::{BufRead, Write};
-use std::sync::Mutex;
 use std::time::Duration;
 
-use mobee_core::budget::BudgetGate;
-#[cfg(feature = "wallet")]
-use mobee_core::collect;
 use mobee_core::home::{self, MobeeHome};
-#[cfg(feature = "wallet")]
-use mobee_core::job_lifecycle::{
-    self, AwardClaimRequest, ContributionSpec, GetJobRequest, JobKind, PostJobRequest, WaitFor,
-};
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+#[cfg(feature = "wallet")]
+use crate::daemon;
 
 const SUCCESS: i32 = 0;
 const RUNTIME_ERROR: i32 = 2;
@@ -37,9 +32,10 @@ struct McpRequest {
     params: Value,
 }
 
+/// The MCP owns no money authority — the buyer daemon does. The MCP only needs the home to resolve
+/// the daemon socket (connect-or-spawn) and to run the never-echo-secret guard over daemon replies.
 struct McpState {
     home: MobeeHome,
-    gate: Mutex<BudgetGate>,
 }
 
 /// Run the MCP server on the provided stdio handles until stdin EOF.
@@ -106,8 +102,7 @@ pub fn run(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 fn bootstrap_state() -> Result<McpState, String> {
     let root = home::default_home_dir().map_err(|error| error.to_string())?;
     let home = home::bootstrap(root).map_err(|error| error.to_string())?;
-    let gate = Mutex::new(BudgetGate::from_home(&home).map_err(|error| error.to_string())?);
-    Ok(McpState { home, gate })
+    Ok(McpState { home })
 }
 
 #[cfg(test)]
@@ -166,13 +161,26 @@ fn tools() -> Value {
     json!([
         {
             "name": "post_job",
-            "description": "Publish a real mobee job offer (OFFER kind) to the configured mobee relay. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job (unchanged). Never echoes secrets.",
+            "description": "Publish a real mobee job offer (OFFER kind) to the configured mobee relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness/model are recorded auto-award preferences. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "task": { "type": "string" },
                     "output": { "type": "string", "description": "MIME / output type (e.g. text/plain)" },
                     "amount_sats": { "type": "integer", "minimum": 0 },
+                    "max_sats": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Per-job spend ceiling for the daemon's auto-award (defaults to amount_sats). A claim priced above it, or that the buyer cannot pay, is never auto-awarded."
+                    },
+                    "harness": {
+                        "type": "string",
+                        "description": "Preferred seller harness (e.g. claude|cursor|codex). Recorded as an auto-award preference; not yet a hard filter (no claim wire field carries it)."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Preferred seller model. Recorded as an auto-award preference; not yet a hard filter."
+                    },
                     "seller_pubkey": {
                         "type": "string",
                         "description": "Targeted seller hex pubkey (documented default)"
@@ -240,12 +248,17 @@ fn tools() -> Value {
         },
         {
             "name": "award_claim",
-            "description": "Award a seller claim BEFORE work: publish the buyer AWARD (kind-3405, status=accepted) selecting one claim so that seller executes and every other claimant releases without spending compute. Verifies the claim is present, still processing, and (for a targeted offer) authored by the targeted seller. Returns quoted_mints — the mints the claim's creq will be paid at — so an incompatible award is visible before you commit. No pay-bind — settle after delivery with collect. Never echoes secrets.",
+            "description": "Manually award a specific seller claim (the fine-grain override of the daemon's auto-award): reserve the funds and publish the buyer AWARD (kind-3405, status=accepted) selecting that claim so the seller executes and every other claimant releases without spending compute. The daemon refuses to award a claim it cannot pay or whose price exceeds max_sats (defaults to the offer amount). No pay-bind — settle after delivery with collect. Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "job_id": { "type": "string" },
-                    "claim_id": { "type": "string" }
+                    "claim_id": { "type": "string" },
+                    "max_sats": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Spend ceiling for this manual award (defaults to the offer amount). A claim priced above it is refused."
+                    }
                 },
                 "required": ["job_id", "claim_id"],
                 "additionalProperties": false
@@ -260,43 +273,77 @@ async fn call_tool_async(state: &McpState, params: &Value) -> Result<Value, Stri
         .and_then(Value::as_str)
         .ok_or_else(|| "tools/call missing name".to_owned())?;
     let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
-    // The MCP surface is the buyer trade loop only. Everything else moved to the `mobee` CLI; a
-    // stale client calling a moved tool gets a clear pointer to the command that replaced it.
+    // The MCP is a thin client of the buyer daemon: the trade-loop tools route over the daemon
+    // socket (connect-or-spawn), which owns the wallet, budget ledger, and reservation ledger — the
+    // single money authority. Everything else moved to the `mobee` CLI; a stale client calling a
+    // moved tool gets a pointer to the command that replaced it. `award_claim` maps to the daemon's
+    // `award` RPC (manual, claim_id-named award).
     match name {
-        "post_job" => {
-            #[cfg(feature = "wallet")]
-            {
-                post_job_tool_async(state, &arguments).await
-            }
-            #[cfg(not(feature = "wallet"))]
-            {
-                post_job_tool(state, &arguments)
-            }
-        }
-        "get_job" => {
-            #[cfg(feature = "wallet")]
-            {
-                get_job_tool_async(state, &arguments).await
-            }
-            #[cfg(not(feature = "wallet"))]
-            {
-                get_job_tool(state, &arguments)
-            }
-        }
-        "collect" => {
-            #[cfg(feature = "wallet")]
-            {
-                collect_tool_async(state, &arguments).await
-            }
-            #[cfg(not(feature = "wallet"))]
-            {
-                let _ = arguments;
-                Err("collect requires the wallet feature".into())
-            }
-        }
-        "award_claim" => award_claim_tool_async(state, &arguments).await,
+        "post_job" => route_tool(state, "post_job", "post_job", arguments).await,
+        "get_job" => route_tool(state, "get_job", "get_job", arguments).await,
+        "collect" => route_tool(state, "collect", "collect", arguments).await,
+        "award_claim" => route_tool(state, "award_claim", "award", arguments).await,
         moved => Err(moved_tool_error(moved)),
     }
+}
+
+/// Route a trade-loop tool over the buyer daemon socket (connect-or-spawn). `tool` is the MCP tool
+/// name (for errors/hints); `method` is the daemon RPC. The tool arguments are forwarded verbatim as
+/// RPC params — the daemon is the sole authority for validation and money, so the MCP adds no
+/// second-guessing. The daemon never returns the secret key; the never-echo guard is defense in
+/// depth over its reply.
+#[cfg(feature = "wallet")]
+async fn route_tool(
+    state: &McpState,
+    tool: &str,
+    method: &str,
+    arguments: Value,
+) -> Result<Value, String> {
+    let home = state.home.clone();
+    let rpc = method.to_owned();
+    // The daemon client is synchronous (a plain UnixStream) and may spawn+poll a daemon on cold
+    // start, so run it off the async reactor under the outer tool deadline.
+    let body = tokio::task::spawn_blocking(move || daemon::ensure_then_call(&home, &rpc, arguments))
+        .await
+        .map_err(|error| format!("buyer daemon call task failed: {error}"))?
+        .map_err(|error| with_prereq_hint(tool, error))?;
+    guard_never_echo(state, tool, &body)?;
+    Ok(tool_ok(with_ok(body)))
+}
+
+#[cfg(not(feature = "wallet"))]
+async fn route_tool(
+    _state: &McpState,
+    tool: &str,
+    _method: &str,
+    _arguments: Value,
+) -> Result<Value, String> {
+    Err(format!(
+        "{tool} requires the wallet feature (rebuild with --features wallet, on by default)"
+    ))
+}
+
+/// Tag a daemon result object with `ok: true` for the MCP surface (a non-object result is wrapped).
+fn with_ok(body: Value) -> Value {
+    match body {
+        Value::Object(mut map) => {
+            map.insert("ok".into(), json!(true));
+            Value::Object(map)
+        }
+        other => json!({ "ok": true, "result": other }),
+    }
+}
+
+/// Defense in depth: refuse a daemon reply that would echo the buyer secret key. The daemon never
+/// includes it, so this only ever fires on a bug.
+#[cfg(feature = "wallet")]
+fn guard_never_echo(state: &McpState, tool: &str, body: &Value) -> Result<(), String> {
+    if let Ok(secret) = home::read_secret_key_hex(&state.home) {
+        if !secret.is_empty() && body.to_string().contains(&secret) {
+            return Err(format!("{tool} refused: response would echo secret key"));
+        }
+    }
+    Ok(())
 }
 
 /// Actionable error for a tool that moved off the MCP surface to the `mobee` CLI, or an unknown
@@ -346,236 +393,6 @@ fn with_prereq_hint(tool: &str, error: String) -> String {
     } else {
         error
     }
-}
-
-#[cfg(feature = "wallet")]
-async fn collect_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
-    let job_id = arguments
-        .get("job_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "collect requires job_id".to_owned())?
-        .to_owned();
-    let out = arguments
-        .get("out")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-
-    let mut gate = state
-        .gate
-        .lock()
-        .map_err(|_| "budget gate lock poisoned".to_owned())?;
-    let outcome = collect::collect_async(
-        &state.home,
-        &mut gate,
-        collect::CollectRequest { job_id, out },
-    )
-    .await
-    .map_err(|error| with_prereq_hint("collect", error.to_string()))?;
-
-    let body = json!({
-        "ok": true,
-        "amount_sats": outcome.pay.amount_sats,
-        "attempt_id": outcome.pay.attempt_id,
-        "spent_total_sats": outcome.pay.spent_total_sats,
-        "remaining_sats": outcome.pay.remaining_sats,
-        "per_job_cap_sats": gate.per_job_cap(),
-        "total_cap_sats": gate.total_cap(),
-        "state": outcome.pay.state,
-        "commit": outcome.commit_oid,
-        "path": outcome.path,
-        "files": outcome.files,
-    });
-    Ok(tool_ok(body))
-}
-
-#[cfg(feature = "wallet")]
-async fn post_job_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
-    let require_str = |key: &str| -> Result<String, String> {
-        arguments
-            .get(key)
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| format!("post_job requires {key} (string)"))
-    };
-    let amount_sats = arguments
-        .get("amount_sats")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| "post_job requires amount_sats (integer)".to_owned())?;
-    let untargeted = arguments
-        .get("untargeted")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let seller_pubkey = arguments
-        .get("seller_pubkey")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let deadline_unix = match arguments.get("deadline_unix") {
-        Some(value) => Some(
-            value
-                .as_u64()
-                .ok_or_else(|| "post_job requires deadline_unix (integer >= 0)".to_owned())?,
-        ),
-        None => None,
-    };
-    let repo = arguments
-        .get("repo")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let branch = arguments
-        .get("branch")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let opt_str = |key: &str| -> Option<String> {
-        arguments.get(key).and_then(Value::as_str).map(str::to_owned)
-    };
-    let accepts = arguments.get("accepts").and_then(Value::as_array).map(|values| {
-        values
-            .iter()
-            .filter_map(|value| value.as_str().map(str::to_owned))
-            .collect::<Vec<String>>()
-    });
-
-    // The four target/base pins are ALL-OR-NOTHING: all four ⇒ a contribution offer; none ⇒
-    // from-scratch; a partial set is refused so the core never sees a half-specified contribution.
-    let job = match (
-        opt_str("target_repo_owner"),
-        opt_str("target_repo_url"),
-        opt_str("base_branch"),
-        opt_str("base_oid"),
-    ) {
-        (None, None, None, None) => JobKind::FromScratch,
-        (Some(target_repo_owner), Some(target_repo_url), Some(base_branch), Some(base_oid)) => {
-            JobKind::Contribution(ContributionSpec {
-                target_repo_owner,
-                target_repo_url,
-                base_branch,
-                base_oid,
-                accepts,
-            })
-        }
-        _ => {
-            return Err(
-                "post_job contribution mode requires ALL of target_repo_owner, target_repo_url, \
-                 base_branch, base_oid (a partial set is refused)"
-                    .into(),
-            )
-        }
-    };
-
-    let outcome = job_lifecycle::post_job_async(
-        &state.home,
-        PostJobRequest {
-            task: require_str("task")?,
-            output: require_str("output")?,
-            amount_sats,
-            seller_pubkey,
-            untargeted,
-            deadline_unix,
-            repo,
-            branch,
-            job,
-        },
-    )
-    .await
-    .map_err(|error| with_prereq_hint("post_job", error.to_string()))?;
-
-    let body = json!({
-        "ok": true,
-        "job_id": outcome.job_id,
-        "job_hash": outcome.job_hash,
-        "offer_kind": outcome.offer_kind,
-        "targeted": outcome.targeted,
-        "seller_pubkey": outcome.seller_pubkey,
-        "amount_sats": outcome.amount_sats,
-        "relay_url": outcome.relay_url,
-        "task": outcome.task,
-        "output": outcome.output,
-    });
-    // never-echo: secret key must not appear
-    let rendered = body.to_string();
-    if let Ok(secret) = home::read_secret_key_hex(&state.home) {
-        if rendered.contains(&secret) {
-            return Err("post_job refused: response would echo secret key".into());
-        }
-    }
-    Ok(tool_ok(body))
-}
-
-#[cfg(not(feature = "wallet"))]
-fn post_job_tool(_state: &McpState, _arguments: &Value) -> Result<Value, String> {
-    Err("post_job requires the wallet feature".into())
-}
-
-#[cfg(feature = "wallet")]
-async fn get_job_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
-    let job_id = arguments
-        .get("job_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "get_job requires job_id (string)".to_owned())?
-        .to_owned();
-    let wait_for = match arguments.get("wait_for").and_then(Value::as_str) {
-        Some(raw) => Some(WaitFor::parse(raw).map_err(|error| error.to_string())?),
-        None => None,
-    };
-    let timeout_secs = arguments.get("timeout_secs").and_then(Value::as_u64);
-    let include_display_names = arguments
-        .get("include_display_names")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let view = job_lifecycle::get_job_async(
-        &state.home,
-        GetJobRequest {
-            job_id,
-            wait_for,
-            timeout_secs,
-            include_display_names,
-        },
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    let body = serde_json::to_value(&view).map_err(|error| error.to_string())?;
-    let mut body = body;
-    if let Some(obj) = body.as_object_mut() {
-        obj.insert("ok".into(), json!(true));
-        obj.insert("source".into(), json!("relay"));
-        if view.pending {
-            obj.insert("status".into(), json!("pending"));
-        }
-    }
-    Ok(tool_ok(body))
-}
-
-#[cfg(not(feature = "wallet"))]
-fn get_job_tool(_state: &McpState, _arguments: &Value) -> Result<Value, String> {
-    Err("get_job requires the wallet feature".into())
-}
-
-#[cfg(feature = "wallet")]
-async fn award_claim_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
-    let require_str = |key: &str| -> Result<String, String> {
-        arguments
-            .get(key)
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| format!("award_claim requires {key} (string)"))
-    };
-    let outcome = job_lifecycle::award_claim_async(
-        &state.home,
-        AwardClaimRequest {
-            job_id: require_str("job_id")?,
-            claim_id: require_str("claim_id")?,
-        },
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    Ok(tool_ok(json!({
-        "ok": true,
-        "award_event_id": outcome.award_event_id,
-        "job_id": outcome.job_id,
-        "claim_id": outcome.claim_id,
-        "seller_pubkey": outcome.seller_pubkey,
-        "quoted_mints": outcome.quoted_mints,
-    })))
 }
 
 fn tool_ok(body: Value) -> Value {
@@ -675,8 +492,7 @@ mod tests {
 
     fn state_at(root: &std::path::Path) -> McpState {
         let home = home::bootstrap(root).expect("bootstrap");
-        let gate = Mutex::new(BudgetGate::from_home(&home).expect("gate"));
-        McpState { home, gate }
+        McpState { home }
     }
 
     // #98: get_result materializes a PAID delivery's files to <home>/results/<job_id> and returns
@@ -785,75 +601,8 @@ mod tests {
         assert_eq!(response["result"]["isError"], true);
     }
 
-    #[cfg(feature = "wallet")]
-    #[test]
-    fn post_job_error_path_never_echoes_secret() {
-        let root = temp_home("post-echo");
-        let _ = std::fs::remove_dir_all(&root);
-        let state = state_at(&root);
-        let secret = home::read_secret_key_hex(&state.home).expect("secret");
-        let response = dispatch(
-            &state,
-            &McpRequest {
-                id: Some(json!(41)),
-                method: "tools/call".into(),
-                params: json!({
-                    "name": "post_job",
-                    "arguments": {
-                        "task": "gate-e",
-                        "output": "text/plain",
-                        "amount_sats": 1
-                    }
-                }),
-            },
-        );
-        let rendered = response.to_string();
-        assert!(!rendered.contains(&secret), "secret leaked on post_job error");
-        assert_eq!(response["result"]["isError"], true);
-        let message = response["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        assert!(
-            message.contains("seller_pubkey") || message.contains("untargeted"),
-            "message={message}"
-        );
-    }
-
-    #[cfg(feature = "wallet")]
-    #[test]
-    fn post_job_mcp_refuses_zero_deadline_before_publish() {
-        let root = temp_home("post-zero-deadline");
-        let _ = std::fs::remove_dir_all(&root);
-        let state = state_at(&root);
-        let secret = home::read_secret_key_hex(&state.home).expect("secret");
-        let response = dispatch(
-            &state,
-            &McpRequest {
-                id: Some(json!(42)),
-                method: "tools/call".into(),
-                params: json!({
-                    "name": "post_job",
-                    "arguments": {
-                        "task": "deadline-gate",
-                        "output": "text/plain",
-                        "amount_sats": 1,
-                        "seller_pubkey": "aa".repeat(32),
-                        "deadline_unix": 0
-                    }
-                }),
-            },
-        );
-        let rendered = response.to_string();
-        assert!(!rendered.contains(&secret), "secret leaked on post_job error");
-        assert_eq!(response["result"]["isError"], true);
-        let message = response["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap_or("");
-        assert!(message.contains("deadline_unix"), "message={message}");
-        assert!(message.contains("given=0"), "message={message}");
-        assert!(message.contains("current="), "message={message}");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
+    // post_job/collect/award business validation (targeting, zero/past deadline, contribution pins,
+    // over-budget, integrity+pay) now lives in the buyer daemon and mobee-core, tested there
+    // (job_lifecycle::post_job_* , buyer::* , collect_integrity). The MCP is a thin router; its own
+    // tests cover the transport surface (framing, tool list, moved-tool pointers, never-echo).
 }

@@ -26,7 +26,10 @@ use super::reservations::{
 /// - v2 — the reservation ledger: the `reservations` table (#123). Upgrade is forward-only and
 ///   additive (a new `CREATE TABLE IF NOT EXISTS` + a monotone version bump); a v1 DB opened by a
 ///   v2 binary gains the table and the version moves to 2 with no data migration.
-pub const SCHEMA_VERSION: i64 = 2;
+/// - v3 — the pending-award intents: the `pending_awards` table (#126/#127 background auto-award).
+///   One row per posted job the daemon still owes an award; re-armed on restart. Same additive
+///   forward-only upgrade.
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// A cloneable handle to the daemon-owned SQLite state.
 #[derive(Clone)]
@@ -98,6 +101,20 @@ impl BuyerStore {
                  job_id          TEXT PRIMARY KEY,
                  amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
                  state           TEXT NOT NULL CHECK (state IN ('reserved','spent','released')),
+                 created_at_unix INTEGER NOT NULL,
+                 updated_at_unix INTEGER NOT NULL
+             );
+             -- v3: pending auto-award intents. One row per posted job the daemon still owes an
+             -- award. `pending` = awaiting a payable claim; `awarded` = a 3405 was published;
+             -- `parked` = could not award (reason surfaced). Re-armed on restart so a job posted
+             -- before a crash still gets its award with zero manual commands.
+             CREATE TABLE IF NOT EXISTS pending_awards (
+                 job_id          TEXT PRIMARY KEY,
+                 max_sats        INTEGER NOT NULL CHECK (max_sats >= 0),
+                 harness         TEXT,
+                 model           TEXT,
+                 state           TEXT NOT NULL CHECK (state IN ('pending','awarded','parked')),
+                 reason          TEXT,
                  created_at_unix INTEGER NOT NULL,
                  updated_at_unix INTEGER NOT NULL
              );",
@@ -411,6 +428,122 @@ impl BuyerStore {
         let conn = self.lock()?;
         read_reservation(&conn, job_id)
     }
+
+    // ---- Pending auto-award intents (#126/#127) ------------------------------------------------
+
+    /// Record (or reset to `pending`) a job's auto-award intent — its `max_sats` ceiling and optional
+    /// harness/model preferences. Re-posting the same job resets it to `pending` and clears any prior
+    /// parked reason so the daemon re-drives it.
+    pub fn put_pending_award(
+        &self,
+        job_id: &str,
+        max_sats: u64,
+        harness: Option<&str>,
+        model: Option<&str>,
+        now_unix: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO pending_awards
+                 (job_id, max_sats, harness, model, state, reason, created_at_unix, updated_at_unix)
+             VALUES (?1, ?2, ?3, ?4, 'pending', NULL, ?5, ?5)
+             ON CONFLICT(job_id) DO UPDATE SET
+                 max_sats = excluded.max_sats,
+                 harness = excluded.harness,
+                 model = excluded.model,
+                 state = 'pending',
+                 reason = NULL,
+                 updated_at_unix = excluded.updated_at_unix",
+            params![job_id, max_sats as i64, harness, model, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Every still-`pending` auto-award intent — the set the daemon re-arms on restart.
+    pub fn list_pending_awards(&self) -> Result<Vec<PendingAward>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT job_id, max_sats, harness, model FROM pending_awards
+             WHERE state = 'pending' ORDER BY created_at_unix",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PendingAward {
+                job_id: row.get::<_, String>(0)?,
+                max_sats: row.get::<_, i64>(1)?.max(0) as u64,
+                harness: row.get::<_, Option<String>>(2)?,
+                model: row.get::<_, Option<String>>(3)?,
+            })
+        })?;
+        let mut intents = Vec::new();
+        for row in rows {
+            intents.push(row?);
+        }
+        Ok(intents)
+    }
+
+    /// Mark a job's auto-award intent `awarded` (a 3405 published, or already present on the relay).
+    /// No-op if the job has no intent row.
+    pub fn mark_award_awarded(&self, job_id: &str, now_unix: i64) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE pending_awards SET state = 'awarded', reason = NULL, updated_at_unix = ?2
+             WHERE job_id = ?1",
+            params![job_id, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a job's auto-award intent `parked` with a surfaced `reason` (e.g. the reservation was
+    /// refused because funds shrank) — never a silent drop. No-op if the job has no intent row.
+    pub fn mark_award_parked(&self, job_id: &str, reason: &str, now_unix: i64) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE pending_awards SET state = 'parked', reason = ?2, updated_at_unix = ?3
+             WHERE job_id = ?1",
+            params![job_id, reason, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// The `(state, reason)` of a job's auto-award intent, if any. Inspection / tests.
+    pub fn pending_award_state(&self, job_id: &str) -> Result<Option<(String, Option<String>)>, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                "SELECT state, reason FROM pending_awards WHERE job_id = ?1",
+                [job_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Every `parked` auto-award intent as `(job_id, reason)` — surfaced in `status` so a buyer sees
+    /// jobs whose award could not be placed rather than silently losing them.
+    pub fn parked_awards(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT job_id, COALESCE(reason, '') FROM pending_awards
+             WHERE state = 'parked' ORDER BY updated_at_unix",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut parked = Vec::new();
+        for row in rows {
+            parked.push(row?);
+        }
+        Ok(parked)
+    }
+}
+
+/// A still-pending auto-award intent: the job the daemon owes an award, its spend ceiling, and the
+/// (not-yet-a-filter) harness/model preferences captured at post time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAward {
+    pub job_id: String,
+    pub max_sats: u64,
+    pub harness: Option<String>,
+    pub model: Option<String>,
 }
 
 /// Read a job's `(state, amount)` from a live transaction. `None` when no row exists.
@@ -522,9 +655,10 @@ mod tests {
     }
 
     // A v1 database (buyer_meta + jobs only, schema_version = 1) is upgraded forward on open: the
-    // reservations table appears and schema_version moves to 2. No data migration, idempotent.
+    // reservations AND pending_awards tables appear and schema_version moves to the current version.
+    // No data migration, idempotent.
     #[test]
-    fn open_migrates_v1_db_forward_to_v2() {
+    fn open_migrates_v1_db_forward() {
         let path = temp_db("migrate");
         let _ = std::fs::remove_file(&path);
         {
@@ -537,15 +671,59 @@ mod tests {
             .expect("seed v1");
         }
         let store = BuyerStore::open(&path).expect("open upgrades");
-        assert_eq!(store.health().expect("health").schema_version, 2);
+        assert_eq!(store.health().expect("health").schema_version, SCHEMA_VERSION);
         // The reservations table is now usable.
         assert_eq!(store.reserved_in_flight().expect("reserved"), 0);
         store
             .reserve(&"a".repeat(64), 10, 100, NO_BUDGET, 0, 1)
             .expect("reserve on upgraded db");
-        // Re-open is idempotent (still v2).
+        // The pending_awards table is now usable too.
+        store
+            .put_pending_award(&"a".repeat(64), 10, None, None, 1)
+            .expect("pending award on upgraded db");
+        assert_eq!(store.list_pending_awards().expect("list").len(), 1);
+        // Re-open is idempotent (still current version).
         let store2 = BuyerStore::open(&path).expect("reopen");
-        assert_eq!(store2.health().expect("health").schema_version, 2);
+        assert_eq!(store2.health().expect("health").schema_version, SCHEMA_VERSION);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Pending auto-award intent lifecycle: put ⇒ listed as pending; mark_parked ⇒ off the pending
+    // list, state=parked with the surfaced reason (invariant B: park, never silent drop);
+    // mark_awarded ⇒ awarded; re-put ⇒ back to pending with the reason cleared.
+    #[test]
+    fn pending_award_lifecycle_parks_with_reason_and_rearms() {
+        let (store, path) = fresh_store("pending-award");
+        let job = "a".repeat(64);
+
+        store.put_pending_award(&job, 21, Some("claude"), Some("opus"), 1).expect("put");
+        let pending = store.list_pending_awards().expect("list");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].job_id, job);
+        assert_eq!(pending[0].max_sats, 21);
+        assert_eq!(pending[0].harness.as_deref(), Some("claude"));
+
+        // Park with a reason — off the pending list, visible as parked.
+        store.mark_award_parked(&job, "reservation refused: funds shrank", 2).expect("park");
+        assert!(store.list_pending_awards().expect("list").is_empty(), "parked is not pending");
+        assert_eq!(
+            store.pending_award_state(&job).expect("state"),
+            Some(("parked".to_owned(), Some("reservation refused: funds shrank".to_owned())))
+        );
+        assert_eq!(
+            store.parked_awards().expect("parked"),
+            vec![(job.clone(), "reservation refused: funds shrank".to_owned())]
+        );
+
+        // Awarding clears the parked reason.
+        store.mark_award_awarded(&job, 3).expect("awarded");
+        assert_eq!(store.pending_award_state(&job).expect("state"), Some(("awarded".to_owned(), None)));
+        assert!(store.parked_awards().expect("parked").is_empty());
+
+        // Re-posting the same job re-arms it (back to pending, reason cleared).
+        store.put_pending_award(&job, 30, None, None, 4).expect("re-put");
+        assert_eq!(store.pending_award_state(&job).expect("state"), Some(("pending".to_owned(), None)));
+        assert_eq!(store.list_pending_awards().expect("list")[0].max_sats, 30);
         let _ = std::fs::remove_file(&path);
     }
 

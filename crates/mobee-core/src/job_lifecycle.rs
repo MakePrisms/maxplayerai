@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::gateway::{
     self, award_draft, parse_git_result_delivery, parse_offer, EventDraft, OfferDraft, TagSpec,
-    JOB_CLAIM_KIND, JOB_FEEDBACK_KIND, JOB_OFFER_KIND, JOB_RESULT_KIND,
+    JOB_AWARD_KIND, JOB_CLAIM_KIND, JOB_FEEDBACK_KIND, JOB_OFFER_KIND, JOB_RESULT_KIND,
 };
 use crate::home::{self, HomeError, MobeeHome};
 #[cfg(feature = "wallet")]
@@ -1530,6 +1530,39 @@ fn derive_claim_liveness(
 /// against `now` (a `processing` claim past the offer deadline is EXPIRED, not live). Exposed
 /// `pub(crate)` so the seller daemon can run the backfill money-safety pre-claim check
 /// (already-delivered / live-claimed-by-another) without duplicating the relay read.
+/// True when a buyer AWARD (kind-3405) authored by this buyer already exists on the relay for
+/// `job_id` — the relay half of the idempotent re-arm check (a 3405 may have published before a
+/// crash, so the local ledger alone is insufficient). A relay error propagates so the caller treats
+/// it as "unknown" and does not falsely mark the intent awarded.
+pub(crate) async fn has_award_async(
+    home: &MobeeHome,
+    keys: &nostr_sdk::Keys,
+    job_id: &str,
+    timeout: Duration,
+) -> Result<bool, JobLifecycleError> {
+    use nostr_sdk::prelude::{Client, EventId, Filter, Kind};
+
+    let offer_id = EventId::from_hex(job_id)
+        .map_err(|error| JobLifecycleError::Input(format!("job_id: {error}")))?;
+    let client = Client::new(keys.clone());
+    client
+        .add_relay(&home.config.relay_url)
+        .await
+        .map_err(|error| JobLifecycleError::Relay(format!("add relay: {error}")))?;
+    client.connect().await;
+
+    let filter = Filter::new()
+        .kind(Kind::Custom(JOB_AWARD_KIND))
+        .author(keys.public_key())
+        .event(offer_id)
+        .hashtag(gateway::MOBEE_TAG);
+    let events = client
+        .fetch_events(filter, timeout)
+        .await
+        .map_err(|error| JobLifecycleError::Relay(format!("fetch award: {error}")))?;
+    Ok(!events.is_empty())
+}
+
 pub(crate) async fn fetch_job_view_async(
     home: &MobeeHome,
     keys: &nostr_sdk::Keys,

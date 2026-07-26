@@ -88,6 +88,28 @@ fn accept_invalid_certs() -> bool {
     std::env::var_os("GIT_SSL_NO_VERIFY").is_some()
 }
 
+/// Run a blocking git2 fetch/push off any ambient async runtime, on a dedicated OS thread.
+///
+/// The smart-HTTP subtransport ([`HttpStream`]) uses `reqwest::blocking`. In a DEBUG build reqwest
+/// guards every request by building and immediately dropping a throwaway Tokio runtime — and
+/// dropping a runtime inside another runtime's context panics ("Cannot drop a runtime in a context
+/// where blocking is not allowed"); a release build makes that guard a no-op, which is why the bug
+/// was masked (#152). The buyer verify-fetch runs synchronously inside `authorize_pay_async` (a
+/// Tokio worker), so the git2 fetch that drives those requests must run on a plain thread where no
+/// ambient runtime is present. Works under any caller runtime flavor (unlike `block_in_place`).
+pub(crate) fn off_runtime<T, F>(work: F) -> T
+where
+    T: Send,
+    F: FnOnce() -> T + Send,
+{
+    std::thread::scope(|scope| {
+        scope
+            .spawn(work)
+            .join()
+            .unwrap_or_else(|_| panic!("git transport worker thread panicked"))
+    })
+}
+
 /// Long-running client for pushes and seller base fetches (large packs are legitimate).
 fn client_default() -> &'static reqwest::blocking::Client {
     static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
@@ -577,5 +599,27 @@ mod tests {
             ),
             Err(TransportError::Transport(_))
         ));
+    }
+
+    // #152 regression: a `reqwest::blocking` REQUEST executed on a Tokio worker hits reqwest's
+    // debug-only guard, which builds and drops a throwaway runtime — a debug panic ("Cannot drop a
+    // runtime in a context where blocking is not allowed"). The buyer verify-fetch runs inside
+    // `authorize_pay_async`, so it must go through `off_runtime` (a plain thread). This drives a real
+    // blocking request from within a Tokio runtime via `off_runtime` and asserts it returns (the
+    // request fails — nothing listens on port 9 — but must NOT panic).
+    //
+    // Red-on-revert (strong form): call `.send()` DIRECTLY here (drop the `off_runtime` wrapper) and
+    // this test panics in a debug build.
+    #[tokio::test]
+    async fn blocking_request_runs_off_the_async_runtime() {
+        let result = off_runtime(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_millis(100))
+                .build()
+                .expect("client")
+                .get("http://127.0.0.1:9/")
+                .send()
+        });
+        assert!(result.is_err(), "the request should fail to connect, but must not panic");
     }
 }
