@@ -18,6 +18,7 @@
 //! receiving wallet (owned by the [`wallet_actor`]). This mirrors the buyer daemon's shape; a shared
 //! node core is deferred until both consumers exist (issue #131).
 
+pub mod buzz;
 pub mod ingester;
 pub mod lock;
 pub mod outbox;
@@ -165,9 +166,11 @@ impl SellerNode {
         &self.store
     }
 
-    /// The serialized signer actor (owns the seller key). Crate-internal: only the run loop reaches
-    /// it (to share it with the publisher and to sign receipts / push-auth / heartbeats / decode
-    /// wraps), and the seller key never leaves the actor.
+    /// The serialized signer actor (owns the seller key). Crate-internal: the run loop and the buzz
+    /// persona reach it (publisher sharing, receipts / push-auth / heartbeats / wrap decode, and the
+    /// persona's raw-sign path — which is DEFAULT-DENY inside the actor to
+    /// [`signer::UNSIGNED_SIGN_ALLOWLIST`], so a holder of the handle cannot sign a trade-path
+    /// event through it). The seller key never leaves the actor.
     pub(crate) fn signer(&self) -> &SignerHandle {
         &self.signer
     }
@@ -191,6 +194,19 @@ impl SellerNode {
         })
     }
 
+    /// Bring up the node's buzz persona if `[buzz]` is configured, returning a live
+    /// [`buzz::BuzzHandle`] (connected relay + presence heartbeat) to hold for the node's lifetime.
+    /// With no `[buzz]` section this is inert — `Ok(None)`, no connection, no publish. The persona
+    /// is signed by the node's existing signer actor (one identity; the key never leaves it).
+    pub async fn start_buzz(&self) -> Result<Option<buzz::BuzzHandle>, buzz::BuzzError> {
+        let Some(cfg) = self.home.config.buzz.as_ref() else {
+            return Ok(None);
+        };
+        let seller_rate_sats = self.home.config.seller.as_ref().map(|seller| seller.rate_sats);
+        let handle = buzz::start(self.signer.clone(), cfg, seller_rate_sats).await?;
+        Ok(Some(handle))
+    }
+
     /// A status snapshot proving the boundary end to end — the store answered, and the wallet actor
     /// answered through its queue. The secret key is never included.
     pub async fn status_snapshot(&self) -> Result<StatusSnapshot, NodeError> {
@@ -207,6 +223,9 @@ impl SellerNode {
         })
     }
 }
+
+#[cfg(test)]
+mod buzz_relay_it;
 
 #[cfg(test)]
 mod tests {

@@ -107,6 +107,45 @@ pub struct ProfileConfig {
     pub about: Option<String>,
 }
 
+/// Buzz persona config (`[buzz]` in config.toml). Absent ⇒ the feature is inert (the node opens
+/// no buzz relay connection and publishes no persona). Present ⇒ the seller node enrolls as a
+/// buzz inhabitant on `relay_url`: it publishes a NIP-01 kind-0 persona carrying a human-readable
+/// rate card and maintains a live presence heartbeat while the node is up. The persona is signed
+/// by the seller's EXISTING protocol key (one identity — no new keys); the key never lives here.
+///
+/// This is discovery/identity context only — nothing here feeds the pay gate, the journal, or the
+/// receipt bind. See [`crate::seller_node::buzz`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuzzConfig {
+    /// The buzz relay websocket URL (e.g. `wss://buzzrelay.orveth.dev`).
+    pub relay_url: String,
+    /// Persona display name (kind-0 `name`).
+    pub name: String,
+    /// Optional human blurb, prepended to the assembled rate card in kind-0 `about`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
+    /// Advertised rate (sats/job) shown in the rate card. `None` ⇒ falls back to the `[seller]`
+    /// `rate_sats` when a seller is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_sats: Option<u64>,
+    /// Human-readable capability tags shown in the rate card (e.g. `["code", "test"]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    /// Mint label shown in the rate card. `None` ⇒ `"testnut"` (the default dev mint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mint: Option<String>,
+    /// Presence heartbeat cadence (seconds). Default **30** (the deployed relay expires presence
+    /// after ~90s of silence, so a 30s cadence keeps it live with margin).
+    #[serde(default = "default_buzz_heartbeat_secs")]
+    pub heartbeat_secs: u64,
+}
+
+/// serde default for [`BuzzConfig::heartbeat_secs`] — 30s (≤ the relay's ~90s presence TTL).
+pub fn default_buzz_heartbeat_secs() -> u64 {
+    30
+}
+
 /// Default relay-git base (delivery). Live on mobee-relay (`/git/<owner>/<repo>.git`).
 pub const DEFAULT_RELAY_GIT_BASE: &str = "https://mobee-relay.orveth.dev/git";
 /// Shared leaf name — NOT used as default (relay name registry is global).
@@ -579,6 +618,9 @@ pub struct MobeeConfig {
     /// Optional `[seller]` daemon config. Absent until `mobee sell` setup writes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seller: Option<SellerConfig>,
+    /// Optional `[buzz]` persona config. Absent ⇒ the buzz persona feature is inert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buzz: Option<BuzzConfig>,
     /// Optional `[agents]` table of custom presets: name -> `{ argv = [...] }`. A custom
     /// entry named after a built-in preset (claude|cursor|codex) OVERRIDES that built-in.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -739,6 +781,7 @@ impl Default for MobeeConfig {
             allow_real_mints: false,
             profile: None,
             seller: None,
+            buzz: None,
             agents: BTreeMap::new(),
             seller_memory: SellerMemoryConfig::default(),
             seller_announce: SellerAnnounceConfig::default(),
