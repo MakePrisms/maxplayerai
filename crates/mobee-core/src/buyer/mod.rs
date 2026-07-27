@@ -24,6 +24,7 @@ pub mod client;
 pub mod lifecycle;
 pub mod lock;
 pub mod protocol;
+pub mod relay;
 pub mod reservations;
 pub mod signer;
 pub mod store;
@@ -78,6 +79,9 @@ pub enum BuyerError {
     Store(StoreError),
     Wallet(FundError),
     Identity(HomeError),
+    /// The relay could not be REGISTERED — a malformed url or a pool refusal. An unreachable relay
+    /// is not this: the daemon comes up and serves with the network down.
+    Relay(String),
     Io(String),
 }
 
@@ -88,6 +92,7 @@ impl std::fmt::Display for BuyerError {
             Self::Store(error) => write!(formatter, "{error}"),
             Self::Wallet(error) => write!(formatter, "buyer wallet error: {error}"),
             Self::Identity(error) => write!(formatter, "buyer identity error: {error}"),
+            Self::Relay(message) => write!(formatter, "buyer relay error: {message}"),
             Self::Io(message) => write!(formatter, "buyer io error: {message}"),
         }
     }
@@ -122,6 +127,9 @@ struct BuyerContext {
     store: BuyerStore,
     wallet: WalletHandle,
     signer: SignerHandle,
+    /// The buyer's one long-lived relay session. Writes and (from the delivery watcher on)
+    /// subscriptions ride this instead of a fresh `Client` per operation.
+    relay: relay::RelayHandle,
     started_at_unix: i64,
     /// Serializes the money-state-mutating RPCs (`award` reserves, `collect` flips) so a
     /// reservation's balance/spent snapshot is never read while a concurrent collect is melting.
@@ -159,12 +167,21 @@ async fn bootstrap(home: MobeeHome) -> Result<(HomeLock, Arc<BuyerContext>, Path
 
     let signer = signer::spawn(&home)?;
 
+    // Registers the relay and hands the session to the actor; it does NOT wait for the socket or
+    // the NIP-42 handshake, so an unreachable relay cannot delay the daemon past connect-or-spawn's
+    // readiness deadline (see `relay::spawn`).
+    let relay_keys = buyer_keys(&home).map_err(BuyerError::Relay)?;
+    let relay = relay::spawn(relay_keys, &home.config.relay_url)
+        .await
+        .map_err(|error| BuyerError::Relay(error.to_string()))?;
+
     let socket_path = home.root.join(SOCKET_FILE);
     let context = Arc::new(BuyerContext {
         home,
         store,
         wallet,
         signer,
+        relay,
         started_at_unix,
         money_lock: Mutex::new(()),
         last_reconcile: Mutex::new(None),
@@ -961,6 +978,11 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
             },
             "reconcile": reconcile,
             "parked_awards": parked_awards,
+            // The relay the buyer's one long-lived session is bound to. Deliberately NOT a liveness
+            // probe: `status` is what connect-or-spawn polls to decide the daemon is up, and a probe
+            // bounded at 10s would push that poll past its own readiness deadline. Liveness belongs
+            // to the watcher's tick, where a slow answer costs nothing.
+            "relay": { "url": context.relay.relay_url() },
         }),
     )
 }
