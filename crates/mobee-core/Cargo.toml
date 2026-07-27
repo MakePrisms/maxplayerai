@@ -51,6 +51,9 @@ required-features = ["git-delivery"]
 [dev-dependencies]
 async-trait = "0.1.89"
 cdk-sqlite = "=0.17.2"
+# Sink/Stream helpers for the p-gate relay fixture's websocket split. Already in the workspace lock
+# via nostr-sdk; no new resolution.
+futures-util = { version = "0.3", default-features = false }
 # In-process NIP-01 relay for the seller-daemon live-delivery integration test. Same nostr 0.44
 # line as `nostr-sdk` above, so its `Event`/`Filter` types unify with the daemon's.
 nostr-relay-builder = "0.44"
@@ -58,6 +61,9 @@ nostr-relay-builder = "0.44"
 # rcgen self-signed cert. ring-backed on both — aws-lc-rs is not in the workspace lock.
 rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-tokio = { version = "1.52.0", features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
+tokio = { version = "1.52.0", features = ["macros", "net", "rt", "rt-multi-thread", "time", "test-util"] }
+# The p-gate relay fixture speaks raw NIP-01 over a websocket, because it has to answer a p-gated REQ
+# with the `restricted:` prefix — see the module docs for why nostr-relay-builder cannot.
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
 url = "2.5.8"
 uuid = "1.23.5"

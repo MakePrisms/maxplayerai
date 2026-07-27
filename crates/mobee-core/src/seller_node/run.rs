@@ -281,6 +281,113 @@ fn subscription_label(id: &str) -> &'static str {
     }
 }
 
+/// Whether `id` names a long-lived subscription this node registers. Anything else — a transient
+/// `fetch_events` REQ, a stale generation, a relay-side artefact — is not a leg of ours, so its
+/// closure cannot make us deaf.
+fn is_our_subscription(id: &str) -> bool {
+    matches!(
+        id,
+        OFFER_SUB_ID | AWARD_SUB_ID | WRAP_SUB_ID | LIVENESS_PROBE_SUB_ID
+    )
+}
+
+/// Whether EVERY filter on this subscription pins `#p` to our own pubkey.
+///
+/// This is the precondition for reading a `restricted:` CLOSED as the #189 pre-auth race instead of a
+/// gate violation, and the CLOSED-prefix taxonomy stays load-bearing everywhere else: `restricted:`
+/// remains permanent-class, and the SDK's `Remove` classification is not softened. The carve-out is
+/// sound because mobee-relay's p-gate has exactly two ways to refuse a `#p` filter — the `#p` names
+/// somebody else, or the connection had no authenticated pubkey to compare it against. We author
+/// these filters from `self.seller_pubkey`, so the first is impossible by construction for the ids
+/// below; only the second remains, and the second is retryable once auth exists. A subscription
+/// carrying ANY un-pinned filter is excluded, because there the refusal may genuinely be about the
+/// un-pinned half — that case has its own repair, the targeted-only degrade.
+fn subscription_pins_only_our_pubkey(id: &str, claim_open_pool: bool) -> bool {
+    match id {
+        AWARD_SUB_ID | WRAP_SUB_ID => true,
+        OFFER_SUB_ID => !claim_open_pool,
+        _ => false,
+    }
+}
+
+/// Owned ticks to wait before the next open-pool re-arm attempt, after `rejections` consecutive
+/// refusals (#190).
+///
+/// Doubling, capped: a relay that permanently refuses the un-pinned filter must cost one REQ per cap
+/// interval, never one REQ per tick. Zero rejections means "attempt on the next tick" — the first
+/// try after a degrade is not delayed, because the degrade itself is usually collateral from the
+/// #189 race rather than a real refusal of the open-pool half.
+fn open_pool_rearm_cooldown_ticks(rejections: u32) -> u32 {
+    /// Ceiling on the backoff, in owned ticks.
+    const MAX_COOLDOWN_TICKS: u32 = 12;
+    match rejections {
+        0 => 0,
+        n => (1u32 << (n - 1).min(31)).min(MAX_COOLDOWN_TICKS),
+    }
+}
+
+/// Open-pool degrade bookkeeping (#190). Absent = the open-pool half is live.
+///
+/// The re-arm this drives is DEFENCE IN DEPTH, not a repair for an observed stuck seat: the reported
+/// specimen was withdrawn — every seat seen degraded was flapping on the #189 sawtooth, not stuck.
+/// The gap it closes is structural rather than field-observed. A seat that degrades and then never
+/// recovers has no path back, because the only re-arm was `open_pool_degraded = false` in the
+/// recovery-success arm; a healthy seat produces no recoveries, so it would hold the degraded shape
+/// indefinitely. That reasoning survives the #189 fix, which is why the owned schedule stays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenPoolDegrade {
+    /// Consecutive re-arm attempts the relay refused.
+    rejections: u32,
+    /// Owned ticks still to skip before the next attempt.
+    cooldown_ticks: u32,
+    /// An attempt is on the wire, awaiting the relay's verdict: `EOSE` re-arms, `CLOSED` rejects.
+    attempt_pending: bool,
+}
+
+impl OpenPoolDegrade {
+    /// Freshly degraded: attempt the re-arm on the very next owned tick.
+    fn new() -> Self {
+        Self {
+            rejections: 0,
+            cooldown_ticks: 0,
+            attempt_pending: false,
+        }
+    }
+
+    /// What the next owned tick should do.
+    fn on_tick(&mut self) -> RearmStep {
+        if self.attempt_pending {
+            // The previous attempt drew neither an EOSE nor a CLOSED within a full tick. Treat the
+            // silence as a refusal rather than waiting on it: an attempt with no verdict pending is
+            // exactly the timer-less park this fix exists to remove.
+            self.reject();
+            return RearmStep::Wait;
+        }
+        if self.cooldown_ticks > 0 {
+            self.cooldown_ticks -= 1;
+            return RearmStep::Wait;
+        }
+        self.attempt_pending = true;
+        RearmStep::Attempt
+    }
+
+    /// The relay refused (or ignored) the re-arm.
+    fn reject(&mut self) {
+        self.attempt_pending = false;
+        self.rejections = self.rejections.saturating_add(1);
+        self.cooldown_ticks = open_pool_rearm_cooldown_ticks(self.rejections);
+    }
+}
+
+/// What an owned tick does about a degraded open-pool half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RearmStep {
+    /// Send the grouped offer REQ again.
+    Attempt,
+    /// Still cooling down, or still waiting on the last attempt's verdict.
+    Wait,
+}
+
 /// Ask the relay to serve one trivial REQ on the CURRENT session and wait for its `EOSE`. True means
 /// the relay is answering OUR subscriptions on THIS authenticated connection — the exact property the
 /// #150 watchdog needs, and the one thing a heartbeat cannot demonstrate.
@@ -400,6 +507,33 @@ async fn reconnect_and_authenticate(
     client.connect().await;
     client.wait_for_connection(CONNECT_WAIT).await;
     relay_auth::wait_for_nip42_auth(&mut relay_notifications, CONNECT_WAIT).await
+}
+
+/// Leave the SDK with nothing to re-`REQ` when the next socket comes up, and return how many
+/// registrations survived — which must be zero.
+///
+/// `RelayPool::unsubscribe_all` is best-effort by construction: the relay-level loop removes each id
+/// from the map and then sends its `CLOSE`, propagating the first send error with `?`
+/// (`relay/inner.rs:1724-1736`), so one failed send leaves every remaining id registered. A single
+/// leftover registration is the whole #189 hazard — it is the thing that gets re-sent pre-auth — so
+/// the relay's own view is swept afterwards. `Relay::unsubscribe` removes before it sends, so the
+/// sweep empties the map whether or not the socket can carry the `CLOSE`.
+async fn clear_subscription_registrations(
+    client: &Client,
+    relay: &nostr_sdk::prelude::Relay,
+) -> usize {
+    client.unsubscribe_all().await;
+    for id in relay.subscriptions().await.keys() {
+        let _ = relay.unsubscribe(id).await;
+    }
+    let leftover = relay.subscriptions().await.len();
+    if leftover > 0 {
+        eprintln!(
+            "seller node WARN: {leftover} subscription registration(s) survived the pre-reconnect \
+             clear; they will be re-sent before NIP-42 completes"
+        );
+    }
+    leftover
 }
 
 /// The refusal reason `on_offer` logs when an offer fails to parse.
@@ -532,6 +666,9 @@ pub struct SellerNodeRunner {
     publisher: RelayPublisher,
     relay_url: String,
     seller_pubkey: nostr_sdk::PublicKey,
+    /// Outcome of the boot NIP-42 handshake, which seeds the run loop's view of whether the current
+    /// socket is authenticated. `NoChallenge` is not authentication.
+    boot_auth: AuthWait,
 }
 
 impl SellerNodeRunner {
@@ -590,15 +727,23 @@ impl SellerNodeRunner {
         let mut relay_notifications = relay.notifications();
         client.connect().await;
         client.wait_for_connection(CONNECT_WAIT).await;
-        match relay_auth::wait_for_nip42_auth(&mut relay_notifications, CONNECT_WAIT).await {
-            Ok(AuthWait::Authenticated) => eprintln!("seller node relay authenticated (NIP-42)"),
-            Ok(AuthWait::NoChallenge) => eprintln!(
-                "seller node WARN: no NIP-42 challenge within {CONNECT_WAIT:?}; proceeding \
-                 (auto-auth stays ON — a challenge on the REQ still authenticates). p-gated kind-1059 \
-                 receive may be degraded until auth completes."
-            ),
+        let boot_auth = match relay_auth::wait_for_nip42_auth(&mut relay_notifications, CONNECT_WAIT)
+            .await
+        {
+            Ok(AuthWait::Authenticated) => {
+                eprintln!("seller node relay authenticated (NIP-42)");
+                AuthWait::Authenticated
+            }
+            Ok(AuthWait::NoChallenge) => {
+                eprintln!(
+                    "seller node WARN: no NIP-42 challenge within {CONNECT_WAIT:?}; proceeding \
+                     (auto-auth stays ON — a challenge on the REQ still authenticates). p-gated \
+                     kind-1059 receive may be degraded until auth completes."
+                );
+                AuthWait::NoChallenge
+            }
             Err(error) => return Err(NodeError::Relay(format!("NIP-42 auth: {error}"))),
-        }
+        };
 
         let publisher = RelayPublisher::new(node.signer().clone(), client.clone(), &relay_url);
 
@@ -608,6 +753,7 @@ impl SellerNodeRunner {
             publisher,
             relay_url,
             seller_pubkey,
+            boot_auth,
         })
     }
 
@@ -658,24 +804,44 @@ impl SellerNodeRunner {
     /// (see [`probe_relay_serves_our_reqs`]), so that REQ could only ever have returned nothing.
     /// Liveness is asserted by the probe instead.
     async fn subscribe_all(&self, since: Option<nostr_sdk::Timestamp>) -> Result<(), NodeError> {
-        let apply = |filter: Filter| match since {
-            Some(cursor) => filter.since(cursor),
-            None => filter,
-        };
-        self.subscribe_offers(since, self.claim_open_pool()).await?;
-        let award_filter = apply(
-            Filter::new()
+        for id in [OFFER_SUB_ID, AWARD_SUB_ID, WRAP_SUB_ID] {
+            self.subscribe_one(id, since).await?;
+        }
+        Ok(())
+    }
+
+    /// Issue (or re-issue) the REQ for ONE named subscription, so a single leg can be repaired
+    /// without re-dialing the relay or disturbing the others.
+    async fn subscribe_one(
+        &self,
+        id: &str,
+        since: Option<nostr_sdk::Timestamp>,
+    ) -> Result<(), NodeError> {
+        // The offer REQ has its own entry point: it is the only subscription with a meaningful
+        // partial form, and it carries two filters rather than one.
+        if id == OFFER_SUB_ID {
+            return self.subscribe_offers(since, self.claim_open_pool()).await;
+        }
+        let base = match id {
+            AWARD_SUB_ID => Filter::new()
                 .kind(Kind::Custom(JOB_AWARD_KIND))
                 .hashtag(crate::gateway::MOBEE_TAG)
                 .pubkey(self.seller_pubkey),
-        );
-        let wrap_filter = apply(Filter::new().kind(Kind::GiftWrap).pubkey(self.seller_pubkey));
-        for (id, filter) in [(AWARD_SUB_ID, award_filter), (WRAP_SUB_ID, wrap_filter)] {
-            self.client
-                .subscribe_with_id(nostr_sdk::SubscriptionId::new(id), filter, None)
-                .await
-                .map_err(|error| NodeError::Relay(format!("subscribe {id}: {error}")))?;
-        }
+            WRAP_SUB_ID => Filter::new().kind(Kind::GiftWrap).pubkey(self.seller_pubkey),
+            other => {
+                return Err(NodeError::Relay(format!(
+                    "subscribe {other}: not one of ours"
+                )))
+            }
+        };
+        let filter = match since {
+            Some(cursor) => base.since(cursor),
+            None => base,
+        };
+        self.client
+            .subscribe_with_id(nostr_sdk::SubscriptionId::new(id), filter, None)
+            .await
+            .map_err(|error| NodeError::Relay(format!("subscribe {id}: {error}")))?;
         Ok(())
     }
 
@@ -769,12 +935,31 @@ impl SellerNodeRunner {
         // probe. Seeded to "now" so a healthy node never trips before its first probe.
         let mut last_liveness_seen = tokio::time::Instant::now();
         let mut last_liveness_seen_unix = now_unix();
-        // Whether the offer REQ is currently running in its degraded targeted-only shape after a
-        // relay `CLOSED` (re-armed by the next successful recovery).
-        let mut open_pool_degraded = false;
+        // Set while the offer REQ is running in its degraded targeted-only shape after a relay
+        // `CLOSED`. Carries its own re-arm schedule (#190) — see [`OpenPoolDegrade`].
+        let mut open_pool: Option<OpenPoolDegrade> = None;
         // A repair the CLOSED arm has asked for, run on the next heartbeat tick through the ONE
         // paced recovery path rather than an off-cadence ad-hoc resubscribe.
         let mut forced_recovery: Option<String> = None;
+        // NIP-42 state of the CURRENT socket, and when it was last established.
+        //
+        // Tracked here because `Authenticated` is a RELAY notification that never becomes a pool
+        // notification (`relay/inner.rs:418` maps it to `None`), so the pool stream the loop already
+        // watches cannot see it. Seeded from the boot handshake. Both stale readings are bounded and
+        // safe: stale-false only declines a cheap retry and falls through to the paced recovery,
+        // while stale-true spends the single retry this session allows and then does the same.
+        let mut nip42_authed = matches!(self.boot_auth, AuthWait::Authenticated);
+        let mut last_authenticated_at = tokio::time::Instant::now();
+        let mut relay_notifications = relay.notifications();
+        // Subscriptions that have already spent their one post-auth retry on this session (#189
+        // belt). Cleared whenever a new session authenticates, so the budget is per-session and can
+        // never become a loop.
+        let mut restricted_retry_used: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        // When the last periodic wrap backfill ran. Reported alongside an unknown-id `CLOSED` so the
+        // relay owner can tell a refusal of our transient `fetch_events` REQ (which uses a generated
+        // id, and runs on exactly this cadence) from a relay-side sweep of a stale generation.
+        let mut last_backfill_at = tokio::time::Instant::now();
         // Which path actually restored the receive leg. Manual recovery and the SDK's background
         // reconnect were previously indistinguishable in the log — which is how a manual path that
         // never once succeeded went unnoticed (#171). The next answered probe names it.
@@ -791,6 +976,38 @@ impl SellerNodeRunner {
                 // the positive signal external supervision watches.
                 _ = wrap_backfill_tick.tick() => {
                     self.run_wrap_backfill().await;
+                    last_backfill_at = tokio::time::Instant::now();
+                    // #190: the open-pool half is re-armed on THIS tick, which is owned and
+                    // unconditional. It rides the backfill rather than the heartbeat because the
+                    // heartbeat is disableable by config, and a repair must not depend on a tick that
+                    // may never fire. Acceptance is the relay's EOSE below — a response the protocol
+                    // owes us — never the fact that we managed to send the REQ.
+                    if let Some(state) = open_pool.as_mut() {
+                        if state.on_tick() == RearmStep::Attempt {
+                            let overlap = nostr_sdk::Timestamp::from(
+                                last_liveness_seen_unix
+                                    .saturating_sub(STALL_OVERLAP_MARGIN_SECS as i64)
+                                    .max(0) as u64,
+                            );
+                            match self.subscribe_offers(Some(overlap), true).await {
+                                Ok(()) => eprintln!(
+                                    "seller node RELAY-CLOSED RE-ARM: retrying the open-pool half of \
+                                     the offer subscription (attempt after {} rejection(s), \
+                                     since={} overlap); the relay's EOSE confirms it",
+                                    state.rejections,
+                                    overlap.as_secs()
+                                ),
+                                Err(error) => {
+                                    state.reject();
+                                    eprintln!(
+                                        "seller node RELAY-CLOSED RE-ARM failed to send ({error}); \
+                                         next attempt in {} backfill tick(s)",
+                                        state.cooldown_ticks
+                                    );
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
                 // The heartbeat tick rides the SAME loop (never a blocking side-thread). Probe first,
@@ -856,7 +1073,7 @@ impl SellerNodeRunner {
                                 last_liveness_seen = tokio::time::Instant::now();
                                 last_liveness_seen_unix = now_unix();
                                 // The full set was re-subscribed, so the open-pool half is back.
-                                open_pool_degraded = false;
+                                open_pool = None;
                                 manual_recovery_succeeded = true;
                                 eprintln!(
                                     "seller node RELAY-STALL recovery SUCCEEDED (attempts={attempts}, \
@@ -905,18 +1122,64 @@ impl SellerNodeRunner {
                                 "seller node RELAY-CLOSED: relay closed the {label} subscription \
                                  (id={id}): {reason}"
                             );
+
+                            // An id we never registered cannot be a leg of ours going deaf, so it
+                            // must not cost a reconnect — and escalating it did exactly that. Field
+                            // seats open every cycle with a CLOSED for an unknown id; that forced a
+                            // full recovery, and the recovery then re-closed the 1059 leg. A
+                            // self-inflicted sawtooth on a socket that was never broken.
+                            //
+                            // The two ages are for the relay owner, who cannot see either from the
+                            // server side. Our periodic wrap backfill uses `fetch_events`, which
+                            // GENERATES its subscription id (`pool/mod.rs:815`) and runs on exactly
+                            // this cadence, so a small backfill age implicates our own transient REQ;
+                            // an auth age near the relay's NIP-42 TTL instead implicates a
+                            // re-challenge sweep closing auth-scoped subs from the pre-expiry
+                            // generation.
+                            if !is_our_subscription(&id) {
+                                eprintln!(
+                                    "seller node RELAY-CLOSED UNKNOWN-ID: id={id} was never in our \
+                                     registry (ours: {OFFER_SUB_ID}, {AWARD_SUB_ID}, {WRAP_SUB_ID}, \
+                                     {LIVENESS_PROBE_SUB_ID}); no recovery forced. \
+                                     last_backfill={}s ago, last_nip42_auth={}s ago, \
+                                     authed={nip42_authed}",
+                                    last_backfill_at.elapsed().as_secs(),
+                                    last_authenticated_at.elapsed().as_secs()
+                                );
+                                continue;
+                            }
+
+                            // Whether the offer REQ currently on the wire carries the un-pinned
+                            // open-pool filter: either it was never dropped, or a re-arm attempt has
+                            // just put it back. This is what decides whether a refusal can be ABOUT
+                            // the un-pinned half — while degraded to targeted-only, it cannot.
+                            let offer_req_carries_unpinned = self.claim_open_pool()
+                                && open_pool.is_none_or(|state| state.attempt_pending);
+
                             // The offer REQ is the one subscription with a meaningful partial form:
                             // drop the un-pinned open-pool filter and re-subscribe targeted-only, so
                             // a relay that refuses the grouped REQ still leaves targeted claiming
                             // alive rather than taking the whole offer leg down.
-                            if id == OFFER_SUB_ID && self.claim_open_pool() && !open_pool_degraded {
+                            if id == OFFER_SUB_ID && offer_req_carries_unpinned {
+                                // A CLOSED landing while a re-arm attempt is on the wire IS that
+                                // attempt's verdict, and it is what advances the backoff (#190).
+                                let refused = open_pool.as_mut().map(|state| {
+                                    state.reject();
+                                    (state.rejections, state.cooldown_ticks)
+                                });
                                 match self.subscribe_offers(None, false).await {
                                     Ok(()) => {
-                                        open_pool_degraded = true;
+                                        let (rejections, cooldown) = refused.unwrap_or_else(|| {
+                                            open_pool = Some(OpenPoolDegrade::new());
+                                            (0, 0)
+                                        });
                                         eprintln!(
                                             "seller node RELAY-CLOSED DEGRADE: offer subscription \
-                                             re-armed TARGETED-ONLY (open-pool half dropped; \
-                                             re-armed on the next successful recovery)"
+                                             re-armed TARGETED-ONLY (open-pool half dropped after \
+                                             {rejections} consecutive refusal(s); the open-pool half \
+                                             is retried on the \
+                                             {wrap_backfill_interval_secs}s backfill tick, next \
+                                             attempt in {cooldown} tick(s) — no reconnect required)"
                                         );
                                     }
                                     Err(error) => {
@@ -929,12 +1192,74 @@ impl SellerNodeRunner {
                                         ));
                                     }
                                 }
-                            } else {
-                                // Awards / 1059 / heartbeat have no partial form — repair them
-                                // through the one paced recovery path so nothing re-dials the relay
-                                // off-cadence.
-                                forced_recovery =
-                                    Some(format!("relay CLOSED the {label} subscription: {reason}"));
+                                continue;
+                            }
+
+                            // #189 BELT. A `restricted:` CLOSED of a subscription whose filters all
+                            // pin `#p` to our OWN pubkey, on a session that has authenticated, is the
+                            // pre-auth REQ race — not a gate violation. It arrives mostly from the
+                            // SDK's own background reconnect, which resubscribes on socket-up before
+                            // AUTH exists (`relay/inner.rs:748-752`) and is not a path we can order
+                            // from out here. So re-issue that ONE REQ, at most once per authenticated
+                            // session (`insert` returns false the second time, and the budget is
+                            // cleared only when a NEW session authenticates). The taxonomy is not
+                            // softened: a genuine wrong-`#p` `restricted:` cannot reach this branch,
+                            // because we author these filters from our own pubkey — and a second
+                            // refusal falls through to the paced recovery below rather than looping.
+                            let restricted = matches!(
+                                nostr_sdk::prelude::MachineReadablePrefix::parse(&reason),
+                                Some(nostr_sdk::prelude::MachineReadablePrefix::Restricted)
+                            );
+                            if restricted
+                                && nip42_authed
+                                && subscription_pins_only_our_pubkey(&id, offer_req_carries_unpinned)
+                                && restricted_retry_used.insert(id.clone())
+                            {
+                                let overlap = nostr_sdk::Timestamp::from(
+                                    last_liveness_seen_unix
+                                        .saturating_sub(STALL_OVERLAP_MARGIN_SECS as i64)
+                                        .max(0) as u64,
+                                );
+                                match self.subscribe_one(&id, Some(overlap)).await {
+                                    Ok(()) => {
+                                        eprintln!(
+                                            "seller node RELAY-CLOSED RETRY: the {label} \
+                                             subscription pins #p to our OWN pubkey and this session \
+                                             authenticated {}s ago, so `restricted:` here is the \
+                                             pre-auth REQ race (#189) and not a gate violation; \
+                                             re-subscribed ONCE with since={} overlap",
+                                            last_authenticated_at.elapsed().as_secs(),
+                                            overlap.as_secs()
+                                        );
+                                        continue;
+                                    }
+                                    Err(error) => eprintln!(
+                                        "seller node RELAY-CLOSED retry failed ({error}); forcing \
+                                         full recovery on the next heartbeat tick"
+                                    ),
+                                }
+                            }
+
+                            // Awards / 1059 / probe have no partial form — repair them through the
+                            // one paced recovery path so nothing re-dials the relay off-cadence.
+                            forced_recovery =
+                                Some(format!("relay CLOSED the {label} subscription: {reason}"));
+                        }
+                        // An EOSE for the offer subscription while a re-arm attempt is on the wire is
+                        // the relay ACCEPTING the grouped REQ. Acceptance is read from this response
+                        // — which NIP-01 owes us — and never from our own send having succeeded: a
+                        // REQ that left the socket proves nothing about whether the relay took it.
+                        Ok(RelayPoolNotification::Message {
+                            message: nostr_sdk::RelayMessage::EndOfStoredEvents(eose_id),
+                            ..
+                        }) if eose_id.to_string() == OFFER_SUB_ID => {
+                            if open_pool.is_some_and(|state| state.attempt_pending) {
+                                open_pool = None;
+                                eprintln!(
+                                    "seller node RELAY-CLOSED RE-ARMED: the open-pool half of the \
+                                     offer subscription is live again (the relay served the grouped \
+                                     REQ); no reconnect was required"
+                                );
                             }
                         }
                         Ok(_) => {}
@@ -943,6 +1268,34 @@ impl SellerNodeRunner {
                             eprintln!("seller node WARN: notification stream {error}; continuing");
                             continue;
                         }
+                    }
+                }
+                // The relay's OWN notification stream, watched only to know whether the current
+                // socket has completed NIP-42. `Authenticated` never reaches the pool stream above
+                // (`relay/inner.rs:418` maps it to `None`), so this is the only way to see it.
+                relay_event = relay_notifications.recv() => {
+                    use nostr_sdk::pool::RelayNotification;
+                    match relay_event {
+                        Ok(RelayNotification::Authenticated) => {
+                            nip42_authed = true;
+                            last_authenticated_at = tokio::time::Instant::now();
+                            // A newly authenticated session earns a fresh retry budget: the budget
+                            // exists to bound retries WITHIN a session, not to spend one forever.
+                            restricted_retry_used.clear();
+                        }
+                        Ok(RelayNotification::AuthenticationFailed) => nip42_authed = false,
+                        // A socket that went away takes its NIP-42 state with it — whatever comes
+                        // back starts unauthenticated.
+                        Ok(RelayNotification::RelayStatus { status })
+                            if status != nostr_sdk::prelude::RelayStatus::Connected =>
+                        {
+                            nip42_authed = false;
+                        }
+                        Ok(RelayNotification::Shutdown) => nip42_authed = false,
+                        Ok(_) => {}
+                        // Lagging this stream costs only auth-state precision, and both stale
+                        // readings are bounded (see the declaration). Never go deaf over it.
+                        Err(_) => {}
                     }
                 }
             }
@@ -1112,20 +1465,56 @@ impl SellerNodeRunner {
         }
     }
 
-    /// Tear down the silently-dead connection and rebuild it: reconnect, re-run NIP-42 (the p-gated
-    /// kind-1059 resubscribe depends on it, same as boot), then resubscribe ALL filters with
-    /// `since = overlap`. Clears the stale subscriptions only AFTER a successful reconnect+auth so a
-    /// failed recovery never leaves the node reconnected-but-deaf.
+    /// Tear down the silently-dead connection and rebuild it: drop the stale registrations, reconnect,
+    /// re-run NIP-42 (the p-gated kind-1059 resubscribe depends on it, same as boot), then resubscribe
+    /// ALL filters with `since = overlap`.
+    ///
+    /// CLEARING BEFORE THE RECONNECT IS THE WHOLE OF #189. `RelayInner::post_connection` re-sends every
+    /// registered `REQ` as its first act on socket-up (`relay/inner.rs:748-752`), before that
+    /// connection has any NIP-42 state at all; auth only happens later, in the ingester
+    /// (`inner.rs:936`). mobee-relay evaluates its p-gate against the empty authed pubkey of that
+    /// unauthenticated session and answers `restricted:` — the PERMANENT prefix — where the truth is
+    /// the retryable `auth-required:`. nostr-sdk takes `restricted:` at its word and DELETES the
+    /// subscription (`inner.rs:1028` → `remove_subscription`), so the post-auth `resubscribe()` at
+    /// `inner.rs:941` cannot see it and never restores it. Carrying registrations across the socket
+    /// boundary therefore kills the kind-1059 money leg on every single recovery. With nothing
+    /// registered, that first resubscribe has nothing to send and the REQs go out below — after auth,
+    /// the same order boot has always had.
     async fn reconnect_and_resubscribe(
         &self,
         relay: &nostr_sdk::prelude::Relay,
         overlap_since: nostr_sdk::Timestamp,
     ) -> Result<(), NodeError> {
-        reconnect_and_authenticate(&self.client, relay)
-            .await
-            .map_err(|error| NodeError::Relay(format!("reconnect NIP-42 auth: {error}")))?;
-        self.client.unsubscribe_all().await;
-        self.subscribe_all(Some(overlap_since)).await
+        clear_subscription_registrations(&self.client, relay).await;
+        match reconnect_and_authenticate(&self.client, relay).await {
+            Ok(AuthWait::Authenticated) => self.subscribe_all(Some(overlap_since)).await,
+            Ok(AuthWait::NoChallenge) => {
+                // Same posture as boot: proceed, loudly. Auto-auth stays on, so a challenge raised on
+                // the REQ itself still authenticates — but a p-gated resubscribe issued before that
+                // completes is exactly the condition above, so say so rather than report a clean
+                // recovery.
+                eprintln!(
+                    "seller node WARN: recovery saw no NIP-42 challenge within {CONNECT_WAIT:?}; \
+                     resubscribing anyway (auto-auth stays ON). p-gated kind-1059 receive may be \
+                     degraded until auth completes."
+                );
+                self.subscribe_all(Some(overlap_since)).await
+            }
+            Err(error) => {
+                // The registrations are gone and the new socket never authenticated. Put them back:
+                // the SDK's own background reconnect is a real recovery path in the field (the run
+                // loop distinguishes it in the RESTORED line) and it can only restore subscriptions it
+                // still knows about. Re-registering makes a failed attempt no worse than not having
+                // tried; the next heartbeat tick retries the whole recovery.
+                if let Err(restore) = self.subscribe_all(Some(overlap_since)).await {
+                    eprintln!(
+                        "seller node WARN: subscriptions could not be restored after a failed \
+                         recovery ({restore}); the next heartbeat tick retries"
+                    );
+                }
+                Err(NodeError::Relay(format!("reconnect NIP-42 auth: {error}")))
+            }
+        }
     }
 
     /// Consider one offer event: parse it, apply the money-safety gates, and — if admitted — journal
@@ -2963,5 +3352,491 @@ mod tests {
             "a resumed re-execution delivers at most once"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- #189 / #190 recovery teeth ------------------------------------------------------------
+    //
+    // These drive the REAL paths against [`p_gate_relay_fixture`], which answers a `#p`-gated REQ
+    // from an unauthenticated session with the permanent-class `restricted:` prefix exactly as
+    // mobee-relay does. The nostr-relay-builder fixture used above cannot express this: it says
+    // `auth-required:`, which nostr-sdk keeps and restores by itself, so every ordering would pass.
+
+    use crate::seller_node::p_gate_relay_fixture::{PGateRelay, ReqRecord, Verdict};
+
+    /// Generous enough that a slow box never flakes, short enough that a real failure fails fast.
+    const FIXTURE_WAIT: Duration = Duration::from_secs(15);
+
+    /// A throwaway home per test. Unique per test name AND process so a parallel run never collides
+    /// on the exclusive home lock.
+    fn throwaway_root(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-recoveryfix-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    /// Boot a real runner against the fixture relay.
+    async fn boot_against(
+        root: &std::path::Path,
+        fixture: &PGateRelay,
+        claim_open_pool: bool,
+    ) -> SellerNodeRunner {
+        let mut home = crate::home::bootstrap(root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, claim_open_pool));
+        SellerNodeRunner::boot(home)
+            .await
+            .expect("boot the node against the fixture relay")
+    }
+
+    /// The relay handle the recovery path takes.
+    async fn relay_handle(runner: &SellerNodeRunner) -> nostr_sdk::prelude::Relay {
+        runner
+            .client
+            .relays()
+            .await
+            .get(&RelayUrl::parse(&runner.relay_url).expect("relay url"))
+            .cloned()
+            .expect("relay handle")
+    }
+
+    /// Every REQ that reached the relay before that session had completed NIP-42, on a filter the
+    /// relay p-gates. This set being non-empty IS #189.
+    fn p_gated_before_auth(reqs: &[ReqRecord]) -> Vec<&ReqRecord> {
+        reqs.iter()
+            .filter(|record| record.p_pinned && !record.authenticated)
+            .collect()
+    }
+
+    /// Every REQ the relay refused with the permanent-class prefix — each one a subscription
+    /// nostr-sdk has deleted from its registry and will never restore.
+    fn permanently_removed(reqs: &[ReqRecord]) -> Vec<&ReqRecord> {
+        reqs.iter()
+            .filter(|record| {
+                matches!(&record.verdict, Verdict::Closed(reason) if reason.starts_with("restricted:"))
+            })
+            .collect()
+    }
+
+    /// TOOTH #189 (a) — THE ORDERING. A recovery whose AUTH lands well after the socket does must
+    /// still put every REQ on the wire AFTER NIP-42, leaving all four subscriptions live and nothing
+    /// permanently removed.
+    ///
+    /// The fixture withholds its challenge for 400ms, so the pre-auth window is wide and the outcome
+    /// is decided by ordering rather than luck.
+    ///
+    /// RED ON REVERT: move `clear_subscription_registrations` back to AFTER
+    /// `reconnect_and_authenticate` in `reconnect_and_resubscribe` and this goes red — the SDK's
+    /// `post_connection` resubscribe (`relay/inner.rs:748-752`) puts all three registered REQs on the
+    /// new socket immediately, the fixture refuses the p-gated ones `restricted:`, and both
+    /// assertions below fire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_puts_no_p_gated_req_on_the_wire_before_nip42_completes() {
+        let fixture = PGateRelay::start(Duration::from_millis(400)).await;
+        let root = throwaway_root("order");
+        let runner = boot_against(&root, &fixture, false).await;
+        let relay = relay_handle(&runner).await;
+
+        runner.subscribe_all(None).await.expect("boot subscribe");
+        assert!(
+            fixture
+                .wait_until(FIXTURE_WAIT, |reqs| {
+                    [OFFER_SUB_ID, AWARD_SUB_ID, WRAP_SUB_ID]
+                        .iter()
+                        .all(|id| reqs.iter().any(|r| r.subscription_id == *id))
+                })
+                .await,
+            "harness check: the boot subscriptions must reach the relay before we induce a recovery"
+        );
+
+        runner
+            .reconnect_and_resubscribe(&relay, nostr_sdk::Timestamp::from(0))
+            .await
+            .expect("recovery must succeed against a relay that authenticates");
+
+        assert!(
+            fixture
+                .wait_until(FIXTURE_WAIT, |reqs| {
+                    [OFFER_SUB_ID, AWARD_SUB_ID, WRAP_SUB_ID]
+                        .iter()
+                        .all(|id| reqs.iter().filter(|r| r.subscription_id == *id).count() >= 2)
+                })
+                .await,
+            "the recovery must re-issue every REQ"
+        );
+
+        // The fourth subscription: the liveness probe, which only exists on a session the relay is
+        // actually serving. Asserting it here is what makes "all four end live" true rather than
+        // three-plus-an-assumption.
+        assert!(
+            probe_relay_serves_our_reqs(&runner.client, runner.seller_pubkey, FIXTURE_WAIT).await,
+            "the liveness probe must answer on the recovered session"
+        );
+
+        let reqs = fixture.reqs().await;
+        assert!(
+            p_gated_before_auth(&reqs).is_empty(),
+            "a p-gated REQ reached the relay before NIP-42 completed — that is #189: {:?}",
+            p_gated_before_auth(&reqs)
+        );
+        assert!(
+            permanently_removed(&reqs).is_empty(),
+            "the relay permanently removed a subscription (`restricted:`), so the money leg is dead \
+             until the next backfill: {:?}",
+            permanently_removed(&reqs)
+        );
+        for id in [OFFER_SUB_ID, AWARD_SUB_ID, WRAP_SUB_ID, LIVENESS_PROBE_SUB_ID] {
+            let last = fixture
+                .reqs_for(id)
+                .await
+                .pop()
+                .unwrap_or_else(|| panic!("no REQ recorded for {id}"));
+            assert_eq!(
+                last.verdict,
+                Verdict::Eose,
+                "{id} must end the recovery LIVE (served), not closed"
+            );
+        }
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// TOOTH #189 (c) — the money leg survives REPEATED recoveries, not just the first. A one-shot
+    /// ordering fix that degrades after a few cycles would still pin settlement to the 300s backfill
+    /// on the reconnect-heavy hosts where this was found.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wraps_subscription_survives_ten_consecutive_reconnects() {
+        let fixture = PGateRelay::start(Duration::from_millis(120)).await;
+        let root = throwaway_root("tenreconnects");
+        let runner = boot_against(&root, &fixture, false).await;
+        let relay = relay_handle(&runner).await;
+        runner.subscribe_all(None).await.expect("boot subscribe");
+
+        for cycle in 1..=10 {
+            runner
+                .reconnect_and_resubscribe(&relay, nostr_sdk::Timestamp::from(0))
+                .await
+                .unwrap_or_else(|error| panic!("recovery {cycle} failed: {error}"));
+            assert!(
+                fixture
+                    .wait_until(FIXTURE_WAIT, |reqs| {
+                        reqs.iter()
+                            .filter(|r| r.subscription_id == WRAP_SUB_ID)
+                            .count()
+                            > cycle
+                    })
+                    .await,
+                "recovery {cycle} did not re-issue the kind-1059 REQ"
+            );
+            let wraps = fixture.reqs_for(WRAP_SUB_ID).await;
+            let last = wraps.last().expect("a wrap REQ exists");
+            assert_eq!(
+                last.verdict,
+                Verdict::Eose,
+                "the kind-1059 money leg was refused on recovery {cycle}: {last:?}"
+            );
+            assert!(
+                last.authenticated,
+                "recovery {cycle} sent the kind-1059 REQ on an unauthenticated session"
+            );
+        }
+
+        assert!(
+            p_gated_before_auth(&fixture.reqs().await).is_empty(),
+            "ten recoveries must not leak a single pre-auth p-gated REQ"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// TOOTH #189 (b) — THE TAXONOMY MUST NOT SOFTEN. A genuine gate violation — a REQ for somebody
+    /// else's `#p` — is still refused `restricted:`, still deleted by the SDK, and stays deleted.
+    ///
+    /// The belt cannot reach it by construction, and both halves of that are asserted: the id is not
+    /// one of ours, and `subscription_pins_only_our_pubkey` refuses it even if it were. Collapse the
+    /// belt's own-`#p` guard into a bare `restricted:` check and this goes red.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_genuine_wrong_p_restricted_stays_removed() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("wrongp");
+        let runner = boot_against(&root, &fixture, false).await;
+        let relay = relay_handle(&runner).await;
+
+        let stranger = Keys::generate().public_key();
+        let foreign_id = "someone-elses-gift-wraps";
+        runner
+            .client
+            .subscribe_with_id(
+                nostr_sdk::SubscriptionId::new(foreign_id),
+                Filter::new().kind(Kind::GiftWrap).pubkey(stranger),
+                None,
+            )
+            .await
+            .expect("send the offending REQ");
+
+        assert!(
+            fixture
+                .wait_until(FIXTURE_WAIT, |reqs| reqs
+                    .iter()
+                    .any(|r| r.subscription_id == foreign_id))
+                .await,
+            "harness check: the offending REQ must reach the relay"
+        );
+        let refusal = fixture
+            .reqs_for(foreign_id)
+            .await
+            .pop()
+            .expect("the offending REQ was recorded");
+        assert!(
+            matches!(&refusal.verdict, Verdict::Closed(reason) if reason.starts_with("restricted:")),
+            "a wrong-#p REQ must still be refused `restricted:`, authenticated or not: {refusal:?}"
+        );
+        assert!(
+            refusal.authenticated,
+            "harness check: this refusal must come from an AUTHENTICATED session, otherwise it \
+             proves nothing about a genuine violation"
+        );
+
+        // The SDK deleted it, and nothing in the client puts it back.
+        assert!(
+            !relay
+                .subscriptions()
+                .await
+                .keys()
+                .any(|id| id.to_string() == foreign_id),
+            "`restricted:` must remain permanent-class: the subscription stays removed"
+        );
+        assert!(
+            !is_our_subscription(foreign_id),
+            "the belt only ever considers our own subscription ids"
+        );
+        assert!(
+            !subscription_pins_only_our_pubkey(foreign_id, false),
+            "and even then only ids whose every filter pins #p to our OWN pubkey"
+        );
+        assert_eq!(
+            fixture.reqs_for(foreign_id).await.len(),
+            1,
+            "the offending REQ must never be retried"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One owned tick, for the loop teeth below. Both #190 loop teeth set the SAME value, so running
+    /// them in parallel cannot make them disagree.
+    const TEST_BACKFILL_SECS: &str = "1";
+
+    /// Drive the backfill tick fast enough to observe. This is the documented test-only seam; no
+    /// production path sets it.
+    fn use_fast_backfill_tick() {
+        unsafe { std::env::set_var(WRAP_BACKFILL_INTERVAL_ENV, TEST_BACKFILL_SECS) };
+    }
+
+    /// Offer REQs that carried the un-pinned open-pool filter — i.e. the grouped shape, armed.
+    fn grouped_offer_reqs(reqs: &[ReqRecord]) -> Vec<&ReqRecord> {
+        reqs.iter()
+            .filter(|record| record.subscription_id == OFFER_SUB_ID && record.has_unpinned_filter)
+            .collect()
+    }
+
+    /// TOOTH #190 (a) + (b) — THE OWNED RE-ARM. Drop the open-pool half on a seat that is perfectly
+    /// healthy and never reconnects; the open-pool half must come back on its own within one owned
+    /// tick, and the targeted half must never be disturbed while that happens.
+    ///
+    /// This is the only proof Fix 2 has. The reported stuck specimen was withdrawn — every seat seen
+    /// degraded in the field was flapping on the #189 sawtooth — so the quiet-seat case is reasoned,
+    /// not observed, and this tooth is what stands in for the observation.
+    ///
+    /// RED ON REVERT: delete the `open_pool` block from the `wrap_backfill_tick` arm (the hookup) and
+    /// this goes red — nothing else re-arms without a recovery, and no recovery ever happens here.
+    /// A state-machine-only test would stay green under that revert, which is why this drives the
+    /// real loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn open_pool_rearms_on_an_owned_tick_without_any_reconnect() {
+        use_fast_backfill_tick();
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("rearm");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, true));
+        // The watchdog is off so nothing but the CLOSED under test can move the node. A recovery
+        // would re-arm the open-pool half for the wrong reason and the tooth would prove nothing.
+        home.config.seller_heartbeat.enabled = false;
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let loop_handle = tokio::spawn(async move { runner.run().await });
+
+        assert!(
+            fixture
+                .wait_until(FIXTURE_WAIT, |reqs| !grouped_offer_reqs(reqs).is_empty())
+                .await,
+            "harness check: the seat must boot with the open-pool half ARMED, or there is nothing \
+             to degrade"
+        );
+        let connections_before = fixture.connections();
+        let grouped_before = grouped_offer_reqs(&fixture.reqs().await).len();
+
+        // The degrade, exactly as the field sees it: an unsolicited CLOSED on a healthy socket.
+        fixture
+            .close_now(
+                OFFER_SUB_ID,
+                "restricted: p-gated events require #p matching your pubkey",
+            )
+            .await;
+
+        assert!(
+            fixture
+                .wait_until(FIXTURE_WAIT, |reqs| grouped_offer_reqs(reqs).len()
+                    > grouped_before)
+                .await,
+            "the open-pool half was never re-armed: a healthy seat that degrades has no recovery to \
+             wait for, which is #190"
+        );
+
+        assert_eq!(
+            fixture.connections(),
+            connections_before,
+            "the re-arm must not cost a reconnect — that dependency IS the bug"
+        );
+
+        // (b) The targeted half is never disturbed: every offer REQ ever sent, degraded or grouped,
+        // carries the `#p == self` filter. A degrade that dropped it would stop targeted claiming.
+        let offers = fixture.reqs_for(OFFER_SUB_ID).await;
+        assert!(offers.len() >= 3, "expected boot + degrade + re-arm REQs");
+        for req in &offers {
+            assert!(
+                req.p_pinned,
+                "an offer REQ went out without the targeted #p filter: {req:?}"
+            );
+            assert_eq!(
+                req.verdict,
+                Verdict::Eose,
+                "the relay refused an offer REQ it should have served: {req:?}"
+            );
+        }
+
+        loop_handle.abort();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// TOOTH #190 (c) — a relay that keeps refusing the open-pool half must cost a REQ per BACKOFF,
+    /// never a REQ per tick. With a 1s owned tick and refusals armed, the doubling schedule (attempt,
+    /// skip 1, skip 2, skip 4, …) has to hold the attempt count far below the tick count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repeated_open_pool_rejection_backs_off_and_never_hot_loops() {
+        use_fast_backfill_tick();
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("backoff");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, true));
+        home.config.seller_heartbeat.enabled = false;
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let loop_handle = tokio::spawn(async move { runner.run().await });
+
+        assert!(
+            fixture
+                .wait_until(FIXTURE_WAIT, |reqs| !grouped_offer_reqs(reqs).is_empty())
+                .await,
+            "harness check: the seat must boot with the open-pool half armed"
+        );
+        // Every grouped REQ from here on is refused; the targeted-only re-subscribe is still served.
+        fixture
+            .refuse_unpinned(
+                OFFER_SUB_ID,
+                12,
+                "restricted: p-gated events require #p matching your pubkey",
+            )
+            .await;
+        let grouped_before = grouped_offer_reqs(&fixture.reqs().await).len();
+
+        fixture
+            .close_now(
+                OFFER_SUB_ID,
+                "restricted: p-gated events require #p matching your pubkey",
+            )
+            .await;
+
+        // Twelve owned ticks. Un-backed-off, that is twelve attempts; the schedule allows at most
+        // four (t+0, +2, +5, +10).
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        let attempts = grouped_offer_reqs(&fixture.reqs().await).len() - grouped_before;
+        assert!(
+            attempts >= 1,
+            "the re-arm must still be attempted — backoff is not abandonment"
+        );
+        assert!(
+            attempts <= 5,
+            "the open-pool re-arm hot-looped: {attempts} attempts over ~12 owned ticks, which is a \
+             REQ per tick against a relay that has refused every one"
+        );
+
+        // The targeted half kept working throughout — a backing-off re-arm must not starve claiming.
+        let served_targeted = fixture
+            .reqs_for(OFFER_SUB_ID)
+            .await
+            .into_iter()
+            .filter(|req| !req.has_unpinned_filter && req.verdict == Verdict::Eose)
+            .count();
+        assert!(
+            served_targeted >= 1,
+            "the targeted-only offer subscription must stay live across the backoff"
+        );
+
+        loop_handle.abort();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The backoff arithmetic itself: doubling, capped, and never zero after a refusal — a zero
+    /// cooldown at any rejection count would be the hot loop the loop tooth above forbids.
+    #[test]
+    fn open_pool_rearm_backoff_doubles_and_stays_capped() {
+        assert_eq!(
+            open_pool_rearm_cooldown_ticks(0),
+            0,
+            "the first attempt after a degrade is not delayed"
+        );
+        let schedule: Vec<u32> = (1..=8).map(open_pool_rearm_cooldown_ticks).collect();
+        assert_eq!(schedule, vec![1, 2, 4, 8, 12, 12, 12, 12]);
+        for rejections in 1..=64 {
+            assert!(
+                open_pool_rearm_cooldown_ticks(rejections) >= 1,
+                "a refused re-arm must always cost at least one skipped tick"
+            );
+            assert!(
+                open_pool_rearm_cooldown_ticks(rejections) <= 12,
+                "the backoff must stay capped so a re-arm is never abandoned"
+            );
+        }
+    }
+
+    /// The degrade state machine, including the case a timer-less design would park on: an attempt
+    /// that draws no verdict at all. Silence must advance the backoff, never wait forever.
+    #[test]
+    fn a_rearm_attempt_with_no_verdict_is_treated_as_a_refusal() {
+        let mut state = OpenPoolDegrade::new();
+        assert_eq!(state.on_tick(), RearmStep::Attempt, "first tick attempts");
+        assert!(state.attempt_pending);
+
+        // No EOSE, no CLOSED — the relay simply said nothing.
+        assert_eq!(
+            state.on_tick(),
+            RearmStep::Wait,
+            "a pending attempt is not re-sent on top of itself"
+        );
+        assert!(
+            !state.attempt_pending,
+            "silence must resolve the attempt rather than leave it pending forever"
+        );
+        assert_eq!(state.rejections, 1);
+        assert_eq!(state.cooldown_ticks, 1);
+
+        assert_eq!(state.on_tick(), RearmStep::Wait, "cooling down");
+        assert_eq!(state.on_tick(), RearmStep::Attempt, "then attempting again");
     }
 }
