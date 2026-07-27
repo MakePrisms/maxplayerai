@@ -22,6 +22,8 @@ pub mod buzz;
 pub mod ingester;
 pub mod lock;
 pub mod outbox;
+#[cfg(test)]
+mod p_gate_relay_fixture;
 pub mod publisher;
 pub mod run;
 pub mod roster;
