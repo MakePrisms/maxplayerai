@@ -268,6 +268,29 @@ impl FsHopJournal {
     fn path_for(&self, attempt_id: &str) -> PathBuf {
         self.dir.join(format!("{attempt_id}.jsonl"))
     }
+
+    /// Every attempt this journal holds records for. An absent directory means no hop has ever run
+    /// here, which is not an error.
+    pub fn attempt_ids(&self) -> Result<Vec<String>, HopError> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(journal_error("read dir", error)),
+        };
+        let mut ids = Vec::new();
+        for entry in entries {
+            let path = entry.map_err(|error| journal_error("read dir entry", error))?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                ids.push(stem.to_owned());
+            }
+        }
+        // Deterministic order so a sweep's output reads the same way twice.
+        ids.sort();
+        Ok(ids)
+    }
 }
 
 fn journal_error(context: &str, error: impl fmt::Display) -> HopError {
@@ -741,6 +764,112 @@ impl HopEffects for CdkHopEffects {
     }
 }
 
+/// One hop the sweep found unfinished and tried to complete.
+#[derive(Debug)]
+pub struct SweptHop {
+    /// The attempt whose hop was resumed.
+    pub attempt_id: String,
+    /// What resuming it did, or why it could not be finished.
+    pub result: Result<HopSettled, HopError>,
+}
+
+/// The directory a home keeps its hop pairings in.
+pub fn hop_journal_dir(home: &MobeeHome) -> PathBuf {
+    home.root.join("crossmint-journal")
+}
+
+/// Finish every hop this home left in flight.
+///
+/// A hop interrupted by a crash is not something the next pay attempt necessarily re-drives — that
+/// attempt may never be retried — so without a sweep the sats could sit melted at the source with no
+/// ecash anywhere and nothing looking for them.
+///
+/// Both wallets are opened and both are recovered before any pairing is resumed, and that is not
+/// belt-and-braces: cdk's `recover_incomplete_sagas` filters to its own wallet's mint, so a two-mint
+/// operation recovered on one wallet SILENTLY SKIPS the other mint's saga. One wallet is not half a
+/// recovery here; it is a recovery that reports success having looked at half the problem.
+///
+/// Every hop is attempted independently, and a hop that cannot be finished says so on stderr rather
+/// than being dropped from the report — including a hop whose mints the fence no longer admits,
+/// which is stuck by design but must not be stuck in silence.
+pub async fn sweep_hops(home: &MobeeHome) -> Result<Vec<SweptHop>, HopError> {
+    let store = FsHopJournal::new(hop_journal_dir(home));
+    let mut swept = Vec::new();
+    for attempt_id in store.attempt_ids()? {
+        let records = store.replay(&attempt_id)?;
+        if settled_of(&records).is_some() {
+            continue;
+        }
+        let Some(pairing) = planned_of(&records).cloned() else {
+            continue;
+        };
+        let result = sweep_one(home, &store, pairing.clone()).await;
+        if let Err(error) = &result {
+            eprintln!(
+                "CROSSMINT STRAND attempt={} could not be completed by the recovery sweep \
+                 (source {} melt quote {}, target {} mint quote {}): {error}",
+                pairing.attempt_id,
+                pairing.source_mint,
+                pairing.melt_quote_id,
+                pairing.target_mint,
+                pairing.mint_quote_id,
+            );
+        }
+        swept.push(SweptHop {
+            attempt_id,
+            result,
+        });
+    }
+    Ok(swept)
+}
+
+/// Refuse a recovery that did not cover both of the hop's mints.
+///
+/// cdk's saga recovery reports success after looking only at its own wallet's mint, so "recovery
+/// ran" and "the hop was recovered" are different claims. This turns the difference into a refusal:
+/// a sweep that somehow touched one mint stops here instead of reporting a hop as swept.
+fn require_both_mints_recovered(
+    recovered: &[String],
+    pairing: &HopJournal,
+) -> Result<(), HopError> {
+    for mint in [&pairing.source_mint, &pairing.target_mint] {
+        if !recovered.iter().any(|seen| seen == mint) {
+            return Err(HopError::Journal(format!(
+                "attempt {}: saga recovery covered {recovered:?}, which does not include {mint}; \
+                 refusing to report a hop as swept on half its mints",
+                pairing.attempt_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn sweep_one(
+    home: &MobeeHome,
+    store: &FsHopJournal,
+    pairing: HopJournal,
+) -> Result<HopSettled, HopError> {
+    let mut effects =
+        CdkHopEffects::open(home, &pairing.source_mint, &pairing.target_mint).await?;
+    let mut recovered = Vec::new();
+    for (label, wallet) in [("source", &effects.source), ("target", &effects.target)] {
+        bounded(
+            &format!("{label} saga recovery"),
+            HOP_LEG_TIMEOUT,
+            wallet.recover_incomplete_sagas(),
+        )
+        .await?;
+        recovered.push(wallet.mint_url.to_string());
+    }
+    require_both_mints_recovered(&recovered, &pairing)?;
+    // `run_hop` blocks (it bridges each leg onto its own runtime), so it may not run on the
+    // caller's async thread.
+    let store = store.clone();
+    tokio::task::spawn_blocking(move || run_hop(&store, &mut effects, &pairing))
+        .await
+        .map_err(|error| HopError::Mint(format!("hop sweep task: {error}")))?
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -748,6 +877,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+    use crate::budget::{BudgetGate, BudgetRefuse};
 
     fn journal(attempt: &str) -> HopJournal {
         HopJournal {
@@ -806,8 +936,11 @@ mod tests {
             let mut world = self.world.borrow_mut();
             world.melts.push(melt_quote_id.to_owned());
             world.melt_leg = Some(MeltLeg::Paid);
-            // The target's invoice is paid by the melt, so its quote flips too.
-            world.mint_leg = Some(MintLeg::Paid);
+            // The target's invoice is paid by the melt, so its quote flips too — unless the target
+            // is unreachable (`None`), which stays unreachable no matter what the source did.
+            if world.mint_leg.is_some() {
+                world.mint_leg = Some(MintLeg::Paid);
+            }
             if world.die_after_melt {
                 return Err(HopError::Mint("process died after the melt".into()));
             }
@@ -1076,6 +1209,172 @@ mod tests {
         assert_eq!(settled_of(&records), Some(100));
         // Attempts do not see each other's records.
         assert!(store.replay("attempt-2").expect("replays").is_empty());
+    }
+
+    // Invariant 3, strong form. A cap one sat under the hop's planned cost must stop the hop BEFORE
+    // it melts — not fail it afterwards, by which point the sats have already left the buyer's
+    // wallet. Driven through the real `BudgetGate`, because the property being tested is that the
+    // gate never reaches the effect, and a fake gate would be testing the fake.
+    #[test]
+    fn a_cap_one_sat_under_the_planned_cost_means_no_melt_is_attempted_at_all() {
+        let pairing = journal("attempt-1");
+        let store = MemJournal::default();
+        let world = MintWorld::shared();
+        let mut effects = FakeMints {
+            world: Rc::clone(&world),
+        };
+
+        // Per-job and total caps both sit one sat under what the hop would cost.
+        let under = pairing.planned_cost.saturating_sub(1);
+        let mut gate = BudgetGate::new(under, under);
+        let refusal = gate
+            .authorize_then_attempt(&pairing.attempt_id, pairing.planned_cost, || {
+                run_hop(&store, &mut effects, &pairing)
+            })
+            .expect_err("a cap under the planned cost must refuse");
+
+        assert!(matches!(refusal, BudgetRefuse::PerJob { .. }), "{refusal}");
+        assert!(
+            world.borrow().melts.is_empty(),
+            "the melt must never be attempted when the cap refuses"
+        );
+        assert!(world.borrow().mints.is_empty());
+        assert_eq!(gate.spent(), 0, "a refused hop spends nothing");
+        assert!(
+            store.replay("attempt-1").expect("replays").is_empty(),
+            "a refused hop leaves no pairing on disk"
+        );
+
+        // The same hop at a cap that covers it does melt — so the refusal above came from the cap
+        // and not from something else refusing first.
+        let mut gate = BudgetGate::new(pairing.planned_cost, pairing.planned_cost);
+        gate.authorize_then_attempt(&pairing.attempt_id, pairing.planned_cost, || {
+            run_hop(&store, &mut effects, &pairing)
+        })
+        .expect("the cap admits the hop")
+        .expect("the hop completes");
+        assert_eq!(world.borrow().melts.len(), 1);
+        assert_eq!(gate.spent(), pairing.planned_cost);
+    }
+
+    // The cap must see the fee, not just the delivery. A cap sized to the amount the seller receives
+    // is NOT enough to authorize the hop that delivers it — which is the whole reason the hop is
+    // charged its planned cost rather than the offer amount.
+    #[test]
+    fn a_cap_sized_to_the_delivered_amount_does_not_authorize_the_hop_that_delivers_it() {
+        let pairing = journal("attempt-1");
+        assert!(
+            pairing.planned_cost > pairing.delivered_sats,
+            "the fixture must actually cost more than it delivers"
+        );
+        let store = MemJournal::default();
+        let world = MintWorld::shared();
+        let mut effects = FakeMints {
+            world: Rc::clone(&world),
+        };
+
+        let mut gate = BudgetGate::new(pairing.delivered_sats, pairing.delivered_sats);
+        let refusal = gate
+            .authorize_then_attempt(&pairing.attempt_id, pairing.planned_cost, || {
+                run_hop(&store, &mut effects, &pairing)
+            })
+            .expect_err("the fee reserve and input fee must not slip past the cap");
+        assert!(matches!(refusal, BudgetRefuse::PerJob { .. }), "{refusal}");
+        assert!(world.borrow().melts.is_empty());
+    }
+
+    // Invariant 4's trap, made into a refusal. cdk's saga recovery filters to its own wallet's
+    // mint, so a sweep that ran on one wallet would report success having examined half the hop.
+    #[test]
+    fn a_sweep_that_covered_one_mint_refuses_to_call_the_hop_swept() {
+        let pairing = journal("attempt-1");
+        require_both_mints_recovered(
+            &[pairing.source_mint.clone(), pairing.target_mint.clone()],
+            &pairing,
+        )
+        .expect("both mints covered");
+
+        for half in [&pairing.source_mint, &pairing.target_mint] {
+            let error = require_both_mints_recovered(std::slice::from_ref(half), &pairing)
+                .expect_err("one mint is not a recovery");
+            assert!(
+                error.to_string().contains("half its mints"),
+                "got: {error}"
+            );
+        }
+        // A recovery that touched two mints, but not the RIGHT two, is no better.
+        let error = require_both_mints_recovered(
+            &["https://elsewhere.example".to_owned(), pairing.source_mint.clone()],
+            &pairing,
+        )
+        .expect_err("the wrong second mint is not a recovery");
+        assert!(error.to_string().contains(&pairing.target_mint), "got: {error}");
+    }
+
+    // A melt the source mint reports as FAILED stops the attempt. Nothing left the wallet, so this
+    // is not the strand — but the quote is dead, and re-melting it is not the answer either.
+    #[test]
+    fn a_failed_melt_refuses_without_melting_again() {
+        let store = MemJournal::default();
+        let world = MintWorld::shared();
+        world.borrow_mut().melt_leg = Some(MeltLeg::Failed);
+        let mut effects = FakeMints {
+            world: Rc::clone(&world),
+        };
+        let error = run_hop(&store, &mut effects, &journal("attempt-1"))
+            .expect_err("a failed melt must refuse");
+        assert!(matches!(error, HopError::MeltFailed { .. }), "got: {error}");
+        assert!(world.borrow().melts.is_empty());
+        assert!(world.borrow().mints.is_empty());
+    }
+
+    // Every leg that can fail must leave the attempt un-completed: no completion record, so a later
+    // run re-reads the pairing and asks the mints again rather than assuming anything landed. This
+    // is the safety the old membership refusal used to provide, re-pinned at the layer that replaced
+    // it — the hop is now what stands between "cannot settle at the seller's mint" and a wrong spend.
+    #[test]
+    fn no_failing_leg_leaves_a_completion_record_behind() {
+        // Each case: how the world is broken, and the leg it breaks.
+        let cases: Vec<(&str, Box<dyn Fn(&mut MintWorld)>)> = vec![
+            (
+                "source mint unreachable",
+                Box::new(|world: &mut MintWorld| world.melt_leg = None),
+            ),
+            (
+                "melt in flight",
+                Box::new(|world: &mut MintWorld| world.melt_leg = Some(MeltLeg::Pending)),
+            ),
+            (
+                "melt failed",
+                Box::new(|world: &mut MintWorld| world.melt_leg = Some(MeltLeg::Failed)),
+            ),
+            (
+                "target mint unreachable",
+                Box::new(|world: &mut MintWorld| world.mint_leg = None),
+            ),
+            (
+                "target refuses to issue",
+                Box::new(|world: &mut MintWorld| world.mint_fails = true),
+            ),
+        ];
+        for (label, break_it) in cases {
+            let store = MemJournal::default();
+            let world = MintWorld::shared();
+            break_it(&mut world.borrow_mut());
+            let mut effects = FakeMints {
+                world: Rc::clone(&world),
+            };
+            let error = run_hop(&store, &mut effects, &journal("attempt-1"))
+                .expect_err(&format!("{label} must refuse"));
+            assert!(
+                settled_of(&store.replay("attempt-1").expect("replays")).is_none(),
+                "{label}: refused with {error}, but left a completion record"
+            );
+            assert!(
+                world.borrow().mints.is_empty(),
+                "{label}: refused but claimed ecash anyway"
+            );
+        }
     }
 
     // A torn final record is refused, not parsed around: a half-written pairing is exactly the

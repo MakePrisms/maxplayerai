@@ -407,7 +407,7 @@ pub async fn authorize_pay_async(
     let mut hop = match plan.hop_source() {
         None => None,
         Some(source) => {
-            let store = FsHopJournal::new(home.root.join("crossmint-journal"));
+            let store = FsHopJournal::new(crossmint_hop::hop_journal_dir(home));
             let effects =
                 CdkHopEffects::open(
                     home,
@@ -467,10 +467,7 @@ pub async fn authorize_pay_async(
     // paid, so a hop can leave the cap reporting less remaining budget than the buyer really spent.
     // That is the safe direction; reconciling reserve-versus-actual would reshape the spend ledger,
     // which is money-gate machinery and its own slice — see MakePrisms/mobee#186.
-    let charged = match hop.as_ref() {
-        Some((_, _, pairing)) => pairing.planned_cost,
-        None => amount,
-    };
+    let charged = cap_charge(hop.as_ref().map(|(_, _, pairing)| pairing), amount);
     // Delivery already verified + bind-checked above (pre-budget). The budget append happens here,
     // before any melt and before the wallet send inside `run_verified`.
     let state = gate.authorize_then_attempt(attempt_id.as_str(), charged, || {
@@ -520,6 +517,20 @@ pub(crate) fn wallet_open_mint_url(home: &MobeeHome, terms: &PaymentTerms) -> St
         "frozen realized mint must already be fenced before wallet open"
     );
     mint_url
+}
+
+/// What the budget cap is asked to cover for one payment.
+///
+/// The direct path is charged the amount, exactly as it always has been — general fee-dust behaviour
+/// is a separate question and is untouched here. A hop costs the buyer more than it delivers, and
+/// every sat of that difference has to pass the cap BEFORE the melt, so a hop is charged its planned
+/// cost. A hop charged the delivered amount would put the Lightning fee reserve and the source
+/// mint's input fee on the wire without the cap ever seeing them.
+fn cap_charge(hop: Option<&crate::crossmint::HopJournal>, amount: u64) -> u64 {
+    match hop {
+        Some(pairing) => pairing.planned_cost,
+        None => amount,
+    }
 }
 
 /// Render a co-signed [`ReceiptPreimage`] as a single-line diagnostic: the digest plus every
@@ -965,6 +976,89 @@ mod tests {
             "unexpected error: {message}"
         );
         assert_eq!(gate.spent(), 0, "empty-hash refuse must not burn spent");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Invariant 3 at the seam that chooses the number. The direct path charges what it always did;
+    // a hop charges what it costs, not what it delivers, because the fee reserve and the input fee
+    // reach the wire and must therefore pass the cap.
+    #[test]
+    fn the_cap_is_charged_the_hop_cost_and_the_direct_amount() {
+        let pairing = crate::crossmint::HopJournal {
+            attempt_id: "attempt-1".to_owned(),
+            source_mint: "https://a.example".to_owned(),
+            melt_quote_id: "melt-1".to_owned(),
+            target_mint: "https://b.example".to_owned(),
+            mint_quote_id: "mint-1".to_owned(),
+            delivered_sats: 100,
+            planned_cost: 109,
+        };
+        assert_eq!(cap_charge(None, 100), 100, "the direct path is unchanged");
+        assert_eq!(
+            cap_charge(Some(&pairing), 100),
+            109,
+            "a hop must be charged its cost, not the amount it delivers"
+        );
+        assert_ne!(
+            cap_charge(Some(&pairing), pairing.delivered_sats),
+            pairing.delivered_sats,
+            "charging the delivered amount would let the hop's fees past the cap"
+        );
+    }
+
+    // The replacement invariant, at the pay entry point. `mint_unreachable_pay` no longer refuses a
+    // buyer that cannot settle at the seller's mint — the hop does, or the fence does. This pins the
+    // fence half END TO END: a hop with nowhere admissible to land refuses through the real pay
+    // path, burns zero budget, and leaves no pairing on disk for a later run to resume.
+    #[test]
+    fn authorize_pay_refuses_an_inadmissible_hop_with_zero_spend_and_no_pairing() {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-authorize-pay-hop-fence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        assert!(
+            !home.config.allow_real_mints,
+            "the default posture is what makes this refuse"
+        );
+        let mut gate = BudgetGate::from_home(&home).expect("gate");
+        let request = AuthorizePayRequest {
+            job_id: "job-hop-fence".into(),
+            result_id: "result-hop-fence".into(),
+            job_class: JobClass::FromScratch,
+            delivery_integrity_hash: "aa".repeat(20),
+            job_hash: "bb".repeat(32),
+            seller_pubkey: home::public_key_hex(&home).expect("pubkey"),
+            amount_sats: 1,
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            commit_oid: "aa".repeat(20),
+            seller_signature: String::new(),
+            creq_hash: None,
+            // The buyer sits on the one fenced mint; the seller accepts only an unfenced one, so
+            // there is nowhere the hop is permitted to land.
+            accepted_mints: vec![REAL_MINT.to_string()],
+            realized_mint: Some(DEFAULT_MINT_URL.to_string()),
+            contribution: None,
+        };
+        let error = authorize_pay_blocking(&home, &mut gate, request)
+            .expect_err("an inadmissible hop target must refuse");
+        let message = error.to_string();
+        assert!(message.contains("real-mint fence"), "unexpected: {message}");
+        assert!(
+            message.contains("nowhere permitted to land"),
+            "the refusal must say the hop had no permitted target: {message}"
+        );
+        assert_eq!(gate.spent(), 0, "a refused hop must not burn budget");
+        assert!(
+            !crate::crossmint_hop::hop_journal_dir(&home).exists(),
+            "a refused hop must leave no pairing for a later run to resume"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

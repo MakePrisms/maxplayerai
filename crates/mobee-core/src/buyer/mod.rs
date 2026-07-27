@@ -227,6 +227,12 @@ pub async fn run(home: MobeeHome) -> Result<(), BuyerError> {
     // must not keep the daemon from coming up (the stale reservation is conservative until the next
     // reconcile).
     run_reconcile_pass(&context).await;
+    // Finish any cross-mint hop a prior run left mid-flight, before serving. A hop whose melt landed
+    // but whose ecash was never issued is money sitting in neither wallet, and nothing else in the
+    // daemon goes looking for it — the pay attempt that started it may never be retried. Logged, not
+    // fatal, for the same reason as the reconcile above: a daemon that refuses to start is a daemon
+    // the operator cannot use to fix anything. An unrecoverable hop prints its own loud line.
+    run_hop_sweep(&context).await;
     // Re-arm pending auto-awards left by a prior run: a job posted before a crash still gets its
     // award with zero manual commands. Each task re-checks the relay for an existing award first
     // (invariant A), so re-arming never double-awards.
@@ -1064,6 +1070,41 @@ async fn run_reconcile_pass(context: &Arc<BuyerContext>) {
         Err(error) => {
             eprintln!("buyer: reconcile pass did not complete ({error}); serving with the ledger as-is")
         }
+    }
+}
+
+/// Complete cross-mint hops a prior run left in flight, reporting UNCONDITIONALLY.
+///
+/// Silence here would be indistinguishable from a sweep that has stopped running, and this is the
+/// one path that notices a buyer's sats melted at one mint with no ecash at the other — so the pass
+/// that found nothing says so too.
+async fn run_hop_sweep(context: &Arc<BuyerContext>) {
+    match crate::crossmint_hop::sweep_hops(&context.home).await {
+        Ok(swept) if swept.is_empty() => {
+            eprintln!("buyer: cross-mint hop sweep found no hop in flight")
+        }
+        Ok(swept) => {
+            let recovered = swept
+                .iter()
+                .filter(|hop| {
+                    hop.result
+                        .as_ref()
+                        .is_ok_and(|settled| settled.recovered_strand)
+                })
+                .count();
+            let failed = swept.iter().filter(|hop| hop.result.is_err()).count();
+            eprintln!(
+                "buyer: cross-mint hop sweep resumed {} hop(s): {recovered} stranded and recovered, \
+                 {failed} still unfinished",
+                swept.len()
+            );
+        }
+        // A journal we cannot read is not a reason to refuse to serve, but it IS a reason to say so:
+        // an unreadable journal means any hop it holds is invisible until someone looks.
+        Err(error) => eprintln!(
+            "buyer: cross-mint hop sweep could not read its journal ({error}); a hop left in flight \
+             by a prior run would not have been noticed"
+        ),
     }
 }
 
