@@ -3712,68 +3712,78 @@ mod tests {
         home.config.seller_heartbeat.enabled = true;
         home.config.seller_heartbeat.interval_secs = 1;
         let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
-        let loop_handle = tokio::spawn(async move { runner.run().await });
+        // `run()` is NOT `Send` under the `acp` feature — the runner holds an `AcpDriver`
+        // whose std mpsc `Receiver` is `!Sync` — so `tokio::spawn` fails to COMPILE on the
+        // seller's real feature combo (`acp` + `wallet`), while compiling fine on the
+        // workspace default. A `LocalSet` keeps the loop on this thread, which is also the
+        // truer shape: the node runs its loop as one task, not spread across a pool.
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        local
+            .run_until(async {
 
-        assert!(
-            fixture
-                .wait_until(FIXTURE_WAIT, |reqs| reqs
-                    .iter()
-                    .any(|r| r.subscription_id == WRAP_SUB_ID))
-                .await,
-            "harness check: the seat must be up before we close something it never registered"
-        );
-        // The watchdog must be demonstrably live, or "no reconnect" is just a dead loop.
-        assert!(
-            fixture
-                .wait_until(FIXTURE_WAIT, |reqs| reqs
-                    .iter()
-                    .any(|r| r.subscription_id == LIVENESS_PROBE_SUB_ID))
-                .await,
-            "harness check: the heartbeat watchdog must be ticking, otherwise a forced recovery \
-             could not have fired even if one had been requested"
-        );
-        let connections_before = fixture.connections();
+                assert!(
+                    fixture
+                        .wait_until(FIXTURE_WAIT, |reqs| reqs
+                            .iter()
+                            .any(|r| r.subscription_id == WRAP_SUB_ID))
+                        .await,
+                    "harness check: the seat must be up before we close something it never registered"
+                );
+                // The watchdog must be demonstrably live, or "no reconnect" is just a dead loop.
+                assert!(
+                    fixture
+                        .wait_until(FIXTURE_WAIT, |reqs| reqs
+                            .iter()
+                            .any(|r| r.subscription_id == LIVENESS_PROBE_SUB_ID))
+                        .await,
+                    "harness check: the heartbeat watchdog must be ticking, otherwise a forced recovery \
+                     could not have fired even if one had been requested"
+                );
+                let connections_before = fixture.connections();
 
-        let stranger_id = "some-subscription-we-never-registered";
-        fixture
-            .close_now(
-                stranger_id,
-                "restricted: p-gated events require #p matching your pubkey",
-            )
+                let stranger_id = "some-subscription-we-never-registered";
+                fixture
+                    .close_now(
+                        stranger_id,
+                        "restricted: p-gated events require #p matching your pubkey",
+                    )
+                    .await;
+
+                let escalated = tokio::time::timeout(Duration::from_secs(20), async {
+                    loop {
+                        if fixture.connections() != connections_before {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await
+                .is_ok();
+                assert!(
+                    !escalated,
+                    "a CLOSED for an id we never registered forced a reconnect — that is a reconnect per \
+                     cycle on a socket that was never broken"
+                );
+                assert!(
+                    fixture.reqs_for(stranger_id).await.is_empty(),
+                    "we must never REQ a subscription id that was never ours"
+                );
+                // Still alive and still watching: inert about the close, not inert about liveness.
+                let probes_before = fixture.reqs_for(LIVENESS_PROBE_SUB_ID).await.len();
+                assert!(
+                    fixture
+                        .wait_until(FIXTURE_WAIT, |reqs| reqs
+                            .iter()
+                            .filter(|r| r.subscription_id == LIVENESS_PROBE_SUB_ID)
+                            .count()
+                            > probes_before)
+                        .await,
+                    "the node must keep probing after an unknown-id CLOSED"
+                );
+
+            })
             .await;
-
-        let escalated = tokio::time::timeout(Duration::from_secs(20), async {
-            loop {
-                if fixture.connections() != connections_before {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .is_ok();
-        assert!(
-            !escalated,
-            "a CLOSED for an id we never registered forced a reconnect — that is a reconnect per \
-             cycle on a socket that was never broken"
-        );
-        assert!(
-            fixture.reqs_for(stranger_id).await.is_empty(),
-            "we must never REQ a subscription id that was never ours"
-        );
-        // Still alive and still watching: inert about the close, not inert about liveness.
-        let probes_before = fixture.reqs_for(LIVENESS_PROBE_SUB_ID).await.len();
-        assert!(
-            fixture
-                .wait_until(FIXTURE_WAIT, |reqs| reqs
-                    .iter()
-                    .filter(|r| r.subscription_id == LIVENESS_PROBE_SUB_ID)
-                    .count()
-                    > probes_before)
-                .await,
-            "the node must keep probing after an unknown-id CLOSED"
-        );
-
         loop_handle.abort();
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3841,70 +3851,80 @@ mod tests {
         // would re-arm the open-pool half for the wrong reason and the tooth would prove nothing.
         home.config.seller_heartbeat.enabled = false;
         let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
-        let loop_handle = tokio::spawn(async move { runner.run().await });
+        // `run()` is NOT `Send` under the `acp` feature — the runner holds an `AcpDriver`
+        // whose std mpsc `Receiver` is `!Sync` — so `tokio::spawn` fails to COMPILE on the
+        // seller's real feature combo (`acp` + `wallet`), while compiling fine on the
+        // workspace default. A `LocalSet` keeps the loop on this thread, which is also the
+        // truer shape: the node runs its loop as one task, not spread across a pool.
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        local
+            .run_until(async {
 
-        assert!(
-            fixture
-                .wait_until(FIXTURE_WAIT, |reqs| !grouped_offer_reqs(reqs).is_empty())
-                .await,
-            "harness check: the seat must boot with the open-pool half ARMED, or there is nothing \
-             to degrade"
-        );
-        let connections_before = fixture.connections();
-        let grouped_before = grouped_offer_reqs(&fixture.reqs().await).len();
+                assert!(
+                    fixture
+                        .wait_until(FIXTURE_WAIT, |reqs| !grouped_offer_reqs(reqs).is_empty())
+                        .await,
+                    "harness check: the seat must boot with the open-pool half ARMED, or there is nothing \
+                     to degrade"
+                );
+                let connections_before = fixture.connections();
+                let grouped_before = grouped_offer_reqs(&fixture.reqs().await).len();
 
-        // The degrade, exactly as the field sees it: an unsolicited CLOSED on a healthy socket.
-        fixture
-            .close_now(
-                OFFER_SUB_ID,
-                "restricted: p-gated events require #p matching your pubkey",
-            )
+                // The degrade, exactly as the field sees it: an unsolicited CLOSED on a healthy socket.
+                fixture
+                    .close_now(
+                        OFFER_SUB_ID,
+                        "restricted: p-gated events require #p matching your pubkey",
+                    )
+                    .await;
+
+                assert!(
+                    fixture
+                        .wait_until(FIXTURE_WAIT, |reqs| grouped_offer_reqs(reqs).len()
+                            > grouped_before)
+                        .await,
+                    "the open-pool half was never re-armed: a healthy seat that degrades has no recovery to \
+                     wait for, which is #190"
+                );
+
+                // Not an observation but the test's PREMISE, and the reason it proves anything: with the
+                // watchdog off there is no recovery path in this process at all, so the re-arm above cannot
+                // have come from one. `open_pool_degraded = false` in the recovery-success arm — the only
+                // re-arm before this fix — is unreachable here.
+                assert_eq!(
+                    fixture.connections(),
+                    connections_before,
+                    "harness check: nothing may reconnect in this test, or the re-arm could be the old \
+                     recovery path in disguise"
+                );
+
+                // (b) The targeted half is never disturbed: every offer REQ ever sent, degraded or grouped,
+                // carries the `#p == self` filter. A degrade that dropped it would stop targeted claiming.
+                let offers = fixture.reqs_for(OFFER_SUB_ID).await;
+                assert!(offers.len() >= 3, "expected boot + degrade + re-arm REQs");
+                for req in &offers {
+                    assert!(
+                        req.p_pinned,
+                        "an offer REQ went out without the targeted #p filter: {req:?}"
+                    );
+                    assert_eq!(
+                        req.verdict,
+                        Verdict::Eose,
+                        "the relay refused an offer REQ it should have served: {req:?}"
+                    );
+                    // Both shapes ride ONE subscription: grouped is targeted + un-pinned, degraded is
+                    // targeted alone. A third shape would mean the two filters had been split across
+                    // subscriptions, which delivers stored offers but never live ones.
+                    let expected = if req.has_unpinned_filter { 2 } else { 1 };
+                    assert_eq!(
+                        req.filter_count, expected,
+                        "an offer REQ carried an unexpected filter count: {req:?}"
+                    );
+                }
+
+            })
             .await;
-
-        assert!(
-            fixture
-                .wait_until(FIXTURE_WAIT, |reqs| grouped_offer_reqs(reqs).len()
-                    > grouped_before)
-                .await,
-            "the open-pool half was never re-armed: a healthy seat that degrades has no recovery to \
-             wait for, which is #190"
-        );
-
-        // Not an observation but the test's PREMISE, and the reason it proves anything: with the
-        // watchdog off there is no recovery path in this process at all, so the re-arm above cannot
-        // have come from one. `open_pool_degraded = false` in the recovery-success arm — the only
-        // re-arm before this fix — is unreachable here.
-        assert_eq!(
-            fixture.connections(),
-            connections_before,
-            "harness check: nothing may reconnect in this test, or the re-arm could be the old \
-             recovery path in disguise"
-        );
-
-        // (b) The targeted half is never disturbed: every offer REQ ever sent, degraded or grouped,
-        // carries the `#p == self` filter. A degrade that dropped it would stop targeted claiming.
-        let offers = fixture.reqs_for(OFFER_SUB_ID).await;
-        assert!(offers.len() >= 3, "expected boot + degrade + re-arm REQs");
-        for req in &offers {
-            assert!(
-                req.p_pinned,
-                "an offer REQ went out without the targeted #p filter: {req:?}"
-            );
-            assert_eq!(
-                req.verdict,
-                Verdict::Eose,
-                "the relay refused an offer REQ it should have served: {req:?}"
-            );
-            // Both shapes ride ONE subscription: grouped is targeted + un-pinned, degraded is
-            // targeted alone. A third shape would mean the two filters had been split across
-            // subscriptions, which delivers stored offers but never live ones.
-            let expected = if req.has_unpinned_filter { 2 } else { 1 };
-            assert_eq!(
-                req.filter_count, expected,
-                "an offer REQ carried an unexpected filter count: {req:?}"
-            );
-        }
-
         loop_handle.abort();
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3922,57 +3942,67 @@ mod tests {
         home.config.seller = Some(seller_cfg(1, true));
         home.config.seller_heartbeat.enabled = false;
         let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
-        let loop_handle = tokio::spawn(async move { runner.run().await });
+        // `run()` is NOT `Send` under the `acp` feature — the runner holds an `AcpDriver`
+        // whose std mpsc `Receiver` is `!Sync` — so `tokio::spawn` fails to COMPILE on the
+        // seller's real feature combo (`acp` + `wallet`), while compiling fine on the
+        // workspace default. A `LocalSet` keeps the loop on this thread, which is also the
+        // truer shape: the node runs its loop as one task, not spread across a pool.
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        local
+            .run_until(async {
 
-        assert!(
-            fixture
-                .wait_until(FIXTURE_WAIT, |reqs| !grouped_offer_reqs(reqs).is_empty())
-                .await,
-            "harness check: the seat must boot with the open-pool half armed"
-        );
-        // Every grouped REQ from here on is refused; the targeted-only re-subscribe is still served.
-        fixture
-            .refuse_unpinned(
-                OFFER_SUB_ID,
-                12,
-                "restricted: p-gated events require #p matching your pubkey",
-            )
+                assert!(
+                    fixture
+                        .wait_until(FIXTURE_WAIT, |reqs| !grouped_offer_reqs(reqs).is_empty())
+                        .await,
+                    "harness check: the seat must boot with the open-pool half armed"
+                );
+                // Every grouped REQ from here on is refused; the targeted-only re-subscribe is still served.
+                fixture
+                    .refuse_unpinned(
+                        OFFER_SUB_ID,
+                        12,
+                        "restricted: p-gated events require #p matching your pubkey",
+                    )
+                    .await;
+                let grouped_before = grouped_offer_reqs(&fixture.reqs().await).len();
+
+                fixture
+                    .close_now(
+                        OFFER_SUB_ID,
+                        "restricted: p-gated events require #p matching your pubkey",
+                    )
+                    .await;
+
+                // Twelve owned ticks. Un-backed-off, that is twelve attempts; the schedule allows at most
+                // four (t+0, +2, +5, +10).
+                tokio::time::sleep(Duration::from_secs(12)).await;
+                let attempts = grouped_offer_reqs(&fixture.reqs().await).len() - grouped_before;
+                assert!(
+                    attempts >= 1,
+                    "the re-arm must still be attempted — backoff is not abandonment"
+                );
+                assert!(
+                    attempts <= 5,
+                    "the open-pool re-arm hot-looped: {attempts} attempts over ~12 owned ticks, which is a \
+                     REQ per tick against a relay that has refused every one"
+                );
+
+                // The targeted half kept working throughout — a backing-off re-arm must not starve claiming.
+                let served_targeted = fixture
+                    .reqs_for(OFFER_SUB_ID)
+                    .await
+                    .into_iter()
+                    .filter(|req| !req.has_unpinned_filter && req.verdict == Verdict::Eose)
+                    .count();
+                assert!(
+                    served_targeted >= 1,
+                    "the targeted-only offer subscription must stay live across the backoff"
+                );
+
+            })
             .await;
-        let grouped_before = grouped_offer_reqs(&fixture.reqs().await).len();
-
-        fixture
-            .close_now(
-                OFFER_SUB_ID,
-                "restricted: p-gated events require #p matching your pubkey",
-            )
-            .await;
-
-        // Twelve owned ticks. Un-backed-off, that is twelve attempts; the schedule allows at most
-        // four (t+0, +2, +5, +10).
-        tokio::time::sleep(Duration::from_secs(12)).await;
-        let attempts = grouped_offer_reqs(&fixture.reqs().await).len() - grouped_before;
-        assert!(
-            attempts >= 1,
-            "the re-arm must still be attempted — backoff is not abandonment"
-        );
-        assert!(
-            attempts <= 5,
-            "the open-pool re-arm hot-looped: {attempts} attempts over ~12 owned ticks, which is a \
-             REQ per tick against a relay that has refused every one"
-        );
-
-        // The targeted half kept working throughout — a backing-off re-arm must not starve claiming.
-        let served_targeted = fixture
-            .reqs_for(OFFER_SUB_ID)
-            .await
-            .into_iter()
-            .filter(|req| !req.has_unpinned_filter && req.verdict == Verdict::Eose)
-            .count();
-        assert!(
-            served_targeted >= 1,
-            "the targeted-only offer subscription must stay live across the backoff"
-        );
-
         loop_handle.abort();
         let _ = std::fs::remove_dir_all(&root);
     }
