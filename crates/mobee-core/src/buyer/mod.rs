@@ -68,6 +68,13 @@ const AUTO_AWARD_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// subscription is the fast path; this backstop is what makes a dropped or missed result event a
 /// latency cost rather than a stranded payment.
 const DELIVERY_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+/// How often the reservation reconcile re-runs while the daemon serves. This is what frees a
+/// reservation stranded by a seller that simply stopped, without waiting for a restart.
+///
+/// Deliberately SLOW: a pass makes one relay fetch per still-reserved job, which is the unbounded
+/// per-job fetch pattern tracked in #180. Until that moves onto the persistent relay session, the
+/// cadence is the thing keeping the load down — raise it only together with that fix.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Lock file leaf under the home.
 pub const LOCK_FILE: &str = "buyer.lock";
@@ -219,12 +226,7 @@ pub async fn run(home: MobeeHome) -> Result<(), BuyerError> {
     // daemon starts from a converged ledger. A failure is logged, not fatal — an unreachable relay
     // must not keep the daemon from coming up (the stale reservation is conservative until the next
     // reconcile).
-    match reconcile_on_start(&context).await {
-        Ok(report) => *context.last_reconcile.lock().await = Some(report),
-        Err(error) => eprintln!(
-            "buyer: reconcile-on-start did not complete ({error}); serving with the ledger as-is"
-        ),
-    }
+    run_reconcile_pass(&context).await;
     // Re-arm pending auto-awards left by a prior run: a job posted before a crash still gets its
     // award with zero manual commands. Each task re-checks the relay for an existing award first
     // (invariant A), so re-arming never double-awards.
@@ -239,6 +241,9 @@ pub async fn run(home: MobeeHome) -> Result<(), BuyerError> {
     // Start watching for delivered results. Its own first action is a sweep of awarded-unsettled
     // jobs, which is what collects a delivery that landed while this daemon was down.
     spawn_delivery_watcher(context.clone());
+    // Keep reconciling while we serve, so a reservation stranded by a seller that went away is
+    // freed within the hour rather than at the next restart.
+    spawn_reconcile_loop(context.clone());
     let listener = bind_socket(&socket_path)?;
     accept_loop(listener, context).await
 }
@@ -990,7 +995,20 @@ async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Ev
 /// a `Closed` attempt is converted to `spent`; an ambiguous (Sent-not-Closed) payment is KEPT (the
 /// phase-3 saga owns it). Pure classification is [`lifecycle::classify_disposition`]; this gathers
 /// its inputs and applies the batch through [`BuyerStore::reconcile`].
-async fn reconcile_on_start(context: &BuyerContext) -> Result<ReconcileReport, String> {
+///
+/// This runs at boot AND on a slow timer, which is what releases a reservation stranded by a seller
+/// that simply stopped — no feedback event required, because a claim stops being live at the offer
+/// deadline whether or not the seller ever says so.
+///
+/// Gather is done WITHOUT the money lock (it is per-job relay I/O and would block the trade RPCs for
+/// seconds); only the apply takes it. That ordering matters: `settle_job` holds the money lock
+/// across pay-then-flip, so taking it here makes it impossible to release a reservation in the
+/// window after a payment's melt but before its `reserved → spent` flip — which would transiently
+/// free funds that had in fact already left the wallet. The apply itself is additionally
+/// state-guarded inside its transaction ([`BuyerStore::reconcile`] re-reads each row and acts only
+/// on the state it expects), so a disposition that went stale during gather is a no-op rather than a
+/// wrong write.
+async fn reconcile_reservations(context: &BuyerContext) -> Result<ReconcileReport, String> {
     let reserved = context
         .store
         .reserved_job_ids()
@@ -1027,10 +1045,88 @@ async fn reconcile_on_start(context: &BuyerContext) -> Result<ReconcileReport, S
     }
 
     let dispositions = plan_reconcile(&reserved, &progress, &payable);
+    let _guard = context.money_lock.lock().await;
     context
         .store
         .reconcile(&dispositions, now_unix())
         .map_err(|error| error.to_string())
+}
+
+/// Run one reconcile pass, publish it to `status`, and report it — always.
+async fn run_reconcile_pass(context: &Arc<BuyerContext>) {
+    match reconcile_reservations(context).await {
+        Ok(report) => {
+            report_reconcile(&report);
+            *context.last_reconcile.lock().await = Some(report);
+        }
+        // An unreachable relay must never be fatal: every job it could not verify was treated as
+        // still-payable, so the ledger is conservative until the next pass.
+        Err(error) => {
+            eprintln!("buyer: reconcile pass did not complete ({error}); serving with the ledger as-is")
+        }
+    }
+}
+
+/// Report a reconcile pass UNCONDITIONALLY — including the pass that changed nothing.
+///
+/// Releasing a reservation is a money-visible decision: it returns funds to `available`. A path that
+/// prints only when it acts is indistinguishable, in a log, from a path that has stopped running —
+/// so the quiet pass is exactly the one worth printing. Released jobs are named, because "something
+/// was released" is not an answer to "which job, and why did my budget move".
+///
+/// The examined count is in the line deliberately: it is also the number of per-job relay fetches
+/// this pass made, so #180's amplification is visible while it grows instead of when it bites.
+fn report_reconcile(report: &ReconcileReport) {
+    eprintln!("{}", reconcile_line(report));
+}
+
+/// Build the reconcile report line. Split from the printing so the wording — including the
+/// released-nothing case that exists precisely because it is easy to leave out — is directly
+/// testable rather than something a reader has to trust.
+fn reconcile_line(report: &ReconcileReport) -> String {
+    let examined = report.released.len() + report.converted.len() + report.kept.len();
+    if report.released.is_empty() {
+        format!(
+            "buyer: reconcile examined {examined} reserved job(s) — released nothing, converted {}, kept {}",
+            report.converted.len(),
+            report.kept.len()
+        )
+    } else {
+        format!(
+            "buyer: reconcile examined {examined} reserved job(s) — RELEASED {} (no longer payable \
+             on the relay and no funds left: {}), converted {}, kept {}",
+            report.released.len(),
+            report.released.join(", "),
+            report.converted.len(),
+            report.kept.len()
+        )
+    }
+}
+
+/// Re-run the reconcile on a slow timer for the daemon's lifetime, with the pass injected.
+///
+/// Sequential BY CONSTRUCTION: the pass is awaited inside the loop, and the interval's `Delay`
+/// behaviour defers a tick that arrives mid-pass. Two passes can therefore never overlap, so the
+/// per-job relay fetches cannot compound into each other — which matters while #180 stands, because
+/// overlapping passes would multiply exactly the load the slow cadence is holding down.
+async fn reconcile_loop<P, Fut>(interval: Duration, mut pass: P)
+where
+    P: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await; // Resolves immediately; the boot pass in `run` WAS it.
+    loop {
+        ticker.tick().await;
+        pass().await;
+    }
+}
+
+fn spawn_reconcile_loop(context: Arc<BuyerContext>) {
+    tokio::spawn(async move {
+        reconcile_loop(RECONCILE_INTERVAL, || run_reconcile_pass(&context)).await;
+    });
 }
 
 /// Pure reconcile planning: map each reserved job to a disposition from its folded payment progress
@@ -1201,6 +1297,92 @@ mod tests {
     fn temp_home(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!("mobee-buyer-mod-{label}-{}-{id}", std::process::id()))
+    }
+
+    // ★ THE #179/4b TOOTH: the reconcile reports the pass that changed NOTHING.
+    //
+    // A release moves the buyer's `available` — it is a money-visible decision — and the pass that
+    // releases nothing is the one most likely to be dropped as noise. But a path that prints only
+    // when it acts reads, in a log, exactly like a path that has stopped running, which is how a
+    // dead release path stays invisible until a reservation strands. So the empty case is asserted
+    // first here, deliberately.
+    //
+    // Red-on-revert: make the empty case return an empty string (or skip the log) and this fails.
+    #[test]
+    fn the_reconcile_reports_every_pass_including_the_one_that_did_nothing() {
+        // Nothing reserved at all: still a line, and it still says what it examined.
+        let quiet = reconcile_line(&ReconcileReport::default());
+        assert!(quiet.contains("examined 0 reserved job(s)"), "unexpected: {quiet}");
+        assert!(quiet.contains("released nothing"), "the empty pass must say so: {quiet}");
+
+        // Jobs examined, none released: the count is still reported, so an operator can see the
+        // pass ran and how many relay fetches it cost (#180's amplification, visible as it grows).
+        let busy_but_quiet = ReconcileReport {
+            kept: vec!["a".repeat(64), "b".repeat(64)],
+            ..ReconcileReport::default()
+        };
+        let line = reconcile_line(&busy_but_quiet);
+        assert!(line.contains("examined 2 reserved job(s)"), "unexpected: {line}");
+        assert!(line.contains("released nothing"), "unexpected: {line}");
+
+        // A release NAMES the job and the reason — "something was released" is not an answer to
+        // "which job, and why did my budget move".
+        let released = ReconcileReport {
+            released: vec!["c".repeat(64)],
+            kept: vec!["d".repeat(64)],
+            ..ReconcileReport::default()
+        };
+        let line = reconcile_line(&released);
+        assert!(line.contains("examined 2 reserved job(s)"), "unexpected: {line}");
+        assert!(line.contains(&"c".repeat(64)), "the released job must be named: {line}");
+        assert!(line.contains("no longer payable"), "the reason must be stated: {line}");
+    }
+
+    // ★ NO-OVERLAP TOOTH: reconcile passes must never run concurrently.
+    //
+    // Each pass makes one relay fetch per still-reserved job — the unbounded per-job pattern in
+    // #180 — so overlapping passes would multiply precisely the load the slow cadence exists to
+    // hold down. `Delay` plus awaiting the pass inside the loop is what prevents it, and both are
+    // one-word changes away from being wrong (`Burst`, or spawning the pass).
+    //
+    // Deterministic: the pass is injected and takes far longer than the tick, so a loop that did
+    // NOT serialise would immediately show overlap.
+    //
+    // Red-on-revert: `tokio::spawn(pass())` instead of awaiting it, and max-in-flight exceeds 1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_passes_never_overlap() {
+        use std::sync::atomic::AtomicUsize;
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let passes = Arc::new(AtomicUsize::new(0));
+
+        let (f, p, n) = (in_flight.clone(), peak.clone(), passes.clone());
+        let task = tokio::spawn(async move {
+            // Pass duration deliberately several times the tick, so any non-serialising loop
+            // overlaps on the very first ticks.
+            reconcile_loop(Duration::from_millis(5), move || {
+                let (f, p, n) = (f.clone(), p.clone(), n.clone());
+                async move {
+                    let now = f.fetch_add(1, Ordering::SeqCst) + 1;
+                    p.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    f.fetch_sub(1, Ordering::SeqCst);
+                    n.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (observed_peak, completed) = (peak.load(Ordering::SeqCst), passes.load(Ordering::SeqCst));
+        task.abort();
+
+        assert!(completed >= 2, "the loop must keep running passes; saw {completed}");
+        assert_eq!(
+            observed_peak, 1,
+            "reconcile passes must never overlap — peak concurrent passes was {observed_peak}"
+        );
     }
 
     /// A non-actionable event for the starvation tooth: any kind the watcher does not act on. Job
