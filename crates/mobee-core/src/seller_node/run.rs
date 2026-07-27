@@ -291,6 +291,29 @@ fn is_our_subscription(id: &str) -> bool {
     )
 }
 
+/// The diagnostic for a `CLOSED` naming a subscription id we never registered.
+///
+/// A function rather than an inline `eprintln!` because this line is field-facing: the relay owner
+/// reads it to tell two hypotheses apart, and neither is visible from the server side. Our periodic
+/// wrap backfill calls `fetch_events`, which GENERATES its subscription id (`pool/mod.rs:815`) and
+/// runs on exactly the cadence these closes appear on — so a small `last_backfill` age implicates our
+/// own transient REQ. A `last_nip42_auth` age near the relay's NIP-42 TTL instead implicates a
+/// re-challenge sweep closing auth-scoped subscriptions from the pre-expiry generation. Being a
+/// function, its content is pinned by a test instead of drifting silently.
+fn unknown_close_diagnostic(
+    id: &str,
+    last_backfill_secs: u64,
+    last_nip42_auth_secs: u64,
+    authed: bool,
+) -> String {
+    format!(
+        "seller node RELAY-CLOSED UNKNOWN-ID: id={id} was never in our registry (ours: \
+         {OFFER_SUB_ID}, {AWARD_SUB_ID}, {WRAP_SUB_ID}, {LIVENESS_PROBE_SUB_ID}); no recovery \
+         forced. last_backfill={last_backfill_secs}s ago, \
+         last_nip42_auth={last_nip42_auth_secs}s ago, authed={authed}"
+    )
+}
+
 /// Whether EVERY filter on this subscription pins `#p` to our own pubkey.
 ///
 /// This is the precondition for reading a `restricted:` CLOSED as the #189 pre-auth race instead of a
@@ -1138,13 +1161,13 @@ impl SellerNodeRunner {
                             // generation.
                             if !is_our_subscription(&id) {
                                 eprintln!(
-                                    "seller node RELAY-CLOSED UNKNOWN-ID: id={id} was never in our \
-                                     registry (ours: {OFFER_SUB_ID}, {AWARD_SUB_ID}, {WRAP_SUB_ID}, \
-                                     {LIVENESS_PROBE_SUB_ID}); no recovery forced. \
-                                     last_backfill={}s ago, last_nip42_auth={}s ago, \
-                                     authed={nip42_authed}",
-                                    last_backfill_at.elapsed().as_secs(),
-                                    last_authenticated_at.elapsed().as_secs()
+                                    "{}",
+                                    unknown_close_diagnostic(
+                                        &id,
+                                        last_backfill_at.elapsed().as_secs(),
+                                        last_authenticated_at.elapsed().as_secs(),
+                                        nip42_authed,
+                                    )
                                 );
                                 continue;
                             }
@@ -3628,6 +3651,119 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// TOOTH — an unknown-id `CLOSED` is INERT beyond its log line. Escalating one cost a reconnect
+    /// per cycle on a socket that was never broken, and that reconnect is what re-closed the money
+    /// leg. Pinned here so a refactor cannot quietly restore the escalation.
+    ///
+    /// Two things make this tooth bite rather than decorate. The watchdog is ENABLED, so a forced
+    /// recovery has a tick to run on — with it off, "no reconnect happened" would be true even with
+    /// the escalation restored. And the window is long enough for a reconnect to COMPLETE against
+    /// this fixture (~6s), because a window shorter than that reads a recovery still in progress as
+    /// a recovery that never happened. A first draft of this tooth waited 4s and passed under
+    /// revert; the wait below returns early when the socket count moves, so the red path is fast and
+    /// only the green path pays the full window.
+    ///
+    /// RED ON REVERT: drop the `!is_our_subscription` early return so the unknown id falls through
+    /// to `forced_recovery`, and the socket-count assertion fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unknown_id_closed_costs_no_reconnect_and_no_resubscribe() {
+        use_fast_backfill_tick();
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("unknownid");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, false));
+        home.config.seller_heartbeat.enabled = true;
+        home.config.seller_heartbeat.interval_secs = 1;
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let loop_handle = tokio::spawn(async move { runner.run().await });
+
+        assert!(
+            fixture
+                .wait_until(FIXTURE_WAIT, |reqs| reqs
+                    .iter()
+                    .any(|r| r.subscription_id == WRAP_SUB_ID))
+                .await,
+            "harness check: the seat must be up before we close something it never registered"
+        );
+        // The watchdog must be demonstrably live, or "no reconnect" is just a dead loop.
+        assert!(
+            fixture
+                .wait_until(FIXTURE_WAIT, |reqs| reqs
+                    .iter()
+                    .any(|r| r.subscription_id == LIVENESS_PROBE_SUB_ID))
+                .await,
+            "harness check: the heartbeat watchdog must be ticking, otherwise a forced recovery \
+             could not have fired even if one had been requested"
+        );
+        let connections_before = fixture.connections();
+
+        let stranger_id = "some-subscription-we-never-registered";
+        fixture
+            .close_now(
+                stranger_id,
+                "restricted: p-gated events require #p matching your pubkey",
+            )
+            .await;
+
+        let escalated = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if fixture.connections() != connections_before {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            !escalated,
+            "a CLOSED for an id we never registered forced a reconnect — that is a reconnect per \
+             cycle on a socket that was never broken"
+        );
+        assert!(
+            fixture.reqs_for(stranger_id).await.is_empty(),
+            "we must never REQ a subscription id that was never ours"
+        );
+        // Still alive and still watching: inert about the close, not inert about liveness.
+        let probes_before = fixture.reqs_for(LIVENESS_PROBE_SUB_ID).await.len();
+        assert!(
+            fixture
+                .wait_until(FIXTURE_WAIT, |reqs| reqs
+                    .iter()
+                    .filter(|r| r.subscription_id == LIVENESS_PROBE_SUB_ID)
+                    .count()
+                    > probes_before)
+                .await,
+            "the node must keep probing after an unknown-id CLOSED"
+        );
+
+        loop_handle.abort();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The unknown-id line is field-facing: the relay owner reads it to separate our own transient
+    /// `fetch_events` REQ from a relay-side auth-TTL sweep, so both ages have to actually be in it.
+    #[test]
+    fn the_unknown_close_diagnostic_carries_both_ages_and_the_auth_state() {
+        let line = unknown_close_diagnostic("deadbeef", 7, 301, true);
+        assert!(line.starts_with("seller node RELAY-CLOSED UNKNOWN-ID:"));
+        for expected in [
+            "id=deadbeef",
+            "last_backfill=7s ago",
+            "last_nip42_auth=301s ago",
+            "authed=true",
+            "no recovery forced",
+            WRAP_SUB_ID,
+        ] {
+            assert!(
+                line.contains(expected),
+                "the unknown-id diagnostic must carry {expected:?}, or the relay owner cannot tell \
+                 the two hypotheses apart: {line}"
+            );
+        }
+    }
+
     /// One owned tick, for the loop teeth below. Both #190 loop teeth set the SAME value, so running
     /// them in parallel cannot make them disagree.
     const TEST_BACKFILL_SECS: &str = "1";
@@ -3698,10 +3834,15 @@ mod tests {
              wait for, which is #190"
         );
 
+        // Not an observation but the test's PREMISE, and the reason it proves anything: with the
+        // watchdog off there is no recovery path in this process at all, so the re-arm above cannot
+        // have come from one. `open_pool_degraded = false` in the recovery-success arm — the only
+        // re-arm before this fix — is unreachable here.
         assert_eq!(
             fixture.connections(),
             connections_before,
-            "the re-arm must not cost a reconnect — that dependency IS the bug"
+            "harness check: nothing may reconnect in this test, or the re-arm could be the old \
+             recovery path in disguise"
         );
 
         // (b) The targeted half is never disturbed: every offer REQ ever sent, degraded or grouped,

@@ -278,7 +278,6 @@ async fn serve_connection(
                 )
                 .await;
 
-
                 transcript.lock().await.push(ReqRecord {
                     subscription_id: subscription_id.clone(),
                     authenticated: authed_pubkey.is_some(),
