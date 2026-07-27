@@ -64,6 +64,10 @@ const RELAY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the background auto-award task re-checks the relay for a payable claim, until one
 /// appears or the offer deadline passes. Bounded polling (no tight spin on a live-but-unpayable claim).
 const AUTO_AWARD_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the delivery watcher re-checks awarded-unsettled jobs with no event to wake it. The
+/// subscription is the fast path; this backstop is what makes a dropped or missed result event a
+/// latency cost rather than a stranded payment.
+const DELIVERY_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Lock file leaf under the home.
 pub const LOCK_FILE: &str = "buyer.lock";
@@ -232,6 +236,9 @@ pub async fn run(home: MobeeHome) -> Result<(), BuyerError> {
         }
         Err(error) => eprintln!("buyer: could not list pending auto-awards to re-arm: {error}"),
     }
+    // Start watching for delivered results. Its own first action is a sweep of awarded-unsettled
+    // jobs, which is what collects a delivery that landed while this daemon was down.
+    spawn_delivery_watcher(context.clone());
     let listener = bind_socket(&socket_path)?;
     accept_loop(listener, context).await
 }
@@ -581,36 +588,77 @@ struct CollectParams {
 /// verify integrity, budget-append + wallet melt, materialize) and, ONLY after it succeeds, flip
 /// the reservation `reserved → spent` via [`lifecycle::settle_after_pay`]. The flip is never
 /// reached on a pay refusal, so a failed pay never over-states `available`.
+/// Failure of [`settle_job`].
+#[derive(Debug)]
+enum SettleJobError {
+    /// The budget gate could not be loaded — nothing was attempted.
+    Gate(String),
+    /// The sealed pay path refused (or failed). No reservation flip was reached.
+    Pay(collect::CollectError),
+    /// The pay landed but the `reserved → spent` flip did not; reconcile converges it on next start.
+    Store(StoreError),
+}
+
+impl std::fmt::Display for SettleJobError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Gate(message) => write!(formatter, "{message}"),
+            Self::Pay(error) => write!(formatter, "{error}"),
+            Self::Store(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+/// The daemon's ONE path to the spend gate: money lock → budget gate → pay-then-flip.
+///
+/// Both the `collect` RPC and the delivery watcher call this and nothing else. That is deliberate:
+/// it makes "can the watcher reach around a money gate?" answerable by construction instead of by
+/// audit. Every gate lives inside the sealed [`collect::collect_async`] this composes — accept-time
+/// job-hash recomputation, offer-authoritative amount, seller co-signature, creq verification,
+/// single-settlement, the pre-spend commit tip-match, the budget ceiling, and pays-exactly-once —
+/// and neither caller can compose a different route to them.
+///
+/// The watcher therefore adds NO money authority. It commits no new money; it converts a
+/// reservation the award already created.
+async fn settle_job(
+    context: &BuyerContext,
+    job_id: &str,
+    out: Option<String>,
+) -> Result<collect::CollectOutcome, SettleJobError> {
+    // Serialize with award + other collects: at most one wallet-melting op in flight daemon-wide.
+    let _guard = context.money_lock.lock().await;
+
+    let mut gate =
+        BudgetGate::from_home(&context.home).map_err(|error| SettleJobError::Gate(error.to_string()))?;
+    let request = CollectRequest {
+        job_id: job_id.to_owned(),
+        out,
+    };
+
+    // Pay FIRST (append + melt), flip AFTER — the #123/#126 ordering, via the tested seam.
+    lifecycle::settle_after_pay(
+        &context.store,
+        job_id,
+        now_unix(),
+        || collect::collect_async(&context.home, &mut gate, request),
+        |outcome| outcome.pay.amount_sats,
+    )
+    .await
+    .map(|(outcome, _converted)| outcome)
+    .map_err(|error| match error {
+        SettleError::Pay(error) => SettleJobError::Pay(error),
+        SettleError::Store(error) => SettleJobError::Store(error),
+    })
+}
+
 async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
     let params: CollectParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(error) => return Response::err(id, CODE_METHOD_NOT_FOUND, format!("collect params: {error}")),
     };
 
-    // Serialize with award + other collects: at most one wallet-melting op in flight daemon-wide.
-    let _guard = context.money_lock.lock().await;
-
-    let mut gate = match BudgetGate::from_home(&context.home) {
-        Ok(gate) => gate,
-        Err(error) => return Response::err(id, CODE_INTERNAL, error.to_string()),
-    };
-    let request = CollectRequest {
-        job_id: params.job_id.clone(),
-        out: params.out,
-    };
-
-    // Pay FIRST (append + melt), flip AFTER — the #123/#126 ordering, via the tested seam.
-    let settled = lifecycle::settle_after_pay(
-        &context.store,
-        &params.job_id,
-        now_unix(),
-        || collect::collect_async(&context.home, &mut gate, request),
-        |outcome| outcome.pay.amount_sats,
-    )
-    .await;
-
-    match settled {
-        Ok((outcome, _converted)) => Response::ok(
+    match settle_job(context, &params.job_id, params.out).await {
+        Ok(outcome) => Response::ok(
             id,
             json!({
                 "pay": {
@@ -625,8 +673,8 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
                 "files": outcome.files,
             }),
         ),
-        Err(SettleError::Pay(error)) => Response::err(id, CODE_REFUSED, error.to_string()),
-        Err(SettleError::Store(error)) => Response::err(id, CODE_INTERNAL, error.to_string()),
+        Err(error @ SettleJobError::Pay(_)) => Response::err(id, CODE_REFUSED, error.to_string()),
+        Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
     }
 }
 
@@ -782,6 +830,157 @@ async fn finalize_auto_award(
                 .store
                 .mark_award_parked(job_id, &format!("award failed: {error}"), now_unix());
             Ok(())
+        }
+    }
+}
+
+/// Spawn the delivery watcher — the "seller paid in seconds" half of the trade loop. Subscribes
+/// BEFORE the task starts so no result published during scheduling is missed, then hands the
+/// receiver to the loop.
+///
+/// `subscribe_events` is a synchronous, non-blocking channel handout and `tokio::spawn` returns
+/// immediately, so this adds nothing measurable to the daemon's readiness path — which matters,
+/// because the socket bind that follows is on a 10s deadline.
+fn spawn_delivery_watcher(context: Arc<BuyerContext>) {
+    let events = context.relay.subscribe_events();
+    tokio::spawn(async move { drive_delivery_watch(&context, events).await });
+}
+
+/// Watch for delivered results and settle them automatically.
+///
+/// Structure mirrors the P2 rule this daemon already lives by — **the subscription is the wake, the
+/// durable state is the truth**. An arriving result event is never evidence of anything: it only
+/// says "look again", and optionally narrows WHICH job to look at. What may be paid is read from
+/// the award/reservation ledger and decided entirely by the sealed pay path, so a forged, replayed,
+/// or malformed result event can at worst cost a wasted fetch.
+///
+/// The loop starts with a sweep because a delivery that landed while the daemon was DOWN has no
+/// event to replay — durable state is the only thing that can find it.
+async fn drive_delivery_watch(
+    context: &Arc<BuyerContext>,
+    events: tokio::sync::broadcast::Receiver<Arc<nostr_sdk::Event>>,
+) {
+    watch_loop(events, DELIVERY_RECHECK_INTERVAL, |wake| async move {
+        match wake {
+            // A result arrived: sweep, narrowed to the jobs that event references.
+            WatchWake::Delivered(event) => settle_awarded(context, Some(&event)).await,
+            WatchWake::Sweep | WatchWake::SubscriptionLost => settle_awarded(context, None).await,
+        }
+    })
+    .await;
+}
+
+/// What woke the watch loop. Modelled explicitly so the loop's control flow is testable without a
+/// relay, a wall clock, or a paused clock — the sweep action is injected, and this says why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WatchWake {
+    /// A delivered result arrived — sweep, narrowed to the jobs it references.
+    Delivered(Arc<nostr_sdk::Event>),
+    /// The backstop fired, or a gap means something may have been missed — sweep everything.
+    Sweep,
+    /// The subscription ended; the loop continues on the backstop alone.
+    SubscriptionLost,
+}
+
+/// The watch loop's control flow, with the sweep action injected.
+///
+/// Two properties here are the whole point, and both are the kind that stay silently dead while
+/// everything looks fine — so both are toothed directly:
+///
+/// 1. The backstop is a fixed-cadence `interval`, NOT a sleep re-armed inside the `select!`. A
+///    per-iteration sleep is pushed back by every arriving event, and events the loop does not act
+///    on (the `continue` below) would reset it WITHOUT sweeping — so a steady claim/feedback stream
+///    would starve the sweep indefinitely, defeating it in exactly the case it exists for: a result
+///    event that was missed. `Delay` keeps a slow settle pass from bunching the next ticks.
+/// 2. A closed subscription DEGRADES, it does not stop the loop. Settling does not depend on the
+///    relay handle at all (the collect path opens its own client), so returning here would strand
+///    every future delivery. It drops to timer-only and says so.
+async fn watch_loop<S, Fut>(
+    events: tokio::sync::broadcast::Receiver<Arc<nostr_sdk::Event>>,
+    interval: Duration,
+    mut sweep: S,
+) where
+    S: FnMut(WatchWake) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    // A delivery that landed while the daemon was DOWN has no event to replay, so the durable set
+    // is the only thing that can find it. That is why the loop sweeps before it ever waits.
+    sweep(WatchWake::Sweep).await;
+
+    let mut backstop = tokio::time::interval(interval);
+    backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    backstop.tick().await; // The first tick resolves immediately; the boot sweep above WAS it.
+
+    // `None` once the subscription is gone — the loop then runs on the backstop alone.
+    let mut events = Some(events);
+
+    loop {
+        let wake = match events.as_mut() {
+            Some(stream) => tokio::select! {
+                received = stream.recv() => match received {
+                    Ok(event) => {
+                        if event.kind != nostr_sdk::Kind::Custom(crate::kinds::JOB_RESULT_KIND) {
+                            continue;
+                        }
+                        WatchWake::Delivered(event)
+                    }
+                    // Lagged is NOT an error — the buffer overflowed and a result may have been
+                    // missed. Treating a busy relay as a failure would strand a payment; the right
+                    // response is to widen to a full sweep.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => WatchWake::Sweep,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        eprintln!(
+                            "buyer: delivery watcher lost the relay subscription; falling back to \
+                             periodic sweeps every {}s (deliveries still settle, just later)",
+                            interval.as_secs()
+                        );
+                        events = None;
+                        WatchWake::SubscriptionLost
+                    }
+                },
+                _ = backstop.tick() => WatchWake::Sweep,
+            },
+            None => {
+                backstop.tick().await;
+                WatchWake::Sweep
+            }
+        };
+        sweep(wake).await;
+    }
+}
+
+/// Settle awarded-but-unsettled jobs through the daemon's single spend path.
+///
+/// `wake` narrows the sweep to the jobs a just-arrived result references (the fast path); `None`
+/// sweeps the whole set (boot, the backstop tick, and after a `Lagged` gap).
+async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Event>) {
+    let jobs = match context.store.awarded_unsettled_job_ids() {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            eprintln!("buyer: delivery watcher could not read awarded jobs ({error}); will retry");
+            return;
+        }
+    };
+    for job_id in jobs {
+        if let Some(event) = wake {
+            if !job_lifecycle::event_references_job(event, &job_id) {
+                continue;
+            }
+        }
+        match settle_job(context, &job_id, None).await {
+            Ok(outcome) => eprintln!(
+                "buyer: delivery watcher settled {job_id} — paid {} sat for commit {} ({} file(s))",
+                outcome.pay.amount_sats,
+                outcome.commit_oid,
+                outcome.files.len()
+            ),
+            // Nothing delivered yet is the ordinary state of an awarded job, not a failure: the job
+            // stays in the set and the next event or tick retries. Every OTHER outcome is a real
+            // refusal — a gate said no — and is named so an operator sees which job stopped and why.
+            Err(SettleJobError::Pay(collect::CollectError::Lifecycle(
+                job_lifecycle::JobLifecycleError::NotFound(_),
+            ))) => {}
+            Err(error) => eprintln!("buyer: delivery watcher could not settle {job_id}: {error}"),
         }
     }
 }
@@ -1002,6 +1201,261 @@ mod tests {
     fn temp_home(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!("mobee-buyer-mod-{label}-{}-{id}", std::process::id()))
+    }
+
+    /// A non-actionable event for the starvation tooth: any kind the watcher does not act on. Job
+    /// FEEDBACK is the realistic one — it shares the buyer-keyed subscription with results, so a
+    /// chatty job produces exactly this traffic.
+    fn non_actionable_event() -> Arc<nostr_sdk::Event> {
+        use nostr_sdk::prelude::{EventBuilder, Keys};
+        Arc::new(
+            EventBuilder::new(nostr_sdk::Kind::Custom(crate::kinds::JOB_FEEDBACK_KIND), "")
+                .sign_with_keys(&Keys::generate())
+                .expect("sign"),
+        )
+    }
+
+    // ★ LIVENESS TOOTH (a): a steady stream of events the watcher does NOT act on must not starve
+    // the backstop sweep.
+    //
+    // This is the failure that keeps costing us: a liveness mechanism silently dead while
+    // everything looks fine. A backstop re-armed per loop iteration is pushed back by every
+    // arriving event — and non-actionable events reset it WITHOUT sweeping — so under steady
+    // traffic it never fires, and the one case it exists for (a result event we missed) is exactly
+    // the case it stops covering. A correctness tooth cannot see this: the loop still returns
+    // correct results for every event it DOES get.
+    //
+    // Deterministic by construction — no relay, no paused clock, no wall-clock assertion. The sweep
+    // action is injected and counted, and the event rate is an order of magnitude faster than the
+    // backstop, so the two implementations separate hugely: fixed-cadence interval ⇒ many sweeps;
+    // re-armed sleep ⇒ exactly the one boot sweep, forever.
+    //
+    // Red-on-revert: replace the `interval` with `tokio::time::sleep(interval)` inside the select
+    // and this fails on `sweeps >= 4`, observing 1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn steady_non_actionable_traffic_does_not_starve_the_backstop_sweep() {
+        use std::sync::atomic::AtomicUsize;
+
+        let (sender, receiver) = tokio::sync::broadcast::channel(64);
+        let sweeps = Arc::new(AtomicUsize::new(0));
+
+        let counter = sweeps.clone();
+        let loop_task = tokio::spawn(async move {
+            watch_loop(receiver, Duration::from_millis(10), move |_wake| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .await;
+        });
+
+        // Flood non-actionable events an order of magnitude faster than the backstop for long
+        // enough that a healthy loop must tick many times.
+        let flood = tokio::spawn(async move {
+            for _ in 0..300 {
+                // A receiver-less send is fine; the loop is the only receiver and may be busy.
+                let _ = sender.send(non_actionable_event());
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            // Hold the sender until the end so the subscription never closes during the flood.
+            sender
+        });
+        let _sender = flood.await.expect("flood");
+
+        let observed = sweeps.load(Ordering::SeqCst);
+        loop_task.abort();
+        assert!(
+            observed >= 4,
+            "the backstop must keep sweeping under steady non-actionable traffic; saw {observed} \
+             sweep(s) across ~300ms at a 10ms cadence (a per-iteration sleep would show exactly 1)"
+        );
+    }
+
+    // ★ LIVENESS TOOTH (b): losing the subscription DEGRADES the watcher to timer-only sweeps — it
+    // must not stop it. Settling never depended on the relay handle (the collect path opens its own
+    // client), so returning on `Closed` would strand every delivery from that moment on, silently.
+    //
+    // Asserts both halves: the loop observes `SubscriptionLost` exactly once (the arm that emits the
+    // unconditional operator line — it cannot fire without executing that line), and sweeps continue
+    // afterwards on the backstop alone.
+    //
+    // Red-on-revert: `return` on `RecvError::Closed` and this fails — no post-close sweeps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_subscription_degrades_to_timer_only_instead_of_stopping() {
+        use std::sync::atomic::AtomicUsize;
+
+        let (sender, receiver) = tokio::sync::broadcast::channel(8);
+        let lost = Arc::new(AtomicUsize::new(0));
+        let after_loss = Arc::new(AtomicUsize::new(0));
+
+        let (lost_counter, after_counter) = (lost.clone(), after_loss.clone());
+        let loop_task = tokio::spawn(async move {
+            watch_loop(receiver, Duration::from_millis(10), move |wake| {
+                let (lost_counter, after_counter) = (lost_counter.clone(), after_counter.clone());
+                async move {
+                    if wake == WatchWake::SubscriptionLost {
+                        lost_counter.fetch_add(1, Ordering::SeqCst);
+                    } else if lost_counter.load(Ordering::SeqCst) > 0 {
+                        after_counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            })
+            .await;
+        });
+
+        // Drop the sender: the subscription closes.
+        drop(sender);
+        // Let the backstop tick several times past the close.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let (losses, sweeps_after) = (lost.load(Ordering::SeqCst), after_loss.load(Ordering::SeqCst));
+        loop_task.abort();
+        assert_eq!(losses, 1, "the subscription loss must be observed exactly once, not spun on");
+        assert!(
+            sweeps_after >= 2,
+            "the watcher must keep sweeping on the backstop after losing the subscription; saw \
+             {sweeps_after} sweep(s) in ~120ms at a 10ms cadence"
+        );
+    }
+
+    // ★ THE MONEY TOOTH for the delivery watcher. The watcher settles with no human in the loop, so
+    // the question that matters is whether its entry to the spend gate is as gated as the RPC's. It
+    // is, by construction — both call `settle_job` and nothing else — and this proves it end to end:
+    // an awarded job whose delivered result carries a FORGED seller co-signature must cost NOTHING.
+    //
+    // Non-vacuity anchor: the watcher drives the full accept-then-pay path, and accept writes the
+    // pay-bind BEFORE the pre-pay co-signature gate refuses. So the bind file EXISTING is positive
+    // evidence the watcher really ran this job — without it, every "nothing happened" assertion
+    // below would pass just as well if the watcher had never woken at all.
+    //
+    // The counterparty events are published from a SEPARATE client than the daemon's own session:
+    // one nostr-sdk client cannot observe the events it published itself, and that trap bites
+    // fixtures exactly as it bites production.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delivery_watcher_refuses_a_forged_delivery_and_spends_nothing() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::{Client, Keys};
+        use nostr_sdk::secp256k1::Message;
+
+        let root = temp_home("watch-forged");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap_home(&root).expect("bootstrap home");
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        home.config.relay_url = relay_url.clone();
+
+        let buyer = Keys::parse(&crate::home::read_secret_key_hex(&home).expect("secret"))
+            .expect("buyer keys");
+        let buyer_hex = buyer.public_key().to_hex();
+        let seller = Keys::generate();
+        let seller_hex = seller.public_key().to_hex();
+        let attacker = Keys::generate();
+
+        let amount = 2u64;
+        let task = "do a task";
+        let output = "text";
+        let deadline = now_unix() as u64 + 3_600;
+
+        // Publish offer + claim + forged-cosig result from a client that is NOT the daemon's.
+        let net = Client::new(Keys::generate());
+        net.add_relay(&relay_url).await.expect("add relay");
+        net.connect().await;
+        net.wait_for_connection(Duration::from_secs(5)).await;
+        let publish = |keys: &Keys, draft: &crate::gateway::EventDraft| {
+            let builder = crate::gateway::nostr::event_builder(draft).expect("event builder");
+            let event = builder.sign_with_keys(keys).expect("sign");
+            let net = net.clone();
+            let id = event.id;
+            async move {
+                net.send_event(&event).await.expect("publish");
+                id
+            }
+        };
+
+        let offer_draft =
+            crate::gateway::OfferDraft::new(task, output, amount, deadline, &seller_hex)
+                .to_event_draft();
+        let job_id = publish(&buyer, &offer_draft).await.to_hex();
+
+        let creq = crate::gateway::creq::build_seller_creq(
+            &job_id,
+            amount,
+            "sat",
+            &[crate::home::DEFAULT_MINT_URL.to_string()],
+            &seller_hex,
+        )
+        .expect("creq");
+        let claim_draft = crate::gateway::claim_draft(&job_id, &buyer_hex, &seller_hex, &creq);
+        let _ = publish(&seller, &claim_draft).await;
+
+        let job_hash = job_lifecycle::job_hash_for_offer(&job_id, task, amount);
+        let forged = attacker
+            .sign_schnorr(&Message::from_digest([0x11u8; 32]))
+            .to_string();
+        let git = crate::gateway::GitResultTags {
+            repo: "https://example.invalid/repo.git",
+            branch: "main",
+            commit_sha: &"a".repeat(40),
+        };
+        let result_draft = crate::gateway::result_draft(
+            &job_id, &buyer_hex, output, amount, &job_hash, &forged, "", Some(git), &[],
+        );
+        let _ = publish(&seller, &result_draft).await;
+
+        let (_lock, context, _socket_path) = bootstrap(home).await.expect("buyer bootstrap");
+
+        // Seed exactly what the award path writes: the reservation, then the published-award row.
+        context
+            .store
+            .reserve(&job_id, amount, 1_000, u64::MAX, 0, now_unix())
+            .expect("reserve");
+        context
+            .store
+            .record_award(&job_id, &"c".repeat(64), &"e".repeat(64), &seller_hex, amount, now_unix())
+            .expect("record award");
+        assert_eq!(
+            context.store.awarded_unsettled_job_ids().expect("awarded"),
+            vec![job_id.clone()],
+            "the seeded award must be the watcher's work set"
+        );
+
+        // Drive the watcher's settle pass directly — the same call its event and tick paths make.
+        settle_awarded(&context, None).await;
+
+        // Non-vacuity: the watcher really drove accept-then-pay for this job.
+        assert!(
+            context.home.root.join("jobs").join(format!("{job_id}.json")).exists(),
+            "the watcher must have driven the accept path (no bind ⇒ it never ran this job, and \
+             every assertion below would be vacuous)"
+        );
+        // And the money gate refused: nothing spent, no payment journal, no files, and the
+        // reservation still held (a refused settle must never drop it and over-state `available`).
+        assert_eq!(
+            BudgetGate::from_home(&context.home).expect("gate").spent(),
+            0,
+            "a refused delivery must burn zero spend"
+        );
+        assert!(
+            !context.home.root.join("payment-journal").exists(),
+            "no payment journal may exist on a pre-pay refusal"
+        );
+        assert!(
+            !context.home.root.join("results").join(&job_id).exists(),
+            "a refused delivery must materialize no files"
+        );
+        assert!(
+            matches!(
+                context.store.reservation(&job_id).expect("reservation"),
+                Some((reservations::ReservationState::Reserved, _))
+            ),
+            "a refused settle must leave the reservation reserved"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

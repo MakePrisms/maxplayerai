@@ -199,7 +199,34 @@ where
         .map_err(AwardError::Reserve)?;
 
     match publish().await {
-        Ok(outcome) => Ok(outcome),
+        Ok(outcome) => {
+            // Record the PUBLISHED award. This is the one seam both the manual and the auto award
+            // path go through, so recording here covers both by construction — recording at the two
+            // call sites instead would let one drift silently.
+            //
+            // A store failure here does NOT fail the award: the 3405 is already public and the
+            // reservation is already held, so reporting failure would be a lie that also releases
+            // funds the buyer has genuinely committed. The window is narrow (the `reserve` write
+            // above went through the same store moments earlier), but it is not nothing, and the
+            // consequence is specific: without this row the delivery watcher cannot see the job, so
+            // it will not auto-settle. Say exactly that, unconditionally — an operator reading the
+            // log must not have to infer why one job stopped settling itself.
+            if let Err(error) = store.record_award(
+                job_id,
+                &outcome.claim_id,
+                &outcome.award_event_id,
+                &outcome.seller_pubkey,
+                amount,
+                now_unix,
+            ) {
+                eprintln!(
+                    "buyer: award for {job_id} published ({}) but recording it failed ({error}); \
+                     this job will NOT be auto-settled on delivery — collect it manually",
+                    outcome.award_event_id
+                );
+            }
+            Ok(outcome)
+        }
         Err(error) => {
             // No award reached the relay — reclaim the reservation rather than strand the funds.
             store
@@ -547,6 +574,57 @@ mod tests {
         assert_eq!(
             store.reservation(&job).expect("read").map(|(state, _)| state),
             Some(super::super::reservations::ReservationState::Released)
+        );
+        // Nothing was published, so nothing may be recorded as awarded — otherwise the delivery
+        // watcher would sweep a job that has no award on the relay.
+        assert!(
+            store.award_record(&job).expect("read").is_none(),
+            "a failed publish must record no award"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The published award is recorded at the reserve-then-award SEAM, not at the call sites. Both
+    // the manual `award` RPC and the background auto-award reach the relay through this one
+    // function, so recording here is what makes the delivery watcher able to see EITHER — and what
+    // stops the two paths from drifting apart. Red-on-revert: drop the `record_award` call and the
+    // job becomes invisible to the watcher (`awarded_unsettled_job_ids` returns empty), which is
+    // exactly the "awarded but never auto-settled" failure.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_published_award_is_recorded_at_the_single_seam() {
+        let (store, path) = fresh_store("award-recorded");
+        let job = "a".repeat(64);
+        let claim = "c".repeat(64);
+        let award_event = "e".repeat(64);
+
+        let outcome = award_with_reservation(&store, &job, 40, 100, u64::MAX, 0, 7, || {
+            let (job, claim, award_event) = (job.clone(), claim.clone(), award_event.clone());
+            async move {
+                Ok(AwardClaimOutcome {
+                    award_event_id: award_event,
+                    job_id: job,
+                    claim_id: claim,
+                    seller_pubkey: SELLER_HEX.to_owned(),
+                    quoted_mints: Vec::new(),
+                })
+            }
+        })
+        .await
+        .expect("award");
+        assert_eq!(outcome.award_event_id, award_event);
+
+        let recorded = store.award_record(&job).expect("read").expect("award recorded");
+        assert_eq!(recorded.award_event_id, award_event);
+        assert_eq!(recorded.claim_id, claim);
+        assert_eq!(recorded.seller_pubkey, SELLER_HEX);
+        assert_eq!(recorded.amount_sats, 40, "the RESERVED amount, not a seller-quoted one");
+        assert_eq!(recorded.awarded_at_unix, 7);
+
+        // And the job is now the delivery watcher's work — awarded, reservation still held.
+        assert_eq!(
+            store.awarded_unsettled_job_ids().expect("awarded"),
+            vec![job],
+            "a published award must put the job in the watcher's work set"
         );
         let _ = std::fs::remove_file(&path);
     }

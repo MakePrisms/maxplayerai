@@ -770,7 +770,7 @@ async fn await_job_event(
 
 /// True when `event` carries an `e` tag naming this job's offer — the tag every claim, result and
 /// feedback roots itself on.
-fn event_references_job(event: &nostr_sdk::Event, job_id: &str) -> bool {
+pub(crate) fn event_references_job(event: &nostr_sdk::Event, job_id: &str) -> bool {
     event.tags.iter().any(|tag| {
         let parts = tag.as_slice();
         parts.first().map(String::as_str) == Some("e") && parts.get(1).map(String::as_str) == Some(job_id)
