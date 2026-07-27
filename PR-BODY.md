@@ -187,13 +187,26 @@ scoped per-run (the after-script asserts `boots=1`):
 
 | invariant (BEFORE, flapping) | expected AFTER |
 |---|---|
-| degrades == recoveries, 1:1 | degrades = 0 |
+| degrades == recoveries, 1:1 | **`deg = 0` across ≥3 consecutive 300s windows (~15 min) per seat** |
 | inter-event interval **exactly 300s** | no periodic degrade/recovery cycle |
 | `attempts=1`, outage ~10s per cycle | recoveries 0, or genuine and non-periodic |
-| offer state **TARGETED-ONLY** | state **FULL**, sustained across several consecutive 300s windows |
+| offer state **TARGETED-ONLY** | state **FULL** — corroborating only, see below |
 
 That 300s regularity is external confirmation of the `run.rs:859` mechanism: the heartbeat tick
 servicing a queued `forced_recovery` is what paces the flap.
+
+**`state` is the weak signal; `deg` over a window is the strong one.** On the known-bad build a seat
+sampled `FULL` — caught inside the few-second armed window between the resubscribe and the next
+close. A point sample can therefore read `FULL` against a 100% degrade rate. `deg` counted over a
+window cannot be caught mid-cycle, which is why the pass criterion hangs on it and not on `state`.
+
+**The pass signal is a zero, so the parser needs a positive control.** `deg = 0` is
+indistinguishable from a regex that matches nothing, so the after-script requires a
+must-be-present line (`wrap backfill`, the node's unconditional periodic line) to parse non-zero
+before it will read any zero as meaningful — measured controls 41/35/43 on the current fleet. This
+is the denominator: a checker that only reports failures cannot tell "nothing broken" from "nothing
+examined". The binary-literal guard in step 0 protects the *vocabulary*; this protects the *parsing*.
+Both are needed, and neither substitutes for the other.
 
 ### Step 0 — prove the lines can still appear, before reading their absence
 
