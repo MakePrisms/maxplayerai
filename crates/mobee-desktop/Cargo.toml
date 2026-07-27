@@ -1,0 +1,17 @@
+[package]
+name = "mobee-desktop"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+eframe = { version = "0.32", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+mobee-core = { workspace = true }
+serde_json.workspace = true
