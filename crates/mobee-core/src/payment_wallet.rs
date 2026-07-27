@@ -3091,6 +3091,7 @@ mod tests {
             unit: "sat".into(),
             deadline_unix: 1,
             seller_pubkey: Some(seller.into()),
+            requested_agent: None,
         }
     }
 

@@ -17,7 +17,7 @@ use mobee_core::delivery_transport::is_relay_git_locator;
 use mobee_core::home::{self, MobeeHome, SellerConfig, DEFAULT_MINT_URL, DEFAULT_RELAY_URL};
 use mobee_core::profile::{self, SetProfileRequest};
 
-use crate::agent_presets;
+use mobee_core::agent_presets;
 
 const SUCCESS: i32 = 0;
 const USAGE_ERROR: i32 = 1;
@@ -38,8 +38,11 @@ fn readiness_decision(gate: Option<Result<(), ()>>) -> Result<(), i32> {
 struct SellOptions {
     /// Force fail-closed naming of missing fields (no TTY prompts).
     non_interactive: bool,
-    /// Named preset: claude | cursor | codex.
+    /// The preferred named preset — the first `--agent`.
     agent: Option<String>,
+    /// Every `--agent` in the order given: the harness registry, preference first. One entry is
+    /// the single-harness case and writes the config a single-harness seller has always had.
+    agents: Vec<String>,
     /// Power-user escape hatch (repeatable).
     agent_argv: Vec<String>,
     rate_sats: Option<u64>,
@@ -394,6 +397,42 @@ fn ensure_seller_config(
         .or_else(|| options.agent.clone())
         .or(existing_agent);
 
+    // The harness registry. Every named preset is resolved here so a typo or a missing adapter is
+    // a config-time refusal, not a boot-time degrade. A single `--agent` writes no list: it is the
+    // one-harness case the fallback already serves identically, and leaving the list out keeps a
+    // single-harness config exactly the shape it has always been.
+    let agents = if options.agents.len() > 1 {
+        let mut resolved = Vec::with_capacity(options.agents.len());
+        for name in &options.agents {
+            let (label, _argv) = agent_presets::resolve_agent_preset(name, &custom_agents)
+                .map_err(|message| {
+                    let _ = writeln!(err, "{message}");
+                    USAGE_ERROR
+                })?;
+            if !resolved
+                .iter()
+                .any(|slot: &home::AgentSlotConfig| slot.name == label)
+            {
+                resolved.push(home::AgentSlotConfig::named(label));
+            }
+        }
+        let _ = writeln!(
+            err,
+            "agent registry: {}",
+            resolved
+                .iter()
+                .map(|slot| slot.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        resolved
+    } else {
+        existing
+            .as_ref()
+            .map(|seller| seller.agents.clone())
+            .unwrap_or_default()
+    };
+
     let seller = SellerConfig {
         agent_command,
         rate_sats: rate_sats.ok_or_else(|| {
@@ -406,6 +445,7 @@ fn ensure_seller_config(
         })?,
         job_timeout_secs,
         agent,
+        agents,
         claim_open_pool,
         offer_backfill_secs,
         // Contribution (freelance-PR fork) support is ON by default for CLI-configured
@@ -554,7 +594,9 @@ impl SellOptions {
                     let name = args
                         .get(index)
                         .ok_or_else(|| "missing value for --agent".to_owned())?;
-                    options.agent = Some(name.clone());
+                    // Repeatable: each occurrence enables one more harness, first = preferred.
+                    options.agents.push(name.clone());
+                    options.agent.get_or_insert_with(|| name.clone());
                 }
                 "--agent-argv" => {
                     index += 1;

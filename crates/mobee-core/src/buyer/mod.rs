@@ -349,8 +349,9 @@ struct PostJobParams {
     /// never auto-awards a claim it cannot pay or priced above this.
     #[serde(default)]
     max_sats: Option<u64>,
-    /// Auto-award preferences recorded with the intent. Not yet hard filters — no offer/claim wire
-    /// field carries harness/model, so they are stored, not matched (added when the wire does).
+    /// Auto-award preferences recorded with the intent. `harness` is ALSO posted on the offer as
+    /// its requested agent, so it is a hard award filter: only a seller advertising that harness
+    /// can be awarded. `model` has no wire field yet and stays a recorded preference.
     #[serde(default)]
     harness: Option<String>,
     #[serde(default)]
@@ -410,6 +411,7 @@ async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Resp
         repo: params.repo,
         branch: params.branch,
         job,
+        requested_agent: harness.clone(),
     };
     match job_lifecycle::post_job_async(&context.home, request).await {
         Ok(outcome) => {
@@ -523,6 +525,7 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
         max_sats,
         buyer_mint: context.home.config.default_mint(),
         allow_real_mints: context.home.config.allow_real_mints,
+        requested_agent: offer.requested_agent.as_deref(),
     };
 
     // Manual award names the claim but applies the SAME hard filters (max_sats, price, mint) as
@@ -783,6 +786,7 @@ async fn drive_auto_award(
             max_sats,
             buyer_mint: context.home.config.default_mint(),
             allow_real_mints: context.home.config.allow_real_mints,
+            requested_agent: offer.requested_agent.as_deref(),
         };
         if let Some(claim_id) = lifecycle::select_awardable_claim(&view, &filters) {
             return finalize_auto_award(context, job_id, offer.amount_sats, claim_id).await;
@@ -1700,7 +1704,7 @@ mod tests {
             &seller_hex,
         )
         .expect("creq");
-        let claim_draft = crate::gateway::claim_draft(&job_id, &buyer_hex, &seller_hex, &creq);
+        let claim_draft = crate::gateway::claim_draft(&job_id, &buyer_hex, &seller_hex, &creq, &[]);
         let _ = publish(&seller, &claim_draft).await;
 
         let job_hash = job_lifecycle::job_hash_for_offer(&job_id, task, amount);

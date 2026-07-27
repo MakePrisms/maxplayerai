@@ -99,7 +99,7 @@ mod checks {
     use mobee_core::seller_git;
 
     use super::Check;
-    use crate::agent_presets;
+    use mobee_core::agent_presets;
 
     const RELAY_TIMEOUT: Duration = Duration::from_secs(15);
     const MINT_TIMEOUT: Duration = Duration::from_secs(10);

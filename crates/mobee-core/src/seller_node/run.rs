@@ -26,6 +26,7 @@ use crate::kinds::{JOB_AWARD_KIND, JOB_OFFER_KIND};
 use crate::receipt::{ReceiptPreimage, EXEC_METADATA_COMMITMENT_EMPTY};
 use crate::relay_auth::{self, AuthWait};
 use crate::seller::rate_gate_allows;
+use crate::seller_agents::AgentRegistry;
 use crate::seller_exec::{
     compose_agent_prompt, delivery_message, job_workdir, run_agent_job, run_agent_with_retry,
     seller_delivery_kind, seller_exec_metadata, unified_job_timeout,
@@ -74,6 +75,8 @@ enum SkipReason {
     Lapsed,
     /// Rate-gate refused: untargeted without open-pool opt-in, or below the seller's rate floor.
     RateGate,
+    /// The offer asked for a harness this node does not run.
+    AgentUnavailable,
 }
 
 impl SkipReason {
@@ -82,6 +85,7 @@ impl SkipReason {
         match self {
             Self::Lapsed => "offer deadline already passed (lapsed; never resurrected)",
             Self::RateGate => "rate-gate refused (untargeted without opt-in / below rate)",
+            Self::AgentUnavailable => "requested agent harness not available on this node",
         }
     }
 }
@@ -655,12 +659,39 @@ fn should_resume_execution(state: super::store::JobState) -> bool {
     )
 }
 
+/// The journaled offer facts for a parsed offer — the ONE place a wire offer becomes a stored row.
+///
+/// Extracted from the claim path so this mapping is reachable by a test. Everything downstream
+/// reads the ROW, not the event: the award arm authorizes against its buyer, the pay path takes its
+/// amount/unit as the redeem terms, and execution (possibly a restart later) takes its
+/// `requested_agent` as the harness to dispatch. A field dropped here is a field that silently does
+/// not exist for the rest of the job's life, which is why the mapping is a named function with its
+/// own tooth rather than a struct literal inlined at the only call site.
+fn offer_row(job_id: &str, buyer_pubkey: &str, offer: &ParsedOffer) -> super::store::Offer {
+    super::store::Offer {
+        offer_id: job_id.to_owned(),
+        buyer_pubkey: buyer_pubkey.to_owned(),
+        amount_sats: offer.amount,
+        unit: offer.unit.clone(),
+        task: offer.task.clone(),
+        deadline_unix: offer.deadline_unix as i64,
+        targeted: offer.is_targeted(),
+        requested_agent: offer.requested_agent.clone(),
+    }
+}
+
 /// Decide whether to claim `offer`, applying the always-on money-safety gates in the legacy order:
 /// a lapsed offer is refused BEFORE its deadline is re-derived (never resurrect a stale offer with a
-/// fresh `now + timeout`), then the targeting/rate gate. Pure over (offer, config, now).
+/// fresh `now + timeout`), then the targeting/rate gate, then the harness the offer asked for.
+/// Pure over (offer, config, registry, now).
+///
+/// The harness gate is a CLAIM-time decision, not a delivery-time one: a node that cannot run the
+/// requested harness never parks a claim at all, so the buyer's offer stays visible to a seller
+/// that can, instead of being answered by one that would fail later.
 fn classify_offer(
     offer: &ParsedOffer,
     seller: &crate::home::SellerConfig,
+    agents: &AgentRegistry,
     seller_pubkey: &str,
     now_unix: u64,
 ) -> ClaimDecision {
@@ -672,9 +703,42 @@ fn classify_offer(
     if rate_gate_allows(offer, seller_pubkey, seller.rate_sats, seller.claim_open_pool).is_err() {
         return ClaimDecision::Skip(SkipReason::RateGate);
     }
+    if !agents.serves(offer.requested_agent.as_deref()) {
+        return ClaimDecision::Skip(SkipReason::AgentUnavailable);
+    }
     ClaimDecision::Claim {
         deadline_unix: crate::seller::job_deadline_unix(offer, seller, now_unix),
     }
+}
+
+/// Resolve + report the harness registry at boot: one PASS/FAIL line per configured preset, then
+/// either a loud degrade line (some resolved) or a refusal (none did).
+///
+/// The three outcomes are deliberately distinct. ALL configured presets failing REFUSES the boot —
+/// a node with no launchable harness that still claimed work would take jobs it must then fail.
+/// SOME failing DEGRADES loudly and serves with the remainder, advertising only those, because a
+/// two-harness seller that loses one is still a working one-harness seller. A node with no `agents`
+/// list at all resolves to its single `agent_command` and prints nothing new.
+fn boot_agent_registry(home: &MobeeHome) -> Result<AgentRegistry, NodeError> {
+    let Some(seller) = home.config.seller.as_ref() else {
+        // No `[seller]` section: nothing serves offers, and the run loop already no-ops. An empty
+        // registry keeps that path unchanged rather than turning it into a boot failure.
+        return Ok(AgentRegistry::new(Vec::new()));
+    };
+    let resolved =
+        crate::seller_agents::resolve(seller, &home.config.agents).map_err(NodeError::Agents)?;
+    for verdict in &resolved.verdicts {
+        eprintln!("seller node agent {}", verdict.line());
+    }
+    if let Some(degraded) = resolved.degrade_line() {
+        eprintln!("{degraded}");
+    } else if !resolved.registry.advertised().is_empty() {
+        eprintln!(
+            "seller node agents ready: {:?} (serial execution — one job at a time)",
+            resolved.registry.advertised()
+        );
+    }
+    Ok(resolved.registry)
 }
 
 /// How long boot waits for the relay connection and the NIP-42 challenge.
@@ -692,6 +756,10 @@ pub struct SellerNodeRunner {
     /// Outcome of the boot NIP-42 handshake, which seeds the run loop's view of whether the current
     /// socket is authenticated. `NoChallenge` is not authentication.
     boot_auth: AuthWait,
+    /// The harnesses this node can run, resolved once at boot. Every claim decision, every
+    /// advertisement, and every dispatch reads THIS — never the config — so what the node
+    /// advertises is what it verified it can launch.
+    agents: AgentRegistry,
 }
 
 impl SellerNodeRunner {
@@ -713,6 +781,10 @@ impl SellerNodeRunner {
         drop(secret);
 
         let node = SellerNode::open(home).await?;
+
+        // Resolve the harness registry BEFORE anything goes on the wire: a node that cannot launch
+        // a single harness must refuse to boot rather than claim work it can never run.
+        let agents = boot_agent_registry(node.home())?;
 
         // Reconcile durable state before serving anything live: expire stale outbox rows, report the
         // non-terminal jobs that resume. Reconcile must NOT release parked claims (invariant 5).
@@ -776,6 +848,7 @@ impl SellerNodeRunner {
             relay_url,
             seller_pubkey,
             boot_auth,
+            agents,
         })
     }
 
@@ -1436,8 +1509,12 @@ impl SellerNodeRunner {
             return;
         };
         let job_in_flight = self.node.store().health().map(|h| h.jobs > 0).unwrap_or(false);
-        let draft =
-            crate::heartbeat::heartbeat_for_state(job_in_flight, seller.rate_sats).to_event_draft();
+        let draft = crate::heartbeat::heartbeat_for_state(
+            job_in_flight,
+            seller.rate_sats,
+            self.agents.advertised(),
+        )
+        .to_event_draft();
         match self.node.signer().sign(draft, now_unix()).await {
             Ok(Ok(signed)) => {
                 use nostr_sdk::JsonUtil as _;
@@ -1584,7 +1661,8 @@ impl SellerNodeRunner {
 
         let seller_pubkey = self.seller_pubkey.to_hex();
         let now = now_unix();
-        let deadline_unix = match classify_offer(&offer, &seller, &seller_pubkey, now as u64) {
+        let deadline_unix = match classify_offer(&offer, &seller, &self.agents, &seller_pubkey, now as u64)
+        {
             ClaimDecision::Claim { deadline_unix } => deadline_unix,
             ClaimDecision::Skip(skip) => {
                 eprintln!("seller node offer skip id={}: {}", event.id, skip.reason());
@@ -1624,18 +1702,11 @@ impl SellerNodeRunner {
         // Journal the offer facts BEFORE claiming: the award arm reads the buyer to authorize an
         // award (author MUST be the offer's buyer), and the pay path reads amount/unit as the redeem
         // terms. Idempotent — a re-seen offer is a no-op.
-        if let Err(error) = self.node.store().record_offer(
-            &super::store::Offer {
-                offer_id: job_id.clone(),
-                buyer_pubkey: buyer_pubkey.clone(),
-                amount_sats: offer.amount,
-                unit: offer.unit.clone(),
-                task: offer.task.clone(),
-                deadline_unix: offer.deadline_unix as i64,
-                targeted: offer.is_targeted(),
-            },
-            now,
-        ) {
+        if let Err(error) = self
+            .node
+            .store()
+            .record_offer(&offer_row(&job_id, &buyer_pubkey, &offer), now)
+        {
             eprintln!("seller node offer skip id={job_id}: record offer failed ({error})");
             return;
         }
@@ -1653,7 +1724,15 @@ impl SellerNodeRunner {
                 return;
             }
         };
-        let claim = claim_draft(&job_id, &buyer_pubkey, &seller_pubkey, &creq);
+        // The claim advertises what this node can run, so the buyer's award filter can hold it to
+        // the harness its job asked for.
+        let claim = claim_draft(
+            &job_id,
+            &buyer_pubkey,
+            &seller_pubkey,
+            &creq,
+            &self.agents.advertised(),
+        );
         match self.node.store().claim_and_enqueue(
             &job_id,
             &job_id,
@@ -1820,6 +1899,33 @@ impl SellerNodeRunner {
             _ => now_unix(),
         };
 
+        // Which harness runs this job. Read from the STORED offer (not live config), so a job
+        // resumed after a restart still dispatches to the harness its buyer asked for. A request
+        // this node cannot serve fails the job rather than substituting another harness — the
+        // claim gate should already have refused it, and quietly running the wrong agent is the
+        // one outcome the registry exists to prevent.
+        let requested_agent = offer.requested_agent.clone();
+        let Some(agent) = self.agents.dispatch(requested_agent.as_deref()) else {
+            eprintln!(
+                "seller node execute fail job_id={job_id}: requested agent {:?} is not available on \
+                 this node (never substituted)",
+                requested_agent.as_deref().unwrap_or("<any>")
+            );
+            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+            return;
+        };
+        let agent_command = agent.argv.clone();
+        let agent_label = agent.name.clone();
+        // Journal WHICH harness ran it before the run starts, so the row exists even if the job
+        // then fails — the journal answers "what ran this", not only "what finished it".
+        if let Some(label) = agent_label.as_deref()
+            && let Err(error) = self.node.store().assign_agent(job_id, label)
+        {
+            eprintln!(
+                "seller node execute job_id={job_id}: agent journal write failed (continuing): {error}"
+            );
+        }
+
         // Move awarded -> executing (idempotent). A failed mark is logged, never fatal.
         if let Err(error) = self.node.store().mark_executing(job_id, now_unix()) {
             eprintln!("seller node execute job_id={job_id}: mark_executing failed (continuing): {error}");
@@ -1850,7 +1956,7 @@ impl SellerNodeRunner {
             || now_unix() as u64,
             |_attempt| {
                 let job_timeout = unified_job_timeout(deadline, now_unix() as u64);
-                run_agent_job(&seller.agent_command, &prompt, &workdir, &identity, job_timeout)
+                run_agent_job(&agent_command, &prompt, &workdir, &identity, job_timeout)
             },
         )
         .await;
@@ -1957,8 +2063,8 @@ impl SellerNodeRunner {
         // Harness-generic PUBLIC seller-claimed usage block (opportunistic; absent fields stay
         // absent). `usage` carries what the ACP driver surfaced this run — `None` when it exposed none.
         let exec_metadata = seller_exec_metadata(
-            &seller.agent_command,
-            seller.agent.as_deref(),
+            &agent_command,
+            agent_label.as_deref(),
             wall_time_ms,
             usage.as_ref(),
         );
@@ -2117,6 +2223,8 @@ impl SellerNodeRunner {
             unit: offer.unit.clone(),
             deadline_unix: offer.deadline_unix.max(0) as u64,
             seller_pubkey: offer.targeted.then(|| seller_pubkey.clone()),
+            // The pay path is harness-blind: which harness ran the job never changes the terms.
+            requested_agent: None,
         };
         let accepted_mints: std::collections::HashSet<cashu::MintUrl> =
             request.mints.iter().cloned().collect();
@@ -2265,10 +2373,19 @@ mod tests {
             git_remote: "https://example.invalid/repo.git".to_owned(),
             job_timeout_secs: None,
             agent: Some("claude".to_owned()),
+            agents: Vec::new(),
             claim_open_pool,
             offer_backfill_secs: 0,
             contribution_enabled: true,
         }
+    }
+
+    /// The registry an existing single-preset (`agent = "claude"`) seller resolves to.
+    fn claude_only() -> AgentRegistry {
+        AgentRegistry::new(vec![crate::seller_agents::RegisteredAgent {
+            name: Some("claude".to_owned()),
+            argv: vec!["claude-agent-acp".to_owned()],
+        }])
     }
 
     fn offer(amount: u64, targeted_to: Option<&str>, deadline_unix: u64) -> ParsedOffer {
@@ -2279,13 +2396,14 @@ mod tests {
             unit: "sat".to_owned(),
             deadline_unix,
             seller_pubkey: targeted_to.map(str::to_owned),
+            requested_agent: None,
         }
     }
 
     // A fresh, in-rate, targeted offer is claimed and carries the resolved deadline.
     #[test]
     fn claims_fresh_targeted_offer_at_rate() {
-        let decision = classify_offer(&offer(5, Some(SELLER), NOW + 600), &seller_cfg(2, false), SELLER, NOW);
+        let decision = classify_offer(&offer(5, Some(SELLER), NOW + 600), &seller_cfg(2, false), &claude_only(), SELLER, NOW);
         assert_eq!(decision, ClaimDecision::Claim { deadline_unix: NOW + 600 });
     }
 
@@ -2293,14 +2411,14 @@ mod tests {
     // it is never resurrected with a fresh window, even though it clears the rate floor.
     #[test]
     fn refuses_lapsed_offer_before_rate() {
-        let decision = classify_offer(&offer(100, Some(SELLER), NOW), &seller_cfg(2, false), SELLER, NOW);
+        let decision = classify_offer(&offer(100, Some(SELLER), NOW), &seller_cfg(2, false), &claude_only(), SELLER, NOW);
         assert_eq!(decision, ClaimDecision::Skip(SkipReason::Lapsed));
     }
 
     // Below the rate floor ⇒ skip (never claim work priced under the seller's floor).
     #[test]
     fn refuses_below_rate() {
-        let decision = classify_offer(&offer(1, Some(SELLER), NOW + 600), &seller_cfg(5, false), SELLER, NOW);
+        let decision = classify_offer(&offer(1, Some(SELLER), NOW + 600), &seller_cfg(5, false), &claude_only(), SELLER, NOW);
         assert_eq!(decision, ClaimDecision::Skip(SkipReason::RateGate));
     }
 
@@ -2360,13 +2478,166 @@ mod tests {
     #[test]
     fn untargeted_needs_open_pool_opt_in() {
         assert_eq!(
-            classify_offer(&offer(5, None, NOW + 600), &seller_cfg(2, false), SELLER, NOW),
+            classify_offer(&offer(5, None, NOW + 600), &seller_cfg(2, false), &claude_only(), SELLER, NOW),
             ClaimDecision::Skip(SkipReason::RateGate)
         );
         assert_eq!(
-            classify_offer(&offer(5, None, NOW + 600), &seller_cfg(2, true), SELLER, NOW),
+            classify_offer(&offer(5, None, NOW + 600), &seller_cfg(2, true), &claude_only(), SELLER, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 }
         );
+    }
+
+    // TOOTH (charter invariant 3) — a node that cannot run the requested harness never CLAIMS.
+    // The refusal is a decision over the offer, not an outcome discovered at delivery: the offer
+    // stays available to a seller that can serve it, instead of being answered by one that would
+    // then fail. Bite: drop the `agents.serves(...)` arm from `classify_offer` and the codex offer
+    // below is claimed by a claude-only node.
+    #[test]
+    fn a_node_without_the_requested_harness_never_claims() {
+        let mut wants_codex = offer(5, Some(SELLER), NOW + 600);
+        wants_codex.requested_agent = Some("codex".to_owned());
+        assert_eq!(
+            classify_offer(&wants_codex, &seller_cfg(2, false), &claude_only(), SELLER, NOW),
+            ClaimDecision::Skip(SkipReason::AgentUnavailable)
+        );
+
+        // The same offer at a node that DOES run codex is claimed — the gate is the harness, not
+        // the presence of a request.
+        let both = AgentRegistry::new(vec![
+            crate::seller_agents::RegisteredAgent {
+                name: Some("claude".to_owned()),
+                argv: vec!["claude-agent-acp".to_owned()],
+            },
+            crate::seller_agents::RegisteredAgent {
+                name: Some("codex".to_owned()),
+                argv: vec!["codex-acp".to_owned()],
+            },
+        ]);
+        assert_eq!(
+            classify_offer(&wants_codex, &seller_cfg(2, false), &both, SELLER, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 }
+        );
+
+        // And an offer asking for nothing is claimed by the claude-only node exactly as before.
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &seller_cfg(2, false), &claude_only(), SELLER, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 }
+        );
+    }
+
+    // TOOTH (the seam my other teeth do not look at) — the harness request survives the trip from
+    // WIRE EVENT to STORED ROW.
+    //
+    // Every other tooth here either builds the `Offer` row by hand or reads one back, so all of
+    // them stay green if this mapping silently drops the field — invariant 2 would then be built,
+    // green, and dead the moment execution happened after a restart. This one starts from an
+    // offer draft, parses it the way the claim path does, and asserts the row carries the request.
+    // Bite (measured): replace `requested_agent` in `offer_row` with `None` — before this tooth
+    // existed the whole suite stayed green; with it, this test and only this test goes red.
+    #[test]
+    fn the_harness_request_survives_the_wire_to_row_mapping() {
+        let asked = gateway::OfferDraft::new("do a task", "text/plain", 5, NOW + 600, "a".repeat(64))
+            .requesting_agent(Some("codex"))
+            .to_event_draft();
+        let parsed = parse_offer(&asked).expect("parse offer");
+        let row = offer_row("job-1", "buyer-1", &parsed);
+        assert_eq!(
+            row.requested_agent.as_deref(),
+            Some("codex"),
+            "the request must reach the row — everything downstream reads the ROW, not the event"
+        );
+        // The rest of the mapping is asserted alongside it, so a field dropped here is caught too.
+        assert_eq!(row.amount_sats, 5);
+        assert_eq!(row.unit, "sat");
+        assert_eq!(row.task, "do a task");
+        assert_eq!(row.deadline_unix, (NOW + 600) as i64);
+        assert!(row.targeted);
+
+        // An offer that asked for nothing stores nothing — absence is carried, not invented.
+        let plain = gateway::OfferDraft::new("do a task", "text/plain", 5, NOW + 600, "a".repeat(64))
+            .to_event_draft();
+        let parsed = parse_offer(&plain).expect("parse offer");
+        assert_eq!(offer_row("job-2", "buyer-1", &parsed).requested_agent, None);
+    }
+
+    // TOOTH (charter invariant 2, RESTART form — the strong one) — a job requesting harness X is
+    // dispatched to X even when the process that claimed it is gone. The request is journaled with
+    // the offer facts, so the resumed execute path reads it from the STORE; the registry below
+    // deliberately PREFERS claude, so a regression that dispatches the preferred harness (or that
+    // re-reads live config) runs claude and goes red.
+    #[test]
+    fn a_resumed_job_still_dispatches_to_the_harness_it_requested() {
+        let job = "a".repeat(64);
+        let buyer = "b".repeat(64);
+        let seller = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let creq = gateway::creq::build_seller_creq(
+            &job,
+            21,
+            "sat",
+            &["https://testnut.cashudevkit.org".to_owned()],
+            &seller,
+        )
+        .expect("creq");
+        let root = temp_dir("restart-dispatch");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mk root");
+        let db = root.join("seller.sqlite");
+
+        // Claim time: the offer asks for codex, and its facts are journaled with the claim.
+        {
+            let store = SellerStore::open(&db).expect("open store");
+            store
+                .record_offer(
+                    &Offer {
+                        offer_id: job.clone(),
+                        buyer_pubkey: buyer.clone(),
+                        amount_sats: 21,
+                        unit: "sat".to_owned(),
+                        task: "build a widget".to_owned(),
+                        deadline_unix: 2_000_000_000,
+                        targeted: true,
+                        requested_agent: Some("codex".to_owned()),
+                    },
+                    1,
+                )
+                .expect("record offer");
+            let draft = claim_draft(&job, &buyer, &seller, &creq, &["codex".to_owned()]);
+            store
+                .claim_and_enqueue(&job, &job, &creq, &draft, 1, 9_999_999_999, 1)
+                .expect("claim");
+        }
+
+        // …the process dies here. A fresh store handle is all the resumed node has.
+        let store = SellerStore::open(&db).expect("reopen store");
+        let resumed = store.offer_row(&job).expect("offer row").expect("offer survives");
+        assert_eq!(resumed.requested_agent.as_deref(), Some("codex"));
+
+        let registry = AgentRegistry::new(vec![
+            crate::seller_agents::RegisteredAgent {
+                name: Some("claude".to_owned()),
+                argv: vec!["claude-agent-acp".to_owned()],
+            },
+            crate::seller_agents::RegisteredAgent {
+                name: Some("codex".to_owned()),
+                argv: vec!["codex-acp".to_owned()],
+            },
+        ]);
+        let dispatched = registry
+            .dispatch(resumed.requested_agent.as_deref())
+            .expect("the requested harness is available");
+        assert_eq!(dispatched.name.as_deref(), Some("codex"));
+        assert_eq!(dispatched.argv, vec!["codex-acp"], "the RUN command is codex's, not the preferred harness's");
+
+        // And the journal names what ran it.
+        store
+            .record_award(&"w".repeat(64), &job, &buyer, 4242)
+            .expect("award");
+        store
+            .assign_agent(&job, dispatched.name.as_deref().expect("label"))
+            .expect("journal the harness");
+        assert_eq!(store.job_agent(&job).expect("job agent"), Some("codex".to_owned()));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // TOOTH (#146 / #117 refusal taxonomy) — a cross-version offer is a DISTINCT refusal, not the
@@ -2374,7 +2645,7 @@ mod tests {
     // parse failure is version skew; the node's on_offer routes that to the unsupported-version skip.
     #[test]
     fn unsupported_version_offer_is_a_distinct_parse_refusal() {
-        let offer = gateway::OfferDraft::new("do a task", "text/plain", 5, NOW + 600, &"a".repeat(64));
+        let offer = gateway::OfferDraft::new("do a task", "text/plain", 5, NOW + 600, "a".repeat(64));
         let mut draft = offer.to_event_draft();
         for tag in &mut draft.tags {
             if tag.0.first().map(String::as_str) == Some("v") {
@@ -2907,7 +3178,7 @@ mod tests {
             "nothing delivered yet"
         );
 
-        let draft = claim_draft(&job, &buyer, &seller, &creq);
+        let draft = claim_draft(&job, &buyer, &seller, &creq, &[]);
         let delivered_at = 6_000;
         assert!(store
             .deliver_and_enqueue(
@@ -2989,7 +3260,7 @@ mod tests {
         let job = "a".repeat(64);
         let buyer = "b".repeat(64);
         let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
-        let draft = claim_draft(&job, &buyer, &seller, &creq);
+        let draft = claim_draft(&job, &buyer, &seller, &creq, &[]);
 
         // Deliver ⇒ state Delivered ⇒ NOT re-execute-eligible (the guard early-returns).
         assert!(store
@@ -3067,11 +3338,12 @@ mod tests {
                     task: "build a widget".to_owned(),
                     deadline_unix: 2_000_000_000,
                     targeted: true,
+                    requested_agent: None,
                 },
                 1,
             )
             .expect("record offer");
-        let draft = claim_draft(job, buyer, &"s".repeat(64), creq);
+        let draft = claim_draft(job, buyer, &"s".repeat(64), creq, &[]);
         store
             .claim_and_enqueue(job, job, creq, &draft, 1, 9_999_999_999, 1)
             .expect("claim");
@@ -3177,7 +3449,7 @@ mod tests {
         )
         .expect("creq");
         let (store, root) = store_with_awarded_job(&creq, &job, &buyer, author_date);
-        let draft = claim_draft(&job, &buyer, &seller, &creq);
+        let draft = claim_draft(&job, &buyer, &seller, &creq, &[]);
         let now = 5000;
         assert!(
             store
@@ -3361,7 +3633,7 @@ mod tests {
         );
 
         // Re-execution delivers exactly once: deliver_and_enqueue is idempotent on the job.
-        let draft = claim_draft(&job, &buyer, &seller, &creq);
+        let draft = claim_draft(&job, &buyer, &seller, &creq, &[]);
         let now = 5000;
         assert!(
             store

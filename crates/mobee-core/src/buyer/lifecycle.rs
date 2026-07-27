@@ -24,10 +24,9 @@ use super::reservations::{Converted, JobDisposition, ReservationState, ReserveRe
 use super::store::{BuyerStore, StoreError};
 
 /// Hard filters an awardable claim must pass (issue #126). Grounded in the wire the offer/claim
-/// actually carry: the offer's signed `amount_sats` is the fixed price, and the seller's claim
-/// `creq` carries the payable terms + accepted mints. (`harness`/`model` targeting from #126 has
-/// no offer/claim wire field yet, so it is deliberately not a filter here — it is added when the
-/// wire carries it, rather than matched against a field that does not exist.)
+/// actually carry: the offer's signed `amount_sats` is the fixed price, the seller's claim `creq`
+/// carries the payable terms + accepted mints, and the claim's `mobee_agent` tag carries the
+/// harnesses the seller can run.
 pub struct AwardFilters<'a> {
     /// The offer's signed amount — authority for the price. A claim whose `creq` quotes a
     /// different amount can never be accepted (the accept gate requires exact equality), so it
@@ -40,6 +39,10 @@ pub struct AwardFilters<'a> {
     pub buyer_mint: &'a str,
     /// Whether real (non-testnut) mints are permitted; gates the mint-compat check.
     pub allow_real_mints: bool,
+    /// The harness the OFFER asked for, read back from the relay (never from award params — the
+    /// signed offer is the authority for what the job requested). `None` ⇒ no preference and every
+    /// claim passes this filter unchanged.
+    pub requested_agent: Option<&'a str>,
 }
 
 /// Select the claim to auto-award: the first LIVE claim whose seller-authored `creq` passes every
@@ -51,8 +54,27 @@ pub fn select_awardable_claim(view: &JobView, filters: &AwardFilters) -> Option<
     }
     view.claims
         .iter()
-        .find(|claim| claim.live && claim_is_payable(&view.job_id, claim.creq.as_deref(), filters))
+        .find(|claim| {
+            claim.live
+                && claim_serves_requested_agent(&claim.agents, filters.requested_agent)
+                && claim_is_payable(&view.job_id, claim.creq.as_deref(), filters)
+        })
         .map(|claim| claim.claim_id.clone())
+}
+
+/// Whether a claim may be awarded a job that asked for a specific harness.
+///
+/// No request ⇒ every claim passes. A request ⇒ the claim must ADVERTISE that harness. A claim
+/// that advertises nothing does not pass: silence is not a capability, and awarding it would be
+/// paying a seller to run the job on whatever it happens to prefer. Matching is on the
+/// canonicalised name so wire casing/whitespace cannot smuggle a mismatch past the filter.
+pub fn claim_serves_requested_agent(claim_agents: &[String], requested: Option<&str>) -> bool {
+    let Some(requested) = crate::seller_agents::normalize_request(requested) else {
+        return true;
+    };
+    claim_agents
+        .iter()
+        .any(|advertised| advertised.trim().to_ascii_lowercase() == requested)
 }
 
 /// Why a specifically-named (manual) award was refused. The manual path names a `claim_id` instead
@@ -69,6 +91,9 @@ pub enum NamedAwardRefused {
     /// The named claim cannot be paid (missing/malformed creq, price ≠ offer amount, wrong unit, or
     /// no mutually-payable mint) — awarding it would commit to something the buyer cannot settle.
     Unpayable { claim_id: String },
+    /// The job asked for a harness the named claim does not advertise — awarding it would buy work
+    /// from a seller that never said it could do it this way.
+    AgentMismatch { claim_id: String, requested: String },
 }
 
 impl std::fmt::Display for NamedAwardRefused {
@@ -83,6 +108,10 @@ impl std::fmt::Display for NamedAwardRefused {
             Self::Unpayable { claim_id } => write!(
                 formatter,
                 "award refused: claim {claim_id} is not payable (price/mint/creq incompatible — the buyer could not settle it)"
+            ),
+            Self::AgentMismatch { claim_id, requested } => write!(
+                formatter,
+                "award refused: job requested agent {requested:?}, which claim {claim_id} does not advertise"
             ),
         }
     }
@@ -111,6 +140,12 @@ pub fn named_claim_awardable(
         .ok_or_else(|| NamedAwardRefused::NotFound { claim_id: claim_id.to_owned() })?;
     if !claim.live {
         return Err(NamedAwardRefused::NotLive { claim_id: claim_id.to_owned() });
+    }
+    if !claim_serves_requested_agent(&claim.agents, filters.requested_agent) {
+        return Err(NamedAwardRefused::AgentMismatch {
+            claim_id: claim_id.to_owned(),
+            requested: filters.requested_agent.unwrap_or_default().to_owned(),
+        });
     }
     if !claim_is_payable(&view.job_id, claim.creq.as_deref(), filters) {
         return Err(NamedAwardRefused::Unpayable { claim_id: claim_id.to_owned() });
@@ -384,6 +419,7 @@ mod tests {
             branch: None,
             job_class: None,
             contribution: None,
+            requested_agent: None,
         }
     }
 
@@ -397,6 +433,7 @@ mod tests {
             status: "processing".into(),
             live,
             creq: Some(creq),
+            agents: Vec::new(),
         }
     }
 
@@ -418,6 +455,7 @@ mod tests {
             max_sats,
             buyer_mint: DEFAULT_MINT_URL,
             allow_real_mints: false,
+            requested_agent: None,
         }
     }
 
@@ -428,6 +466,74 @@ mod tests {
         let view = view_with(&job, 10, vec![claim(&job, true, 10, &[DEFAULT_MINT_URL.into()])]);
         let selected = select_awardable_claim(&view, &filters(10, 100));
         assert_eq!(selected.as_deref(), Some("c".repeat(64).as_str()));
+    }
+
+    // TOOTH (charter invariant 5, the strong one) — a job that asked for a harness is never
+    // awarded to a claim that does not advertise it, on EITHER award path. Everything else about
+    // these claims is payable: same price, same mint, live. Bite: drop the
+    // `claim_serves_requested_agent` arm from `select_awardable_claim` and the codex-only claim
+    // below wins a claude job; drop it from `named_claim_awardable` and the manual path pays it.
+    #[test]
+    fn a_job_requesting_a_harness_is_never_awarded_to_a_claim_without_it() {
+        let job = "a".repeat(64);
+        let mut codex_only = claim(&job, true, 10, &[DEFAULT_MINT_URL.into()]);
+        codex_only.agents = vec!["codex".to_owned()];
+        let mut silent = claim(&job, true, 10, &[DEFAULT_MINT_URL.into()]);
+        silent.claim_id = "d".repeat(64);
+        let view = view_with(&job, 10, vec![codex_only, silent]);
+
+        let mut wants_claude = filters(10, 100);
+        wants_claude.requested_agent = Some("claude");
+        assert_eq!(
+            select_awardable_claim(&view, &wants_claude),
+            None,
+            "neither a wrong-harness claim nor a silent one may win a claude job"
+        );
+        // …and the manual path refuses by NAME, with the reason on the error.
+        let refused = named_claim_awardable(&view, &"c".repeat(64), &wants_claude)
+            .expect_err("manual award must apply the same filter");
+        assert!(
+            matches!(refused, NamedAwardRefused::AgentMismatch { .. }),
+            "unexpected refusal: {refused:?}"
+        );
+        assert!(refused.to_string().contains("claude"), "{refused}");
+        assert!(
+            matches!(
+                named_claim_awardable(&view, &"d".repeat(64), &wants_claude),
+                Err(NamedAwardRefused::AgentMismatch { .. })
+            ),
+            "a claim advertising nothing does not satisfy a request either"
+        );
+
+        // The claim that DOES advertise it is awarded, so the filter selects rather than blocks.
+        let mut wants_codex = filters(10, 100);
+        wants_codex.requested_agent = Some("codex");
+        assert_eq!(
+            select_awardable_claim(&view, &wants_codex).as_deref(),
+            Some("c".repeat(64).as_str())
+        );
+        assert!(named_claim_awardable(&view, &"c".repeat(64), &wants_codex).is_ok());
+    }
+
+    // Compat: with no harness requested the award path behaves exactly as before — a claim that
+    // advertises nothing is still awardable, so existing sellers keep winning existing jobs.
+    #[test]
+    fn no_harness_request_awards_exactly_as_before() {
+        let job = "a".repeat(64);
+        let view = view_with(&job, 10, vec![claim(&job, true, 10, &[DEFAULT_MINT_URL.into()])]);
+        let unfiltered = filters(10, 100);
+        assert!(unfiltered.requested_agent.is_none());
+        assert_eq!(
+            select_awardable_claim(&view, &unfiltered).as_deref(),
+            Some("c".repeat(64).as_str())
+        );
+        // The explicit "any" is the same case as no request at all.
+        let mut any = filters(10, 100);
+        any.requested_agent = Some("any");
+        assert_eq!(
+            select_awardable_claim(&view, &any).as_deref(),
+            Some("c".repeat(64).as_str())
+        );
     }
 
     // A non-live claim is never selected (nothing to award yet).

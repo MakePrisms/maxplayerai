@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use mobee_core::home::AgentPresetConfig;
+use crate::home::AgentPresetConfig;
 
 /// Built-in preset names, in the order they are suggested/detected.
 pub const BUILTIN_PRESETS: [&str; 3] = ["claude", "cursor", "codex"];

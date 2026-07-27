@@ -23,7 +23,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::gateway::EventDraft;
 
 /// Current on-disk schema version.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// A cloneable handle to the node-owned SQLite state.
 #[derive(Clone)]
@@ -59,6 +59,11 @@ pub struct Offer {
     pub task: String,
     pub deadline_unix: i64,
     pub targeted: bool,
+    /// The harness the offer asked for (`["param", "agent", …]`), canonicalised; `None` ⇒ no
+    /// preference. Journaled with the other offer facts because execution can be a RESTART away
+    /// from the claim: a resumed job reads its requested harness from here, so it dispatches to
+    /// the harness the buyer asked for and not to whichever one happens to be preferred now.
+    pub requested_agent: Option<String>,
 }
 
 /// The lifecycle state of a job (execution side of a claim that was awarded).
@@ -172,7 +177,10 @@ impl SellerStore {
                  task            TEXT NOT NULL,
                  deadline_unix   INTEGER NOT NULL,
                  targeted        INTEGER NOT NULL,
-                 created_at_unix INTEGER NOT NULL
+                 created_at_unix INTEGER NOT NULL,
+                 -- The harness the offer requested. NULL ⇒ no preference, which is also what an
+                 -- offer recorded before this column existed reads as.
+                 requested_agent TEXT
              );
              -- Claims the node parked. `state` is the claim's own lifecycle; `awarded` marks the
              -- one the buyer selected, `released` the ones it stepped back from.
@@ -198,8 +206,9 @@ impl SellerStore {
                  buyer_pubkey    TEXT NOT NULL,
                  created_at_unix INTEGER NOT NULL
              );
-             -- Jobs the node is executing (one per awarded claim). `agent_name` is the roster
-             -- agent selected to run it (never published to buyers).
+             -- Jobs the node is executing (one per awarded claim). `agent_name` is the harness that
+             -- actually ran it — the journal row naming which agent did the job, and the evidence
+             -- that a harness-requesting job was served by the harness it asked for.
              CREATE TABLE IF NOT EXISTS jobs (
                  job_id          TEXT PRIMARY KEY,
                  offer_id        TEXT NOT NULL,
@@ -254,6 +263,7 @@ impl SellerStore {
                  updated_at_unix    INTEGER NOT NULL
              );",
         )?;
+        Self::migrate(conn)?;
         conn.execute(
             "INSERT INTO seller_meta (key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value
@@ -261,6 +271,30 @@ impl SellerStore {
             [SCHEMA_VERSION.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Bring a store created by an older binary up to [`SCHEMA_VERSION`]. `CREATE TABLE IF NOT
+    /// EXISTS` never alters a table that already exists, so a column added to the schema above
+    /// reaches existing stores only through here.
+    ///
+    /// Every step is ADDITIVE and idempotent — a nullable column whose absence reads the same as
+    /// its default. Nothing here rewrites or drops a row: this store holds live trade state.
+    fn migrate(conn: &Connection) -> Result<(), StoreError> {
+        if !Self::column_exists(conn, "offers", "requested_agent")? {
+            conn.execute_batch("ALTER TABLE offers ADD COLUMN requested_agent TEXT;")?;
+        }
+        Ok(())
+    }
+
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+        let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            if row.get::<_, String>(1)? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Record (idempotently overwrite) the node's most recent start time.
@@ -288,8 +322,9 @@ impl SellerStore {
         let conn = self.lock()?;
         let changed = conn.execute(
             "INSERT OR IGNORE INTO offers
-                 (offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted, created_at_unix)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted, created_at_unix,
+                  requested_agent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 offer.offer_id,
                 offer.buyer_pubkey,
@@ -299,6 +334,7 @@ impl SellerStore {
                 offer.deadline_unix,
                 offer.targeted as i64,
                 now_unix,
+                offer.requested_agent,
             ],
         )?;
         Ok(changed == 1)
@@ -332,7 +368,8 @@ impl SellerStore {
         let conn = self.lock()?;
         let row = conn
             .query_row(
-                "SELECT offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted
+                "SELECT offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted,
+                        requested_agent
                  FROM offers WHERE offer_id = ?1",
                 [offer_id],
                 |row| {
@@ -344,6 +381,7 @@ impl SellerStore {
                         task: row.get(4)?,
                         deadline_unix: row.get(5)?,
                         targeted: row.get::<_, i64>(6)? != 0,
+                        requested_agent: row.get(7)?,
                     })
                 },
             )
@@ -459,7 +497,7 @@ impl SellerStore {
 
     // ---- Job execution --------------------------------------------------------------------------
 
-    /// Record which roster agent was selected to run a job. Idempotent (last write wins).
+    /// Record which harness ran a job. Idempotent (last write wins).
     pub fn assign_agent(&self, job_id: &str, agent_name: &str) -> Result<(), StoreError> {
         let conn = self.lock()?;
         conn.execute(
@@ -930,6 +968,7 @@ mod tests {
             task: "do the thing".to_owned(),
             deadline_unix: 10_000,
             targeted: true,
+            requested_agent: None,
         }
     }
 
@@ -968,6 +1007,71 @@ mod tests {
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .expect("journal_mode");
         assert_eq!(mode.to_lowercase(), "wal");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // TOOTH — the harness an offer requested is journaled with its other facts and READS BACK
+    // across a reopen. Execution can be a restart away from the claim, so a request that lived only
+    // in memory would let a resumed job run on whatever harness the node prefers now.
+    #[test]
+    fn requested_agent_survives_a_reopen() {
+        let path = temp_db("requested-agent");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = SellerStore::open(&path).expect("open");
+            let mut offer = sample_offer("o1");
+            offer.requested_agent = Some("codex".to_owned());
+            store.record_offer(&offer, 1).expect("record");
+            // An offer with no preference stays None — absence is a value here, not a default.
+            store.record_offer(&sample_offer("o2"), 1).expect("record");
+        }
+        let store = SellerStore::open(&path).expect("reopen");
+        assert_eq!(
+            store.offer_row("o1").expect("row").expect("o1").requested_agent.as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            store.offer_row("o2").expect("row").expect("o2").requested_agent,
+            None
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // TOOTH — a store written by a binary from before this column opens, MIGRATES, and reads its
+    // existing rows as "no preference". `CREATE TABLE IF NOT EXISTS` silently skips an existing
+    // table, so without the ALTER an upgraded node would fail every offer read on a live store.
+    #[test]
+    fn a_store_from_before_the_column_migrates_and_reads_no_preference() {
+        let path = temp_db("pre-agent-schema");
+        let _ = std::fs::remove_file(&path);
+        // The offers table exactly as the previous schema had it, holding a live row.
+        {
+            let conn = Connection::open(&path).expect("create old store");
+            conn.execute_batch(
+                "CREATE TABLE offers (
+                     offer_id        TEXT PRIMARY KEY,
+                     buyer_pubkey    TEXT NOT NULL,
+                     amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
+                     unit            TEXT NOT NULL,
+                     task            TEXT NOT NULL,
+                     deadline_unix   INTEGER NOT NULL,
+                     targeted        INTEGER NOT NULL,
+                     created_at_unix INTEGER NOT NULL
+                 );
+                 INSERT INTO offers VALUES ('old', 'buyer', 21, 'sat', 'task', 10000, 1, 1);",
+            )
+            .expect("old schema");
+        }
+
+        let store = SellerStore::open(&path).expect("open migrates");
+        let row = store.offer_row("old").expect("read").expect("the pre-existing row survives");
+        assert_eq!(row.amount_sats, 21, "the row is migrated, not replaced");
+        assert_eq!(row.requested_agent, None, "an offer from before the column asked for no harness");
+        // Migration is idempotent: opening again neither errors nor double-adds.
+        drop(store);
+        let store = SellerStore::open(&path).expect("second open");
+        assert_eq!(store.health().expect("health").schema_version, SCHEMA_VERSION);
+        assert!(store.offer_row("old").expect("read").is_some());
         let _ = std::fs::remove_file(&path);
     }
 

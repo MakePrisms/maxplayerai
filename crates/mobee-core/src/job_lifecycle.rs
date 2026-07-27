@@ -71,6 +71,10 @@ pub struct PostJobRequest {
     /// (byte-identical to a non-contribution offer); `Contribution` carries the required target +
     /// base pins. See [`JobKind`].
     pub job: JobKind,
+    /// Ask for a specific agent harness (`claude`, `codex`, …). `None` or `"any"` ⇒ no
+    /// preference, and the offer is byte-identical to one posted before harness selection existed.
+    /// A requested harness narrows the market: only sellers advertising it may be awarded.
+    pub requested_agent: Option<String>,
 }
 
 /// Job class of a posted offer. Making this an enum (rather than an all-or-nothing cluster of
@@ -195,6 +199,11 @@ pub struct OfferView {
     /// contribution OR when a `contribution`-class offer's pins were malformed (fail-closed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contribution: Option<ContributionOfferView>,
+    /// The harness this job requested (`["param", "agent", …]`), canonicalised. `None` ⇒ any.
+    /// The award filter reads it from HERE — the signed offer on the relay — never from award
+    /// parameters, so the request cannot be changed after the fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_agent: Option<String>,
 }
 
 /// Serializable view of a well-formed contribution offer's pins.
@@ -232,6 +241,10 @@ pub struct ClaimView {
     /// accept-bind then records no `creq_hash` and binding behaves identically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creq: Option<String>,
+    /// Harnesses this seller advertised on the claim (`["mobee_agent", …]`), preference order.
+    /// Empty ⇒ the claim stated none, which never satisfies a job that asked for one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -537,7 +550,8 @@ fn build_offer_draft(
                 )
             })?,
         )
-    };
+    }
+    .requesting_agent(request.requested_agent.as_deref());
 
     let mut draft = offer.to_event_draft();
     if let (Some(repo), Some(branch)) = (&request.repo, &request.branch) {
@@ -1758,6 +1772,7 @@ pub(crate) async fn fetch_job_view_async(
             job_class: first_tag_value(&draft.tags, crate::contribution::TAG_JOB_CLASS)
                 .map(str::to_owned),
             contribution: contribution_offer_view(&draft.tags),
+            requested_agent: parsed.as_ref().and_then(|p| p.requested_agent.clone()),
         }
     });
 
@@ -1780,6 +1795,7 @@ pub(crate) async fn fetch_job_view_async(
             live: false,
             // Capture the seller-authored creq tag; absent on claims with no creq.
             creq: first_tag_value(&draft.tags, "creq").map(str::to_owned),
+            agents: crate::heartbeat::agents_from_tags(&draft.tags),
         });
     }
     claims.sort_by_key(|c| std::cmp::Reverse(c.created_at));
@@ -2976,6 +2992,7 @@ mod tests {
             status: "processing".to_owned(),
             live: true,
             creq: None,
+            agents: Vec::new(),
         }
     }
 
@@ -3063,6 +3080,7 @@ mod tests {
             status: status.to_owned(),
             live: false,
             creq: None,
+            agents: Vec::new(),
         }
     }
 
@@ -3221,6 +3239,7 @@ mod tests {
                 repo: None,
                 branch: None,
                 job: JobKind::FromScratch,
+                requested_agent: None,
             },
         )
         .expect_err("seller required");
@@ -3395,6 +3414,7 @@ mod tests {
                 repo: None,
                 branch: None,
                 job: JobKind::FromScratch,
+                requested_agent: None,
             },
         )
         .await
@@ -3480,6 +3500,7 @@ mod tests {
                 repo: None,
                 branch: None,
                 job: JobKind::FromScratch,
+                requested_agent: None,
             },
         )
         .await
@@ -3538,6 +3559,7 @@ mod tests {
                 repo: None,
                 branch: None,
                 job: JobKind::FromScratch,
+                requested_agent: None,
             },
         )
         .expect_err("must refuse nested block_on");
@@ -3628,6 +3650,7 @@ mod tests {
                 base_oid: base_oid.to_owned(),
                 accepts: vec!["fork".into()],
             }),
+            requested_agent: None,
         }
     }
 
@@ -3817,6 +3840,7 @@ mod tests {
             repo: None,
             branch: None,
             job: JobKind::Contribution(contribution_spec(owner, url, branch, oid, accepts)),
+            requested_agent: None,
         }
     }
 
@@ -3882,6 +3906,7 @@ mod tests {
             repo: None,
             branch: None,
             job: JobKind::FromScratch,
+            requested_agent: None,
         };
         let contribution: Option<crate::contribution::ContributionOffer> = match &request.job {
             JobKind::FromScratch => None,
@@ -4043,6 +4068,7 @@ mod tests {
                 repo: None,
                 branch: None,
                 job: JobKind::FromScratch,
+                requested_agent: None,
             },
         )
         .await
