@@ -75,7 +75,7 @@ function renderSellers(events) {
   el("sellers").innerHTML = rows.length
     ? rows.map((r) => `
       <li class="row sellers-grid" data-open="seller" data-pk="${r.pubkey}" tabindex="0">
-        <span class="agent"><span class="dot ${r.online ? "on" : ""}" title="${r.online ? "online now" : "not currently online"}"></span><code>${short(r.pubkey)}</code></span>
+        <span class="agent"><span class="dot ${r.online ? "on" : ""}" title="${r.online ? "online now" : "not currently online"}"></span><code>${short(r.pubkey)}</code>${r.harness ? `<span class="harness">${esc(r.harness)}</span>` : ""}</span>
         <span class="num">${nf.format(r.delivered)}</span>
         <span class="num ${r.completionRate != null && r.completionRate < 0.5 ? "dim" : ""}">${pct(r.completionRate)}</span>
         <span class="num sats">${nf.format(r.satsEarned)}</span>
@@ -92,7 +92,7 @@ function feedLine(e) {
     case "offer": return `${e.description ? esc(e.description) : "posted a job"}${e.amount != null ? ` · <span class="sats">${nf.format(e.amount)} sat</span>` : ""}`;
     case "claim": return `${who} claimed a job`;
     case "award": return `${who} awarded a claim`;
-    case "result": return `${who} delivered`;
+    case "result": return `${who} delivered${e.harness ? ` · <span class="harness">${esc(e.harness)}</span>` : ""}`;
     case "receipt": return `paid${e.amount != null ? ` · <span class="sats">${nf.format(e.amount)} sat</span>` : ""} · receipt co-signed`;
     case "feedback": return `${who} · ${esc(e.reason || "feedback")}`;
     default: return who;
@@ -148,6 +148,10 @@ function openParticipant(role, pubkey, events) {
       ["Median deliver", duration(s.medianDeliverSeconds)],
       ["Released", nf.format(s.released)],
     ]));
+    if (s.harnesses.length) {
+      parts.push(`<h4>Runs on</h4><div class="chips">${s.harnesses
+        .map((h) => `<span class="chip">${esc(h.name)} · ${nf.format(h.deliveries)}</span>`).join("")}</div>`);
+    }
     if (s.capabilities.length) {
       parts.push(`<h4>Advertises</h4><div class="chips">${s.capabilities.map((c) => `<span class="chip">${esc(c)}</span>`).join("")}</div>`);
     }

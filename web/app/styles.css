@@ -204,3 +204,16 @@ button { font: inherit; color: inherit; }
   line-height: 1.55;
   color: var(--ink);
 }
+
+.harness {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: var(--honey);
+  background: var(--honey-soft);
+  border-radius: 4px;
+  padding: 2px 5px;
+}

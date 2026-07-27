@@ -9,7 +9,7 @@
  */
 import { buildTrades } from "./trades.js";
 import { parseEvent } from "./model.js";
-import { HANDLER, HEARTBEAT } from "./kinds.js";
+import { HANDLER, HEARTBEAT, RESULT } from "./kinds.js";
 
 /** Selectable periods, longest label first so the UI can render them in order. */
 export const WINDOWS = Object.freeze([
@@ -102,7 +102,10 @@ export function sellerBoard(events, now) {
     let r = rows.get(pk);
     if (!r) {
       r = { pubkey: pk, claimed: 0, delivered: 0, receipted: 0, satsEarned: 0,
-            released: 0, deliverTimes: [], lastSeen: 0, online: false, capabilities: [] };
+            released: 0, deliverTimes: [], lastSeen: 0, online: false, capabilities: [],
+            // Which agent runtime actually did the work, counted per delivery —
+            // a seller may move between harnesses, so this is a tally, not a label.
+            harnessCounts: {} };
       rows.set(pk, r);
     }
     return r;
@@ -132,16 +135,25 @@ export function sellerBoard(events, now) {
       const r = get(p.pubkey);
       const name = p.handler?.name || p.handler?.display_name || p.d;
       if (name && !r.capabilities.includes(name)) r.capabilities.push(name);
+    } else if (p.kind === RESULT && p.harness) {
+      const r = get(p.pubkey);
+      r.harnessCounts[p.harness] = (r.harnessCounts[p.harness] || 0) + 1;
     }
   }
 
   return [...rows.values()]
-    .map((r) => ({
-      ...r,
-      medianDeliverSeconds: median(r.deliverTimes),
-      // Of the claims this seller took, how many turned into a delivery.
-      completionRate: r.claimed > 0 ? r.delivered / r.claimed : null,
-    }))
+    .map((r) => {
+      const ranked = Object.entries(r.harnessCounts).sort((a, b) => b[1] - a[1]);
+      return {
+        ...r,
+        medianDeliverSeconds: median(r.deliverTimes),
+        // Of the claims this seller took, how many turned into a delivery.
+        completionRate: r.claimed > 0 ? r.delivered / r.claimed : null,
+        /** Most-used harness, or null if this seller has never delivered. */
+        harness: ranked.length ? ranked[0][0] : null,
+        harnesses: ranked.map(([name, n]) => ({ name, deliveries: n })),
+      };
+    })
     .sort((a, b) => Number(b.online) - Number(a.online) || b.satsEarned - a.satsEarned);
 }
 
