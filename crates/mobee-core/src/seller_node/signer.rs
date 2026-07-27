@@ -79,13 +79,29 @@ pub struct SignerHandle {
     public_key_hex: String,
 }
 
-/// The signer task exited.
+/// How long a single signer round-trip may take before it is abandoned.
+///
+/// Deliberately generous: everything the actor does is local cryptography measured in milliseconds,
+/// so this is not a latency budget — it is a liveness bound. Its job is to guarantee the call
+/// *returns*, not to police how fast.
+const SIGNER_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A signer round-trip that did not complete: the actor exited, or it failed to answer within
+/// [`SIGNER_CALL_TIMEOUT`]. Carries which call and which leg, so the operator log names the exact
+/// site instead of a bare "actor gone".
 #[derive(Debug)]
-pub struct SignerActorGone;
+pub struct SignerActorGone {
+    call: &'static str,
+    cause: &'static str,
+}
 
 impl std::fmt::Display for SignerActorGone {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "signer actor is not running")
+        write!(
+            formatter,
+            "signer round-trip `{}` did not complete: {}",
+            self.call, self.cause
+        )
     }
 }
 
@@ -97,6 +113,41 @@ impl SignerHandle {
         &self.public_key_hex
     }
 
+    /// Send one command and await its reply, with BOTH legs bounded.
+    ///
+    /// Both legs must be bounded because both are timer-less, and a timer-less await is the one thing
+    /// that can park this node permanently and silently (#173). `send` parks forever if the queue is
+    /// full and the actor is not draining it; `rx.await` parks forever if the actor is alive but never
+    /// answers. Neither arms a timer, so the runtime has nothing to wake for — the run loop's
+    /// `select!` is never polled again, the heartbeat tick never fires, the watchdog dies with it, and
+    /// the process sits at 0% CPU looking healthy with no error logged anywhere.
+    ///
+    /// A bound cannot make a stuck actor answer. What it does is convert an invisible permanent park
+    /// into a named, logged, recoverable failure at this exact call site — which is why this ships
+    /// without yet knowing which call stuck in the field: it makes parking silently impossible.
+    async fn round_trip<T>(
+        &self,
+        call: &'static str,
+        command: Command,
+        rx: oneshot::Receiver<T>,
+    ) -> Result<T, SignerActorGone> {
+        match tokio::time::timeout(SIGNER_CALL_TIMEOUT, self.tx.send(command)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(SignerActorGone { call, cause: "actor exited" }),
+            Err(_) => {
+                return Err(SignerActorGone {
+                    call,
+                    cause: "queue stayed full (actor not draining)",
+                })
+            }
+        }
+        match tokio::time::timeout(SIGNER_CALL_TIMEOUT, rx).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(_)) => Err(SignerActorGone { call, cause: "actor dropped the reply" }),
+            Err(_) => Err(SignerActorGone { call, cause: "actor never answered" }),
+        }
+    }
+
     /// Sign a full event draft through the serialized signer. `created_at` is the fixed authored-at
     /// second so the event id is deterministic across retries. The draft's tags (version, namespace,
     /// routing) are applied verbatim, so the signed event is wire-valid.
@@ -106,15 +157,16 @@ impl SignerHandle {
         created_at: i64,
     ) -> Result<Result<SignedEvent, String>, SignerActorGone> {
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(Command::Sign {
+        self.round_trip(
+            "sign",
+            Command::Sign {
                 draft,
                 created_at,
                 reply,
-            })
-            .await
-            .map_err(|_| SignerActorGone)?;
-        rx.await.map_err(|_| SignerActorGone)
+            },
+            rx,
+        )
+        .await
     }
 
     /// Schnorr-sign a receipt-preimage digest (32-byte hex) through the actor — the delivery
@@ -125,11 +177,12 @@ impl SignerHandle {
         digest_hex: String,
     ) -> Result<Result<String, String>, SignerActorGone> {
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(Command::SignReceiptHash { digest_hex, reply })
-            .await
-            .map_err(|_| SignerActorGone)?;
-        rx.await.map_err(|_| SignerActorGone)
+        self.round_trip(
+            "sign_receipt_hash",
+            Command::SignReceiptHash { digest_hex, reply },
+            rx,
+        )
+        .await
     }
 
     /// Build the NIP-98 push `Authorization` header for `remote_url` through the actor — the seller
@@ -140,11 +193,12 @@ impl SignerHandle {
         remote_url: String,
     ) -> Result<Result<String, String>, SignerActorGone> {
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(Command::HttpAuthHeader { remote_url, reply })
-            .await
-            .map_err(|_| SignerActorGone)?;
-        rx.await.map_err(|_| SignerActorGone)
+        self.round_trip(
+            "http_auth_header",
+            Command::HttpAuthHeader { remote_url, reply },
+            rx,
+        )
+        .await
     }
 
     /// Decode a gift-wrap to its NUT-18 payment through the actor (the NIP-44 decrypt needs the
@@ -154,14 +208,15 @@ impl SignerHandle {
         event: nostr_sdk::Event,
     ) -> Result<Result<Option<crate::payment_send::ReceivedPayment>, String>, SignerActorGone> {
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(Command::UnwrapPaymentWrap {
+        self.round_trip(
+            "unwrap_payment_wrap",
+            Command::UnwrapPaymentWrap {
                 event: Box::new(event),
                 reply,
-            })
-            .await
-            .map_err(|_| SignerActorGone)?;
-        rx.await.map_err(|_| SignerActorGone)
+            },
+            rx,
+        )
+        .await
     }
 
     /// The cashu P2PK signing key derived from the seller key, for a cdk `receive` that must witness
@@ -170,11 +225,8 @@ impl SignerHandle {
         &self,
     ) -> Result<Result<cashu::SecretKey, String>, SignerActorGone> {
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(Command::CashuP2pkSecret { reply })
+        self.round_trip("cashu_p2pk_secret", Command::CashuP2pkSecret { reply }, rx)
             .await
-            .map_err(|_| SignerActorGone)?;
-        rx.await.map_err(|_| SignerActorGone)
     }
 
     /// Sign an already-built [`UnsignedEvent`] through the serialized signer. Used by the buzz
@@ -185,21 +237,15 @@ impl SignerHandle {
         unsigned: UnsignedEvent,
     ) -> Result<Result<Event, String>, SignerActorGone> {
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(Command::SignUnsigned { unsigned, reply })
+        self.round_trip("sign_unsigned", Command::SignUnsigned { unsigned, reply }, rx)
             .await
-            .map_err(|_| SignerActorGone)?;
-        rx.await.map_err(|_| SignerActorGone)
     }
 
     /// The seller public key (hex), routed through the actor queue (proves the serialized path).
     pub async fn public_key_via_actor(&self) -> Result<String, SignerActorGone> {
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(Command::PublicKey { reply })
+        self.round_trip("public_key", Command::PublicKey { reply }, rx)
             .await
-            .map_err(|_| SignerActorGone)?;
-        rx.await.map_err(|_| SignerActorGone)
     }
 }
 
@@ -336,6 +382,58 @@ mod tests {
             "mobee-seller-signer-{label}-{}-{id}",
             std::process::id()
         ))
+    }
+
+    // TOOTH (#173) — a signer round-trip is BOUNDED, so an actor that never answers cannot park the
+    // caller forever. This is the defect that parks the whole node: the run loop awaits signer
+    // round-trips inside `select!` branch bodies, and a timer-less await there means the `select!` is
+    // never polled again — the heartbeat tick stops, the watchdog stops with it, and the process sits
+    // at 0% CPU with nothing logged. Verified against the field frame: the park is at the runtime's
+    // own park point with no timer pending, which excludes every BOUNDED await (nostr-sdk's publish
+    // path is capped at WAIT_FOR_OK_TIMEOUT = 10s and would have armed one) and leaves exactly these
+    // timer-less channel awaits.
+    //
+    // The stalled actor here holds each command — and therefore each reply sender — forever, which is
+    // the one shape that hangs: dropping the sender would surface as a recv error, not a park.
+    //
+    // Time is paused, so the production bound elapses instantly in wall-clock. The OUTER timeout is
+    // what makes a revert fail cleanly instead of hanging the suite: remove the bound in `round_trip`
+    // and there is no timer at 30s, auto-advance jumps to the outer 600s, and the assert goes red.
+    //
+    // Two calls, not one: the second proves the caller was left usable rather than merely returning
+    // once — which is the property the run loop actually needs to keep ticking.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_signer_round_trip_is_bounded_and_leaves_the_caller_usable() {
+        let (tx, mut rx) = mpsc::channel::<Command>(8);
+        // The stalled actor: receive, then hold. Never answers, never drops a reply sender.
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(command) = rx.recv().await {
+                held.push(command);
+            }
+        });
+        let handle = SignerHandle {
+            tx,
+            public_key_hex: "00".repeat(32),
+        };
+
+        let outer = std::time::Duration::from_secs(600);
+        for attempt in 1..=2 {
+            let call = tokio::time::timeout(outer, handle.sign(EventDraft::new(1, Vec::new(), ""), 0));
+            let outcome = call.await.unwrap_or_else(|_| {
+                panic!(
+                    "attempt {attempt}: the signer round-trip never returned — an unbounded \
+                     timer-less await here parks the run loop's select, and with it the heartbeat \
+                     tick and the whole watchdog, silently"
+                )
+            });
+            let error = outcome.expect_err("a stalled actor cannot produce a signature");
+            assert!(
+                error.to_string().contains("sign") && error.to_string().contains("never answered"),
+                "attempt {attempt}: the failure must NAME the call and the leg so an operator can \
+                 see which round-trip stalled, got {error}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

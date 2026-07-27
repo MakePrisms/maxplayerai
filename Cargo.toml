@@ -33,3 +33,14 @@ base64 = "0.22"
 [profile.release]
 lto = "thin"
 strip = true
+
+# A release build that can be profiled and, crucially, symbolicated. `release` is stripped and
+# thin-LTO'd, so a spindump or `sample` of a stuck seller node yields raw addresses and nothing else —
+# diagnosing the #173 park required rebuilding the binary before any capture could be read at all.
+# Same optimisation level as release so behaviour and timing are representative:
+#
+#   cargo build -p mobee --profile release-debug --features acp,wallet
+[profile.release-debug]
+inherits = "release"
+debug = true
+strip = false

@@ -411,6 +411,75 @@ fn which_bin(name: &str) -> Result<PathBuf, ()> {
     Err(())
 }
 
+// --- Off-runtime wrappers for the async seller node -------------------------------------------
+//
+// Everything above is synchronous libgit2 — and the push additionally drives blocking HTTP through
+// the smart subtransport registered in `git_transport`. libgit2 has no async form, so an async client
+// would not help: the C call owns the thread for its duration either way. The only correct shape is
+// to run it on a blocking thread.
+//
+// This matters more than "don't block the executor" usually does. The seller node runs on a
+// CURRENT-THREAD runtime, where the single thread drives futures, the I/O driver AND the timer wheel.
+// A blocking call there does not merely delay other work — it stops time. A slow or hung push takes
+// the heartbeat tick, the relay-stall watchdog and every relay notification down with it, at 0% CPU,
+// with nothing logged. Long-standing (`origin/main` has the same shape) but only visible on a host
+// where pushes hang; on a fast network the window is milliseconds.
+
+/// Off-runtime [`init_empty_delivery_workdir`].
+pub async fn init_empty_delivery_workdir_off_runtime(
+    workdir: PathBuf,
+    identity: DeliveryAgentIdentity,
+) -> Result<(), SellerGitError> {
+    off_runtime(move || init_empty_delivery_workdir(&workdir, &identity)).await
+}
+
+/// Off-runtime [`snapshot_delivery_at`].
+pub async fn snapshot_delivery_at_off_runtime(
+    workdir: PathBuf,
+    identity: DeliveryAgentIdentity,
+    base_oid: Option<String>,
+    branch: String,
+    message: String,
+    author_date_unix: i64,
+) -> Result<String, SellerGitError> {
+    off_runtime(move || {
+        snapshot_delivery_at(
+            &workdir,
+            &identity,
+            base_oid.as_deref(),
+            &branch,
+            &message,
+            author_date_unix,
+        )
+    })
+    .await
+}
+
+/// Off-runtime [`push_branch_with_header`] — the one that reaches the network.
+pub async fn push_branch_with_header_off_runtime(
+    workdir: PathBuf,
+    remote_url: String,
+    branch: String,
+    header: Option<String>,
+) -> Result<String, SellerGitError> {
+    off_runtime(move || push_branch_with_header(&workdir, &remote_url, &branch, header)).await
+}
+
+/// Run one blocking git operation on a blocking thread. A panic inside libgit2 surfaces as an error
+/// rather than taking the caller down.
+async fn off_runtime<T, F>(operation: F) -> Result<T, SellerGitError>
+where
+    F: FnOnce() -> Result<T, SellerGitError> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(operation).await {
+        Ok(result) => result,
+        Err(error) => Err(SellerGitError::Io(format!(
+            "blocking git task did not complete: {error}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
