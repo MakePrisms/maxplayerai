@@ -1299,6 +1299,95 @@ mod tests {
         std::env::temp_dir().join(format!("mobee-buyer-mod-{label}-{}-{id}", std::process::id()))
     }
 
+    // ★ THE MELT-TO-FLIP WINDOW TOOTH. The reconcile must not be able to release a reservation while
+    // a settle is between its wallet melt and its `reserved → spent` flip.
+    //
+    // `settle_job` holds the money lock across pay-then-flip. The reconcile GATHERS unlocked (it is
+    // per-job relay I/O and would block trades for seconds) and takes the lock only for the apply.
+    // That is the whole protection: a pass whose gather decided "dead" cannot act on that decision
+    // until the settle has finished moving the amount from `reserved` into `spent`. Without it, a
+    // pass could free funds that had already left the wallet, and `available` would over-state by
+    // the amount for as long as the discrepancy stood.
+    //
+    // ★ THE ASSERTION IS ON THE REPORT, NOT THE FINAL STATE — and that is the point. The final state
+    // converges to `spent` either way (a released row that turns out paid is converted by the very
+    // next pass), so a test that only checked the end state would pass with the lock REMOVED. That
+    // convergence is exactly what let this ship untoothed: the bug is invisible in the outcome and
+    // visible only in the decision.
+    //
+    // Deterministic: the settle-holder keeps the lock for far longer than a localhost gather takes,
+    // so the ordering is not a coin flip. And it fails safe — if the gather were somehow slow enough
+    // to apply after the flip, it would observe `spent` and still keep, passing for the right reason.
+    //
+    // Red-on-revert: delete the `money_lock` acquisition in `reconcile_reservations` and the pass
+    // releases a job whose payment was already in flight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_reconcile_cannot_release_a_reservation_mid_settle() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let root = temp_home("mid-settle");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap_home(&root).expect("bootstrap home");
+
+        // A relay that serves NO claims, so the classification genuinely reaches `Dead` — with an
+        // unreachable relay every job is conservatively treated as still-payable and the reconcile
+        // would never try to release anything, which would make this test vacuous.
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        home.config.relay_url = relay.url().await.to_string();
+
+        let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
+        let job = "a".repeat(64);
+        context
+            .store
+            .reserve(&job, 4, 1_000, u64::MAX, 0, now_unix())
+            .expect("reserve");
+
+        // Confirm the premise: with no bind, no payment journal and no live claim, this job WOULD be
+        // released by a pass that got to act. Without this the tooth could pass because nothing was
+        // ever at risk.
+        let would_release = plan_reconcile(
+            &[job.clone()],
+            &BTreeMap::new(),
+            &BTreeMap::from([(job.clone(), false)]),
+        );
+        assert_eq!(
+            would_release[&job],
+            reservations::JobDisposition::Dead,
+            "premise: this job must classify Dead, or nothing is at risk and the tooth is vacuous"
+        );
+
+        // Stand in for a settle that has melted but not yet flipped: hold the money lock, wait long
+        // enough that any unlocked apply would have already run, then perform the flip.
+        let settling = {
+            let context = context.clone();
+            let job = job.clone();
+            tokio::spawn(async move {
+                let _guard = context.money_lock.lock().await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                context.store.convert_to_spent(&job, 4, now_unix()).expect("flip");
+            })
+        };
+
+        // Let the settle take the lock first, then run a real pass against it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let report = reconcile_reservations(&context).await.expect("reconcile");
+        settling.await.expect("settle task");
+
+        assert!(
+            !report.released.contains(&job),
+            "the reconcile released a reservation whose payment was mid-flight — it must wait for \
+             the money lock, not act on a gather that went stale. released={:?}",
+            report.released
+        );
+        assert!(
+            report.kept.contains(&job),
+            "the pass should have observed the completed flip and kept the row; report={report:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
+    }
+
     // ★ THE #179/4b TOOTH: the reconcile reports the pass that changed NOTHING.
     //
     // A release moves the buyer's `available` — it is a money-visible decision — and the pass that
