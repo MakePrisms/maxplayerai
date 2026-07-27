@@ -408,13 +408,12 @@ pub async fn authorize_pay_async(
         None => None,
         Some(source) => {
             let store = FsHopJournal::new(crossmint_hop::hop_journal_dir(home));
-            let effects =
-                CdkHopEffects::open(
-                    home,
-                    &source.to_string(),
-                    &wallet_open_mint_url(home, &terms),
-                )
-                .await?;
+            let effects = CdkHopEffects::open(
+                home,
+                &source.to_string(),
+                &wallet_open_mint_url(home, &terms),
+            )
+            .await?;
             // A pairing already on disk WINS over freshly raised quotes. This attempt may have
             // melted on an earlier run, and a second melt quote for one attempt id is precisely the
             // double-pay the hop journal exists to prevent.
@@ -474,7 +473,8 @@ pub async fn authorize_pay_async(
         if let Some((store, hop_effects, pairing)) = hop.as_mut() {
             crossmint_hop::run_hop(store, hop_effects, pairing)?;
         }
-        let state = PaymentService::new(&journal).run_verified(&key, &terms, &authority, &mut effects)?;
+        let state =
+            PaymentService::new(&journal).run_verified(&key, &terms, &authority, &mut effects)?;
         Ok::<_, AuthorizePayError>(state)
     })??;
 
@@ -873,7 +873,10 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("real-mint fence"), "got: {error}");
+        assert!(
+            error.to_string().contains("real-mint fence"),
+            "got: {error}"
+        );
     }
 
     // The boundary, half two. No overlap AND no admissible landing still refuses fail-closed — the
@@ -897,8 +900,8 @@ mod tests {
     // `allow_real_mints` is false (default safety posture)...
     #[test]
     fn pay_plan_real_mint_refused_by_default() {
-        let error = crate::crossmint::plan_payment(REAL_MINT, &[REAL_MINT.to_string()], false)
-            .unwrap_err();
+        let error =
+            crate::crossmint::plan_payment(REAL_MINT, &[REAL_MINT.to_string()], false).unwrap_err();
         assert!(matches!(error, AuthorizePayError::Input(_)));
         assert!(error.to_string().contains("real-mint fence"));
     }
@@ -906,8 +909,8 @@ mod tests {
     // ...and ADMITTED (pays at X when the creq lists X) once the operator opts in with the flag.
     #[test]
     fn pay_plan_real_mint_admitted_when_flag_true() {
-        let plan = crate::crossmint::plan_payment(REAL_MINT, &[REAL_MINT.to_string()], true)
-            .unwrap();
+        let plan =
+            crate::crossmint::plan_payment(REAL_MINT, &[REAL_MINT.to_string()], true).unwrap();
         assert!(!plan.is_hop());
         assert_eq!(plan.realized_mint(), &MintUrl::from_str(REAL_MINT).unwrap());
 

@@ -115,7 +115,7 @@ pub enum HopError {
     ///
     /// interim: the attempt stops here rather than re-planning the melt leg against the (still
     /// unpaid) invoice at the target. Re-planning means a superseding-pairing record and a fresh
-    /// argument about pays-once, which is its own reviewed change — see MakePrisms/mobee#188.
+    /// argument about pays-once, which is its own reviewed change — see MakePrisms/mobee#194.
     MeltFailed {
         /// The attempt whose melt failed.
         attempt_id: String,
@@ -279,7 +279,9 @@ impl FsHopJournal {
         };
         let mut ids = Vec::new();
         for entry in entries {
-            let path = entry.map_err(|error| journal_error("read dir entry", error))?.path();
+            let path = entry
+                .map_err(|error| journal_error("read dir entry", error))?
+                .path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 continue;
             }
@@ -361,7 +363,8 @@ impl HopJournalStore for FsHopJournal {
         line.push(b'\n');
         file.write_all(&line)
             .map_err(|error| journal_error("append", error))?;
-        file.sync_all().map_err(|error| journal_error("sync", error))?;
+        file.sync_all()
+            .map_err(|error| journal_error("sync", error))?;
         sync_parent_directory(&path)
     }
 }
@@ -612,8 +615,12 @@ impl CdkHopEffects {
         let melt_quote = bounded(
             "source melt quote",
             MINT_TOUCH_TIMEOUT,
-            self.source
-                .melt_quote(PaymentMethod::BOLT11, mint_quote.request.clone(), None, None),
+            self.source.melt_quote(
+                PaymentMethod::BOLT11,
+                mint_quote.request.clone(),
+                None,
+                None,
+            ),
         )
         .await?;
         let cost = HopCost {
@@ -815,10 +822,7 @@ pub async fn sweep_hops(home: &MobeeHome) -> Result<Vec<SweptHop>, HopError> {
                 pairing.mint_quote_id,
             );
         }
-        swept.push(SweptHop {
-            attempt_id,
-            result,
-        });
+        swept.push(SweptHop { attempt_id, result });
     }
     Ok(swept)
 }
@@ -849,8 +853,7 @@ async fn sweep_one(
     store: &FsHopJournal,
     pairing: HopJournal,
 ) -> Result<HopSettled, HopError> {
-    let mut effects =
-        CdkHopEffects::open(home, &pairing.source_mint, &pairing.target_mint).await?;
+    let mut effects = CdkHopEffects::open(home, &pairing.source_mint, &pairing.target_mint).await?;
     let mut recovered = Vec::new();
     for (label, wallet) in [("source", &effects.source), ("target", &effects.target)] {
         bounded(
@@ -1063,7 +1066,10 @@ mod tests {
             "https://a.example",
             "https://b.example",
         ] {
-            assert!(line.contains(needle), "strand line missing {needle}: {line}");
+            assert!(
+                line.contains(needle),
+                "strand line missing {needle}: {line}"
+            );
         }
     }
 
@@ -1099,7 +1105,10 @@ mod tests {
         };
         let error = run_hop(&store, &mut effects, &journal("attempt-1"))
             .expect_err("an in-flight melt must refuse");
-        assert!(matches!(error, HopError::MeltInFlight { .. }), "got: {error}");
+        assert!(
+            matches!(error, HopError::MeltInFlight { .. }),
+            "got: {error}"
+        );
         assert!(
             world.borrow().melts.is_empty(),
             "never melt while a melt is in flight"
@@ -1297,18 +1306,21 @@ mod tests {
         for half in [&pairing.source_mint, &pairing.target_mint] {
             let error = require_both_mints_recovered(std::slice::from_ref(half), &pairing)
                 .expect_err("one mint is not a recovery");
-            assert!(
-                error.to_string().contains("half its mints"),
-                "got: {error}"
-            );
+            assert!(error.to_string().contains("half its mints"), "got: {error}");
         }
         // A recovery that touched two mints, but not the RIGHT two, is no better.
         let error = require_both_mints_recovered(
-            &["https://elsewhere.example".to_owned(), pairing.source_mint.clone()],
+            &[
+                "https://elsewhere.example".to_owned(),
+                pairing.source_mint.clone(),
+            ],
             &pairing,
         )
         .expect_err("the wrong second mint is not a recovery");
-        assert!(error.to_string().contains(&pairing.target_mint), "got: {error}");
+        assert!(
+            error.to_string().contains(&pairing.target_mint),
+            "got: {error}"
+        );
     }
 
     // A melt the source mint reports as FAILED stops the attempt. Nothing left the wallet, so this
@@ -1334,8 +1346,10 @@ mod tests {
     // it — the hop is now what stands between "cannot settle at the seller's mint" and a wrong spend.
     #[test]
     fn no_failing_leg_leaves_a_completion_record_behind() {
-        // Each case: how the world is broken, and the leg it breaks.
-        let cases: Vec<(&str, Box<dyn Fn(&mut MintWorld)>)> = vec![
+        /// How one case breaks the world, paired with the name of the leg it breaks.
+        type BrokenLeg = (&'static str, Box<dyn Fn(&mut MintWorld)>);
+
+        let cases: Vec<BrokenLeg> = vec![
             (
                 "source mint unreachable",
                 Box::new(|world: &mut MintWorld| world.melt_leg = None),
@@ -1391,7 +1405,9 @@ mod tests {
         bytes.extend_from_slice(b"{\"record\":\"settled\"");
         std::fs::write(&path, bytes).expect("write");
 
-        let error = store.replay("attempt-1").expect_err("a torn record refuses");
+        let error = store
+            .replay("attempt-1")
+            .expect_err("a torn record refuses");
         assert!(
             error.to_string().contains("torn write"),
             "expected a torn-write refusal, got: {error}"
