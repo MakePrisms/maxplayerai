@@ -24,6 +24,7 @@ pub mod client;
 pub mod lifecycle;
 pub mod lock;
 pub mod protocol;
+pub mod relay;
 pub mod reservations;
 pub mod signer;
 pub mod store;
@@ -63,6 +64,17 @@ const RELAY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the background auto-award task re-checks the relay for a payable claim, until one
 /// appears or the offer deadline passes. Bounded polling (no tight spin on a live-but-unpayable claim).
 const AUTO_AWARD_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the delivery watcher re-checks awarded-unsettled jobs with no event to wake it. The
+/// subscription is the fast path; this backstop is what makes a dropped or missed result event a
+/// latency cost rather than a stranded payment.
+const DELIVERY_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+/// How often the reservation reconcile re-runs while the daemon serves. This is what frees a
+/// reservation stranded by a seller that simply stopped, without waiting for a restart.
+///
+/// Deliberately SLOW: a pass makes one relay fetch per still-reserved job, which is the unbounded
+/// per-job fetch pattern tracked in #180. Until that moves onto the persistent relay session, the
+/// cadence is the thing keeping the load down — raise it only together with that fix.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Lock file leaf under the home.
 pub const LOCK_FILE: &str = "buyer.lock";
@@ -78,6 +90,9 @@ pub enum BuyerError {
     Store(StoreError),
     Wallet(FundError),
     Identity(HomeError),
+    /// The relay could not be REGISTERED — a malformed url or a pool refusal. An unreachable relay
+    /// is not this: the daemon comes up and serves with the network down.
+    Relay(String),
     Io(String),
 }
 
@@ -88,6 +103,7 @@ impl std::fmt::Display for BuyerError {
             Self::Store(error) => write!(formatter, "{error}"),
             Self::Wallet(error) => write!(formatter, "buyer wallet error: {error}"),
             Self::Identity(error) => write!(formatter, "buyer identity error: {error}"),
+            Self::Relay(message) => write!(formatter, "buyer relay error: {message}"),
             Self::Io(message) => write!(formatter, "buyer io error: {message}"),
         }
     }
@@ -122,6 +138,9 @@ struct BuyerContext {
     store: BuyerStore,
     wallet: WalletHandle,
     signer: SignerHandle,
+    /// The buyer's one long-lived relay session. Writes and (from the delivery watcher on)
+    /// subscriptions ride this instead of a fresh `Client` per operation.
+    relay: relay::RelayHandle,
     started_at_unix: i64,
     /// Serializes the money-state-mutating RPCs (`award` reserves, `collect` flips) so a
     /// reservation's balance/spent snapshot is never read while a concurrent collect is melting.
@@ -159,12 +178,21 @@ async fn bootstrap(home: MobeeHome) -> Result<(HomeLock, Arc<BuyerContext>, Path
 
     let signer = signer::spawn(&home)?;
 
+    // Registers the relay and hands the session to the actor; it does NOT wait for the socket or
+    // the NIP-42 handshake, so an unreachable relay cannot delay the daemon past connect-or-spawn's
+    // readiness deadline (see `relay::spawn`).
+    let relay_keys = buyer_keys(&home).map_err(BuyerError::Relay)?;
+    let relay = relay::spawn(relay_keys, &home.config.relay_url)
+        .await
+        .map_err(|error| BuyerError::Relay(error.to_string()))?;
+
     let socket_path = home.root.join(SOCKET_FILE);
     let context = Arc::new(BuyerContext {
         home,
         store,
         wallet,
         signer,
+        relay,
         started_at_unix,
         money_lock: Mutex::new(()),
         last_reconcile: Mutex::new(None),
@@ -198,12 +226,7 @@ pub async fn run(home: MobeeHome) -> Result<(), BuyerError> {
     // daemon starts from a converged ledger. A failure is logged, not fatal — an unreachable relay
     // must not keep the daemon from coming up (the stale reservation is conservative until the next
     // reconcile).
-    match reconcile_on_start(&context).await {
-        Ok(report) => *context.last_reconcile.lock().await = Some(report),
-        Err(error) => eprintln!(
-            "buyer: reconcile-on-start did not complete ({error}); serving with the ledger as-is"
-        ),
-    }
+    run_reconcile_pass(&context).await;
     // Re-arm pending auto-awards left by a prior run: a job posted before a crash still gets its
     // award with zero manual commands. Each task re-checks the relay for an existing award first
     // (invariant A), so re-arming never double-awards.
@@ -215,6 +238,12 @@ pub async fn run(home: MobeeHome) -> Result<(), BuyerError> {
         }
         Err(error) => eprintln!("buyer: could not list pending auto-awards to re-arm: {error}"),
     }
+    // Start watching for delivered results. Its own first action is a sweep of awarded-unsettled
+    // jobs, which is what collects a delivery that landed while this daemon was down.
+    spawn_delivery_watcher(context.clone());
+    // Keep reconciling while we serve, so a reservation stranded by a seller that went away is
+    // freed within the hour rather than at the next restart.
+    spawn_reconcile_loop(context.clone());
     let listener = bind_socket(&socket_path)?;
     accept_loop(listener, context).await
 }
@@ -427,7 +456,11 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
         timeout_secs: params.timeout_secs,
         include_display_names: params.include_display_names,
     };
-    match job_lifecycle::get_job_async(&context.home, request).await {
+    // Subscribe BEFORE the wait begins its first fetch — an event landing in the gap between the
+    // fetch and the subscribe would be lost, and the wait would then sleep on a view that was
+    // already stale when it read it.
+    let events = context.relay.subscribe_events();
+    match job_lifecycle::get_job_awaiting_events_async(&context.home, request, events).await {
         Ok(view) => Response::ok(id, json!(view)),
         Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
     }
@@ -560,36 +593,77 @@ struct CollectParams {
 /// verify integrity, budget-append + wallet melt, materialize) and, ONLY after it succeeds, flip
 /// the reservation `reserved → spent` via [`lifecycle::settle_after_pay`]. The flip is never
 /// reached on a pay refusal, so a failed pay never over-states `available`.
+/// Failure of [`settle_job`].
+#[derive(Debug)]
+enum SettleJobError {
+    /// The budget gate could not be loaded — nothing was attempted.
+    Gate(String),
+    /// The sealed pay path refused (or failed). No reservation flip was reached.
+    Pay(collect::CollectError),
+    /// The pay landed but the `reserved → spent` flip did not; reconcile converges it on next start.
+    Store(StoreError),
+}
+
+impl std::fmt::Display for SettleJobError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Gate(message) => write!(formatter, "{message}"),
+            Self::Pay(error) => write!(formatter, "{error}"),
+            Self::Store(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+/// The daemon's ONE path to the spend gate: money lock → budget gate → pay-then-flip.
+///
+/// Both the `collect` RPC and the delivery watcher call this and nothing else. That is deliberate:
+/// it makes "can the watcher reach around a money gate?" answerable by construction instead of by
+/// audit. Every gate lives inside the sealed [`collect::collect_async`] this composes — accept-time
+/// job-hash recomputation, offer-authoritative amount, seller co-signature, creq verification,
+/// single-settlement, the pre-spend commit tip-match, the budget ceiling, and pays-exactly-once —
+/// and neither caller can compose a different route to them.
+///
+/// The watcher therefore adds NO money authority. It commits no new money; it converts a
+/// reservation the award already created.
+async fn settle_job(
+    context: &BuyerContext,
+    job_id: &str,
+    out: Option<String>,
+) -> Result<collect::CollectOutcome, SettleJobError> {
+    // Serialize with award + other collects: at most one wallet-melting op in flight daemon-wide.
+    let _guard = context.money_lock.lock().await;
+
+    let mut gate =
+        BudgetGate::from_home(&context.home).map_err(|error| SettleJobError::Gate(error.to_string()))?;
+    let request = CollectRequest {
+        job_id: job_id.to_owned(),
+        out,
+    };
+
+    // Pay FIRST (append + melt), flip AFTER — the #123/#126 ordering, via the tested seam.
+    lifecycle::settle_after_pay(
+        &context.store,
+        job_id,
+        now_unix(),
+        || collect::collect_async(&context.home, &mut gate, request),
+        |outcome| outcome.pay.amount_sats,
+    )
+    .await
+    .map(|(outcome, _converted)| outcome)
+    .map_err(|error| match error {
+        SettleError::Pay(error) => SettleJobError::Pay(error),
+        SettleError::Store(error) => SettleJobError::Store(error),
+    })
+}
+
 async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
     let params: CollectParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(error) => return Response::err(id, CODE_METHOD_NOT_FOUND, format!("collect params: {error}")),
     };
 
-    // Serialize with award + other collects: at most one wallet-melting op in flight daemon-wide.
-    let _guard = context.money_lock.lock().await;
-
-    let mut gate = match BudgetGate::from_home(&context.home) {
-        Ok(gate) => gate,
-        Err(error) => return Response::err(id, CODE_INTERNAL, error.to_string()),
-    };
-    let request = CollectRequest {
-        job_id: params.job_id.clone(),
-        out: params.out,
-    };
-
-    // Pay FIRST (append + melt), flip AFTER — the #123/#126 ordering, via the tested seam.
-    let settled = lifecycle::settle_after_pay(
-        &context.store,
-        &params.job_id,
-        now_unix(),
-        || collect::collect_async(&context.home, &mut gate, request),
-        |outcome| outcome.pay.amount_sats,
-    )
-    .await;
-
-    match settled {
-        Ok((outcome, _converted)) => Response::ok(
+    match settle_job(context, &params.job_id, params.out).await {
+        Ok(outcome) => Response::ok(
             id,
             json!({
                 "pay": {
@@ -604,8 +678,8 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
                 "files": outcome.files,
             }),
         ),
-        Err(SettleError::Pay(error)) => Response::err(id, CODE_REFUSED, error.to_string()),
-        Err(SettleError::Store(error)) => Response::err(id, CODE_INTERNAL, error.to_string()),
+        Err(error @ SettleJobError::Pay(_)) => Response::err(id, CODE_REFUSED, error.to_string()),
+        Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
     }
 }
 
@@ -765,12 +839,176 @@ async fn finalize_auto_award(
     }
 }
 
+/// Spawn the delivery watcher — the "seller paid in seconds" half of the trade loop. Subscribes
+/// BEFORE the task starts so no result published during scheduling is missed, then hands the
+/// receiver to the loop.
+///
+/// `subscribe_events` is a synchronous, non-blocking channel handout and `tokio::spawn` returns
+/// immediately, so this adds nothing measurable to the daemon's readiness path — which matters,
+/// because the socket bind that follows is on a 10s deadline.
+fn spawn_delivery_watcher(context: Arc<BuyerContext>) {
+    let events = context.relay.subscribe_events();
+    tokio::spawn(async move { drive_delivery_watch(&context, events).await });
+}
+
+/// Watch for delivered results and settle them automatically.
+///
+/// Structure mirrors the P2 rule this daemon already lives by — **the subscription is the wake, the
+/// durable state is the truth**. An arriving result event is never evidence of anything: it only
+/// says "look again", and optionally narrows WHICH job to look at. What may be paid is read from
+/// the award/reservation ledger and decided entirely by the sealed pay path, so a forged, replayed,
+/// or malformed result event can at worst cost a wasted fetch.
+///
+/// The loop starts with a sweep because a delivery that landed while the daemon was DOWN has no
+/// event to replay — durable state is the only thing that can find it.
+async fn drive_delivery_watch(
+    context: &Arc<BuyerContext>,
+    events: tokio::sync::broadcast::Receiver<Arc<nostr_sdk::Event>>,
+) {
+    watch_loop(events, DELIVERY_RECHECK_INTERVAL, |wake| async move {
+        match wake {
+            // A result arrived: sweep, narrowed to the jobs that event references.
+            WatchWake::Delivered(event) => settle_awarded(context, Some(&event)).await,
+            WatchWake::Sweep | WatchWake::SubscriptionLost => settle_awarded(context, None).await,
+        }
+    })
+    .await;
+}
+
+/// What woke the watch loop. Modelled explicitly so the loop's control flow is testable without a
+/// relay, a wall clock, or a paused clock — the sweep action is injected, and this says why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WatchWake {
+    /// A delivered result arrived — sweep, narrowed to the jobs it references.
+    Delivered(Arc<nostr_sdk::Event>),
+    /// The backstop fired, or a gap means something may have been missed — sweep everything.
+    Sweep,
+    /// The subscription ended; the loop continues on the backstop alone.
+    SubscriptionLost,
+}
+
+/// The watch loop's control flow, with the sweep action injected.
+///
+/// Two properties here are the whole point, and both are the kind that stay silently dead while
+/// everything looks fine — so both are toothed directly:
+///
+/// 1. The backstop is a fixed-cadence `interval`, NOT a sleep re-armed inside the `select!`. A
+///    per-iteration sleep is pushed back by every arriving event, and events the loop does not act
+///    on (the `continue` below) would reset it WITHOUT sweeping — so a steady claim/feedback stream
+///    would starve the sweep indefinitely, defeating it in exactly the case it exists for: a result
+///    event that was missed. `Delay` keeps a slow settle pass from bunching the next ticks.
+/// 2. A closed subscription DEGRADES, it does not stop the loop. Settling does not depend on the
+///    relay handle at all (the collect path opens its own client), so returning here would strand
+///    every future delivery. It drops to timer-only and says so.
+async fn watch_loop<S, Fut>(
+    events: tokio::sync::broadcast::Receiver<Arc<nostr_sdk::Event>>,
+    interval: Duration,
+    mut sweep: S,
+) where
+    S: FnMut(WatchWake) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    // A delivery that landed while the daemon was DOWN has no event to replay, so the durable set
+    // is the only thing that can find it. That is why the loop sweeps before it ever waits.
+    sweep(WatchWake::Sweep).await;
+
+    let mut backstop = tokio::time::interval(interval);
+    backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    backstop.tick().await; // The first tick resolves immediately; the boot sweep above WAS it.
+
+    // `None` once the subscription is gone — the loop then runs on the backstop alone.
+    let mut events = Some(events);
+
+    loop {
+        let wake = match events.as_mut() {
+            Some(stream) => tokio::select! {
+                received = stream.recv() => match received {
+                    Ok(event) => {
+                        if event.kind != nostr_sdk::Kind::Custom(crate::kinds::JOB_RESULT_KIND) {
+                            continue;
+                        }
+                        WatchWake::Delivered(event)
+                    }
+                    // Lagged is NOT an error — the buffer overflowed and a result may have been
+                    // missed. Treating a busy relay as a failure would strand a payment; the right
+                    // response is to widen to a full sweep.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => WatchWake::Sweep,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        eprintln!(
+                            "buyer: delivery watcher lost the relay subscription; falling back to \
+                             periodic sweeps every {}s (deliveries still settle, just later)",
+                            interval.as_secs()
+                        );
+                        events = None;
+                        WatchWake::SubscriptionLost
+                    }
+                },
+                _ = backstop.tick() => WatchWake::Sweep,
+            },
+            None => {
+                backstop.tick().await;
+                WatchWake::Sweep
+            }
+        };
+        sweep(wake).await;
+    }
+}
+
+/// Settle awarded-but-unsettled jobs through the daemon's single spend path.
+///
+/// `wake` narrows the sweep to the jobs a just-arrived result references (the fast path); `None`
+/// sweeps the whole set (boot, the backstop tick, and after a `Lagged` gap).
+async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Event>) {
+    let jobs = match context.store.awarded_unsettled_job_ids() {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            eprintln!("buyer: delivery watcher could not read awarded jobs ({error}); will retry");
+            return;
+        }
+    };
+    for job_id in jobs {
+        if let Some(event) = wake {
+            if !job_lifecycle::event_references_job(event, &job_id) {
+                continue;
+            }
+        }
+        match settle_job(context, &job_id, None).await {
+            Ok(outcome) => eprintln!(
+                "buyer: delivery watcher settled {job_id} — paid {} sat for commit {} ({} file(s))",
+                outcome.pay.amount_sats,
+                outcome.commit_oid,
+                outcome.files.len()
+            ),
+            // Nothing delivered yet is the ordinary state of an awarded job, not a failure: the job
+            // stays in the set and the next event or tick retries. Every OTHER outcome is a real
+            // refusal — a gate said no — and is named so an operator sees which job stopped and why.
+            Err(SettleJobError::Pay(collect::CollectError::Lifecycle(
+                job_lifecycle::JobLifecycleError::NotFound(_),
+            ))) => {}
+            Err(error) => eprintln!("buyer: delivery watcher could not settle {job_id}: {error}"),
+        }
+    }
+}
+
 /// Reconcile every still-`Reserved` job against relay + payment-journal truth: a job the relay no
 /// longer shows payable (and that has left no funds) is released; a job whose payment journal shows
 /// a `Closed` attempt is converted to `spent`; an ambiguous (Sent-not-Closed) payment is KEPT (the
 /// phase-3 saga owns it). Pure classification is [`lifecycle::classify_disposition`]; this gathers
 /// its inputs and applies the batch through [`BuyerStore::reconcile`].
-async fn reconcile_on_start(context: &BuyerContext) -> Result<ReconcileReport, String> {
+///
+/// This runs at boot AND on a slow timer, which is what releases a reservation stranded by a seller
+/// that simply stopped — no feedback event required, because a claim stops being live at the offer
+/// deadline whether or not the seller ever says so.
+///
+/// Gather is done WITHOUT the money lock (it is per-job relay I/O and would block the trade RPCs for
+/// seconds); only the apply takes it. That ordering matters: `settle_job` holds the money lock
+/// across pay-then-flip, so taking it here makes it impossible to release a reservation in the
+/// window after a payment's melt but before its `reserved → spent` flip — which would transiently
+/// free funds that had in fact already left the wallet. The apply itself is additionally
+/// state-guarded inside its transaction ([`BuyerStore::reconcile`] re-reads each row and acts only
+/// on the state it expects), so a disposition that went stale during gather is a no-op rather than a
+/// wrong write.
+async fn reconcile_reservations(context: &BuyerContext) -> Result<ReconcileReport, String> {
     let reserved = context
         .store
         .reserved_job_ids()
@@ -807,10 +1045,88 @@ async fn reconcile_on_start(context: &BuyerContext) -> Result<ReconcileReport, S
     }
 
     let dispositions = plan_reconcile(&reserved, &progress, &payable);
+    let _guard = context.money_lock.lock().await;
     context
         .store
         .reconcile(&dispositions, now_unix())
         .map_err(|error| error.to_string())
+}
+
+/// Run one reconcile pass, publish it to `status`, and report it — always.
+async fn run_reconcile_pass(context: &Arc<BuyerContext>) {
+    match reconcile_reservations(context).await {
+        Ok(report) => {
+            report_reconcile(&report);
+            *context.last_reconcile.lock().await = Some(report);
+        }
+        // An unreachable relay must never be fatal: every job it could not verify was treated as
+        // still-payable, so the ledger is conservative until the next pass.
+        Err(error) => {
+            eprintln!("buyer: reconcile pass did not complete ({error}); serving with the ledger as-is")
+        }
+    }
+}
+
+/// Report a reconcile pass UNCONDITIONALLY — including the pass that changed nothing.
+///
+/// Releasing a reservation is a money-visible decision: it returns funds to `available`. A path that
+/// prints only when it acts is indistinguishable, in a log, from a path that has stopped running —
+/// so the quiet pass is exactly the one worth printing. Released jobs are named, because "something
+/// was released" is not an answer to "which job, and why did my budget move".
+///
+/// The examined count is in the line deliberately: it is also the number of per-job relay fetches
+/// this pass made, so #180's amplification is visible while it grows instead of when it bites.
+fn report_reconcile(report: &ReconcileReport) {
+    eprintln!("{}", reconcile_line(report));
+}
+
+/// Build the reconcile report line. Split from the printing so the wording — including the
+/// released-nothing case that exists precisely because it is easy to leave out — is directly
+/// testable rather than something a reader has to trust.
+fn reconcile_line(report: &ReconcileReport) -> String {
+    let examined = report.released.len() + report.converted.len() + report.kept.len();
+    if report.released.is_empty() {
+        format!(
+            "buyer: reconcile examined {examined} reserved job(s) — released nothing, converted {}, kept {}",
+            report.converted.len(),
+            report.kept.len()
+        )
+    } else {
+        format!(
+            "buyer: reconcile examined {examined} reserved job(s) — RELEASED {} (no longer payable \
+             on the relay and no funds left: {}), converted {}, kept {}",
+            report.released.len(),
+            report.released.join(", "),
+            report.converted.len(),
+            report.kept.len()
+        )
+    }
+}
+
+/// Re-run the reconcile on a slow timer for the daemon's lifetime, with the pass injected.
+///
+/// Sequential BY CONSTRUCTION: the pass is awaited inside the loop, and the interval's `Delay`
+/// behaviour defers a tick that arrives mid-pass. Two passes can therefore never overlap, so the
+/// per-job relay fetches cannot compound into each other — which matters while #180 stands, because
+/// overlapping passes would multiply exactly the load the slow cadence is holding down.
+async fn reconcile_loop<P, Fut>(interval: Duration, mut pass: P)
+where
+    P: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await; // Resolves immediately; the boot pass in `run` WAS it.
+    loop {
+        ticker.tick().await;
+        pass().await;
+    }
+}
+
+fn spawn_reconcile_loop(context: Arc<BuyerContext>) {
+    tokio::spawn(async move {
+        reconcile_loop(RECONCILE_INTERVAL, || run_reconcile_pass(&context)).await;
+    });
 }
 
 /// Pure reconcile planning: map each reserved job to a disposition from its folded payment progress
@@ -961,6 +1277,11 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
             },
             "reconcile": reconcile,
             "parked_awards": parked_awards,
+            // The relay the buyer's one long-lived session is bound to. Deliberately NOT a liveness
+            // probe: `status` is what connect-or-spawn polls to decide the daemon is up, and a probe
+            // bounded at 10s would push that poll past its own readiness deadline. Liveness belongs
+            // to the watcher's tick, where a slow answer costs nothing.
+            "relay": { "url": context.relay.relay_url() },
         }),
     )
 }
@@ -976,6 +1297,436 @@ mod tests {
     fn temp_home(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!("mobee-buyer-mod-{label}-{}-{id}", std::process::id()))
+    }
+
+    // ★ THE MELT-TO-FLIP WINDOW TOOTH. The reconcile must not be able to release a reservation while
+    // a settle is between its wallet melt and its `reserved → spent` flip.
+    //
+    // `settle_job` holds the money lock across pay-then-flip. The reconcile GATHERS unlocked (it is
+    // per-job relay I/O and would block trades for seconds) and takes the lock only for the apply.
+    // That is the whole protection: a pass whose gather decided "dead" cannot act on that decision
+    // until the settle has finished moving the amount from `reserved` into `spent`. Without it, a
+    // pass could free funds that had already left the wallet, and `available` would over-state by
+    // the amount for as long as the discrepancy stood.
+    //
+    // ★ THE ASSERTION IS ON THE REPORT, NOT THE FINAL STATE — and that is the point. The final state
+    // converges to `spent` either way (a released row that turns out paid is converted by the very
+    // next pass), so a test that only checked the end state would pass with the lock REMOVED. That
+    // convergence is exactly what let this ship untoothed: the bug is invisible in the outcome and
+    // visible only in the decision.
+    //
+    // Deterministic: the settle-holder keeps the lock for far longer than a localhost gather takes,
+    // so the ordering is not a coin flip. And it fails safe — if the gather were somehow slow enough
+    // to apply after the flip, it would observe `spent` and still keep, passing for the right reason.
+    //
+    // Red-on-revert: delete the `money_lock` acquisition in `reconcile_reservations` and the pass
+    // releases a job whose payment was already in flight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_reconcile_cannot_release_a_reservation_mid_settle() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let root = temp_home("mid-settle");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap_home(&root).expect("bootstrap home");
+
+        // A relay that serves NO claims, so the classification genuinely reaches `Dead` — with an
+        // unreachable relay every job is conservatively treated as still-payable and the reconcile
+        // would never try to release anything, which would make this test vacuous.
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        home.config.relay_url = relay.url().await.to_string();
+
+        let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
+        let job = "a".repeat(64);
+        context
+            .store
+            .reserve(&job, 4, 1_000, u64::MAX, 0, now_unix())
+            .expect("reserve");
+
+        // Confirm the premise: with no bind, no payment journal and no live claim, this job WOULD be
+        // released by a pass that got to act. Without this the tooth could pass because nothing was
+        // ever at risk.
+        let would_release = plan_reconcile(
+            &[job.clone()],
+            &BTreeMap::new(),
+            &BTreeMap::from([(job.clone(), false)]),
+        );
+        assert_eq!(
+            would_release[&job],
+            reservations::JobDisposition::Dead,
+            "premise: this job must classify Dead, or nothing is at risk and the tooth is vacuous"
+        );
+
+        // Stand in for a settle that has melted but not yet flipped: hold the money lock, wait long
+        // enough that any unlocked apply would have already run, then perform the flip.
+        let settling = {
+            let context = context.clone();
+            let job = job.clone();
+            tokio::spawn(async move {
+                let _guard = context.money_lock.lock().await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                context.store.convert_to_spent(&job, 4, now_unix()).expect("flip");
+            })
+        };
+
+        // Let the settle take the lock first, then run a real pass against it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let report = reconcile_reservations(&context).await.expect("reconcile");
+        settling.await.expect("settle task");
+
+        assert!(
+            !report.released.contains(&job),
+            "the reconcile released a reservation whose payment was mid-flight — it must wait for \
+             the money lock, not act on a gather that went stale. released={:?}",
+            report.released
+        );
+        assert!(
+            report.kept.contains(&job),
+            "the pass should have observed the completed flip and kept the row; report={report:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
+    }
+
+    // ★ THE #179/4b TOOTH: the reconcile reports the pass that changed NOTHING.
+    //
+    // A release moves the buyer's `available` — it is a money-visible decision — and the pass that
+    // releases nothing is the one most likely to be dropped as noise. But a path that prints only
+    // when it acts reads, in a log, exactly like a path that has stopped running, which is how a
+    // dead release path stays invisible until a reservation strands. So the empty case is asserted
+    // first here, deliberately.
+    //
+    // Red-on-revert: make the empty case return an empty string (or skip the log) and this fails.
+    #[test]
+    fn the_reconcile_reports_every_pass_including_the_one_that_did_nothing() {
+        // Nothing reserved at all: still a line, and it still says what it examined.
+        let quiet = reconcile_line(&ReconcileReport::default());
+        assert!(quiet.contains("examined 0 reserved job(s)"), "unexpected: {quiet}");
+        assert!(quiet.contains("released nothing"), "the empty pass must say so: {quiet}");
+
+        // Jobs examined, none released: the count is still reported, so an operator can see the
+        // pass ran and how many relay fetches it cost (#180's amplification, visible as it grows).
+        let busy_but_quiet = ReconcileReport {
+            kept: vec!["a".repeat(64), "b".repeat(64)],
+            ..ReconcileReport::default()
+        };
+        let line = reconcile_line(&busy_but_quiet);
+        assert!(line.contains("examined 2 reserved job(s)"), "unexpected: {line}");
+        assert!(line.contains("released nothing"), "unexpected: {line}");
+
+        // A release NAMES the job and the reason — "something was released" is not an answer to
+        // "which job, and why did my budget move".
+        let released = ReconcileReport {
+            released: vec!["c".repeat(64)],
+            kept: vec!["d".repeat(64)],
+            ..ReconcileReport::default()
+        };
+        let line = reconcile_line(&released);
+        assert!(line.contains("examined 2 reserved job(s)"), "unexpected: {line}");
+        assert!(line.contains(&"c".repeat(64)), "the released job must be named: {line}");
+        assert!(line.contains("no longer payable"), "the reason must be stated: {line}");
+    }
+
+    // ★ NO-OVERLAP TOOTH: reconcile passes must never run concurrently.
+    //
+    // Each pass makes one relay fetch per still-reserved job — the unbounded per-job pattern in
+    // #180 — so overlapping passes would multiply precisely the load the slow cadence exists to
+    // hold down. `Delay` plus awaiting the pass inside the loop is what prevents it, and both are
+    // one-word changes away from being wrong (`Burst`, or spawning the pass).
+    //
+    // Deterministic: the pass is injected and takes far longer than the tick, so a loop that did
+    // NOT serialise would immediately show overlap.
+    //
+    // Red-on-revert: `tokio::spawn(pass())` instead of awaiting it, and max-in-flight exceeds 1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_passes_never_overlap() {
+        use std::sync::atomic::AtomicUsize;
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let passes = Arc::new(AtomicUsize::new(0));
+
+        let (f, p, n) = (in_flight.clone(), peak.clone(), passes.clone());
+        let task = tokio::spawn(async move {
+            // Pass duration deliberately several times the tick, so any non-serialising loop
+            // overlaps on the very first ticks.
+            reconcile_loop(Duration::from_millis(5), move || {
+                let (f, p, n) = (f.clone(), p.clone(), n.clone());
+                async move {
+                    let now = f.fetch_add(1, Ordering::SeqCst) + 1;
+                    p.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    f.fetch_sub(1, Ordering::SeqCst);
+                    n.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (observed_peak, completed) = (peak.load(Ordering::SeqCst), passes.load(Ordering::SeqCst));
+        task.abort();
+
+        assert!(completed >= 2, "the loop must keep running passes; saw {completed}");
+        assert_eq!(
+            observed_peak, 1,
+            "reconcile passes must never overlap — peak concurrent passes was {observed_peak}"
+        );
+    }
+
+    /// A non-actionable event for the starvation tooth: any kind the watcher does not act on. Job
+    /// FEEDBACK is the realistic one — it shares the buyer-keyed subscription with results, so a
+    /// chatty job produces exactly this traffic.
+    fn non_actionable_event() -> Arc<nostr_sdk::Event> {
+        use nostr_sdk::prelude::{EventBuilder, Keys};
+        Arc::new(
+            EventBuilder::new(nostr_sdk::Kind::Custom(crate::kinds::JOB_FEEDBACK_KIND), "")
+                .sign_with_keys(&Keys::generate())
+                .expect("sign"),
+        )
+    }
+
+    // ★ LIVENESS TOOTH (a): a steady stream of events the watcher does NOT act on must not starve
+    // the backstop sweep.
+    //
+    // This is the failure that keeps costing us: a liveness mechanism silently dead while
+    // everything looks fine. A backstop re-armed per loop iteration is pushed back by every
+    // arriving event — and non-actionable events reset it WITHOUT sweeping — so under steady
+    // traffic it never fires, and the one case it exists for (a result event we missed) is exactly
+    // the case it stops covering. A correctness tooth cannot see this: the loop still returns
+    // correct results for every event it DOES get.
+    //
+    // Deterministic by construction — no relay, no paused clock, no wall-clock assertion. The sweep
+    // action is injected and counted, and the event rate is an order of magnitude faster than the
+    // backstop, so the two implementations separate hugely: fixed-cadence interval ⇒ many sweeps;
+    // re-armed sleep ⇒ exactly the one boot sweep, forever.
+    //
+    // Red-on-revert: replace the `interval` with `tokio::time::sleep(interval)` inside the select
+    // and this fails on `sweeps >= 4`, observing 1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn steady_non_actionable_traffic_does_not_starve_the_backstop_sweep() {
+        use std::sync::atomic::AtomicUsize;
+
+        let (sender, receiver) = tokio::sync::broadcast::channel(64);
+        let sweeps = Arc::new(AtomicUsize::new(0));
+
+        let counter = sweeps.clone();
+        let loop_task = tokio::spawn(async move {
+            watch_loop(receiver, Duration::from_millis(10), move |_wake| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .await;
+        });
+
+        // Flood non-actionable events an order of magnitude faster than the backstop for long
+        // enough that a healthy loop must tick many times.
+        let flood = tokio::spawn(async move {
+            for _ in 0..300 {
+                // A receiver-less send is fine; the loop is the only receiver and may be busy.
+                let _ = sender.send(non_actionable_event());
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            // Hold the sender until the end so the subscription never closes during the flood.
+            sender
+        });
+        let _sender = flood.await.expect("flood");
+
+        let observed = sweeps.load(Ordering::SeqCst);
+        loop_task.abort();
+        assert!(
+            observed >= 4,
+            "the backstop must keep sweeping under steady non-actionable traffic; saw {observed} \
+             sweep(s) across ~300ms at a 10ms cadence (a per-iteration sleep would show exactly 1)"
+        );
+    }
+
+    // ★ LIVENESS TOOTH (b): losing the subscription DEGRADES the watcher to timer-only sweeps — it
+    // must not stop it. Settling never depended on the relay handle (the collect path opens its own
+    // client), so returning on `Closed` would strand every delivery from that moment on, silently.
+    //
+    // Asserts both halves: the loop observes `SubscriptionLost` exactly once (the arm that emits the
+    // unconditional operator line — it cannot fire without executing that line), and sweeps continue
+    // afterwards on the backstop alone.
+    //
+    // Red-on-revert: `return` on `RecvError::Closed` and this fails — no post-close sweeps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_subscription_degrades_to_timer_only_instead_of_stopping() {
+        use std::sync::atomic::AtomicUsize;
+
+        let (sender, receiver) = tokio::sync::broadcast::channel(8);
+        let lost = Arc::new(AtomicUsize::new(0));
+        let after_loss = Arc::new(AtomicUsize::new(0));
+
+        let (lost_counter, after_counter) = (lost.clone(), after_loss.clone());
+        let loop_task = tokio::spawn(async move {
+            watch_loop(receiver, Duration::from_millis(10), move |wake| {
+                let (lost_counter, after_counter) = (lost_counter.clone(), after_counter.clone());
+                async move {
+                    if wake == WatchWake::SubscriptionLost {
+                        lost_counter.fetch_add(1, Ordering::SeqCst);
+                    } else if lost_counter.load(Ordering::SeqCst) > 0 {
+                        after_counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            })
+            .await;
+        });
+
+        // Drop the sender: the subscription closes.
+        drop(sender);
+        // Let the backstop tick several times past the close.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let (losses, sweeps_after) = (lost.load(Ordering::SeqCst), after_loss.load(Ordering::SeqCst));
+        loop_task.abort();
+        assert_eq!(losses, 1, "the subscription loss must be observed exactly once, not spun on");
+        assert!(
+            sweeps_after >= 2,
+            "the watcher must keep sweeping on the backstop after losing the subscription; saw \
+             {sweeps_after} sweep(s) in ~120ms at a 10ms cadence"
+        );
+    }
+
+    // ★ THE MONEY TOOTH for the delivery watcher. The watcher settles with no human in the loop, so
+    // the question that matters is whether its entry to the spend gate is as gated as the RPC's. It
+    // is, by construction — both call `settle_job` and nothing else — and this proves it end to end:
+    // an awarded job whose delivered result carries a FORGED seller co-signature must cost NOTHING.
+    //
+    // Non-vacuity anchor: the watcher drives the full accept-then-pay path, and accept writes the
+    // pay-bind BEFORE the pre-pay co-signature gate refuses. So the bind file EXISTING is positive
+    // evidence the watcher really ran this job — without it, every "nothing happened" assertion
+    // below would pass just as well if the watcher had never woken at all.
+    //
+    // The counterparty events are published from a SEPARATE client than the daemon's own session:
+    // one nostr-sdk client cannot observe the events it published itself, and that trap bites
+    // fixtures exactly as it bites production.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delivery_watcher_refuses_a_forged_delivery_and_spends_nothing() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::{Client, Keys};
+        use nostr_sdk::secp256k1::Message;
+
+        let root = temp_home("watch-forged");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap_home(&root).expect("bootstrap home");
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        home.config.relay_url = relay_url.clone();
+
+        let buyer = Keys::parse(&crate::home::read_secret_key_hex(&home).expect("secret"))
+            .expect("buyer keys");
+        let buyer_hex = buyer.public_key().to_hex();
+        let seller = Keys::generate();
+        let seller_hex = seller.public_key().to_hex();
+        let attacker = Keys::generate();
+
+        let amount = 2u64;
+        let task = "do a task";
+        let output = "text";
+        let deadline = now_unix() as u64 + 3_600;
+
+        // Publish offer + claim + forged-cosig result from a client that is NOT the daemon's.
+        let net = Client::new(Keys::generate());
+        net.add_relay(&relay_url).await.expect("add relay");
+        net.connect().await;
+        net.wait_for_connection(Duration::from_secs(5)).await;
+        let publish = |keys: &Keys, draft: &crate::gateway::EventDraft| {
+            let builder = crate::gateway::nostr::event_builder(draft).expect("event builder");
+            let event = builder.sign_with_keys(keys).expect("sign");
+            let net = net.clone();
+            let id = event.id;
+            async move {
+                net.send_event(&event).await.expect("publish");
+                id
+            }
+        };
+
+        let offer_draft =
+            crate::gateway::OfferDraft::new(task, output, amount, deadline, &seller_hex)
+                .to_event_draft();
+        let job_id = publish(&buyer, &offer_draft).await.to_hex();
+
+        let creq = crate::gateway::creq::build_seller_creq(
+            &job_id,
+            amount,
+            "sat",
+            &[crate::home::DEFAULT_MINT_URL.to_string()],
+            &seller_hex,
+        )
+        .expect("creq");
+        let claim_draft = crate::gateway::claim_draft(&job_id, &buyer_hex, &seller_hex, &creq);
+        let _ = publish(&seller, &claim_draft).await;
+
+        let job_hash = job_lifecycle::job_hash_for_offer(&job_id, task, amount);
+        let forged = attacker
+            .sign_schnorr(&Message::from_digest([0x11u8; 32]))
+            .to_string();
+        let git = crate::gateway::GitResultTags {
+            repo: "https://example.invalid/repo.git",
+            branch: "main",
+            commit_sha: &"a".repeat(40),
+        };
+        let result_draft = crate::gateway::result_draft(
+            &job_id, &buyer_hex, output, amount, &job_hash, &forged, "", Some(git), &[],
+        );
+        let _ = publish(&seller, &result_draft).await;
+
+        let (_lock, context, _socket_path) = bootstrap(home).await.expect("buyer bootstrap");
+
+        // Seed exactly what the award path writes: the reservation, then the published-award row.
+        context
+            .store
+            .reserve(&job_id, amount, 1_000, u64::MAX, 0, now_unix())
+            .expect("reserve");
+        context
+            .store
+            .record_award(&job_id, &"c".repeat(64), &"e".repeat(64), &seller_hex, amount, now_unix())
+            .expect("record award");
+        assert_eq!(
+            context.store.awarded_unsettled_job_ids().expect("awarded"),
+            vec![job_id.clone()],
+            "the seeded award must be the watcher's work set"
+        );
+
+        // Drive the watcher's settle pass directly — the same call its event and tick paths make.
+        settle_awarded(&context, None).await;
+
+        // Non-vacuity: the watcher really drove accept-then-pay for this job.
+        assert!(
+            context.home.root.join("jobs").join(format!("{job_id}.json")).exists(),
+            "the watcher must have driven the accept path (no bind ⇒ it never ran this job, and \
+             every assertion below would be vacuous)"
+        );
+        // And the money gate refused: nothing spent, no payment journal, no files, and the
+        // reservation still held (a refused settle must never drop it and over-state `available`).
+        assert_eq!(
+            BudgetGate::from_home(&context.home).expect("gate").spent(),
+            0,
+            "a refused delivery must burn zero spend"
+        );
+        assert!(
+            !context.home.root.join("payment-journal").exists(),
+            "no payment journal may exist on a pre-pay refusal"
+        );
+        assert!(
+            !context.home.root.join("results").join(&job_id).exists(),
+            "a refused delivery must materialize no files"
+        );
+        assert!(
+            matches!(
+                context.store.reservation(&job_id).expect("reservation"),
+                Some((reservations::ReservationState::Reserved, _))
+            ),
+            "a refused settle must leave the reservation reserved"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

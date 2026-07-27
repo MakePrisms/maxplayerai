@@ -122,10 +122,24 @@ pub struct GetJobRequest {
     pub include_display_names: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitFor {
     Claim,
     Result,
+}
+
+/// Whether a fetched view satisfies the caller's `wait_for` condition.
+///
+/// The ONE definition of "ready", shared by every waiter. The buyer daemon waits by subscription
+/// and the CLI waits by poll — the mechanisms differ deliberately, but if the two ever disagreed
+/// about what they were waiting FOR, the same job would read complete to one and pending to the
+/// other. Extracting the predicate rather than the loop is what makes that disagreement impossible
+/// to write.
+pub fn view_is_ready(view: &JobView, wait_for: WaitFor) -> bool {
+    match wait_for {
+        WaitFor::Claim => view.live_claim_id.is_some(),
+        WaitFor::Result => !view.results.is_empty(),
+    }
 }
 
 impl WaitFor {
@@ -643,22 +657,14 @@ pub async fn get_job_async(
             let mut view =
                 fetch_job_view_async(home, &keys, &request.job_id, fetch_timeout, now_unix())
                     .await?;
-            let ready = match wait_for {
-                WaitFor::Claim => view.live_claim_id.is_some(),
-                WaitFor::Result => !view.results.is_empty(),
-            };
-            view.pending = !ready;
+            view.pending = !view_is_ready(&view, wait_for);
             maybe_attach_display_names_async(home, &mut view, request.include_display_names).await;
             return Ok(view);
         }
         let this_fetch = fetch_timeout.min(remaining);
         let mut view =
             fetch_job_view_async(home, &keys, &request.job_id, this_fetch, now_unix()).await?;
-        let ready = match wait_for {
-            WaitFor::Claim => view.live_claim_id.is_some(),
-            WaitFor::Result => !view.results.is_empty(),
-        };
-        if ready {
+        if view_is_ready(&view, wait_for) {
             view.pending = false;
             maybe_attach_display_names_async(home, &mut view, request.include_display_names).await;
             return Ok(view);
@@ -670,6 +676,105 @@ pub async fn get_job_async(
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
+}
+
+/// How long a subscription-driven wait will sit before re-reading the view anyway.
+///
+/// This is a BACKSTOP, not the mechanism. Events resolve the wait in milliseconds; this only bounds
+/// how long a wait can be wrong if an event never arrives — a relay that CLOSED our subscription, a
+/// fan-out we fell behind on, an event filtered away upstream. Without it, a single missed event
+/// costs the caller its whole remaining deadline.
+const SAFETY_RECHECK: Duration = Duration::from_secs(3);
+
+/// `get_job` for a caller that holds a live subscription to this buyer's job events.
+///
+/// Same contract and same readiness rule as [`get_job_async`] — [`view_is_ready`] decides for both
+/// — but it WAKES on event arrival instead of sleeping 400ms between full reconnect-and-refetch
+/// cycles. The poll variant stays exactly as it is for callers with no persistent session (the CLI);
+/// this is not a replacement, it is the daemon's path.
+///
+/// THE SUBSCRIPTION IS THE WAKE; THE FETCH IS THE TRUTH. An arriving event means only "something
+/// changed for this job" — the view is then re-read from the relay. Assembling the view out of the
+/// event stream would duplicate the assembly logic and force trusting a stream that may be partial;
+/// this way a missed event costs a re-check, never a wrong answer.
+///
+/// The caller must have subscribed BEFORE calling: `events` is passed in already-live precisely so
+/// the subscribe cannot land after the first fetch and lose an event in the gap.
+pub async fn get_job_awaiting_events_async(
+    home: &MobeeHome,
+    request: GetJobRequest,
+    mut events: tokio::sync::broadcast::Receiver<std::sync::Arc<nostr_sdk::Event>>,
+) -> Result<JobView, JobLifecycleError> {
+    let keys = buyer_keys(home)?;
+    let fetch_timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
+
+    let Some(wait_for) = request.wait_for else {
+        let mut view =
+            fetch_job_view_async(home, &keys, &request.job_id, fetch_timeout, now_unix()).await?;
+        view.pending = false;
+        maybe_attach_display_names_async(home, &mut view, request.include_display_names).await;
+        return Ok(view);
+    };
+
+    let wait_cap_secs = request
+        .timeout_secs
+        .unwrap_or(WAIT_FOR_CAP_SECS)
+        .min(WAIT_FOR_CAP_SECS);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_cap_secs);
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let this_fetch = fetch_timeout.min(remaining.max(Duration::from_millis(1)));
+        let mut view =
+            fetch_job_view_async(home, &keys, &request.job_id, this_fetch, now_unix()).await?;
+        if view_is_ready(&view, wait_for) {
+            view.pending = false;
+            maybe_attach_display_names_async(home, &mut view, request.include_display_names).await;
+            return Ok(view);
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            view.pending = true;
+            maybe_attach_display_names_async(home, &mut view, request.include_display_names).await;
+            return Ok(view);
+        }
+        await_job_event(&mut events, &request.job_id, remaining.min(SAFETY_RECHECK)).await;
+    }
+}
+
+/// Wait until an event referencing `job_id` arrives, the window elapses, or the fan-out reports we
+/// fell behind. Returns in all three cases — the caller's next act is the same either way: re-read
+/// the view.
+///
+/// `Lagged` is deliberately NOT an error. It says this receiver missed events, which means
+/// something happened; returning here re-checks, whereas treating it as a failure would turn a busy
+/// relay into a spurious timeout. `Closed` also returns rather than erroring: the session is gone,
+/// and the caller's deadline plus its next fetch is what surfaces that honestly.
+async fn await_job_event(
+    events: &mut tokio::sync::broadcast::Receiver<std::sync::Arc<nostr_sdk::Event>>,
+    job_id: &str,
+    window: Duration,
+) {
+    let _ = tokio::time::timeout(window, async {
+        loop {
+            match events.recv().await {
+                Ok(event) if event_references_job(&event, job_id) => return,
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => return,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    })
+    .await;
+}
+
+/// True when `event` carries an `e` tag naming this job's offer — the tag every claim, result and
+/// feedback roots itself on.
+pub(crate) fn event_references_job(event: &nostr_sdk::Event, job_id: &str) -> bool {
+    event.tags.iter().any(|tag| {
+        let parts = tag.as_slice();
+        parts.first().map(String::as_str) == Some("e") && parts.get(1).map(String::as_str) == Some(job_id)
+    })
 }
 
 /// Accept a live claim: persist the pay-bind, then publish the `accepted` AWARD (kind-3405).
@@ -3148,6 +3253,193 @@ mod tests {
                 nostr_relay_builder::prelude::PolicyResult::Accept
             })
         }
+    }
+
+    // The ONE definition of "ready", asserted as a table so the two waiters cannot drift apart.
+    // The poll path and the subscription path deliberately differ in MECHANISM; if they ever
+    // differed in what they were waiting FOR, the same job would read complete to the daemon and
+    // pending to the CLI. Extracting the predicate is what makes that unwritable — this pins it.
+    #[test]
+    fn readiness_is_one_shared_definition() {
+        let mut view = JobView {
+            job_id: "job".into(),
+            offer: None,
+            claims: Vec::new(),
+            results: Vec::new(),
+            live_claim_id: None,
+            accepted: None,
+            pending: false,
+        };
+        assert!(!view_is_ready(&view, WaitFor::Claim));
+        assert!(!view_is_ready(&view, WaitFor::Result));
+
+        view.live_claim_id = Some("claim".into());
+        assert!(view_is_ready(&view, WaitFor::Claim));
+        assert!(
+            !view_is_ready(&view, WaitFor::Result),
+            "a live claim is not a delivery — waiting for a result must not be satisfied by one"
+        );
+    }
+
+    /// A signed event carrying nothing but an `e` tag. The wake path inspects only that tag, so
+    /// this is the whole of what a forwarded event contributes: the signal, never the truth.
+    async fn wake_event(signer: &nostr_sdk::Keys, job_id: &str) -> std::sync::Arc<nostr_sdk::Event> {
+        use nostr_sdk::prelude::{EventBuilder, Tag};
+        let event = EventBuilder::new(nostr_sdk::Kind::Custom(JOB_RESULT_KIND), "")
+            .tag(Tag::parse(["e", job_id]).expect("e tag"))
+            .sign(signer)
+            .await
+            .expect("sign wake");
+        std::sync::Arc::new(event)
+    }
+
+    // TOOTH — the wake primitive returns for every reason the caller must re-check for, and for
+    // nothing else.
+    //
+    // `Lagged` is the reviewer trap: it means this receiver fell behind and events were DROPPED for
+    // it — i.e. something happened. Returning re-checks; treating it as a failure would turn a busy
+    // relay into a spurious timeout, which then looks like a relay fault rather than a client bug.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_wake_returns_on_a_match_on_lag_and_on_expiry_but_not_on_an_unrelated_event() {
+        let seller = nostr_sdk::Keys::generate();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+
+        // A matching event wakes it.
+        tx.send(wake_event(&seller, "job-a").await).expect("send");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            await_job_event(&mut rx, "job-a", Duration::from_secs(30)),
+        )
+        .await
+        .expect("a matching event must wake the wait");
+
+        // An event for a DIFFERENT job does not: waking on it would send the caller into a pointless
+        // re-fetch on every other job's traffic.
+        tx.send(wake_event(&seller, "job-b").await).expect("send");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(400),
+                await_job_event(&mut rx, "job-a", Duration::from_secs(30)),
+            )
+            .await
+            .is_err(),
+            "an unrelated job's event must not wake this wait"
+        );
+
+        // Lag wakes it — we cannot know what we missed, so the only safe response is to re-check.
+        for index in 0..8 {
+            tx.send(wake_event(&seller, &format!("flood-{index}")).await)
+                .expect("send");
+        }
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            await_job_event(&mut rx, "job-a", Duration::from_secs(30)),
+        )
+        .await
+        .expect("Lagged must wake the wait — it is a re-check signal, not a failure");
+
+        // And the window expiring returns rather than hanging.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            await_job_event(&mut rx, "job-a", Duration::from_millis(200)),
+        )
+        .await
+        .expect("the window must bound the wait");
+    }
+
+    // TOOTH — the wait resolves ON EVENT ARRIVAL, not on the safety re-check.
+    //
+    // This is the whole point of the piece: `get_job(wait_for=…)` used to sleep 400ms and then
+    // rebuild a Client, reconnect, and run three sequential fetches, every iteration. Now an event
+    // wakes it and it re-reads once.
+    //
+    // The TIMING assertion is what makes this a tooth rather than a demonstration. The result is
+    // genuinely on the relay, so a wait with no event wake still succeeds — three seconds later, at
+    // SAFETY_RECHECK. Asserting only "it returned ready" would pass with the subscription removed
+    // entirely. Asserting it returned FASTER than the backstop is what proves the event did the work.
+    //
+    // The result is published by a SEPARATE identity (a seller), which is both the faithful shape
+    // and the safe one: a single client can never observe its own published events.
+    //
+    // BITE: drop the `tx.send(...)` wake below and this goes red on elapsed, not on correctness.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wait_resolves_on_arrival_rather_than_on_the_safety_recheck() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let (root, mut home) = temp_job_home("wait-on-arrival");
+        home.config.relay_url = relay.url().await.to_string();
+
+        let posted = post_job_async(
+            &home,
+            PostJobRequest {
+                task: "wake on arrival".into(),
+                output: "text/plain".into(),
+                amount_sats: 2,
+                seller_pubkey: Some(nostr_sdk::Keys::generate().public_key().to_hex()),
+                untargeted: false,
+                deadline_unix: Some(now_unix() + 3_600),
+                repo: None,
+                branch: None,
+                job: JobKind::FromScratch,
+            },
+        )
+        .await
+        .expect("post job");
+        let job_id = posted.job_id.clone();
+        let buyer_pubkey = buyer_keys(&home).expect("keys").public_key().to_hex();
+
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        let waiting_home = home.clone();
+        let waiting_job = job_id.clone();
+        let started = tokio::time::Instant::now();
+        let waiter = tokio::spawn(async move {
+            get_job_awaiting_events_async(
+                &waiting_home,
+                GetJobRequest {
+                    job_id: waiting_job,
+                    wait_for: Some(WaitFor::Result),
+                    timeout_secs: Some(30),
+                    include_display_names: false,
+                },
+                rx,
+            )
+            .await
+        });
+
+        // Let the catch-up fetch finish and the waiter park on the fan-out, so what we measure is
+        // the wake and not a race with the first read.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let seller = nostr_sdk::Keys::generate();
+        let draft = crate::gateway::result_draft(
+            &job_id,
+            &buyer_pubkey,
+            "text/plain",
+            2,
+            "job-hash",
+            "seller-signature",
+            "delivered",
+            None,
+            &[],
+        );
+        publish_draft_async(&home, &seller, &draft)
+            .await
+            .expect("publish the seller result");
+        tx.send(wake_event(&seller, &job_id).await).expect("wake");
+
+        let view = waiter.await.expect("join").expect("wait");
+        let elapsed = started.elapsed();
+        assert!(!view.pending, "the wait must report the job ready");
+        assert!(!view.results.is_empty(), "the delivered result must be in the view");
+        assert!(
+            elapsed < SAFETY_RECHECK,
+            "the wait must resolve on the EVENT, not on the {SAFETY_RECHECK:?} backstop — took \
+             {elapsed:?}; if this fails on timing alone the subscription is not doing the work"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

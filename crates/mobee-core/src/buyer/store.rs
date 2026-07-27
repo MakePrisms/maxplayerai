@@ -29,7 +29,10 @@ use super::reservations::{
 /// - v3 — the pending-award intents: the `pending_awards` table (#126/#127 background auto-award).
 ///   One row per posted job the daemon still owes an award; re-armed on restart. Same additive
 ///   forward-only upgrade.
-pub const SCHEMA_VERSION: i64 = 3;
+/// - v4 — the published-award record: the `awards` table. `pending_awards` tracks the INTENT and
+///   its state; this records the award the buyer actually published, keyed by job, carrying the
+///   3405 event id. Same additive forward-only upgrade.
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// A cloneable handle to the daemon-owned SQLite state.
 #[derive(Clone)]
@@ -117,6 +120,20 @@ impl BuyerStore {
                  reason          TEXT,
                  created_at_unix INTEGER NOT NULL,
                  updated_at_unix INTEGER NOT NULL
+             );
+             -- v4: the awards the buyer actually PUBLISHED, one row per job, written at publish
+             -- time from the single reserve-then-award seam. `pending_awards.state='awarded'` says
+             -- the intent completed; this says WHICH 3405 carries it. Held locally so the delivery
+             -- watcher and the boot re-check can enumerate awarded-but-unsettled work from durable
+             -- state alone — no relay round-trip on the boot path, which is already the tightest
+             -- deadline the daemon has.
+             CREATE TABLE IF NOT EXISTS awards (
+                 job_id          TEXT PRIMARY KEY,
+                 claim_id        TEXT NOT NULL,
+                 award_event_id  TEXT NOT NULL,
+                 seller_pubkey   TEXT NOT NULL,
+                 amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
+                 awarded_at_unix INTEGER NOT NULL
              );",
         )?;
         // Forward-only, monotone schema-version bump. A fresh DB is stamped at SCHEMA_VERSION; a
@@ -517,6 +534,75 @@ impl BuyerStore {
             .optional()?)
     }
 
+    /// Record the award the buyer PUBLISHED for `job_id`. Called from the single reserve-then-award
+    /// seam ([`super::lifecycle::award_with_reservation`]) so both the manual and auto award paths
+    /// are covered by construction — recording at the two call sites instead would let one drift.
+    ///
+    /// Idempotent by job: a re-award that republishes the same job overwrites the row rather than
+    /// failing, matching the re-arm path's own idempotence.
+    pub fn record_award(
+        &self,
+        job_id: &str,
+        claim_id: &str,
+        award_event_id: &str,
+        seller_pubkey: &str,
+        amount_sats: u64,
+        now_unix: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO awards
+                 (job_id, claim_id, award_event_id, seller_pubkey, amount_sats, awarded_at_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(job_id) DO UPDATE SET
+                 claim_id = excluded.claim_id,
+                 award_event_id = excluded.award_event_id,
+                 seller_pubkey = excluded.seller_pubkey,
+                 amount_sats = excluded.amount_sats,
+                 awarded_at_unix = excluded.awarded_at_unix",
+            params![job_id, claim_id, award_event_id, seller_pubkey, amount_sats as i64, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// The published award for `job_id`, if the buyer awarded it.
+    pub fn award_record(&self, job_id: &str) -> Result<Option<AwardRecord>, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                "SELECT job_id, claim_id, award_event_id, seller_pubkey, amount_sats,
+                        awarded_at_unix
+                 FROM awards WHERE job_id = ?1",
+                [job_id],
+                row_to_award,
+            )
+            .optional()?)
+    }
+
+    /// Jobs the buyer AWARDED that have not yet settled — the delivery watcher's work set and the
+    /// boot re-check's sweep set.
+    ///
+    /// "Not yet settled" is read from the reservation ledger rather than tracked as a new state:
+    /// `reserved` is exactly "money committed, not yet paid out", because collect flips it to
+    /// `spent` only after the pay lands ([`super::lifecycle::settle_after_pay`]) and a release
+    /// moves it to `released`. Deriving it means there is no second lifecycle that can disagree
+    /// with the ledger the budget already trusts.
+    pub fn awarded_unsettled_job_ids(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT a.job_id FROM awards a
+             JOIN reservations r ON r.job_id = a.job_id
+             WHERE r.state = 'reserved'
+             ORDER BY a.awarded_at_unix",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            jobs.push(row?);
+        }
+        Ok(jobs)
+    }
+
     /// Every `parked` auto-award intent as `(job_id, reason)` — surfaced in `status` so a buyer sees
     /// jobs whose award could not be placed rather than silently losing them.
     pub fn parked_awards(&self) -> Result<Vec<(String, String)>, StoreError> {
@@ -544,6 +630,30 @@ pub struct PendingAward {
     pub max_sats: u64,
     pub harness: Option<String>,
     pub model: Option<String>,
+}
+
+/// An award the buyer PUBLISHED: the job it commits to, the claim it picked, and the 3405 that
+/// carries it. Distinct from [`PendingAward`], which is the intent that preceded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwardRecord {
+    pub job_id: String,
+    pub claim_id: String,
+    pub award_event_id: String,
+    pub seller_pubkey: String,
+    pub amount_sats: u64,
+    pub awarded_at_unix: i64,
+}
+
+/// Map an `awards` row (in the column order both queries select) to an [`AwardRecord`].
+fn row_to_award(row: &rusqlite::Row<'_>) -> rusqlite::Result<AwardRecord> {
+    Ok(AwardRecord {
+        job_id: row.get::<_, String>(0)?,
+        claim_id: row.get::<_, String>(1)?,
+        award_event_id: row.get::<_, String>(2)?,
+        seller_pubkey: row.get::<_, String>(3)?,
+        amount_sats: row.get::<_, i64>(4)?.max(0) as u64,
+        awarded_at_unix: row.get::<_, i64>(5)?,
+    })
 }
 
 /// Read a job's `(state, amount)` from a live transaction. `None` when no row exists.
@@ -655,8 +765,8 @@ mod tests {
     }
 
     // A v1 database (buyer_meta + jobs only, schema_version = 1) is upgraded forward on open: the
-    // reservations AND pending_awards tables appear and schema_version moves to the current version.
-    // No data migration, idempotent.
+    // reservations, pending_awards AND awards tables appear and schema_version moves to the current
+    // version. No data migration, idempotent.
     #[test]
     fn open_migrates_v1_db_forward() {
         let path = temp_db("migrate");
@@ -682,9 +792,62 @@ mod tests {
             .put_pending_award(&"a".repeat(64), 10, None, None, 1)
             .expect("pending award on upgraded db");
         assert_eq!(store.list_pending_awards().expect("list").len(), 1);
+        // The v4 awards table is now usable too — and the job reserved above is immediately
+        // enumerable as awarded-unsettled, which is the delivery watcher's entire work set.
+        store
+            .record_award(&"a".repeat(64), &"c".repeat(64), &"e".repeat(64), &"f".repeat(64), 10, 1)
+            .expect("record award on upgraded db");
+        assert_eq!(
+            store.awarded_unsettled_job_ids().expect("awarded"),
+            vec!["a".repeat(64)]
+        );
         // Re-open is idempotent (still current version).
         let store2 = BuyerStore::open(&path).expect("reopen");
         assert_eq!(store2.health().expect("health").schema_version, SCHEMA_VERSION);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The watcher's work set is DERIVED from the reservation ledger, never tracked as a second
+    // state: an awarded job counts as unsettled exactly while its reservation is `reserved`, and
+    // drops out the moment collect flips it to `spent` or a release moves it to `released`. Guards
+    // the property that makes the watcher safe to re-run — a settled job can never be re-offered
+    // to the pay path by this query.
+    #[test]
+    fn awarded_unsettled_follows_the_reservation_ledger() {
+        let (store, path) = fresh_store("awarded-unsettled");
+        let paid = "a".repeat(64);
+        let dropped = "b".repeat(64);
+        let waiting = "c".repeat(64);
+
+        for (job, amount) in [(&paid, 10u64), (&dropped, 20), (&waiting, 30)] {
+            store.reserve(job, amount, 1_000, NO_BUDGET, 0, 1).expect("reserve");
+            store
+                .record_award(job, &"c".repeat(64), &"e".repeat(64), &"f".repeat(64), amount, 1)
+                .expect("record award");
+        }
+        // All three are awarded and still reserved ⇒ all three are the watcher's work.
+        assert_eq!(
+            store.awarded_unsettled_job_ids().expect("awarded").len(),
+            3
+        );
+
+        store.convert_to_spent(&paid, 10, 2).expect("settle");
+        store.release(&dropped, 2).expect("release");
+
+        // Only the job still awaiting delivery remains payable-by-the-watcher.
+        assert_eq!(
+            store.awarded_unsettled_job_ids().expect("awarded"),
+            vec![waiting.clone()]
+        );
+
+        // A reservation with no award row is NOT the watcher's business — it never awarded it.
+        let foreign = "d".repeat(64);
+        store.reserve(&foreign, 5, 1_000, NO_BUDGET, 0, 3).expect("reserve foreign");
+        assert_eq!(
+            store.awarded_unsettled_job_ids().expect("awarded"),
+            vec![waiting],
+            "a reserved job the buyer never awarded must not enter the watcher's work set"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
