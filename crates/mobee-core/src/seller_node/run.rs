@@ -659,6 +659,27 @@ fn should_resume_execution(state: super::store::JobState) -> bool {
     )
 }
 
+/// The journaled offer facts for a parsed offer — the ONE place a wire offer becomes a stored row.
+///
+/// Extracted from the claim path so this mapping is reachable by a test. Everything downstream
+/// reads the ROW, not the event: the award arm authorizes against its buyer, the pay path takes its
+/// amount/unit as the redeem terms, and execution (possibly a restart later) takes its
+/// `requested_agent` as the harness to dispatch. A field dropped here is a field that silently does
+/// not exist for the rest of the job's life, which is why the mapping is a named function with its
+/// own tooth rather than a struct literal inlined at the only call site.
+fn offer_row(job_id: &str, buyer_pubkey: &str, offer: &ParsedOffer) -> super::store::Offer {
+    super::store::Offer {
+        offer_id: job_id.to_owned(),
+        buyer_pubkey: buyer_pubkey.to_owned(),
+        amount_sats: offer.amount,
+        unit: offer.unit.clone(),
+        task: offer.task.clone(),
+        deadline_unix: offer.deadline_unix as i64,
+        targeted: offer.is_targeted(),
+        requested_agent: offer.requested_agent.clone(),
+    }
+}
+
 /// Decide whether to claim `offer`, applying the always-on money-safety gates in the legacy order:
 /// a lapsed offer is refused BEFORE its deadline is re-derived (never resurrect a stale offer with a
 /// fresh `now + timeout`), then the targeting/rate gate, then the harness the offer asked for.
@@ -1681,19 +1702,11 @@ impl SellerNodeRunner {
         // Journal the offer facts BEFORE claiming: the award arm reads the buyer to authorize an
         // award (author MUST be the offer's buyer), and the pay path reads amount/unit as the redeem
         // terms. Idempotent — a re-seen offer is a no-op.
-        if let Err(error) = self.node.store().record_offer(
-            &super::store::Offer {
-                offer_id: job_id.clone(),
-                buyer_pubkey: buyer_pubkey.clone(),
-                amount_sats: offer.amount,
-                unit: offer.unit.clone(),
-                task: offer.task.clone(),
-                deadline_unix: offer.deadline_unix as i64,
-                targeted: offer.is_targeted(),
-                requested_agent: offer.requested_agent.clone(),
-            },
-            now,
-        ) {
+        if let Err(error) = self
+            .node
+            .store()
+            .record_offer(&offer_row(&job_id, &buyer_pubkey, &offer), now)
+        {
             eprintln!("seller node offer skip id={job_id}: record offer failed ({error})");
             return;
         }
@@ -2510,6 +2523,41 @@ mod tests {
             classify_offer(&offer(5, Some(SELLER), NOW + 600), &seller_cfg(2, false), &claude_only(), SELLER, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 }
         );
+    }
+
+    // TOOTH (the seam my other teeth do not look at) — the harness request survives the trip from
+    // WIRE EVENT to STORED ROW.
+    //
+    // Every other tooth here either builds the `Offer` row by hand or reads one back, so all of
+    // them stay green if this mapping silently drops the field — invariant 2 would then be built,
+    // green, and dead the moment execution happened after a restart. This one starts from an
+    // offer draft, parses it the way the claim path does, and asserts the row carries the request.
+    // Bite (measured): replace `requested_agent` in `offer_row` with `None` — before this tooth
+    // existed the whole suite stayed green; with it, this test and only this test goes red.
+    #[test]
+    fn the_harness_request_survives_the_wire_to_row_mapping() {
+        let asked = gateway::OfferDraft::new("do a task", "text/plain", 5, NOW + 600, &"a".repeat(64))
+            .requesting_agent(Some("codex"))
+            .to_event_draft();
+        let parsed = parse_offer(&asked).expect("parse offer");
+        let row = offer_row("job-1", "buyer-1", &parsed);
+        assert_eq!(
+            row.requested_agent.as_deref(),
+            Some("codex"),
+            "the request must reach the row — everything downstream reads the ROW, not the event"
+        );
+        // The rest of the mapping is asserted alongside it, so a field dropped here is caught too.
+        assert_eq!(row.amount_sats, 5);
+        assert_eq!(row.unit, "sat");
+        assert_eq!(row.task, "do a task");
+        assert_eq!(row.deadline_unix, (NOW + 600) as i64);
+        assert!(row.targeted);
+
+        // An offer that asked for nothing stores nothing — absence is carried, not invented.
+        let plain = gateway::OfferDraft::new("do a task", "text/plain", 5, NOW + 600, &"a".repeat(64))
+            .to_event_draft();
+        let parsed = parse_offer(&plain).expect("parse offer");
+        assert_eq!(offer_row("job-2", "buyer-1", &parsed).requested_agent, None);
     }
 
     // TOOTH (charter invariant 2, RESTART form — the strong one) — a job requesting harness X is
