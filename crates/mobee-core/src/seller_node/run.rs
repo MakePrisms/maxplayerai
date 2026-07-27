@@ -1905,12 +1905,12 @@ impl SellerNodeRunner {
         let agent_label = agent.name.clone();
         // Journal WHICH harness ran it before the run starts, so the row exists even if the job
         // then fails — the journal answers "what ran this", not only "what finished it".
-        if let Some(label) = agent_label.as_deref() {
-            if let Err(error) = self.node.store().assign_agent(job_id, label) {
-                eprintln!(
-                    "seller node execute job_id={job_id}: agent journal write failed (continuing): {error}"
-                );
-            }
+        if let Some(label) = agent_label.as_deref()
+            && let Err(error) = self.node.store().assign_agent(job_id, label)
+        {
+            eprintln!(
+                "seller node execute job_id={job_id}: agent journal write failed (continuing): {error}"
+            );
         }
 
         // Move awarded -> executing (idempotent). A failed mark is logged, never fatal.
