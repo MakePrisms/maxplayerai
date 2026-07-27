@@ -1,123 +1,247 @@
 /**
- * App shell — wires the relay, the cache and the metrics to the page.
+ * The board — buyers, activity, sellers — plus the detail sheet.
  *
- * Deliberately plain: this proves the core works in a browser and is the
- * scaffold the designed UI is built on. All presentation logic lives here so
- * the core modules stay free of the DOM.
+ * All presentation lives here; the core modules never touch the DOM. The
+ * selected time window applies to the whole board, so the three columns always
+ * describe the same period.
  */
 import { RELAY_URL } from "../config.js";
 import { createCache } from "./cache.js";
 import { createRelayClient } from "./relay.js";
-import { conversionRates, marketMetrics } from "./trades.js";
-import { KIND_LABELS, TRADE_STAGES } from "./kinds.js";
 import { parseEvent } from "./model.js";
+import { KIND_LABELS, TRADE_STAGES } from "./kinds.js";
+import {
+  DEFAULT_WINDOW, WINDOWS, buyerBoard, participantDetail, sellerBoard, withinWindow,
+} from "./participants.js";
 
 const el = (id) => document.getElementById(id);
 const cache = createCache();
-
-const STATUS_TEXT = {
-  connecting: "connecting to the relay…",
-  history: "reading the market…",
-  live: "live — new events appear as they happen",
-  reconnecting: "connection lost, retrying…",
-  failed: "could not read the relay",
-  idle: "stopped",
-};
-
-/** A settlement figure is a floor, so the label has to say so wherever it shows. */
-const TOTALS = [
-  ["receiptsOnRecord", "Co-signed receipts", "settlements published on the public record"],
-  ["satsInReceipts", "Sats in those receipts", "total across published receipts"],
-  ["buyers", "Buyers", "distinct agents that posted work"],
-  ["sellers", "Sellers", "distinct agents that did work"],
-  ["tradesTracked", "Jobs tracked", "trades seen at any stage"],
-  ["daysActive", "Days of activity", "span of the events in view"],
-];
-
-const FUNNEL_STAGES = [
-  ["posted", "Posted"],
-  ["claimed", "Claimed"],
-  ["awarded", "Awarded"],
-  ["delivered", "Delivered"],
-  ["receipted", "Receipt published"],
-];
-
 const nf = new Intl.NumberFormat("en-US");
+let windowKey = DEFAULT_WINDOW;
 
-function ago(ts, now) {
-  const s = Math.max(0, now - ts);
-  if (s < 60) return `${s}s ago`;
-  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
-  return `${Math.floor(s / 86400)}d ago`;
+const short = (pk) => pk.slice(0, 8);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const now = () => Math.floor(Date.now() / 1000);
+
+function ago(ts, t = now()) {
+  const s = Math.max(0, t - ts);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
 }
-
-function setStatus(state, detail) {
-  const node = el("status");
-  node.setAttribute("data-state", state);
-  el("status-text").textContent = detail ? `${STATUS_TEXT[state]} (${detail})` : STATUS_TEXT[state];
+function duration(s) {
+  if (s == null) return "—";
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m}m ${s % 60}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
 }
+const pct = (x) => (x == null ? "—" : `${Math.round(x * 100)}%`);
+const stamp = (ts) => new Date(ts * 1000).toISOString().replace("T", " ").slice(0, 19) + "Z";
 
-function renderTotals(m) {
-  el("totals").innerHTML = TOTALS.map(([key, label, hint]) =>
-    `<div class="total"><dt>${label}</dt><dd>${nf.format(m[key] ?? 0)}</dd><p>${hint}</p></div>`,
+/* ---------------- top bar ---------------- */
+
+function renderWindows() {
+  el("windows").innerHTML = WINDOWS.map((w) =>
+    `<button type="button" data-window="${w.key}" aria-pressed="${w.key === windowKey}">${w.label}</button>`,
   ).join("");
-  el("totals-note").textContent =
-    "A receipt is optional — a trade can settle without one ever being published, " +
-    "so these settlement figures are a floor, not a total.";
 }
 
-function renderFunnel(m) {
-  const rates = conversionRates(m.funnel);
-  const top = m.funnel.posted || 1;
-  el("funnel").innerHTML = FUNNEL_STAGES.map(([key, label]) => {
-    const n = m.funnel[key];
-    const width = Math.max(0, Math.min(100, (n / top) * 100));
-    const rate = key === "posted" ? "" : `<span class="rate">${Math.round((rates[key] || 0) * 100)}%</span>`;
-    return `<li><span class="stage">${label}</span>
-      <span class="bar"><span style="width:${width}%"></span></span>
-      <span class="n">${nf.format(n)}${rate}</span></li>`;
-  }).join("");
+function setConn(state, detail) {
+  el("conn").setAttribute("data-state", state);
+  el("conn-text").textContent = detail ? `${state} · ${detail}` : state;
 }
 
-function renderFeed(events, now) {
-  const rows = events
-    .map((e) => parseEvent(e))
-    .filter((e) => e && TRADE_STAGES[e.kind])
-    .sort((a, b) => b.created_at - a.created_at)
-    .slice(0, 12);
+/* ---------------- columns ---------------- */
 
+function renderBuyers(events) {
+  const rows = buyerBoard(events, now());
+  el("buyers-meta").textContent = rows.length ? `${rows.length} active` : "";
+  el("buyers").innerHTML = rows.length
+    ? rows.map((r) => `
+      <li class="row buyers-grid" data-open="buyer" data-pk="${r.pubkey}" tabindex="0">
+        <span class="agent"><code>${short(r.pubkey)}</code></span>
+        <span class="num">${nf.format(r.posted)}</span>
+        <span class="num ${r.receipted ? "" : "dim"}">${nf.format(r.receipted)}</span>
+        <span class="num sats">${nf.format(r.satsPaid)}</span>
+      </li>`).join("")
+    : '<li class="empty">No buyers in this period.</li>';
+}
+
+function renderSellers(events) {
+  const rows = sellerBoard(events, now());
+  const online = rows.filter((r) => r.online).length;
+  el("sellers-meta").textContent = rows.length ? `${online} online · ${rows.length} seen` : "";
+  el("sellers").innerHTML = rows.length
+    ? rows.map((r) => `
+      <li class="row sellers-grid" data-open="seller" data-pk="${r.pubkey}" tabindex="0">
+        <span class="agent"><span class="dot ${r.online ? "on" : ""}" title="${r.online ? "online now" : "not currently online"}"></span><code>${short(r.pubkey)}</code></span>
+        <span class="num">${nf.format(r.delivered)}</span>
+        <span class="num ${r.completionRate != null && r.completionRate < 0.5 ? "dim" : ""}">${pct(r.completionRate)}</span>
+        <span class="num sats">${nf.format(r.satsEarned)}</span>
+      </li>`).join("")
+    : '<li class="empty">No sellers in this period.</li>';
+}
+
+/** One line of plain English per event kind — the feed reads, not decodes. */
+function feedLine(e) {
+  const who = `<code>${short(e.pubkey)}</code>`;
+  switch (e.stage) {
+    case "offer": return `${who} posted a job${e.amount != null ? ` · <span class="sats">${nf.format(e.amount)} sat</span>` : ""}`;
+    case "claim": return `${who} claimed a job`;
+    case "award": return `${who} awarded a claim`;
+    case "result": return `${who} delivered`;
+    case "receipt": return `paid${e.amount != null ? ` · <span class="sats">${nf.format(e.amount)} sat</span>` : ""} · receipt co-signed`;
+    case "feedback": return `${who} · ${esc(e.reason || "feedback")}`;
+    default: return who;
+  }
+}
+
+function renderFeed(events) {
+  const t = now();
+  const rows = events.map(parseEvent).filter((e) => e && TRADE_STAGES[e.kind])
+    .sort((a, b) => b.created_at - a.created_at).slice(0, 60);
+  el("feed-meta").textContent = rows.length ? `${nf.format(rows.length)} shown` : "";
   el("feed").innerHTML = rows.length
-    ? rows.map((e) => {
-        const amount = e.amount != null && e.stage === "receipt"
-          ? `<span class="sats">${nf.format(e.amount)} sat</span>` : "";
-        return `<li><span class="chip" data-stage="${e.stage}">${KIND_LABELS[e.kind]}</span>
-          <span class="who"><code>${e.pubkey.slice(0, 8)}</code>${amount}</span>
-          <span class="when">${ago(e.created_at, now)}</span></li>`;
-      }).join("")
-    : '<li class="empty">No activity in view.</li>';
+    ? rows.map((e) => `
+      <li class="row" data-open="event" data-id="${e.id}" tabindex="0">
+        <span class="tag" data-s="${e.stage}">${KIND_LABELS[e.kind]}</span>
+        <span class="line">${feedLine(e)}</span>
+        <span class="when">${ago(e.created_at, t)}</span>
+      </li>`).join("")
+    : '<li class="empty">No activity in this period.</li>';
 }
+
+/* ---------------- detail sheet ---------------- */
+
+const statBlock = (pairs) =>
+  `<dl class="stats">${pairs.map(([k, v, cls]) => `<div><dt>${k}</dt><dd class="${cls || ""}">${v}</dd></div>`).join("")}</dl>`;
+
+function tradeList(trades, t) {
+  if (!trades.length) return '<p class="tiny">No trades in this period.</p>';
+  return `<ul class="trades">${trades.slice(0, 12).map((tr) => {
+    const stage = tr.at.receipt ? "paid" : tr.at.result ? "delivered" : tr.at.award ? "awarded" : tr.at.claim ? "claimed" : "posted";
+    const when = tr.at.receipt ?? tr.at.result ?? tr.at.award ?? tr.at.claim ?? tr.at.offer;
+    return `<li><code>${short(tr.offerId)}</code>
+      <span class="num ${tr.receiptAmount ? "sats" : "dim"}">${tr.receiptAmount ? nf.format(tr.receiptAmount) + " sat" : stage}</span>
+      <span class="when">${ago(when, t)}</span></li>`;
+  }).join("")}</ul>`;
+}
+
+function openParticipant(role, pubkey, events) {
+  const t = now();
+  const d = participantDetail(events, pubkey, t);
+  const b = d.buyer;
+  const s = d.seller;
+  const parts = [`<h3>${role === "seller" ? "Seller" : "Buyer"} ${short(pubkey)}</h3>
+    <p class="sub">${pubkey}</p>`];
+
+  if (s) {
+    parts.push(`<h4>As a seller${s.online ? " · online now" : ""}</h4>`);
+    parts.push(statBlock([
+      ["Claimed", nf.format(s.claimed)],
+      ["Delivered", nf.format(s.delivered)],
+      ["Completion", pct(s.completionRate)],
+      ["Sats earned", nf.format(s.satsEarned), "sats"],
+      ["Median deliver", duration(s.medianDeliverSeconds)],
+      ["Released", nf.format(s.released)],
+    ]));
+    if (s.capabilities.length) {
+      parts.push(`<h4>Advertises</h4><div class="chips">${s.capabilities.map((c) => `<span class="chip">${esc(c)}</span>`).join("")}</div>`);
+    }
+  }
+  if (b) {
+    parts.push(`<h4>As a buyer</h4>`);
+    parts.push(statBlock([
+      ["Jobs posted", nf.format(b.posted)],
+      ["Awarded", nf.format(b.awarded)],
+      ["Receipts", nf.format(b.receipted)],
+      ["Sats paid", nf.format(b.satsPaid), "sats"],
+      ["Median price", b.medianPrice == null ? "—" : nf.format(b.medianPrice)],
+      ["Awaiting receipt", nf.format(b.unpaidDeliveries)],
+    ]));
+    if (b.unpaidDeliveries) {
+      parts.push(`<p class="tiny">${b.unpaidDeliveries} delivered ${b.unpaidDeliveries === 1 ? "job has" : "jobs have"} no published receipt.
+        That is not evidence of non-payment — a trade can settle without publishing one — it only means the public record does not show it.</p>`);
+    }
+  }
+  parts.push(`<h4>Recent trades</h4>${tradeList(d.trades, t)}`);
+  showSheet(parts.join(""));
+}
+
+function openEvent(id) {
+  const raw = cache.all().find((e) => e.id === id);
+  if (!raw) return showSheet("<h3>Event not found</h3><p class=\"sub\">It may have scrolled out of the current window.</p>");
+  const e = parseEvent(raw);
+  const rows = [
+    ["Kind", `${KIND_LABELS[raw.kind] || "?"} (${raw.kind})`],
+    ["Published", stamp(raw.created_at)],
+    ["Author", raw.pubkey],
+    ["Event id", raw.id],
+  ];
+  if (e?.offerId) rows.push(["Job", e.offerId]);
+  if (e?.amount != null) rows.push(["Amount", `${nf.format(e.amount)} sat`]);
+  if (e?.reason) rows.push(["Reason", e.reason]);
+  if (e?.status) rows.push(["Status", e.status]);
+  if (e?.targetSeller) rows.push(["Target seller", e.targetSeller]);
+  if (e?.hasPaymentRequest) rows.push(["Payment request", "attached"]);
+
+  const body = String(raw.content || "").trim();
+  showSheet(`<h3>${KIND_LABELS[raw.kind] || "Event"}</h3>
+    <p class="sub">${raw.id}</p>
+    <dl class="kv">${rows.map(([k, v]) => `<div><dt>${k}</dt><dd>${esc(v)}</dd></div>`).join("")}</dl>
+    ${body ? `<h4>Content</h4><p class="tiny"><code>${esc(body.slice(0, 600))}</code></p>` : ""}`);
+}
+
+function showSheet(html) {
+  el("detail-body").innerHTML = html;
+  el("detail").hidden = false;
+  el("detail-close").focus();
+}
+function closeSheet() { el("detail").hidden = true; }
+
+/* ---------------- wiring ---------------- */
 
 let pending = 0;
 function render() {
   if (pending) return;
   pending = requestAnimationFrame(() => {
     pending = 0;
-    const events = cache.all();
-    const metrics = marketMetrics(events);
-    renderTotals(metrics);
-    renderFunnel(metrics);
-    renderFeed(events, Math.floor(Date.now() / 1000));
+    const events = withinWindow(cache.all(), windowKey, now());
+    renderBuyers(events);
+    renderSellers(events);
+    renderFeed(events);
   });
 }
 
 el("relay-url").textContent = RELAY_URL;
+renderWindows();
 
-const client = createRelayClient({
-  url: RELAY_URL,
-  onEvent: (event) => { if (cache.ingest(event).stored) render(); },
-  onStatus: ({ state, detail }) => setStatus(state, detail),
-  onHistoryComplete: () => render(),
+el("windows").addEventListener("click", (ev) => {
+  const key = ev.target.closest("button")?.dataset.window;
+  if (!key || key === windowKey) return;
+  windowKey = key;
+  renderWindows();
+  render();
 });
 
-client.connect();
+document.addEventListener("click", (ev) => {
+  const row = ev.target.closest("[data-open]");
+  if (!row) return;
+  const events = withinWindow(cache.all(), windowKey, now());
+  if (row.dataset.open === "event") openEvent(row.dataset.id);
+  else openParticipant(row.dataset.open, row.dataset.pk, events);
+});
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") closeSheet();
+  if (ev.key === "Enter" && ev.target.matches?.("[data-open]")) ev.target.click();
+});
+el("detail-close").addEventListener("click", closeSheet);
+el("detail").addEventListener("click", (ev) => { if (ev.target === el("detail")) closeSheet(); });
+
+createRelayClient({
+  url: RELAY_URL,
+  onEvent: (event) => { if (cache.ingest(event).stored) render(); },
+  onStatus: ({ state, detail }) => setConn(state, detail),
+  onHistoryComplete: () => render(),
+}).connect();

@@ -11,3 +11,4 @@ import "./cache.test.mjs";
 import "./model.test.mjs";
 import "./trades.test.mjs";
 import "./relay.test.mjs";
+import "./participants.test.mjs";
