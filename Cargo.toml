@@ -5,6 +5,13 @@ members = [
     "crates/mobee-evals",
     "crates/mobee",
 ]
+# mobee-desktop pulls egui's native deps (wayland/x11/fontconfig); keep it out of
+# default builds so headless boxes and CI don't inherit them. Build with -p mobee-desktop.
+default-members = [
+    "crates/mobee-core",
+    "crates/mobee-evals",
+    "crates/mobee",
+]
 resolver = "3"
 
 [workspace.package]
