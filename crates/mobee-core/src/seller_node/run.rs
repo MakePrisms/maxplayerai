@@ -774,6 +774,11 @@ pub struct SellerNodeRunner {
 /// "the relay refused us inside its own bounds" and "we outran our own backstop" are the same value
 /// to the caller and completely different facts about [`BUZZ_START_TIMEOUT`] — the second one says
 /// the backstop is bearing load, which is the thing worth noticing.
+///
+/// `Live` is far larger than the other variants, and boxing it would buy nothing: exactly one of
+/// these exists per process boot and it is destructured immediately, so the size difference costs a
+/// few hundred stack bytes once — where an allocation would cost one every time.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum BuzzStartOutcome {
     /// A live persona; the handle is held for the node's lifetime.
     Live(buzz::BuzzHandle),
