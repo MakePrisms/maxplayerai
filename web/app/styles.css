@@ -217,3 +217,8 @@ button { font: inherit; color: inherit; }
   border-radius: 4px;
   padding: 2px 5px;
 }
+
+.who2 { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.who2 .nm { font-size: 12.5px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.who2 .nm code { color: var(--ink-2); }
+.who2 .meta { display: flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--faint); font-family: var(--mono); overflow: hidden; white-space: nowrap; }

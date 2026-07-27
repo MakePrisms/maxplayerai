@@ -121,8 +121,19 @@ export function parseEvent(event) {
                amount: firstNumber(event, "amount", "amt", "sats") };
     case HEARTBEAT:
       return { ...base, d: firstTag(event, "d") || "", status: firstTag(event, "status") };
-    case HANDLER:
-      return { ...base, d: firstTag(event, "d") || "", handler: parseJsonContent(event) };
+    case HANDLER: {
+      // A seller's advert: who they are, what they charge, whether they will
+      // take work nobody offered them directly.
+      const h = parseJsonContent(event);
+      const rate = Number.parseFloat(h.rate_sats);
+      return { ...base, d: firstTag(event, "d") || "", handler: h,
+               name: h.name || h.display_name || null,
+               about: h.about || null,
+               askSats: Number.isFinite(rate) ? rate : null,
+               openPool: h.claim_open_pool === true,
+               mint: h.mint || null,
+               runtime: h.agent || null };
+    }
     case PROFILE: {
       const p = parseJsonContent(event);
       return { ...base, name: p.name || p.display_name || null, about: p.about || null };

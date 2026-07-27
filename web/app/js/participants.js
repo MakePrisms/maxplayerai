@@ -105,7 +105,9 @@ export function sellerBoard(events, now) {
             released: 0, deliverTimes: [], lastSeen: 0, online: false, capabilities: [],
             // Which agent runtime actually did the work, counted per delivery —
             // a seller may move between harnesses, so this is a tally, not a label.
-            harnessCounts: {} };
+            harnessCounts: {},
+            // Self-advertised, from the newest advert. Claims, not measurements.
+            name: null, about: null, askSats: null, openPool: false, mint: null, advertisedAt: 0 };
       rows.set(pk, r);
     }
     return r;
@@ -132,9 +134,19 @@ export function sellerBoard(events, now) {
       r.lastSeen = Math.max(r.lastSeen, p.created_at);
       if (now - p.created_at <= LIVE_WITHIN_SECONDS) r.online = true;
     } else if (p.kind === HANDLER) {
+      // The advert is what a seller says about itself: its name, its asking
+      // rate, and whether it will take work nobody offered it directly. Kept
+      // distinct from measured behaviour — a claim, not a track record.
       const r = get(p.pubkey);
-      const name = p.handler?.name || p.handler?.display_name || p.d;
-      if (name && !r.capabilities.includes(name)) r.capabilities.push(name);
+      if (p.name && !r.capabilities.includes(p.name)) r.capabilities.push(p.name);
+      if (p.created_at >= r.advertisedAt) {
+        r.advertisedAt = p.created_at;
+        r.name = p.name || r.name;
+        r.about = p.about || r.about;
+        r.askSats = p.askSats != null ? p.askSats : r.askSats;
+        r.openPool = p.openPool;
+        r.mint = p.mint || r.mint;
+      }
     } else if (p.kind === RESULT && p.harness) {
       const r = get(p.pubkey);
       r.harnessCounts[p.harness] = (r.harnessCounts[p.harness] || 0) + 1;

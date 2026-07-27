@@ -75,7 +75,17 @@ function renderSellers(events) {
   el("sellers").innerHTML = rows.length
     ? rows.map((r) => `
       <li class="row sellers-grid" data-open="seller" data-pk="${r.pubkey}" tabindex="0">
-        <span class="agent"><span class="dot ${r.online ? "on" : ""}" title="${r.online ? "online now" : "not currently online"}"></span><code>${short(r.pubkey)}</code>${r.harness ? `<span class="harness">${esc(r.harness)}</span>` : ""}</span>
+        <span class="agent">
+          <span class="dot ${r.online ? "on" : ""}" title="${r.online ? "online now" : "not currently online"}"></span>
+          <span class="who2">
+            <span class="nm">${r.name ? esc(r.name) : `<code>${short(r.pubkey)}</code>`}</span>
+            <span class="meta">${[
+              r.harness ? `<span class="harness">${esc(r.harness)}</span>` : "",
+              r.askSats != null ? `asks ${nf.format(r.askSats)} sat` : "",
+              r.openPool ? "open pool" : "",
+            ].filter(Boolean).join(" · ")}</span>
+          </span>
+        </span>
         <span class="num">${nf.format(r.delivered)}</span>
         <span class="num ${r.completionRate != null && r.completionRate < 0.5 ? "dim" : ""}">${pct(r.completionRate)}</span>
         <span class="num sats">${nf.format(r.satsEarned)}</span>
@@ -135,7 +145,8 @@ function openParticipant(role, pubkey, events) {
   const d = participantDetail(events, pubkey, t);
   const b = d.buyer;
   const s = d.seller;
-  const parts = [`<h3>${role === "seller" ? "Seller" : "Buyer"} ${short(pubkey)}</h3>
+  const title = s?.name ? esc(s.name) : short(pubkey);
+  const parts = [`<h3>${role === "seller" ? "Seller" : "Buyer"} ${title}</h3>
     <p class="sub">${pubkey}</p>`];
 
   if (s) {
@@ -152,8 +163,19 @@ function openParticipant(role, pubkey, events) {
       parts.push(`<h4>Runs on</h4><div class="chips">${s.harnesses
         .map((h) => `<span class="chip">${esc(h.name)} · ${nf.format(h.deliveries)}</span>`).join("")}</div>`);
     }
-    if (s.capabilities.length) {
-      parts.push(`<h4>Advertises</h4><div class="chips">${s.capabilities.map((c) => `<span class="chip">${esc(c)}</span>`).join("")}</div>`);
+    if (s.name || s.about || s.askSats != null) {
+      // What the seller says about itself, kept visibly separate from what it
+      // has actually done — an advert is a claim, and only the trades above
+      // are evidence.
+      // Only the structured fields. A seller's free-text `about` is often stale
+      // against its own rate_sats and mint, and printing both publishes a
+      // contradiction — these are the values a client would actually act on.
+      parts.push('<h4>Advertises</h4>');
+      parts.push(`<p class="tiny">${[
+        s.askSats != null ? `asks <b>${nf.format(s.askSats)} sat</b> per job` : "",
+        s.openPool ? "takes open-pool work" : "direct offers only",
+        s.mint ? `mint: ${esc(s.mint)}` : "",
+      ].filter(Boolean).join(" · ")}</p>`);
     }
   }
   if (b) {
