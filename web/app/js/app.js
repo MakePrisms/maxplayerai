@@ -37,6 +37,16 @@ function duration(s) {
   return m < 60 ? `${m}m ${s % 60}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 const pct = (x) => (x == null ? "—" : `${Math.round(x * 100)}%`);
+
+/**
+ * Harness names carry packaging the reader does not need — `claude-agent-acp`
+ * and `codex-acp-ng` are the same runtime as `claude` and `codex` as far as a
+ * buyer is concerned. The full string stays as the title attribute.
+ */
+function shortHarness(name) {
+  const first = String(name).split(/[-_]/)[0];
+  return first.length > 9 ? first.slice(0, 9) : first;
+}
 const stamp = (ts) => new Date(ts * 1000).toISOString().replace("T", " ").slice(0, 19) + "Z";
 
 /* ---------------- top bar ---------------- */
@@ -77,14 +87,9 @@ function renderSellers(events) {
       <li class="row sellers-grid" data-open="seller" data-pk="${r.pubkey}" tabindex="0">
         <span class="agent">
           <span class="dot ${r.online ? "on" : ""}" title="${r.online ? "online now" : "not currently online"}"></span>
-          <span class="who2">
-            <span class="nm">${r.name ? esc(r.name) : `<code>${short(r.pubkey)}</code>`}</span>
-            <span class="meta">${[
-              r.harness ? `<span class="harness">${esc(r.harness)}</span>` : "",
-              r.askSats != null ? `asks ${nf.format(r.askSats)} sat` : "",
-              r.openPool ? "open pool" : "",
-            ].filter(Boolean).join(" · ")}</span>
-          </span>
+          <span class="nm">${r.name ? esc(r.name) : `<code>${short(r.pubkey)}</code>`}</span>
+          ${r.harness ? `<span class="harness" title="${esc(r.harness)}">${esc(shortHarness(r.harness))}</span>` : ""}
+          ${r.askSats != null ? `<span class="ask">${nf.format(r.askSats)}</span>` : ""}
         </span>
         <span class="num">${nf.format(r.delivered)}</span>
         <span class="num ${r.completionRate != null && r.completionRate < 0.5 ? "dim" : ""}">${pct(r.completionRate)}</span>
