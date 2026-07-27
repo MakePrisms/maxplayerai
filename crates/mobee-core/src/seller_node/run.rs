@@ -830,8 +830,11 @@ impl ShutdownSignals {
         }
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
-            match (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) {
+            use tokio::signal::unix::{SignalKind, signal};
+            match (
+                signal(SignalKind::terminate()),
+                signal(SignalKind::interrupt()),
+            ) {
                 (Ok(terminate), Ok(interrupt)) => Some(Self {
                     terminate,
                     interrupt,

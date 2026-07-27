@@ -8,7 +8,7 @@
 //! the positive control for the unconfigured one: the silence asserted for a `[buzz]`-less node is
 //! only evidence because the instrument demonstrably sees the configured node's traffic.
 
-use super::run::{ShutdownSignals, SellerNodeRunner, BUZZ_START_TIMEOUT};
+use super::run::{BUZZ_START_TIMEOUT, SellerNodeRunner, ShutdownSignals};
 use crate::home::{self, BuzzConfig};
 
 use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
@@ -23,7 +23,10 @@ static WIRE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn unique_root(label: &str) -> std::path::PathBuf {
     let n = WIRE_SEQ.fetch_add(1, Ordering::SeqCst);
-    std::env::temp_dir().join(format!("mobee-buzz-wire-{label}-{}-{n}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "mobee-buzz-wire-{label}-{}-{n}",
+        std::process::id()
+    ))
 }
 
 async fn start_relay() -> (LocalRelay, String) {
@@ -193,7 +196,10 @@ async fn a_buzz_relay_that_is_down_never_keeps_the_node_from_booting() {
     let started = std::time::Instant::now();
     let booted = SellerNodeRunner::boot(home).await;
     let elapsed = started.elapsed();
-    eprintln!("boot with a dead buzz relay: ok={} in {elapsed:?}", booted.is_ok());
+    eprintln!(
+        "boot with a dead buzz relay: ok={} in {elapsed:?}",
+        booted.is_ok()
+    );
 
     let runner = booted.expect("a dead buzz relay must NOT fail the boot");
     assert!(
