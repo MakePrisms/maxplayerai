@@ -69,6 +69,11 @@ export function createRelayClient({
   onHistoryComplete = () => {},
   openSocket = (u) => new WebSocket(u),
   now = () => Math.floor(Date.now() / 1000),
+  // Injectable so a test can drive the retry itself. A test that waits out a
+  // real backoff is asserting against a clock, which rots the moment any
+  // machine or dependency changes speed.
+  setTimer = (fn, ms) => setTimeout(fn, ms),
+  clearTimer = (id) => clearTimeout(id),
 } = {}) {
   let ws = null;
   let phase = "idle";           // idle | history | live | failed
@@ -158,7 +163,7 @@ export function createRelayClient({
     const wait = BACKOFF[Math.min(attempt, BACKOFF.length - 1)];
     attempt += 1;
     status("reconnecting", `retrying in ${Math.round(wait / 1000)}s`);
-    retryTimer = setTimeout(() => { retryTimer = null; connect(); }, wait);
+    retryTimer = setTimer(() => { retryTimer = null; connect(); }, wait);
   }
 
   function connect() {
@@ -184,7 +189,7 @@ export function createRelayClient({
 
   return {
     connect,
-    stop() { stopped = true; if (retryTimer) clearTimeout(retryTimer); retryTimer = null; teardown(); status("idle"); },
+    stop() { stopped = true; if (retryTimer) clearTimer(retryTimer); retryTimer = null; teardown(); status("idle"); },
     get phase() { return phase; },
     get pagesRead() { return pages; },
   };

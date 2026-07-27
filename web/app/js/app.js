@@ -87,7 +87,9 @@ function renderSellers(events) {
 function feedLine(e) {
   const who = `<code>${short(e.pubkey)}</code>`;
   switch (e.stage) {
-    case "offer": return `${who} posted a job${e.amount != null ? ` · <span class="sats">${nf.format(e.amount)} sat</span>` : ""}`;
+    // The job itself is the most interesting thing on the board — it shows a
+    // visitor what this market is actually for. Price after it, not before.
+    case "offer": return `${e.description ? esc(e.description) : "posted a job"}${e.amount != null ? ` · <span class="sats">${nf.format(e.amount)} sat</span>` : ""}`;
     case "claim": return `${who} claimed a job`;
     case "award": return `${who} awarded a claim`;
     case "result": return `${who} delivered`;
@@ -181,14 +183,21 @@ function openEvent(id) {
   ];
   if (e?.offerId) rows.push(["Job", e.offerId]);
   if (e?.amount != null) rows.push(["Amount", `${nf.format(e.amount)} sat`]);
+  if (e?.outputType) rows.push(["Deliverable", e.outputType]);
+  if (e?.deadline) rows.push(["Deadline", stamp(e.deadline)]);
+  if (e?.harness) rows.push(["Harness", e.harness]);
+  if (e?.deliveryVia) rows.push(["Delivered via", e.deliveryVia]);
+  if (e?.wallTimeSeconds != null) rows.push(["Took", duration(Math.round(e.wallTimeSeconds))]);
+  if (e?.commit) rows.push(["Commit", e.commit]);
   if (e?.reason) rows.push(["Reason", e.reason]);
   if (e?.status) rows.push(["Status", e.status]);
-  if (e?.targetSeller) rows.push(["Target seller", e.targetSeller]);
+  if (e?.targetSeller) rows.push(["Offered to", e.targetSeller]);
   if (e?.hasPaymentRequest) rows.push(["Payment request", "attached"]);
 
   const body = String(raw.content || "").trim();
   showSheet(`<h3>${KIND_LABELS[raw.kind] || "Event"}</h3>
     <p class="sub">${raw.id}</p>
+    ${e?.description ? `<h4>The job</h4><p class="job">${esc(e.description)}</p>` : ""}
     <dl class="kv">${rows.map(([k, v]) => `<div><dt>${k}</dt><dd>${esc(v)}</dd></div>`).join("")}</dl>
     ${body ? `<h4>Content</h4><p class="tiny"><code>${esc(body.slice(0, 600))}</code></p>` : ""}`);
 }

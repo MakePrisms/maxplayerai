@@ -8,14 +8,53 @@ const pk = (c) => c.repeat(64);
 const ev = (kind, { id = "x", pubkey = pk("a"), at = 1000, tags = [], content = "" }) =>
   ({ id, kind, pubkey, created_at: at, tags, content });
 
-test("an offer is its own trade root and carries its price", () => {
-  const p = parseEvent(ev(OFFER, { id: "o1", tags: [["amount", "21", "sat"], ["p", pk("c")]], content: "do a thing" }));
+// Tag shapes below are copied from real offers on the relay, not invented.
+// An earlier version of these fixtures supplied a `content` description that
+// live offers never carry, so the parser read a field that was always empty
+// and the tests still passed.
+test("an offer is its own trade root and carries its price and the job", () => {
+  const p = parseEvent(ev(OFFER, {
+    id: "o1",
+    tags: [
+      ["i", "Create a file rebind2.txt containing exactly one line"],
+      ["output", "text/plain"],
+      ["amount", "21", "sat"],
+      ["param", "deadline", "1785184881"],
+      ["p", pk("c")],
+    ],
+  }));
   assert.equal(p.stage, "offer");
   assert.equal(p.offerId, "o1");
   assert.equal(p.buyer, pk("a"));
   assert.equal(p.amount, 21);
   assert.equal(p.targetSeller, pk("c"));
-  assert.equal(p.description, "do a thing");
+  assert.equal(p.description, "Create a file rebind2.txt containing exactly one line");
+  assert.equal(p.outputType, "text/plain");
+  assert.equal(p.deadline, 1785184881);
+});
+
+test("the job description comes from the i tag, never from content", () => {
+  // Every live offer has empty content; reading it gives a field with no value.
+  const p = parseEvent(ev(OFFER, { id: "o1", tags: [["i", "the actual job"]], content: "" }));
+  assert.equal(p.description, "the actual job");
+
+  const none = parseEvent(ev(OFFER, { id: "o2", tags: [["amount", "5", "sat"]] }));
+  assert.equal(none.description, "", "an offer with no i tag has no description, not undefined");
+});
+
+test("a result reports what did the work and how it was handed over", () => {
+  const p = parseEvent(ev(RESULT, {
+    pubkey: pk("c"),
+    tags: [
+      ["e", "o1", "", "root"], ["delivery", "git"], ["harness", "grok"],
+      ["commit", "42b8115deae26731523dbe1686ef00a008b66414"],
+      ["amount", "10", "sat"], ["wall_time", "137"],
+    ],
+  }));
+  assert.equal(p.harness, "grok");
+  assert.equal(p.deliveryVia, "git");
+  assert.equal(p.commit, "42b8115deae26731523dbe1686ef00a008b66414");
+  assert.equal(p.wallTimeSeconds, 137);
 });
 
 test("rootOfferId prefers the root marker over an incidental e-tag", () => {

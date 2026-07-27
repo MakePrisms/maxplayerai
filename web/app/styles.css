@@ -193,3 +193,14 @@ button { font: inherit; color: inherit; }
   .windows button { flex: 1; }
 }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
+
+.job {
+  margin: 0 0 4px;
+  padding: 12px 14px;
+  background: var(--raise);
+  border-left: 2px solid var(--honey);
+  border-radius: 0 8px 8px 0;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--ink);
+}

@@ -20,6 +20,7 @@ function fakeSocket() {
 }
 
 function clientOn(sock, overrides = {}) {
+  // sock may be null when the caller supplies its own openSocket factory.
   const events = [];
   const statuses = [];
   const client = createRelayClient({
@@ -151,6 +152,53 @@ test("events reach the caller as they arrive", () => {
   sock.deliver(evt("e1"));
   sock.deliver(evt("e2"));
   assert.deepEqual(events.map((e) => e.id), ["e1", "e2"]);
+});
+
+test("a dropped socket reconnects and reads history again", () => {
+  // This relay is known to drop subscriptions mid-session. A client that
+  // reaches "live" once and then dies quietly looks identical, in a single
+  // check, to one that stays connected — so the recovery path is asserted here
+  // rather than inferred from one successful connect.
+  const sockets = [];
+  const timers = [];
+  const { client, statuses } = clientOn(null, {
+    openSocket: () => { const s = fakeSocket(); sockets.push(s); return s; },
+    // Drive the backoff by hand. Waiting out a real one would assert against a
+    // clock, and a test that sleeps "long enough" rots when anything changes speed.
+    setTimer: (fn) => { timers.push(fn); return timers.length; },
+    clearTimer: () => {},
+  });
+  client.connect();
+  sockets[0].open();
+  sockets[0].deliver(evt("e1", 900));
+  sockets[0].deliver(["EOSE", "h1"]);
+
+  assert.equal(sockets.length, 1);
+  sockets[0].onclose();                       // the drop
+
+  assert.ok(statuses.some((s) => s.state === "reconnecting"), "a drop must surface, not be swallowed");
+  assert.equal(timers.length, 1, "a retry must be scheduled");
+
+  timers[0]();                                // the backoff elapses
+
+  assert.equal(sockets.length, 2, "a fresh socket is opened");
+  sockets[1].open();
+  const reissued = reqs(sockets[1]);
+  assert.equal(reissued.length, 1, "history is requested again on the new socket");
+  assert.equal(reissued[0][2].until, undefined, "and it restarts from the top, not mid-page");
+});
+
+test("stop() means stop — a drop after it must not reconnect", () => {
+  const sockets = [];
+  const { client, statuses } = clientOn(null, {
+    openSocket: () => { const s = fakeSocket(); sockets.push(s); return s; },
+  });
+  client.connect();
+  sockets[0].open();
+  client.stop();
+  sockets[0].onclose?.();
+  assert.ok(!statuses.some((s) => s.state === "reconnecting"), "stopped clients stay stopped");
+  assert.equal(sockets.length, 1);
 });
 
 test("the client never sends anything but reads", () => {

@@ -53,6 +53,14 @@ function parseJsonContent(event) {
 }
 
 /**
+ * A `param` tag is a named value: ["param", "deadline", "1785184881"].
+ */
+export function param(event, name) {
+  for (const t of event.tags || []) if (t[0] === "param" && t[1] === name) return t[2];
+  return null;
+}
+
+/**
  * A feedback event's reason is the code before the first colon
  * ("claim_released: ..."), not free text. Anything unlike a code is unspecified.
  */
@@ -85,7 +93,12 @@ export function parseEvent(event) {
     case OFFER:
       return { ...base, offerId: event.id, buyer: event.pubkey,
                amount: firstNumber(event, "amount", "rate", "price", "sats"),
-               targetSeller: firstTag(event, "p"), description: event.content || "" };
+               targetSeller: firstTag(event, "p"),
+               // The job itself is the `i` (input) tag. Offer content is empty
+               // in practice, so reading it yields a field that is never set.
+               description: firstTag(event, "i") || "",
+               outputType: firstTag(event, "output"),
+               deadline: Number.parseInt(param(event, "deadline"), 10) || null };
     case CLAIM:
       return { ...base, offerId: rootOfferId(event), seller: event.pubkey,
                status: firstTag(event, "status"), hasPaymentRequest: Boolean(firstTag(event, "creq")) };
@@ -94,7 +107,12 @@ export function parseEvent(event) {
                status: firstTag(event, "status") };
     case RESULT:
       return { ...base, offerId: rootOfferId(event), seller: event.pubkey,
-               amount: firstNumber(event, "amount", "amt", "sats") };
+               amount: firstNumber(event, "amount", "amt", "sats"),
+               // What actually did the work, and how it was handed over.
+               harness: firstTag(event, "harness"),
+               deliveryVia: firstTag(event, "delivery"),
+               commit: firstTag(event, "commit"),
+               wallTimeSeconds: firstNumber(event, "wall_time") };
     case FEEDBACK:
       return { ...base, offerId: rootOfferId(event), seller: event.pubkey,
                reason: feedbackReason(event) };
