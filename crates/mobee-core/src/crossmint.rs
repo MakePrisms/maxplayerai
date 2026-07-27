@@ -50,6 +50,19 @@ impl PayPlan {
         }
     }
 
+    /// The buyer's own funded mint — where the proofs being spent live, on either path.
+    ///
+    /// This is the SELECTION the accept-bind freezes. Freezing the selection rather than the
+    /// realized mint is what keeps the hop reachable: the realized mint of a hop is already in the
+    /// seller's accepted set, so a bind that sealed it would re-plan at pay time as a direct payment
+    /// from a mint the buyer holds nothing at.
+    pub fn source_mint(&self) -> &MintUrl {
+        match self {
+            Self::Direct { mint } => mint,
+            Self::Hop { source, .. } => source,
+        }
+    }
+
     /// The hop's source mint, or `None` on the direct path.
     pub fn hop_source(&self) -> Option<&MintUrl> {
         match self {
@@ -186,6 +199,10 @@ pub struct HopJournal {
     pub target_mint: String,
     /// Mint quote id at the target mint — the handle recovery uses to detect a paid-but-unissued strand.
     pub mint_quote_id: String,
+    /// What the seller receives: the amount pinned by the buyer-signed offer. Journalled so a
+    /// recovering process knows what to expect at the target without re-reading it from anywhere
+    /// that could have changed since the offer was signed.
+    pub delivered_sats: u64,
     /// Cost charged against the cap before the melt.
     pub planned_cost: u64,
 }
@@ -246,6 +263,35 @@ mod tests {
         // the attempt id and the receipt must bind it rather than the buyer's funded mint.
         assert_eq!(plan.realized_mint(), &mint("https://seller.example"));
         assert_eq!(plan.hop_source(), Some(&mint("https://buyer.example")));
+        // The source is the buyer's own mint on either path — that is what the accept-bind seals.
+        assert_eq!(plan.source_mint(), &mint("https://buyer.example"));
+    }
+
+    // What the accept-bind seals must re-plan into the SAME payment. Sealing the realized mint
+    // instead would make a hop re-plan as a direct payment from a mint the buyer holds nothing at,
+    // which is how a hop ships dead.
+    #[test]
+    fn the_sealed_source_replans_into_the_same_plan() {
+        let accepted = vec![
+            "https://first.example".to_owned(),
+            "https://second.example".to_owned(),
+        ];
+        let planned = plan_payment("https://buyer.example", &accepted, true).expect("plans");
+        let sealed = planned.source_mint().to_string();
+
+        let replanned = plan_payment(&sealed, &accepted, true).expect("the sealed source re-plans");
+        assert_eq!(replanned, planned, "the seal must re-derive the same plan");
+        assert!(replanned.is_hop(), "re-planning must not collapse the hop");
+        assert_eq!(replanned.realized_mint(), planned.realized_mint());
+    }
+
+    // The direct path's seal is unchanged: the buyer's own mint, which is also what it realizes at.
+    #[test]
+    fn the_direct_path_seals_the_mint_it_realizes_at() {
+        let plan = plan_payment(DEFAULT_MINT_URL, &[DEFAULT_MINT_URL.to_owned()], false)
+            .expect("direct plans");
+        assert_eq!(plan.source_mint(), plan.realized_mint());
+        assert_eq!(plan.source_mint(), &mint(DEFAULT_MINT_URL));
     }
 
     // The attempt id is derived from the realized mint, so a retry must re-derive the SAME target or
@@ -380,6 +426,7 @@ mod tests {
             melt_quote_id: "melt-quote-1".to_owned(),
             target_mint: "https://b.example".to_owned(),
             mint_quote_id: "mint-quote-1".to_owned(),
+            delivered_sats: 100,
             planned_cost: 109,
         };
         let encoded = serde_json::to_string(&journal).expect("journal serializes");
@@ -387,6 +434,10 @@ mod tests {
         assert_eq!(decoded, journal);
         assert_eq!(decoded.melt_quote_id, "melt-quote-1");
         assert_eq!(decoded.mint_quote_id, "mint-quote-1");
+        // The delivered amount survives the round trip separately from the cost: recovery must be
+        // able to issue exactly the offer amount without consulting anything mutable.
+        assert_eq!(decoded.delivered_sats, 100);
+        assert_ne!(decoded.delivered_sats, decoded.planned_cost);
     }
 
     // Selection skips an unfenced entry rather than refusing outright when a later entry is fine.

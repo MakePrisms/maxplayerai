@@ -273,7 +273,9 @@ pub async fn open_wallet_async(
     .map_err(|error| WalletOpsError::Wallet(error.to_string()))
 }
 
-async fn poll_and_mint(
+/// Wait for a mint quote to be paid, then issue it. Refuses a phantom credit (nothing issued) and an
+/// issue that does not equal what was quoted.
+pub(crate) async fn poll_and_mint(
     wallet: &Wallet,
     quote_id: &str,
     expected_sats: u64,

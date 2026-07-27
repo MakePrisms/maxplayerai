@@ -7,7 +7,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use cashu::{Amount, CurrencyUnit, MintUrl, PublicKey as CashuPublicKey};
+use cashu::{Amount, CurrencyUnit, PublicKey as CashuPublicKey};
 use nostr_sdk::secp256k1::{Message, Secp256k1};
 use nostr_sdk::Keys;
 use nostr_sdk::PublicKey as NostrPublicKey;
@@ -15,6 +15,7 @@ use nostr_sdk::Timestamp;
 
 use crate::budget::{BudgetGate, BudgetRefuse};
 use crate::buyer_fund::{self, FundError};
+use crate::crossmint_hop::{self, CdkHopEffects, FsHopJournal, HopError};
 use crate::delivery::{CommitOid, DeliveryError, GitDelivery};
 use crate::delivery_git::PayPathDeliveryVerifier;
 use crate::gateway;
@@ -108,7 +109,12 @@ pub struct ContributionPayBinds {
 pub struct AuthorizePayOutcome {
     pub state: PaymentState,
     pub attempt_id: String,
+    /// What the seller received — the buyer-signed offer amount.
     pub amount_sats: u64,
+    /// What the budget cap was charged. Equals `amount_sats` on the direct path; a cross-mint hop
+    /// costs the buyer the Lightning fee reserve and the source mint's input fee on top, so the two
+    /// differ and the gap is the hop's cost rather than anything the seller was paid.
+    pub charged_sats: u64,
     pub spent_total_sats: u64,
     pub remaining_sats: u64,
 }
@@ -119,6 +125,9 @@ pub enum AuthorizePayError {
     Budget(BudgetRefuse),
     Fund(FundError),
     Delivery(DeliveryError),
+    /// A cross-mint hop refused. Every variant is fail-closed; the pays-once cases name the quote
+    /// ids so an operator can ask the mints directly.
+    Hop(HopError),
     Payment(PaymentError),
     Wallet(PaymentWalletError),
     Home(String),
@@ -135,6 +144,7 @@ impl fmt::Display for AuthorizePayError {
             Self::Budget(refuse) => write!(formatter, "{refuse}"),
             Self::Fund(error) => write!(formatter, "{error}"),
             Self::Delivery(error) => write!(formatter, "authorize_pay delivery: {error}"),
+            Self::Hop(error) => write!(formatter, "authorize_pay: {error}"),
             Self::Payment(error) => write!(formatter, "authorize_pay payment: {error}"),
             Self::Wallet(error) => write!(formatter, "authorize_pay wallet: {error}"),
             Self::CosigRefused(message) => write!(formatter, "authorize_pay payment: {message}"),
@@ -173,6 +183,12 @@ impl From<PaymentError> for AuthorizePayError {
 impl From<PaymentWalletError> for AuthorizePayError {
     fn from(value: PaymentWalletError) -> Self {
         Self::Wallet(value)
+    }
+}
+
+impl From<HopError> for AuthorizePayError {
+    fn from(value: HopError) -> Self {
+        Self::Hop(value)
     }
 }
 
@@ -245,13 +261,18 @@ pub async fn authorize_pay_async(
         .realized_mint
         .as_deref()
         .unwrap_or_else(|| home.config.default_mint());
-    let mint = resolve_realized_mint(
+    // A buyer funded only at mints the seller does not accept still has a way through: melt at a
+    // funded mint to pay a mint quote raised at one the seller does accept, and pay from there. The
+    // plan decides which of those two shapes this payment is; the realized mint is where the ecash
+    // the seller receives ends up, so for a hop it is the TARGET, and the terms, the attempt id and
+    // the receipt all bind that one mint exactly as they do on the direct path.
+    let plan = crate::crossmint::plan_payment(
         buyer_selected_mint,
         &request.accepted_mints,
         home.config.allow_real_mints,
     )?;
     let terms = PaymentTerms::new(
-        mint,
+        plan.realized_mint().clone(),
         Amount::from(request.amount_sats),
         CurrencyUnit::Sat,
         seller_nostr,
@@ -378,6 +399,33 @@ pub async fn authorize_pay_async(
     crate::payment::verify_pay_path_delivery(&mut verifier, &delivery, &key)
         .map_err(AuthorizePayError::Payment)?;
 
+    let amount = request.amount_sats;
+    // Cross-mint hop planning. Pre-budget and pre-spend: raising quotes moves no money, so a hop
+    // that cannot be priced refuses having spent nothing. Delivery is PINNED here — the quote at the
+    // seller's mint is raised for exactly `amount`, the buyer-signed offer amount — and the buyer's
+    // COST is what floats, which is why no fee reading can reduce what the seller receives.
+    let mut hop = match plan.hop_source() {
+        None => None,
+        Some(source) => {
+            let store = FsHopJournal::new(home.root.join("crossmint-journal"));
+            let effects =
+                CdkHopEffects::open(
+                    home,
+                    &source.to_string(),
+                    &wallet_open_mint_url(home, &terms),
+                )
+                .await?;
+            // A pairing already on disk WINS over freshly raised quotes. This attempt may have
+            // melted on an earlier run, and a second melt quote for one attempt id is precisely the
+            // double-pay the hop journal exists to prevent.
+            let pairing = match crossmint_hop::journalled_pairing(&store, attempt_id.as_str())? {
+                Some(existing) => existing,
+                None => effects.plan_quotes(attempt_id.as_str(), amount).await?,
+            };
+            Some((store, effects, pairing))
+        }
+    };
+
     let wallet = buyer_fund::open_wallet_at_mint_async(home, &wallet_open_mint_url(home, &terms))
         .await?;
     // Dust guard (live keyset N=1 floor, fail-closed). lock_or_reconcile re-checks
@@ -409,17 +457,35 @@ pub async fn authorize_pay_async(
         .map_err(|error| AuthorizePayError::Home(format!("payment journal dir: {error}")))?;
     let journal = FsPaymentJournal::new(journal_dir.join(format!("{}.jsonl", attempt_id.as_str())));
 
-    let amount = request.amount_sats;
+    // What the cap is asked to cover. On the direct path that is the amount, exactly as before —
+    // general fee-dust behaviour is a separate question and stays untouched here. A hop costs the
+    // buyer more than it delivers, and every sat of that difference must pass the cap BEFORE the
+    // melt, so the hop is charged its planned cost: melt amount + the source mint's Lightning fee
+    // reserve + its input fee.
+    //
+    // interim: the fee reserve is charged in full rather than reconciled against the fee actually
+    // paid, so a hop can leave the cap reporting less remaining budget than the buyer really spent.
+    // That is the safe direction; reconciling reserve-versus-actual would reshape the spend ledger,
+    // which is money-gate machinery and its own slice — see MakePrisms/mobee#186.
+    let charged = match hop.as_ref() {
+        Some((_, _, pairing)) => pairing.planned_cost,
+        None => amount,
+    };
     // Delivery already verified + bind-checked above (pre-budget). The budget append happens here,
-    // before the wallet send inside `run_verified`.
-    let state = gate.authorize_then_attempt(attempt_id.as_str(), amount, || {
-        PaymentService::new(&journal).run_verified(&key, &terms, &authority, &mut effects)
+    // before any melt and before the wallet send inside `run_verified`.
+    let state = gate.authorize_then_attempt(attempt_id.as_str(), charged, || {
+        if let Some((store, hop_effects, pairing)) = hop.as_mut() {
+            crossmint_hop::run_hop(store, hop_effects, pairing)?;
+        }
+        let state = PaymentService::new(&journal).run_verified(&key, &terms, &authority, &mut effects)?;
+        Ok::<_, AuthorizePayError>(state)
     })??;
 
     Ok(AuthorizePayOutcome {
         state,
         attempt_id: attempt_id.as_str().to_owned(),
         amount_sats: amount,
+        charged_sats: charged,
         spent_total_sats: gate.spent(),
         remaining_sats: gate.remaining(),
     })
@@ -438,27 +504,15 @@ fn contribution_policy(home: &MobeeHome) -> crate::contribution::ContentPolicy {
     }
 }
 
-/// Buyer mint selection for the pay path, config-driven.
-///
-/// `buyer_mint_url` is the mint the buyer's wallet spends from — the home config's default mint
-/// ([`crate::home::MobeeConfig::default_mint`]), the SAME source `buyer_fund` opens the wallet at.
-/// The buyer pays from a mint it holds balance at that the seller listed in its `creq` `m` array;
-/// since the buyer wallet is single-mint, that reduces to: is the buyer's configured mint listed?
-///
-/// - **empty creq list (no creq):** pay from the buyer's configured mint.
-/// - **configured mint listed:** pay directly from it (the direct path).
-/// - **configured mint NOT listed:** the single-mint buyer wallet holds no balance at any mint the
-///   seller listed, so it cannot pay this claim and refuses `mint_unreachable_pay`; no funds move,
-///   no binding is committed.
 /// The mint URL the pay path opens the buyer wallet at: the FROZEN realized mint sealed into the
 /// payment terms (`terms.mint`), NEVER `home.config.default_mint()`. The realized mint is already
-/// resolved from the sealed accept-bind ([`resolve_realized_mint`]) and bound into `terms`; opening
-/// the wallet at the live config default instead would, after accept seals mint A and the buyer
-/// flips its config default to B, bind the wallet to B while the attempt id + send target A — the
-/// budget is appended, then the send refuses on mint mismatch and strands the reservation. Taking
-/// the mint from the sealed terms keeps the wallet, the attempt id, and the send all on one mint.
-/// `home` is passed so the already-fenced invariant is asserted at this seam (the realized mint was
-/// fenced by `resolve_realized_mint`; `open_wallet_at_mint_async` re-checks, redundant-safe).
+/// planned from the sealed accept-bind ([`crate::crossmint::plan_payment`]) and bound into `terms`;
+/// opening the wallet at the live config default instead would, after accept seals mint A and the
+/// buyer flips its config default to B, bind the wallet to B while the attempt id + send target A —
+/// the budget is appended, then the send refuses on mint mismatch and strands the reservation.
+/// Taking the mint from the sealed terms keeps the wallet, the attempt id, and the send all on one
+/// mint. `home` is passed so the already-fenced invariant is asserted at this seam (the realized
+/// mint was fenced while planning; `open_wallet_at_mint_async` re-checks, redundant-safe).
 pub(crate) fn wallet_open_mint_url(home: &MobeeHome, terms: &PaymentTerms) -> String {
     let mint_url = terms.mint.to_string();
     debug_assert!(
@@ -466,41 +520,6 @@ pub(crate) fn wallet_open_mint_url(home: &MobeeHome, terms: &PaymentTerms) -> St
         "frozen realized mint must already be fenced before wallet open"
     );
     mint_url
-}
-
-pub(crate) fn resolve_realized_mint(
-    buyer_mint_url: &str,
-    accepted_mints: &[String],
-    allow_real_mints: bool,
-) -> Result<MintUrl, AuthorizePayError> {
-    // Real-mint fence: the buyer's own paying mint must be admissible under the flag.
-    // Default (`allow_real_mints=false`) admits only the testnut/dev allow-list; a real mint is
-    // refused fail-closed before any spend unless the operator opts in.
-    if !crate::home::mint_allowed(buyer_mint_url, allow_real_mints) {
-        return Err(AuthorizePayError::Input(format!(
-            "real-mint fence: buyer mint {buyer_mint_url} is not an allow-listed testnut/dev mint; \
-             set allow_real_mints=true to pay at a real mint"
-        )));
-    }
-    let buyer_mint = MintUrl::from_str(buyer_mint_url)
-        .map_err(|error| AuthorizePayError::Input(format!("buyer mint url: {error}")))?;
-    if accepted_mints.is_empty() {
-        return Ok(buyer_mint);
-    }
-    let listed = accepted_mints
-        .iter()
-        .map(|entry| MintUrl::from_str(entry))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| {
-            AuthorizePayError::Input(format!("creq accepted mint url: {error}"))
-        })?;
-    if listed.contains(&buyer_mint) {
-        return Ok(buyer_mint);
-    }
-    Err(AuthorizePayError::Wallet(PaymentWalletError::Wallet(format!(
-        "mint_unreachable_pay: buyer mint {buyer_mint} is not in the creq mint list {listed:?}; \
-         the single-mint buyer wallet holds no balance at any accepted mint"
-    ))))
 }
 
 /// Render a co-signed [`ReceiptPreimage`] as a single-line diagnostic: the digest plus every
@@ -766,6 +785,8 @@ fn publish_receipt_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cashu::MintUrl;
+
     use crate::budget::BudgetGate;
     use crate::home::{self, DEFAULT_MINT_URL};
 
@@ -773,17 +794,21 @@ mod tests {
     const REAL_MINT: &str = "https://minibits.example";
 
     // Empty creq list → pay from the buyer's configured mint (config-driven).
-    // Default flag (false): the configured testnut/dev mint resolves.
+    // Default flag (false): the configured testnut/dev mint plans a direct payment.
     #[test]
-    fn resolve_realized_mint_empty_creq_uses_configured_mint() {
-        let mint = resolve_realized_mint(DEFAULT_MINT_URL, &[], false).unwrap();
-        assert_eq!(mint, MintUrl::from_str(DEFAULT_MINT_URL).unwrap());
+    fn pay_plan_empty_creq_uses_configured_mint() {
+        let plan = crate::crossmint::plan_payment(DEFAULT_MINT_URL, &[], false).unwrap();
+        assert!(!plan.is_hop());
+        assert_eq!(
+            plan.realized_mint(),
+            &MintUrl::from_str(DEFAULT_MINT_URL).unwrap()
+        );
     }
 
     // Direct path: the buyer's configured mint is one the seller listed → pay from it directly.
     #[test]
-    fn resolve_realized_mint_direct_when_configured_mint_is_listed() {
-        let mint = resolve_realized_mint(
+    fn pay_plan_is_direct_when_configured_mint_is_listed() {
+        let plan = crate::crossmint::plan_payment(
             DEFAULT_MINT_URL,
             &[
                 "https://other.example".to_string(),
@@ -792,41 +817,99 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(mint, MintUrl::from_str(DEFAULT_MINT_URL).unwrap());
+        assert!(!plan.is_hop(), "overlap must not hop");
+        assert_eq!(
+            plan.realized_mint(),
+            &MintUrl::from_str(DEFAULT_MINT_URL).unwrap()
+        );
     }
 
-    // Configured mint NOT in the creq list → refuse `mint_unreachable_pay` fail-closed (no spend).
+    // The boundary, half one. A configured mint outside the creq list used to be the end of the
+    // road for this claim; it is now a hop to a mint the seller does accept.
+    //
+    // `allow_real_mints` is on because it has to be: with the flag off the fence admits exactly one
+    // mint (the testnut default), so a buyer and a seller can never be at two DIFFERENT admissible
+    // mints and a hop is structurally unreachable in the default posture. The flag is what makes
+    // two distinct admissible mints possible at all.
     #[test]
-    fn resolve_realized_mint_refuses_when_configured_mint_not_listed() {
-        let error = resolve_realized_mint(
-            DEFAULT_MINT_URL,
-            &["https://other.example".to_string()],
+    fn pay_plan_hops_when_the_configured_mint_is_not_listed_but_the_target_is_admissible() {
+        let plan = crate::crossmint::plan_payment(
+            "https://buyer-only.example",
+            &[DEFAULT_MINT_URL.to_string()],
+            true,
+        )
+        .unwrap();
+        assert!(plan.is_hop(), "no overlap must plan a hop, not refuse");
+        assert_eq!(
+            plan.hop_source(),
+            Some(&MintUrl::from_str("https://buyer-only.example").unwrap())
+        );
+        assert_eq!(
+            plan.realized_mint(),
+            &MintUrl::from_str(DEFAULT_MINT_URL).unwrap()
+        );
+    }
+
+    // The same no-overlap shape under the DEFAULT posture refuses, because the buyer's own mint is
+    // not admissible there — the fence stops it before a target is even considered. Together with
+    // the two tests around it this pins the whole boundary: a hop needs the operator's opt-in AND an
+    // admissible landing, and the fence refuses first when either is missing.
+    #[test]
+    fn pay_plan_refuses_a_no_overlap_hop_under_the_default_posture() {
+        let error = crate::crossmint::plan_payment(
+            "https://buyer-only.example",
+            &[DEFAULT_MINT_URL.to_string()],
             false,
         )
         .unwrap_err();
-        assert!(matches!(error, AuthorizePayError::Wallet(_)));
-        assert!(error.to_string().contains("mint_unreachable_pay"));
+        assert!(error.to_string().contains("real-mint fence"), "got: {error}");
+    }
+
+    // The boundary, half two. No overlap AND no admissible landing still refuses fail-closed — the
+    // target fence is the refusal that now covers what the old membership check covered. This pair
+    // pins exactly where "hop" ends and "refuse" begins.
+    #[test]
+    fn pay_plan_refuses_when_no_overlap_and_no_accepted_mint_is_admissible() {
+        let error =
+            crate::crossmint::plan_payment(DEFAULT_MINT_URL, &[REAL_MINT.to_string()], false)
+                .unwrap_err();
+        assert!(matches!(error, AuthorizePayError::Input(_)));
+        let rendered = error.to_string();
+        assert!(rendered.contains("real-mint fence"), "got: {rendered}");
+        assert!(
+            rendered.contains("nowhere permitted to land"),
+            "got: {rendered}"
+        );
     }
 
     // Real-mint switch: a buyer configured at a real mint X is REFUSED by the fence when
     // `allow_real_mints` is false (default safety posture)...
     #[test]
-    fn resolve_realized_mint_real_mint_refused_by_default() {
-        let error = resolve_realized_mint(REAL_MINT, &[REAL_MINT.to_string()], false).unwrap_err();
+    fn pay_plan_real_mint_refused_by_default() {
+        let error = crate::crossmint::plan_payment(REAL_MINT, &[REAL_MINT.to_string()], false)
+            .unwrap_err();
         assert!(matches!(error, AuthorizePayError::Input(_)));
         assert!(error.to_string().contains("real-mint fence"));
     }
 
     // ...and ADMITTED (pays at X when the creq lists X) once the operator opts in with the flag.
     #[test]
-    fn resolve_realized_mint_real_mint_admitted_when_flag_true() {
-        let paid = resolve_realized_mint(REAL_MINT, &[REAL_MINT.to_string()], true).unwrap();
-        assert_eq!(paid, MintUrl::from_str(REAL_MINT).unwrap());
+    fn pay_plan_real_mint_admitted_when_flag_true() {
+        let plan = crate::crossmint::plan_payment(REAL_MINT, &[REAL_MINT.to_string()], true)
+            .unwrap();
+        assert!(!plan.is_hop());
+        assert_eq!(plan.realized_mint(), &MintUrl::from_str(REAL_MINT).unwrap());
 
-        // Even with the flag on, a mint the creq did NOT list still refuses (membership unchanged).
-        let refused =
-            resolve_realized_mint(REAL_MINT, &[DEFAULT_MINT_URL.to_string()], true).unwrap_err();
-        assert!(refused.to_string().contains("mint_unreachable_pay"));
+        // With the flag on, a creq that lists a DIFFERENT admissible mint is now reachable by hop
+        // rather than refused for non-membership.
+        let hopped =
+            crate::crossmint::plan_payment(REAL_MINT, &[DEFAULT_MINT_URL.to_string()], true)
+                .unwrap();
+        assert!(hopped.is_hop());
+        assert_eq!(
+            hopped.realized_mint(),
+            &MintUrl::from_str(DEFAULT_MINT_URL).unwrap()
+        );
     }
 
     // Build a current-thread runtime and block on `authorize_pay_async` — the pattern the MCP
@@ -1116,7 +1199,10 @@ mod tests {
         // a legacy bind (`None`) falls back to the live config default.
         let select = |sealed: Option<&str>, config_default: &str| {
             let chosen = sealed.unwrap_or(config_default);
-            resolve_realized_mint(chosen, &accepted, true).expect("resolve")
+            crate::crossmint::plan_payment(chosen, &accepted, true)
+                .expect("plans")
+                .realized_mint()
+                .clone()
         };
 
         // SEALED bind (realized_mint = Some(m1)): the first attempt runs with config default m1, then

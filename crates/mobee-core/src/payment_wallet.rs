@@ -512,6 +512,24 @@ async fn cached_input_fee_floor(
     Ok(floor.map(|ppk| Amount::from((ppk * proof_count).div_ceil(1000))))
 }
 
+/// Live input fee for `proof_count` inputs at this mint, bounded and fail-closed.
+///
+/// The same reader and the same bound as the dust guard below, for callers that must PRICE a spend
+/// whose input count they have already bounded rather than test the N=1 floor. Never defaults the
+/// fee: a mint that will not answer refuses the spend.
+pub(crate) async fn bounded_input_fee(
+    wallet: &Wallet,
+    proof_count: u64,
+) -> Result<Amount, PaymentWalletError> {
+    match mint_input_fee_bounded(wallet, proof_count, MINT_TOUCH_TIMEOUT).await {
+        BoundedFee::Fee(fee) => Ok(fee),
+        BoundedFee::Failed(error) => Err(error),
+        BoundedFee::Unreachable(detail) => {
+            Err(mint_unreachable(wallet, MINT_UNREACHABLE_PAY, detail))
+        }
+    }
+}
+
 /// Refuse amounts that cannot yield a redeemable locked token after mint input fees.
 ///
 /// Uses the N=1 floor from the live keyset (`ceil(ppk/1000)`), bounded so a dead

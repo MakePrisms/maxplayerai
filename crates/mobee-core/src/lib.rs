@@ -11,6 +11,8 @@ pub mod profile;
 pub mod contribution;
 #[cfg(all(feature = "wallet", feature = "gateway"))]
 pub mod crossmint;
+#[cfg(all(feature = "wallet", feature = "gateway"))]
+pub mod crossmint_hop;
 pub mod delivery;
 #[cfg(feature = "git-delivery")]
 pub mod delivery_git;

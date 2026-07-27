@@ -967,18 +967,26 @@ pub async fn accept_claim_async(
     let accepted_mints =
         verify_accepted_claim_creq(claim.creq.as_deref(), &request.job_id, offer.amount_sats)?;
 
-    // FREEZE the realized paying mint at accept from the buyer's then-configured default (validated
-    // against the accepted set + the real-mint fence). Sealing the SELECTION here — not just the
-    // accepted SET (finding V) — is what makes the pay-path attempt id stable across retries: a
-    // config-default change after accept can no longer shift the mint into a different attempt id and
-    // mint a second payment for one job (double-pay). A buyer whose configured mint is not payable
-    // for this claim is refused HERE (fail-closed), never accepted into an unpayable bind.
-    let realized_mint = crate::authorize_pay::resolve_realized_mint(
+    // FREEZE the buyer's paying mint at accept from its then-configured default, validated by
+    // planning the payment against the accepted set + the real-mint fence. Sealing the SELECTION
+    // here — not just the accepted SET (finding V) — is what makes the pay-path attempt id stable
+    // across retries: a config-default change after accept can no longer shift the mint into a
+    // different attempt id and mint a second payment for one job (double-pay). A buyer with no
+    // payable route to this claim is refused HERE (fail-closed), never accepted into an unpayable
+    // bind.
+    //
+    // The seal is the buyer's own funded mint, which is also the mint a direct payment realizes at.
+    // A payment that reaches the seller's mint by hopping realizes at the TARGET, but sealing that
+    // would re-plan at pay time as a direct payment from a mint the buyer holds nothing at; the
+    // target is re-derived there from this seal plus the accepted set frozen alongside it, so it
+    // stays deterministic without being stored twice.
+    let realized_mint = crate::crossmint::plan_payment(
         home.config.default_mint(),
         &accepted_mints,
         home.config.allow_real_mints,
     )
     .map_err(|error| JobLifecycleError::Input(error.to_string()))?
+    .source_mint()
     .to_string();
 
     let buyer_pubkey = keys.public_key().to_hex();
@@ -1408,8 +1416,9 @@ pub fn authorize_request_from_bind(
 /// (finding V). The co-signed receipt preimage binds only `creq_hash` (which pins the accepted SET),
 /// not the realized mint, so the seller cosig does not pin `accepted_mints`; a caller-supplied list
 /// could otherwise substitute a mint outside the bound set. Deriving it solely from the sealed bind
-/// closes that: the realized-mint selection ([`crate::authorize_pay::resolve_realized_mint`]) can
-/// only pick the buyer's own mint from within the bound set.
+/// closes that: payment planning ([`crate::crossmint::plan_payment`]) realizes only at a mint drawn
+/// from the bound set — the buyer's own when the seller accepts it, otherwise a hop target taken
+/// from that same set.
 pub fn fill_explicit_request_from_bind(
     request: &mut crate::authorize_pay::AuthorizePayRequest,
     bind: &AcceptedBind,
@@ -2365,8 +2374,8 @@ mod tests {
     // co-signed receipt preimage binds only creq_hash (the accepted SET), not the realized mint, so
     // a caller list is unpinned by the seller cosig; `fill_explicit_request_from_bind` overwrites it
     // from the sealed bind unconditionally. Here the caller passes a mint OUTSIDE the bind's set;
-    // after fill the request carries ONLY the bind's set, so realized-mint selection can never pick
-    // the substituted mint (`resolve_realized_mint` accepts only a buyer mint within that set).
+    // after fill the request carries ONLY the bind's set, so planning can never realize at the
+    // substituted mint (`plan_payment` realizes only at a mint drawn from that set).
     #[test]
     fn fill_explicit_overwrites_caller_accepted_mints_with_bind() {
         let bound_mint = "https://mint.minibits.cash/Bitcoin".to_string();
@@ -2440,7 +2449,8 @@ mod tests {
     // `authorize_pay`'s exact mint-selection + attempt-id derivation over the resulting request.
     #[tokio::test(flavor = "current_thread")]
     async fn config_default_flip_after_accept_does_not_shift_attempt_id() {
-        use crate::authorize_pay::{resolve_realized_mint, wallet_open_mint_url};
+        use crate::authorize_pay::wallet_open_mint_url;
+        use crate::crossmint::plan_payment;
         use crate::payment::{
             DeliveryIntegrityHash, JobHash, JobId, PaymentKey, PaymentTerms, ResultId,
         };
@@ -2508,8 +2518,10 @@ mod tests {
         // wallet-open seam consumes).
         let attempt_for = |config_default: &str| -> (String, MintUrl, PaymentTerms) {
             let selected = request.realized_mint.as_deref().unwrap_or(config_default);
-            let mint = resolve_realized_mint(selected, &request.accepted_mints, true)
-                .expect("resolve realized mint");
+            let mint = plan_payment(selected, &request.accepted_mints, true)
+                .expect("plan payment")
+                .realized_mint()
+                .clone();
             let terms = PaymentTerms::new(
                 mint.clone(),
                 Amount::from(request.amount_sats),
