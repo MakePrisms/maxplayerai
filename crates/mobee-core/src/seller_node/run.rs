@@ -1278,7 +1278,12 @@ impl SellerNodeRunner {
         let seller_pubkey = self.seller_pubkey.to_hex();
         let identity = DeliveryAgentIdentity::for_seller(&seller_pubkey);
         let workdir = job_workdir(self.node.home(), job_id);
-        if let Err(error) = seller_git::init_empty_delivery_workdir(&workdir, &identity) {
+        if let Err(error) = seller_git::init_empty_delivery_workdir_off_runtime(
+            workdir.clone(),
+            identity.clone(),
+        )
+        .await
+        {
             eprintln!("seller node execute fail job_id={job_id}: workdir init failed ({error})");
             self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
             return;
@@ -1313,14 +1318,16 @@ impl SellerNodeRunner {
         // An empty / no-op tree is refused with a precise reason (nothing to deliver).
         let branch = format!("mobee/{}", &job_id[..8.min(job_id.len())]);
         let message = delivery_message(&offer.task);
-        if let Err(error) = seller_git::snapshot_delivery_at(
-            &workdir,
-            &identity,
+        if let Err(error) = seller_git::snapshot_delivery_at_off_runtime(
+            workdir.clone(),
+            identity.clone(),
             None,
-            &branch,
-            &message,
+            branch.clone(),
+            message,
             author_date,
-        ) {
+        )
+        .await
+        {
             eprintln!("seller node execute fail job_id={job_id}: delivery snapshot refused ({error})");
             self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
             return;
@@ -1347,12 +1354,14 @@ impl SellerNodeRunner {
         } else {
             None
         };
-        let commit = match seller_git::push_branch_with_header(
-            &workdir,
-            &seller.git_remote,
-            &branch,
+        let commit = match seller_git::push_branch_with_header_off_runtime(
+            workdir.clone(),
+            seller.git_remote.clone(),
+            branch.clone(),
             push_header,
-        ) {
+        )
+        .await
+        {
             Ok(oid) => oid,
             Err(error) => {
                 eprintln!("seller node execute fail job_id={job_id}: git push failed ({error})");

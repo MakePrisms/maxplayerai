@@ -226,9 +226,17 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
     );
 
     // Boot the durable seller node (sqlite store + outbox + reconcile_on_start) as the seller path.
-    // run_sell is synchronous, so it owns a current-thread runtime here and block_on's the async boot
-    // + run loop.
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    // run_sell is synchronous, so it owns a runtime here and block_on's the async boot + run loop.
+    //
+    // MULTI-THREAD is deliberate. On a current-thread runtime the single thread drives futures, the
+    // I/O driver AND the timer wheel, so any blocking or stalled call stops *time* — the heartbeat
+    // tick, the relay-stall watchdog and every relay notification die together, at 0% CPU, silently
+    // (#173). Blocking git work is now handed to `spawn_blocking` and the signer round-trips are
+    // bounded, which is the real fix; a worker pool is the complement that keeps one stuck task from
+    // taking the timer with it. Two workers is enough for a node whose concurrency is one job at a
+    // time — the point is that the timer is never the only thing waiting on a busy thread.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .map_err(|error| {
