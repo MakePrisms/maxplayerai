@@ -444,7 +444,11 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
         timeout_secs: params.timeout_secs,
         include_display_names: params.include_display_names,
     };
-    match job_lifecycle::get_job_async(&context.home, request).await {
+    // Subscribe BEFORE the wait begins its first fetch — an event landing in the gap between the
+    // fetch and the subscribe would be lost, and the wait would then sleep on a view that was
+    // already stale when it read it.
+    let events = context.relay.subscribe_events();
+    match job_lifecycle::get_job_awaiting_events_async(&context.home, request, events).await {
         Ok(view) => Response::ok(id, json!(view)),
         Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
     }

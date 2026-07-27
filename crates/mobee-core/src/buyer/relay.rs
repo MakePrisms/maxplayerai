@@ -32,13 +32,14 @@
 //! `automatic_authentication(true)` explicitly as a drift guard, and a tooth pins the contract
 //! itself: a write refused with `auth-required:` must still land once auth completes.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use nostr_sdk::prelude::{
     Client, Event, Filter, Keys, Kind, RelayOptions, RelayPoolNotification, RelayUrl,
     SubscriptionId,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::relay_auth::{self, AuthWait};
 
@@ -68,6 +69,13 @@ const RELAY_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Stable id for the liveness REQ, so a relay `CLOSED` names it.
 const LIVENESS_PROBE_SUB_ID: &str = "mobee-buyer-liveness";
+
+/// Stable id for the buyer's job-event REQ, so a relay `CLOSED` names which subscription died.
+const JOB_EVENTS_SUB_ID: &str = "mobee-buyer-jobs";
+
+/// Depth of the fan-out channel carrying job events to waiters. A waiter that falls behind sees
+/// `Lagged`, which is a re-check signal and NOT an error — see [`RelayHandle::subscribe_events`].
+const JOB_EVENT_CHANNEL_DEPTH: usize = 256;
 
 enum Command {
     Publish {
@@ -155,12 +163,28 @@ impl std::error::Error for RelayBootError {}
 pub struct RelayHandle {
     tx: mpsc::Sender<Command>,
     relay_url: String,
+    events: broadcast::Sender<Arc<Event>>,
 }
 
 impl RelayHandle {
     /// The relay this buyer is bound to.
     pub fn relay_url(&self) -> &str {
         &self.relay_url
+    }
+
+    /// Live seller-authored events for this buyer's jobs (claims, results, feedback).
+    ///
+    /// Synchronous and cheap by design — no round-trip to the actor. That matters because a waiter
+    /// MUST subscribe BEFORE it does its catch-up fetch: an event landing in the gap between the
+    /// fetch and the subscribe is gone, and the waiter then sleeps until its deadline holding a
+    /// view that was already stale when it read it. Making this a plain call keeps the correct
+    /// order the natural one to write.
+    ///
+    /// `RecvError::Lagged` is NOT an error. It means this receiver fell behind and events were
+    /// dropped for it — i.e. *something happened*. A waiter must treat it as a re-check signal;
+    /// treating it as a failure turns a busy relay into spurious timeouts.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<Arc<Event>> {
+        self.events.subscribe()
     }
 
     /// Send one command and await its reply, with BOTH legs bounded — see the module doc.
@@ -263,35 +287,142 @@ pub async fn spawn(keys: Keys, relay_url: &str) -> Result<RelayHandle, RelayBoot
 
     let public_key = keys.public_key();
     let (tx, mut rx) = mpsc::channel::<Command>(64);
+    let (events, _) = broadcast::channel::<Arc<Event>>(JOB_EVENT_CHANNEL_DEPTH);
     let owned_url = relay_url.to_owned();
+
+    // The session task: bring the socket up, subscribe, then FAN OUT events for the rest of its
+    // life. Commands are served by a sibling task rather than this one, because a publish may
+    // legitimately occupy PUBLISH_TIMEOUT — and if that ran here, no job event would be forwarded
+    // for the duration. A delivery arriving during a slow write would reach waiters late or, past
+    // the channel depth, not at all.
+    let command_client = client.clone();
+    let event_sender = events.clone();
     tokio::spawn(async move {
         connect_and_authenticate(&client, &relay, "boot").await;
-        while let Some(command) = rx.recv().await {
-            match command {
-                Command::Publish { event, reply } => {
-                    let _ = reply.send(publish_bounded(&client, &owned_url, &event).await);
-                }
-                Command::Probe { reply } => {
-                    let _ = reply.send(
-                        probe_relay_serves_our_reqs(&client, public_key, LIVENESS_PROBE_TIMEOUT)
-                            .await,
-                    );
-                }
-                Command::Reconnect { reply } => {
-                    let outcome = reconnect_and_authenticate(&client, &relay).await;
-                    if let Ok(wait) = &outcome {
-                        report_auth_wait("reconnect", Ok(*wait));
+        // AFTER auth, never before: an unauthenticated `#p` REQ can be CLOSED with `restricted:`,
+        // which nostr-sdk treats as Remove — the subscription is dropped and no later
+        // `resubscribe()` brings it back. Ordering here is the difference between a live
+        // subscription and a permanently deaf one that still looks connected.
+        subscribe_job_events(&client, public_key).await;
+
+        tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                match command {
+                    Command::Publish { event, reply } => {
+                        let _ =
+                            reply.send(publish_bounded(&command_client, &owned_url, &event).await);
                     }
-                    let _ = reply.send(outcome.map_err(|error| error.to_string()));
+                    Command::Probe { reply } => {
+                        let _ = reply.send(
+                            probe_relay_serves_our_reqs(
+                                &command_client,
+                                public_key,
+                                LIVENESS_PROBE_TIMEOUT,
+                            )
+                            .await,
+                        );
+                    }
+                    Command::Reconnect { reply } => {
+                        let outcome = reconnect_and_authenticate(&command_client, &relay).await;
+                        if let Ok(wait) = &outcome {
+                            report_auth_wait("reconnect", Ok(*wait));
+                            // Re-assert the job REQ on the NEW session rather than trusting the
+                            // pool to replay it, and only after auth has completed — same ordering
+                            // rule as boot. The stable id makes this idempotent.
+                            subscribe_job_events(&command_client, public_key).await;
+                        }
+                        let _ = reply.send(outcome.map_err(|error| error.to_string()));
+                    }
                 }
             }
-        }
+        });
+
+        forward_job_events(&client, event_sender).await;
     });
 
     Ok(RelayHandle {
         tx,
         relay_url: relay_url.to_owned(),
+        events,
     })
+}
+
+/// Subscribe to every seller-authored event addressed to this buyer.
+///
+/// ONE STATIC FILTER covers every job this buyer has or will ever have, because claims, results and
+/// feedback all `p`-tag the buyer (`gateway::claim_draft` / `result_draft` / `error_draft`). So
+/// there is no per-job subscription to open when a job is posted, none to close when it settles,
+/// and no filter to rebuild on reconnect — a dynamic `#e`-list would be a subscription-lifecycle
+/// problem taken on for no benefit.
+///
+/// The `#t=mobee` guard keeps a foreign event squatting these kinds from ever being delivered.
+async fn subscribe_job_events(client: &Client, buyer_pubkey: nostr_sdk::PublicKey) {
+    let filter = Filter::new()
+        .kinds([
+            Kind::Custom(crate::kinds::JOB_CLAIM_KIND),
+            Kind::Custom(crate::kinds::JOB_RESULT_KIND),
+            Kind::Custom(crate::kinds::JOB_FEEDBACK_KIND),
+        ])
+        .hashtag(crate::gateway::MOBEE_TAG)
+        .pubkey(buyer_pubkey);
+    if let Err(error) = client
+        .subscribe_with_id(SubscriptionId::new(JOB_EVENTS_SUB_ID), filter, None)
+        .await
+    {
+        eprintln!(
+            "buyer relay: job-event subscription could not be opened ({error}); waiters fall back \
+             to their safety re-check until a reconnect restores it"
+        );
+    }
+}
+
+/// Fan out job events to every waiter for the life of the session.
+///
+/// Nothing here interprets an event: an arrival means only "something changed for some job", and
+/// the waiter re-reads the authoritative view. The subscription is the WAKE; the fetch is the TRUTH.
+/// Assembling a view from this stream would duplicate view-assembly and force us to trust a stream
+/// that may be partial.
+///
+/// No own-echo hazard exists on this path and it must stay that way: every kind here is
+/// SELLER-authored, so the buyer never needs to observe its own event — which a single client
+/// cannot do anyway. A future "did my own publish land" check must NOT be built on this stream.
+async fn forward_job_events(client: &Client, events: broadcast::Sender<Arc<Event>>) {
+    let mut notifications = client.notifications();
+    loop {
+        match notifications.recv().await {
+            Ok(RelayPoolNotification::Message {
+                message: nostr_sdk::RelayMessage::Closed { subscription_id, message },
+                ..
+            }) if subscription_id.to_string() == JOB_EVENTS_SUB_ID => {
+                // A CLOSED while the socket is up is the silent-deafness case: connected, and
+                // serving nothing. Name it — a waiter's safety re-check will carry the load until
+                // a reconnect re-subscribes, but an operator needs to see why waits got slow.
+                eprintln!(
+                    "buyer relay: the relay CLOSED our job-event subscription ({message}); waits \
+                     degrade to the safety re-check until a reconnect re-subscribes"
+                );
+            }
+            Ok(RelayPoolNotification::Event {
+                subscription_id,
+                event,
+                ..
+            }) if subscription_id.to_string() == JOB_EVENTS_SUB_ID => {
+                // A send failure means only that nobody is waiting right now — not a fault.
+                let _ = events.send(Arc::new(*event));
+            }
+            Ok(_) => continue,
+            // The notification stream ending means the pool is gone; so is this session.
+            Err(broadcast::error::RecvError::Closed) => return,
+            // We fell behind the relay. We cannot know what we missed, so say so: every waiter's
+            // safety re-check is what recovers the state we dropped.
+            Err(broadcast::error::RecvError::Lagged(missed)) => {
+                eprintln!(
+                    "buyer relay: fell behind the relay notification stream, {missed} dropped; \
+                     waiters recover via their safety re-check"
+                );
+            }
+        }
+    }
 }
 
 /// Bring the session up on a socket that is not yet connected, and report the handshake.
@@ -614,6 +745,7 @@ mod tests {
         let handle = RelayHandle {
             tx,
             relay_url: "wss://example.invalid".to_owned(),
+            events: broadcast::channel(1).0,
         };
 
         let outer = Duration::from_secs(600);
