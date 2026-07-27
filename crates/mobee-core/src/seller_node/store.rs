@@ -594,6 +594,32 @@ impl SellerStore {
     /// Whether a COMPLETED receipt exists for `job_id`. This is the ONLY positive proof of our own
     /// prior collection (finding S): on an already-spent re-see, `true` ⇒ idempotent no-op, `false` ⇒
     /// refuse (never forge a receipt from a breadcrumb), and a read error fails CLOSED at the caller.
+    /// The most recent collected receipt's timestamp, or `None` when nothing has ever been
+    /// collected. One half of the wrap-backfill cursor.
+    pub fn last_receipt_unix(&self) -> Result<Option<i64>, StoreError> {
+        let conn = self.lock()?;
+        let latest = conn.query_row(
+            "SELECT MAX(received_at_unix) FROM receipts",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        Ok(latest)
+    }
+
+    /// Delivery timestamp of the OLDEST job that has been delivered but never paid, or `None` when
+    /// every delivery has settled. The clamp that stops the wrap-backfill cursor from stepping over
+    /// an older job's still-uncollected payment.
+    pub fn oldest_unsettled_delivery_unix(&self) -> Result<Option<i64>, StoreError> {
+        let conn = self.lock()?;
+        let oldest = conn.query_row(
+            "SELECT MIN(d.delivered_at_unix) FROM deliveries d
+             WHERE NOT EXISTS (SELECT 1 FROM receipts r WHERE r.job_id = d.job_id)",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        Ok(oldest)
+    }
+
     pub fn has_receipt(&self, job_id: &str) -> Result<bool, StoreError> {
         let conn = self.lock()?;
         let found = conn

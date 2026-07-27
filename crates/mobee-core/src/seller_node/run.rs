@@ -195,6 +195,64 @@ fn recovery_backoff(attempt: u32) -> Duration {
         .min(RECOVERY_BACKOFF_MAX)
 }
 
+/// Cadence of the periodic payment-wrap backfill.
+///
+/// A live kind-1059 subscription is not sufficient on its own. Field-observed on the in-memory
+/// daemon this node replaces: a fresh subscription delivers a wrap within ~1 min, but a subscription
+/// ~10+ minutes old was seen to go deaf and never deliver again — and a payment then sat unredeemed
+/// until the process was manually restarted, because the restart re-ran the boot backfill. Re-asking
+/// the relay for stored wraps on a timer is what makes that recover WITHOUT a restart.
+///
+/// Note this is a failure the liveness probe cannot see: the session still answers our REQs, so the
+/// relay is "alive" by every measure the watchdog has. The three layers are deliberately distinct —
+/// probe = session liveness, this backfill = money-leg recovery, and a subscription-map reconciler
+/// (#172) = registration integrity. None of them subsumes another.
+const WRAP_BACKFILL_INTERVAL_SECS: u64 = 300;
+/// Skew margin subtracted from the oldest delivered-but-unpaid job when clamping the backfill cursor.
+const WRAP_BACKFILL_MARGIN_SECS: i64 = 3600;
+/// Test-only override of [`WRAP_BACKFILL_INTERVAL_SECS`]. NOT a user config knob; no production path
+/// sets it (mirrors the heartbeat cadence seam).
+const WRAP_BACKFILL_INTERVAL_ENV: &str = "MOBEE_WRAP_BACKFILL_INTERVAL_SECS";
+/// Hard cap on one backfill fetch, so an auth-gated relay that never EOSEs cannot wedge the tick.
+const WRAP_BACKFILL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Effective backfill cadence: the env test seam wins over [`WRAP_BACKFILL_INTERVAL_SECS`]; a `0` or
+/// unparseable value is ignored.
+fn resolve_wrap_backfill_interval_secs() -> u64 {
+    match std::env::var(WRAP_BACKFILL_INTERVAL_ENV) {
+        Ok(value) => value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|secs| *secs > 0)
+            .unwrap_or(WRAP_BACKFILL_INTERVAL_SECS),
+        Err(_) => WRAP_BACKFILL_INTERVAL_SECS,
+    }
+}
+
+/// The `since` cursor for a wrap backfill: the last collected receipt, but never later than the
+/// oldest delivered-but-unpaid job (minus a skew margin).
+///
+/// The last-receipt timestamp alone is wrong: a receipt for a NEWER job would advance the cursor past
+/// an OLDER unsettled job and skip its still-uncollected payment wrap forever. Clamping keeps that
+/// wrap in range; the per-job idempotency guards (`has_receipt` skip, mint already-spent refuse) make
+/// the wider re-scan safe.
+///
+/// A journal/store READ ERROR must abort the cycle, never fall back to `since = 0` — that would turn a
+/// transient read failure into a full-history backfill. Absent data (nothing collected, nothing
+/// unsettled) is legitimately `0`; a failure to read is not.
+fn resolve_backfill_since(
+    last_receipt: Result<Option<i64>, super::store::StoreError>,
+    oldest_unsettled: Result<Option<i64>, super::store::StoreError>,
+) -> Result<u64, super::store::StoreError> {
+    let last_receipt = last_receipt?.unwrap_or(0);
+    let cursor = match oldest_unsettled? {
+        Some(oldest) => last_receipt.min(oldest.saturating_sub(WRAP_BACKFILL_MARGIN_SECS)),
+        None => last_receipt,
+    };
+    Ok(cursor.max(0) as u64)
+}
+
 /// Upper bound on stored open-pool offers a backfilling REQ may return.
 const OFFER_BACKFILL_LIMIT: usize = 500;
 
@@ -670,6 +728,12 @@ impl SellerNodeRunner {
                  ({stall_missed_intervals} missed intervals)"
             );
         }
+        eprintln!(
+            "seller node wrap backfill enabled: re-fetching stored kind-1059(s) every {}s (recovers a \
+             silently-deaf payment subscription without a restart; its log line is the periodic \
+             liveness signal)",
+            resolve_wrap_backfill_interval_secs()
+        );
 
         // Drain anything reconcile left pending before the first tick.
         self.drain().await;
@@ -695,6 +759,9 @@ impl SellerNodeRunner {
         }
 
         let mut drain_tick = tokio::time::interval(DRAIN_INTERVAL);
+        let wrap_backfill_interval_secs = resolve_wrap_backfill_interval_secs();
+        let mut wrap_backfill_tick =
+            tokio::time::interval(Duration::from_secs(wrap_backfill_interval_secs));
         let mut heartbeat_tick =
             tokio::time::interval(Duration::from_secs(heartbeat_interval_secs.max(1)));
         // Watchdog liveness clocks: monotonic instant (staleness measure, robust to wall-clock jumps)
@@ -717,6 +784,13 @@ impl SellerNodeRunner {
             tokio::select! {
                 _ = drain_tick.tick() => {
                     self.drain().await;
+                    continue;
+                }
+                // Re-ask the relay for stored payment wraps, so a silently-deaf 1059 subscription
+                // recovers without a restart. Also the node's only periodic log line, and therefore
+                // the positive signal external supervision watches.
+                _ = wrap_backfill_tick.tick() => {
+                    self.run_wrap_backfill().await;
                     continue;
                 }
                 // The heartbeat tick rides the SAME loop (never a blocking side-thread). Probe first,
@@ -912,6 +986,69 @@ impl SellerNodeRunner {
     async fn publish_under_rate_feedback(&self, event: &nostr_sdk::Event, reason: &str) {
         self.publish_buyer_feedback(&event.id.to_hex(), &event.pubkey.to_hex(), reason)
             .await;
+    }
+
+    /// Re-ask the relay for stored payment gift-wraps and ingest whatever comes back.
+    ///
+    /// This is the money leg's recovery path, and it is response-based: we make a request and read
+    /// what is returned, rather than waiting on a broadcast that may never come. A live kind-1059
+    /// subscription that has silently gone deaf strands a payment indefinitely otherwise — see
+    /// [`WRAP_BACKFILL_INTERVAL_SECS`] for the field case.
+    ///
+    /// Every wrap is routed through the normal `on_gift_wrap` path, so all the pay-once guards apply
+    /// unchanged: a re-seen wrap hits the receipt dedup, and an already-spent token fails closed.
+    /// Re-scanning a wide window is therefore safe by construction.
+    ///
+    /// LOAD-BEARING LOG: the "fetching" line is emitted unconditionally, BEFORE the fetch. It is the
+    /// only periodic line a healthy idle node produces, which makes it the positive liveness signal
+    /// external supervision has — a parked process satisfies pid-presence, so absence of failures is
+    /// not evidence of health. Do not make it conditional to reduce noise.
+    async fn run_wrap_backfill(&self) {
+        let since = match resolve_backfill_since(
+            self.node.store().last_receipt_unix(),
+            self.node.store().oldest_unsettled_delivery_unix(),
+        ) {
+            Ok(since) => since,
+            Err(error) => {
+                eprintln!(
+                    "seller node wrap backfill: ABORT — cursor read failed (retrying next cycle, \
+                     NOT defaulting to since=0): {error}"
+                );
+                return;
+            }
+        };
+        eprintln!("seller node wrap backfill (periodic): fetching stored kind-1059(s) since ts={since}");
+        let filter = Filter::new()
+            .kind(Kind::GiftWrap)
+            .pubkey(self.seller_pubkey)
+            .since(nostr_sdk::Timestamp::from(since));
+        match tokio::time::timeout(
+            WRAP_BACKFILL_FETCH_TIMEOUT,
+            self.client
+                .fetch_events(filter, WRAP_BACKFILL_FETCH_TIMEOUT / 2),
+        )
+        .await
+        {
+            Ok(Ok(events)) => {
+                eprintln!(
+                    "seller node wrap backfill (periodic): {} stored kind-1059(s) returned since ts={since}",
+                    events.len()
+                );
+                for event in events {
+                    self.on_gift_wrap(&event).await;
+                }
+                self.drain().await;
+            }
+            Ok(Err(error)) => eprintln!(
+                "seller node WARN: wrap backfill fetch failed (continuing; live 1059 subscription \
+                 active): {error}"
+            ),
+            Err(_) => eprintln!(
+                "seller node WARN: wrap backfill fetch timed out after {}s (continuing; live 1059 \
+                 subscription active)",
+                WRAP_BACKFILL_FETCH_TIMEOUT.as_secs()
+            ),
+        }
     }
 
     /// Publish one own-heartbeat (kind-30340) — best-effort liveness/discovery + the watchdog's
@@ -2206,6 +2343,104 @@ mod tests {
 
         authed.disconnect().await;
         unauthed.disconnect().await;
+    }
+
+    // TOOTH (wrap backfill) — the cursor keeps an OLDER delivered-but-unpaid job's payment window in
+    // range, and a read failure ABORTS rather than silently becoming a full-history rescan.
+    //
+    // The clamp is the whole point: a receipt collected for a NEWER job must not advance the cursor
+    // past an OLDER unsettled delivery, or that job's payment wrap falls out of every future backfill
+    // and the payment is stranded forever — which is the failure this backfill exists to recover.
+    //
+    // BITE: drop the `.min(oldest - margin)` clamp and `cursor_stays_behind_an_unsettled_delivery`
+    // goes red; make the error arm fall back to 0 and the abort assertion goes red.
+    #[test]
+    fn wrap_backfill_cursor_clamps_to_the_oldest_unsettled_delivery_and_fails_closed() {
+        use super::super::store::StoreError;
+
+        // Nothing collected, nothing unsettled ⇒ 0 is legitimate (first boot), not an error.
+        assert_eq!(resolve_backfill_since(Ok(None), Ok(None)).expect("fresh"), 0);
+
+        // A receipt at t=10_000 with NO unsettled delivery ⇒ cursor is the receipt.
+        assert_eq!(
+            resolve_backfill_since(Ok(Some(10_000)), Ok(None)).expect("settled"),
+            10_000
+        );
+
+        // cursor_stays_behind_an_unsettled_delivery: a NEWER receipt must not step over an OLDER
+        // delivered-but-unpaid job — the cursor clamps to that job's delivery minus the skew margin.
+        let cursor = resolve_backfill_since(Ok(Some(10_000)), Ok(Some(6_000))).expect("clamped");
+        assert_eq!(cursor, (6_000 - WRAP_BACKFILL_MARGIN_SECS) as u64);
+        assert!(
+            cursor < 6_000,
+            "the cursor must sit BEFORE the unsettled delivery or its wrap is never re-fetched"
+        );
+
+        // Fail-closed: a store READ ERROR aborts the cycle. Falling back to 0 would turn a transient
+        // failure into a full-history rescan.
+        assert!(
+            resolve_backfill_since(Err(StoreError("boom".into())), Ok(None)).is_err(),
+            "a cursor read failure must abort, never default to since=0"
+        );
+        assert!(
+            resolve_backfill_since(Ok(Some(1)), Err(StoreError("boom".into()))).is_err(),
+            "an unsettled-delivery read failure must abort too"
+        );
+    }
+
+    // TOOTH (wrap backfill, store) — the two cursor readers answer over real rows: a delivered job
+    // with no receipt is "unsettled" and pins the cursor; collecting its receipt releases it.
+    #[test]
+    fn unsettled_delivery_pins_the_cursor_until_its_receipt_lands() {
+        let seller = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let creq = gateway::creq::build_seller_creq(
+            &"a".repeat(64),
+            21,
+            "sat",
+            &["https://testnut.cashudevkit.org".to_owned()],
+            &seller,
+        )
+        .expect("creq");
+        let job = "a".repeat(64);
+        let buyer = "b".repeat(64);
+        let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
+
+        assert_eq!(store.last_receipt_unix().expect("receipts"), None);
+        assert_eq!(
+            store.oldest_unsettled_delivery_unix().expect("unsettled"),
+            None,
+            "nothing delivered yet"
+        );
+
+        let draft = claim_draft(&job, &buyer, &seller, &creq);
+        let delivered_at = 6_000;
+        assert!(store
+            .deliver_and_enqueue(
+                &job,
+                &"c".repeat(40),
+                &draft,
+                delivered_at,
+                delivered_at + RESULT_PUBLISH_WINDOW_SECS,
+                delivered_at
+            )
+            .expect("deliver"));
+        assert_eq!(
+            store.oldest_unsettled_delivery_unix().expect("unsettled"),
+            Some(delivered_at),
+            "a delivered job with no receipt is unsettled and must pin the backfill cursor"
+        );
+
+        // The payment lands ⇒ no longer unsettled, and the receipt time becomes the cursor.
+        store
+            .collect_receipt(&"d".repeat(64), &job, 21, 10_000)
+            .expect("collect");
+        assert_eq!(store.last_receipt_unix().expect("receipts"), Some(10_000));
+        assert_eq!(
+            store.oldest_unsettled_delivery_unix().expect("unsettled"),
+            None,
+            "a settled delivery must stop pinning the cursor"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // TOOTH (#171 layer 3) — recovery attempts back off instead of re-dialing at a flat interval,
