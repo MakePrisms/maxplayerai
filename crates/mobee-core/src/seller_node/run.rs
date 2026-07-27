@@ -2536,7 +2536,7 @@ mod tests {
     // existed the whole suite stayed green; with it, this test and only this test goes red.
     #[test]
     fn the_harness_request_survives_the_wire_to_row_mapping() {
-        let asked = gateway::OfferDraft::new("do a task", "text/plain", 5, NOW + 600, &"a".repeat(64))
+        let asked = gateway::OfferDraft::new("do a task", "text/plain", 5, NOW + 600, "a".repeat(64))
             .requesting_agent(Some("codex"))
             .to_event_draft();
         let parsed = parse_offer(&asked).expect("parse offer");
@@ -2554,7 +2554,7 @@ mod tests {
         assert!(row.targeted);
 
         // An offer that asked for nothing stores nothing — absence is carried, not invented.
-        let plain = gateway::OfferDraft::new("do a task", "text/plain", 5, NOW + 600, &"a".repeat(64))
+        let plain = gateway::OfferDraft::new("do a task", "text/plain", 5, NOW + 600, "a".repeat(64))
             .to_event_draft();
         let parsed = parse_offer(&plain).expect("parse offer");
         assert_eq!(offer_row("job-2", "buyer-1", &parsed).requested_agent, None);
@@ -2645,7 +2645,7 @@ mod tests {
     // parse failure is version skew; the node's on_offer routes that to the unsupported-version skip.
     #[test]
     fn unsupported_version_offer_is_a_distinct_parse_refusal() {
-        let offer = gateway::OfferDraft::new("do a task", "text/plain", 5, NOW + 600, &"a".repeat(64));
+        let offer = gateway::OfferDraft::new("do a task", "text/plain", 5, NOW + 600, "a".repeat(64));
         let mut draft = offer.to_event_draft();
         for tag in &mut draft.tags {
             if tag.0.first().map(String::as_str) == Some("v") {
