@@ -86,10 +86,6 @@ enum Command {
     Probe {
         reply: oneshot::Sender<bool>,
     },
-    /// Drop the socket and bring a fresh authenticated one up.
-    Reconnect {
-        reply: oneshot::Sender<Result<AuthWait, String>>,
-    },
 }
 
 /// A write the relay accepted.
@@ -241,13 +237,6 @@ impl RelayHandle {
         let (reply, rx) = oneshot::channel();
         self.round_trip("probe", Command::Probe { reply }, rx).await
     }
-
-    /// Rebuild the session: drop the socket and re-authenticate a fresh one.
-    pub async fn reconnect(&self) -> Result<Result<AuthWait, String>, RelayActorGone> {
-        let (reply, rx) = oneshot::channel();
-        self.round_trip("reconnect", Command::Reconnect { reply }, rx)
-            .await
-    }
 }
 
 /// Register the buyer's relay and spawn the actor that owns the session.
@@ -321,17 +310,6 @@ pub async fn spawn(keys: Keys, relay_url: &str) -> Result<RelayHandle, RelayBoot
                             )
                             .await,
                         );
-                    }
-                    Command::Reconnect { reply } => {
-                        let outcome = reconnect_and_authenticate(&command_client, &relay).await;
-                        if let Ok(wait) = &outcome {
-                            report_auth_wait("reconnect", Ok(*wait));
-                            // Re-assert the job REQ on the NEW session rather than trusting the
-                            // pool to replay it, and only after auth has completed — same ordering
-                            // rule as boot. The stable id makes this idempotent.
-                            subscribe_job_events(&command_client, public_key).await;
-                        }
-                        let _ = reply.send(outcome.map_err(|error| error.to_string()));
                     }
                 }
             }
@@ -543,26 +521,6 @@ async fn probe_relay_serves_our_reqs(
     .unwrap_or(false)
 }
 
-/// Drop the live socket and bring a fresh authenticated one up, returning once NIP-42 has completed
-/// on the NEW connection.
-///
-/// ORDER IS LOAD-BEARING. `Relay::disconnect` emits `RelayNotification::Shutdown` on the relay's own
-/// notification channel; a receiver taken BEFORE the disconnect inherits that Shutdown and the auth
-/// wait reads it as "relay shutdown before NIP-42 authentication" — on a socket that in fact
-/// authenticated fine. A `broadcast::Receiver` only observes sends made after it subscribes, so
-/// taking it AFTER the disconnect cannot inherit our own teardown, while still taking it BEFORE
-/// `connect` so the one-shot `Authenticated` cannot be missed. Both halves are required.
-async fn reconnect_and_authenticate(
-    client: &Client,
-    relay: &nostr_sdk::prelude::Relay,
-) -> Result<AuthWait, relay_auth::RelayAuthError> {
-    client.disconnect().await;
-    let mut relay_notifications = relay.notifications();
-    client.connect().await;
-    client.wait_for_connection(CONNECT_WAIT).await;
-    relay_auth::wait_for_nip42_auth(&mut relay_notifications, CONNECT_WAIT).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,6 +604,149 @@ mod tests {
             "with automatic_authentication(false) the auth-gated write must stay refused — if this \
              passes, the fixture is not enforcing NIP-42 and arm 1 proves nothing, got {refused:?}"
         );
+    }
+
+    // TOOTH — the SECOND DEPENDENCY CONTRACT this buyer rests on: the SDK recovers our `#p`-gated
+    // subscription by itself, across a relay restart.
+    //
+    // We do NOT re-subscribe on reconnect. We used to carry code that did (disconnect, re-auth,
+    // re-assert the REQ), and it had NO production caller — so every reconnect in the field was
+    // always the SDK's, and that code was only masking an unverified assumption. It is deleted, and
+    // this pins the behaviour we actually stand on instead.
+    //
+    // What the relay really does is worth stating, because it looks like breakage in the logs: the
+    // `#p`-gated REQ IS refused after a reconnect — the relay sends `CLOSED auth-required:` because
+    // the pool re-issues the REQ before NIP-42 completes. The SDK then authenticates and re-asserts
+    // the SAME subscription id, and because a fresh REQ also returns matching STORED events, work
+    // published while we were away is delivered on recovery rather than lost.
+    //
+    // The event here is published to the REPLACEMENT relay with NO wait for our session to recover
+    // first, so it lands while our subscription is still down. That is the field case — a relay
+    // restarts, the seller delivers, and we must still see it — and it is the property a test that
+    // waited for recovery before publishing would silently fail to cover.
+    //
+    // Arm 1 (baseline delivery before any reconnect) is the non-vacuity anchor: without it, a
+    // subscription that never delivered anything at all would pass arm 2 by never being tested.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_sdk_recovers_our_job_subscription_across_a_relay_restart() {
+        use nostr_relay_builder::prelude::{
+            LocalRelay, RelayBuilder, RelayBuilderNip42, RelayBuilderNip42Mode,
+        };
+        use nostr_sdk::prelude::EventBuilder;
+
+        // Pin a port so the replacement relay comes up at the SAME url the client will retry.
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+            probe.local_addr().expect("addr").port()
+        };
+        let fixture = |port: u16| {
+            LocalRelay::new(
+                RelayBuilder::default()
+                    .port(port)
+                    .nip42(RelayBuilderNip42 { mode: RelayBuilderNip42Mode::Both }),
+            )
+        };
+
+        let relay_one = fixture(port);
+        relay_one.run().await.expect("relay one");
+        let relay_url = relay_one.url().await.to_string();
+
+        let buyer = Keys::generate();
+        let handle = spawn(buyer.clone(), &relay_url).await.expect("spawn");
+        let mut events = handle.subscribe_events();
+
+        // A counterparty result event matching the buyer's static filter, from a SEPARATE key.
+        let seller = Keys::generate();
+        let deliver = |label: &'static str| {
+            let seller = seller.clone();
+            let buyer_pk = buyer.public_key();
+            let url = relay_url.clone();
+            async move {
+                let event = EventBuilder::new(Kind::Custom(crate::kinds::JOB_RESULT_KIND), label)
+                    .tags([
+                        nostr_sdk::Tag::hashtag(crate::gateway::MOBEE_TAG),
+                        nostr_sdk::Tag::public_key(buyer_pk),
+                    ])
+                    .sign(&seller)
+                    .await
+                    .expect("sign");
+                let publisher = Client::new(seller.clone());
+                publisher
+                    .pool()
+                    .add_relay(&url, RelayOptions::default().reconnect(false))
+                    .await
+                    .expect("add");
+                publisher.connect().await;
+                publisher.wait_for_connection(CONNECT_WAIT).await;
+                let sent = publisher.send_event(&event).await;
+                let _ = publisher.disconnect().await;
+                (event.id, sent.is_ok())
+            }
+        };
+
+        // Wait for the session to actually be up before the baseline. `spawn` deliberately does not
+        // wait for the handshake, and this fixture challenges LAZILY, so boot can sit in NoChallenge
+        // for CONNECT_WAIT before the job subscription is opened at all.
+        let mut ready = false;
+        for _ in 0..30 {
+            if matches!(handle.probe().await, Ok(true)) {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        assert!(ready, "the session must come up before the baseline arm means anything");
+
+        // Baseline: delivery works BEFORE any reconnect. If this fails the probe says nothing.
+        let (first_id, first_sent) = deliver("before-reconnect").await;
+        let before = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Ok(event) = events.recv().await {
+                    if event.id == first_id {
+                        return true;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(first_sent, "the fixture must accept the counterparty's baseline delivery");
+        assert!(
+            before,
+            "baseline delivery must work, or arm 2 proves nothing — a subscription that never \
+             delivered would pass it by never having been exercised"
+        );
+
+        // Arm 2 — tear the relay down and bring a fresh one up on the SAME url, then publish
+        // IMMEDIATELY, without waiting for our own session to recover. The delivery lands while our
+        // subscription is still closed, so passing this means recovery replayed it.
+        relay_one.shutdown();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let relay_two = fixture(port);
+        relay_two.run().await.expect("relay two");
+
+        let (second_id, second_sent) = deliver("during-outage").await;
+        assert!(second_sent, "the fixture must accept the counterparty's delivery");
+        let after = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if let Ok(event) = events.recv().await {
+                    if event.id == second_id {
+                        return true;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            after,
+            "the SDK must recover our job subscription after a relay restart and deliver work \
+             published while we were away. If this fails, every reconnect silently demotes the \
+             delivery watcher to its periodic sweep — deliveries still settle, but seconds become \
+             minutes — and the fix is to re-assert the REQ ourselves AFTER auth completes."
+        );
+        relay_two.shutdown();
     }
 
     // TOOTH — an empty accepted-set is a FAILURE, never a quiet success.
