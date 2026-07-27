@@ -181,17 +181,50 @@ the red path. Any "X did not happen" assertion has to outlast the time X takes t
 
 Pre-registered by the rocky fleet *before* the fix, which is the right order.
 
-**BEFORE**, three seats mid-flap: 42 recoveries, `attempts=1` on all, degrades 1:1 with recoveries,
-inter-event gap exactly 300s in 38 of 39 intervals, deaf window ~10.7s per cycle, open-pool armed
-window ≈0s. That 300s regularity is external confirmation of the `run.rs:859` mechanism: the
-heartbeat tick servicing a queued `forced_recovery` is what paces the flap.
+**The contract is the invariant set, not cumulative counts.** Cumulative totals grow with uptime and
+say nothing across a rebuild, so the BEFORE state is characterised by the shape of each cycle,
+scoped per-run (the after-script asserts `boots=1`):
 
-**Expected after**: degrades → 0, recoveries → 0 or genuine, state FULL across several consecutive
-300s windows.
+| invariant (BEFORE, flapping) | expected AFTER |
+|---|---|
+| degrades == recoveries, 1:1 | degrades = 0 |
+| inter-event interval **exactly 300s** | no periodic degrade/recovery cycle |
+| `attempts=1`, outage ~10s per cycle | recoveries 0, or genuine and non-periodic |
+| offer state **TARGETED-ONLY** | state **FULL**, sustained across several consecutive 300s windows |
 
-**One guard on reading that result.** The success signal here is the *absence* of `RELAY-CLOSED`
-lines, and an absence is only evidence if the line could still have appeared. **This diff renames no
-existing log line** — every field-facing line keeps its prefix, and the changed `DEGRADE` line keeps
-`seller node RELAY-CLOSED DEGRADE:` while only its trailing parenthetical now states the real
-schedule. The after-run should confirm those lines still exist in the new build before reading their
-absence as success.
+That 300s regularity is external confirmation of the `run.rs:859` mechanism: the heartbeat tick
+servicing a queued `forced_recovery` is what paces the flap.
+
+### Step 0 — prove the lines can still appear, before reading their absence
+
+The success signal is the *absence* of `RELAY-CLOSED` lines, and an absence is only evidence if the
+line could still have been emitted. The after-script therefore checks the literals in the shipped
+binary first and aborts if any is missing. **Grep the stable PREFIX, not the full sentence**, and
+here is why that is not pedantry:
+
+```
+$ strings <binary> | grep -cF 'seller node RELAY-CLOSED DEGRADE:'          # 1  — anchor present
+$ strings <binary> | grep -cF 're-armed on the next successful recovery'   # 0  — GONE, on purpose
+```
+
+The `DEGRADE` line's trailing parenthetical **changed by design** — #190 requires it to state the
+real re-arm schedule instead of the old "re-armed on the next successful recovery". A step 0
+matching that old sentence aborts on a correct build. The prefix is the contract; the tail is not.
+
+For the same reason, expected literal counts must be calibrated against a binary, not remembered.
+Measured on this branch (`cargo build -p mobee --features wallet`, `strings | grep -cF`):
+
+```
+1  seller node RELAY-CLOSED:              1  seller node RELAY-CLOSED DEGRADE:
+1  seller node RELAY-CLOSED degrade failed
+1  RELAY-RECOVERY triggered               1  recovery SUCCEEDED
+1  RESTORED via MANUAL                    2  wrap backfill (periodic)
+```
+
+Note these are counts of `strings` lines, and `eprintln!` splits a message at each `{}` placeholder —
+so a count is a property of where the placeholders fall, not of how many call sites exist. If the
+pre-registered expectations were taken from a differently-built binary they will not match this one,
+and the mismatch is not a rename.
+
+New literals this PR adds, all following the existing shape, none replacing anything:
+`RELAY-CLOSED RETRY:`, `RELAY-CLOSED RE-ARM`, `RELAY-CLOSED RE-ARMED:`, `RELAY-CLOSED UNKNOWN-ID:`.
