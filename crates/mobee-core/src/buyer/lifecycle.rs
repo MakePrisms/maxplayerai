@@ -17,7 +17,7 @@ use std::future::Future;
 
 use cashu::{Amount, CurrencyUnit};
 
-use crate::authorize_pay::resolve_realized_mint;
+use crate::crossmint::plan_payment;
 use crate::job_lifecycle::{AwardClaimOutcome, JobLifecycleError, JobView};
 
 use super::reservations::{Converted, JobDisposition, ReservationState, ReserveRefused};
@@ -139,11 +139,12 @@ fn claim_is_payable(job_id: &str, creq: Option<&str>, filters: &AwardFilters) ->
     if filters.offer_amount_sats > filters.max_sats {
         return false;
     }
-    // Mint compatibility: the buyer's single-mint wallet must be able to settle at a mint the
-    // seller listed. This is the SAME resolution the pay path performs, so a claim that passes
-    // here is one the buyer can actually pay.
+    // Mint compatibility: the buyer must have a route to a mint the seller listed — paying from its
+    // own mint when the seller accepts it, otherwise hopping to one that the seller accepts and the
+    // fence admits. This is the SAME planning the pay path performs, so a claim that passes here is
+    // one the buyer can actually pay, by whichever of those two routes.
     let listed: Vec<String> = request.mints.iter().map(|mint| mint.to_string()).collect();
-    resolve_realized_mint(filters.buyer_mint, &listed, filters.allow_real_mints).is_ok()
+    plan_payment(filters.buyer_mint, &listed, filters.allow_real_mints).is_ok()
 }
 
 /// Failure of [`award_with_reservation`].
