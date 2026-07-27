@@ -770,6 +770,32 @@ pub struct SellerNodeRunner {
     buzz: Option<buzz::BuzzHandle>,
 }
 
+/// What the bounded bring-up did. The arms are named rather than collapsed into an `Option` because
+/// "the relay refused us inside its own bounds" and "we outran our own backstop" are the same value
+/// to the caller and completely different facts about [`BUZZ_START_TIMEOUT`] — the second one says
+/// the backstop is bearing load, which is the thing worth noticing.
+pub(super) enum BuzzStartOutcome {
+    /// A live persona; the handle is held for the node's lifetime.
+    Live(buzz::BuzzHandle),
+    /// `[buzz]` absent — inert by contract: no connection, no publish.
+    Inert,
+    /// The bring-up failed within its own bounds (relay refused, clobber guard, signer).
+    Failed(buzz::BuzzError),
+    /// The bring-up outran [`BUZZ_START_TIMEOUT`].
+    TimedOut,
+}
+
+/// Run the persona bring-up under [`BUZZ_START_TIMEOUT`] and report which arm ran. Silent — the boot
+/// path logs (see [`start_buzz_or_degrade`]), so a test can assert the arm without parsing output.
+pub(super) async fn start_buzz_bounded(node: &SellerNode) -> BuzzStartOutcome {
+    match tokio::time::timeout(BUZZ_START_TIMEOUT, node.start_buzz()).await {
+        Ok(Ok(Some(handle))) => BuzzStartOutcome::Live(handle),
+        Ok(Ok(None)) => BuzzStartOutcome::Inert,
+        Ok(Err(error)) => BuzzStartOutcome::Failed(error),
+        Err(_) => BuzzStartOutcome::TimedOut,
+    }
+}
+
 /// Bring up the node's buzz persona at boot when `[buzz]` is configured, bounded by
 /// [`BUZZ_START_TIMEOUT`].
 ///
@@ -777,10 +803,8 @@ pub struct SellerNodeRunner {
 /// stop this node from selling: an absent section is inert and silent, and a bring-up that fails or
 /// outruns the bound degrades to no persona with a loud line. Only a live persona yields a handle.
 async fn start_buzz_or_degrade(node: &SellerNode) -> Option<buzz::BuzzHandle> {
-    match tokio::time::timeout(BUZZ_START_TIMEOUT, node.start_buzz()).await {
-        // `[buzz]` absent — inert by contract: no connection, no publish, and no line to log.
-        Ok(Ok(None)) => None,
-        Ok(Ok(Some(handle))) => {
+    match start_buzz_bounded(node).await {
+        BuzzStartOutcome::Live(handle) => {
             eprintln!(
                 "seller node buzz persona live: pubkey={} kind0={}",
                 handle.pubkey_hex(),
@@ -788,14 +812,16 @@ async fn start_buzz_or_degrade(node: &SellerNode) -> Option<buzz::BuzzHandle> {
             );
             Some(handle)
         }
-        Ok(Err(error)) => {
+        // Inert by contract: nothing opened, nothing published, and no line to log.
+        BuzzStartOutcome::Inert => None,
+        BuzzStartOutcome::Failed(error) => {
             eprintln!(
                 "seller node BUZZ DEGRADE: persona bring-up failed; selling continues with no \
                  persona: {error}"
             );
             None
         }
-        Err(_) => {
+        BuzzStartOutcome::TimedOut => {
             eprintln!(
                 "seller node BUZZ DEGRADE: persona bring-up exceeded {}s; selling continues with no \
                  persona",

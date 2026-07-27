@@ -8,15 +8,23 @@
 //! the positive control for the unconfigured one: the silence asserted for a `[buzz]`-less node is
 //! only evidence because the instrument demonstrably sees the configured node's traffic.
 
-use super::run::{BUZZ_START_TIMEOUT, SellerNodeRunner, ShutdownSignals};
+use super::run::{
+    BUZZ_START_TIMEOUT, BuzzStartOutcome, SellerNodeRunner, ShutdownSignals, start_buzz_bounded,
+};
 use crate::home::{self, BuzzConfig};
 
-use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
-use nostr_sdk::prelude::{Client, Filter, Keys, Kind, PublicKey, RelayPoolNotification};
+use nostr_relay_builder::prelude::{
+    LocalRelay, PolicyResult, QueryPolicy, RelayBuilder, WritePolicy,
+};
+use nostr_sdk::prelude::{
+    BoxedFuture, Client, Event, Filter, Keys, Kind, PublicKey, RelayPoolNotification,
+};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::SellerNode;
 use super::buzz::PRESENCE_KIND;
 
 static WIRE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -212,6 +220,88 @@ async fn a_buzz_relay_that_is_down_never_keeps_the_node_from_booting() {
     assert!(
         elapsed < BUZZ_START_TIMEOUT + Duration::from_secs(30),
         "the buzz bring-up must be bounded — boot took {elapsed:?}"
+    );
+
+    relay.shutdown();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A relay that completes the websocket handshake and then answers NOTHING — the REQ never gets its
+/// EOSE, the EVENT never gets its OK. This is the dishonest failure: the socket looks alive.
+#[derive(Debug)]
+struct NeverAnswers;
+
+impl QueryPolicy for NeverAnswers {
+    fn admit_query<'a>(
+        &'a self,
+        _query: &'a Filter,
+        _addr: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(std::future::pending())
+    }
+}
+
+impl WritePolicy for NeverAnswers {
+    fn admit_event<'a>(
+        &'a self,
+        _event: &'a Event,
+        _addr: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(std::future::pending())
+    }
+}
+
+/// A relay that hangs mid-conversation degrades — AND the arm that saves the node is the bring-up's
+/// INNER bounds, not the outer backstop. That second half is a tripwire on `BUZZ_START_TIMEOUT`'s
+/// headroom, because the bound is only a backstop while this arithmetic holds:
+///
+/// ```text
+///   kind-0 fetch      8s   buzz::KIND0_FETCH_TIMEOUT_SECS
+///   OK-wait          10s   nostr-relay-pool relay::constants::WAIT_FOR_OK_TIMEOUT
+///   ────────────────────
+///   worst reproducible 18s   <   25s   BUZZ_START_TIMEOUT
+/// ```
+///
+/// The assertion is on the RETURNED VARIANT, never on elapsed time — the call has returned, so there
+/// is no window here to be wrong about and nothing that rots when a machine or a suite gets slower.
+/// If a dependency bump ever pushes that sum past the bound, this flips to `TimedOut` and goes red:
+/// the day the backstop starts bearing load is the day someone needs to know.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_that_hangs_is_caught_by_the_inner_bounds_not_the_backstop() {
+    let relay = LocalRelay::new(
+        RelayBuilder::default()
+            .query_policy(NeverAnswers)
+            .write_policy(NeverAnswers),
+    );
+    relay.run().await.expect("relay run");
+    let hung_url = relay.url().await.to_string();
+
+    // Marketplace leg unused here — this drives the bring-up directly, so no boot/NIP-42 wait.
+    let root = unique_root("hung-buzz");
+    let home = seller_home(&root, &hung_url, Some(&hung_url));
+    let node = SellerNode::open(home).await.expect("open node");
+
+    let started = std::time::Instant::now();
+    let outcome = start_buzz_bounded(&node).await;
+    let elapsed = started.elapsed();
+
+    let arm = match &outcome {
+        BuzzStartOutcome::Live(_) => "Live",
+        BuzzStartOutcome::Inert => "Inert",
+        BuzzStartOutcome::Failed(error) => {
+            eprintln!("inner-bound failure: {error}");
+            "Failed"
+        }
+        BuzzStartOutcome::TimedOut => "TimedOut",
+    };
+    eprintln!("hung relay: arm={arm} elapsed={elapsed:?} (bound {BUZZ_START_TIMEOUT:?})");
+
+    assert_eq!(
+        arm, "Failed",
+        "a hung relay must be refused by the bring-up's own bounds, leaving BUZZ_START_TIMEOUT a \
+         backstop. arm={arm} means the arithmetic in this test's docs no longer holds — if it is \
+         TimedOut, the inner bounds now sum past {BUZZ_START_TIMEOUT:?} and the backstop is bearing \
+         load"
     );
 
     relay.shutdown();
