@@ -234,6 +234,9 @@ impl SellerNode {
 mod buzz_relay_it;
 
 #[cfg(test)]
+mod buzz_wire_it;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::home::bootstrap as bootstrap_home;
