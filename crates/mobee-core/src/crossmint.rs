@@ -165,7 +165,7 @@ mod tests {
             "https://a.example".to_owned(),
         ];
         let plan = plan_payment("https://a.example", &accepted, true).expect("listed mint plans");
-        assert_eq!(plan.is_hop(), false, "a listed buyer mint never hops");
+        assert!(!plan.is_hop(), "a listed buyer mint never hops");
         assert_eq!(plan.realized_mint(), &mint("https://a.example"));
     }
 
