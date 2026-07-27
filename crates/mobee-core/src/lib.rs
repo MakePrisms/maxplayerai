@@ -1,3 +1,4 @@
+pub mod agent_presets;
 pub mod announce;
 #[cfg(all(feature = "wallet", feature = "gateway"))]
 pub mod authorize_pay;
@@ -54,6 +55,9 @@ pub mod receipt;
 pub mod relay_auth;
 pub mod runtime_guard;
 pub mod seller;
+/// The seller's harness registry: the agent harnesses one node enables, what it advertises for
+/// them, and which one a given job dispatches to.
+pub mod seller_agents;
 /// Agent-run + delivery-shaping helpers for the seller node: run the awarded agent, compose its
 /// delivery prompt, derive the delivery kind, and shape the public exec-metadata block. Kept in its
 /// own module (with a neutral error) so the run loop stays focused on the relay surface.

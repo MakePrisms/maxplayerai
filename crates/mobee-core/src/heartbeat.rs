@@ -13,6 +13,7 @@
 use serde::Serialize;
 
 use crate::gateway::{EventDraft, MOBEE_TAG, PROTOCOL_VERSION, TagSpec};
+use crate::seller_agents::AGENT_TAG;
 
 /// Addressable kind for the seller heartbeat. MUST be in NIP-01's `30000..=39999` addressable
 /// range so the relay replaces it in place keyed by `(pubkey, d)` — hence `30340`, not a `34xx`
@@ -46,6 +47,10 @@ pub struct HeartbeatDraft {
     pub rate_sats: u64,
     /// The mobee protocol versions this seller speaks.
     pub protocol_versions: Vec<String>,
+    /// The agent harnesses this seller can run, in preference order. Empty ⇒ the seller states no
+    /// harness and the tag is omitted entirely (an unlabelled `agent_command` seller has no honest
+    /// name to publish).
+    pub agents: Vec<String>,
 }
 
 impl HeartbeatDraft {
@@ -60,6 +65,7 @@ impl HeartbeatDraft {
             queue_depth,
             rate_sats,
             protocol_versions,
+            agents: Vec::new(),
         }
     }
 
@@ -73,6 +79,12 @@ impl HeartbeatDraft {
         )
     }
 
+    /// Advertise `agents` (preference order) on this heartbeat.
+    pub fn with_agents(mut self, agents: Vec<String>) -> Self {
+        self.agents = agents;
+        self
+    }
+
     pub fn to_event_draft(&self) -> EventDraft {
         let accepting = if self.accepting { "y" } else { "n" };
         let queue_depth = self.queue_depth.to_string();
@@ -82,7 +94,7 @@ impl HeartbeatDraft {
         let mut protocol_tag = vec!["protocol_versions".to_owned()];
         protocol_tag.extend(self.protocol_versions.iter().cloned());
 
-        let tags = vec![
+        let mut tags = vec![
             TagSpec::new(["d", SELLER_HEARTBEAT_D]),
             TagSpec::new(["t", MOBEE_TAG]),
             TagSpec::new(["accepting", accepting]),
@@ -90,16 +102,41 @@ impl HeartbeatDraft {
             TagSpec::new(["rate", &rate]),
             TagSpec(protocol_tag),
         ];
+        if let Some(tag) = agent_tag(&self.agents) {
+            tags.push(tag);
+        }
         EventDraft::new(SELLER_HEARTBEAT_KIND, tags, "")
     }
 }
 
+/// The `["mobee_agent", …]` advertisement tag, or `None` for a seller that states no harness (the
+/// tag is then omitted rather than emitted empty — absent means "unstated", never "none").
+pub fn agent_tag(agents: &[String]) -> Option<TagSpec> {
+    if agents.is_empty() {
+        return None;
+    }
+    let mut tag = vec![AGENT_TAG.to_owned()];
+    tag.extend(agents.iter().cloned());
+    Some(TagSpec(tag))
+}
+
+/// Read a `["mobee_agent", …]` advertisement off any event's tags. Absent ⇒ empty.
+pub fn agents_from_tags(tags: &[TagSpec]) -> Vec<String> {
+    first_tag(tags, AGENT_TAG)
+        .map(|tag| tag.0[1..].to_vec())
+        .unwrap_or_default()
+}
+
 /// Build the heartbeat for a seller's live state. `accepting` is `n` while a job holds the
 /// single-flight slot (a busy seller is not taking new work); `queue_depth` is that in-flight
-/// count. This is the single mapping the daemon loop uses, factored out so the flip is unit-
-/// testable without a live relay.
-pub fn heartbeat_for_state(job_in_flight: bool, rate_sats: u64) -> HeartbeatDraft {
-    HeartbeatDraft::v1(!job_in_flight, u32::from(job_in_flight), rate_sats)
+/// count; `agents` is what the resolved harness registry advertises. This is the single mapping
+/// the daemon loop uses, factored out so the flip is unit-testable without a live relay.
+pub fn heartbeat_for_state(
+    job_in_flight: bool,
+    rate_sats: u64,
+    agents: Vec<String>,
+) -> HeartbeatDraft {
+    HeartbeatDraft::v1(!job_in_flight, u32::from(job_in_flight), rate_sats).with_agents(agents)
 }
 
 /// A parsed heartbeat's payload. The author pubkey is NOT carried here — combine it with [`d`]
@@ -113,6 +150,9 @@ pub struct ParsedHeartbeat {
     pub queue_depth: u32,
     pub rate_sats: u64,
     pub protocol_versions: Vec<String>,
+    /// Advertised harnesses, preference order. Empty ⇒ the seller stated none (the tag was
+    /// absent) — NOT a claim that it can run nothing.
+    pub agents: Vec<String>,
 }
 
 impl ParsedHeartbeat {
@@ -217,6 +257,7 @@ pub fn parse_heartbeat(event: &EventDraft) -> Result<ParsedHeartbeat, HeartbeatP
         queue_depth,
         rate_sats,
         protocol_versions,
+        agents: agents_from_tags(&event.tags),
     })
 }
 
@@ -315,8 +356,33 @@ mod tests {
     }
 
     #[test]
+    fn advertises_every_harness_in_preference_order() {
+        let draft = heartbeat_for_state(false, 5, vec!["claude".into(), "codex".into()])
+            .to_event_draft();
+        let tag = first_tag(&draft.tags, "mobee_agent").expect("mobee_agent tag");
+        assert_eq!(tag.0, vec!["mobee_agent", "claude", "codex"]);
+        // The reader gets the same ordered list back.
+        let parsed = parse_heartbeat(&draft).expect("round-trip");
+        assert_eq!(parsed.agents, vec!["claude", "codex"]);
+    }
+
+    #[test]
+    fn a_seller_stating_no_harness_emits_a_byte_identical_heartbeat() {
+        // Compat, the byte-identity half: a raw `agent_command` seller has no preset label, so it
+        // advertises nothing and its heartbeat is EXACTLY the pre-registry event — no empty tag.
+        let stated_none = heartbeat_for_state(false, 5, Vec::new()).to_event_draft();
+        let before_registry = HeartbeatDraft::v1(true, 0, 5).to_event_draft();
+        assert_eq!(stated_none, before_registry);
+        assert!(
+            first_tag(&stated_none.tags, "mobee_agent").is_none(),
+            "an unstated harness list must omit the tag, never emit it empty"
+        );
+        assert!(parse_heartbeat(&stated_none).expect("parse").agents.is_empty());
+    }
+
+    #[test]
     fn accepting_flips_with_in_flight_state() {
-        let idle = heartbeat_for_state(false, 5);
+        let idle = heartbeat_for_state(false, 5, Vec::new());
         assert!(idle.accepting);
         assert_eq!(idle.queue_depth, 0);
         assert_eq!(
@@ -324,7 +390,7 @@ mod tests {
             Some("y")
         );
 
-        let busy = heartbeat_for_state(true, 5);
+        let busy = heartbeat_for_state(true, 5, Vec::new());
         assert!(!busy.accepting);
         assert_eq!(busy.queue_depth, 1);
         assert_eq!(

@@ -57,6 +57,9 @@ pub struct OfferDraft {
     pub amount_sats: u64,
     pub deadline_unix: u64,
     pub seller_pubkey: Option<String>,
+    /// The harness this job asks for, as `["param", "agent", …]`. `None` (or `"any"`) ⇒ no
+    /// preference: any seller may claim and run it on whichever harness it prefers.
+    pub requested_agent: Option<String>,
 }
 
 impl OfferDraft {
@@ -73,6 +76,7 @@ impl OfferDraft {
             amount_sats,
             deadline_unix,
             seller_pubkey: Some(seller_pubkey.into()),
+            requested_agent: None,
         }
     }
 
@@ -88,7 +92,15 @@ impl OfferDraft {
             amount_sats,
             deadline_unix,
             seller_pubkey: None,
+            requested_agent: None,
         }
+    }
+
+    /// Request a specific harness for this job. A canonicalised-away value (`any`, blank) records
+    /// no request, so "no preference" has exactly one representation on the wire.
+    pub fn requesting_agent(mut self, requested_agent: Option<&str>) -> Self {
+        self.requested_agent = crate::seller_agents::normalize_request(requested_agent);
+        self
     }
 
     pub fn to_event_draft(&self) -> EventDraft {
@@ -100,6 +112,13 @@ impl OfferDraft {
             TagSpec::new(["amount", &self.amount_sats.to_string(), "sat"]),
             TagSpec::new(["param", "deadline", &self.deadline_unix.to_string()]),
         ];
+        if let Some(requested_agent) = &self.requested_agent {
+            tags.push(TagSpec::new([
+                "param",
+                crate::seller_agents::AGENT_PARAM,
+                requested_agent,
+            ]));
+        }
         if let Some(seller_pubkey) = &self.seller_pubkey {
             tags.push(TagSpec::new(["p", seller_pubkey]));
         }
@@ -118,6 +137,9 @@ pub struct ParsedOffer {
     pub unit: String,
     pub deadline_unix: u64,
     pub seller_pubkey: Option<String>,
+    /// The harness this job requested, canonicalised. `None` ⇒ no preference (the parameter was
+    /// absent, blank, or the explicit `any`).
+    pub requested_agent: Option<String>,
 }
 
 impl ParsedOffer {
@@ -305,7 +327,22 @@ pub fn parse_offer(event: &EventDraft) -> Result<ParsedOffer, OfferParseError> {
         unit: unit.clone(),
         deadline_unix,
         seller_pubkey: first_tag_value(&event.tags, "p").map(str::to_owned),
+        requested_agent: crate::seller_agents::normalize_request(param_value(
+            &event.tags,
+            crate::seller_agents::AGENT_PARAM,
+        )),
     })
+}
+
+/// Read a `["param", <name>, <value>]` parameter off an event's tags.
+fn param_value<'a>(tags: &'a [TagSpec], name: &str) -> Option<&'a str> {
+    tags.iter()
+        .find(|tag| {
+            tag.0.first().map(String::as_str) == Some("param")
+                && tag.0.get(1).map(String::as_str) == Some(name)
+        })
+        .and_then(|tag| tag.0.get(2))
+        .map(String::as_str)
 }
 
 /// Parses the buyer-visible git delivery fields carried by a result event.
@@ -365,22 +402,27 @@ pub fn parse_bound_git_delivery(
 /// NUT-18 payment request as a `["creq", "creqA…"]` tag — the claim *is*
 /// the invoice. Build `creq` with [`creq::build_seller_creq`]; buyers read it back with
 /// [`creq::parse_creq`].
+///
+/// `agents` advertises the harnesses this seller can run (preference order) as
+/// `["mobee_agent", …]`, so the buyer's award filter can hold the claim to the harness its job
+/// asked for. Empty ⇒ the tag is omitted and the claim is byte-identical to a pre-registry claim.
 pub fn claim_draft(
     offer_id: &str,
     buyer_pubkey: &str,
     seller_pubkey: &str,
     creq: &str,
+    agents: &[String],
 ) -> EventDraft {
-    status_draft(
-        JOB_CLAIM_KIND,
-        "processing",
-        vec![
-            TagSpec::new(["e", offer_id]),
-            TagSpec::new(["p", buyer_pubkey]),
-            TagSpec::new(["p", seller_pubkey]),
-            TagSpec::new(["creq", creq]),
-        ],
-    )
+    let mut tags = vec![
+        TagSpec::new(["e", offer_id]),
+        TagSpec::new(["p", buyer_pubkey]),
+        TagSpec::new(["p", seller_pubkey]),
+        TagSpec::new(["creq", creq]),
+    ];
+    if let Some(tag) = crate::heartbeat::agent_tag(agents) {
+        tags.push(tag);
+    }
+    status_draft(JOB_CLAIM_KIND, "processing", tags)
 }
 
 /// Kind-award AWARD draft (`status=accepted`). Buyer-authored selection of a claim — e-tags the
@@ -846,6 +888,7 @@ mod tests {
                 unit: "sat".into(),
                 deadline_unix: 1_800_000_001,
                 seller_pubkey: Some(SELLER.into()),
+                requested_agent: None,
             }
         );
     }
@@ -882,7 +925,7 @@ mod tests {
         // The claim (processing) is its own claim kind, and the buyer-authored award
         // is the award kind — each distinct from the seller's feedback kind.
         assert_eq!(
-            claim_draft("offer", BUYER, SELLER, "creqAtest"),
+            claim_draft("offer", BUYER, SELLER, "creqAtest", &[]),
             EventDraft::new(
                 JOB_CLAIM_KIND,
                 vec![
@@ -925,7 +968,7 @@ mod tests {
         );
         // A non-award event yields no selection.
         assert_eq!(
-            parse_award(&claim_draft("offer", BUYER, SELLER, "creqAtest")),
+            parse_award(&claim_draft("offer", BUYER, SELLER, "creqAtest", &[])),
             None
         );
     }
@@ -1165,7 +1208,7 @@ mod creq_tests {
             build_seller_creq("job-1", 21, "sat", &[MINT_A.to_string()], &seller).expect("build creq");
         assert!(creq.starts_with("creqA"), "creq must start with creqA: {creq}");
 
-        let draft = claim_draft("job-1", "buyer-pubkey", &seller, &creq);
+        let draft = claim_draft("job-1", "buyer-pubkey", &seller, &creq, &[]);
         let creq_tag = draft
             .tags
             .iter()
@@ -1219,7 +1262,7 @@ mod creq_tests {
         let seller = seller_hex();
         let creq =
             build_seller_creq("job-7", 5, "sat", &[MINT_A.to_string()], &seller).expect("build creq");
-        let draft = claim_draft("job-7", "buyer", &seller, &creq);
+        let draft = claim_draft("job-7", "buyer", &seller, &creq, &[]);
         let tag: &TagSpec = draft
             .tags
             .iter()

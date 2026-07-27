@@ -54,6 +54,9 @@ pub enum NodeError {
     Identity(HomeError),
     /// A live relay-surface failure (connect, NIP-42 auth, subscribe) raised by the run loop.
     Relay(String),
+    /// The configured agent harnesses could not be resolved into a registry the node can serve
+    /// with — boot refuses rather than advertise work it cannot run.
+    Agents(crate::seller_agents::RegistryError),
 }
 
 impl std::fmt::Display for NodeError {
@@ -64,6 +67,7 @@ impl std::fmt::Display for NodeError {
             Self::Wallet(error) => write!(formatter, "seller node wallet error: {error}"),
             Self::Identity(error) => write!(formatter, "seller node identity error: {error}"),
             Self::Relay(message) => write!(formatter, "seller node relay error: {message}"),
+            Self::Agents(error) => write!(formatter, "seller node agent config error: {error}"),
         }
     }
 }
@@ -249,7 +253,7 @@ mod tests {
     }
 
     fn claim_draft() -> crate::gateway::EventDraft {
-        crate::gateway::claim_draft(&"e".repeat(64), &"b".repeat(64), &"s".repeat(64), "creqA")
+        crate::gateway::claim_draft(&"e".repeat(64), &"b".repeat(64), &"s".repeat(64), "creqA", &[])
     }
 
     struct FakePublisher {

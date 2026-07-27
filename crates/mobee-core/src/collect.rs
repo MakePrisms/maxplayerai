@@ -530,7 +530,7 @@ mod tests {
             &seller_hex,
         )
         .expect("creq");
-        let claim_draft = crate::gateway::claim_draft(&offer_id, &buyer_hex, &seller_hex, &creq);
+        let claim_draft = crate::gateway::claim_draft(&offer_id, &buyer_hex, &seller_hex, &creq, &[]);
         let _ = publish(&seller, &claim_draft).await;
 
         let job_hash = crate::job_lifecycle::job_hash_for_offer(&offer_id, task, amount);

@@ -119,6 +119,7 @@ mod tests {
             task: "task".to_owned(),
             deadline_unix: 9_999,
             targeted: true,
+            requested_agent: None,
         }
     }
 
@@ -138,7 +139,7 @@ mod tests {
         let (store, path) = fresh_store("award");
         let job = "j".repeat(64);
         let offer_id = "o".repeat(64);
-        let draft = crate::gateway::claim_draft(&offer_id, &"b".repeat(64), &"s".repeat(64), "creqA");
+        let draft = crate::gateway::claim_draft(&offer_id, &"b".repeat(64), &"s".repeat(64), "creqA", &[]);
         store.claim_and_enqueue(&job, &offer_id, "creqA", &draft, 1, 9_999, 1).expect("claim");
 
         let mut stream = VecStream(

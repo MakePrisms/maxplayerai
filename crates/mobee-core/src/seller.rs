@@ -739,6 +739,7 @@ mod tests {
             unit: "sat".into(),
             deadline_unix: 2_000_000_000,
             seller_pubkey: seller.map(str::to_owned),
+            requested_agent: None,
         }
     }
 
@@ -887,6 +888,7 @@ offer_backfill_secs = {backfill}
                 git_remote: "https://example.invalid/repo.git".into(),
                 job_timeout_secs: None,
                 agent: None,
+                agents: Vec::new(),
                 claim_open_pool: false,
                 offer_backfill_secs: 0,
                 contribution_enabled: true,

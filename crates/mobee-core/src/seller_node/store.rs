@@ -23,7 +23,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::gateway::EventDraft;
 
 /// Current on-disk schema version.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// A cloneable handle to the node-owned SQLite state.
 #[derive(Clone)]
@@ -59,6 +59,11 @@ pub struct Offer {
     pub task: String,
     pub deadline_unix: i64,
     pub targeted: bool,
+    /// The harness the offer asked for (`["param", "agent", …]`), canonicalised; `None` ⇒ no
+    /// preference. Journaled with the other offer facts because execution can be a RESTART away
+    /// from the claim: a resumed job reads its requested harness from here, so it dispatches to
+    /// the harness the buyer asked for and not to whichever one happens to be preferred now.
+    pub requested_agent: Option<String>,
 }
 
 /// The lifecycle state of a job (execution side of a claim that was awarded).
@@ -172,7 +177,10 @@ impl SellerStore {
                  task            TEXT NOT NULL,
                  deadline_unix   INTEGER NOT NULL,
                  targeted        INTEGER NOT NULL,
-                 created_at_unix INTEGER NOT NULL
+                 created_at_unix INTEGER NOT NULL,
+                 -- The harness the offer requested. NULL ⇒ no preference, which is also what an
+                 -- offer recorded before this column existed reads as.
+                 requested_agent TEXT
              );
              -- Claims the node parked. `state` is the claim's own lifecycle; `awarded` marks the
              -- one the buyer selected, `released` the ones it stepped back from.
@@ -198,8 +206,9 @@ impl SellerStore {
                  buyer_pubkey    TEXT NOT NULL,
                  created_at_unix INTEGER NOT NULL
              );
-             -- Jobs the node is executing (one per awarded claim). `agent_name` is the roster
-             -- agent selected to run it (never published to buyers).
+             -- Jobs the node is executing (one per awarded claim). `agent_name` is the harness that
+             -- actually ran it — the journal row naming which agent did the job, and the evidence
+             -- that a harness-requesting job was served by the harness it asked for.
              CREATE TABLE IF NOT EXISTS jobs (
                  job_id          TEXT PRIMARY KEY,
                  offer_id        TEXT NOT NULL,
@@ -254,6 +263,7 @@ impl SellerStore {
                  updated_at_unix    INTEGER NOT NULL
              );",
         )?;
+        Self::migrate(conn)?;
         conn.execute(
             "INSERT INTO seller_meta (key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value
@@ -261,6 +271,30 @@ impl SellerStore {
             [SCHEMA_VERSION.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Bring a store created by an older binary up to [`SCHEMA_VERSION`]. `CREATE TABLE IF NOT
+    /// EXISTS` never alters a table that already exists, so a column added to the schema above
+    /// reaches existing stores only through here.
+    ///
+    /// Every step is ADDITIVE and idempotent — a nullable column whose absence reads the same as
+    /// its default. Nothing here rewrites or drops a row: this store holds live trade state.
+    fn migrate(conn: &Connection) -> Result<(), StoreError> {
+        if !Self::column_exists(conn, "offers", "requested_agent")? {
+            conn.execute_batch("ALTER TABLE offers ADD COLUMN requested_agent TEXT;")?;
+        }
+        Ok(())
+    }
+
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+        let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            if row.get::<_, String>(1)? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Record (idempotently overwrite) the node's most recent start time.
@@ -288,8 +322,9 @@ impl SellerStore {
         let conn = self.lock()?;
         let changed = conn.execute(
             "INSERT OR IGNORE INTO offers
-                 (offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted, created_at_unix)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted, created_at_unix,
+                  requested_agent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 offer.offer_id,
                 offer.buyer_pubkey,
@@ -299,6 +334,7 @@ impl SellerStore {
                 offer.deadline_unix,
                 offer.targeted as i64,
                 now_unix,
+                offer.requested_agent,
             ],
         )?;
         Ok(changed == 1)
@@ -332,7 +368,8 @@ impl SellerStore {
         let conn = self.lock()?;
         let row = conn
             .query_row(
-                "SELECT offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted
+                "SELECT offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted,
+                        requested_agent
                  FROM offers WHERE offer_id = ?1",
                 [offer_id],
                 |row| {
@@ -344,6 +381,7 @@ impl SellerStore {
                         task: row.get(4)?,
                         deadline_unix: row.get(5)?,
                         targeted: row.get::<_, i64>(6)? != 0,
+                        requested_agent: row.get(7)?,
                     })
                 },
             )
@@ -459,7 +497,7 @@ impl SellerStore {
 
     // ---- Job execution --------------------------------------------------------------------------
 
-    /// Record which roster agent was selected to run a job. Idempotent (last write wins).
+    /// Record which harness ran a job. Idempotent (last write wins).
     pub fn assign_agent(&self, job_id: &str, agent_name: &str) -> Result<(), StoreError> {
         let conn = self.lock()?;
         conn.execute(
@@ -930,6 +968,7 @@ mod tests {
             task: "do the thing".to_owned(),
             deadline_unix: 10_000,
             targeted: true,
+            requested_agent: None,
         }
     }
 

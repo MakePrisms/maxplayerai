@@ -1,0 +1,4 @@
+export PATH="/nix/store/lrap4wy75llyp86axair0f1v2n87r99m-rust-default-1.94.0/bin:/nix/store/a245z3cvf9x9sn0xlk6k8j9xhxbhda1z-gcc-wrapper-15.2.0/bin:/etc/profiles/per-user/gudnuf/bin:$PATH"
+export CARGO_HOME="/srv/forge/workspaces/mobee-devsoak/.cargo-home"
+export CARGO_TARGET_DIR="/srv/forge/workspaces/.multiharness-target"
+export GIT_CONFIG_GLOBAL=/dev/null

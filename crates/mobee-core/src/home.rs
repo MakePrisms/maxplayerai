@@ -165,9 +165,19 @@ pub struct SellerConfig {
     /// Job deadline override (seconds). Default: offer `deadline_unix`, else ~600s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_timeout_secs: Option<u64>,
-    /// Optional preset label (`claude` | `cursor` | `codex`) for rediscovery / status.
+    /// Optional preset label (`claude` | `cursor` | `codex`) for rediscovery / status. With an
+    /// `agents` list configured this names the harness the list's first entry resolved to; on its
+    /// own it labels the single `agent_command`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// The harnesses this node enables, in preference order — the multi-harness registry
+    /// ([`crate::seller_agents`]). Each entry is a preset name (bare, or a `{ name, slots }`
+    /// table). Empty ⇒ the node serves with the single `agent_command` alone.
+    ///
+    /// The node advertises this list on its heartbeat and claims, and dispatches a job to the
+    /// harness its offer requested. Execution stays one job at a time across the whole list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<AgentSlotConfig>,
     /// Opt-in to claim untargeted/open offers. Default **false** (targeted-only).
     #[serde(default)]
     pub claim_open_pool: bool,
@@ -574,6 +584,110 @@ where
 pub struct AgentPresetConfig {
     #[serde(deserialize_with = "deserialize_agent_command_argv")]
     pub argv: Vec<String>,
+}
+
+/// One enabled harness in `[seller] agents` — a preset name plus the size of its pool.
+///
+/// Written either as a bare name or as a table, in the same list:
+///
+/// ```toml
+/// agents = ["claude", { name = "codex", slots = 1 }]
+/// ```
+///
+/// The bare form is the whole config today. The table form is why pool counts can arrive later
+/// without reshaping anything an operator already wrote — a `slots` value only ever gets added to
+/// an entry. `slots` above 1 is refused at boot while execution is serial (see
+/// [`crate::seller_agents::RegistryError::ParallelismUnsupported`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSlotConfig {
+    /// Preset name from the `[agents]` table or the built-ins (`claude|cursor|codex`).
+    pub name: String,
+    /// Concurrent jobs this harness may run. Always 1 today.
+    pub slots: u32,
+}
+
+impl AgentSlotConfig {
+    /// A single-slot entry — the bare-name form.
+    pub fn named(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            slots: default_agent_slots(),
+        }
+    }
+}
+
+/// Serde default for [`AgentSlotConfig::slots`].
+fn default_agent_slots() -> u32 {
+    1
+}
+
+impl Serialize for AgentSlotConfig {
+    /// Round-trips to the form it was written in: a single-slot entry serializes as the bare name,
+    /// so a config the CLI writes stays `agents = ["claude", "codex"]`.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.slots == default_agent_slots() {
+            return serializer.serialize_str(&self.name);
+        }
+        use serde::ser::SerializeStruct;
+        let mut table = serializer.serialize_struct("AgentSlotConfig", 2)?;
+        table.serialize_field("name", &self.name)?;
+        table.serialize_field("slots", &self.slots)?;
+        table.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentSlotConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{self, MapAccess, Visitor};
+        use std::fmt;
+
+        struct SlotVisitor;
+
+        impl<'de> Visitor<'de> for SlotVisitor {
+            type Value = AgentSlotConfig;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("an agent preset name, or a { name, slots } table")
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                if value.trim().is_empty() {
+                    return Err(E::custom("agent name must be non-empty"));
+                }
+                Ok(AgentSlotConfig::named(value))
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+                self.visit_str(&value)
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut name: Option<String> = None;
+                let mut slots: Option<u32> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "name" => name = Some(map.next_value()?),
+                        "slots" => slots = Some(map.next_value()?),
+                        other => {
+                            return Err(de::Error::custom(format!(
+                                "unknown agent entry field {other:?} (want name, slots)"
+                            )));
+                        }
+                    }
+                }
+                let name = name.ok_or_else(|| de::Error::missing_field("name"))?;
+                if name.trim().is_empty() {
+                    return Err(de::Error::custom("agent name must be non-empty"));
+                }
+                Ok(AgentSlotConfig {
+                    name,
+                    slots: slots.unwrap_or_else(default_agent_slots),
+                })
+            }
+        }
+
+        deserializer.deserialize_any(SlotVisitor)
+    }
 }
 
 /// Buyer-facing packaged config (`~/.mobee/config.toml`).
