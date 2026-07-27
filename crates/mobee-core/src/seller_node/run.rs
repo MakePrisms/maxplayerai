@@ -2345,6 +2345,88 @@ mod tests {
         unauthed.disconnect().await;
     }
 
+    /// Counts REQs the relay is asked to serve for kind-1059, so a test can assert the backfill
+    /// actually reached the wire rather than inferring it from a log line.
+    #[derive(Debug)]
+    struct CountWrapQueries(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl nostr_relay_builder::prelude::QueryPolicy for CountWrapQueries {
+        fn admit_query<'a>(
+            &'a self,
+            query: &'a nostr_sdk::Filter,
+            _addr: &'a std::net::SocketAddr,
+        ) -> nostr_relay_builder::prelude::BoxedFuture<
+            'a,
+            nostr_relay_builder::prelude::PolicyResult,
+        > {
+            Box::pin(async move {
+                if query
+                    .kinds
+                    .as_ref()
+                    .is_some_and(|kinds| kinds.contains(&Kind::GiftWrap))
+                {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                nostr_relay_builder::prelude::PolicyResult::Accept
+            })
+        }
+    }
+
+    // TOOTH (wrap backfill, UNCONDITIONALITY) — the backfill fetch must reach the relay even when the
+    // store has nothing pending, because the empty case is exactly the one that goes quiet.
+    //
+    // The obvious future optimisation — "skip the fetch when nothing is outstanding" — would silence
+    // precisely the healthy idle seats an operator least suspects, putting external supervision back
+    // on absence-reasoning (a parked process satisfies pid-presence; see #173). The cursor teeth below
+    // guard the log line's CONTENT; this one guards that it happens at all.
+    //
+    // Asserted at the wire, not in the log: the fixture counts kind-1059 REQs, so a skip-when-empty
+    // guard cannot pass by keeping the eprintln and dropping the fetch. It also drives the REAL boot
+    // path (`SellerNodeRunner::boot`), so the assertion covers the deployable shape rather than a
+    // hand-built runner.
+    //
+    // BITE: add `if self.node.store().oldest_unsettled_delivery_unix().ok().flatten().is_none() {
+    // return; }` at the top of run_wrap_backfill → rc=101 here (verified).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wrap_backfill_fetches_even_with_nothing_pending() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let wrap_queries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let relay = LocalRelay::new(
+            RelayBuilder::default()
+                .query_policy(CountWrapQueries(std::sync::Arc::clone(&wrap_queries))),
+        );
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+
+        let root = temp_dir("backfill-empty");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap");
+        home.config.relay_url = relay_url;
+
+        let runner = SellerNodeRunner::boot(home).await.expect("boot node");
+        // Baseline AFTER boot: boot's own subscriptions include the live 1059 REQ, so only the delta
+        // across the backfill call is evidence.
+        let before = wrap_queries.load(std::sync::atomic::Ordering::SeqCst);
+
+        // A pristine home: no deliveries, no receipts, nothing outstanding whatsoever.
+        assert_eq!(
+            runner.node.store().oldest_unsettled_delivery_unix().expect("unsettled"),
+            None,
+            "fixture check: the store must be empty for this to be the nothing-pending case"
+        );
+
+        runner.run_wrap_backfill().await;
+
+        assert!(
+            wrap_queries.load(std::sync::atomic::Ordering::SeqCst) > before,
+            "the backfill must re-ask the relay for stored kind-1059(s) even with nothing pending — \
+             skipping the fetch when the store looks idle silences the only periodic signal a healthy \
+             seat emits"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // TOOTH (wrap backfill) — the cursor keeps an OLDER delivered-but-unpaid job's payment window in
     // range, and a read failure ABORTS rather than silently becoming a full-history rescan.
     //
