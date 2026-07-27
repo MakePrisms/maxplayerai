@@ -7,11 +7,19 @@ import {
 } from "../js/participants.js";
 import { AWARD, CLAIM, FEEDBACK, HANDLER, HEARTBEAT, OFFER, RECEIPT, RESULT } from "../js/kinds.js";
 
+
+/** Fixtures use readable labels; the wire uses 32 bytes of hex. Map one to the other. */
+const _ids = new Map();
+const H = (label) => {
+  if (!_ids.has(label)) _ids.set(label, (_ids.size + 1).toString(16).padStart(64, "0"));
+  return _ids.get(label);
+};
+
 const pk = (c) => c.repeat(64);
 const NOW = 1_800_000_000;
 const ev = (kind, { id, pubkey = pk("a"), at = NOW, tags = [], content = "" }) =>
-  ({ id, kind, pubkey, created_at: at, tags, content });
-const root = (offerId) => ["e", offerId, "", "root"];
+  ({ id: H(id), kind, pubkey, created_at: at, tags, content });
+const root = (offerId) => ["e", H(offerId), "", "root"];
 
 function trade(offerId, { buyer = pk("b"), seller = pk("c"), sats = 10, t0 = NOW - 3600, receipt = true } = {}) {
   const out = [
@@ -33,8 +41,8 @@ test("the default window is a week and every window is selectable", () => {
 
 test("a window filters events, and all-time filters nothing", () => {
   const events = [ev(OFFER, { id: "recent", at: NOW - 3600 }), ev(OFFER, { id: "old", at: NOW - 86400 * 10 })];
-  assert.deepEqual(withinWindow(events, "24h", NOW).map((e) => e.id), ["recent"]);
-  assert.deepEqual(withinWindow(events, "week", NOW).map((e) => e.id), ["recent"]);
+  assert.deepEqual(withinWindow(events, "24h", NOW).map((e) => e.id), [H("recent")]);
+  assert.deepEqual(withinWindow(events, "week", NOW).map((e) => e.id), [H("recent")]);
   assert.equal(withinWindow(events, "all", NOW).length, 2);
 });
 

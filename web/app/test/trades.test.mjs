@@ -4,10 +4,18 @@ import { test } from "node:test";
 import { buildTrades, conversionRates, marketMetrics } from "../js/trades.js";
 import { AWARD, CLAIM, FEEDBACK, OFFER, RECEIPT, RESULT } from "../js/kinds.js";
 
+
+/** Fixtures use readable labels; the wire uses 32 bytes of hex. Map one to the other. */
+const _ids = new Map();
+const H = (label) => {
+  if (!_ids.has(label)) _ids.set(label, (_ids.size + 1).toString(16).padStart(64, "0"));
+  return _ids.get(label);
+};
+
 const pk = (c) => c.repeat(64);
 const ev = (kind, { id, pubkey = pk("a"), at = 1000, tags = [] }) =>
-  ({ id, kind, pubkey, created_at: at, tags, content: "" });
-const rootTag = (offerId) => ["e", offerId, "", "root"];
+  ({ id: H(id), kind, pubkey, created_at: at, tags, content: "" });
+const rootTag = (offerId) => ["e", H(offerId), "", "root"];
 
 /** offer -> claim -> award -> result -> receipt, all rooted on the offer. */
 function fullTrade(offerId, { sats = 21, buyer = pk("b"), seller = pk("c"), t0 = 1000 } = {}) {
@@ -24,7 +32,7 @@ test("a trade's events join into one record under the offer id", () => {
   const trades = buildTrades(fullTrade("offer1"));
   assert.equal(trades.length, 1);
   const [t] = trades;
-  assert.equal(t.offerId, "offer1");
+  assert.equal(t.offerId, H("offer1"));
   assert.equal(t.buyer, pk("b"));
   assert.equal(t.seller, pk("c"));
   assert.equal(t.receiptAmount, 21);
@@ -64,7 +72,7 @@ test("an award e-tagging the winning claim still keys off the offer", () => {
   const events = fullTrade("offer1");
   events[2] = ev(AWARD, {
     id: "award-1", pubkey: pk("b"), at: 1020,
-    tags: [["e", "offer1-claim"], rootTag("offer1")],
+    tags: [["e", H("offer1-claim")], rootTag("offer1")],
   });
   const trades = buildTrades(events);
   assert.equal(trades.length, 1, "one trade, not two");

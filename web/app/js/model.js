@@ -40,9 +40,12 @@ function firstNumber(event, ...names) {
  */
 export function rootOfferId(event) {
   const es = tagsNamed(event, "e");
-  for (const t of es) if (t[3] === "root") return t[1];
-  if (es.length && es[0][1]) return es[0][1];
-  return firstTag(event, "E", "offer", "root");
+  for (const t of es) if (t[3] === "root" && isHex32(t[1])) return t[1];
+  for (const t of es) if (isHex32(t[1])) return t[1];
+  // An offer id becomes a DOM key and a rendered label, so a tag whose value is
+  // not an event id is not one, whatever it claims.
+  const named = firstTag(event, "E", "offer", "root");
+  return isHex32(named) ? named : null;
 }
 
 function parseJsonContent(event) {
@@ -76,9 +79,20 @@ export function feedbackReason(event) {
  * `stage` is present exactly when the event belongs to a trade, so callers can
  * branch on it without knowing kind numbers.
  */
+/**
+ * Nostr ids and pubkeys are 32 bytes of lowercase hex. Nothing else is one.
+ *
+ * This is enforced at the boundary because a relay is untrusted input: these
+ * values end up in markup and in `data-` attributes, so a non-hex "pubkey"
+ * would be an injection path. Rejecting the event here means nothing
+ * downstream has to remember to escape them.
+ */
+const HEX32 = /^[0-9a-f]{64}$/;
+export const isHex32 = (s) => typeof s === "string" && HEX32.test(s);
+
 export function parseEvent(event) {
-  if (!event || typeof event.kind !== "number" || typeof event.id !== "string") return null;
-  if (typeof event.pubkey !== "string" || typeof event.created_at !== "number") return null;
+  if (!event || typeof event.kind !== "number" || typeof event.created_at !== "number") return null;
+  if (!isHex32(event.id) || !isHex32(event.pubkey)) return null;
 
   const base = {
     id: event.id,
