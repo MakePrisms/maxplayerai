@@ -89,7 +89,7 @@ function renderSellers(events) {
           <span class="dot ${r.online ? "on" : ""}" title="${r.online ? "online now" : "not currently online"}"></span>
           <span class="nm">${r.name ? esc(r.name) : `<code>${short(r.pubkey)}</code>`}</span>
           ${r.harness ? `<span class="harness" title="${esc(r.harness)}">${esc(shortHarness(r.harness))}</span>` : ""}
-          ${r.askSats != null ? `<span class="ask">${nf.format(r.askSats)}</span>` : ""}
+          ${r.askSats != null ? `<span class="ask" title="Advertised rate — self-reported by the seller and not verified against what it actually charges">${nf.format(r.askSats)}</span>` : ""}
         </span>
         <span class="num">${nf.format(r.delivered)}</span>
         <span class="num ${r.completionRate != null && r.completionRate < 0.5 ? "dim" : ""}">${pct(r.completionRate)}</span>
@@ -175,12 +175,16 @@ function openParticipant(role, pubkey, events) {
       // Only the structured fields. A seller's free-text `about` is often stale
       // against its own rate_sats and mint, and printing both publishes a
       // contradiction — these are the values a client would actually act on.
-      parts.push('<h4>Advertises</h4>');
+      parts.push('<h4>Advertises <span class="unver">unverified</span></h4>');
       parts.push(`<p class="tiny">${[
         s.askSats != null ? `asks <b>${nf.format(s.askSats)} sat</b> per job` : "",
         s.openPool ? "takes open-pool work" : "direct offers only",
         s.mint ? `mint: ${esc(s.mint)}` : "",
       ].filter(Boolean).join(" · ")}</p>`);
+      // Advertised terms are self-reported and nothing checks them against what
+      // the seller actually does — observed diverging for weeks in practice.
+      // The trades above are the only evidence on this page.
+      parts.push('<p class="tiny">Self-reported by the seller. Nothing verifies these against what it actually charges or accepts — the trades below are the evidence.</p>');
     }
   }
   if (b) {
