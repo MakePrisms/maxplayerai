@@ -1010,6 +1010,71 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // TOOTH — the harness an offer requested is journaled with its other facts and READS BACK
+    // across a reopen. Execution can be a restart away from the claim, so a request that lived only
+    // in memory would let a resumed job run on whatever harness the node prefers now.
+    #[test]
+    fn requested_agent_survives_a_reopen() {
+        let path = temp_db("requested-agent");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = SellerStore::open(&path).expect("open");
+            let mut offer = sample_offer("o1");
+            offer.requested_agent = Some("codex".to_owned());
+            store.record_offer(&offer, 1).expect("record");
+            // An offer with no preference stays None — absence is a value here, not a default.
+            store.record_offer(&sample_offer("o2"), 1).expect("record");
+        }
+        let store = SellerStore::open(&path).expect("reopen");
+        assert_eq!(
+            store.offer_row("o1").expect("row").expect("o1").requested_agent.as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            store.offer_row("o2").expect("row").expect("o2").requested_agent,
+            None
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // TOOTH — a store written by a binary from before this column opens, MIGRATES, and reads its
+    // existing rows as "no preference". `CREATE TABLE IF NOT EXISTS` silently skips an existing
+    // table, so without the ALTER an upgraded node would fail every offer read on a live store.
+    #[test]
+    fn a_store_from_before_the_column_migrates_and_reads_no_preference() {
+        let path = temp_db("pre-agent-schema");
+        let _ = std::fs::remove_file(&path);
+        // The offers table exactly as the previous schema had it, holding a live row.
+        {
+            let conn = Connection::open(&path).expect("create old store");
+            conn.execute_batch(
+                "CREATE TABLE offers (
+                     offer_id        TEXT PRIMARY KEY,
+                     buyer_pubkey    TEXT NOT NULL,
+                     amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
+                     unit            TEXT NOT NULL,
+                     task            TEXT NOT NULL,
+                     deadline_unix   INTEGER NOT NULL,
+                     targeted        INTEGER NOT NULL,
+                     created_at_unix INTEGER NOT NULL
+                 );
+                 INSERT INTO offers VALUES ('old', 'buyer', 21, 'sat', 'task', 10000, 1, 1);",
+            )
+            .expect("old schema");
+        }
+
+        let store = SellerStore::open(&path).expect("open migrates");
+        let row = store.offer_row("old").expect("read").expect("the pre-existing row survives");
+        assert_eq!(row.amount_sats, 21, "the row is migrated, not replaced");
+        assert_eq!(row.requested_agent, None, "an offer from before the column asked for no harness");
+        // Migration is idempotent: opening again neither errors nor double-adds.
+        drop(store);
+        let store = SellerStore::open(&path).expect("second open");
+        assert_eq!(store.health().expect("health").schema_version, SCHEMA_VERSION);
+        assert!(store.offer_row("old").expect("read").is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn record_offer_is_idempotent() {
         let (store, path) = fresh_store("offer");

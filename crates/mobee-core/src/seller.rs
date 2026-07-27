@@ -822,6 +822,67 @@ git_remote = "https://example.invalid/repo.git"
         );
     }
 
+    // TOOTH (compat) — a seller config written before the registry existed parses unchanged, with
+    // an EMPTY agents list. It is the fallback path that then serves it, not a silently invented
+    // registry.
+    #[test]
+    fn a_config_without_an_agents_list_parses_with_none() {
+        let raw = r#"
+relay_url = "wss://example.invalid"
+accepted_mints = ["https://testnut.cashudevkit.org"]
+per_job_budget_sats = 21
+total_budget_sats = 100
+
+[seller]
+agent_command = ["claude-agent-acp"]
+agent = "claude"
+rate_sats = 7
+git_remote = "https://example.invalid/repo.git"
+"#;
+        let seller = toml::from_str::<MobeeConfig>(raw).expect("parse").seller.expect("seller");
+        assert!(seller.agents.is_empty());
+        assert_eq!(seller.agent.as_deref(), Some("claude"));
+    }
+
+    // TOOTH — the `agents` list takes bare names AND `{ name, slots }` tables in the SAME list, and
+    // a single-slot entry serializes back to the bare name. This is the growth seam: adding pool
+    // counts later means adding a field to an entry, never reshaping a config an operator wrote.
+    #[test]
+    fn the_agents_list_accepts_bare_names_and_tables_together() {
+        let raw = r#"
+relay_url = "wss://example.invalid"
+accepted_mints = ["https://testnut.cashudevkit.org"]
+per_job_budget_sats = 21
+total_budget_sats = 100
+
+[seller]
+agent_command = ["claude-agent-acp"]
+rate_sats = 7
+git_remote = "https://example.invalid/repo.git"
+agents = ["claude", { name = "codex" }, { name = "cursor", slots = 3 }]
+"#;
+        let seller = toml::from_str::<MobeeConfig>(raw).expect("parse").seller.expect("seller");
+        let listed: Vec<(&str, u32)> = seller
+            .agents
+            .iter()
+            .map(|slot| (slot.name.as_str(), slot.slots))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![("claude", 1), ("codex", 1), ("cursor", 3)],
+            "order is preference order; an omitted slots defaults to 1"
+        );
+
+        // Single-slot entries round-trip as bare names, so the CLI keeps writing the simple form.
+        let rendered = toml::to_string(&seller).expect("serialize");
+        assert!(rendered.contains("\"claude\""), "{rendered}");
+        assert!(rendered.contains("slots = 3"), "{rendered}");
+
+        // A nameless or unknown-field entry is refused rather than half-understood.
+        assert!(toml::from_str::<crate::home::AgentSlotConfig>("slots = 2").is_err());
+        assert!(toml::from_str::<crate::home::AgentSlotConfig>("name = \"x\"\nrate = 2").is_err());
+    }
+
     #[test]
     fn agent_command_argv_array_parses() {
         let raw = r#"

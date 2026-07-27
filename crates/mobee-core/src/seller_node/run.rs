@@ -2474,6 +2474,124 @@ mod tests {
         );
     }
 
+    // TOOTH (charter invariant 3) — a node that cannot run the requested harness never CLAIMS.
+    // The refusal is a decision over the offer, not an outcome discovered at delivery: the offer
+    // stays available to a seller that can serve it, instead of being answered by one that would
+    // then fail. Bite: drop the `agents.serves(...)` arm from `classify_offer` and the codex offer
+    // below is claimed by a claude-only node.
+    #[test]
+    fn a_node_without_the_requested_harness_never_claims() {
+        let mut wants_codex = offer(5, Some(SELLER), NOW + 600);
+        wants_codex.requested_agent = Some("codex".to_owned());
+        assert_eq!(
+            classify_offer(&wants_codex, &seller_cfg(2, false), &claude_only(), SELLER, NOW),
+            ClaimDecision::Skip(SkipReason::AgentUnavailable)
+        );
+
+        // The same offer at a node that DOES run codex is claimed — the gate is the harness, not
+        // the presence of a request.
+        let both = AgentRegistry::new(vec![
+            crate::seller_agents::RegisteredAgent {
+                name: Some("claude".to_owned()),
+                argv: vec!["claude-agent-acp".to_owned()],
+            },
+            crate::seller_agents::RegisteredAgent {
+                name: Some("codex".to_owned()),
+                argv: vec!["codex-acp".to_owned()],
+            },
+        ]);
+        assert_eq!(
+            classify_offer(&wants_codex, &seller_cfg(2, false), &both, SELLER, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 }
+        );
+
+        // And an offer asking for nothing is claimed by the claude-only node exactly as before.
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &seller_cfg(2, false), &claude_only(), SELLER, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 }
+        );
+    }
+
+    // TOOTH (charter invariant 2, RESTART form — the strong one) — a job requesting harness X is
+    // dispatched to X even when the process that claimed it is gone. The request is journaled with
+    // the offer facts, so the resumed execute path reads it from the STORE; the registry below
+    // deliberately PREFERS claude, so a regression that dispatches the preferred harness (or that
+    // re-reads live config) runs claude and goes red.
+    #[test]
+    fn a_resumed_job_still_dispatches_to_the_harness_it_requested() {
+        let job = "a".repeat(64);
+        let buyer = "b".repeat(64);
+        let seller = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let creq = gateway::creq::build_seller_creq(
+            &job,
+            21,
+            "sat",
+            &["https://testnut.cashudevkit.org".to_owned()],
+            &seller,
+        )
+        .expect("creq");
+        let root = temp_dir("restart-dispatch");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mk root");
+        let db = root.join("seller.sqlite");
+
+        // Claim time: the offer asks for codex, and its facts are journaled with the claim.
+        {
+            let store = SellerStore::open(&db).expect("open store");
+            store
+                .record_offer(
+                    &Offer {
+                        offer_id: job.clone(),
+                        buyer_pubkey: buyer.clone(),
+                        amount_sats: 21,
+                        unit: "sat".to_owned(),
+                        task: "build a widget".to_owned(),
+                        deadline_unix: 2_000_000_000,
+                        targeted: true,
+                        requested_agent: Some("codex".to_owned()),
+                    },
+                    1,
+                )
+                .expect("record offer");
+            let draft = claim_draft(&job, &buyer, &seller, &creq, &["codex".to_owned()]);
+            store
+                .claim_and_enqueue(&job, &job, &creq, &draft, 1, 9_999_999_999, 1)
+                .expect("claim");
+        }
+
+        // …the process dies here. A fresh store handle is all the resumed node has.
+        let store = SellerStore::open(&db).expect("reopen store");
+        let resumed = store.offer_row(&job).expect("offer row").expect("offer survives");
+        assert_eq!(resumed.requested_agent.as_deref(), Some("codex"));
+
+        let registry = AgentRegistry::new(vec![
+            crate::seller_agents::RegisteredAgent {
+                name: Some("claude".to_owned()),
+                argv: vec!["claude-agent-acp".to_owned()],
+            },
+            crate::seller_agents::RegisteredAgent {
+                name: Some("codex".to_owned()),
+                argv: vec!["codex-acp".to_owned()],
+            },
+        ]);
+        let dispatched = registry
+            .dispatch(resumed.requested_agent.as_deref())
+            .expect("the requested harness is available");
+        assert_eq!(dispatched.name.as_deref(), Some("codex"));
+        assert_eq!(dispatched.argv, vec!["codex-acp"], "the RUN command is codex's, not the preferred harness's");
+
+        // And the journal names what ran it.
+        store
+            .record_award(&"w".repeat(64), &job, &buyer, 4242)
+            .expect("award");
+        store
+            .assign_agent(&job, dispatched.name.as_deref().expect("label"))
+            .expect("journal the harness");
+        assert_eq!(store.job_agent(&job).expect("job agent"), Some("codex".to_owned()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // TOOTH (#146 / #117 refusal taxonomy) — a cross-version offer is a DISTINCT refusal, not the
     // generic "unparseable" bucket. Build a well-formed offer, then swap ONLY its `v` tag so the sole
     // parse failure is version skew; the node's on_offer routes that to the unsupported-version skip.

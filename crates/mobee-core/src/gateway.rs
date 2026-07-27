@@ -816,6 +816,64 @@ pub mod creq {
 
 #[cfg(test)]
 mod tests {
+    // TOOTH — an offer's harness request rides the existing `param` grammar and round-trips, and
+    // "no preference" has exactly ONE representation on the wire: no tag. `any` and blank
+    // canonicalise to that same absence, so a buyer stating indifference and one omitting it post
+    // byte-identical offers.
+    #[test]
+    fn offer_carries_a_requested_agent_or_nothing_at_all() {
+        let plain = OfferDraft::untargeted("t", "text/plain", 5, 1_800_000_001);
+        let asking = plain.clone().requesting_agent(Some("Codex"));
+        let draft = asking.to_event_draft();
+        let param = draft
+            .tags
+            .iter()
+            .find(|tag| tag.first() == Some("param") && tag.0.get(1).map(String::as_str) == Some("agent"))
+            .expect("offer carries the agent param");
+        assert_eq!(param.0, vec!["param", "agent", "codex"], "canonicalised on the way out");
+        assert_eq!(
+            parse_offer(&draft).expect("parse").requested_agent.as_deref(),
+            Some("codex")
+        );
+
+        for indifferent in [None, Some("any"), Some("  "), Some("ANY")] {
+            let draft = plain.clone().requesting_agent(indifferent).to_event_draft();
+            assert_eq!(
+                draft,
+                plain.to_event_draft(),
+                "{indifferent:?} must post the same offer as no request at all"
+            );
+            assert_eq!(parse_offer(&draft).expect("parse").requested_agent, None);
+        }
+    }
+
+    // TOOTH — a claim advertises the harnesses its seller can run, in order; a seller that states
+    // none emits a byte-identical pre-registry claim rather than an empty tag.
+    #[test]
+    fn claim_advertises_its_harnesses_in_order() {
+        let advertised = claim_draft(
+            "job-1",
+            "buyer",
+            "seller",
+            "creqAtest",
+            &["claude".to_owned(), "codex".to_owned()],
+        );
+        let tag = advertised
+            .tags
+            .iter()
+            .find(|tag| tag.first() == Some("mobee_agent"))
+            .expect("claim advertises its harnesses");
+        assert_eq!(tag.0, vec!["mobee_agent", "claude", "codex"]);
+        assert_eq!(
+            crate::heartbeat::agents_from_tags(&advertised.tags),
+            vec!["claude", "codex"]
+        );
+
+        let silent = claim_draft("job-1", "buyer", "seller", "creqAtest", &[]);
+        assert!(silent.tags.iter().all(|tag| tag.first() != Some("mobee_agent")));
+        assert!(crate::heartbeat::agents_from_tags(&silent.tags).is_empty());
+    }
+
     use super::*;
 
     const BUYER: &str = "buyer";
