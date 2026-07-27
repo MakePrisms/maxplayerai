@@ -129,6 +129,67 @@ pub fn plan_payment(
     }
 }
 
+/// What the buyer spends to deliver `offer.amount` across a hop.
+///
+/// Three components, all of which the buyer pays and none of which reduce what the seller receives:
+/// the melt amount (which equals the invoice raised at the target), the Lightning fee reserve the
+/// source mint holds back, and the source mint's input fee for spending the proofs. All three must be
+/// covered by the budget cap BEFORE the melt fires — a fee that reaches the wire without passing the
+/// cap is the #185 class of defect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HopCost {
+    /// Amount the source mint melts, per its melt quote.
+    pub melt_amount: u64,
+    /// Lightning fee reserve held back by the source mint (`MeltQuote::fee_reserve`).
+    pub fee_reserve: u64,
+    /// Source-mint input fee for spending the proofs that fund the melt.
+    pub input_fee: u64,
+}
+
+impl HopCost {
+    /// Total the cap must cover before any melt.
+    ///
+    /// Checked, and refuses on overflow rather than saturating: a saturated total would still refuse
+    /// at the cap today, but it would do so by arriving at a number nobody computed. A cost we cannot
+    /// add up is a cost we decline to spend.
+    pub fn planned_cost(&self) -> Result<u64, AuthorizePayError> {
+        self.melt_amount
+            .checked_add(self.fee_reserve)
+            .and_then(|subtotal| subtotal.checked_add(self.input_fee))
+            .ok_or_else(|| {
+                AuthorizePayError::Input(format!(
+                    "cross-mint hop cost overflows u64: melt_amount={} fee_reserve={} input_fee={}",
+                    self.melt_amount, self.fee_reserve, self.input_fee
+                ))
+            })
+    }
+}
+
+/// The pairing record written before the melt fires.
+///
+/// cdk already journals each half of the hop on its own (a `WalletSaga` carries the quote id, and
+/// `check_melt_quote_status` resumes off the persisted store from a cold process). The one thing
+/// nothing in cdk knows is that these two quotes are **one logical hop** — so that, and nothing more,
+/// is what we persist. Written before the melt (write-before-effect), which is the same discipline the
+/// budget ledger already uses, and stronger than marking the melt "initiated" reactively once the mint
+/// reports it pending — that ordering leaves a window where money is in flight and the flag says
+/// otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HopJournal {
+    /// The pay attempt this hop funds; ties the hop to the budget ledger's idempotence key.
+    pub attempt_id: String,
+    /// Mint whose proofs are melted.
+    pub source_mint: String,
+    /// Melt quote id at the source mint — the handle recovery uses to ask "did this melt land?".
+    pub melt_quote_id: String,
+    /// Mint where the fresh ecash lands.
+    pub target_mint: String,
+    /// Mint quote id at the target mint — the handle recovery uses to detect a paid-but-unissued strand.
+    pub mint_quote_id: String,
+    /// Cost charged against the cap before the melt.
+    pub planned_cost: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +325,68 @@ mod tests {
                 target: mint("https://real-mint.example"),
             }
         );
+    }
+
+    // Invariant 3 — the cap must see the WHOLE hop. The failure this guards is #185's shape: a fee
+    // that reaches the wire without passing the cap. Asserted as "all three components are in the
+    // total", so dropping any one of them bites.
+    #[test]
+    fn planned_cost_counts_melt_amount_fee_reserve_and_input_fee() {
+        let cost = HopCost {
+            melt_amount: 100,
+            fee_reserve: 7,
+            input_fee: 2,
+        };
+        assert_eq!(cost.planned_cost().expect("sums"), 109);
+
+        // Each component individually moves the total — none is silently dropped.
+        let no_reserve = HopCost {
+            fee_reserve: 0,
+            ..cost
+        };
+        let no_input_fee = HopCost {
+            input_fee: 0,
+            ..cost
+        };
+        assert_eq!(no_reserve.planned_cost().expect("sums"), 102);
+        assert_eq!(no_input_fee.planned_cost().expect("sums"), 107);
+    }
+
+    // A cost we cannot add up is a cost we decline to spend: overflow refuses rather than saturating
+    // into a number nobody computed.
+    #[test]
+    fn planned_cost_refuses_on_overflow_instead_of_saturating() {
+        let cost = HopCost {
+            melt_amount: u64::MAX,
+            fee_reserve: 1,
+            input_fee: 0,
+        };
+        let error = cost
+            .planned_cost()
+            .expect_err("an unrepresentable total must refuse");
+        assert!(
+            error.to_string().contains("overflows"),
+            "expected an overflow refusal, got: {error}"
+        );
+    }
+
+    // The journal's whole job is to record that two quotes are ONE hop, so both ids must survive a
+    // round trip — recovery reads this to ask each mint about its half.
+    #[test]
+    fn hop_journal_round_trips_both_quote_ids() {
+        let journal = HopJournal {
+            attempt_id: "attempt-1".to_owned(),
+            source_mint: "https://a.example".to_owned(),
+            melt_quote_id: "melt-quote-1".to_owned(),
+            target_mint: "https://b.example".to_owned(),
+            mint_quote_id: "mint-quote-1".to_owned(),
+            planned_cost: 109,
+        };
+        let encoded = serde_json::to_string(&journal).expect("journal serializes");
+        let decoded: HopJournal = serde_json::from_str(&encoded).expect("journal deserializes");
+        assert_eq!(decoded, journal);
+        assert_eq!(decoded.melt_quote_id, "melt-quote-1");
+        assert_eq!(decoded.mint_quote_id, "mint-quote-1");
     }
 
     // Selection skips an unfenced entry rather than refusing outright when a later entry is fine.
