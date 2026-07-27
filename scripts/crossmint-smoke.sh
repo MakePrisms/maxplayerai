@@ -15,35 +15,48 @@
 # between two mints. That is the caveat the slice ships with, stated rather than hidden.
 #
 # ── Stages ──────────────────────────────────────────────────────────────────────────────────────
-#   --self-test   parsers only. No network, no home, no money.
-#   --dry-run     testnut. Proves the gates, home discipline, env config, balance math, and that a
-#                 failed melt halts the script. Cannot prove a SUCCESSFUL melt (see above).
-#   --stage-a     REAL SATS. Routing + fee probe: the hop performed by hand in three wallet
-#                 commands — no daemon, no relay, no seller, no hop code. Answers the only question
-#                 hermetic tests cannot: does LN route source -> target, and what does it cost?
-#   --stage-b     REAL SATS. The full trade through the real pay path.
+#   --self-test              parsers only. No network, no home, no money.
+#   --dry-run                testnut. Proves the gates, home discipline, env config, balance math,
+#                            and that a failed melt halts the script. Cannot prove a SUCCESSFUL
+#                            melt (see above).
+#   --fund                   REAL SATS. Raises a mint quote at the SOURCE and prints a bolt11 for a
+#                            human to pay. Nothing is at risk until that invoice is paid.
+#   --fund-complete <quote>  issues the ecash once the invoice is paid.
+#   --stage-a                REAL SATS. Routing + fee probe: the hop performed by hand in three
+#                            wallet commands — no daemon, no relay, no seller, no hop code. Answers
+#                            the only question hermetic tests cannot: does LN route source ->
+#                            target, and what does it cost? Exits 3 if the fee will not fit.
+#   --stage-b                refuses; the two-sided trade rig is its own slice.
 #
 # Stage A before Stage B is deliberate. The unknowns in A are EXTERNAL (two mints, LN routing,
 # fees); the unknowns in B are OURS. Run together, a failure tells you neither. Run in order, an
 # A-failure means the mint pair and a B-failure means our code.
 #
-# Usage:
-#   CROSSMINT_SMOKE_AUTH="<amount>:<source-mint>:<target-mint>" ./scripts/crossmint-smoke.sh --stage-a
+# Usage — fund and probe are separate invocations against the SAME throwaway wallet, so RUN_DIR must
+# be the same for both (it defaults to a stable path):
 #
-# The token must match the configured values exactly. Change the values and the token stops
-# matching — authorization is for one specific spend, not for the script.
+#   export SOURCE_MINT=... TARGET_MINT=...
+#   export CROSSMINT_SMOKE_AUTH="<fund-sats>:<source-mint>:<target-mint>"
+#   ./scripts/crossmint-smoke.sh --fund
+#   # pay the printed invoice, then:
+#   ./scripts/crossmint-smoke.sh --fund-complete <quote_id>
+#   ./scripts/crossmint-smoke.sh --stage-a
+#
+# The token names the TOTAL FUNDED EXPOSURE and must match exactly. Change the values and the token
+# stops matching — authorization is for one specific spend, not for the script.
 
 set -euo pipefail
 
 # ── The authorized spend ────────────────────────────────────────────────────────────────────────
 DELIVERY_SATS="${DELIVERY_SATS:-21}"   # what the seller receives; the buyer pays this plus hop fees
+FUND_SATS="${FUND_SATS:-50}"      # total real sats put at risk; the auth token names THIS number
 PROBE_SATS="${PROBE_SATS:-5}"          # Stage A probe. Small: its job is to measure, not to deliver
 EXPOSURE_CAP_SATS="${EXPOSURE_CAP_SATS:-50}"
 SOURCE_MINT="${SOURCE_MINT:-}"         # the mint the buyer holds sats at
 TARGET_MINT="${TARGET_MINT:-}"         # the mint the seller accepts — MUST differ from SOURCE_MINT
 
 MOBEE="${MOBEE:-/srv/forge/workspaces/.crossmint-target/release/mobee}"
-RUN_DIR="${RUN_DIR:-}"
+RUN_DIR="${RUN_DIR:-/tmp/crossmint-smoke-run}"
 
 # The marker that makes a directory a legitimate target. Bootstrap WRITES into MOBEE_HOME, and an
 # unset MOBEE_HOME falls back to ~/.mobee — a real home with a real key and wallet. So no mobee
@@ -68,6 +81,11 @@ parse_balance_for_mint() { # <text> <mint-url>
 parse_quote_id() { printf '%s\n' "$1" | command sed -n 's/.*quote_id=\([A-Za-z0-9-]*\).*/\1/p' | command head -1; }
 # `paid_sats=<n> fee_sats=<n> balance_sats=<n> mint=<url>`
 parse_field()   { printf '%s\n' "$1" | command sed -n "s/.*$2=\([0-9]*\).*/\1/p" | command head -1; }
+
+# A mint that auto-funds (i.e. a TEST mint) prints a `minted_sats=...` line where a real mint
+# prints a bolt11. Both are non-empty, so a bare emptiness check would happily feed that line into
+# `wallet melt`. Check the shape, so the failure names the real cause.
+is_bolt11() { case "${1:-}" in ln[bt]c*) return 0 ;; *) return 1 ;; esac; }
 
 self_test() {
     local fail=0 got
@@ -96,14 +114,30 @@ total_sats=179'
     # A zero fee must read as "0", never as empty — the fee-fit verdict does arithmetic on it.
     check "zero fee is 0 not empty" "0" "$(parse_field 'paid_sats=5 fee_sats=0 balance_sats=1 mint=x' fee_sats)"
 
+    # The auto-fund line a TEST mint emits where a real mint emits a bolt11. It is non-empty, so
+    # only a shape check keeps it out of `wallet melt`.
+    is_bolt11 "lnbc20n1p4x0cksdqqpp5yvc5c6" && check "real bolt11 accepted" "y" "y" || check "real bolt11 accepted" "y" "n"
+    is_bolt11 "minted_sats=5 balance_sats=5 mint=https://testnut.cashudevkit.org" \
+        && check "auto-fund line rejected" "y" "n" || check "auto-fund line rejected" "y" "y"
+    is_bolt11 "" && check "empty rejected" "y" "n" || check "empty rejected" "y" "y"
+
     [ "$fail" -eq 0 ] || die "parser self-test FAILED"
     say "parser self-test passed"
 }
 
 # ── Home discipline ─────────────────────────────────────────────────────────────────────────────
-make_home() { # <path>
-    [ -n "$1" ] || die "make_home: empty path"
-    [ -e "$1" ] && die "refusing to reuse an existing path as a throwaway home: $1"
+# Create the home, or reuse one THIS tooling marked. Funding and probing are separate invocations
+# against the same wallet — the operator pays a real invoice out of band between them — so reuse
+# has to be allowed. What must never be allowed is touching a directory we did not mark, and that
+# is what the marker enforces; reuse of our own marked home is safe.
+ensure_home() { # <path>
+    [ -n "$1" ] || die "ensure_home: empty path"
+    if [ -e "$1" ]; then
+        [ -f "$1/$MARKER" ] || die "refusing to reuse $1 as a throwaway home: it exists but carries
+no $MARKER, so this tooling did not create it."
+        say "  reusing throwaway home $1"
+        return
+    fi
     mkdir -p "$1"
     : > "$1/$MARKER"
     say "  created throwaway home $1"
@@ -135,14 +169,17 @@ mobee_env() { # <home> <args...>
 }
 
 # ── Authorization ───────────────────────────────────────────────────────────────────────────────
-require_auth() { # <amount>
+# The token names the TOTAL FUNDED EXPOSURE, not each step's amount. One authorization covers the
+# whole envelope (fund -> probe), which is the shape the spend was actually approved in: a single
+# human decision about how many real sats are at risk, not a per-command negotiation.
+require_auth() {
     for var in SOURCE_MINT TARGET_MINT; do
         [ -n "${!var}" ] || die "$var is not set — fill in the authorized values first"
     done
     [ "$SOURCE_MINT" != "$TARGET_MINT" ] \
         || die "source and target mints are identical; that is a direct payment, not a hop"
 
-    local expected="${1}:${SOURCE_MINT}:${TARGET_MINT}"
+    local expected="${FUND_SATS}:${SOURCE_MINT}:${TARGET_MINT}"
     # The expected token is deliberately NOT echoed on refusal. Its job is to make the run
     # DELIBERATE — a human naming the amount and both mints — and a refusal that printed the
     # expected value would hand that straight back to whatever just tried to run this.
@@ -172,16 +209,63 @@ arm_real_mints() {
     export MOBEE_TOTAL_BUDGET_SATS="$EXPOSURE_CAP_SATS"
 }
 
+# ── Funding ─────────────────────────────────────────────────────────────────────────────────────
+# Two steps, because paying the invoice happens out of band and by a human. A real (non-test) mint
+# returns a bolt11 rather than auto-funding, so this is also the first place the live
+# `status=needs_payment` branch is exercised — the branch no test mint can produce.
+fund() {
+    require_auth
+    arm_real_mints
+    local home="$RUN_DIR/probe"
+    rule "FUND — raise a ${FUND_SATS} sat mint quote at the SOURCE (${SOURCE_MINT})"
+    ensure_home "$home"
+
+    local invoice quote_out quote_id
+    invoice=$(mobee_at "$home" wallet mint "$FUND_SATS" --mint "$SOURCE_MINT" 2>"$RUN_DIR/fund.err") \
+        || die "mint quote at the source failed: $(command cat "$RUN_DIR/fund.err" 2>/dev/null)"
+    quote_out=$(command cat "$RUN_DIR/fund.err" 2>/dev/null || true)
+    say "$quote_out"
+    quote_id=$(parse_quote_id "$quote_out")
+    [ -n "$quote_id" ] || die "no quote_id from the source mint: $quote_out"
+    is_bolt11 "$invoice" || die "the source did not return a bolt11 (got: ${invoice:0:40}).
+If it auto-funded instead, it is a TEST mint and this is not the real-sats path."
+
+    say ""
+    rule "PAY THIS INVOICE (${FUND_SATS} sats), then run --fund-complete"
+    say "$invoice"
+    say ""
+    say "  quote_id : $quote_id"
+    say "  next     : RUN_DIR=$RUN_DIR ... $0 --fund-complete $quote_id"
+    say ""
+    say "Nothing is at risk until the invoice is paid. If you stop here, no sats have moved."
+}
+
+fund_complete() { # <quote_id>
+    require_auth
+    arm_real_mints
+    local home="$RUN_DIR/probe" quote_id="${1:-}"
+    [ -n "$quote_id" ] || die "usage: $0 --fund-complete <quote_id>"
+    rule "FUND-COMPLETE — issue the ecash at the source"
+    ensure_home "$home"
+    mobee_at "$home" wallet mint-complete "$quote_id" --mint "$SOURCE_MINT" 2>&1 \
+        || die "mint-complete failed for quote ${quote_id}. If the invoice IS paid, the sats are at
+the mint and recoverable — re-run this exact command. Do not re-pay the invoice."
+    rule "balance at the source"
+    mobee_at "$home" wallet balance 2>&1
+    say ""
+    say "Funded. Next: $0 --stage-a"
+}
+
 # ── Stage A: routing + fee probe ────────────────────────────────────────────────────────────────
 stage_a() {
-    require_auth "$PROBE_SATS"
+    require_auth
+    arm_real_mints
     local home="$RUN_DIR/probe"
     rule "STAGE A — routing + fee probe: ${PROBE_SATS} sats ${SOURCE_MINT} -> ${TARGET_MINT}"
-    make_home "$home"
+    ensure_home "$home"
 
-    # One wallet holding BOTH mints: source as default, target as extra. Verified: `wallet mints
-    # list` reports role=default and role=extra respectively under these two env vars.
-    arm_real_mints
+    # One wallet holds BOTH mints: source as default, target as extra. Verified: `wallet mints
+    # list` reports role=default and role=extra respectively under the two env vars armed above.
 
     rule "balances before"
     local before; before=$(mobee_at "$home" wallet balance 2>&1) || die "balance failed: $before"
@@ -202,8 +286,8 @@ stage_a() {
     quote_id=$(parse_quote_id "$quote_out")
     [ -n "$quote_id" ] || die "no quote_id in the target's response — cannot complete the hop:
 $quote_out"
-    [ -n "$invoice" ] || die "target returned no bolt11. If it auto-funded instead, the target is a
-TEST mint and this probe proves nothing about real routing."
+    is_bolt11 "$invoice" || die "the target did not return a bolt11 (got: ${invoice:0:40}).
+If it auto-funded instead, the target is a TEST mint and this probe proves nothing about routing."
     say "  quote_id=$quote_id  invoice=${invoice:0:32}..."
 
     # 2. Melt at the SOURCE to pay it. THIS is the leg no hermetic test can reach.
@@ -263,7 +347,7 @@ target. It is recoverable — re-run mint-complete with that quote id. Report be
 
 # ── Stage B: the full trade ─────────────────────────────────────────────────────────────────────
 stage_b() {
-    require_auth "$DELIVERY_SATS"
+    require_auth
     die "STAGE B IS NOT WIRED YET — refusing rather than pretending.
 
 Stage A is complete and proven end to end. Stage B needs a two-sided trade rig that this script
@@ -289,7 +373,7 @@ Run --stage-a first. Its fee verdict decides whether Stage B is even viable unde
 dry_run() {
     local home="$RUN_DIR/dry"
     rule "DRY RUN — testnut, no real money"
-    make_home "$home"
+    ensure_home "$home"
 
     rule "home discipline refuses an unmarked directory"
     local unmarked="$RUN_DIR/unmarked"; mkdir -p "$unmarked"
@@ -334,22 +418,22 @@ main() {
     local mode="${1:-}"
     case "$mode" in
         --self-test) self_test; exit 0 ;;
-        --dry-run|--stage-a|--stage-b) ;;
-        *) die "usage: $0 --self-test | --dry-run | --stage-a | --stage-b" ;;
+        --dry-run|--fund|--fund-complete|--stage-a|--stage-b) ;;
+        *) die "usage: $0 --self-test | --dry-run | --fund | --fund-complete <quote_id> | --stage-a | --stage-b" ;;
     esac
 
     [ -x "$MOBEE" ] || die "no mobee binary at $MOBEE (set MOBEE=...)"
     self_test   # parsers are proven before anything else runs, on every mode
 
-    if [ -z "$RUN_DIR" ]; then
-        RUN_DIR="$(mktemp -d -t crossmint-smoke-XXXXXX)"
-    fi
+    mkdir -p "$RUN_DIR"
     say "run dir: $RUN_DIR"
 
     case "$mode" in
-        --dry-run) dry_run ;;
-        --stage-a) stage_a ;;
-        --stage-b) stage_b ;;
+        --dry-run)        dry_run ;;
+        --fund)           fund ;;
+        --fund-complete)  fund_complete "${2:-}" ;;
+        --stage-a)        stage_a ;;
+        --stage-b)        stage_b ;;
     esac
 }
 
