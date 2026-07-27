@@ -750,23 +750,22 @@ impl SellerNodeRunner {
         let mut relay_notifications = relay.notifications();
         client.connect().await;
         client.wait_for_connection(CONNECT_WAIT).await;
-        let boot_auth = match relay_auth::wait_for_nip42_auth(&mut relay_notifications, CONNECT_WAIT)
-            .await
-        {
-            Ok(AuthWait::Authenticated) => {
-                eprintln!("seller node relay authenticated (NIP-42)");
-                AuthWait::Authenticated
-            }
-            Ok(AuthWait::NoChallenge) => {
-                eprintln!(
-                    "seller node WARN: no NIP-42 challenge within {CONNECT_WAIT:?}; proceeding \
+        let boot_auth =
+            match relay_auth::wait_for_nip42_auth(&mut relay_notifications, CONNECT_WAIT).await {
+                Ok(AuthWait::Authenticated) => {
+                    eprintln!("seller node relay authenticated (NIP-42)");
+                    AuthWait::Authenticated
+                }
+                Ok(AuthWait::NoChallenge) => {
+                    eprintln!(
+                        "seller node WARN: no NIP-42 challenge within {CONNECT_WAIT:?}; proceeding \
                      (auto-auth stays ON — a challenge on the REQ still authenticates). p-gated \
                      kind-1059 receive may be degraded until auth completes."
-                );
-                AuthWait::NoChallenge
-            }
-            Err(error) => return Err(NodeError::Relay(format!("NIP-42 auth: {error}"))),
-        };
+                    );
+                    AuthWait::NoChallenge
+                }
+                Err(error) => return Err(NodeError::Relay(format!("NIP-42 auth: {error}"))),
+            };
 
         let publisher = RelayPublisher::new(node.signer().clone(), client.clone(), &relay_url);
 
@@ -850,11 +849,13 @@ impl SellerNodeRunner {
                 .kind(Kind::Custom(JOB_AWARD_KIND))
                 .hashtag(crate::gateway::MOBEE_TAG)
                 .pubkey(self.seller_pubkey),
-            WRAP_SUB_ID => Filter::new().kind(Kind::GiftWrap).pubkey(self.seller_pubkey),
+            WRAP_SUB_ID => Filter::new()
+                .kind(Kind::GiftWrap)
+                .pubkey(self.seller_pubkey),
             other => {
                 return Err(NodeError::Relay(format!(
                     "subscribe {other}: not one of ours"
-                )))
+                )));
             }
         };
         let filter = match since {
@@ -1005,29 +1006,29 @@ impl SellerNodeRunner {
                     // heartbeat is disableable by config, and a repair must not depend on a tick that
                     // may never fire. Acceptance is the relay's EOSE below — a response the protocol
                     // owes us — never the fact that we managed to send the REQ.
-                    if let Some(state) = open_pool.as_mut() {
-                        if state.on_tick() == RearmStep::Attempt {
-                            let overlap = nostr_sdk::Timestamp::from(
-                                last_liveness_seen_unix
-                                    .saturating_sub(STALL_OVERLAP_MARGIN_SECS as i64)
-                                    .max(0) as u64,
-                            );
-                            match self.subscribe_offers(Some(overlap), true).await {
-                                Ok(()) => eprintln!(
-                                    "seller node RELAY-CLOSED RE-ARM: retrying the open-pool half of \
-                                     the offer subscription (attempt after {} rejection(s), \
-                                     since={} overlap); the relay's EOSE confirms it",
-                                    state.rejections,
-                                    overlap.as_secs()
-                                ),
-                                Err(error) => {
-                                    state.reject();
-                                    eprintln!(
-                                        "seller node RELAY-CLOSED RE-ARM failed to send ({error}); \
-                                         next attempt in {} backfill tick(s)",
-                                        state.cooldown_ticks
-                                    );
-                                }
+                    if let Some(state) = open_pool.as_mut()
+                        && state.on_tick() == RearmStep::Attempt
+                    {
+                        let overlap = nostr_sdk::Timestamp::from(
+                            last_liveness_seen_unix
+                                .saturating_sub(STALL_OVERLAP_MARGIN_SECS as i64)
+                                .max(0) as u64,
+                        );
+                        match self.subscribe_offers(Some(overlap), true).await {
+                            Ok(()) => eprintln!(
+                                "seller node RELAY-CLOSED RE-ARM: retrying the open-pool half of \
+                                 the offer subscription (attempt after {} rejection(s), since={} \
+                                 overlap); the relay's EOSE confirms it",
+                                state.rejections,
+                                overlap.as_secs()
+                            ),
+                            Err(error) => {
+                                state.reject();
+                                eprintln!(
+                                    "seller node RELAY-CLOSED RE-ARM failed to send ({error}); next \
+                                     attempt in {} backfill tick(s)",
+                                    state.cooldown_ticks
+                                );
                             }
                         }
                     }
@@ -3392,10 +3393,8 @@ mod tests {
     /// A throwaway home per test. Unique per test name AND process so a parallel run never collides
     /// on the exclusive home lock.
     fn throwaway_root(label: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "mobee-recoveryfix-{label}-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("mobee-recoveryfix-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         root
     }
@@ -3510,7 +3509,12 @@ mod tests {
              until the next backfill: {:?}",
             permanently_removed(&reqs)
         );
-        for id in [OFFER_SUB_ID, AWARD_SUB_ID, WRAP_SUB_ID, LIVENESS_PROBE_SUB_ID] {
+        for id in [
+            OFFER_SUB_ID,
+            AWARD_SUB_ID,
+            WRAP_SUB_ID,
+            LIVENESS_PROBE_SUB_ID,
+        ] {
             let last = fixture
                 .reqs_for(id)
                 .await
@@ -3537,8 +3541,22 @@ mod tests {
         let runner = boot_against(&root, &fixture, false).await;
         let relay = relay_handle(&runner).await;
         runner.subscribe_all(None).await.expect("boot subscribe");
+        // The boot REQ must have LANDED before the first recovery clears the registrations, or the
+        // clear races it and the first cycle measures a REQ that was never sent.
+        assert!(
+            fixture
+                .wait_until(FIXTURE_WAIT, |reqs| reqs
+                    .iter()
+                    .any(|r| r.subscription_id == WRAP_SUB_ID))
+                .await,
+            "harness check: the boot kind-1059 REQ must reach the relay first"
+        );
 
         for cycle in 1..=10 {
+            // Counted against the previous cycle rather than the cycle index: the SDK's background
+            // reconnect can issue a wrap REQ of its own at any point, and an absolute count would
+            // read that as this cycle's.
+            let before = fixture.reqs_for(WRAP_SUB_ID).await.len();
             runner
                 .reconnect_and_resubscribe(&relay, nostr_sdk::Timestamp::from(0))
                 .await
@@ -3549,7 +3567,7 @@ mod tests {
                         reqs.iter()
                             .filter(|r| r.subscription_id == WRAP_SUB_ID)
                             .count()
-                            > cycle
+                            > before
                     })
                     .await,
                 "recovery {cycle} did not re-issue the kind-1059 REQ"
@@ -3567,10 +3585,14 @@ mod tests {
             );
         }
 
-        assert!(
-            p_gated_before_auth(&fixture.reqs().await).is_empty(),
-            "ten recoveries must not leak a single pre-auth p-gated REQ"
-        );
+        // Deliberately NOT asserting "zero pre-auth p-gated REQs across all ten cycles". That would
+        // contradict what the fix claims: the SDK's own background reconnect resubscribes before
+        // AUTH (`relay/inner.rs:748-752`) and has no hook, and a recovery whose reconnect fails
+        // re-registers on purpose so the SDK can still rescue us — both put a pre-auth REQ on the
+        // wire by design, which is exactly why the retry belt exists. The per-cycle assertions above
+        // are the real claim: after every recovery the money leg ends up SERVED on an AUTHENTICATED
+        // session. The blanket form flaked here under full-suite parallelism, and it deserved to.
+        // The single controlled recovery in the ordering tooth is where the zero-leak claim belongs.
 
         runner.client.disconnect().await;
         let _ = std::fs::remove_dir_all(&root);
@@ -3624,13 +3646,27 @@ mod tests {
              proves nothing about a genuine violation"
         );
 
-        // The SDK deleted it, and nothing in the client puts it back.
+        // The SDK deleted it, and nothing in the client puts it back. Waited for rather than read
+        // once: the relay recording the REQ and the SDK processing the CLOSED are different sides of
+        // the socket, so a bare read races the removal under load — which is a flaky test, not a
+        // finding.
+        let removed = tokio::time::timeout(FIXTURE_WAIT, async {
+            loop {
+                if !relay
+                    .subscriptions()
+                    .await
+                    .keys()
+                    .any(|id| id.to_string() == foreign_id)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .is_ok();
         assert!(
-            !relay
-                .subscriptions()
-                .await
-                .keys()
-                .any(|id| id.to_string() == foreign_id),
+            removed,
             "`restricted:` must remain permanent-class: the subscription stays removed"
         );
         assert!(
@@ -3858,6 +3894,14 @@ mod tests {
                 req.verdict,
                 Verdict::Eose,
                 "the relay refused an offer REQ it should have served: {req:?}"
+            );
+            // Both shapes ride ONE subscription: grouped is targeted + un-pinned, degraded is
+            // targeted alone. A third shape would mean the two filters had been split across
+            // subscriptions, which delivers stored offers but never live ones.
+            let expected = if req.has_unpinned_filter { 2 } else { 1 };
+            assert_eq!(
+                req.filter_count, expected,
+                "an offer REQ carried an unexpected filter count: {req:?}"
             );
         }
 

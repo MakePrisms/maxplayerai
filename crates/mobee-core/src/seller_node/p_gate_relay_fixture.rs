@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 /// What the relay answered a `REQ` with.
@@ -52,14 +52,16 @@ pub(super) struct ReqRecord {
     pub verdict: Verdict,
 }
 
-/// A refusal the test has armed for the relay to emit on the next matching `REQ`, once.
+/// A refusal the test has armed, spent on the next `REQ` for this subscription that carries an
+/// un-pinned filter.
+///
+/// Matching only the un-pinned shape is load-bearing: a refusal armed for the open-pool half would
+/// otherwise be spent on the targeted-only re-subscribe that immediately follows a rejection, and
+/// the backoff tooth would be measuring the wrong REQ.
 #[derive(Debug, Clone)]
 struct ForcedClose {
     subscription_id: String,
     reason: String,
-    /// Match only a `REQ` that carries an un-pinned filter. Without this, a refusal armed for the
-    /// open-pool half would be spent on the targeted-only re-subscribe that follows a rejection.
-    require_unpinned: bool,
 }
 
 #[derive(Debug, Default)]
@@ -141,16 +143,6 @@ impl PGateRelay {
         self.url.clone()
     }
 
-    /// Arm one refusal: the next `REQ` for `subscription_id` is answered `CLOSED` with `reason`,
-    /// whatever the session's auth state. Used to induce a degrade on an otherwise healthy seat.
-    pub(super) async fn force_close_once(&self, subscription_id: &str, reason: &str) {
-        self.controls.forced.lock().await.push_back(ForcedClose {
-            subscription_id: subscription_id.to_string(),
-            reason: reason.to_string(),
-            require_unpinned: false,
-        });
-    }
-
     /// Refuse the next `count` `REQ`s for `subscription_id` that carry an un-pinned filter — i.e. a
     /// relay that keeps rejecting the open-pool half while serving the targeted one.
     pub(super) async fn refuse_unpinned(&self, subscription_id: &str, count: usize, reason: &str) {
@@ -159,7 +151,6 @@ impl PGateRelay {
             forced.push_back(ForcedClose {
                 subscription_id: subscription_id.to_string(),
                 reason: reason.to_string(),
-                require_unpinned: true,
             });
         }
     }
@@ -317,9 +308,10 @@ async fn decide(
 ) -> Verdict {
     let has_unpinned = pinned.iter().any(Option::is_none);
     let mut forced = controls.forced.lock().await;
-    if let Some(index) = forced.iter().position(|entry| {
-        entry.subscription_id == subscription_id && (!entry.require_unpinned || has_unpinned)
-    }) {
+    if let Some(index) = forced
+        .iter()
+        .position(|entry| entry.subscription_id == subscription_id && has_unpinned)
+    {
         let entry = forced.remove(index).expect("index just found");
         return Verdict::Closed(entry.reason);
     }
