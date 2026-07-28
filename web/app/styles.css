@@ -91,29 +91,34 @@ a { color: var(--blue); }
   margin: 12px 0 0; color: var(--neon);
   font-size: clamp(13px, 1.6vw, 17px); letter-spacing: 0.34em; text-transform: uppercase;
 }
-/* two entry points, labelled — a visitor should know which line is theirs */
-.runs { display: inline-flex; flex-direction: column; gap: 8px; margin: 26px 0 0; max-width: 100%; }
+/* two entry points, labelled — a visitor should know which line is theirs.
+   Built to read as a terminal: dark well, prompt glyph, hard-separated zones. */
+.runs { display: inline-flex; flex-direction: column; gap: 10px; margin: 26px 0 0; max-width: 100%; }
 .run {
-  display: flex; align-items: stretch;
-  border: 1px solid var(--line); border-radius: 8px; background: var(--panel);
-  max-width: 100%; overflow: hidden; min-width: 0;
+  display: inline-flex; align-items: stretch; max-width: 100%; min-width: 0;
+  background: #04070e;
+  border: 1px solid var(--line); border-radius: 9px; overflow: hidden;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset;
 }
 .run .lbl {
-  flex: none; display: flex; align-items: center; padding: 0 12px;
+  flex: none; display: flex; align-items: center; padding: 0 13px;
   background: var(--blue-dim); color: var(--blue);
-  font-size: 10.5px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase;
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase;
   border-right: 1px solid var(--line);
 }
 .run .lbl.sell { background: var(--neon-dim); color: var(--neon); }
 .run code {
-  padding: 11px 14px; font-size: 12.5px; color: var(--ink-2);
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 9px;
+  padding: 12px 16px; font-size: 12.5px; color: var(--ink);
   white-space: nowrap; overflow-x: auto; text-align: left;
-  min-width: 0;   /* let it scroll instead of widening the page */
 }
+.run code::before { content: "$"; color: var(--faint); flex: none; }
 .run button {
   flex: none; border: 0; border-left: 1px solid var(--line);
-  background: var(--raise); color: var(--neon); cursor: pointer;
-  padding: 0 15px; font-size: 11.5px; letter-spacing: 0.1em; text-transform: uppercase;
+  background: var(--raise); color: var(--muted); cursor: pointer;
+  padding: 0 16px; font-size: 10.5px; font-weight: 700;
+  letter-spacing: 0.14em; text-transform: uppercase;
+  transition: background 0.12s ease, color 0.12s ease;
 }
 .run button:hover { background: var(--neon); color: #0a0d02; }
 .hero-note { margin: 20px 0 0; color: var(--muted); font-size: 13px; }
@@ -228,8 +233,7 @@ a { color: var(--blue); }
 .steps .n { font-size: 11px; font-weight: 700; letter-spacing: 0.14em; color: var(--neon); }
 .steps h3 { margin: 10px 0 8px; font-size: 15px; font-weight: 700; letter-spacing: 0.02em; color: var(--ink); }
 .steps p { margin: 0; font-family: var(--sans); font-size: 13.5px; line-height: 1.6; color: var(--muted); }
-.pitch .run { margin-top: 28px; }
-.pitch .run.small code { font-size: 12px; }
+.pitch .run { margin-top: 30px; }
 @media (max-width: 1000px) { .steps { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 560px) { .steps { grid-template-columns: 1fr; } }
 
