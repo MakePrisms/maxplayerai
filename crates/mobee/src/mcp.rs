@@ -175,7 +175,7 @@ fn tools() -> Value {
                     },
                     "harness": {
                         "type": "string",
-                        "description": "Preferred seller harness (e.g. claude|cursor|codex). Recorded as an auto-award preference; not yet a hard filter (no claim wire field carries it)."
+                        "description": "Request a specific seller harness (e.g. claude|cursor|codex). Posted on the offer as [\"param\",\"agent\",<name>] and enforced as a HARD award filter: only a seller advertising that harness on its claim can be awarded, and a seller that cannot run it will not claim at all. Omit it (or pass \"any\") for no preference. Also recorded as the auto-award preference it always was."
                     },
                     "model": {
                         "type": "string",
