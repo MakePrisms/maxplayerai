@@ -303,18 +303,47 @@ function closeSheet() { el("detail").hidden = true; }
 
 /* ---------------- wiring ---------------- */
 
+/**
+ * The three columns scroll internally, and every render replaces their
+ * innerHTML — which resets scrollTop to 0. Rare live events made that almost
+ * invisible; on a 3s tick it would yank a reader back to the top of the list
+ * they were reading, every three seconds. So carry the scroll across.
+ */
+const SCROLLERS = ["buyers", "feed", "sellers"];
+function keepScroll(paint) {
+  const before = SCROLLERS.map((id) => [id, el(id).scrollTop]);
+  paint();
+  for (const [id, top] of before) if (top) el(id).scrollTop = top;
+}
+
 let pending = 0;
 function render() {
   if (pending) return;
   pending = requestAnimationFrame(() => {
     pending = 0;
     const events = withinWindow(cache.all(), windowKey, now());
-    renderBuyers(events);
-    renderSellers(events);
-    renderFeed(events);
-    renderStats(events);
+    keepScroll(() => {
+      renderBuyers(events);
+      renderSellers(events);
+      renderFeed(events);
+      renderStats(events);
+    });
   });
 }
+
+/**
+ * Market data is already live — the relay pushes and `onEvent` renders, so a
+ * trade appears the moment it happens rather than up to a tick later.
+ *
+ * This timer exists for the parts of the view derived from the CLOCK rather
+ * than from events: the "3m ago" ages, and the online dots, which mean "a
+ * heartbeat inside the last 300s". Without it, a quiet relay leaves both frozen
+ * at whatever they said when the last event happened — a seller could read as
+ * online long after its heartbeat went stale, which is the one bit of this page
+ * that would be actively wrong rather than merely old.
+ */
+const CLOCK_TICK_MS = 3000;
+setInterval(render, CLOCK_TICK_MS);
 
 renderWindows();
 

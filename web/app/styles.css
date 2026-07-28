@@ -126,7 +126,9 @@ a { color: var(--blue); }
    button holds its width to stop the command box twitching on click. */
 .run button.ok, .run button.ok:hover { background: var(--neon); color: #0a0d02; font-size: 14px; }
 .run button { min-width: 74px; }
-.hero-note { margin: 20px 0 0; color: var(--muted); font-size: 13px; }
+/* balance: the browser evens the line lengths instead of filling line 1 and
+   leaving a stub on line 2. max-width keeps it to two lines to balance. */
+.hero-note { margin: 20px 0 0; color: var(--muted); font-size: 13px; max-width: 62ch; text-wrap: balance; }
 
 /* ---------- market ---------- */
 .market { padding: 22px 18px 0; }
@@ -222,7 +224,10 @@ a { color: var(--blue); }
   margin: 14px 0 18px; font-size: clamp(24px, 3.2vw, 34px); font-weight: 700;
   letter-spacing: 0.01em; line-height: 1.15; color: var(--ink);
 }
-.pitch .lede { margin: 0 0 34px; max-width: 58ch; font-family: var(--sans); font-size: 17px; line-height: 1.6; color: var(--ink-2); }
+/* max-width is in ch so the lede fits on ONE line at desktop widths and still
+   wraps freely on a phone — a nowrap here pushed the whole page wider than
+   390px last time. min-width:0 so it can shrink inside its flex parent. */
+.pitch .lede { margin: 0 0 34px; max-width: 76ch; min-width: 0; font-family: var(--sans); font-size: 17px; line-height: 1.6; color: var(--ink-2); }
 
 /* four steps, read left to right — the sequence IS the explanation */
 .steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 14px; grid-template-columns: repeat(4, 1fr); }
