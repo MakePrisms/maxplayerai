@@ -29,7 +29,7 @@ use crate::seller::rate_gate_allows;
 use crate::seller_agents::AgentRegistry;
 use crate::seller_exec::{
     compose_agent_prompt, delivery_message, job_workdir, run_agent_job, run_agent_with_retry,
-    seller_delivery_kind, seller_exec_metadata, unified_job_timeout,
+    seller_delivery_kind, seller_exec_metadata, unified_job_timeout, SandboxPolicy,
 };
 use crate::seller_git::{self, DeliveryAgentIdentity};
 
@@ -1946,9 +1946,11 @@ impl SellerNodeRunner {
         }
 
         // Run the agent under the job's remaining deadline, retrying a transient error while the
-        // deadline has room. The agent edits files in `workdir`; the node owns commit + push.
+        // deadline has room. The agent edits files in `workdir`; the node owns commit + push. The
+        // configured `[sandbox]` policy launches the command (pass-through when absent).
         let deadline = offer.deadline_unix.max(0) as u64;
         let prompt = compose_agent_prompt(&offer.task, &seller.git_remote, None);
+        let sandbox = SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref());
         let run_started = std::time::Instant::now();
         let run_result = run_agent_with_retry(
             deadline,
@@ -1956,7 +1958,7 @@ impl SellerNodeRunner {
             || now_unix() as u64,
             |_attempt| {
                 let job_timeout = unified_job_timeout(deadline, now_unix() as u64);
-                run_agent_job(&agent_command, &prompt, &workdir, &identity, job_timeout)
+                run_agent_job(&agent_command, &sandbox, &prompt, &workdir, &identity, job_timeout)
             },
         )
         .await;

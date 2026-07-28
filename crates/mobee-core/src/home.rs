@@ -202,6 +202,24 @@ pub struct SellerConfig {
     pub contribution_enabled: bool,
 }
 
+/// Executor sandbox config (`[sandbox]` section): the launcher the awarded agent command runs
+/// inside. Absent ⇒ pass-through — the command runs exactly as configured, byte-identical to no
+/// sandbox. Present ⇒ the launcher argv is prepended to the agent command so it runs inside an OS
+/// sandbox, without the run/exec path knowing which launcher.
+///
+/// Top-level on `MobeeConfig`, not nested under `[seller]`: `SellerConfig`'s literal is built in
+/// the money-path `seller.rs`, which this must not touch (same placement rationale as
+/// [`SellerAnnounceConfig`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxConfig {
+    /// The launcher argv the agent command runs inside (no-shell argv array, same rule as
+    /// `agent_command`: a bare string is refused, and the array must be non-empty — an empty
+    /// launcher is expressed by omitting the whole `[sandbox]` section, not by an empty array).
+    #[serde(deserialize_with = "deserialize_agent_command_argv")]
+    pub launcher: Vec<String>,
+}
+
 /// Persistent-seller-memory config (`[seller_memory]` section): the read-on-start +
 /// retro-write-back knobs and the two plugin seams (prompt template paths). Every field has a
 /// serde default so a config written before this section existed parses to the shipped defaults.
@@ -763,6 +781,9 @@ pub struct MobeeConfig {
     /// `agent_command`) when absent.
     #[serde(default, skip_serializing_if = "SellerRosterConfig::is_default")]
     pub seller_roster: SellerRosterConfig,
+    /// Optional `[sandbox]` executor config. Absent ⇒ the agent command runs pass-through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxConfig>,
 }
 
 /// Buyer-side content policy for contribution verify (the content-policy hook). Maps 1:1
@@ -904,6 +925,7 @@ impl Default for MobeeConfig {
             seller_preflight: SellerPreflightConfig::default(),
             contribution: None,
             seller_roster: SellerRosterConfig::default(),
+            sandbox: None,
         }
     }
 }
