@@ -199,14 +199,19 @@ function openParticipant(role, pubkey, events) {
       // What the seller says about itself, kept visibly separate from what it
       // has actually done — an advert is a claim, and only the trades above
       // are evidence.
-      // Only the structured fields. A seller's free-text `about` is often stale
-      // against its own rate_sats and mint, and printing both publishes a
-      // contradiction — these are the values a client would actually act on.
+      // Only the structured fields — a seller's free-text `about` is often stale
+      // against its own numbers, and printing both publishes a contradiction.
+      //
+      // The advertised MINT is deliberately NOT shown. mobee #209: the mint in
+      // the announce is hardcoded "testnut" on stock builds and never reads
+      // config, so sellers settling in real bitcoin advertise a test mint. A
+      // reader seeing "testnut" would conclude no real money is involved, which
+      // is both false and the most costly way to be wrong. Better to show
+      // nothing than a money field known to be lying. Restore when #209 ships.
       parts.push('<h4>Advertises <span class="unver">unverified</span></h4>');
       parts.push(`<p class="tiny">${[
         s.askSats != null ? `asks <b>${nf.format(s.askSats)} sat</b> per job` : "",
         s.openPool ? "takes open-pool work" : "direct offers only",
-        s.mint ? `mint: ${esc(s.mint)}` : "",
       ].filter(Boolean).join(" · ")}</p>`);
       // Advertised terms are self-reported and nothing checks them against what
       // the seller actually does — observed diverging for weeks in practice.
