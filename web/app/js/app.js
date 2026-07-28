@@ -341,20 +341,46 @@ el("detail-close").addEventListener("click", closeSheet);
 el("detail").addEventListener("click", (ev) => { if (ev.target === el("detail")) closeSheet(); });
 
 /**
- * Copy a command to the clipboard. Clipboard access can be refused, and a
- * button that says "copied" when nothing was copied is worse than one that
- * admits it — so failure is reported, not swallowed.
+ * Copy a command to the clipboard, then confirm with a tick.
+ *
+ * `navigator.clipboard` is UNDEFINED in an insecure context, not merely
+ * permission-denied — measured on the http staging host, where the whole API is
+ * absent. Without the fallback below, every click there reported failure while
+ * working fine on https, so the feature would look broken in exactly the place
+ * it gets reviewed. execCommand is deprecated and is the only thing that works
+ * on a plain-http origin; it returns a boolean we can actually trust.
+ *
+ * The tick is shown ONLY for a copy that really happened. A button claiming
+ * success sends someone off to paste nothing, which is worse than admitting it.
  */
+function copyLegacy(text) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.cssText = "position:fixed;top:-1000px;opacity:0";
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch { ok = false; }
+  ta.remove();
+  return ok;
+}
+
 async function copyFrom(sourceId, btn) {
+  const text = el(sourceId).textContent.trim();
+  let ok = false;
   try {
-    await navigator.clipboard.writeText(el(sourceId).textContent.trim());
-    // Checkmark ONLY on a write that actually resolved. A tick shown for a copy
-    // that did not happen sends someone to paste nothing.
-    btn.textContent = "✓";
-    btn.classList.add("ok");
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    } else {
+      ok = copyLegacy(text);
+    }
   } catch {
-    btn.textContent = "select it";
+    ok = copyLegacy(text);
   }
+  btn.textContent = ok ? "✓" : "select it";
+  btn.classList.toggle("ok", ok);
   setTimeout(() => { btn.textContent = "copy"; btn.classList.remove("ok"); }, 1600);
 }
 for (const btn of document.querySelectorAll("[data-copy]")) {
