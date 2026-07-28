@@ -19,9 +19,9 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-        in
-        {
-          default = pkgs.rustPlatform.buildRustPackage {
+
+          # Args common to every `mobee` build.
+          mobeeArgs = {
             pname = "mobee";
             version = "0.1.0";
             src = self;
@@ -36,22 +36,42 @@
               "mobee"
             ];
 
-            # Enable the `acp` feature (off by default) so the acp-gated
-            # `run` subcommand is compiled in. Default features (wallet)
-            # are kept.
-            buildFeatures = [ "acp" ];
-
             # The flake's job is packaging the runnable binary, not running
             # the test suite (some tests are heavy / touch the network).
             doCheck = false;
-
-            nativeBuildInputs = [ pkgs.pkg-config ];
 
             meta = {
               description = "Mobee";
               mainProgram = "mobee";
             };
           };
+        in
+        {
+          default = pkgs.rustPlatform.buildRustPackage (
+            mobeeArgs
+            // {
+              # Enable the `acp` feature (off by default) so the acp-gated
+              # `run` subcommand is compiled in. Default features (wallet)
+              # are kept.
+              buildFeatures = [ "acp" ];
+
+              nativeBuildInputs = [ pkgs.pkg-config ];
+            }
+          );
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          # Fully static buyer binary. Links against musl with no ELF
+          # interpreter, so the artifact runs on any Linux without nix
+          # present — the property a downloaded release needs.
+          #
+          # Buyer surface only: `acp` is left out, so the seller's
+          # agent-execution path is not compiled in.
+          buyer-static = pkgs.pkgsStatic.rustPlatform.buildRustPackage (
+            mobeeArgs
+            // {
+              nativeBuildInputs = [ pkgs.pkgsStatic.pkg-config ];
+            }
+          );
         }
       );
 
