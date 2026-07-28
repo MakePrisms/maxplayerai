@@ -11,13 +11,21 @@ Every measurement below was taken against `dev` @ `8debf43`.
 
 ## 1. What installing `mobee` means today
 
-One path, stated in five files and nine places:
+One path:
 
 ```
 nix run --refresh github:MakePrisms/mobee -- mcp
 ```
 
-`README.md` · `docs/ONBOARDING.md` (×2) · `docs/SELLER-QUICKSTART.md` (×2) · `docs/DEPLOYMENT.md` (×4)
+That copy-paste form appears **5 times across 4 files** — `README.md` · `docs/ONBOARDING.md` (×2) ·
+`docs/SELLER-QUICKSTART.md` · `docs/DEPLOYMENT.md`. Counting *any* mention of `nix run`, including
+prose forms written with an ellipsis, gives **10 occurrences on 9 lines** across those same 4 files.
+Counted at `8debf43`.
+
+★ **State the unit, or the sweep will miss things.** Occurrences and lines genuinely differ here:
+`docs/SELLER-QUICKSTART.md:68` holds two `nix run` forms on one line (one of them deliberately
+without `--refresh`, as the counter-example). Grep the canonical form to find what a user copies;
+grep `nix run` to find everything that needs rewording.
 
 It works, it is hermetic, and it is the right interim answer for a team that is entirely on nix.
 It has three properties that only start to hurt once someone outside the team arrives:
