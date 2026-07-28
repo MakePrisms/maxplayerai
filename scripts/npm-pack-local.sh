@@ -50,6 +50,16 @@ mkdir -p "$STAGE" "$DIST" "$PROJECT"
 # output, and it belongs to a release, not to the source tree.
 cp -R "$PKG_MAIN"     "$STAGE/mobee"
 cp -R "$PKG_PLATFORM" "$STAGE/cli-linux-x64"
+
+# Every published package carries both licence texts. Apache-2.0 section 4(a) requires a copy of the
+# License to travel with distributed copies, and npm cannot reference paths above a package
+# directory, so the files are copied in here rather than listed from the repo root.
+stage_licenses() {
+    cp LICENSE-MIT LICENSE-APACHE "$1/" \
+        || die "could not stage the licence files into $1"
+}
+stage_licenses "$STAGE/mobee"
+stage_licenses "$STAGE/cli-linux-x64"
 mkdir -p "$STAGE/cli-linux-x64/bin"
 cp -L "$BINARY" "$STAGE/cli-linux-x64/bin/mobee"
 chmod 755 "$STAGE/cli-linux-x64/bin/mobee"
@@ -73,6 +83,17 @@ TARBALL_LISTING="$(tar -tzf "$TGZ_PLATFORM")"
 grep -qx 'package/bin/mobee' <<<"$TARBALL_LISTING" \
     || die "platform tarball does not contain package/bin/mobee"
 echo "ok: platform tarball carries bin/mobee"
+
+# Both licence texts must be inside BOTH tarballs. A `files` typo or a missed staging step fails
+# silently: the package installs cleanly and is simply missing the licence it claims to be under.
+for tgz in "$TGZ_MAIN" "$TGZ_PLATFORM"; do
+    listing="$(tar -tzf "$tgz")"
+    for lic in LICENSE-MIT LICENSE-APACHE; do
+        grep -qx "package/$lic" <<<"$listing" \
+            || die "$(basename "$tgz") does not contain $lic — Apache-2.0 4(a) requires it to ship"
+    done
+done
+echo "ok: both tarballs carry LICENSE-MIT and LICENSE-APACHE"
 
 # ── Install into a clean project, scripts disabled ──────────────────────────────────────────────
 cat > "$PROJECT/package.json" <<JSON

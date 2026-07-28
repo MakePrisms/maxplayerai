@@ -2,7 +2,7 @@
   "name": "@mobee/cli-linux-x64",
   "version": "0.1.0",
   "description": "mobee binary for linux-x64 — payload package, install `mobee` instead",
-  "license": "MIT",
+  "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/MakePrisms/mobee.git"
@@ -12,5 +12,5 @@
   "bin": {
     "mobee-linux-x64": "bin/mobee"
   },
-  "files": ["bin/mobee"]
+  "files": ["bin/mobee", "LICENSE-MIT", "LICENSE-APACHE"]
 }
