@@ -58,9 +58,20 @@ function renderWindows() {
   ).join("");
 }
 
+let connState = "connecting";
 function setConn(state, detail) {
+  connState = state;
   el("conn").setAttribute("data-state", state);
   el("conn-text").textContent = detail ? `${state} · ${detail}` : state;
+  // An empty board means "nothing happened" only if the read succeeded.
+  if (state === "failed" || state === "reconnecting") render();
+}
+
+/** Empty-column text. A failed read is not an empty market. */
+function emptyText(what) {
+  return connState === "failed" || connState === "reconnecting"
+    ? "Could not reach the relay — figures unavailable, retrying."
+    : `No ${what} in this period.`;
 }
 
 /* ---------------- columns ---------------- */
@@ -76,7 +87,7 @@ function renderBuyers(events) {
         <span class="num ${r.receipted ? "" : "dim"}">${nf.format(r.receipted)}</span>
         <span class="num sats">${nf.format(r.satsPaid)}</span>
       </li>`).join("")
-    : '<li class="empty">No buyers in this period.</li>';
+    : `<li class="empty">${emptyText("buyers")}</li>`;
 }
 
 function renderSellers(events) {
@@ -90,13 +101,13 @@ function renderSellers(events) {
           <span class="dot ${r.online ? "on" : ""}" title="${r.online ? "online now" : "not currently online"}"></span>
           <span class="nm">${r.name ? esc(r.name) : `<code>${short(r.pubkey)}</code>`}</span>
           ${r.harness ? `<span class="harness" title="${esc(r.harness)}">${esc(shortHarness(r.harness))}</span>` : ""}
-          ${r.askSats != null ? `<span class="ask" title="Advertised rate — self-reported by the seller and not verified against what it actually charges">${nf.format(r.askSats)}</span>` : ""}
+          ${r.askSats != null ? `<span class="ask" title="Advertised rate — self-reported by the seller and not verified against what it actually charges"><span class="asklbl">asks</span>${nf.format(r.askSats)}</span>` : ""}
         </span>
         <span class="num">${nf.format(r.delivered)}</span>
         <span class="num ${r.completionRate != null && r.completionRate < 0.5 ? "dim" : ""}">${pct(r.completionRate)}</span>
         <span class="num sats">${nf.format(r.satsEarned)}</span>
       </li>`).join("")
-    : '<li class="empty">No sellers in this period.</li>';
+    : `<li class="empty">${emptyText("sellers")}</li>`;
 }
 
 /** One line of plain English per event kind — the feed reads, not decodes. */
@@ -127,7 +138,7 @@ function renderFeed(events) {
         <span class="line">${feedLine(e)}</span>
         <span class="when">${ago(e.created_at, t)}</span>
       </li>`).join("")
-    : '<li class="empty">No activity in this period.</li>';
+    : `<li class="empty">${emptyText("activity")}</li>`;
 }
 
 
@@ -153,6 +164,8 @@ function renderStats(events) {
   const excluded = m.selfTrades
     ? ` ${nf.format(m.selfTrades)} self-commissioned trade${m.selfTrades === 1 ? " is" : "s are"} excluded — the buyer operated the seller, so it is real work but not market demand.`
     : "";
+  const win = WINDOWS.find((w) => w.key === windowKey);
+  el("stats-window").textContent = win ? `· ${win.label.toLowerCase()}` : "";
   el("stats-note").textContent =
     `Across ${m.daysActive} day${m.daysActive === 1 ? "" : "s"} of activity in the selected period, ` +
     "derived in your browser from relay events. A trade can settle without publishing a receipt, " +

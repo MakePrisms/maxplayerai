@@ -305,3 +305,6 @@ a { color: var(--blue); }
 
 .self { flex: none; font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase; font-weight: 700; color: var(--warn); background: rgba(255,122,77,.15); border-radius: 3px; padding: 2px 5px; margin-right: 2px; }
 .selfnote { margin: 0 0 14px; padding: 11px 13px; background: rgba(255,122,77,.09); border-left: 2px solid var(--warn); border-radius: 0 8px 8px 0; font-size: 12.5px; line-height: 1.55; color: var(--ink-2); }
+
+.ask .asklbl { color: var(--faint); margin-right: 4px; font-size: 9.5px; letter-spacing: 0.06em; text-transform: uppercase; }
+@media (max-width: 900px) { .conn { display: flex; } .conn #conn-text { display: none; } }
