@@ -212,19 +212,22 @@ npm side never compiles anything and never runs a postinstall downloader.
 ```acceptance
 # ★ Two DIFFERENT predicates. Do not let the first stand in for the second.
 #
-# (1) PORTABILITY — does the artifact run at all with no nix and no toolchain present.
-# Assert on the ELF structure, not on `file` (not installed everywhere, this box included):
-readelf -lW result/bin/mobee | grep -qi interp && { echo "FAIL: has an ELF interpreter"; exit 1; }
-readelf -dW result/bin/mobee | grep -qi needed && { echo "FAIL: has shared-library deps"; exit 1; }
-# Then COPY THE BINARY OUT of /nix/store and run it where no /nix exists. Copying out is the
-# point: a needed store path cannot be silently satisfied by the build machine's own store.
-cp -L result/bin/mobee ship/mobee-x86_64-unknown-linux-musl
-docker run --rm -v "$PWD/ship:/b:ro" alpine:3            /b/mobee-x86_64-unknown-linux-musl version
-docker run --rm -v "$PWD/ship:/b:ro" debian:bookworm-slim /b/mobee-x86_64-unknown-linux-musl version
-#   → both print a version, rc=0. Two libcs on purpose: alpine is musl, debian is glibc, so a
-#     pass on both shows the artifact is libc-independent rather than merely alpine-compatible.
+# (1) PORTABILITY — does the artifact run at all with no nix and no toolchain present:
+nix build .#buyer-static && ./scripts/verify-static-artifact.sh result/bin/mobee
+#   → rc=0
+# The script copies the binary OUT of /nix/store and runs it in containers that have no /nix —
+# alpine for musl, debian for glibc, so a pass shows libc-independence and not merely
+# alpine-compatibility. Copying out is the point: run in place and a store path the binary still
+# needs can be satisfied by the build machine's own store, so a broken artifact would pass.
+#
+# It fails closed on a missing tool rather than skipping, and it asserts a negative control
+# (unknown subcommand → rc!=0) without which the passes would be unfalsified.
+#
+# ★ Do NOT reach for readelf/objdump/file here: none of the three is installed on a stock NixOS
+#   host, and with stderr suppressed a missing tool reads exactly like a clean result. The
+#   container run subsumes them anyway — a binary wanting a /nix/store interpreter cannot exec
+#   inside these images at all.
 # ★ Capture rc WITHOUT a pipe — `docker ... | tail` reports tail's exit code, not docker's.
-# ★ Negative control, or rc=0 means nothing: a bogus subcommand MUST give rc!=0.
 #
 # (2) BUYER CAPABILITY — that the buyer surface actually works. `version`/`--help` rc=0 CANNOT
 # test this: the CLI surface is present in every build regardless of features, which is the same
@@ -249,7 +252,6 @@ Not a projection. Built 2026-07-28 against the pinned nixpkgs, `nix build .#buye
 ```
 size            39,816,976 bytes (38M), already stripped by the fixup phase
 ldd             statically linked
-PT_INTERP       absent          DT_NEEDED  absent
 /nix/store refs 0 occurrences in the binary
 alpine:3 (musl, no /nix)             mobee version → "mobee 0.1.0"  rc=0
 debian:bookworm-slim (glibc, no /nix) mobee version → "mobee 0.1.0"  rc=0
