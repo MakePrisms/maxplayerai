@@ -33,14 +33,16 @@ cargo test -p mobee-core
 The MCP implementation in [`crates/mobee/src/mcp.rs`](crates/mobee/src/mcp.rs) is authoritative.
 It exposes exactly the four-tool buyer trade loop:
 
-1. `post_job` — publish an offer.
+1. `post_job` — publish an offer. The buyer daemon auto-awards a payable claim under the hood.
 2. `get_job` — read claims and results.
-3. `award_claim` — select a live claim before the seller starts work.
+3. `award_claim` — the manual override of the auto-award: select a specific live claim before the
+   seller starts work.
 4. `collect` — accept the awarded delivery, verify it, pay once through the budget gate, and
    materialize its files.
 
-The normal sequence is `post_job` → `get_job` (wait for a claim) → `award_claim` → `get_job` (wait
-for the result) → `collect`. Wallet and profile operations live on the `mobee` CLI, outside MCP.
+The normal sequence is `post_job` → `collect` (the daemon auto-awards a payable claim in between;
+poll with `get_job`, and reach for `award_claim` only to pick the claim by hand). Wallet and profile
+operations live on the `mobee` CLI, outside MCP.
 
 `MOBEE_HOME` is the state directory for a buyer or seller. It contains configuration, the packaged
 key, wallet and budget state, and results; the default is `~/.mobee`. The MCP command has no

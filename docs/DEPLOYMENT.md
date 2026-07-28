@@ -2,22 +2,27 @@
 
 > **Status (dev tip) — read this first.** Today `flake.nix` ships exactly one artifact:
 > `packages.default` — the `mobee` client binary (built with `--features acp`) — plus
-> `apps.default` (`nix run … -- mcp|sell`) and a `devShells.default`. The multi-service backend
-> described below (relay / relay-git / blossom / Caddy / Postgres, Docker Compose, NixOS modules,
+> `apps.default` (`nix run … -- mcp|sell`) and a `devShells.default`. A root `Dockerfile` and
+> `docker-compose.yml` also exist, but they package only the **mobee client** (a `sell` daemon /
+> buyer `mcp` container — see [`DOCKER.md`](DOCKER.md)), not the backend below. The multi-service
+> backend described below (relay / relay-git / blossom / Caddy / Postgres bundle, NixOS modules,
 > split `packages.*`) is the **target architecture — not yet in-tree.** Read the rest of this file as
 > the deployment *design + roadmap*; verify any target against `flake.nix` before relying on it.
 
 This is the self-host design for the mobee marketplace: one Rust workspace, Nix as the packaging
 foundation, targeting two runtimes (Docker, NixOS/systemd) across three operator personas
-(relay-operator, seller, buyer). Only the client binary above exists today; the rest is roadmap.
+(relay-operator, seller, buyer). Only the client binary (native, flake, and the client Docker image)
+exists today; the backend bundle is roadmap.
 
 ## Principle
 
 Nix + Rust is the foundation: the whole system is one cargo workspace, so every
 persona is a package built from the same source and pinned by one `Cargo.lock` +
-`flake.lock`. Docker images are built *from* the Nix packages (not a parallel
-Dockerfile toolchain), so there is a single build path and no drift between the
-two runtimes.
+`flake.lock`. The design target is Docker images built *from* the Nix packages
+(one build path, no drift between the two runtimes). The client `Dockerfile` that
+ships today is not there yet — it is a standalone multi-stage `cargo` build
+(`rust:1-bookworm` builder → `debian:bookworm-slim` runtime); folding it onto the
+Nix packages is roadmap.
 
 ## Components (the backend bundle)
 
@@ -61,9 +66,13 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
   seller), no clone. Always `--refresh` (or pin+bump the rev) — nix caches the git ref and will
   otherwise serve a stale binary.
 - `devShells.default` — the workspace build/dev shell.
+- Root `Dockerfile` + `docker-compose.yml` — a **client** container only: a `mobee sell` daemon
+  (the compose `seller` service) or an attached buyer `mobee mcp`. Standalone cargo build, not
+  derived from the flake. See [`DOCKER.md`](DOCKER.md).
 
-That is the whole flake surface right now: one client binary, one run app, one dev shell. There is
-no compose file, no blossom crate, no NixOS module, and no split `packages.*` / `apps.*` in-tree.
+That is the whole packaged surface right now: one client binary, one run app, one dev shell, and one
+client Docker image. There is no **backend-bundle** compose (relay + relay-git + blossom + Caddy +
+Postgres), no blossom crate, no NixOS module, and no split `packages.*` / `apps.*` in-tree.
 
 ### Roadmap — not yet built (do not assume these exist)
 
