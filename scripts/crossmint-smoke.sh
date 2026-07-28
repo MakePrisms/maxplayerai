@@ -78,7 +78,13 @@ parse_balance_for_mint() { # <text> <mint-url>
     printf '%s\n' "$1" | command grep -F "mint=$2 " | command sed -n 's/.*balance_sats=\([0-9]*\).*/\1/p' | command head -1
 }
 # `status=needs_payment amount_sats=<n> mint=<url> quote_id=<id> (...)`
-parse_quote_id() { printf '%s\n' "$1" | command sed -n 's/.*quote_id=\([A-Za-z0-9-]*\).*/\1/p' | command head -1; }
+#
+# Match everything up to whitespace rather than an allow-list of characters. A previous version
+# used [A-Za-z0-9-], which silently TRUNCATED real quote ids at the first underscore
+# (lcLc0JwHHCIG_UIwQ8... -> lcLc0JwHHCIG) and cost two live mint-complete failures. Quote ids are
+# opaque: testnut issues UUIDs, the real mints issue base64url with _ and -. Never enumerate the
+# characters of an identifier you do not define.
+parse_quote_id() { printf '%s\n' "$1" | command sed -n 's/.*quote_id=\([^ ]*\).*/\1/p' | command head -1; }
 # `paid_sats=<n> fee_sats=<n> balance_sats=<n> mint=<url>`
 parse_field()   { printf '%s\n' "$1" | command sed -n "s/.*$2=\([0-9]*\).*/\1/p" | command head -1; }
 
@@ -103,9 +109,24 @@ total_sats=179'
     check "absent mint = empty" ""   "$(parse_balance_for_mint "$bal" "https://none.test")"
 
     # The live non-testnut mint branch — the one the dry run structurally cannot reach.
-    local needs='status=needs_payment amount_sats=21 mint=https://b.test quote_id=019fa5cd-b27c-7803-b89e-51d8f45c3c05 (pay the invoice, then `mobee wallet mint-complete 019fa5cd-b27c-7803-b89e-51d8f45c3c05`)'
-    check "quote id from needs_payment" "019fa5cd-b27c-7803-b89e-51d8f45c3c05" "$(parse_quote_id "$needs")"
-    check "amount from needs_payment"   "21" "$(parse_field "$needs" amount_sats)"
+    #
+    # ★ BOTH id shapes, because the first version of this fixture used only the UUID and that is
+    # exactly why the truncation shipped. The UUID came from testnut — the mint the dry run CAN
+    # reach — so the fixture inherited the id format of the reachable world while standing in for
+    # the unreachable one. The real mints issue base64url. A fixture for a format you cannot
+    # observe must be drawn from that format, not from the one in front of you.
+    local uuid='019fa5cd-b27c-7803-b89e-51d8f45c3c05'
+    local needs="status=needs_payment amount_sats=21 mint=https://b.test quote_id=${uuid} (pay the invoice, then \`mobee wallet mint-complete ${uuid}\`)"
+    check "quote id, uuid form"  "$uuid" "$(parse_quote_id "$needs")"
+    check "amount from needs_payment" "21" "$(parse_field "$needs" amount_sats)"
+
+    # The id that actually broke it live, verbatim: underscore AND hyphen.
+    local b64='lcLc0JwHHCIG_UIwQ8cvPB-LXgiVfSxE6ZO6Tq1b'
+    local needs64="status=needs_payment amount_sats=5 mint=https://b.test quote_id=${b64} (pay the invoice, then \`mobee wallet mint-complete ${b64}\`)"
+    check "quote id, base64url form" "$b64" "$(parse_quote_id "$needs64")"
+    # Pin the exact regression: an allow-list class truncates here, and a truncated id is a
+    # PREFIX of the real one — it looks like an id, which is why it failed downstream, not here.
+    check "id is not truncated at _" "$b64" "$(parse_quote_id "quote_id=${b64} (trailing)")"
 
     local melt='paid_sats=21 fee_sats=3 balance_sats=26 mint=https://a.test'
     check "paid_sats from melt" "21" "$(parse_field "$melt" paid_sats)"
@@ -247,7 +268,9 @@ fund_complete() { # <quote_id>
     [ -n "$quote_id" ] || die "usage: $0 --fund-complete <quote_id>"
     rule "FUND-COMPLETE — issue the ecash at the source"
     ensure_home "$home"
-    mobee_at "$home" wallet mint-complete "$quote_id" --mint "$SOURCE_MINT" 2>&1 \
+    # --amount is passed explicitly: a quote raised by a DIFFERENT process leaves no stored amount
+    # in this home, and mint-complete then fails "no stored amount". Measured live on both legs.
+    mobee_at "$home" wallet mint-complete "$quote_id" --amount "$FUND_SATS" --mint "$SOURCE_MINT" 2>&1 \
         || die "mint-complete failed for quote ${quote_id}. If the invoice IS paid, the sats are at
 the mint and recoverable — re-run this exact command. Do not re-pay the invoice."
     rule "balance at the source"
@@ -305,10 +328,16 @@ unpaid. STOP HERE and report. Do not run mint-complete."
 
     # 3. Issue the ecash at the target.
     rule "3/3 issue the ecash at the target"
-    mobee_at "$home" wallet mint-complete "$quote_id" --mint "$TARGET_MINT" 2>&1 \
+    mobee_at "$home" wallet mint-complete "$quote_id" --amount "$PROBE_SATS" --mint "$TARGET_MINT" 2>&1 \
         || die "THE STRAND: the melt at ${SOURCE_MINT} PAID (${paid} sats, fee ${fee}) but issuing at
 ${TARGET_MINT} failed for quote ${quote_id}. The money left the source and is not yet ecash at the
-target. It is recoverable — re-run mint-complete with that quote id. Report before retrying."
+target. It is RECOVERABLE and no sats are lost — re-run exactly:
+
+  MOBEE_HOME=${home} MOBEE_ALLOW_REAL_MINTS=true MOBEE_ACCEPTED_MINTS=${SOURCE_MINT} \\
+  MOBEE_EXTRA_MINTS=${TARGET_MINT} ${MOBEE} wallet mint-complete ${quote_id} \\
+  --amount ${PROBE_SATS} --mint ${TARGET_MINT} --home ${home}
+
+Copy the quote id from THIS line, not from any earlier output. Report before retrying."
 
     rule "balances after"
     local after; after=$(mobee_at "$home" wallet balance 2>&1)
