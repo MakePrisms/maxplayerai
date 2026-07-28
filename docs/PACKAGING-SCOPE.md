@@ -140,6 +140,143 @@ sha256sum -c SHA256SUMS
 # testing what it claims and the trap survives under a green gate.
 ```
 
+### Track A.1 — how nix produces the artifact
+
+Track A says *what* ships. This says *how* it is built: nix emits the exact file npm carries, so
+distribution is the only remaining problem.
+
+**Named output — `packages.<system>.buyer-static`.** The buyer surface is a feature *narrowing* of
+the existing derivation, not a second toolchain: `default = ["wallet"]`, and `acp` is simply left
+out, so the seller's agent-execution path is not compiled in. The seller artifact is the same
+derivation with `buildFeatures = [ "acp" ]`. One shape, two feature sets.
+
+```nix
+buyer-static = pkgs.pkgsStatic.rustPlatform.buildRustPackage (
+  mobeeArgs // { nativeBuildInputs = [ pkgs.pkgsStatic.pkg-config ]; }
+);
+```
+
+`mobeeArgs` holds what both builds share — `src = self`, `cargoLock.lockFile = ./Cargo.lock`
+(hermetic vendoring, no network at build time), `cargoBuildFlags = [ "-p" "mobee" ]`, `doCheck =
+false`. Guarded by `lib.optionalAttrs stdenv.hostPlatform.isLinux`, because static linking is a
+Linux-only property (see the matrix below).
+
+#### Option A (static musl) over Option B (patchelf)
+
+**A is strictly better where it links, and B is a weak fallback rather than an equal option.**
+patchelf rewrites the ELF interpreter to a path that must exist *on the user's machine*, which
+either means shipping a loader and glibc alongside the binary, or pointing at the target's own
+glibc and inheriting a **version floor** — the familiar `GLIBC_2.xx not found` failure on older
+distros. It also leaves every `DT_NEEDED` shared library to be resolved. Static musl has no floor
+and no dependencies to resolve.
+
+#### ★ Why the cc-wrapper false-blocker does not apply here — and the reason it is *not* the obvious one
+
+The tempting justification is "pkgsStatic is native-musl, so there is no cross-compile and no
+wrapper." **Both halves of that are false**, measured against the pinned nixpkgs:
+
+```
+buildPlatform  = x86_64-unknown-linux-gnu     hostPlatform = x86_64-unknown-linux-musl
+crossCompiling = true                          ccIsWrapper  = true
+cc             = x86_64-unknown-linux-musl-gcc-wrapper-14.3.0
+libc           = musl-static-x86_64-unknown-linux-musl-1.2.5
+```
+
+It *is* a cross set and it *does* use a cc-wrapper. It works anyway because **the wrapper carries
+a libc for the target triple.** The failure documented in
+`reference_nix_cc_wrapper_fakes_cross_compile_failure` was never about cross-compilation or about
+wrappers as such — it was a **sysroot mismatch**: the wasm32 wrapper had no libc for its target,
+fell back to injecting host glibc, and produced an error naming a real C crate (`secp256k1-sys`)
+that had nothing wrong with it.
+
+**The predictive test, stated so it can be reused:** compare `stdenv.cc.libc` against
+`stdenv.hostPlatform`. If the wrapper's libc does not belong to the target triple, expect a
+confident error blaming a C crate — and do not accept that error as a portability finding until an
+unwrapped compiler has been tried. Here they match, so the wrapper is sound.
+
+Getting the right answer from the wrong reason is still a hazard: the wrong reason predicts that
+any pkgsStatic build is safe, which is not what was measured.
+
+#### Output contract
+
+One regular file per platform plus one checksum line — nothing else:
+
+```
+mobee-x86_64-unknown-linux-musl          # static ELF, no interpreter, no DT_NEEDED
+SHA256SUMS                                # one line per artifact
+```
+
+That file *is* the payload of the track B per-platform sub-package (`@mobee/cli-linux-x64`), so the
+npm side never compiles anything and never runs a postinstall downloader.
+
+```acceptance
+# ★ Two DIFFERENT predicates. Do not let the first stand in for the second.
+#
+# (1) PORTABILITY — does the artifact run at all with no nix and no toolchain present.
+# Assert on the ELF structure, not on `file` (not installed everywhere, this box included):
+readelf -lW result/bin/mobee | grep -qi interp && { echo "FAIL: has an ELF interpreter"; exit 1; }
+readelf -dW result/bin/mobee | grep -qi needed && { echo "FAIL: has shared-library deps"; exit 1; }
+# Then COPY THE BINARY OUT of /nix/store and run it where no /nix exists. Copying out is the
+# point: a needed store path cannot be silently satisfied by the build machine's own store.
+cp -L result/bin/mobee ship/mobee-x86_64-unknown-linux-musl
+docker run --rm -v "$PWD/ship:/b:ro" alpine:3            /b/mobee-x86_64-unknown-linux-musl version
+docker run --rm -v "$PWD/ship:/b:ro" debian:bookworm-slim /b/mobee-x86_64-unknown-linux-musl version
+#   → both print a version, rc=0. Two libcs on purpose: alpine is musl, debian is glibc, so a
+#     pass on both shows the artifact is libc-independent rather than merely alpine-compatible.
+# ★ Capture rc WITHOUT a pipe — `docker ... | tail` reports tail's exit code, not docker's.
+# ★ Negative control, or rc=0 means nothing: a bogus subcommand MUST give rc!=0.
+#
+# (2) BUYER CAPABILITY — that the buyer surface actually works. `version`/`--help` rc=0 CANNOT
+# test this: the CLI surface is present in every build regardless of features, which is the same
+# trap Track A documents for `acp`. Requires a real buyer operation against `nak serve --port
+# 10547`: post one job, read it back by id, assert the job is returned.
+#
+# ★ And (2) must go RED against a binary built without `wallet`.
+```
+
+#### CI hook — design only
+
+No release workflow exists; `ci.yml` is the only workflow, it triggers on push, and it builds with
+`dtolnay/rust-toolchain` — **there is no nix in CI today.** So the hook is a new tag-triggered
+`release.yml` that must first *install* nix (`DeterminateSystems/nix-installer-action`), then call
+`nix build .#buyer-static` per Linux platform and upload the artifact plus its `SHA256SUMS` line.
+`ci.yml` is left alone: it gates correctness on every push, and a release build is neither.
+
+#### Measured — this derivation has been built and run
+
+Not a projection. Built 2026-07-28 against the pinned nixpkgs, `nix build .#buyer-static` → rc=0:
+
+```
+size            39,816,976 bytes (38M), already stripped by the fixup phase
+ldd             statically linked
+PT_INTERP       absent          DT_NEEDED  absent
+/nix/store refs 0 occurrences in the binary
+alpine:3 (musl, no /nix)             mobee version → "mobee 0.1.0"  rc=0
+debian:bookworm-slim (glibc, no /nix) mobee version → "mobee 0.1.0"  rc=0
+bogus subcommand                                                     rc=1   (control)
+sha256 de0b96258aa4dc83c6b72ba3a3e604de8bd91175d70dbfb0c957414a01b4f1bf
+```
+
+The three C dependencies that were the whole risk — `secp256k1-sys`, `libsqlite3-sys`,
+`libgit2-sys` (vendored libgit2) — **link under pkgsStatic with no per-crate flags and no patching.**
+Option A is therefore settled for `x86_64-linux`, and Option B (patchelf) is not needed.
+
+**38M per platform is the honest cost**, and it is the one number worth carrying into track B: npm
+will hold a ~38M binary per platform sub-package (materially smaller compressed). The
+`optionalDependencies` split matters more because of this — a user installs one platform, not four.
+
+#### Size and platform matrix
+
+- **`x86_64-linux`** — **built and verified** (above). Remaining work is release plumbing, not
+  feasibility. Roughly 2 engineering days.
+- **`aarch64-linux`** — **measure-only.** Either a native build on an arm64 runner (same derivation,
+  no new question) or `pkgsCross.aarch64-multiplatform-musl.pkgsStatic` from x86_64. The wrapper
+  test above is what decides the cross route: its libc must be aarch64-musl.
+- **darwin (both arches)** — **`buyer-static` deliberately does not exist here.** macOS does not
+  support fully static executables; there is no static crt0 to link against. Darwin needs a
+  dynamically linked binary with a declared minimum macOS version, which is a different artifact
+  with a different portability argument — not a variant of this one.
+
 ### Track B — `npx mobee` *([#212](https://github.com/MakePrisms/mobee/issues/212); the MCP-config unlock)*
 
 **Read this section before assuming what "npx" means here.** This repo *banned* npx in the other
