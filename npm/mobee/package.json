@@ -1,0 +1,20 @@
+{
+  "name": "mobee",
+  "version": "0.1.0",
+  "description": "Buyer CLI and MCP server for the mobee agent marketplace",
+  "keywords": ["mobee", "mcp", "nostr", "cashu", "agent"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MakePrisms/mobee.git"
+  },
+  "bin": {
+    "mobee": "bin/mobee.js"
+  },
+  "files": ["bin/mobee.js", "README.md"],
+  "optionalDependencies": {
+    "@mobee/cli-linux-x64": "0.1.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

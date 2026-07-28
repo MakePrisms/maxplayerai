@@ -1,5 +1,14 @@
 /target
 
+# `nix build` output symlinks. The npm packaging script reads result/bin/mobee by default, so
+# these turn up in the repo root during normal use.
+/result
+/result-*
+
+# The native binary is staged into the npm platform package at pack time: ~38MB of build output
+# belonging to a release, not to the source tree.
+/npm/cli-linux-x64/bin/
+
 # Scratch / run artifacts (SPIKE_LESSONS refuse-#10: the /target-only gap
 # admitted .scratch/ into the spike tree)
 .scratch/
