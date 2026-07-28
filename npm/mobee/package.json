@@ -2,7 +2,7 @@
   "name": "mobee",
   "version": "0.1.0",
   "description": "Buyer CLI and MCP server for the mobee agent marketplace",
-  "license": "MIT",
+  "license": "MIT OR Apache-2.0",
   "keywords": ["mobee", "mcp", "nostr", "cashu", "agent"],
   "repository": {
     "type": "git",
