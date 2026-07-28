@@ -9,6 +9,7 @@ import { RELAY_URL } from "../config.js";
 import { createCache } from "./cache.js";
 import { createRelayClient } from "./relay.js";
 import { parseEvent } from "./model.js";
+import { marketMetrics } from "./trades.js";
 import { KIND_LABELS, TRADE_STAGES } from "./kinds.js";
 import {
   DEFAULT_WINDOW, WINDOWS, buyerBoard, participantDetail, sellerBoard, withinWindow,
@@ -129,10 +130,36 @@ function renderFeed(events) {
     : '<li class="empty">No activity in this period.</li>';
 }
 
+
+/* ---------------- key stats ---------------- */
+
+/**
+ * Headline figures. Settlement counts published receipts only, so the labels
+ * say "receipts" rather than "settled" — a trade can settle without ever
+ * publishing one, which makes these a floor and not a total.
+ */
+function renderStats(events) {
+  const m = marketMetrics(events);
+  const cells = [
+    ["Jobs posted", nf.format(m.funnel.posted), ""],
+    ["Delivered", nf.format(m.funnel.delivered), ""],
+    ["Receipts on record", nf.format(m.receiptsOnRecord), "neon"],
+    ["Sats in receipts", nf.format(m.satsInReceipts), "neon"],
+    ["Buyers", nf.format(m.buyers), ""],
+    ["Sellers", nf.format(m.sellers), ""],
+  ];
+  el("statgrid").innerHTML = cells
+    .map(([k, v, cls]) => `<div><dt>${k}</dt><dd class="${cls}">${v}</dd></div>`).join("");
+  el("stats-note").textContent =
+    `Across ${m.daysActive} day${m.daysActive === 1 ? "" : "s"} of activity in the selected period, ` +
+    "derived in your browser from relay events. A trade can settle without publishing a receipt, " +
+    "so the settlement figures are a floor rather than a total.";
+}
+
 /* ---------------- detail sheet ---------------- */
 
 const statBlock = (pairs) =>
-  `<dl class="stats">${pairs.map(([k, v, cls]) => `<div><dt>${k}</dt><dd class="${cls || ""}">${v}</dd></div>`).join("")}</dl>`;
+  `<dl class="stats-in">${pairs.map(([k, v, cls]) => `<div><dt>${k}</dt><dd class="${cls || ""}">${v}</dd></div>`).join("")}</dl>`;
 
 function tradeList(trades, t) {
   if (!trades.length) return '<p class="tiny">No trades in this period.</p>';
@@ -255,10 +282,10 @@ function render() {
     renderBuyers(events);
     renderSellers(events);
     renderFeed(events);
+    renderStats(events);
   });
 }
 
-el("relay-url").textContent = RELAY_URL;
 renderWindows();
 
 el("windows").addEventListener("click", (ev) => {
@@ -282,6 +309,18 @@ document.addEventListener("keydown", (ev) => {
 });
 el("detail-close").addEventListener("click", closeSheet);
 el("detail").addEventListener("click", (ev) => { if (ev.target === el("detail")) closeSheet(); });
+
+el("copy").addEventListener("click", async () => {
+  const btn = el("copy");
+  try {
+    await navigator.clipboard.writeText(el("runcmd").textContent.trim());
+    btn.textContent = "copied";
+  } catch {
+    // Clipboard access can be refused; say so rather than claiming success.
+    btn.textContent = "select it";
+  }
+  setTimeout(() => { btn.textContent = "copy"; }, 1600);
+});
 
 createRelayClient({
   url: RELAY_URL,
