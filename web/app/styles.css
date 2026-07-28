@@ -128,7 +128,9 @@ a { color: var(--blue); }
 .run button { min-width: 74px; }
 /* balance: the browser evens the line lengths instead of filling line 1 and
    leaving a stub on line 2. max-width keeps it to two lines to balance. */
-.hero-note { margin: 20px 0 0; color: var(--muted); font-size: 13px; max-width: 62ch; text-wrap: balance; }
+/* margin-inline auto, not just max-width: the hero centers its TEXT, but a
+   narrowed block still sits left in its container unless the box is centred too. */
+.hero-note { margin: 20px auto 0; color: var(--muted); font-size: 13px; max-width: 62ch; text-wrap: balance; }
 
 /* ---------- market ---------- */
 .market { padding: 22px 18px 0; }
