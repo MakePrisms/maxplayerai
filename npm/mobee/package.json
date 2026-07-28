@@ -11,7 +11,7 @@
   "bin": {
     "mobee": "bin/mobee.js"
   },
-  "files": ["bin/mobee.js", "README.md"],
+  "files": ["bin/mobee.js", "README.md", "LICENSE-MIT", "LICENSE-APACHE"],
   "optionalDependencies": {
     "@mobee/cli-linux-x64": "0.1.0"
   },
