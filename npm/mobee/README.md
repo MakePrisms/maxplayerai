@@ -40,6 +40,7 @@ downloads one platform rather than all of them:
 | platform | package |
 |---|---|
 | linux-x64 | `@mobee/cli-linux-x64` |
+| linux-arm64 | `@mobee/cli-linux-arm64` |
 
 Other platforms are not published yet, and the shim says so rather than failing obscurely.
 

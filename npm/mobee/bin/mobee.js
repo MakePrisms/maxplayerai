@@ -9,6 +9,7 @@ const os = require("node:os");
 
 const PLATFORM_PACKAGES = {
   "linux-x64": "@mobee/cli-linux-x64",
+  "linux-arm64": "@mobee/cli-linux-arm64",
 };
 
 const key = `${process.platform}-${process.arch}`;

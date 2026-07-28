@@ -10,12 +10,17 @@
 # installs WITH --ignore-scripts to keep that property honest.
 #
 # Usage:
-#   ./scripts/npm-pack-local.sh [path-to-static-binary]     # default: result/bin/mobee
-#     nix build .#buyer-static     # produces result/bin/mobee
+#   ./scripts/npm-pack-local.sh [path-to-static-binary] [path-to-aarch64-binary]
+#     default: result/bin/mobee
+#     nix build .#buyer-static            # produces the x86_64 payload
+#     nix build .#buyer-static-aarch64    # optional second argument
+#
+# The aarch64 payload is packed and structurally checked only — see the note at that step.
 
 set -euo pipefail
 
 BINARY="${1:-result/bin/mobee}"
+BINARY_ARM64="${2:-}"
 PKG_MAIN="npm/mobee"
 PKG_PLATFORM="npm/cli-linux-x64"
 
@@ -84,16 +89,47 @@ grep -qx 'package/bin/mobee' <<<"$TARBALL_LISTING" \
     || die "platform tarball does not contain package/bin/mobee"
 echo "ok: platform tarball carries bin/mobee"
 
-# Both licence texts must be inside BOTH tarballs. A `files` typo or a missed staging step fails
-# silently: the package installs cleanly and is simply missing the licence it claims to be under.
-for tgz in "$TGZ_MAIN" "$TGZ_PLATFORM"; do
+# ── Optional: the aarch64 payload package ───────────────────────────────────────────────────────
+# Packed and structurally checked, nothing more. npm skips it here on the os/cpu mismatch, and an
+# aarch64 binary cannot execute on x86_64, so proving it RUNS belongs to verify-arm64-artifact.sh on
+# an arm64 host. What is worth asserting here is that the tarball exists, carries the executable, and
+# carries the right architecture — a payload package that shipped the wrong binary would install
+# cleanly and fail only at run time, on the one platform we cannot test.
+TGZ_ARM64=""
+if [ -n "$BINARY_ARM64" ]; then
+    [ -f "$BINARY_ARM64" ] || die "no aarch64 binary at $BINARY_ARM64 — run: nix build .#buyer-static-aarch64"
+
+    cp -R npm/cli-linux-arm64 "$STAGE/cli-linux-arm64"
+    stage_licenses "$STAGE/cli-linux-arm64"
+    mkdir -p "$STAGE/cli-linux-arm64/bin"
+    cp -L "$BINARY_ARM64" "$STAGE/cli-linux-arm64/bin/mobee"
+    chmod 755 "$STAGE/cli-linux-arm64/bin/mobee"
+    ( cd "$STAGE/cli-linux-arm64" && npm pack --silent --pack-destination "$DIST" >/dev/null )
+
+    TGZ_ARM64="$(find "$DIST" -name 'mobee-cli-linux-arm64-*.tgz' | head -1)"
+    [ -n "$TGZ_ARM64" ] || die "aarch64 tarball not produced"
+    ARM_LISTING="$(tar -tzf "$TGZ_ARM64")"
+    grep -qx 'package/bin/mobee' <<<"$ARM_LISTING" \
+        || die "aarch64 tarball does not contain package/bin/mobee"
+
+    ARM_MACHINE="$(node "$(dirname "$0")/elf-info.mjs" "$BINARY_ARM64" | sed -n 's/^machine=//p')"
+    [ "$ARM_MACHINE" = "AArch64" ] \
+        || die "aarch64 payload is $ARM_MACHINE, not AArch64 — the wrong binary was staged"
+    echo "ok: packed $(basename "$TGZ_ARM64") carrying an AArch64 binary"
+fi
+
+# Both licence texts must be inside EVERY published tarball, the aarch64 payload included — it is a
+# published package like any other, and Apache-2.0 4(a) does not exempt it. A `files` typo or a missed
+# staging step fails silently: the package installs cleanly and is simply missing the licence it
+# claims to be under.
+for tgz in "$TGZ_MAIN" "$TGZ_PLATFORM" ${TGZ_ARM64:+"$TGZ_ARM64"}; do
     listing="$(tar -tzf "$tgz")"
     for lic in LICENSE-MIT LICENSE-APACHE; do
         grep -qx "package/$lic" <<<"$listing" \
             || die "$(basename "$tgz") does not contain $lic — Apache-2.0 4(a) requires it to ship"
     done
 done
-echo "ok: both tarballs carry LICENSE-MIT and LICENSE-APACHE"
+echo "ok: every tarball carries LICENSE-MIT and LICENSE-APACHE"
 
 # ── Install into a clean project, scripts disabled ──────────────────────────────────────────────
 cat > "$PROJECT/package.json" <<JSON
