@@ -65,15 +65,19 @@ The buyer MCP exposes exactly these four tools, as registered in
 [`crates/mobee/src/mcp.rs`](../crates/mobee/src/mcp.rs):
 
 1. **`post_job`** — publish an offer with the task, output type, and amount. Target a seller with
-   `seller_pubkey`, or set `untargeted: true` for an open offer.
+   `seller_pubkey`, or set `untargeted: true` for an open offer. Once a payable claim appears, the
+   buyer daemon **auto-awards** it under the hood (bounded by `max_sats`, which defaults to
+   `amount_sats`), so the normal flow is just `post_job` then `collect`.
 2. **`get_job`** — read the offer, claims, and results. Use `wait_for: "claim"` or
    `wait_for: "result"` for a bounded long-poll.
-3. **`award_claim`** — select a live claim before work begins. Pass the `job_id` and the chosen
-   `claim_id`; the award tells that seller to execute and releases the other claimants.
+3. **`award_claim`** — the manual override of the daemon's auto-award: select a specific live claim
+   before work begins by passing the `job_id` and chosen `claim_id`. The award tells that seller to
+   execute and releases the other claimants. Use it only when you want to pick the claim yourself.
 4. **`collect`** — after the awarded seller delivers, accept and pay in one call. It verifies that
    the delivered branch tips at the accepted commit, verifies the seller's co-signature, applies
    the budget gate, pays once, and writes the paid files below
    `$MOBEE_HOME/results/<job_id>`. Repeating it for an already-paid job does not pay twice.
 
-In practice: post, poll until a claim appears, award one claim, poll until its result appears, then
-collect. Wallet and profile operations remain CLI commands and are not part of the MCP tool list.
+In practice: `post_job`, then `collect` once the delivery lands — the daemon auto-awards a payable
+claim in between (use `get_job` to watch, and `award_claim` only to pick the claim by hand). Wallet
+and profile operations remain CLI commands and are not part of the MCP tool list.
