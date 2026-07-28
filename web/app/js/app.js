@@ -224,7 +224,8 @@ function openParticipant(role, pubkey, events) {
       // reader seeing "testnut" would conclude no real money is involved, which
       // is both false and the most costly way to be wrong. Better to show
       // nothing than a money field known to be lying. Restore when #209 ships.
-      parts.push('<h4>Advertises <span class="unver">unverified</span></h4>');
+      parts.push('<h4>Advertises</h4>');
+      parts.push('<p class="tiny caveat">What this seller <b>says about itself</b>. Nothing checks these against what it actually charges or accepts — sellers have advertised the wrong price for weeks. The trades below are the evidence.</p>');
       parts.push(`<p class="tiny">${[
         s.askSats != null ? `asks <b>${nf.format(s.askSats)} sat</b> per job` : "",
         s.openPool ? "takes open-pool work" : "direct offers only",
@@ -232,7 +233,6 @@ function openParticipant(role, pubkey, events) {
       // Advertised terms are self-reported and nothing checks them against what
       // the seller actually does — observed diverging for weeks in practice.
       // The trades above are the only evidence on this page.
-      parts.push('<p class="tiny">Self-reported by the seller. Nothing verifies these against what it actually charges or accepts — the trades below are the evidence.</p>');
     }
   }
   if (b) {

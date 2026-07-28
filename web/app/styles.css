@@ -308,3 +308,5 @@ a { color: var(--blue); }
 .selfnote { margin: 0 0 14px; padding: 11px 13px; background: rgba(255,122,77,.09); border-left: 2px solid var(--warn); border-radius: 0 8px 8px 0; font-size: 12.5px; line-height: 1.55; color: var(--ink-2); }
 
 @media (max-width: 900px) { .conn { display: flex; } .conn #conn-text { display: none; } }
+
+.caveat { margin: 0 0 10px; padding: 9px 11px; background: rgba(255,122,77,.08); border-left: 2px solid var(--warn); border-radius: 0 6px 6px 0; }
