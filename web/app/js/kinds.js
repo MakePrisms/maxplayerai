@@ -40,6 +40,15 @@ export const HEARTBEAT = 30340;
 export const MOBEE_TAG = "mobee";
 
 /**
+ * A second `t` value marking an offer whose buyer operates the seller being
+ * paid. Self-commissioned work is real work, but it is not market demand, and
+ * a receipt cannot be told apart from an arms-length one after the fact.
+ *
+ * Events carry both values, so the `#t` filter for MOBEE_TAG still matches.
+ */
+export const SELF_TRADE_TAG = "self-trade";
+
+/**
  * Kinds that carry `["t","mobee"]` — requested with a `#t` filter.
  */
 export const MOBEE_TAGGED_KINDS = Object.freeze([

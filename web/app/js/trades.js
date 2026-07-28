@@ -19,7 +19,7 @@ export function buildTrades(events) {
     let t = trades.get(offerId);
     if (!t) {
       t = { offerId, buyer: null, seller: null, offerAmount: null, receiptAmount: null,
-            declineReason: null, at: {} };
+            declineReason: null, selfTrade: false, at: {} };
       trades.set(offerId, t);
     }
     return t;
@@ -37,6 +37,7 @@ export function buildTrades(events) {
     if (e.buyer) t.buyer = t.buyer || e.buyer;
     if (e.seller) t.seller = t.seller || e.seller;
     if (e.stage === "offer" && e.amount != null) t.offerAmount = e.amount;
+    if (e.stage === "offer" && e.selfTrade) t.selfTrade = true;
     if (e.stage === "receipt" && e.amount != null) t.receiptAmount = e.amount;
     if (e.stage === "feedback" && e.reason) t.declineReason = t.declineReason || e.reason;
   }
@@ -52,7 +53,12 @@ export function buildTrades(events) {
  * separately as `rootedElsewhere` rather than dropped without trace.
  */
 export function marketMetrics(events) {
-  const trades = buildTrades(events);
+  const all = buildTrades(events);
+  // Self-commissioned trades are real work but not market demand. They are
+  // removed from every trade-derived figure and reported separately — excluding
+  // them silently would be its own dishonesty, since the trade did happen.
+  const selfTrades = all.filter((t) => t.selfTrade).length;
+  const trades = all.filter((t) => !t.selfTrade);
   const withOffer = trades.filter((t) => t.at.offer != null);
   const reached = (stage) => withOffer.filter((t) => t.at[stage] != null).length;
 
@@ -90,6 +96,8 @@ export function marketMetrics(events) {
     /** Whole UTC days spanned, inclusive. */
     daysActive: first == null ? 0 : Math.floor(last / 86400) - Math.floor(first / 86400) + 1,
     tradesTracked: trades.length,
+    /** Excluded from every figure above. Real work; not demand. */
+    selfTrades,
   };
 }
 

@@ -13,3 +13,4 @@ import "./trades.test.mjs";
 import "./relay.test.mjs";
 import "./participants.test.mjs";
 import "./injection.test.mjs";
+import "./selftrade.test.mjs";

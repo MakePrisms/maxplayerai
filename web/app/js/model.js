@@ -8,7 +8,7 @@
  */
 import {
   AWARD, CLAIM, FEEDBACK, HANDLER, HEARTBEAT, OFFER, PROFILE, RECEIPT, RESULT,
-  TRADE_STAGES,
+  SELF_TRADE_TAG, TRADE_STAGES,
 } from "./kinds.js";
 
 const tagsNamed = (event, name) => (event.tags || []).filter((t) => t[0] === name);
@@ -106,6 +106,10 @@ export function parseEvent(event) {
   switch (event.kind) {
     case OFFER:
       return { ...base, offerId: event.id, buyer: event.pubkey,
+               // A buyer commissioning its own seller marks the offer
+               // ["t","self-trade"]. A structured predicate, not prose: the
+               // disclosure in the job text is for humans, this is for counting.
+               selfTrade: tagsNamed(event, "t").some((t) => t[1] === SELF_TRADE_TAG),
                amount: firstNumber(event, "amount", "rate", "price", "sats"),
                targetSeller: firstTag(event, "p"),
                // The job itself is the `i` (input) tag. Offer content is empty

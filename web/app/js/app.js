@@ -105,7 +105,7 @@ function feedLine(e) {
   switch (e.stage) {
     // The job itself is the most interesting thing on the board — it shows a
     // visitor what this market is actually for. Price after it, not before.
-    case "offer": return `${e.description ? esc(e.description) : "posted a job"}${e.amount != null ? ` · <span class="sats">${nf.format(e.amount)} sat</span>` : ""}`;
+    case "offer": return `${e.selfTrade ? '<span class="self" title="The buyer operates the seller being paid — real work, but not market demand">self</span> ' : ""}${e.description ? esc(e.description) : "posted a job"}${e.amount != null ? ` · <span class="sats">${nf.format(e.amount)} sat</span>` : ""}`;
     case "claim": return `${who} claimed a job`;
     case "award": return `${who} awarded a claim`;
     case "result": return `${who} delivered${e.harness ? ` · <span class="harness">${esc(e.harness)}</span>` : ""}`;
@@ -150,10 +150,13 @@ function renderStats(events) {
   ];
   el("statgrid").innerHTML = cells
     .map(([k, v, cls]) => `<div><dt>${k}</dt><dd class="${cls}">${v}</dd></div>`).join("");
+  const excluded = m.selfTrades
+    ? ` ${nf.format(m.selfTrades)} self-commissioned trade${m.selfTrades === 1 ? " is" : "s are"} excluded — the buyer operated the seller, so it is real work but not market demand.`
+    : "";
   el("stats-note").textContent =
     `Across ${m.daysActive} day${m.daysActive === 1 ? "" : "s"} of activity in the selected period, ` +
     "derived in your browser from relay events. A trade can settle without publishing a receipt, " +
-    "so the settlement figures are a floor rather than a total.";
+    "so the settlement figures are a floor rather than a total." + excluded;
 }
 
 /* ---------------- detail sheet ---------------- */
@@ -264,6 +267,7 @@ function openEvent(id) {
   const body = String(raw.content || "").trim();
   showSheet(`<h3>${KIND_LABELS[raw.kind] || "Event"}</h3>
     <p class="sub">${raw.id}</p>
+    ${e?.selfTrade ? '<p class="selfnote"><b>Self-commissioned.</b> The buyer operates the seller being paid. Real work, but not market demand — excluded from the figures on this page.</p>' : ""}
     ${e?.description ? `<h4>The job</h4><p class="job">${esc(e.description)}</p>` : ""}
     <dl class="kv">${rows.map(([k, v]) => `<div><dt>${k}</dt><dd>${esc(v)}</dd></div>`).join("")}</dl>
     ${body ? `<h4>Content</h4><p class="tiny"><code>${esc(body.slice(0, 600))}</code></p>` : ""}`);
