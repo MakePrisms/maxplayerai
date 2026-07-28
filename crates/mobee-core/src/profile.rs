@@ -176,8 +176,11 @@ pub async fn publish_seller_discoverability_async(
         .and_then(|p| p.about.as_ref())
         .is_none()
     {
-        let agent_label = agent.as_deref().unwrap_or("agent");
-        let about = format!("mobee seller · {agent_label} · {rate_sats} sat/job · testnut");
+        let about = default_seller_about(
+            agent.as_deref(),
+            rate_sats,
+            &home.config.accepted_mints,
+        );
         home::save_config(home, |config| {
             config.profile.get_or_insert_with(ProfileConfig::default).about = Some(about);
         })?;
@@ -333,6 +336,49 @@ async fn publish_metadata_merged_async(
     Ok(output.val.to_hex())
 }
 
+/// Default kind-0 / profile `about` when the operator has not set one.
+///
+/// Mint label is config-derived from `accepted_mints` (issue #209) — never a hard-coded
+/// `"testnut"` placeholder.
+fn default_seller_about(agent: Option<&str>, rate_sats: u64, accepted_mints: &[String]) -> String {
+    let agent_label = agent.unwrap_or("agent");
+    let mint_label = accepted_mints
+        .first()
+        .map(String::as_str)
+        .unwrap_or("no-mint");
+    format!("mobee seller · {agent_label} · {rate_sats} sat/job · {mint_label}")
+}
+
+/// Build NIP-89 kind-31990 content from profile + seller knobs + accepted mints.
+///
+/// The advertised mint is always derived from `accepted_mints` (issue #209) — never a
+/// hard-coded `"testnut"` placeholder. When the list is empty the field is `""` rather
+/// than a misleading default (seller boot already refuses empty `accepted_mints`).
+///
+/// Wire shape keeps `"mint"` as a single URL string (primary = first accepted mint) so
+/// existing orderbook consumers stay compatible; the full list is also advertised under
+/// `"accepted_mints"` so a buyer can match membership on any accepted mint.
+fn nip89_handler_content(
+    profile: &ProfileConfig,
+    rate_sats: u64,
+    claim_open_pool: bool,
+    agent: Option<&str>,
+    accepted_mints: &[String],
+) -> String {
+    let primary_mint = accepted_mints.first().map(String::as_str).unwrap_or("");
+    serde_json::json!({
+        "name": profile.name,
+        "about": profile.about,
+        "rate_sats": rate_sats,
+        "claim_open_pool": claim_open_pool,
+        "agent": agent,
+        "mint": primary_mint,
+        "accepted_mints": accepted_mints,
+        "protocol": "mobee-seller",
+    })
+    .to_string()
+}
+
 async fn publish_nip89_announce_async(
     home: &MobeeHome,
     keys: &nostr_sdk::Keys,
@@ -343,16 +389,13 @@ async fn publish_nip89_announce_async(
 ) -> Result<String, ProfileError> {
     use nostr_sdk::prelude::{EventBuilder, Kind, Tag};
 
-    let content = serde_json::json!({
-        "name": profile.name,
-        "about": profile.about,
-        "rate_sats": rate_sats,
-        "claim_open_pool": claim_open_pool,
-        "agent": agent,
-        "mint": "testnut",
-        "protocol": "mobee-seller",
-    })
-    .to_string();
+    let content = nip89_handler_content(
+        profile,
+        rate_sats,
+        claim_open_pool,
+        agent,
+        &home.config.accepted_mints,
+    );
 
     // NIP-89 handler advertises the mobee kinds this seller handles: the OFFER it consumes and the
     // RESULT it produces.
@@ -690,6 +733,78 @@ mod tests {
             err.to_string().contains("fetch_names"),
             "op name missing: {err}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Issue #209: NIP-89 announce must derive mint from config.accepted_mints — never hard-code
+    // "testnut". A home configured with a non-testnut mint must advertise that mint, and the
+    // announcement content must not contain the string "testnut".
+    #[test]
+    fn nip89_announce_mint_matches_config_not_testnut() {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-nip89-mint-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = home::bootstrap(&root).expect("home");
+
+        const REAL_MINT: &str = "https://mint.minibits.cash/Bitcoin";
+        home::save_config(&mut home, |config| {
+            config.accepted_mints = vec![REAL_MINT.to_owned()];
+            config.allow_real_mints = true;
+            config.profile = Some(ProfileConfig {
+                name: Some("frogger".into()),
+                about: Some("mobee seller · grok-4.5 · 100 sat/job · minibits".into()),
+            });
+        })
+        .expect("save");
+        home::reload_config(&mut home).expect("reload");
+
+        let profile = home.config.profile.clone().unwrap_or_default();
+        let content = nip89_handler_content(
+            &profile,
+            100,
+            true,
+            Some("grok-4.5"),
+            &home.config.accepted_mints,
+        );
+
+        assert!(
+            !content.contains("testnut"),
+            "announcement must not contain hard-coded testnut; got: {content}"
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("announce content is JSON");
+        assert_eq!(
+            parsed["mint"].as_str(),
+            Some(REAL_MINT),
+            "advertised mint must match config.accepted_mints[0]; got: {content}"
+        );
+        let mints = parsed["accepted_mints"]
+            .as_array()
+            .expect("accepted_mints array present");
+        assert_eq!(
+            mints.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>(),
+            vec![REAL_MINT],
+            "full accepted_mints list must be advertised"
+        );
+
+        // Default about fallback must also derive mint from config (no testnut).
+        let about = default_seller_about(Some("agent"), 21, &home.config.accepted_mints);
+        assert!(
+            !about.contains("testnut"),
+            "about fallback must not hard-code testnut; got: {about}"
+        );
+        assert!(
+            about.contains(REAL_MINT),
+            "about fallback must include configured mint; got: {about}"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }
