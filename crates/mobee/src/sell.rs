@@ -451,6 +451,9 @@ fn ensure_seller_config(
         // Contribution (freelance-PR fork) support is ON by default for CLI-configured
         // sellers. Operators disable it by editing `[seller] contribution_enabled = false`.
         contribution_enabled: true,
+        // Serial execution by default; operators raise concurrency by editing `[seller] slots = N`.
+        slots: home::default_slots(),
+        claim_award_timeout_secs: None,
     };
     home::save_config(home, |config| {
         config.seller = Some(seller);
