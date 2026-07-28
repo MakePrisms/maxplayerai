@@ -89,11 +89,11 @@ head -c 4 "$(readlink -f "$LINK")" | grep -q $'\x7fELF' \
 echo "ok: 'mobee' resolves to the JS launcher"
 
 # ── Prove it launches ───────────────────────────────────────────────────────────────────────────
-# A scratch home, always. With MOBEE_HOME unset, mobee falls back to ~/.mobee — a real wallet home
-# on a developer machine — so this script refuses to run without one rather than touch it.
+# A scratch home, always: this OVERRIDES whatever MOBEE_HOME the caller had. With MOBEE_HOME unset
+# mobee falls back to ~/.mobee — a real wallet home on a developer machine — and inheriting a
+# caller's home would be just as wrong, so the value is forced rather than checked.
 export MOBEE_HOME="$WORK/home"
 mkdir -p "$MOBEE_HOME"
-[ -n "${MOBEE_HOME:-}" ] || die "refusing to run without a scratch MOBEE_HOME"
 
 VERSION_OUT="$( cd "$PROJECT" && npx --no-install mobee version )" \
     || die "npx mobee version failed"
