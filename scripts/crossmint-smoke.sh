@@ -84,6 +84,13 @@ parse_balance_for_mint() { # <text> <mint-url>
 # (lcLc0JwHHCIG_UIwQ8... -> lcLc0JwHHCIG) and cost two live mint-complete failures. Quote ids are
 # opaque: testnut issues UUIDs, the real mints issue base64url with _ and -. Never enumerate the
 # characters of an identifier you do not define.
+#
+# The failure surfaced as `quote <id> has no stored amount; pass --amount to complete it`, which
+# is why it took two hops to place. That message means the id was NOT FOUND in this home — the
+# lookup missed, and the code guesses you need --amount. It has no way to know your id is a
+# truncated prefix. Confirmed both ways: `complete_mint_by_id` only reaches that error when the
+# quote lookup returns None, and the live leg-1 recovery succeeded with the FULL id and NO
+# --amount. An error's suggested remedy is a hypothesis, not a diagnosis.
 parse_quote_id() { printf '%s\n' "$1" | command sed -n 's/.*quote_id=\([^ ]*\).*/\1/p' | command head -1; }
 # `paid_sats=<n> fee_sats=<n> balance_sats=<n> mint=<url>`
 parse_field()   { printf '%s\n' "$1" | command sed -n "s/.*$2=\([0-9]*\).*/\1/p" | command head -1; }
@@ -268,8 +275,9 @@ fund_complete() { # <quote_id>
     [ -n "$quote_id" ] || die "usage: $0 --fund-complete <quote_id>"
     rule "FUND-COMPLETE — issue the ecash at the source"
     ensure_home "$home"
-    # --amount is passed explicitly: a quote raised by a DIFFERENT process leaves no stored amount
-    # in this home, and mint-complete then fails "no stored amount". Measured live on both legs.
+    # --amount here is a CROSS-CHECK, not a fix. When the quote is found, mint-complete refuses if
+    # the passed amount differs from the stored one, so this pins that we are completing the quote
+    # we raised. It is NOT what cured the live failure — the truncated id was (see parse_quote_id).
     mobee_at "$home" wallet mint-complete "$quote_id" --amount "$FUND_SATS" --mint "$SOURCE_MINT" 2>&1 \
         || die "mint-complete failed for quote ${quote_id}. If the invoice IS paid, the sats are at
 the mint and recoverable — re-run this exact command. Do not re-pay the invoice."
@@ -328,6 +336,8 @@ unpaid. STOP HERE and report. Do not run mint-complete."
 
     # 3. Issue the ecash at the target.
     rule "3/3 issue the ecash at the target"
+    # As in fund(): a cross-check that refuses a mismatched completion, not the cure for the
+    # truncation bug.
     mobee_at "$home" wallet mint-complete "$quote_id" --amount "$PROBE_SATS" --mint "$TARGET_MINT" 2>&1 \
         || die "THE STRAND: the melt at ${SOURCE_MINT} PAID (${paid} sats, fee ${fee}) but issuing at
 ${TARGET_MINT} failed for quote ${quote_id}. The money left the source and is not yet ecash at the
