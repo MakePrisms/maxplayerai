@@ -43,6 +43,23 @@ case "$(ldd "$BINARY" 2>&1 || true)" in
 esac
 echo "ok: payload is a static ELF"
 
+# ── Every package declares the project's licence ─────────────────────────────────────────────────
+# The SPDX `license` FIELD and the licence FILES are two independent things a package must get right,
+# and a new platform package can satisfy one while contradicting the other — shipping LICENSE-APACHE
+# in `files` while declaring plain "MIT" says two different things about the same tarball. The files
+# are asserted after packing; the field is asserted here.
+#
+# Every directory under npm/ is checked, not only the ones this run packs, so a package added but not
+# yet wired up (the next platform) is covered too. The field is read as JSON rather than grepped:
+# `"license"` also matches a `licenseFile` key or a nested string.
+EXPECTED_LICENSE="MIT OR Apache-2.0"
+for manifest in npm/*/package.json; do
+    declared="$(node -e 'process.stdout.write(String(require(process.argv[1]).license))' "$PWD/$manifest")"
+    [ "$declared" = "$EXPECTED_LICENSE" ] \
+        || die "$manifest declares license '$declared', expected '$EXPECTED_LICENSE'"
+done
+echo "ok: every npm package declares $EXPECTED_LICENSE"
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 STAGE="$WORK/stage"
