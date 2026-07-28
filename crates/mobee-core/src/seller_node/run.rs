@@ -2746,6 +2746,50 @@ mod slot_gate_tests {
         let _ = gate.sweep_lapsed(Instant::now());
         assert_eq!(gate.available(), 1, "all three release paths must return the slot");
     }
+
+    #[test]
+    fn double_release_cannot_exceed_capacity() {
+        // Double-release is worse than a leak: a leak under-counts (safe-ish), but inflating the
+        // count would over-commit and take jobs the node cannot deliver — where money exposure
+        // enters. The permit lives in the parked map XOR in the execution task (an atomic
+        // remove-and-return), and it is an `OwnedSemaphorePermit` released exactly once on drop; the
+        // gate NEVER calls `add_permits`. So a stray release can only ever be a no-op, and the free
+        // count can never exceed the configured capacity.
+        let gate = SlotGate::new(1, LONG);
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        // Award moves the permit out into execution.
+        let permit = gate.take_for_execution("a").expect("permit");
+        // A stray release for the executing job id must NOT fabricate a slot (nothing parked).
+        gate.release("a");
+        assert_eq!(gate.available(), 0, "releasing an executing job's id must not free a slot");
+        // The job ends: exactly one slot returns.
+        drop(permit);
+        assert_eq!(gate.available(), 1);
+        // A second release after the drop is still a no-op — the count cannot exceed capacity.
+        gate.release("a");
+        assert_eq!(gate.available(), 1);
+        assert!(gate.available() <= 1, "live slot count can never exceed configured capacity");
+    }
+
+    #[test]
+    fn awarded_job_is_out_of_lapse_sweep_reach() {
+        // The lapse timer keys off "no award yet": it only sees the parked map. An award moves the
+        // permit into the execution task (removing it from parked), so an awarded job is out of the
+        // sweep's reach entirely — ownership passes from the lapse-timer to the execution lifecycle.
+        // This is why a slow-but-successful delivery can never have its slot freed out from under it,
+        // and why there is no double-count: the sweep and the award both run on the single event
+        // loop, so they never interleave, and the permit is never both sweepable and executing.
+        let gate = SlotGate::new(1, Duration::ZERO); // zero window ⇒ everything parked is eligible
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        let permit = gate.take_for_execution("a").expect("permit");
+        assert!(
+            gate.sweep_lapsed(Instant::now()).is_empty(),
+            "an awarded (executing) job must never be swept, even past the timeout"
+        );
+        assert_eq!(gate.available(), 0, "the executing job keeps its slot despite the elapsed timer");
+        drop(permit);
+        assert_eq!(gate.available(), 1);
+    }
 }
 
 #[cfg(test)]
