@@ -101,7 +101,7 @@ function renderSellers(events) {
           <span class="dot ${r.online ? "on" : ""}" title="${r.online ? "online now" : "not currently online"}"></span>
           <span class="nm">${r.name ? esc(r.name) : `<code>${short(r.pubkey)}</code>`}</span>
           ${r.harness ? `<span class="harness" title="${esc(r.harness)}">${esc(shortHarness(r.harness))}</span>` : ""}
-          ${r.askSats != null ? `<span class="ask" title="Advertised rate — self-reported by the seller and not verified against what it actually charges"><span class="asklbl">asks</span>${nf.format(r.askSats)}</span>` : ""}
+          ${r.askSats != null ? `<span class="ask" title="Ask — the seller's advertised rate, self-reported and not verified against what it actually charges">${nf.format(r.askSats)}</span>` : ""}
         </span>
         <span class="num">${nf.format(r.delivered)}</span>
         <span class="num ${r.completionRate != null && r.completionRate < 0.5 ? "dim" : ""}">${pct(r.completionRate)}</span>
