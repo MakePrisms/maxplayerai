@@ -7,7 +7,7 @@
  */
 import { RELAY_URL } from "../config.js";
 import { createCache } from "./cache.js";
-import { createRelayClient } from "./relay.js";
+import { POLL_MS, createRelayClient } from "./relay.js";
 import { parseEvent } from "./model.js";
 import { marketMetrics } from "./trades.js";
 import { KIND_LABELS, TRADE_STAGES } from "./kinds.js";
@@ -332,18 +332,19 @@ function render() {
 }
 
 /**
- * Market data is already live — the relay pushes and `onEvent` renders, so a
- * trade appears the moment it happens rather than up to a tick later.
+ * One tick drives both halves of staying current.
  *
- * This timer exists for the parts of the view derived from the CLOCK rather
- * than from events: the "3m ago" ages, and the online dots, which mean "a
- * heartbeat inside the last 300s". Without it, a quiet relay leaves both frozen
- * at whatever they said when the last event happened — a seller could read as
- * online long after its heartbeat went stale, which is the one bit of this page
- * that would be actively wrong rather than merely old.
+ * ASK: the relay does not push to us. Measured 7/28 — it answers stored-event
+ * queries anonymously but never streams post-EOSE, so a subscription sits open
+ * delivering nothing. `client.poll()` fetches whatever is newer than we hold.
+ *
+ * REDRAW: the parts of the view derived from the clock rather than from events
+ * — the "3m ago" ages, and the online dots, which mean "a heartbeat inside the
+ * last 300s". Without a redraw a seller reads as online long after going stale,
+ * which is the one thing here that would be wrong rather than merely old.
  */
-const CLOCK_TICK_MS = 3000;
-setInterval(render, CLOCK_TICK_MS);
+// Started below, once the client it drives exists.
+let tick = null;
 
 renderWindows();
 
@@ -416,9 +417,11 @@ for (const btn of document.querySelectorAll("[data-copy]")) {
   btn.addEventListener("click", (e) => copyFrom(e.currentTarget.dataset.copy, e.currentTarget));
 }
 
-createRelayClient({
+const client = createRelayClient({
   url: RELAY_URL,
   onEvent: (event) => { if (cache.ingest(event).stored) render(); },
   onStatus: ({ state, detail }) => setConn(state, detail),
   onHistoryComplete: () => render(),
-}).connect();
+});
+client.connect();
+tick = setInterval(() => { client.poll(); render(); }, POLL_MS);

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { classifyClosed, createRelayClient, historyFilter, historyStreams, liveFilters } from "../js/relay.js";
-import { MOBEE_TAG } from "../js/kinds.js";
+import { MOBEE_TAG, OFFER } from "../js/kinds.js";
 
 /** A scriptable stand-in for a relay socket. */
 function fakeSocket() {
@@ -139,9 +139,36 @@ test("history ends and goes live only once every stream is drained", () => {
   const streamCount = historyStreams().length;
   for (let i = 0; i < streamCount; i++) sock.deliver(["EOSE", `h${i + 1}`]);
 
+  // Drained history hands over to POLLING, not to a live stream: this relay
+  // answers stored-event queries anonymously but never pushes post-EOSE.
   const last = reqs(sock).at(-1);
-  assert.equal(last[1], "live", "all streams drained => live");
+  assert.match(last[1], /^p\d+$/, "all streams drained => a poll subscription");
   assert.equal(last[2].since, 1_000_000);
+});
+
+test("a poll asks only for what is newer, and closes its own subscription", () => {
+  const sock = fakeSocket();
+  const { client } = clientOn(sock);
+  client.connect();
+  sock.open();
+  for (let i = 0; i < historyStreams().length; i++) sock.deliver(["EOSE", `h${i + 1}`]);
+
+  const firstPoll = reqs(sock).at(-1);
+  const subId = firstPoll[1];
+
+  // Its EOSE must CLOSE it. Without this, one subscription leaks per tick.
+  sock.deliver(["EOSE", subId]);
+  assert.equal(
+    sock.sent.filter((f) => f[0] === "CLOSE" && f[1] === subId).length,
+    1,
+    "a finished poll closes its own subscription",
+  );
+
+  // An ingested event moves the cursor forward, so the next poll asks for
+  // strictly newer. Re-asking from the same second re-delivers what we hold.
+  sock.deliver(["EVENT", subId, { id: "a".repeat(64), kind: OFFER, pubkey: "b".repeat(64), created_at: 1_000_500, tags: [], content: "" }]);
+  client.poll();
+  assert.equal(reqs(sock).at(-1)[2].since, 1_000_501, "since = newest + 1");
 });
 
 test("events reach the caller as they arrive", () => {

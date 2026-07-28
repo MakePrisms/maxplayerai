@@ -66,7 +66,7 @@ a { color: var(--blue); }
 
 .conn { display: flex; align-items: center; gap: 7px; margin: 0 0 0 auto; font-size: 11.5px; color: var(--muted); }
 .lamp { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
-.conn[data-state="live"] .lamp { background: var(--neon); box-shadow: 0 0 0 3px var(--neon-dim), 0 0 10px var(--neon); }
+.conn[data-state="live"] .lamp, .conn[data-state="watching"] .lamp { background: var(--neon); box-shadow: 0 0 0 3px var(--neon-dim), 0 0 10px var(--neon); }
 .conn[data-state="history"] .lamp, .conn[data-state="connecting"] .lamp { background: var(--blue); animation: blink 1.2s ease-in-out infinite; }
 .conn[data-state="failed"] .lamp, .conn[data-state="reconnecting"] .lamp { background: var(--warn); }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }

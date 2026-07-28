@@ -17,6 +17,9 @@ export const MAX_PAGES = 40;
 /** Reconnect backoff in ms, then steady. */
 const BACKOFF = [1000, 2000, 5000, 10000, 30000];
 
+/** How often to ask for new events, since the relay will not push them to us. */
+export const POLL_MS = 3000;
+
 /**
  * History is read as independent streams, each paged with its OWN cursor.
  *
@@ -83,6 +86,8 @@ export function createRelayClient({
   let streamIndex = 0;
   /** Cursor for the stream being paged — reset when moving to the next one. */
   let oldestSeen = null;
+  /** Forward cursor for polling: the newest created_at we have ingested. */
+  let newestSeen = null;
   let subCounter = 0;
   let activeSub = null;
   let attempt = 0;
@@ -102,11 +107,39 @@ export function createRelayClient({
     send(["REQ", activeSub, historyFilter(streams[streamIndex], oldestSeen == null ? null : oldestSeen - 1)]);
   }
 
-  function goLive() {
-    activeSub = "live";
-    send(["REQ", activeSub, ...liveFilters(now())]);
-    status("live");
+  /**
+   * Poll for new events. We do NOT get pushed to.
+   *
+   * MEASURED 7/28: this relay answers stored-event queries anonymously but never
+   * streams post-EOSE. Held a `since:T` subscription for 90s, then asked for
+   * stored events in that same window — 4 existed, 0 had been pushed. It sends a
+   * NIP-42 AUTH challenge on connect; reading history without a key is allowed,
+   * receiving a live feed is not. A long-lived REQ therefore sits there looking
+   * healthy and delivering nothing, which is how the board claimed "live" for
+   * days while showing a snapshot from page load.
+   *
+   * So: ask, don't wait. Each tick is one REQ for `since: newest+1`, closed on
+   * its own EOSE. Incremental, so a quiet market costs an empty round trip.
+   */
+  function pollOnce() {
+    if (stopped) return;
+    activeSub = `p${++subCounter}`;
+    // +1 so an event already ingested is not re-fetched every tick. `since` is
+    // inclusive, and this cursor only moves forward.
+    send(["REQ", activeSub, ...liveFilters(newestSeen == null ? now() : newestSeen + 1)]);
+  }
+
+  /**
+   * The CLIENT does not own a clock. The app already ticks every POLL_MS to
+   * refresh clock-derived parts of the view, so it calls `poll()` on that same
+   * tick — one ticker, not two that can drift apart or double after a
+   * reconnect. It also keeps this module free of a repeating timer, which is
+   * what a caller has to remember to cancel and a test suite hangs on.
+   */
+  function startPolling() {
+    status("watching");
     onHistoryComplete({ pages });
+    pollOnce();
   }
 
   function handleEose() {
@@ -118,12 +151,12 @@ export function createRelayClient({
       send(["CLOSE", activeSub]);
     }
     const exhausted = seenThisPage === 0 || oldestSeen == null;
-    if (pages >= MAX_PAGES) return goLive();
+    if (pages >= MAX_PAGES) return startPolling();
     if (exhausted) {
       // This stream is drained; the next one starts from its own beginning.
       streamIndex += 1;
       oldestSeen = null;
-      if (streamIndex >= streams.length) return goLive();
+      if (streamIndex >= streams.length) return startPolling();
     }
     requestHistory();
   }
@@ -134,10 +167,21 @@ export function createRelayClient({
       const event = frame[2];
       seenThisPage += 1;
       if (event && (oldestSeen == null || event.created_at < oldestSeen)) oldestSeen = event.created_at;
+      if (event && (newestSeen == null || event.created_at > newestSeen)) newestSeen = event.created_at;
       onEvent(event);
       return;
     }
-    if (type === "EOSE") { if (phase === "history") handleEose(); return; }
+    if (type === "EOSE") {
+      if (phase === "history") { handleEose(); return; }
+      // A poll's EOSE means that round is done. CLOSE it, or subscriptions
+      // accumulate at one every POLL_MS — twenty a minute, none of them ever
+      // ended — until the relay drops us for holding too many.
+      if (frame[1] === activeSub) {
+        closedByUs.add(activeSub);
+        send(["CLOSE", activeSub]);
+      }
+      return;
+    }
     if (type === "CLOSED") {
       const verdict = classifyClosed(frame[2], closedByUs.has(frame[1]));
       if (verdict === "acknowledged") { closedByUs.delete(frame[1]); return; }
@@ -189,6 +233,8 @@ export function createRelayClient({
 
   return {
     connect,
+    /** Ask for anything newer than we hold. No-op unless we are past history. */
+    poll() { if (phase === "watching") pollOnce(); },
     stop() { stopped = true; if (retryTimer) clearTimer(retryTimer); retryTimer = null; teardown(); status("idle"); },
     get phase() { return phase; },
     get pagesRead() { return pages; },
