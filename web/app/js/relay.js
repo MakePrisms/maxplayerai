@@ -137,7 +137,9 @@ export function createRelayClient({
    * what a caller has to remember to cancel and a test suite hangs on.
    */
   function startPolling() {
-    status("watching");
+    // "live" = the board keeps itself current without a reload, which it now
+    // does. It does NOT claim the relay pushes to us — it will not, see above.
+    status("live");
     onHistoryComplete({ pages });
     pollOnce();
   }
@@ -234,7 +236,10 @@ export function createRelayClient({
   return {
     connect,
     /** Ask for anything newer than we hold. No-op unless we are past history. */
-    poll() { if (phase === "watching") pollOnce(); },
+    // Guard reads the SAME string status() sets. Rename one without the other
+    // and polling stops with no error, no symptom, and a page that looks fine
+    // until you notice it never changes.
+    poll() { if (phase === "live") pollOnce(); },
     stop() { stopped = true; if (retryTimer) clearTimer(retryTimer); retryTimer = null; teardown(); status("idle"); },
     get phase() { return phase; },
     get pagesRead() { return pages; },

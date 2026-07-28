@@ -146,6 +146,24 @@ test("history ends and goes live only once every stream is drained", () => {
   assert.equal(last[2].since, 1_000_000);
 });
 
+test("poll() fires in whatever phase history hands over to", () => {
+  // The guard inside poll() compares against the string status() sets. Rename
+  // one and not the other and polling dies silently — no error, no symptom, a
+  // page that simply never changes. So assert the two agree by BEHAVIOUR: after
+  // history drains, a poll() must put a REQ on the wire.
+  const sock = fakeSocket();
+  const states = [];
+  const { client } = clientOn(sock, { onStatus: ({ state }) => states.push(state) });
+  client.connect();
+  sock.open();
+  for (let i = 0; i < historyStreams().length; i++) sock.deliver(["EOSE", `h${i + 1}`]);
+
+  const before = reqs(sock).length;
+  client.poll();
+  assert.equal(reqs(sock).length, before + 1, "poll() after history must reach the wire");
+  assert.ok(states.includes("live"), `handover state is reported: ${states.join(",")}`);
+});
+
 test("a poll asks only for what is newer, and closes its own subscription", () => {
   const sock = fakeSocket();
   const { client } = clientOn(sock);
