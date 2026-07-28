@@ -12,5 +12,5 @@
   "bin": {
     "mobee-linux-x64": "bin/mobee"
   },
-  "files": ["bin/mobee"]
+  "files": ["bin/mobee", "LICENSE-MIT", "LICENSE-APACHE"]
 }
