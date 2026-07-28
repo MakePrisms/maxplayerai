@@ -1,0 +1,296 @@
+name: Release
+
+# A pushed tag is the ONLY thing that can publish anything.
+#
+# `workflow_dispatch` exists so the whole build and every verifier can be exercised on demand, and it
+# deliberately cannot reach the publishing jobs. Note that a dispatch can be aimed at a tag ref, so
+# `github.ref_type == 'tag'` is not on its own evidence of a tag PUSH — every gate below tests the
+# event name as well.
+#
+# `pull_request` is absent on purpose: a pull request cannot start this workflow at all.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# Read-only for every job; the two that need to write ask for it themselves.
+permissions:
+  contents: read
+
+# Never cancel a release in flight. A publish interrupted between the payload packages and the
+# launcher leaves the registry in a state where `mobee` resolves a binary that was never published.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: plan
+        name: Resolve the version being built
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
+            # The tag is authoritative: the tree is checked against it, not the other way round.
+            version="${GITHUB_REF_NAME#v}"
+          else
+            # A dry run has no tag. Take the version from the tree so the cross-checks in
+            # verify-release-version.sh still compare the crate, the manifests and the pins against
+            # each other.
+            version="$(node -p "require('./npm/mobee/package.json').version")"
+          fi
+          [ -n "$version" ] || { echo "could not resolve a version" >&2; exit 1; }
+
+          # Any semver pre-release suffix (-rc1, -beta.2, …) marks this a pre-release. Matching the
+          # suffix rather than the literal "rc" keeps `-beta` from being published as latest.
+          case "$version" in
+            *-*) prerelease=true ;;
+            *)   prerelease=false ;;
+          esac
+
+          echo "version=$version"       >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "Building $version (prerelease=$prerelease)"
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One platform failing must not hide another's result — the point of a dry run is to learn
+      # about every platform at once.
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners throughout. Cross-building the aarch64 static artifact through nix
+          # compiles rustc from source, which dominates the build; a native runner per platform
+          # avoids that entirely.
+          - platform: linux-x64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            kind: linux-musl
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            kind: linux-musl
+          - platform: darwin-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            kind: darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      # musl-gcc, for the C dependencies. secp256k1-sys, libsqlite3-sys and the vendored libgit2-sys
+      # each compile C, and they need a compiler targeting musl rather than the host's glibc.
+      - name: Install the musl toolchain
+        if: matrix.kind == 'linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # `--no-default-features --features wallet` states the buyer surface explicitly instead of
+      # relying on `default`. The two are equal today (`default = ["wallet"]`), but naming the
+      # feature means a later change to `default` cannot quietly compile the seller's
+      # agent-execution path into the artifact handed to buyers.
+      - name: Build
+        env:
+          # Both linux targets are built on a runner of their own architecture, so `musl-gcc` is a
+          # native musl compiler in each case rather than a cross toolchain.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          cargo build -p mobee --release --locked \
+            --no-default-features --features wallet \
+            --target ${{ matrix.target }}
+
+      - name: Verify the version matches the release
+        run: ./scripts/verify-release-version.sh '${{ needs.plan.outputs.version }}' \
+          "target/${{ matrix.target }}/release/mobee"
+
+      # Which features were compiled in — wallet present, acp absent. `version` succeeds in every
+      # build, so nothing else here can tell one feature combination from another.
+      - name: Verify the buyer surface
+        run: ./scripts/verify-buyer-surface.sh "target/${{ matrix.target }}/release/mobee"
+
+      # The decisive portability check for linux: run the artifact inside alpine and debian with no
+      # nix and no toolchain present. This is what makes the choice of musl toolchain above safe to
+      # revisit — the property is re-proved on the binary that actually ships, never inherited from
+      # a build recipe.
+      - name: Verify portability (linux)
+        if: matrix.kind == 'linux-musl'
+        run: ./scripts/verify-static-artifact.sh "target/${{ matrix.target }}/release/mobee"
+
+      # macOS cannot link libSystem statically, so a static check does not apply. What does apply is
+      # that the binary must not have picked up a Homebrew or /usr/local dylib: those live outside
+      # the base OS, so a user without them gets a binary that cannot start.
+      - name: Verify portability (darwin)
+        if: matrix.kind == 'darwin'
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/mobee"
+          otool -L "$BIN"
+          if otool -L "$BIN" | grep -Eq '/opt/homebrew|/usr/local'; then
+            echo "the artifact links a dylib outside the base OS, so it will not start on a clean mac" >&2
+            exit 1
+          fi
+          echo "ok: links only against base-OS libraries"
+
+      - name: Package the asset
+        run: ./scripts/package-release-asset.sh \
+          "target/${{ matrix.target }}/release/mobee" \
+          '${{ matrix.platform }}' '${{ needs.plan.outputs.version }}' dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-${{ matrix.platform }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    # A tag PUSH only. Both halves are needed: a dispatch can target a tag ref, so the ref type
+    # alone does not establish that a tag was pushed.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: asset-*
+          merge-multiple: true
+
+      - name: Checksum
+        run: |
+          set -euo pipefail
+          cd dist
+          # Guard the glob: with no assets, `sha256sum *.tar.gz` would write a SHA256SUMS naming a
+          # literal `*.tar.gz`, and the release would carry a checksum file for nothing.
+          count=$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)
+          [ "$count" -gt 0 ] || { echo "no assets were downloaded" >&2; exit 1; }
+          # `--` rather than `./*.tar.gz`: it stops option parsing without prefixing every path in
+          # SHA256SUMS, which keeps `sha256sum -c SHA256SUMS` usable next to the downloaded files.
+          sha256sum -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          flags=(--title "mobee $VERSION" --generate-notes)
+          if [ "$PRERELEASE" = true ]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" "${flags[@]}" dist/*.tar.gz dist/SHA256SUMS
+
+  publish:
+    name: npm publish
+    # ★ The gate this workflow is judged on. Publishing requires a tag PUSH, and the job additionally
+    #   fails closed below if the token is absent, so merging this workflow publishes nothing:
+    #   `workflow_dispatch` never reaches here, a pull request cannot trigger the workflow at all,
+    #   and a tag pushed before the secret exists stops at the first step.
+    #
+    #   The token cannot be tested here — the `secrets` context is not available in a job-level `if`,
+    #   which is why that half is a step instead.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [plan, build, release]
+    runs-on: ubuntu-latest
+    steps:
+      # Fail rather than skip. A silent skip is indistinguishable from a successful release, so a
+      # missing token would look like a published one until somebody tried to install it.
+      - name: Require the publish secret
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NPM_TOKEN:-}" ]; then
+            echo "NPM_TOKEN is not configured — nothing has been published." >&2
+            echo "The GitHub Release above is complete; add the secret and re-run this job." >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: asset-*
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+          # Every platform whose payload package is published. Adding a platform package under npm/
+          # without adding it here is caught below rather than silently never shipping.
+          RELEASE_PLATFORMS: linux-x64 linux-arm64
+        run: |
+          set -euo pipefail
+
+          # A payload package that exists in the tree but is not in RELEASE_PLATFORMS would be left
+          # unpublished while the launcher still pins it by exact version — every install on that
+          # platform would then resolve a package that is not on the registry. Fail here instead.
+          for dir in npm/cli-*/; do
+            platform="$(basename "$dir")"; platform="${platform#cli-}"
+            case " $RELEASE_PLATFORMS " in
+              *" $platform "*) ;;
+              *) echo "npm/$(basename "$dir") exists but $platform is not in RELEASE_PLATFORMS — add it or the launcher will pin an unpublished package" >&2; exit 1 ;;
+            esac
+          done
+
+          # A pre-release goes out under the `rc` dist-tag so `npm i mobee` keeps resolving the last
+          # stable version. The array always holds at least `--access public`, which is what the
+          # scoped payload packages need on their first publish.
+          publish_args=(--access public)
+          if [ "$PRERELEASE" = true ]; then
+            publish_args+=(--tag rc)
+          fi
+
+          # Payload packages first. The launcher resolves them by exact version, so publishing it
+          # ahead of them leaves a window where `npm i mobee` installs a launcher with no binary.
+          for platform in $RELEASE_PLATFORMS; do
+            asset="dist/mobee-$VERSION-$platform.tar.gz"
+            [ -f "$asset" ] || { echo "no built asset for $platform at $asset" >&2; exit 1; }
+
+            mkdir -p "npm/cli-$platform/bin"
+            tar -xzf "$asset" -O "mobee-$VERSION-$platform/mobee" > "npm/cli-$platform/bin/mobee"
+            chmod 755 "npm/cli-$platform/bin/mobee"
+            cp LICENSE-MIT LICENSE-APACHE "npm/cli-$platform/"
+
+            ( cd "npm/cli-$platform" && npm publish "${publish_args[@]}" )
+          done
+
+          cp LICENSE-MIT LICENSE-APACHE npm/mobee/
+          ( cd npm/mobee && npm publish "${publish_args[@]}" )
