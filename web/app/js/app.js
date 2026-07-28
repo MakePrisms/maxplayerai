@@ -101,7 +101,7 @@ function renderSellers(events) {
           <span class="dot ${r.online ? "on" : ""}" title="${r.online ? "online now" : "not currently online"}"></span>
           <span class="nm">${r.name ? esc(r.name) : `<code>${short(r.pubkey)}</code>`}</span>
           ${r.harness ? `<span class="harness" title="${esc(r.harness)}">${esc(shortHarness(r.harness))}</span>` : ""}
-          ${r.askSats != null ? `<span class="ask" title="Ask — the seller's advertised rate, self-reported and not verified against what it actually charges">${nf.format(r.askSats)}</span>` : ""}
+          ${r.askSats != null ? `<span class="ask" title="Ask — the rate this seller advertises">${nf.format(r.askSats)}</span>` : ""}
         </span>
         <span class="num">${nf.format(r.delivered)}</span>
         <span class="num ${r.completionRate != null && r.completionRate < 0.5 ? "dim" : ""}">${pct(r.completionRate)}</span>
@@ -119,7 +119,9 @@ function feedLine(e) {
     case "offer": return `${e.selfTrade ? '<span class="self" title="The buyer operates the seller being paid — real work, but not market demand">self</span> ' : ""}${e.description ? esc(e.description) : "posted a job"}${e.amount != null ? ` · <span class="sats">${nf.format(e.amount)} sat</span>` : ""}`;
     case "claim": return `${who} claimed a job`;
     case "award": return `${who} awarded a claim`;
-    case "result": return `${who} delivered${e.harness ? ` · <span class="harness">${esc(e.harness)}</span>` : ""}`;
+    // No harness tag here — the activity stream reads as a sentence, and the
+    // runtime is noise in it. Still on the seller row and in the event sheet.
+    case "result": return `${who} delivered`;
     case "receipt": return `paid${e.amount != null ? ` · <span class="sats">${nf.format(e.amount)} sat</span>` : ""} · receipt co-signed`;
     case "feedback": return `${who} · ${esc(e.reason || "feedback")}`;
     default: return who;
@@ -151,6 +153,10 @@ function renderFeed(events) {
  */
 function renderStats(events) {
   const m = marketMetrics(events);
+  // The labels carry what the numbers are: "Receipts on record" and "Sats in
+  // receipts" say they count published receipts, which is the honest framing —
+  // a trade can settle without publishing one, so these are a floor. That fact
+  // is recorded in the lane anchor rather than repeated on the page.
   const cells = [
     ["Jobs posted", nf.format(m.funnel.posted), ""],
     ["Delivered", nf.format(m.funnel.delivered), ""],
@@ -161,15 +167,14 @@ function renderStats(events) {
   ];
   el("statgrid").innerHTML = cells
     .map(([k, v, cls]) => `<div><dt>${k}</dt><dd class="${cls}">${v}</dd></div>`).join("");
-  const excluded = m.selfTrades
-    ? ` ${nf.format(m.selfTrades)} self-commissioned trade${m.selfTrades === 1 ? " is" : "s are"} excluded — the buyer operated the seller, so it is real work but not market demand.`
-    : "";
+  // Kept: an exclusion must be COUNTED, never silent — a reader who knows one
+  // trade was removed can recover the full picture; a silent removal cannot be
+  // undone. Only renders when there is something to declare.
   const win = WINDOWS.find((w) => w.key === windowKey);
   el("stats-window").textContent = win ? `· ${win.label.toLowerCase()}` : "";
-  el("stats-note").textContent =
-    `Across ${m.daysActive} day${m.daysActive === 1 ? "" : "s"} of activity in the selected period, ` +
-    "derived in your browser from relay events. A trade can settle without publishing a receipt, " +
-    "so the settlement figures are a floor rather than a total." + excluded;
+  el("stats-note").textContent = m.selfTrades
+    ? `${nf.format(m.selfTrades)} self-commissioned trade${m.selfTrades === 1 ? " is" : "s are"} excluded — the buyer operated the seller, so it is real work but not market demand.`
+    : "";
 }
 
 /* ---------------- detail sheet ---------------- */
@@ -224,8 +229,11 @@ function openParticipant(role, pubkey, events) {
       // reader seeing "testnut" would conclude no real money is involved, which
       // is both false and the most costly way to be wrong. Better to show
       // nothing than a money field known to be lying. Restore when #209 ships.
+      // "Advertises" is itself the disclosure — an advert is what someone says
+      // about themselves, and the trades above are the evidence. The prose that
+      // spelled this out is gone at the design owner's instruction; the fact it
+      // stated is recorded in the lane anchor.
       parts.push('<h4>Advertises</h4>');
-      parts.push('<p class="tiny caveat">What this seller <b>says about itself</b>. Nothing checks these against what it actually charges or accepts — sellers have advertised the wrong price for weeks. The trades below are the evidence.</p>');
       parts.push(`<p class="tiny">${[
         s.askSats != null ? `asks <b>${nf.format(s.askSats)} sat</b> per job` : "",
         s.openPool ? "takes open-pool work" : "direct offers only",
@@ -340,11 +348,14 @@ el("detail").addEventListener("click", (ev) => { if (ev.target === el("detail"))
 async function copyFrom(sourceId, btn) {
   try {
     await navigator.clipboard.writeText(el(sourceId).textContent.trim());
-    btn.textContent = "copied";
+    // Checkmark ONLY on a write that actually resolved. A tick shown for a copy
+    // that did not happen sends someone to paste nothing.
+    btn.textContent = "✓";
+    btn.classList.add("ok");
   } catch {
     btn.textContent = "select it";
   }
-  setTimeout(() => { btn.textContent = "copy"; }, 1600);
+  setTimeout(() => { btn.textContent = "copy"; btn.classList.remove("ok"); }, 1600);
 }
 for (const btn of document.querySelectorAll("[data-copy]")) {
   btn.addEventListener("click", (e) => copyFrom(e.currentTarget.dataset.copy, e.currentTarget));

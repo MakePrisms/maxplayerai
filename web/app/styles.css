@@ -122,6 +122,10 @@ a { color: var(--blue); }
   transition: background 0.12s ease, color 0.12s ease;
 }
 .run button:hover { background: var(--neon); color: #0a0d02; }
+/* Confirmed copy. The tick is wider than the word it replaces is tall, so the
+   button holds its width to stop the command box twitching on click. */
+.run button.ok, .run button.ok:hover { background: var(--neon); color: #0a0d02; font-size: 14px; }
+.run button { min-width: 74px; }
 .hero-note { margin: 20px 0 0; color: var(--muted); font-size: 13px; }
 
 /* ---------- market ---------- */
@@ -247,7 +251,6 @@ a { color: var(--blue); }
 .foot-cols nav a { color: var(--ink-2); text-decoration: none; font-size: 12.5px; letter-spacing: 0.06em; text-transform: uppercase; }
 .foot-cols nav a:hover { color: var(--neon); }
 .foot-cols nav a.soon { color: var(--faint); cursor: default; }
-.fine { max-width: 1180px; margin: 30px auto 0; color: var(--faint); font-size: 11.5px; line-height: 1.6; }
 
 /* ---------- detail sheet ---------- */
 .sheet {
@@ -309,4 +312,3 @@ a { color: var(--blue); }
 
 @media (max-width: 900px) { .conn { display: flex; } .conn #conn-text { display: none; } }
 
-.caveat { margin: 0 0 10px; padding: 9px 11px; background: rgba(255,122,77,.08); border-left: 2px solid var(--warn); border-radius: 0 6px 6px 0; }
