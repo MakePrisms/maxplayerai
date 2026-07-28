@@ -86,7 +86,15 @@ export function buyerBoard(events, now) {
 }
 
 /**
- * Sellers, ranked by sats earned.
+ * Sellers, ranked by track record: work delivered, then how much of what they
+ * took they finished, then sats. That order matches the columns as they read
+ * left to right, and it leads with the sturdiest number — a delivery is a
+ * protocol step the buyer needs in order to pay, whereas a receipt is optional,
+ * so sats are a floor and deliveries are not.
+ *
+ * Being online does not lift a seller up the board. It is a claim about this
+ * minute, not evidence of anything, and ranking on it puts a seller that has
+ * never finished a job above one with a history. It is still shown per row.
  *
  * `online` comes from a heartbeat inside LIVE_WITHIN_SECONDS — a claim about
  * right now. `lastSeen` is the last time they did anything at all. The two are
@@ -166,7 +174,15 @@ export function sellerBoard(events, now) {
         harnesses: ranked.map(([name, n]) => ({ name, deliveries: n })),
       };
     })
-    .sort((a, b) => Number(b.online) - Number(a.online) || b.satsEarned - a.satsEarned);
+    // A seller with no claims has no rate to compare, so it sorts below any
+    // measured rate rather than tying with a zero.
+    .sort((a, b) =>
+      b.delivered - a.delivered ||
+      (b.completionRate ?? -1) - (a.completionRate ?? -1) ||
+      b.satsEarned - a.satsEarned ||
+      b.lastSeen - a.lastSeen ||
+      // Last resort, so the board does not reshuffle as new events arrive.
+      a.pubkey.localeCompare(b.pubkey));
 }
 
 /** Everything known about one participant, for a detail view. */

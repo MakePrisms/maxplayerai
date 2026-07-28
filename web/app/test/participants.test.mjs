@@ -112,7 +112,30 @@ test("online means a recent heartbeat, not merely recent trading", () => {
   assert.equal(byKey[fresh].online, true);
   assert.equal(byKey[stale].online, false, "a stale heartbeat is not availability");
   assert.ok(byKey[stale].lastSeen > 0, "but they are still known to exist");
-  assert.equal(board[0].pubkey, fresh, "online sellers sort first");
+});
+
+test("sellers rank by track record, and being online does not lift them", () => {
+  const veteran = pk("1"), steady = pk("2"), flaky = pk("3"), newcomer = pk("4");
+  const events = [
+    // Two finished jobs, paid, but not around right now.
+    ...trade("o-vet-1", { seller: veteran, sats: 10 }),
+    ...trade("o-vet-2", { seller: veteran, sats: 10 }),
+    // One finished job each, unpaid, so sats cannot break the tie — the
+    // difference is that flaky also walked away from a claim.
+    ...trade("o-steady", { seller: steady, receipt: false }),
+    ...trade("o-flaky", { seller: flaky, receipt: false }),
+    ...trade("o-flaky-open", { seller: flaky }).slice(0, 2),
+    // Live this minute, has never finished anything.
+    ...trade("o-new", { seller: newcomer }).slice(0, 2),
+    ev(HEARTBEAT, { id: "hb-new", pubkey: newcomer, at: NOW - 10, tags: [["d", "seat"]] }),
+  ];
+
+  const board = sellerBoard(events, NOW);
+  assert.deepEqual(board.map((r) => r.pubkey), [veteran, steady, flaky, newcomer]);
+  assert.equal(board[0].delivered, 2, "most delivered leads");
+  assert.equal(board[1].completionRate, 1, "equal deliveries break on completion rate");
+  assert.equal(board[2].completionRate, 0.5);
+  assert.equal(board[3].online, true, "online, and still last — it is not a ranking signal");
 });
 
 test("a capability advert attaches to its seller", () => {
