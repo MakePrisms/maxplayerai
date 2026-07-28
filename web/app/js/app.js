@@ -310,17 +310,23 @@ document.addEventListener("keydown", (ev) => {
 el("detail-close").addEventListener("click", closeSheet);
 el("detail").addEventListener("click", (ev) => { if (ev.target === el("detail")) closeSheet(); });
 
-el("copy").addEventListener("click", async () => {
-  const btn = el("copy");
+/**
+ * Copy a command to the clipboard. Clipboard access can be refused, and a
+ * button that says "copied" when nothing was copied is worse than one that
+ * admits it — so failure is reported, not swallowed.
+ */
+async function copyFrom(sourceId, btn) {
   try {
-    await navigator.clipboard.writeText(el("runcmd").textContent.trim());
+    await navigator.clipboard.writeText(el(sourceId).textContent.trim());
     btn.textContent = "copied";
   } catch {
-    // Clipboard access can be refused; say so rather than claiming success.
     btn.textContent = "select it";
   }
   setTimeout(() => { btn.textContent = "copy"; }, 1600);
-});
+}
+for (const btn of document.querySelectorAll("[data-copy]")) {
+  btn.addEventListener("click", (e) => copyFrom(e.currentTarget.dataset.copy, e.currentTarget));
+}
 
 createRelayClient({
   url: RELAY_URL,

@@ -91,11 +91,20 @@ a { color: var(--blue); }
   margin: 12px 0 0; color: var(--neon);
   font-size: clamp(13px, 1.6vw, 17px); letter-spacing: 0.34em; text-transform: uppercase;
 }
+/* two entry points, labelled — a visitor should know which line is theirs */
+.runs { display: inline-flex; flex-direction: column; gap: 8px; margin: 26px 0 0; max-width: 100%; }
 .run {
-  display: inline-flex; align-items: stretch; margin: 26px 0 0;
+  display: flex; align-items: stretch;
   border: 1px solid var(--line); border-radius: 8px; background: var(--panel);
-  max-width: 100%; overflow: hidden;
+  max-width: 100%; overflow: hidden; min-width: 0;
 }
+.run .lbl {
+  flex: none; display: flex; align-items: center; padding: 0 12px;
+  background: var(--blue-dim); color: var(--blue);
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase;
+  border-right: 1px solid var(--line);
+}
+.run .lbl.sell { background: var(--neon-dim); color: var(--neon); }
 .run code {
   padding: 11px 14px; font-size: 12.5px; color: var(--ink-2);
   white-space: nowrap; overflow-x: auto; text-align: left;
@@ -197,14 +206,32 @@ a { color: var(--blue); }
 /* ---------- buy / sell ---------- */
 .pitch { padding: 74px 18px; border-top: 1px solid var(--line); }
 .pitch.alt { background: var(--bg-2); }
-.pitch-in { max-width: 640px; margin: 0 auto; }
+.pitch-in { max-width: 1000px; margin: 0 auto; }
 .eyebrow { font-size: 11px; letter-spacing: 0.26em; text-transform: uppercase; color: var(--neon); }
 .pitch h2 {
   margin: 14px 0 18px; font-size: clamp(24px, 3.2vw, 34px); font-weight: 700;
   letter-spacing: 0.01em; line-height: 1.15; color: var(--ink);
 }
-.pitch p { margin: 0 0 14px; font-family: var(--sans); font-size: 16px; line-height: 1.65; color: var(--ink-2); }
-.pitch p:last-child { margin-bottom: 0; }
+.pitch .lede { margin: 0 0 34px; max-width: 58ch; font-family: var(--sans); font-size: 17px; line-height: 1.6; color: var(--ink-2); }
+
+/* four steps, read left to right — the sequence IS the explanation */
+.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 14px; grid-template-columns: repeat(4, 1fr); }
+.steps li {
+  position: relative; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; padding: 20px 18px 18px;
+}
+.steps li::after {
+  content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px;
+  background: linear-gradient(90deg, var(--neon), transparent);
+  border-radius: 10px 10px 0 0;
+}
+.steps .n { font-size: 11px; font-weight: 700; letter-spacing: 0.14em; color: var(--neon); }
+.steps h3 { margin: 10px 0 8px; font-size: 15px; font-weight: 700; letter-spacing: 0.02em; color: var(--ink); }
+.steps p { margin: 0; font-family: var(--sans); font-size: 13.5px; line-height: 1.6; color: var(--muted); }
+.pitch .run { margin-top: 28px; }
+.pitch .run.small code { font-size: 12px; }
+@media (max-width: 1000px) { .steps { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 560px) { .steps { grid-template-columns: 1fr; } }
 
 /* ---------- footer ---------- */
 .site-foot { border-top: 1px solid var(--line); padding: 42px 18px 54px; background: var(--bg-2); }
