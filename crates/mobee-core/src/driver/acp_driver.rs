@@ -1,9 +1,17 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+// Tokio (not std) channels: every driver wait must YIELD to the runtime instead of blocking the
+// thread. The seller node runs all awarded jobs as `spawn_local` tasks on ONE LocalSet thread, so
+// a `std::sync::mpsc` blocking receive here — which used to span the ENTIRE `session/prompt` turn,
+// i.e. the whole agent run — froze every other job and the run loop itself (issue #223). The
+// reader THREAD stays a plain thread (blocking reads of the child's stdout belong off-runtime);
+// only the receive side is async.
+use tokio::sync::mpsc;
 
 use serde_json::{Value, json};
 
@@ -36,9 +44,9 @@ pub struct AcpDriver {
     idle_timeout: Duration,
     child: Option<Child>,
     stdin: Option<Arc<Mutex<ChildStdin>>>,
-    responses: Option<mpsc::Receiver<RpcResponse>>,
-    updates: Option<mpsc::Receiver<SessionUpdate>>,
-    update_tx: Option<mpsc::Sender<SessionUpdate>>,
+    responses: Option<mpsc::UnboundedReceiver<RpcResponse>>,
+    updates: Option<mpsc::UnboundedReceiver<SessionUpdate>>,
+    update_tx: Option<mpsc::UnboundedSender<SessionUpdate>>,
     next_request_id: AtomicU64,
     /// ACP-native usage captured from the most recent `session/prompt` result.
     /// `None` when the harness surfaced nothing (absent-stays-absent).
@@ -95,8 +103,8 @@ impl AcpDriver {
             .ok_or_else(|| DriverError::Other("ACP child stdout unavailable".into()))?;
 
         let stdin = Arc::new(Mutex::new(stdin));
-        let (response_tx, response_rx) = mpsc::channel();
-        let (update_tx, update_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::unbounded_channel();
+        let (update_tx, update_rx) = mpsc::unbounded_channel();
         let update_tx_for_reader = update_tx.clone();
         let stdin_for_reader = stdin.clone();
         let permission_policy = self.permission_policy.clone();
@@ -160,15 +168,27 @@ impl AcpDriver {
             .map_err(|error| DriverError::Other(format!("failed to write ACP JSON-RPC: {error}")))
     }
 
-    fn wait_response(&self, id: u64) -> Result<Value, DriverError> {
+    /// Await the response to request `id`. This is where the driver spends the whole agent turn
+    /// (`session/prompt` answers only when the turn ends), so it MUST yield to the runtime — a
+    /// blocking receive here serializes every job on the seller node's single-threaded LocalSet
+    /// and deafens its run loop (issue #223).
+    async fn wait_response(&mut self, id: u64) -> Result<Value, DriverError> {
+        let idle_timeout = self.idle_timeout;
         let responses = self
             .responses
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| DriverError::Other("ACP response channel unavailable".into()))?;
         loop {
-            let response = responses.recv_timeout(self.idle_timeout).map_err(|_| {
-                DriverError::Other(format!("ACP request {id} timed out waiting for response"))
-            })?;
+            let response = tokio::time::timeout(idle_timeout, responses.recv())
+                .await
+                .map_err(|_| {
+                    DriverError::Other(format!("ACP request {id} timed out waiting for response"))
+                })?
+                .ok_or_else(|| {
+                    DriverError::Other(format!(
+                        "ACP agent exited before responding to request {id}"
+                    ))
+                })?;
             if response.id != json!(id) {
                 continue;
             }
@@ -196,7 +216,7 @@ impl Driver for AcpDriver {
                 DriverError::Other(format!("failed to encode initialize params: {error}"))
             })?,
         )?;
-        let result = self.wait_response(id)?;
+        let result = self.wait_response(id).await?;
         let protocol_version = result
             .get("protocol_version")
             .or_else(|| result.get("protocolVersion"))
@@ -221,7 +241,7 @@ impl Driver for AcpDriver {
                 DriverError::Other(format!("failed to encode session params: {error}"))
             })?,
         )?;
-        let result = self.wait_response(id)?;
+        let result = self.wait_response(id).await?;
         session_id_from_result(&result)
     }
 
@@ -231,7 +251,7 @@ impl Driver for AcpDriver {
         turn: PromptTurn,
     ) -> Result<UpdateStream, DriverError> {
         let id = self.send_request("session/prompt", prompt_params(session_id, turn))?;
-        let result = self.wait_response(id)?;
+        let result = self.wait_response(id).await?;
         // Capture ACP-native usage off the prompt result before we reduce it to a stop reason.
         // Absent-stays-absent — `None` when the harness surfaced nothing.
         self.last_usage = parse_acp_usage(&result);
@@ -262,7 +282,7 @@ impl Driver for AcpDriver {
                     "sessionId": session_id,
                 }),
             )?;
-            let _ = self.wait_response(id);
+            let _ = self.wait_response(id).await;
         }
         Ok(())
     }
@@ -273,15 +293,20 @@ impl Driver for AcpDriver {
 
     async fn shutdown(&mut self) -> Result<(), DriverError> {
         if let Some(mut child) = self.child.take() {
-            #[cfg(unix)]
-            {
-                let _ = Command::new("kill")
-                    .arg("-TERM")
-                    .arg(format!("-{}", child.id()))
-                    .status();
-            }
-            let _ = child.kill();
-            let _ = child.wait();
+            // Reaping the child (`wait`) and the group TERM are blocking syscalls/process spawns;
+            // run them off the runtime so shutdown never stalls sibling jobs on the LocalSet.
+            let _ = tokio::task::spawn_blocking(move || {
+                #[cfg(unix)]
+                {
+                    let _ = Command::new("kill")
+                        .arg("-TERM")
+                        .arg(format!("-{}", child.id()))
+                        .status();
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+            })
+            .await;
         }
         Ok(())
     }
@@ -296,8 +321,8 @@ struct RpcResponse {
 
 fn route_wire_message(
     value: &Value,
-    response_tx: &mpsc::Sender<RpcResponse>,
-    update_tx: &mpsc::Sender<SessionUpdate>,
+    response_tx: &mpsc::UnboundedSender<RpcResponse>,
+    update_tx: &mpsc::UnboundedSender<SessionUpdate>,
     permission_policy: &PermissionOutcome,
     respond_permission: &mut impl FnMut(Value, Value),
 ) {
@@ -615,8 +640,8 @@ mod tests {
 
     #[test]
     fn fixture_lines_translate_to_updates() {
-        let (response_tx, _response_rx) = mpsc::channel();
-        let (update_tx, update_rx) = mpsc::channel();
+        let (response_tx, _response_rx) = mpsc::unbounded_channel();
+        let (update_tx, mut update_rx) = mpsc::unbounded_channel();
         let mut permission_responses = Vec::new();
 
         route_wire_message(
@@ -646,13 +671,13 @@ mod tests {
         );
 
         assert_eq!(
-            update_rx.recv().expect("first update"),
+            update_rx.try_recv().expect("first update"),
             SessionUpdate::AgentMessage(vec![ContentBlock::Text {
                 text: "hello".into()
             }])
         );
         assert_eq!(
-            update_rx.recv().expect("terminal"),
+            update_rx.try_recv().expect("terminal"),
             SessionUpdate::TurnEnded(StopReason::Completed)
         );
         assert!(permission_responses.is_empty());
@@ -660,8 +685,8 @@ mod tests {
 
     #[test]
     fn real_agent_message_chunks_translate_to_updates() {
-        let (response_tx, _response_rx) = mpsc::channel();
-        let (update_tx, update_rx) = mpsc::channel();
+        let (response_tx, _response_rx) = mpsc::unbounded_channel();
+        let (update_tx, mut update_rx) = mpsc::unbounded_channel();
         let mut permission_responses = Vec::new();
 
         route_wire_message(
@@ -683,7 +708,7 @@ mod tests {
         );
 
         assert_eq!(
-            update_rx.recv().expect("chunk update"),
+            update_rx.try_recv().expect("chunk update"),
             SessionUpdate::AgentMessageChunk(ContentBlock::Text {
                 text: "hello ".into()
             })
@@ -693,8 +718,8 @@ mod tests {
 
     #[test]
     fn unknown_methods_surface_as_ext() {
-        let (response_tx, _response_rx) = mpsc::channel();
-        let (update_tx, update_rx) = mpsc::channel();
+        let (response_tx, _response_rx) = mpsc::unbounded_channel();
+        let (update_tx, mut update_rx) = mpsc::unbounded_channel();
         let mut permission_responses = Vec::new();
         let params = json!({"x": 1});
 
@@ -711,7 +736,7 @@ mod tests {
         );
 
         assert_eq!(
-            update_rx.recv().expect("ext update"),
+            update_rx.try_recv().expect("ext update"),
             SessionUpdate::Ext(ExtMethod {
                 method: "cursor/ask_question".into(),
                 params,
@@ -722,8 +747,8 @@ mod tests {
 
     #[test]
     fn permission_request_replies_immediately_and_emits_observer_update() {
-        let (response_tx, _response_rx) = mpsc::channel();
-        let (update_tx, update_rx) = mpsc::channel();
+        let (response_tx, _response_rx) = mpsc::unbounded_channel();
+        let (update_tx, mut update_rx) = mpsc::unbounded_channel();
         let mut permission_responses = Vec::new();
 
         route_wire_message(
@@ -761,7 +786,7 @@ mod tests {
             })]
         );
         assert_eq!(
-            update_rx.recv().expect("permission update"),
+            update_rx.try_recv().expect("permission update"),
             SessionUpdate::PermissionRequest(PermissionRequest {
                 tool: "shell".into(),
                 detail: json!({"cmd": "true"}),
@@ -831,8 +856,8 @@ mod tests {
         // turn hangs until the job deadline. Exercised through `route_wire_message` so the test
         // covers the exact auto-answer path the live hang takes.
         let codex_request = |policy| {
-            let (response_tx, _response_rx) = mpsc::channel();
-            let (update_tx, _update_rx) = mpsc::channel();
+            let (response_tx, _response_rx) = mpsc::unbounded_channel();
+            let (update_tx, _update_rx) = mpsc::unbounded_channel();
             let mut permission_responses = Vec::new();
             route_wire_message(
                 &json!({
