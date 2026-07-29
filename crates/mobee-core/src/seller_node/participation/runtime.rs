@@ -132,8 +132,33 @@ struct Live {
     /// whole wake surface from durable cursors, which is strictly more than a pending resend would do.
     resend_due: BTreeMap<Option<String>, i64>,
     /// Set when this relay's socket was kicked for an auth failure: the tick at which its access may be
-    /// re-proven. `None` means nothing is owed.
+    /// re-proven. `None` means nothing is owed — and, per [`Live::quarantined`], that it is the only
+    /// state in which anything may be asked of this relay.
     reprove_due: Option<i64>,
+}
+
+impl Live {
+    /// Whether all outbound wire recovery for this relay is suspended pending proof of access.
+    ///
+    /// ★ `reprove_due` HAS TO BE A QUARANTINE AND NOT MERELY A DEADLINE. It is set when the relay told
+    /// us our authentication or scope failed, which is the relay saying the admission we hold may no
+    /// longer be valid. As a bare deadline it left the relay fully live in the meantime, so the resync,
+    /// re-send and retry lanes went on sending REQs — on the very socket whose access is in question,
+    /// and often in the SAME tick that kicked it, since `retry_suppressed_channels` runs after the
+    /// batch that set this. If the probe then fails the relay is dropped, so every one of those REQs
+    /// was addressed to a relay we had already been told we may not read from.
+    ///
+    /// ★★ Independent recovery lanes that share a socket have to share the socket's gate. Each lane
+    /// was individually right about its own precondition and none of them owned this one, which is how
+    /// three correct lanes composed into traffic nobody had authorised.
+    ///
+    /// Debts survive the quarantine untouched — they are owed, not cancelled — and the rate floors are
+    /// not advanced either, because a quarantine means no attempt was made. Whichever way
+    /// [`Participation::drain_reproves`] resolves, it resolves: proof clears this, and a failed probe
+    /// removes the relay entirely, so nothing can be held here forever.
+    fn quarantined(&self) -> bool {
+        self.reprove_due.is_some()
+    }
 }
 
 /// The node's live participation across all configured relays.
@@ -385,6 +410,7 @@ impl Participation {
                 .iter()
                 .filter(|(_, live)| {
                     live.resync_pending
+                        && !live.quarantined()
                         && now.saturating_sub(live.last_resync_unix) >= MIN_RESYNC_INTERVAL_SECS
                 })
                 .map(|(url, _)| url.clone())
@@ -415,6 +441,12 @@ impl Participation {
             // Re-send subscriptions a `CLOSED` deferred, now that their capped deadline has passed. Grouped
             // with the resync because both are owed WIRE RECOVERY and neither arms an attribution token —
             // which is why they may run before the batch while `retry_suppressed_channels` may not.
+            //
+            // ★ ALL FOUR RECOVERY LANES — resync above, these two, and the retry after the batch — ARE
+            // GATED ON [`Live::quarantined`]. They fire on independent deadlines and share one socket, so
+            // being individually right about their own preconditions was not enough: whether the relay
+            // will still talk to us is a precondition of all of them, and it belongs to none of them.
+            // `drain_reproves` is the exception because it IS that gate.
             self.drain_resends(now).await;
             self.drain_reproves(now).await;
 
@@ -635,6 +667,23 @@ impl Participation {
         }
     }
 
+    /// Mark a re-send owed, so a test can be about the DRAIN rather than about how the debt was recorded.
+    #[cfg(test)]
+    fn owe_resend(&mut self, url: &str, channel_id: Option<&str>, deadline: i64) {
+        if let Some(live) = self.live.get_mut(url) {
+            live.resend_due
+                .insert(channel_id.map(str::to_string), deadline);
+        }
+    }
+
+    /// Put a relay into quarantine at a chosen deadline — the state an auth failure leaves behind.
+    #[cfg(test)]
+    fn owe_reprove(&mut self, url: &str, at: i64) {
+        if let Some(live) = self.live.get_mut(url) {
+            live.reprove_due = Some(at);
+        }
+    }
+
     /// When this relay may next be resynced, so a test can tell "throttled" from "hot loop".
     #[cfg(test)]
     fn last_resync_unix(&self, url: &str) -> i64 {
@@ -693,10 +742,22 @@ impl Participation {
     ///
     /// Failures isolate per subscription: the entry stays owed and its deadline is pushed out by the resync
     /// floor, so a relay that keeps refusing is re-asked at a bounded rate rather than every tick.
+    ///
+    /// ★ THE ONE LANE THAT CARRIES A SNAPSHOT, so it is the one lane that has to re-validate. Every other
+    /// recovery here re-derives its work from the store at the moment it fires — the resync asks
+    /// `channels_to_resume`, the retry asks `channels_to_retry` — so a membership change between deciding
+    /// and doing simply changes the answer. This lane records a channel id and comes back to it later, and
+    /// a recorded intent cannot notice that its reason expired: a `44101` or a refusal in the interval
+    /// leaves the channel un-resumable while the debt still says "ask for this". Record-time truth is not
+    /// fire-time truth. So the gate is checked HERE as well as at the set-sites, and the debt is dropped
+    /// rather than sent.
     async fn drain_resends(&mut self, now: i64) {
         let due: Vec<(String, Option<String>)> = self
             .live
             .iter()
+            // Nothing goes out on a relay whose access is unproven — see [`Live::quarantined`]. The
+            // deadlines stay exactly as they are: the debt is owed, and a quarantine is not payment.
+            .filter(|(_, live)| !live.quarantined())
             .flat_map(|(url, live)| {
                 live.resend_due
                     .iter()
@@ -706,6 +767,35 @@ impl Participation {
             .collect();
 
         for (url, target) in due {
+            // A channel we have since left, or that has since been refused, is not ours to ask for — and
+            // re-asking a suppressed one would send the REQ from the wrong lane as well as the wrong
+            // state: unmarked, so the `EOSE` answering it could not clear the suppression it was meant to.
+            // Cancel the debt; this is an outcome, not a fault.
+            let resumable = match self.live.get(&url) {
+                Some(entry) => match &target {
+                    Some(channel_id) => entry.engine.is_resumable(channel_id),
+                    None => Ok(true),
+                },
+                None => continue,
+            };
+            match resumable {
+                Ok(true) => {}
+                Ok(false) => {
+                    if let Some(live) = self.live.get_mut(&url) {
+                        live.resend_due.remove(&target);
+                    }
+                    continue;
+                }
+                // A store read failing decides nothing either way, so the debt keeps its turn.
+                Err(_) => {
+                    self.relay_faults = self.relay_faults.saturating_add(1);
+                    if let Some(live) = self.live.get_mut(&url) {
+                        live.resend_due
+                            .insert(target, now.saturating_add(MIN_RESYNC_INTERVAL_SECS));
+                    }
+                    continue;
+                }
+            }
             let Some(entry) = self.live.get(&url) else {
                 continue;
             };
@@ -805,6 +895,12 @@ impl Participation {
         let now = now_unix();
         let mut retries: Vec<(String, String, Option<u64>)> = Vec::new();
         for (url, entry) in self.live.iter() {
+            // ★ SKIPPED ENTIRELY on a quarantined relay, not merely stopped short of the send — because
+            // `channels_to_retry` expires stale retry tokens as a side effect, and expiring one while we
+            // are deliberately not asking would charge the relay a backoff step for OUR silence.
+            if entry.quarantined() {
+                continue;
+            }
             for channel_id in entry.engine.channels_to_retry(now)? {
                 let since = entry.engine.channel_cursor(&channel_id)?;
                 retries.push((url.clone(), channel_id, since));
@@ -865,6 +961,16 @@ impl Participation {
             };
             match action {
                 Action::SubscribeChannel { channel_id } => {
+                    // Nothing may be asked of a relay whose access is unproven, so the invite is owed
+                    // rather than answered — the same debt a failed send records below, and no fault,
+                    // because nothing failed. [`Self::drain_resends`] honours the quarantine too, so the
+                    // deadline being immediately past is harmless: it fires on the first tick after proof.
+                    if entry.quarantined() {
+                        if let Some(live) = self.live.get_mut(url) {
+                            live.resend_due.insert(Some(channel_id), now_unix());
+                        }
+                        continue;
+                    }
                     let since = entry.engine.channel_cursor(&channel_id)?;
                     let sent = subscribe_channel(&entry.reader, &channel_id, self.me, since).await;
                     if sent.is_err() {
@@ -891,6 +997,13 @@ impl Participation {
                         .reader
                         .unsubscribe(&SubscriptionId::new(channel_sub(&channel_id)))
                         .await;
+                    // ★ THE RESET-SITE FOR THE DEBT ABOVE. Leaving the channel is precisely the fact that
+                    // makes an owed re-send wrong, and the debt is in memory where no store gate can see
+                    // it — so cancelling it belongs at the event, paired with the set-site, not left for
+                    // the drain alone to notice. Both ends, per the idempotency-pair rule.
+                    if let Some(live) = self.live.get_mut(url) {
+                        live.resend_due.remove(&Some(channel_id));
+                    }
                 }
                 // The job path owns trade events; participation's role is to not get in the way of
                 // them. The gateway ingester reads them from its own marketplace subscription, so
@@ -928,6 +1041,12 @@ impl Participation {
                     .reader
                     .unsubscribe(&SubscriptionId::new(channel_sub(&channel_id)))
                     .await;
+                // The second reset-site: a refusal raises the suppression, and a suppressed channel is
+                // re-asked by the retry lane alone. An owed re-send would ask again from outside the
+                // backoff, unmarked.
+                if let Some(live) = self.live.get_mut(url) {
+                    live.resend_due.remove(&Some(channel_id));
+                }
             }
             ClosedAction::ResendAfter {
                 channel_id,
@@ -942,9 +1061,20 @@ impl Participation {
                 // 86400` from any single relay stopped all participation on every relay for a day. Two
                 // separate faults in one line: blocking the shared loop, and letting a peer pick how long.
                 // Now the delay is clamped to a ceiling we own and left for the pump to notice.
+                //
+                // ★★★ AND CLAMPED AT THE BOTTOM, WHICH IS THE HALF THAT WAS MISSING. A ceiling stops a
+                // peer stalling us; only a FLOOR stops one driving us. `retry in 1` bought the relay one
+                // re-send per second — a cadence chosen by the peer, which is the same fault as the
+                // uncapped sleep wearing the opposite sign. The floor is the interval that already
+                // answers "how often may we re-ask one relay", so there is one rate to reason about
+                // rather than two that can drift.
+                //
+                // A channel that is SUPPRESSED never reaches here at all: `on_closed` turns a rate-limit
+                // answering a retry into the refusal it is, so the suppression backoff stays the only
+                // owner of that channel's cadence.
                 let delay = hint_secs
                     .unwrap_or(DEFAULT_RESEND_DELAY_SECS)
-                    .clamp(1, MAX_RESEND_DELAY_SECS);
+                    .clamp(MIN_RESYNC_INTERVAL_SECS as u64, MAX_RESEND_DELAY_SECS);
                 if let Some(live) = self.live.get_mut(url) {
                     live.resend_due
                         .insert(channel_id, now_unix().saturating_add(delay as i64));
@@ -962,6 +1092,15 @@ impl Participation {
                 // 10s each, and every healthy relay's traffic waited behind all of them. The settle is now
                 // a deadline the pump notices, and `drain_reproves` takes ONE relay per tick so the probe
                 // timeout cannot multiply either.
+                //
+                // ★★ AND IT CHECKS ITS OWN GATE FIRST. An auth-required relay closes EVERY subscription
+                // we hold, so one tick's batch carries one of these per channel plus one for membership.
+                // Unguarded, each kicked the socket again and re-stamped the settle from `now` — the relay
+                // deciding when its own access gets re-checked, by refusing more. A reconnect that is
+                // already owed is already owed; the second `CLOSED` saying so adds nothing.
+                if entry.quarantined() {
+                    return Ok(());
+                }
                 entry.reader.disconnect().await;
                 entry.reader.connect().await;
                 if let Some(live) = self.live.get_mut(url) {
@@ -1123,6 +1262,7 @@ fn now_unix() -> i64 {
 mod tests {
     use super::super::channel_filter_id;
     use super::*;
+    use crate::seller_node::store::RETRY_EOSE_TIMEOUT_SECS;
     use nostr_sdk::prelude::{EventBuilder as TestEventBuilder, Keys, Kind};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1406,7 +1546,7 @@ mod tests {
     const BAD_RELAY: &str = "wss://a-bad.invalid";
     const GOOD_RELAY: &str = "wss://b-good.invalid";
 
-    fn joined_and_suppressed(store: &SellerStore, relay: &str, channel_id: &str, when: i64) {
+    fn joined(store: &SellerStore, relay: &str, channel_id: &str, when: i64) {
         store
             .record_channel_joined(
                 relay,
@@ -1417,6 +1557,10 @@ mod tests {
                 when,
             )
             .expect("join");
+    }
+
+    fn joined_and_suppressed(store: &SellerStore, relay: &str, channel_id: &str, when: i64) {
+        joined(store, relay, channel_id, when);
         store
             .advance_suppression(relay, channel_id, when)
             .expect("refused");
@@ -1583,11 +1727,15 @@ mod tests {
 
     /// ★ FINDING 3. A `CLOSED` hint is a number a PEER chose. Sleeping on it inline, uncapped, inside the
     /// batch loop let any single relay stop all participation for as long as it liked.
+    ///
+    /// The channel is joined and NOT suppressed on purpose: a rate-limit on a suppressed channel is a
+    /// refusal of our retry and never reaches the re-send lane at all. The matching FLOOR — a hint too
+    /// small — is [`a_relay_supplied_retry_hint_is_floored_by_our_own_send_interval`].
     #[tokio::test]
     async fn a_relay_supplied_retry_hint_is_capped_and_never_slept_on() {
         let store = test_store("resend-hint");
         let me = Keys::generate().public_key();
-        joined_and_suppressed(&store, GOOD_RELAY, "chan-1", now_unix());
+        joined(&store, GOOD_RELAY, "chan-1", now_unix());
 
         let (good_tx, good_rx) = broadcast::channel(8);
         good_tx
@@ -1765,6 +1913,426 @@ mod tests {
         assert!(
             deadline <= before + RECONNECT_SETTLE_SECS + 1,
             "the settle window grew beyond the bound it replaced"
+        );
+    }
+
+    /// ★ ROUND 11 / FINDING 1. `reprove_due` has to QUARANTINE the relay, not merely schedule a probe.
+    ///
+    /// The relay accepts everything, so any lane that runs succeeds and visibly clears its own debt. That
+    /// is the whole design of this fixture: with an accepting relay, "the lane was gated" and "the lane
+    /// ran and failed" cannot be confused — three debts still owed can only mean nothing was sent.
+    #[tokio::test]
+    async fn an_unproven_relay_is_asked_for_nothing_by_any_recovery_lane() {
+        let store = test_store("quarantine");
+        let me = Keys::generate().public_key();
+        let long_ago = now_unix() - 86_400;
+        joined_and_suppressed(&store, GOOD_RELAY, "chan-sup", long_ago);
+        // A SEPARATE, unsuppressed channel carries the re-send debt: an owed re-send for `chan-sup` would
+        // be cancelled by the resumability gate whether or not the quarantine works, so using it would
+        // make this test pass for the wrong reason.
+        joined(&store, GOOD_RELAY, "chan-open", long_ago);
+
+        let (good_tx, good_rx) = broadcast::channel(8);
+        good_tx
+            .send(RelayPoolNotification::Message {
+                relay_url: GOOD_RELAY.parse().expect("url"),
+                message: RelayMessage::Closed {
+                    subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(MEMBERSHIP_SUB)),
+                    message: std::borrow::Cow::Borrowed("auth-required: we need your NIP-42 auth"),
+                },
+            })
+            .expect("send closed");
+
+        let mut participation = Participation::for_wire_test_many(
+            vec![(GOOD_RELAY, true, good_rx)],
+            store.clone(),
+            me,
+            long_ago,
+        )
+        .await;
+
+        // Tick 1 learns about the auth failure in the batch, and `retry_suppressed_channels` runs AFTER
+        // the batch in the same tick — so the suppressed channel is the same-tick hazard.
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+        assert!(
+            participation.reprove_deadline(GOOD_RELAY).is_some(),
+            "the auth failure did not put the relay into quarantine, so nothing below is being tested"
+        );
+        assert_eq!(
+            store
+                .suppressed_channels_due(GOOD_RELAY, now_unix())
+                .expect("due"),
+            vec![("chan-sup".to_string(), 1)],
+            "a retry REQ went out on a socket whose access is unproven — in the very tick that kicked it"
+        );
+
+        // Tick 2: the resync and re-send lanes both fire before the probe would, and a fresh invite is the
+        // fourth lane — `apply_event` answers one with a REQ of its own.
+        participation.owe_resync(GOOD_RELAY);
+        participation.owe_resend(GOOD_RELAY, Some("chan-open"), now_unix());
+        let invite = TestEventBuilder::new(Kind::Custom(44100), "")
+            .tag(nostr_sdk::prelude::Tag::public_key(me))
+            .tag(nostr_sdk::prelude::Tag::parse(["h", "chan-new"]).expect("h tag"))
+            .sign_with_keys(&Keys::generate())
+            .expect("sign invite");
+        good_tx
+            .send(RelayPoolNotification::Message {
+                relay_url: GOOD_RELAY.parse().expect("url"),
+                message: RelayMessage::Event {
+                    subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(MEMBERSHIP_SUB)),
+                    event: std::borrow::Cow::Owned(invite),
+                },
+            })
+            .expect("send invite");
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+
+        assert!(
+            participation.resync_pending(GOOD_RELAY),
+            "the resync re-subscribed the whole wake surface on an unproven socket"
+        );
+        assert!(
+            participation
+                .resend_deadline(GOOD_RELAY, Some("chan-open"))
+                .is_some(),
+            "the deferred re-send went out on an unproven socket — and a quarantine is not payment, so \
+             the debt must still be owed afterwards"
+        );
+        assert_eq!(
+            store
+                .suppressed_channels_due(GOOD_RELAY, now_unix())
+                .expect("due"),
+            vec![("chan-sup".to_string(), 1)],
+            "the retry lane ran on an unproven socket on a later tick"
+        );
+        // The relay accepts, so an ungated `apply_event` would simply succeed and owe nothing. A debt is
+        // therefore the only evidence the invite was DEFERRED rather than answered on an unproven socket.
+        assert!(
+            participation
+                .resend_deadline(GOOD_RELAY, Some("chan-new"))
+                .is_some(),
+            "a fresh invite was answered with a REQ on an unproven socket — and worse, owing nothing, so \
+             if the probe then denies the relay the join is recorded with nothing listening"
+        );
+    }
+
+    /// ★ ROUND 11 / FINDING 3, the other reset-site. A refusal raises the suppression, after which the
+    /// retry lane alone may re-ask — an owed re-send would ask from outside the backoff, and unmarked.
+    #[tokio::test]
+    async fn a_refusal_cancels_the_resend_it_invalidates() {
+        let store = test_store("resend-cancelled-refusal");
+        let me = Keys::generate().public_key();
+        joined(&store, GOOD_RELAY, "chan-x", now_unix() - 100);
+
+        let (good_tx, good_rx) = broadcast::channel(8);
+        good_tx
+            .send(RelayPoolNotification::Message {
+                relay_url: GOOD_RELAY.parse().expect("url"),
+                message: RelayMessage::Closed {
+                    subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(channel_sub(
+                        "chan-x",
+                    ))),
+                    message: std::borrow::Cow::Borrowed("restricted: not a channel member"),
+                },
+            })
+            .expect("send closed");
+
+        let mut participation = Participation::for_wire_test_many(
+            vec![(GOOD_RELAY, true, good_rx)],
+            store,
+            me,
+            now_unix(),
+        )
+        .await;
+        // Far enough out that the drain's re-validation cannot be what clears it: this is the cancel at
+        // the event, and the two ends are separately mutable.
+        participation.owe_resend(GOOD_RELAY, Some("chan-x"), now_unix() + 600);
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+
+        assert!(
+            participation
+                .resend_deadline(GOOD_RELAY, Some("chan-x"))
+                .is_none(),
+            "a re-send is still owed for a channel the relay just refused — it will re-ask from outside \
+             the suppression backoff, and unmarked, so the EOSE answering it clears nothing"
+        );
+    }
+
+    /// ★ ROUND 11 / FINDING 2. A rate-limit answering a retry we MARKED is a refusal of that retry.
+    ///
+    /// Treated as a re-send hint it broke twice: the token stayed armed with the relay having answered, so
+    /// it later expired as a silence that never happened; and `retry in 1` handed the relay our send
+    /// cadence. Both halves are asserted, and then the EXIT — that an `EOSE` still lifts the suppression —
+    /// because a fix that closed the rate hole by breaking the way out would look identical here.
+    #[tokio::test]
+    async fn a_rate_limit_answering_a_retry_is_a_refusal_not_our_new_send_rate() {
+        let store = test_store("retry-rate-limit");
+        let me = Keys::generate().public_key();
+        let long_ago = now_unix() - 86_400;
+        joined_and_suppressed(&store, GOOD_RELAY, "chan-1", long_ago);
+        // The state a retry REQ leaves behind: outstanding, so the `CLOSED` below is attributable to us.
+        store
+            .note_retry_attempt(GOOD_RELAY, "chan-1", now_unix())
+            .expect("arm");
+
+        let (good_tx, good_rx) = broadcast::channel(8);
+        good_tx
+            .send(RelayPoolNotification::Message {
+                relay_url: GOOD_RELAY.parse().expect("url"),
+                message: RelayMessage::Closed {
+                    subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(channel_sub(
+                        "chan-1",
+                    ))),
+                    message: std::borrow::Cow::Borrowed("rate-limited: retry in 1 second"),
+                },
+            })
+            .expect("send closed");
+
+        let mut participation = Participation::for_wire_test_many(
+            vec![(GOOD_RELAY, true, good_rx)],
+            store.clone(),
+            me,
+            now_unix(),
+        )
+        .await;
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+
+        assert!(
+            participation
+                .resend_deadline(GOOD_RELAY, Some("chan-1"))
+                .is_none(),
+            "a re-send was queued outside the suppression backoff — `retry in 1` buys the relay one REQ \
+             per second on a channel it has just refused, which is our send rate chosen by the peer"
+        );
+        assert_eq!(
+            store
+                .suppressed_channels_due(GOOD_RELAY, now_unix() + 900)
+                .expect("due"),
+            vec![("chan-1".to_string(), 2)],
+            "the refusal was not charged to the backoff, so the wait did not get longer"
+        );
+        assert_eq!(
+            store
+                .expire_stale_retries(GOOD_RELAY, now_unix() + 61, RETRY_EOSE_TIMEOUT_SECS)
+                .expect("expire"),
+            0,
+            "the retry token was left armed after the relay ANSWERED, so it expires as a silence that \
+             did not happen — a second backoff step for one refusal"
+        );
+
+        // The exit: the next retry arms the token, and the `EOSE` answering it lifts the suppression.
+        store
+            .note_retry_attempt(GOOD_RELAY, "chan-1", now_unix())
+            .expect("arm again");
+        good_tx
+            .send(RelayPoolNotification::Message {
+                relay_url: GOOD_RELAY.parse().expect("url"),
+                message: RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
+                    SubscriptionId::new(channel_sub("chan-1")),
+                )),
+            })
+            .expect("send eose");
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+        assert!(
+            !store
+                .channel_suppressed(GOOD_RELAY, "chan-1")
+                .expect("suppressed"),
+            "the channel can no longer be served out of suppression — the rate fix closed the way out"
+        );
+    }
+
+    /// ★ ROUND 11 / FINDING 2, the floor. A ceiling stops a peer STALLING us; only a floor stops one
+    /// DRIVING us. Same fault, opposite sign.
+    #[tokio::test]
+    async fn a_relay_supplied_retry_hint_is_floored_by_our_own_send_interval() {
+        let store = test_store("resend-floor");
+        let me = Keys::generate().public_key();
+        joined(&store, GOOD_RELAY, "chan-1", now_unix());
+
+        let (good_tx, good_rx) = broadcast::channel(8);
+        good_tx
+            .send(RelayPoolNotification::Message {
+                relay_url: GOOD_RELAY.parse().expect("url"),
+                message: RelayMessage::Closed {
+                    subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(channel_sub(
+                        "chan-1",
+                    ))),
+                    message: std::borrow::Cow::Borrowed("rate-limited: retry in 1 second"),
+                },
+            })
+            .expect("send closed");
+
+        let mut participation = Participation::for_wire_test_many(
+            vec![(GOOD_RELAY, true, good_rx)],
+            store,
+            me,
+            now_unix(),
+        )
+        .await;
+        let before = now_unix();
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+
+        let deadline = participation
+            .resend_deadline(GOOD_RELAY, Some("chan-1"))
+            .expect("the re-send was neither sent nor recorded, so the REQ is simply lost");
+        assert!(
+            deadline >= before + MIN_RESYNC_INTERVAL_SECS,
+            "a 1-second hint was honoured as given: the relay now picks how often we re-ask it, which is \
+             the rate the floor exists to keep ours"
+        );
+    }
+
+    /// ★ ROUND 11 / FINDING 3, the set-site's pair. Leaving the channel is what makes an owed re-send
+    /// wrong, and the debt lives in memory where no store gate can see it — so the event cancels it.
+    #[tokio::test]
+    async fn a_leave_cancels_the_resend_it_invalidates() {
+        let store = test_store("resend-cancelled");
+        let relay_keys = Keys::generate();
+        let me = Keys::generate().public_key();
+        joined(&store, GOOD_RELAY, "chan-x", now_unix() - 100);
+
+        let removal = TestEventBuilder::new(Kind::Custom(44101), "")
+            .tag(nostr_sdk::prelude::Tag::public_key(me))
+            .tag(nostr_sdk::prelude::Tag::parse(["h", "chan-x"]).expect("h tag"))
+            .sign_with_keys(&relay_keys)
+            .expect("sign removal");
+        let (good_tx, good_rx) = broadcast::channel(8);
+        good_tx
+            .send(RelayPoolNotification::Message {
+                relay_url: GOOD_RELAY.parse().expect("url"),
+                message: RelayMessage::Event {
+                    subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(MEMBERSHIP_SUB)),
+                    event: std::borrow::Cow::Owned(removal),
+                },
+            })
+            .expect("send removal");
+
+        let mut participation = Participation::for_wire_test_many(
+            vec![(GOOD_RELAY, true, good_rx)],
+            store,
+            me,
+            now_unix(),
+        )
+        .await;
+        // Due well after this pump, so the drain cannot be the thing that clears it — this is about the
+        // cancel at the event, not the re-validation in the drain.
+        participation.owe_resend(GOOD_RELAY, Some("chan-x"), now_unix() + 600);
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+
+        assert!(
+            participation
+                .resend_deadline(GOOD_RELAY, Some("chan-x"))
+                .is_none(),
+            "the re-send is still owed for a channel we have been removed from — the debt outlived its \
+             reason, and it will re-subscribe us to a channel the relay already took us out of"
+        );
+    }
+
+    /// ★ ROUND 11 / FINDING 3, the fire-time half. Record-time truth is not fire-time truth: this lane is
+    /// the only one that carries a snapshot instead of re-deriving from the store, so it re-validates.
+    ///
+    /// The relay does NOT accept, which is what makes the two outcomes distinguishable — a cancelled debt
+    /// leaves no fault, an attempted send leaves one. On an accepting relay both look the same.
+    #[tokio::test]
+    async fn the_resend_drain_refuses_a_channel_that_is_no_longer_resumable() {
+        let store = test_store("resend-revalidate");
+        let me = Keys::generate().public_key();
+        joined(&store, BAD_RELAY, "chan-x", now_unix() - 100);
+        // Left in the store WITHOUT the event, so the in-memory cancel cannot be what saves us: this is
+        // the state a restart, or an ordering we did not think of, can still produce.
+        store
+            .record_channel_left(BAD_RELAY, "chan-x", &"b".repeat(64), now_unix(), now_unix())
+            .expect("leave");
+
+        let (_bad_tx, bad_rx) = broadcast::channel(8);
+        let mut participation = Participation::for_wire_test_many(
+            vec![(BAD_RELAY, false, bad_rx)],
+            store,
+            me,
+            now_unix(),
+        )
+        .await;
+        participation.owe_resend(BAD_RELAY, Some("chan-x"), now_unix());
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+
+        assert_eq!(
+            participation.relay_faults(),
+            0,
+            "the drain tried to re-subscribe a channel we are no longer a member of"
+        );
+        assert!(
+            participation
+                .resend_deadline(BAD_RELAY, Some("chan-x"))
+                .is_none(),
+            "the debt was neither sent nor cancelled, so it will be tried again forever"
+        );
+    }
+
+    /// ★ ROUND 11, found in the sweep rather than reported: the reconnect did not check the gate IT sets.
+    ///
+    /// An auth-required relay closes EVERY subscription we hold, so one batch carries one of these per
+    /// channel plus one for membership. Each kicked the socket again and re-stamped the settle from `now`,
+    /// which lets a relay postpone the re-check of its own access by refusing more. The observable is the
+    /// deadline; the socket kick rides in the same block.
+    #[tokio::test]
+    async fn a_second_auth_failure_does_not_restamp_a_settle_already_owed() {
+        let store = test_store("reconnect-idempotent");
+        let me = Keys::generate().public_key();
+        let (good_tx, good_rx) = broadcast::channel(8);
+        good_tx
+            .send(RelayPoolNotification::Message {
+                relay_url: GOOD_RELAY.parse().expect("url"),
+                message: RelayMessage::Closed {
+                    subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(MEMBERSHIP_SUB)),
+                    message: std::borrow::Cow::Borrowed("auth-required: we need your NIP-42 auth"),
+                },
+            })
+            .expect("send closed");
+
+        let mut participation = Participation::for_wire_test_many(
+            vec![(GOOD_RELAY, true, good_rx)],
+            store,
+            me,
+            now_unix(),
+        )
+        .await;
+        // A settle already owed, at a deadline far enough out that `drain_reproves` will not fire and near
+        // enough to nothing else that only a re-stamp could change it.
+        let owed = now_unix() + 600;
+        participation.owe_reprove(GOOD_RELAY, owed);
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+
+        assert_eq!(
+            participation.reprove_deadline(GOOD_RELAY),
+            Some(owed),
+            "a second auth-required CLOSED pushed the settle out again — a relay that keeps refusing can \
+             hold off the probe of its own access indefinitely, one refusal at a time"
         );
     }
 

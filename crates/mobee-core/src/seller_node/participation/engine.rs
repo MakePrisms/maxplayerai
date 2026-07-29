@@ -108,6 +108,21 @@ impl Engine {
             .collect())
     }
 
+    /// Whether this channel may be re-asked on the wire right now: still a member, and not suppressed.
+    ///
+    /// ★ THE SAME PREDICATE [`Self::channels_to_resume`] USES, deliberately — one definition of
+    /// "resumable", so a deferred re-send and a resync can never disagree about whether a channel is
+    /// still ours to ask for. A debt recorded when this was true must re-check it when it fires: a
+    /// `44101` or a refusal in between makes the recorded intent wrong, and neither of those events
+    /// knows the debt exists.
+    pub fn is_resumable(&self, channel_id: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .store
+            .joined_channels(&self.relay_url)?
+            .iter()
+            .any(|joined| joined == channel_id))
+    }
+
     /// A retry REQ is away — see [`SellerStore::note_retry_attempt`].
     pub fn note_retry_sent(&self, channel_id: &str, now_unix: i64) -> Result<(), StoreError> {
         self.store
@@ -281,10 +296,37 @@ impl Engine {
                 // relay-level access problem.
                 None => ClosedAction::ReconnectRelay,
             },
-            dialect::ClosedVerdict::RetryAfter { hint_secs } => ClosedAction::ResendAfter {
-                channel_id,
-                hint_secs,
-            },
+            // ★ A RATE-LIMIT ON AN ALREADY-SUPPRESSED CHANNEL IS A REFUSAL OF OUR RETRY, and it is
+            // handled as one — not as a re-send hint. Two things went wrong when it was:
+            //
+            // The retry token stayed armed with the relay having ANSWERED, so
+            // [`SellerStore::expire_stale_retries`] charged a backoff step for a silence that did not
+            // happen; and the deferred re-send then went out UNMARKED, so the `EOSE` that finally
+            // served it was unattributable and ignored — the channel stayed suppressed after being
+            // served. `advance_suppression` settles both: it lengthens the wait for a refusal that IS
+            // attributable, and clears the token so nothing later expires it a second time.
+            //
+            // ★★ And it means ONE LANE OWNS RE-ASKING A SUPPRESSED CHANNEL: the suppression backoff.
+            // A `retry in 1` otherwise let the relay drive one re-send per second on a channel it had
+            // just refused — our send cadence, chosen by the peer, straight through the lane that was
+            // supposed to be rate-limiting it.
+            dialect::ClosedVerdict::RetryAfter { hint_secs } => {
+                let refused_our_retry = match &channel_id {
+                    Some(channel) => self.store.channel_suppressed(&self.relay_url, channel)?,
+                    None => false,
+                };
+                match channel_id {
+                    Some(channel_id) if refused_our_retry => {
+                        self.store
+                            .advance_suppression(&self.relay_url, &channel_id, now_unix)?;
+                        ClosedAction::DropChannel { channel_id }
+                    }
+                    channel_id => ClosedAction::ResendAfter {
+                        channel_id,
+                        hint_secs,
+                    },
+                }
+            }
             dialect::ClosedVerdict::Reauthenticate => ClosedAction::ReconnectRelay,
             dialect::ClosedVerdict::Acknowledged => ClosedAction::Ignore,
             dialect::ClosedVerdict::Unknown(_) => ClosedAction::Ignore,
