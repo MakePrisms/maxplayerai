@@ -103,11 +103,23 @@ impl Engine {
                     &self.relay_url,
                     &channel_id,
                     &event.id.to_hex(),
+                    event.created_at.as_secs() as i64,
                     now_unix,
                 )?;
                 // A re-delivered 44100 for a channel we are already in produces no action. This is
                 // the ordinary case after a reconnect, not an anomaly.
                 if newly {
+                    // ★ Seed the channel cursor from the INVITE's timestamp before the REQ goes out.
+                    // Without this the first subscription has no cursor and opens at `now`, so any
+                    // mention published between the relay signing the 44100 and this REQ reaching it
+                    // is skipped — and skipped permanently, because the cursor only moves forward.
+                    // The skew is applied on read, so the stored value is the invite's own time.
+                    self.store.advance_participation_cursor(
+                        &self.relay_url,
+                        &channel_filter_id(&channel_id),
+                        event.created_at.as_secs() as i64,
+                        now_unix,
+                    )?;
                     vec![Action::SubscribeChannel { channel_id }]
                 } else {
                     Vec::new()
@@ -118,6 +130,7 @@ impl Engine {
                     &self.relay_url,
                     &channel_id,
                     &event.id.to_hex(),
+                    event.created_at.as_secs() as i64,
                     now_unix,
                 )?;
                 if was_member {
@@ -198,10 +211,16 @@ impl Engine {
                     // Losing access is a membership fact, so it is recorded exactly as a 44101 is
                     // — otherwise a restart would cheerfully re-subscribe to a channel the relay
                     // has already told us we cannot read, forever.
+                    // Ordered at `now`: unlike a 44101 this has no author timestamp, and it is an
+                    // observation about the PRESENT, so it must outrank every membership event we
+                    // have already seen. A later relay-signed 44100 still wins, which is what
+                    // re-admission should do. (A 44100 bearing a future timestamp would too — but
+                    // such an event is anomalous on its own terms, not a case to encode here.)
                     self.store.record_channel_left(
                         &self.relay_url,
                         &channel_id,
                         &format!("closed:{reason}"),
+                        now_unix,
                         now_unix,
                     )?;
                     ClosedAction::DropChannel { channel_id }
@@ -331,6 +350,21 @@ mod tests {
     fn a_mention_lands_as_a_debt_and_asks_for_nothing_on_the_wire() {
         let (engine, me, path) = engine("mention");
         let them = Keys::generate();
+        // Join first: a debt is only recorded for a channel we hold, and a mention can only reach us
+        // through that channel's subscription — so a mention without a membership is a state the wire
+        // cannot produce, and asserting against it would test nothing real.
+        engine
+            .ingest(
+                &event(
+                    &Keys::generate(),
+                    dialect::KIND_MEMBER_ADDED,
+                    Some("chan-1"),
+                    Some(me.public_key()),
+                    1_400,
+                ),
+                1_401,
+            )
+            .expect("join");
         let mention = event(
             &them,
             dialect::KIND_CHANNEL_MESSAGE,
@@ -352,6 +386,18 @@ mod tests {
     fn a_message_redelivered_after_a_restart_is_ingested_exactly_once() {
         let (engine, me, path) = engine("exactly-once");
         let them = Keys::generate();
+        engine
+            .ingest(
+                &event(
+                    &Keys::generate(),
+                    dialect::KIND_MEMBER_ADDED,
+                    Some("chan-1"),
+                    Some(me.public_key()),
+                    1_400,
+                ),
+                1_401,
+            )
+            .expect("join");
         let mention = event(
             &them,
             dialect::KIND_CHANNEL_MESSAGE,
@@ -375,6 +421,9 @@ mod tests {
         let relay_key = Keys::generate();
         let them = Keys::generate();
 
+        // The invite seeds the channel cursor at its OWN timestamp, so the channel filter starts at
+        // our membership rather than at `now` — which is what stops a mention published between the
+        // invite and the first channel REQ from being skipped forever.
         engine
             .ingest(
                 &event(
@@ -382,11 +431,17 @@ mod tests {
                     dialect::KIND_MEMBER_ADDED,
                     Some("chan-1"),
                     Some(me.public_key()),
-                    5_000,
+                    1_000,
                 ),
-                5_001,
+                1_001,
             )
-            .expect("membership");
+            .expect("join");
+        assert_eq!(
+            engine.channel_cursor("chan-1").expect("seeded"),
+            Some(1_000),
+            "the channel cursor must be seeded from the invite, not left to open at now()"
+        );
+
         engine
             .ingest(
                 &event(
@@ -394,18 +449,32 @@ mod tests {
                     dialect::KIND_CHANNEL_MESSAGE,
                     Some("chan-1"),
                     Some(me.public_key()),
-                    1_000,
+                    2_000,
                 ),
-                1_001,
+                2_001,
             )
             .expect("mention");
+
+        // A second, much later membership event on the busy global filter.
+        engine
+            .ingest(
+                &event(
+                    &relay_key,
+                    dialect::KIND_MEMBER_ADDED,
+                    Some("chan-2"),
+                    Some(me.public_key()),
+                    5_000,
+                ),
+                5_001,
+            )
+            .expect("second membership");
 
         // The busy membership filter must not drag the channel filter forward past the backlog it
         // has not read yet.
         assert_eq!(engine.membership_cursor().expect("membership"), Some(5_000));
         assert_eq!(
             engine.channel_cursor("chan-1").expect("channel"),
-            Some(1_000)
+            Some(2_000)
         );
         let _ = std::fs::remove_file(&path);
     }

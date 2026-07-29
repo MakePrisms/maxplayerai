@@ -70,6 +70,14 @@ pub fn triage(event: &Event, me: PublicKey) -> Triage {
     let kind = event.kind.as_u16();
 
     if kind == dialect::KIND_MEMBER_ADDED || kind == dialect::KIND_MEMBER_REMOVED {
+        // ★ A membership notification that does not p-tag US describes somebody else's membership.
+        // The subscription filter already pins `#p`, so reaching here without our tag means the
+        // relay served something we did not ask for — and acting on it would let one relay move
+        // this node in and out of channels at will. Checked here too: the filter is the relay's
+        // promise, this is our own verification of it, and only one of the two is ours to trust.
+        if !dialect::mentions(event, me) {
+            return Triage::Unhandled { kind };
+        }
         // A membership notification with no channel tag is malformed: it names no channel to join
         // or leave, so there is no action it could describe. Surfaced rather than guessed at.
         return match dialect::channel_of(event) {
@@ -161,6 +169,30 @@ mod tests {
                 channel_id: "chan-1".into()
             }
         );
+    }
+
+    /// A membership notification about SOMEBODY ELSE must not move this node.
+    ///
+    /// The subscription filter pins `#p`, so this should never arrive — but that filter is the
+    /// relay's promise, and a relay that broke it (or was hostile) could otherwise walk this node
+    /// into and out of channels at will. The kind-9 arm already verifies the p-tag itself; this is
+    /// the same verification on the arm that has more authority.
+    #[test]
+    fn a_membership_notification_for_another_pubkey_is_not_acted_on() {
+        let (me, relay) = me_and_them();
+        let someone_else = Keys::generate();
+        for kind in [dialect::KIND_MEMBER_ADDED, dialect::KIND_MEMBER_REMOVED] {
+            let event = signed(
+                &relay,
+                kind,
+                vec![tag_channel("chan-1"), tag_pubkey(someone_else.public_key())],
+            );
+            assert_eq!(
+                triage(&event, me.public_key()),
+                Triage::Unhandled { kind },
+                "a {kind} p-tagging someone else moved our own membership"
+            );
+        }
     }
 
     #[test]

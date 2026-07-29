@@ -9,7 +9,7 @@
 //! feature, so a module that reached for `tokio::spawn` would fail to compile on the shipped
 //! feature combination while looking fine on the workspace default.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use tokio::sync::broadcast;
@@ -99,6 +99,12 @@ pub struct Participation {
     lagged: u64,
     roster: RelayRoster,
     me: PublicKey,
+    /// Kept so access can be RE-proven, not assumed to have survived. A relay whose auth or scope
+    /// failed has told us the admission we hold may be stale, and the only way to know is to run the
+    /// same positive probe again. `Client` is `Arc`-backed, so holding it costs a refcount.
+    publisher: Client,
+    carrier: Event,
+    probe_timeout: Duration,
 }
 
 impl Participation {
@@ -136,7 +142,7 @@ impl Participation {
                 }
             };
 
-            let outcome = probe::probe_access(publisher, &reader, carrier, timeout).await;
+            let outcome = probe::probe_access(publisher, &url, &reader, carrier, timeout).await;
             let admitted = matches!(outcome, ProbeOutcome::EchoObserved);
             roster.record_probe(&url, outcome, now_unix());
 
@@ -167,6 +173,9 @@ impl Participation {
             roster,
             me,
             lagged: 0,
+            publisher: publisher.clone(),
+            carrier: carrier.clone(),
+            probe_timeout: timeout,
         })
     }
 
@@ -222,6 +231,7 @@ impl Participation {
 
         loop {
             let mut batch: Vec<(String, RelayMessage)> = Vec::new();
+            let mut resync: BTreeSet<String> = BTreeSet::new();
             for (url, live) in self.live.iter_mut() {
                 loop {
                     match live.notifications.try_recv() {
@@ -234,14 +244,23 @@ impl Participation {
                         Err(broadcast::error::TryRecvError::Empty) => break,
                         Err(broadcast::error::TryRecvError::Closed) => break,
                         // ★ The buffer overflowed and `skipped` notifications are GONE — not
-                        // delayed, gone. Counted so the loss is reportable rather than invisible;
-                        // a pump that swallowed this would look identical to a quiet relay.
+                        // delayed, gone. Counting alone is not enough: a later event would advance
+                        // this filter's cursor PAST the skipped ones, turning a recoverable gap into
+                        // permanent loss. So the relay is marked for resync and its cursors are
+                        // replayed from the store before anything else is processed.
                         Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
                             self.lagged = self.lagged.saturating_add(skipped);
+                            resync.insert(url.clone());
                             continue;
                         }
                     }
                 }
+            }
+
+            // Replay the gap BEFORE draining this round's batch: those messages arrived after the
+            // drop, so processing them first is exactly what would carry the cursor past the hole.
+            for url in resync {
+                self.resync_relay(&url).await?;
             }
 
             for (url, message) in batch {
@@ -280,6 +299,20 @@ impl Participation {
     /// pump is not being driven often enough, and that events were lost — never that none arrived.
     pub fn lagged(&self) -> u64 {
         self.lagged
+    }
+
+    /// Re-request every active filter on one relay from its durable cursor.
+    ///
+    /// This is the recovery half of a `Lagged` drop. The cursors are the only record of how far we
+    /// got, and they are behind the events we lost, so re-subscribing from them makes the relay
+    /// re-send the gap. Replay is safe by construction rather than by luck: owed rows are keyed on
+    /// `event_id`, and membership is applied in author order, so a re-delivered event either changes
+    /// nothing or corrects the ordering.
+    async fn resync_relay(&mut self, url: &str) -> Result<(), ParticipationError> {
+        let Some(entry) = self.live.get(url) else {
+            return Ok(());
+        };
+        subscribe_wake_surface(&entry.reader, &entry.engine, self.me).await
     }
 
     async fn apply_event(&mut self, url: &str, event: &Event) -> Result<(), ParticipationError> {
@@ -371,6 +404,27 @@ impl Participation {
                     .reader
                     .wait_for_connection(Duration::from_secs(10))
                     .await;
+
+                // ★ RE-PROVE access before trusting the reconnected socket. An auth or scope refusal
+                // is the relay saying our admission may no longer hold; resubscribing on that socket
+                // because we were admitted MINUTES ago would keep sending traffic to a relay that has
+                // revoked us. The admission was established by a positive probe, so it is re-checked
+                // the same way — a stale `Admitted` is exactly what the roster exists to prevent.
+                let outcome = probe::probe_access(
+                    &self.publisher,
+                    url,
+                    &entry.reader,
+                    &self.carrier,
+                    self.probe_timeout,
+                )
+                .await;
+                if !matches!(outcome, ProbeOutcome::EchoObserved) {
+                    self.roster.record_probe(url, outcome, now_unix());
+                    if let Some(entry) = self.live.remove(url) {
+                        entry.reader.disconnect().await;
+                    }
+                    return Ok(());
+                }
                 subscribe_wake_surface(&entry.reader, &entry.engine, self.me).await?;
             }
             ClosedAction::Ignore => {}

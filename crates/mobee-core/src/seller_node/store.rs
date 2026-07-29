@@ -23,7 +23,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::gateway::EventDraft;
 
 /// Current on-disk schema version.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// A cloneable handle to the node-owned SQLite state.
 #[derive(Clone)]
@@ -307,6 +307,11 @@ impl SellerStore {
                  -- The relay-signed 44100/44101 that last moved this row — the provenance of our
                  -- membership claim, so it can be checked against the relay rather than believed.
                  source_event_id TEXT NOT NULL,
+                 -- The AUTHOR's timestamp on that event, which is what orders membership. Delivery
+                 -- order cannot: a replayed old 44100 arriving after a newer 44101 would otherwise
+                 -- flip us back to joined. Kept as a high-water mark even when the state does not
+                 -- change, or a newer add followed by an older remove would still be applied.
+                 source_created_at_unix INTEGER NOT NULL DEFAULT 0,
                  updated_at_unix INTEGER NOT NULL,
                  PRIMARY KEY (relay_url, channel_id)
              );
@@ -352,6 +357,15 @@ impl SellerStore {
     fn migrate(conn: &Connection) -> Result<(), StoreError> {
         if !Self::column_exists(conn, "offers", "requested_agent")? {
             conn.execute_batch("ALTER TABLE offers ADD COLUMN requested_agent TEXT;")?;
+        }
+        // A store written by a v3 binary has membership rows with no author timestamp. `0` is the
+        // right backfill: it makes every stored row lose to the next real membership event, so the
+        // relay's own notification re-establishes order rather than a guessed timestamp doing it.
+        if !Self::column_exists(conn, "participation_channels", "source_created_at_unix")? {
+            conn.execute_batch(
+                "ALTER TABLE participation_channels
+                     ADD COLUMN source_created_at_unix INTEGER NOT NULL DEFAULT 0;",
+            )?;
         }
         Ok(())
     }
@@ -1009,21 +1023,17 @@ impl SellerStore {
         relay_url: &str,
         channel_id: &str,
         source_event_id: &str,
+        source_created_at_unix: i64,
         now_unix: i64,
     ) -> Result<bool, StoreError> {
-        let conn = self.lock()?;
-        let changed = conn.execute(
-            "INSERT INTO participation_channels
-                 (relay_url, channel_id, state, source_event_id, updated_at_unix)
-             VALUES (?1, ?2, 'joined', ?3, ?4)
-             ON CONFLICT(relay_url, channel_id) DO UPDATE SET
-                 state           = 'joined',
-                 source_event_id = excluded.source_event_id,
-                 updated_at_unix = excluded.updated_at_unix
-             WHERE participation_channels.state <> 'joined'",
-            params![relay_url, channel_id, source_event_id, now_unix],
-        )?;
-        Ok(changed == 1)
+        self.apply_membership(
+            relay_url,
+            channel_id,
+            "joined",
+            source_event_id,
+            source_created_at_unix,
+            now_unix,
+        )
     }
 
     /// Record that we were removed from a channel, and close out anything still owed inside it.
@@ -1038,28 +1048,110 @@ impl SellerStore {
         relay_url: &str,
         channel_id: &str,
         source_event_id: &str,
+        source_created_at_unix: i64,
+        now_unix: i64,
+    ) -> Result<bool, StoreError> {
+        self.apply_membership(
+            relay_url,
+            channel_id,
+            "left",
+            source_event_id,
+            source_created_at_unix,
+            now_unix,
+        )
+    }
+
+    /// Apply one relay-signed membership notification, ordered by the AUTHOR's timestamp.
+    ///
+    /// Returns whether the membership state actually transitioned — which is what decides if there
+    /// is wire work to do. A stale notification returns `false` having changed nothing, and so does
+    /// a newer one that merely re-states the state we already hold.
+    ///
+    /// The `(created_at, event_id)` high-water mark advances even when the state does not change.
+    /// Without that, `add@3` (ignored as a no-op because we are already joined) followed by
+    /// `remove@2` would compare `remove@2` against `add@1` and apply — resurrecting an ordering bug
+    /// through the one path that looked safe to skip.
+    fn apply_membership(
+        &self,
+        relay_url: &str,
+        channel_id: &str,
+        state: &str,
+        source_event_id: &str,
+        source_created_at_unix: i64,
         now_unix: i64,
     ) -> Result<bool, StoreError> {
         let mut conn = self.lock()?;
         let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute(
-            "INSERT INTO participation_channels
-                 (relay_url, channel_id, state, source_event_id, updated_at_unix)
-             VALUES (?1, ?2, 'left', ?3, ?4)
-             ON CONFLICT(relay_url, channel_id) DO UPDATE SET
-                 state           = 'left',
-                 source_event_id = excluded.source_event_id,
-                 updated_at_unix = excluded.updated_at_unix
-             WHERE participation_channels.state <> 'left'",
-            params![relay_url, channel_id, source_event_id, now_unix],
-        )?;
-        transaction.execute(
-            "UPDATE participation_owed SET state = 'dropped'
-             WHERE relay_url = ?1 AND channel_id = ?2 AND state = 'owed'",
-            params![relay_url, channel_id],
-        )?;
+
+        let current: Option<(String, i64, String)> = transaction
+            .query_row(
+                "SELECT state, source_created_at_unix, source_event_id
+                 FROM participation_channels WHERE relay_url = ?1 AND channel_id = ?2",
+                params![relay_url, channel_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+
+        let transitioned = match current {
+            None => {
+                transaction.execute(
+                    "INSERT INTO participation_channels
+                         (relay_url, channel_id, state, source_event_id, source_created_at_unix,
+                          updated_at_unix)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        relay_url,
+                        channel_id,
+                        state,
+                        source_event_id,
+                        source_created_at_unix,
+                        now_unix
+                    ],
+                )?;
+                // A removal for a channel we hold no row for is recorded, but we were never a
+                // member of it — so there is no subscription to tear down and nothing transitioned.
+                state == "joined"
+            }
+            Some((stored_state, stored_created_at, stored_event_id)) => {
+                // Event id breaks a same-second tie so the outcome does not depend on which frame
+                // the relay happened to flush first.
+                let newer = (source_created_at_unix, source_event_id)
+                    > (stored_created_at, stored_event_id.as_str());
+                if !newer {
+                    transaction.commit()?;
+                    return Ok(false);
+                }
+                transaction.execute(
+                    "UPDATE participation_channels
+                     SET state = ?3, source_event_id = ?4, source_created_at_unix = ?5,
+                         updated_at_unix = ?6
+                     WHERE relay_url = ?1 AND channel_id = ?2",
+                    params![
+                        relay_url,
+                        channel_id,
+                        state,
+                        source_event_id,
+                        source_created_at_unix,
+                        now_unix
+                    ],
+                )?;
+                stored_state != state
+            }
+        };
+
+        if state == "left" {
+            // A debt in a channel we can no longer read is a debt we cannot discharge. Closed in the
+            // same transaction as the membership change so no restart can observe one without the
+            // other.
+            transaction.execute(
+                "UPDATE participation_owed SET state = 'dropped'
+                 WHERE relay_url = ?1 AND channel_id = ?2 AND state = 'owed'",
+                params![relay_url, channel_id],
+            )?;
+        }
+
         transaction.commit()?;
-        Ok(changed == 1)
+        Ok(transitioned)
     }
 
     /// The channels to re-subscribe on boot for one relay.
@@ -1101,11 +1193,20 @@ impl SellerStore {
     /// re-delivered after a reconnect is one debt, not two. Returns whether a new debt landed.
     pub fn record_owed(&self, owed: &OwedResponse, now_unix: i64) -> Result<bool, StoreError> {
         let conn = self.lock()?;
+        // ★ Conditional on still holding the channel. A mention can arrive after the 44101 that
+        // removed us — queued behind it on the socket, or replayed within the cursor skew — and an
+        // unconditional insert would mint a debt in a channel we can no longer read OR answer.
+        // `record_channel_left` drains the debts that exist when it runs; this is the other half,
+        // for the ones that turn up afterwards.
         let changed = conn.execute(
             "INSERT OR IGNORE INTO participation_owed
                  (event_id, relay_url, channel_id, counterparty, kind, state, created_at_unix,
                   recorded_at_unix)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'owed', ?6, ?7)",
+             SELECT ?1, ?2, ?3, ?4, ?5, 'owed', ?6, ?7
+             WHERE EXISTS (
+                 SELECT 1 FROM participation_channels
+                 WHERE relay_url = ?2 AND channel_id = ?3 AND state = 'joined'
+             )",
             params![
                 owed.event_id,
                 owed.relay_url,
@@ -1568,10 +1669,10 @@ mod tests {
     #[test]
     fn joining_the_same_channel_twice_is_joining_it_once() {
         let (store, path) = fresh_store("join-idempotent");
-        assert!(store.record_channel_joined(RELAY, "chan-1", "e1", 100).expect("first"));
-        // The relay re-delivers the 44100 after a reconnect. The effect is the row, so writing it
-        // again writes it once — which is why membership needs no event-id dedup set.
-        assert!(!store.record_channel_joined(RELAY, "chan-1", "e1", 101).expect("replay"));
+        assert!(store.record_channel_joined(RELAY, "chan-1", "e1", 100, 100).expect("first"));
+        // The relay re-delivers the 44100 after a reconnect — SAME event, so same author timestamp.
+        // The effect is the row, so writing it again writes it once.
+        assert!(!store.record_channel_joined(RELAY, "chan-1", "e1", 100, 101).expect("replay"));
         assert_eq!(store.joined_channels(RELAY).expect("channels"), ["chan-1"]);
         let _ = std::fs::remove_file(&path);
     }
@@ -1579,14 +1680,14 @@ mod tests {
     #[test]
     fn restart_resubscribes_exactly_the_channels_we_are_still_in() {
         let (store, path) = fresh_store("join-leave");
-        store.record_channel_joined(RELAY, "chan-1", "e1", 100).expect("join 1");
-        store.record_channel_joined(RELAY, "chan-2", "e2", 100).expect("join 2");
-        store.record_channel_left(RELAY, "chan-1", "e3", 200).expect("leave 1");
+        store.record_channel_joined(RELAY, "chan-1", "e1", 100, 100).expect("join 1");
+        store.record_channel_joined(RELAY, "chan-2", "e2", 100, 100).expect("join 2");
+        store.record_channel_left(RELAY, "chan-1", "e3", 200, 200).expect("leave 1");
 
         assert_eq!(store.joined_channels(RELAY).expect("channels"), ["chan-2"]);
 
         // A re-add flips the same row back rather than inventing a second one.
-        assert!(store.record_channel_joined(RELAY, "chan-1", "e4", 300).expect("re-add"));
+        assert!(store.record_channel_joined(RELAY, "chan-1", "e4", 300, 300).expect("re-add"));
         assert_eq!(store.joined_channels(RELAY).expect("channels"), ["chan-1", "chan-2"]);
         let _ = std::fs::remove_file(&path);
     }
@@ -1594,11 +1695,14 @@ mod tests {
     #[test]
     fn losing_a_channel_closes_the_debts_inside_it_and_nothing_else() {
         let (store, path) = fresh_store("owed-dropped");
-        store.record_channel_joined(RELAY, "chan-1", "e1", 100).expect("join");
+        store.record_channel_joined(RELAY, "chan-1", "e1", 100, 100).expect("join");
+        // Both channels must be JOINED for their debts to exist at all — a debt is only recorded for
+        // a channel we hold. Without joining chan-2 this test would pass on an empty control.
+        store.record_channel_joined(RELAY, "chan-2", "e2", 100, 100).expect("join 2");
         store.record_owed(&owed(&"a".repeat(64), "chan-1", 110), 111).expect("owed 1");
         store.record_owed(&owed(&"b".repeat(64), "chan-2", 120), 121).expect("owed 2");
 
-        store.record_channel_left(RELAY, "chan-1", "e2", 200).expect("leave");
+        store.record_channel_left(RELAY, "chan-1", "e3", 200, 200).expect("leave");
 
         // A debt we can no longer discharge is closed, not left pending forever; a debt in a
         // channel we still hold is untouched.
@@ -1608,10 +1712,89 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Membership must be ordered by the AUTHOR's clock, not by which frame the relay flushed first.
+    ///
+    /// Replay makes delivery order arbitrary: every reconnect deliberately re-asks from before its
+    /// cursor, so an old 44100 can legitimately arrive after a newer 44101. Applying that would
+    /// re-subscribe us to a channel the relay has already removed us from — and the store would look
+    /// perfectly consistent while doing it.
+    #[test]
+    fn a_replayed_old_add_cannot_undo_a_newer_removal() {
+        let (store, path) = fresh_store("membership-order");
+        store.record_channel_joined(RELAY, "chan-1", "add-1", 100, 100).expect("join");
+        store.record_channel_left(RELAY, "chan-1", "remove-1", 200, 200).expect("leave");
+
+        // The stale 44100 the relay re-sends after a reconnect. Older by author time, later by
+        // arrival — and it must lose.
+        assert!(
+            !store.record_channel_joined(RELAY, "chan-1", "add-1", 100, 300).expect("stale add"),
+            "a stale add reported a transition, so it was applied"
+        );
+        assert!(
+            store.joined_channels(RELAY).expect("channels").is_empty(),
+            "a replayed old 44100 resurrected a membership the relay had already revoked"
+        );
+
+        // The inverse: a stale removal must not drop a membership we legitimately re-acquired.
+        store.record_channel_joined(RELAY, "chan-1", "add-2", 400, 400).expect("re-add");
+        assert!(
+            !store.record_channel_left(RELAY, "chan-1", "remove-1", 200, 500).expect("stale remove"),
+            "a stale removal reported a transition"
+        );
+        assert_eq!(store.joined_channels(RELAY).expect("channels"), ["chan-1"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The high-water mark has to advance even when the state does NOT change, or ordering is only
+    /// half-enforced: `add@3` is a no-op against an existing join, so if it left the stored timestamp
+    /// at `add@1` then `remove@2` would compare against the wrong event and apply.
+    #[test]
+    fn a_newer_add_that_changes_nothing_still_advances_the_ordering_mark() {
+        let (store, path) = fresh_store("membership-highwater");
+        store.record_channel_joined(RELAY, "chan-1", "add-1", 100, 100).expect("join");
+        // Newer add, same state — reports no transition, but must still move the mark to 300.
+        assert!(!store.record_channel_joined(RELAY, "chan-1", "add-3", 300, 300).expect("newer add"));
+
+        assert!(
+            !store.record_channel_left(RELAY, "chan-1", "remove-2", 200, 400).expect("stale remove"),
+            "a removal older than the newest add was applied"
+        );
+        assert_eq!(
+            store.joined_channels(RELAY).expect("channels"),
+            ["chan-1"],
+            "the mark stayed at the first add, so a stale removal beat it"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A mention can arrive after the 44101 that removed us — queued behind it, or replayed inside the
+    /// cursor skew. Recording it would mint a debt in a channel we can neither read nor answer, and
+    /// nothing downstream would ever clear it.
+    #[test]
+    fn a_mention_arriving_after_we_left_creates_no_debt() {
+        let (store, path) = fresh_store("owed-after-left");
+        store.record_channel_joined(RELAY, "chan-1", "add-1", 100, 100).expect("join");
+        store.record_channel_left(RELAY, "chan-1", "remove-1", 200, 200).expect("leave");
+
+        assert!(
+            !store.record_owed(&owed(&"f".repeat(64), "chan-1", 150), 300).expect("late mention"),
+            "a debt was recorded for a channel we had already left"
+        );
+        assert!(store.owed_responses().expect("owed").is_empty());
+
+        // And the positive control: the same call in a channel we DO hold must still record, or this
+        // test would pass just as well against a record_owed that never writes anything.
+        store.record_channel_joined(RELAY, "chan-2", "add-2", 100, 100).expect("join 2");
+        assert!(store.record_owed(&owed(&"e".repeat(64), "chan-2", 150), 300).expect("live mention"));
+        assert_eq!(store.owed_responses().expect("owed").len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn a_redelivered_message_is_one_debt_not_two() {
         let (store, path) = fresh_store("owed-dedup");
         let event = "d".repeat(64);
+        store.record_channel_joined(RELAY, "chan-1", "e1", 100, 100).expect("join");
         assert!(store.record_owed(&owed(&event, "chan-1", 110), 111).expect("first"));
         // Every reconnect deliberately re-asks from before its cursor, so this is the normal case.
         assert!(!store.record_owed(&owed(&event, "chan-1", 110), 999).expect("replay"));
@@ -1622,6 +1805,7 @@ mod tests {
     #[test]
     fn debts_come_back_oldest_first_with_the_authors_timestamp() {
         let (store, path) = fresh_store("owed-order");
+        store.record_channel_joined(RELAY, "chan-1", "e1", 100, 100).expect("join");
         store.record_owed(&owed(&"2".repeat(64), "chan-1", 200), 1).expect("later");
         store.record_owed(&owed(&"1".repeat(64), "chan-1", 100), 2).expect("earlier");
 
@@ -1654,7 +1838,7 @@ mod tests {
 
         let reopened = SellerStore::open(&path).expect("reopen");
         assert_eq!(reopened.health().expect("health").schema_version, SCHEMA_VERSION);
-        assert!(reopened.record_channel_joined(RELAY, "chan-1", "e1", 100).expect("join"));
+        assert!(reopened.record_channel_joined(RELAY, "chan-1", "e1", 100, 100).expect("join"));
         assert_eq!(reopened.participation_cursor(RELAY, "membership").expect("read"), None);
         let _ = std::fs::remove_file(&path);
     }

@@ -72,8 +72,27 @@ use super::relays::ProbeOutcome;
 /// The outcome is deliberately blunt: either the echo arrived ([`ProbeOutcome::EchoObserved`]) or
 /// admission is unproven and the relay is not used. "Unproven" is not a claim that the relay is
 /// broken or empty — it is the only thing we may act on.
+///
+/// # The assumption this probe rests on, stated because it is not self-evident
+///
+/// The carrier is a **kind-0 persona**, but the surface we actually need is the `#p`-gated one
+/// (44100/44101 and channel reads). Those are not the same surface, and a relay is free to serve
+/// public metadata while refusing p-gated reads — in which case this probe would report `Admitted`
+/// for a relay we cannot read a single membership event from.
+///
+/// It holds on the deployed relay, and that was measured rather than assumed: after the throwaway
+/// key's membership row was deleted, a freshly published carrier came back `EchoMissing` — the write
+/// was accepted and the read returned nothing, so kind-0 reads there ARE membership-gated. Evidence:
+/// `participation-s1-live-artifacts/*-L7-postrevoke.log`.
+///
+/// It is NOT guaranteed for a relay we have not characterised, so it is a single-relay assumption
+/// carried deliberately into a single-relay slice. The stronger shape, for the multi-relay slice, is
+/// to promote only on a positive read of the **access-scoped** surface itself — publish nothing and
+/// require a `44100`/`44101` for `me` to come back, falling back to this echo only where the roster
+/// records that the relay has been characterised.
 pub async fn probe_access(
     publisher: &Client,
+    relay_url: &str,
     reader: &Client,
     carrier: &Event,
     timeout: Duration,
@@ -90,7 +109,12 @@ pub async fn probe_access(
 
     let event_id = carrier.id;
 
-    if let Err(error) = publisher.send_event(carrier).await {
+    // ★ `send_event_to`, NEVER `send_event`. The publisher holds every configured relay, and
+    // `send_event` writes to ALL of them — so probing one relay would publish the carrier to relays
+    // we have not proven, and to relays already classified denied. The roster gates which relay we
+    // ADDRESS, but it cannot gate a client that was handed the whole list; targeting the URL here is
+    // what makes "a denied relay gets nothing" true of the publish path too, not just the REQ path.
+    if let Err(error) = publisher.send_event_to([relay_url], carrier).await {
         return ProbeOutcome::Refused(format!("relay refused the probe publish: {error}"));
     }
 
@@ -320,7 +344,7 @@ mod tests {
         let reader = connect(&url, Keys::generate()).await;
 
         let outcome =
-            probe_access(&publisher, &reader, &persona(&keys), Duration::from_secs(5)).await;
+            probe_access(&publisher, &url, &reader, &persona(&keys), Duration::from_secs(5)).await;
 
         assert_eq!(outcome, ProbeOutcome::EchoObserved);
     }
@@ -337,7 +361,7 @@ mod tests {
         let reader = connect(&url_b, Keys::generate()).await;
 
         let outcome =
-            probe_access(&publisher, &reader, &persona(&keys), Duration::from_secs(3)).await;
+            probe_access(&publisher, &url_a, &reader, &persona(&keys), Duration::from_secs(3)).await;
 
         assert_eq!(outcome, ProbeOutcome::EchoMissing);
     }
@@ -351,7 +375,8 @@ mod tests {
         let publisher = connect(&url, keys.clone()).await;
         let reader = connect(&url, Keys::generate()).await;
 
-        let outcome = probe_access(&publisher, &reader, &beat(&keys), Duration::from_secs(3)).await;
+        let outcome =
+            probe_access(&publisher, &url, &reader, &beat(&keys), Duration::from_secs(3)).await;
 
         match outcome {
             ProbeOutcome::Refused(reason) => assert!(
