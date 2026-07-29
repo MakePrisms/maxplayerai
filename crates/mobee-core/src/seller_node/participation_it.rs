@@ -628,6 +628,24 @@ async fn live_participation_against_deployed_relay() {
         "L1 invite author (cross-check against the relay's signing key)",
         &invite.pubkey.to_hex(),
     );
+    // The signer's identity is cross-confirmed off-box; the signature is only ever ours to check.
+    // Record the measured values, not literals — an artifact that prints `true` regardless of what
+    // was measured is a transcription of intent, not evidence.
+    let id_ok = invite.verify_id();
+    let signature_ok = invite.verify_signature();
+    evidence.note(
+        "L1 signature verified here, not inherited",
+        &format!(
+            "verify_id={id_ok} verify_signature={signature_ok} signer={}",
+            invite.pubkey.to_hex()
+        ),
+    );
+    assert!(id_ok, "the invite's id is not the hash of its own content");
+    assert!(
+        signature_ok,
+        "the invite's schnorr signature does not verify against {}",
+        invite.pubkey.to_hex()
+    );
 
     // ── L4: a mention lands as an owed debt ────────────────────────────────────────────────────
     eprintln!("=== joined {channel} — now post a kind-9 mentioning {} ===", me.to_hex());
@@ -734,6 +752,32 @@ async fn live_fetch_invite_by_id() {
         "L1 invite author (cross-check against the relay's signing key)",
         &invite.pubkey.to_hex(),
     );
+
+    // ★ Cross-confirming the signer's IDENTITY and verifying its SIGNATURE are two different claims,
+    // and only the first can be settled off-box. nostr-sdk does verify on ingest, but inheriting that
+    // silently is a verification valid only under a condition it never checks: a client flag or a
+    // version change could stop verifying and this artifact would still read as proof. Both halves are
+    // recorded separately so a failure says WHICH one broke.
+    let id_ok = invite.verify_id();
+    let signature_ok = invite.verify_signature();
+    evidence.note(
+        "L1 signature verified here, not inherited",
+        &format!(
+            "verify_id={id_ok} verify_signature={signature_ok} signer={}",
+            invite.pubkey.to_hex()
+        ),
+    );
+    assert!(
+        id_ok,
+        "the invite's id is not the hash of its own content — the event was altered in transit"
+    );
+    assert!(
+        signature_ok,
+        "the invite's schnorr signature does not verify against {} — its authorship is unproven, so \
+         a matching signer identity would mean nothing",
+        invite.pubkey.to_hex()
+    );
+
     evidence.note(
         "L1 invite kind + created_at",
         &format!(
@@ -756,6 +800,209 @@ async fn live_fetch_invite_by_id() {
         "an unadmitted key read the invite too, so this relay is NOT read-gated — the positive \
          result above then says nothing about admission"
     );
+}
+
+/// L4 + L5: resume from an existing store, take a mention as a debt, and stay exactly-once.
+///
+/// This leg **must** resume rather than start clean, and the reason is structural: a cold start
+/// subscribes the membership filter from `now`, so a node that is *already* a channel member will
+/// never see another `44100`, will therefore never subscribe to the channel, and could not observe a
+/// mention at all. The already-joined store is the only state from which a mention is reachable —
+/// and resuming is itself the restart property L5 is about, so one window covers both.
+///
+/// Exactly-once is asserted against the events actually pumped. The cursor deliberately rewinds
+/// [`SINCE_SKEW_SECS`](super::participation::dialect::SINCE_SKEW_SECS), so re-delivery of an
+/// already-recorded mention is the EXPECTED case, and surviving it is the property worth proving.
+/// `participation_owed.event_id` is the primary key and the insert is `OR IGNORE`, so the guarantee
+/// is store-level dedup, not cursor luck.
+///
+/// ```text
+/// BUZZ_PERSONA_SECRET=<64-hex admitted throwaway>              \
+/// PARTICIPATION_RESUME_DB=/tmp/mobee-participation-it-live-…   \
+/// BUZZ_LIVE_RELAY=wss://buzzrelay.orveth.dev                   \
+/// PARTICIPATION_LIVE_LOG=/path/to/live.log                     \
+///   cargo test -p mobee-core --features acp,gateway,git-delivery,wallet --lib \
+///     -- live_resume_and_await_mention --ignored --nocapture
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an already-joined store, an admitted key, and a human to post the kind-9"]
+async fn live_resume_and_await_mention() {
+    let secret = match std::env::var("BUZZ_PERSONA_SECRET") {
+        Ok(value) if value.trim().len() == 64 => value.trim().to_string(),
+        _ => panic!("set BUZZ_PERSONA_SECRET to a 64-hex throwaway secret (never the seller key)"),
+    };
+    let db = std::env::var("PARTICIPATION_RESUME_DB")
+        .expect("set PARTICIPATION_RESUME_DB to the store that already holds the joined channel");
+    let url = std::env::var("BUZZ_LIVE_RELAY")
+        .unwrap_or_else(|_| "wss://buzzrelay.orveth.dev".to_string());
+    let log = std::env::var("PARTICIPATION_LIVE_LOG")
+        .expect("set PARTICIPATION_LIVE_LOG — evidence is asserted from a file, never from a pane");
+
+    let node = Keys::parse(&secret).expect("parse throwaway secret");
+    let me = node.public_key();
+    let mut evidence = Evidence::new(&log);
+
+    assert!(
+        std::path::Path::new(&db).exists(),
+        "no store at {db} — this leg resumes an existing one, it does not create it"
+    );
+    let store = SellerStore::open(&db).expect("open the existing store");
+
+    // ★ The resume PRECONDITION. If this is empty the leg is unrunnable, not merely failing: with no
+    // joined channel there is no channel subscription, so no mention could arrive however long we wait.
+    let joined = store.joined_channels(&url).expect("channels");
+    assert!(
+        !joined.is_empty(),
+        "the store at {db} holds no joined channel for {url}, so a mention is unreachable — resume \
+         a store that has one rather than waiting on a window that cannot close"
+    );
+    let channel = joined.first().expect("a joined channel").clone();
+    evidence.note(
+        "L4 resume precondition — channel already joined",
+        &format!("db={db} channels={joined:?}"),
+    );
+
+    // The debts already on the books. The new one is measured against this, and every one of these
+    // must still be present exactly once at the end — that is the exactly-once half.
+    let before = store.owed_responses().expect("owed");
+    evidence.note(
+        "L4 owed BEFORE (denominator)",
+        &format!("{} row(s): {before:?}", before.len()),
+    );
+
+    // The cursor this run will resume the channel from, read BEFORE it moves. `pump` counts events
+    // but not WHICH, so the count alone cannot show that an already-recorded mention came back —
+    // and "no duplicate appeared" is worthless unless re-delivery actually happened. Capturing the
+    // resume point lets the delivered set be reconstructed from the relay afterwards.
+    let resume_cursor = store
+        .participation_cursor(&url, &super::participation::channel_filter_id(&channel))
+        .expect("channel cursor");
+    evidence.note(
+        "L5 channel resume cursor (before this run moves it)",
+        &format!(
+            "cursor={resume_cursor:?} skew={}s ⇒ the subscription opens at {:?}",
+            super::participation::dialect::SINCE_SKEW_SECS,
+            resume_cursor
+                .map(|c| (c as u64).saturating_sub(super::participation::dialect::SINCE_SKEW_SECS))
+        ),
+    );
+
+    let publisher = connect(&url, node.clone()).await;
+    let mut participation = Participation::start(
+        &ParticipationConfig {
+            relays: vec![url.clone()],
+            probe_timeout_secs: 20,
+        },
+        store.clone(),
+        me,
+        &publisher,
+        &carrier(&node),
+    )
+    .await
+    .expect("start participation");
+
+    let states = participation.access_states();
+    evidence.note("L4 access states on resume", &format!("{states:?}"));
+    assert_eq!(
+        states,
+        vec![(url.clone(), AccessState::Admitted)],
+        "resumed but not admitted — a staging problem, so stop rather than reinterpret it"
+    );
+
+    evidence.note(
+        "READY (resume)",
+        &format!("resumed on channel {channel}; post a kind-9 there mentioning {}", me.to_hex()),
+    );
+    eprintln!("=== READY — post a kind-9 in {channel} mentioning {} ===", me.to_hex());
+
+    let mut pumped = 0u64;
+    let owed = wait_for_counting(Duration::from_secs(300), &mut participation, &mut pumped, || {
+        let owed = store.owed_responses().expect("owed");
+        (owed.len() > before.len()).then_some(owed)
+    })
+    .await
+    .expect("no mention landed within the window");
+
+    evidence.note("L4 owed AFTER", &format!("{} row(s): {owed:?}", owed.len()));
+    evidence.note(
+        "L5 exactly-once — with its denominator",
+        &format!(
+            "events pumped this run = {pumped}; owed rows {} -> {}. Re-delivery within the {}s \
+             cursor skew is expected; the guarantee is the event_id primary key, not the cursor.",
+            before.len(),
+            owed.len(),
+            super::participation::dialect::SINCE_SKEW_SECS,
+        ),
+    );
+
+    // ★ What the relay actually had available to deliver on the node's own resume filter. Fetched
+    // independently, with the same filter shape and the same `since`, so a prior debt appearing here
+    // means it WAS re-delivered to the subscription — the denominator that turns "no duplicate row"
+    // into evidence of dedup rather than evidence of nothing having arrived.
+    if let Some(cursor) = resume_cursor {
+        let since = (cursor as u64).saturating_sub(super::participation::dialect::SINCE_SKEW_SECS);
+        let delivered = connect(&url, node.clone())
+            .await
+            .fetch_events(
+                super::participation::dialect::channel_mention_filter(&channel, me, Some(since)),
+                Duration::from_secs(15),
+            )
+            .await
+            .expect("fetch the delivered set");
+        let ids: Vec<String> = delivered.iter().map(|event| event.id.to_hex()).collect();
+        let redelivered: Vec<&String> = ids
+            .iter()
+            .filter(|id| before.iter().any(|old| &old.event_id == *id))
+            .collect();
+        evidence.note(
+            "L5 delivered set on the resume filter (independent fetch)",
+            &format!(
+                "since={since} matched={} ids={ids:?}\nalready-recorded and therefore RE-DELIVERED: \
+                 {redelivered:?} — if this list is empty, dedup was never exercised and L5 is unproven \
+                 no matter how the row counts look.",
+                ids.len()
+            ),
+        );
+    }
+
+    // L4: exactly one new debt, attributed to someone other than us.
+    assert_eq!(
+        owed.len(),
+        before.len() + 1,
+        "one mention must produce exactly one new debt"
+    );
+    let fresh = owed
+        .iter()
+        .find(|row| !before.iter().any(|old| old.event_id == row.event_id))
+        .expect("a debt not present before");
+    assert_eq!(fresh.channel_id, channel);
+    assert_eq!(fresh.relay_url, url);
+    assert_ne!(fresh.counterparty, me.to_hex(), "we must not be our own counterparty");
+    evidence.note("L4 the new debt", &format!("{fresh:?}"));
+
+    // L5: nothing already on the books was duplicated or lost across the restart.
+    //
+    // ★ With an empty `before` this loop asserts NOTHING and the leg still goes green — the exact
+    // false pass this predicate exists to rule out. Say so in the evidence rather than let a vacuous
+    // pass read as a proof; L5 needs a prior debt to re-deliver, so it takes a second mention.
+    if before.is_empty() {
+        evidence.note(
+            "L5 NOT EXERCISED — vacuous, do not score it",
+            "no debt was on the books before this run, so there was nothing for the relay to \
+             re-deliver and the exactly-once check had no subject. L4 stands; L5 does not. Re-run \
+             this leg after a SECOND mention, with the first still recorded, so `before` is non-empty.",
+        );
+    }
+    for old in &before {
+        assert_eq!(
+            owed.iter().filter(|row| row.event_id == old.event_id).count(),
+            1,
+            "debt {} is not present exactly once after the restart",
+            old.event_id
+        );
+    }
+
+    participation.shutdown().await;
 }
 
 /// Append-only evidence file. Every predicate's artifact is written here and asserted from here —
@@ -787,6 +1034,32 @@ impl Evidence {
 
 /// Pump until `probe` yields a value or the window closes. Returns `None` on timeout rather than
 /// panicking, so the caller names what was expected.
+/// [`wait_for`], but totalling the events actually pumped.
+///
+/// That total is a **denominator**, not decoration. "No duplicate rows appeared" is worthless on its
+/// own — it reads identically whether dedup held or the relay simply never re-delivered anything.
+/// Only the pump count separates the two.
+async fn wait_for_counting<T>(
+    window: Duration,
+    participation: &mut Participation,
+    pumped: &mut u64,
+    mut probe: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        *pumped += participation
+            .pump(Duration::from_secs(2))
+            .await
+            .expect("pump") as u64;
+        if let Some(value) = probe() {
+            return Some(value);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+    }
+}
+
 async fn wait_for<T>(
     window: Duration,
     participation: &mut Participation,
