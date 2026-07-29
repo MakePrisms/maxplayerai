@@ -22,6 +22,7 @@ pub mod buzz;
 pub mod ingester;
 pub mod lock;
 pub mod outbox;
+pub mod participation;
 #[cfg(test)]
 mod p_gate_relay_fixture;
 pub mod publisher;
@@ -213,6 +214,59 @@ impl SellerNode {
         Ok(Some(handle))
     }
 
+    /// Bring up the participation surface if `[participation]` is configured: establish access on
+    /// each configured relay, then subscribe the wake surface on the ones that proved it.
+    ///
+    /// Inert without `[participation]` — `Ok(None)`, no connection, no publish, no table read.
+    /// Also inert without `[buzz]`, because the access probe's carrier is the persona and a node
+    /// with no persona has nothing to be reached *as*.
+    ///
+    /// # Two clients, on purpose
+    ///
+    /// This opens its own publisher for the probe carrier, independent of
+    /// [`buzz::BuzzHandle`]'s connection. A client cannot read back its own published events (see
+    /// [`participation::probe`]), so the probe's read side must be a different client from its write
+    /// side — that part is a hard requirement and the ⚠ in that module explains what breaks when it
+    /// is "optimised" away.
+    ///
+    /// The *publisher* being separate from the persona's connection is a weaker choice: it keeps
+    /// this seam independent of the persona's own boot wiring, at the cost of one extra kind-0
+    /// publish. The persona is replaceable and both publishes carry identical content from the same
+    /// key, so the relay simply keeps the newest. Merging the publisher into the persona's client is
+    /// a safe future tidy-up; merging the READER into it is not.
+    pub async fn start_participation(
+        &self,
+    ) -> Result<Option<participation::runtime::Participation>, NodeError> {
+        let Some(config) = self.home.config.participation.as_ref() else {
+            return Ok(None);
+        };
+        let Some(buzz_cfg) = self.home.config.buzz.as_ref() else {
+            return Ok(None);
+        };
+        let seller_rate_sats = self.home.config.seller.as_ref().map(|seller| seller.rate_sats);
+
+        let carrier =
+            buzz::build_persona_carrier(self.signer.clone(), buzz_cfg, seller_rate_sats)
+                .await
+                .map_err(|error| NodeError::Relay(format!("participation carrier: {error}")))?;
+        let me = carrier.pubkey;
+
+        let publisher = participation::runtime::persona_publisher(self.signer.clone(), config)
+            .await
+            .map_err(|error| NodeError::Relay(error.to_string()))?;
+
+        let participating = participation::runtime::Participation::start(
+            config,
+            self.store.clone(),
+            me,
+            &publisher,
+            &carrier,
+        )
+        .await
+        .map_err(|error| NodeError::Relay(error.to_string()))?;
+        Ok(Some(participating))
+    }
+
     /// A status snapshot proving the boundary end to end — the store answered, and the wallet actor
     /// answered through its queue. The secret key is never included.
     pub async fn status_snapshot(&self) -> Result<StatusSnapshot, NodeError> {
@@ -232,6 +286,8 @@ impl SellerNode {
 
 #[cfg(test)]
 mod buzz_relay_it;
+#[cfg(test)]
+mod participation_it;
 
 #[cfg(test)]
 mod tests {

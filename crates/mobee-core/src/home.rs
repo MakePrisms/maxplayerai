@@ -146,6 +146,43 @@ pub fn default_buzz_heartbeat_secs() -> u64 {
     30
 }
 
+/// `[participation]` — how the node participates on social relays: which relays to be reachable on,
+/// and how patiently to establish access on each.
+///
+/// Absent from the config, the whole surface is inert: no roster, no subscriptions, and the
+/// participation tables are never read. See [`crate::seller_node::participation`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParticipationConfig {
+    /// The relays to participate on.
+    ///
+    /// Empty is a no-op rather than an error: an operator midway through setup should still be able
+    /// to boot the node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<String>,
+
+    /// How long the access probe waits to read its carrier back before giving up.
+    ///
+    /// Giving up classifies the relay as DENIED, not as empty. The default is generous because the
+    /// error is asymmetric: too short wrongly denies a relay that would have worked, and nothing
+    /// re-probes a denied relay without new signal.
+    #[serde(default = "default_probe_timeout_secs")]
+    pub probe_timeout_secs: u64,
+}
+
+/// serde default for [`ParticipationConfig::probe_timeout_secs`] — 15s.
+pub fn default_probe_timeout_secs() -> u64 {
+    15
+}
+
+impl Default for ParticipationConfig {
+    fn default() -> Self {
+        Self {
+            relays: Vec::new(),
+            probe_timeout_secs: default_probe_timeout_secs(),
+        }
+    }
+}
+
 /// Default relay-git base (delivery). Live on mobee-relay (`/git/<owner>/<repo>.git`).
 pub const DEFAULT_RELAY_GIT_BASE: &str = "https://mobee-relay.orveth.dev/git";
 /// Shared leaf name — NOT used as default (relay name registry is global).
@@ -753,6 +790,10 @@ pub struct MobeeConfig {
     /// Optional `[buzz]` persona config. Absent ⇒ the buzz persona feature is inert.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buzz: Option<BuzzConfig>,
+    /// Optional `[participation]` social-relay config (relay roster + inbox). Absent ⇒ the node
+    /// neither subscribes to anything nor reads the participation tables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participation: Option<ParticipationConfig>,
     /// Optional `[agents]` table of custom presets: name -> `{ argv = [...] }`. A custom
     /// entry named after a built-in preset (claude|cursor|codex) OVERRIDES that built-in.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -917,6 +958,7 @@ impl Default for MobeeConfig {
             profile: None,
             seller: None,
             buzz: None,
+            participation: None,
             agents: BTreeMap::new(),
             seller_memory: SellerMemoryConfig::default(),
             seller_announce: SellerAnnounceConfig::default(),

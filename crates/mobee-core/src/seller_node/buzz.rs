@@ -351,6 +351,21 @@ pub async fn start(
     })
 }
 
+/// Build (and sign) the persona kind-0 without publishing it.
+///
+/// This is the carrier the participation access probe publishes and reads back — see
+/// [`super::participation::probe`]. Handing the event out rather than letting that module build one
+/// is deliberate: participation holds no builder and no signer, so it has no way to originate a post.
+pub async fn build_persona_carrier(
+    signer: SignerHandle,
+    cfg: &BuzzConfig,
+    seller_rate_sats: Option<u64>,
+) -> Result<Event, BuzzError> {
+    let adapter = NodeNostrSigner::new(signer)?;
+    let pubkey = adapter.pubkey;
+    build_kind0(&adapter, pubkey, cfg, seller_rate_sats).await
+}
+
 /// Fetch the key's current kind-0 and classify it for the clobber guard: `Ok(None)` ⇒ no kind-0,
 /// `Ok(Some(true/false))` ⇒ one exists with/without our marker.
 async fn fetch_kind0_marker(client: &Client, pubkey: PublicKey) -> Result<Option<bool>, BuzzError> {
