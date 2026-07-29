@@ -648,7 +648,34 @@ mod checks {
     /// (#357/#358). A pass-through policy (no `[sandbox]` section) launches the agent directly, so
     /// there is nothing to resolve: a no-op Pass, never a spurious Fail.
     pub(super) fn check_sandbox_launcher(sandbox: Option<SandboxConfig>) -> Check {
-        let policy = SandboxPolicy::from_config(sandbox.as_ref());
+        let policy = match SandboxPolicy::from_config(sandbox.as_ref()) {
+            Ok(policy) => policy,
+            Err(error) => {
+                return Check::fail(
+                    SANDBOX_CHECK,
+                    format!("[sandbox] does not resolve into an executor: {error}"),
+                    "fix the [sandbox] section (or remove it to run unsandboxed)",
+                )
+            }
+        };
+        // Under `mode = "docker"` there is no launcher argv; the spawn is `docker run …`, so the
+        // same "resolves before it can ENOENT every job" property is asked of `docker` itself.
+        if let Some(image) = policy.docker_image() {
+            return if argv0_resolvable("docker") {
+                Check::pass(
+                    SANDBOX_CHECK,
+                    format!("[sandbox] mode=docker, image '{image}' — docker resolvable"),
+                )
+            } else {
+                Check::fail(
+                    SANDBOX_CHECK,
+                    "[sandbox] mode=docker but 'docker' is neither on PATH nor an existing file — \
+                     every job would fail at spawn (ENOENT)"
+                        .to_owned(),
+                    "install docker or switch [sandbox] mode (or remove [sandbox] to run unsandboxed)",
+                )
+            };
+        }
         match policy.launcher().first() {
             None => Check::pass(
                 SANDBOX_CHECK,
@@ -698,7 +725,16 @@ mod checks {
         unsafe_override: bool,
         model: ContainmentModel,
     ) -> Check {
-        let policy = SandboxPolicy::from_config(sandbox.as_ref());
+        let policy = match SandboxPolicy::from_config(sandbox.as_ref()) {
+            Ok(policy) => policy,
+            Err(error) => {
+                return Check::fail(
+                    CONTAINMENT_CHECK,
+                    format!("[sandbox] does not resolve into an executor: {error}"),
+                    "fix the [sandbox] section so the containment probe has an executor to measure",
+                )
+            }
+        };
         let containment = crate::sandbox_probe::probe_containment(&policy, &home_root);
 
         if !claims_open_pool {
@@ -1439,10 +1475,12 @@ mod tests {
     #[cfg(feature = "wallet")]
     #[test]
     fn sandbox_launcher_check_fails_only_on_an_unresolvable_launcher() {
-        use maxplayer_core::home::SandboxConfig;
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
 
         let bogus = checks::check_sandbox_launcher(Some(SandboxConfig {
+            mode: SandboxMode::Launcher,
             launcher: vec!["definitely-not-a-real-binary-xyz".into()],
+            image: None,
         }));
         assert_eq!(
             bogus.status,
@@ -1458,7 +1496,12 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(
-            checks::check_sandbox_launcher(Some(SandboxConfig { launcher: vec![real] })).status,
+            checks::check_sandbox_launcher(Some(SandboxConfig {
+                mode: SandboxMode::Launcher,
+                launcher: vec![real],
+                image: None,
+            }))
+            .status,
             Status::Pass,
             "a resolvable launcher must PASS"
         );
@@ -1620,7 +1663,9 @@ mod tests {
         ));
         let mut home = resolve_doctor_home(Some(tmp.clone())).expect("bootstrap the home");
         home.config.sandbox = Some(SandboxConfig {
+            mode: maxplayer_core::home::SandboxMode::Launcher,
             launcher: vec!["definitely-not-a-real-binary-xyz".into()],
+            image: None,
         });
         home.config.relay_url = "not-a-relay-url".into();
         home.config.accepted_mints = Vec::new();

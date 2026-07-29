@@ -280,6 +280,19 @@ pub fn probe_containment(policy: &SandboxPolicy, home_root: &Path) -> Containmen
         );
     }
 
+    // This probe measures a LAUNCHER: it spawns our own binary under the policy and reads what the
+    // payload could reach. A docker policy is not expressible as a host argv — the container mounts
+    // only the job workdir, so neither this binary nor the canary path exists inside it — and
+    // running the payload anyway would measure the host, not the container. Say so rather than
+    // guess: `Inconclusive` is never read as a pass, so an open-pool seat is refused rather than
+    // admitted on an unproven containment claim.
+    if let Some(image) = policy.docker_image() {
+        return Containment::Inconclusive(format!(
+            "[sandbox] mode=docker (image '{image}'): this probe measures a launcher, and \
+             containment under a container is not proven by it yet"
+        ));
+    }
+
     let exe = match std::env::current_exe() {
         Ok(path) => path,
         Err(error) => {
@@ -345,7 +358,10 @@ pub fn probe_containment(policy: &SandboxPolicy, home_root: &Path) -> Containmen
         "--workdir".to_owned(),
         workdir.to_string_lossy().into_owned(),
     ];
-    let argv = policy.wrap(&payload);
+    // Non-docker by the guard above, so the policy always yields a host argv here.
+    let argv = policy
+        .wrap(&payload)
+        .expect("a launcher/pass-through policy always wraps into a host argv");
     let verdict = spawn_and_read(&argv);
 
     cleanup(&workdir, &canary);

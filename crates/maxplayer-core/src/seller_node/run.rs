@@ -2400,7 +2400,10 @@ pub async fn probe_configured_harnesses(
     home: &MaxplayerHome,
 ) -> Result<Vec<HarnessProbeVerdict>, NodeError> {
     let registry = boot_agent_registry(home)?;
-    let sandbox = SandboxPolicy::from_config(home.config.sandbox.as_ref());
+    // A `[sandbox]` that does not resolve into an executor refuses the boot gate outright: probing
+    // under a pass-through fallback would prove a harness the awarded job will never run under.
+    let sandbox = SandboxPolicy::from_config(home.config.sandbox.as_ref())
+        .map_err(|error| NodeError::Sandbox(error.to_string()))?;
     let identity = DeliveryAgentIdentity::for_seller(&home::public_key_hex(home)?);
     let mut verdicts = Vec::with_capacity(registry.entries().len());
     for (index, entry) in registry.entries().iter().enumerate() {
@@ -4607,7 +4610,18 @@ impl SellerNodeRunner {
                 continue;
             };
             let roster = Arc::clone(&self.agents);
-            let sandbox = SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref());
+            // A `[sandbox]` that does not resolve grounds the harness rather than restoring it under
+            // a pass-through: a probe that ran unsandboxed would prove nothing about the executor an
+            // awarded job actually gets.
+            let sandbox = match SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref()) {
+                Ok(sandbox) => sandbox,
+                Err(error) => {
+                    if let Some(fault) = harness_fault_for(&error) {
+                        self.agents.fault(harness, fault, Instant::now());
+                    }
+                    continue;
+                }
+            };
             let identity = DeliveryAgentIdentity::for_seller(&self.seller_pubkey.to_hex());
             // Minted per probe, so neither a stale workdir nor a replayed transcript can satisfy one:
             // the artifact has to be produced by THIS turn. The workdir is named after the NON-SECRET
@@ -5048,7 +5062,16 @@ impl SellerNodeRunner {
         // configured `[sandbox]` policy launches the command (pass-through when absent).
         let deadline = offer.deadline_unix.max(0) as u64;
         let prompt = job_prompt(&offer, &seller.git_remote, deadline);
-        let sandbox = SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref());
+        // Resolve the sandbox executor before the run; a misconfigured `[sandbox]` fails the job
+        // rather than silently running the agent unsandboxed.
+        let sandbox = match SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref()) {
+            Ok(sandbox) => sandbox,
+            Err(error) => {
+                opline!("seller node execute fail job_id={job_id}: sandbox config invalid ({error})");
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK).await;
+                return;
+            }
+        };
         let run_started = std::time::Instant::now();
         let run_result = run_agent_with_retry(
             deadline,
@@ -11305,7 +11328,9 @@ mod tests {
             config.seller = Some(seller_cfg(1, false));
             config.relay_url = fixture.url();
             config.sandbox = Some(SandboxConfig {
+                mode: crate::home::SandboxMode::Launcher,
                 launcher: vec!["definitely-not-a-real-binary-xyz".to_owned()],
+                image: None,
             });
         })
         .expect("persist config");
