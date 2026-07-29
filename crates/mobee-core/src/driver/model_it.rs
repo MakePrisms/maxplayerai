@@ -19,8 +19,9 @@
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::time::Duration;
+
+use tokio::sync::Mutex;
 
 use serde_json::{Value, json};
 
@@ -193,7 +194,10 @@ fn answer(mode: Mode, method: &str, params: &Value) -> Option<Value> {
 /// were scheduled far enough apart to miss each other) and every one of them failed when run as a
 /// filtered subset. The green was scheduling luck. A lock is the honest fix for a global resource —
 /// held across set → spawn → session → unset, which is exactly the window that must not overlap.
-static ADAPTER_ENV: Mutex<()> = Mutex::new(());
+///
+/// `tokio::sync::Mutex` rather than the std one precisely BECAUSE the guard spans await points: an
+/// async-aware lock is the right tool for that, not a suppressed lint.
+static ADAPTER_ENV: Mutex<()> = Mutex::const_new(());
 
 /// A wire log path unique to one leg, so concurrent legs never read each other's frames.
 fn wire_log_path(leg: &str) -> PathBuf {
@@ -219,12 +223,9 @@ async fn start_session_against_fake(
     Vec<Value>,
     PathBuf,
 ) {
-    // Held for the whole set-env → spawn → session window. Poisoning is ignored: a leg that panics
-    // does so in its OWN assertions after this helper returns, and a poisoned lock must not turn
-    // every later leg into an unrelated failure.
-    let _env_guard = ADAPTER_ENV
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Held for the whole set-env → spawn → session window. tokio's Mutex does not poison, so a leg
+    // that panics in its own assertions cannot turn every later leg into an unrelated failure.
+    let _env_guard = ADAPTER_ENV.lock().await;
     let wire = wire_log_path(leg);
     let exe = std::env::current_exe().expect("test binary path");
     let mut driver = AcpDriver::new(

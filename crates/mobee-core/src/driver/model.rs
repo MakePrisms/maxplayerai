@@ -70,13 +70,15 @@ impl ModelSupport {
     /// Prefers the config-option dialect whenever it is advertised, because it is the only one
     /// whose application can be confirmed.
     pub fn read(session_result: &Value) -> Self {
-        if let Some(option) = model_config_option(session_result.get("configOptions")) {
-            if let Some(config_id) = option.get("id").and_then(Value::as_str) {
-                return Self::ConfigOption {
-                    config_id: config_id.to_owned(),
-                    offered: offered_values(option.get("options"), "value"),
-                };
-            }
+        // An advertised option with no `id` is unaddressable — fall through to the legacy dialect
+        // rather than guessing one, since `configId` is what the setter is keyed on.
+        if let Some(option) = model_config_option(session_result.get("configOptions"))
+            && let Some(config_id) = option.get("id").and_then(Value::as_str)
+        {
+            return Self::ConfigOption {
+                config_id: config_id.to_owned(),
+                offered: offered_values(option.get("options"), "value"),
+            };
         }
         if let Some(models) = session_result.get("models") {
             return Self::LegacyModels {
