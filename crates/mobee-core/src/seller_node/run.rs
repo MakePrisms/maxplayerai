@@ -10,11 +10,14 @@
 //! and gift-wrap→pay arms + the #150 relay-stall watchdog + #162 recovery-retry are ported on top of
 //! this in the following cutover steps (marked `PORT` below); `mobee sell` is NOT yet pointed here.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use nostr_sdk::prelude::{
     Client, Filter, Keys, Kind, RelayOptions, RelayPoolNotification, RelayUrl,
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::gateway::{
     self, claim_draft, error_draft, git_result_draft, parse_award, parse_offer, OfferParseError,
@@ -54,6 +57,127 @@ const RESULT_PUBLISH_WINDOW_SECS: i64 = 86_400;
 /// failed instead of waiting on a delivery that will never come.
 const EXEC_FAILURE_FEEDBACK: &str = "seller could not complete the job (execution failed before delivery)";
 
+// TODO(multi-slot): this default is a placeholder pending real award-latency measurement — how long
+// a live buyer actually takes between our claim and its award. It is deliberately far below
+// CLAIM_PUBLISH_WINDOW_SECS (3600), which stays long for relay resilience: the claim keeps
+// retrying on the wire for an hour, but a slot it reserved is reclaimed much sooner if no award
+// arrives, so a loaded node does not strand capacity on claims buyers never act on. Operators
+// override with `[seller] claim_award_timeout_secs`.
+/// Default seconds a parked, unawarded claim may hold its reserved execution slot before the lapse
+/// sweep reclaims it. See [`SlotGate`].
+const DEFAULT_CLAIM_AWARD_TIMEOUT_SECS: u64 = 300;
+
+/// Homogeneous execution-slot admission for the seller node: at most `capacity` awarded jobs run
+/// concurrently, and every slot is identical (it runs whatever harness the job asked for — there is
+/// no per-slot typing).
+///
+/// A permit is RESERVED when the node claims an offer ([`SellerNodeRunner::on_offer`]) and released
+/// when the job reaches a terminal outcome (delivery or failure — the permit is moved into the
+/// execution task and dropped when it returns, so every early-return, error, and panic path releases
+/// by construction), when the buyer awards another seller ([`SellerNodeRunner::on_award`]), or when a
+/// parked claim lapses unawarded (the sweep). Reserve-at-claim is what makes a fully loaded node
+/// invisible to the market: with no free permit it does not claim, so it never appears.
+///
+/// The gate is consulted only on the single event loop, which never runs concurrently with itself,
+/// so the "is a slot free?" decision is race-free without any additional locking discipline — the
+/// `Mutex` here exists only so the gate can be shared behind an `Arc` (execution runs off the loop),
+/// never for contention. Reserved-but-not-yet-executing permits are parked keyed by job id; the
+/// award moves a permit out into the execution task, and a release/lapse drops it.
+struct SlotGate {
+    permits: Arc<Semaphore>,
+    parked: Mutex<HashMap<String, ParkedSlot>>,
+    lapse_after: Duration,
+}
+
+/// A reserved slot held for a claim that is awaiting its award. `reserved_at` bounds how long the
+/// claim may sit unawarded before the lapse sweep reclaims the slot.
+struct ParkedSlot {
+    permit: OwnedSemaphorePermit,
+    reserved_at: Instant,
+}
+
+/// Outcome of [`SlotGate::try_reserve`]. The caller needs to tell a fresh reservation apart from a
+/// re-seen offer whose slot is already parked: only a fresh reservation is released if the claim
+/// then turns out to be a dedup no-op or fails to journal (releasing an already-parked job's slot
+/// would strand a live claim).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reserve {
+    /// A slot was newly reserved for this job id (a permit was taken).
+    Reserved,
+    /// This job id already held a reserved slot (a re-seen offer) — no new permit taken.
+    AlreadyParked,
+    /// Every slot is busy — the node is fully loaded and must not claim.
+    Full,
+}
+
+impl SlotGate {
+    fn new(capacity: usize, lapse_after: Duration) -> Self {
+        Self {
+            // `capacity.max(1)`: zero slots would mean a node that can never claim, which is never
+            // what an operator means by configuring a seller — clamp to serial rather than mute it.
+            permits: Arc::new(Semaphore::new(capacity.max(1))),
+            parked: Mutex::new(HashMap::new()),
+            lapse_after,
+        }
+    }
+
+    /// Reserve a slot for `job_id` at claim time. [`Reserve::Full`] when every slot is busy — the
+    /// caller then skips the offer (does not claim), which is exactly how a loaded node stays
+    /// invisible. Idempotent for an already-parked job id (a re-seen offer does not double-reserve).
+    fn try_reserve(&self, job_id: &str) -> Reserve {
+        let mut parked = self.parked.lock().expect("slot gate poisoned");
+        if parked.contains_key(job_id) {
+            return Reserve::AlreadyParked;
+        }
+        match self.permits.clone().try_acquire_owned() {
+            Ok(permit) => {
+                parked.insert(job_id.to_owned(), ParkedSlot { permit, reserved_at: Instant::now() });
+                Reserve::Reserved
+            }
+            Err(_) => Reserve::Full,
+        }
+    }
+
+    /// Release a reserved slot without executing (claim failed to journal, was a dedup no-op, or the
+    /// buyer awarded another seller). Dropping the permit returns it to the pool. Idempotent.
+    fn release(&self, job_id: &str) {
+        self.parked.lock().expect("slot gate poisoned").remove(job_id);
+    }
+
+    /// Take a reserved slot's permit to hand to the execution task, which holds it until the job is
+    /// terminal (drop-on-return releases it). `None` when no permit is parked for this job — the
+    /// restart case, where the in-memory map is empty but the durable store still has the awarded
+    /// job (re-acquiring a permit for resumed jobs is P4, tracked in the PR body).
+    fn take_for_execution(&self, job_id: &str) -> Option<OwnedSemaphorePermit> {
+        self.parked
+            .lock()
+            .expect("slot gate poisoned")
+            .remove(job_id)
+            .map(|slot| slot.permit)
+    }
+
+    /// Reclaim every slot whose parked claim has sat unawarded longer than `lapse_after`. Returns the
+    /// job ids so the caller can release the durable claim to match. Dropping each permit returns it
+    /// to the pool.
+    fn sweep_lapsed(&self, now: Instant) -> Vec<String> {
+        let mut parked = self.parked.lock().expect("slot gate poisoned");
+        let lapsed: Vec<String> = parked
+            .iter()
+            .filter(|(_, slot)| now.duration_since(slot.reserved_at) >= self.lapse_after)
+            .map(|(job_id, _)| job_id.clone())
+            .collect();
+        for job_id in &lapsed {
+            parked.remove(job_id);
+        }
+        lapsed
+    }
+
+    /// Permits currently free. For logging and tests.
+    fn available(&self) -> usize {
+        self.permits.available_permits()
+    }
+}
+
 /// The pure claim/skip decision over a parsed offer — no I/O, so the money-safety ordering
 /// (targeting, deadline-expiry, rate floor) is unit-testable. Mirrors the legacy `classify_offer`
 /// gates that do not need durable state; the store-backed dedup + capacity checks ride on top in
@@ -77,6 +201,11 @@ enum SkipReason {
     RateGate,
     /// The offer asked for a harness this node does not run.
     AgentUnavailable,
+    /// Every execution slot is busy — the node is fully loaded and does not claim (reserve-at-claim
+    /// back-pressure; a loaded node is invisible to the market by simply not claiming). Emitted by
+    /// [`SellerNodeRunner::on_offer`], never by the pure [`classify_offer`], because it depends on
+    /// live slot state.
+    SlotsBusy,
 }
 
 impl SkipReason {
@@ -86,6 +215,7 @@ impl SkipReason {
             Self::Lapsed => "offer deadline already passed (lapsed; never resurrected)",
             Self::RateGate => "rate-gate refused (untargeted without opt-in / below rate)",
             Self::AgentUnavailable => "requested agent harness not available on this node",
+            Self::SlotsBusy => "all execution slots busy (node fully loaded; not claiming)",
         }
     }
 }
@@ -734,7 +864,7 @@ fn boot_agent_registry(home: &MobeeHome) -> Result<AgentRegistry, NodeError> {
         eprintln!("{degraded}");
     } else if !resolved.registry.advertised().is_empty() {
         eprintln!(
-            "seller node agents ready: {:?} (serial execution — one job at a time)",
+            "seller node agents ready: {:?} (execution concurrency set by [seller] slots)",
             resolved.registry.advertised()
         );
     }
@@ -760,6 +890,9 @@ pub struct SellerNodeRunner {
     /// advertisement, and every dispatch reads THIS — never the config — so what the node
     /// advertises is what it verified it can launch.
     agents: AgentRegistry,
+    /// Homogeneous execution-slot admission (reserve-at-claim). Behind an `Arc` so it is shared with
+    /// the off-loop execution tasks; see [`SlotGate`].
+    slots: Arc<SlotGate>,
 }
 
 impl SellerNodeRunner {
@@ -841,6 +974,26 @@ impl SellerNodeRunner {
 
         let publisher = RelayPublisher::new(node.signer().clone(), client.clone(), &relay_url);
 
+        // Execution-slot admission from config: `slots` (default 1 = serial) and the claim-lapse
+        // timeout (default when unset). A node with no `[seller]` block never claims, so its slot
+        // count is immaterial — default to serial.
+        let (capacity, lapse_secs) = node
+            .home()
+            .config
+            .seller
+            .as_ref()
+            .map(|s| (s.slots, s.claim_award_timeout_secs))
+            .unwrap_or((1, None));
+        let slots = Arc::new(SlotGate::new(
+            capacity,
+            Duration::from_secs(lapse_secs.unwrap_or(DEFAULT_CLAIM_AWARD_TIMEOUT_SECS)),
+        ));
+        eprintln!(
+            "seller node execution slots: {} (claim-lapse timeout {}s)",
+            capacity.max(1),
+            lapse_secs.unwrap_or(DEFAULT_CLAIM_AWARD_TIMEOUT_SECS)
+        );
+
         Ok(Self {
             node,
             client,
@@ -849,6 +1002,7 @@ impl SellerNodeRunner {
             seller_pubkey,
             boot_auth,
             agents,
+            slots,
         })
     }
 
@@ -958,6 +1112,22 @@ impl SellerNodeRunner {
     /// no own heartbeat has round-tripped within the stall threshold), with #162 bounded recovery
     /// retries.
     pub async fn run(self) -> Result<(), NodeError> {
+        // Consume the runner into an `Arc` so each awarded job's execution runs as its own task (see
+        // [`SlotGate`]) while this loop stays responsive to new offers, awards, and payments — the
+        // loop never runs a job inline, which is the multi-slot change.
+        //
+        // Jobs run as `spawn_local` tasks under a LocalSet, NOT `tokio::spawn`: `execute_job` holds
+        // `&self` (node store and friends, not `Sync`) across awaits, so its future is `!Send` and
+        // cannot cross threads. A LocalSet runs the jobs cooperatively on THIS thread, interleaving
+        // with the loop at every await. That is the right model here: execution is I/O-bound (it
+        // awaits the agent subprocess over ACP — the driver's waits genuinely yield, issue #223), so
+        // one thread suffices, and it keeps the nostr client and signer on their original runtime —
+        // no cross-runtime client calls.
+        let local = tokio::task::LocalSet::new();
+        local.run_until(Arc::new(self).run_loop()).await
+    }
+
+    async fn run_loop(self: Arc<Self>) -> Result<(), NodeError> {
         // Heartbeat + relay-stall watchdog config. Disabled ⇒ no heartbeat publish and the watchdog
         // branch is inert (the loop only waits on the drain tick + relay stream).
         let hb = &self.node.home().config.seller_heartbeat;
@@ -1012,7 +1182,13 @@ impl SellerNodeRunner {
                         eprintln!(
                             "seller node resume: re-driving execution for job_id={job_id} (state={state:?})"
                         );
-                        self.execute_job(&job_id).await;
+                        // Resume off the loop too. P4 (PR body): re-acquire a slot permit per resumed
+                        // job so a restart honors `slots`; today they resume WITHOUT a permit (`None`),
+                        // so a restart could briefly exceed capacity until the resumed jobs drain.
+                        let runner = Arc::clone(&self);
+                        tokio::task::spawn_local(async move {
+                            runner.execute_job(&job_id, None).await;
+                        });
                     }
                 }
             }
@@ -1065,6 +1241,7 @@ impl SellerNodeRunner {
         loop {
             tokio::select! {
                 _ = drain_tick.tick() => {
+                    self.sweep_lapsed_claims();
                     self.drain().await;
                     continue;
                 }
@@ -1625,6 +1802,25 @@ impl SellerNodeRunner {
     /// The claim-time creq is authored here from the seller's OWN config (accepted mints + rate) and
     /// journaled via `claim_and_enqueue`, so delivery later signs the STORED creq's hash (invariant
     /// 8) and the restart redeem-guard reads its mints (Fix Q) — never a rebuild from live config.
+    /// Reclaim execution slots reserved by claims that have sat unawarded past the lapse timeout,
+    /// releasing the durable claim to match. Runs on the drain tick. Without it, reserve-at-claim
+    /// would let a claim a buyer never awards hold its slot for the full (long) publish window —
+    /// permanently shrinking a busy node's capacity. Runs on the event loop, so it never races the
+    /// reserve/take done by `on_offer`/`on_award`.
+    fn sweep_lapsed_claims(&self) {
+        for job_id in self.slots.sweep_lapsed(Instant::now()) {
+            match self.node.store().release_claim(&job_id, now_unix()) {
+                Ok(()) => eprintln!(
+                    "seller node slot reclaimed job_id={job_id}: parked claim lapsed unawarded ({} slot(s) free)",
+                    self.slots.available()
+                ),
+                Err(error) => {
+                    eprintln!("seller node slot reclaim job_id={job_id}: release_claim failed ({error})")
+                }
+            }
+        }
+    }
+
     async fn on_offer(&self, event: &nostr_sdk::Event) {
         let Some(seller) = self.node.home().config.seller.clone() else {
             eprintln!("seller node offer skipped: no [seller] config");
@@ -1733,6 +1929,21 @@ impl SellerNodeRunner {
             &creq,
             &self.agents.advertised(),
         );
+        // Reserve-at-claim: a fully loaded node has no free slot and simply does not claim, which is
+        // how it stays invisible to the market. The gate is consulted only here on the event loop,
+        // never concurrently with itself, so two offers can never both take the last slot.
+        let reserved = self.slots.try_reserve(&job_id);
+        if reserved == Reserve::Full {
+            eprintln!("seller node offer skip id={job_id}: {}", SkipReason::SlotsBusy.reason());
+            return;
+        }
+        // Release a FRESH reservation if the claim does not actually become a new parked claim (dedup
+        // no-op or journal error). An already-parked job id keeps its existing slot untouched.
+        let release_on_no_claim = |runner: &Self| {
+            if reserved == Reserve::Reserved {
+                runner.slots.release(&job_id);
+            }
+        };
         match self.node.store().claim_and_enqueue(
             &job_id,
             &job_id,
@@ -1744,22 +1955,27 @@ impl SellerNodeRunner {
         ) {
             Ok(super::store::Claimed::New) => {
                 eprintln!(
-                    "seller node claimed job_id={job_id} buyer={buyer_pubkey} amount={} deadline={deadline_unix} (awaiting award)",
-                    offer.amount
+                    "seller node claimed job_id={job_id} buyer={buyer_pubkey} amount={} deadline={deadline_unix} slot-reserved (awaiting award; {} slot(s) free)",
+                    offer.amount,
+                    self.slots.available()
                 );
                 // The caller drains after dispatch, publishing the just-enqueued claim.
             }
             Ok(super::store::Claimed::Idempotent) => {
                 eprintln!("seller node offer id={job_id}: already claimed (dedup no-op)");
+                release_on_no_claim(self);
             }
-            Err(error) => eprintln!("seller node claim failed job_id={job_id}: {error}"),
+            Err(error) => {
+                eprintln!("seller node claim failed job_id={job_id}: {error}");
+                release_on_no_claim(self);
+            }
         }
     }
 
     /// Handle one award event: authorize it (author must be the offer's buyer), decide whether it
     /// names OUR claim, and bind or release accordingly. Binding records the award (which moves the
     /// claim → awarded and creates the job row); execution of the awarded job is the next port step.
-    async fn on_award(&self, event: &nostr_sdk::Event) {
+    async fn on_award(self: &Arc<Self>, event: &nostr_sdk::Event) {
         let draft = event_to_draft(event);
         let Some(award) = parse_award(&draft) else {
             return;
@@ -1806,19 +2022,36 @@ impl SellerNodeRunner {
                     .record_award(&event.id.to_hex(), &job_id, &buyer, now_unix())
                 {
                     Ok(super::store::Awarded::New) => {
-                        eprintln!("seller node awarded job_id={job_id} buyer={buyer} — executing");
-                        self.execute_job(&job_id).await;
+                        // Decouple execution from the loop: move the reserved permit into a spawned
+                        // task so the loop keeps servicing offers/awards/payments while the job runs.
+                        // The permit rides the task and releases on drop — covering delivery, every
+                        // fail_job path, and a panic (unwind drops it). `None` only on the restart
+                        // path (permit not in-memory); re-acquiring for resumed jobs is P4.
+                        let slot = self.slots.take_for_execution(&job_id);
+                        eprintln!(
+                            "seller node awarded job_id={job_id} buyer={buyer} — executing (spawned; {} slot(s) free)",
+                            self.slots.available()
+                        );
+                        let runner = Arc::clone(self);
+                        let job = job_id.clone();
+                        tokio::task::spawn_local(async move {
+                            runner.execute_job(&job, slot).await;
+                        });
                     }
                     Ok(super::store::Awarded::Duplicate) => {
                         eprintln!("seller node award dedup job_id={job_id} (already recorded)")
                     }
                     Ok(super::store::Awarded::NoClaim) => {
-                        eprintln!("seller node award job_id={job_id}: no claim to bind")
+                        eprintln!("seller node award job_id={job_id}: no claim to bind");
+                        // No claim to bind ⇒ any slot we reserved for it is orphaned; return it.
+                        self.slots.release(&job_id);
                     }
                     Err(error) => eprintln!("seller node award record failed job_id={job_id}: {error}"),
                 }
             }
             AwardMatch::Release => {
+                // The buyer picked another seller: release the durable claim AND its reserved slot.
+                self.slots.release(&job_id);
                 match self.node.store().release_claim(&job_id, now_unix()) {
                     Ok(()) => eprintln!(
                         "seller node released claim job_id={job_id}: buyer picked another seller's claim"
@@ -1839,7 +2072,13 @@ impl SellerNodeRunner {
     /// into a co-signature the seller signs through its actor, and journal + enqueue the result event
     /// in one transaction. Every failure path fails the job with a named reason and publishes nothing
     /// partial; the delivery journal is idempotent, so a resumed job never double-publishes.
-    async fn execute_job(&self, job_id: &str) {
+    async fn execute_job(&self, job_id: &str, _slot: Option<OwnedSemaphorePermit>) {
+        // `_slot` is the reserved execution permit, moved in and held for the whole call. It is
+        // released the instant this function returns — on delivery, on any `fail_job*` path, on an
+        // early idempotency return, or on a panic (unwind drops it). This RAII pairing is the single
+        // release site for an executing slot; there is no explicit release to forget. `None` only on
+        // the restart-resume path (P4), where no in-memory permit exists to carry.
+        //
         // Idempotency guard: only a job still `awarded`/`executing` runs. A REDUNDANT award (a second
         // award event with a different award_id for a job already delivered/paid — seen live in the
         // smoke) or any re-drive must NOT re-run the agent: a duplicate execute burns operator compute
@@ -2362,6 +2601,199 @@ impl SellerNodeRunner {
 }
 
 #[cfg(test)]
+mod slot_gate_tests {
+    //! The execution-slot admission algebra — reserve-at-claim, release on every terminal path,
+    //! and the lapse sweep. These drive [`SlotGate`] directly (no relay, no agent), so they are the
+    //! deterministic core of the multi-slot correctness claim: the acquire/release PAIRING is what
+    //! keeps a busy node from silently shrinking its own capacity. Each `available()` assertion is a
+    //! revert-red tripwire — neuter a release path and the matching assertion fails.
+    use super::{Reserve, SlotGate};
+    use std::time::{Duration, Instant};
+
+    const LONG: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn one_slot_is_serial_admits_one_then_blocks() {
+        // slots=1 reproduces today's behavior exactly: one claim admitted, the next refused as
+        // SlotsBusy — so a single-slot node never parks a second concurrent claim.
+        let gate = SlotGate::new(1, LONG);
+        assert_eq!(gate.available(), 1);
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        assert_eq!(gate.available(), 0);
+        assert_eq!(gate.try_reserve("b"), Reserve::Full, "second claim must be refused at slots=1");
+    }
+
+    #[test]
+    fn zero_config_clamps_to_serial() {
+        // A misconfigured `slots = 0` is clamped to serial rather than muting the node entirely.
+        let gate = SlotGate::new(0, LONG);
+        assert_eq!(gate.available(), 1);
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        assert_eq!(gate.try_reserve("b"), Reserve::Full);
+    }
+
+    #[test]
+    fn two_slots_admit_two_then_block_the_third() {
+        // slots=2: two concurrent claims parked; a third arriving while both are held is NOT
+        // claimed. This is the gate half of the "3rd offer while both busy is not claimed" property
+        // (the on-the-wire half is the live capstone, P5).
+        let gate = SlotGate::new(2, LONG);
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        assert_eq!(gate.try_reserve("b"), Reserve::Reserved);
+        assert_eq!(gate.available(), 0);
+        assert_eq!(
+            gate.try_reserve("c"),
+            Reserve::Full,
+            "third claim must be refused while both slots busy"
+        );
+    }
+
+    #[test]
+    fn release_returns_the_slot() {
+        // The award-elsewhere / dedup-no-op path: releasing a reserved slot returns capacity.
+        let gate = SlotGate::new(1, LONG);
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        gate.release("a");
+        assert_eq!(gate.available(), 1);
+        assert_eq!(
+            gate.try_reserve("b"),
+            Reserve::Reserved,
+            "a released slot must admit the next claim"
+        );
+    }
+
+    #[test]
+    fn release_is_idempotent() {
+        let gate = SlotGate::new(1, LONG);
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        gate.release("a");
+        gate.release("a"); // second release is a no-op, not a double-free / capacity inflation
+        assert_eq!(gate.available(), 1);
+    }
+
+    #[test]
+    fn re_seen_offer_does_not_double_reserve() {
+        // A re-seen offer for an already-parked claim must not take a second permit — otherwise a
+        // duplicate offer would leak a slot.
+        let gate = SlotGate::new(1, LONG);
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        assert_eq!(gate.try_reserve("a"), Reserve::AlreadyParked);
+        assert_eq!(gate.available(), 0);
+    }
+
+    #[test]
+    fn taken_permit_holds_capacity_until_dropped() {
+        // Models execution: the award moves the permit out into the job task, which holds it until
+        // the job is terminal. Capacity stays consumed while the permit lives and returns on drop —
+        // this is the RAII release that covers delivery, every fail_job path, and a panic.
+        let gate = SlotGate::new(1, LONG);
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        let permit = gate.take_for_execution("a").expect("a reserved permit to take");
+        assert_eq!(gate.available(), 0, "the executing job still holds its slot");
+        assert_eq!(gate.try_reserve("b"), Reserve::Full, "no free slot while the job runs");
+        drop(permit); // job reaches a terminal outcome (or panics — same drop)
+        assert_eq!(gate.available(), 1, "the slot returns when execution ends");
+        assert_eq!(gate.try_reserve("b"), Reserve::Reserved);
+    }
+
+    #[test]
+    fn take_for_execution_is_none_on_the_restart_path() {
+        // No permit parked (restart: durable store has the job, in-memory map is empty) ⇒ None, and
+        // it does not fabricate capacity.
+        let gate = SlotGate::new(1, LONG);
+        assert!(gate.take_for_execution("never-reserved").is_none());
+        assert_eq!(gate.available(), 1);
+    }
+
+    #[test]
+    fn lapse_sweep_reclaims_expired_and_leaves_fresh() {
+        // A zero lapse window makes every parked claim immediately eligible; the sweep returns its
+        // id (so the caller releases the durable claim) and frees the slot.
+        let expiring = SlotGate::new(2, Duration::ZERO);
+        assert_eq!(expiring.try_reserve("a"), Reserve::Reserved);
+        assert_eq!(expiring.try_reserve("b"), Reserve::Reserved);
+        let mut reclaimed = expiring.sweep_lapsed(Instant::now());
+        reclaimed.sort();
+        assert_eq!(reclaimed, vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(expiring.available(), 2, "lapsed claims return their slots");
+
+        // A long lapse window: a just-reserved claim is not swept.
+        let fresh = SlotGate::new(1, LONG);
+        assert_eq!(fresh.try_reserve("a"), Reserve::Reserved);
+        assert!(fresh.sweep_lapsed(Instant::now()).is_empty(), "a fresh claim must not lapse");
+        assert_eq!(fresh.available(), 0, "the un-lapsed claim keeps its slot");
+    }
+
+    #[test]
+    fn every_release_path_returns_capacity() {
+        // Consolidated revert-red over the three ways a reserved slot is returned: explicit release
+        // (award-elsewhere / dedup), permit-drop (execution terminal / panic), and the lapse sweep.
+        // If any one path stopped returning the permit, the final assertion would fail.
+        let gate = SlotGate::new(1, Duration::ZERO);
+
+        // 1. explicit release
+        assert_eq!(gate.try_reserve("release"), Reserve::Reserved);
+        gate.release("release");
+        assert_eq!(gate.available(), 1);
+
+        // 2. permit drop (models a job finishing or panicking)
+        assert_eq!(gate.try_reserve("execute"), Reserve::Reserved);
+        let permit = gate.take_for_execution("execute").expect("permit");
+        drop(permit);
+        assert_eq!(gate.available(), 1);
+
+        // 3. lapse sweep
+        assert_eq!(gate.try_reserve("lapse"), Reserve::Reserved);
+        let _ = gate.sweep_lapsed(Instant::now());
+        assert_eq!(gate.available(), 1, "all three release paths must return the slot");
+    }
+
+    #[test]
+    fn double_release_cannot_exceed_capacity() {
+        // Double-release is worse than a leak: a leak under-counts (safe-ish), but inflating the
+        // count would over-commit and take jobs the node cannot deliver — where money exposure
+        // enters. The permit lives in the parked map XOR in the execution task (an atomic
+        // remove-and-return), and it is an `OwnedSemaphorePermit` released exactly once on drop; the
+        // gate NEVER calls `add_permits`. So a stray release can only ever be a no-op, and the free
+        // count can never exceed the configured capacity.
+        let gate = SlotGate::new(1, LONG);
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        // Award moves the permit out into execution.
+        let permit = gate.take_for_execution("a").expect("permit");
+        // A stray release for the executing job id must NOT fabricate a slot (nothing parked).
+        gate.release("a");
+        assert_eq!(gate.available(), 0, "releasing an executing job's id must not free a slot");
+        // The job ends: exactly one slot returns.
+        drop(permit);
+        assert_eq!(gate.available(), 1);
+        // A second release after the drop is still a no-op — the count cannot exceed capacity.
+        gate.release("a");
+        assert_eq!(gate.available(), 1);
+        assert!(gate.available() <= 1, "live slot count can never exceed configured capacity");
+    }
+
+    #[test]
+    fn awarded_job_is_out_of_lapse_sweep_reach() {
+        // The lapse timer keys off "no award yet": it only sees the parked map. An award moves the
+        // permit into the execution task (removing it from parked), so an awarded job is out of the
+        // sweep's reach entirely — ownership passes from the lapse-timer to the execution lifecycle.
+        // This is why a slow-but-successful delivery can never have its slot freed out from under it,
+        // and why there is no double-count: the sweep and the award both run on the single event
+        // loop, so they never interleave, and the permit is never both sweepable and executing.
+        let gate = SlotGate::new(1, Duration::ZERO); // zero window ⇒ everything parked is eligible
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        let permit = gate.take_for_execution("a").expect("permit");
+        assert!(
+            gate.sweep_lapsed(Instant::now()).is_empty(),
+            "an awarded (executing) job must never be swept, even past the timeout"
+        );
+        assert_eq!(gate.available(), 0, "the executing job keeps its slot despite the elapsed timer");
+        drop(permit);
+        assert_eq!(gate.available(), 1);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2379,6 +2811,8 @@ mod tests {
             claim_open_pool,
             offer_backfill_secs: 0,
             contribution_enabled: true,
+            slots: 1,
+            claim_award_timeout_secs: None,
         }
     }
 

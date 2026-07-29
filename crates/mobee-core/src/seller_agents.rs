@@ -17,9 +17,11 @@
 //!   not served; there is no nearest-match fallback, because silently running a job on a harness
 //!   the buyer did not ask for is the failure this registry exists to prevent.
 //!
-//! Execution is serial regardless of size — one job at a time across the whole registry. Pool
-//! counts (`slots`) are parsed and REFUSED above 1 (see [`RegistryError::ParallelismUnsupported`]):
-//! the config shape is ready for parallel pools, the execution engine is deliberately not.
+//! How many awarded jobs run at once is governed by the homogeneous node-level `[seller] slots`
+//! (see [`crate::home::SellerConfig::slots`]) — every slot runs whichever harness the job asked
+//! for. The PER-ENTRY pool count (`agents = [{ name, slots }]`) is a different, heterogeneous knob
+//! and is still parsed and REFUSED above 1 (see [`RegistryError::ParallelismUnsupported`]):
+//! per-harness slot pools are out of scope for V1, whose slots are homogeneous.
 
 use std::collections::BTreeMap;
 
@@ -109,8 +111,8 @@ impl std::fmt::Display for RegistryError {
             }
             Self::ParallelismUnsupported { name, slots } => write!(
                 formatter,
-                "agent {name:?} declares slots={slots}: parallel execution is not supported \
-                 (this node runs one job at a time). Set slots = 1."
+                "agent {name:?} declares slots={slots}: per-harness slot pools are not supported \
+                 (V1 slots are homogeneous — use node-level `[seller] slots` instead). Set slots = 1."
             ),
             Self::Empty => write!(
                 formatter,
@@ -311,6 +313,8 @@ mod tests {
             claim_open_pool: false,
             offer_backfill_secs: 0,
             contribution_enabled: true,
+            slots: 1,
+            claim_award_timeout_secs: None,
         }
     }
 

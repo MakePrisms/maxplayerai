@@ -175,7 +175,9 @@ pub struct SellerConfig {
     /// table). Empty ⇒ the node serves with the single `agent_command` alone.
     ///
     /// The node advertises this list on its heartbeat and claims, and dispatches a job to the
-    /// harness its offer requested. Execution stays one job at a time across the whole list.
+    /// harness its offer requested. How many awarded jobs run at once is governed by the
+    /// homogeneous [`SellerConfig::slots`] (every slot runs whichever harness the job asked for),
+    /// not by per-entry pool counts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<AgentSlotConfig>,
     /// Opt-in to claim untargeted/open offers. Default **false** (targeted-only).
@@ -200,6 +202,22 @@ pub struct SellerConfig {
     /// (interop courtesy — NOT a security control; buyer refusal is the boundary).
     #[serde(default = "default_contribution_enabled")]
     pub contribution_enabled: bool,
+    /// Homogeneous execution slots: the maximum number of awarded jobs this node runs
+    /// concurrently. Default **1** — serial execution, today's behavior exactly. A slot is
+    /// RESERVED when the node claims an offer and released on the job's terminal outcome
+    /// (delivery/failure), when the buyer awards another seller, or when a parked claim lapses
+    /// unawarded. Reserve-at-claim is what makes a fully loaded node invisible to the market: with
+    /// no free slot it simply does not claim. Every slot is identical and runs the seller's
+    /// configured harness — there is no per-slot harness typing (that is the per-agent
+    /// `AgentSlotConfig.slots`, which stays refused above 1).
+    #[serde(default = "default_slots")]
+    pub slots: usize,
+    /// How long (seconds) a parked, unawarded claim may hold its reserved execution slot before the
+    /// lapse sweep reclaims it. Deliberately separate from — and much shorter than — the claim's
+    /// on-the-wire publish window, which stays long for relay resilience. `None` ⇒ the built-in
+    /// default (see `DEFAULT_CLAIM_AWARD_TIMEOUT_SECS`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_award_timeout_secs: Option<u64>,
 }
 
 /// Executor sandbox config (`[sandbox]` section): the launcher the awarded agent command runs
@@ -513,6 +531,13 @@ pub fn default_retro_enabled() -> bool {
 /// Default for [`SellerConfig::contribution_enabled`] — contribution support ON.
 pub fn default_contribution_enabled() -> bool {
     true
+}
+
+/// serde default for [`SellerConfig::slots`]: 1. A `[seller]` block written before this field
+/// existed parses to a single execution slot — serial execution, byte-identical to the pre-
+/// multi-slot behavior.
+pub fn default_slots() -> usize {
+    1
 }
 
 /// serde default for [`SellerConfig::offer_backfill_secs`]: 1200s (20 min). A `[seller]` block
