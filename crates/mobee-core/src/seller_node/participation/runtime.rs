@@ -421,19 +421,20 @@ impl Participation {
                 // because `due_resyncs` is ordered — discarded every healthy relay's messages and starved
                 // their retries forever. Being conservative on failure is necessary and not sufficient:
                 // an error path that halts the loop turns one dead peer into a fleet outage.
-                let outcome = self.resync_relay(url).await;
-                if outcome.is_err() {
-                    self.relay_faults = self.relay_faults.saturating_add(1);
-                }
-                if let Some(live) = self.live.get_mut(url) {
-                    // ★★ The FLOOR records that an ATTEMPT happened, so it advances either way. Leaving it
-                    // untouched on failure — which is what "on error both stay put" did — re-asks a dead
-                    // relay at pump frequency, the hot loop the floor exists to prevent. The MARKER records
-                    // whether the recovery HAPPENED, so only success clears it. Rate and debt are separate
-                    // questions about the same event, and a failed attempt answers only the first.
-                    live.last_resync_unix = now;
-                    if outcome.is_ok() {
-                        live.resync_pending = false;
+                // ★★ The FLOOR records that an ATTEMPT happened, so it advances either way. Leaving it
+                // untouched on failure — which is what "on error both stay put" did — re-asks a dead
+                // relay at pump frequency, the hot loop the floor exists to prevent. The DEBTS record
+                // whether the recovery HAPPENED, so only success discharges them. Rate and debt are
+                // separate questions about the same event, and a failed attempt answers only the first.
+                match self.resync_relay(url).await {
+                    // ★ And success discharges EVERY debt this install paid, not just the one that asked
+                    // for it — see [`Self::settle_wake_surface`]. It advances the floor too.
+                    Ok(installed) => self.settle_wake_surface(url, &installed, now),
+                    Err(_) => {
+                        self.relay_faults = self.relay_faults.saturating_add(1);
+                        if let Some(live) = self.live.get_mut(url) {
+                            live.last_resync_unix = now;
+                        }
                     }
                 }
             }
@@ -676,6 +677,41 @@ impl Participation {
         }
     }
 
+    /// Install the wake surface, so a test starts from the state a live relay is actually in — with
+    /// subscriptions REGISTERED in the SDK, which is the precondition the reconnect has to destroy.
+    #[cfg(test)]
+    async fn install_wake_surface(&mut self, url: &str) {
+        let Some(entry) = self.live.get(url) else {
+            return;
+        };
+        subscribe_wake_surface(&entry.reader, &entry.engine, self.me)
+            .await
+            .expect("install wake surface");
+    }
+
+    /// Kill the socket while leaving the SDK's subscription registry intact — the state a relay that
+    /// refused our auth and then dropped the connection leaves behind, and the one in which the SDK's
+    /// bulk `unsubscribe_all()` stops early.
+    #[cfg(test)]
+    async fn drop_socket(&self, url: &str) {
+        if let Some(entry) = self.live.get(url) {
+            entry.reader.disconnect().await;
+        }
+    }
+
+    /// How many subscriptions the SDK still holds registered for this relay.
+    ///
+    /// ★ This is the SDK's own state, not ours — and it is the SAME map `resubscribe()` reads:
+    /// `RelayPool::subscriptions` is built by asking each `Relay` for its registry, not from a separate
+    /// pool-side cache. Verified in `nostr-relay-pool-0.44.1` `pool/mod.rs`.
+    #[cfg(test)]
+    async fn registered_subscriptions(&self, url: &str) -> usize {
+        match self.live.get(url) {
+            Some(entry) => entry.reader.subscriptions().await.len(),
+            None => 0,
+        }
+    }
+
     /// Put a relay into quarantine at a chosen deadline — the state an auth failure leaves behind.
     #[cfg(test)]
     fn owe_reprove(&mut self, url: &str, at: i64) {
@@ -873,16 +909,22 @@ impl Participation {
         if let Some(live) = self.live.get_mut(&url) {
             live.reprove_due = None;
         }
-        let Some(entry) = self.live.get(&url) else {
-            return;
+        let rebuilt = {
+            let Some(entry) = self.live.get(&url) else {
+                return;
+            };
+            subscribe_wake_surface(&entry.reader, &entry.engine, self.me).await
         };
-        if subscribe_wake_surface(&entry.reader, &entry.engine, self.me)
-            .await
-            .is_err()
-        {
-            self.relay_faults = self.relay_faults.saturating_add(1);
-            if let Some(live) = self.live.get_mut(&url) {
-                live.resync_pending = true;
+        match rebuilt {
+            // ★ The rebuild that ends a quarantine pays whatever the quarantine held: the resync that could
+            // not run, the re-sends that could not go out. Same settlement as the resync drain, because it
+            // is the same install — see [`Self::settle_wake_surface`].
+            Ok(installed) => self.settle_wake_surface(&url, &installed, now),
+            Err(_) => {
+                self.relay_faults = self.relay_faults.saturating_add(1);
+                if let Some(live) = self.live.get_mut(&url) {
+                    live.resync_pending = true;
+                }
             }
         }
     }
@@ -940,11 +982,41 @@ impl Participation {
     /// re-send the gap. Replay is safe by construction rather than by luck: owed rows are keyed on
     /// `event_id`, and membership is applied in author order, so a re-delivered event either changes
     /// nothing or corrects the ordering.
-    async fn resync_relay(&mut self, url: &str) -> Result<(), ParticipationError> {
+    async fn resync_relay(&mut self, url: &str) -> Result<Vec<String>, ParticipationError> {
         let Some(entry) = self.live.get(url) else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         subscribe_wake_surface(&entry.reader, &entry.engine, self.me).await
+    }
+
+    /// Settle every debt one wake-surface rebuild paid.
+    ///
+    /// ★★★ THE DUAL OF THE FIRE-TIME RULE. Round 11 made sure a debt SURVIVES until its work is done; this
+    /// is the other half — a debt whose work has been done must DIE. A rebuild installs the membership
+    /// filter and every resumable channel, so it discharges a pending resync AND any re-send owed for the
+    /// filters it covers. Clearing only the marker that triggered it left the others recorded, and they
+    /// fired again on the next tick: the same REQs a second time, which on a relay that rate-limits is a
+    /// self-inflicted refusal.
+    ///
+    /// ★★ ONE SETTLEMENT, BOTH CALLERS — the resync drain and a successful re-prove. They pay the same
+    /// debts by running the same install, so they cannot be allowed to disagree about what that discharges;
+    /// the same reason [`Engine::is_resumable`] is shared rather than restated.
+    ///
+    /// ★ Scoped to what was ACTUALLY installed, never "everything owed". A channel the rebuild skipped —
+    /// left, or suppressed — still owes whatever it owed; pruning it here would silently drop a
+    /// subscription nothing else re-sends.
+    ///
+    /// The floor moves too: the work happened now, so "may we ask again yet" counts from now.
+    fn settle_wake_surface(&mut self, url: &str, installed: &[String], now: i64) {
+        let Some(live) = self.live.get_mut(url) else {
+            return;
+        };
+        live.resync_pending = false;
+        live.last_resync_unix = now;
+        live.resend_due.remove(&None);
+        for channel_id in installed {
+            live.resend_due.remove(&Some(channel_id.clone()));
+        }
     }
 
     async fn apply_event(&mut self, url: &str, event: &Event) -> Result<(), ParticipationError> {
@@ -1101,6 +1173,10 @@ impl Participation {
                 if entry.quarantined() {
                     return Ok(());
                 }
+                // ★★★ AND THE REGISTRATIONS GO FIRST, or the quarantine governs nothing. See
+                // [`clear_registrations`]: the SDK re-sends every registered subscription the instant the
+                // socket comes back, underneath every gate in this file.
+                clear_registrations(&entry.reader).await;
                 entry.reader.disconnect().await;
                 entry.reader.connect().await;
                 if let Some(live) = self.live.get_mut(url) {
@@ -1187,20 +1263,62 @@ async fn connect_reader(url: &str, publisher: &Client) -> Result<Client, String>
     Ok(client)
 }
 
-/// Subscribe both filters of the wake surface, resuming each from its own stored cursor.
+/// Install the wake surface — both filters, each resuming from its own stored cursor — and return the
+/// channels it actually subscribed.
+///
+/// ★ THE RETURN VALUE IS THE SETTLEMENT RECEIPT. One call here pays several debts at once — a pending
+/// resync, an owed membership re-send, an owed re-send for any channel it covers — and a debt that was
+/// paid but not cleared fires again next tick as a duplicate REQ. So the caller is told what was
+/// installed rather than left to re-derive it: settle against the ARTIFACT, not against a second guess
+/// at what this function probably did.
+///
+/// On a partial failure this reports NOTHING installed even though the earlier subscribes landed. That
+/// direction is deliberate: an unsettled debt costs a duplicate REQ, an over-settled one costs a
+/// subscription nobody ever re-sends.
 async fn subscribe_wake_surface(
     reader: &Client,
     engine: &Engine,
     me: PublicKey,
-) -> Result<(), ParticipationError> {
+) -> Result<Vec<String>, ParticipationError> {
     subscribe_membership(reader, me, engine.membership_cursor()?).await?;
     // Exactly the channels we were in when we stopped — read from the store, never re-derived from
     // the membership feed, which resumes past the notifications that admitted us.
-    for channel_id in engine.channels_to_resume()? {
-        let since = engine.channel_cursor(&channel_id)?;
-        subscribe_channel(reader, &channel_id, me, since).await?;
+    let channels = engine.channels_to_resume()?;
+    for channel_id in &channels {
+        let since = engine.channel_cursor(channel_id)?;
+        subscribe_channel(reader, channel_id, me, since).await?;
     }
-    Ok(())
+    Ok(channels)
+}
+
+/// Drop every subscription the SDK still holds registered for this reader.
+///
+/// ★★★ A GATE OVER OUR OWN CALL SITES IS NOT A GATE. `nostr_sdk` treats `connect()` as a lifecycle
+/// event, not a socket operation: `post_connection` calls `resubscribe()` unconditionally for a readable
+/// relay, which re-sends a REQ for every registered subscription. Worse, it is guaranteed rather than
+/// merely possible on exactly the path we take — an `auth-required` `CLOSED` makes the SDK mark that
+/// subscription `closed`, and `should_resubscribe` returns true immediately for a closed non-auto-closing
+/// subscription. So the very frame that told us our access may be revoked is what arms the library to ask
+/// again, beneath the quarantine, before the probe. Verified in `nostr-relay-pool-0.44.1`
+/// (`relay/inner.rs`: `post_connection`, `resubscribe`, `should_resubscribe`, `subscription_closed`).
+///
+/// ⇒ **the reconnect has nothing to re-send only if the registry is empty when the socket returns.**
+///
+/// ★★ ONE ID AT A TIME RATHER THAN `unsubscribe_all()`, AND THE REASON IS WEAKER THAN IT LOOKS — stated
+/// plainly so nobody "simplifies" it on a wrong premise, and nobody trusts it as a bug fix either.
+/// The bulk helper removes each id from the registry and then sends that id's `CLOSE`, propagating the
+/// send error with `?`, so a failed send abandons the loop and leaves the remaining ids REGISTERED. But
+/// that send fails only for a relay `ensure_operational` rejects — `Initialized` (never connected) or
+/// `Banned`; `Sleeping` self-heals because `ensure_awake_for_activity` runs first — and this reader is in
+/// neither state by the time we get here. **So this is not a live defect, and no test reddens for it:**
+/// `unsubscribe_all()` clears the registry here too, including on a socket we have already dropped.
+/// Per-id anyway, because it costs one line and makes the property hold without depending on that
+/// reachability argument staying true across an SDK upgrade. Round 9's isolate-per-item rule, applied to
+/// a dependency's loop — as insurance, not as a repair.
+async fn clear_registrations(reader: &Client) {
+    for id in reader.subscriptions().await.into_keys() {
+        reader.unsubscribe(&id).await;
+    }
 }
 
 async fn subscribe_membership(
@@ -2333,6 +2451,193 @@ mod tests {
             Some(owed),
             "a second auth-required CLOSED pushed the settle out again — a relay that keeps refusing can \
              hold off the probe of its own access indefinitely, one refusal at a time"
+        );
+    }
+
+    /// ★ ROUND 12 / FINDING 1. The quarantine governed our call sites; it did not govern the SDK.
+    ///
+    /// `nostr_sdk`'s `post_connection` calls `resubscribe()` for a readable relay, and
+    /// `should_resubscribe` returns true immediately for a subscription the relay marked `closed` — which
+    /// an `auth-required` `CLOSED` does. So the reconnect re-sent the whole wake surface on the unproven
+    /// socket, beneath every gate in this file.
+    ///
+    /// ⚠ WHAT THIS TEST CAN AND CANNOT REACH. The fixture relay never completes a websocket handshake, so
+    /// `post_connection` never runs in-process and the library's REQ is NOT observable here. What is
+    /// observable is the PRECONDITION that makes it possible: subscriptions still registered when the
+    /// socket returns. This asserts the registry is empty, which is the link in the chain we control. The
+    /// rest of the chain is read from the SDK source, cited on [`clear_registrations`], and the live legs
+    /// are where a real handshake happens.
+    #[tokio::test]
+    async fn a_reconnect_leaves_the_sdk_nothing_to_resubscribe() {
+        let store = test_store("reconnect-registrations");
+        let me = Keys::generate().public_key();
+        joined(&store, GOOD_RELAY, "chan-1", now_unix() - 100);
+
+        let (good_tx, good_rx) = broadcast::channel(8);
+        good_tx
+            .send(RelayPoolNotification::Message {
+                relay_url: GOOD_RELAY.parse().expect("url"),
+                message: RelayMessage::Closed {
+                    subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(MEMBERSHIP_SUB)),
+                    message: std::borrow::Cow::Borrowed("auth-required: we need your NIP-42 auth"),
+                },
+            })
+            .expect("send closed");
+
+        let mut participation = Participation::for_wire_test_many(
+            vec![(GOOD_RELAY, true, good_rx)],
+            store,
+            me,
+            now_unix(),
+        )
+        .await;
+        participation.install_wake_surface(GOOD_RELAY).await;
+        assert_eq!(
+            participation.registered_subscriptions(GOOD_RELAY).await,
+            2,
+            "the wake surface did not register (membership + chan-1), so an empty registry afterwards \
+             would prove nothing at all"
+        );
+
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+
+        assert!(
+            participation.reprove_deadline(GOOD_RELAY).is_some(),
+            "the auth failure did not trigger the reconnect, so nothing below is being tested"
+        );
+        assert_eq!(
+            participation.registered_subscriptions(GOOD_RELAY).await,
+            0,
+            "the SDK still holds the wake surface registered across the reconnect, so it re-sends every \
+             REQ the instant the socket returns — on the socket whose access is in question, before the \
+             probe, and underneath the quarantine entirely"
+        );
+    }
+
+    /// ★ ROUND 12. The clearing has to work on a socket that is already gone — a relay that refuses our
+    /// auth and then drops the connection is the ordinary case, not the exotic one.
+    ///
+    /// ⚠ WHAT THIS TEST DOES NOT PROVE. It does not discriminate the per-id loop in
+    /// [`clear_registrations`] from the SDK's bulk `unsubscribe_all()`: both pass here, because the failed
+    /// `CLOSE` that would strand the bulk helper's remaining ids needs a relay `ensure_operational`
+    /// rejects, and a dropped socket is not one. Swapping the loop for the bulk call reddens NOTHING —
+    /// that is recorded on `clear_registrations` rather than implied by this test's existence.
+    #[tokio::test]
+    async fn a_dropped_socket_still_gives_up_every_registration() {
+        let store = test_store("reconnect-dead-socket");
+        let me = Keys::generate().public_key();
+        joined(&store, GOOD_RELAY, "chan-1", now_unix() - 100);
+        joined(&store, GOOD_RELAY, "chan-2", now_unix() - 100);
+
+        let (good_tx, good_rx) = broadcast::channel(8);
+        good_tx
+            .send(RelayPoolNotification::Message {
+                relay_url: GOOD_RELAY.parse().expect("url"),
+                message: RelayMessage::Closed {
+                    subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(MEMBERSHIP_SUB)),
+                    message: std::borrow::Cow::Borrowed("auth-required: we need your NIP-42 auth"),
+                },
+            })
+            .expect("send closed");
+
+        let mut participation = Participation::for_wire_test_many(
+            vec![(GOOD_RELAY, true, good_rx)],
+            store,
+            me,
+            now_unix(),
+        )
+        .await;
+        participation.install_wake_surface(GOOD_RELAY).await;
+        // Three registrations, so "stopped after the first" and "cleared them all" are distinguishable —
+        // with one subscription the bulk helper's early return is indistinguishable from success.
+        participation.drop_socket(GOOD_RELAY).await;
+        assert_eq!(
+            participation.registered_subscriptions(GOOD_RELAY).await,
+            3,
+            "the registry did not survive the dropped socket, so this test cannot be about giving it up"
+        );
+
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+
+        assert_eq!(
+            participation.registered_subscriptions(GOOD_RELAY).await,
+            0,
+            "subscriptions are still registered after the reconnect on a dead socket — the bulk \
+             unsubscribe abandoned the loop on the first failed CLOSE, and everything behind it stays \
+             armed for the SDK to re-send"
+        );
+    }
+
+    /// ★ ROUND 12 / FINDING 2, and the dual of round 11: a debt that SURVIVES until its work is done must
+    /// also DIE once something else does that work.
+    ///
+    /// One wake-surface rebuild installs the membership filter and every resumable channel, so it pays a
+    /// pending resync AND the re-sends owed for those filters. Clearing only the marker that asked for it
+    /// left the rest recorded, and they fired again next tick — the same REQs twice, which on a relay that
+    /// rate-limits is a refusal we caused ourselves.
+    ///
+    /// The deadlines are far in the future so `drain_resends` cannot be what cleared them: settlement is
+    /// the only thing that can. And `chan-sup` is the control — the rebuild skips a suppressed channel, so
+    /// its debt must SURVIVE. Settlement is scoped to what was installed, not to everything owed.
+    #[tokio::test]
+    async fn a_wake_surface_rebuild_settles_every_debt_it_paid() {
+        let store = test_store("settlement");
+        let me = Keys::generate().public_key();
+        let long_ago = now_unix() - 86_400;
+        joined(&store, GOOD_RELAY, "chan-1", long_ago);
+        joined_and_suppressed(&store, GOOD_RELAY, "chan-sup", now_unix());
+
+        let (_good_tx, good_rx) = broadcast::channel(8);
+        let mut participation = Participation::for_wire_test_many(
+            vec![(GOOD_RELAY, true, good_rx)],
+            store,
+            me,
+            long_ago,
+        )
+        .await;
+        let before = now_unix();
+        participation.owe_resync(GOOD_RELAY);
+        participation.owe_resend(GOOD_RELAY, None, before + 600);
+        participation.owe_resend(GOOD_RELAY, Some("chan-1"), before + 600);
+        participation.owe_resend(GOOD_RELAY, Some("chan-sup"), before + 600);
+
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+
+        assert!(
+            !participation.resync_pending(GOOD_RELAY),
+            "the resync did not succeed, so nothing below is about settlement"
+        );
+        assert!(
+            participation.resend_deadline(GOOD_RELAY, None).is_none(),
+            "the rebuild installed the membership filter and left the re-send owed anyway — the same REQ \
+             goes out a second time on the next tick"
+        );
+        assert!(
+            participation
+                .resend_deadline(GOOD_RELAY, Some("chan-1"))
+                .is_none(),
+            "the rebuild subscribed chan-1 and left its re-send owed anyway — a duplicate REQ, and on a \
+             rate-limiting relay a refusal we brought on ourselves"
+        );
+        assert!(
+            participation
+                .resend_deadline(GOOD_RELAY, Some("chan-sup"))
+                .is_some(),
+            "a suppressed channel is NOT in the wake surface, so its debt was not paid — settling it here \
+             drops a subscription nothing else will ever re-send"
+        );
+        assert!(
+            participation.last_resync_unix(GOOD_RELAY) >= before,
+            "the floor did not move, so the work that just happened does not count against the next ask"
         );
     }
 
