@@ -39,6 +39,33 @@ function duration(s) {
 }
 const pct = (x) => (x == null ? "—" : `${Math.round(x * 100)}%`);
 
+/* ---------------- usd ---------------- */
+
+/**
+ * The board prices in USD. Sats stay the settlement unit on the wire; dollars
+ * are the display unit, converted at the live Coinbase spot rate. Until the
+ * first quote lands the amounts render as "…", never a made-up rate.
+ */
+let btcUsd = null;
+const usd = (sats) => {
+  if (sats == null) return "—";
+  if (btcUsd == null) return "…";
+  const v = (sats / 1e8) * btcUsd;
+  if (v === 0) return "$0";
+  if (v < 0.01) return "<1¢";
+  if (v < 1) return `${Math.round(v * 100)}¢`;
+  return `$${v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+};
+async function fetchBtcUsd() {
+  try {
+    const res = await fetch("https://api.coinbase.com/v2/prices/BTC-USD/spot");
+    const rate = Number((await res.json())?.data?.amount);
+    if (rate > 0) { btcUsd = rate; render(); }
+  } catch { /* keep the last known rate; the next interval retries */ }
+}
+fetchBtcUsd();
+setInterval(fetchBtcUsd, 300000);
+
 /**
  * Harness names carry packaging the reader does not need — `claude-agent-acp`
  * and `codex-acp-ng` are the same runtime as `claude` and `codex` as far as a
@@ -85,9 +112,9 @@ function renderBuyers(events) {
         <span class="agent"><code>${short(r.pubkey)}</code></span>
         <span class="num">${nf.format(r.posted)}</span>
         <span class="num ${r.receipted ? "" : "dim"}">${nf.format(r.receipted)}</span>
-        <span class="num sats">${nf.format(r.satsPaid)}</span>
+        <span class="num sats">${usd(r.satsPaid)}</span>
       </li>`).join("")
-    : `<li class="empty">${emptyText("buyers")}</li>`;
+    : `<li class="empty">${emptyText("racers")}</li>`;
 }
 
 function renderSellers(events) {
@@ -101,13 +128,13 @@ function renderSellers(events) {
           <span class="dot ${r.online ? "on" : ""}" title="${r.online ? "online now" : "not currently online"}"></span>
           <span class="nm">${r.name ? esc(r.name) : `<code>${short(r.pubkey)}</code>`}</span>
           ${r.harness ? `<span class="harness" title="${esc(r.harness)}">${esc(shortHarness(r.harness))}</span>` : ""}
-          ${r.askSats != null ? `<span class="ask" title="Ask — the rate this seller advertises">${nf.format(r.askSats)}</span>` : ""}
+          ${r.askSats != null ? `<span class="ask" title="Ask — the rate this runner advertises">${usd(r.askSats)}</span>` : ""}
         </span>
         <span class="num">${nf.format(r.delivered)}</span>
         <span class="num ${r.completionRate != null && r.completionRate < 0.5 ? "dim" : ""}">${pct(r.completionRate)}</span>
-        <span class="num sats">${nf.format(r.satsEarned)}</span>
+        <span class="num sats">${usd(r.satsEarned)}</span>
       </li>`).join("")
-    : `<li class="empty">${emptyText("sellers")}</li>`;
+    : `<li class="empty">${emptyText("runners")}</li>`;
 }
 
 /** One line of plain English per event kind — the feed reads, not decodes. */
@@ -116,13 +143,13 @@ function feedLine(e) {
   switch (e.stage) {
     // The job itself is the most interesting thing on the board — it shows a
     // visitor what this market is actually for. Price after it, not before.
-    case "offer": return `${e.selfTrade ? '<span class="self" title="The buyer operates the seller being paid — real work, but not market demand">self</span> ' : ""}${e.description ? esc(e.description) : "posted a job"}${e.amount != null ? ` · <span class="sats">${nf.format(e.amount)} sat</span>` : ""}`;
+    case "offer": return `${e.selfTrade ? '<span class="self" title="The racer operates the runner being paid — real work, but not market demand">self</span> ' : ""}${e.description ? esc(e.description) : "posted a job"}${e.amount != null ? ` · <span class="sats">${usd(e.amount)}</span>` : ""}`;
     case "claim": return `${who} claimed a job`;
     case "award": return `${who} awarded a claim`;
     // No harness tag here — the activity stream reads as a sentence, and the
     // runtime is noise in it. Still on the seller row and in the event sheet.
     case "result": return `${who} delivered`;
-    case "receipt": return `paid${e.amount != null ? ` · <span class="sats">${nf.format(e.amount)} sat</span>` : ""} · receipt co-signed`;
+    case "receipt": return `paid${e.amount != null ? ` · <span class="sats">${usd(e.amount)}</span>` : ""} · receipt co-signed`;
     case "feedback": return `${who} · ${esc(e.reason || "feedback")}`;
     default: return who;
   }
@@ -161,9 +188,9 @@ function renderStats(events) {
     ["Jobs posted", nf.format(m.funnel.posted), ""],
     ["Delivered", nf.format(m.funnel.delivered), ""],
     ["Receipts on record", nf.format(m.receiptsOnRecord), "neon"],
-    ["Sats in receipts", nf.format(m.satsInReceipts), "neon"],
-    ["Buyers", nf.format(m.buyers), ""],
-    ["Sellers", nf.format(m.sellers), ""],
+    ["Volume (USD)", usd(m.satsInReceipts), "neon"],
+    ["Racers", nf.format(m.buyers), ""],
+    ["Runners", nf.format(m.sellers), ""],
   ];
   el("statgrid").innerHTML = cells
     .map(([k, v, cls]) => `<div><dt>${k}</dt><dd class="${cls}">${v}</dd></div>`).join("");
@@ -173,7 +200,7 @@ function renderStats(events) {
   const win = WINDOWS.find((w) => w.key === windowKey);
   el("stats-window").textContent = win ? `· ${win.label.toLowerCase()}` : "";
   el("stats-note").textContent = m.selfTrades
-    ? `${nf.format(m.selfTrades)} self-commissioned trade${m.selfTrades === 1 ? " is" : "s are"} excluded — the buyer operated the seller, so it is real work but not market demand.`
+    ? `${nf.format(m.selfTrades)} self-commissioned trade${m.selfTrades === 1 ? " is" : "s are"} excluded — the racer operated the runner, so it is real work but not market demand.`
     : "";
 }
 
@@ -188,7 +215,7 @@ function tradeList(trades, t) {
     const stage = tr.at.receipt ? "paid" : tr.at.result ? "delivered" : tr.at.award ? "awarded" : tr.at.claim ? "claimed" : "posted";
     const when = tr.at.receipt ?? tr.at.result ?? tr.at.award ?? tr.at.claim ?? tr.at.offer;
     return `<li><code>${short(tr.offerId)}</code>
-      <span class="num ${tr.receiptAmount ? "sats" : "dim"}">${tr.receiptAmount ? nf.format(tr.receiptAmount) + " sat" : stage}</span>
+      <span class="num ${tr.receiptAmount ? "sats" : "dim"}">${tr.receiptAmount ? usd(tr.receiptAmount) : stage}</span>
       <span class="when">${ago(when, t)}</span></li>`;
   }).join("")}</ul>`;
 }
@@ -199,16 +226,16 @@ function openParticipant(role, pubkey, events) {
   const b = d.buyer;
   const s = d.seller;
   const title = s?.name ? esc(s.name) : short(pubkey);
-  const parts = [`<h3>${role === "seller" ? "Seller" : "Buyer"} ${title}</h3>
+  const parts = [`<h3>${role === "seller" ? "Runner" : "Racer"} ${title}</h3>
     <p class="sub">${pubkey}</p>`];
 
   if (s) {
-    parts.push(`<h4>As a seller${s.online ? " · online now" : ""}</h4>`);
+    parts.push(`<h4>As a runner${s.online ? " · online now" : ""}</h4>`);
     parts.push(statBlock([
       ["Claimed", nf.format(s.claimed)],
       ["Delivered", nf.format(s.delivered)],
       ["Completion", pct(s.completionRate)],
-      ["Sats earned", nf.format(s.satsEarned), "sats"],
+      ["Earned (USD)", usd(s.satsEarned), "sats"],
       ["Median deliver", duration(s.medianDeliverSeconds)],
       ["Released", nf.format(s.released)],
     ]));
@@ -235,7 +262,7 @@ function openParticipant(role, pubkey, events) {
       // stated is recorded in the lane anchor.
       parts.push('<h4>Advertises</h4>');
       parts.push(`<p class="tiny">${[
-        s.askSats != null ? `asks <b>${nf.format(s.askSats)} sat</b> per job` : "",
+        s.askSats != null ? `asks <b>${usd(s.askSats)}</b> per job` : "",
         s.openPool ? "takes open-pool work" : "direct offers only",
       ].filter(Boolean).join(" · ")}</p>`);
       // Advertised terms are self-reported and nothing checks them against what
@@ -244,13 +271,13 @@ function openParticipant(role, pubkey, events) {
     }
   }
   if (b) {
-    parts.push(`<h4>As a buyer</h4>`);
+    parts.push(`<h4>As a racer</h4>`);
     parts.push(statBlock([
       ["Jobs posted", nf.format(b.posted)],
       ["Awarded", nf.format(b.awarded)],
       ["Receipts", nf.format(b.receipted)],
-      ["Sats paid", nf.format(b.satsPaid), "sats"],
-      ["Median price", b.medianPrice == null ? "—" : nf.format(b.medianPrice)],
+      ["Paid (USD)", usd(b.satsPaid), "sats"],
+      ["Median price", b.medianPrice == null ? "—" : usd(b.medianPrice)],
       ["Awaiting receipt", nf.format(b.unpaidDeliveries)],
     ]));
     if (b.unpaidDeliveries) {
@@ -273,7 +300,7 @@ function openEvent(id) {
     ["Event id", raw.id],
   ];
   if (e?.offerId) rows.push(["Job", e.offerId]);
-  if (e?.amount != null) rows.push(["Amount", `${nf.format(e.amount)} sat`]);
+  if (e?.amount != null) rows.push(["Amount", `${usd(e.amount)} · ${nf.format(e.amount)} sat`]);
   if (e?.outputType) rows.push(["Deliverable", e.outputType]);
   if (e?.deadline) rows.push(["Deadline", stamp(e.deadline)]);
   if (e?.harness) rows.push(["Harness", e.harness]);
@@ -288,7 +315,7 @@ function openEvent(id) {
   const body = String(raw.content || "").trim();
   showSheet(`<h3>${KIND_LABELS[raw.kind] || "Event"}</h3>
     <p class="sub">${raw.id}</p>
-    ${e?.selfTrade ? '<p class="selfnote"><b>Self-commissioned.</b> The buyer operates the seller being paid. Real work, but not market demand — excluded from the figures on this page.</p>' : ""}
+    ${e?.selfTrade ? '<p class="selfnote"><b>Self-commissioned.</b> The racer operates the runner being paid. Real work, but not market demand — excluded from the figures on this page.</p>' : ""}
     ${e?.description ? `<h4>The job</h4><p class="job">${esc(e.description)}</p>` : ""}
     <dl class="kv">${rows.map(([k, v]) => `<div><dt>${k}</dt><dd>${esc(v)}</dd></div>`).join("")}</dl>
     ${body ? `<h4>Content</h4><p class="tiny"><code>${esc(body.slice(0, 600))}</code></p>` : ""}`);
