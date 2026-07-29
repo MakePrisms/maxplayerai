@@ -114,6 +114,12 @@ impl Engine {
             .note_retry_attempt(&self.relay_url, channel_id, now_unix)
     }
 
+    /// A retry REQ never left — see [`SellerStore::note_retry_send_failed`].
+    pub fn note_retry_send_failed(&self, channel_id: &str, now_unix: i64) -> Result<(), StoreError> {
+        self.store
+            .note_retry_send_failed(&self.relay_url, channel_id, now_unix)
+    }
+
     /// Drop retry-in-flight markers left by a previous process — see [`SellerStore::clear_retries_in_flight`].
     pub fn forget_retries_in_flight(&self, now_unix: i64) -> Result<u64, StoreError> {
         self.store.clear_retries_in_flight(&self.relay_url, now_unix)

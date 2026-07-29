@@ -1201,6 +1201,35 @@ impl SellerStore {
         Ok(())
     }
 
+    /// Our own retry REQ never left — restart the wait WITHOUT escalating.
+    ///
+    /// ★ The failure is ours, not the relay's, so [`Self::advance_suppression`] would be wrong: it would
+    /// charge a backoff step for our dead socket, and a channel could reach the six-hour cap without the
+    /// relay having refused anything. But doing nothing is worse. The channel stays due with no retry armed,
+    /// so the pump re-attempts it on EVERY tick — a hot loop against a relay that is already failing, which
+    /// is exactly what the backoff exists to prevent. Not-escalating and not-waiting are different choices.
+    ///
+    /// ★★ This RE-STAMPS `suppressed_at_unix`, which is the write [`Self::advance_suppression`] refuses to
+    /// make on an unattributable refusal — and the difference is WHO CONTROLS THE RATE. There, the trigger is
+    /// a `CLOSED` the relay may send as often as it likes, so re-stamping lets it postpone the retry forever
+    /// (starvation). Here the trigger is our own send attempt, which happens at most once per backoff
+    /// interval by construction, so the wait cannot be driven by anyone else. Do not "simplify" these two
+    /// into one rule: a legitimate re-stamp and a starvation are the same write with different rate owners.
+    pub fn note_retry_send_failed(
+        &self,
+        relay_url: &str,
+        channel_id: &str,
+        now_unix: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE participation_channels SET suppressed_at_unix = ?3, updated_at_unix = ?3
+             WHERE relay_url = ?1 AND channel_id = ?2 AND suppressed = 1 AND retry_started_unix = 0",
+            params![relay_url, channel_id, now_unix],
+        )?;
+        Ok(())
+    }
+
     /// A refusal — the first one, or a `CLOSED` answering a retry. Raises the suppression and ADVANCES
     /// the backoff. Returns whether this raised a suppression that was not already up.
     ///

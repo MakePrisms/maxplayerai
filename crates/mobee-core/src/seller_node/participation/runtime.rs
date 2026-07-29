@@ -38,6 +38,14 @@ const POLL_TICK: Duration = Duration::from_millis(50);
 /// path into a hot loop against the relay.
 const MIN_RESYNC_INTERVAL_SECS: i64 = 5;
 
+/// Ceiling on a `CLOSED` retry hint, and the delay used when the relay gives none.
+///
+/// ★ The hint is a number a PEER chose. Honouring it unbounded lets any relay park participation for as
+/// long as it likes by answering one REQ with `rate-limited: retry in 86400`. A cap makes the worst case
+/// ours to choose; the floor of 1s keeps a `retry in 0` from becoming a hot loop.
+const MAX_RESEND_DELAY_SECS: u64 = 300;
+const DEFAULT_RESEND_DELAY_SECS: u64 = 30;
+
 /// The subscription id of one channel's mention filter.
 fn channel_sub(channel_id: &str) -> String {
     format!("participation:chan:{channel_id}")
@@ -109,6 +117,14 @@ struct Live {
     /// A resync was owed but deferred by the floor interval. Held as STATE, because a throttled
     /// recovery that is merely dropped is a recovery that never happened.
     resync_pending: bool,
+    /// Subscriptions a `CLOSED` asked us to re-send, and the earliest tick that may do it. `None` keys the
+    /// membership filter; `Some(channel)` a channel filter.
+    ///
+    /// ★ A DEADLINE THE PUMP CHECKS, never an inline sleep. Waiting inside the batch loop blocks every
+    /// other relay's traffic for a duration a peer chose, so one relay's `retry in 86400` stopped all
+    /// participation. In-memory is fine for the same reason `resync_pending` is: a restart rebuilds the
+    /// whole wake surface from durable cursors, which is strictly more than a pending resend would do.
+    resend_due: BTreeMap<Option<String>, i64>,
 }
 
 /// The node's live participation across all configured relays.
@@ -118,6 +134,8 @@ pub struct Participation {
     lagged: u64,
     /// Times a `Lagged` was not permitted to discard — see [`Participation::forced_progress`].
     forced_progress: u64,
+    /// Wire failures isolated to one relay or channel — see [`Participation::relay_faults`].
+    relay_faults: u64,
     roster: RelayRoster,
     me: PublicKey,
     /// Kept so access can be RE-proven, not assumed to have survived. A relay whose auth or scope
@@ -192,6 +210,7 @@ impl Participation {
                     progress_since_resync: 0,
                     last_resync_unix: 0,
                     resync_pending: false,
+                    resend_due: BTreeMap::new(),
                 },
             );
         }
@@ -202,6 +221,7 @@ impl Participation {
             me,
             lagged: 0,
             forced_progress: 0,
+            relay_faults: 0,
             publisher: publisher.clone(),
             carrier: carrier.clone(),
             probe_timeout: timeout,
@@ -360,16 +380,32 @@ impl Participation {
                 .map(|(url, _)| url.clone())
                 .collect();
             for url in &due_resyncs {
-                // ★ CLEAR ONLY AFTER SUCCESS. Dropping the marker and advancing the floor before the
-                // subscribe returned threw the owed recovery away on any failure: nothing remembered the
-                // resync was due, so the gap the lag opened became permanent — and silently, which is this
-                // module's entire failure class. On error both stay put and the next tick tries again.
-                self.resync_relay(url).await?;
+                // ★ ISOLATED TO THE RELAY THAT FAILED. `?` here aborted the whole pump before the drained
+                // batch was processed, so one permanently-failing relay — which fails FIRST on every tick,
+                // because `due_resyncs` is ordered — discarded every healthy relay's messages and starved
+                // their retries forever. Being conservative on failure is necessary and not sufficient:
+                // an error path that halts the loop turns one dead peer into a fleet outage.
+                let outcome = self.resync_relay(url).await;
+                if outcome.is_err() {
+                    self.relay_faults = self.relay_faults.saturating_add(1);
+                }
                 if let Some(live) = self.live.get_mut(url) {
-                    live.resync_pending = false;
+                    // ★★ The FLOOR records that an ATTEMPT happened, so it advances either way. Leaving it
+                    // untouched on failure — which is what "on error both stay put" did — re-asks a dead
+                    // relay at pump frequency, the hot loop the floor exists to prevent. The MARKER records
+                    // whether the recovery HAPPENED, so only success clears it. Rate and debt are separate
+                    // questions about the same event, and a failed attempt answers only the first.
                     live.last_resync_unix = now;
+                    if outcome.is_ok() {
+                        live.resync_pending = false;
+                    }
                 }
             }
+
+            // Re-send subscriptions a `CLOSED` deferred, now that their capped deadline has passed. Grouped
+            // with the resync because both are owed WIRE RECOVERY and neither arms an attribution token —
+            // which is why they may run before the batch while `retry_suppressed_channels` may not.
+            self.drain_resends(now).await;
 
             for (url, message) in batch {
                 match message {
@@ -461,12 +497,14 @@ impl Participation {
                 progress_since_resync,
                 last_resync_unix,
                 resync_pending: false,
+                resend_due: BTreeMap::new(),
             },
         );
         Self {
             live,
             lagged: 0,
             forced_progress: 0,
+            relay_faults: 0,
             roster: RelayRoster::new(vec![url.to_string()]),
             me,
             publisher: Client::default(),
@@ -507,13 +545,88 @@ impl Participation {
         notifications: broadcast::Receiver<RelayPoolNotification>,
         accepted: bool,
     ) -> Self {
-        let participation = Self::for_lag_test(url, store, me, notifications, now_unix(), 1);
-        let live = participation.live.get(url).expect("seam relay");
-        live.reader.add_relay(url).await.expect("add relay");
-        if accepted {
-            live.reader.connect().await;
+        Self::for_wire_test_many(vec![(url, accepted, notifications)], store, me, now_unix()).await
+    }
+
+    /// SEVERAL relays in one pump, each with its own notification channel and its own verdict on whether
+    /// the pool will accept a REQ.
+    ///
+    /// ★ THE FAULT-ISOLATION FIXTURE. A single-relay pump cannot distinguish "the failure was isolated"
+    /// from "the failure stopped everything", because there is nothing else left to stop — every
+    /// isolation test on one relay is green by construction. It takes a failing relay and a healthy relay
+    /// in the SAME pump, and the failing one has to sort FIRST: the due lists are ordered by url, so a
+    /// relay that fails is deterministically reached before the relay that would have worked. That
+    /// ordering is the whole reason one dead peer could starve the rest.
+    #[cfg(test)]
+    async fn for_wire_test_many(
+        relays: Vec<(&str, bool, broadcast::Receiver<RelayPoolNotification>)>,
+        store: SellerStore,
+        me: PublicKey,
+        last_resync_unix: i64,
+    ) -> Self {
+        let mut live = BTreeMap::new();
+        let mut urls = Vec::new();
+        for (url, accepted, notifications) in relays {
+            let reader = Client::default();
+            reader.add_relay(url).await.expect("add relay");
+            if accepted {
+                reader.connect().await;
+            }
+            urls.push(url.to_string());
+            live.insert(
+                url.to_string(),
+                Live {
+                    reader,
+                    notifications,
+                    engine: Engine::new(store.clone(), url.to_string(), me),
+                    progress_since_resync: 1,
+                    last_resync_unix,
+                    resync_pending: false,
+                    resend_due: BTreeMap::new(),
+                },
+            );
         }
-        participation
+        Self {
+            live,
+            lagged: 0,
+            forced_progress: 0,
+            relay_faults: 0,
+            roster: RelayRoster::new(urls),
+            me,
+            publisher: Client::default(),
+            carrier: nostr_sdk::prelude::EventBuilder::new(
+                nostr_sdk::prelude::Kind::Metadata,
+                "{}",
+            )
+            .sign_with_keys(&nostr_sdk::prelude::Keys::generate())
+            .expect("sign carrier"),
+            probe_timeout: Duration::from_secs(1),
+        }
+    }
+
+    /// Mark a resync owed, the state a `Lagged` with forward progress leaves behind. The lag-to-owed path
+    /// is covered by its own tests; this states the precondition so a test can be about the DRAIN.
+    #[cfg(test)]
+    fn owe_resync(&mut self, url: &str) {
+        if let Some(live) = self.live.get_mut(url) {
+            live.resync_pending = true;
+        }
+    }
+
+    /// When this relay may next be resynced, so a test can tell "throttled" from "hot loop".
+    #[cfg(test)]
+    fn last_resync_unix(&self, url: &str) -> i64 {
+        self.live.get(url).map_or(0, |live| live.last_resync_unix)
+    }
+
+    /// The deadline stored for a deferred re-send, if one is owed.
+    #[cfg(test)]
+    fn resend_deadline(&self, url: &str, channel_id: Option<&str>) -> Option<i64> {
+        self.live
+            .get(url)?
+            .resend_due
+            .get(&channel_id.map(str::to_string))
+            .copied()
     }
 
     /// Whether a resync is deferred for this relay, waiting on the floor interval.
@@ -538,6 +651,61 @@ impl Participation {
         self.forced_progress
     }
 
+    /// Wire failures that were isolated to one relay or channel instead of stopping the pump.
+    ///
+    /// A relay cannot be allowed to halt participation for the others — [`Self::start`] already refuses to
+    /// fail because of one, and the pump has to hold the same line or a single dead peer becomes an outage.
+    /// Isolation without a count would be indistinguishable from health, so it is reported: non-zero means
+    /// some relay is not taking our REQs, and a rising number means it still is not.
+    pub fn relay_faults(&self) -> u64 {
+        self.relay_faults
+    }
+
+    /// Re-send the subscriptions a `CLOSED` deferred, for every relay whose deadline has passed.
+    ///
+    /// Failures isolate per subscription: the entry stays owed and its deadline is pushed out by the resync
+    /// floor, so a relay that keeps refusing is re-asked at a bounded rate rather than every tick.
+    async fn drain_resends(&mut self, now: i64) {
+        let due: Vec<(String, Option<String>)> = self
+            .live
+            .iter()
+            .flat_map(|(url, live)| {
+                live.resend_due
+                    .iter()
+                    .filter(|(_, deadline)| now >= **deadline)
+                    .map(move |(target, _)| (url.clone(), target.clone()))
+            })
+            .collect();
+
+        for (url, target) in due {
+            let Some(entry) = self.live.get(&url) else {
+                continue;
+            };
+            let outcome = match &target {
+                Some(channel_id) => match entry.engine.channel_cursor(channel_id) {
+                    Ok(since) => subscribe_channel(&entry.reader, channel_id, self.me, since).await,
+                    // A store read failing is not a relay fault, but it is also not a reason to stop
+                    // serving other relays. Count it and move on; the entry stays owed.
+                    Err(error) => Err(ParticipationError::Store(error)),
+                },
+                None => match entry.engine.membership_cursor() {
+                    Ok(since) => subscribe_membership(&entry.reader, self.me, since).await,
+                    Err(error) => Err(ParticipationError::Store(error)),
+                },
+            };
+            let Some(live) = self.live.get_mut(&url) else {
+                continue;
+            };
+            if outcome.is_ok() {
+                live.resend_due.remove(&target);
+            } else {
+                self.relay_faults = self.relay_faults.saturating_add(1);
+                live.resend_due
+                    .insert(target, now.saturating_add(MIN_RESYNC_INTERVAL_SECS));
+            }
+        }
+    }
+
     /// Re-subscribe every channel whose suppression backoff has elapsed, one attempt each.
     ///
     /// The suppression stays raised until the relay answers with `EOSE`; this only sends the REQ and
@@ -560,8 +728,20 @@ impl Participation {
             // returned marked one in flight for a REQ that never left: the channel went ineligible for the
             // whole timeout and was then charged a backoff step for a failure that was ours, not the
             // relay's. Selecting a channel and claiming to have asked it are different facts.
-            subscribe_channel(&entry.reader, &channel_id, self.me, since).await?;
-            entry.engine.note_retry_sent(&channel_id, now)?;
+            //
+            // ★★ ISOLATED PER CHANNEL. `?` here abandoned every channel queued behind the first failure —
+            // and the failing one is deterministically first, because it stays due while the others never
+            // get asked. One dead relay silently stopped the retry path for all of them. Leaving the token
+            // unarmed is right; leaving the loop is not.
+            match subscribe_channel(&entry.reader, &channel_id, self.me, since).await {
+                Ok(()) => entry.engine.note_retry_sent(&channel_id, now)?,
+                Err(_) => {
+                    self.relay_faults = self.relay_faults.saturating_add(1);
+                    // Not escalated — the failure is ours — but the wait restarts, or this channel is
+                    // re-attempted on every tick. See `SellerStore::note_retry_send_failed`.
+                    entry.engine.note_retry_send_failed(&channel_id, now)?;
+                }
+            }
         }
         Ok(())
     }
@@ -647,16 +827,18 @@ impl Participation {
                 // ★ The relay refused the REQ outright, so the subscription never existed on its
                 // side and nothing is queued behind it. Waiting would wait forever; the REQ has to
                 // go again. Backing off first is what keeps that from becoming a hot loop.
-                tokio::time::sleep(Duration::from_secs(hint_secs.unwrap_or(30))).await;
-                match channel_id {
-                    Some(channel_id) => {
-                        let since = entry.engine.channel_cursor(&channel_id)?;
-                        subscribe_channel(&entry.reader, &channel_id, self.me, since).await?;
-                    }
-                    None => {
-                        let since = entry.engine.membership_cursor()?;
-                        subscribe_membership(&entry.reader, self.me, since).await?;
-                    }
+                //
+                // ★★ RECORDED AS A DEADLINE, NEVER SLEPT ON. This ran `tokio::time::sleep` inline, on a
+                // duration the RELAY chose, uncapped — inside the batch loop, so `rate-limited: retry in
+                // 86400` from any single relay stopped all participation on every relay for a day. Two
+                // separate faults in one line: blocking the shared loop, and letting a peer pick how long.
+                // Now the delay is clamped to a ceiling we own and left for the pump to notice.
+                let delay = hint_secs
+                    .unwrap_or(DEFAULT_RESEND_DELAY_SECS)
+                    .clamp(1, MAX_RESEND_DELAY_SECS);
+                if let Some(live) = self.live.get_mut(url) {
+                    live.resend_due
+                        .insert(channel_id, now_unix().saturating_add(delay as i64));
                 }
             }
             ClosedAction::ReconnectRelay => {
@@ -985,10 +1167,14 @@ mod tests {
             1,
         );
 
-        let outcome = participation.pump(Duration::from_millis(1)).await;
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("a relay fault is isolated and counted, never raised as a pump error");
 
-        assert!(
-            outcome.is_err(),
+        assert_eq!(
+            participation.relay_faults(),
+            1,
             "the resync succeeded, so this test says nothing about what happens when it fails"
         );
         assert!(
@@ -1098,19 +1284,262 @@ mod tests {
         )
         .await;
 
-        let outcome = participation.pump(Duration::from_millis(1)).await;
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("a relay fault is isolated and counted, never raised as a pump error");
 
-        assert!(
-            outcome.is_err(),
-            "an un-connected relay took the REQ, so this test says nothing about a rejected one"
+        assert_eq!(
+            participation.relay_faults(),
+            1,
+            "an un-connected relay took the REQ, so this test says nothing about a rejected one — and a \
+             pool `Ok` with an empty success set is exactly the failure that used to be invisible"
         );
+        // Due after ONE backoff and still at attempt 1: the token never armed (an armed retry is excluded
+        // from the due list entirely) and our own dead socket earned the relay no escalation.
         assert_eq!(
             store
-                .suppressed_channels_due(TEST_RELAY, now_unix())
+                .suppressed_channels_due(TEST_RELAY, now_unix() + 60)
                 .expect("due"),
             vec![("chan-1".to_string(), 1)],
             "the retry token armed for a REQ no relay accepted — the channel is now un-retryable until the \
              timeout expires a retry that never happened"
+        );
+    }
+
+    // ★ The failing relay sorts BEFORE the healthy one on purpose: due lists are ordered by url, so this
+    // is the arrangement in which one dead peer reaches the loop first and starves everything behind it.
+    const BAD_RELAY: &str = "wss://a-bad.invalid";
+    const GOOD_RELAY: &str = "wss://b-good.invalid";
+
+    fn joined_and_suppressed(store: &SellerStore, relay: &str, channel_id: &str, when: i64) {
+        store
+            .record_channel_joined(
+                relay,
+                channel_id,
+                &channel_filter_id(channel_id),
+                &"a".repeat(64),
+                when,
+                when,
+            )
+            .expect("join");
+        store
+            .advance_suppression(relay, channel_id, when)
+            .expect("refused");
+    }
+
+    /// ★ FINDING 1. A failed resync must not take the pump down with it. The bad relay is reached first, so
+    /// `?` there discarded the healthy relay's already-drained batch and starved its retries forever.
+    #[tokio::test]
+    async fn one_relays_failed_resync_does_not_stop_the_others() {
+        let store = test_store("resync-isolation");
+        let me = Keys::generate().public_key();
+        let (_bad_tx, bad_rx) = broadcast::channel(8);
+        let (good_tx, good_rx) = broadcast::channel(8);
+
+        // A message the healthy relay has already handed us. It must still be processed.
+        let event = TestEventBuilder::new(Kind::Metadata, "{}")
+            .sign_with_keys(&Keys::generate())
+            .expect("sign");
+        good_tx
+            .send(RelayPoolNotification::Message {
+                relay_url: GOOD_RELAY.parse().expect("url"),
+                message: RelayMessage::Event {
+                    subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(channel_sub(
+                        "chan-1",
+                    ))),
+                    event: std::borrow::Cow::Owned(event),
+                },
+            })
+            .expect("send");
+
+        // `last_resync_unix = 0` ⇒ both floors have passed, so both resyncs are attempted this tick.
+        let mut participation = Participation::for_wire_test_many(
+            vec![(BAD_RELAY, false, bad_rx), (GOOD_RELAY, true, good_rx)],
+            store,
+            me,
+            0,
+        )
+        .await;
+        participation.owe_resync(BAD_RELAY);
+        participation.owe_resync(GOOD_RELAY);
+
+        let ingested = participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("a relay fault must not surface as a pump error");
+
+        assert_eq!(
+            participation.relay_faults(),
+            1,
+            "the bad relay's failure was not observed, so this test proves nothing about isolating it"
+        );
+        assert!(
+            !participation.resync_pending(GOOD_RELAY),
+            "the healthy relay's resync never ran — the failing relay, which sorts first, aborted the loop"
+        );
+        assert!(
+            participation.resync_pending(BAD_RELAY),
+            "the failed resync stopped being owed, so nothing will ever repair that relay's gap"
+        );
+        assert!(
+            ingested > 0,
+            "the healthy relay's already-drained batch was dropped because another relay failed"
+        );
+    }
+
+    /// ★ FINDING 1, second half. Keeping the marker is right; keeping the FLOOR is not. A relay that always
+    /// fails would be re-asked at pump frequency — the hot loop the floor exists to prevent.
+    #[tokio::test]
+    async fn a_failed_resync_still_advances_the_rate_floor() {
+        let store = test_store("resync-floor");
+        let (_tx, rx) = broadcast::channel(8);
+        let mut participation = Participation::for_wire_test_many(
+            vec![(BAD_RELAY, false, rx)],
+            store,
+            Keys::generate().public_key(),
+            0,
+        )
+        .await;
+        participation.owe_resync(BAD_RELAY);
+
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+
+        assert!(
+            participation.relay_faults() >= 1,
+            "the resync did not fail, so this test says nothing about what a failed one leaves behind"
+        );
+        assert!(
+            participation.resync_pending(BAD_RELAY),
+            "still owed — the recovery has not happened"
+        );
+        assert!(
+            participation.last_resync_unix(BAD_RELAY) > 0,
+            "the floor did not move on a failed attempt, so this relay is re-asked every tick — a hot \
+             loop against a relay that is already failing"
+        );
+        // ★ The count IS the hot-loop evidence, and it has its own message because it is a different
+        // claim: one pump, one attempt. Asserting only `>= 1` above would let a loop hide inside a green.
+        assert_eq!(
+            participation.relay_faults(),
+            1,
+            "one pump made more than one resync attempt at the same relay — the floor is not holding it \
+             down, which is the hot loop rather than a retry"
+        );
+    }
+
+    /// ★ FINDING 2. A failed retry send must not abandon the channels queued behind it, and the failing
+    /// channel must not be re-attempted every tick either.
+    #[tokio::test]
+    async fn one_channels_failed_retry_does_not_block_the_rest() {
+        let store = test_store("retry-isolation");
+        let me = Keys::generate().public_key();
+        let long_ago = now_unix() - 3_600;
+        joined_and_suppressed(&store, BAD_RELAY, "chan-bad", long_ago);
+        joined_and_suppressed(&store, GOOD_RELAY, "chan-good", long_ago);
+
+        let (_bad_tx, bad_rx) = broadcast::channel(8);
+        let (_good_tx, good_rx) = broadcast::channel(8);
+        let mut participation = Participation::for_wire_test_many(
+            vec![(BAD_RELAY, false, bad_rx), (GOOD_RELAY, true, good_rx)],
+            store.clone(),
+            me,
+            now_unix(),
+        )
+        .await;
+
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("a channel fault must not surface as a pump error");
+
+        assert_eq!(
+            participation.relay_faults(),
+            1,
+            "the bad relay's retry did not fail, so nothing was isolated here"
+        );
+        assert!(
+            store
+                .suppressed_channels_due(GOOD_RELAY, now_unix())
+                .expect("due")
+                .is_empty(),
+            "the healthy channel's retry never went out — it was queued behind a failing relay that is \
+             reached first and stays due forever"
+        );
+        assert!(
+            store
+                .suppressed_channels_due(BAD_RELAY, now_unix())
+                .expect("due")
+                .is_empty(),
+            "the failed channel is still due right now, so it is re-attempted on every tick — the wait \
+             must restart even though the failure was ours and earns no escalation"
+        );
+        assert_eq!(
+            store
+                .suppressed_channels_due(BAD_RELAY, now_unix() + 60)
+                .expect("later"),
+            vec![("chan-bad".to_string(), 1)],
+            "the failed channel must come back due after ONE backoff, still at attempt 1 — our own dead \
+             socket is not the relay refusing us"
+        );
+    }
+
+    /// ★ FINDING 3. A `CLOSED` hint is a number a PEER chose. Sleeping on it inline, uncapped, inside the
+    /// batch loop let any single relay stop all participation for as long as it liked.
+    #[tokio::test]
+    async fn a_relay_supplied_retry_hint_is_capped_and_never_slept_on() {
+        let store = test_store("resend-hint");
+        let me = Keys::generate().public_key();
+        joined_and_suppressed(&store, GOOD_RELAY, "chan-1", now_unix());
+
+        let (good_tx, good_rx) = broadcast::channel(8);
+        good_tx
+            .send(RelayPoolNotification::Message {
+                relay_url: GOOD_RELAY.parse().expect("url"),
+                message: RelayMessage::Closed {
+                    subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(channel_sub(
+                        "chan-1",
+                    ))),
+                    message: std::borrow::Cow::Borrowed("rate-limited: retry in 86400 seconds"),
+                },
+            })
+            .expect("send closed");
+
+        let mut participation = Participation::for_wire_test_many(
+            vec![(GOOD_RELAY, true, good_rx)],
+            store,
+            me,
+            now_unix(),
+        )
+        .await;
+
+        let before = now_unix();
+        // A real clock, deliberately: pausing time would make the inline sleep instant and hide the defect.
+        let finished = tokio::time::timeout(
+            Duration::from_secs(3),
+            participation.pump(Duration::from_millis(1)),
+        )
+        .await;
+
+        assert!(
+            finished.is_ok(),
+            "the pump blocked on a relay-supplied delay — one relay can stop every relay's participation \
+             for as long as it asks"
+        );
+        finished.expect("not timed out").expect("pump");
+        let deadline = participation
+            .resend_deadline(GOOD_RELAY, Some("chan-1"))
+            .expect("the re-send was neither sent nor recorded, so the REQ is simply lost");
+        assert!(
+            deadline <= before + MAX_RESEND_DELAY_SECS as i64 + 1,
+            "a peer-supplied hint of 86400s was honoured as given; the ceiling has to be ours to choose"
+        );
+        assert!(
+            deadline > before,
+            "the re-send is due immediately, which makes it a hot loop rather than a backoff"
         );
     }
 
