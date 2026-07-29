@@ -24,7 +24,26 @@ account to be able to publish into it.
    them must read the same string, and it must match the tag with the `v` dropped — the build
    asserts this and stops if anything disagrees.
 2. Open a PR to `dev` with the bump, let it merge, then merge `dev` into `main`.
-3. **Tag `main` and push the tag:**
+3. **Merge `main` back into `dev`.** Not housekeeping — the cut itself is what makes this necessary,
+   so it belongs to the cut rather than to whoever notices later:
+
+   ```sh
+   git checkout dev && git merge --no-ff main && git push origin dev
+   ```
+
+   A `dev → main` merge leaves a commit on `main` that `dev` does not have, so `main` stops being an
+   ancestor of `dev`. While that holds, anything reaching `main` by a fast-forward or a reset silently
+   drops whatever `main` had and `dev` lacked — which includes every previous cut, and anything merged
+   straight to `main` such as a site change. The back-merge restores the ancestor relation, so there is
+   nothing for such a cut to drop.
+
+   Verify rather than assume — this prints nothing and exits `0` when the invariant holds:
+
+   ```sh
+   git fetch origin && git merge-base --is-ancestor origin/main origin/dev
+   ```
+
+4. **Tag `main` and push the tag:**
    ```sh
    git tag v0.2.0 && git push origin v0.2.0
    ```

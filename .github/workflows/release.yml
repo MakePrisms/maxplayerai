@@ -190,8 +190,14 @@ jobs:
             "target/${{ matrix.target }}/release/mobee" \
             '${{ matrix.platform }}' '${{ needs.plan.outputs.version }}' dist-recheck
           ASSET="mobee-${{ needs.plan.outputs.version }}-${{ matrix.platform }}.tar.gz"
-          cmp -s "dist/$ASSET" "dist-recheck/$ASSET" || {
+          cmp "dist/$ASSET" "dist-recheck/$ASSET" || {
             echo "the archive is not a function of its contents: two runs over identical inputs differ" >&2
+            # Say WHERE, because this check runs on platforms nobody here can reproduce, and "they
+            # differ" turns the next run into a guess. A difference inside the first 10 bytes is the
+            # gzip header (offset 5-8 is its timestamp); anything later is the tar stream itself.
+            echo "first 16 bytes of each — gzip header is bytes 1-10, its mtime is 5-8:" >&2
+            od -An -tx1 -N16 "dist/$ASSET" >&2
+            od -An -tx1 -N16 "dist-recheck/$ASSET" >&2
             exit 1
           }
           echo "ok: two runs over identical inputs produced byte-identical archives"

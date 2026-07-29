@@ -38,6 +38,11 @@ jobs:
         run: cargo build -p mobee --release --features acp,wallet --locked
       - name: Build mobee-core (full shipped feature combo)
         run: cargo build -p mobee-core --features acp,gateway,git-delivery,wallet --locked
+      # The acp-gated tests (the ACP driver units + the #223 seller-concurrency regression:
+      # N jobs must OVERLAP on one LocalSet thread and the loop must stay live) only exist under
+      # the acp feature — the default-feature job above compiles them out, so run them here.
+      - name: Test mobee-core (acp)
+        run: cargo test -p mobee-core --features acp --locked
       # Release build: the money-path suite is run in release (as the local money gate is), which
       # also sidesteps a debug-only latent bug in the git-delivery HTTP transport
       # (git_transport::client_short builds a nested tokio runtime inside the async collect path and

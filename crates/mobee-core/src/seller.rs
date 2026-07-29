@@ -953,6 +953,8 @@ offer_backfill_secs = {backfill}
                 claim_open_pool: false,
                 offer_backfill_secs: 0,
                 contribution_enabled: true,
+                slots: 1,
+                claim_award_timeout_secs: None,
             });
         })
         .expect("save");
