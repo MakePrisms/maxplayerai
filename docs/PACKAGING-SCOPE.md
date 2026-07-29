@@ -287,7 +287,7 @@ will hold a ~38M binary per platform sub-package (materially smaller compressed)
   dynamically linked binary with a declared minimum macOS version, which is a different artifact
   with a different portability argument — not a variant of this one.
 
-### Track B — `npx mobee` *([#212](https://github.com/MakePrisms/maxplayerai/issues/212); the MCP-config unlock)*
+### Track B — `npx maxplayer` *([#212](https://github.com/MakePrisms/maxplayerai/issues/212); the MCP-config unlock)*
 
 **Read this section before assuming what "npx" means here.** This repo *banned* npx in the other
 direction: post-R4 the seller deliberately removed the npx auto-launch fallback for ACP adapters,
