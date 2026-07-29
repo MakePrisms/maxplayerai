@@ -55,11 +55,17 @@ TARBALL="$OUTDIR/mobee-$VERSION-$PLATFORM.tar.gz"
 # while quietly reducing the determinism guarantee to same-platform-only.
 TAR="${TAR:-tar}"
 
+# Compression is a separate step, and `gzip -n` is the reason: gzip writes the source name and a
+# timestamp into its header, and `tar -z` delegates to whichever gzip is on PATH, so the archive's
+# determinism silently depended on that implementation choosing to omit them. GNU gzip does; the one
+# on the macOS runner does not, which made darwin archives differ between two runs over identical
+# inputs while linux archives matched. `-n` states the requirement instead of inheriting it.
 "$TAR" --sort=name \
     --owner=0 --group=0 --numeric-owner \
     --mtime='UTC 1970-01-01' \
-    -czf "$TARBALL" \
-    -C "$STAGE" "mobee-$VERSION-$PLATFORM"
+    -cf - \
+    -C "$STAGE" "mobee-$VERSION-$PLATFORM" \
+    | gzip -n > "$TARBALL"
 
 # Assert the archive actually holds all three files. A staging slip produces a well-formed tarball
 # that is simply missing something, and the licence omission is the one nobody notices until it
