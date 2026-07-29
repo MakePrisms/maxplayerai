@@ -46,6 +46,12 @@ const MIN_RESYNC_INTERVAL_SECS: i64 = 5;
 const MAX_RESEND_DELAY_SECS: u64 = 300;
 const DEFAULT_RESEND_DELAY_SECS: u64 = 30;
 
+/// How long a reconnected socket is given to settle before access is re-proven on it.
+///
+/// This was a `wait_for_connection` blocking the pump. The duration is the same; what changed is that
+/// the pump is free during it.
+const RECONNECT_SETTLE_SECS: i64 = 10;
+
 /// The subscription id of one channel's mention filter.
 fn channel_sub(channel_id: &str) -> String {
     format!("participation:chan:{channel_id}")
@@ -125,6 +131,9 @@ struct Live {
     /// participation. In-memory is fine for the same reason `resync_pending` is: a restart rebuilds the
     /// whole wake surface from durable cursors, which is strictly more than a pending resend would do.
     resend_due: BTreeMap<Option<String>, i64>,
+    /// Set when this relay's socket was kicked for an auth failure: the tick at which its access may be
+    /// re-proven. `None` means nothing is owed.
+    reprove_due: Option<i64>,
 }
 
 /// The node's live participation across all configured relays.
@@ -211,6 +220,7 @@ impl Participation {
                     last_resync_unix: 0,
                     resync_pending: false,
                     resend_due: BTreeMap::new(),
+                    reprove_due: None,
                 },
             );
         }
@@ -406,7 +416,17 @@ impl Participation {
             // with the resync because both are owed WIRE RECOVERY and neither arms an attribution token —
             // which is why they may run before the batch while `retry_suppressed_channels` may not.
             self.drain_resends(now).await;
+            self.drain_reproves(now).await;
 
+            // ★ THE `?`s BELOW CARRY ONLY `Store` ERRORS, BY CONSTRUCTION — and that is a property to
+            // re-check, not to trust, because it is what keeps one relay from emptying this batch.
+            // A `Relay` error here would abort mid-batch and drop every message after it, INCLUDING other
+            // relays'. Rather than swallow one at the loop, every wire call reachable from here records a
+            // debt and returns `Ok`, so there is nothing to swallow: `apply_event` turns a failed subscribe
+            // into a `resend_due` entry, and `apply_closed` turns a reconnect into a `reprove_due` deadline.
+            // What remains is `ingest`, `on_closed` and the cursor reads — all `StoreError`, i.e. OUR
+            // persistence failing, which is nobody's peer fault and not a thing to carry on through.
+            // ⚠ Adding a wire call to `apply_event` or `apply_closed` breaks this. Give it a debt to record.
             for (url, message) in batch {
                 match message {
                     RelayMessage::EndOfStoredEvents(subscription_id) => {
@@ -498,6 +518,7 @@ impl Participation {
                 last_resync_unix,
                 resync_pending: false,
                 resend_due: BTreeMap::new(),
+                reprove_due: None,
             },
         );
         Self {
@@ -583,6 +604,7 @@ impl Participation {
                     last_resync_unix,
                     resync_pending: false,
                     resend_due: BTreeMap::new(),
+                    reprove_due: None,
                 },
             );
         }
@@ -627,6 +649,12 @@ impl Participation {
             .resend_due
             .get(&channel_id.map(str::to_string))
             .copied()
+    }
+
+    /// The deadline at which this relay's access will be re-proven after a reconnect, if one is owed.
+    #[cfg(test)]
+    fn reprove_deadline(&self, url: &str) -> Option<i64> {
+        self.live.get(url).and_then(|live| live.reprove_due)
     }
 
     /// Whether a resync is deferred for this relay, waiting on the floor interval.
@@ -706,6 +734,69 @@ impl Participation {
         }
     }
 
+    /// Re-prove access on ONE relay whose reconnect has settled, and rebuild its wake surface.
+    ///
+    /// ★ RE-PROVE, never assume. An auth or scope refusal is the relay saying the admission we hold may no
+    /// longer be valid; resubscribing on that socket because we were admitted minutes ago keeps sending
+    /// traffic to a relay that has revoked us. Admission was established by a positive probe, so it is
+    /// re-checked the same way — a stale `Admitted` is exactly what the roster exists to prevent.
+    ///
+    /// ★★ ONE PER TICK, on purpose. `probe_access` blocks for up to `probe_timeout`, and this is the last
+    /// place in the pump that waits on a relay at all. Bounded per call is not bounded per tick: N relays
+    /// re-proving together would serialise N timeouts while every healthy relay's traffic waited. Taking one
+    /// caps the pump's exposure at a single probe regardless of how many relays failed at once; the rest keep
+    /// their deadline and are picked up on later ticks.
+    async fn drain_reproves(&mut self, now: i64) {
+        let Some(url) = self
+            .live
+            .iter()
+            .find(|(_, live)| live.reprove_due.is_some_and(|at| now >= at))
+            .map(|(url, _)| url.clone())
+        else {
+            return;
+        };
+        // `Client` is `Arc`-backed, so cloning the handle costs a refcount and frees the borrow on
+        // `self.live` — which matters because the denial path REMOVES the entry.
+        let Some(reader) = self.live.get(&url).map(|live| live.reader.clone()) else {
+            return;
+        };
+
+        let outcome = probe::probe_access(
+            &self.publisher,
+            &url,
+            &reader,
+            &self.carrier,
+            self.probe_timeout,
+        )
+        .await;
+        if !matches!(outcome, ProbeOutcome::EchoObserved) {
+            self.roster.record_probe(&url, outcome, now);
+            if let Some(entry) = self.live.remove(&url) {
+                entry.reader.disconnect().await;
+            }
+            return;
+        }
+
+        // ★ Cleared because the thing the deadline was FOR — re-proving access — has now happened. This is
+        // not the arm-on-the-way-in mistake: the wake surface is a separate debt, and it gets its own
+        // marker below rather than riding on this one.
+        if let Some(live) = self.live.get_mut(&url) {
+            live.reprove_due = None;
+        }
+        let Some(entry) = self.live.get(&url) else {
+            return;
+        };
+        if subscribe_wake_surface(&entry.reader, &entry.engine, self.me)
+            .await
+            .is_err()
+        {
+            self.relay_faults = self.relay_faults.saturating_add(1);
+            if let Some(live) = self.live.get_mut(&url) {
+                live.resync_pending = true;
+            }
+        }
+    }
+
     /// Re-subscribe every channel whose suppression backoff has elapsed, one attempt each.
     ///
     /// The suppression stays raised until the relay answers with `EOSE`; this only sends the REQ and
@@ -775,7 +866,25 @@ impl Participation {
             match action {
                 Action::SubscribeChannel { channel_id } => {
                     let since = entry.engine.channel_cursor(&channel_id)?;
-                    subscribe_channel(&entry.reader, &channel_id, self.me, since).await?;
+                    let sent = subscribe_channel(&entry.reader, &channel_id, self.me, since).await;
+                    if sent.is_err() {
+                        // ★ OWED, not raised. `?` here aborted the batch, so one relay's failed subscribe
+                        // discarded every message behind it — other relays' included.
+                        //
+                        // ★★ And a debt is needed, not just isolation: the store already says `joined`
+                        // (`ingest` commits before returning actions), so the channel would sit joined with
+                        // nothing listening. `joined_channels` still lists it, but only a RESTART or a
+                        // lag-triggered resync re-subscribes — in a healthy long-running process neither
+                        // happens, and the invite goes unanswered forever. The resend deadline repairs it,
+                        // reusing the machinery the `CLOSED` path already needed.
+                        self.relay_faults = self.relay_faults.saturating_add(1);
+                        if let Some(live) = self.live.get_mut(url) {
+                            live.resend_due.insert(
+                                Some(channel_id),
+                                now_unix().saturating_add(MIN_RESYNC_INTERVAL_SECS),
+                            );
+                        }
+                    }
                 }
                 Action::UnsubscribeChannel { channel_id } => {
                     entry
@@ -842,37 +951,22 @@ impl Participation {
                 }
             }
             ClosedAction::ReconnectRelay => {
-                // The socket's authentication is what failed, so every subscription on it is
-                // suspect. Reconnect, then rebuild the whole wake surface from the store rather
-                // than from what we thought was subscribed.
+                // The socket's authentication is what failed, so every subscription on it is suspect.
+                // Kick it, and come back for the PROOF on a deadline.
+                //
+                // ★ THE SETTLE IS NO LONGER A BLOCK. `disconnect`/`connect` return promptly (`connect`
+                // sets the relay `Pending` synchronously and spawns its own task); what used to follow was
+                // `wait_for_connection(10s)` plus a probe timeout, run inline in the batch loop. Both are
+                // bounded and self-chosen, so neither is the peer-controlled hazard the `CLOSED` hint was —
+                // but they MULTIPLY: several relays answering auth-failure in one tick stalled the pump by
+                // 10s each, and every healthy relay's traffic waited behind all of them. The settle is now
+                // a deadline the pump notices, and `drain_reproves` takes ONE relay per tick so the probe
+                // timeout cannot multiply either.
                 entry.reader.disconnect().await;
                 entry.reader.connect().await;
-                entry
-                    .reader
-                    .wait_for_connection(Duration::from_secs(10))
-                    .await;
-
-                // ★ RE-PROVE access before trusting the reconnected socket. An auth or scope refusal
-                // is the relay saying our admission may no longer hold; resubscribing on that socket
-                // because we were admitted MINUTES ago would keep sending traffic to a relay that has
-                // revoked us. The admission was established by a positive probe, so it is re-checked
-                // the same way — a stale `Admitted` is exactly what the roster exists to prevent.
-                let outcome = probe::probe_access(
-                    &self.publisher,
-                    url,
-                    &entry.reader,
-                    &self.carrier,
-                    self.probe_timeout,
-                )
-                .await;
-                if !matches!(outcome, ProbeOutcome::EchoObserved) {
-                    self.roster.record_probe(url, outcome, now_unix());
-                    if let Some(entry) = self.live.remove(url) {
-                        entry.reader.disconnect().await;
-                    }
-                    return Ok(());
+                if let Some(live) = self.live.get_mut(url) {
+                    live.reprove_due = Some(now_unix().saturating_add(RECONNECT_SETTLE_SECS));
                 }
-                subscribe_wake_surface(&entry.reader, &entry.engine, self.me).await?;
             }
             ClosedAction::Ignore => {}
         }
@@ -1540,6 +1634,137 @@ mod tests {
         assert!(
             deadline > before,
             "the re-send is due immediately, which makes it a hot loop rather than a backoff"
+        );
+    }
+
+    /// ★ ROUND 10 / FINDING 1. A failed subscribe inside the batch loop must not empty the batch — and it
+    /// must leave a DEBT, because the store already says `joined` while nothing is listening.
+    #[tokio::test]
+    async fn a_failed_subscribe_owes_a_resend_and_does_not_empty_the_batch() {
+        let store = test_store("subscribe-isolation");
+        let relay_keys = Keys::generate();
+        let me = Keys::generate().public_key();
+
+        // An invite on the BAD relay: triage → ChannelJoined → Action::SubscribeChannel, which fails.
+        let invite = TestEventBuilder::new(Kind::Custom(44100), "")
+            .tag(nostr_sdk::prelude::Tag::public_key(me))
+            .tag(nostr_sdk::prelude::Tag::parse(["h", "chan-x"]).expect("h tag"))
+            .sign_with_keys(&relay_keys)
+            .expect("sign invite");
+        let (bad_tx, bad_rx) = broadcast::channel(8);
+        bad_tx
+            .send(RelayPoolNotification::Message {
+                relay_url: BAD_RELAY.parse().expect("url"),
+                message: RelayMessage::Event {
+                    subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(MEMBERSHIP_SUB)),
+                    event: std::borrow::Cow::Owned(invite),
+                },
+            })
+            .expect("send invite");
+
+        // Ambient traffic on the HEALTHY relay, queued behind it.
+        let (good_tx, good_rx) = broadcast::channel(8);
+        good_tx
+            .send(RelayPoolNotification::Message {
+                relay_url: GOOD_RELAY.parse().expect("url"),
+                message: RelayMessage::Event {
+                    subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(channel_sub(
+                        "chan-good",
+                    ))),
+                    event: std::borrow::Cow::Owned(
+                        TestEventBuilder::new(Kind::Custom(9), "hello")
+                            .sign_with_keys(&Keys::generate())
+                            .expect("sign"),
+                    ),
+                },
+            })
+            .expect("send ambient");
+
+        let mut participation = Participation::for_wire_test_many(
+            vec![(BAD_RELAY, false, bad_rx), (GOOD_RELAY, true, good_rx)],
+            store,
+            me,
+            now_unix(),
+        )
+        .await;
+
+        let ingested = participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("a failed subscribe must not surface as a pump error");
+
+        assert_eq!(
+            participation.relay_faults(),
+            1,
+            "the bad relay's subscribe did not fail, so this test proves nothing about isolating it"
+        );
+        assert_eq!(
+            ingested, 2,
+            "a message was dropped — the bad relay's failed subscribe aborted the batch, taking the \
+             healthy relay's traffic with it"
+        );
+        let before = now_unix();
+        let deadline = participation
+            .resend_deadline(BAD_RELAY, Some("chan-x"))
+            .expect(
+                "the channel is joined in the store with nothing listening and no debt recorded — only a \
+                 restart would ever repair it",
+            );
+        assert!(
+            deadline > before - 1 && deadline <= before + MIN_RESYNC_INTERVAL_SECS + 1,
+            "the owed re-send is not on a bounded near-term deadline"
+        );
+    }
+
+    /// ★ ROUND 10 / FINDING 2. An auth-failure `CLOSED` used to block the batch loop for 10s plus a probe
+    /// timeout. The settle is a deadline now; nothing waits.
+    #[tokio::test]
+    async fn an_auth_failure_defers_the_reprove_instead_of_blocking_the_pump() {
+        let store = test_store("reconnect-deadline");
+        let me = Keys::generate().public_key();
+        let (good_tx, good_rx) = broadcast::channel(8);
+        good_tx
+            .send(RelayPoolNotification::Message {
+                relay_url: GOOD_RELAY.parse().expect("url"),
+                message: RelayMessage::Closed {
+                    subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(MEMBERSHIP_SUB)),
+                    message: std::borrow::Cow::Borrowed("auth-required: we need your NIP-42 auth"),
+                },
+            })
+            .expect("send closed");
+
+        let mut participation = Participation::for_wire_test_many(
+            vec![(GOOD_RELAY, true, good_rx)],
+            store,
+            me,
+            now_unix(),
+        )
+        .await;
+
+        let before = now_unix();
+        // Real clock: the old code's 10s wait plus probe timeout has to be able to show up as a stall.
+        let finished = tokio::time::timeout(
+            Duration::from_secs(4),
+            participation.pump(Duration::from_millis(1)),
+        )
+        .await;
+
+        assert!(
+            finished.is_ok(),
+            "the pump blocked on a reconnect settle — every other relay's traffic waits behind it, and \
+             several relays failing at once serialise the stalls"
+        );
+        finished.expect("not timed out").expect("pump");
+        let deadline = participation
+            .reprove_deadline(GOOD_RELAY)
+            .expect("no re-prove was recorded, so the socket was kicked and access never re-checked");
+        assert!(
+            deadline > before,
+            "the re-prove is due immediately, which probes a socket that has had no time to settle"
+        );
+        assert!(
+            deadline <= before + RECONNECT_SETTLE_SECS + 1,
+            "the settle window grew beyond the bound it replaced"
         );
     }
 
