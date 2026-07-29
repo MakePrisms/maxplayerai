@@ -909,4 +909,310 @@ mod tests {
         assert_eq!(plan_rearm(false, Some(ReservationState::Released)), RearmAction::Attempt);
         assert_eq!(plan_rearm(false, None), RearmAction::Attempt);
     }
+
+    // ── CONCURRENCY test helpers ────────────────────────────────────────────────────────────────
+
+    /// A home with the given budget cap, on a scratch dir. `per_job` is set equal to `cap` so the
+    /// per-job ceiling never masks the total/wallet ceilings these tests exercise.
+    fn conc_home(label: &str, cap: u64) -> (crate::home::MobeeHome, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-buyer-lifecycle-conc-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = home::bootstrap(&root).expect("home");
+        home.config.total_budget_sats = cap;
+        home.config.per_job_budget_sats = cap;
+        (home, root)
+    }
+
+    /// A stand-in published-award outcome for the `award_with_reservation` publish closure (these
+    /// tests never touch a relay — the money accounting is what is under test, not the wire).
+    fn fake_award_outcome(job_id: &str) -> AwardClaimOutcome {
+        AwardClaimOutcome {
+            award_event_id: "e".repeat(64),
+            job_id: job_id.to_owned(),
+            claim_id: "c".repeat(64),
+            seller_pubkey: SELLER_HEX.to_owned(),
+            quoted_mints: Vec::new(),
+        }
+    }
+
+    // ★ N-AGENT NO-OVERSPEND TOOTH. The buyer daemon serves N MCP agents that all draw the SAME
+    // wallet + budget (gudnuf's product decision: one wallet, one budget, N equal agents, no
+    // per-agent caps). This is the assembled-money invariant at that scale: no matter how the awards
+    // interleave, the funds committed across every agent can never exceed what the buyer actually
+    // has — the smaller of the live wallet balance and the budget cap.
+    //
+    // It composes the SAME seam the daemon's `award` RPC uses — a balance/spent snapshot then
+    // `award_with_reservation` — serialized behind the SAME kind of async money lock the daemon
+    // holds (`BuyerContext::money_lock`), over the REAL durable store + REAL budget ledger. Five
+    // agents each try to reserve 30 against a shared 100: at most three fit (90), the other two must
+    // get a clean insufficient-available refusal, and the total reserved must land at exactly 90.
+    //
+    // The reserved-accumulation race itself is closed one layer down by the store's `BEGIN
+    // IMMEDIATE` (store `tooth2`); this proves the assembled award path — snapshot + reserve seam +
+    // budget ledger — enforces the two-ceiling cap under many concurrent agents, and that idempotent
+    // re-awards never inflate the committed total.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn n_equal_agents_cannot_overspend_the_shared_budget() {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let cap = 100u64;
+        let balance = 100u64; // modeled wallet ecash; no settle in this test, so it never moves
+        let amount = 30u64; // min(cap, balance) = 100 ⇒ exactly 3 fit (90), 2 must be refused
+        let agents = 5usize;
+
+        let (home, root) = conc_home("n-agents", cap);
+        let home = Arc::new(home);
+        let store = Arc::new(BuyerStore::open(root.join("buyer.sqlite")).expect("store"));
+        let money_lock = Arc::new(Mutex::new(()));
+
+        let mut set = tokio::task::JoinSet::new();
+        for agent in 0..agents {
+            let (home, store, money_lock) = (home.clone(), store.clone(), money_lock.clone());
+            // A distinct 64-hex job id per agent.
+            let job = format!("{agent:064x}");
+            set.spawn(async move {
+                // The daemon's money lock, held across the snapshot AND the reserve — exactly as
+                // `award` composes it, so no agent's snapshot races another's commit.
+                let _guard = money_lock.lock().await;
+                let gate = BudgetGate::from_home(&home).expect("gate");
+                let (total_cap, spent) = (gate.total_cap(), gate.spent());
+                let job_out = job.clone();
+                award_with_reservation(&store, &job, amount, balance, total_cap, spent, 1, || async {
+                    Ok(fake_award_outcome(&job_out))
+                })
+                .await
+                .map_err(|error| {
+                    // A refused agent must be a clean insufficient-available refusal, never a panic
+                    // or a partial write.
+                    assert!(
+                        matches!(
+                            error,
+                            AwardError::Reserve(ReserveRefused::InsufficientAvailable { .. })
+                        ),
+                        "unexpected award failure: {error}"
+                    );
+                })
+                .is_ok()
+            });
+        }
+
+        let mut wins = 0usize;
+        let mut refusals = 0usize;
+        while let Some(result) = set.join_next().await {
+            if result.expect("join") {
+                wins += 1;
+            } else {
+                refusals += 1;
+            }
+        }
+
+        assert_eq!(wins, 3, "exactly three 30-sat awards fit under a shared 100");
+        assert_eq!(refusals, 2, "the other two agents must get a clean refusal, not an overspend");
+
+        let reserved = store.reserved_in_flight().expect("reserved");
+        assert_eq!(reserved, 90, "total committed is exactly the three winners' 90");
+        assert!(
+            reserved <= cap.min(balance),
+            "committed {reserved} must never exceed min(cap, balance) = {}",
+            cap.min(balance)
+        );
+
+        // Idempotency under concurrency: a winning agent re-awarding its own job (a client retry)
+        // must not commit a second time — the reserved total stays put.
+        let winner = format!("{:064x}", 0);
+        let winner_out = winner.clone();
+        let _ = award_with_reservation(&store, &winner, amount, balance, cap, 0, 2, || async {
+            Ok(fake_award_outcome(&winner_out))
+        })
+        .await
+        .expect("idempotent re-award");
+        assert_eq!(
+            store.reserved_in_flight().expect("reserved"),
+            90,
+            "an idempotent re-award must not inflate the committed total"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ★ THE MONEY-LOCK-IS-LOAD-BEARING TOOTH (the red-without-serialization proof).
+    //
+    // The store's atomic reserve cannot, by itself, stop an overspend: `reserve` trusts the
+    // `balance`/`spent` SNAPSHOT the caller passes in. If an award reads that snapshot while a
+    // concurrent settle is melting — balance read BEFORE the melt drops it, but the reserve landing
+    // AFTER the settle's `reserved → spent` flip clears the paid job — the award commits against
+    // ecash that has already left the wallet. `BuyerContext::money_lock`, held across BOTH the
+    // award's snapshot+reserve and the settle's pay+flip, is the ONE thing that closes this window;
+    // nothing in the store or the budget ledger can.
+    //
+    // This test reproduces that exact interleave deterministically over the REAL store + REAL budget
+    // ledger + a modeled wallet balance (the melt drops it; a real melt needs a mint we must not
+    // touch), and shows both directions:
+    //   • UNSERIALIZED — the stale-snapshot interleave over-commits: reserved + spent exceeds the
+    //     wallet's starting ecash. This is the bug that returns the moment the daemon's money_lock
+    //     is narrowed or dropped around `award`/`settle_job`.
+    //   • SERIALIZED — the same two operations behind one async money lock can interleave in either
+    //     order, and neither over-commits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_money_lock_closes_the_award_snapshot_vs_settle_melt_race() {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::Arc;
+        use tokio::sync::{Mutex, Notify};
+
+        let start_balance = 100u64; // wallet ecash on hand
+        let cap = 1_000u64; // budget cap deliberately NOT the binding ceiling — the wallet is
+        let paid = 60u64; // the in-flight job being settled
+        let award = 60u64; // the new award racing it; 60 + 60 = 120 > 100 ecash if both commit
+
+        let job_x = "a".repeat(64); // settled (melt + flip)
+        let job_y = "b".repeat(64); // newly awarded during the settle
+
+        // ---- UNSERIALIZED: the stale-snapshot interleave over-commits the wallet ----
+        {
+            let (home, root) = conc_home("race-unserial", cap);
+            let store = Arc::new(BuyerStore::open(root.join("buyer.sqlite")).expect("store"));
+            let balance = Arc::new(AtomicU64::new(start_balance));
+            store
+                .reserve(&job_x, paid, start_balance, cap, 0, 1)
+                .expect("pre-reserve the in-flight job");
+
+            let snapshot_taken = Arc::new(Notify::new());
+            let settle_done = Arc::new(Notify::new());
+
+            let settle = {
+                let (store, balance) = (store.clone(), balance.clone());
+                let (home, job_x) = (home.clone(), job_x.clone());
+                let (snapshot_taken, settle_done) = (snapshot_taken.clone(), settle_done.clone());
+                tokio::spawn(async move {
+                    // Wait until the award has read the pre-melt balance, then pay + flip.
+                    snapshot_taken.notified().await;
+                    settle_after_pay(
+                        &store,
+                        &job_x,
+                        3,
+                        || async {
+                            let mut gate = BudgetGate::from_home(&home).expect("gate");
+                            gate.authorize_and_commit(paid).expect("budget append"); // durable spent
+                            balance.fetch_sub(paid, Ordering::SeqCst); // models the wallet melt
+                            Ok::<(), &str>(())
+                        },
+                        |_| paid,
+                    )
+                    .await
+                    .expect("settle");
+                    settle_done.notify_one();
+                })
+            };
+
+            let awarding = {
+                let (store, balance) = (store.clone(), balance.clone());
+                let (home, job_y) = (home.clone(), job_y.clone());
+                let (snapshot_taken, settle_done) = (snapshot_taken.clone(), settle_done.clone());
+                tokio::spawn(async move {
+                    // Read the balance snapshot BEFORE the settle melts it…
+                    let stale_balance = balance.load(Ordering::SeqCst);
+                    snapshot_taken.notify_one();
+                    // …then reserve AFTER the settle's flip has cleared job_x from `reserved`.
+                    settle_done.notified().await;
+                    let spent = BudgetGate::from_home(&home).expect("gate").spent();
+                    let job_out = job_y.clone();
+                    award_with_reservation(
+                        &store,
+                        &job_y,
+                        award,
+                        stale_balance,
+                        cap,
+                        spent,
+                        4,
+                        || async { Ok(fake_award_outcome(&job_out)) },
+                    )
+                    .await
+                })
+            };
+
+            settle.await.expect("settle task");
+            let awarded = awarding.await.expect("award task");
+            assert!(awarded.is_ok(), "the stale-snapshot award slips through unserialized");
+
+            let committed = store.reserved_in_flight().expect("reserved")
+                + BudgetGate::from_home(&home).expect("gate").spent();
+            assert!(
+                committed > start_balance,
+                "the race must over-commit the wallet without the money lock — committed \
+                 {committed} sat against only {start_balance} sat of starting ecash; this is the \
+                 window BuyerContext::money_lock exists to close"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // ---- SERIALIZED: the same two ops behind one money lock never over-commit ----
+        {
+            let (home, root) = conc_home("race-serial", cap);
+            let home = Arc::new(home);
+            let store = Arc::new(BuyerStore::open(root.join("buyer.sqlite")).expect("store"));
+            let balance = Arc::new(AtomicU64::new(start_balance));
+            let money_lock = Arc::new(Mutex::new(()));
+            store
+                .reserve(&job_x, paid, start_balance, cap, 0, 1)
+                .expect("pre-reserve the in-flight job");
+
+            let settle = {
+                let (store, balance, money_lock) =
+                    (store.clone(), balance.clone(), money_lock.clone());
+                let (home, job_x) = (home.clone(), job_x.clone());
+                tokio::spawn(async move {
+                    // The daemon's `settle_job` holds money_lock across pay + flip.
+                    let _guard = money_lock.lock().await;
+                    settle_after_pay(
+                        &store,
+                        &job_x,
+                        3,
+                        || async {
+                            let mut gate = BudgetGate::from_home(&home).expect("gate");
+                            gate.authorize_and_commit(paid).expect("budget append");
+                            balance.fetch_sub(paid, Ordering::SeqCst);
+                            Ok::<(), &str>(())
+                        },
+                        |_| paid,
+                    )
+                    .await
+                    .expect("settle");
+                })
+            };
+
+            let awarding = {
+                let (store, balance, money_lock) =
+                    (store.clone(), balance.clone(), money_lock.clone());
+                let (home, job_y) = (home.clone(), job_y.clone());
+                tokio::spawn(async move {
+                    // The daemon's `award` holds money_lock across snapshot + reserve.
+                    let _guard = money_lock.lock().await;
+                    let snap = balance.load(Ordering::SeqCst);
+                    let spent = BudgetGate::from_home(&home).expect("gate").spent();
+                    let job_out = job_y.clone();
+                    award_with_reservation(&store, &job_y, award, snap, cap, spent, 4, || async {
+                        Ok(fake_award_outcome(&job_out))
+                    })
+                    .await
+                })
+            };
+
+            let _ = settle.await.expect("settle task");
+            let _ = awarding.await.expect("award task");
+
+            let committed = store.reserved_in_flight().expect("reserved")
+                + BudgetGate::from_home(&home).expect("gate").spent();
+            assert!(
+                committed <= start_balance,
+                "under the money lock the wallet is never over-committed — committed {committed} \
+                 sat against {start_balance} sat of ecash, in EITHER interleave order"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
 }
