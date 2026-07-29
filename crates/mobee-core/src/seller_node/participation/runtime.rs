@@ -288,8 +288,21 @@ impl Participation {
                 }
             }
 
+            // Retry channels whose suppression backoff has elapsed. This is the exit from a refusal
+            // whose only other way out is a membership event the relay has no reason to send.
+            self.retry_suppressed_channels().await?;
+
             for (url, message) in batch {
                 match message {
+                    RelayMessage::EndOfStoredEvents(subscription_id) => {
+                        // A protocol-owed response, which is why it is safe to read success from it.
+                        if let Some(channel_id) = channel_of_sub(subscription_id.as_str()) {
+                            let channel_id = channel_id.to_string();
+                            if let Some(entry) = self.live.get(&url) {
+                                entry.engine.note_channel_served(&channel_id, now_unix())?;
+                            }
+                        }
+                    }
                     RelayMessage::Event {
                         subscription_id,
                         event,
@@ -333,6 +346,25 @@ impl Participation {
     /// re-send the gap. Replay is safe by construction rather than by luck: owed rows are keyed on
     /// `event_id`, and membership is applied in author order, so a re-delivered event either changes
     /// nothing or corrects the ordering.
+    /// Re-subscribe every channel whose suppression backoff has elapsed, one attempt each.
+    async fn retry_suppressed_channels(&mut self) -> Result<(), ParticipationError> {
+        let now = now_unix();
+        let mut retries: Vec<(String, String, Option<u64>)> = Vec::new();
+        for (url, entry) in self.live.iter() {
+            for channel_id in entry.engine.channels_to_retry(now)? {
+                let since = entry.engine.channel_cursor(&channel_id)?;
+                retries.push((url.clone(), channel_id, since));
+            }
+        }
+        for (url, channel_id, since) in retries {
+            let Some(entry) = self.live.get(&url) else {
+                continue;
+            };
+            subscribe_channel(&entry.reader, &channel_id, self.me, since).await?;
+        }
+        Ok(())
+    }
+
     async fn resync_relay(&mut self, url: &str) -> Result<(), ParticipationError> {
         let Some(entry) = self.live.get(url) else {
             return Ok(());

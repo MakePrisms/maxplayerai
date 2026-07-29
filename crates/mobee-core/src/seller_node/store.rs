@@ -23,7 +23,21 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::gateway::EventDraft;
 
 /// Current on-disk schema version.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
+
+/// How long a refused channel waits before ONE retry, by consecutive refusal count.
+///
+/// Escalating and capped, which is what lets both intents hold at once: a relay that really has revoked
+/// us is not polled (the interval decays to six-hourly), and a relay whose refusal was transient is never
+/// abandoned. The cap is the important half — retrying forever at a low frequency is bounded work, while
+/// giving up is unbounded silence.
+const SUPPRESSION_BACKOFF_SECS: [i64; 5] = [60, 300, 900, 3_600, 21_600];
+
+/// The backoff for the `attempts`-th consecutive refusal, saturating at the last step.
+pub fn suppression_backoff_secs(attempts: i64) -> i64 {
+    let index = attempts.max(1) as usize - 1;
+    SUPPRESSION_BACKOFF_SECS[index.min(SUPPRESSION_BACKOFF_SECS.len() - 1)]
+}
 
 /// A cloneable handle to the node-owned SQLite state.
 #[derive(Clone)]
@@ -316,6 +330,12 @@ impl SellerStore {
                  -- Kept out of membership ordering entirely (see `suppress_channel`) and cleared only
                  -- by a genuinely newer relay-signed membership event.
                  suppressed INTEGER NOT NULL DEFAULT 0,
+                 -- When the refusal was observed, and how many times running. Together they are the
+                 -- EXIT TIMER: a suppression with no mechanism to fire is a permanent park wearing
+                 -- optimistic naming, because its only other clearer is an event the relay has no
+                 -- reason to send after a TRANSIENT refusal.
+                 suppressed_at_unix INTEGER NOT NULL DEFAULT 0,
+                 suppress_attempts INTEGER NOT NULL DEFAULT 0,
                  updated_at_unix INTEGER NOT NULL,
                  PRIMARY KEY (relay_url, channel_id)
              );
@@ -377,6 +397,21 @@ impl SellerStore {
             conn.execute_batch(
                 "ALTER TABLE participation_channels
                      ADD COLUMN suppressed INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        // `0` on both is right for a pre-existing suppressed row: it becomes due for retry immediately
+        // at the shortest backoff, which is the recovering direction — a store written before the exit
+        // timer existed may be sitting on exactly the permanent suppression this closes.
+        if !Self::column_exists(conn, "participation_channels", "suppressed_at_unix")? {
+            conn.execute_batch(
+                "ALTER TABLE participation_channels
+                     ADD COLUMN suppressed_at_unix INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        if !Self::column_exists(conn, "participation_channels", "suppress_attempts")? {
+            conn.execute_batch(
+                "ALTER TABLE participation_channels
+                     ADD COLUMN suppress_attempts INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
         Ok(())
@@ -1107,8 +1142,12 @@ impl SellerStore {
     ) -> Result<bool, StoreError> {
         let mut conn = self.lock()?;
         let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // The attempt count escalates on every refusal, including a re-refusal after a retry, so the
+        // backoff grows instead of settling into a poll.
         let changed = transaction.execute(
-            "UPDATE participation_channels SET suppressed = 1, updated_at_unix = ?3
+            "UPDATE participation_channels
+             SET suppressed = 1, suppressed_at_unix = ?3, suppress_attempts = suppress_attempts + 1,
+                 updated_at_unix = ?3
              WHERE relay_url = ?1 AND channel_id = ?2 AND suppressed = 0",
             params![relay_url, channel_id, now_unix],
         )?;
@@ -1121,6 +1160,85 @@ impl SellerStore {
         )?;
         transaction.commit()?;
         Ok(changed == 1)
+    }
+
+    /// Suppressed channels whose backoff has elapsed, with the attempt count that set it.
+    ///
+    /// This is the EXIT MECHANISM. Without it a suppression's only other clearer is a newer
+    /// relay-signed membership event — and after a *transient* refusal the relay has no reason to emit
+    /// one, because our membership never changed. A flag whose only clearer the counterparty owes us
+    /// nothing to send is a permanent flag, however provisional it is called.
+    pub fn suppressed_channels_due(
+        &self,
+        relay_url: &str,
+        now_unix: i64,
+    ) -> Result<Vec<(String, i64)>, StoreError> {
+        let conn = self.lock()?;
+        // The due-check lives in Rust, next to the backoff schedule it depends on, rather than being
+        // duplicated in SQL where the two could drift apart.
+        let mut statement = conn.prepare(
+            "SELECT channel_id, suppress_attempts, suppressed_at_unix FROM participation_channels
+             WHERE relay_url = ?1 AND state = 'joined' AND suppressed = 1
+             ORDER BY channel_id",
+        )?;
+        let rows = statement.query_map([relay_url], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut due = Vec::new();
+        for row in rows {
+            let (channel_id, attempts, since) = row?;
+            if now_unix.saturating_sub(since) >= suppression_backoff_secs(attempts) {
+                due.push((channel_id, attempts));
+            }
+        }
+        Ok(due)
+    }
+
+    /// Lift a suppression optimistically, on the retry ATTEMPT rather than on its outcome.
+    ///
+    /// ★ Deliberately not "clear when the subscribe succeeds". Success would have to be read from the
+    /// ABSENCE of a refusal, and an absence proves nothing — the same trap this module has been bitten
+    /// by three times. A refusal actively re-suppresses with a longer backoff, so clearing up front is
+    /// safe in the only direction that matters: the permissive one, which self-corrects.
+    /// The attempt count is deliberately NOT reset here — only a protocol-owed `EOSE` does that.
+    pub fn clear_suppression(
+        &self,
+        relay_url: &str,
+        channel_id: &str,
+        now_unix: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE participation_channels SET suppressed = 0, updated_at_unix = ?3
+             WHERE relay_url = ?1 AND channel_id = ?2",
+            params![relay_url, channel_id, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// The relay SERVED this channel's subscription — reset the escalation.
+    ///
+    /// Gated on `EOSE`, which the relay owes us by protocol, never on silence. Without this the attempt
+    /// count only ever climbs, so a channel that recovered would carry a punishing backoff into its next
+    /// unrelated refusal.
+    pub fn note_channel_served(
+        &self,
+        relay_url: &str,
+        channel_id: &str,
+        now_unix: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE participation_channels
+             SET suppress_attempts = 0, suppressed = 0, updated_at_unix = ?3
+             WHERE relay_url = ?1 AND channel_id = ?2 AND (suppress_attempts <> 0 OR suppressed <> 0)",
+            params![relay_url, channel_id, now_unix],
+        )?;
+        Ok(())
     }
 
     /// Whether a channel is locally suppressed after a refused read.
@@ -1313,11 +1431,16 @@ impl SellerStore {
     /// re-delivered after a reconnect is one debt, not two. Returns whether a new debt landed.
     pub fn record_owed(&self, owed: &OwedResponse, now_unix: i64) -> Result<bool, StoreError> {
         let conn = self.lock()?;
-        // ★ Conditional on still holding the channel. A mention can arrive after the 44101 that
-        // removed us — queued behind it on the socket, or replayed within the cursor skew — and an
-        // unconditional insert would mint a debt in a channel we can no longer read OR answer.
-        // `record_channel_left` drains the debts that exist when it runs; this is the other half,
-        // for the ones that turn up afterwards.
+        // ★ Conditional on still holding AND still reading the channel. A mention can arrive after the
+        // 44101 that removed us, or after a CLOSED suppressed us — queued behind it on the socket, or
+        // replayed within the cursor skew — and an unconditional insert would mint a debt in a channel
+        // we can no longer read OR answer. `record_channel_left` and `suppress_channel` drain the debts
+        // that exist when they run; this is the other half, for the ones that turn up afterwards.
+        //
+        // ★ `suppressed = 0` matters as much as the state: a suppressed row is still `state='joined'`,
+        // because membership is the relay's to revoke and a local refusal does not revoke it. Checking
+        // only the state would let a post-CLOSED mention recreate exactly the debt `suppress_channel`
+        // had just dropped. Every predicate that asks "can we act in this channel" has to read BOTH.
         let changed = conn.execute(
             "INSERT OR IGNORE INTO participation_owed
                  (event_id, relay_url, channel_id, counterparty, kind, state, created_at_unix,
@@ -1325,7 +1448,7 @@ impl SellerStore {
              SELECT ?1, ?2, ?3, ?4, ?5, 'owed', ?6, ?7
              WHERE EXISTS (
                  SELECT 1 FROM participation_channels
-                 WHERE relay_url = ?2 AND channel_id = ?3 AND state = 'joined'
+                 WHERE relay_url = ?2 AND channel_id = ?3 AND state = 'joined' AND suppressed = 0
              )",
             params![
                 owed.event_id,
@@ -1946,6 +2069,90 @@ mod tests {
         assert!(store.owed_responses().expect("owed").is_empty());
         // Idempotent: suppressing again is not a new event.
         assert!(!store.suppress_channel(RELAY, "chan-1", 700).expect("again"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ★ THE EXIT TIMER. A suppression whose only other clearer is a newer membership event is permanent
+    /// after a TRANSIENT refusal, because the relay has no reason to emit one — our membership never
+    /// changed. So the backoff has to fire on its own.
+    #[test]
+    fn a_suppression_becomes_due_for_retry_on_an_escalating_backoff() {
+        let (store, path) = fresh_store("suppress-retry");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 100, 100)
+            .expect("join");
+        store.suppress_channel(RELAY, "chan-1", 1_000).expect("suppress");
+
+        // First refusal: 60s. Not due a second early, due on the boundary.
+        assert!(store.suppressed_channels_due(RELAY, 1_059).expect("early").is_empty());
+        assert_eq!(
+            store.suppressed_channels_due(RELAY, 1_060).expect("due"),
+            vec![("chan-1".to_string(), 1)],
+            "the suppression never became due — it is a permanent park, not a provisional one"
+        );
+
+        // Retry, then a fresh refusal: the wait ESCALATES rather than settling into a poll.
+        store.clear_suppression(RELAY, "chan-1", 1_060).expect("retry");
+        store.suppress_channel(RELAY, "chan-1", 1_060).expect("refused again");
+        assert!(store.suppressed_channels_due(RELAY, 1_060 + 299).expect("early").is_empty());
+        assert_eq!(
+            store.suppressed_channels_due(RELAY, 1_060 + 300).expect("due").len(),
+            1
+        );
+        // And it is capped, so it retries forever at a bounded rate instead of being abandoned.
+        assert_eq!(suppression_backoff_secs(99), 21_600);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `EOSE` is protocol-owed, so it is the one signal that may be read as success. Without resetting on
+    /// it, the attempt count only climbs and a recovered channel carries a punishing backoff into its
+    /// next, unrelated refusal.
+    #[test]
+    fn being_served_resets_the_escalation() {
+        let (store, path) = fresh_store("suppress-reset");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 100, 100)
+            .expect("join");
+        store.suppress_channel(RELAY, "chan-1", 1_000).expect("s1");
+        store.clear_suppression(RELAY, "chan-1", 1_100).expect("retry");
+        store.suppress_channel(RELAY, "chan-1", 1_100).expect("s2");
+        assert_eq!(store.suppressed_channels_due(RELAY, 1_100 + 300).expect("due").len(), 1);
+
+        store.note_channel_served(RELAY, "chan-1", 2_000).expect("eose");
+        assert!(!store.channel_suppressed(RELAY, "chan-1").expect("flag"));
+        assert_eq!(store.joined_channels(RELAY).expect("channels"), ["chan-1"]);
+
+        // Next refusal starts from the SHORTEST backoff again, not from where the old escalation left off.
+        store.suppress_channel(RELAY, "chan-1", 3_000).expect("s3");
+        assert_eq!(
+            store.suppressed_channels_due(RELAY, 3_060).expect("due"),
+            vec![("chan-1".to_string(), 1)],
+            "the escalation was not reset by a served subscription"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A suppressed row is still `state='joined'` — membership is the relay's to revoke. So every
+    /// predicate asking "can we act in this channel" must read the suppression too, or a mention queued
+    /// behind the CLOSED recreates the debt that suppression had just dropped.
+    #[test]
+    fn a_mention_arriving_after_a_suppression_creates_no_debt() {
+        let (store, path) = fresh_store("owed-after-suppress");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 100, 100)
+            .expect("join");
+        store.record_owed(&owed(&"d".repeat(64), "chan-1", 110), 111).expect("owed");
+        store.suppress_channel(RELAY, "chan-1", 200).expect("suppress");
+        assert!(store.owed_responses().expect("drained").is_empty());
+
+        assert!(
+            !store.record_owed(&owed(&"e".repeat(64), "chan-1", 150), 300).expect("queued mention"),
+            "a mention queued behind the CLOSED recreated a debt we can neither read nor answer"
+        );
+        assert!(store.owed_responses().expect("owed").is_empty());
+
+        // Positive control: once the channel is readable again, debts record normally — otherwise this
+        // test would pass against a record_owed that never writes at all.
+        store.note_channel_served(RELAY, "chan-1", 400).expect("served");
+        assert!(store.record_owed(&owed(&"f".repeat(64), "chan-1", 410), 411).expect("live"));
+        assert_eq!(store.owed_responses().expect("owed").len(), 1);
         let _ = std::fs::remove_file(&path);
     }
 

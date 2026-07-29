@@ -82,6 +82,28 @@ impl Engine {
             .map(|since| since as u64))
     }
 
+    /// Channels whose suppression backoff has elapsed, cleared and ready for ONE retry each.
+    ///
+    /// The clear happens here, on the attempt — not on its outcome. A refusal will re-suppress with an
+    /// incremented count and therefore a longer wait, so the optimistic direction is the self-correcting
+    /// one; waiting for "no refusal arrived" would be reading success out of an absence.
+    pub fn channels_to_retry(&self, now_unix: i64) -> Result<Vec<String>, StoreError> {
+        let due = self.store.suppressed_channels_due(&self.relay_url, now_unix)?;
+        let mut channels = Vec::with_capacity(due.len());
+        for (channel_id, _attempts) in due {
+            self.store
+                .clear_suppression(&self.relay_url, &channel_id, now_unix)?;
+            channels.push(channel_id);
+        }
+        Ok(channels)
+    }
+
+    /// The relay answered a channel subscription with `EOSE` — it served us, so the escalation resets.
+    pub fn note_channel_served(&self, channel_id: &str, now_unix: i64) -> Result<(), StoreError> {
+        self.store
+            .note_channel_served(&self.relay_url, channel_id, now_unix)
+    }
+
     /// The stored cursor for one channel's mention filter.
     pub fn channel_cursor(&self, channel_id: &str) -> Result<Option<u64>, StoreError> {
         Ok(self
