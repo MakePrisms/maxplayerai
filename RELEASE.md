@@ -23,7 +23,18 @@ account to be able to publish into it.
    `npm/*/package.json`, and the `optionalDependencies` pins in `npm/mobee/package.json`. All of
    them must read the same string, and it must match the tag with the `v` dropped — the build
    asserts this and stops if anything disagrees.
-2. Open a PR to `dev` with the bump, let it merge, then merge `dev` into `main`.
+2. Open a PR to `dev` with the bump and let it merge. **Then cut `dev` into `main` as a pull request —
+   `main` rejects direct pushes**, and the merge must create a merge commit:
+
+   ```sh
+   gh pr create --base main --head dev --title 'Cut dev to main: <what>'
+   gh pr merge --merge          # NOT --squash, NOT --rebase
+   ```
+
+   `--merge` rather than the alternatives because both others rewrite the commits: a squash gives
+   `main` a commit that exists nowhere in `dev`'s history, and a rebase does the same for every commit
+   it moves. Either one breaks the ancestor relation that step 3 exists to maintain, so they defeat
+   the next step rather than merely differing in style.
 3. **Merge `main` back into `dev`.** Not housekeeping — the cut itself is what makes this necessary,
    so it belongs to the cut rather than to whoever notices later:
 
@@ -43,7 +54,8 @@ account to be able to publish into it.
    git fetch origin && git merge-base --is-ancestor origin/main origin/dev
    ```
 
-4. **Tag `main` and push the tag:**
+4. **Tag `main` and push the tag** — this still works as a direct push. `main`'s ruleset targets
+   branches, not tags, so the tag that triggers the release is not gated by it:
    ```sh
    git tag v0.2.0 && git push origin v0.2.0
    ```
