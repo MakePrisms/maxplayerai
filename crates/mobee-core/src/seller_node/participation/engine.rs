@@ -99,9 +99,15 @@ impl Engine {
     pub fn ingest(&self, event: &Event, now_unix: i64) -> Result<Vec<Action>, StoreError> {
         let actions = match triage(event, self.me) {
             Triage::ChannelJoined { channel_id } => {
+                // ★ The join row and the channel cursor are seeded in ONE transaction inside the store.
+                // They were two calls, and a crash between them left a joined channel with no cursor —
+                // which subscribes from `now` and silently drops any mention published between the
+                // relay signing the invite and the first REQ. The store seeds unconditionally, so the
+                // replayed 44100 repairs that state even though it reports no transition.
                 let newly = self.store.record_channel_joined(
                     &self.relay_url,
                     &channel_id,
+                    &channel_filter_id(&channel_id),
                     &event.id.to_hex(),
                     event.created_at.as_secs() as i64,
                     now_unix,
@@ -109,17 +115,6 @@ impl Engine {
                 // A re-delivered 44100 for a channel we are already in produces no action. This is
                 // the ordinary case after a reconnect, not an anomaly.
                 if newly {
-                    // ★ Seed the channel cursor from the INVITE's timestamp before the REQ goes out.
-                    // Without this the first subscription has no cursor and opens at `now`, so any
-                    // mention published between the relay signing the 44100 and this REQ reaching it
-                    // is skipped — and skipped permanently, because the cursor only moves forward.
-                    // The skew is applied on read, so the stored value is the invite's own time.
-                    self.store.advance_participation_cursor(
-                        &self.relay_url,
-                        &channel_filter_id(&channel_id),
-                        event.created_at.as_secs() as i64,
-                        now_unix,
-                    )?;
                     vec![Action::SubscribeChannel { channel_id }]
                 } else {
                     Vec::new()

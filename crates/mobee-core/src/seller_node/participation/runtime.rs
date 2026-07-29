@@ -243,24 +243,37 @@ impl Participation {
                         Ok(_) => continue,
                         Err(broadcast::error::TryRecvError::Empty) => break,
                         Err(broadcast::error::TryRecvError::Closed) => break,
-                        // ★ The buffer overflowed and `skipped` notifications are GONE — not
-                        // delayed, gone. Counting alone is not enough: a later event would advance
-                        // this filter's cursor PAST the skipped ones, turning a recoverable gap into
-                        // permanent loss. So the relay is marked for resync and its cursors are
-                        // replayed from the store before anything else is processed.
+                        // ★ The buffer overflowed and `skipped` notifications are GONE — not delayed,
+                        // gone. Two things follow, and only the first is obvious.
+                        //
+                        // Counting is not enough: a later event would carry this filter's cursor PAST
+                        // the skipped ones, turning a recoverable gap into permanent loss.
+                        //
+                        // And marking the relay for resync is STILL not enough while we keep reading:
+                        // every message after the gap is data from beyond a hole we have not filled,
+                        // and processing it advances the cursor just the same. If the resubscribe is
+                        // then refused or rate-limited, no replay ever arrives and the gap is
+                        // permanent. So stop draining this relay, drop what we already hold from it,
+                        // and process nothing of its traffic until the replay lands. Discarding is
+                        // safe BECAUSE the cursor is behind those messages — the replay re-delivers
+                        // them.
                         Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
                             self.lagged = self.lagged.saturating_add(skipped);
                             resync.insert(url.clone());
-                            continue;
+                            break;
                         }
                     }
                 }
             }
 
-            // Replay the gap BEFORE draining this round's batch: those messages arrived after the
-            // drop, so processing them first is exactly what would carry the cursor past the hole.
-            for url in resync {
-                self.resync_relay(&url).await?;
+            // Drop everything already in hand from a relay that lagged. These arrived after its gap,
+            // so acting on them is acting on data from beyond a hole — and it is the cursor advance
+            // that would make the hole permanent.
+            if !resync.is_empty() {
+                batch.retain(|(url, _)| !resync.contains(url));
+                for url in &resync {
+                    self.resync_relay(url).await?;
+                }
             }
 
             for (url, message) in batch {

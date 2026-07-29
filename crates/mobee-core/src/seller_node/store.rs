@@ -1018,10 +1018,21 @@ impl SellerStore {
     ///
     /// This is why membership needs no event-id dedup set of its own: the effect of the notification
     /// is the row, and writing the same row twice is writing it once.
+    /// Record a join AND seed the channel's mention cursor in ONE transaction.
+    ///
+    /// ★ The two writes cannot be separate calls. A crash between them leaves a joined channel with no
+    /// cursor, and a channel with no cursor subscribes from `now` — reopening the lost-mentions window
+    /// through a crash seam. Worse, it is unrecoverable by replay: the re-delivered `44100` finds the
+    /// row already joined, reports no transition, and a caller that seeds only on a fresh join would
+    /// skip the seed forever. Atomic here means a restart sees both or neither.
+    ///
+    /// `cursor_filter_id` is the channel's mention-filter id, and the seed is monotonic — an existing
+    /// cursor that is already further ahead is left alone.
     pub fn record_channel_joined(
         &self,
         relay_url: &str,
         channel_id: &str,
+        cursor_filter_id: &str,
         source_event_id: &str,
         source_created_at_unix: i64,
         now_unix: i64,
@@ -1030,6 +1041,7 @@ impl SellerStore {
             relay_url,
             channel_id,
             "joined",
+            Some((cursor_filter_id, source_created_at_unix)),
             source_event_id,
             source_created_at_unix,
             now_unix,
@@ -1055,6 +1067,7 @@ impl SellerStore {
             relay_url,
             channel_id,
             "left",
+            None,
             source_event_id,
             source_created_at_unix,
             now_unix,
@@ -1076,6 +1089,7 @@ impl SellerStore {
         relay_url: &str,
         channel_id: &str,
         state: &str,
+        seed_cursor: Option<(&str, i64)>,
         source_event_id: &str,
         source_created_at_unix: i64,
         now_unix: i64,
@@ -1091,6 +1105,24 @@ impl SellerStore {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
+
+        // ★ Seed the mention cursor FIRST, and unconditionally — before the staleness check below can
+        // return early. The crash seam this closes is precisely a joined row with no cursor, whose only
+        // repair is the replayed 44100; that replay is by definition NOT newer, so a seed placed after
+        // the early return would be skipped exactly when it is the one thing needed. Monotonic, so a
+        // cursor already further ahead is left alone and re-running this is free.
+        if let Some((filter_id, since_unix)) = seed_cursor {
+            transaction.execute(
+                "INSERT INTO participation_cursors
+                     (relay_url, filter_id, since_unix, updated_at_unix)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(relay_url, filter_id) DO UPDATE SET
+                     since_unix      = excluded.since_unix,
+                     updated_at_unix = excluded.updated_at_unix
+                 WHERE excluded.since_unix > participation_cursors.since_unix",
+                params![relay_url, filter_id, since_unix, now_unix],
+            )?;
+        }
 
         let transitioned = match current {
             None => {
@@ -1113,10 +1145,29 @@ impl SellerStore {
                 state == "joined"
             }
             Some((stored_state, stored_created_at, stored_event_id)) => {
-                // Event id breaks a same-second tie so the outcome does not depend on which frame
-                // the relay happened to flush first.
-                let newer = (source_created_at_unix, source_event_id)
-                    > (stored_created_at, stored_event_id.as_str());
+                // ★ Ordering is (created_at, restrictiveness, event_id) — NOT (created_at, event_id).
+                //
+                // A `CLOSED`-derived leave has no author timestamp and carries a SYNTHETIC
+                // `closed:{reason}` marker as its source id. Comparing that against a real hex event id
+                // is a string sort: `'c'` sits inside the hex alphabet, so a same-second CLOSED-leave
+                // versus a genuine re-add would be decided by lexicographic accident.
+                //
+                // Ranking `left` above `joined` at an equal timestamp settles it on meaning instead:
+                // the RESTRICTIVE transition wins, so ties FAIL CLOSED. Believing we hold access we do
+                // not keeps sending traffic to a relay that refused us; believing we lack access we do
+                // hold costs one channel, which the next 44100 replay restores. The synthetic id then
+                // only ever participates when timestamp AND state both match — two leaves in the same
+                // second, where either outcome is the same row.
+                let rank = |state: &str| i32::from(state == "left");
+                let newer = (
+                    source_created_at_unix,
+                    rank(state),
+                    source_event_id,
+                ) > (
+                    stored_created_at,
+                    rank(&stored_state),
+                    stored_event_id.as_str(),
+                );
                 if !newer {
                     transaction.commit()?;
                     return Ok(false);
@@ -1149,6 +1200,7 @@ impl SellerStore {
                 params![relay_url, channel_id],
             )?;
         }
+
 
         transaction.commit()?;
         Ok(transitioned)
@@ -1669,10 +1721,10 @@ mod tests {
     #[test]
     fn joining_the_same_channel_twice_is_joining_it_once() {
         let (store, path) = fresh_store("join-idempotent");
-        assert!(store.record_channel_joined(RELAY, "chan-1", "e1", 100, 100).expect("first"));
+        assert!(store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "e1", 100, 100).expect("first"));
         // The relay re-delivers the 44100 after a reconnect — SAME event, so same author timestamp.
         // The effect is the row, so writing it again writes it once.
-        assert!(!store.record_channel_joined(RELAY, "chan-1", "e1", 100, 101).expect("replay"));
+        assert!(!store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "e1", 100, 101).expect("replay"));
         assert_eq!(store.joined_channels(RELAY).expect("channels"), ["chan-1"]);
         let _ = std::fs::remove_file(&path);
     }
@@ -1680,14 +1732,14 @@ mod tests {
     #[test]
     fn restart_resubscribes_exactly_the_channels_we_are_still_in() {
         let (store, path) = fresh_store("join-leave");
-        store.record_channel_joined(RELAY, "chan-1", "e1", 100, 100).expect("join 1");
-        store.record_channel_joined(RELAY, "chan-2", "e2", 100, 100).expect("join 2");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "e1", 100, 100).expect("join 1");
+        store.record_channel_joined(RELAY, "chan-2", "channel:chan-2", "e2", 100, 100).expect("join 2");
         store.record_channel_left(RELAY, "chan-1", "e3", 200, 200).expect("leave 1");
 
         assert_eq!(store.joined_channels(RELAY).expect("channels"), ["chan-2"]);
 
         // A re-add flips the same row back rather than inventing a second one.
-        assert!(store.record_channel_joined(RELAY, "chan-1", "e4", 300, 300).expect("re-add"));
+        assert!(store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "e4", 300, 300).expect("re-add"));
         assert_eq!(store.joined_channels(RELAY).expect("channels"), ["chan-1", "chan-2"]);
         let _ = std::fs::remove_file(&path);
     }
@@ -1695,10 +1747,10 @@ mod tests {
     #[test]
     fn losing_a_channel_closes_the_debts_inside_it_and_nothing_else() {
         let (store, path) = fresh_store("owed-dropped");
-        store.record_channel_joined(RELAY, "chan-1", "e1", 100, 100).expect("join");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "e1", 100, 100).expect("join");
         // Both channels must be JOINED for their debts to exist at all — a debt is only recorded for
         // a channel we hold. Without joining chan-2 this test would pass on an empty control.
-        store.record_channel_joined(RELAY, "chan-2", "e2", 100, 100).expect("join 2");
+        store.record_channel_joined(RELAY, "chan-2", "channel:chan-2", "e2", 100, 100).expect("join 2");
         store.record_owed(&owed(&"a".repeat(64), "chan-1", 110), 111).expect("owed 1");
         store.record_owed(&owed(&"b".repeat(64), "chan-2", 120), 121).expect("owed 2");
 
@@ -1721,13 +1773,13 @@ mod tests {
     #[test]
     fn a_replayed_old_add_cannot_undo_a_newer_removal() {
         let (store, path) = fresh_store("membership-order");
-        store.record_channel_joined(RELAY, "chan-1", "add-1", 100, 100).expect("join");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "add-1", 100, 100).expect("join");
         store.record_channel_left(RELAY, "chan-1", "remove-1", 200, 200).expect("leave");
 
         // The stale 44100 the relay re-sends after a reconnect. Older by author time, later by
         // arrival — and it must lose.
         assert!(
-            !store.record_channel_joined(RELAY, "chan-1", "add-1", 100, 300).expect("stale add"),
+            !store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "add-1", 100, 300).expect("stale add"),
             "a stale add reported a transition, so it was applied"
         );
         assert!(
@@ -1736,7 +1788,7 @@ mod tests {
         );
 
         // The inverse: a stale removal must not drop a membership we legitimately re-acquired.
-        store.record_channel_joined(RELAY, "chan-1", "add-2", 400, 400).expect("re-add");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "add-2", 400, 400).expect("re-add");
         assert!(
             !store.record_channel_left(RELAY, "chan-1", "remove-1", 200, 500).expect("stale remove"),
             "a stale removal reported a transition"
@@ -1751,9 +1803,9 @@ mod tests {
     #[test]
     fn a_newer_add_that_changes_nothing_still_advances_the_ordering_mark() {
         let (store, path) = fresh_store("membership-highwater");
-        store.record_channel_joined(RELAY, "chan-1", "add-1", 100, 100).expect("join");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "add-1", 100, 100).expect("join");
         // Newer add, same state — reports no transition, but must still move the mark to 300.
-        assert!(!store.record_channel_joined(RELAY, "chan-1", "add-3", 300, 300).expect("newer add"));
+        assert!(!store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "add-3", 300, 300).expect("newer add"));
 
         assert!(
             !store.record_channel_left(RELAY, "chan-1", "remove-2", 200, 400).expect("stale remove"),
@@ -1767,13 +1819,87 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The join row and the mention cursor must land together, or a crash between them leaves a joined
+    /// channel whose filter opens at `now` — the lost-mentions window, reopened through a crash seam.
+    #[test]
+    fn a_join_seeds_its_cursor_in_the_same_write() {
+        let (store, path) = fresh_store("join-seeds-cursor");
+        assert!(
+            store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "add-1", 1_000, 1_001)
+                .expect("join")
+        );
+        assert_eq!(
+            store.participation_cursor(RELAY, "channel:chan-1").expect("cursor"),
+            Some(1_000),
+            "the join committed without its cursor, so a restart would subscribe from now()"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The repair path for that crash seam. A joined row with no cursor can only be fixed by the
+    /// replayed 44100 — which is NOT newer, reports no transition, and would be skipped by any seed
+    /// placed behind the staleness check. So the seed has to be unconditional.
+    #[test]
+    fn a_replayed_invite_still_repairs_a_missing_cursor() {
+        let (store, path) = fresh_store("join-repairs-cursor");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "add-1", 1_000, 1_001)
+            .expect("join");
+        // Simulate the crash seam: the membership row survived, the cursor did not.
+        {
+            let conn = store.lock().expect("lock");
+            conn.execute("DELETE FROM participation_cursors", []).expect("drop cursor");
+        }
+        assert_eq!(store.participation_cursor(RELAY, "channel:chan-1").expect("gone"), None);
+
+        // The relay re-delivers the same 44100 after a reconnect: same id, same timestamp, no transition.
+        assert!(
+            !store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "add-1", 1_000, 9_999)
+                .expect("replay")
+        );
+        assert_eq!(
+            store.participation_cursor(RELAY, "channel:chan-1").expect("cursor"),
+            Some(1_000),
+            "the replayed invite did not restore the cursor, so the window stays open forever"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A `CLOSED`-derived leave carries a synthetic `closed:{reason}` marker instead of an event id, and
+    /// `'c'` is inside the hex alphabet — so a same-second tie against a real re-add must not be settled
+    /// by string sort. Ties resolve on meaning: the restrictive transition wins, fail-closed.
+    #[test]
+    fn a_same_second_closed_leave_beats_a_re_add_regardless_of_id_sorting() {
+        let (store, path) = fresh_store("closed-tie");
+        // A real hex id starting BELOW 'c', so a plain string sort would let the re-add win.
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 500, 500)
+            .expect("join");
+        store.record_channel_left(RELAY, "chan-1", "closed:restricted: no access", 500, 500)
+            .expect("closed leave");
+        assert!(
+            store.joined_channels(RELAY).expect("channels").is_empty(),
+            "a same-second CLOSED leave lost to a re-add on id sorting instead of failing closed"
+        );
+
+        // And the tie must not swing the other way either: an id sorting ABOVE the marker must still
+        // lose to it at the same second.
+        let (store2, path2) = fresh_store("closed-tie-2");
+        store2.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"f".repeat(64), 500, 500)
+            .expect("join");
+        store2.record_channel_left(RELAY, "chan-1", "closed:restricted: no access", 500, 500)
+            .expect("closed leave");
+        assert!(store2.joined_channels(RELAY).expect("channels").is_empty());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+    }
+
     /// A mention can arrive after the 44101 that removed us — queued behind it, or replayed inside the
     /// cursor skew. Recording it would mint a debt in a channel we can neither read nor answer, and
     /// nothing downstream would ever clear it.
     #[test]
     fn a_mention_arriving_after_we_left_creates_no_debt() {
         let (store, path) = fresh_store("owed-after-left");
-        store.record_channel_joined(RELAY, "chan-1", "add-1", 100, 100).expect("join");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "add-1", 100, 100).expect("join");
         store.record_channel_left(RELAY, "chan-1", "remove-1", 200, 200).expect("leave");
 
         assert!(
@@ -1784,7 +1910,7 @@ mod tests {
 
         // And the positive control: the same call in a channel we DO hold must still record, or this
         // test would pass just as well against a record_owed that never writes anything.
-        store.record_channel_joined(RELAY, "chan-2", "add-2", 100, 100).expect("join 2");
+        store.record_channel_joined(RELAY, "chan-2", "channel:chan-2", "add-2", 100, 100).expect("join 2");
         assert!(store.record_owed(&owed(&"e".repeat(64), "chan-2", 150), 300).expect("live mention"));
         assert_eq!(store.owed_responses().expect("owed").len(), 1);
         let _ = std::fs::remove_file(&path);
@@ -1794,7 +1920,7 @@ mod tests {
     fn a_redelivered_message_is_one_debt_not_two() {
         let (store, path) = fresh_store("owed-dedup");
         let event = "d".repeat(64);
-        store.record_channel_joined(RELAY, "chan-1", "e1", 100, 100).expect("join");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "e1", 100, 100).expect("join");
         assert!(store.record_owed(&owed(&event, "chan-1", 110), 111).expect("first"));
         // Every reconnect deliberately re-asks from before its cursor, so this is the normal case.
         assert!(!store.record_owed(&owed(&event, "chan-1", 110), 999).expect("replay"));
@@ -1805,7 +1931,7 @@ mod tests {
     #[test]
     fn debts_come_back_oldest_first_with_the_authors_timestamp() {
         let (store, path) = fresh_store("owed-order");
-        store.record_channel_joined(RELAY, "chan-1", "e1", 100, 100).expect("join");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "e1", 100, 100).expect("join");
         store.record_owed(&owed(&"2".repeat(64), "chan-1", 200), 1).expect("later");
         store.record_owed(&owed(&"1".repeat(64), "chan-1", 100), 2).expect("earlier");
 
@@ -1838,7 +1964,7 @@ mod tests {
 
         let reopened = SellerStore::open(&path).expect("reopen");
         assert_eq!(reopened.health().expect("health").schema_version, SCHEMA_VERSION);
-        assert!(reopened.record_channel_joined(RELAY, "chan-1", "e1", 100, 100).expect("join"));
+        assert!(reopened.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "e1", 100, 100).expect("join"));
         assert_eq!(reopened.participation_cursor(RELAY, "membership").expect("read"), None);
         let _ = std::fs::remove_file(&path);
     }
