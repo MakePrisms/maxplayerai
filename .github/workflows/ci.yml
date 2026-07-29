@@ -46,3 +46,13 @@ jobs:
       # journal/materialization) hold in release.
       - name: Test mobee-core (money-path suite)
         run: cargo test -p mobee-core --release --no-default-features --features gateway,git-delivery,wallet --locked
+
+  # The release workflow triggers only on a tag, so no pull request ever exercises it. What CI can
+  # check is that the gates keeping it from publishing are still in place — otherwise the property
+  # holds only until somebody edits the file, and nothing would say so.
+  release-gates:
+    name: Release workflow gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/verify-release-workflow.sh

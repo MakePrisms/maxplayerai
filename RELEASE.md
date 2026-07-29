@@ -1,0 +1,126 @@
+# Cutting a release
+
+`mobee` ships two ways from one tag: downloadable archives on a GitHub Release, and `npx mobee` from
+npm. Both come out of `.github/workflows/release.yml`, which runs on a pushed `v*` tag.
+
+## Before the first release
+
+One setup step, done once, and it is the only thing standing between a tag and a publish:
+
+- Add an npm **automation** token as the repository secret `NPM_TOKEN`
+  (Settings → Secrets and variables → Actions).
+
+Until that secret exists the workflow builds, verifies and creates GitHub Releases as normal, and the
+publish job stops on its first step. That is deliberate: the token lives in repository secrets and
+never in the tree.
+
+Publishing `@mobee/*` for the first time also needs the `mobee` npm org to exist and the token's
+account to be able to publish into it.
+
+## Cutting one
+
+1. **Bump the version.** `[workspace.package].version` in `Cargo.toml`, and `version` in every
+   `npm/*/package.json`, and the `optionalDependencies` pins in `npm/mobee/package.json`. All of
+   them must read the same string, and it must match the tag with the `v` dropped — the build
+   asserts this and stops if anything disagrees.
+2. Open a PR to `dev` with the bump, let it merge, then merge `dev` into `main`.
+3. **Tag `main` and push the tag:**
+   ```sh
+   git tag v0.2.0 && git push origin v0.2.0
+   ```
+
+A pre-release works the same way, with a semver suffix on both the tag and the tree — tag
+`v0.2.0-rc1` against a tree that says `0.2.0-rc1`. Any suffix marks the GitHub Release a pre-release
+and publishes npm under the `rc` dist-tag, so `npm i mobee` still resolves the last stable version.
+
+## What the tag does
+
+- Builds `mobee` for each platform on a runner of that architecture.
+- Verifies each artifact: the version matches the tag, the feature set is the buyer surface
+  (`wallet` in, `acp` out), and on Linux that it runs inside alpine and debian with no toolchain
+  present.
+- Attaches `mobee-<version>-<platform>.tar.gz` plus `SHA256SUMS` to a GitHub Release.
+- Publishes the npm packages: every payload package first, then the `mobee` launcher.
+
+The publish order matters. The launcher pins its payload by exact version, so publishing it first
+would leave a window where `npm i mobee` installs a launcher whose binary is not on the registry yet.
+
+## Dry run
+
+`workflow_dispatch` ("Run workflow" in the Actions tab) builds every platform and runs every
+verifier, and **cannot publish** — the release and publish jobs are gated on a tag push, and a
+dispatch is not one even if you aim it at a tag ref.
+
+Use it after any change to the workflow. On a dispatch run the release and publish jobs should show
+as skipped; that is the live confirmation that the gates hold, and it is worth watching once before
+the first real tag.
+
+## Platforms
+
+| platform | runner | shipped as |
+|---|---|---|
+| linux-x64 | `ubuntu-latest` | archive + `@mobee/cli-linux-x64` |
+| linux-arm64 | `ubuntu-24.04-arm` | archive + `@mobee/cli-linux-arm64` |
+| darwin-arm64 | `macos-14` | archive only |
+
+darwin-arm64 has no npm payload package yet, so macOS users download the archive; `npx mobee` tells
+them so rather than failing obscurely. Adding it means a `npm/cli-darwin-arm64` package and its entry
+in the launcher's platform map — at which point the publish job's platform list has to name it too,
+and the workflow fails at release time if it does not. That failure is the point: a payload package
+present in the tree but missing from the registry breaks every install on that platform, because the
+launcher pins it by exact version.
+
+**darwin-x64 and Windows are out of scope.**
+
+Adding a platform means: a matrix entry in `release.yml`, a package under `npm/`, an entry in
+`PLATFORM_PACKAGES` in `npm/mobee/bin/mobee.js`, an `optionalDependencies` pin, and the platform in
+`RELEASE_PLATFORMS`. Two of those five are asserted rather than trusted — the pin by
+`verify-release-version.sh`, and the platform list by the publish job.
+
+## Notes on the build
+
+**The Linux static build uses rustup's musl target, not nix.** `nix build .#buyer-static` is the
+derivation the artifact was originally proven with, and it remains the reference; CI does not use it
+because a cold `pkgsStatic` build on a hosted runner has no bounded cost — the aarch64 route was
+measured compiling rustc from source.
+
+That substitution is safe only because the property is re-proved rather than inherited:
+`verify-static-artifact.sh` runs on the binary CI actually produced, in containers with no nix and no
+toolchain. If the musl toolchain ever produces something dynamically linked, the release fails. If it
+turns out to produce something unacceptable for another reason, the fallback is
+`cachix/install-nix-action` plus `nix build .#buyer-static`, and nothing else in the pipeline changes.
+
+**The feature set is named explicitly.** CI builds `--no-default-features --features wallet` rather
+than relying on `default`. The two are equal today, but `acp` compiles the seller's agent-execution
+path, and a later change to `default` should not be able to put that into the binary handed to
+buyers. `flake.nix` still relies on `default` for `buyer-static`; making it explicit there too is a
+loose end.
+
+## Reproducibility cross-check (darwin, optional)
+
+A darwin binary built on a different machine will not hash the same as CI's even when the code is
+identical: `LC_UUID` and the ad-hoc code signature differ per link. Comparing raw `shasum` output
+therefore reports a mismatch on a perfectly good build, which looks exactly like tampering.
+
+A comparison worth trusting needs both of:
+
+1. **Locate the volatile regions structurally** — read `LC_UUID` and the `LC_CODE_SIGNATURE`
+   `dataoff`/`datasize` out of the load commands, and zero those. Never hardcode byte offsets: they
+   move with code size, and a stale offset produces a false match.
+2. **Negative-test the normalizer** — flip one byte deep in `__TEXT` and confirm the normalized hash
+   changes. A normalizer that zeroes too much would call two different binaries identical, and that
+   failure is invisible without this step.
+
+Fail closed: not Mach-O, missing file, or an ambiguous `LC_UUID` must exit non-zero, never a quiet 0.
+
+This is advisory. A mismatch is a prompt to investigate, not a release blocker — an independent
+rebuild is a cross-check, and letting it gate the pipeline would quietly make it load-bearing.
+
+## If a release goes wrong
+
+- **Publish failed, Release exists.** Fix the cause and re-run just the publish job. The build is
+  reproducible from the tag.
+- **A version disagreed with the tag.** Nothing was published — the check runs before any upload.
+  Delete the tag, fix the versions, tag again.
+- **A bad version reached npm.** npm does not allow republishing a version. Bump and release again;
+  `npm deprecate` the bad one.
