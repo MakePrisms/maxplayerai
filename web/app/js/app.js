@@ -375,6 +375,19 @@ let tick = null;
 
 renderWindows();
 
+/* mobile nav: the hamburger opens/closes the drop-down, and tapping any link
+   inside it closes the panel so the destination isn't hidden behind the menu. */
+const navToggle = el("nav-toggle");
+const navLinks = el("nav-links");
+if (navToggle && navLinks) {
+  const setNav = (open) => {
+    navLinks.classList.toggle("open", open);
+    navToggle.setAttribute("aria-expanded", open ? "true" : "false");
+  };
+  navToggle.addEventListener("click", () => setNav(!navLinks.classList.contains("open")));
+  navLinks.addEventListener("click", (ev) => { if (ev.target.closest("a")) setNav(false); });
+}
+
 el("windows").addEventListener("click", (ev) => {
   const key = ev.target.closest("button")?.dataset.window;
   if (!key || key === windowKey) return;
