@@ -33,7 +33,7 @@ pub mod wallet_actor;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -49,7 +49,9 @@ use crate::job_lifecycle::{
     self, AwardClaimRequest, ContributionSpec, GetJobRequest, JobKind, PostJobRequest, WaitFor,
 };
 use crate::payment::{PaymentMachine, PaymentRecord, PaymentState};
-use lifecycle::{AwardError, AwardFilters, PaymentProgress, RearmAction, SettleError};
+use lifecycle::{
+    AwardError, AwardFilters, MissingOfferAction, PaymentProgress, RearmAction, SettleError,
+};
 use lock::{HomeLock, LockError};
 use protocol::{CODE_INTERNAL, CODE_METHOD_NOT_FOUND, CODE_NOT_IMPLEMENTED, Request, Response};
 use reservations::{Dispositions, ReconcileReport};
@@ -60,7 +62,18 @@ use wallet_actor::WalletHandle;
 /// A recognized trade method was refused by its money guard (reservation refused, budget refused).
 pub const CODE_REFUSED: i64 = -32002;
 /// Timeout for the daemon's relay fetches (job view / auto-award selection / reconcile liveness).
-const RELAY_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// Sized above observed round-trip latency, not at it. At 5s this budget sat *under* the measured
+/// answer time of a live relay (~4.9s) once the WebSocket connect is charged against the first
+/// fetch, so reads lost the race often enough to park valid trades (#253). The doctor's relay probe
+/// already uses 15s for the same network, which is the precedent this follows.
+const RELAY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Consecutive offer reads that may come back empty before the auto-award driver gives up on a job
+/// whose deadline it has never learned. An empty read proves nothing (see
+/// [`lifecycle::plan_missing_offer`]), so this bound exists only to stop an unbounded loop when
+/// there is no deadline to bound it — a job posted through this daemon carries its deadline from the
+/// post, so the bound applies to re-armed intents whose first reads all fail.
+const MAX_UNVERIFIED_OFFER_READS: u32 = 5;
 /// How often the background auto-award task re-checks the relay for a payable claim, until one
 /// appears or the offer deadline passes. Bounded polling (no tight spin on a live-but-unpayable claim).
 const AUTO_AWARD_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -239,7 +252,9 @@ pub async fn run(home: MobeeHome) -> Result<(), BuyerError> {
     match context.store.list_pending_awards() {
         Ok(pending) => {
             for intent in pending {
-                spawn_auto_award(context.clone(), intent.job_id, intent.max_sats);
+                // No posted deadline on a re-arm — the intent row does not carry one, so the
+                // driver learns it from its first successful read.
+                spawn_auto_award(context.clone(), intent.job_id, intent.max_sats, None);
             }
         }
         Err(error) => eprintln!("buyer: could not list pending auto-awards to re-arm: {error}"),
@@ -428,7 +443,12 @@ async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Resp
                     outcome.job_id
                 );
             } else {
-                spawn_auto_award(context.clone(), outcome.job_id.clone(), max_sats);
+                spawn_auto_award(
+                    context.clone(),
+                    outcome.job_id.clone(),
+                    max_sats,
+                    Some(outcome.deadline_unix),
+                );
             }
             Response::ok(id, json!(outcome))
         }
@@ -713,9 +733,19 @@ fn buyer_keys(home: &MobeeHome) -> Result<nostr_sdk::Keys, String> {
 /// Spawn the background auto-award task for a posted job — the daemon-drives-the-award half of the
 /// 2-call trade loop. A task failure never affects the daemon; the intent stays `pending` and is
 /// re-armed on the next start.
-fn spawn_auto_award(context: Arc<BuyerContext>, job_id: String, max_sats: u64) {
+/// `posted_deadline_unix` is `Some` when this call follows the post that created the intent (the
+/// deadline is then known without asking the relay) and `None` on a boot re-arm, where the deadline
+/// must be learned from a read.
+fn spawn_auto_award(
+    context: Arc<BuyerContext>,
+    job_id: String,
+    max_sats: u64,
+    posted_deadline_unix: Option<u64>,
+) {
     tokio::spawn(async move {
-        if let Err(error) = drive_auto_award(&context, &job_id, max_sats).await {
+        if let Err(error) =
+            drive_auto_award(&context, &job_id, max_sats, posted_deadline_unix).await
+        {
             eprintln!("buyer: auto-award for {job_id} did not complete ({error}); left pending for re-arm");
         }
     });
@@ -737,6 +767,7 @@ async fn drive_auto_award(
     context: &Arc<BuyerContext>,
     job_id: &str,
     max_sats: u64,
+    posted_deadline_unix: Option<u64>,
 ) -> Result<(), String> {
     let keys = buyer_keys(&context.home)?;
 
@@ -756,7 +787,13 @@ async fn drive_auto_award(
         return Ok(());
     }
 
+    // The offer deadline, as known so far: from the post that created this intent, else learned
+    // from the first read that succeeds. It is what bounds retrying through unverifiable reads.
+    let mut deadline_unix = posted_deadline_unix;
+    let mut unverified_reads: u32 = 0;
+
     loop {
+        let read_started = Instant::now();
         let view = job_lifecycle::fetch_job_view_async(
             &context.home,
             &keys,
@@ -766,12 +803,55 @@ async fn drive_auto_award(
         )
         .await
         .map_err(|error| error.to_string())?;
+        let read_ms = read_started.elapsed().as_millis();
         let Some(offer) = view.offer.as_ref() else {
-            let _ = context
-                .store
-                .mark_award_parked(job_id, "offer no longer on the relay", now_unix());
-            return Ok(());
+            // An empty read is CANNOT-VERIFY, never ABSENT: `fetch_events` returns an empty set
+            // both for "no such event" and for "the budget expired first" (#253). Log the elapsed
+            // time, because that is the only thing that distinguishes the two from outside.
+            unverified_reads += 1;
+            eprintln!(
+                "buyer: auto-award {job_id}: offer read returned no offer in {read_ms}ms \
+                 (budget {}s, unverified read {unverified_reads}/{MAX_UNVERIFIED_OFFER_READS}, \
+                 deadline {})",
+                RELAY_TIMEOUT.as_secs(),
+                deadline_unix
+                    .map(|deadline| deadline.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned()),
+            );
+            match lifecycle::plan_missing_offer(
+                deadline_unix,
+                now_unix() as u64,
+                unverified_reads,
+                MAX_UNVERIFIED_OFFER_READS,
+            ) {
+                MissingOfferAction::Retry => {
+                    tokio::time::sleep(AUTO_AWARD_POLL_INTERVAL).await;
+                    continue;
+                }
+                MissingOfferAction::ParkExpired => {
+                    let _ = context.store.mark_award_parked(
+                        job_id,
+                        "offer deadline passed before an awardable claim appeared",
+                        now_unix(),
+                    );
+                    return Ok(());
+                }
+                // Say only what is known. The offer was never read successfully — that is not the
+                // same claim as "the offer is not on the relay", and stating the stronger one is
+                // what made four parked trades unexplainable after the fact.
+                MissingOfferAction::ParkUnverified => {
+                    let _ = context.store.mark_award_parked(
+                        job_id,
+                        "offer could not be read from the relay (never verified present or absent)",
+                        now_unix(),
+                    );
+                    return Ok(());
+                }
+            }
         };
+        // The offer is in hand: its deadline is now known truth, and the unverified streak is over.
+        deadline_unix = Some(offer.deadline_unix);
+        unverified_reads = 0;
         if now_unix() as u64 > offer.deadline_unix {
             let _ = context.store.mark_award_parked(
                 job_id,

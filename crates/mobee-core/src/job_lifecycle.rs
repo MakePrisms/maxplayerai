@@ -29,8 +29,20 @@ use crate::home::{self, HomeError, MobeeHome};
 use crate::{buyer_fund, payment_wallet};
 
 const JOBS_DIR: &str = "jobs";
-/// Per-relay-fetch budget. Kept well under [`WAIT_FOR_CAP_SECS`] / MCP tool deadline.
-const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 5;
+/// Per-relay-fetch budget for INTERACTIVE reads — the `get_job` family, where a client is waiting.
+/// Kept well under [`WAIT_FOR_CAP_SECS`] / MCP tool deadline: a read that outlives the tool
+/// deadline starves the caller instead of answering it, so this one is bounded from ABOVE.
+const INTERACTIVE_FETCH_TIMEOUT_SECS: u64 = 5;
+/// Per-relay-fetch budget for the TRADE reads — award, accept, accept-for-collect. Nothing is
+/// long-polling these, so unlike [`INTERACTIVE_FETCH_TIMEOUT_SECS`] they are bounded from BELOW:
+/// they must exceed observed relay round-trip latency, because an empty read here refuses an award
+/// or an accept and the caller cannot tell that from a genuine absence (#253).
+///
+/// These were one constant with one value. That is the defect: the same number served a read
+/// bounded by a client deadline and a read whose failure costs a trade. They are separate budgets
+/// with opposite constraints, so they are separate names — collapsing them again would either
+/// break the MCP deadline or under-budget the money path.
+const TRADE_FETCH_TIMEOUT_SECS: u64 = 15;
 /// Cap for `get_job(wait_for=…)` long-poll. Must stay < MCP tool deadline (~15s) so
 /// cap-hit returns PENDING for re-poll instead of starving the client read-timeout (~60s).
 const WAIT_FOR_CAP_SECS: u64 = 10;
@@ -113,6 +125,10 @@ pub struct PostJobOutcome {
     pub relay_url: String,
     pub task: String,
     pub output: String,
+    /// The deadline actually published on the offer, resolved from the request (which may leave it
+    /// unset). Returned so the caller knows the offer's own clock without re-reading the relay —
+    /// the auto-award driver uses it to bound its retries.
+    pub deadline_unix: u64,
 }
 
 /// Inputs for reading job state from the relay.
@@ -477,6 +493,7 @@ pub async fn post_job_async(
         relay_url: home.config.relay_url.clone(),
         task: request.task,
         output: request.output,
+        deadline_unix,
     })
 }
 
@@ -649,7 +666,7 @@ pub async fn get_job_async(
     request: GetJobRequest,
 ) -> Result<JobView, JobLifecycleError> {
     let keys = buyer_keys(home)?;
-    let fetch_timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
+    let fetch_timeout = Duration::from_secs(INTERACTIVE_FETCH_TIMEOUT_SECS);
 
     let Some(wait_for) = request.wait_for else {
         let mut view =
@@ -720,7 +737,7 @@ pub async fn get_job_awaiting_events_async(
     mut events: tokio::sync::broadcast::Receiver<std::sync::Arc<nostr_sdk::Event>>,
 ) -> Result<JobView, JobLifecycleError> {
     let keys = buyer_keys(home)?;
-    let fetch_timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
+    let fetch_timeout = Duration::from_secs(INTERACTIVE_FETCH_TIMEOUT_SECS);
 
     let Some(wait_for) = request.wait_for else {
         let mut view =
@@ -817,7 +834,7 @@ pub async fn award_claim_async(
     home: &MobeeHome,
     request: AwardClaimRequest,
 ) -> Result<AwardClaimOutcome, JobLifecycleError> {
-    let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
+    let timeout = Duration::from_secs(TRADE_FETCH_TIMEOUT_SECS);
     let keys = buyer_keys(home)?;
     // Injected `now` derives claim liveness — a claim past the offer deadline surfaces as
     // non-processing and is refused below.
@@ -877,7 +894,7 @@ pub async fn accept_claim_async(
     home: &MobeeHome,
     request: AcceptClaimRequest,
 ) -> Result<AcceptClaimOutcome, JobLifecycleError> {
-    let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
+    let timeout = Duration::from_secs(TRADE_FETCH_TIMEOUT_SECS);
     let keys = buyer_keys(home)?;
     // Injected `now` derives the claim status: past the offer deadline a claim reads `expired`
     // (refused below) UNLESS its seller delivered inside the pay window, in which case it reads
@@ -1078,7 +1095,7 @@ pub async fn accept_for_collect_async(
     home: &MobeeHome,
     job_id: &str,
 ) -> Result<AcceptedBind, JobLifecycleError> {
-    let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
+    let timeout = Duration::from_secs(TRADE_FETCH_TIMEOUT_SECS);
     let keys = buyer_keys(home)?;
     let view = fetch_job_view_async(home, &keys, job_id, timeout, now_unix()).await?;
     let claim_id = select_deliverable_claim(&view)?;

@@ -361,6 +361,52 @@ pub fn plan_rearm(award_on_relay: bool, reservation: Option<ReservationState>) -
     RearmAction::Attempt
 }
 
+/// What the auto-award driver does when its relay read comes back carrying no offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingOfferAction {
+    /// The offer's own deadline has passed — park on positive knowledge.
+    ParkExpired,
+    /// The read cannot tell absence from a failed read — read again.
+    Retry,
+    /// The bound on consecutive unverifiable reads is exhausted and the offer was never seen —
+    /// park, stating only that the read never succeeded.
+    ParkUnverified,
+}
+
+/// The decision behind a missing offer, kept separate from the read so the rule is testable
+/// without a relay.
+///
+/// A relay read that returns nothing is NOT evidence of absence. `fetch_events` yields an empty
+/// set both for "no such event" and for "the timeout expired first", and the two are
+/// indistinguishable at the call site — so an empty offer read is CANNOT-VERIFY, never ABSENT.
+/// (Issue #253: rendering it as absence parked valid trades, four of them provably so, because a
+/// relay answering near the read budget loses the race often enough to matter.) This is the same
+/// posture [`plan_rearm`]'s caller already takes on the award check, where a relay error is
+/// treated as "unknown" rather than "no award".
+///
+/// `deadline_unix` is the offer's deadline when it is known — from the post that created this
+/// intent, or from any earlier successful read. Knowing it is what makes retrying safe: the
+/// deadline bounds the retry, so a job cannot spin forever. Only when the deadline is unknown
+/// does the consecutive-read bound apply, and giving up then parks with a reason that claims no
+/// more than we can support.
+pub fn plan_missing_offer(
+    deadline_unix: Option<u64>,
+    now_unix: u64,
+    consecutive_unverified_reads: u32,
+    max_unverified_reads: u32,
+) -> MissingOfferAction {
+    if let Some(deadline) = deadline_unix {
+        if now_unix > deadline {
+            return MissingOfferAction::ParkExpired;
+        }
+        return MissingOfferAction::Retry;
+    }
+    if consecutive_unverified_reads < max_unverified_reads {
+        return MissingOfferAction::Retry;
+    }
+    MissingOfferAction::ParkUnverified
+}
+
 /// Classify a reserved job for [`BuyerStore::reconcile`] from its payment progress + relay
 /// liveness. The payment journal is authoritative over relay liveness: a `Closed` payment is
 /// `Paid` regardless of whether the claim still looks live, and an ambiguous payment is KEPT
@@ -908,6 +954,36 @@ mod tests {
         // Released or never reserved, no relay award ⇒ Attempt.
         assert_eq!(plan_rearm(false, Some(ReservationState::Released)), RearmAction::Attempt);
         assert_eq!(plan_rearm(false, None), RearmAction::Attempt);
+    }
+
+    // An empty offer read is CANNOT-VERIFY, never ABSENT (#253). Enumerated failure modes: a
+    // never-seen offer must retry up to the bound and then park WITHOUT claiming absence; a known
+    // deadline must retry until it actually passes, then park on that positive knowledge.
+    #[test]
+    fn plan_missing_offer_never_treats_an_empty_read_as_absence() {
+        const MAX: u32 = 5;
+
+        // Deadline unknown: retry up to the bound. The FIRST empty read must not park — that is
+        // exactly the read that killed four valid trades.
+        assert_eq!(plan_missing_offer(None, 1_000, 0, MAX), MissingOfferAction::Retry);
+        assert_eq!(plan_missing_offer(None, 1_000, MAX - 1, MAX), MissingOfferAction::Retry);
+        // Bound exhausted, offer never seen ⇒ park, but as unverified, not as absent.
+        assert_eq!(plan_missing_offer(None, 1_000, MAX, MAX), MissingOfferAction::ParkUnverified);
+        assert_eq!(plan_missing_offer(None, 1_000, MAX + 1, MAX), MissingOfferAction::ParkUnverified);
+
+        // Deadline known and in the future: retry no matter how many reads have failed — the
+        // deadline is the bound, so consecutive failures never cut a live offer short.
+        assert_eq!(plan_missing_offer(Some(2_000), 1_000, 0, MAX), MissingOfferAction::Retry);
+        assert_eq!(plan_missing_offer(Some(2_000), 1_000, 99, MAX), MissingOfferAction::Retry);
+        // Exactly at the deadline is still inside it (the read loop uses `now > deadline`).
+        assert_eq!(plan_missing_offer(Some(2_000), 2_000, 99, MAX), MissingOfferAction::Retry);
+        // Past the deadline ⇒ park on positive knowledge, whatever the read count.
+        assert_eq!(plan_missing_offer(Some(2_000), 2_001, 0, MAX), MissingOfferAction::ParkExpired);
+
+        // A bound of zero still cannot park a job whose deadline is known and unexpired.
+        assert_eq!(plan_missing_offer(Some(2_000), 1_000, 0, 0), MissingOfferAction::Retry);
+        // …but with no deadline it gives up at once, which is the only case that may.
+        assert_eq!(plan_missing_offer(None, 1_000, 0, 0), MissingOfferAction::ParkUnverified);
     }
 
     // ── CONCURRENCY test helpers ────────────────────────────────────────────────────────────────

@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::home::{self, HomeError, MobeeHome, ProfileConfig};
 
-const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 8;
+/// Budget for a kind-0 profile fetch. Named for what it reads: a third constant called
+/// `DEFAULT_FETCH_TIMEOUT_SECS` used to live here, sharing a name with two unrelated budgets on the
+/// trade path (#253) — so grepping the name found three different concepts with three values.
+const PROFILE_FETCH_TIMEOUT_SECS: u64 = 8;
 /// Cap hostile kind-0 payloads (same order as web network parser).
 const PROFILE_CONTENT_MAX: usize = 64 * 1024;
 const PROFILE_NAME_MAX: usize = 128;
@@ -270,7 +273,7 @@ async fn publish_metadata_merged_async(
         .author(keys.public_key())
         .kind(Kind::Metadata)
         .limit(1);
-    let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
+    let timeout = Duration::from_secs(PROFILE_FETCH_TIMEOUT_SECS);
     let fetched = client.fetch_events(filter, timeout).await;
     let fetched = match fetched {
         Ok(events) => events,
@@ -549,7 +552,7 @@ pub async fn fetch_names_async(
     client.connect().await;
 
     let filter = Filter::new().authors(authors).kind(Kind::Metadata);
-    let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
+    let timeout = Duration::from_secs(PROFILE_FETCH_TIMEOUT_SECS);
     let events = client.fetch_events(filter, timeout).await;
     client.disconnect().await;
     let events =
