@@ -269,8 +269,20 @@ impl Participation {
             // Drop everything already in hand from a relay that lagged. These arrived after its gap,
             // so acting on them is acting on data from beyond a hole — and it is the cursor advance
             // that would make the hole permanent.
+            //
+            // ★ Dropping the in-hand batch is NOT sufficient on its own. After a `Lagged`, the receiver
+            // is positioned at the oldest still-buffered post-gap message, so the next tick would go on
+            // consuming pre-resync traffic — the same hole, one tick later. The receiver has to be
+            // REPLACED, and replaced BEFORE the resync REQs are sent: a fresh receiver starts at the
+            // channel's current tail, discarding the stale backlog, and doing it first guarantees the
+            // replay lands in the receiver we will actually read.
             if !resync.is_empty() {
                 batch.retain(|(url, _)| !resync.contains(url));
+                for url in &resync {
+                    if let Some(live) = self.live.get_mut(url) {
+                        live.notifications = live.reader.notifications();
+                    }
+                }
                 for url in &resync {
                     self.resync_relay(url).await?;
                 }

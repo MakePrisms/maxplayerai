@@ -206,18 +206,15 @@ impl Engine {
                     // Losing access is a membership fact, so it is recorded exactly as a 44101 is
                     // — otherwise a restart would cheerfully re-subscribe to a channel the relay
                     // has already told us we cannot read, forever.
-                    // Ordered at `now`: unlike a 44101 this has no author timestamp, and it is an
-                    // observation about the PRESENT, so it must outrank every membership event we
-                    // have already seen. A later relay-signed 44100 still wins, which is what
-                    // re-admission should do. (A 44100 bearing a future timestamp would too — but
-                    // such an event is anomalous on its own terms, not a case to encode here.)
-                    self.store.record_channel_left(
-                        &self.relay_url,
-                        &channel_id,
-                        &format!("closed:{reason}"),
-                        now_unix,
-                        now_unix,
-                    )?;
+                    // ★ Suppression, NOT a membership change. A refused read is a local observation
+                    // about one subscription attempt; it is not the relay revoking our membership, and
+                    // it has no author timestamp to order against events that do. Recording it as a
+                    // leave meant inventing a synthetic source id and ranking it against real ones,
+                    // which livelocked: the replayed 44100 carries the same timestamp and could never
+                    // win the channel back. The membership row stays as the relay left it; the channel
+                    // simply stops being resumed until a newer relay-signed event clears it.
+                    self.store
+                        .suppress_channel(&self.relay_url, &channel_id, now_unix)?;
                     ClosedAction::DropChannel { channel_id }
                 }
                 // A `restricted:` on the GLOBAL membership subscription is not about one channel —

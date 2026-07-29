@@ -23,7 +23,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::gateway::EventDraft;
 
 /// Current on-disk schema version.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// A cloneable handle to the node-owned SQLite state.
 #[derive(Clone)]
@@ -312,6 +312,10 @@ impl SellerStore {
                  -- flip us back to joined. Kept as a high-water mark even when the state does not
                  -- change, or a newer add followed by an older remove would still be applied.
                  source_created_at_unix INTEGER NOT NULL DEFAULT 0,
+                 -- A LOCAL refusal, not a membership fact: the relay CLOSED a read on this channel.
+                 -- Kept out of membership ordering entirely (see `suppress_channel`) and cleared only
+                 -- by a genuinely newer relay-signed membership event.
+                 suppressed INTEGER NOT NULL DEFAULT 0,
                  updated_at_unix INTEGER NOT NULL,
                  PRIMARY KEY (relay_url, channel_id)
              );
@@ -365,6 +369,14 @@ impl SellerStore {
             conn.execute_batch(
                 "ALTER TABLE participation_channels
                      ADD COLUMN source_created_at_unix INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        // `0` = not suppressed, which is the right default: a store written before this column knew
+        // nothing about local refusals, so nothing in it was suppressed.
+        if !Self::column_exists(conn, "participation_channels", "suppressed")? {
+            conn.execute_batch(
+                "ALTER TABLE participation_channels
+                     ADD COLUMN suppressed INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
         Ok(())
@@ -1074,6 +1086,61 @@ impl SellerStore {
         )
     }
 
+    /// Record that the relay REFUSED a read on this channel — a local observation, not a membership fact.
+    ///
+    /// ★ Deliberately not a `record_channel_left`. A `CLOSED` tells us one subscription attempt was
+    /// refused; it does not tell us the relay revoked our membership, and it carries no author timestamp
+    /// to order against ones that do. Feeding it into membership ordering is a category error, and an
+    /// earlier attempt at exactly that produced a livelock: a synthetic marker ranked above a join at
+    /// equal timestamps could never be beaten by the replayed invite, which carries the same timestamp.
+    ///
+    /// So the membership row is left untouched and a suppression flag is raised instead. The channel
+    /// stops being resumed ([`Self::joined_channels`] excludes it) and its debts are closed, but the
+    /// relay's own assertion of our membership is preserved — and a genuinely NEWER relay-signed
+    /// membership event clears the suppression, which is what makes this provisional rather than
+    /// terminal. Returns whether this call is what suppressed it.
+    pub fn suppress_channel(
+        &self,
+        relay_url: &str,
+        channel_id: &str,
+        now_unix: i64,
+    ) -> Result<bool, StoreError> {
+        let mut conn = self.lock()?;
+        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE participation_channels SET suppressed = 1, updated_at_unix = ?3
+             WHERE relay_url = ?1 AND channel_id = ?2 AND suppressed = 0",
+            params![relay_url, channel_id, now_unix],
+        )?;
+        // A debt in a channel we cannot read is a debt we cannot discharge — same reasoning as a
+        // revocation, same transaction.
+        transaction.execute(
+            "UPDATE participation_owed SET state = 'dropped'
+             WHERE relay_url = ?1 AND channel_id = ?2 AND state = 'owed'",
+            params![relay_url, channel_id],
+        )?;
+        transaction.commit()?;
+        Ok(changed == 1)
+    }
+
+    /// Whether a channel is locally suppressed after a refused read.
+    pub fn channel_suppressed(
+        &self,
+        relay_url: &str,
+        channel_id: &str,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                "SELECT suppressed FROM participation_channels
+                 WHERE relay_url = ?1 AND channel_id = ?2",
+                params![relay_url, channel_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some_and(|flag| flag == 1))
+    }
+
     /// Apply one relay-signed membership notification, ordered by the AUTHOR's timestamp.
     ///
     /// Returns whether the membership state actually transitioned — which is what decides if there
@@ -1097,12 +1164,12 @@ impl SellerStore {
         let mut conn = self.lock()?;
         let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let current: Option<(String, i64, String)> = transaction
+        let current: Option<(String, i64, String, i64)> = transaction
             .query_row(
-                "SELECT state, source_created_at_unix, source_event_id
+                "SELECT state, source_created_at_unix, source_event_id, suppressed
                  FROM participation_channels WHERE relay_url = ?1 AND channel_id = ?2",
                 params![relay_url, channel_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
 
@@ -1144,38 +1211,32 @@ impl SellerStore {
                 // member of it — so there is no subscription to tear down and nothing transitioned.
                 state == "joined"
             }
-            Some((stored_state, stored_created_at, stored_event_id)) => {
-                // ★ Ordering is (created_at, restrictiveness, event_id) — NOT (created_at, event_id).
+            Some((stored_state, stored_created_at, stored_event_id, stored_suppressed)) => {
+                // ★ ONLY relay-signed membership events reach here, so `(created_at, event_id)` is a
+                // meaningful scale: both sides are the same KIND of fact — the relay asserting
+                // membership — and the author's clock orders them. A local refusal is NOT a membership
+                // fact and never enters this comparison; it goes through `suppress_channel`.
                 //
-                // A `CLOSED`-derived leave has no author timestamp and carries a SYNTHETIC
-                // `closed:{reason}` marker as its source id. Comparing that against a real hex event id
-                // is a string sort: `'c'` sits inside the hex alphabet, so a same-second CLOSED-leave
-                // versus a genuine re-add would be decided by lexicographic accident.
-                //
-                // Ranking `left` above `joined` at an equal timestamp settles it on meaning instead:
-                // the RESTRICTIVE transition wins, so ties FAIL CLOSED. Believing we hold access we do
-                // not keeps sending traffic to a relay that refused us; believing we lack access we do
-                // hold costs one channel, which the next 44100 replay restores. The synthetic id then
-                // only ever participates when timestamp AND state both match — two leaves in the same
-                // second, where either outcome is the same row.
-                let rank = |state: &str| i32::from(state == "left");
-                let newer = (
-                    source_created_at_unix,
-                    rank(state),
-                    source_event_id,
-                ) > (
-                    stored_created_at,
-                    rank(&stored_state),
-                    stored_event_id.as_str(),
-                );
+                // That separation is the fix for a livelock an earlier attempt introduced: ranking a
+                // CLOSED-derived leave above a join at equal timestamps made the leave win, and a
+                // replayed 44100 carries the SAME `created_at` — so it could never win back, leaving us
+                // permanently out of a channel we were still a member of. Comparing two different kinds
+                // of evidence on one timestamp scale was the error; loosening the tie to `>=` would only
+                // reopen the replay hazard this ordering exists for.
+                let newer = (source_created_at_unix, source_event_id)
+                    > (stored_created_at, stored_event_id.as_str());
                 if !newer {
                     transaction.commit()?;
                     return Ok(false);
                 }
+                // A newer relay-signed membership event also CLEARS any local suppression: the relay is
+                // authoritative about membership, and a fresh assertion is new evidence that whatever we
+                // were refused before has changed. A mere replay does not reach here, so a stale invite
+                // cannot un-suppress a channel the relay is still refusing.
                 transaction.execute(
                     "UPDATE participation_channels
                      SET state = ?3, source_event_id = ?4, source_created_at_unix = ?5,
-                         updated_at_unix = ?6
+                         updated_at_unix = ?6, suppressed = 0
                      WHERE relay_url = ?1 AND channel_id = ?2",
                     params![
                         relay_url,
@@ -1186,7 +1247,11 @@ impl SellerStore {
                         now_unix
                     ],
                 )?;
-                stored_state != state
+                // ★ Clearing a suppression is wire work even when the state does not change. We had
+                // stopped reading that channel, so a newer invite that un-suppresses it must produce a
+                // subscribe — otherwise the flag clears and nothing ever re-subscribes, which is the
+                // livelock again wearing a different mask.
+                stored_state != state || (state == "joined" && stored_suppressed == 1)
             }
         };
 
@@ -1209,9 +1274,12 @@ impl SellerStore {
     /// The channels to re-subscribe on boot for one relay.
     pub fn joined_channels(&self, relay_url: &str) -> Result<Vec<String>, StoreError> {
         let conn = self.lock()?;
+        // Suppressed channels are excluded: the relay refused a read on them, so re-subscribing would
+        // be asking again for something already denied. They keep their membership row — that is a
+        // relay-asserted fact and only the relay revokes it — but they are not resumed.
         let mut statement = conn.prepare(
             "SELECT channel_id FROM participation_channels
-             WHERE relay_url = ?1 AND state = 'joined'
+             WHERE relay_url = ?1 AND state = 'joined' AND suppressed = 0
              ORDER BY channel_id",
         )?;
         let rows = statement.query_map([relay_url], |row| row.get::<_, String>(0))?;
@@ -1864,33 +1932,60 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A `CLOSED`-derived leave carries a synthetic `closed:{reason}` marker instead of an event id, and
-    /// `'c'` is inside the hex alphabet — so a same-second tie against a real re-add must not be settled
-    /// by string sort. Ties resolve on meaning: the restrictive transition wins, fail-closed.
+    /// A refused read stops the channel being resumed, without pretending to be a membership change.
     #[test]
-    fn a_same_second_closed_leave_beats_a_re_add_regardless_of_id_sorting() {
-        let (store, path) = fresh_store("closed-tie");
-        // A real hex id starting BELOW 'c', so a plain string sort would let the re-add win.
+    fn a_refused_read_suppresses_the_channel_and_closes_its_debts() {
+        let (store, path) = fresh_store("suppress");
         store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 500, 500)
             .expect("join");
-        store.record_channel_left(RELAY, "chan-1", "closed:restricted: no access", 500, 500)
-            .expect("closed leave");
+        store.record_owed(&owed(&"d".repeat(64), "chan-1", 510), 511).expect("owed");
+
+        assert!(store.suppress_channel(RELAY, "chan-1", 600).expect("suppress"));
+        assert!(store.joined_channels(RELAY).expect("channels").is_empty());
+        assert!(store.channel_suppressed(RELAY, "chan-1").expect("flag"));
+        assert!(store.owed_responses().expect("owed").is_empty());
+        // Idempotent: suppressing again is not a new event.
+        assert!(!store.suppress_channel(RELAY, "chan-1", 700).expect("again"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ★ THE LIVELOCK. A refused read must not permanently exclude us from a channel we are still a
+    /// member of. The earlier attempt ranked a synthetic `closed:` marker above a join at equal
+    /// timestamps, and since the relay replays an invite with its ORIGINAL `created_at`, nothing could
+    /// ever win the channel back. Suppression and membership are now separate kinds of fact, so a
+    /// genuinely newer relay-signed invite clears it regardless of when the refusal happened.
+    #[test]
+    fn a_newer_invite_clears_a_suppression_that_a_replay_cannot() {
+        let (store, path) = fresh_store("suppress-clear");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 500, 500)
+            .expect("join");
+        // Refused at the SAME second as the membership event — the exact tie that used to livelock.
+        store.suppress_channel(RELAY, "chan-1", 500).expect("suppress");
+        assert!(store.joined_channels(RELAY).expect("channels").is_empty());
+
+        // A REPLAY of the original invite must not un-suppress it: same id, same timestamp, no new
+        // information, and the relay may still be refusing the read.
+        assert!(
+            !store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 500, 900)
+                .expect("replay")
+        );
         assert!(
             store.joined_channels(RELAY).expect("channels").is_empty(),
-            "a same-second CLOSED leave lost to a re-add on id sorting instead of failing closed"
+            "a replayed invite un-suppressed a channel the relay is still refusing"
         );
 
-        // And the tie must not swing the other way either: an id sorting ABOVE the marker must still
-        // lose to it at the same second.
-        let (store2, path2) = fresh_store("closed-tie-2");
-        store2.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"f".repeat(64), 500, 500)
-            .expect("join");
-        store2.record_channel_left(RELAY, "chan-1", "closed:restricted: no access", 500, 500)
-            .expect("closed leave");
-        assert!(store2.joined_channels(RELAY).expect("channels").is_empty());
-
+        // A genuinely newer relay-signed invite is new evidence, and clears it.
+        assert!(
+            store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"b".repeat(64), 800, 900)
+                .expect("re-add")
+        );
+        assert_eq!(
+            store.joined_channels(RELAY).expect("channels"),
+            ["chan-1"],
+            "a newer invite could not clear the suppression — the channel is livelocked"
+        );
+        assert!(!store.channel_suppressed(RELAY, "chan-1").expect("flag"));
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&path2);
     }
 
     /// A mention can arrive after the 44101 that removed us — queued behind it, or replayed inside the
