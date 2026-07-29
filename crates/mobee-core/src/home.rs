@@ -213,11 +213,34 @@ pub struct SellerConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxConfig {
-    /// The launcher argv the agent command runs inside (no-shell argv array, same rule as
-    /// `agent_command`: a bare string is refused, and the array must be non-empty — an empty
-    /// launcher is expressed by omitting the whole `[sandbox]` section, not by an empty array).
-    #[serde(deserialize_with = "deserialize_agent_command_argv")]
+    /// Which executor runs the agent command. `launcher` (default) prepends a launcher argv;
+    /// `docker` runs the command inside a container that mounts ONLY the per-job workdir.
+    #[serde(default)]
+    pub mode: SandboxMode,
+    /// `launcher` mode: the launcher argv the agent command runs inside (no-shell argv array, same
+    /// rule as `agent_command`: a bare string is refused, and a present array must be non-empty).
+    /// Omitted ⇒ pass-through under `launcher` mode. Unused under `docker` mode.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_agent_command_argv",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub launcher: Vec<String>,
+    /// `docker` mode: the container image carrying the agent runtime (node + ACP adapter + git +
+    /// CA certs — see `docker/mobee-sandbox/Dockerfile`). Required under `docker` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+}
+
+/// Which executor the `[sandbox]` section selects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxMode {
+    /// Prepend a launcher argv to the agent command (Phase-0 behavior; empty launcher = pass-through).
+    #[default]
+    Launcher,
+    /// Run the agent command inside a container that mounts only the per-job workdir.
+    Docker,
 }
 
 /// Persistent-seller-memory config (`[seller_memory]` section): the read-on-start +

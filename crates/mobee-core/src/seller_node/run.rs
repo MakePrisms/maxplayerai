@@ -1950,7 +1950,16 @@ impl SellerNodeRunner {
         // configured `[sandbox]` policy launches the command (pass-through when absent).
         let deadline = offer.deadline_unix.max(0) as u64;
         let prompt = compose_agent_prompt(&offer.task, &seller.git_remote, None);
-        let sandbox = SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref());
+        // Resolve the sandbox executor before the run; a misconfigured `[sandbox]` fails the job
+        // rather than silently running the agent unsandboxed.
+        let sandbox = match SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref()) {
+            Ok(sandbox) => sandbox,
+            Err(error) => {
+                eprintln!("seller node execute fail job_id={job_id}: sandbox config invalid ({error})");
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+                return;
+            }
+        };
         let run_started = std::time::Instant::now();
         let run_result = run_agent_with_retry(
             deadline,
