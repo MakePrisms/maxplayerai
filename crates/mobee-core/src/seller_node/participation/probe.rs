@@ -74,6 +74,7 @@ use super::relays::ProbeOutcome;
 /// broken or empty — it is the only thing we may act on.
 pub async fn probe_access(
     publisher: &Client,
+    relay_url: &str,
     reader: &Client,
     carrier: &Event,
     timeout: Duration,
@@ -90,7 +91,12 @@ pub async fn probe_access(
 
     let event_id = carrier.id;
 
-    if let Err(error) = publisher.send_event(carrier).await {
+    // ★ `send_event_to`, NEVER `send_event`. The publisher holds every configured relay, and
+    // `send_event` writes to ALL of them — so probing one relay would publish the carrier to relays
+    // we have not proven, and to relays already classified denied. The roster gates which relay we
+    // ADDRESS, but it cannot gate a client that was handed the whole list; targeting the URL here is
+    // what makes "a denied relay gets nothing" true of the publish path too, not just the REQ path.
+    if let Err(error) = publisher.send_event_to([relay_url], carrier).await {
         return ProbeOutcome::Refused(format!("relay refused the probe publish: {error}"));
     }
 

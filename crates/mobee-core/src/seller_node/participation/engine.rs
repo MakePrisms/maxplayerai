@@ -103,11 +103,23 @@ impl Engine {
                     &self.relay_url,
                     &channel_id,
                     &event.id.to_hex(),
+                    event.created_at.as_secs() as i64,
                     now_unix,
                 )?;
                 // A re-delivered 44100 for a channel we are already in produces no action. This is
                 // the ordinary case after a reconnect, not an anomaly.
                 if newly {
+                    // ★ Seed the channel cursor from the INVITE's timestamp before the REQ goes out.
+                    // Without this the first subscription has no cursor and opens at `now`, so any
+                    // mention published between the relay signing the 44100 and this REQ reaching it
+                    // is skipped — and skipped permanently, because the cursor only moves forward.
+                    // The skew is applied on read, so the stored value is the invite's own time.
+                    self.store.advance_participation_cursor(
+                        &self.relay_url,
+                        &channel_filter_id(&channel_id),
+                        event.created_at.as_secs() as i64,
+                        now_unix,
+                    )?;
                     vec![Action::SubscribeChannel { channel_id }]
                 } else {
                     Vec::new()
@@ -118,6 +130,7 @@ impl Engine {
                     &self.relay_url,
                     &channel_id,
                     &event.id.to_hex(),
+                    event.created_at.as_secs() as i64,
                     now_unix,
                 )?;
                 if was_member {
@@ -198,10 +211,16 @@ impl Engine {
                     // Losing access is a membership fact, so it is recorded exactly as a 44101 is
                     // — otherwise a restart would cheerfully re-subscribe to a channel the relay
                     // has already told us we cannot read, forever.
+                    // Ordered at `now`: unlike a 44101 this has no author timestamp, and it is an
+                    // observation about the PRESENT, so it must outrank every membership event we
+                    // have already seen. A later relay-signed 44100 still wins, which is what
+                    // re-admission should do. (A 44100 bearing a future timestamp would too — but
+                    // such an event is anomalous on its own terms, not a case to encode here.)
                     self.store.record_channel_left(
                         &self.relay_url,
                         &channel_id,
                         &format!("closed:{reason}"),
+                        now_unix,
                         now_unix,
                     )?;
                     ClosedAction::DropChannel { channel_id }

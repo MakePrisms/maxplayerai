@@ -23,7 +23,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::gateway::EventDraft;
 
 /// Current on-disk schema version.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// A cloneable handle to the node-owned SQLite state.
 #[derive(Clone)]
@@ -307,6 +307,11 @@ impl SellerStore {
                  -- The relay-signed 44100/44101 that last moved this row — the provenance of our
                  -- membership claim, so it can be checked against the relay rather than believed.
                  source_event_id TEXT NOT NULL,
+                 -- The AUTHOR's timestamp on that event, which is what orders membership. Delivery
+                 -- order cannot: a replayed old 44100 arriving after a newer 44101 would otherwise
+                 -- flip us back to joined. Kept as a high-water mark even when the state does not
+                 -- change, or a newer add followed by an older remove would still be applied.
+                 source_created_at_unix INTEGER NOT NULL DEFAULT 0,
                  updated_at_unix INTEGER NOT NULL,
                  PRIMARY KEY (relay_url, channel_id)
              );
@@ -352,6 +357,15 @@ impl SellerStore {
     fn migrate(conn: &Connection) -> Result<(), StoreError> {
         if !Self::column_exists(conn, "offers", "requested_agent")? {
             conn.execute_batch("ALTER TABLE offers ADD COLUMN requested_agent TEXT;")?;
+        }
+        // A store written by a v3 binary has membership rows with no author timestamp. `0` is the
+        // right backfill: it makes every stored row lose to the next real membership event, so the
+        // relay's own notification re-establishes order rather than a guessed timestamp doing it.
+        if !Self::column_exists(conn, "participation_channels", "source_created_at_unix")? {
+            conn.execute_batch(
+                "ALTER TABLE participation_channels
+                     ADD COLUMN source_created_at_unix INTEGER NOT NULL DEFAULT 0;",
+            )?;
         }
         Ok(())
     }
@@ -1009,21 +1023,17 @@ impl SellerStore {
         relay_url: &str,
         channel_id: &str,
         source_event_id: &str,
+        source_created_at_unix: i64,
         now_unix: i64,
     ) -> Result<bool, StoreError> {
-        let conn = self.lock()?;
-        let changed = conn.execute(
-            "INSERT INTO participation_channels
-                 (relay_url, channel_id, state, source_event_id, updated_at_unix)
-             VALUES (?1, ?2, 'joined', ?3, ?4)
-             ON CONFLICT(relay_url, channel_id) DO UPDATE SET
-                 state           = 'joined',
-                 source_event_id = excluded.source_event_id,
-                 updated_at_unix = excluded.updated_at_unix
-             WHERE participation_channels.state <> 'joined'",
-            params![relay_url, channel_id, source_event_id, now_unix],
-        )?;
-        Ok(changed == 1)
+        self.apply_membership(
+            relay_url,
+            channel_id,
+            "joined",
+            source_event_id,
+            source_created_at_unix,
+            now_unix,
+        )
     }
 
     /// Record that we were removed from a channel, and close out anything still owed inside it.
@@ -1038,28 +1048,110 @@ impl SellerStore {
         relay_url: &str,
         channel_id: &str,
         source_event_id: &str,
+        source_created_at_unix: i64,
+        now_unix: i64,
+    ) -> Result<bool, StoreError> {
+        self.apply_membership(
+            relay_url,
+            channel_id,
+            "left",
+            source_event_id,
+            source_created_at_unix,
+            now_unix,
+        )
+    }
+
+    /// Apply one relay-signed membership notification, ordered by the AUTHOR's timestamp.
+    ///
+    /// Returns whether the membership state actually transitioned — which is what decides if there
+    /// is wire work to do. A stale notification returns `false` having changed nothing, and so does
+    /// a newer one that merely re-states the state we already hold.
+    ///
+    /// The `(created_at, event_id)` high-water mark advances even when the state does not change.
+    /// Without that, `add@3` (ignored as a no-op because we are already joined) followed by
+    /// `remove@2` would compare `remove@2` against `add@1` and apply — resurrecting an ordering bug
+    /// through the one path that looked safe to skip.
+    fn apply_membership(
+        &self,
+        relay_url: &str,
+        channel_id: &str,
+        state: &str,
+        source_event_id: &str,
+        source_created_at_unix: i64,
         now_unix: i64,
     ) -> Result<bool, StoreError> {
         let mut conn = self.lock()?;
         let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute(
-            "INSERT INTO participation_channels
-                 (relay_url, channel_id, state, source_event_id, updated_at_unix)
-             VALUES (?1, ?2, 'left', ?3, ?4)
-             ON CONFLICT(relay_url, channel_id) DO UPDATE SET
-                 state           = 'left',
-                 source_event_id = excluded.source_event_id,
-                 updated_at_unix = excluded.updated_at_unix
-             WHERE participation_channels.state <> 'left'",
-            params![relay_url, channel_id, source_event_id, now_unix],
-        )?;
-        transaction.execute(
-            "UPDATE participation_owed SET state = 'dropped'
-             WHERE relay_url = ?1 AND channel_id = ?2 AND state = 'owed'",
-            params![relay_url, channel_id],
-        )?;
+
+        let current: Option<(String, i64, String)> = transaction
+            .query_row(
+                "SELECT state, source_created_at_unix, source_event_id
+                 FROM participation_channels WHERE relay_url = ?1 AND channel_id = ?2",
+                params![relay_url, channel_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+
+        let transitioned = match current {
+            None => {
+                transaction.execute(
+                    "INSERT INTO participation_channels
+                         (relay_url, channel_id, state, source_event_id, source_created_at_unix,
+                          updated_at_unix)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        relay_url,
+                        channel_id,
+                        state,
+                        source_event_id,
+                        source_created_at_unix,
+                        now_unix
+                    ],
+                )?;
+                // A removal for a channel we hold no row for is recorded, but we were never a
+                // member of it — so there is no subscription to tear down and nothing transitioned.
+                state == "joined"
+            }
+            Some((stored_state, stored_created_at, stored_event_id)) => {
+                // Event id breaks a same-second tie so the outcome does not depend on which frame
+                // the relay happened to flush first.
+                let newer = (source_created_at_unix, source_event_id)
+                    > (stored_created_at, stored_event_id.as_str());
+                if !newer {
+                    transaction.commit()?;
+                    return Ok(false);
+                }
+                transaction.execute(
+                    "UPDATE participation_channels
+                     SET state = ?3, source_event_id = ?4, source_created_at_unix = ?5,
+                         updated_at_unix = ?6
+                     WHERE relay_url = ?1 AND channel_id = ?2",
+                    params![
+                        relay_url,
+                        channel_id,
+                        state,
+                        source_event_id,
+                        source_created_at_unix,
+                        now_unix
+                    ],
+                )?;
+                stored_state != state
+            }
+        };
+
+        if state == "left" {
+            // A debt in a channel we can no longer read is a debt we cannot discharge. Closed in the
+            // same transaction as the membership change so no restart can observe one without the
+            // other.
+            transaction.execute(
+                "UPDATE participation_owed SET state = 'dropped'
+                 WHERE relay_url = ?1 AND channel_id = ?2 AND state = 'owed'",
+                params![relay_url, channel_id],
+            )?;
+        }
+
         transaction.commit()?;
-        Ok(changed == 1)
+        Ok(transitioned)
     }
 
     /// The channels to re-subscribe on boot for one relay.
@@ -1101,11 +1193,20 @@ impl SellerStore {
     /// re-delivered after a reconnect is one debt, not two. Returns whether a new debt landed.
     pub fn record_owed(&self, owed: &OwedResponse, now_unix: i64) -> Result<bool, StoreError> {
         let conn = self.lock()?;
+        // ★ Conditional on still holding the channel. A mention can arrive after the 44101 that
+        // removed us — queued behind it on the socket, or replayed within the cursor skew — and an
+        // unconditional insert would mint a debt in a channel we can no longer read OR answer.
+        // `record_channel_left` drains the debts that exist when it runs; this is the other half,
+        // for the ones that turn up afterwards.
         let changed = conn.execute(
             "INSERT OR IGNORE INTO participation_owed
                  (event_id, relay_url, channel_id, counterparty, kind, state, created_at_unix,
                   recorded_at_unix)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'owed', ?6, ?7)",
+             SELECT ?1, ?2, ?3, ?4, ?5, 'owed', ?6, ?7
+             WHERE EXISTS (
+                 SELECT 1 FROM participation_channels
+                 WHERE relay_url = ?2 AND channel_id = ?3 AND state = 'joined'
+             )",
             params![
                 owed.event_id,
                 owed.relay_url,

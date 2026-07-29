@@ -70,6 +70,14 @@ pub fn triage(event: &Event, me: PublicKey) -> Triage {
     let kind = event.kind.as_u16();
 
     if kind == dialect::KIND_MEMBER_ADDED || kind == dialect::KIND_MEMBER_REMOVED {
+        // ★ A membership notification that does not p-tag US describes somebody else's membership.
+        // The subscription filter already pins `#p`, so reaching here without our tag means the
+        // relay served something we did not ask for — and acting on it would let one relay move
+        // this node in and out of channels at will. Checked here too: the filter is the relay's
+        // promise, this is our own verification of it, and only one of the two is ours to trust.
+        if !dialect::mentions(event, me) {
+            return Triage::Unhandled { kind };
+        }
         // A membership notification with no channel tag is malformed: it names no channel to join
         // or leave, so there is no action it could describe. Surfaced rather than guessed at.
         return match dialect::channel_of(event) {
