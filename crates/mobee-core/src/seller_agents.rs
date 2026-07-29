@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::agent_presets::resolve_agent_preset;
+use crate::agent_presets::{preset_model, resolve_agent_preset};
 use crate::home::{AgentPresetConfig, SellerConfig};
 
 /// Wire tag naming the harnesses an event's author can run — `["mobee_agent", "claude", "codex"]`,
@@ -49,6 +49,13 @@ pub struct RegisteredAgent {
     pub name: Option<String>,
     /// The launch argv for the ACP driver (no shell).
     pub argv: Vec<String>,
+    /// Model this seat pins on its harness, when the operator configured one. `None` ⇒ the harness
+    /// default. It rides the same struct as the argv deliberately: dispatch hands the runner ONE
+    /// seat, so the model cannot drift from the harness it was configured against.
+    ///
+    /// Node-local. It is never advertised and never published — harness selection is the only
+    /// agent axis on the market wire.
+    pub model: Option<String>,
 }
 
 /// One listed preset's boot verdict. A FAIL never names an argv — it names the reason, so the
@@ -228,7 +235,7 @@ pub fn resolve(
     presets: &BTreeMap<String, AgentPresetConfig>,
 ) -> Result<ResolvedRegistry, RegistryError> {
     if seller.agents.is_empty() {
-        return fallback_registry(seller);
+        return fallback_registry(seller, presets);
     }
 
     let mut verdicts = Vec::with_capacity(seller.agents.len());
@@ -252,9 +259,17 @@ pub fn resolve(
                     .iter()
                     .any(|e: &RegisteredAgent| e.name.as_deref() == Some(label.as_str()))
                 {
+                    // Model resolution: this seat's entry, then the preset's own. No global
+                    // default exists on purpose — a node-wide model would land on harnesses that
+                    // cannot accept one, which is the silent-ignore this config replaces.
+                    let model = slot
+                        .model
+                        .clone()
+                        .or_else(|| preset_model(&slot.name, presets));
                     entries.push(RegisteredAgent {
                         name: Some(label),
                         argv,
+                        model,
                     });
                 }
             }
@@ -277,7 +292,15 @@ pub fn resolve(
 /// The single-harness registry: the stored `agent_command` labelled by the configured preset (or
 /// unlabelled for the raw-argv hatch). The argv is taken from config as-is and never re-resolved,
 /// so an existing seller launches the same binary it launched before.
-fn fallback_registry(seller: &SellerConfig) -> Result<ResolvedRegistry, RegistryError> {
+///
+/// The model DOES come from the preset table here, even though the argv deliberately does not.
+/// Nothing is being overridden by that: there is no stored model to preserve, and a single-harness
+/// seller — still the common shape — has no `agents` list to carry one, so without this lookup it
+/// could never pin a model at all.
+fn fallback_registry(
+    seller: &SellerConfig,
+    presets: &BTreeMap<String, AgentPresetConfig>,
+) -> Result<ResolvedRegistry, RegistryError> {
     if seller.agent_command.is_empty() {
         return Err(RegistryError::Empty);
     }
@@ -286,10 +309,14 @@ fn fallback_registry(seller: &SellerConfig) -> Result<ResolvedRegistry, Registry
         .as_ref()
         .map(|label| label.trim().to_ascii_lowercase())
         .filter(|label| !label.is_empty());
+    let model = name
+        .as_deref()
+        .and_then(|label| preset_model(label, presets));
     Ok(ResolvedRegistry {
         registry: AgentRegistry::new(vec![RegisteredAgent {
             name,
             argv: seller.agent_command.clone(),
+            model,
         }]),
         verdicts: Vec::new(),
     })
@@ -322,10 +349,107 @@ mod tests {
                     (*name).to_owned(),
                     AgentPresetConfig {
                         argv: argv.iter().map(|a| (*a).to_owned()).collect(),
+                        model: None,
                     },
                 )
             })
             .collect()
+    }
+
+    /// Presets with an optional pinned model per entry.
+    fn presets_with_models(
+        entries: &[(&str, &[&str], Option<&str>)],
+    ) -> BTreeMap<String, AgentPresetConfig> {
+        entries
+            .iter()
+            .map(|(name, argv, model)| {
+                (
+                    (*name).to_owned(),
+                    AgentPresetConfig {
+                        argv: argv.iter().map(|a| (*a).to_owned()).collect(),
+                        model: model.map(str::to_owned),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_seats_model_resolves_from_its_own_entry_first_then_the_preset() {
+        // Resolution order is seat entry -> preset -> none, and it is asserted as an ORDER: the
+        // seat's value must WIN over a preset that also pins one, not merely be read when the
+        // preset is silent.
+        let table = presets_with_models(&[
+            ("pinned", &["/bin/sh"], Some("from-preset")),
+            ("bare", &["/bin/sh"], None),
+        ]);
+        let seller = seller_with(
+            vec![
+                AgentSlotConfig::with_model("pinned", "from-seat"),
+                AgentSlotConfig::named("bare"),
+            ],
+            None,
+        );
+        let resolved = resolve(&seller, &table).expect("both presets resolve");
+        let model_of = |name: &str| {
+            resolved
+                .registry
+                .dispatch(Some(name))
+                .and_then(|agent| agent.model.clone())
+        };
+        assert_eq!(model_of("pinned").as_deref(), Some("from-seat"));
+        assert_eq!(
+            model_of("bare"),
+            None,
+            "no model configured anywhere ⇒ None"
+        );
+    }
+
+    #[test]
+    fn a_preset_model_applies_when_the_seat_entry_pins_nothing() {
+        let table = presets_with_models(&[("only-preset", &["/bin/sh"], Some("from-preset"))]);
+        let seller = seller_with(vec![AgentSlotConfig::named("only-preset")], None);
+        let resolved = resolve(&seller, &table).expect("preset resolves");
+        assert_eq!(
+            resolved
+                .registry
+                .dispatch(Some("only-preset"))
+                .and_then(|agent| agent.model.clone())
+                .as_deref(),
+            Some("from-preset")
+        );
+    }
+
+    #[test]
+    fn a_single_harness_seller_with_no_agents_list_still_picks_up_its_presets_model() {
+        // The fallback path is the common shape for existing sellers. Without this the feature
+        // would be unreachable for them — and the argv must STILL come from the stored command,
+        // not from re-resolving the preset.
+        let table = presets_with_models(&[("claude", &["/bin/sh", "acp"], Some("haiku"))]);
+        let seller = seller_with(Vec::new(), Some("claude"));
+        let resolved = resolve(&seller, &table).expect("fallback registry");
+        let agent = resolved
+            .registry
+            .dispatch(Some("claude"))
+            .expect("labelled fallback entry");
+        assert_eq!(agent.model.as_deref(), Some("haiku"));
+        assert_eq!(
+            agent.argv,
+            vec!["fallback-bin".to_owned()],
+            "the fallback argv stays the STORED command; only the model is looked up"
+        );
+    }
+
+    #[test]
+    fn the_raw_argv_hatch_gets_no_model_because_it_has_no_preset_to_read_one_from() {
+        // An unlabelled seller has no harness identity, so there is nowhere to configure a model
+        // for it. It must resolve to None rather than borrowing some other preset's.
+        let table = presets_with_models(&[("claude", &["/bin/sh"], Some("haiku"))]);
+        let seller = seller_with(Vec::new(), None);
+        let resolved = resolve(&seller, &table).expect("unlabelled fallback registry");
+        let agent = resolved.registry.dispatch(None).expect("hatch entry");
+        assert_eq!(agent.name, None);
+        assert_eq!(agent.model, None);
     }
 
     fn registry(names: &[&str]) -> AgentRegistry {
@@ -335,6 +459,7 @@ mod tests {
                 .map(|name| RegisteredAgent {
                     name: Some((*name).to_owned()),
                     argv: vec![format!("{name}-acp")],
+                    model: None,
                 })
                 .collect(),
         )
@@ -465,7 +590,14 @@ mod tests {
     #[test]
     fn a_pool_larger_than_one_is_refused_never_silently_serialized() {
         let table = presets(&[("good", &["/bin/sh"])]);
-        let seller = seller_with(vec![AgentSlotConfig { name: "good".into(), slots: 2 }], None);
+        let seller = seller_with(
+            vec![AgentSlotConfig {
+                name: "good".into(),
+                slots: 2,
+                model: None,
+            }],
+            None,
+        );
         assert_eq!(
             resolve(&seller, &table),
             Err(RegistryError::ParallelismUnsupported { name: "good".into(), slots: 2 })

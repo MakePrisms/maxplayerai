@@ -8,6 +8,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use crate::driver::acp::{PROTOCOL_VERSION, UpdateStream, parse_acp_usage};
+use crate::driver::model::{ModelOutcome, ModelSupport};
 use crate::driver::{
     Artifact, Caps, ContentBlock, Driver, DriverError, Initialize, PermissionOutcome,
     PermissionRequest, PromptTurn, Readiness, RuntimeId, SessionConfig, SessionId, SessionUpdate,
@@ -18,15 +19,40 @@ use crate::driver::{
 pub struct AgentCommand {
     program: String,
     args: Vec<String>,
+    /// Model to pin on each session, from the seat's config. `None` ⇒ the harness default, and no
+    /// model call is made at all.
+    model: Option<String>,
 }
 
 impl AgentCommand {
+    /// A launch command that runs the harness default model.
     pub fn new(program: String, args: Vec<String>) -> Self {
-        Self { program, args }
+        Self {
+            program,
+            args,
+            model: None,
+        }
+    }
+
+    /// A launch command pinned to `model`. A harness that cannot accept it fails the session
+    /// rather than running its default — see [`crate::driver::model`].
+    pub fn with_model(program: String, args: Vec<String>, model: Option<String>) -> Self {
+        Self {
+            program,
+            args,
+            model,
+        }
     }
 
     fn runtime_id(&self) -> RuntimeId {
         RuntimeId(self.program.clone())
+    }
+
+    /// The adapter identity used in model errors — the launched binary's basename, which is what an
+    /// operator recognises from their config.
+    fn adapter_label(&self) -> &str {
+        let program = self.program.as_str();
+        program.rsplit('/').next().unwrap_or(program)
     }
 }
 
@@ -43,6 +69,9 @@ pub struct AcpDriver {
     /// ACP-native usage captured from the most recent `session/prompt` result.
     /// `None` when the harness surfaced nothing (absent-stays-absent).
     last_usage: Option<UsageMetadata>,
+    /// The model pinned on the most recent session. `None` when no model was configured — never a
+    /// record of the harness default, which the driver does not ask for and does not know.
+    last_model: Option<ModelOutcome>,
 }
 
 impl AcpDriver {
@@ -62,7 +91,14 @@ impl AcpDriver {
             update_tx: None,
             next_request_id: AtomicU64::new(1),
             last_usage: None,
+            last_model: None,
         }
+    }
+
+    /// The model pinned on the most recent session, once the harness confirmed it. `None` when the
+    /// seat configured no model.
+    pub fn last_model(&self) -> Option<&ModelOutcome> {
+        self.last_model.as_ref()
     }
 
     fn spawn(&mut self) -> Result<(), DriverError> {
@@ -160,6 +196,26 @@ impl AcpDriver {
             .map_err(|error| DriverError::Other(format!("failed to write ACP JSON-RPC: {error}")))
     }
 
+    /// Pin `model` on a freshly created session, then confirm it took.
+    ///
+    /// `session_result` is the `session/new` result: the harness's own statement of which model
+    /// dialect it speaks and which values it accepts. Every refusal here fails the session — a
+    /// configured model that cannot be proven in effect must not be prompted, because the
+    /// alternative is delivering work from a model nobody asked for.
+    fn pin_model(
+        &self,
+        session_id: &SessionId,
+        session_result: &Value,
+        model: &str,
+    ) -> Result<ModelOutcome, DriverError> {
+        let adapter = self.command.adapter_label();
+        let support = ModelSupport::read(session_result);
+        let request = support.request(adapter, session_id, model)?;
+        let id = self.send_request(request.method, request.params.clone())?;
+        let response = self.wait_response(id)?;
+        request.confirm(adapter, &response)
+    }
+
     fn wait_response(&self, id: u64) -> Result<Value, DriverError> {
         let responses = self
             .responses
@@ -222,7 +278,15 @@ impl Driver for AcpDriver {
             })?,
         )?;
         let result = self.wait_response(id)?;
-        session_id_from_result(&result)
+        let session_id = session_id_from_result(&result)?;
+        // A pinned model is applied HERE — after the session exists (ACP `session/new` takes no
+        // model) and before any prompt, so a turn never runs on a model that was not configured.
+        // The whole `session/new` result is what advertises how (or whether) this harness accepts
+        // one, so it is classified rather than discarded.
+        if let Some(model) = self.command.model.clone() {
+            self.last_model = Some(self.pin_model(&session_id, &result, &model)?);
+        }
+        Ok(session_id)
     }
 
     async fn prompt(

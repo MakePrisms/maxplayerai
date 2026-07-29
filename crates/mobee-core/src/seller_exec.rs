@@ -349,6 +349,11 @@ pub fn harness_and_transport(
 /// command is launched through `policy` — directly under a pass-through policy, or inside the
 /// policy's launcher. Returns the ACP usage the driver surfaced (`None` when the harness exposed
 /// nothing).
+///
+/// `model` is the seat's pinned model ([`crate::seller_agents::RegisteredAgent::model`]). `None` ⇒
+/// the harness default and no model call at all. When set, a harness that cannot accept it fails
+/// the run: quietly delivering work from a different model is the outcome the seat config exists to
+/// prevent. It stays node-local — nothing about it reaches the wire.
 #[cfg(feature = "acp")]
 pub async fn run_agent_job(
     agent_command: &[String],
@@ -357,6 +362,7 @@ pub async fn run_agent_job(
     workdir: &Path,
     identity: &DeliveryAgentIdentity,
     timeout: Duration,
+    model: Option<&str>,
 ) -> Result<Option<UsageMetadata>, ExecError> {
     use crate::driver::{AcpDriver, AgentCommand, ContentBlock, PromptTurn, SessionConfig};
     use crate::engine::{run_job, RunParams};
@@ -367,7 +373,7 @@ pub async fn run_agent_job(
     // The ACP idle/response timeout IS the unified job timeout — never a hardcoded 300s that could
     // override or conflict with `--job-timeout-secs`.
     let mut driver = AcpDriver::new(
-        AgentCommand::new(program, args),
+        AgentCommand::with_model(program, args, model.map(str::to_owned)),
         crate::driver::PermissionOutcome::Allow,
         timeout,
     );
@@ -409,6 +415,7 @@ pub async fn run_agent_job(
     _workdir: &Path,
     _identity: &DeliveryAgentIdentity,
     _timeout: Duration,
+    _model: Option<&str>,
 ) -> Result<Option<UsageMetadata>, ExecError> {
     Err(ExecError::AcpRequired)
 }
@@ -615,6 +622,58 @@ mod tests {
         assert_eq!(value(&unknown, "usage_transport").as_deref(), Some("side-channel"));
     }
 
+    /// ★ THE WIRE FENCE. A seat's configured model is NODE-LOCAL and must never reach the result
+    /// event, whose `model` tag means "what the harness REPORTED it used" — a different claim
+    /// entirely, and one no ACP harness currently makes ([`crate::driver::acp::parse_acp_usage`]
+    /// hardcodes `model: None`).
+    ///
+    /// The leak this guards is one line long: feeding the configured model into `UsageMetadata`
+    /// would put it on the 3403 result, changing the market wire. Harness selection is the only
+    /// agent axis the wire carries, so this asserts the tag block is what it was before seat model
+    /// config existed — for a run whose seat pinned a model.
+    #[test]
+    fn a_configured_seat_model_never_reaches_the_result_tags() {
+        let value = |tags: &[TagSpec], name: &str| -> Option<String> {
+            tags.iter()
+                .find(|tag| tag.first() == Some(name))
+                .and_then(|tag| tag.value().map(str::to_owned))
+        };
+
+        // `seller_exec_metadata` takes usage, never a seat config — the model has no route in. The
+        // only usage an ACP run can produce carries `model: None`, so the tag stays absent.
+        let usage = UsageMetadata {
+            model: None,
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            reasoning_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost: None,
+        };
+        let tags = seller_exec_metadata(
+            &["claude-agent-acp".into()],
+            Some("claude"),
+            42,
+            Some(&usage),
+        );
+        assert!(
+            value(&tags, "model").is_none(),
+            "a seat model must not appear on the result event: {tags:?}"
+        );
+        // The seat's model string must not appear ANYWHERE in the tag block — not as a value, and
+        // not smuggled into another tag. Checked against the whole rendered block rather than one
+        // field, because the fence is about the event, not about one tag name.
+        let rendered = format!("{tags:?}");
+        for pinned in ["haiku", "fable", "gpt-5.6-sol"] {
+            assert!(
+                !rendered.contains(pinned),
+                "model {pinned:?} leaked into the result tags: {rendered}"
+            );
+        }
+        // What the wire DOES carry about the agent axis: harness identity, unchanged.
+        assert_eq!(value(&tags, "harness").as_deref(), Some("claude-agent-acp"));
+    }
+
     #[test]
     fn claude_preset_resolves_harness_family_claude_despite_npx_argv0() {
         // Mirror the downstream harness-family classifier: a family substring wins;
@@ -785,10 +844,18 @@ mod tests {
             Path::new("."),
             &identity,
             Duration::from_secs(1),
+            Some("haiku"),
         )
         .await
         .expect_err("acp required");
         assert!(matches!(err, ExecError::AcpRequired));
         assert!(err.to_string().contains("acp"));
+        // A configured model must not change WHICH failure this is: without the agent runtime there
+        // is nothing to pin a model on, and reporting a model problem here would send an operator
+        // after their config instead of the missing feature.
+        assert!(
+            !err.to_string().contains("haiku"),
+            "the no-acp refusal must name the missing runtime, not the model: {err}"
+        );
     }
 }

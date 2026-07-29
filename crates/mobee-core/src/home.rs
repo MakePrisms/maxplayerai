@@ -602,6 +602,11 @@ where
 pub struct AgentPresetConfig {
     #[serde(deserialize_with = "deserialize_agent_command_argv")]
     pub argv: Vec<String>,
+    /// Model this preset's harness runs, when the operator pins one. Applied over ACP after the
+    /// session exists ([`crate::driver::ModelSelection`]); a `[seller] agents` entry naming this
+    /// preset overrides it. Absent ⇒ the harness default, and nothing is sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// One enabled harness in `[seller] agents` — a preset name plus the size of its pool.
@@ -609,7 +614,7 @@ pub struct AgentPresetConfig {
 /// Written either as a bare name or as a table, in the same list:
 ///
 /// ```toml
-/// agents = ["claude", { name = "codex", slots = 1 }]
+/// agents = ["claude", { name = "codex", slots = 1 }, { name = "claude", model = "haiku" }]
 /// ```
 ///
 /// The bare form is the whole config today. The table form is why pool counts can arrive later
@@ -622,14 +627,30 @@ pub struct AgentSlotConfig {
     pub name: String,
     /// Concurrent jobs this harness may run. Always 1 today.
     pub slots: u32,
+    /// Model this seat's harness runs. Overrides the preset's own `model`; absent ⇒ the preset's,
+    /// then the harness default. There is deliberately NO global `[seller] model`: a global would
+    /// land on seats whose adapter cannot take one, which is the silent-ignore this config exists
+    /// to abolish. A pinned model that the harness cannot accept fails the run rather than
+    /// downgrading to the default.
+    pub model: Option<String>,
 }
 
 impl AgentSlotConfig {
-    /// A single-slot entry — the bare-name form.
+    /// A single-slot entry with no pinned model — the bare-name form.
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             slots: default_agent_slots(),
+            model: None,
+        }
+    }
+
+    /// A single-slot entry pinned to `model`.
+    pub fn with_model(name: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            slots: default_agent_slots(),
+            model: Some(model.into()),
         }
     }
 }
@@ -640,16 +661,24 @@ fn default_agent_slots() -> u32 {
 }
 
 impl Serialize for AgentSlotConfig {
-    /// Round-trips to the form it was written in: a single-slot entry serializes as the bare name,
-    /// so a config the CLI writes stays `agents = ["claude", "codex"]`.
+    /// Round-trips to the form it was written in: an entry carrying nothing beyond its name
+    /// serializes as the bare name, so a config the CLI writes stays `agents = ["claude", "codex"]`.
+    ///
+    /// The bare form is only correct while every other field is at its default. A pinned `model`
+    /// collapsed to a bare name would be ERASED by any config rewrite — so the collapse condition
+    /// names every field, and each new field must extend it.
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if self.slots == default_agent_slots() {
+        if self.slots == default_agent_slots() && self.model.is_none() {
             return serializer.serialize_str(&self.name);
         }
         use serde::ser::SerializeStruct;
-        let mut table = serializer.serialize_struct("AgentSlotConfig", 2)?;
+        let fields = 2 + usize::from(self.model.is_some());
+        let mut table = serializer.serialize_struct("AgentSlotConfig", fields)?;
         table.serialize_field("name", &self.name)?;
         table.serialize_field("slots", &self.slots)?;
+        if let Some(model) = &self.model {
+            table.serialize_field("model", model)?;
+        }
         table.end()
     }
 }
@@ -665,7 +694,7 @@ impl<'de> Deserialize<'de> for AgentSlotConfig {
             type Value = AgentSlotConfig;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("an agent preset name, or a { name, slots } table")
+                formatter.write_str("an agent preset name, or a { name, slots, model } table")
             }
 
             fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
@@ -682,13 +711,15 @@ impl<'de> Deserialize<'de> for AgentSlotConfig {
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
                 let mut name: Option<String> = None;
                 let mut slots: Option<u32> = None;
+                let mut model: Option<String> = None;
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "name" => name = Some(map.next_value()?),
                         "slots" => slots = Some(map.next_value()?),
+                        "model" => model = Some(map.next_value()?),
                         other => {
                             return Err(de::Error::custom(format!(
-                                "unknown agent entry field {other:?} (want name, slots)"
+                                "unknown agent entry field {other:?} (want name, slots, model)"
                             )));
                         }
                     }
@@ -697,9 +728,20 @@ impl<'de> Deserialize<'de> for AgentSlotConfig {
                 if name.trim().is_empty() {
                     return Err(de::Error::custom("agent name must be non-empty"));
                 }
+                // An empty `model` string is refused rather than read as "no model": it would
+                // otherwise reach the harness as a request for the model named "", and an operator
+                // who wrote `model = ""` meant something, so guessing which is wrong either way.
+                if let Some(value) = &model
+                    && value.trim().is_empty()
+                {
+                    return Err(de::Error::custom(
+                        "agent model must be non-empty (omit the field for the harness default)",
+                    ));
+                }
                 Ok(AgentSlotConfig {
                     name,
                     slots: slots.unwrap_or_else(default_agent_slots),
+                    model,
                 })
             }
         }
@@ -1329,6 +1371,100 @@ mod tests {
         .expect("parse bare");
         assert!(bare.agents.is_empty());
         assert!(!toml::to_string_pretty(&bare).expect("ser").contains("[agents"));
+    }
+
+    /// ★ THE CONFIG DESTROYER. `AgentSlotConfig` collapses to a bare name when nothing but the name
+    /// is set, so the CLI's rewritten config stays `agents = ["claude", "codex"]`. A pinned model
+    /// collapsed that way would be ERASED — silently, on the next config write, long after the
+    /// operator set it. The round trip is the only place that shows it.
+    #[test]
+    fn a_seat_model_survives_a_config_rewrite_and_a_bare_seat_still_collapses() {
+        let raw = "relay_url = 'r'\nmint_url = 'm'\n\
+                   per_job_budget_sats = 1\ntotal_budget_sats = 2\n\
+                   [seller]\nagent_command = ['claude-agent-acp']\nrate_sats = 5\n\
+                   git_remote = 'https://example.invalid/repo'\n\
+                   agents = ['codex', { name = 'claude', model = 'haiku' }]\n";
+        let config = parse_config_toml(raw).expect("parse seats with a model");
+        let seats = &config.seller.as_ref().expect("[seller]").agents;
+        assert_eq!(seats.len(), 2);
+        assert_eq!(seats[0], AgentSlotConfig::named("codex"));
+        assert_eq!(seats[1], AgentSlotConfig::with_model("claude", "haiku"));
+
+        // Write it back out and reload: the model must still be there.
+        let serialized = toml::to_string_pretty(&config).expect("serialize");
+        let reloaded: MobeeConfig = toml::from_str(&serialized).expect("reparse");
+        assert_eq!(
+            reloaded, config,
+            "a rewritten config must round-trip a pinned model, not drop it"
+        );
+        let reloaded_seats = &reloaded.seller.as_ref().expect("[seller]").agents;
+        assert_eq!(
+            reloaded_seats[1].model.as_deref(),
+            Some("haiku"),
+            "the model was erased by the rewrite"
+        );
+        // The plain seat must still collapse to a bare string — the compat behaviour this guards.
+        assert!(
+            serialized.contains("\"codex\"") || serialized.contains("'codex'"),
+            "a seat with nothing but a name must still serialize bare: {serialized}"
+        );
+    }
+
+    /// An empty `model` states an intent that cannot be honoured — refused, never read as absent.
+    #[test]
+    fn an_empty_seat_model_is_refused_rather_than_treated_as_unset() {
+        let raw = "relay_url = 'r'\nmint_url = 'm'\n\
+                   per_job_budget_sats = 1\ntotal_budget_sats = 2\n\
+                   [seller]\nagent_command = ['claude-agent-acp']\nrate_sats = 5\n\
+                   git_remote = 'https://example.invalid/repo'\n\
+                   agents = [{ name = 'claude', model = '' }]\n";
+        let error = parse_config_toml(raw).expect_err("an empty model must be refused");
+        assert!(
+            error.to_string().contains("model"),
+            "the error must name the field: {error}"
+        );
+    }
+
+    /// An unknown field in a seat entry names the fields that ARE accepted, including `model`.
+    #[test]
+    fn an_unknown_seat_field_lists_the_accepted_ones() {
+        let raw = "relay_url = 'r'\nmint_url = 'm'\n\
+                   per_job_budget_sats = 1\ntotal_budget_sats = 2\n\
+                   [seller]\nagent_command = ['claude-agent-acp']\nrate_sats = 5\n\
+                   git_remote = 'https://example.invalid/repo'\n\
+                   agents = [{ name = 'claude', modle = 'haiku' }]\n";
+        let error = parse_config_toml(raw).expect_err("a typo'd field must be refused");
+        let message = error.to_string();
+        for field in ["name", "slots", "model"] {
+            assert!(message.contains(field), "{message} missing {field}");
+        }
+    }
+
+    /// A preset can pin a model too, and it must survive the same round trip.
+    #[test]
+    fn a_preset_model_round_trips_through_the_agents_table() {
+        let raw = "relay_url = 'r'\nmint_url = 'm'\n\
+                   per_job_budget_sats = 1\ntotal_budget_sats = 2\n\
+                   [agents.grok]\nargv = ['grok', 'agent', 'stdio']\nmodel = 'grok-4.5'\n";
+        let config = parse_config_toml(raw).expect("parse preset model");
+        assert_eq!(
+            config.agents.get("grok").and_then(|p| p.model.clone()),
+            Some("grok-4.5".to_owned())
+        );
+        let serialized = toml::to_string_pretty(&config).expect("serialize");
+        let reloaded: MobeeConfig = toml::from_str(&serialized).expect("reparse");
+        assert_eq!(reloaded, config);
+        // A preset with no model must not gain an empty one in the file.
+        let bare = parse_config_toml(
+            "relay_url = 'r'\nmint_url = 'm'\nper_job_budget_sats = 1\ntotal_budget_sats = 2\n\
+             [agents.grok]\nargv = ['grok']\n",
+        )
+        .expect("parse bare preset");
+        assert!(
+            !toml::to_string_pretty(&bare)
+                .expect("ser")
+                .contains("model")
+        );
     }
 
     #[test]

@@ -2,6 +2,10 @@ pub mod acp;
 #[cfg(feature = "acp")]
 pub mod acp_driver;
 pub mod mock;
+pub mod model;
+/// Acceptance legs for seat model config, driven through the real driver against a fake adapter.
+#[cfg(all(test, feature = "acp"))]
+mod model_it;
 
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -16,6 +20,7 @@ pub use acp::{
 #[cfg(feature = "acp")]
 pub use acp_driver::{AcpDriver, AgentCommand};
 pub use mock::{MockDriver, ScriptedSession};
+pub use model::{ModelOutcome, ModelRequest, ModelSupport};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Readiness {

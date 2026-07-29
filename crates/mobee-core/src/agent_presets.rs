@@ -41,6 +41,20 @@ pub fn resolve_agent_preset(
     }
 }
 
+/// The model a preset pins, when a config-defined `[agents.<name>]` entry sets one.
+///
+/// Looked up by the SAME rule as [`resolve_agent_preset`] resolves argv — exact name first, then
+/// lower-cased — so a preset's model can never come from a different entry than its argv did.
+/// Built-ins carry no model: only a config entry can pin one.
+pub fn preset_model(name: &str, custom: &BTreeMap<String, AgentPresetConfig>) -> Option<String> {
+    let trimmed = name.trim();
+    let key = trimmed.to_ascii_lowercase();
+    custom
+        .get(trimmed)
+        .or_else(|| custom.get(key.as_str()))
+        .and_then(|preset| preset.model.clone())
+}
+
 /// `claude|cursor|codex[|<custom>...]` — every accepted preset name, for messages.
 pub fn preset_choices(custom: &BTreeMap<String, AgentPresetConfig>) -> String {
     let mut out = BUILTIN_PRESETS.join("|");
@@ -147,6 +161,7 @@ mod tests {
                     (*name).to_owned(),
                     AgentPresetConfig {
                         argv: argv.iter().map(|a| (*a).to_owned()).collect(),
+                        model: None,
                     },
                 )
             })
