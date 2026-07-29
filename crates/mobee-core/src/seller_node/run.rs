@@ -1116,12 +1116,13 @@ impl SellerNodeRunner {
         // [`SlotGate`]) while this loop stays responsive to new offers, awards, and payments — the
         // loop never runs a job inline, which is the multi-slot change.
         //
-        // Jobs run as `spawn_local` tasks under a LocalSet, NOT `tokio::spawn`: the awarded agent's
-        // ACP driver holds a `!Send` receiver, so `execute_job`'s future is `!Send` and cannot cross
-        // threads. A LocalSet runs the jobs cooperatively on THIS thread, interleaving with the loop
-        // at every await. That is the right model here: execution is I/O-bound (it awaits the agent
-        // subprocess over ACP), so one thread suffices, and it keeps the nostr client and signer on
-        // their original runtime — no cross-runtime client calls.
+        // Jobs run as `spawn_local` tasks under a LocalSet, NOT `tokio::spawn`: `execute_job` holds
+        // `&self` (node store and friends, not `Sync`) across awaits, so its future is `!Send` and
+        // cannot cross threads. A LocalSet runs the jobs cooperatively on THIS thread, interleaving
+        // with the loop at every await. That is the right model here: execution is I/O-bound (it
+        // awaits the agent subprocess over ACP — the driver's waits genuinely yield, issue #223), so
+        // one thread suffices, and it keeps the nostr client and signer on their original runtime —
+        // no cross-runtime client calls.
         let local = tokio::task::LocalSet::new();
         local.run_until(Arc::new(self).run_loop()).await
     }

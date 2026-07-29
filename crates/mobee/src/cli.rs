@@ -132,8 +132,22 @@ fn run_agent(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         },
     };
 
+    // The ACP driver's waits are tokio-timed (they must YIELD so N seller jobs can share one
+    // thread — issue #223), so this path needs a REAL tokio runtime: the noop-waker
+    // `crate::exec::block_on` has no timer or blocking pool and would panic inside
+    // `tokio::time::timeout`. The mock path keeps `exec::block_on` (no tokio primitives).
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = writeln!(err, "failed to build tokio runtime: {error}");
+            return RUNTIME_ERROR;
+        }
+    };
     let mut write_error = None;
-    let result = crate::exec::block_on(run_job(
+    let result = runtime.block_on(run_job(
         &mut driver,
         &mut log,
         &options.job_id,
