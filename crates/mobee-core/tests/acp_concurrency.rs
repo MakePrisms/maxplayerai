@@ -1,4 +1,4 @@
-//! Regression test for MakePrisms/mobee#223 (multi-slot execution): N awarded jobs must run
+//! Regression test for MakePrisms/maxplayerai#223 (multi-slot execution): N awarded jobs must run
 //! CONCURRENTLY on the seller node's single-threaded LocalSet, and the event loop must keep
 //! breathing while a job is in flight.
 //!

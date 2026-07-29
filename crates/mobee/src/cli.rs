@@ -26,7 +26,7 @@ where
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
     match args.get(1).map(String::as_str) {
         Some("version") if args.len() == 2 => {
-            let _ = writeln!(out, "mobee {}", mobee_core::version());
+            let _ = writeln!(out, "maxplayer {}", mobee_core::version());
             SUCCESS
         }
         Some("mcp") if args.len() == 2 => crate::mcp::run(out, err),
@@ -94,7 +94,7 @@ fn run_mock(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 fn run_agent(_args: &[String], _out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let _ = writeln!(
         err,
-        "mobee run requires rebuilding with the acp feature: cargo run -p mobee --features acp -- run ..."
+        "maxplayer run requires rebuilding with the acp feature: cargo run -p mobee --features acp -- run ..."
     );
     USAGE_ERROR
 }
@@ -268,16 +268,16 @@ fn write_json_line<T: Serialize + ?Sized>(out: &mut dyn Write, value: &T) -> std
 fn usage(err: &mut dyn Write) -> i32 {
     let _ = write!(
         err,
-        "Usage:\n  mobee version\n  mobee mcp\n  mobee buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `mobee buyer status` = thin client\n  mobee doctor   # seller environment self-check (git, credential helper, relay, mint, agent)\n  mobee wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  mobee profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n"
+        "Usage:\n  maxplayer version\n  maxplayer mcp\n  maxplayer buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # runner environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n"
     );
     #[cfg(feature = "stub-pay")]
     let _ = write!(
         err,
-        "  mobee stub-pay <amount_sats>   # exercise the config-bound budget gate\n"
+        "  maxplayer stub-pay <amount_sats>   # exercise the config-bound budget gate\n"
     );
     let _ = writeln!(
         err,
-        "  mobee sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool]\n  mobee sell   # zero-prompt relaunch from config.toml\n  mobee accept <job_id> <claim_id> [--result-id <id>]   # buyer: bind a delivered result (collect folds this in)\n  mobee collect <job_id> [--out <folder>]   # buyer: accept-if-needed + verify + pay + materialize\n  mobee log replay <path>\n  mobee mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n  mobee run --agent-command <cmd> --task <text> --log <path> [--cwd <dir>] [--job-id <id>] [--permission-policy allow|allow-always|deny] [--idle-timeout <secs>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error"
+        "  maxplayer sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool]\n  maxplayer sell   # zero-prompt relaunch from config.toml\n  maxplayer accept <job_id> <claim_id> [--result-id <id>]   # buyer: bind a delivered result (collect folds this in)\n  maxplayer collect <job_id> [--out <folder>]   # buyer: accept-if-needed + verify + pay + materialize\n  maxplayer log replay <path>\n  maxplayer mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n  maxplayer run --agent-command <cmd> --task <text> --log <path> [--cwd <dir>] [--job-id <id>] [--permission-policy allow|allow-always|deny] [--idle-timeout <secs>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error"
     );
     USAGE_ERROR
 }
@@ -482,9 +482,9 @@ mod tests {
         assert!(out.is_empty());
         assert!(err.contains("Usage:"));
 
-        let (code, out, err) = run_captured(["mobee", "version"]);
+        let (code, out, err) = run_captured(["maxplayer", "version"]);
         assert_eq!(code, 0);
-        assert_eq!(out, format!("mobee {}\n", mobee_core::version()));
+        assert_eq!(out, format!("maxplayer {}\n", mobee_core::version()));
         assert!(err.is_empty());
     }
 

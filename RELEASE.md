@@ -1,6 +1,6 @@
 # Cutting a release
 
-`mobee` ships two ways from one tag: downloadable archives on a GitHub Release, and `npx mobee` from
+`maxplayer` ships two ways from one tag: downloadable archives on a GitHub Release, and `npx maxplayer` from
 npm. Both come out of `.github/workflows/release.yml`, which runs on a pushed `v*` tag.
 
 ## Before the first release
@@ -14,8 +14,9 @@ Until that secret exists the workflow builds, verifies and creates GitHub Releas
 publish job stops on its first step. That is deliberate: the token lives in repository secrets and
 never in the tree.
 
-Publishing `@mobee/*` for the first time also needs the `mobee` npm org to exist and the token's
-account to be able to publish into it.
+The launcher publishes as the unscoped package `maxplayer`; the per-platform payloads publish under
+the `@maxplayerai` scope. Both need to be writable by the token's account, and a scoped package's
+first publish needs `--access public`, which the publish job already passes.
 
 ## Cutting one
 
@@ -60,21 +61,40 @@ account to be able to publish into it.
    git tag v0.2.0 && git push origin v0.2.0
    ```
 
-A pre-release works the same way, with a semver suffix on both the tag and the tree — tag
-`v0.2.0-rc1` against a tree that says `0.2.0-rc1`. Any suffix marks the GitHub Release a pre-release
-and publishes npm under the `rc` dist-tag, so `npm i mobee` still resolves the last stable version.
+## Version scheme: plain `0.x.y` while below v1
+
+**Releases before v1 are the release candidates.** They are numbered `0.1.0`, `0.2.0` and so on —
+plain versions with **no `-rc` suffix**. `v1.0.0` is deliberately unspent until the thing under it is
+what we mean by 1.0.
+
+That is not only a naming preference. **A suffix would break the install path it looks like it
+supports.** Any hyphen in the version makes the workflow treat the release as a pre-release, and a
+pre-release publishes to npm under the `rc` dist-tag *only*. The reasoning behind that — "so
+`npm i maxplayer` still resolves the last stable version" — assumes a stable version already exists.
+Before the first release there isn't one, so an `-rc` first release would leave `latest` unset and
+`npx maxplayer` with nothing to resolve. The dist-tag branch is correct in every case except the one
+that comes first.
+
+⚠ The `latest`-unset half of that has not been executed against the live registry — it is npm's
+documented behaviour and the workflow already assumes it, but nothing here has published yet. Plain
+`0.x.y` avoids depending on the answer. Should an `-rc` ever ship first, the repair is one command:
+`npm dist-tag add maxplayer@<version> latest`.
+
+A genuine pre-release, once a stable exists, works as it always did: a semver suffix on both the tag
+and the tree — tag `v0.3.0-rc1` against a tree that says `0.3.0-rc1`. The suffix marks the GitHub
+Release a pre-release and publishes under the `rc` dist-tag, leaving `latest` where it was.
 
 ## What the tag does
 
-- Builds `mobee` for each platform on a runner of that architecture.
-- Verifies each artifact: the version matches the tag, the feature set is the buyer surface
+- Builds the racer binary `maxplayer` for each platform on a runner of that architecture.
+- Verifies each artifact: the version matches the tag, the feature set is the racer surface
   (`wallet` in, `acp` out), and on Linux that it runs inside alpine and debian with no toolchain
   present.
-- Attaches `mobee-<version>-<platform>.tar.gz` plus `SHA256SUMS` to a GitHub Release.
-- Publishes the npm packages: every payload package first, then the `mobee` launcher.
+- Attaches `maxplayer-<version>-<platform>.tar.gz` plus `SHA256SUMS` to a GitHub Release.
+- Publishes the npm packages: every payload package first, then the `maxplayer` launcher.
 
 The publish order matters. The launcher pins its payload by exact version, so publishing it first
-would leave a window where `npm i mobee` installs a launcher whose binary is not on the registry yet.
+would leave a window where `npm i maxplayer` installs a launcher whose binary is not on the registry yet.
 
 ## Dry run
 
@@ -112,11 +132,11 @@ git cat-file -e "$TAG":.github/workflows/release.yml && echo present || echo abs
 
 | platform | runner | shipped as |
 |---|---|---|
-| linux-x64 | `ubuntu-latest` | archive + `@mobee/cli-linux-x64` |
-| linux-arm64 | `ubuntu-24.04-arm` | archive + `@mobee/cli-linux-arm64` |
+| linux-x64 | `ubuntu-latest` | archive + `@maxplayerai/linux-x64` |
+| linux-arm64 | `ubuntu-24.04-arm` | archive + `@maxplayerai/linux-arm64` |
 | darwin-arm64 | `macos-14` | archive only |
 
-darwin-arm64 has no npm payload package yet, so macOS users download the archive; `npx mobee` tells
+darwin-arm64 has no npm payload package yet, so macOS users download the archive; `npx maxplayer` tells
 them so rather than failing obscurely. Adding it means a `npm/cli-darwin-arm64` package and its entry
 in the launcher's platform map — at which point the publish job's platform list has to name it too,
 and the workflow fails at release time if it does not. That failure is the point: a payload package
@@ -126,7 +146,7 @@ launcher pins it by exact version.
 **darwin-x64 and Windows are out of scope.**
 
 Adding a platform means: a matrix entry in `release.yml`, a package under `npm/`, an entry in
-`PLATFORM_PACKAGES` in `npm/mobee/bin/mobee.js`, an `optionalDependencies` pin, and the platform in
+`PLATFORM_PACKAGES` in `npm/mobee/bin/maxplayer.js`, an `optionalDependencies` pin, and the platform in
 `RELEASE_PLATFORMS`. Two of those five are asserted rather than trusted — the pin by
 `verify-release-version.sh`, and the platform list by the publish job.
 

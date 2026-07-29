@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# Build the npm wrapper packages and prove `npx mobee` launches the native binary — entirely
+# Build the npm wrapper packages and prove `npx maxplayer` launches the native binary — entirely
 # locally. Nothing here publishes, and nothing here reaches the public registry.
 #
-# The shape is the esbuild/swc one: `mobee` is a tiny JS launcher, and the executable lives in a
+# The shape is the esbuild/swc one: `maxplayer` is a tiny JS launcher, and the executable lives in a
 # per-platform package listed under optionalDependencies so an install pulls one platform's binary
 # rather than all of them. The alternative — a postinstall downloader — breaks under
 # --ignore-scripts, which security-conscious users and many CI setups set by default, so this script
@@ -11,7 +11,7 @@
 #
 # Usage:
 #   ./scripts/npm-pack-local.sh [path-to-static-binary] [path-to-aarch64-binary]
-#     default: result/bin/mobee
+#     default: result/bin/maxplayer
 #     nix build .#buyer-static            # produces the x86_64 payload
 #     nix build .#buyer-static-aarch64    # optional second argument
 #
@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-BINARY="${1:-result/bin/mobee}"
+BINARY="${1:-result/bin/maxplayer}"
 BINARY_ARM64="${2:-}"
 PKG_MAIN="npm/mobee"
 PKG_PLATFORM="npm/cli-linux-x64"
@@ -83,14 +83,14 @@ stage_licenses() {
 stage_licenses "$STAGE/mobee"
 stage_licenses "$STAGE/cli-linux-x64"
 mkdir -p "$STAGE/cli-linux-x64/bin"
-cp -L "$BINARY" "$STAGE/cli-linux-x64/bin/mobee"
-chmod 755 "$STAGE/cli-linux-x64/bin/mobee"
+cp -L "$BINARY" "$STAGE/cli-linux-x64/bin/maxplayer"
+chmod 755 "$STAGE/cli-linux-x64/bin/maxplayer"
 
 ( cd "$STAGE/mobee"          && npm pack --silent --pack-destination "$DIST" >/dev/null )
 ( cd "$STAGE/cli-linux-x64"  && npm pack --silent --pack-destination "$DIST" >/dev/null )
 
-TGZ_MAIN="$(find "$DIST" -name 'mobee-*.tgz' -not -name 'mobee-cli-*' | head -1)"
-TGZ_PLATFORM="$(find "$DIST" -name 'mobee-cli-linux-x64-*.tgz' | head -1)"
+TGZ_MAIN="$(find "$DIST" -name 'maxplayer-*.tgz' | head -1)"
+TGZ_PLATFORM="$(find "$DIST" -name 'maxplayerai-linux-x64-*.tgz' | head -1)"
 [ -n "$TGZ_MAIN" ]     || die "main tarball not produced"
 [ -n "$TGZ_PLATFORM" ] || die "platform tarball not produced"
 echo "ok: packed $(basename "$TGZ_MAIN") + $(basename "$TGZ_PLATFORM")"
@@ -102,9 +102,9 @@ echo "ok: packed $(basename "$TGZ_MAIN") + $(basename "$TGZ_PLATFORM")"
 # on a successful match: grep exits at the first hit, tar dies of SIGPIPE, and pipefail surfaces
 # tar's death. That inverts the check — it fails loudest when the file is present.
 TARBALL_LISTING="$(tar -tzf "$TGZ_PLATFORM")"
-grep -qx 'package/bin/mobee' <<<"$TARBALL_LISTING" \
-    || die "platform tarball does not contain package/bin/mobee"
-echo "ok: platform tarball carries bin/mobee"
+grep -qx 'package/bin/maxplayer' <<<"$TARBALL_LISTING" \
+    || die "platform tarball does not contain package/bin/maxplayer"
+echo "ok: platform tarball carries bin/maxplayer"
 
 # ── Optional: the aarch64 payload package ───────────────────────────────────────────────────────
 # Packed and structurally checked, nothing more. npm skips it here on the os/cpu mismatch, and an
@@ -119,15 +119,15 @@ if [ -n "$BINARY_ARM64" ]; then
     cp -R npm/cli-linux-arm64 "$STAGE/cli-linux-arm64"
     stage_licenses "$STAGE/cli-linux-arm64"
     mkdir -p "$STAGE/cli-linux-arm64/bin"
-    cp -L "$BINARY_ARM64" "$STAGE/cli-linux-arm64/bin/mobee"
-    chmod 755 "$STAGE/cli-linux-arm64/bin/mobee"
+    cp -L "$BINARY_ARM64" "$STAGE/cli-linux-arm64/bin/maxplayer"
+    chmod 755 "$STAGE/cli-linux-arm64/bin/maxplayer"
     ( cd "$STAGE/cli-linux-arm64" && npm pack --silent --pack-destination "$DIST" >/dev/null )
 
-    TGZ_ARM64="$(find "$DIST" -name 'mobee-cli-linux-arm64-*.tgz' | head -1)"
+    TGZ_ARM64="$(find "$DIST" -name 'maxplayerai-linux-arm64-*.tgz' | head -1)"
     [ -n "$TGZ_ARM64" ] || die "aarch64 tarball not produced"
     ARM_LISTING="$(tar -tzf "$TGZ_ARM64")"
-    grep -qx 'package/bin/mobee' <<<"$ARM_LISTING" \
-        || die "aarch64 tarball does not contain package/bin/mobee"
+    grep -qx 'package/bin/maxplayer' <<<"$ARM_LISTING" \
+        || die "aarch64 tarball does not contain package/bin/maxplayer"
 
     ARM_MACHINE="$(node "$(dirname "$0")/elf-info.mjs" "$BINARY_ARM64" | sed -n 's/^machine=//p')"
     [ "$ARM_MACHINE" = "AArch64" ] \
@@ -150,49 +150,49 @@ echo "ok: every tarball carries LICENSE-MIT and LICENSE-APACHE"
 
 # ── Install into a clean project, scripts disabled ──────────────────────────────────────────────
 cat > "$PROJECT/package.json" <<JSON
-{ "name": "mobee-wrapper-proof", "version": "0.0.0", "private": true }
+{ "name": "maxplayer-wrapper-proof", "version": "0.0.0", "private": true }
 JSON
 ( cd "$PROJECT" && npm install --silent --ignore-scripts "$TGZ_PLATFORM" "$TGZ_MAIN" >/dev/null )
 
-# `npx mobee` must reach the LAUNCHER. The platform package deliberately names its own bin
-# `mobee-linux-x64` so it cannot win the `mobee` name and silently bypass the launcher.
-LINK="$PROJECT/node_modules/.bin/mobee"
-[ -e "$LINK" ] || die "npm did not link a 'mobee' bin"
+# `npx maxplayer` must reach the LAUNCHER. The platform package deliberately names its own bin
+# `maxplayer-linux-x64` so it cannot win the `maxplayer` name and silently bypass the launcher.
+LINK="$PROJECT/node_modules/.bin/maxplayer"
+[ -e "$LINK" ] || die "npm did not link a 'maxplayer' bin"
 head -c 4 "$(readlink -f "$LINK")" | grep -q $'\x7fELF' \
-    && die "'mobee' resolves straight to the ELF — the launcher is being bypassed"
-echo "ok: 'mobee' resolves to the JS launcher"
+    && die "'maxplayer' resolves straight to the ELF — the launcher is being bypassed"
+echo "ok: 'maxplayer' resolves to the JS launcher"
 
 # ── Prove it launches ───────────────────────────────────────────────────────────────────────────
 # A scratch home, always: this OVERRIDES whatever MOBEE_HOME the caller had. With MOBEE_HOME unset
-# mobee falls back to ~/.mobee — a real wallet home on a developer machine — and inheriting a
+# maxplayer falls back to ~/.mobee — a real wallet home on a developer machine — and inheriting a
 # caller's home would be just as wrong, so the value is forced rather than checked.
 export MOBEE_HOME="$WORK/home"
 mkdir -p "$MOBEE_HOME"
 
-VERSION_OUT="$( cd "$PROJECT" && npx --no-install mobee version )" \
-    || die "npx mobee version failed"
-echo "$VERSION_OUT" | grep -Eq '^mobee [0-9]+\.[0-9]+\.[0-9]+$' \
+VERSION_OUT="$( cd "$PROJECT" && npx --no-install maxplayer version )" \
+    || die "npx maxplayer version failed"
+echo "$VERSION_OUT" | grep -Eq '^maxplayer [0-9]+\.[0-9]+\.[0-9]+$' \
     || die "unexpected version output: $VERSION_OUT"
-echo "ok: npx mobee version -> $VERSION_OUT"
+echo "ok: npx maxplayer version -> $VERSION_OUT"
 
 # The real target: the buyer MCP server over stdio, which is how an MCP client launches it.
 REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"npm-wrapper-proof","version":"0"}}}'
-MCP_OUT="$( cd "$PROJECT" && printf '%s\n' "$REQ" | timeout 30 npx --no-install mobee mcp 2>/dev/null )" \
-    || die "npx mobee mcp failed"
-echo "$MCP_OUT" | grep -q '"serverInfo":{"name":"mobee"' \
+MCP_OUT="$( cd "$PROJECT" && printf '%s\n' "$REQ" | timeout 30 npx --no-install maxplayer mcp 2>/dev/null )" \
+    || die "npx maxplayer mcp failed"
+echo "$MCP_OUT" | grep -q '"serverInfo":{"name":"maxplayer"' \
     || die "no MCP initialize result; got: $(echo "$MCP_OUT" | head -2)"
-echo "ok: npx mobee mcp -> initialize answered by serverInfo.name=mobee"
+echo "ok: npx maxplayer mcp -> initialize answered by serverInfo.name=maxplayer"
 
 # ── Negative control ────────────────────────────────────────────────────────────────────────────
 # Without this, the launcher's "no binary for this platform" branch is unreachable code that has
 # never been observed working — and a missing payload would surface as a confusing crash.
-rm -rf "$PROJECT/node_modules/@mobee/cli-linux-x64"
-if ( cd "$PROJECT" && npx --no-install mobee version >/dev/null 2>&1 ); then
+rm -rf "$PROJECT/node_modules/@maxplayerai/linux-x64"
+if ( cd "$PROJECT" && npx --no-install maxplayer version >/dev/null 2>&1 ); then
     die "control failed: launcher still succeeded with the platform package removed"
 fi
-CONTROL_ERR="$( cd "$PROJECT" && npx --no-install mobee version 2>&1 >/dev/null || true )"
+CONTROL_ERR="$( cd "$PROJECT" && npx --no-install maxplayer version 2>&1 >/dev/null || true )"
 echo "$CONTROL_ERR" | grep -q 'no binary for' \
     || die "control produced no actionable message: $CONTROL_ERR"
 echo "ok: control -> platform package removed gives a clear error, non-zero"
 
-echo "PASS: npx mobee launches the native binary, and fails cleanly without it"
+echo "PASS: npx maxplayer launches the native binary, and fails cleanly without it"

@@ -1,6 +1,6 @@
-//! `mobee accept` — lower-level buyer primitive: accept a seller claim and record the local
+//! `maxplayer accept` — lower-level buyer primitive: accept a seller claim and record the local
 //! co-signed pay-bind (seller / result / commit / repo / branch / job-hash / creq_hash) for a
-//! later `mobee collect` / authorize_pay. `collect` folds this step in automatically, so `accept`
+//! later `maxplayer collect` / authorize_pay. `collect` folds this step in automatically, so `accept`
 //! is only needed to bind a specific result up front (e.g. to disambiguate multiple deliveries).
 //! Never echoes the secret key.
 
@@ -54,15 +54,15 @@ fn usage(err: &mut dyn Write) {
     let _ = writeln!(
         err,
         "Usage:\n\
-         \x20 mobee accept <job_id> <claim_id> [--result-id <id>] [--home <path>]\n\
+         \x20 maxplayer accept <job_id> <claim_id> [--result-id <id>] [--home <path>]\n\
          \n\
-         Records the local co-signed pay-bind for a delivered result. Optional; `mobee collect`\n\
+         Records the local co-signed pay-bind for a delivered result. Optional; `maxplayer collect`\n\
          accepts the delivered claim itself when no bind exists. Never echoes the secret key.\n\
          Exit codes: 0 success, 1 usage error, 2 runtime error"
     );
 }
 
-/// Entry from `cli::run` for `mobee accept ...`.
+/// Entry from `cli::run` for `maxplayer accept ...`.
 #[cfg(feature = "wallet")]
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     use mobee_core::home;
@@ -129,6 +129,6 @@ pub fn run(args: &[String], _out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         usage(err);
         return USAGE_ERROR;
     }
-    let _ = writeln!(err, "mobee accept requires the wallet feature");
+    let _ = writeln!(err, "maxplayer accept requires the wallet feature");
     USAGE_ERROR
 }

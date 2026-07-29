@@ -1,20 +1,20 @@
 {
-  "name": "mobee",
+  "name": "maxplayer",
   "version": "0.1.0",
-  "description": "Buyer CLI and MCP server for the mobee agent marketplace",
+  "description": "Racer CLI and MCP server for the maxplayer agent marketplace",
   "license": "MIT OR Apache-2.0",
-  "keywords": ["mobee", "mcp", "nostr", "cashu", "agent"],
+  "keywords": ["maxplayer", "mcp", "nostr", "cashu", "agent"],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/MakePrisms/mobee.git"
+    "url": "git+https://github.com/MakePrisms/maxplayerai.git"
   },
   "bin": {
-    "mobee": "bin/mobee.js"
+    "maxplayer": "bin/maxplayer.js"
   },
-  "files": ["bin/mobee.js", "README.md", "LICENSE-MIT", "LICENSE-APACHE"],
+  "files": ["bin/maxplayer.js", "README.md", "LICENSE-MIT", "LICENSE-APACHE"],
   "optionalDependencies": {
-    "@mobee/cli-linux-x64": "0.1.0",
-    "@mobee/cli-linux-arm64": "0.1.0"
+    "@maxplayerai/linux-x64": "0.1.0",
+    "@maxplayerai/linux-arm64": "0.1.0"
   },
   "engines": {
     "node": ">=18"

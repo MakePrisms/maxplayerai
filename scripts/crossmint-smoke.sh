@@ -55,7 +55,7 @@ EXPOSURE_CAP_SATS="${EXPOSURE_CAP_SATS:-50}"
 SOURCE_MINT="${SOURCE_MINT:-}"         # the mint the buyer holds sats at
 TARGET_MINT="${TARGET_MINT:-}"         # the mint the seller accepts — MUST differ from SOURCE_MINT
 
-MOBEE="${MOBEE:-/srv/forge/workspaces/.crossmint-target/release/mobee}"
+MOBEE="${MOBEE:-/srv/forge/workspaces/.crossmint-target/release/maxplayer}"
 RUN_DIR="${RUN_DIR:-/tmp/crossmint-smoke-run}"
 
 # The marker that makes a directory a legitimate target. Bootstrap WRITES into MOBEE_HOME, and an
@@ -123,13 +123,13 @@ total_sats=179'
     # the unreachable one. The real mints issue base64url. A fixture for a format you cannot
     # observe must be drawn from that format, not from the one in front of you.
     local uuid='019fa5cd-b27c-7803-b89e-51d8f45c3c05'
-    local needs="status=needs_payment amount_sats=21 mint=https://b.test quote_id=${uuid} (pay the invoice, then \`mobee wallet mint-complete ${uuid}\`)"
+    local needs="status=needs_payment amount_sats=21 mint=https://b.test quote_id=${uuid} (pay the invoice, then \`maxplayer wallet mint-complete ${uuid}\`)"
     check "quote id, uuid form"  "$uuid" "$(parse_quote_id "$needs")"
     check "amount from needs_payment" "21" "$(parse_field "$needs" amount_sats)"
 
     # The id that actually broke it live, verbatim: underscore AND hyphen.
     local b64='lcLc0JwHHCIG_UIwQ8cvPB-LXgiVfSxE6ZO6Tq1b'
-    local needs64="status=needs_payment amount_sats=5 mint=https://b.test quote_id=${b64} (pay the invoice, then \`mobee wallet mint-complete ${b64}\`)"
+    local needs64="status=needs_payment amount_sats=5 mint=https://b.test quote_id=${b64} (pay the invoice, then \`maxplayer wallet mint-complete ${b64}\`)"
     check "quote id, base64url form" "$b64" "$(parse_quote_id "$needs64")"
     # Pin the exact regression: an allow-list class truncates here, and a truncated id is a
     # PREFIX of the real one — it looks like an id, which is why it failed downstream, not here.
@@ -396,8 +396,8 @@ of them returned rc=1 against the real binary.
 
 What Stage B requires, all verified against the merged tree:
   - buyer:  post_job over the daemon socket (\$MOBEE_HOME/buyer.sock, newline-delimited JSON;
-            methods status|post_job|get_job|award|collect). There is NO 'mobee job' CLI.
-            'mobee collect <job_id>' auto-spawns the daemon, so no manual daemon step is needed.
+            methods status|post_job|get_job|award|collect). There is NO 'maxplayer job' CLI.
+            'maxplayer collect <job_id>' auto-spawns the daemon, so no manual daemon step is needed.
   - seller: a throwaway seller home with MOBEE_SELLER__AGENT_COMMAND / __RATE_SATS / __GIT_REMOTE,
             plus a delivery path (git) and a relay both sides can see.
   - award protocol: post -> award -> deliver -> collect. accept_claim and authorize_pay are FOLDED
@@ -461,7 +461,7 @@ main() {
         *) die "usage: $0 --self-test | --dry-run | --fund | --fund-complete <quote_id> | --stage-a | --stage-b" ;;
     esac
 
-    [ -x "$MOBEE" ] || die "no mobee binary at $MOBEE (set MOBEE=...)"
+    [ -x "$MOBEE" ] || die "no maxplayer binary at $MOBEE (set MOBEE=...)"
     self_test   # parsers are proven before anything else runs, on every mode
 
     mkdir -p "$RUN_DIR"

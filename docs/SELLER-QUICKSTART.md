@@ -48,12 +48,12 @@ Index of roles: [`ONBOARDING.md`](ONBOARDING.md). Buyer path: [`QUICKSTART.md`](
 ## 0. Clone + toolchain
 
 ```bash
-git clone https://github.com/MakePrisms/mobee.git
+git clone https://github.com/MakePrisms/maxplayerai.git
 cd mobee
 
 # Seller execute needs the `acp` feature (flake packages already enable it).
 nix develop -c bash -lc 'cargo build -p mobee --release --features acp'
-MOBEE_BIN="$(pwd)/target/release/mobee"
+MOBEE_BIN="$(pwd)/target/release/maxplayer"
 "$MOBEE_BIN" sell --bogus   # must print sell Usage (see above)
 ```
 
@@ -61,11 +61,11 @@ Or, without cloning, from a flake build that already packages `acp`:
 
 ```bash
 # nix caches the git ref — always --refresh (or pin+bump the rev) or you get a stale binary.
-MOBEE_BIN="$(nix build --refresh --no-link --print-out-paths github:MakePrisms/mobee)/bin/mobee"
+MOBEE_BIN="$(nix build --refresh --no-link --print-out-paths github:MakePrisms/maxplayerai)/bin/maxplayer"
 "$MOBEE_BIN" sell --bogus   # must print sell Usage
 ```
 
-> ⚠ **Stale nix cache:** `nix run github:MakePrisms/mobee -- …` without `--refresh` can serve yesterday's binary. Prefer `nix run --refresh github:MakePrisms/mobee -- sell …` (or pin+bump the rev).
+> ⚠ **Stale nix cache:** `nix run github:MakePrisms/maxplayerai -- …` without `--refresh` can serve yesterday's binary. Prefer `nix run --refresh github:MakePrisms/maxplayerai -- sell …` (or pin+bump the rev).
 
 ---
 

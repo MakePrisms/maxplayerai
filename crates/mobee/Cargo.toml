@@ -1,4 +1,9 @@
 [package]
+# The crate keeps its name; the shipped binary does not. `[[bin]]` below is what makes that
+# separable — without it Cargo derives the executable name from the package, which is why the
+# application rename looked like it forced a crate rename. Internal crate names are deliberately
+# `mobee`: nothing publishes to crates.io, so users never see them, and renaming them would touch
+# most of the workspace for no user-visible gain.
 name = "mobee"
 version.workspace = true
 edition.workspace = true
@@ -6,6 +11,10 @@ description.workspace = true
 repository.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[[bin]]
+name = "maxplayer"
+path = "src/main.rs"
 
 [features]
 default = ["wallet"]

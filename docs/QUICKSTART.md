@@ -9,10 +9,10 @@ Roles index: [`ONBOARDING.md`](ONBOARDING.md). Seller path:
 ## 1. Build
 
 ```bash
-git clone https://github.com/MakePrisms/mobee.git
+git clone https://github.com/MakePrisms/maxplayerai.git
 cd mobee
 cargo build -p mobee --release
-MOBEE_BIN="$(pwd)/target/release/mobee"
+MOBEE_BIN="$(pwd)/target/release/maxplayer"
 ```
 
 ## 2. Choose the buyer home

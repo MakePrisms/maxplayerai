@@ -13,12 +13,12 @@
 # not print the same word.
 #
 # Usage:
-#   ./scripts/verify-arm64-artifact.sh [path-to-binary]     # default: result/bin/mobee
+#   ./scripts/verify-arm64-artifact.sh [path-to-binary]     # default: result/bin/maxplayer
 #     nix build .#buyer-static-aarch64
 
 set -euo pipefail
 
-BINARY="${1:-result/bin/mobee}"
+BINARY="${1:-result/bin/maxplayer}"
 ELF_INFO="$(dirname "$0")/elf-info.mjs"
 
 die() { echo "verify-arm64-artifact: $*" >&2; exit 1; }
@@ -56,16 +56,16 @@ RAN=no
 if docker run --rm --platform linux/arm64 alpine:3 true >/dev/null 2>&1; then
     SHIPDIR="$(mktemp -d)"
     trap 'rm -rf "$SHIPDIR"' EXIT
-    cp -L "$BINARY" "$SHIPDIR/mobee"
-    chmod 755 "$SHIPDIR/mobee"
+    cp -L "$BINARY" "$SHIPDIR/maxplayer"
+    chmod 755 "$SHIPDIR/maxplayer"
 
-    OUT="$(docker run --rm --platform linux/arm64 -v "$SHIPDIR:/b:ro" alpine:3 /b/mobee version)" \
+    OUT="$(docker run --rm --platform linux/arm64 -v "$SHIPDIR:/b:ro" alpine:3 /b/maxplayer version)" \
         || die "aarch64 emulation is available but the artifact failed to run"
-    grep -Eq '^mobee [0-9]+\.[0-9]+\.[0-9]+$' <<<"$OUT" \
+    grep -Eq '^maxplayer [0-9]+\.[0-9]+\.[0-9]+$' <<<"$OUT" \
         || die "unexpected version output under emulation: $OUT"
     echo "ok: runs under aarch64 emulation -> $OUT"
 
-    if docker run --rm --platform linux/arm64 -v "$SHIPDIR:/b:ro" alpine:3 /b/mobee not-a-subcommand >/dev/null 2>&1; then
+    if docker run --rm --platform linux/arm64 -v "$SHIPDIR:/b:ro" alpine:3 /b/maxplayer not-a-subcommand >/dev/null 2>&1; then
         die "control failed: exits 0 on an unknown subcommand, so the run above proves nothing"
     fi
     echo "ok: control -> unknown subcommand exits non-zero"

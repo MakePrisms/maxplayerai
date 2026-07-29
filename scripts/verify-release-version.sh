@@ -14,7 +14,7 @@
 #
 # Usage:
 #   ./scripts/verify-release-version.sh <version> [path-to-binary]
-#     e.g. ./scripts/verify-release-version.sh 0.1.0 result/bin/mobee
+#     e.g. ./scripts/verify-release-version.sh 0.1.0 result/bin/maxplayer
 #
 # Pass the version WITHOUT a leading `v` — the workflow strips it from the tag.
 

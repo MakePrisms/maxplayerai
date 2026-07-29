@@ -1,4 +1,4 @@
-//! `mobee profile set` — set the optional buyer/seller kind-0 identity (name/about) and
+//! `maxplayer profile set` — set the optional buyer/seller kind-0 identity (name/about) and
 //! publish it to the configured relay. Never required; absent profile leaves the identity as hex.
 //! Never echoes the secret key.
 
@@ -45,7 +45,7 @@ fn usage(err: &mut dyn Write) {
     let _ = writeln!(
         err,
         "Usage:\n\
-         \x20 mobee profile set [--name <name>] [--about <about>] [--home <path>]\n\
+         \x20 maxplayer profile set [--name <name>] [--about <about>] [--home <path>]\n\
          \n\
          Publishes/replaces the kind-0 metadata event on the configured relay. Called with no\n\
          name/about = re-publish from existing config. Never echoes the secret key.\n\
@@ -53,7 +53,7 @@ fn usage(err: &mut dyn Write) {
     );
 }
 
-/// Entry from `cli::run` for `mobee profile ...`.
+/// Entry from `cli::run` for `maxplayer profile ...`.
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     match args.first().map(String::as_str) {
         Some("set") => cmd_set(&args[1..], out, err),
@@ -142,6 +142,6 @@ fn cmd_set(args: &[String], _out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         usage(err);
         return USAGE_ERROR;
     }
-    let _ = writeln!(err, "mobee profile requires the wallet feature");
+    let _ = writeln!(err, "maxplayer profile requires the wallet feature");
     USAGE_ERROR
 }
