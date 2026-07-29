@@ -55,6 +55,28 @@ Use it after any change to the workflow. On a dispatch run the release and publi
 as skipped; that is the live confirmation that the gates hold, and it is worth watching once before
 the first real tag.
 
+### ⚠ Both triggers read the workflow from a specific commit, not from `dev`
+
+**`workflow_dispatch` is only offered for a workflow that exists on the default branch (`main`).**
+Change `release.yml` on `dev` and there is nothing to dispatch until that change reaches `main` — the
+"Run workflow" button describes `main`'s copy, not yours.
+
+**A `v*` tag runs the copy of the workflow in the tagged commit.** So a tag cut from a `main` that
+predates `release.yml` starts **no run at all** — no output, no failure, nothing in the Actions tab.
+That is the failure mode to watch for, because an absent run looks identical to one nobody noticed.
+
+Both follow from the same fact and have the same fix: **merge `dev` into `main` before tagging or
+dispatching**, which step 2 above already does. The trap is only reachable by tagging or dispatching
+without it — most easily by cutting a release from a `main` merged minutes *before* a workflow change
+landed on `dev`.
+
+If a tag produced no run, confirm the workflow was actually in that tree rather than assuming the
+trigger misfired:
+
+```sh
+git cat-file -e "$TAG":.github/workflows/release.yml && echo present || echo absent
+```
+
 ## Platforms
 
 | platform | runner | shipped as |
@@ -118,6 +140,8 @@ rebuild is a cross-check, and letting it gate the pipeline would quietly make it
 
 ## If a release goes wrong
 
+- **The tag produced no run at all.** The tagged commit has no `release.yml` — see the warning under
+  Dry run. Merge `dev` into `main`, delete the tag, tag again.
 - **Publish failed, Release exists.** Fix the cause and re-run just the publish job. The build is
   reproducible from the tag.
 - **A version disagreed with the tag.** Nothing was published — the check runs before any upload.
