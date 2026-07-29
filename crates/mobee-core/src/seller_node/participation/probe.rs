@@ -114,8 +114,20 @@ pub async fn probe_access(
     // we have not proven, and to relays already classified denied. The roster gates which relay we
     // ADDRESS, but it cannot gate a client that was handed the whole list; targeting the URL here is
     // what makes "a denied relay gets nothing" true of the publish path too, not just the REQ path.
-    if let Err(error) = publisher.send_event_to([relay_url], carrier).await {
-        return ProbeOutcome::Refused(format!("relay refused the probe publish: {error}"));
+    match publisher.send_event_to([relay_url], carrier).await {
+        Err(error) => {
+            return ProbeOutcome::Refused(format!("relay refused the probe publish: {error}"));
+        }
+        // ★ A pool `Ok` is acceptance, not delivery — see [`super::undelivered`]. Both outcomes are
+        // fail-closed, so this is not an admission bug; it is a DIAGNOSIS bug, and those are the ones
+        // that waste an operator's afternoon. Without it a carrier that never left the process would be
+        // reported as `EchoMissing` — "the relay did not retain it" — which blames the relay for our own
+        // disconnected socket, after burning the full probe timeout waiting for an echo of nothing.
+        Ok(output) => {
+            if let Some(why) = super::undelivered(&output) {
+                return ProbeOutcome::Refused(format!("the probe publish reached no relay: {why}"));
+            }
+        }
     }
 
     match reader

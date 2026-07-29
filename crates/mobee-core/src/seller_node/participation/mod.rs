@@ -48,6 +48,38 @@ pub fn channel_filter_id(channel_id: &str) -> String {
     format!("channel:{channel_id}")
 }
 
+/// Why nothing was sent, or `None` if at least one relay took the message.
+///
+/// ★ A pool `Ok` means ACCEPTED, NOT SENT. `subscribe_with_id` and `send_event_to` return `Ok` whenever
+/// the pool holds the named relays at all; a relay that would not take the message — never connected
+/// (`NotReady`), banned, asleep, or with a full send channel — is recorded in `output.failed` and NOWHERE
+/// ELSE. The `Result` cannot express it, so `.map(|_| ())` discards the only evidence there was.
+///
+/// Every client here holds exactly one relay, so an empty `success` set means our only relay took nothing
+/// and there is no message in flight for anything to answer.
+///
+/// This is load-bearing, not tidiness. `note_retry_attempt` arms an attribution token, and a resync clears
+/// the pending marker that owes it, both on the strength of "the REQ went out" — reading that from a value
+/// which cannot say it arms a token for a message nobody sent. Same defect as arming it too early, one
+/// layer further down.
+pub(super) fn undelivered<T: std::fmt::Debug>(
+    output: &nostr_sdk::prelude::Output<T>,
+) -> Option<String> {
+    if !output.success.is_empty() {
+        return None;
+    }
+    let reasons: Vec<String> = output
+        .failed
+        .iter()
+        .map(|(url, why)| format!("{url}: {why}"))
+        .collect();
+    Some(if reasons.is_empty() {
+        "no relay accepted it".to_string()
+    } else {
+        reasons.join("; ")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

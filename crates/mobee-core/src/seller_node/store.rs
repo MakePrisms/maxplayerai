@@ -1217,6 +1217,8 @@ impl SellerStore {
     /// ★ One function for the first refusal and a failed retry, on purpose: they are the same fact, and
     /// the only difference is that the wait gets longer. A raise that fired only when the flag was down
     /// would leave a refused retry with an unchanged backoff — retrying at a fixed interval forever.
+    ///
+    /// A refusal that is neither of those two things is a NO-OP — no counter, and no timestamp either.
     pub fn advance_suppression(
         &self,
         relay_url: &str,
@@ -1244,13 +1246,28 @@ impl SellerStore {
         // retry, would each add a step to the backoff for nothing. The wait would grow from the relay's
         // chattiness rather than from our failures, and a channel could reach the six-hour cap without a
         // single retry having been refused.
-        let counts = was_clear || retry_outstanding;
+        //
+        // ★★ And NOT COUNTING HAS TO MEAN NOT TOUCHING. An earlier cut skipped only the increment and
+        // still wrote `suppressed_at_unix = now`, which traded inflation for STARVATION — strictly worse.
+        // The due-check is `now - suppressed_at_unix >= backoff(attempts)`, so re-stamping that timestamp
+        // postpones the retry by a full backoff every time: a chatty relay would keep a channel forever
+        // un-retried AND forever un-escalated, where the bug being fixed only made the wait too long.
+        // An unattributable refusal is not news, and the correct handling of not-news is to change
+        // nothing at all.
+        //
+        // Nothing else here needs to run either. Unattributable means the suppression was already up
+        // (`!was_clear`), so `suppressed = 1` is a no-op, `retry_started_unix` is already 0, and the owed
+        // rows were dropped when the flag went up — [`Self::record_owed`] refuses to mint more while
+        // `suppressed = 1`, so there are none to find.
+        if !(was_clear || retry_outstanding) {
+            return Ok(false);
+        }
         transaction.execute(
             "UPDATE participation_channels
              SET suppressed = 1, suppressed_at_unix = ?3, retry_started_unix = 0,
-                 suppress_attempts = suppress_attempts + ?4, updated_at_unix = ?3
+                 suppress_attempts = suppress_attempts + 1, updated_at_unix = ?3
              WHERE relay_url = ?1 AND channel_id = ?2",
-            params![relay_url, channel_id, now_unix, i64::from(counts)],
+            params![relay_url, channel_id, now_unix],
         )?;
         transaction.execute(
             "UPDATE participation_owed SET state = 'dropped'
@@ -2230,8 +2247,12 @@ mod tests {
         // Duplicate CLOSEDs with nothing outstanding must NOT escalate.
         store.advance_suppression(RELAY, "chan-1", 1_001).expect("dup");
         store.advance_suppression(RELAY, "chan-1", 1_002).expect("dup");
+        // ★ Measured from the FIRST refusal, not from the last dup. An earlier version of this assertion
+        // asked at `1_002 + 60` — a due time derived from the re-stamped timestamp — so it agreed with the
+        // starvation bug instead of catching it. A test whose expected value is computed the same wrong way
+        // the code is cannot disagree with it.
         assert_eq!(
-            store.suppressed_channels_due(RELAY, 1_002 + 60).expect("due"),
+            store.suppressed_channels_due(RELAY, 1_060).expect("due"),
             vec![("chan-1".to_string(), 1)],
             "unattributable CLOSEDs escalated the backoff — the wait now grows with relay chattiness"
         );
@@ -2242,6 +2263,31 @@ mod tests {
         assert_eq!(
             store.suppressed_channels_due(RELAY, 1_110 + 300).expect("due"),
             vec![("chan-1".to_string(), 2)]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ★ THE STARVATION HALF of the same gate, and the worse failure of the two. Not counting a refusal has
+    /// to mean not TOUCHING it: an earlier cut skipped the increment but still wrote `suppressed_at_unix`,
+    /// which pushes the due time out by a full backoff on EVERY unattributable `CLOSED`. Fixing an inflated
+    /// wait by making the retry never arrive is a regression, not a fix.
+    #[test]
+    fn an_unattributable_refusal_does_not_postpone_the_retry() {
+        let (store, path) = fresh_store("refusal-starvation");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 100, 100)
+            .expect("join");
+        store.advance_suppression(RELAY, "chan-1", 1_000).expect("first");
+
+        // A chatty relay, right up to the second the first backoff would elapse.
+        for now in 1_001..1_060 {
+            store.advance_suppression(RELAY, "chan-1", now).expect("dup");
+        }
+
+        assert_eq!(
+            store.suppressed_channels_due(RELAY, 1_060).expect("due"),
+            vec![("chan-1".to_string(), 1)],
+            "an unattributable CLOSED re-stamped the backoff clock, so every message the relay sends \
+             postpones the retry by another full backoff — the channel is never due and never escalates"
         );
         let _ = std::fs::remove_file(&path);
     }

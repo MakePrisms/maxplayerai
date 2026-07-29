@@ -328,7 +328,6 @@ impl Participation {
             // us to process past a gap, and that is what `forced_progress` counts.
             let now = now_unix();
             let mut discard: BTreeSet<String> = BTreeSet::new();
-            let mut send_resync: BTreeSet<String> = BTreeSet::new();
             for url in &resync {
                 let Some(live) = self.live.get_mut(url) else {
                     continue;
@@ -340,33 +339,37 @@ impl Participation {
                 live.progress_since_resync = 0;
                 live.notifications = live.reader.notifications();
                 discard.insert(url.clone());
-                if now.saturating_sub(live.last_resync_unix) < MIN_RESYNC_INTERVAL_SECS {
-                    live.resync_pending = true;
-                } else {
-                    live.last_resync_unix = now;
-                    live.resync_pending = false;
-                    send_resync.insert(url.clone());
-                }
-            }
-            // Resyncs deferred by the floor, now due. Held as state rather than dropped, or a throttled
-            // recovery would be a recovery that never happened.
-            for (url, live) in self.live.iter_mut() {
-                if live.resync_pending
-                    && now.saturating_sub(live.last_resync_unix) >= MIN_RESYNC_INTERVAL_SECS
-                {
-                    live.resync_pending = false;
-                    live.last_resync_unix = now;
-                    send_resync.insert(url.clone());
-                }
+                // OWED, unconditionally. The floor decides only WHEN the REQ goes out; the marker comes
+                // down where the REQ is confirmed sent, never here on the way in.
+                live.resync_pending = true;
             }
             batch.retain(|(url, _)| !discard.contains(url));
-            for url in &send_resync {
-                self.resync_relay(url).await?;
-            }
 
-            // Retry channels whose suppression backoff has elapsed. This is the exit from a refusal
-            // whose only other way out is a membership event the relay has no reason to send.
-            self.retry_suppressed_channels().await?;
+            // Every owed resync whose floor has passed — including ones deferred on an earlier tick, which
+            // are held as state rather than dropped, or a throttled recovery would be a recovery that never
+            // happened. ★ This drain is deliberately OUTSIDE the `resync` branch: a deferred resync must
+            // fire once the floor elapses whether or not another lag ever arrives. Moving it under the
+            // lagged branch would turn "held" back into "never".
+            let due_resyncs: Vec<String> = self
+                .live
+                .iter()
+                .filter(|(_, live)| {
+                    live.resync_pending
+                        && now.saturating_sub(live.last_resync_unix) >= MIN_RESYNC_INTERVAL_SECS
+                })
+                .map(|(url, _)| url.clone())
+                .collect();
+            for url in &due_resyncs {
+                // ★ CLEAR ONLY AFTER SUCCESS. Dropping the marker and advancing the floor before the
+                // subscribe returned threw the owed recovery away on any failure: nothing remembered the
+                // resync was due, so the gap the lag opened became permanent — and silently, which is this
+                // module's entire failure class. On error both stay put and the next tick tries again.
+                self.resync_relay(url).await?;
+                if let Some(live) = self.live.get_mut(url) {
+                    live.resync_pending = false;
+                    live.last_resync_unix = now;
+                }
+            }
 
             for (url, message) in batch {
                 match message {
@@ -391,7 +394,8 @@ impl Participation {
                         // Forward progress for this relay: the cursor has moved, so a later `Lagged` may
                         // safely discard again without re-asking for the window we just consumed.
                         if let Some(live) = self.live.get_mut(&url) {
-                            live.progress_since_resync = live.progress_since_resync.saturating_add(1);
+                            live.progress_since_resync =
+                                live.progress_since_resync.saturating_add(1);
                         }
                     }
                     RelayMessage::Closed {
@@ -406,6 +410,18 @@ impl Participation {
                     _ => continue,
                 }
             }
+
+            // Retry channels whose suppression backoff has elapsed. This is the exit from a refusal whose
+            // only other way out is a membership event the relay has no reason to send.
+            //
+            // ★ AFTER the batch, and that ordering is the whole correctness of it. `note_retry_attempt`
+            // arms `retry_started_unix`, which is what makes an `EOSE` or a `CLOSED` attributable to a REQ
+            // of ours — so anything ALREADY IN HAND when the token arms becomes falsely attributable to a
+            // retry it predates. An `EOSE` buffered from the pre-suppression subscription would clear the
+            // flag outright; a duplicate `CLOSED` would charge a backoff step to a retry it never saw. The
+            // arming has to come after everything that could be mistaken for its answer has been judged
+            // against the state that was true when it arrived.
+            self.retry_suppressed_channels().await?;
 
             if tokio::time::Instant::now() >= deadline {
                 return Ok(ingested);
@@ -464,6 +480,42 @@ impl Participation {
         }
     }
 
+    /// A `Participation` whose relay client HOLDS a relay, so a test can observe what the pump does around a
+    /// REQ rather than only what it decides before one.
+    ///
+    /// ★ [`Self::for_lag_test`]'s client holds no relays at all, so every subscribe fails at the POOL. That
+    /// is the right fixture for "what survives a failed recovery" and the wrong one for anything about
+    /// ordering: a pump that aborts on the first subscribe would pass an ordering test by never reaching the
+    /// code the test is about — a green that means nothing, which is this module's recurring trap.
+    ///
+    /// The two modes here are the two halves of [`super::undelivered`], and having both is what makes "a pool
+    /// `Ok` is not delivery" a tested claim instead of an asserted one:
+    ///
+    /// - `accepted = true` calls `connect`, which sets the relay's status to `Pending` SYNCHRONOUSLY and
+    ///   hands REQs to its send channel. The pool reports the url in `success`, exactly as a live relay would.
+    ///   Nothing is delivered anywhere — the address does not resolve — and that is fine: accepted by a relay
+    ///   is the strongest claim a REQ can make at this layer, and `EOSE` or
+    ///   [`SellerStore::expire_stale_retries`] settles the rest.
+    /// - `accepted = false` leaves the relay un-connected, so it refuses the REQ with `NotReady` while the
+    ///   POOL STILL RETURNS `Ok` — the failure recorded only in `output.failed`. That is the whole finding:
+    ///   a success value with nothing behind it.
+    #[cfg(test)]
+    async fn for_wire_test(
+        url: &str,
+        store: SellerStore,
+        me: PublicKey,
+        notifications: broadcast::Receiver<RelayPoolNotification>,
+        accepted: bool,
+    ) -> Self {
+        let participation = Self::for_lag_test(url, store, me, notifications, now_unix(), 1);
+        let live = participation.live.get(url).expect("seam relay");
+        live.reader.add_relay(url).await.expect("add relay");
+        if accepted {
+            live.reader.connect().await;
+        }
+        participation
+    }
+
     /// Whether a resync is deferred for this relay, waiting on the floor interval.
     #[cfg(test)]
     fn resync_pending(&self, url: &str) -> bool {
@@ -503,7 +555,13 @@ impl Participation {
             let Some(entry) = self.live.get(&url) else {
                 continue;
             };
+            // ★ ARM AFTER THE SEND. `retry_started_unix` asserts "a REQ of ours is outstanding" — the fact
+            // that makes an `EOSE` or a `CLOSED` attributable to us at all. Setting it before the subscribe
+            // returned marked one in flight for a REQ that never left: the channel went ineligible for the
+            // whole timeout and was then charged a backoff step for a failure that was ours, not the
+            // relay's. Selecting a channel and claiming to have asked it are different facts.
             subscribe_channel(&entry.reader, &channel_id, self.me, since).await?;
+            entry.engine.note_retry_sent(&channel_id, now)?;
         }
         Ok(())
     }
@@ -735,15 +793,21 @@ async fn subscribe_membership(
     me: PublicKey,
     since: Option<u64>,
 ) -> Result<(), ParticipationError> {
-    reader
+    let output = reader
         .subscribe_with_id(
             SubscriptionId::new(MEMBERSHIP_SUB),
             dialect::membership_filter(me, since),
             None::<SubscribeAutoCloseOptions>,
         )
         .await
-        .map(|_| ())
-        .map_err(|error| ParticipationError::Relay(format!("membership subscribe: {error}")))
+        .map_err(|error| ParticipationError::Relay(format!("membership subscribe: {error}")))?;
+    // `Ok` from the pool is not delivery — see [`super::undelivered`].
+    match super::undelivered(&output) {
+        Some(why) => Err(ParticipationError::Relay(format!(
+            "membership subscribe reached no relay: {why}"
+        ))),
+        None => Ok(()),
+    }
 }
 
 async fn subscribe_channel(
@@ -752,17 +816,24 @@ async fn subscribe_channel(
     me: PublicKey,
     since: Option<u64>,
 ) -> Result<(), ParticipationError> {
-    reader
+    let output = reader
         .subscribe_with_id(
             SubscriptionId::new(channel_sub(channel_id)),
             dialect::channel_mention_filter(channel_id, me, since),
             None::<SubscribeAutoCloseOptions>,
         )
         .await
-        .map(|_| ())
         .map_err(|error| {
             ParticipationError::Relay(format!("channel {channel_id} subscribe: {error}"))
-        })
+        })?;
+    // `Ok` from the pool is not delivery — see [`super::undelivered`]. This one gates
+    // `note_retry_attempt`, so a false success here arms the attribution token on nothing.
+    match super::undelivered(&output) {
+        Some(why) => Err(ParticipationError::Relay(format!(
+            "channel {channel_id} subscribe reached no relay: {why}"
+        ))),
+        None => Ok(()),
+    }
 }
 
 fn now_unix() -> i64 {
@@ -774,6 +845,7 @@ fn now_unix() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::channel_filter_id;
     use super::*;
     use nostr_sdk::prelude::{EventBuilder as TestEventBuilder, Keys, Kind};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -893,6 +965,153 @@ mod tests {
              which is the livelock this branch exists to avoid"
         );
         assert!(!participation.resync_pending(TEST_RELAY));
+    }
+
+    /// ★ A resync that FAILED to go out is still owed. Clearing the marker and advancing the floor before the
+    /// subscribe returned threw the recovery away on any error: nothing remembered the gap needed repairing,
+    /// so the hole the lag opened became permanent.
+    #[tokio::test]
+    async fn a_resync_that_failed_to_send_is_still_owed() {
+        let (_sender, receiver) = lagged_receiver(2);
+        let store = test_store("resync-failure");
+        // `last_resync_unix = 0` ⇒ the floor has passed, so the resync is attempted for real. The seam's
+        // client holds no relays, so the subscribe fails — the fixture IS the failure injection.
+        let mut participation = Participation::for_lag_test(
+            TEST_RELAY,
+            store,
+            Keys::generate().public_key(),
+            receiver,
+            0,
+            1,
+        );
+
+        let outcome = participation.pump(Duration::from_millis(1)).await;
+
+        assert!(
+            outcome.is_err(),
+            "the resync succeeded, so this test says nothing about what happens when it fails"
+        );
+        assert!(
+            participation.lagged() > 0,
+            "the lag was not observed at all, so this test proves nothing"
+        );
+        assert!(
+            participation.resync_pending(TEST_RELAY),
+            "a resync that never reached the wire was forgotten — the marker came down before the REQ was \
+             confirmed sent, so nothing will ever repair the gap"
+        );
+    }
+
+    /// ★ An `EOSE` already in hand when the retry token arms PREDATES that retry, so it cannot be its answer.
+    /// Arming before the drained batch is judged makes every stale signal in that batch falsely attributable —
+    /// and this one lifts a suppression with nothing retried at all.
+    #[tokio::test]
+    async fn a_stale_eose_is_judged_before_the_retry_token_arms() {
+        let store = test_store("stale-eose");
+        let long_ago = now_unix() - 3_600;
+        store
+            .record_channel_joined(
+                TEST_RELAY,
+                "chan-1",
+                &channel_filter_id("chan-1"),
+                &"a".repeat(64),
+                long_ago,
+                long_ago,
+            )
+            .expect("join");
+        // Suppressed long enough ago that the retry is due on this very tick.
+        store
+            .advance_suppression(TEST_RELAY, "chan-1", long_ago)
+            .expect("refused");
+
+        // An `EOSE` for the channel, buffered from the subscription that existed BEFORE the suppression.
+        let (sender, receiver) = broadcast::channel(8);
+        sender
+            .send(RelayPoolNotification::Message {
+                relay_url: TEST_RELAY.parse().expect("url"),
+                message: RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
+                    SubscriptionId::new(channel_sub("chan-1")),
+                )),
+            })
+            .expect("send eose");
+
+        let mut participation = Participation::for_wire_test(
+            TEST_RELAY,
+            store.clone(),
+            Keys::generate().public_key(),
+            receiver,
+            true,
+        )
+        .await;
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+
+        assert!(
+            store
+                .suppressed_channels_due(TEST_RELAY, now_unix())
+                .expect("due")
+                .is_empty(),
+            "no retry armed this tick, so the test never reached the ordering it is about"
+        );
+        assert!(
+            store
+                .channel_suppressed(TEST_RELAY, "chan-1")
+                .expect("read"),
+            "a stale EOSE lifted the suppression — it was already in hand when the retry token armed, so it \
+             answers a REQ that did not exist when it arrived"
+        );
+    }
+
+    /// ★ A pool `Ok` is ACCEPTANCE, NOT DELIVERY. `subscribe_with_id` returns `Ok` whenever the pool knows the
+    /// relay; a relay that would not take the REQ is reported in `output.failed` and nowhere the `Result` can
+    /// see. Arming `retry_started_unix` off that value marks a retry in flight for a REQ nobody sent — the
+    /// channel then sits ineligible for the whole timeout and is charged a backoff step for our own failure.
+    #[tokio::test]
+    async fn a_req_no_relay_accepted_does_not_arm_the_retry_token() {
+        let store = test_store("unaccepted-req");
+        let long_ago = now_unix() - 3_600;
+        store
+            .record_channel_joined(
+                TEST_RELAY,
+                "chan-1",
+                &channel_filter_id("chan-1"),
+                &"a".repeat(64),
+                long_ago,
+                long_ago,
+            )
+            .expect("join");
+        store
+            .advance_suppression(TEST_RELAY, "chan-1", long_ago)
+            .expect("refused");
+
+        let (_sender, receiver) = broadcast::channel(8);
+        // `accepted = false`: the relay is known to the pool but never connected, so it refuses with
+        // `NotReady` while the pool itself still answers `Ok`.
+        let mut participation = Participation::for_wire_test(
+            TEST_RELAY,
+            store.clone(),
+            Keys::generate().public_key(),
+            receiver,
+            false,
+        )
+        .await;
+
+        let outcome = participation.pump(Duration::from_millis(1)).await;
+
+        assert!(
+            outcome.is_err(),
+            "an un-connected relay took the REQ, so this test says nothing about a rejected one"
+        );
+        assert_eq!(
+            store
+                .suppressed_channels_due(TEST_RELAY, now_unix())
+                .expect("due"),
+            vec![("chan-1".to_string(), 1)],
+            "the retry token armed for a REQ no relay accepted — the channel is now un-retryable until the \
+             timeout expires a retry that never happened"
+        );
     }
 
     #[test]

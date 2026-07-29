@@ -91,20 +91,27 @@ impl Engine {
     ///
     /// Stale retries are expired first, so a lost REQ keeps the backoff moving instead of parking the
     /// channel on a promise the relay never kept.
+    ///
+    /// ★ SELECTING IS NOT ARMING. This only answers "which channels are due"; the caller arms the
+    /// attribution token with [`Self::note_retry_sent`] once the REQ is actually away.
     pub fn channels_to_retry(&self, now_unix: i64) -> Result<Vec<String>, StoreError> {
         self.store.expire_stale_retries(
             &self.relay_url,
             now_unix,
             super::super::store::RETRY_EOSE_TIMEOUT_SECS,
         )?;
-        let due = self.store.suppressed_channels_due(&self.relay_url, now_unix)?;
-        let mut channels = Vec::with_capacity(due.len());
-        for (channel_id, _attempts) in due {
-            self.store
-                .note_retry_attempt(&self.relay_url, &channel_id, now_unix)?;
-            channels.push(channel_id);
-        }
-        Ok(channels)
+        Ok(self
+            .store
+            .suppressed_channels_due(&self.relay_url, now_unix)?
+            .into_iter()
+            .map(|(channel_id, _attempts)| channel_id)
+            .collect())
+    }
+
+    /// A retry REQ is away — see [`SellerStore::note_retry_attempt`].
+    pub fn note_retry_sent(&self, channel_id: &str, now_unix: i64) -> Result<(), StoreError> {
+        self.store
+            .note_retry_attempt(&self.relay_url, channel_id, now_unix)
     }
 
     /// Drop retry-in-flight markers left by a previous process — see [`SellerStore::clear_retries_in_flight`].
