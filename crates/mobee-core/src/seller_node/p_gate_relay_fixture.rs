@@ -143,6 +143,19 @@ impl PGateRelay {
         self.url.clone()
     }
 
+    /// Close the live socket from the SERVER side — a relay that stops talking to us.
+    ///
+    /// ★ The only way to make the SDK's OWN reconnect supervisor fire. Our `disconnect()` leaves the relay
+    /// `Terminated`, which the pool's connection loop treats as final whatever its reconnect setting is; a
+    /// drop the client did not ask for is the transition the library reacts to by itself. Paired with
+    /// [`Self::connections`], that makes "the library reconnected without us" an observation.
+    pub(super) async fn drop_socket_now(&self) {
+        let live = self.controls.live.lock().await.take();
+        if let Some(writer) = live {
+            let _ = writer.lock().await.close().await;
+        }
+    }
+
     /// Refuse the next `count` `REQ`s for `subscription_id` that carry an un-pinned filter — i.e. a
     /// relay that keeps rejecting the open-pool half while serving the targeted one.
     pub(super) async fn refuse_unpinned(&self, subscription_id: &str, count: usize, reason: &str) {

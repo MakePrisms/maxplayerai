@@ -15,8 +15,8 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 
 use nostr_sdk::prelude::{
-    Client, Event, PublicKey, RelayMessage, RelayPoolNotification, SubscribeAutoCloseOptions,
-    SubscriptionId,
+    Client, Event, PublicKey, RelayMessage, RelayOptions, RelayPoolNotification, RelayStatus,
+    SubscribeAutoCloseOptions, SubscriptionId,
 };
 
 use super::super::store::{SellerStore, StoreError};
@@ -405,6 +405,11 @@ impl Participation {
             // happened. ★ This drain is deliberately OUTSIDE the `resync` branch: a deferred resync must
             // fire once the floor elapses whether or not another lag ever arrives. Moving it under the
             // lagged branch would turn "held" back into "never".
+            // ★ FIRST, because a socket nobody will revive is a precondition of every lane below, and
+            // learning about it after they have each spent an attempt on it is learning about it too late.
+            // With the SDK's own supervision off, this is the only thing that reconnects anything.
+            self.revive_dead_sockets().await;
+
             let due_resyncs: Vec<String> = self
                 .live
                 .iter()
@@ -649,6 +654,58 @@ impl Participation {
             roster: RelayRoster::new(urls),
             me,
             publisher: Client::default(),
+            carrier: nostr_sdk::prelude::EventBuilder::new(
+                nostr_sdk::prelude::Kind::Metadata,
+                "{}",
+            )
+            .sign_with_keys(&nostr_sdk::prelude::Keys::generate())
+            .expect("sign carrier"),
+            probe_timeout: Duration::from_secs(1),
+        }
+    }
+
+    /// One relay reached through [`connect_reader`], against a URL that really accepts sockets.
+    ///
+    /// ★ THROUGH `connect_reader` ON PURPOSE. The other seams build their own `Client`, which means the
+    /// relay OPTIONS — the thing that decides whether the SDK supervises the socket behind our back — are
+    /// invisible to them. A test that constructs its own client cannot see a change to how production
+    /// constructs one, so it would report every setting as green.
+    ///
+    /// ★★ `keys` MUST be the identity the wake surface is addressed to. The reader authenticates with the
+    /// publisher's signer, and a `#p`-gating relay refuses a filter whose `#p` is not the authenticated
+    /// pubkey — with `restricted:`, which this module turns into a reconnect. Signing as anyone else makes
+    /// every test on this seam pass or fail for that reason instead of its own; it cost one round-13
+    /// assertion that read as green while measuring a refusal.
+    #[cfg(test)]
+    async fn for_live_test(url: &str, store: SellerStore, keys: nostr_sdk::prelude::Keys) -> Self {
+        let me = keys.public_key();
+        let publisher = Client::new(keys);
+        let reader = connect_reader(url, &publisher)
+            .await
+            .expect("connect reader to the fixture relay");
+        let notifications = reader.notifications();
+        let mut live = BTreeMap::new();
+        live.insert(
+            url.to_string(),
+            Live {
+                reader,
+                notifications,
+                engine: Engine::new(store, url.to_string(), me),
+                progress_since_resync: 1,
+                last_resync_unix: now_unix(),
+                resync_pending: false,
+                resend_due: BTreeMap::new(),
+                reprove_due: None,
+            },
+        );
+        Self {
+            live,
+            lagged: 0,
+            forced_progress: 0,
+            relay_faults: 0,
+            roster: RelayRoster::new(vec![url.to_string()]),
+            me,
+            publisher,
             carrier: nostr_sdk::prelude::EventBuilder::new(
                 nostr_sdk::prelude::Kind::Metadata,
                 "{}",
@@ -989,6 +1046,66 @@ impl Participation {
         subscribe_wake_surface(&entry.reader, &entry.engine, self.me).await
     }
 
+    /// Take one relay's socket down and back up, and owe a fresh proof of access.
+    ///
+    /// ★★ ONE OWNER FOR RECONNECTING, TWO TRIGGERS: a `CLOSED` telling us our authentication failed, and
+    /// a socket we found dead. They are the same act — the registry has to be emptied before the socket
+    /// returns or the SDK replays it, and admission has to be re-proven because a socket that went away is
+    /// not a socket we are still admitted on. Two call sites doing that by hand would be two chances to
+    /// forget half of it.
+    ///
+    /// ★ The registrations go first, and that ordering is the whole point: see [`clear_registrations`].
+    ///
+    /// Nothing here blocks — `disconnect`/`connect` return promptly (`connect` sets the relay `Pending`
+    /// synchronously and spawns its own task) and the settle is left as a deadline. That is why this needs
+    /// no one-per-tick cap while [`Self::drain_reproves`] does: the probe waits, this does not.
+    async fn reconnect_relay(&mut self, url: &str) {
+        let Some(entry) = self.live.get(url) else {
+            return;
+        };
+        clear_registrations(&entry.reader).await;
+        entry.reader.disconnect().await;
+        entry.reader.connect().await;
+        if let Some(live) = self.live.get_mut(url) {
+            live.reprove_due = Some(now_unix().saturating_add(RECONNECT_SETTLE_SECS));
+        }
+    }
+
+    /// Bring back any relay whose socket died, because with SDK auto-reconnect off nothing else will.
+    ///
+    /// ★★★ THE DUTY THAT COMES WITH TAKING THE WHEEL. Disabling the pool's own supervision (see
+    /// [`connect_reader`]) is what makes every reconnect ours to gate — and it means a lost socket now ends
+    /// `Terminated` with no retry behind it. Left there, participation on that relay simply stops: no error,
+    /// no timer, nothing owed. A silent park is exactly what this module treats as the worst outcome, so
+    /// removing the SDK's retry without replacing it would have been a worse trade than the leak it fixed.
+    ///
+    /// ★★ It runs BEFORE the recovery lanes, not after, so the quarantine it raises is honoured on the same
+    /// tick — otherwise the resync, re-send and retry lanes each spend an attempt on a socket we already
+    /// know is gone.
+    ///
+    /// ★ `reprove_due` is the rate limit, and no second knob is needed: a revived relay is quarantined
+    /// until its probe, and the probe cannot pass on a socket that is still dead — so a relay that will not
+    /// come back is removed after one attempt rather than reconnected every tick. The count is what keeps a
+    /// flapping relay from looking like a healthy one.
+    async fn revive_dead_sockets(&mut self) {
+        let candidates: Vec<(String, Client)> = self
+            .live
+            .iter()
+            .filter(|(_, live)| !live.quarantined())
+            .map(|(url, live)| (url.clone(), live.reader.clone()))
+            .collect();
+        let mut dead: Vec<String> = Vec::new();
+        for (url, reader) in candidates {
+            if reader_socket_is_dead(&reader, &url).await {
+                dead.push(url);
+            }
+        }
+        for url in dead {
+            self.relay_faults = self.relay_faults.saturating_add(1);
+            self.reconnect_relay(&url).await;
+        }
+    }
+
     /// Settle every debt one wake-surface rebuild paid.
     ///
     /// ★★★ THE DUAL OF THE FIRE-TIME RULE. Round 11 made sure a debt SURVIVES until its work is done; this
@@ -1170,18 +1287,10 @@ impl Participation {
                 // Unguarded, each kicked the socket again and re-stamped the settle from `now` — the relay
                 // deciding when its own access gets re-checked, by refusing more. A reconnect that is
                 // already owed is already owed; the second `CLOSED` saying so adds nothing.
-                if entry.quarantined() {
+                if self.live.get(url).is_some_and(Live::quarantined) {
                     return Ok(());
                 }
-                // ★★★ AND THE REGISTRATIONS GO FIRST, or the quarantine governs nothing. See
-                // [`clear_registrations`]: the SDK re-sends every registered subscription the instant the
-                // socket comes back, underneath every gate in this file.
-                clear_registrations(&entry.reader).await;
-                entry.reader.disconnect().await;
-                entry.reader.connect().await;
-                if let Some(live) = self.live.get_mut(url) {
-                    live.reprove_due = Some(now_unix().saturating_add(RECONNECT_SETTLE_SECS));
-                }
+                self.reconnect_relay(url).await;
             }
             ClosedAction::Ignore => {}
         }
@@ -1254,13 +1363,67 @@ async fn connect_reader(url: &str, publisher: &Client) -> Result<Client, String>
         .map_err(|error| format!("the publisher has no signer to authenticate the reader: {error}"))?;
     let client = Client::new(signer);
     client.automatic_authentication(true);
+    // ★★★ AUTO-RECONNECT OFF, AND IT IS A CORRECTNESS REQUIREMENT, NOT A TUNING CHOICE.
+    //
+    // The default pool supervises the socket itself: on any connection loss it waits a retry interval
+    // and reconnects, and `post_connection` then replays every registered subscription. That is the same
+    // leak [`clear_registrations`] exists to prevent, through a door we cannot stand in front of — a
+    // transition the LIBRARY triggers, not one we do. Emptying the registry when OUR pump handles the
+    // `CLOSED` is no defence when the pool has already reconnected on its own, which it will whenever the
+    // relay drops us and the pump is a tick behind. A transition we do not own cannot be gated, only
+    // removed: with `reconnect(false)` every reconnect goes through
+    // [`Participation::reconnect_relay`], which clears the registry first and owes a fresh probe after.
+    //
+    // ★★ AND IT HANDS US A DUTY THE SDK WAS DISCHARGING. With this off, a lost socket ends `Terminated`
+    // and the pool never tries again — silent retries become a dead relay nobody revives, which is a
+    // TIMER-LESS PARK, the shape this module already refuses everywhere else. So the pump owns liveness
+    // now: [`Participation::revive_dead_sockets`]. Disabling supervision without taking it over would
+    // have traded a leak for a silence, which is the worse of the two.
+    //
+    // `RelayOptions::default()` carries exactly the flags `Client::add_relay` would have set
+    // (`READ | WRITE | PING`), so `reconnect` is the only behaviour that changes. `sleep_when_idle` is
+    // false by default too, which is why `Sleeping` is not a state this reader can be found in.
     client
-        .add_relay(url)
+        .pool()
+        .add_relay(url, RelayOptions::default().reconnect(false))
         .await
         .map_err(|error| format!("add relay {url}: {error}"))?;
     client.connect().await;
     client.wait_for_connection(Duration::from_secs(10)).await;
     Ok(client)
+}
+
+/// Whether a relay in this state has a socket that is down with nothing left to bring it back.
+///
+/// ★ SPLIT FROM THE I/O ON PURPOSE. Every judgement in here is a line someone could reasonably draw
+/// elsewhere, and as a predicate over plain values it can be pinned by a table test instead of resting on
+/// a fixture that cannot produce most of these states. What the caller does with a `true` is a separate
+/// question from which states earn one.
+///
+/// - `Pending` and `Connecting` are attempts IN FLIGHT, not failures. Calling them dead would kick a socket
+///   that is halfway up, forever, at pump frequency.
+/// - `Sleeping` recovers by itself — `ensure_awake_for_activity` runs ahead of every send. (Our readers set
+///   `sleep_when_idle: false`, so it should not arise at all; it is listed because being wrong about it
+///   would be expensive and the cost of naming it is a line.)
+/// - `Connected` is the whole point.
+/// - ★ `successes == 0` is NOT dead, whatever the status says. A relay that never completed a single
+///   connection was never alive to lose, so there is nothing to revive; it is [`Participation::start`]'s
+///   probe that judges those, and a second opinion from here could only disagree with it.
+fn socket_is_dead(status: RelayStatus, successes: usize) -> bool {
+    successes > 0
+        && matches!(
+            status,
+            RelayStatus::Disconnected | RelayStatus::Terminated | RelayStatus::Banned
+        )
+}
+
+/// Ask the SDK for one relay's state and put the question to [`socket_is_dead`].
+async fn reader_socket_is_dead(reader: &Client, url: &str) -> bool {
+    match reader.relay(url).await {
+        Ok(relay) => socket_is_dead(relay.status(), relay.stats().success()),
+        // No such relay on this client: there is no socket to revive, and nothing here can fix that.
+        Err(_) => false,
+    }
 }
 
 /// Install the wake surface — both filters, each resuming from its own stored cursor — and return the
@@ -1304,17 +1467,21 @@ async fn subscribe_wake_surface(
 ///
 /// ⇒ **the reconnect has nothing to re-send only if the registry is empty when the socket returns.**
 ///
-/// ★★ ONE ID AT A TIME RATHER THAN `unsubscribe_all()`, AND THE REASON IS WEAKER THAN IT LOOKS — stated
-/// plainly so nobody "simplifies" it on a wrong premise, and nobody trusts it as a bug fix either.
-/// The bulk helper removes each id from the registry and then sends that id's `CLOSE`, propagating the
-/// send error with `?`, so a failed send abandons the loop and leaves the remaining ids REGISTERED. But
-/// that send fails only for a relay `ensure_operational` rejects — `Initialized` (never connected) or
-/// `Banned`; `Sleeping` self-heals because `ensure_awake_for_activity` runs first — and this reader is in
-/// neither state by the time we get here. **So this is not a live defect, and no test reddens for it:**
-/// `unsubscribe_all()` clears the registry here too, including on a socket we have already dropped.
-/// Per-id anyway, because it costs one line and makes the property hold without depending on that
-/// reachability argument staying true across an SDK upgrade. Round 9's isolate-per-item rule, applied to
-/// a dependency's loop — as insurance, not as a repair.
+/// ★★ ONE ID AT A TIME RATHER THAN `unsubscribe_all()`, and the reachability is worth stating exactly,
+/// because the obvious argument for it is the wrong one. The bulk helper removes each id from the registry
+/// and then sends that id's `CLOSE`, propagating the send error with `?`, so a failed send abandons the loop
+/// and leaves every remaining id REGISTERED. Two ways that send can fail, and they are not equally real:
+/// - `ensure_operational` rejecting the relay — `Initialized` or `Banned`; `Sleeping` self-heals because
+///   `ensure_awake_for_activity` runs first. **This reader is in none of those states here**, so the
+///   argument I first wrote down was not a live one.
+/// - `send_client_msgs` doing a `try_send` into a BOUNDED queue, which fails when that queue is FULL. That
+///   one needs no unusual relay state at all — only backpressure — so it is reachable in ordinary running.
+///
+/// Per-id therefore guards something real, but **no test in this suite reddens for it**: the fixture cannot
+/// fill the outbound queue, and `unsubscribe_all()` clears the registry in every state a fixture can reach,
+/// including a socket already dropped. Treat it as insurance with a reason, not as a proven repair — and do
+/// not "simplify" it back on the strength of the first bullet alone. Round 9's isolate-per-item rule,
+/// applied to a dependency's loop.
 async fn clear_registrations(reader: &Client) {
     for id in reader.subscriptions().await.into_keys() {
         reader.unsubscribe(&id).await;
@@ -1380,6 +1547,7 @@ fn now_unix() -> i64 {
 mod tests {
     use super::super::channel_filter_id;
     use super::*;
+    use crate::seller_node::p_gate_relay_fixture::{PGateRelay, Verdict};
     use crate::seller_node::store::RETRY_EOSE_TIMEOUT_SECS;
     use nostr_sdk::prelude::{EventBuilder as TestEventBuilder, Keys, Kind};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2521,10 +2689,10 @@ mod tests {
     /// auth and then drops the connection is the ordinary case, not the exotic one.
     ///
     /// ⚠ WHAT THIS TEST DOES NOT PROVE. It does not discriminate the per-id loop in
-    /// [`clear_registrations`] from the SDK's bulk `unsubscribe_all()`: both pass here, because the failed
-    /// `CLOSE` that would strand the bulk helper's remaining ids needs a relay `ensure_operational`
-    /// rejects, and a dropped socket is not one. Swapping the loop for the bulk call reddens NOTHING —
-    /// that is recorded on `clear_registrations` rather than implied by this test's existence.
+    /// [`clear_registrations`] from the SDK's bulk `unsubscribe_all()`: both pass here, because neither way
+    /// of stranding the bulk helper's remaining ids — a relay `ensure_operational` rejects, or a full
+    /// outbound queue — is a state this fixture can produce. Swapping the loop for the bulk call reddens
+    /// NOTHING; that is recorded on `clear_registrations` rather than implied by this test's existence.
     #[tokio::test]
     async fn a_dropped_socket_still_gives_up_every_registration() {
         let store = test_store("reconnect-dead-socket");
@@ -2639,6 +2807,176 @@ mod tests {
             participation.last_resync_unix(GOOD_RELAY) >= before,
             "the floor did not move, so the work that just happened does not count against the next ask"
         );
+    }
+
+    /// ★ ROUND 13 / THE FINDING ITSELF, against a relay that really accepts sockets.
+    ///
+    /// Two claims, and neither is reachable with a fixture the SDK cannot complete a handshake with:
+    ///
+    /// 1. **The library must not reconnect behind us.** With the pool's default supervision, a socket the
+    ///    RELAY drops is reconnected by the SDK after its retry interval and `post_connection` replays every
+    ///    registered subscription — on a relay that may have just refused our auth, with no quarantine set
+    ///    and our pump none the wiser. `connections()` counts accepted sockets, so the library acting alone
+    ///    is an observation rather than an inference.
+    /// 2. **And then the socket is OURS to revive**, because with supervision off nothing else will.
+    ///
+    /// ⚠ THE WAIT IS LOAD-BEARING, DO NOT TRIM IT. The SDK retries after `DEFAULT_RETRY_INTERVAL` (10s)
+    /// plus up to 3s of jitter, so a shorter window would report "the library did not reconnect" for a
+    /// library that simply had not got round to it yet — a pass by impatience. This is the one place in the
+    /// module where a peer's clock, not ours, sets the cost.
+    #[tokio::test]
+    async fn the_sdk_never_reconnects_a_participation_reader_behind_us() {
+        let relay = PGateRelay::start(Duration::ZERO).await;
+        let url = relay.url();
+        let store = test_store("sdk-supervision");
+        // The reader authenticates as `me`, so the `#p`-gated wake surface is SERVED rather than refused —
+        // a refusal would set `reprove_due` by itself and every assertion below would be about that.
+        let keys = Keys::generate();
+        let me = keys.public_key();
+        joined(&store, &url, "chan-1", now_unix() - 100);
+
+        let mut participation = Participation::for_live_test(&url, store, keys).await;
+        // ★ Let NIP-42 finish before the wake surface goes out. A REQ that beats AUTH is refused with
+        // `restricted:`, and this module turns a refusal of the MEMBERSHIP filter into a reconnect — which
+        // sets `reprove_due` all by itself. Without this, the assertions below measure that refusal instead
+        // of the socket dying, and one of them did exactly that until the mutation caught it. The pre-auth
+        // race is issue #189's own subject; here it is noise, and the assertion after the install is what
+        // turns its absence into a fact rather than a hope.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        participation.install_wake_surface(&url).await;
+        assert!(
+            relay
+                .wait_until(Duration::from_secs(5), |records| records.len() >= 2)
+                .await,
+            "the wake surface never reached the fixture relay, so nothing below is about a REPLAY of it"
+        );
+        let refusals: Vec<Verdict> = relay
+            .reqs()
+            .await
+            .into_iter()
+            .map(|record| record.verdict)
+            .filter(|verdict| *verdict != Verdict::Eose)
+            .collect();
+        assert!(
+            refusals.is_empty(),
+            "the wake surface was REFUSED rather than served ({refusals:?}), so `reprove_due` is already \
+             owed for a reason that has nothing to do with a dead socket — every assertion below would be \
+             measuring that refusal"
+        );
+        assert_eq!(
+            relay.connections(),
+            1,
+            "the reader did not settle on a single socket, so a later count cannot mean a reconnect"
+        );
+        let sent_before = relay.reqs().await.len();
+
+        // The relay drops us — the transition the LIBRARY reacts to on its own.
+        relay.drop_socket_now().await;
+        tokio::time::sleep(Duration::from_secs(14)).await;
+
+        assert_eq!(
+            relay.connections(),
+            1,
+            "the SDK reconnected this reader by itself — and `post_connection` replays every registered \
+             subscription, so the whole wake surface goes back out on a socket our quarantine never saw"
+        );
+        assert_eq!(
+            relay.reqs().await.len(),
+            sent_before,
+            "REQs reached the relay that our code never sent — the library replayed the registry"
+        );
+
+        // Now the pump: with nobody else supervising, reviving it is ours.
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+        assert!(
+            participation.reprove_deadline(&url).is_some(),
+            "a socket that died was left dead — with SDK supervision off nothing else revives it, so \
+             participation on this relay stops silently and nothing is owed"
+        );
+        assert_eq!(
+            participation.relay_faults(),
+            1,
+            "the dead socket was not counted, so a relay that keeps dying looks exactly like a healthy one"
+        );
+        assert_eq!(
+            participation.registered_subscriptions(&url).await,
+            0,
+            "the registry survived OUR reconnect too, so the socket comes back with the wake surface \
+             already armed to replay"
+        );
+
+        // ★ And the lane checks the gate IT sets. Kill the freshly revived socket: the relay is now BOTH
+        // dead and quarantined, and a revive that ignored the quarantine would kick it again and re-stamp
+        // the settle — a relay whose socket keeps dying deciding when its own access gets re-checked.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while relay.connections() < 2 {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .is_ok(),
+            "our own reconnect never reached the relay, so there is no revived socket to re-kill"
+        );
+        relay.drop_socket_now().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+        assert_eq!(
+            relay.connections(),
+            2,
+            "a quarantined relay was reconnected again while its probe was still pending — the settle \
+             restarts every tick the socket stays down, so the access re-check never arrives"
+        );
+        assert_eq!(
+            participation.relay_faults(),
+            1,
+            "the same dead socket was counted twice, so one flapping relay inflates the fault count \
+             without anything new having failed"
+        );
+    }
+
+    /// ★ ROUND 13. Every relay state, named, with the verdict that decides whether we kick the socket.
+    ///
+    /// This is a table rather than a couple of examples because the lane it feeds cannot be driven in
+    /// process — no fixture relay ever completes a connection, so none can be found dead. The judgement is
+    /// therefore the only part a test can hold, and it holds all of it: get `Pending` wrong and a socket
+    /// halfway up is kicked every tick; get `success == 0` wrong and a relay `start` already judged gets
+    /// revived by a lane with no way to reach a different verdict.
+    #[test]
+    fn only_a_socket_that_was_alive_and_is_now_down_counts_as_dead() {
+        // Every variant of `RelayStatus`, so a state added upstream cannot slip through unjudged. The
+        // reason each one falls where it does is on [`socket_is_dead`] rather than repeated here.
+        let alive_once = 1;
+        for (status, dead) in [
+            (RelayStatus::Initialized, false),
+            (RelayStatus::Pending, false),
+            (RelayStatus::Connecting, false),
+            (RelayStatus::Connected, false),
+            (RelayStatus::Disconnected, true),
+            (RelayStatus::Terminated, true),
+            (RelayStatus::Banned, true),
+            (RelayStatus::Sleeping, false),
+        ] {
+            assert_eq!(
+                socket_is_dead(status, alive_once),
+                dead,
+                "a relay in {status} must {} be kicked and re-proven — see `socket_is_dead` for why",
+                if dead { "" } else { "NOT" }
+            );
+            // ★ The never-alive guard holds for EVERY status, not just the obvious ones — a relay that
+            // never connected is `start`'s to judge whatever state it ended in.
+            assert!(
+                !socket_is_dead(status, 0),
+                "{status} with zero successful connections was called dead — it was never alive to lose, \
+                 so reviving it second-guesses the probe that already denied it"
+            );
+        }
     }
 
     #[test]
