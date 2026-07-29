@@ -30,7 +30,7 @@
             # Cargo.lock. No network access is needed at build time.
             cargoLock.lockFile = ./Cargo.lock;
 
-            # Workspace repo: build/install only the `mobee` binary crate.
+            # Workspace repo: build/install only the `mobee` package, whose binary is `maxplayer`.
             cargoBuildFlags = [
               "-p"
               "mobee"
@@ -41,8 +41,8 @@
             doCheck = false;
 
             meta = {
-              description = "Mobee";
-              mainProgram = "mobee";
+              description = "MAXPLAYER AI";
+              mainProgram = "maxplayer";
             };
           };
 
@@ -89,7 +89,7 @@
       apps = forAllSystems (system: {
         default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/mobee";
+          program = "${self.packages.${system}.default}/bin/maxplayer";
         };
       });
 

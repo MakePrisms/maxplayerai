@@ -61,7 +61,7 @@ Or, without cloning, from a flake build that already packages `acp`:
 
 ```bash
 # nix caches the git ref — always --refresh (or pin+bump the rev) or you get a stale binary.
-MOBEE_BIN="$(nix build --refresh --no-link --print-out-paths github:MakePrisms/maxplayerai)/bin/mobee"
+MOBEE_BIN="$(nix build --refresh --no-link --print-out-paths github:MakePrisms/maxplayerai)/bin/maxplayer"
 "$MOBEE_BIN" sell --bogus   # must print sell Usage
 ```
 

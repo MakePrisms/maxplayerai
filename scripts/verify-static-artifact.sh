@@ -13,11 +13,11 @@
 #   features were compiled in. A capability gate has to drive the real subcommand instead.
 #
 # Usage:
-#   ./scripts/verify-static-artifact.sh [path-to-binary]        # default: result/bin/mobee
+#   ./scripts/verify-static-artifact.sh [path-to-binary]        # default: result/bin/maxplayer
 
 set -euo pipefail
 
-BINARY="${1:-result/bin/mobee}"
+BINARY="${1:-result/bin/maxplayer}"
 
 # Two images on purpose: alpine is musl, debian is glibc. Passing on both shows the artifact is
 # libc-independent rather than merely alpine-compatible.
@@ -54,8 +54,8 @@ echo "ok: statically linked"
 # can be satisfied by the build machine's own store, so a broken artifact would pass.
 SHIPDIR="$(mktemp -d)"
 trap 'rm -rf "$SHIPDIR"' EXIT
-cp -L "$BINARY" "$SHIPDIR/mobee"
-chmod 755 "$SHIPDIR/mobee"
+cp -L "$BINARY" "$SHIPDIR/maxplayer"
+chmod 755 "$SHIPDIR/maxplayer"
 
 for image in "${IMAGES[@]}"; do
     # Assert the premise instead of assuming it: an image that shipped a /nix could satisfy a
@@ -63,7 +63,7 @@ for image in "${IMAGES[@]}"; do
     docker run --rm "$image" sh -c '! test -e /nix' \
         || die "$image contains /nix — it cannot show the artifact runs without nix"
 
-    out="$(docker run --rm -v "$SHIPDIR:/b:ro" "$image" /b/mobee version)" \
+    out="$(docker run --rm -v "$SHIPDIR:/b:ro" "$image" /b/maxplayer version)" \
         || die "$image: the artifact failed to run"
     [ -n "$out" ] || die "$image: ran but printed nothing"
     echo "ok: $image -> $out"
@@ -72,7 +72,7 @@ done
 # ── Negative control ────────────────────────────────────────────────────────────────────────────
 # Without this the successes above are unfalsified: a binary that exited 0 on everything would
 # pass every check so far.
-if docker run --rm -v "$SHIPDIR:/b:ro" "${IMAGES[0]}" /b/mobee not-a-subcommand >/dev/null 2>&1; then
+if docker run --rm -v "$SHIPDIR:/b:ro" "${IMAGES[0]}" /b/maxplayer not-a-subcommand >/dev/null 2>&1; then
     die "control failed: the artifact exits 0 on an unknown subcommand, so rc=0 above proves nothing"
 fi
 echo "ok: control -> unknown subcommand exits nonzero"

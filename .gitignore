@@ -1,6 +1,6 @@
 /target
 
-# `nix build` output symlinks. The npm packaging script reads result/bin/mobee by default, so
+# `nix build` output symlinks. The npm packaging script reads result/bin/maxplayer by default, so
 # these turn up in the repo root during normal use.
 /result
 /result-*

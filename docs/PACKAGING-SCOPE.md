@@ -221,7 +221,7 @@ npm side never compiles anything and never runs a postinstall downloader.
 # ★ Two DIFFERENT predicates. Do not let the first stand in for the second.
 #
 # (1) PORTABILITY — does the artifact run at all with no nix and no toolchain present:
-nix build .#buyer-static && ./scripts/verify-static-artifact.sh result/bin/mobee
+nix build .#buyer-static && ./scripts/verify-static-artifact.sh result/bin/maxplayer
 #   → rc=0
 # The script copies the binary OUT of /nix/store and runs it in containers that have no /nix —
 # alpine for musl, debian for glibc, so a pass shows libc-independence and not merely
