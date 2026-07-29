@@ -82,20 +82,35 @@ impl Engine {
             .map(|since| since as u64))
     }
 
-    /// Channels whose suppression backoff has elapsed, cleared and ready for ONE retry each.
+    /// Channels whose suppression backoff has elapsed and which have no retry already in flight.
     ///
-    /// The clear happens here, on the attempt — not on its outcome. A refusal will re-suppress with an
-    /// incremented count and therefore a longer wait, so the optimistic direction is the self-correcting
-    /// one; waiting for "no refusal arrived" would be reading success out of an absence.
+    /// ★ The suppression is NOT lifted here. Marking the attempt and clearing the flag are different
+    /// things: a retry REQ that is silently dropped would otherwise leave the channel un-gated AND out of
+    /// the backoff cycle at once. The flag comes down only on [`Self::note_channel_served`] — a
+    /// protocol-owed `EOSE` — and a retry nobody answered is expired back into a failed attempt.
+    ///
+    /// Stale retries are expired first, so a lost REQ keeps the backoff moving instead of parking the
+    /// channel on a promise the relay never kept.
     pub fn channels_to_retry(&self, now_unix: i64) -> Result<Vec<String>, StoreError> {
+        self.store.expire_stale_retries(
+            &self.relay_url,
+            now_unix,
+            super::super::store::RETRY_EOSE_TIMEOUT_SECS,
+        )?;
         let due = self.store.suppressed_channels_due(&self.relay_url, now_unix)?;
         let mut channels = Vec::with_capacity(due.len());
         for (channel_id, _attempts) in due {
             self.store
-                .clear_suppression(&self.relay_url, &channel_id, now_unix)?;
+                .note_retry_attempt(&self.relay_url, &channel_id, now_unix)?;
             channels.push(channel_id);
         }
         Ok(channels)
+    }
+
+    /// The relay REFUSED this channel — the first time, or in answer to a retry. Advances the backoff.
+    pub fn note_channel_refused(&self, channel_id: &str, now_unix: i64) -> Result<bool, StoreError> {
+        self.store
+            .advance_suppression(&self.relay_url, channel_id, now_unix)
     }
 
     /// The relay answered a channel subscription with `EOSE` — it served us, so the escalation resets.
@@ -235,8 +250,12 @@ impl Engine {
                     // which livelocked: the replayed 44100 carries the same timestamp and could never
                     // win the channel back. The membership row stays as the relay left it; the channel
                     // simply stops being resumed until a newer relay-signed event clears it.
+                    // ★ `advance_suppression`, not a plain raise: this same `CLOSED` may be the relay's
+                    // ANSWER to a retry we sent, in which case the wait has to get longer. A raise that
+                    // only fired when the flag was down would leave a refused retry with an unchanged
+                    // backoff, retrying at a fixed interval forever.
                     self.store
-                        .suppress_channel(&self.relay_url, &channel_id, now_unix)?;
+                        .advance_suppression(&self.relay_url, &channel_id, now_unix)?;
                     ClosedAction::DropChannel { channel_id }
                 }
                 // A `restricted:` on the GLOBAL membership subscription is not about one channel —

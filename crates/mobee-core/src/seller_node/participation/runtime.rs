@@ -31,6 +31,13 @@ const MEMBERSHIP_SUB: &str = "participation:membership";
 /// long enough that an idle node is not spinning.
 const POLL_TICK: Duration = Duration::from_millis(50);
 
+/// Floor on how often one relay may be resynced.
+///
+/// Recovery must not run at pump frequency: a backlog large enough to lag us will still be arriving on
+/// the next tick, so an unthrottled resync re-asks for the same window ~20x/second and turns a recovery
+/// path into a hot loop against the relay.
+const MIN_RESYNC_INTERVAL_SECS: i64 = 5;
+
 /// The subscription id of one channel's mention filter.
 fn channel_sub(channel_id: &str) -> String {
     format!("participation:chan:{channel_id}")
@@ -90,6 +97,15 @@ struct Live {
     /// they failed by *missing* events rather than by erroring, which is how it would have shipped.
     notifications: broadcast::Receiver<RelayPoolNotification>,
     engine: Engine,
+    /// Events processed since this relay was last resynced — the FORWARD-PROGRESS guarantee.
+    ///
+    /// A `Lagged` discards the batch in hand so we never act on data from beyond a gap. But if the
+    /// discard happens before anything was processed, the cursor does not move, so the resync re-asks
+    /// for the same window, floods again, and lags again — the discard removes the very progress that
+    /// would end the loop. Zero here means discarding again would repeat it.
+    progress_since_resync: u64,
+    /// When this relay was last resynced, so recovery cannot re-fire at pump frequency.
+    last_resync_unix: i64,
 }
 
 /// The node's live participation across all configured relays.
@@ -97,6 +113,8 @@ pub struct Participation {
     live: BTreeMap<String, Live>,
     /// Notifications dropped by a client's broadcast buffer before the pump read them.
     lagged: u64,
+    /// Times a `Lagged` was not permitted to discard — see [`Participation::forced_progress`].
+    forced_progress: u64,
     roster: RelayRoster,
     me: PublicKey,
     /// Kept so access can be RE-proven, not assumed to have survived. A relay whose auth or scope
@@ -164,6 +182,8 @@ impl Participation {
                     reader,
                     notifications,
                     engine,
+                    progress_since_resync: 0,
+                    last_resync_unix: 0,
                 },
             );
         }
@@ -173,6 +193,7 @@ impl Participation {
             roster,
             me,
             lagged: 0,
+            forced_progress: 0,
             publisher: publisher.clone(),
             carrier: carrier.clone(),
             probe_timeout: timeout,
@@ -276,14 +297,38 @@ impl Participation {
             // REPLACED, and replaced BEFORE the resync REQs are sent: a fresh receiver starts at the
             // channel's current tail, discarding the stale backlog, and doing it first guarantees the
             // replay lands in the receiver we will actually read.
+            //
+            // ★★ And the discard is only safe to repeat once something has been PROCESSED. A cleared
+            // suppression re-subscribes from a cursor that stopped advancing, so the relay can serve a
+            // backlog big enough to lag us; discarding before any of it is processed leaves the cursor
+            // where it was, so the resync re-asks for the same window and lags again. Two individually
+            // correct behaviours — never act past a gap, and re-ask from the durable cursor — compose
+            // into a livelock unless forward progress is a precondition for discarding again.
+            //
+            // When it is not safe to discard, we process what we hold instead. That may advance a cursor
+            // over skipped events, which is a real loss — but a bounded one, against a livelock that
+            // loses everything forever. It is COUNTED rather than silent, because the whole failure class
+            // in this module is losses that looked like quiet.
             if !resync.is_empty() {
-                batch.retain(|(url, _)| !resync.contains(url));
+                let now = now_unix();
+                let mut discard: BTreeSet<String> = BTreeSet::new();
                 for url in &resync {
-                    if let Some(live) = self.live.get_mut(url) {
-                        live.notifications = live.reader.notifications();
+                    let Some(live) = self.live.get_mut(url) else {
+                        continue;
+                    };
+                    let throttled = now.saturating_sub(live.last_resync_unix)
+                        < MIN_RESYNC_INTERVAL_SECS;
+                    if live.progress_since_resync == 0 || throttled {
+                        self.forced_progress = self.forced_progress.saturating_add(1);
+                        continue;
                     }
+                    live.progress_since_resync = 0;
+                    live.last_resync_unix = now;
+                    live.notifications = live.reader.notifications();
+                    discard.insert(url.clone());
                 }
-                for url in &resync {
+                batch.retain(|(url, _)| !discard.contains(url));
+                for url in &discard {
                     self.resync_relay(url).await?;
                 }
             }
@@ -312,6 +357,11 @@ impl Participation {
                         }
                         ingested += 1;
                         self.apply_event(&url, &event).await?;
+                        // Forward progress for this relay: the cursor has moved, so a later `Lagged` may
+                        // safely discard again without re-asking for the window we just consumed.
+                        if let Some(live) = self.live.get_mut(&url) {
+                            live.progress_since_resync = live.progress_since_resync.saturating_add(1);
+                        }
                     }
                     RelayMessage::Closed {
                         subscription_id,
@@ -339,14 +389,20 @@ impl Participation {
         self.lagged
     }
 
-    /// Re-request every active filter on one relay from its durable cursor.
+    /// Times a `Lagged` was NOT allowed to discard, because doing so would have re-asked for a window
+    /// nothing had been consumed from yet, or because recovery was already running at its floor.
     ///
-    /// This is the recovery half of a `Lagged` drop. The cursors are the only record of how far we
-    /// got, and they are behind the events we lost, so re-subscribing from them makes the relay
-    /// re-send the gap. Replay is safe by construction rather than by luck: owed rows are keyed on
-    /// `event_id`, and membership is applied in author order, so a re-delivered event either changes
-    /// nothing or corrects the ordering.
+    /// Non-zero means events may have been skipped while a cursor advanced over them — a bounded loss
+    /// taken deliberately in place of an unbounded one. It is reported rather than inferred, because a
+    /// silent version of this is indistinguishable from a healthy relay.
+    pub fn forced_progress(&self) -> u64 {
+        self.forced_progress
+    }
+
     /// Re-subscribe every channel whose suppression backoff has elapsed, one attempt each.
+    ///
+    /// The suppression stays raised until the relay answers with `EOSE`; this only sends the REQ and
+    /// records that it is in flight.
     async fn retry_suppressed_channels(&mut self) -> Result<(), ParticipationError> {
         let now = now_unix();
         let mut retries: Vec<(String, String, Option<u64>)> = Vec::new();
@@ -365,6 +421,13 @@ impl Participation {
         Ok(())
     }
 
+    /// Re-request every active filter on one relay from its durable cursor.
+    ///
+    /// This is the recovery half of a `Lagged` drop. The cursors are the only record of how far we
+    /// got, and they are behind the events we lost, so re-subscribing from them makes the relay
+    /// re-send the gap. Replay is safe by construction rather than by luck: owed rows are keyed on
+    /// `event_id`, and membership is applied in author order, so a re-delivered event either changes
+    /// nothing or corrects the ordering.
     async fn resync_relay(&mut self, url: &str) -> Result<(), ParticipationError> {
         let Some(entry) = self.live.get(url) else {
             return Ok(());
