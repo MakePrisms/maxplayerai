@@ -106,9 +106,10 @@ fn run_agent(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         Err(()) => return usage(err),
     };
     let mut driver = AcpDriver::new(
-        AgentCommand::new(
+        AgentCommand::with_model(
             options.agent_command[0].clone(),
             options.agent_command[1..].to_vec(),
+            options.model.clone(),
         ),
         options.permission_policy.outcome(),
         options.idle_timeout,
@@ -324,6 +325,10 @@ struct RunOptions {
     job_id: JobId,
     permission_policy: PermissionPolicy,
     idle_timeout: Duration,
+    /// `--model` — pin the harness's model for this run, the same way a seller seat's
+    /// `[seller] agents` entry does. Absent ⇒ the harness default. This is the surface for checking
+    /// by hand which models an adapter actually accepts, without posting a job.
+    model: Option<String>,
 }
 
 #[cfg(feature = "acp")]
@@ -336,6 +341,7 @@ impl RunOptions {
         let mut job_id = JobId("job-1".into());
         let mut permission_policy = PermissionPolicy::Allow;
         let mut idle_timeout = Duration::from_secs(300);
+        let mut model = None;
         let mut index = 0;
 
         while index < args.len() {
@@ -374,6 +380,16 @@ impl RunOptions {
                     idle_timeout =
                         Duration::from_secs(args.get(index).ok_or(())?.parse().map_err(|_| ())?);
                 }
+                "--model" => {
+                    index += 1;
+                    // An empty `--model` is a usage error, not "no model": passing the flag states
+                    // an intent, and reading it as absent would run the default while looking set.
+                    let value = args.get(index).ok_or(())?;
+                    if value.trim().is_empty() {
+                        return Err(());
+                    }
+                    model = Some(value.clone());
+                }
                 _ => return Err(()),
             }
             index += 1;
@@ -392,6 +408,7 @@ impl RunOptions {
             job_id,
             permission_policy,
             idle_timeout,
+            model,
         })
     }
 }
@@ -700,6 +717,46 @@ mod tests {
     #[cfg(feature = "acp")]
     #[test]
     #[ignore = "requires MOBEE_ACP_SMOKE=1 and MOBEE_ACP_SMOKE_CMD"]
+    /// `--model` parses onto the run options and reaches the driver's launch command.
+    ///
+    /// This crate is bin-only: `cargo test -p mobee --lib` matches no target and exits 0 having run
+    /// NOTHING, so these tests only execute under `cargo test -p mobee` / `--bins`. Worth knowing
+    /// before trusting a green run that named `--lib`.
+    #[test]
+    fn run_model_flag_parses_and_is_absent_by_default() {
+        let base = |extra: &[&str]| -> Vec<String> {
+            let mut args: Vec<String> = [
+                "--agent-command",
+                "fake-acp",
+                "--task",
+                "do the work",
+                "--log",
+                "/dev/null",
+            ]
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect();
+            args.extend(extra.iter().map(|value| (*value).to_owned()));
+            args
+        };
+
+        let pinned = RunOptions::parse(&base(&["--model", "haiku"])).expect("parse --model");
+        assert_eq!(pinned.model.as_deref(), Some("haiku"));
+
+        // Absent ⇒ None, so the driver makes no model call at all (the harness default).
+        let bare = RunOptions::parse(&base(&[])).expect("parse without --model");
+        assert_eq!(bare.model, None);
+
+        // An empty value states an intent that cannot be honoured — a usage error, never "unset".
+        assert!(
+            RunOptions::parse(&base(&["--model", "   "])).is_err(),
+            "an empty --model must be refused rather than read as absent"
+        );
+        // A flag with no value is a usage error too.
+        assert!(RunOptions::parse(&base(&["--model"])).is_err());
+    }
+
+    #[test]
     fn acp_smoke_real_agent_command_writes_terminal_log() {
         if std::env::var("MOBEE_ACP_SMOKE").ok().as_deref() != Some("1") {
             eprintln!("set MOBEE_ACP_SMOKE=1 to run the ACP smoke test");

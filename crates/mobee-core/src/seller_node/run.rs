@@ -1916,6 +1916,10 @@ impl SellerNodeRunner {
         };
         let agent_command = agent.argv.clone();
         let agent_label = agent.name.clone();
+        // The seat's pinned model travels with the seat that dispatch chose, so it can never be
+        // the model of a harness other than the one about to run. Node-local: it is not journaled
+        // and not published — the wire carries harness identity only.
+        let agent_model = agent.model.clone();
         // Journal WHICH harness ran it before the run starts, so the row exists even if the job
         // then fails — the journal answers "what ran this", not only "what finished it".
         if let Some(label) = agent_label.as_deref()
@@ -1958,7 +1962,15 @@ impl SellerNodeRunner {
             || now_unix() as u64,
             |_attempt| {
                 let job_timeout = unified_job_timeout(deadline, now_unix() as u64);
-                run_agent_job(&agent_command, &sandbox, &prompt, &workdir, &identity, job_timeout)
+                run_agent_job(
+                    &agent_command,
+                    &sandbox,
+                    &prompt,
+                    &workdir,
+                    &identity,
+                    job_timeout,
+                    agent_model.as_deref(),
+                )
             },
         )
         .await;
@@ -2387,6 +2399,7 @@ mod tests {
         AgentRegistry::new(vec![crate::seller_agents::RegisteredAgent {
             name: Some("claude".to_owned()),
             argv: vec!["claude-agent-acp".to_owned()],
+            model: None,
         }])
     }
 
@@ -2509,10 +2522,12 @@ mod tests {
             crate::seller_agents::RegisteredAgent {
                 name: Some("claude".to_owned()),
                 argv: vec!["claude-agent-acp".to_owned()],
+                model: None,
             },
             crate::seller_agents::RegisteredAgent {
                 name: Some("codex".to_owned()),
                 argv: vec!["codex-acp".to_owned()],
+                model: None,
             },
         ]);
         assert_eq!(
@@ -2618,10 +2633,12 @@ mod tests {
             crate::seller_agents::RegisteredAgent {
                 name: Some("claude".to_owned()),
                 argv: vec!["claude-agent-acp".to_owned()],
+                model: None,
             },
             crate::seller_agents::RegisteredAgent {
                 name: Some("codex".to_owned()),
                 argv: vec!["codex-acp".to_owned()],
+                model: None,
             },
         ]);
         let dispatched = registry
