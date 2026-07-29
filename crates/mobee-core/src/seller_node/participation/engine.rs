@@ -138,7 +138,7 @@ impl Engine {
                         channel_id,
                         counterparty,
                         kind,
-                        created_at_unix: event.created_at.as_u64() as i64,
+                        created_at_unix: event.created_at.as_secs() as i64,
                     },
                     now_unix,
                 )?;
@@ -177,7 +177,7 @@ impl Engine {
         self.store.advance_participation_cursor(
             &self.relay_url,
             &filter_id,
-            event.created_at.as_u64() as i64,
+            event.created_at.as_secs() as i64,
             now_unix,
         )
     }

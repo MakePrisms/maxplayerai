@@ -119,7 +119,7 @@ pub fn carrier_is_storable(event: &Event) -> bool {
 mod tests {
     use super::*;
     use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
-    use nostr_sdk::prelude::{EventBuilder, Keys, Kind, NostrDatabase, RelayPoolNotification};
+    use nostr_sdk::prelude::{EventBuilder, Keys, Kind, RelayPoolNotification};
 
     async fn start_relay() -> (LocalRelay, String) {
         let relay = LocalRelay::new(RelayBuilder::default());

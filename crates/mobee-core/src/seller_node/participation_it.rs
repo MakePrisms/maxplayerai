@@ -599,7 +599,11 @@ async fn live_participation_against_deployed_relay() {
         .joined_channel_source(&url, &channel)
         .expect("source id")
         .expect("the joined row must carry the event that admitted us");
-    let reader = connect(&url, Keys::generate()).await;
+    // ★ The ADMITTED key, not a fresh one. Admission on an access-scoped relay is per-pubkey, so a
+    // `Keys::generate()` reader is refused and its fetch comes back EMPTY — indistinguishable here
+    // from "the relay does not have the event". A *new Client* is still required (the own-echo trap
+    // is per-Client-DATABASE, not per key), which is why this is a second client on the same key.
+    let reader = connect(&url, node.clone()).await;
     let invite = reader
         .fetch_events(
             Filter::new().id(EventId::from_hex(&source_id).expect("event id")),
@@ -646,6 +650,112 @@ async fn live_participation_against_deployed_relay() {
          driven separately per LIVE-RUN-PLAN.md.",
     );
     participation.shutdown().await;
+}
+
+/// L1 on its own: dump a known `44100` verbatim, straight off the relay, by id.
+///
+/// Split out from the leg above because the invite is only delivered to the membership filter *once*
+/// — a cold start subscribes from `now`, so once the cursor has passed the invite no re-run can
+/// re-observe it, and re-obtaining L1's artifact would otherwise need a fresh `9000`. Given the id
+/// recorded in `participation_channels.source_event_id`, the event itself is still fetchable.
+///
+/// It carries its own **negative control**: the same fetch on an unadmitted key must come back
+/// empty. Without that, an empty result proves nothing — "the relay refused me" and "the relay does
+/// not have this event" are the same observation, and only the contrast separates them.
+///
+/// ```text
+/// BUZZ_PERSONA_SECRET=<64-hex admitted throwaway>  \
+/// BUZZ_LIVE_INVITE_ID=<64-hex event id>            \
+/// BUZZ_LIVE_RELAY=wss://buzzrelay.orveth.dev       \
+/// PARTICIPATION_LIVE_LOG=/path/to/live.log         \
+///   cargo test -p mobee-core --features acp,gateway,git-delivery,wallet --lib \
+///     -- live_fetch_invite_by_id --ignored --nocapture
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a relay-admitted throwaway key and a known invite id; run explicitly with env"]
+async fn live_fetch_invite_by_id() {
+    let secret = match std::env::var("BUZZ_PERSONA_SECRET") {
+        Ok(value) if value.trim().len() == 64 => value.trim().to_string(),
+        _ => panic!("set BUZZ_PERSONA_SECRET to a 64-hex throwaway secret (never the seller key)"),
+    };
+    let invite_id = std::env::var("BUZZ_LIVE_INVITE_ID")
+        .expect("set BUZZ_LIVE_INVITE_ID to the source_event_id of the joined row");
+    let url = std::env::var("BUZZ_LIVE_RELAY")
+        .unwrap_or_else(|_| "wss://buzzrelay.orveth.dev".to_string());
+    let log = std::env::var("PARTICIPATION_LIVE_LOG")
+        .expect("set PARTICIPATION_LIVE_LOG — evidence is asserted from a file, never from a pane");
+    // The same fetch settles the *other* half of L1's cross-check: pointed at the `9000` that
+    // triggered the invite, it dates the request against the invite's `created_at`. Defaults to the
+    // invite's own kind so the common case needs no flag.
+    let expect_kind: u16 = std::env::var("BUZZ_LIVE_EXPECT_KIND")
+        .ok()
+        .map(|value| value.parse().expect("BUZZ_LIVE_EXPECT_KIND must be a u16"))
+        .unwrap_or(44100);
+
+    let node = Keys::parse(&secret).expect("parse throwaway secret");
+    let me = node.public_key();
+    let id = EventId::from_hex(&invite_id).expect("invite id must be 64-hex");
+    let mut evidence = Evidence::new(&log);
+
+    // ── The negative control runs FIRST, so a passing positive can't be explained by an open relay ──
+    let outsider = Keys::generate();
+    let refused = connect(&url, outsider.clone()).await
+        .fetch_events(Filter::new().id(id), Duration::from_secs(15))
+        .await;
+    let refused_count = refused.as_ref().map(|events| events.len()).unwrap_or(0);
+    evidence.note(
+        "L1 negative control — unadmitted key fetching the same id",
+        &format!(
+            "reader={} result={} \nAn empty/errored result here is what proves the relay is \
+             read-gated; if this ever returns the event, the relay is open and the positive leg \
+             below proves nothing about admission.",
+            outsider.public_key().to_hex(),
+            match &refused {
+                Ok(events) => format!("{} event(s)", events.len()),
+                Err(error) => format!("error: {error}"),
+            }
+        ),
+    );
+
+    // ── The positive: the ADMITTED key can read the invite ──────────────────────────────────────
+    let invite = connect(&url, node.clone()).await
+        .fetch_events(Filter::new().id(id), Duration::from_secs(15))
+        .await
+        .expect("fetch the invite")
+        .first()
+        .cloned()
+        .expect("the admitted key must be able to fetch the invite by id");
+
+    evidence.note(
+        "L1 the 44100, verbatim",
+        &serde_json::to_string(&invite).expect("serialize the invite"),
+    );
+    evidence.note(
+        "L1 invite author (cross-check against the relay's signing key)",
+        &invite.pubkey.to_hex(),
+    );
+    evidence.note(
+        "L1 invite kind + created_at",
+        &format!(
+            "kind={} created_at={} ({})",
+            invite.kind.as_u16(),
+            invite.created_at.as_secs(),
+            invite.created_at.to_human_datetime(),
+        ),
+    );
+
+    assert_eq!(invite.id, id, "the relay served an event we did not ask for");
+    assert_eq!(invite.kind.as_u16(), expect_kind);
+    assert_ne!(
+        invite.pubkey, me,
+        "a self-authored 44100 would mean we invited ourselves — exactly the false pass this exists \
+         to rule out"
+    );
+    assert_eq!(
+        refused_count, 0,
+        "an unadmitted key read the invite too, so this relay is NOT read-gated — the positive \
+         result above then says nothing about admission"
+    );
 }
 
 /// Append-only evidence file. Every predicate's artifact is written here and asserted from here —
