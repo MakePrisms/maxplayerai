@@ -47,7 +47,15 @@ TARBALL="$OUTDIR/mobee-$VERSION-$PLATFORM.tar.gz"
 # Fixed uid/gid/mtime so the archive is a function of its contents. Without this, two archives built
 # from identical inputs differ, and any reproducibility comparison downstream compares timestamps
 # instead of code.
-tar --sort=name \
+#
+# Every flag below is GNU tar's. macOS ships BSD tar, which rejects `--sort` outright and spells the
+# ownership options differently, so `$TAR` lets the caller name a GNU tar (`gtar`) on platforms whose
+# default is not one. The archive format stays identical everywhere as a result — branching the FLAGS
+# per platform would instead leave each platform with its own archive semantics, which reads as a fix
+# while quietly reducing the determinism guarantee to same-platform-only.
+TAR="${TAR:-tar}"
+
+"$TAR" --sort=name \
     --owner=0 --group=0 --numeric-owner \
     --mtime='UTC 1970-01-01' \
     -czf "$TARBALL" \
@@ -59,7 +67,7 @@ tar --sort=name \
 #
 # The listing is read into a variable first: under `set -o pipefail`, `tar … | grep -q` FAILS on a
 # successful match, because grep exits at the first hit and tar then dies of SIGPIPE.
-LISTING="$(tar -tzf "$TARBALL")"
+LISTING="$("$TAR" -tzf "$TARBALL")"
 for entry in mobee LICENSE-MIT LICENSE-APACHE; do
     grep -qx "mobee-$VERSION-$PLATFORM/$entry" <<<"$LISTING" \
         || die "$TARBALL is missing $entry"

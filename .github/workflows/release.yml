@@ -105,6 +105,17 @@ jobs:
         if: matrix.kind == 'linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      # macOS ships BSD tar, which rejects the GNU flags that make the archive a function of its
+      # contents. Installing GNU tar keeps ONE archive format across every platform; the alternative —
+      # per-platform tar flags — would leave each platform with its own archive semantics, which looks
+      # like a fix while reducing the determinism guarantee to same-platform-only.
+      - name: Install GNU tar (darwin)
+        if: matrix.kind == 'darwin'
+        run: |
+          brew install gnu-tar
+          command -v gtar >/dev/null || { echo "gnu-tar installed but gtar is not on PATH" >&2; exit 1; }
+          echo "TAR=gtar" >> "$GITHUB_ENV"
+
       # `--no-default-features --features wallet` states the buyer surface explicitly instead of
       # relying on `default`. The two are equal today (`default = ["wallet"]`), but naming the
       # feature means a later change to `default` cannot quietly compile the seller's
@@ -164,6 +175,26 @@ jobs:
           ./scripts/package-release-asset.sh \
             "target/${{ matrix.target }}/release/mobee" \
             '${{ matrix.platform }}' '${{ needs.plan.outputs.version }}' dist
+
+      # Determinism is the property those fixed uid/gid/mtime flags exist to provide, so it is proved
+      # on the artifact rather than inferred from the flags being present — the same reason
+      # portability is re-checked on the binary CI actually built. Runs on every platform: the bug
+      # this follows was a platform-specific assumption, and gating only the platform that happened to
+      # break would rebuild that mistake.
+      #
+      # `cmp` rather than a hash: choosing between `sha256sum` and `shasum -a 256` is the very GNU/BSD
+      # split this commit removes, and byte-equality is the property anyway.
+      - name: Verify the archive is deterministic
+        run: |
+          ./scripts/package-release-asset.sh \
+            "target/${{ matrix.target }}/release/mobee" \
+            '${{ matrix.platform }}' '${{ needs.plan.outputs.version }}' dist-recheck
+          ASSET="mobee-${{ needs.plan.outputs.version }}-${{ matrix.platform }}.tar.gz"
+          cmp -s "dist/$ASSET" "dist-recheck/$ASSET" || {
+            echo "the archive is not a function of its contents: two runs over identical inputs differ" >&2
+            exit 1
+          }
+          echo "ok: two runs over identical inputs produced byte-identical archives"
 
       - uses: actions/upload-artifact@v4
         with:
