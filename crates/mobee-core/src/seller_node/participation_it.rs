@@ -25,6 +25,7 @@ use super::store::SellerStore;
 use crate::seller_node::p_gate_relay_fixture::PGateRelay;
 use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{
+    EventId, Filter,
     Client, Event, EventBuilder, Keys, Kind, PublicKey, Tag, TagKind, Timestamp,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -175,6 +176,57 @@ async fn leg1_an_invite_admits_us_and_a_mention_becomes_an_owed_debt() {
         owed[0].counterparty,
         owed[0].kind,
         owed[0].created_at_unix
+    );
+
+    participation.shutdown().await;
+}
+
+// ── Leg 1b: the reader can actually authenticate ──────────────────────────────────────────────────
+
+/// ★ The regression tooth for the defect the live run caught, which every other leg here passed over.
+///
+/// The read client was built as `Client::default()` — no signer. It set `automatic_authentication`,
+/// but auto-auth has nothing to sign a NIP-42 challenge with, so it stayed **anonymous**. Against the
+/// deployed relay that means `auth-required:` on every REQ: no carrier echo, no 44100, no mention,
+/// nothing — for the whole life of the process.
+///
+/// Every fixture leg above passed anyway, because `LocalRelay` does not require NIP-42 and therefore
+/// **cannot distinguish an anonymous reader from an authenticated one**. That is the shape to guard
+/// against, so this asserts the property directly instead of hoping a fixture happens to demand it:
+/// the reader must hold the node's identity, since admission is granted per-pubkey and an anonymous
+/// or differently-keyed reader is unadmitted no matter how healthy the socket looks.
+///
+/// It is asserted on identity rather than on the fixture's per-REQ `authenticated` flag on purpose:
+/// the probe's read REQ is not `#p`-pinned, so it may legitimately race the AUTH handshake. REQ/auth
+/// ORDERING is a separate question with its own fixture (`p_gate_relay_fixture`, issue #189); this
+/// leg is about whether an identity exists at all.
+#[tokio::test]
+async fn leg1b_the_reader_authenticates_as_the_node_not_as_nobody() {
+    let (_relay, url) = start_relay().await;
+    let node = Keys::generate();
+    let store = SellerStore::open(temp_db("leg1b")).expect("open store");
+
+    let publisher = connect(&url, node.clone()).await;
+    let participation = Participation::start(
+        &config(&url),
+        store.clone(),
+        node.public_key(),
+        &publisher,
+        &carrier(&node),
+    )
+    .await
+    .expect("start participation");
+
+    let identities = participation.reader_identities().await;
+    assert_eq!(identities.len(), 1, "one admitted relay ⇒ one reader");
+    let (seen_url, identity) = &identities[0];
+    assert_eq!(seen_url, &url);
+    assert_eq!(
+        identity.as_ref().expect("the reader MUST have a signer — a signer-less reader is anonymous \
+                                  and reads nothing on any relay that requires NIP-42"),
+        &node.public_key(),
+        "the reader must authenticate as the ADMITTED key; admission is per-pubkey, so any other \
+         identity reads nothing even when the handshake succeeds"
     );
 
     participation.shutdown().await;
@@ -438,4 +490,209 @@ async fn leg5_an_absent_config_participates_nowhere_and_touches_nothing() {
     assert!(store.joined_channels(&url).expect("channels").is_empty());
 
     participation.shutdown().await;
+}
+
+// ── LIVE leg: the half no fixture can prove — the RELAY producing the 44100 ───────────────────────
+
+/// Drive the participation surface against the **deployed** buzz relay, human-in-the-loop.
+///
+/// Everything above proves how the node RESPONDS to a membership notification. Nothing above proves
+/// the relay PRODUCES one: in every fixture a member key publishes the 44100 directly. Only the
+/// deployed relay turns a member's `kind-9000` into a relay-signed 44100, so only this leg closes
+/// that gap.
+///
+/// Ignored by default and env-gated, following the existing live buzz-persona tests. It needs a
+/// THROWAWAY key that the relay has admitted — never the real seller identity, which carries
+/// reputation and money.
+///
+/// ```text
+/// BUZZ_PERSONA_SECRET=<64-hex throwaway>  \
+/// BUZZ_LIVE_CHANNEL=<channel uuid>        \
+/// BUZZ_LIVE_RELAY=wss://buzzrelay.orveth.dev  \
+/// PARTICIPATION_LIVE_LOG=/path/to/live.log    \
+///   cargo test -p mobee-core --features acp,gateway,git-delivery,wallet --lib \
+///     -- live_participation_against_deployed_relay --ignored --nocapture
+/// ```
+///
+/// It waits for a human to fire the `9000` after it reports READY, so the window is generous.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a relay-admitted throwaway key and a human to fire the kind-9000; run explicitly with env"]
+async fn live_participation_against_deployed_relay() {
+    let secret = match std::env::var("BUZZ_PERSONA_SECRET") {
+        Ok(value) if value.trim().len() == 64 => value.trim().to_string(),
+        _ => panic!("set BUZZ_PERSONA_SECRET to a 64-hex throwaway secret (never the seller key)"),
+    };
+    // OPTIONAL, and a prefix is enough. The node is not supposed to know the channel in advance —
+    // it learns it from the invite's `h` tag, which is the whole point of the 44100. Requiring an
+    // exact uuid here would also turn a truncated id (`00fe7a48` for a full uuid) into a spurious
+    // failure that looks like the invite never landed.
+    let expect_channel = std::env::var("BUZZ_LIVE_CHANNEL").ok().filter(|v| !v.is_empty());
+    let url = std::env::var("BUZZ_LIVE_RELAY")
+        .unwrap_or_else(|_| "wss://buzzrelay.orveth.dev".to_string());
+    let log = std::env::var("PARTICIPATION_LIVE_LOG")
+        .expect("set PARTICIPATION_LIVE_LOG — evidence is asserted from a file, never from a pane");
+
+    let node = Keys::parse(&secret).expect("parse throwaway secret");
+    let me = node.public_key();
+    let store = SellerStore::open(temp_db("live")).expect("open store");
+    let mut evidence = Evidence::new(&log);
+    evidence.note("L0 identity", &format!("pubkey={} relay={url} expect_channel={expect_channel:?}", me.to_hex()));
+
+    // ── L2: access classified by positive probe against a real access-scoped relay ──────────────
+    let publisher = connect(&url, node.clone()).await;
+    let mut participation = Participation::start(
+        &ParticipationConfig {
+            relays: vec![url.clone()],
+            probe_timeout_secs: 20,
+        },
+        store.clone(),
+        me,
+        &publisher,
+        &carrier(&node),
+    )
+    .await
+    .expect("start participation");
+
+    let states = participation.access_states();
+    evidence.note("L2 access states", &format!("{states:?}"));
+    assert_eq!(
+        states,
+        vec![(url.clone(), AccessState::Admitted)],
+        "the relay must serve our carrier back. Denied here means the admission has not landed — \
+         which is a staging problem, not a code one, so stop rather than reinterpret it"
+    );
+
+    // ★ L3's BASELINE. Auto-subscribe is measured against this being empty: a pre-existing joined
+    // row would make the 44100 look effective when nothing happened.
+    let baseline = store.joined_channels(&url).expect("channels");
+    evidence.note("L3 baseline (must be empty)", &format!("{baseline:?}"));
+    assert!(
+        baseline.is_empty(),
+        "the node must hold no channel before the 9000 fires, or L3 proves nothing"
+    );
+
+    evidence.note(
+        "READY",
+        "subscribed and idle; membership filter live. Fire the kind-9000 add now.",
+    );
+    eprintln!("=== READY — fire the kind-9000 add for {} ===", me.to_hex());
+
+    // ── L1 + L3: the relay-signed invite arrives and we auto-subscribe ──────────────────────────
+    let joined = wait_for(Duration::from_secs(300), &mut participation, || {
+        let channels = store.joined_channels(&url).expect("channels");
+        (!channels.is_empty()).then_some(channels)
+    })
+    .await
+    .expect("no 44100 arrived within the window — check the 9000 actually fired");
+    evidence.note("L3 joined", &format!("{joined:?}"));
+    let channel = joined.first().expect("a joined channel").clone();
+    if let Some(expected) = &expect_channel {
+        assert!(
+            channel.starts_with(expected) || expected.starts_with(&channel),
+            "the invite named channel {channel}, which does not match the expected {expected}"
+        );
+    }
+
+    // Pull the 44100 back off the relay by the id we recorded, so the artifact is the relay's own
+    // event rather than our belief about it.
+    let source_id = store
+        .joined_channel_source(&url, &channel)
+        .expect("source id")
+        .expect("the joined row must carry the event that admitted us");
+    let reader = connect(&url, Keys::generate()).await;
+    let invite = reader
+        .fetch_events(
+            Filter::new().id(EventId::from_hex(&source_id).expect("event id")),
+            Duration::from_secs(15),
+        )
+        .await
+        .expect("fetch the 44100")
+        .first()
+        .cloned()
+        .expect("the 44100 must be fetchable from the relay by id");
+    evidence.note("L1 the 44100, verbatim", &serde_json::to_string(&invite).expect("serialize the invite"));
+
+    assert_eq!(invite.kind.as_u16(), 44100);
+    // ★ The one thing no fixture can show: the invite was authored by a THIRD PARTY, not by us.
+    // Confirming that author is specifically the RELAY's signing key needs that key from
+    // keeper:buzz — so it is RECORDED here for cross-check, not asserted into a proof we cannot make.
+    assert_ne!(
+        invite.pubkey, me,
+        "a self-authored 44100 would mean we invited ourselves — exactly the false pass this leg exists to rule out"
+    );
+    evidence.note(
+        "L1 invite author (cross-check against the relay's signing key)",
+        &invite.pubkey.to_hex(),
+    );
+
+    // ── L4: a mention lands as an owed debt ────────────────────────────────────────────────────
+    eprintln!("=== joined {channel} — now post a kind-9 mentioning {} ===", me.to_hex());
+    let owed = wait_for(Duration::from_secs(300), &mut participation, || {
+        let owed = store.owed_responses().expect("owed");
+        (!owed.is_empty()).then_some(owed)
+    })
+    .await
+    .expect("no mention landed within the window");
+    evidence.note("L4 owed ledger", &format!("{owed:?}"));
+    assert_eq!(owed[0].channel_id, channel);
+    assert_eq!(owed[0].relay_url, url);
+    assert_ne!(owed[0].counterparty, me.to_hex(), "we must not be our own counterparty");
+
+    evidence.note(
+        "LIMITS",
+        "one relay, one throwaway key, one junk channel. Human rate tier (60/min) — a \
+         'rate-limited:' CLOSED here is throttle, not a defect. No money, no 340x signing, no real \
+         identity touched. Restart/exactly-once (L5) and the denied-relay frame count (L6) are \
+         driven separately per LIVE-RUN-PLAN.md.",
+    );
+    participation.shutdown().await;
+}
+
+/// Append-only evidence file. Every predicate's artifact is written here and asserted from here —
+/// rendered terminal text cannot distinguish a line that was printed from one that merely looks it.
+struct Evidence {
+    path: std::path::PathBuf,
+}
+
+impl Evidence {
+    fn new(path: &str) -> Self {
+        let path = std::path::PathBuf::from(path);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        Self { path }
+    }
+
+    fn note(&mut self, label: &str, body: &str) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .expect("open evidence log");
+        writeln!(file, "=== {label} ===\n{body}\n").expect("write evidence");
+        eprintln!("=== {label} ===\n{body}");
+    }
+}
+
+/// Pump until `probe` yields a value or the window closes. Returns `None` on timeout rather than
+/// panicking, so the caller names what was expected.
+async fn wait_for<T>(
+    window: Duration,
+    participation: &mut Participation,
+    mut probe: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        participation
+            .pump(Duration::from_secs(2))
+            .await
+            .expect("pump");
+        if let Some(value) = probe() {
+            return Some(value);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+    }
 }

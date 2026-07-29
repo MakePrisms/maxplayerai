@@ -22,7 +22,7 @@ use nostr_sdk::prelude::{
 use super::super::store::{SellerStore, StoreError};
 use super::engine::{Action, ClosedAction, Engine};
 use super::relays::{AccessState, ProbeOutcome, RelayRoster};
-use super::{MEMBERSHIP_FILTER_ID, ParticipationConfig, channel_filter_id, dialect, probe};
+use super::{ParticipationConfig, dialect, probe};
 
 /// The subscription id of the global membership filter on every relay.
 const MEMBERSHIP_SUB: &str = "participation:membership";
@@ -128,7 +128,7 @@ impl Participation {
             .collect();
 
         for url in candidates {
-            let reader = match connect_reader(&url, me).await {
+            let reader = match connect_reader(&url, publisher).await {
                 Ok(reader) => reader,
                 Err(error) => {
                     roster.record_probe(&url, ProbeOutcome::Refused(error), now_unix());
@@ -183,6 +183,29 @@ impl Participation {
     /// lists no relays, or whose relays all denied it.
     pub fn is_live(&self) -> bool {
         !self.live.is_empty()
+    }
+
+    /// The identity each reader will authenticate as, per relay.
+    ///
+    /// Exists because a reader with **no** signer is the one failure that cannot be seen from
+    /// behaviour on a relay that does not demand NIP-42: it connects, subscribes, and reads nothing,
+    /// forever. `Err` here means that client could not produce an identity at all — which is exactly
+    /// the anonymous-reader defect, and it is a question worth being able to ask directly rather
+    /// than inferring from silence.
+    pub async fn reader_identities(&self) -> Vec<(String, Result<PublicKey, String>)> {
+        let mut identities = Vec::new();
+        for (url, live) in &self.live {
+            let identity = match live.reader.signer().await {
+                Ok(signer) => signer
+                    .get_public_key()
+                    .await
+                    .map_err(|error| format!("reader signer cannot produce a pubkey: {error}")),
+                Err(error) => Err(format!("reader has NO signer — it will stay anonymous and every \
+                                           REQ will be refused with auth-required: {error}")),
+            };
+            identities.push((url.clone(), identity));
+        }
+        identities
     }
 
     /// Process inbound traffic until `budget` elapses.
@@ -396,8 +419,30 @@ pub async fn persona_publisher(
 ///
 /// NIP-42 is left to `automatic_authentication`, exactly as the persona path does it — the seller
 /// key stays in the signer actor and is never handled here.
-async fn connect_reader(url: &str, _me: PublicKey) -> Result<Client, String> {
-    let client = Client::default();
+/// Open an authenticated reader for one relay, on the SAME identity as `publisher`.
+///
+/// ★ The reader must carry a signer. `automatic_authentication` can only answer a NIP-42 challenge
+/// if there is something to sign with — a signer-less client sets the flag, stays **anonymous**, and
+/// gets `auth-required:` on every REQ. It then reads nothing, forever, which the probe reports as
+/// "admission unproven" and which is indistinguishable from a relay that revoked us. A fixture relay
+/// that does not require NIP-42 cannot tell the two apart, which is how it got this far.
+///
+/// ★ And it must be THAT key. Admission is granted per-pubkey, so a reader on any other identity is
+/// unadmitted even when it authenticates perfectly well.
+///
+/// Both are guaranteed here by lifting the signer off the publisher rather than accepting one: the
+/// reader's identity cannot drift from the publisher's or from the carrier's author, because there
+/// is no parameter through which it could.
+///
+/// Sharing the key does NOT reintroduce the own-echo trap — that trap is per `Client` **database**,
+/// not per key, so a second Client on the same key still observes the first one's publishes. Two
+/// clients is the requirement; two identities never was.
+async fn connect_reader(url: &str, publisher: &Client) -> Result<Client, String> {
+    let signer = publisher
+        .signer()
+        .await
+        .map_err(|error| format!("the publisher has no signer to authenticate the reader: {error}"))?;
+    let client = Client::new(signer);
     client.automatic_authentication(true);
     client
         .add_relay(url)

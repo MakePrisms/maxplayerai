@@ -1078,6 +1078,25 @@ impl SellerStore {
         Ok(channels)
     }
 
+    /// The event that last made us a member of this channel — the provenance of our membership
+    /// claim, so it can be checked against the relay rather than believed.
+    pub fn joined_channel_source(
+        &self,
+        relay_url: &str,
+        channel_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let conn = self.lock()?;
+        let source = conn
+            .query_row(
+                "SELECT source_event_id FROM participation_channels
+                 WHERE relay_url = ?1 AND channel_id = ?2 AND state = 'joined'",
+                params![relay_url, channel_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(source)
+    }
+
     /// Record a message that is owed a response. Idempotent on the event id: the same message
     /// re-delivered after a reconnect is one debt, not two. Returns whether a new debt landed.
     pub fn record_owed(&self, owed: &OwedResponse, now_unix: i64) -> Result<bool, StoreError> {
