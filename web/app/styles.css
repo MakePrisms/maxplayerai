@@ -1,27 +1,30 @@
-/* Mobee Market — deep blue, neon yellow, machine type.
-   Single-theme on purpose: this is a trading screen, not a document. */
+/* MAXPLAYER AI — carbon black, Rosso Corsa, Giallo Modena. Racing livery on a
+   trading screen. Single-theme on purpose. NOTE: legacy var names kept —
+   --neon is now the Ferrari yellow (money), --blue is now the Ferrari red
+   (structure, links, action) — so every component recolors without edits. */
 :root {
   color-scheme: dark;
-  --bg: #060a14;
-  --bg-2: #08101f;
-  --panel: #0b1424;
-  --raise: #101c31;
-  --line: #1b2b47;
-  --line-2: #14203a;
+  --bg: #0a0808;
+  --bg-2: #110c0b;
+  --panel: #151010;
+  --raise: #1e1514;
+  --line: #33201d;
+  --line-2: #251715;
 
-  --ink: #e9f1ff;
-  --ink-2: #b8c8e6;
-  --muted: #7d90b4;
-  --faint: #566a91;
+  --ink: #fff4ee;
+  --ink-2: #e6ccc3;
+  --muted: #a8867c;
+  --faint: #705a51;
 
-  --neon: #e5ff3d;          /* money, prices, the thing you came for */
-  --neon-dim: rgba(229, 255, 61, 0.13);
-  --blue: #47a6ff;          /* structure, links, secondary signal */
-  --blue-dim: rgba(71, 166, 255, 0.14);
-  --warn: #ff7a4d;
+  --neon: #ffdf00;          /* money, prices — Giallo Modena */
+  --neon-dim: rgba(255, 223, 0, 0.14);
+  --blue: #ff2800;          /* structure, links, action — Rosso Corsa */
+  --blue-dim: rgba(255, 40, 0, 0.16);
+  --warn: #ff8a3d;
 
-  --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Roboto Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  --sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --display: "Chakra Petch", "Saira", ui-sans-serif, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", "Roboto Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: "Saira", ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 
   --nav-h: 54px;
 }
@@ -45,7 +48,7 @@ a { color: var(--blue); }
   position: sticky; top: 0; z-index: 40;
   display: flex; align-items: center; gap: 24px;
   height: var(--nav-h); padding: 0 18px;
-  background: rgba(6, 10, 20, 0.88);
+  background: rgba(10, 8, 8, 0.88);
   backdrop-filter: blur(10px);
   border-bottom: 1px solid var(--line);
 }
@@ -54,7 +57,7 @@ a { color: var(--blue); }
   color: var(--ink); text-decoration: none;
   font-weight: 700; font-size: 15px; letter-spacing: 0.14em;
 }
-.brand .mark { width: 20px; height: 20px; color: var(--neon); }
+.brand .mark { width: 21px; height: 21px; color: var(--blue); }
 .nav-links { display: flex; align-items: center; gap: 22px; margin-left: 8px; }
 .nav-links a {
   color: var(--ink-2); text-decoration: none;
@@ -64,9 +67,13 @@ a { color: var(--blue); }
 .nav-links a.soon { color: var(--faint); cursor: default; }
 .nav-links a.soon:hover { color: var(--faint); }
 
-.conn { display: flex; align-items: center; gap: 7px; margin: 0 0 0 auto; font-size: 11.5px; color: var(--muted); }
+.conn {
+  display: flex; align-items: center; gap: 7px; margin: 0 0 0 auto;
+  font-family: var(--display); font-size: 11.5px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.08em;
+}
 .lamp { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
-.conn[data-state="live"] .lamp { background: var(--neon); box-shadow: 0 0 0 3px var(--neon-dim), 0 0 10px var(--neon); }
+.conn[data-state="live"] .lamp { background: var(--neon); }
 .conn[data-state="history"] .lamp, .conn[data-state="connecting"] .lamp { background: var(--blue); animation: blink 1.2s ease-in-out infinite; }
 .conn[data-state="failed"] .lamp, .conn[data-state="reconnecting"] .lamp { background: var(--warn); }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
@@ -75,17 +82,24 @@ a { color: var(--blue); }
 .hero {
   height: calc(50vh - var(--nav-h)); min-height: 300px;
   display: flex; align-items: center; justify-content: center;
-  padding: 24px 18px; text-align: center;
+  padding: 30px 18px 24px; text-align: center;
   border-bottom: 1px solid var(--line);
+  /* livery stripes: hard stops, no fades — angle matches the italic lean */
   background:
-    radial-gradient(900px 380px at 50% -10%, rgba(71, 166, 255, 0.13), transparent 70%),
-    linear-gradient(var(--bg-2), var(--bg));
+    linear-gradient(102deg,
+      var(--bg) 0 57%,
+      #150d0b 57% 74%,
+      var(--bg) 74% 78%,
+      var(--blue) 78% 79.4%,
+      var(--bg) 79.4% 81.8%,
+      var(--neon) 81.8% 82.4%,
+      var(--bg) 82.4% 100%);
 }
 .hero-in { max-width: 760px; min-width: 0; }
 .hero h1 {
-  margin: 0; font-size: clamp(34px, 7vw, 68px); font-weight: 700;
+  margin: 0; font-size: clamp(40px, 8.5vw, 86px); font-weight: 700;
   letter-spacing: 0.12em; line-height: 1.02; color: var(--ink);
-  text-shadow: 0 0 34px rgba(229, 255, 61, 0.16);
+  text-shadow: 0 0 34px rgba(255, 40, 0, 0.28);
 }
 .hero .sub {
   margin: 12px 0 0; color: var(--neon);
@@ -96,7 +110,7 @@ a { color: var(--blue); }
 .runs { display: inline-flex; flex-direction: column; gap: 10px; margin: 26px 0 0; max-width: 100%; }
 .run {
   display: inline-flex; align-items: stretch; max-width: 100%; min-width: 0;
-  background: #04070e;
+  background: #070404;
   border: 1px solid var(--line); border-radius: 9px; overflow: hidden;
   box-shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset;
 }
@@ -165,8 +179,11 @@ a { color: var(--blue); }
 .col-meta { font-size: 10.5px; color: var(--faint); }
 
 .rows { list-style: none; margin: 0; padding: 0 0 12px; overflow-y: auto; flex: 1; min-height: 0; }
+/* scrollbar stays invisible until the pointer is over the list */
 .rows::-webkit-scrollbar { width: 8px; }
-.rows::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
+.rows::-webkit-scrollbar-track { background: transparent; }
+.rows::-webkit-scrollbar-thumb { background: transparent; border-radius: 4px; }
+.rows:hover::-webkit-scrollbar-thumb { background: var(--line); }
 .row { display: grid; align-items: center; gap: 10px; padding: 7px 14px; font-size: 12.5px; }
 .row.head {
   flex: none; padding-top: 0; padding-bottom: 8px;
@@ -185,13 +202,12 @@ a { color: var(--blue); }
 .num.sats { color: var(--neon); font-weight: 700; }
 .num.dim { color: var(--faint); }
 .dot { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--faint); }
-.dot.on { background: var(--neon); box-shadow: 0 0 0 2px var(--neon-dim), 0 0 7px var(--neon); }
+.dot.on { background: var(--neon); }
 .harness {
   flex: none; font-size: 9.5px; letter-spacing: 0.05em; text-transform: uppercase; font-weight: 700;
   color: var(--blue); background: var(--blue-dim); border-radius: 3px; padding: 2px 5px;
 }
 .ask { flex: none; margin-left: auto; font-variant-numeric: tabular-nums; font-size: 11px; color: var(--muted); }
-.ask::after { content: " sats"; color: var(--faint); }
 
 .feed .row { grid-template-columns: 62px minmax(0, 1fr) auto; }
 .tag {
@@ -319,3 +335,63 @@ a { color: var(--blue); }
 
 @media (max-width: 900px) { .conn { display: flex; } .conn #conn-text { display: none; } }
 
+
+/* ================= MAXPLAYER racing layer ================= */
+/* Display type: Chakra Petch semibold italic — the lean IS the speed.
+   Body prose: Saira (via --sans, already applied to ledes/steps). Data stays mono. */
+h1, h2, h3, .brand span, .eyebrow, .steps .n, .run .lbl, .windows button, .tag, .statgrid dd, .nav-links a {
+  font-family: var(--display);
+}
+h1 { font-weight: 700; font-style: italic; }
+h2, h3, .brand span, .eyebrow { font-weight: 600; font-style: italic; }
+.hero-note, .foot-cols p, .foot-note { font-family: var(--sans); font-size: 14px; }
+
+/* nav: plain hairline, no stripe */
+
+/* hero wordmark: solid ink, no shadow */
+.hero h1 {
+  color: var(--ink);
+  text-shadow: none;
+}
+.hero .sub { color: var(--blue); }
+
+/* orderbook rows: red edge on hover, no movement */
+.rows .row { transition: background 0.1s ease, border-color 0.1s ease; border-left: 2px solid transparent; }
+.rows .row:hover { border-left-color: var(--blue); }
+
+/* action controls go full red */
+.run button:hover { background: var(--blue); color: #fff; }
+.run button.ok, .run button.ok:hover { background: var(--blue); color: #fff; }
+.windows button[aria-pressed="true"] { background: var(--blue); color: #fff; }
+
+/* buy/sell: the livery carries through — slimmer stripe sets, same 102° lean.
+   Buy wears them on the right like the hero; Sell answers from the left. */
+.pitch {
+  background-image:
+    linear-gradient(102deg,
+      transparent 0 86%,
+      #150d0b 86% 94%,
+      transparent 94% 95.6%,
+      var(--blue) 95.6% 96.6%,
+      transparent 96.6% 98.2%,
+      var(--neon) 98.2% 98.6%,
+      transparent 98.6% 100%);
+}
+.pitch.alt {
+  background-image:
+    linear-gradient(102deg,
+      transparent 0 3%,
+      var(--neon) 3% 3.4%,
+      transparent 3.4% 5%,
+      var(--blue) 5% 6%,
+      transparent 6% 7.6%,
+      #1b110e 7.6% 15.6%,
+      transparent 15.6% 100%);
+}
+
+/* step cards: no strip, quiet lift on hover */
+.steps li::after { display: none; }
+.steps li { transition: transform 0.12s ease, border-color 0.12s ease; }
+.steps li:hover { transform: translateY(-3px); border-color: var(--blue); }
+
+/* lamps and dots: flat solid color — no glow, no pulse */
