@@ -25,12 +25,6 @@ use crate::gateway::EventDraft;
 /// Current on-disk schema version.
 pub const SCHEMA_VERSION: i64 = 7;
 
-/// How long a refused channel waits before ONE retry, by consecutive refusal count.
-///
-/// Escalating and capped, which is what lets both intents hold at once: a relay that really has revoked
-/// us is not polled (the interval decays to six-hourly), and a relay whose refusal was transient is never
-/// abandoned. The cap is the important half — retrying forever at a low frequency is bounded work, while
-/// giving up is unbounded silence.
 /// How long a retry REQ may go unanswered before it counts as a failed attempt.
 ///
 /// This is what makes "clears only on EOSE" a mechanism instead of a wish: a dropped REQ would otherwise
@@ -38,6 +32,12 @@ pub const SCHEMA_VERSION: i64 = 7;
 /// requirement exists to prevent, one level further in.
 pub const RETRY_EOSE_TIMEOUT_SECS: i64 = 60;
 
+/// How long a refused channel waits before ONE retry, by consecutive refusal count.
+///
+/// Escalating and capped, which is what lets both intents hold at once: a relay that really has revoked
+/// us is not polled (the interval decays to six-hourly), and a relay whose refusal was transient is never
+/// abandoned. The cap is the important half — retrying forever at a low frequency is bounded work, while
+/// giving up is unbounded silence.
 const SUPPRESSION_BACKOFF_SECS: [i64; 5] = [60, 300, 900, 3_600, 21_600];
 
 /// The backoff for the `attempts`-th consecutive refusal, saturating at the last step.
@@ -1225,21 +1225,32 @@ impl SellerStore {
     ) -> Result<bool, StoreError> {
         let mut conn = self.lock()?;
         let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let was_clear: bool = transaction
+        let current: Option<(i64, i64)> = transaction
             .query_row(
-                "SELECT suppressed FROM participation_channels
+                "SELECT suppressed, retry_started_unix FROM participation_channels
                  WHERE relay_url = ?1 AND channel_id = ?2",
                 params![relay_url, channel_id],
-                |row| row.get::<_, i64>(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .optional()?
-            .is_some_and(|flag| flag == 0);
+            .optional()?;
+        let was_clear = current.is_some_and(|(suppressed, _)| suppressed == 0);
+        let retry_outstanding = current.is_some_and(|(_, retry_started)| retry_started != 0);
+
+        // ★ Count the refusal only when it is attributable: either it is the FIRST one, or it answers a
+        // retry we actually have outstanding. `retry_started_unix` is the attribution token for both this
+        // and the `EOSE` clear — the same question ("is this about a REQ of ours?") decides both.
+        //
+        // Without the gate, a duplicate `CLOSED`, or one arriving after the timeout already expired the
+        // retry, would each add a step to the backoff for nothing. The wait would grow from the relay's
+        // chattiness rather than from our failures, and a channel could reach the six-hour cap without a
+        // single retry having been refused.
+        let counts = was_clear || retry_outstanding;
         transaction.execute(
             "UPDATE participation_channels
              SET suppressed = 1, suppressed_at_unix = ?3, retry_started_unix = 0,
-                 suppress_attempts = suppress_attempts + 1, updated_at_unix = ?3
+                 suppress_attempts = suppress_attempts + ?4, updated_at_unix = ?3
              WHERE relay_url = ?1 AND channel_id = ?2",
-            params![relay_url, channel_id, now_unix],
+            params![relay_url, channel_id, now_unix, i64::from(counts)],
         )?;
         transaction.execute(
             "UPDATE participation_owed SET state = 'dropped'
@@ -1248,6 +1259,29 @@ impl SellerStore {
         )?;
         transaction.commit()?;
         Ok(was_clear)
+    }
+
+    /// Forget every retry this relay had in flight, because none of them survived the process.
+    ///
+    /// ★ `retry_started_unix` is durable; the SOCKET that carried the REQ is not. After a restart the marker
+    /// is still set and still truthful about the past, yet there is no outstanding REQ and no `EOSE` will
+    /// ever answer it — so the channel would sit ineligible until the timeout expired it. Durability and
+    /// validity are different properties: this row survived correctly and stopped meaning anything.
+    ///
+    /// Cleared rather than expired, so a restart costs no backoff: nothing was refused, we simply never
+    /// asked. Returns how many markers were dropped.
+    pub fn clear_retries_in_flight(
+        &self,
+        relay_url: &str,
+        now_unix: i64,
+    ) -> Result<u64, StoreError> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE participation_channels SET retry_started_unix = 0, updated_at_unix = ?2
+             WHERE relay_url = ?1 AND retry_started_unix <> 0",
+            params![relay_url, now_unix],
+        )?;
+        Ok(changed as u64)
     }
 
     /// Turn retries that were never answered into failed attempts, so the backoff keeps moving.
@@ -1274,11 +1308,16 @@ impl SellerStore {
         Ok(changed as u64)
     }
 
-    /// The relay SERVED this channel's subscription — reset the escalation.
+    /// The relay SERVED a retry we sent — lift the suppression and reset the escalation.
     ///
-    /// Gated on `EOSE`, which the relay owes us by protocol, never on silence. Without this the attempt
-    /// count only ever climbs, so a channel that recovered would carry a punishing backoff into its next
-    /// unrelated refusal.
+    /// Gated on `EOSE`, which the relay owes us by protocol, never on silence.
+    ///
+    /// ★ AND gated on a retry actually being outstanding. The subscription id is per-CHANNEL, not
+    /// per-attempt, so an `EOSE` cannot be attributed to a particular REQ on its own: one buffered from the
+    /// subscription that existed BEFORE the suppression was raised would otherwise clear it, with no retry
+    /// ever having been sent. Being protocol-owed makes a signal TRUSTWORTHY; it does not make it
+    /// ATTRIBUTABLE, and only the second property licenses reading it as an answer to us. If we are
+    /// suppressed with nothing in flight, an `EOSE` proves nothing and is ignored.
     pub fn note_channel_served(
         &self,
         relay_url: &str,
@@ -1290,7 +1329,7 @@ impl SellerStore {
             "UPDATE participation_channels
              SET suppress_attempts = 0, suppressed = 0, retry_started_unix = 0, updated_at_unix = ?3
              WHERE relay_url = ?1 AND channel_id = ?2
-               AND (suppress_attempts <> 0 OR suppressed <> 0 OR retry_started_unix <> 0)",
+               AND retry_started_unix <> 0",
             params![relay_url, channel_id, now_unix],
         )?;
         Ok(())
@@ -1409,7 +1448,7 @@ impl SellerStore {
                 transaction.execute(
                     "UPDATE participation_channels
                      SET state = ?3, source_event_id = ?4, source_created_at_unix = ?5,
-                         updated_at_unix = ?6, suppressed = 0
+                         updated_at_unix = ?6, suppressed = 0, retry_started_unix = 0
                      WHERE relay_url = ?1 AND channel_id = ?2",
                     params![
                         relay_url,
@@ -2122,15 +2161,15 @@ mod tests {
         assert!(store.joined_channels(RELAY).expect("channels").is_empty());
         assert!(store.channel_suppressed(RELAY, "chan-1").expect("flag"));
         assert!(store.owed_responses().expect("owed").is_empty());
-        // A second refusal reports that the flag was already up — but it still advances the backoff,
-        // which is the point: repeated refusals must lengthen the wait, not idempotently do nothing.
+        // A second refusal reports that the flag was already up, and with no retry outstanding it must NOT
+        // escalate — see `only_an_attributable_refusal_lengthens_the_wait`. The wait must grow from OUR
+        // failed retries, not from how often the relay repeats itself.
         assert!(!store.advance_suppression(RELAY, "chan-1", 700).expect("again"));
         assert_eq!(
-            store.suppressed_channels_due(RELAY, 700 + 299).expect("early").len(),
-            0,
-            "a second refusal did not lengthen the wait"
+            store.suppressed_channels_due(RELAY, 700 + 60).expect("due"),
+            vec![("chan-1".to_string(), 1)],
+            "an unattributable second refusal escalated the backoff"
         );
-        assert_eq!(store.suppressed_channels_due(RELAY, 700 + 300).expect("due").len(), 1);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2173,6 +2212,87 @@ mod tests {
         );
         // And it is capped, so it retries forever at a bounded rate instead of being abandoned.
         assert_eq!(suppression_backoff_secs(99), 21_600);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A refusal only counts against the backoff if it is attributable: the first one, or one answering a
+    /// retry we have outstanding. Otherwise a chatty relay could walk the wait to the six-hour cap without
+    /// a single retry of ours having been refused.
+    #[test]
+    fn only_an_attributable_refusal_lengthens_the_wait() {
+        let (store, path) = fresh_store("refusal-attribution");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 100, 100)
+            .expect("join");
+        // First refusal counts.
+        store.advance_suppression(RELAY, "chan-1", 1_000).expect("first");
+        assert_eq!(store.suppressed_channels_due(RELAY, 1_060).expect("due").len(), 1);
+
+        // Duplicate CLOSEDs with nothing outstanding must NOT escalate.
+        store.advance_suppression(RELAY, "chan-1", 1_001).expect("dup");
+        store.advance_suppression(RELAY, "chan-1", 1_002).expect("dup");
+        assert_eq!(
+            store.suppressed_channels_due(RELAY, 1_002 + 60).expect("due"),
+            vec![("chan-1".to_string(), 1)],
+            "unattributable CLOSEDs escalated the backoff — the wait now grows with relay chattiness"
+        );
+
+        // A CLOSED that answers a real retry does escalate.
+        store.note_retry_attempt(RELAY, "chan-1", 1_100).expect("retry");
+        store.advance_suppression(RELAY, "chan-1", 1_110).expect("refused retry");
+        assert_eq!(
+            store.suppressed_channels_due(RELAY, 1_110 + 300).expect("due"),
+            vec![("chan-1".to_string(), 2)]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ★ RACE 1. The subscription id is per-CHANNEL, not per-attempt, so an `EOSE` is not attributable on
+    /// its own. One buffered from the subscription that existed BEFORE the suppression was raised must not
+    /// clear it — being protocol-owed makes a signal trustworthy, not *about us*.
+    #[test]
+    fn an_eose_with_no_retry_outstanding_proves_nothing() {
+        let (store, path) = fresh_store("eose-stale");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 100, 100)
+            .expect("join");
+        store.advance_suppression(RELAY, "chan-1", 1_000).expect("refused");
+
+        // A late EOSE from the pre-suppression subscription. No retry has been sent.
+        store.note_channel_served(RELAY, "chan-1", 1_010).expect("stale eose");
+        assert!(
+            store.channel_suppressed(RELAY, "chan-1").expect("flag"),
+            "a stale EOSE cleared a suppression no retry had been sent for"
+        );
+        assert!(store.joined_channels(RELAY).expect("channels").is_empty());
+
+        // Once a retry IS outstanding, the same call is an answer to us and does clear it.
+        store.note_retry_attempt(RELAY, "chan-1", 1_060).expect("retry");
+        store.note_channel_served(RELAY, "chan-1", 1_070).expect("real eose");
+        assert!(!store.channel_suppressed(RELAY, "chan-1").expect("flag"));
+        assert_eq!(store.joined_channels(RELAY).expect("channels"), ["chan-1"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ★ RACE 2. A retry marker is durable; the socket that carried the REQ is not. After a restart the row
+    /// is still truthful about the past and no longer means anything, so it must be forgotten rather than
+    /// waited on — and forgotten without charging a backoff, because nothing was refused.
+    #[test]
+    fn a_restart_forgets_retries_that_did_not_survive_it() {
+        let (store, path) = fresh_store("retry-phantom");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 100, 100)
+            .expect("join");
+        store.advance_suppression(RELAY, "chan-1", 1_000).expect("refused");
+        store.note_retry_attempt(RELAY, "chan-1", 1_060).expect("retry sent");
+        assert!(store.suppressed_channels_due(RELAY, 1_070).expect("in flight").is_empty());
+
+        // Restart.
+        assert_eq!(store.clear_retries_in_flight(RELAY, 1_080).expect("forget"), 1);
+        assert_eq!(
+            store.suppressed_channels_due(RELAY, 1_080).expect("due"),
+            vec![("chan-1".to_string(), 1)],
+            "a phantom retry kept the channel parked after the REQ had died with the process"
+        );
+        // And no backoff was charged for a REQ nobody refused.
+        assert_eq!(suppression_backoff_secs(1), 60);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2225,6 +2345,8 @@ mod tests {
         store.advance_suppression(RELAY, "chan-1", 1_100).expect("s2");
         assert_eq!(store.suppressed_channels_due(RELAY, 1_100 + 300).expect("due").len(), 1);
 
+        // A retry has to be outstanding for the EOSE to be attributable to us.
+        store.note_retry_attempt(RELAY, "chan-1", 1_900).expect("retry");
         store.note_channel_served(RELAY, "chan-1", 2_000).expect("eose");
         assert!(!store.channel_suppressed(RELAY, "chan-1").expect("flag"));
         assert_eq!(store.joined_channels(RELAY).expect("channels"), ["chan-1"]);
@@ -2259,6 +2381,7 @@ mod tests {
 
         // Positive control: once the channel is readable again, debts record normally — otherwise this
         // test would pass against a record_owed that never writes at all.
+        store.note_retry_attempt(RELAY, "chan-1", 390).expect("retry");
         store.note_channel_served(RELAY, "chan-1", 400).expect("served");
         assert!(store.record_owed(&owed(&"f".repeat(64), "chan-1", 410), 411).expect("live"));
         assert_eq!(store.owed_responses().expect("owed").len(), 1);

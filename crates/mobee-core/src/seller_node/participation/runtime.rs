@@ -106,6 +106,9 @@ struct Live {
     progress_since_resync: u64,
     /// When this relay was last resynced, so recovery cannot re-fire at pump frequency.
     last_resync_unix: i64,
+    /// A resync was owed but deferred by the floor interval. Held as STATE, because a throttled
+    /// recovery that is merely dropped is a recovery that never happened.
+    resync_pending: bool,
 }
 
 /// The node's live participation across all configured relays.
@@ -172,6 +175,10 @@ impl Participation {
             }
 
             let engine = Engine::new(store.clone(), url.clone(), me);
+            // No REQ we sent before this process started is still outstanding, so any retry marked in
+            // flight is a phantom: truthful about the past, meaningless now. Cleared rather than expired —
+            // nothing was refused, we simply never got to ask.
+            engine.forget_retries_in_flight(now_unix())?;
             // Subscribe to the notification stream BEFORE the first REQ goes out, or the events
             // that REQ produces are broadcast to nobody.
             let notifications = reader.notifications();
@@ -184,6 +191,7 @@ impl Participation {
                     engine,
                     progress_since_resync: 0,
                     last_resync_unix: 0,
+                    resync_pending: false,
                 },
             );
         }
@@ -309,28 +317,51 @@ impl Participation {
             // over skipped events, which is a real loss — but a bounded one, against a livelock that
             // loses everything forever. It is COUNTED rather than silent, because the whole failure class
             // in this module is losses that looked like quiet.
-            if !resync.is_empty() {
-                let now = now_unix();
-                let mut discard: BTreeSet<String> = BTreeSet::new();
-                for url in &resync {
-                    let Some(live) = self.live.get_mut(url) else {
-                        continue;
-                    };
-                    let throttled = now.saturating_sub(live.last_resync_unix)
-                        < MIN_RESYNC_INTERVAL_SECS;
-                    if live.progress_since_resync == 0 || throttled {
-                        self.forced_progress = self.forced_progress.saturating_add(1);
-                        continue;
-                    }
-                    live.progress_since_resync = 0;
+            // ★★ Discard-safety and resync-TIMING are separate questions, and conflating them cost
+            // correctness. Discarding is safe whenever forward progress exists — the cursor moved, so a
+            // re-ask cannot repeat the same window. Whether the REQ may go out *yet* is a rate question.
+            // Treating "too soon to re-ask" as "unsafe to discard" meant processing traffic from beyond a
+            // gap for no reason other than a clock, which is the loss the discard exists to prevent.
+            //
+            // So: progress ⇒ always discard and replace the receiver; the resync REQ either goes now or is
+            // marked pending and sent once the floor has passed. Only a genuine absence of progress forces
+            // us to process past a gap, and that is what `forced_progress` counts.
+            let now = now_unix();
+            let mut discard: BTreeSet<String> = BTreeSet::new();
+            let mut send_resync: BTreeSet<String> = BTreeSet::new();
+            for url in &resync {
+                let Some(live) = self.live.get_mut(url) else {
+                    continue;
+                };
+                if live.progress_since_resync == 0 {
+                    self.forced_progress = self.forced_progress.saturating_add(1);
+                    continue;
+                }
+                live.progress_since_resync = 0;
+                live.notifications = live.reader.notifications();
+                discard.insert(url.clone());
+                if now.saturating_sub(live.last_resync_unix) < MIN_RESYNC_INTERVAL_SECS {
+                    live.resync_pending = true;
+                } else {
                     live.last_resync_unix = now;
-                    live.notifications = live.reader.notifications();
-                    discard.insert(url.clone());
+                    live.resync_pending = false;
+                    send_resync.insert(url.clone());
                 }
-                batch.retain(|(url, _)| !discard.contains(url));
-                for url in &discard {
-                    self.resync_relay(url).await?;
+            }
+            // Resyncs deferred by the floor, now due. Held as state rather than dropped, or a throttled
+            // recovery would be a recovery that never happened.
+            for (url, live) in self.live.iter_mut() {
+                if live.resync_pending
+                    && now.saturating_sub(live.last_resync_unix) >= MIN_RESYNC_INTERVAL_SECS
+                {
+                    live.resync_pending = false;
+                    live.last_resync_unix = now;
+                    send_resync.insert(url.clone());
                 }
+            }
+            batch.retain(|(url, _)| !discard.contains(url));
+            for url in &send_resync {
+                self.resync_relay(url).await?;
             }
 
             // Retry channels whose suppression backoff has elapsed. This is the exit from a refusal
@@ -381,6 +412,62 @@ impl Participation {
             }
             tokio::time::sleep(POLL_TICK).await;
         }
+    }
+
+    /// A `Participation` whose only relay is fed by a caller-supplied notification channel.
+    ///
+    /// ★ THE LAG SEAM (issue #235). `Lagged` is the one branch in [`Self::pump`] that no fixture could
+    /// reach: overflowing a real relay's broadcast buffer is not something a test can do on demand, so
+    /// three separate defects on this path were found by review and none by a test — and a verifier then
+    /// proved the recovery logic had NO teeth at all, because deleting the progress precondition left every
+    /// test green. A branch that cannot be reached by a test is not covered by having code that looks right.
+    ///
+    /// The relay client here is never connected. That is deliberate: the assertions are about which
+    /// messages are DISCARDED and whether a resync is DEFERRED, and both are decided before any REQ goes
+    /// out. Set `last_resync_unix` to `now` so the resync is throttled and no I/O is attempted.
+    #[cfg(test)]
+    fn for_lag_test(
+        url: &str,
+        store: SellerStore,
+        me: PublicKey,
+        notifications: broadcast::Receiver<RelayPoolNotification>,
+        last_resync_unix: i64,
+        progress_since_resync: u64,
+    ) -> Self {
+        let reader = Client::default();
+        let mut live = BTreeMap::new();
+        live.insert(
+            url.to_string(),
+            Live {
+                reader,
+                notifications,
+                engine: Engine::new(store, url.to_string(), me),
+                progress_since_resync,
+                last_resync_unix,
+                resync_pending: false,
+            },
+        );
+        Self {
+            live,
+            lagged: 0,
+            forced_progress: 0,
+            roster: RelayRoster::new(vec![url.to_string()]),
+            me,
+            publisher: Client::default(),
+            carrier: nostr_sdk::prelude::EventBuilder::new(
+                nostr_sdk::prelude::Kind::Metadata,
+                "{}",
+            )
+            .sign_with_keys(&nostr_sdk::prelude::Keys::generate())
+            .expect("sign carrier"),
+            probe_timeout: Duration::from_secs(1),
+        }
+    }
+
+    /// Whether a resync is deferred for this relay, waiting on the floor interval.
+    #[cfg(test)]
+    fn resync_pending(&self, url: &str) -> bool {
+        self.live.get(url).is_some_and(|live| live.resync_pending)
     }
 
     /// Notifications the client's broadcast buffer dropped before we read them. Non-zero means the
@@ -688,6 +775,125 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr_sdk::prelude::{EventBuilder as TestEventBuilder, Keys, Kind};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    const TEST_RELAY: &str = "wss://relay.invalid";
+
+    fn test_store(label: &str) -> SellerStore {
+        let id = SEQ.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "mobee-participation-lag-{label}-{}-{id}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        SellerStore::open(path).expect("open store")
+    }
+
+    /// Overflow a small broadcast channel so the receiver is guaranteed to report `Lagged`.
+    fn lagged_receiver(
+        capacity: usize,
+    ) -> (
+        broadcast::Sender<RelayPoolNotification>,
+        broadcast::Receiver<RelayPoolNotification>,
+    ) {
+        let (sender, receiver) = broadcast::channel(capacity);
+        let event = TestEventBuilder::new(Kind::Metadata, "{}")
+            .sign_with_keys(&Keys::generate())
+            .expect("sign");
+        // One more than the buffer holds: the oldest is evicted, so the next read is a `Lagged`.
+        for _ in 0..capacity + 1 {
+            let _ = sender.send(RelayPoolNotification::Message {
+                relay_url: TEST_RELAY.parse().expect("url"),
+                message: RelayMessage::Event {
+                    subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(channel_sub(
+                        "chan-1",
+                    ))),
+                    event: std::borrow::Cow::Owned(event.clone()),
+                },
+            });
+        }
+        (sender, receiver)
+    }
+
+    /// ★ With forward progress, a lag DISCARDS — and when the resync is merely too soon, it is DEFERRED
+    /// rather than abandoned. Discard-safety and resync-timing are separate concerns; conflating them meant
+    /// processing traffic from beyond a gap because of a clock.
+    #[tokio::test]
+    async fn a_lag_with_progress_discards_and_defers_a_throttled_resync() {
+        let (_sender, receiver) = lagged_receiver(2);
+        let store = test_store("progress");
+        // `last_resync_unix = now` ⇒ the resync is inside the floor, so it must be deferred, not sent.
+        let mut participation = Participation::for_lag_test(
+            TEST_RELAY,
+            store,
+            Keys::generate().public_key(),
+            receiver,
+            now_unix(),
+            1,
+        );
+
+        let ingested = participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+
+        assert_eq!(
+            ingested, 0,
+            "messages from beyond the gap were processed instead of discarded"
+        );
+        assert!(
+            participation.lagged() > 0,
+            "the lag was not observed at all, so this test proves nothing"
+        );
+        assert_eq!(
+            participation.forced_progress(),
+            0,
+            "progress existed, so nothing should have been forced past the gap"
+        );
+        assert!(
+            participation.resync_pending(TEST_RELAY),
+            "a resync blocked by the floor was dropped instead of deferred — recovery never happens"
+        );
+    }
+
+    /// ★ Without forward progress, discarding again would re-ask for a window nothing was consumed from —
+    /// the livelock. So the batch is processed instead, and that concession is COUNTED rather than silent.
+    #[tokio::test]
+    async fn a_lag_with_no_progress_is_forced_through_and_counted() {
+        let (_sender, receiver) = lagged_receiver(2);
+        let store = test_store("no-progress");
+        let mut participation = Participation::for_lag_test(
+            TEST_RELAY,
+            store,
+            Keys::generate().public_key(),
+            receiver,
+            now_unix(),
+            0,
+        );
+
+        let ingested = participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+
+        assert!(
+            participation.lagged() > 0,
+            "the lag was not observed at all, so this test proves nothing"
+        );
+        assert_eq!(
+            participation.forced_progress(),
+            1,
+            "a lag with no progress must be counted, or the concession is silent"
+        );
+        assert!(
+            ingested > 0,
+            "nothing was processed and nothing was discarded — the pump made no progress at all, \
+             which is the livelock this branch exists to avoid"
+        );
+        assert!(!participation.resync_pending(TEST_RELAY));
+    }
 
     #[test]
     fn a_channel_subscription_id_round_trips_to_its_channel() {

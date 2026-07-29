@@ -107,6 +107,11 @@ impl Engine {
         Ok(channels)
     }
 
+    /// Drop retry-in-flight markers left by a previous process — see [`SellerStore::clear_retries_in_flight`].
+    pub fn forget_retries_in_flight(&self, now_unix: i64) -> Result<u64, StoreError> {
+        self.store.clear_retries_in_flight(&self.relay_url, now_unix)
+    }
+
     /// The relay REFUSED this channel — the first time, or in answer to a retry. Advances the backoff.
     pub fn note_channel_refused(&self, channel_id: &str, now_unix: i64) -> Result<bool, StoreError> {
         self.store
