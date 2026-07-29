@@ -122,9 +122,14 @@ jobs:
             --no-default-features --features wallet \
             --target ${{ matrix.target }}
 
+      # `run: |` is load-bearing wherever the command is continued with a backslash. A plain scalar
+      # folds its newline to a space, so `\` + newline reaches the shell as `\ ` — an escaped space,
+      # which joins onto the next word instead of continuing the line. The argument then carries a
+      # leading space and no path matches it. `verify-release-workflow.sh` fails on the shape.
       - name: Verify the version matches the release
-        run: ./scripts/verify-release-version.sh '${{ needs.plan.outputs.version }}' \
-          "target/${{ matrix.target }}/release/mobee"
+        run: |
+          ./scripts/verify-release-version.sh '${{ needs.plan.outputs.version }}' \
+            "target/${{ matrix.target }}/release/mobee"
 
       # Which features were compiled in — wallet present, acp absent. `version` succeeds in every
       # build, so nothing else here can tell one feature combination from another.
@@ -155,9 +160,10 @@ jobs:
           echo "ok: links only against base-OS libraries"
 
       - name: Package the asset
-        run: ./scripts/package-release-asset.sh \
-          "target/${{ matrix.target }}/release/mobee" \
-          '${{ matrix.platform }}' '${{ needs.plan.outputs.version }}' dist
+        run: |
+          ./scripts/package-release-asset.sh \
+            "target/${{ matrix.target }}/release/mobee" \
+            '${{ matrix.platform }}' '${{ needs.plan.outputs.version }}' dist
 
       - uses: actions/upload-artifact@v4
         with:
