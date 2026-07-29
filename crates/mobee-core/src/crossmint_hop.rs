@@ -115,7 +115,7 @@ pub enum HopError {
     ///
     /// interim: the attempt stops here rather than re-planning the melt leg against the (still
     /// unpaid) invoice at the target. Re-planning means a superseding-pairing record and a fresh
-    /// argument about pays-once, which is its own reviewed change — see MakePrisms/mobee#194.
+    /// argument about pays-once, which is its own reviewed change — see MakePrisms/maxplayerai#194.
     MeltFailed {
         /// The attempt whose melt failed.
         attempt_id: String,
@@ -677,7 +677,7 @@ impl CdkHopEffects {
     /// a fee on the wire that the cap never saw, which is the defect class the cap exists to stop.
     ///
     /// interim: the reserve-versus-actual reconciliation that would make this exact reshapes the
-    /// spend ledger, which is money-gate machinery and its own slice — see MakePrisms/mobee#186.
+    /// spend ledger, which is money-gate machinery and its own slice — see MakePrisms/maxplayerai#186.
     async fn source_input_fee_ceiling(&self) -> Result<u64, HopError> {
         let proofs = bounded(
             "source proof count",

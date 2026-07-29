@@ -1,7 +1,7 @@
 # Packaging scope — getting `mobee` onto a machine that has never heard of nix
 
 Scope of work only. Nothing here is built, and nothing here is approved: the prebuilt-binary path
-was downgraded to later on 2026-07-23 ([#125](https://github.com/MakePrisms/mobee/issues/125)) and
+was downgraded to later on 2026-07-23 ([#125](https://github.com/MakePrisms/maxplayerai/issues/125)) and
 that ruling stands until it is revisited. This document exists so that the revisit is a decision
 about a specified thing rather than about a vibe.
 
@@ -14,7 +14,7 @@ Every measurement below was taken against `dev` @ `8debf43`.
 One path:
 
 ```
-nix run --refresh github:MakePrisms/mobee -- mcp
+nix run --refresh github:MakePrisms/maxplayerai -- mcp
 ```
 
 That copy-paste form appears **5 times across 4 files** — `README.md` · `docs/ONBOARDING.md` (×2) ·
@@ -110,7 +110,7 @@ They are ordered by dependency, not by preference. **A is a prerequisite for bot
 installer and an npm wrapper are both just delivery mechanisms for an artifact that does not yet
 exist.
 
-### Track A — release artifacts *([#211](https://github.com/MakePrisms/mobee/issues/211); foundation)*
+### Track A — release artifacts *([#211](https://github.com/MakePrisms/maxplayerai/issues/211); foundation)*
 
 A tag produces per-platform binaries and checksums on a GitHub release.
 
@@ -287,7 +287,7 @@ will hold a ~38M binary per platform sub-package (materially smaller compressed)
   dynamically linked binary with a declared minimum macOS version, which is a different artifact
   with a different portability argument — not a variant of this one.
 
-### Track B — `npx mobee` *([#212](https://github.com/MakePrisms/mobee/issues/212); the MCP-config unlock)*
+### Track B — `npx mobee` *([#212](https://github.com/MakePrisms/maxplayerai/issues/212); the MCP-config unlock)*
 
 **Read this section before assuming what "npx" means here.** This repo *banned* npx in the other
 direction: post-R4 the seller deliberately removed the npx auto-launch fallback for ACP adapters,
@@ -325,7 +325,7 @@ npm install --ignore-scripts -g mobee@<version> && mobee version   # → still w
 cargo test -p mobee-core builtin_presets_resolve_to_binary_or_install_hint
 ```
 
-### Track C — `install.sh` *(belongs on [#125](https://github.com/MakePrisms/mobee/issues/125))*
+### Track C — `install.sh` *(belongs on [#125](https://github.com/MakePrisms/maxplayerai/issues/125))*
 
 #125 is exactly this issue and it is still open. The spec goes there as a comment rather than into
 a new issue: a duplicate would re-litigate a decision sideways instead of extending it where it
