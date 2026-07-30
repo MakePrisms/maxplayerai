@@ -997,21 +997,23 @@ mod tests {
                         "unexpected award failure: {error}"
                     );
                 })
-                .is_ok()
+                .ok()
+                // Report WHICH agent won, not merely that one did: which three of the five win is
+                // decided by the order they acquire the money lock, and nothing pins that order.
+                .map(|_| job)
             });
         }
 
-        let mut wins = 0usize;
+        let mut winners: Vec<String> = Vec::new();
         let mut refusals = 0usize;
         while let Some(result) = set.join_next().await {
-            if result.expect("join") {
-                wins += 1;
-            } else {
-                refusals += 1;
+            match result.expect("join") {
+                Some(job) => winners.push(job),
+                None => refusals += 1,
             }
         }
 
-        assert_eq!(wins, 3, "exactly three 30-sat awards fit under a shared 100");
+        assert_eq!(winners.len(), 3, "exactly three 30-sat awards fit under a shared 100");
         assert_eq!(refusals, 2, "the other two agents must get a clean refusal, not an overspend");
 
         let reserved = store.reserved_in_flight().expect("reserved");
@@ -1024,7 +1026,14 @@ mod tests {
 
         // Idempotency under concurrency: a winning agent re-awarding its own job (a client retry)
         // must not commit a second time — the reserved total stays put.
-        let winner = format!("{:064x}", 0);
+        //
+        // Re-award an agent that ACTUALLY won, taken from the join results. Naming a fixed agent
+        // here is what makes this leg flaky: the winners are whichever three reached the money lock
+        // first, so a scheduling change (one more test in the binary is enough) can leave the named
+        // agent among the two refused. Then this is not a re-award at all — it is a fresh reserve of
+        // 30 against the 10 the winners left, which `reserve` correctly refuses, and the refusal
+        // reads as an idempotency failure when the code did exactly the right thing.
+        let winner = winners[0].clone();
         let winner_out = winner.clone();
         let _ = award_with_reservation(&store, &winner, amount, balance, cap, 0, 2, || async {
             Ok(fake_award_outcome(&winner_out))
