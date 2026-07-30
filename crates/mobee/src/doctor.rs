@@ -99,7 +99,7 @@ mod checks {
     use mobee_core::seller_git;
 
     use super::Check;
-    use mobee_core::agent_presets;
+    use mobee_core::seller_agents::{self, AgentRegistry};
 
     const RELAY_TIMEOUT: Duration = Duration::from_secs(15);
     const MINT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -130,16 +130,19 @@ mod checks {
 
     // Blocking (issue #107): a seller can neither sign offers nor NIP-98-authenticate delivery
     // pushes without its key, so `maxplayer sell` refuses to boot when this FAILs. `present` is
-    // `home::key_file_present` (the ~/.mobee/key file). The key material itself is never read here
-    // and never appears in any Check detail.
-    pub(super) fn check_seller_key(present: bool) -> Check {
+    // `home::key_file_present` for the RESOLVED home, and `key_path` is that home's key file — the
+    // detail names the file actually inspected rather than a hardcoded `~/.mobee/key`, so a
+    // multi-home / `--home` run never reports about a home it did not read (issues #216, #265). The
+    // key material itself is never read here and never appears in any Check detail.
+    pub(super) fn check_seller_key(key_path: &Path, present: bool) -> Check {
+        let path = key_path.display();
         if present {
-            Check::pass(KEY_CHECK, "~/.mobee/key present")
+            Check::pass(KEY_CHECK, format!("{path} present"))
         } else {
             Check::fail(
                 KEY_CHECK,
-                "~/.mobee/key missing — seller has no signing key",
-                "ensure ~/.mobee/key exists and is readable (mode 0600) — it is auto-generated on first run",
+                format!("{path} missing — seller has no signing key"),
+                "ensure the seller key file exists and is readable (mode 0600) — it is auto-generated on first run",
             )
         }
     }
@@ -224,9 +227,17 @@ mod checks {
         }
     }
 
-    pub(super) fn check_agent_preset(
+    /// Resolve the seller's harness registry EXACTLY the way `SellerNodeRunner::boot` does — via
+    /// [`seller_agents::resolve`] on this same config — and report ITS verdict, rather than
+    /// re-deriving harness resolution through the PATH-based preset resolver (issue #217). Boot is
+    /// the authority (#201): it refuses to advertise work it cannot run, and `--skip-doctor` can
+    /// bypass this gate entirely, so the boot-side resolve is the only guaranteed check on a real
+    /// launch. Because this lives in [`super::build_checks`], `maxplayer doctor` and the
+    /// `sell_readiness_gate` share it, so a green doctor means "this seat boots with these
+    /// harnesses" by construction.
+    pub(super) fn check_agent_registry(
         seller: Option<SellerConfig>,
-        custom: BTreeMap<String, AgentPresetConfig>,
+        presets: BTreeMap<String, AgentPresetConfig>,
     ) -> Check {
         let Some(seller) = seller else {
             return Check::warn(
@@ -235,29 +246,42 @@ mod checks {
                 "run `maxplayer sell --agent <claude|cursor|codex> --rate-sats <n>` once to configure",
             );
         };
-        let available = agent_presets::detect_available_agents(&custom);
-        let (label, argv) = match seller.agent.as_deref() {
-            Some(name) => match agent_presets::resolve_agent_preset(name, &custom) {
-                Ok(pair) => pair,
-                Err(message) => {
-                    return Check::fail(
-                        AGENT_CHECK,
-                        message,
-                        "set [seller] agent to claude|cursor|codex or a configured [agents] preset",
-                    );
-                }
+        match seller_agents::resolve(&seller, &presets) {
+            // Fully resolved ⇒ PASS. A partial resolve still BOOTS (it serves with the remainder),
+            // so it is an advisory WARN carrying the same loud degrade line boot would print — never
+            // a boot-blocking FAIL, because boot does not refuse it.
+            Ok(resolved) => match resolved.degrade_line() {
+                None => Check::pass(AGENT_CHECK, describe_registry(&resolved.registry)),
+                Some(degrade) => Check::warn(
+                    AGENT_CHECK,
+                    degrade,
+                    "install the missing harness adapter(s) or fix [seller] agents / [agents]",
+                ),
             },
-            None => ("custom".to_owned(), seller.agent_command.clone()),
-        };
-        let argv0 = argv.first().cloned().unwrap_or_default();
-        if available.contains(&label) || argv0_resolvable(&argv0) {
-            Check::pass(AGENT_CHECK, format!("agent '{label}' resolvable (argv0={argv0})"))
-        } else {
-            Check::fail(
+            // Boot would REFUSE this config; doctor reports the identical refusal.
+            Err(error) => Check::fail(
                 AGENT_CHECK,
-                format!("agent '{label}' not found (argv0={argv0})"),
-                "install the agent harness or fix [seller] agent / [agents]",
-            )
+                error.to_string(),
+                "set [seller] agents = [\"claude\", …] (or agent_command) and install the harness adapter",
+            ),
+        }
+    }
+
+    /// One-line PASS detail for a resolved registry: the advertised harnesses (in preference order)
+    /// and the preferred entry's `argv0`. An unlabelled raw-`agent_command` hatch advertises nothing
+    /// honest, so it is named as such.
+    fn describe_registry(registry: &AgentRegistry) -> String {
+        let argv0 = registry
+            .entries()
+            .first()
+            .and_then(|entry| entry.argv.first())
+            .cloned()
+            .unwrap_or_default();
+        let advertised = registry.advertised();
+        if advertised.is_empty() {
+            format!("registry resolves (raw agent_command hatch; argv0={argv0})")
+        } else {
+            format!("registry resolves: {} (preferred argv0={argv0})", advertised.join(", "))
         }
     }
 
@@ -314,10 +338,15 @@ mod checks {
 }
 
 /// Entry from `cli::run` for `maxplayer doctor`.
-pub fn run(_args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+///
+/// Honors `--home <dir>` (mirroring `maxplayer sell`) so an operator can diagnose a specific seat,
+/// and REFUSES any other argument rather than silently dropping it — a discarded flag produced a
+/// confident report about the wrong home, which is worse than an error (issue #216).
+pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     #[cfg(not(feature = "wallet"))]
     {
         let _ = out;
+        let _ = args;
         let _ = writeln!(
             err,
             "maxplayer doctor requires the wallet feature (rebuild with default features)"
@@ -327,8 +356,44 @@ pub fn run(_args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 
     #[cfg(feature = "wallet")]
     {
-        run_doctor(out, err)
+        let home_override = match parse_doctor_args(args) {
+            Ok(home_override) => home_override,
+            Err(message) => {
+                let _ = writeln!(err, "maxplayer doctor: {message}");
+                return FAILURE;
+            }
+        };
+        run_doctor(home_override, out, err)
     }
+}
+
+/// Parse `maxplayer doctor`'s argv (everything after the `doctor` subcommand). The only accepted
+/// argument is `--home <dir>`; anything else is refused so the operator is told to use `--home` or
+/// `MOBEE_HOME` rather than being silently answered about the default home (issue #216). Mirrors the
+/// `--home` parse in `sell.rs`.
+#[cfg(feature = "wallet")]
+fn parse_doctor_args(args: &[String]) -> Result<Option<std::path::PathBuf>, String> {
+    let mut home: Option<std::path::PathBuf> = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--home" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --home".to_owned())?;
+                home = Some(std::path::PathBuf::from(value));
+            }
+            other => {
+                return Err(format!(
+                    "unknown doctor option: {other} (doctor accepts only `--home <dir>`; \
+                     the home may also be set via MOBEE_HOME)"
+                ));
+            }
+        }
+        index += 1;
+    }
+    Ok(home)
 }
 
 /// Build the full check registry from a bootstrapped home. Shared by `maxplayer doctor` and the
@@ -340,6 +405,8 @@ fn build_checks(home: &mobee_core::home::MobeeHome) -> Vec<Box<dyn FnOnce() -> C
     let relay_url = home.config.relay_url.clone();
     let secret = mobee_core::home::read_secret_key_hex(home).ok();
     let key_present = mobee_core::home::key_file_present(home);
+    // The key file of the RESOLVED home, so the key check names what it read (#216/#265).
+    let key_path = home.key_path.clone();
     // The seller accept-policy mints (`accepted_mints`) — the list this seller will settle at.
     // `extra_mints` is a BUYER wallet field (see `MobeeConfig` in home.rs) and has no place in a
     // seller boot gate, so it is deliberately NOT consulted here.
@@ -350,28 +417,39 @@ fn build_checks(home: &mobee_core::home::MobeeHome) -> Vec<Box<dyn FnOnce() -> C
 
     let mut checks: Vec<Box<dyn FnOnce() -> Check>> = vec![
         Box::new(checks::check_credential_helper),
-        Box::new(move || checks::check_seller_key(key_present)),
+        Box::new(move || checks::check_seller_key(&key_path, key_present)),
         Box::new(move || checks::check_relay(relay_url, secret)),
         // One aggregate mint check across the accept-policy: "can I settle anywhere?".
         Box::new(move || checks::check_mints(accepted_mints)),
     ];
-    checks.push(Box::new(move || checks::check_agent_preset(seller, custom_agents)));
+    checks.push(Box::new(move || checks::check_agent_registry(seller, custom_agents)));
     checks.push(Box::new(move || checks::check_telemetry(telemetry)));
     checks
 }
 
+/// Resolve which home `maxplayer doctor` inspects and bootstrap it: the `--home <dir>` override when
+/// given, else the default resolution (`MOBEE_HOME`, then `~/.mobee`). Threading the override here
+/// is the fix for issue #216 — before it, `doctor` always bootstrapped the default home and
+/// reported on a seat nobody asked about. No network I/O: `bootstrap` only touches the filesystem.
 #[cfg(feature = "wallet")]
-fn run_doctor(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+fn resolve_doctor_home(
+    home_override: Option<std::path::PathBuf>,
+) -> Result<mobee_core::home::MobeeHome, mobee_core::home::HomeError> {
     use mobee_core::home;
-
-    let root = match home::default_home_dir() {
-        Ok(root) => root,
-        Err(error) => {
-            let _ = writeln!(err, "{error}");
-            return FAILURE;
-        }
+    let root = match home_override {
+        Some(root) => root,
+        None => home::default_home_dir()?,
     };
-    let home = match home::bootstrap(&root) {
+    home::bootstrap(&root)
+}
+
+#[cfg(feature = "wallet")]
+fn run_doctor(
+    home_override: Option<std::path::PathBuf>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    let home = match resolve_doctor_home(home_override) {
         Ok(home) => home,
         Err(error) => {
             let _ = writeln!(err, "{error}");
@@ -503,10 +581,184 @@ mod tests {
     #[cfg(feature = "wallet")]
     #[test]
     fn seller_key_check_blocks_when_absent() {
-        assert_eq!(checks::check_seller_key(true).status, Status::Pass);
-        let missing = checks::check_seller_key(false);
+        use std::path::Path;
+        let key = Path::new("/some/seat/home/key");
+        assert_eq!(checks::check_seller_key(key, true).status, Status::Pass);
+        let missing = checks::check_seller_key(key, false);
         assert_eq!(missing.status, Status::Fail, "a missing key must block boot");
         assert!(missing.render().contains("fix:"), "must give a fix hint");
+    }
+
+    // Issue #216 / #265: the key check names the RESOLVED home's key file, never a hardcoded
+    // `~/.mobee/key`, so a `--home`/multi-home run cannot report about a home it did not read.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn seller_key_check_names_the_resolved_home_not_hardcoded_default() {
+        use std::path::Path;
+        let key = Path::new("/srv/forge/workspaces/.buzzwire-demo-seat/key");
+        let detail = checks::check_seller_key(key, true).render();
+        assert!(
+            detail.contains("/srv/forge/workspaces/.buzzwire-demo-seat/key"),
+            "key check must name the home it inspected: {detail}"
+        );
+        assert!(
+            !detail.contains("~/.mobee"),
+            "key check must not hardcode ~/.mobee: {detail}"
+        );
+    }
+
+    // ---- Issue #216: `maxplayer doctor` must honor `--home` and refuse unknown flags ----
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn doctor_parses_home_and_refuses_unknown_flags() {
+        use std::path::PathBuf;
+        assert_eq!(parse_doctor_args(&[]).unwrap(), None, "no args ⇒ default home");
+        assert_eq!(
+            parse_doctor_args(&["--home".into(), "/srv/seat-b".into()]).unwrap(),
+            Some(PathBuf::from("/srv/seat-b")),
+            "--home must be parsed, not dropped"
+        );
+        assert!(
+            parse_doctor_args(&["--home".into()]).is_err(),
+            "--home with no value must error"
+        );
+        // The heart of #216: a flag doctor does not understand must be REFUSED, never silently
+        // dropped and answered about the default home.
+        let unknown = parse_doctor_args(&["--bogus".into()]).unwrap_err();
+        assert!(unknown.contains("unknown doctor option"), "{unknown}");
+        assert!(
+            parse_doctor_args(&["/srv/seat-b".into()]).is_err(),
+            "a bare positional must be refused too"
+        );
+    }
+
+    // Issue #216 red-prove: `doctor --home <tmp>` must inspect THAT home. Drop the `--home` threading
+    // (make `resolve_doctor_home` ignore its override) and `home.root` becomes the default home, so
+    // this assertion goes red. No network: `bootstrap` is filesystem-only.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn doctor_honors_home_override_and_inspects_that_home() {
+        use std::path::PathBuf;
+        let tmp: PathBuf = std::env::temp_dir().join(format!(
+            "mobee-doctor-home-216-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let home = resolve_doctor_home(Some(tmp.clone())).expect("bootstrap the overridden home");
+        assert_eq!(home.root, tmp, "doctor must bootstrap the --home dir, not the default");
+        assert!(
+            home.key_path.starts_with(&tmp),
+            "the inspected key must live under the overridden home: {}",
+            home.key_path.display()
+        );
+
+        // …and the key check reports about THAT home (ties #216 cosmetic / #265 residual).
+        let present = mobee_core::home::key_file_present(&home);
+        let detail = checks::check_seller_key(&home.key_path, present).render();
+        assert!(
+            detail.contains(&tmp.display().to_string()),
+            "key check must name the overridden home: {detail}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ---- Issue #217: doctor's agent verdict must equal boot's registry verdict ----
+
+    // A config where PATH-resolve (old doctor) and verbatim-resolve (boot) DISAGREE: an absolute
+    // `agent_command` that boot uses verbatim (→ resolves), while the named preset's adapter is
+    // absent from PATH (→ the old preset probe FAILed). Doctor must now report boot's PASS. Revert
+    // to the preset/PATH check and doctor FAILs, so this assertion goes red.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn doctor_agent_check_matches_boot_verdict_on_verbatim_command() {
+        use mobee_core::home::{AgentPresetConfig, SellerConfig};
+        use mobee_core::seller_agents;
+        use std::collections::BTreeMap;
+
+        // An existing file, used as an absolute agent_command — boot launches it verbatim.
+        let existing = std::env::current_exe().expect("current exe exists");
+        // A preset whose adapter is deliberately absent from PATH: the PATH-based resolver FAILs it.
+        let mut presets = BTreeMap::new();
+        presets.insert(
+            "myabsent".to_owned(),
+            AgentPresetConfig {
+                argv: vec!["mobee-doctor-absent-adapter-x7q".to_owned()],
+            },
+        );
+
+        let seller = SellerConfig {
+            agent_command: vec![existing.to_string_lossy().into_owned()],
+            rate_sats: 5,
+            git_remote: "https://example.invalid/repo".into(),
+            job_timeout_secs: None,
+            agent: Some("myabsent".to_owned()),
+            agents: Vec::new(), // empty ⇒ boot uses fallback_registry (agent_command VERBATIM)
+            claim_open_pool: false,
+            offer_backfill_secs: 0,
+            contribution_enabled: true,
+            slots: 1,
+            claim_award_timeout_secs: None,
+        };
+
+        // Boot's verdict: the registry the seller node actually boots with.
+        let boot = seller_agents::resolve(&seller, &presets);
+        assert!(boot.is_ok(), "boot resolves the verbatim agent_command");
+
+        // Doctor must report the SAME verdict, not a FAIL derived from a PATH probe of the preset.
+        let check = checks::check_agent_registry(Some(seller), presets);
+        assert_eq!(
+            check.status,
+            Status::Pass,
+            "doctor must converge on boot's registry verdict, not a PATH-based preset probe: {}",
+            check.render()
+        );
+    }
+
+    // The inverse hazard #217 names: a config that RESOLVES on PATH but whose registry REFUSES must
+    // read as FAIL, matching boot's refusal — never a green doctor over a seat that cannot boot.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn doctor_agent_check_fails_when_boot_registry_refuses() {
+        use mobee_core::home::SellerConfig;
+        use mobee_core::seller_agents::{self, RegistryError};
+        use std::collections::BTreeMap;
+
+        // `agents` lists a preset that is neither built-in nor configured ⇒ every listed preset
+        // fails to resolve ⇒ resolve → AllFailed (boot refuses). Deterministic: an unknown preset
+        // name errors without any PATH lookup.
+        let presets = BTreeMap::new();
+        let seller = SellerConfig {
+            agent_command: vec!["ignored-when-agents-listed".to_owned()],
+            rate_sats: 5,
+            git_remote: "https://example.invalid/repo".into(),
+            job_timeout_secs: None,
+            agent: Some("ghostxyz-not-a-preset".to_owned()),
+            agents: vec![mobee_core::home::AgentSlotConfig::named("ghostxyz-not-a-preset")],
+            claim_open_pool: false,
+            offer_backfill_secs: 0,
+            contribution_enabled: true,
+            slots: 1,
+            claim_award_timeout_secs: None,
+        };
+
+        let boot = seller_agents::resolve(&seller, &presets);
+        assert!(
+            matches!(boot, Err(RegistryError::AllFailed(_))),
+            "boot must refuse a registry with no launchable harness"
+        );
+        let check = checks::check_agent_registry(Some(seller), presets);
+        assert_eq!(
+            check.status,
+            Status::Fail,
+            "doctor must report boot's refusal as a FAIL: {}",
+            check.render()
+        );
     }
 
     // The mint gate answers "can I settle anywhere". It must Fail ONLY when every accepted mint is
