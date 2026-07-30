@@ -24,11 +24,9 @@ jobs:
 
   # The acp feature gates the seller-execute path and is off by default, so it rots silently unless
   # CI compiles it explicitly (issue #108). Build BOTH crates with acp on — mobee-core with the full
-  # shipped feature combo — and run the money-path test suite. The default-feature test job above
-  # runs the featureless tests only and carries zero money teeth, so the gateway/git-delivery/wallet
-  # tests (the money path) never run there.
+  # shipped feature combo — then run the acp-gated tests.
   build-acp:
-    name: Build (acp) + money-path tests
+    name: Build & test (acp)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,6 +41,28 @@ jobs:
       # the acp feature — the default-feature job above compiles them out, so run them here.
       - name: Test mobee-core (acp)
         run: cargo test -p mobee-core --features acp --locked
+
+  # The money path runs in its OWN job, on its own runner, with no `needs:` — the isolation IS the
+  # feature here, not an accident of layout (#271). Sharing a job means sharing fate: when the acp
+  # concurrency test dies, every step still queued behind it is marked `skipped` while the job as a
+  # whole reports `failure`, so the check list shows a single red row that cannot distinguish "the
+  # money suite failed" from "the money suite never ran" — the one ambiguity a money gate must not
+  # have. Job isolation is what empirically survives this fault: on run 30487009981 attempt 2 both
+  # sibling jobs passed while that job died. `if: always()` is the cheaper edit but a weaker
+  # guarantee — it keeps the suite on the same runner as the fault it is meant to outlive, and still
+  # buries its result inside another job's conclusion. A separate runner also gives the suite its own
+  # resource budget, which matters while the acp test's subprocess peak is the leading suspect.
+  # Co-locating them bought nothing to trade away, either: this suite compiles its own feature set
+  # (no acp, release) and so reuses none of the acp job's build output. The default-feature job
+  # carries zero money teeth (it compiles the gateway/git-delivery/wallet tests out entirely), which
+  # makes this the only job in CI that runs them.
+  money-path:
+    name: Money-path tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       # Release build: the money-path suite is run in release (as the local money gate is), which
       # also sidesteps a debug-only latent bug in the git-delivery HTTP transport
       # (git_transport::client_short builds a nested tokio runtime inside the async collect path and
