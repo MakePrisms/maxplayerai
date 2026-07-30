@@ -32,8 +32,9 @@ use crate::seller::rate_gate_allows;
 use crate::seller_agents::AgentRegistry;
 use crate::seller_exec::{
     compose_agent_prompt, delivery_message, job_workdir, run_agent_job, run_agent_with_retry,
-    seller_delivery_kind, seller_exec_metadata, unified_job_timeout, SandboxPolicy,
+    seller_delivery_kind, seller_exec_metadata, unified_job_timeout, ExecError, SandboxPolicy,
 };
+use crate::seller_roster::{Fault, LiveRoster, MissingCapability};
 use crate::seller_git::{self, DeliveryAgentIdentity};
 
 use super::outbox::drain_once;
@@ -821,7 +822,7 @@ fn offer_row(job_id: &str, buyer_pubkey: &str, offer: &ParsedOffer) -> super::st
 fn classify_offer(
     offer: &ParsedOffer,
     seller: &crate::home::SellerConfig,
-    agents: &AgentRegistry,
+    agents: &LiveRoster,
     seller_pubkey: &str,
     now_unix: u64,
 ) -> ClaimDecision {
@@ -871,6 +872,31 @@ fn boot_agent_registry(home: &MobeeHome) -> Result<AgentRegistry, NodeError> {
     Ok(resolved.registry)
 }
 
+/// Which agent-run failures implicate the HARNESS, and how.
+///
+/// Attribution, not severity, decides this. `None` means the failure says nothing about the harness,
+/// so the roster must not narrow — a gate that drops a harness for our own refusal is an outage we
+/// inflict on ourselves.
+///
+/// - [`ExecError::AcpRequired`] — the binary has no `acp` feature, so NO harness here can run a turn.
+///   A named capability, and no probe is scheduled: retrying cannot add a build feature.
+/// - [`ExecError::Config`] — a misconfiguration surfaced before the run. Also structural, and the
+///   remedy is derived from the reported detail rather than assumed to be a rebuild: a harness whose
+///   barrier is an unset provider is not fixed by rebuilding, and saying so would be a lie.
+/// - [`ExecError::Agent`] — deliberately UNPROVEN. A timeout and a provider that will never resolve
+///   arrive here byte-identically, so this classifier does not guess which; the self-probe decides.
+/// - [`ExecError::Policy`] — OUR OWN refusal (e.g. an un-typeable delivery oid). Never the harness.
+fn harness_fault_for(error: &ExecError) -> Option<Fault> {
+    match error {
+        ExecError::AcpRequired => Some(Fault::Incapable(MissingCapability::AcpFeature)),
+        ExecError::Config(detail) => Some(Fault::Incapable(MissingCapability::HarnessConfig(
+            detail.clone(),
+        ))),
+        ExecError::Agent(_) => Some(Fault::Unproven),
+        ExecError::Policy(_) => None,
+    }
+}
+
 /// How long boot waits for the relay connection and the NIP-42 challenge.
 const CONNECT_WAIT: Duration = Duration::from_secs(20);
 /// Cadence of the outbox drain / housekeeping tick.
@@ -886,10 +912,14 @@ pub struct SellerNodeRunner {
     /// Outcome of the boot NIP-42 handshake, which seeds the run loop's view of whether the current
     /// socket is authenticated. `NoChallenge` is not authentication.
     boot_auth: AuthWait,
-    /// The harnesses this node can run, resolved once at boot. Every claim decision, every
-    /// advertisement, and every dispatch reads THIS — never the config — so what the node
-    /// advertises is what it verified it can launch.
-    agents: AgentRegistry,
+    /// The harnesses this node is serving with. Resolved once at boot, then narrowed at RUNTIME as
+    /// harnesses fail: every claim decision, every advertisement, and every dispatch reads THIS —
+    /// never the config, and never the boot registry directly — so what the node advertises is what
+    /// it still believes it can deliver with, not merely what it once launched.
+    ///
+    /// Behind an `Arc` because execution runs off the loop: the task that discovers a harness is
+    /// broken is not the task that publishes the next advertisement. See [`LiveRoster`].
+    agents: Arc<LiveRoster>,
     /// Homogeneous execution-slot admission (reserve-at-claim). Behind an `Arc` so it is shared with
     /// the off-loop execution tasks; see [`SlotGate`].
     slots: Arc<SlotGate>,
@@ -916,8 +946,10 @@ impl SellerNodeRunner {
         let node = SellerNode::open(home).await?;
 
         // Resolve the harness registry BEFORE anything goes on the wire: a node that cannot launch
-        // a single harness must refuse to boot rather than claim work it can never run.
-        let agents = boot_agent_registry(node.home())?;
+        // a single harness must refuse to boot rather than claim work it can never run. Boot can
+        // only verify LAUNCHABILITY, so the resolved set becomes the live roster's starting point
+        // and narrows from there as harnesses prove they cannot deliver.
+        let agents = Arc::new(LiveRoster::new(boot_agent_registry(node.home())?));
 
         // Reconcile durable state before serving anything live: expire stale outbox rows, report the
         // non-terminal jobs that resume. Reconcile must NOT release parked claims (invariant 5).
@@ -2065,6 +2097,28 @@ impl SellerNodeRunner {
         }
     }
 
+    /// Take a harness out of service after a failure attributed to IT, and say so in one line naming
+    /// both the drop and what would fix it.
+    ///
+    /// `None` is the deliberate no-op: a failure that does not implicate the harness must not narrow
+    /// the roster, or the node inflicts its own outage. Only the sites that can attribute a failure
+    /// call this at all — see [`harness_fault_for`].
+    fn drop_harness(&self, harness: usize, fault: Option<Fault>) {
+        let Some(fault) = fault else {
+            return;
+        };
+        let state = self.agents.fault(harness, fault, Instant::now());
+        let label = self.agents.label(harness).unwrap_or_else(|| "<unlabelled>".to_owned());
+        // The denominator belongs in the line: "1 harness dropped" means nothing without how many
+        // this node had, and a roster that has reached 0 is a node that has gone quiet on the market.
+        eprintln!(
+            "seller node harness DROPPED {label}: {} — now advertising {:?} of {} resolved",
+            state.reason(),
+            self.agents.advertised(),
+            self.agents.entry_count()
+        );
+    }
+
     /// Execute an awarded job end to end: run the agent in a fresh empty-base workdir, snapshot its
     /// output into ONE delivery commit dated at the STORED award time (so a re-created commit after a
     /// restart keeps the same oid — invariant 2), push it under the seller's NIP-98 auth, then bind
@@ -2144,7 +2198,7 @@ impl SellerNodeRunner {
         // claim gate should already have refused it, and quietly running the wrong agent is the
         // one outcome the registry exists to prevent.
         let requested_agent = offer.requested_agent.clone();
-        let Some(agent) = self.agents.dispatch(requested_agent.as_deref()) else {
+        let Some(selected) = self.agents.dispatch(requested_agent.as_deref()) else {
             eprintln!(
                 "seller node execute fail job_id={job_id}: requested agent {:?} is not available on \
                  this node (never substituted)",
@@ -2153,8 +2207,12 @@ impl SellerNodeRunner {
             self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
             return;
         };
-        let agent_command = agent.argv.clone();
-        let agent_label = agent.name.clone();
+        let agent_command = selected.agent.argv.clone();
+        let agent_label = selected.agent.name.clone();
+        // The registry index travels with the run: reporting a fault happens long after dispatch, and
+        // a name would not do — the unlabelled `--agent-argv` hatch has none, and it is exactly as
+        // capable of being a black hole as a named harness.
+        let harness = selected.index;
         // Journal WHICH harness ran it before the run starts, so the row exists even if the job
         // then fails — the journal answers "what ran this", not only "what finished it".
         if let Some(label) = agent_label.as_deref()
@@ -2206,6 +2264,7 @@ impl SellerNodeRunner {
             Ok(usage) => usage,
             Err(error) => {
                 eprintln!("seller node execute fail job_id={job_id}: agent run failed ({error})");
+                self.drop_harness(harness, harness_fault_for(&error));
                 self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
                 return;
             }
@@ -2226,6 +2285,10 @@ impl SellerNodeRunner {
         .await
         {
             eprintln!("seller node execute fail job_id={job_id}: delivery snapshot refused ({error})");
+            // Harness-attributable: the agent returned success having left nothing to deliver. This
+            // is the site that fires on a quota-dead harness — its turn "completes", so the agent-run
+            // arm above sees no error at all — which is why the trigger cannot live at one site.
+            self.drop_harness(harness, Some(Fault::Unproven));
             self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
             return;
         }
@@ -2817,11 +2880,13 @@ mod tests {
     }
 
     /// The registry an existing single-preset (`agent = "claude"`) seller resolves to.
-    fn claude_only() -> AgentRegistry {
-        AgentRegistry::new(vec![crate::seller_agents::RegisteredAgent {
-            name: Some("claude".to_owned()),
-            argv: vec!["claude-agent-acp".to_owned()],
-        }])
+    fn claude_only() -> LiveRoster {
+        LiveRoster::new(AgentRegistry::new(vec![
+            crate::seller_agents::RegisteredAgent {
+                name: Some("claude".to_owned()),
+                argv: vec!["claude-agent-acp".to_owned()],
+            },
+        ]))
     }
 
     fn offer(amount: u64, targeted_to: Option<&str>, deadline_unix: u64) -> ParsedOffer {
@@ -2939,7 +3004,7 @@ mod tests {
 
         // The same offer at a node that DOES run codex is claimed — the gate is the harness, not
         // the presence of a request.
-        let both = AgentRegistry::new(vec![
+        let both = LiveRoster::new(AgentRegistry::new(vec![
             crate::seller_agents::RegisteredAgent {
                 name: Some("claude".to_owned()),
                 argv: vec!["claude-agent-acp".to_owned()],
@@ -2948,7 +3013,7 @@ mod tests {
                 name: Some("codex".to_owned()),
                 argv: vec!["codex-acp".to_owned()],
             },
-        ]);
+        ]));
         assert_eq!(
             classify_offer(&wants_codex, &seller_cfg(2, false), &both, SELLER, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 }
