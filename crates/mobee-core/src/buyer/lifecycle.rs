@@ -283,8 +283,12 @@ impl std::fmt::Display for AwardError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Reserve(refused) => write!(formatter, "{refused}"),
-            // Both refusals name the operator action: an award refused for safety is only useful if
-            // the person reading the log knows what to do about it.
+            // An award refused for safety is only useful if the reader knows what happens next —
+            // but "what happens next" is not always an operator action, and naming one that does
+            // not exist is worse than naming none. `PublishedButUnrecorded` needs a human, because
+            // nothing else will write the missing row. `PresenceUnverified` does not: reconcile
+            // releases the reservation on its own once the claim stops being live, which re-arms
+            // the award. Each message states its own recovery, and only that.
             Self::PublishedButUnrecorded { job_id, award_event_id } => write!(
                 formatter,
                 "award {award_event_id} for job {job_id} is already published on the relay but has \
@@ -295,8 +299,10 @@ impl std::fmt::Display for AwardError {
                 formatter,
                 "job {job_id} has funds reserved with no local awards row, and the relay could not \
                  confirm whether an award is already public ({detail}); refusing to publish rather \
-                 than risk a duplicate award. Check the relay for a 3405 on this job: if one exists, \
-                 collect it manually; if none does, release the reservation to re-arm the award",
+                 than risk a duplicate award. No operator action is required: the reconcile pass \
+                 releases this reservation once the claim is no longer live on the relay, which \
+                 re-arms the award. If you want it settled sooner, check the relay for a 3405 on \
+                 this job and, if one exists, run `collect {job_id}`",
             ),
             Self::Presence(error) => {
                 write!(formatter, "could not read local award state: {error}")
@@ -1055,12 +1061,28 @@ mod tests {
                 matches!(error, AwardError::PresenceUnverified { .. }),
                 "{label}: expected PresenceUnverified, got: {error}"
             );
-            // Both remedies, because the operator cannot know which state they are in without looking.
+            // The refusal must name a recovery that EXISTS. The original wording told the operator
+            // to "release the reservation" — there is no such command anywhere in the CLI or MCP
+            // surface; recovery actually rides the reconcile pass. Naming an unreachable action is
+            // worse than naming none, because it sends the reader looking for it.
+            //
+            // Asserting on absence as well as presence is deliberate: the previous version of this
+            // test checked `contains("release")`, which a message saying "reconcile RELEASES this
+            // reservation" still satisfies — the substring survives a change that inverts the
+            // meaning, so the test would have passed on wording it was written to reject.
             let message = error.to_string();
             assert!(
-                message.contains("collect") && message.contains("release"),
-                "{label}: the refusal must name BOTH remedies (collect if an award exists, release \
-                 if none does): {message}"
+                message.contains(&format!("collect {job}")),
+                "{label}: the refusal must name the one reachable command, `collect <job>`: {message}"
+            );
+            assert!(
+                message.contains("No operator action is required"),
+                "{label}: the refusal must say recovery is automatic, or the reader will hunt for a \
+                 command to run: {message}"
+            );
+            assert!(
+                !message.contains("release the reservation"),
+                "{label}: this names an operator action that does not exist (#290): {message}"
             );
             assert_eq!(
                 store.reserved_in_flight().expect("reserved"),
