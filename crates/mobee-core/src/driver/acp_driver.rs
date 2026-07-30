@@ -296,8 +296,23 @@ impl Driver for AcpDriver {
             // Reaping the child (`wait`) and the group TERM are blocking syscalls/process spawns;
             // run them off the runtime so shutdown never stalls sibling jobs on the LocalSet.
             let _ = tokio::task::spawn_blocking(move || {
+                // The group TERM is for a harness that spawned children of its own: the agent is its
+                // own process-group leader (`process_group(0)` at spawn), so `kill -TERM -<pid>`
+                // reaches that subtree and nothing else — WHILE THE AGENT IS STILL ALIVE.
+                //
+                // Once the agent has exited, its group has no members left to signal and its pid,
+                // which is also its pgid, is held only by the unreaped zombie — and the `wait()`
+                // below releases it for reuse. A group-directed signal in that state cannot reach the
+                // agent (it is gone) and can only ever reach a group that inherited the number. So
+                // the liveness check is the whole point of signalling here at all, not a politeness:
+                // it is what keeps a teardown signal inside the subtree it was aimed at.
+                //
+                // Measured on `tests/acp_concurrency.rs`, where the stub agent exits on its own after
+                // reporting `end_turn`: at teardown its process group is already EMPTY, so the
+                // unguarded TERM was firing at a group with no members every time (its ESRCH
+                // discarded), on a CI runner, milliseconds before the pid was recycled.
                 #[cfg(unix)]
-                {
+                if matches!(child.try_wait(), Ok(None)) {
                     let _ = Command::new("kill")
                         .arg("-TERM")
                         .arg(format!("-{}", child.id()))
