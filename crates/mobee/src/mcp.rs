@@ -161,7 +161,7 @@ fn tools() -> Value {
     json!([
         {
             "name": "post_job",
-            "description": "Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness/model are recorded auto-award preferences. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. Never echoes secrets.",
+            "description": "Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness is a hard award filter (only a seller advertising it can be awarded); model is a recorded auto-award preference. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -175,7 +175,7 @@ fn tools() -> Value {
                     },
                     "harness": {
                         "type": "string",
-                        "description": "Preferred seller harness (e.g. claude|cursor|codex). Recorded as an auto-award preference; not yet a hard filter (no claim wire field carries it)."
+                        "description": "Request a specific seller harness (e.g. claude|cursor|codex). Posted on the offer as [\"param\",\"agent\",<name>] and enforced as a HARD award filter: only a seller advertising that harness on its claim can be awarded, and a seller that cannot run it will not claim at all. Omit it (or pass \"any\") for no preference. Also recorded as the auto-award preference it always was."
                     },
                     "model": {
                         "type": "string",
