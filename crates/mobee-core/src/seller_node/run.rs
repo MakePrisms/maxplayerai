@@ -897,6 +897,100 @@ fn harness_fault_for(error: &ExecError) -> Option<Fault> {
     }
 }
 
+/// How long a harness self-probe turn may take. Deliberately short: the probe asks for one tiny file,
+/// so a harness that cannot manage that inside this window is not one to hand a paid job to either.
+const HARNESS_PROBE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The self-probe prompt. Asks for ONE artifact carrying a token minted for this probe.
+fn harness_probe_prompt(token: &str) -> String {
+    format!(
+        "Create a file named `probe.txt` in your current working directory whose contents are \
+         exactly this token:\n\n{token}\n\n\
+         Do nothing else. Do not explain, and do not ask a question — write the file."
+    )
+}
+
+/// Run ONE self-probe turn and decide it on the ARTIFACT.
+///
+/// A positive control, not a liveness check, and the distinction is the entire reason this exists. A
+/// harness whose account is exhausted ends its turn `completed`, exits 0, and returns a perfectly
+/// non-empty message explaining that you should upgrade your plan — so exit status, turn state and
+/// response length are ALL green for exactly the harness we most need to catch. The token is the only
+/// signal that goes red, because a harness that cannot work cannot produce it.
+///
+/// The probe runs under the same sandbox policy as a real job. Probing an unsandboxed path while jobs
+/// run sandboxed would verify a path no paid job ever takes.
+///
+/// An `Err` carries both an operator-facing reason and the fault to record. Failures that ARE typed
+/// go through [`harness_fault_for`], the same classifier a real job's failure uses, so a probe against
+/// an `acp`-less binary marks the harness INCAPABLE and stops being probed at all rather than
+/// re-asking a settled question every few hours.
+async fn run_harness_probe(
+    argv: &[String],
+    sandbox: &SandboxPolicy,
+    identity: &DeliveryAgentIdentity,
+    workdir: &std::path::Path,
+    token: &str,
+) -> Result<(), (String, Fault)> {
+    seller_git::init_empty_delivery_workdir_off_runtime(workdir.to_path_buf(), identity.clone())
+        .await
+        .map_err(|error| {
+            // Our own filesystem, not the harness: record nothing against it, but the probe still
+            // did not answer, so re-arm the window rather than restoring on a non-answer.
+            (
+                format!("probe workdir init failed ({error})"),
+                Fault::Unproven,
+            )
+        })?;
+
+    if let Err(error) = run_agent_job(
+        argv,
+        sandbox,
+        &harness_probe_prompt(token),
+        workdir,
+        identity,
+        HARNESS_PROBE_TIMEOUT,
+    )
+    .await
+    {
+        let fault = harness_fault_for(&error).unwrap_or(Fault::Unproven);
+        return Err((format!("probe turn failed ({error})"), fault));
+    }
+
+    // The turn "succeeded" — now ask the only question that separates a working harness from an
+    // exhausted one: is the token actually here?
+    if probe_token_present(workdir, token) {
+        Ok(())
+    } else {
+        Err((
+            format!(
+                "probe turn reported success but produced no artifact carrying {token} — a completed \
+                 turn is not delivered work"
+            ),
+            Fault::Unproven,
+        ))
+    }
+}
+
+/// Whether any file the harness left in `workdir` carries the probe token.
+///
+/// Content, not filename: a harness that wrote the token somewhere sensible has demonstrated the
+/// capability being tested, and failing it for choosing a different filename would report a working
+/// harness as broken. `.git` is skipped — the workdir is a fresh repo and its own metadata is ours.
+fn probe_token_present(workdir: &std::path::Path, token: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(workdir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        if entry.file_name() == ".git" {
+            return false;
+        }
+        std::fs::read_to_string(entry.path())
+            .map(|content| content.contains(token))
+            .unwrap_or(false)
+    })
+}
+
 /// How long boot waits for the relay connection and the NIP-42 challenge.
 const CONNECT_WAIT: Duration = Duration::from_secs(20);
 /// Cadence of the outbox drain / housekeeping tick.
@@ -1274,6 +1368,7 @@ impl SellerNodeRunner {
             tokio::select! {
                 _ = drain_tick.tick() => {
                     self.sweep_lapsed_claims();
+                    self.start_due_harness_probes();
                     self.drain().await;
                     continue;
                 }
@@ -2094,6 +2189,54 @@ impl SellerNodeRunner {
             AwardMatch::Ignore => eprintln!(
                 "seller node award ignore job_id={job_id}: author not the offer buyer, or our claim not yet published"
             ),
+        }
+    }
+
+    /// Start a self-probe for every dropped harness whose window has passed, each OFF the event loop.
+    ///
+    /// Probes are spawned, never awaited here: a probe runs a whole agent turn, and awaiting one on
+    /// the loop would deafen the node to offers, awards and payments for its duration — the failure
+    /// mode #223 exists to prevent. [`LiveRoster::claim_due_probes`] marks each harness in-flight as
+    /// it hands it over, so this tick firing every few seconds cannot stack probes on one harness.
+    fn start_due_harness_probes(&self) {
+        for harness in self.agents.claim_due_probes(Instant::now()) {
+            let Some(argv) = self.agents.argv(harness) else {
+                // No argv means no harness at that index, which cannot happen for a claimed probe;
+                // release it rather than leaving the mark set forever.
+                self.agents.fault(harness, Fault::Unproven, Instant::now());
+                continue;
+            };
+            let roster = Arc::clone(&self.agents);
+            let sandbox = SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref());
+            let identity = DeliveryAgentIdentity::for_seller(&self.seller_pubkey.to_hex());
+            // A token minted per probe, so neither a stale workdir nor a replayed transcript can
+            // satisfy one: the artifact has to be produced by THIS turn.
+            let token = format!("mobee-probe-{harness}-{}", now_unix());
+            let workdir = job_workdir(self.node.home(), &token);
+            tokio::task::spawn_local(async move {
+                let label = roster
+                    .label(harness)
+                    .unwrap_or_else(|| "<unlabelled>".to_owned());
+                match run_harness_probe(&argv, &sandbox, &identity, &workdir, &token).await {
+                    Ok(()) => {
+                        roster.restore(harness);
+                        eprintln!(
+                            "seller node harness RESTORED {label}: self-probe delivered its token — \
+                             now advertising {:?} of {} resolved",
+                            roster.advertised(),
+                            roster.entry_count()
+                        );
+                    }
+                    Err((reason, fault)) => {
+                        let state = roster.fault(harness, fault, Instant::now());
+                        eprintln!(
+                            "seller node harness probe FAILED {label}: {reason} — {}",
+                            state.reason()
+                        );
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&workdir);
+            });
         }
     }
 
@@ -3024,6 +3167,129 @@ mod tests {
             classify_offer(&offer(5, Some(SELLER), NOW + 600), &seller_cfg(2, false), &claude_only(), SELLER, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 }
         );
+    }
+
+    // TOOTH (#254) — a harness that FAILED stops the node claiming for it, not merely fails the next
+    // job. Boot verified the harness launches; launching is not delivering, and a node that keeps
+    // claiming for a harness it cannot deliver with is a black hole for awards — under
+    // award-is-payment the buyer's sats are committed before the failure is visible.
+    // Bite: drop the availability filter from `LiveRoster::dispatch` and the SAME offer that was
+    // refused below is claimed again, by a node that just proved it cannot serve it.
+    #[test]
+    fn a_dropped_harness_stops_the_node_claiming_for_it() {
+        let roster = LiveRoster::new(AgentRegistry::new(vec![
+            crate::seller_agents::RegisteredAgent {
+                name: Some("claude".to_owned()),
+                argv: vec!["claude-agent-acp".to_owned()],
+            },
+        ]));
+        let untargeted = offer(5, Some(SELLER), NOW + 600);
+
+        // Precondition — the SAME offer is claimable before the drop, so the assertion below cannot
+        // pass for some unrelated reason.
+        assert_eq!(
+            classify_offer(&untargeted, &seller_cfg(2, false), &roster, SELLER, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "the offer must be claimable first, or the drop below proves nothing"
+        );
+
+        roster.fault(0, Fault::Unproven, std::time::Instant::now());
+
+        assert_eq!(
+            classify_offer(&untargeted, &seller_cfg(2, false), &roster, SELLER, NOW),
+            ClaimDecision::Skip(SkipReason::AgentUnavailable),
+            "a node whose only harness is dropped must stop claiming"
+        );
+        assert!(
+            roster.advertised().is_empty(),
+            "and it must stop advertising in the same motion — the wire and the dispatch table are \
+             one set, so a buyer can never read a harness this node would refuse"
+        );
+    }
+
+    // TOOTH (#254) — the self-probe is decided by the ARTIFACT, and nothing else it could be decided
+    // by would work. A harness whose account is exhausted ends its turn `completed`, exits 0, and
+    // returns a non-empty message telling you to upgrade your plan: exit status, turn state and
+    // response length are all GREEN for precisely the harness this exists to catch. Only a token it
+    // cannot produce goes red.
+    // Bite: decide the probe on turn completion, or on the workdir merely being non-empty, and the
+    // billing-notice case below passes — restoring a harness that cannot do any work to the roster,
+    // where it will rank as the FASTEST seat on it.
+    #[test]
+    fn the_self_probe_is_decided_by_the_token_not_by_a_completed_turn() {
+        let dir = std::env::temp_dir().join(format!("mobee-probe-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("probe dir");
+        let token = "mobee-probe-0-1785400000";
+
+        // Nothing written at all — a turn that completed having done nothing.
+        assert!(
+            !probe_token_present(&dir, token),
+            "an empty workdir is not a delivered artifact"
+        );
+
+        // The quota-dead case: a completed turn whose ONLY output is a billing notice. Non-empty,
+        // plausible, and worthless.
+        std::fs::write(dir.join("probe.txt"), "Upgrade your plan to continue")
+            .expect("write notice");
+        assert!(
+            !probe_token_present(&dir, token),
+            "a non-empty file that lacks the token must NOT pass — this is the whole failure mode"
+        );
+
+        // The working case. Content, not filename: a harness that put the token somewhere sensible
+        // has shown the capability, and failing it over a filename would report it broken.
+        std::fs::write(dir.join("notes.md"), format!("done: {token}\n")).expect("write token");
+        assert!(
+            probe_token_present(&dir, token),
+            "the token present in any file is the capability being tested"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // TOOTH (#254) — only failures ATTRIBUTABLE to the harness narrow the roster. Attribution, not
+    // severity, is the test: an execution failure caused by a remote, our own signer, or our own
+    // policy refusal says nothing about whether the harness works.
+    // Bite: map every `ExecError` to a drop and a node whose git remote is briefly unreachable, or
+    // whose delivery oid we ourselves declined to type, takes its own harness out of service — an
+    // outage the node inflicts on itself, and one that looks exactly like a real harness failure.
+    #[test]
+    fn only_harness_attributable_failures_narrow_the_roster() {
+        // OUR refusal is never the harness's fault.
+        assert_eq!(
+            harness_fault_for(&ExecError::Policy("un-typeable delivery oid".into())),
+            None,
+            "a policy WE refused must never drop the harness"
+        );
+
+        // A missing build feature is structural and NAMED — no probe can supply it.
+        assert_eq!(
+            harness_fault_for(&ExecError::AcpRequired),
+            Some(Fault::Incapable(MissingCapability::AcpFeature))
+        );
+
+        // An untyped agent failure is deliberately UNPROVEN: a timeout and a provider that will
+        // never resolve arrive here identically, so the probe decides rather than this classifier.
+        assert_eq!(
+            harness_fault_for(&ExecError::Agent("turn ended non-terminal".into())),
+            Some(Fault::Unproven)
+        );
+
+        // A config barrier is structural too, but its remedy is DERIVED — reporting "rebuild" for a
+        // harness whose provider was never selected would send the operator after the wrong thing.
+        let config = harness_fault_for(&ExecError::Config("GOOSE_PROVIDER is unset".into()))
+            .expect("a config barrier implicates the harness");
+        match config {
+            Fault::Incapable(capability) => {
+                let remedy = capability.remedy();
+                assert!(remedy.contains("GOOSE_PROVIDER"), "{remedy}");
+                assert!(
+                    !remedy.contains("--features acp"),
+                    "a configuration barrier must not be reported as a rebuild: {remedy}"
+                );
+            }
+            other => panic!("a config barrier is structural, got {other:?}"),
+        }
     }
 
     // TOOTH (the seam my other teeth do not look at) — the harness request survives the trip from

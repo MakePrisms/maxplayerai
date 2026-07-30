@@ -157,6 +157,11 @@ struct HarnessState {
     /// Unattributable faults ever recorded for this harness. Kept ACROSS a restore, so a harness
     /// that flaps backs off further each time instead of pinning at the shortest window.
     strikes: u32,
+    /// Set while a self-probe for this harness is in flight. A probe runs OFF the event loop and can
+    /// take a whole turn, while the housekeeping tick that starts one fires every few seconds — so
+    /// without this the tick would launch a new probe on every tick and the harness would be running
+    /// a dozen concurrent turns of our own tokens.
+    probing: bool,
 }
 
 /// The harnesses a booted node is serving with right now: its resolved registry plus live
@@ -243,7 +248,10 @@ impl LiveRoster {
         let entry = state.entry(index).or_insert(HarnessState {
             unavailable: None,
             strikes: 0,
+            probing: false,
         });
+        // Whatever a probe was testing, its answer arrived: this fault IS the answer.
+        entry.probing = false;
         let unavailable = match fault {
             Fault::Incapable(capability) => Unavailable::Incapable(capability),
             Fault::Unproven => {
@@ -271,23 +279,39 @@ impl LiveRoster {
             .get_mut(&index)
         {
             entry.unavailable = None;
+            entry.probing = false;
         }
     }
 
-    /// The indices whose self-probe is due: dropped, and past `probe_due_at`. Never includes an
-    /// [`Unavailable::Incapable`] harness — there is nothing a probe could establish about a missing
-    /// build feature, and running one would spend tokens to re-learn a known answer.
-    pub fn probes_due(&self, now: Instant) -> Vec<usize> {
-        let state = self.state.lock().expect("live roster poisoned");
-        state
+    /// Take the harnesses whose self-probe is due, marking each as being probed in the SAME locked
+    /// step. Claiming and reporting are one operation on purpose: the caller runs each probe off the
+    /// event loop, so a plain "which are due?" query would hand the same harness out again on every
+    /// tick until the first probe finished.
+    ///
+    /// Never yields an [`Unavailable::Incapable`] harness. There is nothing a probe could establish
+    /// about a missing build feature, and running one would spend tokens to re-learn a known answer.
+    ///
+    /// A claimed probe is released by whichever verdict lands: [`Self::restore`] when it passed,
+    /// [`Self::fault`] when it did not. Both are reachable from every path the probe can take.
+    pub fn claim_due_probes(&self, now: Instant) -> Vec<usize> {
+        let mut state = self.state.lock().expect("live roster poisoned");
+        let due: Vec<usize> = state
             .iter()
             .filter_map(|(index, harness)| match &harness.unavailable {
-                Some(Unavailable::Dropped { probe_due_at, .. }) if now >= *probe_due_at => {
+                Some(Unavailable::Dropped { probe_due_at, .. })
+                    if now >= *probe_due_at && !harness.probing =>
+                {
                     Some(*index)
                 }
                 _ => None,
             })
-            .collect()
+            .collect();
+        for index in &due {
+            if let Some(harness) = state.get_mut(index) {
+                harness.probing = true;
+            }
+        }
+        due
     }
 
     /// A index's current unavailability, or `None` when it is serving.
@@ -402,7 +426,7 @@ mod tests {
 
         let long_after = now + Duration::from_secs(24 * 60 * 60);
         assert_eq!(
-            roster.probes_due(long_after),
+            roster.claim_due_probes(long_after),
             vec![0],
             "a probe is due once the window passes"
         );
@@ -417,9 +441,39 @@ mod tests {
         assert!(roster.serves(None));
         assert_eq!(roster.advertised(), vec!["claude"]);
         assert!(
-            roster.probes_due(long_after).is_empty(),
+            roster.claim_due_probes(long_after).is_empty(),
             "a serving harness owes no probe"
         );
+    }
+
+    #[test]
+    fn a_claimed_probe_is_not_handed_out_again_until_its_verdict_lands() {
+        // The probe runs off the event loop while the tick that starts one fires every few seconds.
+        // Without the in-flight mark the same harness would be handed out on every tick and we would
+        // be paying for a dozen concurrent turns of our own.
+        let roster = named(&["claude"]);
+        let now = Instant::now();
+        roster.fault(0, Fault::Unproven, now);
+        let due = now + Duration::from_secs(24 * 60 * 60);
+
+        assert_eq!(roster.claim_due_probes(due), vec![0], "first claim takes it");
+        assert!(
+            roster.claim_due_probes(due).is_empty(),
+            "a probe already in flight must not be started again"
+        );
+
+        // A verdict releases it. A FAILING probe re-arms with the escalated window…
+        roster.fault(0, Fault::Unproven, now);
+        assert_eq!(
+            roster.claim_due_probes(due),
+            vec![0],
+            "the next window is claimable once the previous verdict landed"
+        );
+
+        // …and a PASSING one puts the harness back, owing nothing.
+        roster.restore(0);
+        assert!(roster.serves(None));
+        assert!(roster.claim_due_probes(due).is_empty());
     }
 
     #[test]
@@ -490,7 +544,7 @@ mod tests {
 
         assert!(
             roster
-                .probes_due(now + Duration::from_secs(365 * 24 * 60 * 60))
+                .claim_due_probes(now + Duration::from_secs(365 * 24 * 60 * 60))
                 .is_empty(),
             "an incapable harness is never probed, however long we wait"
         );
