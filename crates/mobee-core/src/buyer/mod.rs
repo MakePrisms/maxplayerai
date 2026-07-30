@@ -49,7 +49,10 @@ use crate::job_lifecycle::{
     self, AwardClaimRequest, ContributionSpec, GetJobRequest, JobKind, PostJobRequest, WaitFor,
 };
 use crate::payment::{PaymentMachine, PaymentRecord, PaymentState};
-use lifecycle::{AwardError, AwardFilters, PaymentProgress, RearmAction, SettleError};
+use lifecycle::{
+    AwardError, AwardFilters, AwardOutcome, MissingOfferAction, PaymentProgress, RearmAction,
+    SettleError,
+};
 use lock::{HomeLock, LockError};
 use protocol::{CODE_INTERNAL, CODE_METHOD_NOT_FOUND, CODE_NOT_IMPLEMENTED, Request, Response};
 use reservations::{Dispositions, ReconcileReport};
@@ -64,6 +67,14 @@ const RELAY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the background auto-award task re-checks the relay for a payable claim, until one
 /// appears or the offer deadline passes. Bounded polling (no tight spin on a live-but-unpayable claim).
 const AUTO_AWARD_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// How many consecutive UNANSWERED job reads the auto-award loop tolerates before it parks.
+///
+/// #291 made an unconfirmed read stop being grounds to park — but a refusal with no bound is an
+/// infinite loop, and the deadline check that bounds the normal path lives inside the branch that
+/// requires an offer, so it is never reached when the read comes back empty. A ceiling without a
+/// floor is half a fix. What this bound must NOT do is smuggle the old conclusion back in: it parks
+/// on "we could not read", never on "the offer is gone", and the recorded reason says so.
+const AUTO_AWARD_MAX_UNCONFIRMED_READS: u32 = 12;
 /// How often the delivery watcher re-checks awarded-unsettled jobs with no event to wake it. The
 /// subscription is the fast path; this backstop is what makes a dropped or missed result event a
 /// latency cost rather than a stranded payment.
@@ -558,6 +569,9 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
     let job_id = params.job_id.clone();
     let home = context.home.clone();
     let publish_claim = claim_id.clone();
+    let probe_home = context.home.clone();
+    let probe_keys = keys.clone();
+    let probe_job = params.job_id.clone();
     let result = lifecycle::award_with_reservation(
         &context.store,
         &params.job_id,
@@ -566,6 +580,10 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
         total_cap,
         spent,
         now_unix(),
+        move || async move {
+            job_lifecycle::award_presence_async(&probe_home, &probe_keys, &probe_job, RELAY_TIMEOUT)
+                .await
+        },
         move || async move {
             job_lifecycle::award_claim_async(
                 &home,
@@ -576,8 +594,19 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
     )
     .await;
 
+    // #291, second defect: the intent row is advanced only by the AUTO path, so a manual award left
+    // a stale row behind and `status` went on reporting `parked / offer no longer on the relay` for
+    // a job that was awarded and running. BOTH success shapes clear it, `AlreadyAwarded` included —
+    // a parked reason sitting beside a recorded award is false whichever call published the award.
+    if matches!(
+        result,
+        Ok(AwardOutcome::Published(_) | AwardOutcome::AlreadyAwarded(_))
+    ) {
+        let _ = context.store.mark_award_awarded(&params.job_id, now_unix());
+    }
+
     match result {
-        Ok(outcome) => Response::ok(
+        Ok(AwardOutcome::Published(outcome)) => Response::ok(
             id,
             json!({
                 "awarded": outcome,
@@ -585,7 +614,29 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
                 "reserved_for": params.job_id,
             }),
         ),
+        // Already awarded by this buyer: report the recorded award and say plainly that nothing was
+        // published now, rather than returning a shape indistinguishable from a fresh award.
+        Ok(AwardOutcome::AlreadyAwarded(record)) => Response::ok(
+            id,
+            json!({
+                "already_awarded": {
+                    "job_id": record.job_id,
+                    "claim_id": record.claim_id,
+                    "award_event_id": record.award_event_id,
+                    "seller_pubkey": record.seller_pubkey,
+                    "amount_sats": record.amount_sats,
+                    "awarded_at_unix": record.awarded_at_unix,
+                },
+                "published_now": false,
+                "reserved_for": params.job_id,
+            }),
+        ),
         Err(AwardError::Reserve(refused)) => Response::err(id, CODE_REFUSED, refused.to_string()),
+        // Presence refusals are REFUSED, not INTERNAL: nothing broke, the daemon declined to
+        // publish a second award. The message names the operator action.
+        Err(error @ (AwardError::PublishedButUnrecorded { .. } | AwardError::PresenceUnverified { .. })) => {
+            Response::err(id, CODE_REFUSED, error.to_string())
+        }
         Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
     }
 }
@@ -740,11 +791,17 @@ async fn drive_auto_award(
 ) -> Result<(), String> {
     let keys = buyer_keys(&context.home)?;
 
-    // Invariant A: never award twice. A relay error is "unknown" (unwrap_or false) — do not skip;
-    // the reserve-then-award path below is itself idempotent on the reserve.
-    let award_on_relay = job_lifecycle::has_award_async(&context.home, &keys, job_id, RELAY_TIMEOUT)
-        .await
-        .unwrap_or(false);
+    // Invariant A, first pass: skip cheaply if the relay already shows our award. An unknown answer
+    // (error, or `Ok(None)`, which a timed-out read also produces) does NOT skip — it falls through
+    // to `award_with_reservation`, which is where an unverified presence is adjudicated against the
+    // local `awards` row and REFUSED rather than republished. This check is an optimisation; the
+    // chokepoint is the guard.
+    let award_on_relay =
+        job_lifecycle::award_presence_async(&context.home, &keys, job_id, RELAY_TIMEOUT)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
     let reservation = context
         .store
         .reservation(job_id)
@@ -756,6 +813,7 @@ async fn drive_auto_award(
         return Ok(());
     }
 
+    let mut unconfirmed_reads: u32 = 0;
     loop {
         let view = job_lifecycle::fetch_job_view_async(
             &context.home,
@@ -767,11 +825,47 @@ async fn drive_auto_award(
         .await
         .map_err(|error| error.to_string())?;
         let Some(offer) = view.offer.as_ref() else {
-            let _ = context
-                .store
-                .mark_award_parked(job_id, "offer no longer on the relay", now_unix());
+            // An empty offer read is evidence the offer is GONE only if the relay answered us.
+            // Parking is terminal — the driver never retries a parked row — so it has to rest on a
+            // positive determination, never on the absence of a signal we may simply have missed.
+            //
+            // #291: this line parked a live, claimed, real-money job with 5.8 hours left on its
+            // deadline, because a 5s timeout and an empty relay are the same bytes here. Twenty-five
+            // lines up, the award-presence check already treats its empty read as unknown; the two
+            // sites disagreed about the same evidence, and only one of them was right.
+            if !view.read_confirmed {
+                unconfirmed_reads += 1;
+            }
+            match lifecycle::plan_missing_offer(
+                view.read_confirmed,
+                unconfirmed_reads,
+                AUTO_AWARD_MAX_UNCONFIRMED_READS,
+            ) {
+                MissingOfferAction::Retry => {
+                    tokio::time::sleep(AUTO_AWARD_POLL_INTERVAL).await;
+                    continue;
+                }
+                MissingOfferAction::ParkOfferAbsent => {
+                    let _ = context.store.mark_award_parked(
+                        job_id,
+                        lifecycle::PARK_REASON_OFFER_ABSENT,
+                        now_unix(),
+                    );
+                }
+                // The reason states what we OBSERVED. It does not say the offer is gone — we never
+                // established that — because a row that said so would be the same false status line
+                // #291 was filed about, just arriving a minute later.
+                MissingOfferAction::ParkUnreadable { unanswered_reads } => {
+                    let _ = context.store.mark_award_parked(
+                        job_id,
+                        &lifecycle::park_reason_unreadable(unanswered_reads),
+                        now_unix(),
+                    );
+                }
+            }
             return Ok(());
         };
+        unconfirmed_reads = 0;
         if now_unix() as u64 > offer.deadline_unix {
             let _ = context.store.mark_award_parked(
                 job_id,
@@ -812,6 +906,9 @@ async fn finalize_auto_award(
     let home = context.home.clone();
     let job = job_id.to_owned();
     let publish_claim = claim_id.clone();
+    let probe_keys = buyer_keys(&context.home)?;
+    let probe_home = context.home.clone();
+    let probe_job = job_id.to_owned();
     let result = lifecycle::award_with_reservation(
         &context.store,
         job_id,
@@ -821,6 +918,10 @@ async fn finalize_auto_award(
         spent,
         now_unix(),
         move || async move {
+            job_lifecycle::award_presence_async(&probe_home, &probe_keys, &probe_job, RELAY_TIMEOUT)
+                .await
+        },
+        move || async move {
             job_lifecycle::award_claim_async(&home, AwardClaimRequest { job_id: job, claim_id: publish_claim })
                 .await
         },
@@ -828,6 +929,8 @@ async fn finalize_auto_award(
     .await;
 
     match result {
+        // Both outcomes mean the job IS awarded by this buyer — freshly published, or already
+        // published and recorded. The intent is satisfied either way.
         Ok(_) => {
             let _ = context.store.mark_award_awarded(job_id, now_unix());
             Ok(())
@@ -839,6 +942,24 @@ async fn finalize_auto_award(
                 now_unix(),
             );
             Ok(())
+        }
+        // An award is public but unrecorded: TERMINAL. No retry can fix it — the missing row will
+        // not appear on its own — so park it, which surfaces the refusal (with its operator action)
+        // in `status` via `parked_awards` rather than retrying forever against a fixed state.
+        Err(error @ AwardError::PublishedButUnrecorded { .. }) => {
+            let _ = context
+                .store
+                .mark_award_parked(job_id, &error.to_string(), now_unix());
+            Ok(())
+        }
+        // Presence could not be verified, or local state could not be read: UNKNOWN, and possibly a
+        // transient relay/DB blip. Return Err so the intent stays `pending` and re-arms on the next
+        // start (this function's contract) instead of demanding an operator for a 10-second hiccup.
+        // Re-arming is safe by construction: the chokepoint refuses again on every unverified pass,
+        // so retrying can never publish a duplicate — it can only later succeed once the answer is
+        // knowable.
+        Err(error @ (AwardError::PresenceUnverified { .. } | AwardError::Presence(_))) => {
+            Err(error.to_string())
         }
         Err(error) => {
             let _ = context

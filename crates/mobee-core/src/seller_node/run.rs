@@ -10,11 +10,14 @@
 //! and gift-wrap→pay arms + the #150 relay-stall watchdog + #162 recovery-retry are ported on top of
 //! this in the following cutover steps (marked `PORT` below); `mobee sell` is NOT yet pointed here.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use nostr_sdk::prelude::{
     Client, Filter, Keys, Kind, RelayOptions, RelayPoolNotification, RelayUrl,
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::gateway::{
     self, claim_draft, error_draft, git_result_draft, parse_award, parse_offer, OfferParseError,
@@ -29,8 +32,9 @@ use crate::seller::rate_gate_allows;
 use crate::seller_agents::AgentRegistry;
 use crate::seller_exec::{
     compose_agent_prompt, delivery_message, job_workdir, run_agent_job, run_agent_with_retry,
-    seller_delivery_kind, seller_exec_metadata, unified_job_timeout,
+    seller_delivery_kind, seller_exec_metadata, unified_job_timeout, ExecError, SandboxPolicy,
 };
+use crate::seller_roster::{Fault, LiveRoster, MissingCapability};
 use crate::seller_git::{self, DeliveryAgentIdentity};
 
 use super::outbox::drain_once;
@@ -53,6 +57,191 @@ const RESULT_PUBLISH_WINDOW_SECS: i64 = 86_400;
 /// error detail — the operator log carries the specifics) but enough that the buyer learns the job
 /// failed instead of waiting on a delivery that will never come.
 const EXEC_FAILURE_FEEDBACK: &str = "seller could not complete the job (execution failed before delivery)";
+
+// TODO(multi-slot): this default is a placeholder pending real award-latency measurement — how long
+// a live buyer actually takes between our claim and its award. It is deliberately far below
+// CLAIM_PUBLISH_WINDOW_SECS (3600), which stays long for relay resilience: the claim keeps
+// retrying on the wire for an hour, but a slot it reserved is reclaimed much sooner if no award
+// arrives, so a loaded node does not strand capacity on claims buyers never act on. Operators
+// override with `[seller] claim_award_timeout_secs`.
+/// Default seconds a parked, unawarded claim may hold its reserved execution slot before the lapse
+/// sweep reclaims it. See [`SlotGate`].
+const DEFAULT_CLAIM_AWARD_TIMEOUT_SECS: u64 = 300;
+
+/// Homogeneous execution-slot admission for the seller node: at most `capacity` awarded jobs run
+/// concurrently, and every slot is identical (it runs whatever harness the job asked for — there is
+/// no per-slot typing).
+///
+/// A permit is RESERVED when the node claims an offer ([`SellerNodeRunner::on_offer`]) and released
+/// when the job reaches a terminal outcome (delivery or failure — the permit is moved into the
+/// execution task and dropped when it returns, so every early-return, error, and panic path releases
+/// by construction), when the buyer awards another seller ([`SellerNodeRunner::on_award`]), or when a
+/// parked claim lapses unawarded (the sweep). Reserve-at-claim is what makes a fully loaded node
+/// invisible to the market: with no free permit it does not claim, so it never appears.
+///
+/// The gate is consulted only on the single event loop, which never runs concurrently with itself,
+/// so the "is a slot free?" decision is race-free without any additional locking discipline — the
+/// `Mutex` here exists only so the gate can be shared behind an `Arc` (execution runs off the loop),
+/// never for contention. Reserved-but-not-yet-executing permits are parked keyed by job id; the
+/// award moves a permit out into the execution task, and a release/lapse drops it.
+struct SlotGate {
+    permits: Arc<Semaphore>,
+    parked: Mutex<HashMap<String, ParkedSlot>>,
+    lapse_after: Duration,
+    /// Configured ceiling, clamped as `new` clamps it. Held so a report can carry its denominator: a
+    /// count of resumed jobs means nothing without the capacity they are being bounded to.
+    capacity: usize,
+}
+
+/// A reserved slot held for a claim that is awaiting its award. `reserved_at` bounds how long the
+/// claim may sit unawarded before the lapse sweep reclaims the slot.
+struct ParkedSlot {
+    permit: OwnedSemaphorePermit,
+    reserved_at: Instant,
+}
+
+/// Outcome of [`SlotGate::try_reserve`]. The caller needs to tell a fresh reservation apart from a
+/// re-seen offer whose slot is already parked: only a fresh reservation is released if the claim
+/// then turns out to be a dedup no-op or fails to journal (releasing an already-parked job's slot
+/// would strand a live claim).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reserve {
+    /// A slot was newly reserved for this job id (a permit was taken).
+    Reserved,
+    /// This job id already held a reserved slot (a re-seen offer) — no new permit taken.
+    AlreadyParked,
+    /// Every slot is busy — the node is fully loaded and must not claim.
+    Full,
+}
+
+impl SlotGate {
+    fn new(capacity: usize, lapse_after: Duration) -> Self {
+        Self {
+            // `capacity.max(1)`: zero slots would mean a node that can never claim, which is never
+            // what an operator means by configuring a seller — clamp to serial rather than mute it.
+            permits: Arc::new(Semaphore::new(capacity.max(1))),
+            parked: Mutex::new(HashMap::new()),
+            lapse_after,
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Reserve a slot for `job_id` at claim time. [`Reserve::Full`] when every slot is busy — the
+    /// caller then skips the offer (does not claim), which is exactly how a loaded node stays
+    /// invisible. Idempotent for an already-parked job id (a re-seen offer does not double-reserve).
+    fn try_reserve(&self, job_id: &str) -> Reserve {
+        let mut parked = self.parked.lock().expect("slot gate poisoned");
+        if parked.contains_key(job_id) {
+            return Reserve::AlreadyParked;
+        }
+        match self.permits.clone().try_acquire_owned() {
+            Ok(permit) => {
+                parked.insert(job_id.to_owned(), ParkedSlot { permit, reserved_at: Instant::now() });
+                Reserve::Reserved
+            }
+            Err(_) => Reserve::Full,
+        }
+    }
+
+    /// Release a reserved slot without executing (claim failed to journal, was a dedup no-op, or the
+    /// buyer awarded another seller). Dropping the permit returns it to the pool. Idempotent.
+    fn release(&self, job_id: &str) {
+        self.parked.lock().expect("slot gate poisoned").remove(job_id);
+    }
+
+    /// Acquire a permit for a job a restart left mid-flight, WAITING for one to free.
+    ///
+    /// A restart cannot inherit reservations by construction: [`ParkedSlot::reserved_at`] is a
+    /// monotonic `Instant` and the parked map is in-memory, so every permit is free when resumed jobs
+    /// start and [`Self::take_for_execution`] has nothing to hand them.
+    ///
+    /// WAITED, not tried: the alternative to waiting is abandoning awarded work, and under
+    /// award-is-payment the buyer's sats are already committed. The excess queues here instead —
+    /// tokio's semaphore hands permits to waiters in order, so a restart that caught more jobs than
+    /// `slots` runs them in waves rather than all at once or not at all.
+    ///
+    /// Nothing is parked and no `reserved_at` is seeded, which is the whole answer to the lapse clock:
+    /// an awarded job is already past the point the lapse sweep exists to bound (a CLAIM sitting
+    /// unawarded), so [`Self::sweep_lapsed`] can never reclaim a resumed job's permit and there is no
+    /// timer to restart. It is released exactly like every other executing slot — by the execution
+    /// future returning, unwind included.
+    ///
+    /// `None` is unreachable in this tree: it requires a closed semaphore, and this gate never calls
+    /// `close` or `add_permits`. Kept as an `Option` rather than an `expect` so an impossible case
+    /// cannot panic a resume task into silence — the caller logs it and resumes anyway, because
+    /// briefly exceeding a ceiling is the lesser failure against dropping awarded work.
+    async fn acquire_for_resume(&self) -> Option<OwnedSemaphorePermit> {
+        self.permits.clone().acquire_owned().await.ok()
+    }
+
+    /// Take a reserved slot's permit to hand to the execution task, which holds it until the job is
+    /// terminal (drop-on-return releases it). `None` when no permit is parked for this job — the
+    /// restart case, where the in-memory map is empty but the durable store still has the awarded
+    /// job, and where [`Self::acquire_for_resume`] is what supplies the permit instead.
+    fn take_for_execution(&self, job_id: &str) -> Option<OwnedSemaphorePermit> {
+        self.parked
+            .lock()
+            .expect("slot gate poisoned")
+            .remove(job_id)
+            .map(|slot| slot.permit)
+    }
+
+    /// Reclaim every slot whose parked claim has sat unawarded longer than `lapse_after`. Returns the
+    /// job ids so the caller can release the durable claim to match. Dropping each permit returns it
+    /// to the pool.
+    fn sweep_lapsed(&self, now: Instant) -> Vec<String> {
+        let mut parked = self.parked.lock().expect("slot gate poisoned");
+        let lapsed: Vec<String> = parked
+            .iter()
+            .filter(|(_, slot)| now.duration_since(slot.reserved_at) >= self.lapse_after)
+            .map(|(job_id, _)| job_id.clone())
+            .collect();
+        for job_id in &lapsed {
+            parked.remove(job_id);
+        }
+        lapsed
+    }
+
+    /// Permits currently free. For logging and tests.
+    fn available(&self) -> usize {
+        self.permits.available_permits()
+    }
+}
+
+/// Spawn one resume task per job a restart left mid-flight, each bounded by a real slot permit.
+///
+/// Without this the restart path re-drove every non-terminal job at once with no permit, so a node
+/// that came back up holding K such jobs ran `slots + K` executions against a ceiling of `slots` —
+/// invisible at `slots = 1`, and growing with every slot count we raise.
+///
+/// Each task waits for its permit INSIDE the task, so boot is never blocked on capacity: the loop
+/// must reach its select arms to stay responsive to offers and awards (issue #223), and a fan-out
+/// that awaited here would deafen exactly the node that just restarted.
+///
+/// Generic over the execution step so the fan-out — the part that carries the bound — is reachable by
+/// a test without a live relay, an agent, or a store. What a resumed job DOES is irrelevant to the
+/// bound, which is why stubbing it is sound rather than a shortcut.
+fn spawn_bounded_resumes<F, Fut>(slots: Arc<SlotGate>, job_ids: Vec<String>, execute: F)
+where
+    F: Fn(String, Option<OwnedSemaphorePermit>) -> Fut + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let execute = std::rc::Rc::new(execute);
+    for job_id in job_ids {
+        let slots = Arc::clone(&slots);
+        let execute = std::rc::Rc::clone(&execute);
+        tokio::task::spawn_local(async move {
+            let slot = slots.acquire_for_resume().await;
+            if slot.is_none() {
+                eprintln!(
+                    "seller node resume job_id={job_id}: slot gate closed; resuming WITHOUT a permit \
+                     (capacity may be exceeded — dropping awarded work is the worse outcome)"
+                );
+            }
+            execute(job_id, slot).await;
+        });
+    }
+}
 
 /// The pure claim/skip decision over a parsed offer — no I/O, so the money-safety ordering
 /// (targeting, deadline-expiry, rate floor) is unit-testable. Mirrors the legacy `classify_offer`
@@ -77,6 +266,11 @@ enum SkipReason {
     RateGate,
     /// The offer asked for a harness this node does not run.
     AgentUnavailable,
+    /// Every execution slot is busy — the node is fully loaded and does not claim (reserve-at-claim
+    /// back-pressure; a loaded node is invisible to the market by simply not claiming). Emitted by
+    /// [`SellerNodeRunner::on_offer`], never by the pure [`classify_offer`], because it depends on
+    /// live slot state.
+    SlotsBusy,
 }
 
 impl SkipReason {
@@ -86,6 +280,7 @@ impl SkipReason {
             Self::Lapsed => "offer deadline already passed (lapsed; never resurrected)",
             Self::RateGate => "rate-gate refused (untargeted without opt-in / below rate)",
             Self::AgentUnavailable => "requested agent harness not available on this node",
+            Self::SlotsBusy => "all execution slots busy (node fully loaded; not claiming)",
         }
     }
 }
@@ -653,10 +848,9 @@ fn should_publish_under_rate_feedback(
 /// snapshot is deterministic (stored award-date) and `deliver_and_enqueue` dedups, so a re-created
 /// delivery lands exactly once.
 fn should_resume_execution(state: super::store::JobState) -> bool {
-    matches!(
-        state,
-        super::store::JobState::Awarded | super::store::JobState::Executing
-    )
+    // Same predicate the wire's `queue_depth` counts with, so "occupies a slot" has one definition
+    // rather than one here and another in the heartbeat path.
+    state.occupies_execution_slot()
 }
 
 /// The journaled offer facts for a parsed offer — the ONE place a wire offer becomes a stored row.
@@ -691,7 +885,7 @@ fn offer_row(job_id: &str, buyer_pubkey: &str, offer: &ParsedOffer) -> super::st
 fn classify_offer(
     offer: &ParsedOffer,
     seller: &crate::home::SellerConfig,
-    agents: &AgentRegistry,
+    agents: &LiveRoster,
     seller_pubkey: &str,
     now_unix: u64,
 ) -> ClaimDecision {
@@ -734,11 +928,181 @@ fn boot_agent_registry(home: &MobeeHome) -> Result<AgentRegistry, NodeError> {
         eprintln!("{degraded}");
     } else if !resolved.registry.advertised().is_empty() {
         eprintln!(
-            "seller node agents ready: {:?} (serial execution — one job at a time)",
+            "seller node agents ready: {:?} (execution concurrency set by [seller] slots)",
             resolved.registry.advertised()
         );
     }
     Ok(resolved.registry)
+}
+
+/// Which agent-run failures implicate the HARNESS, and how.
+///
+/// Attribution, not severity, decides this. `None` means the failure says nothing about the harness,
+/// so the roster must not narrow — a gate that drops a harness for our own refusal is an outage we
+/// inflict on ourselves.
+///
+/// - [`ExecError::AcpRequired`] — the binary has no `acp` feature, so NO harness here can run a turn.
+///   A named capability, and no probe is scheduled: retrying cannot add a build feature.
+/// - [`ExecError::Config`] — a misconfiguration surfaced before the run. Also structural, and the
+///   remedy is derived from the reported detail rather than assumed to be a rebuild: a harness whose
+///   barrier is an unset provider is not fixed by rebuilding, and saying so would be a lie.
+/// - [`ExecError::Agent`] — deliberately UNPROVEN. A timeout and a provider that will never resolve
+///   arrive here byte-identically, so this classifier does not guess which; the self-probe decides.
+/// - [`ExecError::Policy`] — OUR OWN refusal (e.g. an un-typeable delivery oid). Never the harness.
+fn harness_fault_for(error: &ExecError) -> Option<Fault> {
+    match error {
+        ExecError::AcpRequired => Some(Fault::Incapable(MissingCapability::AcpFeature)),
+        ExecError::Config(detail) => Some(Fault::Incapable(MissingCapability::HarnessConfig(
+            detail.clone(),
+        ))),
+        ExecError::Agent(_) => Some(Fault::Unproven),
+        ExecError::Policy(_) => None,
+    }
+}
+
+/// How long a harness self-probe turn may take. Deliberately short: the probe asks for one tiny file,
+/// so a harness that cannot manage that inside this window is not one to hand a paid job to either.
+const HARNESS_PROBE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Prefix of a probe sentinel.
+///
+/// Called a SENTINEL and never a "token" on purpose: in this crate a token is **Cashu ecash**, i.e.
+/// money (`payload.to_token()`, `token_hash`, "already-spent token" — all in this same file). A probe
+/// sentinel is an opaque nonce that spends nothing, and naming it "token" made a reviewer stop and ask
+/// whether probing costs sats. A name that forces that question on a money path is wrong whatever the
+/// answer is.
+const PROBE_SENTINEL_PREFIX: &str = "mobee-probe";
+
+/// Prefix of the NON-SECRET label naming a probe's workdir. Distinct from the sentinel's prefix so no
+/// sentinel value can ever be a substring of a workdir path.
+const PROBE_DIR_PREFIX: &str = "mobee-selfprobe";
+
+/// One probe's two values: a non-secret label for its workdir, and the secret it must produce.
+///
+/// **They are separate, and that separation is the property.** A workdir path is trivially observable
+/// by the harness — it *is* its own cwd — so any harness that echoes a path into a file (an error
+/// trace, a log header, a partial write) would reproduce a sentinel that lived in that path, passing
+/// the probe **without doing the task**. A discriminator must not appear in the environment it is
+/// discriminating. Keying the workdir off the sentinel is exactly that mistake.
+struct ProbeIdentity {
+    /// Names the workdir. The harness sees it and may echo it freely; nothing depends on its secrecy.
+    dir_label: String,
+    /// The secret the harness must write. Reaches it ONLY through the prompt — never through the
+    /// filesystem, the cwd, or any argv.
+    sentinel: String,
+}
+
+/// Mint one probe's identity — the ONE place either value's shape is decided.
+///
+/// Both are then PASSED to the prompt, the workdir name and the readback, so no second literal exists
+/// anywhere that could drift out of step. The sentinel carries sub-second entropy the label does not,
+/// so it is neither equal to nor derivable from anything the harness can read off its own path.
+fn mint_probe_identity(harness: usize, now_unix: u64) -> ProbeIdentity {
+    let entropy = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.subsec_nanos())
+        .unwrap_or(0);
+    ProbeIdentity {
+        dir_label: format!("{PROBE_DIR_PREFIX}-{harness}-{now_unix}"),
+        sentinel: format!("{PROBE_SENTINEL_PREFIX}-{harness}-{now_unix}-{entropy:09}"),
+    }
+}
+
+/// The self-probe prompt. Asks for ONE artifact carrying the sentinel minted for this probe.
+fn harness_probe_prompt(sentinel: &str) -> String {
+    format!(
+        "Create a file named `probe.txt` in your current working directory whose contents are \
+         exactly this line:\n\n{sentinel}\n\n\
+         Do nothing else. Do not explain, and do not ask a question — write the file."
+    )
+}
+
+/// Run ONE self-probe turn and decide it on the ARTIFACT.
+///
+/// A positive control, not a liveness check, and the distinction is the entire reason this exists. A
+/// harness whose account is exhausted ends its turn `completed`, exits 0, and returns a perfectly
+/// non-empty message explaining that you should upgrade your plan — so exit status, turn state and
+/// response length are ALL green for exactly the harness we most need to catch. The sentinel is the only
+/// signal that goes red, because a harness that cannot work cannot produce it.
+///
+/// The probe runs under the same sandbox policy as a real job. Probing an unsandboxed path while jobs
+/// run sandboxed would verify a path no paid job ever takes.
+///
+/// An `Err` carries both an operator-facing reason and the fault to record. Failures that ARE typed
+/// go through [`harness_fault_for`], the same classifier a real job's failure uses, so a probe against
+/// an `acp`-less binary marks the harness INCAPABLE and stops being probed at all rather than
+/// re-asking a settled question every few hours.
+async fn run_harness_probe(
+    argv: &[String],
+    sandbox: &SandboxPolicy,
+    identity: &DeliveryAgentIdentity,
+    workdir: &std::path::Path,
+    sentinel: &str,
+) -> Result<(), (String, Fault)> {
+    seller_git::init_empty_delivery_workdir_off_runtime(workdir.to_path_buf(), identity.clone())
+        .await
+        .map_err(|error| {
+            // Our own filesystem, not the harness: record nothing against it, but the probe still
+            // did not answer, so re-arm the window rather than restoring on a non-answer.
+            (
+                format!("probe workdir init failed ({error})"),
+                Fault::Unproven,
+            )
+        })?;
+
+    if let Err(error) = run_agent_job(
+        argv,
+        sandbox,
+        &harness_probe_prompt(sentinel),
+        workdir,
+        identity,
+        HARNESS_PROBE_TIMEOUT,
+    )
+    .await
+    {
+        let fault = harness_fault_for(&error).unwrap_or(Fault::Unproven);
+        return Err((format!("probe turn failed ({error})"), fault));
+    }
+
+    // The turn "succeeded" — now ask the only question that separates a working harness from an
+    // exhausted one: is the sentinel actually here?
+    if probe_sentinel_present(workdir, sentinel) {
+        Ok(())
+    } else {
+        Err((
+            format!(
+                "probe turn reported success but produced no artifact carrying {sentinel} — a completed \
+                 turn is not delivered work"
+            ),
+            Fault::Unproven,
+        ))
+    }
+}
+
+/// Whether any file the harness left in `workdir` carries the probe sentinel.
+///
+/// Content, not filename: a harness that wrote the sentinel somewhere sensible has demonstrated the
+/// capability being tested, and failing it for choosing a different filename would report a working
+/// harness as broken. `.git` is skipped — the workdir is a fresh repo and its own metadata is ours.
+///
+/// **The workdir's own path is subtracted from the content before matching.** A harness that echoes
+/// its cwd has demonstrated nothing about the task, so a sentinel reachable only through that echo
+/// must not count. [`mint_probe_identity`] already keeps the sentinel out of the path, which is the
+/// real fix; this is the belt to that braces, so a future caller that reintroduces the leak cannot
+/// silently turn a dead harness into a serving one.
+fn probe_sentinel_present(workdir: &std::path::Path, sentinel: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(workdir) else {
+        return false;
+    };
+    let path_text = workdir.to_string_lossy().to_string();
+    entries.flatten().any(|entry| {
+        if entry.file_name() == ".git" {
+            return false;
+        }
+        std::fs::read_to_string(entry.path())
+            .map(|content| content.replace(&path_text, "").contains(sentinel))
+            .unwrap_or(false)
+    })
 }
 
 /// How long boot waits for the relay connection and the NIP-42 challenge.
@@ -761,13 +1125,25 @@ pub struct SellerNodeRunner {
     /// Outcome of the boot NIP-42 handshake, which seeds the run loop's view of whether the current
     /// socket is authenticated. `NoChallenge` is not authentication.
     boot_auth: AuthWait,
-    /// The harnesses this node can run, resolved once at boot. Every claim decision, every
-    /// advertisement, and every dispatch reads THIS — never the config — so what the node
-    /// advertises is what it verified it can launch.
-    agents: AgentRegistry,
+    /// The harnesses this node is serving with. Resolved once at boot, then narrowed at RUNTIME as
+    /// harnesses fail: every claim decision, every advertisement, and every dispatch reads THIS —
+    /// never the config, and never the boot registry directly — so what the node advertises is what
+    /// it still believes it can deliver with, not merely what it once launched.
+    ///
+    /// Behind an `Arc` because execution runs off the loop: the task that discovers a harness is
+    /// broken is not the task that publishes the next advertisement. See [`LiveRoster`].
+    agents: Arc<LiveRoster>,
+    /// Homogeneous execution-slot admission (reserve-at-claim). Behind an `Arc` so it is shared with
+    /// the off-loop execution tasks; see [`SlotGate`].
+    slots: Arc<SlotGate>,
     /// The live buzz persona, held for the node's lifetime so presence stays up (see
     /// [`start_buzz_or_degrade`]). `None` when `[buzz]` is absent — or when the bring-up degraded.
-    buzz: Option<buzz::BuzzHandle>,
+    ///
+    /// Behind a `Mutex` because the clean-exit path must TAKE the handle:
+    /// [`buzz::BuzzHandle::shutdown`] consumes it to join the presence task, while the loop holds
+    /// `Arc<Self>` (execution runs off the loop), so there is no owned `self` to move out of and a
+    /// borrow will not do. The lock is never held across an await.
+    buzz: Mutex<Option<buzz::BuzzHandle>>,
 }
 
 /// What the bounded bring-up did. The arms are named rather than collapsed into an `Option` because
@@ -925,8 +1301,10 @@ impl SellerNodeRunner {
         let node = SellerNode::open(home).await?;
 
         // Resolve the harness registry BEFORE anything goes on the wire: a node that cannot launch
-        // a single harness must refuse to boot rather than claim work it can never run.
-        let agents = boot_agent_registry(node.home())?;
+        // a single harness must refuse to boot rather than claim work it can never run. Boot can
+        // only verify LAUNCHABILITY, so the resolved set becomes the live roster's starting point
+        // and narrows from there as harnesses prove they cannot deliver.
+        let agents = Arc::new(LiveRoster::new(boot_agent_registry(node.home())?));
 
         // Reconcile durable state before serving anything live: expire stale outbox rows, report the
         // non-terminal jobs that resume. Reconcile must NOT release parked claims (invariant 5).
@@ -983,6 +1361,26 @@ impl SellerNodeRunner {
 
         let publisher = RelayPublisher::new(node.signer().clone(), client.clone(), &relay_url);
 
+        // Execution-slot admission from config: `slots` (default 1 = serial) and the claim-lapse
+        // timeout (default when unset). A node with no `[seller]` block never claims, so its slot
+        // count is immaterial — default to serial.
+        let (capacity, lapse_secs) = node
+            .home()
+            .config
+            .seller
+            .as_ref()
+            .map(|s| (s.slots, s.claim_award_timeout_secs))
+            .unwrap_or((1, None));
+        let slots = Arc::new(SlotGate::new(
+            capacity,
+            Duration::from_secs(lapse_secs.unwrap_or(DEFAULT_CLAIM_AWARD_TIMEOUT_SECS)),
+        ));
+        eprintln!(
+            "seller node execution slots: {} (claim-lapse timeout {}s)",
+            capacity.max(1),
+            lapse_secs.unwrap_or(DEFAULT_CLAIM_AWARD_TIMEOUT_SECS)
+        );
+
         // The persona comes up LAST, once the marketplace surface is authenticated and ready: buzz is
         // discovery context, so it may never sit in front of the money path's connect.
         let buzz = start_buzz_or_degrade(&node).await;
@@ -995,13 +1393,23 @@ impl SellerNodeRunner {
             seller_pubkey,
             boot_auth,
             agents,
-            buzz,
+            slots,
+            buzz: Mutex::new(buzz),
         })
     }
 
     /// The seller public key (hex).
     pub fn seller_pubkey(&self) -> String {
         self.seller_pubkey.to_hex()
+    }
+
+    /// Whether a live persona is held — the single reader of that fact, so the signal-handler
+    /// decision and the clean-exit clear cannot disagree about it.
+    ///
+    /// A poisoned lock reads as NO persona: that installs no signal handlers and leaves presence to
+    /// expire on the relay's TTL, which is the documented degrade path rather than a panic at boot.
+    fn persona_live(&self) -> bool {
+        self.buzz.lock().map(|slot| slot.is_some()).unwrap_or(false)
     }
 
     /// Subscribe (or re-subscribe) the offer REQ. `open_pool` false forces the targeted-only shape —
@@ -1105,6 +1513,22 @@ impl SellerNodeRunner {
     /// no own heartbeat has round-tripped within the stall threshold), with #162 bounded recovery
     /// retries.
     pub async fn run(self) -> Result<(), NodeError> {
+        // Consume the runner into an `Arc` so each awarded job's execution runs as its own task (see
+        // [`SlotGate`]) while this loop stays responsive to new offers, awards, and payments — the
+        // loop never runs a job inline, which is the multi-slot change.
+        //
+        // Jobs run as `spawn_local` tasks under a LocalSet, NOT `tokio::spawn`: `execute_job` holds
+        // `&self` (node store and friends, not `Sync`) across awaits, so its future is `!Send` and
+        // cannot cross threads. A LocalSet runs the jobs cooperatively on THIS thread, interleaving
+        // with the loop at every await. That is the right model here: execution is I/O-bound (it
+        // awaits the agent subprocess over ACP — the driver's waits genuinely yield, issue #223), so
+        // one thread suffices, and it keeps the nostr client and signer on their original runtime —
+        // no cross-runtime client calls.
+        let local = tokio::task::LocalSet::new();
+        local.run_until(Arc::new(self).run_loop()).await
+    }
+
+    async fn run_loop(self: Arc<Self>) -> Result<(), NodeError> {
         // Heartbeat + relay-stall watchdog config. Disabled ⇒ no heartbeat publish and the watchdog
         // branch is inert (the loop only waits on the drain tick + relay stream).
         let hb = &self.node.home().config.seller_heartbeat;
@@ -1154,14 +1578,32 @@ impl SellerNodeRunner {
         // (deterministic snapshot + deliver_and_enqueue dedup). Runs once at boot, before the loop.
         match self.node.store().resumable_jobs() {
             Ok(jobs) => {
+                let mut resumable = Vec::new();
                 for (job_id, state) in jobs {
                     if should_resume_execution(state) {
                         eprintln!(
                             "seller node resume: re-driving execution for job_id={job_id} (state={state:?})"
                         );
-                        self.execute_job(&job_id).await;
+                        resumable.push(job_id);
                     }
                 }
+                if !resumable.is_empty() {
+                    // The count WITH its denominator: a restart that caught more jobs than `slots`
+                    // runs them in waves, and an operator seeing only the count cannot tell whether
+                    // that is happening. While the backlog drains the node also stops claiming new
+                    // offers (no free permit ⇒ `SlotsBusy`), which is the intended back-pressure.
+                    eprintln!(
+                        "seller node resume: {} job(s) to re-drive, bounded to {} execution slot(s)",
+                        resumable.len(),
+                        self.slots.capacity
+                    );
+                }
+                // Resume off the loop, each holding a real permit so a restart honors `slots`.
+                let runner = Arc::clone(&self);
+                spawn_bounded_resumes(Arc::clone(&self.slots), resumable, move |job_id, slot| {
+                    let runner = Arc::clone(&runner);
+                    async move { runner.execute_job(&job_id, slot).await }
+                });
             }
             Err(error) => {
                 eprintln!("seller node resume: resumable_jobs read failed (continuing): {error}")
@@ -1210,7 +1652,7 @@ impl SellerNodeRunner {
         let mut stalled_since_recovery = false;
         let mut manual_recovery_succeeded = false;
         // Registered only for a daemon carrying a live persona — see [`ShutdownSignals`].
-        let mut shutdown = ShutdownSignals::install(self.buzz.is_some());
+        let mut shutdown = ShutdownSignals::install(self.persona_live());
         loop {
             tokio::select! {
                 // A stop request exists only when a persona is live: end the loop so presence is
@@ -1222,6 +1664,8 @@ impl SellerNodeRunner {
                     break;
                 }
                 _ = drain_tick.tick() => {
+                    self.sweep_lapsed_claims();
+                    self.start_due_harness_probes();
                     self.drain().await;
                     continue;
                 }
@@ -1556,7 +2000,10 @@ impl SellerNodeRunner {
         }
         // Clean exit: clear presence NOW rather than leaving the persona advertised as online until
         // the relay's TTL expires it. A crash still falls back to that TTL — this is the clean path.
-        if let Some(buzz) = self.buzz {
+        // Taken in one statement so the guard is released before the await below — the lock never
+        // spans a suspension point, and a second exit path finds `None` rather than a live handle.
+        let persona = self.buzz.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(buzz) = persona {
             buzz.shutdown().await;
             eprintln!("seller node buzz persona cleared (clean shutdown)");
         }
@@ -1671,11 +2118,28 @@ impl SellerNodeRunner {
         let Some(seller) = self.node.home().config.seller.clone() else {
             return;
         };
-        let job_in_flight = self.node.store().health().map(|h| h.jobs > 0).unwrap_or(false);
+        // A LIVE count of jobs occupying execution capacity — never `health().jobs`, which counts
+        // every row ever written and so never returns to zero (#313).
+        let in_flight = match self.node.store().jobs_in_flight() {
+            Ok(count) => count,
+            Err(error) => {
+                // Fail toward AVAILABLE, as this path always has, but say so: a silent read failure
+                // that parked the seat would be the same invisible-refusal shape as #313 itself.
+                eprintln!(
+                    "seller node heartbeat: in-flight count unavailable ({error}); \
+                     advertising as free this tick"
+                );
+                0
+            }
+        };
+        // ONE roster read for both wire signals: a seat that has dropped every harness advertises
+        // `accepting=n`, so it stops attracting work instead of looking open and declining later.
+        let roster = self.agents.advertisement();
         let draft = crate::heartbeat::heartbeat_for_state(
-            job_in_flight,
+            in_flight,
+            roster.serving,
             seller.rate_sats,
-            self.agents.advertised(),
+            roster.names,
         )
         .to_event_draft();
         match self.node.signer().sign(draft, now_unix()).await {
@@ -1788,6 +2252,25 @@ impl SellerNodeRunner {
     /// The claim-time creq is authored here from the seller's OWN config (accepted mints + rate) and
     /// journaled via `claim_and_enqueue`, so delivery later signs the STORED creq's hash (invariant
     /// 8) and the restart redeem-guard reads its mints (Fix Q) — never a rebuild from live config.
+    /// Reclaim execution slots reserved by claims that have sat unawarded past the lapse timeout,
+    /// releasing the durable claim to match. Runs on the drain tick. Without it, reserve-at-claim
+    /// would let a claim a buyer never awards hold its slot for the full (long) publish window —
+    /// permanently shrinking a busy node's capacity. Runs on the event loop, so it never races the
+    /// reserve/take done by `on_offer`/`on_award`.
+    fn sweep_lapsed_claims(&self) {
+        for job_id in self.slots.sweep_lapsed(Instant::now()) {
+            match self.node.store().release_claim(&job_id, now_unix()) {
+                Ok(()) => eprintln!(
+                    "seller node slot reclaimed job_id={job_id}: parked claim lapsed unawarded ({} slot(s) free)",
+                    self.slots.available()
+                ),
+                Err(error) => {
+                    eprintln!("seller node slot reclaim job_id={job_id}: release_claim failed ({error})")
+                }
+            }
+        }
+    }
+
     async fn on_offer(&self, event: &nostr_sdk::Event) {
         let Some(seller) = self.node.home().config.seller.clone() else {
             eprintln!("seller node offer skipped: no [seller] config");
@@ -1896,6 +2379,21 @@ impl SellerNodeRunner {
             &creq,
             &self.agents.advertised(),
         );
+        // Reserve-at-claim: a fully loaded node has no free slot and simply does not claim, which is
+        // how it stays invisible to the market. The gate is consulted only here on the event loop,
+        // never concurrently with itself, so two offers can never both take the last slot.
+        let reserved = self.slots.try_reserve(&job_id);
+        if reserved == Reserve::Full {
+            eprintln!("seller node offer skip id={job_id}: {}", SkipReason::SlotsBusy.reason());
+            return;
+        }
+        // Release a FRESH reservation if the claim does not actually become a new parked claim (dedup
+        // no-op or journal error). An already-parked job id keeps its existing slot untouched.
+        let release_on_no_claim = |runner: &Self| {
+            if reserved == Reserve::Reserved {
+                runner.slots.release(&job_id);
+            }
+        };
         match self.node.store().claim_and_enqueue(
             &job_id,
             &job_id,
@@ -1907,22 +2405,27 @@ impl SellerNodeRunner {
         ) {
             Ok(super::store::Claimed::New) => {
                 eprintln!(
-                    "seller node claimed job_id={job_id} buyer={buyer_pubkey} amount={} deadline={deadline_unix} (awaiting award)",
-                    offer.amount
+                    "seller node claimed job_id={job_id} buyer={buyer_pubkey} amount={} deadline={deadline_unix} slot-reserved (awaiting award; {} slot(s) free)",
+                    offer.amount,
+                    self.slots.available()
                 );
                 // The caller drains after dispatch, publishing the just-enqueued claim.
             }
             Ok(super::store::Claimed::Idempotent) => {
                 eprintln!("seller node offer id={job_id}: already claimed (dedup no-op)");
+                release_on_no_claim(self);
             }
-            Err(error) => eprintln!("seller node claim failed job_id={job_id}: {error}"),
+            Err(error) => {
+                eprintln!("seller node claim failed job_id={job_id}: {error}");
+                release_on_no_claim(self);
+            }
         }
     }
 
     /// Handle one award event: authorize it (author must be the offer's buyer), decide whether it
     /// names OUR claim, and bind or release accordingly. Binding records the award (which moves the
     /// claim → awarded and creates the job row); execution of the awarded job is the next port step.
-    async fn on_award(&self, event: &nostr_sdk::Event) {
+    async fn on_award(self: &Arc<Self>, event: &nostr_sdk::Event) {
         let draft = event_to_draft(event);
         let Some(award) = parse_award(&draft) else {
             return;
@@ -1969,19 +2472,36 @@ impl SellerNodeRunner {
                     .record_award(&event.id.to_hex(), &job_id, &buyer, now_unix())
                 {
                     Ok(super::store::Awarded::New) => {
-                        eprintln!("seller node awarded job_id={job_id} buyer={buyer} — executing");
-                        self.execute_job(&job_id).await;
+                        // Decouple execution from the loop: move the reserved permit into a spawned
+                        // task so the loop keeps servicing offers/awards/payments while the job runs.
+                        // The permit rides the task and releases on drop — covering delivery, every
+                        // fail_job path, and a panic (unwind drops it). `None` only on the restart
+                        // path (permit not in-memory); re-acquiring for resumed jobs is P4.
+                        let slot = self.slots.take_for_execution(&job_id);
+                        eprintln!(
+                            "seller node awarded job_id={job_id} buyer={buyer} — executing (spawned; {} slot(s) free)",
+                            self.slots.available()
+                        );
+                        let runner = Arc::clone(self);
+                        let job = job_id.clone();
+                        tokio::task::spawn_local(async move {
+                            runner.execute_job(&job, slot).await;
+                        });
                     }
                     Ok(super::store::Awarded::Duplicate) => {
                         eprintln!("seller node award dedup job_id={job_id} (already recorded)")
                     }
                     Ok(super::store::Awarded::NoClaim) => {
-                        eprintln!("seller node award job_id={job_id}: no claim to bind")
+                        eprintln!("seller node award job_id={job_id}: no claim to bind");
+                        // No claim to bind ⇒ any slot we reserved for it is orphaned; return it.
+                        self.slots.release(&job_id);
                     }
                     Err(error) => eprintln!("seller node award record failed job_id={job_id}: {error}"),
                 }
             }
             AwardMatch::Release => {
+                // The buyer picked another seller: release the durable claim AND its reserved slot.
+                self.slots.release(&job_id);
                 match self.node.store().release_claim(&job_id, now_unix()) {
                     Ok(()) => eprintln!(
                         "seller node released claim job_id={job_id}: buyer picked another seller's claim"
@@ -1995,6 +2515,78 @@ impl SellerNodeRunner {
         }
     }
 
+    /// Start a self-probe for every dropped harness whose window has passed, each OFF the event loop.
+    ///
+    /// Probes are spawned, never awaited here: a probe runs a whole agent turn, and awaiting one on
+    /// the loop would deafen the node to offers, awards and payments for its duration — the failure
+    /// mode #223 exists to prevent. [`LiveRoster::claim_due_probes`] marks each harness in-flight as
+    /// it hands it over, so this tick firing every few seconds cannot stack probes on one harness.
+    fn start_due_harness_probes(&self) {
+        for harness in self.agents.claim_due_probes(Instant::now()) {
+            let Some(argv) = self.agents.argv(harness) else {
+                // No argv means no harness at that index, which cannot happen for a claimed probe;
+                // release it rather than leaving the mark set forever.
+                self.agents.fault(harness, Fault::Unproven, Instant::now());
+                continue;
+            };
+            let roster = Arc::clone(&self.agents);
+            let sandbox = SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref());
+            let identity = DeliveryAgentIdentity::for_seller(&self.seller_pubkey.to_hex());
+            // Minted per probe, so neither a stale workdir nor a replayed transcript can satisfy one:
+            // the artifact has to be produced by THIS turn. The workdir is named after the NON-SECRET
+            // label — never the sentinel, which the harness must not be able to read off its own cwd.
+            let probe = mint_probe_identity(harness, now_unix() as u64);
+            let workdir = job_workdir(self.node.home(), &probe.dir_label);
+            let sentinel = probe.sentinel;
+            tokio::task::spawn_local(async move {
+                let label = roster
+                    .label(harness)
+                    .unwrap_or_else(|| "<unlabelled>".to_owned());
+                match run_harness_probe(&argv, &sandbox, &identity, &workdir, &sentinel).await {
+                    Ok(()) => {
+                        roster.restore(harness);
+                        eprintln!(
+                            "seller node harness RESTORED {label}: self-probe delivered its sentinel — \
+                             now advertising {:?} of {} resolved",
+                            roster.advertised(),
+                            roster.entry_count()
+                        );
+                    }
+                    Err((reason, fault)) => {
+                        let state = roster.fault(harness, fault, Instant::now());
+                        eprintln!(
+                            "seller node harness probe FAILED {label}: {reason} — {}",
+                            state.reason()
+                        );
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&workdir);
+            });
+        }
+    }
+
+    /// Take a harness out of service after a failure attributed to IT, and say so in one line naming
+    /// both the drop and what would fix it.
+    ///
+    /// `None` is the deliberate no-op: a failure that does not implicate the harness must not narrow
+    /// the roster, or the node inflicts its own outage. Only the sites that can attribute a failure
+    /// call this at all — see [`harness_fault_for`].
+    fn drop_harness(&self, harness: usize, fault: Option<Fault>) {
+        let Some(fault) = fault else {
+            return;
+        };
+        let state = self.agents.fault(harness, fault, Instant::now());
+        let label = self.agents.label(harness).unwrap_or_else(|| "<unlabelled>".to_owned());
+        // The denominator belongs in the line: "1 harness dropped" means nothing without how many
+        // this node had, and a roster that has reached 0 is a node that has gone quiet on the market.
+        eprintln!(
+            "seller node harness DROPPED {label}: {} — now advertising {:?} of {} resolved",
+            state.reason(),
+            self.agents.advertised(),
+            self.agents.entry_count()
+        );
+    }
+
     /// Execute an awarded job end to end: run the agent in a fresh empty-base workdir, snapshot its
     /// output into ONE delivery commit dated at the STORED award time (so a re-created commit after a
     /// restart keeps the same oid — invariant 2), push it under the seller's NIP-98 auth, then bind
@@ -2002,7 +2594,16 @@ impl SellerNodeRunner {
     /// into a co-signature the seller signs through its actor, and journal + enqueue the result event
     /// in one transaction. Every failure path fails the job with a named reason and publishes nothing
     /// partial; the delivery journal is idempotent, so a resumed job never double-publishes.
-    async fn execute_job(&self, job_id: &str) {
+    async fn execute_job(&self, job_id: &str, _slot: Option<OwnedSemaphorePermit>) {
+        // `_slot` is the reserved execution permit, moved in and held for the whole call. It is
+        // released the instant this function returns — on delivery, on any `fail_job*` path, on an
+        // early idempotency return, or on a panic (unwind drops it). This RAII pairing is the single
+        // release site for an executing slot; there is no explicit release to forget. Every caller
+        // supplies one: the award path takes the parked reservation, the restart path acquires a fresh
+        // permit (`SlotGate::acquire_for_resume`). `None` is reachable only where a permit genuinely
+        // does not exist — a second award for a job already executing, whose reservation the first
+        // award removed — and that case early-returns on the idempotency guard below without running.
+        //
         // Idempotency guard: only a job still `awarded`/`executing` runs. A REDUNDANT award (a second
         // award event with a different award_id for a job already delivered/paid — seen live in the
         // smoke) or any re-drive must NOT re-run the agent: a duplicate execute burns operator compute
@@ -2068,7 +2669,7 @@ impl SellerNodeRunner {
         // claim gate should already have refused it, and quietly running the wrong agent is the
         // one outcome the registry exists to prevent.
         let requested_agent = offer.requested_agent.clone();
-        let Some(agent) = self.agents.dispatch(requested_agent.as_deref()) else {
+        let Some(selected) = self.agents.dispatch(requested_agent.as_deref()) else {
             eprintln!(
                 "seller node execute fail job_id={job_id}: requested agent {:?} is not available on \
                  this node (never substituted)",
@@ -2077,8 +2678,12 @@ impl SellerNodeRunner {
             self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
             return;
         };
-        let agent_command = agent.argv.clone();
-        let agent_label = agent.name.clone();
+        let agent_command = selected.agent.argv.clone();
+        let agent_label = selected.agent.name.clone();
+        // The registry index travels with the run: reporting a fault happens long after dispatch, and
+        // a name would not do — the unlabelled `--agent-argv` hatch has none, and it is exactly as
+        // capable of being a black hole as a named harness.
+        let harness = selected.index;
         // Journal WHICH harness ran it before the run starts, so the row exists even if the job
         // then fails — the journal answers "what ran this", not only "what finished it".
         if let Some(label) = agent_label.as_deref()
@@ -2109,9 +2714,11 @@ impl SellerNodeRunner {
         }
 
         // Run the agent under the job's remaining deadline, retrying a transient error while the
-        // deadline has room. The agent edits files in `workdir`; the node owns commit + push.
+        // deadline has room. The agent edits files in `workdir`; the node owns commit + push. The
+        // configured `[sandbox]` policy launches the command (pass-through when absent).
         let deadline = offer.deadline_unix.max(0) as u64;
         let prompt = compose_agent_prompt(&offer.task, &seller.git_remote, None);
+        let sandbox = SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref());
         let run_started = std::time::Instant::now();
         let run_result = run_agent_with_retry(
             deadline,
@@ -2119,7 +2726,7 @@ impl SellerNodeRunner {
             || now_unix() as u64,
             |_attempt| {
                 let job_timeout = unified_job_timeout(deadline, now_unix() as u64);
-                run_agent_job(&agent_command, &prompt, &workdir, &identity, job_timeout)
+                run_agent_job(&agent_command, &sandbox, &prompt, &workdir, &identity, job_timeout)
             },
         )
         .await;
@@ -2128,6 +2735,7 @@ impl SellerNodeRunner {
             Ok(usage) => usage,
             Err(error) => {
                 eprintln!("seller node execute fail job_id={job_id}: agent run failed ({error})");
+                self.drop_harness(harness, harness_fault_for(&error));
                 self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
                 return;
             }
@@ -2148,6 +2756,10 @@ impl SellerNodeRunner {
         .await
         {
             eprintln!("seller node execute fail job_id={job_id}: delivery snapshot refused ({error})");
+            // Harness-attributable: the agent returned success having left nothing to deliver. This
+            // is the site that fires on a quota-dead harness — its turn "completes", so the agent-run
+            // arm above sees no error at all — which is why the trigger cannot live at one site.
+            self.drop_harness(harness, Some(Fault::Unproven));
             self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
             return;
         }
@@ -2523,6 +3135,339 @@ impl SellerNodeRunner {
 }
 
 #[cfg(test)]
+mod slot_gate_tests {
+    //! The execution-slot admission algebra — reserve-at-claim, release on every terminal path,
+    //! and the lapse sweep. These drive [`SlotGate`] directly (no relay, no agent), so they are the
+    //! deterministic core of the multi-slot correctness claim: the acquire/release PAIRING is what
+    //! keeps a busy node from silently shrinking its own capacity. Each `available()` assertion is a
+    //! revert-red tripwire — neuter a release path and the matching assertion fails.
+    use super::{spawn_bounded_resumes, Reserve, SlotGate};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const LONG: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn one_slot_is_serial_admits_one_then_blocks() {
+        // slots=1 reproduces today's behavior exactly: one claim admitted, the next refused as
+        // SlotsBusy — so a single-slot node never parks a second concurrent claim.
+        let gate = SlotGate::new(1, LONG);
+        assert_eq!(gate.available(), 1);
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        assert_eq!(gate.available(), 0);
+        assert_eq!(gate.try_reserve("b"), Reserve::Full, "second claim must be refused at slots=1");
+    }
+
+    #[test]
+    fn zero_config_clamps_to_serial() {
+        // A misconfigured `slots = 0` is clamped to serial rather than muting the node entirely.
+        let gate = SlotGate::new(0, LONG);
+        assert_eq!(gate.available(), 1);
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        assert_eq!(gate.try_reserve("b"), Reserve::Full);
+    }
+
+    #[test]
+    fn two_slots_admit_two_then_block_the_third() {
+        // slots=2: two concurrent claims parked; a third arriving while both are held is NOT
+        // claimed. This is the gate half of the "3rd offer while both busy is not claimed" property
+        // (the on-the-wire half is the live capstone, P5).
+        let gate = SlotGate::new(2, LONG);
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        assert_eq!(gate.try_reserve("b"), Reserve::Reserved);
+        assert_eq!(gate.available(), 0);
+        assert_eq!(
+            gate.try_reserve("c"),
+            Reserve::Full,
+            "third claim must be refused while both slots busy"
+        );
+    }
+
+    #[test]
+    fn release_returns_the_slot() {
+        // The award-elsewhere / dedup-no-op path: releasing a reserved slot returns capacity.
+        let gate = SlotGate::new(1, LONG);
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        gate.release("a");
+        assert_eq!(gate.available(), 1);
+        assert_eq!(
+            gate.try_reserve("b"),
+            Reserve::Reserved,
+            "a released slot must admit the next claim"
+        );
+    }
+
+    /// #251 — a restart that caught K jobs mid-flight must still honor `slots`.
+    ///
+    /// Four resumed jobs, two slots. Peak concurrency must be 2, and all four must still run: the
+    /// excess queues, it is never dropped, because under award-is-payment abandoning a resumed job
+    /// abandons work a buyer already committed sats to.
+    ///
+    /// ⚠ RED ON REVERT, and this is the pre-fix code exactly: delete the `acquire_for_resume().await`
+    /// from `spawn_bounded_resumes` and pass `None` instead. All four then run at once and `peak`
+    /// reaches 4 — `left: 4, right: 2`. Verified, not assumed.
+    ///
+    /// The execution step is stubbed on purpose. The bound is a property of the FAN-OUT, not of what a
+    /// job does, and stubbing is what makes peak concurrency observable at all — a real `execute_job`
+    /// would need a relay, an agent and a store, none of which the bound depends on. What this test
+    /// does NOT cover: that the production loop passes `execute_job` as its step. That is one call
+    /// site, checked by the compiler and by reading, and it is the only gap.
+    #[tokio::test]
+    async fn a_restart_resumes_more_jobs_than_slots_without_exceeding_capacity() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let gate = Arc::new(SlotGate::new(2, LONG));
+        let live = Rc::new(Cell::new(0usize));
+        let peak = Rc::new(Cell::new(0usize));
+        let done = Rc::new(Cell::new(0usize));
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (live_t, peak_t, done_t) =
+                    (Rc::clone(&live), Rc::clone(&peak), Rc::clone(&done));
+                spawn_bounded_resumes(
+                    Arc::clone(&gate),
+                    vec!["a".into(), "b".into(), "c".into(), "d".into()],
+                    move |_job_id, slot| {
+                        let (live, peak, done) =
+                            (Rc::clone(&live_t), Rc::clone(&peak_t), Rc::clone(&done_t));
+                        async move {
+                            // Held for the whole stub execution, exactly as `execute_job` holds it.
+                            let _slot = slot;
+                            live.set(live.get() + 1);
+                            peak.set(peak.get().max(live.get()));
+                            // Yield across an await so admitted tasks genuinely overlap: a bound that
+                            // held only because nothing ever ran concurrently would prove nothing.
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            live.set(live.get() - 1);
+                            done.set(done.get() + 1);
+                        }
+                    },
+                );
+                // Bounded drain rather than a fixed sleep, so a slow box cannot flake this.
+                for _ in 0..200 {
+                    if done.get() == 4 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+
+        assert_eq!(
+            done.get(),
+            4,
+            "every resumed job must run — the excess queues behind a permit, it is never dropped"
+        );
+        assert_eq!(
+            peak.get(),
+            2,
+            "concurrent resumed executions must never exceed the configured slots"
+        );
+        assert_eq!(
+            gate.available(),
+            2,
+            "every permit returns to the pool once the resumed jobs drain"
+        );
+    }
+
+    /// A resumed job's permit is never parked, so the lapse sweep cannot reclaim it mid-execution.
+    ///
+    /// This is the answer to #251's second question — the lapse clock for a re-acquired permit — and it
+    /// is "there isn't one". `reserved_at` bounds a CLAIM waiting to be awarded; a resumed job is
+    /// already awarded and executing, so seeding a fresh `Instant` would start a timer over a state the
+    /// sweep was never meant to measure.
+    #[tokio::test]
+    async fn a_resumed_permit_is_not_parked_so_the_lapse_sweep_cannot_reclaim_it() {
+        let gate = SlotGate::new(1, Duration::from_millis(0));
+        let permit = gate
+            .acquire_for_resume()
+            .await
+            .expect("the gate is never closed, so a permit is always eventually available");
+
+        assert_eq!(gate.available(), 0, "a resumed job holds real capacity");
+        assert!(
+            gate.sweep_lapsed(Instant::now()).is_empty(),
+            "an executing resumed job is not a parked claim and must never be swept"
+        );
+        assert_eq!(gate.available(), 0, "and the sweep must not have freed its permit");
+
+        drop(permit);
+        assert_eq!(gate.available(), 1, "released by the execution ending, like every other slot");
+    }
+
+    /// A queued resume waiter is not starved by incoming claims — the back-pressure #251's fix relies
+    /// on, measured rather than assumed.
+    ///
+    /// The claim path uses `try_acquire` and the resume path `acquire().await`, so "a restarted node
+    /// stops claiming while its backlog drains" holds only if tokio's semaphore is FAIR: a permit
+    /// released while a waiter is queued must go to that waiter, not to a barging `try_acquire`. If it
+    /// barged, resumed jobs could be starved indefinitely by a busy market and the bound would weaken
+    /// to "`slots` per wave".
+    ///
+    /// The discriminating instant is a release with a waiter queued AND the waiter not yet polled.
+    /// Asserting `Full` merely while the permit is still held would prove nothing — that is just "no
+    /// permits available", one state next to the one that matters.
+    #[tokio::test]
+    async fn a_queued_resume_waiter_is_not_starved_by_a_barging_claim() {
+        let gate = Arc::new(SlotGate::new(1, LONG));
+        let held = gate.acquire_for_resume().await.expect("the gate is never closed");
+
+        let waiting = Arc::clone(&gate);
+        let waiter = tokio::spawn(async move { waiting.acquire_for_resume().await.is_some() });
+        tokio::time::sleep(Duration::from_millis(50)).await; // let the waiter reach the queue
+
+        drop(held);
+        assert!(
+            !waiter.is_finished(),
+            "the waiter must still be unpolled, or this is not the contested instant"
+        );
+        assert_eq!(
+            gate.try_reserve("an offer arriving the instant a slot frees"),
+            Reserve::Full,
+            "a released permit belongs to the queued resume, never to a barging claim"
+        );
+
+        assert!(
+            waiter.await.expect("waiter task"),
+            "and the queued resume is the one that gets it"
+        );
+    }
+
+    #[test]
+    fn release_is_idempotent() {
+        let gate = SlotGate::new(1, LONG);
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        gate.release("a");
+        gate.release("a"); // second release is a no-op, not a double-free / capacity inflation
+        assert_eq!(gate.available(), 1);
+    }
+
+    #[test]
+    fn re_seen_offer_does_not_double_reserve() {
+        // A re-seen offer for an already-parked claim must not take a second permit — otherwise a
+        // duplicate offer would leak a slot.
+        let gate = SlotGate::new(1, LONG);
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        assert_eq!(gate.try_reserve("a"), Reserve::AlreadyParked);
+        assert_eq!(gate.available(), 0);
+    }
+
+    #[test]
+    fn taken_permit_holds_capacity_until_dropped() {
+        // Models execution: the award moves the permit out into the job task, which holds it until
+        // the job is terminal. Capacity stays consumed while the permit lives and returns on drop —
+        // this is the RAII release that covers delivery, every fail_job path, and a panic.
+        let gate = SlotGate::new(1, LONG);
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        let permit = gate.take_for_execution("a").expect("a reserved permit to take");
+        assert_eq!(gate.available(), 0, "the executing job still holds its slot");
+        assert_eq!(gate.try_reserve("b"), Reserve::Full, "no free slot while the job runs");
+        drop(permit); // job reaches a terminal outcome (or panics — same drop)
+        assert_eq!(gate.available(), 1, "the slot returns when execution ends");
+        assert_eq!(gate.try_reserve("b"), Reserve::Reserved);
+    }
+
+    #[test]
+    fn take_for_execution_is_none_on_the_restart_path() {
+        // No permit parked (restart: durable store has the job, in-memory map is empty) ⇒ None, and
+        // it does not fabricate capacity.
+        let gate = SlotGate::new(1, LONG);
+        assert!(gate.take_for_execution("never-reserved").is_none());
+        assert_eq!(gate.available(), 1);
+    }
+
+    #[test]
+    fn lapse_sweep_reclaims_expired_and_leaves_fresh() {
+        // A zero lapse window makes every parked claim immediately eligible; the sweep returns its
+        // id (so the caller releases the durable claim) and frees the slot.
+        let expiring = SlotGate::new(2, Duration::ZERO);
+        assert_eq!(expiring.try_reserve("a"), Reserve::Reserved);
+        assert_eq!(expiring.try_reserve("b"), Reserve::Reserved);
+        let mut reclaimed = expiring.sweep_lapsed(Instant::now());
+        reclaimed.sort();
+        assert_eq!(reclaimed, vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(expiring.available(), 2, "lapsed claims return their slots");
+
+        // A long lapse window: a just-reserved claim is not swept.
+        let fresh = SlotGate::new(1, LONG);
+        assert_eq!(fresh.try_reserve("a"), Reserve::Reserved);
+        assert!(fresh.sweep_lapsed(Instant::now()).is_empty(), "a fresh claim must not lapse");
+        assert_eq!(fresh.available(), 0, "the un-lapsed claim keeps its slot");
+    }
+
+    #[test]
+    fn every_release_path_returns_capacity() {
+        // Consolidated revert-red over the three ways a reserved slot is returned: explicit release
+        // (award-elsewhere / dedup), permit-drop (execution terminal / panic), and the lapse sweep.
+        // If any one path stopped returning the permit, the final assertion would fail.
+        let gate = SlotGate::new(1, Duration::ZERO);
+
+        // 1. explicit release
+        assert_eq!(gate.try_reserve("release"), Reserve::Reserved);
+        gate.release("release");
+        assert_eq!(gate.available(), 1);
+
+        // 2. permit drop (models a job finishing or panicking)
+        assert_eq!(gate.try_reserve("execute"), Reserve::Reserved);
+        let permit = gate.take_for_execution("execute").expect("permit");
+        drop(permit);
+        assert_eq!(gate.available(), 1);
+
+        // 3. lapse sweep
+        assert_eq!(gate.try_reserve("lapse"), Reserve::Reserved);
+        let _ = gate.sweep_lapsed(Instant::now());
+        assert_eq!(gate.available(), 1, "all three release paths must return the slot");
+    }
+
+    #[test]
+    fn double_release_cannot_exceed_capacity() {
+        // Double-release is worse than a leak: a leak under-counts (safe-ish), but inflating the
+        // count would over-commit and take jobs the node cannot deliver — where money exposure
+        // enters. The permit lives in the parked map XOR in the execution task (an atomic
+        // remove-and-return), and it is an `OwnedSemaphorePermit` released exactly once on drop; the
+        // gate NEVER calls `add_permits`. So a stray release can only ever be a no-op, and the free
+        // count can never exceed the configured capacity.
+        let gate = SlotGate::new(1, LONG);
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        // Award moves the permit out into execution.
+        let permit = gate.take_for_execution("a").expect("permit");
+        // A stray release for the executing job id must NOT fabricate a slot (nothing parked).
+        gate.release("a");
+        assert_eq!(gate.available(), 0, "releasing an executing job's id must not free a slot");
+        // The job ends: exactly one slot returns.
+        drop(permit);
+        assert_eq!(gate.available(), 1);
+        // A second release after the drop is still a no-op — the count cannot exceed capacity.
+        gate.release("a");
+        assert_eq!(gate.available(), 1);
+        assert!(gate.available() <= 1, "live slot count can never exceed configured capacity");
+    }
+
+    #[test]
+    fn awarded_job_is_out_of_lapse_sweep_reach() {
+        // The lapse timer keys off "no award yet": it only sees the parked map. An award moves the
+        // permit into the execution task (removing it from parked), so an awarded job is out of the
+        // sweep's reach entirely — ownership passes from the lapse-timer to the execution lifecycle.
+        // This is why a slow-but-successful delivery can never have its slot freed out from under it,
+        // and why there is no double-count: the sweep and the award both run on the single event
+        // loop, so they never interleave, and the permit is never both sweepable and executing.
+        let gate = SlotGate::new(1, Duration::ZERO); // zero window ⇒ everything parked is eligible
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        let permit = gate.take_for_execution("a").expect("permit");
+        assert!(
+            gate.sweep_lapsed(Instant::now()).is_empty(),
+            "an awarded (executing) job must never be swept, even past the timeout"
+        );
+        assert_eq!(gate.available(), 0, "the executing job keeps its slot despite the elapsed timer");
+        drop(permit);
+        assert_eq!(gate.available(), 1);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2540,15 +3485,19 @@ mod tests {
             claim_open_pool,
             offer_backfill_secs: 0,
             contribution_enabled: true,
+            slots: 1,
+            claim_award_timeout_secs: None,
         }
     }
 
     /// The registry an existing single-preset (`agent = "claude"`) seller resolves to.
-    fn claude_only() -> AgentRegistry {
-        AgentRegistry::new(vec![crate::seller_agents::RegisteredAgent {
-            name: Some("claude".to_owned()),
-            argv: vec!["claude-agent-acp".to_owned()],
-        }])
+    fn claude_only() -> LiveRoster {
+        LiveRoster::new(AgentRegistry::new(vec![
+            crate::seller_agents::RegisteredAgent {
+                name: Some("claude".to_owned()),
+                argv: vec!["claude-agent-acp".to_owned()],
+            },
+        ]))
     }
 
     fn offer(amount: u64, targeted_to: Option<&str>, deadline_unix: u64) -> ParsedOffer {
@@ -2666,7 +3615,7 @@ mod tests {
 
         // The same offer at a node that DOES run codex is claimed — the gate is the harness, not
         // the presence of a request.
-        let both = AgentRegistry::new(vec![
+        let both = LiveRoster::new(AgentRegistry::new(vec![
             crate::seller_agents::RegisteredAgent {
                 name: Some("claude".to_owned()),
                 argv: vec!["claude-agent-acp".to_owned()],
@@ -2675,7 +3624,7 @@ mod tests {
                 name: Some("codex".to_owned()),
                 argv: vec!["codex-acp".to_owned()],
             },
-        ]);
+        ]));
         assert_eq!(
             classify_offer(&wants_codex, &seller_cfg(2, false), &both, SELLER, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 }
@@ -2686,6 +3635,207 @@ mod tests {
             classify_offer(&offer(5, Some(SELLER), NOW + 600), &seller_cfg(2, false), &claude_only(), SELLER, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 }
         );
+    }
+
+    // TOOTH (#254) — a harness that FAILED stops the node claiming for it, not merely fails the next
+    // job. Boot verified the harness launches; launching is not delivering, and a node that keeps
+    // claiming for a harness it cannot deliver with is a black hole for awards — under
+    // award-is-payment the buyer's sats are committed before the failure is visible.
+    // Bite: drop the availability filter from `LiveRoster::dispatch` and the SAME offer that was
+    // refused below is claimed again, by a node that just proved it cannot serve it.
+    #[test]
+    fn a_dropped_harness_stops_the_node_claiming_for_it() {
+        let roster = LiveRoster::new(AgentRegistry::new(vec![
+            crate::seller_agents::RegisteredAgent {
+                name: Some("claude".to_owned()),
+                argv: vec!["claude-agent-acp".to_owned()],
+            },
+        ]));
+        let untargeted = offer(5, Some(SELLER), NOW + 600);
+
+        // Precondition — the SAME offer is claimable before the drop, so the assertion below cannot
+        // pass for some unrelated reason.
+        assert_eq!(
+            classify_offer(&untargeted, &seller_cfg(2, false), &roster, SELLER, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "the offer must be claimable first, or the drop below proves nothing"
+        );
+
+        roster.fault(0, Fault::Unproven, std::time::Instant::now());
+
+        assert_eq!(
+            classify_offer(&untargeted, &seller_cfg(2, false), &roster, SELLER, NOW),
+            ClaimDecision::Skip(SkipReason::AgentUnavailable),
+            "a node whose only harness is dropped must stop claiming"
+        );
+        assert!(
+            roster.advertised().is_empty(),
+            "and it must stop advertising in the same motion — the wire and the dispatch table are \
+             one set, so a buyer can never read a harness this node would refuse"
+        );
+    }
+
+    // TOOTH (#254) — the self-probe is decided by the ARTIFACT, and nothing else it could be decided
+    // by would work. A harness whose account is exhausted ends its turn `completed`, exits 0, and
+    // returns a non-empty message telling you to upgrade your plan: exit status, turn state and
+    // response length are all GREEN for precisely the harness this exists to catch. Only a sentinel it
+    // cannot produce goes red.
+    // Bite: decide the probe on turn completion, or on the workdir merely being non-empty, and the
+    // billing-notice case below passes — restoring a harness that cannot do any work to the roster,
+    // where it will rank as the FASTEST seat on it.
+    #[test]
+    fn the_self_probe_is_decided_by_the_sentinel_not_by_a_completed_turn() {
+        // Deliberately NOT sharing the sentinel prefix: a grep for it must return the ONE definition.
+        let dir = std::env::temp_dir().join(format!("mobee-selfprobe-td-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("probe dir");
+        // Minted through the SAME function the probe path uses, so this test cannot pass against a
+        // sentinel shape the node would never actually produce.
+        let sentinel = mint_probe_identity(0, 1_785_400_000).sentinel;
+
+        // Nothing written at all — a turn that completed having done nothing.
+        assert!(
+            !probe_sentinel_present(&dir, &sentinel),
+            "an empty workdir is not a delivered artifact"
+        );
+
+        // The quota-dead case: a completed turn whose ONLY output is a billing notice. Non-empty,
+        // plausible, and worthless.
+        std::fs::write(dir.join("probe.txt"), "Upgrade your plan to continue")
+            .expect("write notice");
+        assert!(
+            !probe_sentinel_present(&dir, &sentinel),
+            "a non-empty file lacking the sentinel must NOT pass — this is the whole failure mode"
+        );
+
+        // The working case. Content, not filename: a harness that put the sentinel somewhere sensible
+        // has shown the capability, and failing it over a filename would report it broken.
+        std::fs::write(dir.join("notes.md"), format!("done: {sentinel}\n")).expect("write sentinel");
+        assert!(
+            probe_sentinel_present(&dir, &sentinel),
+            "the sentinel present in any file is the capability being tested"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A probe sentinel must never be confusable with ecash. `token` in this crate means Cashu money
+    // (`payload.to_token()`, `token_hash`, "already-spent token" — same file), so the sentinel carries
+    // its own prefix from ONE definition shared by the mint site and the readback.
+    // Bite: reintroduce a second literal for the prefix and the mint and the readback can drift apart
+    // silently — which is why the assertion runs through the shared function.
+    #[test]
+    fn a_probe_sentinel_is_minted_from_one_definition_and_is_not_ecash() {
+        let a = mint_probe_identity(0, 1_785_400_000);
+        let b = mint_probe_identity(0, 1_785_400_001);
+        let other_harness = mint_probe_identity(1, 1_785_400_000);
+
+        assert!(a.sentinel.starts_with(PROBE_SENTINEL_PREFIX), "{}", a.sentinel);
+        assert_ne!(
+            a.sentinel, b.sentinel,
+            "a sentinel is per-probe, so a replay cannot satisfy a later one"
+        );
+        assert_ne!(a.sentinel, other_harness.sentinel, "and it is per-harness");
+
+        // The readback accepts exactly what the mint produced — one definition, both ends.
+        let dir = std::env::temp_dir().join(format!("mobee-sn-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("probe.txt"), &a.sentinel).expect("write");
+        assert!(probe_sentinel_present(&dir, &a.sentinel));
+        assert!(
+            !probe_sentinel_present(&dir, &b.sentinel),
+            "a DIFFERENT probe's sentinel must not be satisfied by this artifact"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // TOOTH (#254, review finding R1) — a harness must not be able to pass its probe by ECHOING ITS
+    // OWN CWD. The workdir path is the one string a harness always has without doing any work, so if
+    // the sentinel lives in that path, an error trace or a log header that mentions the cwd satisfies
+    // the probe and a dead harness is restored to the roster as "serving".
+    // ⇒ A discriminator must not appear in the environment it discriminates.
+    // Bite: key the workdir off the sentinel again (`job_workdir(home, &sentinel)`) and the first
+    // assertion below still holds, but the second fails — a file containing nothing but the cwd path
+    // passes a probe the harness did no work for.
+    #[test]
+    fn a_harness_cannot_pass_its_probe_by_echoing_its_own_workdir_path() {
+        let probe = mint_probe_identity(3, 1_785_400_000);
+
+        // ① The mint keeps them disjoint: no workdir named after the label can contain the sentinel.
+        assert!(
+            !probe.dir_label.contains(&probe.sentinel),
+            "the workdir label must never carry the sentinel: label={} sentinel={}",
+            probe.dir_label,
+            probe.sentinel
+        );
+
+        // ② And the readback refuses a path echo even when the path DOES carry the sentinel — the
+        // belt to ①'s braces, so a future caller reintroducing the leak cannot revive a dead harness.
+        let leaky = std::env::temp_dir()
+            .join(format!("mobee-leak-{}-{}", std::process::id(), probe.sentinel));
+        std::fs::create_dir_all(&leaky).expect("leaky dir");
+        std::fs::write(
+            leaky.join("trace.log"),
+            format!("error: could not write to {}\n", leaky.display()),
+        )
+        .expect("write trace");
+        assert!(
+            !probe_sentinel_present(&leaky, &probe.sentinel),
+            "a file containing only the cwd path must NOT pass — the harness did no task work"
+        );
+
+        // ③ Positive control: the SAME leaky workdir passes once the harness actually writes it.
+        std::fs::write(leaky.join("probe.txt"), &probe.sentinel).expect("write sentinel");
+        assert!(
+            probe_sentinel_present(&leaky, &probe.sentinel),
+            "real work in the same workdir must still pass, or ② is just breaking the predicate"
+        );
+
+        let _ = std::fs::remove_dir_all(&leaky);
+    }
+
+    // TOOTH (#254) — only failures ATTRIBUTABLE to the harness narrow the roster. Attribution, not
+    // severity, is the test: an execution failure caused by a remote, our own signer, or our own
+    // policy refusal says nothing about whether the harness works.
+    // Bite: map every `ExecError` to a drop and a node whose git remote is briefly unreachable, or
+    // whose delivery oid we ourselves declined to type, takes its own harness out of service — an
+    // outage the node inflicts on itself, and one that looks exactly like a real harness failure.
+    #[test]
+    fn only_harness_attributable_failures_narrow_the_roster() {
+        // OUR refusal is never the harness's fault.
+        assert_eq!(
+            harness_fault_for(&ExecError::Policy("un-typeable delivery oid".into())),
+            None,
+            "a policy WE refused must never drop the harness"
+        );
+
+        // A missing build feature is structural and NAMED — no probe can supply it.
+        assert_eq!(
+            harness_fault_for(&ExecError::AcpRequired),
+            Some(Fault::Incapable(MissingCapability::AcpFeature))
+        );
+
+        // An untyped agent failure is deliberately UNPROVEN: a timeout and a provider that will
+        // never resolve arrive here identically, so the probe decides rather than this classifier.
+        assert_eq!(
+            harness_fault_for(&ExecError::Agent("turn ended non-terminal".into())),
+            Some(Fault::Unproven)
+        );
+
+        // A config barrier is structural too, but its remedy is DERIVED — reporting "rebuild" for a
+        // harness whose provider was never selected would send the operator after the wrong thing.
+        let config = harness_fault_for(&ExecError::Config("GOOSE_PROVIDER is unset".into()))
+            .expect("a config barrier implicates the harness");
+        match config {
+            Fault::Incapable(capability) => {
+                let remedy = capability.remedy();
+                assert!(remedy.contains("GOOSE_PROVIDER"), "{remedy}");
+                assert!(
+                    !remedy.contains("--features acp"),
+                    "a configuration barrier must not be reported as a rebuild: {remedy}"
+                );
+            }
+            other => panic!("a config barrier is structural, got {other:?}"),
+        }
     }
 
     // TOOTH (the seam my other teeth do not look at) — the harness request survives the trip from
@@ -3432,7 +4582,7 @@ mod tests {
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Delivered));
         assert!(
             !should_resume_execution(store.job_state(&job).expect("s").expect("s")),
-            "a delivered job must not re-execute on a duplicate award"
+            "a delivered job is not re-execute-eligible"
         );
 
         // Pay ⇒ state Paid ⇒ likewise not re-execute-eligible (terminal never clobbered).
@@ -3446,6 +4596,148 @@ mod tests {
             "a paid job must not re-execute"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // TOOTH (award dedup, LEG 1 — the retry shape, post-terminal). TWO DISTINCT award events for ONE
+    // job id. That is the shape a buyer retry produces, and it is NOT the shape a relay redelivery
+    // produces: the two take DIFFERENT dedup keys, so exercising one says nothing about the other.
+    // `awards.award_id` is the PK, so a RE-SEEN award id is absorbed at the record layer
+    // (`Awarded::Duplicate`, no job row touched). A FRESH award id for a job we already hold is
+    // `Awarded::New` — it reaches the spawn, takes an execution slot, and the only thing between it and
+    // a second agent run is the job-STATE guard at the top of `execute_job`. So the contract worth
+    // asserting is the COMPOSITION (record decision AND state guard), never either half alone:
+    // asserting the predicate by itself leaves the record layer's answer unstated, and that answer is
+    // what decides whether the guard is load-bearing at all.
+    #[test]
+    fn a_fresh_award_id_for_a_delivered_job_is_recorded_but_never_re_executed() {
+        use crate::seller_node::store::{Awarded, JobState};
+        let seller = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let creq = gateway::creq::build_seller_creq(
+            &"a".repeat(64),
+            21,
+            "sat",
+            &["https://testnut.cashudevkit.org".to_owned()],
+            &seller,
+        )
+        .expect("creq");
+        let job = "a".repeat(64);
+        let buyer = "b".repeat(64);
+        // The helper journals award event A (`w`×64) — that is execution #1's award.
+        let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
+        let draft = claim_draft(&job, &buyer, &seller, &creq, &[]);
+
+        // Execution #1 finished and published ⇒ Delivered.
+        assert!(
+            store
+                .deliver_and_enqueue(
+                    &job,
+                    &"c".repeat(40),
+                    &draft,
+                    5000,
+                    5000 + RESULT_PUBLISH_WINDOW_SECS,
+                    5000
+                )
+                .expect("deliver")
+        );
+        assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Delivered));
+
+        // REDELIVERY shape: award A seen a second time. The event-id key absorbs it; execute is never
+        // reached, so the state guard is not even consulted.
+        assert_eq!(
+            store.record_award(&"w".repeat(64), &job, &buyer, 6000).expect("re-see A"),
+            Awarded::Duplicate,
+            "a re-seen award id must be absorbed by the award-record key"
+        );
+
+        // RETRY shape: a DIFFERENT award event for the SAME job. The record layer does NOT catch this
+        // one — new row, and it re-attempts job creation.
+        assert_eq!(
+            store.record_award(&"d".repeat(64), &job, &buyer, 6001).expect("fresh B"),
+            Awarded::New,
+            "a fresh award id is NOT deduped at the record layer — the retry shape reaches the spawn"
+        );
+
+        // The job row survives that re-attempt, so the state guard is what refuses the second run.
+        assert_eq!(
+            store.job_state(&job).expect("state"),
+            Some(JobState::Delivered),
+            "a second award must never clobber a terminal job state back to awarded"
+        );
+        assert!(
+            !should_resume_execution(store.job_state(&job).expect("s").expect("s")),
+            "a delivered job must not re-execute when a SECOND award event arrives"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ⚠⚠ LEG 2 (#279) — THIS TEST PASSING IS NOT GOOD NEWS. It pins a known defect in executable form.
+    //
+    // Same retry shape as the test above (two distinct award ids, one job id), but arriving MID-FLIGHT
+    // while the job is still `awarded`/`executing` rather than terminal. NEITHER dedup layer catches
+    // it: the award record keys on EVENT ID (a fresh id ⇒ `Awarded::New`) and the execute guard keys on
+    // JOB STATE (`awarded`/`executing` ⇒ proceed). Nothing sits between them — there is no per-job
+    // in-flight lock — so a second `execute_job` is admitted for a job that is already running: a
+    // second agent process and a second delivery attempt.
+    //
+    // Note what it does to capacity, because it is worse than double-booking a slot: the first award
+    // already REMOVED this job's parked permit (`take_for_execution` is a map `remove`), so the second
+    // award's `take_for_execution` returns `None` and the second execution runs holding NO permit at
+    // all. It does not consume a slot — it BYPASSES slot accounting, so the node exceeds its
+    // configured concurrency without that showing up in `available()`.
+    //
+    // It is NOT a payment defect. Double payment is blocked further down the path (reservation PK, a
+    // single job-keyed watcher, outbox dedup); that path was verified by the mobee lead, not here, and
+    // this comment should not be read as this test having checked it. The costs are operator compute,
+    // slot accounting, and a second push that can move the branch tip off the journaled commit — which
+    // the buyer then refuses on tip-match, i.e. it fails toward NOT paying a seller who did the work.
+    //
+    // 🛑 IF THIS TEST GOES RED, THE FIX LANDED — do not "repair" it. Invert the final assertion to the
+    // guarded behaviour and close #279. It is written as a PASSING tripwire rather than an
+    // `#[ignore]`d failing test precisely so it cannot rot in silence: an ignored test reports nothing
+    // whether the hole is open or closed.
+    #[test]
+    fn mid_flight_second_award_is_admitted_for_execution_no_per_job_in_flight_lock() {
+        use crate::seller_node::store::{Awarded, JobState};
+        let seller = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let creq = gateway::creq::build_seller_creq(
+            &"a".repeat(64),
+            21,
+            "sat",
+            &["https://testnut.cashudevkit.org".to_owned()],
+            &seller,
+        )
+        .expect("creq");
+        let buyer = "b".repeat(64);
+
+        // Both mid-flight states, because the guard admits both and either one means a second run.
+        for (label, drive_to_executing, expected) in [
+            ("awarded", false, JobState::Awarded),
+            ("executing", true, JobState::Executing),
+        ] {
+            let job = "a".repeat(64);
+            let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
+            if drive_to_executing {
+                store.mark_executing(&job, 4300).expect("mark executing");
+            }
+            assert_eq!(
+                store.job_state(&job).expect("state"),
+                Some(expected),
+                "{label}: precondition — the job is mid-flight, not terminal"
+            );
+
+            // A DIFFERENT award event for the SAME job, landing while execution #1 is in flight.
+            assert_eq!(
+                store.record_award(&"d".repeat(64), &job, &buyer, 4400).expect("fresh award"),
+                Awarded::New,
+                "{label}: the award record keys on event id, so a fresh id is not deduped"
+            );
+            assert!(
+                should_resume_execution(store.job_state(&job).expect("s").expect("s")),
+                "{label}: MID-FLIGHT SECOND EXECUTION IS ADMITTED — if THIS line is what failed, the \
+                 per-job in-flight lock has landed: invert this assertion and close #279"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     // TOOTH (buyer-facing feedback) — an execution failure produces a buyer-addressed feedback-kind

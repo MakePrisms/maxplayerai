@@ -1,4 +1,4 @@
-//! Thin MCP stdio surface: `mobee mcp`.
+//! Thin MCP stdio surface: `maxplayer mcp`.
 //!
 //! Writes are newline-delimited JSON-RPC. Reads accept newline JSON *or* legacy
 //! `Content-Length` framing (spike scar — Claude Code hung on LSP-only writes).
@@ -49,7 +49,7 @@ pub fn run(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     };
     let _ = writeln!(
         err,
-        "mobee mcp ready (home={}, key_created={}, mint={}, relay={}, tool_deadline_secs={})",
+        "maxplayer mcp ready (home={}, key_created={}, mint={}, relay={}, tool_deadline_secs={})",
         state.home.root.display(),
         state.home.key_created,
         state.home.config.default_mint(),
@@ -124,7 +124,7 @@ async fn dispatch_async(state: &McpState, request: &McpRequest) -> Value {
                 "protocolVersion": "2024-11-05",
                 "capabilities": { "tools": {} },
                 "serverInfo": {
-                    "name": "mobee",
+                    "name": "maxplayer",
                     "version": mobee_core::version(),
                 },
             }),
@@ -161,7 +161,7 @@ fn tools() -> Value {
     json!([
         {
             "name": "post_job",
-            "description": "Publish a real mobee job offer (OFFER kind) to the configured mobee relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness/model are recorded auto-award preferences. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. Never echoes secrets.",
+            "description": "Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness/model are recorded auto-award preferences. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -235,7 +235,7 @@ fn tools() -> Value {
         },
         {
             "name": "collect",
-            "description": "Single-call buyer collect: if no accept-bind exists yet, accept the delivered claim itself (fetch the seller's result from the relay and record the co-signed pay-bind — the same accept path `mobee accept` runs), verify the delivery integrity (the delivered branch must tip at the accepted commit — the PayPathDeliveryVerifier tip-match), auto-pay the seller through the sealed money path (BudgetGate → PaymentService::run, single-redeem + mint-compat intact), then materialize the paid files into <home>/results/<job_id>. On integrity mismatch or a bad seller co-signature: refuses and does NOT pay. Idempotent: re-collecting an already-paid job re-materializes without a second payment. If the wallet holds no funds it refuses with a message pointing at `mobee wallet setup`. Returns {amount_sats, attempt_id, spent_total_sats, remaining_sats, state, commit, path, files}. Never echoes secrets.",
+            "description": "Single-call buyer collect: if no accept-bind exists yet, accept the delivered claim itself (fetch the seller's result from the relay and record the co-signed pay-bind — the same accept path `maxplayer accept` runs), verify the delivery integrity (the delivered branch must tip at the accepted commit — the PayPathDeliveryVerifier tip-match), auto-pay the seller through the sealed money path (BudgetGate → PaymentService::run, single-redeem + mint-compat intact), then materialize the paid files into <home>/results/<job_id>. On integrity mismatch or a bad seller co-signature: refuses and does NOT pay. Idempotent: re-collecting an already-paid job re-materializes without a second payment. If the wallet holds no funds it refuses with a message pointing at `maxplayer wallet setup`. Returns {amount_sats, attempt_id, spent_total_sats, remaining_sats, state, commit, path, files}. Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -350,18 +350,18 @@ fn guard_never_echo(state: &McpState, tool: &str, body: &Value) -> Result<(), St
 /// tool. Names the exact CLI command a stale caller should run instead.
 fn moved_tool_error(name: &str) -> String {
     let cli = match name {
-        "setup_wallet" => "mobee wallet setup",
-        "wallet_balance" => "mobee wallet balance",
-        "wallet_mint" | "wallet_invoice" => "mobee wallet mint / mobee wallet invoice",
-        "wallet_send" => "mobee wallet send",
-        "wallet_receive" => "mobee wallet receive",
-        "wallet_melt" => "mobee wallet melt",
-        "wallet_mints" => "mobee wallet mints",
-        "reconcile_wallet" => "mobee wallet reconcile",
-        "set_profile" => "mobee profile set",
-        "stub_pay" => "mobee stub-pay",
-        "accept_claim" => "mobee accept",
-        "authorize_pay" | "get_result" => "mobee collect",
+        "setup_wallet" => "maxplayer wallet setup",
+        "wallet_balance" => "maxplayer wallet balance",
+        "wallet_mint" | "wallet_invoice" => "maxplayer wallet mint / maxplayer wallet invoice",
+        "wallet_send" => "maxplayer wallet send",
+        "wallet_receive" => "maxplayer wallet receive",
+        "wallet_melt" => "maxplayer wallet melt",
+        "wallet_mints" => "maxplayer wallet mints",
+        "reconcile_wallet" => "maxplayer wallet reconcile",
+        "set_profile" => "maxplayer profile set",
+        "stub_pay" => "maxplayer stub-pay",
+        "accept_claim" => "maxplayer accept",
+        "authorize_pay" | "get_result" => "maxplayer collect",
         other => {
             return format!(
                 "unknown tool: {other} (MCP surface is post_job, get_job, award_claim, collect)"
@@ -369,13 +369,13 @@ fn moved_tool_error(name: &str) -> String {
         }
     };
     format!(
-        "tool `{name}` moved to the mobee CLI — run `{cli}`. The MCP surface is the trade loop only \
+        "tool `{name}` moved to the maxplayer CLI — run `{cli}`. The MCP surface is the trade loop only \
          (post_job, get_job, award_claim, collect)."
     )
 }
 
 
-/// Wallet bootstrap/funding moved off the MCP surface to `mobee wallet setup`, so a kept trade tool
+/// Wallet bootstrap/funding moved off the MCP surface to `maxplayer wallet setup`, so a kept trade tool
 /// that fails because the wallet is unfunded / its mint is unreachable appends the actionable CLI
 /// remedy to the underlying error. Pure over the message so it stays testable without fixtures;
 /// non-prerequisite errors pass through unchanged.
@@ -387,8 +387,8 @@ fn with_prereq_hint(tool: &str, error: String) -> String {
         || lower.contains("real-mint fence");
     if funds_prereq {
         format!(
-            "{error} — {tool} prerequisite: fund your wallet with `mobee wallet setup` (testnut) \
-             or `mobee wallet mint <sats>`"
+            "{error} — {tool} prerequisite: fund your wallet with `maxplayer wallet setup` (testnut) \
+             or `maxplayer wallet mint <sats>`"
         )
     } else {
         error
@@ -550,14 +550,14 @@ mod tests {
     // A moved tool called by a stale client returns an actionable error naming the CLI command.
     #[test]
     fn moved_tools_point_at_their_cli_command() {
-        assert!(moved_tool_error("setup_wallet").contains("mobee wallet setup"));
-        assert!(moved_tool_error("wallet_balance").contains("mobee wallet balance"));
-        assert!(moved_tool_error("reconcile_wallet").contains("mobee wallet reconcile"));
-        assert!(moved_tool_error("set_profile").contains("mobee profile set"));
-        assert!(moved_tool_error("stub_pay").contains("mobee stub-pay"));
-        assert!(moved_tool_error("accept_claim").contains("mobee accept"));
-        assert!(moved_tool_error("authorize_pay").contains("mobee collect"));
-        assert!(moved_tool_error("get_result").contains("mobee collect"));
+        assert!(moved_tool_error("setup_wallet").contains("maxplayer wallet setup"));
+        assert!(moved_tool_error("wallet_balance").contains("maxplayer wallet balance"));
+        assert!(moved_tool_error("reconcile_wallet").contains("maxplayer wallet reconcile"));
+        assert!(moved_tool_error("set_profile").contains("maxplayer profile set"));
+        assert!(moved_tool_error("stub_pay").contains("maxplayer stub-pay"));
+        assert!(moved_tool_error("accept_claim").contains("maxplayer accept"));
+        assert!(moved_tool_error("authorize_pay").contains("maxplayer collect"));
+        assert!(moved_tool_error("get_result").contains("maxplayer collect"));
         assert!(moved_tool_error("bogus").contains("unknown tool"));
     }
 
@@ -570,7 +570,7 @@ mod tests {
             "authorize_pay refused: the single-mint buyer wallet holds no balance at any accepted mint"
                 .to_owned(),
         );
-        assert!(mapped.contains("mobee wallet setup"), "message: {mapped}");
+        assert!(mapped.contains("maxplayer wallet setup"), "message: {mapped}");
         assert!(mapped.contains("collect prerequisite"), "message: {mapped}");
 
         let untouched = with_prereq_hint("post_job", "task must be non-empty".to_owned());

@@ -1,4 +1,4 @@
-//! `mobee collect` — single-call buyer collect: verify integrity + pay + materialize.
+//! `maxplayer collect` — single-call buyer collect: verify integrity + pay + materialize.
 //!
 //! Thin adapter over [`mobee_core::collect`]. The money authority (spend gate, budget,
 //! single-redeem, mint-compat) lives in the core path; this only parses args and renders the
@@ -49,7 +49,7 @@ fn usage(err: &mut dyn Write) {
     let _ = writeln!(
         err,
         "Usage:\n\
-         \x20 mobee collect <job_id> [--out <folder>] [--home <path>]\n\
+         \x20 maxplayer collect <job_id> [--out <folder>] [--home <path>]\n\
          \n\
          Accepts the delivered claim if no bind exists yet, verifies the delivery integrity\n\
          (delivered branch must tip at the accepted commit), pays the seller through the sealed\n\
@@ -59,7 +59,7 @@ fn usage(err: &mut dyn Write) {
     );
 }
 
-/// Entry from `cli::run` for `mobee collect ...`.
+/// Entry from `cli::run` for `maxplayer collect ...`.
 ///
 /// Money ops are owned by the buyer daemon (exclusive home lock, single wallet + budget + reservation
 /// ledger). This command routes `collect` over the daemon socket (connect-or-spawn) rather than
@@ -123,6 +123,6 @@ pub fn run(args: &[String], _out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         usage(err);
         return USAGE_ERROR;
     }
-    let _ = writeln!(err, "mobee collect requires the wallet feature");
+    let _ = writeln!(err, "maxplayer collect requires the wallet feature");
     USAGE_ERROR
 }

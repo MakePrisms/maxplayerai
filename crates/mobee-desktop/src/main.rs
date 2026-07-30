@@ -576,21 +576,33 @@ fn run_doctor(home: &Path) -> HealthResult {
     }
 }
 
+/// Name of the CLI binary this desktop app drives. Since #262 the CLI ships as
+/// `maxplayer` (see the crate's `[[bin]]` name, the flake `mainProgram`, and
+/// `apps.*.program`). Keep this the single source of truth for the spawned
+/// name so the three resolution sites cannot drift apart again.
+const CLI_BIN: &str = "maxplayer";
+
 fn mobee_command() -> Command {
     if let Some(path) = env::var_os("MOBEE_BIN").filter(|value| !value.is_empty()) {
         return Command::new(path);
     }
 
-    if let Ok(exe) = env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let sibling = dir.join(executable_name("mobee"));
+    resolve_cli_command(CLI_BIN, env::current_exe().ok().as_deref())
+}
+
+/// Resolve the CLI command for `bin`, preferring a sibling next to the desktop
+/// executable and otherwise falling back to `bin` on `PATH`. Split out from
+/// `mobee_command` so the spawned name can be asserted in a unit test without
+/// depending on the process' real `current_exe`.
+fn resolve_cli_command(bin: &str, current_exe: Option<&Path>) -> Command {
+    if let Some(dir) = current_exe.and_then(Path::parent) {
+        let sibling = dir.join(executable_name(bin));
         if sibling.exists() {
             return Command::new(sibling);
         }
     }
 
-    Command::new("mobee")
+    Command::new(bin)
 }
 
 fn executable_name(base: &str) -> OsString {
@@ -801,6 +813,37 @@ mod tests {
     }
 
     #[test]
+    fn resolve_cli_command_spawns_the_shipped_maxplayer_binary() {
+        use std::ffi::OsStr;
+
+        // Point the resolver at a directory that has no sibling binary, so it
+        // exercises the PATH-fallback branch and the spawned name is exactly
+        // the one it was asked to resolve.
+        let no_sibling = Path::new("/nonexistent/desktop-dir/mobee-desktop");
+
+        // The real resolver must target the binary that actually ships today.
+        let shipped = resolve_cli_command(CLI_BIN, Some(no_sibling));
+        assert_eq!(
+            shipped.get_program(),
+            OsStr::new("maxplayer"),
+            "resolver must spawn the shipped `maxplayer` binary, got {:?}",
+            shipped.get_program()
+        );
+
+        // Red leg / positive control: the same resolver pointed at the retired
+        // `mobee` name resolves to `mobee` — a binary nothing has installed
+        // since #262. If this differed from the assertion above the test would
+        // be a no-op guard; instead it proves the name is what makes it pass.
+        let retired = resolve_cli_command("mobee", Some(no_sibling));
+        assert_eq!(retired.get_program(), OsStr::new("mobee"));
+        assert_ne!(
+            shipped.get_program(),
+            retired.get_program(),
+            "shipped and retired binary names must differ"
+        );
+    }
+
+    #[test]
     fn seller_start_command_uses_mobee_sell_without_secret_args() {
         let request = StartSellerRequest {
             home: PathBuf::from("/tmp/mobee-home"),
@@ -840,7 +883,7 @@ mod tests {
 
     #[test]
     fn format_command_redacts_sensitive_argv_values() {
-        let mut command = Command::new("mobee");
+        let mut command = Command::new(CLI_BIN);
         command.args([
             "wallet",
             "receive",

@@ -1,4 +1,4 @@
-//! `mobee wallet` — flexible ecash wallet management (CLI).
+//! `maxplayer wallet` — flexible ecash wallet management (CLI).
 //!
 //! Never echoes the secret key. Token/bolt11 may appear on argv per subcommand
 //! surface but are not written to durable logs here.
@@ -21,10 +21,10 @@ struct CommonOpts {
     amount: Option<u64>,
 }
 
-/// Default testnut fund amount for `mobee wallet setup` (mirrors the old setup_wallet MCP tool).
+/// Default testnut fund amount for `maxplayer wallet setup` (mirrors the old setup_wallet MCP tool).
 const SETUP_FUND_SATS: u64 = 21;
 
-/// Entry from `cli::run` for `mobee wallet ...`.
+/// Entry from `cli::run` for `maxplayer wallet ...`.
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     match args.first().map(String::as_str) {
         Some("setup") => cmd_setup(&args[1..], out, err),
@@ -48,18 +48,18 @@ fn wallet_usage(err: &mut dyn Write) {
     let _ = writeln!(
         err,
         "Usage:\n\
-         \x20 mobee wallet setup [<amount>] [--mint <url>] [--home <path>]   # bootstrap ~/.mobee + fund (default testnut, 21 sat)\n\
-         \x20 mobee wallet balance [--mint <url>] [--home <path>]\n\
-         \x20 mobee wallet mint <amount> [--mint <url>] [--home <path>]\n\
-         \x20 mobee wallet mint-complete <quote_id> [--amount <sats>] [--mint <url>] [--home <path>]\n\
-         \x20 mobee wallet send <amount> [--mint <url>] [--home <path>]\n\
-         \x20 mobee wallet receive <token> [--home <path>]\n\
-         \x20 mobee wallet melt <bolt11> [--mint <url>] [--home <path>]\n\
-         \x20 mobee wallet invoice <amount> [--mint <url>] [--home <path>]\n\
-         \x20 mobee wallet mints list [--home <path>]\n\
-         \x20 mobee wallet mints add <url> [--home <path>]\n\
-         \x20 mobee wallet mints remove <url> [--home <path>]\n\
-         \x20 mobee wallet reconcile [--home <path>]   # retire eligible incomplete send sagas (no receipt/credit)\n\
+         \x20 maxplayer wallet setup [<amount>] [--mint <url>] [--home <path>]   # bootstrap ~/.mobee + fund (default testnut, 21 sat)\n\
+         \x20 maxplayer wallet balance [--mint <url>] [--home <path>]\n\
+         \x20 maxplayer wallet mint <amount> [--mint <url>] [--home <path>]\n\
+         \x20 maxplayer wallet mint-complete <quote_id> [--amount <sats>] [--mint <url>] [--home <path>]\n\
+         \x20 maxplayer wallet send <amount> [--mint <url>] [--home <path>]\n\
+         \x20 maxplayer wallet receive <token> [--home <path>]\n\
+         \x20 maxplayer wallet melt <bolt11> [--mint <url>] [--home <path>]\n\
+         \x20 maxplayer wallet invoice <amount> [--mint <url>] [--home <path>]\n\
+         \x20 maxplayer wallet mints list [--home <path>]\n\
+         \x20 maxplayer wallet mints add <url> [--home <path>]\n\
+         \x20 maxplayer wallet mints remove <url> [--home <path>]\n\
+         \x20 maxplayer wallet reconcile [--home <path>]   # retire eligible incomplete send sagas (no receipt/credit)\n\
          \n\
          Default mint is testnut (pinned). Extra mints are opt-in via `mints add`.\n\
          Exit codes: 0 success, 1 usage error, 2 runtime error"
@@ -131,7 +131,7 @@ fn parse_amount(raw: &str) -> Result<u64, String> {
 
 #[cfg(not(feature = "wallet"))]
 fn cmd_balance(_args: &[String], _out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let _ = writeln!(err, "mobee wallet requires the wallet feature");
+    let _ = writeln!(err, "maxplayer wallet requires the wallet feature");
     USAGE_ERROR
 }
 #[cfg(not(feature = "wallet"))]
@@ -226,7 +226,7 @@ fn cmd_balance(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32
     if filter.is_some() && matched == 0 {
         let _ = writeln!(
             err,
-            "no balance row for mint={} (configured mints only; check `mobee wallet mints list`)",
+            "no balance row for mint={} (configured mints only; check `maxplayer wallet mints list`)",
             filter.as_deref().unwrap_or("")
         );
         return RUNTIME_ERROR;
@@ -281,7 +281,7 @@ fn cmd_setup(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             // Non-testnut mint: emit the bolt11 to pay, then complete with mint-complete.
             let _ = writeln!(
                 err,
-                "status=needs_payment amount_sats={} mint={} quote_id={} (pay the invoice, then `mobee wallet mint-complete {}`)",
+                "status=needs_payment amount_sats={} mint={} quote_id={} (pay the invoice, then `maxplayer wallet mint-complete {}`)",
                 quote.amount_sats, quote.mint_url, quote.quote_id, quote.quote_id
             );
             let _ = writeln!(out, "{}", quote.invoice);

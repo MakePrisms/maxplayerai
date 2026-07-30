@@ -486,7 +486,7 @@ async fn publish_bounded(
 /// — a single `Client` can never be delivered its own echo (the publish saves into the client's own
 /// database, and the inbound handler drops anything already present), so such a probe can never
 /// succeed at all.
-async fn probe_relay_serves_our_reqs(
+pub(crate) async fn probe_relay_serves_our_reqs(
     client: &Client,
     buyer_pubkey: nostr_sdk::PublicKey,
     timeout: Duration,

@@ -1,5 +1,17 @@
 /target
 
+# `nix build` output symlinks. The npm packaging script reads result/bin/maxplayer by default, so
+# these turn up in the repo root during normal use.
+/result
+/result-*
+
+# Native binaries are staged into the npm platform packages at pack time: ~38MB of build output
+# each, belonging to a release rather than the source tree.
+/npm/cli-*/bin/
+
+# Release archives assembled by scripts/package-release-asset.sh.
+/dist/
+
 # Scratch / run artifacts (SPIKE_LESSONS refuse-#10: the /target-only gap
 # admitted .scratch/ into the spike tree)
 .scratch/

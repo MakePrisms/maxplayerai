@@ -9,9 +9,11 @@
 //! deterministic roster ([`roster`]) routes each awarded job to one agent under the single seller
 //! identity.
 //!
-//! Concurrency is 1: the queue behind each actor — not SQLite locking — is the in-process
-//! concurrency boundary, mirroring the home lock across processes. The node runs one job at a time,
-//! so no two operations ever race the wallet, the signer, or the store.
+//! Concurrency safety does not depend on running one job at a time: the queue behind each actor —
+//! not SQLite locking — is the in-process concurrency boundary, mirroring the home lock across
+//! processes. Even with several execution slots active (`[seller] slots`), no two operations ever
+//! race the wallet, the signer, or the store — the actors serialize them regardless of how many
+//! jobs run at once.
 //!
 //! Money-safe boundary: agents produce files; the node signs, commits, publishes, and receives
 //! payment. No agent process ever holds the seller key (owned by the [`signer`] actor) or the
@@ -26,7 +28,6 @@ pub mod outbox;
 mod p_gate_relay_fixture;
 pub mod publisher;
 pub mod run;
-pub mod roster;
 pub mod signer;
 pub mod store;
 pub mod wallet_actor;

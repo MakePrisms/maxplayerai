@@ -49,6 +49,74 @@ impl std::fmt::Display for ExecError {
 
 impl std::error::Error for ExecError {}
 
+/// How the awarded agent command is launched: either directly (pass-through) or inside a launcher
+/// (e.g. `bwrap …`, `systemd-nspawn …`) the command runs under. The wrap is a pure argv transform,
+/// so the run/exec path stays launcher-agnostic — the launcher is the only thing a future OS
+/// sandbox changes here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SandboxPolicy {
+    /// The launcher argv prepended to the agent command. Empty ⇒ pass-through.
+    launcher: Vec<String>,
+}
+
+impl SandboxPolicy {
+    /// A pass-through policy: the agent command runs exactly as configured.
+    pub fn passthrough() -> Self {
+        Self {
+            launcher: Vec::new(),
+        }
+    }
+
+    /// A policy that runs the agent command inside `launcher` (its argv is prepended). An empty
+    /// launcher is a pass-through.
+    pub fn wrapped(launcher: Vec<String>) -> Self {
+        Self { launcher }
+    }
+
+    /// Resolve the policy from the optional `[sandbox]` config: present ⇒ its launcher, absent ⇒
+    /// pass-through.
+    pub fn from_config(config: Option<&crate::home::SandboxConfig>) -> Self {
+        match config {
+            Some(config) => Self::wrapped(config.launcher.clone()),
+            None => Self::passthrough(),
+        }
+    }
+
+    /// Whether this policy launches the command directly (no launcher).
+    pub fn is_passthrough(&self) -> bool {
+        self.launcher.is_empty()
+    }
+
+    /// The full argv to spawn: the agent command unchanged under a pass-through policy, otherwise
+    /// the launcher argv followed by the agent command.
+    pub fn wrap(&self, agent_command: &[String]) -> Vec<String> {
+        if self.launcher.is_empty() {
+            return agent_command.to_vec();
+        }
+        let mut argv = Vec::with_capacity(self.launcher.len() + agent_command.len());
+        argv.extend_from_slice(&self.launcher);
+        argv.extend_from_slice(agent_command);
+        argv
+    }
+}
+
+/// The `(program, args)` the ACP driver actually spawns for `agent_command` under `policy`: wrap
+/// the command in the policy's launcher, then split argv0 from the rest. Fails closed when the
+/// agent command is empty (a launcher alone is not a runnable command).
+fn launch_argv(
+    policy: &SandboxPolicy,
+    agent_command: &[String],
+) -> Result<(String, Vec<String>), ExecError> {
+    if agent_command.is_empty() {
+        return Err(ExecError::Config("agent_command empty".into()));
+    }
+    let mut argv = policy.wrap(agent_command).into_iter();
+    let program = argv
+        .next()
+        .expect("wrap of a non-empty command yields a non-empty argv");
+    Ok((program, argv.collect()))
+}
+
 /// The per-job working directory under the home (`$MOBEE_HOME/seller-jobs/<job_id>`).
 pub fn job_workdir(home: &MobeeHome, job_id: &str) -> PathBuf {
     home.root.join("seller-jobs").join(job_id)
@@ -103,13 +171,14 @@ pub fn compose_agent_prompt(task: &str, git_remote: &str, memory_section: Option
     let base = format!(
         "{task}\n\n\
          ---\n\
-         DELIVERY (required). Deliver your work by committing it with git in your current \
-         working directory:\n\
-         - Make one or more non-empty commits authored by you. Do not leave the deliverable \
-         uncommitted and do not only print it to the console.\n\
-         - You do NOT need to push and you are NOT handed any credentials: the daemon pushes \
-         your committed branch to the bound git remote ({git_remote}) on your behalf.\n\
-         Anything not committed to git will not be delivered."
+         DELIVERY (required). Your deliverable is the FINAL STATE OF YOUR CURRENT WORKING \
+         DIRECTORY:\n\
+         - Leave your work as files on disk there. The daemon snapshots that directory into one \
+         commit and pushes it to the bound git remote ({git_remote}) on your behalf.\n\
+         - You do NOT need to commit or push, and you are NOT handed any credentials. Committing \
+         is harmless, but it is the directory CONTENTS that are delivered, not your commits.\n\
+         - Files excluded by .gitignore are NOT delivered, so never ignore your own deliverable.\n\
+         Anything you only print to the console is not delivered."
     );
     // Read-on-start: when memory is enabled the rendered index section is appended. When `None`
     // (memory_enabled=false, or no non-empty index) the output is byte-IDENTICAL to the
@@ -277,11 +346,14 @@ pub fn harness_and_transport(
 }
 
 /// Run the awarded agent under the ACP driver: one session in `workdir`, seeded with `prompt`, with
-/// the delivery `identity`'s git env, bounded by `timeout` (the unified job timeout). Returns the ACP
-/// usage the driver surfaced (`None` when the harness exposed nothing).
+/// the delivery `identity`'s git env, bounded by `timeout` (the unified job timeout). The agent
+/// command is launched through `policy` — directly under a pass-through policy, or inside the
+/// policy's launcher. Returns the ACP usage the driver surfaced (`None` when the harness exposed
+/// nothing).
 #[cfg(feature = "acp")]
 pub async fn run_agent_job(
     agent_command: &[String],
+    policy: &SandboxPolicy,
     prompt: &str,
     workdir: &Path,
     identity: &DeliveryAgentIdentity,
@@ -292,13 +364,11 @@ pub async fn run_agent_job(
     use crate::event::JobId;
     use crate::log::EventLog;
 
-    if agent_command.is_empty() {
-        return Err(ExecError::Config("agent_command empty".into()));
-    }
+    let (program, args) = launch_argv(policy, agent_command)?;
     // The ACP idle/response timeout IS the unified job timeout — never a hardcoded 300s that could
     // override or conflict with `--job-timeout-secs`.
     let mut driver = AcpDriver::new(
-        AgentCommand::new(agent_command[0].clone(), agent_command[1..].to_vec()),
+        AgentCommand::new(program, args),
         crate::driver::PermissionOutcome::Allow,
         timeout,
     );
@@ -335,6 +405,7 @@ pub async fn run_agent_job(
 #[cfg(not(feature = "acp"))]
 pub async fn run_agent_job(
     _agent_command: &[String],
+    _policy: &SandboxPolicy,
     _prompt: &str,
     _workdir: &Path,
     _identity: &DeliveryAgentIdentity,
@@ -352,6 +423,59 @@ fn short_hash(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The default (pass-through) policy launches the agent command exactly as configured: the
+    // spawned `(program, args)` reconstruct the configured argv byte-for-byte, with no launcher.
+    #[test]
+    fn passthrough_policy_launches_the_configured_command_byte_identical() {
+        let agent_command: Vec<String> = ["claude", "--print", "--flag=a b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let policy = SandboxPolicy::passthrough();
+        assert!(policy.is_passthrough());
+        // The argv `wrap` hands the driver is the configured command, unchanged.
+        assert_eq!(policy.wrap(&agent_command), agent_command);
+        // Split into what the ACP driver spawns: program = argv0, args = the rest — reconstructing
+        // the configured command exactly (byte-identical to before the seam existed).
+        let (program, args) = launch_argv(&policy, &agent_command).expect("non-empty command");
+        assert_eq!(program, agent_command[0]);
+        assert_eq!(args, agent_command[1..]);
+        assert_eq!(
+            std::iter::once(program).chain(args).collect::<Vec<_>>(),
+            agent_command
+        );
+        // The default policy is the pass-through policy.
+        assert_eq!(SandboxPolicy::default(), policy);
+    }
+
+    // A launcher policy runs the agent command INSIDE the launcher: argv0 becomes the launcher, the
+    // configured command follows unchanged.
+    #[test]
+    fn launcher_policy_makes_the_launcher_argv0() {
+        let agent_command: Vec<String> =
+            ["claude", "--print"].iter().map(|s| s.to_string()).collect();
+        let launcher: Vec<String> = ["bwrap", "--unshare-all", "--"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let policy = SandboxPolicy::wrapped(launcher.clone());
+        assert!(!policy.is_passthrough());
+        let (program, args) = launch_argv(&policy, &agent_command).expect("non-empty command");
+        assert_eq!(program, launcher[0]);
+        // Full spawned argv is launcher then the agent command, in order.
+        let spawned: Vec<String> = std::iter::once(program).chain(args).collect();
+        let expected: Vec<String> = launcher.iter().chain(agent_command.iter()).cloned().collect();
+        assert_eq!(spawned, expected);
+    }
+
+    // A launcher with no agent command is a misconfig — a launcher alone is not a runnable command.
+    #[test]
+    fn empty_agent_command_fails_closed_even_with_a_launcher() {
+        let policy = SandboxPolicy::wrapped(vec!["bwrap".into()]);
+        let err = launch_argv(&policy, &[]).expect_err("empty command refused");
+        assert!(matches!(err, ExecError::Config(_)));
+    }
 
     // The seller-side receipt-preimage delivery discriminator is DERIVED from the typed
     // `GitDelivery` ("fork"), not a hardcoded label — buyer and seller agree by construction.
@@ -446,11 +570,26 @@ mod tests {
         assert!(prompt.starts_with("build a widget"), "task preserved: {prompt}");
         // Explicit, seller-owned delivery instructions are appended.
         assert!(prompt.contains("DELIVERY"), "has a delivery section: {prompt}");
-        assert!(
-            prompt.contains("commit") || prompt.contains("Commit"),
-            "tells the agent to commit: {prompt}"
-        );
         assert!(prompt.contains("git"), "delivery is via git: {prompt}");
+
+        // The instructions must describe what `snapshot_delivery_at` ACTUALLY delivers: the final
+        // worktree, staged with `add_all`. Telling an agent its commits are the deliverable is
+        // false — the snapshot takes `base_oid = None`, so the agent's commits are orphaned by the
+        // delivery commit and never pushed.
+        assert!(
+            prompt.contains("FINAL STATE OF YOUR CURRENT WORKING DIRECTORY"),
+            "names the worktree as the deliverable: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Anything not committed to git will not be delivered"),
+            "must NOT claim uncommitted work is undelivered — `add_all` delivers it: {prompt}"
+        );
+        // `add_all` uses IndexAddOption::DEFAULT, which honours .gitignore, so an agent that
+        // ignores its own output loses it silently. That has to be said where the agent can read it.
+        assert!(
+            prompt.contains(".gitignore"),
+            "warns that ignored files are not delivered: {prompt}"
+        );
         assert!(
             prompt.contains(remote),
             "names the bound remote so delivery is not guessed: {prompt}"
@@ -657,6 +796,7 @@ mod tests {
         let identity = DeliveryAgentIdentity::for_seller(&"aa".repeat(32));
         let err = run_agent_job(
             &["echo".into()],
+            &SandboxPolicy::passthrough(),
             "task",
             Path::new("."),
             &identity,

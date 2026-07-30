@@ -4,11 +4,16 @@ version.workspace = true
 edition.workspace = true
 description.workspace = true
 repository.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [features]
 default = []
-acp = []
+# Async channel receives + timeouts in the ACP driver (tokio mpsc / tokio::time): the driver's
+# waits must YIELD, not block the thread — the seller node runs every awarded job as a
+# `spawn_local` task on ONE LocalSet thread, so a blocking wait in the driver serializes all jobs
+# and deafens the run loop (issue #223).
+acp = ["tokio/sync", "tokio/time"]
 gateway = ["dep:nostr-sdk"]
 # All git legs (seller push/fetch, buyer verify-fetch, ref-advertisement probes) run in-process
 # via libgit2 — NO system `git` on any product path (issue #55). Needs nostr-sdk (NIP-98 signing)

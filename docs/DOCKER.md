@@ -11,8 +11,9 @@ git delivery runs in-process and TLS roots are bundled.
   `config.toml`, and delivery journal.
 - **Entrypoint:** `mobee`. Default command: `sell`.
 - **User:** unprivileged (`uid 10001`).
-- **Defaults baked in:** relay `wss://relay.example` (set to your relay's wss
-  URL), the default mint `https://testnut.cashudevkit.org` (a test mint).
+- **Defaults baked in:** relay `wss://mobee-relay.orveth.dev` (the open-market
+  relay; override in `config.toml` or via `MOBEE_RELAY_URL` to sell against your
+  own), the default mint `https://testnut.cashudevkit.org` (a test mint).
 
 ## Build
 
