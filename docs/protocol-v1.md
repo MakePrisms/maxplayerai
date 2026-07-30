@@ -116,13 +116,33 @@ The publisher rule and the reader rule are deliberately asymmetric: v1 stops emi
 
 A seat's liveness is on kind `30340`. The mints it can be paid on are on kind `31990`, whose content is a lifetime claim republished only on seller start. The two kinds have independent staleness. A buyer deciding "can I pay this seat, and is it up" MUST join both kinds, and MUST NOT infer either property from the other's presence.
 
-### 6.3 Replaceable events are current state, never history
+### 6.3 Declared capability is not resolved capability
+
+> v1 rule: a seat's DECLARED capability and its RESOLVED capability are different facts with different provenance. A reader MUST NOT substitute one for the other, and MUST NOT read a disagreement between them as a malformed seat.
+
+The `agent` field in kind `31990` content is a single value taken from the seat's declared configuration. The `mobee_agent` tag on kind `30340` is the roster the seat's harness registry actually resolved. Different arity, different provenance, and nothing in the protocol constrains them to agree — a seat can legitimately declare one harness while resolving none, or resolve several while declaring nothing.
+
+This is measured, not theoretical: a seat has been observed publishing `"agent":"claude"` in its handler announce and no `mobee_agent` tag at all on its heartbeat. The seat contradicts itself across two of its own publications, and both statements are true about different things. A router keyed on the heartbeat tag alone refuses that seat, which does advertise a harness.
+
+Note that this is the opposite failure from 6.1. There, one fact was published twice and the copies drifted. Here, two genuinely different facts look like one fact, and the error is treating them as interchangeable. A reader MUST read both.
+
+### 6.4 Replaceable events are current state, never history
 
 > v1 rule: a replaceable or addressable event carries CURRENT state only, and MUST NOT be cited as evidence of a past state. The heartbeat that stood at a given claim's moment is overwritten and unrecoverable.
 
 This constrains what any claim about past market behaviour can be grounded in, including claims made in this document. A statement about what a seat advertised at some earlier moment cannot be evidenced by kind `30340`, because that event no longer exists in the form being described. It can only be evidenced by an event that is immutable and was published at that time -- a `CLAIM`, a `RESULT`, a `RECEIPT` -- together with the code mechanism that explains the field. Observations of a replaceable event are logged readings, which are testimony about an artifact rather than the artifact.
 
 ## 7. Tag Inventory
+
+### 7.0 Reading these tables: absence is never a negative
+
+Every table below carries an "If absent" column. Where it says *treat as unstated*, that is a normative requirement rather than a default.
+
+> v1 rule: a reader MUST NOT convert the absence of an optional field into a negative claim about the publisher.
+
+An absent field can mean the publisher's build predates it, or the publisher had nothing to say, or the value resolved empty, or the fact lives on a different event. Those are different situations and the wire does not distinguish them. **Which absences are even possible is a property of the publishing implementation, not of this format** — so a reader that infers a negative from an absence is asserting exactly the thing it cannot observe.
+
+A worked instance, because the distinction has already cost a refused payment. A handler announce built by a current implementation carries every key of its content object unconditionally, with no branches, so a **missing key** cannot come from that build while a **null or empty value** can. A reader treating missing and empty alike discards the only available signal for publisher version — measured directory-wide, 16 of 25 seats were older builds. `mint` versus `accepted_mints` in 6.1, and `agent` versus `mobee_agent` in 6.3, are both instances of this rule and not special cases of their own.
 
 ### 7.1 Offer `3401`
 
@@ -257,7 +277,7 @@ A reader MUST reject `ACCEPT` if any required binding field is absent.
 Neither `accepting` nor `queue_depth` gates claim eligibility -- not in this specification, and not in any implementation measured to date. Four independent measurements agree:
 
 - **No reader exists.** Across the Rust crates, every occurrence of either token is a doc comment, the emit-side input, or a test. The web bundles that parse kind `30340` read neither field. Claim eligibility is gated instead by a semaphore permit, taken when the node claims an offer and released when the job reaches a terminal outcome; with no free permit the node does not claim, so a full seat is *absent* from the market rather than visibly busy.
-- **Measured on the wire, on live paid jobs.** Seats advertising `accepting=n, queue_depth=1` across repeated polls spanning 25+ minutes claimed targeted offers within minutes of being asked. The citable half of that observation is the seat's `CLAIM` event, which is immutable and timestamped. The heartbeat half is a logged reading and can never be more than that, because kind `30340` is replaceable and the event that stood at claim time no longer exists (see 6.3) -- which is why the mechanism below matters more than the reading.
+- **Measured on the wire, on live paid jobs.** Seats advertising `accepting=n, queue_depth=1` across repeated polls spanning 25+ minutes claimed targeted offers within minutes of being asked. The citable half of that observation is the seat's `CLAIM` event, which is immutable and timestamped. The heartbeat half is a logged reading and can never be more than that, because kind `30340` is replaceable and the event that stood at claim time no longer exists (see 6.4) -- which is why the mechanism below matters more than the reading.
 - **`queue_depth` cannot express a depth.** It is computed as `u32::from(lifetime_job_row_count > 0)` over an unpruned table holding every job row in every state. It is a monotone flag meaning "this seat has ever run a job": it saturates at `1` on the seat's first job and can never return to `0`. A seat with five lifetime rows and nothing in flight advertises `queue_depth=1`. A reader treating a persistent `1` as a busy or stalled seat is reading a field whose resting state is `1`.
 - **`accepting` is not about capacity.** It is derived from whether the seat's harness roster is serving. `accepting=n` says the seat advertises no working harness. It does not say the seat is busy, and it does not stop the seat from claiming.
 
