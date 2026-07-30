@@ -129,6 +129,12 @@ The publisher rule and the reader rule are deliberately asymmetric: v1 stops emi
 
 A seat's liveness is on kind `30340`. The mints it can be paid on are on kind `31990`, whose content is a lifetime claim republished only on seller start. The two kinds have independent staleness. A buyer deciding "can I pay this seat, and is it up" MUST join both kinds, and MUST NOT infer either property from the other's presence.
 
+### 6.3 Replaceable events are current state, never history
+
+> v1 rule: a replaceable or addressable event carries CURRENT state only, and MUST NOT be cited as evidence of a past state. The heartbeat that stood at a given claim's moment is overwritten and unrecoverable.
+
+This constrains what any claim about past market behaviour can be grounded in, including claims made in this document. A statement about what a seat advertised at some earlier moment cannot be evidenced by kind `30340`, because that event no longer exists in the form being described. It can only be evidenced by an event that is immutable and was published at that time -- a `CLAIM`, a `RESULT`, a `RECEIPT` -- together with the code mechanism that explains the field. Observations of a replaceable event are logged readings, which are testimony about an artifact rather than the artifact.
+
 ## 7. Tag Inventory
 
 **STATUS: specified, not implemented**
@@ -270,7 +276,7 @@ A reader MUST reject `ACCEPT` if any required binding field is absent.
 Neither `accepting` nor `queue_depth` gates claim eligibility -- not in this specification, and not in any implementation measured to date. Four independent measurements agree:
 
 - **No reader exists.** Across the Rust crates, every occurrence of either token is a doc comment, the emit-side input, or a test. The web bundles that parse kind `30340` read neither field. Claim eligibility is gated instead by a semaphore permit, taken when the node claims an offer and released when the job reaches a terminal outcome; with no free permit the node does not claim, so a full seat is *absent* from the market rather than visibly busy.
-- **Measured on the wire, on live paid jobs.** Seats advertising `accepting=n, queue_depth=1` continuously for 25+ minutes claimed targeted offers within minutes, while still advertising both values unchanged.
+- **Measured on the wire, on live paid jobs.** Seats advertising `accepting=n, queue_depth=1` across repeated polls spanning 25+ minutes claimed targeted offers within minutes of being asked. The citable half of that observation is the seat's `CLAIM` event, which is immutable and timestamped. The heartbeat half is a logged reading and can never be more than that, because kind `30340` is replaceable and the event that stood at claim time no longer exists (see 6.3) -- which is why the mechanism below matters more than the reading.
 - **`queue_depth` cannot express a depth.** It is computed as `u32::from(lifetime_job_row_count > 0)` over an unpruned table holding every job row in every state. It is a monotone flag meaning "this seat has ever run a job": it saturates at `1` on the seat's first job and can never return to `0`. A seat with five lifetime rows and nothing in flight advertises `queue_depth=1`. A reader treating a persistent `1` as a busy or stalled seat is reading a field whose resting state is `1`.
 - **`accepting` is not about capacity.** It is derived from whether the seat's harness roster is serving. `accepting=n` says the seat advertises no working harness. It does not say the seat is busy, and it does not stop the seat from claiming.
 
@@ -484,6 +490,15 @@ Verified in-tree rather than taken on report, and all three legs hold: the runne
 
 The attested-versus-asserted rule decides it (see 19). The node is the protocol participant we can hold to a specification; the harness is arbitrary third-party software. Defining delivery as *the agent's commit* makes the paid artifact depend on cooperation from a component the protocol cannot constrain, with no enforcement point.
 
+### 16.1 Delivery parentage, per mode
+
+v1 states parentage explicitly per mode. The field has measured this design three times and called it a defect each time (most recently n=56, zero exceptions), so the specification says it out loud rather than leaving it to be rediscovered:
+
+- **Contribution** (a buyer-pinned base exists): the delivery is exactly one commit parented on that base, which the node fetches to its own `refs/mobee/base`. The implementation asserts a parent count of one, on the pinned base rather than on any scratch tip.
+- **Greenfield** (no base): there is nothing to parent onto, so the delivery is a **root commit** whose tree is the whole workdir. The implementation asserts a parent count of zero.
+
+The agent's own commit is an ancestor in **neither** mode. That is the design and not a defect — it follows directly from the recommendation above, since a discarded commit cannot be an ancestor of anything.
+
 Costs, stated rather than buried:
 
 - `.gitignore`d files are excluded from the snapshot, so the job prompt MUST say so.
@@ -504,6 +519,8 @@ The same rule decides the sub-question. A tag is authored by the seller at publi
 > Normative limit: a sentinel proves EXECUTION IN THIS WORKDIR. It never proves work quality, and it can never stand in for acceptance.
 
 Costs: prompt overhead on every job, and a compliance burden on every harness. A harness that ignores the requirement produces a delivery with no sentinel, which MUST be a defined refusal carrying `no_sentinel` (see 10) -- otherwise the requirement has no failure mode and is decoration.
+
+**A sentinel is not a transcript.** Deliveries have been observed shipping the full agent conversation log inside the delivered tree (#324, 16 of 56). What belongs in the tree is a **structured execution manifest** -- the minimum that proves execution in this workdir, which is the sentinel's payload. A verbatim transcript is not that: it leaks prompt content into a public artifact, inflates every delivery, and still proves only what the harness chose to write. v1 requires the manifest and does not make the transcript part of the artifact.
 
 ## 18. Money Invariants
 
@@ -530,7 +547,13 @@ v1 distinguishes two epistemic classes of statement about a seat, because a scor
 
 Two consequences follow directly.
 
-**A self-report cannot reveal that self-reports are unreliable.** For a seat outside your own fleet there is no process table, no workdir, and no log, so the only available statement about its internals is its own. The control has to come from outside the reporting system, and for a foreign seat there is none. The strongest available signal is differential: request a named harness, and compare that seat's self-report against the same seat with the harness unset. If the self-report changes, the request is honoured in the seat's own accounting. If it does not change, that is a finding too -- either the request is ignored or the label is wrong. Neither outcome establishes what actually ran, and v1 does not pretend otherwise.
+**A self-report cannot reveal that self-reports are unreliable.** For a seat outside your own fleet there is no process table, no live log, and no shell, so no *live* control exists. It does not follow that no control exists at all. **The delivered tree is an artifact the buyer independently fetches and hashes, so any execution record the seller ships inside it is evidence by the definition above, not testimony.**
+
+This was measured the hard way, in the safe direction. A buyer concluded that no outside control existed for a foreign seat; the seat's own run record, carrying a runtime identifier, was already sitting in three delivery collects that had been downloaded and never opened. The search had stopped at the transport boundary instead of at the data already in hand.
+
+> v1 rule: before concluding that a property is unverifiable for a foreign seat, a reader MUST enumerate what the delivered artifact already contains. "No live access" and "no evidence" are different findings, and only the second one licenses giving up.
+
+Where no shipped artifact carries the property, the strongest remaining signal is differential: request a named harness, and compare that seat's self-report against the same seat with the harness unset. If the self-report changes, the request is honoured in the seat's own accounting. If it does not change, that is a finding too -- either the request is ignored or the label is wrong. Neither outcome establishes what actually ran, and v1 does not pretend otherwise.
 
 **Lapse is a protocol question, not a component defect.** Buyer-side parked jobs and seller-side stuck claims are the same failed trades seen from two ends; a replication measured seven of seven cross-side correspondences. No component owns lapse, so it is specified here rather than tracked as a defect in either implementation.
 
