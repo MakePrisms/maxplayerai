@@ -88,6 +88,9 @@ struct SlotGate {
     permits: Arc<Semaphore>,
     parked: Mutex<HashMap<String, ParkedSlot>>,
     lapse_after: Duration,
+    /// Configured ceiling, clamped as `new` clamps it. Held so a report can carry its denominator: a
+    /// count of resumed jobs means nothing without the capacity they are being bounded to.
+    capacity: usize,
 }
 
 /// A reserved slot held for a claim that is awaiting its award. `reserved_at` bounds how long the
@@ -119,6 +122,7 @@ impl SlotGate {
             permits: Arc::new(Semaphore::new(capacity.max(1))),
             parked: Mutex::new(HashMap::new()),
             lapse_after,
+            capacity: capacity.max(1),
         }
     }
 
@@ -145,10 +149,35 @@ impl SlotGate {
         self.parked.lock().expect("slot gate poisoned").remove(job_id);
     }
 
+    /// Acquire a permit for a job a restart left mid-flight, WAITING for one to free.
+    ///
+    /// A restart cannot inherit reservations by construction: [`ParkedSlot::reserved_at`] is a
+    /// monotonic `Instant` and the parked map is in-memory, so every permit is free when resumed jobs
+    /// start and [`Self::take_for_execution`] has nothing to hand them.
+    ///
+    /// WAITED, not tried: the alternative to waiting is abandoning awarded work, and under
+    /// award-is-payment the buyer's sats are already committed. The excess queues here instead —
+    /// tokio's semaphore hands permits to waiters in order, so a restart that caught more jobs than
+    /// `slots` runs them in waves rather than all at once or not at all.
+    ///
+    /// Nothing is parked and no `reserved_at` is seeded, which is the whole answer to the lapse clock:
+    /// an awarded job is already past the point the lapse sweep exists to bound (a CLAIM sitting
+    /// unawarded), so [`Self::sweep_lapsed`] can never reclaim a resumed job's permit and there is no
+    /// timer to restart. It is released exactly like every other executing slot — by the execution
+    /// future returning, unwind included.
+    ///
+    /// `None` is unreachable in this tree: it requires a closed semaphore, and this gate never calls
+    /// `close` or `add_permits`. Kept as an `Option` rather than an `expect` so an impossible case
+    /// cannot panic a resume task into silence — the caller logs it and resumes anyway, because
+    /// briefly exceeding a ceiling is the lesser failure against dropping awarded work.
+    async fn acquire_for_resume(&self) -> Option<OwnedSemaphorePermit> {
+        self.permits.clone().acquire_owned().await.ok()
+    }
+
     /// Take a reserved slot's permit to hand to the execution task, which holds it until the job is
     /// terminal (drop-on-return releases it). `None` when no permit is parked for this job — the
     /// restart case, where the in-memory map is empty but the durable store still has the awarded
-    /// job (re-acquiring a permit for resumed jobs is P4, tracked in the PR body).
+    /// job, and where [`Self::acquire_for_resume`] is what supplies the permit instead.
     fn take_for_execution(&self, job_id: &str) -> Option<OwnedSemaphorePermit> {
         self.parked
             .lock()
@@ -176,6 +205,41 @@ impl SlotGate {
     /// Permits currently free. For logging and tests.
     fn available(&self) -> usize {
         self.permits.available_permits()
+    }
+}
+
+/// Spawn one resume task per job a restart left mid-flight, each bounded by a real slot permit.
+///
+/// Without this the restart path re-drove every non-terminal job at once with no permit, so a node
+/// that came back up holding K such jobs ran `slots + K` executions against a ceiling of `slots` —
+/// invisible at `slots = 1`, and growing with every slot count we raise.
+///
+/// Each task waits for its permit INSIDE the task, so boot is never blocked on capacity: the loop
+/// must reach its select arms to stay responsive to offers and awards (issue #223), and a fan-out
+/// that awaited here would deafen exactly the node that just restarted.
+///
+/// Generic over the execution step so the fan-out — the part that carries the bound — is reachable by
+/// a test without a live relay, an agent, or a store. What a resumed job DOES is irrelevant to the
+/// bound, which is why stubbing it is sound rather than a shortcut.
+fn spawn_bounded_resumes<F, Fut>(slots: Arc<SlotGate>, job_ids: Vec<String>, execute: F)
+where
+    F: Fn(String, Option<OwnedSemaphorePermit>) -> Fut + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let execute = std::rc::Rc::new(execute);
+    for job_id in job_ids {
+        let slots = Arc::clone(&slots);
+        let execute = std::rc::Rc::clone(&execute);
+        tokio::task::spawn_local(async move {
+            let slot = slots.acquire_for_resume().await;
+            if slot.is_none() {
+                eprintln!(
+                    "seller node resume job_id={job_id}: slot gate closed; resuming WITHOUT a permit \
+                     (capacity may be exceeded — dropping awarded work is the worse outcome)"
+                );
+            }
+            execute(job_id, slot).await;
+        });
     }
 }
 
@@ -1354,20 +1418,32 @@ impl SellerNodeRunner {
         // (deterministic snapshot + deliver_and_enqueue dedup). Runs once at boot, before the loop.
         match self.node.store().resumable_jobs() {
             Ok(jobs) => {
+                let mut resumable = Vec::new();
                 for (job_id, state) in jobs {
                     if should_resume_execution(state) {
                         eprintln!(
                             "seller node resume: re-driving execution for job_id={job_id} (state={state:?})"
                         );
-                        // Resume off the loop too. P4 (PR body): re-acquire a slot permit per resumed
-                        // job so a restart honors `slots`; today they resume WITHOUT a permit (`None`),
-                        // so a restart could briefly exceed capacity until the resumed jobs drain.
-                        let runner = Arc::clone(&self);
-                        tokio::task::spawn_local(async move {
-                            runner.execute_job(&job_id, None).await;
-                        });
+                        resumable.push(job_id);
                     }
                 }
+                if !resumable.is_empty() {
+                    // The count WITH its denominator: a restart that caught more jobs than `slots`
+                    // runs them in waves, and an operator seeing only the count cannot tell whether
+                    // that is happening. While the backlog drains the node also stops claiming new
+                    // offers (no free permit ⇒ `SlotsBusy`), which is the intended back-pressure.
+                    eprintln!(
+                        "seller node resume: {} job(s) to re-drive, bounded to {} execution slot(s)",
+                        resumable.len(),
+                        self.slots.capacity
+                    );
+                }
+                // Resume off the loop, each holding a real permit so a restart honors `slots`.
+                let runner = Arc::clone(&self);
+                spawn_bounded_resumes(Arc::clone(&self.slots), resumable, move |job_id, slot| {
+                    let runner = Arc::clone(&runner);
+                    async move { runner.execute_job(&job_id, slot).await }
+                });
             }
             Err(error) => {
                 eprintln!("seller node resume: resumable_jobs read failed (continuing): {error}")
@@ -2326,8 +2402,11 @@ impl SellerNodeRunner {
         // `_slot` is the reserved execution permit, moved in and held for the whole call. It is
         // released the instant this function returns — on delivery, on any `fail_job*` path, on an
         // early idempotency return, or on a panic (unwind drops it). This RAII pairing is the single
-        // release site for an executing slot; there is no explicit release to forget. `None` only on
-        // the restart-resume path (P4), where no in-memory permit exists to carry.
+        // release site for an executing slot; there is no explicit release to forget. Every caller
+        // supplies one: the award path takes the parked reservation, the restart path acquires a fresh
+        // permit (`SlotGate::acquire_for_resume`). `None` is reachable only where a permit genuinely
+        // does not exist — a second award for a job already executing, whose reservation the first
+        // award removed — and that case early-returns on the idempotency guard below without running.
         //
         // Idempotency guard: only a job still `awarded`/`executing` runs. A REDUNDANT award (a second
         // award event with a different award_id for a job already delivered/paid — seen live in the
@@ -2866,7 +2945,8 @@ mod slot_gate_tests {
     //! deterministic core of the multi-slot correctness claim: the acquire/release PAIRING is what
     //! keeps a busy node from silently shrinking its own capacity. Each `available()` assertion is a
     //! revert-red tripwire — neuter a release path and the matching assertion fails.
-    use super::{Reserve, SlotGate};
+    use super::{spawn_bounded_resumes, Reserve, SlotGate};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     const LONG: Duration = Duration::from_secs(3600);
@@ -2919,6 +2999,107 @@ mod slot_gate_tests {
             Reserve::Reserved,
             "a released slot must admit the next claim"
         );
+    }
+
+    /// #251 — a restart that caught K jobs mid-flight must still honor `slots`.
+    ///
+    /// Four resumed jobs, two slots. Peak concurrency must be 2, and all four must still run: the
+    /// excess queues, it is never dropped, because under award-is-payment abandoning a resumed job
+    /// abandons work a buyer already committed sats to.
+    ///
+    /// ⚠ RED ON REVERT, and this is the pre-fix code exactly: delete the `acquire_for_resume().await`
+    /// from `spawn_bounded_resumes` and pass `None` instead. All four then run at once and `peak`
+    /// reaches 4 — `left: 4, right: 2`. Verified, not assumed.
+    ///
+    /// The execution step is stubbed on purpose. The bound is a property of the FAN-OUT, not of what a
+    /// job does, and stubbing is what makes peak concurrency observable at all — a real `execute_job`
+    /// would need a relay, an agent and a store, none of which the bound depends on. What this test
+    /// does NOT cover: that the production loop passes `execute_job` as its step. That is one call
+    /// site, checked by the compiler and by reading, and it is the only gap.
+    #[tokio::test]
+    async fn a_restart_resumes_more_jobs_than_slots_without_exceeding_capacity() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let gate = Arc::new(SlotGate::new(2, LONG));
+        let live = Rc::new(Cell::new(0usize));
+        let peak = Rc::new(Cell::new(0usize));
+        let done = Rc::new(Cell::new(0usize));
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (live_t, peak_t, done_t) =
+                    (Rc::clone(&live), Rc::clone(&peak), Rc::clone(&done));
+                spawn_bounded_resumes(
+                    Arc::clone(&gate),
+                    vec!["a".into(), "b".into(), "c".into(), "d".into()],
+                    move |_job_id, slot| {
+                        let (live, peak, done) =
+                            (Rc::clone(&live_t), Rc::clone(&peak_t), Rc::clone(&done_t));
+                        async move {
+                            // Held for the whole stub execution, exactly as `execute_job` holds it.
+                            let _slot = slot;
+                            live.set(live.get() + 1);
+                            peak.set(peak.get().max(live.get()));
+                            // Yield across an await so admitted tasks genuinely overlap: a bound that
+                            // held only because nothing ever ran concurrently would prove nothing.
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            live.set(live.get() - 1);
+                            done.set(done.get() + 1);
+                        }
+                    },
+                );
+                // Bounded drain rather than a fixed sleep, so a slow box cannot flake this.
+                for _ in 0..200 {
+                    if done.get() == 4 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+
+        assert_eq!(
+            done.get(),
+            4,
+            "every resumed job must run — the excess queues behind a permit, it is never dropped"
+        );
+        assert_eq!(
+            peak.get(),
+            2,
+            "concurrent resumed executions must never exceed the configured slots"
+        );
+        assert_eq!(
+            gate.available(),
+            2,
+            "every permit returns to the pool once the resumed jobs drain"
+        );
+    }
+
+    /// A resumed job's permit is never parked, so the lapse sweep cannot reclaim it mid-execution.
+    ///
+    /// This is the answer to #251's second question — the lapse clock for a re-acquired permit — and it
+    /// is "there isn't one". `reserved_at` bounds a CLAIM waiting to be awarded; a resumed job is
+    /// already awarded and executing, so seeding a fresh `Instant` would start a timer over a state the
+    /// sweep was never meant to measure.
+    #[tokio::test]
+    async fn a_resumed_permit_is_not_parked_so_the_lapse_sweep_cannot_reclaim_it() {
+        let gate = SlotGate::new(1, Duration::from_millis(0));
+        let permit = gate
+            .acquire_for_resume()
+            .await
+            .expect("the gate is never closed, so a permit is always eventually available");
+
+        assert_eq!(gate.available(), 0, "a resumed job holds real capacity");
+        assert!(
+            gate.sweep_lapsed(Instant::now()).is_empty(),
+            "an executing resumed job is not a parked claim and must never be swept"
+        );
+        assert_eq!(gate.available(), 0, "and the sweep must not have freed its permit");
+
+        drop(permit);
+        assert_eq!(gate.available(), 1, "released by the execution ending, like every other slot");
     }
 
     #[test]
