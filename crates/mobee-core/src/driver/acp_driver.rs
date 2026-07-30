@@ -298,10 +298,29 @@ impl Driver for AcpDriver {
             let _ = tokio::task::spawn_blocking(move || {
                 #[cfg(unix)]
                 {
-                    let _ = Command::new("kill")
-                        .arg("-TERM")
-                        .arg(format!("-{}", child.id()))
-                        .status();
+                    let pid = child.id();
+                    // Signal the GROUP only when this child actually leads it. `spawn` requests
+                    // `process_group(0)`, but nothing here ever verified the request took effect —
+                    // and a group TERM aimed at a group we do not own lands on processes that are
+                    // not ours. On a CI runner that is the runner's own tree: the job dies at the
+                    // instant of shutdown with exit 143 and reports "the runner has received a
+                    // shutdown signal", which looks like infrastructure rather than like us.
+                    match process_group_of(pid) {
+                        Some(pgid) if pgid == pid => {
+                            // `--` ends option parsing so an external `kill` cannot read the
+                            // negative operand as a signal spec.
+                            let _ = Command::new("kill")
+                                .arg("-s")
+                                .arg("TERM")
+                                .arg("--")
+                                .arg(format!("-{pgid}"))
+                                .status();
+                        }
+                        // Not the group leader (or the group is unreadable): kill this process
+                        // alone. Leaking a grandchild is recoverable; signalling a group we do not
+                        // own is not.
+                        _ => {}
+                    }
                 }
                 let _ = child.kill();
                 let _ = child.wait();
@@ -309,6 +328,73 @@ impl Driver for AcpDriver {
             .await;
         }
         Ok(())
+    }
+}
+
+/// The process group id of `pid`, or `None` if it cannot be established.
+///
+/// `None` is the SAFE answer — a caller that cannot establish the group MUST NOT signal one.
+///
+/// Read from `/proc/<pid>/stat` rather than `libc::getpgid` deliberately: `libc` is an **optional**
+/// dependency of this crate, enabled only by the `wallet` feature, while this module compiles under
+/// `default = []`. A `libc` call here would break the default build — the one that is green.
+#[cfg(unix)]
+fn process_group_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_pgrp_from_stat(&stat)
+}
+
+/// Pull field 5 (`pgrp`) out of a `/proc/<pid>/stat` line.
+///
+/// ⚠ These fields CANNOT be split naively from the left. Field 2 is `comm`, a parenthesised command
+/// name that may itself contain spaces and parentheses (`(my prog (v2))`), which mis-numbers every
+/// field after it. Everything after the LAST `)` is parsed instead; there the fields are
+/// `state ppid pgrp …`, so `pgrp` is the 3rd.
+#[cfg(unix)]
+fn parse_pgrp_from_stat(stat: &str) -> Option<u32> {
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(2)?.parse().ok()
+}
+
+#[cfg(all(test, unix))]
+mod group_scope_tests {
+    use super::parse_pgrp_from_stat;
+
+    /// The ordinary shape.
+    #[test]
+    fn pgrp_is_field_five() {
+        // pid comm state ppid pgrp …
+        assert_eq!(parse_pgrp_from_stat("4242 (bash) S 4000 4242 4242 0"), Some(4242));
+        assert_eq!(parse_pgrp_from_stat("4242 (bash) S 4000 999 4242 0"), Some(999));
+    }
+
+    /// ★ The reason this is parsed from the RIGHT. A left-to-right split would read `prog` as the
+    /// state field and return a wrong pgrp — silently, since it still parses as a number.
+    #[test]
+    fn a_comm_containing_spaces_and_parens_does_not_shift_the_fields() {
+        assert_eq!(
+            parse_pgrp_from_stat("77 (my prog (v2)) S 1 4242 4242 0"),
+            Some(4242)
+        );
+        assert_eq!(parse_pgrp_from_stat("77 (a b c d e) S 1 555 555 0"), Some(555));
+    }
+
+    /// Unreadable ⇒ `None`, and `None` must mean "never signal a group".
+    #[test]
+    fn unparseable_stat_yields_none_so_no_group_is_signalled() {
+        assert_eq!(parse_pgrp_from_stat(""), None);
+        assert_eq!(parse_pgrp_from_stat("no parens here at all"), None);
+        assert_eq!(parse_pgrp_from_stat("77 (bash) S"), None);
+        assert_eq!(parse_pgrp_from_stat("77 (bash) S 1 notanumber"), None);
+    }
+
+    /// Live control: this test's own process must be readable, and its pgrp non-zero. Without this,
+    /// every assertion above is about a string literal and none about `/proc`.
+    #[test]
+    fn our_own_process_group_is_readable() {
+        let pgid = super::process_group_of(std::process::id())
+            .expect("our own /proc/<pid>/stat must be readable");
+        assert!(pgid > 0, "a real pgrp is never 0");
     }
 }
 
