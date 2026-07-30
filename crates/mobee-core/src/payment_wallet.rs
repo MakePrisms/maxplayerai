@@ -45,8 +45,14 @@ pub const MINT_UNREACHABLE_PAY: &str = "mint_unreachable_pay";
 pub struct RetireReport {
     /// `Send(ProofsReserved)` sagas cancelled after mint Unspent proof.
     pub retired: usize,
-    /// Mapped `Send(TokenCreated)` pending claims left alone (not a wedge).
+    /// Mapped `Send(TokenCreated)` sagas SEEN — a completed send, never a wedge. Counted whether
+    /// or not the row was then dropped, so `mapped_token_created - retired_mapped` is the number
+    /// that were recognised but refused.
     pub mapped_token_created: usize,
+    /// Mapped `Send(TokenCreated)` sagas actually RETIRED (row deleted). A tally is not a
+    /// retirement: this field exists because the mapped arm used to only count, which left the
+    /// table growing by one per payment forever (#293).
+    pub retired_mapped: usize,
     /// Stranded Swap sagas rolled back after mint-truth said the reserved inputs
     /// were all UNSPENT — the swap never executed.
     pub swap_rolled_back: usize,
@@ -671,10 +677,20 @@ pub async fn retire_eligible_incomplete_sagas(
                 retire_one_proofs_reserved(wallet, &saga).await?;
                 report.retired += 1;
             }
+            // A `TokenCreated` send WITH a confirmed outgoing transaction is a send that
+            // demonstrably completed. Counting it and moving on is what left this table growing by
+            // exactly one row per payment, forever (#293) — so the row is dropped here.
             WalletSagaState::Send(SendSagaState::TokenCreated)
                 if saga_has_confirmed_outgoing_tx(wallet, &saga).await? =>
             {
                 report.mapped_token_created += 1;
+                // A refusal is recorded and the pass continues: one saga that cannot be retired
+                // must not stop the others from being, and leaving the row is always the safe
+                // outcome here (it is inert, not a wedge — `recover_unmapped_sagas` tolerates it).
+                match retire_one_mapped_send(wallet, &saga).await {
+                    Ok(()) => report.retired_mapped += 1,
+                    Err(refusal) => report.unresolved.push(format!("{}: {refusal}", saga.id)),
+                }
             }
             // Unmapped `Send(TokenCreated)`: resolve on mint truth. Left unresolved these
             // wedge the wallet permanently — `recover_unmapped_sagas` refuses them
@@ -1171,6 +1187,83 @@ async fn resolve_one_send_saga(
             ));
         }
     }
+    Ok(())
+}
+
+/// Retire a `Send(TokenCreated)` saga that has a confirmed outgoing transaction: the send
+/// completed, and the row is bookkeeping for a finished operation.
+///
+/// ★ **This is a SECOND admission predicate, not a relaxation of the first.** The empty-reserved
+/// refusal in [`retire_one_proofs_reserved`] guards a `ProofsReserved` saga, where the send has NOT
+/// completed and an empty reserved set cannot be told apart from a spent-then-deleted orphan.
+/// Here the outgoing transaction independently establishes that the send happened, so the same
+/// observation carries the opposite meaning: nothing is reserved because there is nothing left to
+/// reserve. That guard is untouched, and this path never reads its way around it.
+///
+/// The identifier is `transactions.saga_id`, never the amount — amounts collide freely (four
+/// 100-sat sends in the live wallet), so an amount match is not evidence of identity. Direction is
+/// asserted too, since a saga id could otherwise be satisfied by an incoming row.
+///
+/// ⚠ Refuses on a NON-EMPTY reserved set. A completed send still holding reserved inputs is an
+/// anomaly, and deleting the saga would strand those proofs reserved against a row that no longer
+/// exists — unspendable, with nothing left to explain why. Surfacing beats tidying.
+///
+/// Proofs are deliberately NOT mutated. The inputs of a completed send are already in their final
+/// state (that is why nothing is reserved), and the token's OUTPUT proofs belong to the payee —
+/// they are unreachable from a saga in any case, because `created_by_operation` is never populated
+/// (tracked separately). Retiring here is a row deletion and nothing else.
+///
+/// TOCTOU: re-prove state and the transaction immediately before mutating.
+async fn retire_one_mapped_send(
+    wallet: &Wallet,
+    saga: &cdk::wallet::types::WalletSaga,
+) -> Result<(), PaymentWalletError> {
+    let fresh = wallet
+        .localstore
+        .get_saga(&saga.id)
+        .await
+        .map_err(wallet_error)?
+        .ok_or_else(|| {
+            PaymentWalletError::Reconcile(
+                "mapped-send retire refused: saga disappeared before mutate".into(),
+            )
+        })?;
+    if !matches!(
+        fresh.state,
+        WalletSagaState::Send(SendSagaState::TokenCreated)
+    ) {
+        return Err(PaymentWalletError::Reconcile(
+            "mapped-send retire refused: saga no longer a TokenCreated send before mutate (TOCTOU)"
+                .into(),
+        ));
+    }
+    // Re-prove the admission itself, not just the state it was admitted from.
+    if !saga_has_confirmed_outgoing_tx(wallet, &fresh).await? {
+        return Err(PaymentWalletError::Reconcile(
+            "mapped-send retire refused: no confirmed outgoing tx for this saga before mutate \
+             (TOCTOU)"
+                .into(),
+        ));
+    }
+    let reserved = wallet
+        .localstore
+        .get_reserved_proofs(&saga.id)
+        .await
+        .map_err(wallet_error)?;
+    if !reserved.is_empty() {
+        return Err(PaymentWalletError::Reconcile(format!(
+            "mapped-send retire refused: send completed but {} proofs are still reserved against \
+             this saga; deleting it would strand them (surface, do not tidy)",
+            reserved.len()
+        )));
+    }
+    wallet
+        .localstore
+        .delete_saga(&saga.id)
+        .await
+        .map_err(|error| {
+            PaymentWalletError::Reconcile(format!("mapped-send retire failed deleting saga: {error}"))
+        })?;
     Ok(())
 }
 
@@ -3814,6 +3907,138 @@ mod tests {
             .iter()
             .map(|info| info.y)
             .collect()
+    }
+
+    /// Attach a transaction to `saga_id`. Direction, amount and the id are all explicit so a test
+    /// can build the NEAR-MISSES — an incoming row, or a row whose amount matches while its
+    /// `saga_id` does not — which is where the admission predicate is actually decided.
+    async fn add_tx_for_saga(
+        wallet: &Wallet,
+        saga_id: Option<uuid::Uuid>,
+        direction: TransactionDirection,
+        amount: u64,
+    ) {
+        wallet
+            .localstore
+            .add_transaction(Transaction {
+                mint_url: wallet.mint_url.clone(),
+                direction,
+                amount: Amount::from(amount),
+                fee: Amount::ZERO,
+                unit: wallet.unit.clone(),
+                ys: vec![],
+                timestamp: 1,
+                memo: None,
+                metadata: HashMap::new(),
+                quote_id: None,
+                payment_request: None,
+                payment_proof: None,
+                payment_method: None,
+                saga_id,
+            })
+            .await
+            .unwrap();
+    }
+
+    // #293. A `TokenCreated` send WITH a confirmed outgoing transaction is a COMPLETED send. The
+    // arm that recognised it used to only increment a counter, so the table grew by one row per
+    // payment forever — measured live at 7 sagas against 7 outgoing transactions, 1:1.
+    #[tokio::test]
+    async fn a_mapped_token_created_saga_is_retired_not_merely_counted() {
+        let wallet = send_saga_wallet(60, vec![], vec![]).await;
+        let saga_id = add_send_saga(&wallet, &[]).await;
+        add_tx_for_saga(&wallet, Some(saga_id), TransactionDirection::Outgoing, 100).await;
+
+        let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
+
+        assert_eq!(report.mapped_token_created, 1, "it must still be RECOGNISED as mapped");
+        assert_eq!(report.retired_mapped, 1, "and recognising it is not enough — it must be DROPPED");
+        assert!(report.unresolved.is_empty(), "unexpected refusal: {:?}", report.unresolved);
+        // The predicate that matters is over the artifact, not the report: the row is gone.
+        assert!(
+            wallet.localstore.get_saga(&saga_id).await.unwrap().is_none(),
+            "the saga row must be absent after a retire — a tally is not a retirement"
+        );
+    }
+
+    // RED LEGS for the admission predicate. Each is a near-miss that a sloppier join would admit,
+    // and admitting any of them deletes bookkeeping for an operation that did not demonstrably
+    // finish. The saga must survive every one of them.
+    #[tokio::test]
+    async fn a_mapped_retire_refuses_every_near_miss_and_leaves_the_saga_in_place() {
+        // ★ THE IDENTIFIER CONTROL. A transaction with the SAME AMOUNT but a different `saga_id`
+        // must not admit. This is the exact collinearity that made two unrelated row-sets look
+        // like one during triage: `100` appears four times in the live wallet, so an amount match
+        // is not evidence of identity. Only `transactions.saga_id` is.
+        let wallet = send_saga_wallet(61, vec![], vec![]).await;
+        let saga_id = add_send_saga(&wallet, &[]).await;
+        add_tx_for_saga(
+            &wallet,
+            Some(uuid::Uuid::now_v7()),
+            TransactionDirection::Outgoing,
+            0,
+        )
+        .await;
+        let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
+        assert_eq!(
+            report.retired_mapped, 0,
+            "a tx matching by amount but NOT saga_id must not admit a retire"
+        );
+        assert!(
+            wallet.localstore.get_saga(&saga_id).await.unwrap().is_some(),
+            "the saga must survive an amount-only match"
+        );
+
+        // Direction. A saga id can be satisfied by an INCOMING row, which says nothing about a
+        // send having gone out.
+        let wallet = send_saga_wallet(62, vec![], vec![]).await;
+        let saga_id = add_send_saga(&wallet, &[]).await;
+        add_tx_for_saga(&wallet, Some(saga_id), TransactionDirection::Incoming, 0).await;
+        let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
+        assert_eq!(report.retired_mapped, 0, "an incoming tx must not admit a retire");
+        assert!(
+            wallet.localstore.get_saga(&saga_id).await.unwrap().is_some(),
+            "the saga must survive an incoming-only match"
+        );
+
+        // No transaction at all — the #269 fail-closed property, which this change must not erode.
+        let wallet = send_saga_wallet(63, vec![], vec![]).await;
+        let saga_id = add_send_saga(&wallet, &[]).await;
+        let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
+        assert_eq!(
+            report.retired_mapped, 0,
+            "an UNMAPPED token_created saga must never reach the mapped retire"
+        );
+        assert!(
+            wallet.localstore.get_saga(&saga_id).await.unwrap().is_some(),
+            "an unmapped saga must survive for recover_unmapped_sagas to refuse over"
+        );
+    }
+
+    // A completed send that still holds RESERVED inputs is an anomaly, and deleting its saga would
+    // strand those proofs reserved against a row that no longer exists — unspendable, with nothing
+    // left to say why. Surface it instead of tidying it away.
+    #[tokio::test]
+    async fn a_mapped_send_still_holding_reserved_proofs_refuses_rather_than_stranding_them() {
+        let seller = secret_key(1).public_key();
+        let proof = p2pk_proof(7, seller);
+        let wallet = send_saga_wallet(64, vec![proof.clone()], vec![]).await;
+        let saga_id = add_send_saga(&wallet, &[proof]).await;
+        add_tx_for_saga(&wallet, Some(saga_id), TransactionDirection::Outgoing, 7).await;
+
+        let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
+
+        assert_eq!(report.mapped_token_created, 1, "still recognised as a mapped send");
+        assert_eq!(report.retired_mapped, 0, "but it must NOT be retired");
+        assert!(
+            report.unresolved.iter().any(|line| line.contains("still reserved")),
+            "the refusal must surface why, got: {:?}",
+            report.unresolved
+        );
+        assert!(
+            wallet.localstore.get_saga(&saga_id).await.unwrap().is_some(),
+            "the saga must survive so the reserved proofs stay explained"
+        );
     }
 
     #[tokio::test]
