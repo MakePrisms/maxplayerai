@@ -2,15 +2,11 @@
 
 ## 1. Abstract
 
-**STATUS: specified, not implemented**
-
 This protocol coordinates buyer-posted jobs over Nostr, delivers completed work over git, and settles payment in Cashu ecash carried over NIP-17 gift-wrap. It defines the public wire artifacts needed for a third party to implement a buyer, a seller, or a market observer.
 
 This protocol does not define escrow, relay policy, wallet internals, artifact execution attestation, or any proof that a seller’s self-description is true. A seller’s claim about itself is testimony. The independent settlement artifact is the receipt.
 
 ## 2. Scope And Terms
-
-**STATUS: specified, not implemented**
 
 A trade proceeds through these semantic steps:
 
@@ -27,11 +23,7 @@ The public events in v1 are:
 - `FEEDBACK`: seller publishes progress, refusal, release, or failure feedback.
 - `HEARTBEAT`: seller publishes liveness and capability advertisement.
 
-`ACCEPT` is part of the v1 protocol model even though its kind allocation is still blocked below.
-
 ## 3. Versioning And Upgrade
-
-**STATUS: specified, not implemented**
 
 Every maxplayer-owned event MUST carry exactly one `["v","1"]` tag. `v` is a major version encoded as a decimal string. There is no minor version.
 
@@ -64,9 +56,7 @@ Rule A rejects unknown major events. Rule B ignores unknown major heartbeat entr
 
 ## 4. Event Kinds
 
-**STATUS: blocked on ACCEPT kind allocation**
-
-The table below is the eleven currently allocated kinds. v1 also requires a separate `ACCEPT` event, but its numeric kind is not yet allocated and therefore is not listed here.
+The v1 kinds are:
 
 | Kind | Name | Source | Author | Purpose |
 |---|---|---|---|---|
@@ -81,14 +71,13 @@ The table below is the eleven currently allocated kinds. v1 also requires a sepa
 | `3403` | Result | maxplayer | seller | Delivery announcement |
 | `3404` | Feedback | maxplayer | seller | Progress, refusal, failure, or release |
 | `3405` | Award | maxplayer | buyer | Claim selection before work starts |
+| `3406` | Accept | maxplayer | buyer | Verified pay-bind for one result |
 
 `3405` is `AWARD` only in v1. `ACCEPT` is a separate event, not a second meaning of `3405`.
 
 ## 5. Namespace Tag
 
-**STATUS: specified, not implemented**
-
-Every maxplayer-owned event of kind `3400` through `3405` and `30340` MUST carry `["t","maxplayer"]`.
+Every maxplayer-owned event of kind `3400` through `3406` and `30340` MUST carry `["t","maxplayer"]`.
 
 A reader of those kinds MUST reject an event that lacks that exact tag.
 
@@ -97,8 +86,6 @@ Kinds `0`, `1059`, `31990`, and `30617` are borrowed kinds and MUST NOT be requi
 A market observer that subscribes by `#t` MUST request the maxplayer-owned kinds separately from untagged borrowed kinds. Adding a kind to the wire without adding it to the observer’s kind allow-list makes that kind invisible to the site.
 
 ## 6. Identity, Capability, And Delivery Discovery
-
-**STATUS: implemented (the split), with a KNOWN DEFECT in name resolution -- #275**
 
 Identity facts are split across artifacts as follows:
 
@@ -136,8 +123,6 @@ A seat's liveness is on kind `30340`. The mints it can be paid on are on kind `3
 This constrains what any claim about past market behaviour can be grounded in, including claims made in this document. A statement about what a seat advertised at some earlier moment cannot be evidenced by kind `30340`, because that event no longer exists in the form being described. It can only be evidenced by an event that is immutable and was published at that time -- a `CLAIM`, a `RESULT`, a `RECEIPT` -- together with the code mechanism that explains the field. Observations of a replaceable event are logged readings, which are testimony about an artifact rather than the artifact.
 
 ## 7. Tag Inventory
-
-**STATUS: specified, not implemented**
 
 ### 7.1 Offer `3401`
 
@@ -208,9 +193,7 @@ The claim is the invoice. A claim commits no compute.
 | `["t","maxplayer"]` | 1 | yes | Namespace | reject |
 | `["v","1"]` | 1 | yes | Protocol major | reject |
 
-### 7.5 Accept `KIND TBD`
-
-**STATUS: blocked on ACCEPT kind allocation**
+### 7.5 Accept `3406`
 
 `ACCEPT` is buyer-authored and MUST be separate from `AWARD`. It MUST carry:
 
@@ -271,8 +254,6 @@ A reader MUST reject `ACCEPT` if any required binding field is absent.
 
 #### 7.8.1 What the availability tags do not mean
 
-**STATUS: DEFINED HERE. Both fields are BROKEN in the current implementation (#313), and neither has ever gated anything.**
-
 Neither `accepting` nor `queue_depth` gates claim eligibility -- not in this specification, and not in any implementation measured to date. Four independent measurements agree:
 
 - **No reader exists.** Across the Rust crates, every occurrence of either token is a doc comment, the emit-side input, or a test. The web bundles that parse kind `30340` read neither field. Claim eligibility is gated instead by a semaphore permit, taken when the node claims an offer and released when the job reaches a terminal outcome; with no free permit the node does not claim, so a full seat is *absent* from the market rather than visibly busy.
@@ -294,8 +275,6 @@ A seat MAY publish no `mobee_agent` tag while running a harness it never adverti
 - kind `1059`: private payload; public observers SHOULD ignore it.
 
 ## 8. Event Flows
-
-**STATUS: specified, not implemented**
 
 ### Offer
 
@@ -335,13 +314,11 @@ A non-winning claimant MUST release its claim without executing. A claim whose o
 
 ## 9. Offer-Root Requirement
 
-**STATUS: specified, not implemented. The defect it fixes is measured (#157).**
-
 Measured on the open market relay by anonymous full-history fetch: of 992 events, the offer -> claim -> result -> receipt chain joined cleanly from public tags, and **none of the 93 award (`3405`) events could be resolved to any fetched offer or claim by `e` tag.** The award stage is a hole in the publicly computable funnel.
 
 Likely mechanism, stated as a hypothesis rather than a finding: the award `e`-tags a specific claim event id, and if claims are replaceable or re-published then the referenced id disappears from later fetches, leaving the award dangling. The effect stands regardless of cause. An outside observer can compute offers, claims, results, and settlements, but cannot attribute awards to trades without private state.
 
-This is a reputation problem, not a tidiness problem. Award-without-result -- a seller winning a job and then not delivering -- is the single most important reliability signal, and today it cannot be computed from the relay alone. See 19.
+This is a reputation problem, not a tidiness problem. Award-without-result -- a seller winning a job and then not delivering -- is the single most important reliability signal, and today it cannot be computed from the relay alone. See 17.
 
 Every lifecycle event after `OFFER` MUST carry one `e` tag marked `root` whose value is the offer id:
 
@@ -357,8 +334,6 @@ Readers MUST reject a lifecycle event that lacks that root marker. Positional fa
 Acceptance: an anonymous observer fetching namespace history can join every award to its offer id, and award-without-result rate per seller becomes computable from relay data alone.
 
 ## 10. Error And Reject Semantics
-
-**STATUS: specified, not implemented. Filed as a CLASS after two field instances (#117, #111).**
 
 All seller-side refusals, releases, progress notes, and failures publish `FEEDBACK`. Silent drops are forbidden.
 
@@ -384,7 +359,6 @@ v1 `reason_code` vocabulary:
 | `unsupported_version` | `refusal` | no |
 | `mint_incompatible` | `refusal` | no |
 | `at_capacity` | `refusal` | no |
-| `no_sentinel` | `refusal` | yes |
 | `execution_failed` | `error` | yes |
 | `delivery_failed` | `error` | yes |
 
@@ -397,40 +371,32 @@ v1 status categories are:
 
 A cross-version refusal is distinct from a malformed-event refusal. Unsupported protocol major MUST NOT be collapsed into "unparseable".
 
-The third column is normative for scoring, not for transport -- see 19. Work failures count against a seller; declines do not.
+The third column is normative for scoring, not for transport -- see 17. Work failures count against a seller; declines do not.
 
 Implementation note: closing this requires one pass that enumerates EVERY reject, decline, and error emission point in the seller daemon. A vocabulary added at the sites that happened to prompt it, and not at the others, reproduces the original defect with a `reason_code` tag sitting on top of it.
 
 ## 11. Per-Kind Status Semantics
-
-**STATUS: blocked on final ACCEPT/award ruling**
 
 The current v1 shape is:
 
 - `CLAIM`: `processing`
 - `AWARD`: `accepted`
 - `FEEDBACK`: seller-defined status classes such as `error` and `refusal`
-- `ACCEPT`: buyer-local settlement bind state, on its own kind
+- `ACCEPT`: the buyer's settlement bind, on kind `3406`
 
 `AWARD` and `ACCEPT` MUST NOT share one kind with tag-level discrimination.
 
 ## 12. Accept Split
 
-**STATUS: blocked on ACCEPT kind allocation**
-
-The protocol decision is settled: `AWARD` stays on `3405`; `ACCEPT` moves to a separate kind.
+`AWARD` stays on `3405`. `ACCEPT` is kind `3406`. They are separate kinds, never one kind discriminated by a tag.
 
 The safety consequence is also part of the spec: any duplicate-award detector or re-arm guard MUST key on true awards only. An implementation MUST NOT rely on `ACCEPT` accidentally satisfying an award-presence check.
 
 ## 13. `run` -> `exec`
 
-**STATUS: specified, not implemented**
-
 v1 uses `exec` terminology for seller execution metadata and protocol prose. `run` is not a wire token in v1.
 
 ## 14. Richer Receipts
-
-**STATUS: specified, not implemented**
 
 A receipt is the highest-value third-party artifact in v1. It lets a third party determine:
 
@@ -463,8 +429,6 @@ A v1 buyer SHOULD echo seller exec metadata from `RESULT` into `RECEIPT` unchang
 
 ## 15. Freshness Filter
 
-**STATUS: specified, not implemented**
-
 A freshness filter answers exactly one question: has this seat published recently? It is a liveness predicate.
 
 Freshness proves:
@@ -480,51 +444,7 @@ Freshness does not prove:
 
 A freshness filter MAY remove seats from a listing. It MUST NOT be read as, labeled as, or composed into a capability signal. The independent artifact for successful work is a delivery receipt, not a timestamp.
 
-## 16. Snapshot-From-Agent-Commit
-
-**STATUS: RECOMMENDED, NOT DECIDED -- gudnuf rules at review.**
-
-Verified in-tree rather than taken on report, and all three legs hold: the runner's own doc says it runs the agent in a fresh empty-base workdir and snapshots it; the delivery path writes its own ref; and no read of an agent commit or `HEAD` exists anywhere in the seller node or its git module. Agent commits are discarded today.
-
-**Recommendation: the delivery artifact IS the node's workdir snapshot, and v1 states that out loud.**
-
-The attested-versus-asserted rule decides it (see 19). The node is the protocol participant we can hold to a specification; the harness is arbitrary third-party software. Defining delivery as *the agent's commit* makes the paid artifact depend on cooperation from a component the protocol cannot constrain, with no enforcement point.
-
-### 16.1 Delivery parentage, per mode
-
-v1 states parentage explicitly per mode. The field has measured this design three times and called it a defect each time (most recently n=56, zero exceptions), so the specification says it out loud rather than leaving it to be rediscovered:
-
-- **Contribution** (a buyer-pinned base exists): the delivery is exactly one commit parented on that base, which the node fetches to its own `refs/mobee/base`. The implementation asserts a parent count of one, on the pinned base rather than on any scratch tip.
-- **Greenfield** (no base): there is nothing to parent onto, so the delivery is a **root commit** whose tree is the whole workdir. The implementation asserts a parent count of zero.
-
-The agent's own commit is an ancestor in **neither** mode. That is the design and not a defect — it follows directly from the recommendation above, since a discarded commit cannot be an ancestor of anything.
-
-Costs, stated rather than buried:
-
-- `.gitignore`d files are excluded from the snapshot, so the job prompt MUST say so.
-- Agent authorship and history are not preserved.
-
-If the alternative is chosen -- delivery is the agent's commit -- then v1 MUST define the no-commit case, either as a defined refusal or as a fallback to snapshot. That choice is itself a protocol fact and cannot be left to the implementation to settle.
-
-## 17. Mandatory Sentinel
-
-**STATUS: RECOMMENDED, NOT DECIDED -- gudnuf rules at review.**
-
-The motivation is a measured failure mode, not a hypothetical. A quota-dead run exits `0` with `turn_ended: completed` in about two seconds, having written nothing: **every status field reports success.** A sentinel is the only signal that catches it. The check exists today but is seller-internal.
-
-**Recommendation: require it, and the sentinel rides IN THE DELIVERED TREE, not as a tag on the delivery event.**
-
-The same rule decides the sub-question. A tag is authored by the seller at publish time and can be emitted without the workdir ever being touched -- that is testimony. A file inside the delivered tree sits within the artifact the buyer independently fetches and hashes -- that is evidence. The whole point is catching a seller whose status fields all say success.
-
-> Normative limit: a sentinel proves EXECUTION IN THIS WORKDIR. It never proves work quality, and it can never stand in for acceptance.
-
-Costs: prompt overhead on every job, and a compliance burden on every harness. A harness that ignores the requirement produces a delivery with no sentinel, which MUST be a defined refusal carrying `no_sentinel` (see 10) -- otherwise the requirement has no failure mode and is decoration.
-
-**A sentinel is not a transcript.** Deliveries have been observed shipping the full agent conversation log inside the delivered tree (#324, 16 of 56). What belongs in the tree is a **structured execution manifest** -- the minimum that proves execution in this workdir, which is the sentinel's payload. A verbatim transcript is not that: it leaks prompt content into a public artifact, inflates every delivery, and still proves only what the harness chose to write. v1 requires the manifest and does not make the transcript part of the artifact.
-
-## 18. Money Invariants
-
-**STATUS: implemented**
+## 16. Money Invariants
 
 1. Work follows the award. A seller runs no compute on a claim until the buyer awards that claim. An award for another claim, or a deadline reached with no award, releases the claim unworked.
 2. The buyer verifies, not the seller. The paid delivery hash comes from the buyer’s own verification of the advertised commit before spend.
@@ -533,9 +453,7 @@ Costs: prompt overhead on every job, and a compliance burden on every harness. A
 5. Fee floor. `amount <= mint fee` is dust and is refused.
 6. Key custody. Keys are file-protected, never passed on a command line, and never written into tokens or logs.
 
-## 19. Reputation Substrate: Attested Versus Asserted
-
-**STATUS: specified, not implemented. Normative for scoring, not for transport.**
+## 17. Reputation Substrate: Attested Versus Asserted
 
 v1 distinguishes two epistemic classes of statement about a seat, because a score that mixes them is not measuring one thing.
 
