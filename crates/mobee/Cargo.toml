@@ -1,15 +1,25 @@
 [package]
+# The crate keeps its name; the shipped binary does not. `[[bin]]` below is what makes that
+# separable — without it Cargo derives the executable name from the package, which is why the
+# application rename looked like it forced a crate rename. Internal crate names are deliberately
+# `mobee`: nothing publishes to crates.io, so users never see them, and renaming them would touch
+# most of the workspace for no user-visible gain.
 name = "mobee"
 version.workspace = true
 edition.workspace = true
 description.workspace = true
 repository.workspace = true
+license.workspace = true
 publish.workspace = true
+
+[[bin]]
+name = "maxplayer"
+path = "src/main.rs"
 
 [features]
 default = ["wallet"]
 acp = ["mobee-core/acp"]
-wallet = ["mobee-core/wallet", "dep:git2"]
+wallet = ["mobee-core/wallet", "dep:git2", "dep:nostr-sdk"]
 # Dev-only: exposes `mobee stub-pay` (budget-gate exercise). Not on the settlement
 # path and not part of the default user CLI surface.
 stub-pay = []
@@ -22,3 +32,7 @@ tokio = { version = "1.52.0", features = ["rt", "rt-multi-thread", "time", "macr
 # Read-only materialization of a paid delivery from the buyer store (get_result). Local bare-repo
 # reads only — no transport — so the workspace's default-features-off git2 (no openssl) suffices.
 git2 = { workspace = true, optional = true }
+# `whoami` encodes the derived PUBLIC key as its npub (bech32). Same nostr 0.44 line mobee-core
+# already resolves under `wallet`, so no new resolution — gated by `wallet` because the public key
+# it encodes comes from `mobee-core::home::public_key_hex`, itself `wallet`-gated.
+nostr-sdk = { version = "0.44.1", optional = true }

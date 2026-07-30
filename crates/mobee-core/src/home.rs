@@ -175,7 +175,9 @@ pub struct SellerConfig {
     /// table). Empty ⇒ the node serves with the single `agent_command` alone.
     ///
     /// The node advertises this list on its heartbeat and claims, and dispatches a job to the
-    /// harness its offer requested. Execution stays one job at a time across the whole list.
+    /// harness its offer requested. How many awarded jobs run at once is governed by the
+    /// homogeneous [`SellerConfig::slots`] (every slot runs whichever harness the job asked for),
+    /// not by per-entry pool counts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<AgentSlotConfig>,
     /// Opt-in to claim untargeted/open offers. Default **false** (targeted-only).
@@ -200,6 +202,40 @@ pub struct SellerConfig {
     /// (interop courtesy — NOT a security control; buyer refusal is the boundary).
     #[serde(default = "default_contribution_enabled")]
     pub contribution_enabled: bool,
+    /// Homogeneous execution slots: the maximum number of awarded jobs this node runs
+    /// concurrently. Default **1** — serial execution, today's behavior exactly. A slot is
+    /// RESERVED when the node claims an offer and released on the job's terminal outcome
+    /// (delivery/failure), when the buyer awards another seller, or when a parked claim lapses
+    /// unawarded. Reserve-at-claim is what makes a fully loaded node invisible to the market: with
+    /// no free slot it simply does not claim. Every slot is identical and runs the seller's
+    /// configured harness — there is no per-slot harness typing (that is the per-agent
+    /// `AgentSlotConfig.slots`, which stays refused above 1).
+    #[serde(default = "default_slots")]
+    pub slots: usize,
+    /// How long (seconds) a parked, unawarded claim may hold its reserved execution slot before the
+    /// lapse sweep reclaims it. Deliberately separate from — and much shorter than — the claim's
+    /// on-the-wire publish window, which stays long for relay resilience. `None` ⇒ the built-in
+    /// default (see `DEFAULT_CLAIM_AWARD_TIMEOUT_SECS`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_award_timeout_secs: Option<u64>,
+}
+
+/// Executor sandbox config (`[sandbox]` section): the launcher the awarded agent command runs
+/// inside. Absent ⇒ pass-through — the command runs exactly as configured, byte-identical to no
+/// sandbox. Present ⇒ the launcher argv is prepended to the agent command so it runs inside an OS
+/// sandbox, without the run/exec path knowing which launcher.
+///
+/// Top-level on `MobeeConfig`, not nested under `[seller]`: `SellerConfig`'s literal is built in
+/// the money-path `seller.rs`, which this must not touch (same placement rationale as
+/// [`SellerAnnounceConfig`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxConfig {
+    /// The launcher argv the agent command runs inside (no-shell argv array, same rule as
+    /// `agent_command`: a bare string is refused, and the array must be non-empty — an empty
+    /// launcher is expressed by omitting the whole `[sandbox]` section, not by an empty array).
+    #[serde(deserialize_with = "deserialize_agent_command_argv")]
+    pub launcher: Vec<String>,
 }
 
 /// Persistent-seller-memory config (`[seller_memory]` section): the read-on-start +
@@ -497,6 +533,13 @@ pub fn default_contribution_enabled() -> bool {
     true
 }
 
+/// serde default for [`SellerConfig::slots`]: 1. A `[seller]` block written before this field
+/// existed parses to a single execution slot — serial execution, byte-identical to the pre-
+/// multi-slot behavior.
+pub fn default_slots() -> usize {
+    1
+}
+
 /// serde default for [`SellerConfig::offer_backfill_secs`]: 1200s (20 min). A `[seller]` block
 /// written before this field existed parses to this default; `0` must be set explicitly.
 pub fn default_offer_backfill_secs() -> u64 {
@@ -759,10 +802,9 @@ pub struct MobeeConfig {
     /// forbidden paths / max diff size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contribution: Option<ContributionPolicyConfig>,
-    /// `[seller_roster]` heterogeneous agent roster under one identity. Defaults (empty ⇒ single
-    /// `agent_command`) when absent.
-    #[serde(default, skip_serializing_if = "SellerRosterConfig::is_default")]
-    pub seller_roster: SellerRosterConfig,
+    /// Optional `[sandbox]` executor config. Absent ⇒ the agent command runs pass-through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxConfig>,
 }
 
 /// Buyer-side content policy for contribution verify (the content-policy hook). Maps 1:1
@@ -780,56 +822,6 @@ pub struct ContributionPolicyConfig {
     /// Refuse when summed churn exceeds this many units. `None` ⇒ no cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_diff_bytes: Option<u64>,
-}
-
-/// One agent in the seller's roster (`[[seller_roster.agents]]`). Every agent runs under the
-/// ONE seller identity — the roster is private execution capacity, not multiple sellers. `argv`
-/// is the no-shell command (same argv-array rule as [`SellerConfig::agent_command`]); the rest is
-/// the routing metadata the node selects on. Public claims expose terms, never these agent names.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RosterAgent {
-    /// Operator-facing label (routing/telemetry only; never published to buyers).
-    pub name: String,
-    /// The agent command, argv array (no shell).
-    #[serde(deserialize_with = "deserialize_agent_command_argv")]
-    pub argv: Vec<String>,
-    /// Task tags this agent can serve. Empty ⇒ no capability constraint (serves any task).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub capabilities: Vec<String>,
-    /// Minimum rate (sats) this agent is worth dispatching for. `None` ⇒ the seller `rate_sats`
-    /// floor is the only bound.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_rate_sats: Option<u64>,
-    /// Per-job timeout (seconds) for this agent. `None` ⇒ the seller/offer default applies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_secs: Option<u64>,
-    /// Execution slots this agent exposes. Concurrency is 1 for now (the node runs one job at a
-    /// time); `slots` is the declared capacity the parallel phase will honor. Defaults to 1.
-    #[serde(default = "default_roster_slots")]
-    pub slots: u32,
-}
-
-/// Serde default for [`RosterAgent::slots`].
-fn default_roster_slots() -> u32 {
-    1
-}
-
-/// The seller agent roster (`[seller_roster]`): heterogeneous agents under one identity. Absent /
-/// empty ⇒ the node falls back to the single [`SellerConfig::agent_command`], so a config written
-/// before the roster existed behaves identically.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct SellerRosterConfig {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub agents: Vec<RosterAgent>,
-}
-
-impl SellerRosterConfig {
-    /// True when no roster is configured (skip-serialize guard, mirroring the other sections).
-    pub fn is_default(&self) -> bool {
-        self.agents.is_empty()
-    }
 }
 
 /// Serde/default seed for [`MobeeConfig::accepted_mints`]: exactly the current testnut
@@ -903,7 +895,7 @@ impl Default for MobeeConfig {
             seller_heartbeat: SellerHeartbeatConfig::default(),
             seller_preflight: SellerPreflightConfig::default(),
             contribution: None,
-            seller_roster: SellerRosterConfig::default(),
+            sandbox: None,
         }
     }
 }

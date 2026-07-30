@@ -19,6 +19,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Mobee"
 repository = "https://buzzrelay.orveth.dev/git/79284e2b167317bc455f2daccfb38c38d4836b7b2bd0d73650b0cff46660263a/mobee.git"
+license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.dependencies]

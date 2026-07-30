@@ -465,7 +465,7 @@ pub async fn authorize_pay_async(
     // interim: the fee reserve is charged in full rather than reconciled against the fee actually
     // paid, so a hop can leave the cap reporting less remaining budget than the buyer really spent.
     // That is the safe direction; reconciling reserve-versus-actual would reshape the spend ledger,
-    // which is money-gate machinery and its own slice — see MakePrisms/mobee#186.
+    // which is money-gate machinery and its own slice — see MakePrisms/maxplayerai#186.
     let charged = cap_charge(hop.as_ref().map(|(_, _, pairing)| pairing), amount);
     // Delivery already verified + bind-checked above (pre-budget). The budget append happens here,
     // before any melt and before the wallet send inside `run_verified`.

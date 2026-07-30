@@ -3,9 +3,9 @@
 //! The MCP and the CLI money commands never own the wallet, key, or budget ledger — the buyer
 //! daemon does, guarded by the exclusive home lock. A caller that needs the daemon calls
 //! [`ensure`], which connects to `$MOBEE_HOME/buyer.sock` if a daemon is already serving, or spawns
-//! one (this same binary, `mobee buyer serve`, detached) and waits for it to come up. A concurrent
+//! one (this same binary, `maxplayer buyer serve`, detached) and waits for it to come up. A concurrent
 //! double-spawn is safe: the loser fails closed at the exclusive home lock and exits, the winner
-//! binds the socket, and both callers connect to the winner. No manual `mobee buyer` command is
+//! binds the socket, and both callers connect to the winner. No manual `maxplayer buyer` command is
 //! ever needed.
 
 use std::path::{Path, PathBuf};
@@ -52,12 +52,12 @@ pub fn ensure(home: &MobeeHome) -> Result<PathBuf, String> {
     }
 }
 
-/// Spawn this binary as a detached `mobee buyer serve`. Detached into its own process group so it
+/// Spawn this binary as a detached `maxplayer buyer serve`. Detached into its own process group so it
 /// outlives the spawning session (a later session connects to the same daemon). A double-spawn is
 /// safe — the loser fails closed at the exclusive home lock and exits.
 fn spawn_detached(home_root: &Path) -> Result<(), String> {
     let exe = std::env::current_exe()
-        .map_err(|error| format!("cannot resolve the mobee binary to spawn the buyer daemon: {error}"))?;
+        .map_err(|error| format!("cannot resolve the maxplayer binary to spawn the buyer daemon: {error}"))?;
     let mut command = Command::new(exe);
     command
         .arg("buyer")
@@ -77,7 +77,7 @@ fn spawn_detached(home_root: &Path) -> Result<(), String> {
     command
         .spawn()
         .map(|_child| ())
-        .map_err(|error| format!("failed to spawn the buyer daemon (`mobee buyer serve`): {error}"))
+        .map_err(|error| format!("failed to spawn the buyer daemon (`maxplayer buyer serve`): {error}"))
 }
 
 /// Call a daemon method over the socket, returning its `result` value or a flattened error message.

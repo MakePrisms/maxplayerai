@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1
 #
-# Run-anywhere mobee: a stranger can `docker run` a seller (or the buyer MCP)
+# Run-anywhere maxplayer: a stranger can `docker run` a seller (or the buyer MCP)
 # with no Rust, no system git, and no build toolchain on their host.
 #
 # Two stages:
-#   1. builder  — compiles the `mobee` binary with the acp + wallet features.
+#   1. builder  — compiles the `maxplayer` binary with the acp + wallet features.
 #   2. runtime  — a slim Debian image carrying only the binary + CA roots.
 #
 # Delivery git is in-process (libgit2), so the runtime image needs NO system
@@ -23,15 +23,15 @@ WORKDIR /src
 # and docs so the build context stays small.
 COPY . .
 
-# Release build of just the `mobee` binary.
+# Release build of just the `maxplayer` binary.
 #   acp    — REQUIRED for agent-backed job execution (not in the default set).
 #   wallet — default feature; named explicitly for clarity.
 # A cache mount keeps the cargo registry + target dir warm across rebuilds.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release -p mobee --features acp,wallet \
-    && cp /src/target/release/mobee /usr/local/bin/mobee \
-    && strip /usr/local/bin/mobee || true
+    && cp /src/target/release/maxplayer /usr/local/bin/maxplayer \
+    && strip /usr/local/bin/maxplayer || true
 
 # ---------------------------------------------------------------------------
 # Stage 2: runtime
@@ -51,7 +51,7 @@ RUN useradd --system --create-home --uid 10001 --shell /usr/sbin/nologin mobee \
     && mkdir -p /data \
     && chown mobee:mobee /data
 
-COPY --from=builder /usr/local/bin/mobee /usr/local/bin/mobee
+COPY --from=builder /usr/local/bin/maxplayer /usr/local/bin/maxplayer
 
 # Seller home lives on a mounted volume so the key, wallet, config, and journal
 # survive image upgrades. See docs/DOCKER.md for the upgrade path.
@@ -62,9 +62,9 @@ USER mobee
 WORKDIR /data
 
 # tini as PID 1 so SIGTERM from `docker stop` cleanly shuts the daemon.
-ENTRYPOINT ["/usr/bin/tini", "--", "mobee"]
+ENTRYPOINT ["/usr/bin/tini", "--", "maxplayer"]
 
-# Default to the seller daemon. `mobee sell` with no args relaunches zero-prompt
+# Default to the seller daemon. `maxplayer sell` with no args relaunches zero-prompt
 # from an existing config.toml; first run needs --agent + --rate-sats (see
 # docker-compose.yml / docs/DOCKER.md). Override the command for `mcp`, `doctor`,
 # `wallet`, etc.

@@ -1,9 +1,17 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+// Tokio (not std) channels: every driver wait must YIELD to the runtime instead of blocking the
+// thread. The seller node runs all awarded jobs as `spawn_local` tasks on ONE LocalSet thread, so
+// a `std::sync::mpsc` blocking receive here — which used to span the ENTIRE `session/prompt` turn,
+// i.e. the whole agent run — froze every other job and the run loop itself (issue #223). The
+// reader THREAD stays a plain thread (blocking reads of the child's stdout belong off-runtime);
+// only the receive side is async.
+use tokio::sync::mpsc;
 
 use serde_json::{Value, json};
 
@@ -36,9 +44,9 @@ pub struct AcpDriver {
     idle_timeout: Duration,
     child: Option<Child>,
     stdin: Option<Arc<Mutex<ChildStdin>>>,
-    responses: Option<mpsc::Receiver<RpcResponse>>,
-    updates: Option<mpsc::Receiver<SessionUpdate>>,
-    update_tx: Option<mpsc::Sender<SessionUpdate>>,
+    responses: Option<mpsc::UnboundedReceiver<RpcResponse>>,
+    updates: Option<mpsc::UnboundedReceiver<SessionUpdate>>,
+    update_tx: Option<mpsc::UnboundedSender<SessionUpdate>>,
     next_request_id: AtomicU64,
     /// ACP-native usage captured from the most recent `session/prompt` result.
     /// `None` when the harness surfaced nothing (absent-stays-absent).
@@ -95,8 +103,8 @@ impl AcpDriver {
             .ok_or_else(|| DriverError::Other("ACP child stdout unavailable".into()))?;
 
         let stdin = Arc::new(Mutex::new(stdin));
-        let (response_tx, response_rx) = mpsc::channel();
-        let (update_tx, update_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::unbounded_channel();
+        let (update_tx, update_rx) = mpsc::unbounded_channel();
         let update_tx_for_reader = update_tx.clone();
         let stdin_for_reader = stdin.clone();
         let permission_policy = self.permission_policy.clone();
@@ -160,15 +168,27 @@ impl AcpDriver {
             .map_err(|error| DriverError::Other(format!("failed to write ACP JSON-RPC: {error}")))
     }
 
-    fn wait_response(&self, id: u64) -> Result<Value, DriverError> {
+    /// Await the response to request `id`. This is where the driver spends the whole agent turn
+    /// (`session/prompt` answers only when the turn ends), so it MUST yield to the runtime — a
+    /// blocking receive here serializes every job on the seller node's single-threaded LocalSet
+    /// and deafens its run loop (issue #223).
+    async fn wait_response(&mut self, id: u64) -> Result<Value, DriverError> {
+        let idle_timeout = self.idle_timeout;
         let responses = self
             .responses
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| DriverError::Other("ACP response channel unavailable".into()))?;
         loop {
-            let response = responses.recv_timeout(self.idle_timeout).map_err(|_| {
-                DriverError::Other(format!("ACP request {id} timed out waiting for response"))
-            })?;
+            let response = tokio::time::timeout(idle_timeout, responses.recv())
+                .await
+                .map_err(|_| {
+                    DriverError::Other(format!("ACP request {id} timed out waiting for response"))
+                })?
+                .ok_or_else(|| {
+                    DriverError::Other(format!(
+                        "ACP agent exited before responding to request {id}"
+                    ))
+                })?;
             if response.id != json!(id) {
                 continue;
             }
@@ -196,7 +216,7 @@ impl Driver for AcpDriver {
                 DriverError::Other(format!("failed to encode initialize params: {error}"))
             })?,
         )?;
-        let result = self.wait_response(id)?;
+        let result = self.wait_response(id).await?;
         let protocol_version = result
             .get("protocol_version")
             .or_else(|| result.get("protocolVersion"))
@@ -221,7 +241,7 @@ impl Driver for AcpDriver {
                 DriverError::Other(format!("failed to encode session params: {error}"))
             })?,
         )?;
-        let result = self.wait_response(id)?;
+        let result = self.wait_response(id).await?;
         session_id_from_result(&result)
     }
 
@@ -231,7 +251,7 @@ impl Driver for AcpDriver {
         turn: PromptTurn,
     ) -> Result<UpdateStream, DriverError> {
         let id = self.send_request("session/prompt", prompt_params(session_id, turn))?;
-        let result = self.wait_response(id)?;
+        let result = self.wait_response(id).await?;
         // Capture ACP-native usage off the prompt result before we reduce it to a stop reason.
         // Absent-stays-absent — `None` when the harness surfaced nothing.
         self.last_usage = parse_acp_usage(&result);
@@ -262,7 +282,7 @@ impl Driver for AcpDriver {
                     "sessionId": session_id,
                 }),
             )?;
-            let _ = self.wait_response(id);
+            let _ = self.wait_response(id).await;
         }
         Ok(())
     }
@@ -273,17 +293,108 @@ impl Driver for AcpDriver {
 
     async fn shutdown(&mut self) -> Result<(), DriverError> {
         if let Some(mut child) = self.child.take() {
-            #[cfg(unix)]
-            {
-                let _ = Command::new("kill")
-                    .arg("-TERM")
-                    .arg(format!("-{}", child.id()))
-                    .status();
-            }
-            let _ = child.kill();
-            let _ = child.wait();
+            // Reaping the child (`wait`) and the group TERM are blocking syscalls/process spawns;
+            // run them off the runtime so shutdown never stalls sibling jobs on the LocalSet.
+            let _ = tokio::task::spawn_blocking(move || {
+                #[cfg(unix)]
+                {
+                    let pid = child.id();
+                    // Signal the GROUP only when this child actually leads it. `spawn` requests
+                    // `process_group(0)`, but nothing here ever verified the request took effect —
+                    // and a group TERM aimed at a group we do not own lands on processes that are
+                    // not ours. On a CI runner that is the runner's own tree: the job dies at the
+                    // instant of shutdown with exit 143 and reports "the runner has received a
+                    // shutdown signal", which looks like infrastructure rather than like us.
+                    match process_group_of(pid) {
+                        Some(pgid) if pgid == pid => {
+                            // `--` ends option parsing so an external `kill` cannot read the
+                            // negative operand as a signal spec.
+                            let _ = Command::new("kill")
+                                .arg("-s")
+                                .arg("TERM")
+                                .arg("--")
+                                .arg(format!("-{pgid}"))
+                                .status();
+                        }
+                        // Not the group leader (or the group is unreadable): kill this process
+                        // alone. Leaking a grandchild is recoverable; signalling a group we do not
+                        // own is not.
+                        _ => {}
+                    }
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+            })
+            .await;
         }
         Ok(())
+    }
+}
+
+/// The process group id of `pid`, or `None` if it cannot be established.
+///
+/// `None` is the SAFE answer — a caller that cannot establish the group MUST NOT signal one.
+///
+/// Read from `/proc/<pid>/stat` rather than `libc::getpgid` deliberately: `libc` is an **optional**
+/// dependency of this crate, enabled only by the `wallet` feature, while this module compiles under
+/// `default = []`. A `libc` call here would break the default build — the one that is green.
+#[cfg(unix)]
+fn process_group_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_pgrp_from_stat(&stat)
+}
+
+/// Pull field 5 (`pgrp`) out of a `/proc/<pid>/stat` line.
+///
+/// ⚠ These fields CANNOT be split naively from the left. Field 2 is `comm`, a parenthesised command
+/// name that may itself contain spaces and parentheses (`(my prog (v2))`), which mis-numbers every
+/// field after it. Everything after the LAST `)` is parsed instead; there the fields are
+/// `state ppid pgrp …`, so `pgrp` is the 3rd.
+#[cfg(unix)]
+fn parse_pgrp_from_stat(stat: &str) -> Option<u32> {
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(2)?.parse().ok()
+}
+
+#[cfg(all(test, unix))]
+mod group_scope_tests {
+    use super::parse_pgrp_from_stat;
+
+    /// The ordinary shape.
+    #[test]
+    fn pgrp_is_field_five() {
+        // pid comm state ppid pgrp …
+        assert_eq!(parse_pgrp_from_stat("4242 (bash) S 4000 4242 4242 0"), Some(4242));
+        assert_eq!(parse_pgrp_from_stat("4242 (bash) S 4000 999 4242 0"), Some(999));
+    }
+
+    /// ★ The reason this is parsed from the RIGHT. A left-to-right split would read `prog` as the
+    /// state field and return a wrong pgrp — silently, since it still parses as a number.
+    #[test]
+    fn a_comm_containing_spaces_and_parens_does_not_shift_the_fields() {
+        assert_eq!(
+            parse_pgrp_from_stat("77 (my prog (v2)) S 1 4242 4242 0"),
+            Some(4242)
+        );
+        assert_eq!(parse_pgrp_from_stat("77 (a b c d e) S 1 555 555 0"), Some(555));
+    }
+
+    /// Unreadable ⇒ `None`, and `None` must mean "never signal a group".
+    #[test]
+    fn unparseable_stat_yields_none_so_no_group_is_signalled() {
+        assert_eq!(parse_pgrp_from_stat(""), None);
+        assert_eq!(parse_pgrp_from_stat("no parens here at all"), None);
+        assert_eq!(parse_pgrp_from_stat("77 (bash) S"), None);
+        assert_eq!(parse_pgrp_from_stat("77 (bash) S 1 notanumber"), None);
+    }
+
+    /// Live control: this test's own process must be readable, and its pgrp non-zero. Without this,
+    /// every assertion above is about a string literal and none about `/proc`.
+    #[test]
+    fn our_own_process_group_is_readable() {
+        let pgid = super::process_group_of(std::process::id())
+            .expect("our own /proc/<pid>/stat must be readable");
+        assert!(pgid > 0, "a real pgrp is never 0");
     }
 }
 
@@ -296,8 +407,8 @@ struct RpcResponse {
 
 fn route_wire_message(
     value: &Value,
-    response_tx: &mpsc::Sender<RpcResponse>,
-    update_tx: &mpsc::Sender<SessionUpdate>,
+    response_tx: &mpsc::UnboundedSender<RpcResponse>,
+    update_tx: &mpsc::UnboundedSender<SessionUpdate>,
     permission_policy: &PermissionOutcome,
     respond_permission: &mut impl FnMut(Value, Value),
 ) {
@@ -615,8 +726,8 @@ mod tests {
 
     #[test]
     fn fixture_lines_translate_to_updates() {
-        let (response_tx, _response_rx) = mpsc::channel();
-        let (update_tx, update_rx) = mpsc::channel();
+        let (response_tx, _response_rx) = mpsc::unbounded_channel();
+        let (update_tx, mut update_rx) = mpsc::unbounded_channel();
         let mut permission_responses = Vec::new();
 
         route_wire_message(
@@ -646,13 +757,13 @@ mod tests {
         );
 
         assert_eq!(
-            update_rx.recv().expect("first update"),
+            update_rx.try_recv().expect("first update"),
             SessionUpdate::AgentMessage(vec![ContentBlock::Text {
                 text: "hello".into()
             }])
         );
         assert_eq!(
-            update_rx.recv().expect("terminal"),
+            update_rx.try_recv().expect("terminal"),
             SessionUpdate::TurnEnded(StopReason::Completed)
         );
         assert!(permission_responses.is_empty());
@@ -660,8 +771,8 @@ mod tests {
 
     #[test]
     fn real_agent_message_chunks_translate_to_updates() {
-        let (response_tx, _response_rx) = mpsc::channel();
-        let (update_tx, update_rx) = mpsc::channel();
+        let (response_tx, _response_rx) = mpsc::unbounded_channel();
+        let (update_tx, mut update_rx) = mpsc::unbounded_channel();
         let mut permission_responses = Vec::new();
 
         route_wire_message(
@@ -683,7 +794,7 @@ mod tests {
         );
 
         assert_eq!(
-            update_rx.recv().expect("chunk update"),
+            update_rx.try_recv().expect("chunk update"),
             SessionUpdate::AgentMessageChunk(ContentBlock::Text {
                 text: "hello ".into()
             })
@@ -693,8 +804,8 @@ mod tests {
 
     #[test]
     fn unknown_methods_surface_as_ext() {
-        let (response_tx, _response_rx) = mpsc::channel();
-        let (update_tx, update_rx) = mpsc::channel();
+        let (response_tx, _response_rx) = mpsc::unbounded_channel();
+        let (update_tx, mut update_rx) = mpsc::unbounded_channel();
         let mut permission_responses = Vec::new();
         let params = json!({"x": 1});
 
@@ -711,7 +822,7 @@ mod tests {
         );
 
         assert_eq!(
-            update_rx.recv().expect("ext update"),
+            update_rx.try_recv().expect("ext update"),
             SessionUpdate::Ext(ExtMethod {
                 method: "cursor/ask_question".into(),
                 params,
@@ -722,8 +833,8 @@ mod tests {
 
     #[test]
     fn permission_request_replies_immediately_and_emits_observer_update() {
-        let (response_tx, _response_rx) = mpsc::channel();
-        let (update_tx, update_rx) = mpsc::channel();
+        let (response_tx, _response_rx) = mpsc::unbounded_channel();
+        let (update_tx, mut update_rx) = mpsc::unbounded_channel();
         let mut permission_responses = Vec::new();
 
         route_wire_message(
@@ -761,7 +872,7 @@ mod tests {
             })]
         );
         assert_eq!(
-            update_rx.recv().expect("permission update"),
+            update_rx.try_recv().expect("permission update"),
             SessionUpdate::PermissionRequest(PermissionRequest {
                 tool: "shell".into(),
                 detail: json!({"cmd": "true"}),
@@ -831,8 +942,8 @@ mod tests {
         // turn hangs until the job deadline. Exercised through `route_wire_message` so the test
         // covers the exact auto-answer path the live hang takes.
         let codex_request = |policy| {
-            let (response_tx, _response_rx) = mpsc::channel();
-            let (update_tx, _update_rx) = mpsc::channel();
+            let (response_tx, _response_rx) = mpsc::unbounded_channel();
+            let (update_tx, _update_rx) = mpsc::unbounded_channel();
             let mut permission_responses = Vec::new();
             route_wire_message(
                 &json!({

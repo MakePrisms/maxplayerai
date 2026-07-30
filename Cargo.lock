@@ -2586,6 +2586,7 @@ version = "0.1.0"
 dependencies = [
  "git2",
  "mobee-core",
+ "nostr-sdk",
  "serde",
  "serde_json",
  "tokio",

@@ -26,7 +26,7 @@ where
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
     match args.get(1).map(String::as_str) {
         Some("version") if args.len() == 2 => {
-            let _ = writeln!(out, "mobee {}", mobee_core::version());
+            let _ = writeln!(out, "maxplayer {}", mobee_core::version());
             SUCCESS
         }
         Some("mcp") if args.len() == 2 => crate::mcp::run(out, err),
@@ -37,6 +37,7 @@ where
         Some("doctor") => crate::doctor::run(&args[2..], out, err),
         Some("wallet") => crate::wallet_cli::run(&args[2..], out, err),
         Some("profile") => crate::profile_cli::run(&args[2..], out, err),
+        Some("whoami") => crate::whoami::run(&args[2..], out, err),
         #[cfg(feature = "stub-pay")]
         Some("stub-pay") => crate::stub_pay_cli::run(&args[2..], out, err),
         Some("log") => run_log(&args[2..], out, err),
@@ -94,7 +95,7 @@ fn run_mock(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 fn run_agent(_args: &[String], _out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let _ = writeln!(
         err,
-        "mobee run requires rebuilding with the acp feature: cargo run -p mobee --features acp -- run ..."
+        "maxplayer run requires rebuilding with the acp feature: cargo run -p mobee --features acp -- run ..."
     );
     USAGE_ERROR
 }
@@ -132,8 +133,22 @@ fn run_agent(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         },
     };
 
+    // The ACP driver's waits are tokio-timed (they must YIELD so N seller jobs can share one
+    // thread — issue #223), so this path needs a REAL tokio runtime: the noop-waker
+    // `crate::exec::block_on` has no timer or blocking pool and would panic inside
+    // `tokio::time::timeout`. The mock path keeps `exec::block_on` (no tokio primitives).
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = writeln!(err, "failed to build tokio runtime: {error}");
+            return RUNTIME_ERROR;
+        }
+    };
     let mut write_error = None;
-    let result = crate::exec::block_on(run_job(
+    let result = runtime.block_on(run_job(
         &mut driver,
         &mut log,
         &options.job_id,
@@ -254,16 +269,16 @@ fn write_json_line<T: Serialize + ?Sized>(out: &mut dyn Write, value: &T) -> std
 fn usage(err: &mut dyn Write) -> i32 {
     let _ = write!(
         err,
-        "Usage:\n  mobee version\n  mobee mcp\n  mobee buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `mobee buyer status` = thin client\n  mobee doctor   # seller environment self-check (git, credential helper, relay, mint, agent)\n  mobee wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  mobee profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n"
+        "Usage:\n  maxplayer version\n  maxplayer mcp\n  maxplayer buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # runner environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  maxplayer whoami [--home <dir>]   # print this seat's public identity (hex pubkey, npub, resolved home)\n"
     );
     #[cfg(feature = "stub-pay")]
     let _ = write!(
         err,
-        "  mobee stub-pay <amount_sats>   # exercise the config-bound budget gate\n"
+        "  maxplayer stub-pay <amount_sats>   # exercise the config-bound budget gate\n"
     );
     let _ = writeln!(
         err,
-        "  mobee sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool]\n  mobee sell   # zero-prompt relaunch from config.toml\n  mobee accept <job_id> <claim_id> [--result-id <id>]   # buyer: bind a delivered result (collect folds this in)\n  mobee collect <job_id> [--out <folder>]   # buyer: accept-if-needed + verify + pay + materialize\n  mobee log replay <path>\n  mobee mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n  mobee run --agent-command <cmd> --task <text> --log <path> [--cwd <dir>] [--job-id <id>] [--permission-policy allow|allow-always|deny] [--idle-timeout <secs>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error"
+        "  maxplayer sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool]\n  maxplayer sell   # zero-prompt relaunch from config.toml\n  maxplayer accept <job_id> <claim_id> [--result-id <id>]   # buyer: bind a delivered result (collect folds this in)\n  maxplayer collect <job_id> [--out <folder>]   # buyer: accept-if-needed + verify + pay + materialize\n  maxplayer log replay <path>\n  maxplayer mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n  maxplayer run --agent-command <cmd> --task <text> --log <path> [--cwd <dir>] [--job-id <id>] [--permission-policy allow|allow-always|deny] [--idle-timeout <secs>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error"
     );
     USAGE_ERROR
 }
@@ -468,9 +483,9 @@ mod tests {
         assert!(out.is_empty());
         assert!(err.contains("Usage:"));
 
-        let (code, out, err) = run_captured(["mobee", "version"]);
+        let (code, out, err) = run_captured(["maxplayer", "version"]);
         assert_eq!(code, 0);
-        assert_eq!(out, format!("mobee {}\n", mobee_core::version()));
+        assert_eq!(out, format!("maxplayer {}\n", mobee_core::version()));
         assert!(err.is_empty());
     }
 
@@ -697,6 +712,83 @@ mod tests {
         );
     }
 
+    /// `whoami` dispatches through the real `Some("whoami")` arm and prints the seat's PUBLIC
+    /// identity — hex pubkey, npub (bech32), and the resolved `--home` — for a given home.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn whoami_prints_pubkey_npub_and_resolved_home() {
+        let home = test_home("whoami-prints");
+        let (code, out, err) = run_captured([
+            "maxplayer",
+            "whoami",
+            "--home",
+            home.to_str().unwrap(),
+        ]);
+
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(err.is_empty(), "stderr: {err}");
+
+        // The resolved home path echoed back is exactly the --home we passed.
+        assert!(
+            out.contains(&home.display().to_string()),
+            "output should echo resolved home {}, got:\n{out}",
+            home.display()
+        );
+
+        // hex pubkey: 64 hex chars.
+        let pubkey = out
+            .lines()
+            .find_map(|line| line.strip_prefix("pubkey:"))
+            .expect("pubkey line")
+            .trim();
+        assert_eq!(pubkey.len(), 64, "hex pubkey is 32 bytes: {pubkey}");
+        assert!(
+            pubkey.chars().all(|c| c.is_ascii_hexdigit()),
+            "pubkey is hex: {pubkey}"
+        );
+
+        // npub: bech32 with the `npub1` HRP.
+        let npub = out
+            .lines()
+            .find_map(|line| line.strip_prefix("npub:"))
+            .expect("npub line")
+            .trim();
+        assert!(npub.starts_with("npub1"), "npub is bech32 npub: {npub}");
+    }
+
+    /// RED-PROVE (critical security property): `whoami` must NEVER leak key material. Read the
+    /// packaged secret straight off disk and assert none of it — nor any `nsec` — appears in the
+    /// command output.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn whoami_output_never_contains_secret_key() {
+        let home = test_home("whoami-nosecret");
+        let (code, out, err) = run_captured([
+            "maxplayer",
+            "whoami",
+            "--home",
+            home.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "stderr: {err}");
+
+        // bootstrap wrote the secret to `<home>/key` (0600). Read it directly, then red-prove it
+        // is absent from stdout.
+        let secret_hex = fs::read_to_string(home.join("key"))
+            .expect("secret key file")
+            .trim()
+            .to_owned();
+        assert!(!secret_hex.is_empty(), "precondition: key file is non-empty");
+
+        assert!(
+            !out.contains(&secret_hex),
+            "SECURITY: whoami output leaked the hex secret key"
+        );
+        assert!(
+            !out.contains("nsec1"),
+            "SECURITY: whoami output contains an nsec"
+        );
+    }
+
     #[cfg(feature = "acp")]
     #[test]
     #[ignore = "requires MOBEE_ACP_SMOKE=1 and MOBEE_ACP_SMOKE_CMD"]
@@ -786,5 +878,11 @@ mod tests {
             "mobee-cli-{name}-{}-{id}.jsonl",
             std::process::id()
         ))
+    }
+
+    #[cfg(feature = "wallet")]
+    fn test_home(name: &str) -> PathBuf {
+        let id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("mobee-cli-home-{name}-{}-{id}", std::process::id()))
     }
 }
