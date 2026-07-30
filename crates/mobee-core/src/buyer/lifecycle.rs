@@ -21,7 +21,7 @@ use crate::crossmint::plan_payment;
 use crate::job_lifecycle::{AwardClaimOutcome, JobLifecycleError, JobView};
 
 use super::reservations::{Converted, JobDisposition, ReservationState, ReserveRefused};
-use super::store::{BuyerStore, StoreError};
+use super::store::{AwardRecord, BuyerStore, StoreError};
 
 /// Hard filters an awardable claim must pass (issue #126). Grounded in the wire the offer/claim
 /// actually carry: the offer's signed `amount_sats` is the fixed price, the seller's claim `creq`
@@ -182,12 +182,96 @@ fn claim_is_payable(job_id: &str, creq: Option<&str>, filters: &AwardFilters) ->
     plan_payment(filters.buyer_mint, &listed, filters.allow_real_mints).is_ok()
 }
 
+/// What [`award_with_reservation`] may do about a job, decided BEFORE any reserve or publish.
+///
+/// The local `awards` row is consulted first because it is the only signal here that cannot lie by
+/// omission: it is a `job_id`-keyed row written AT this chokepoint, so reading it is a local
+/// point-query that either finds the award or proves it was never recorded. The relay cannot offer
+/// that — see [`AwardPrecheck::AskRelay`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AwardPrecheck {
+    /// A local `awards` row exists: this buyer published this award and recorded it. Return it;
+    /// publish nothing.
+    AlreadyRecorded,
+    /// No local row and no funds reserved for this job — nothing was ever started here, so this is
+    /// a first award. Publish.
+    Publish,
+    /// No local row, but funds ARE reserved. Indeterminate from local state alone, and the two
+    /// states it covers want OPPOSITE actions:
+    ///
+    /// - the process died between `reserve` and `publish` — no award went out, republishing is right;
+    /// - `publish` succeeded and `record_award` then failed (the window
+    ///   [`award_with_reservation`] logs) — the award IS public, republishing DUPLICATES it.
+    ///
+    /// Only the relay can tell these apart, so it is asked here and ONLY here.
+    AskRelay,
+}
+
+/// The three-state award presence decision (#126/#127 invariant A: never award twice), local-first.
+///
+/// `reservations.state` alone cannot make this call: `Reserved` is the state of a healthy in-flight
+/// award AND of both failure windows above. The discriminator is the JOIN against `awards` — the
+/// same shape [`BuyerStore::awarded_unsettled_job_ids`] already relies on.
+pub fn award_precheck(
+    has_local_record: bool,
+    reservation: Option<ReservationState>,
+) -> AwardPrecheck {
+    if has_local_record {
+        return AwardPrecheck::AlreadyRecorded;
+    }
+    match reservation {
+        // Funds committed but no award recorded — the one genuinely ambiguous state.
+        Some(ReservationState::Reserved) => AwardPrecheck::AskRelay,
+        // `Spent` (already paid) and `Released` (publish failed, funds reclaimed) are both decided
+        // downstream by `reserve` itself, which refuses `AlreadySpent` and re-reserves a `Released`
+        // row. Falling through keeps ONE authority for those two rather than a second opinion here.
+        Some(ReservationState::Spent) | Some(ReservationState::Released) | None => {
+            AwardPrecheck::Publish
+        }
+    }
+}
+
+/// Outcome of [`award_with_reservation`]: whether it published an award now, or found one this
+/// buyer had already published.
+///
+/// These are separate variants because they know DIFFERENT things, and the difference is
+/// money-relevant. [`AwardClaimOutcome`] carries `quoted_mints` — the mints the award commits the
+/// buyer to paying at — and [`AwardRecord`] does not persist them. Collapsing both into
+/// `AwardClaimOutcome` would mean handing back an empty mint list on the already-awarded path,
+/// which is not a neutral placeholder: an empty `quoted_mints` already MEANS "the claim carried no
+/// parseable `creq`". The type keeps "we don't store this" from being reported as "there were none".
+#[derive(Debug)]
+pub enum AwardOutcome {
+    /// An award was published by THIS call; `quoted_mints` is live from the claim.
+    Published(AwardClaimOutcome),
+    /// This buyer had already published and recorded an award for the job; nothing was published
+    /// now. The record carries no mint list (see the type note above).
+    AlreadyAwarded(AwardRecord),
+}
+
 /// Failure of [`award_with_reservation`].
 #[derive(Debug)]
 pub enum AwardError {
     /// The reservation was refused — NOTHING was published and (by the store's zero-write
     /// guarantee on refusal) no reservation row was written.
     Reserve(ReserveRefused),
+    /// An award for this job is ALREADY PUBLIC on the relay but missing from the local `awards`
+    /// table. Refused rather than published: a second 3405 would be a genuine duplicate award of
+    /// real money. Nothing was published and the reservation was left untouched.
+    ///
+    /// Repairing the missing row is deliberately NOT done here (it would write relay-parsed data
+    /// into the money ledger); it is tracked separately. Carries the relayed award's event id so
+    /// the operator can act without re-querying.
+    PublishedButUnrecorded { job_id: String, award_event_id: String },
+    /// Funds are reserved for this job with no local award record, and the relay could not say
+    /// whether an award is already public. Refused: publishing on an unverified absence is exactly
+    /// the duplicate-award risk this gate exists to remove. Nothing was published; the reservation
+    /// was left untouched.
+    PresenceUnverified { job_id: String, detail: String },
+    /// The local presence read failed. Refused rather than assumed absent — the whole point of
+    /// reading local state first is that it is authoritative, so a failure to read it is not a
+    /// licence to publish.
+    Presence(StoreError),
     /// The award publish failed after the reservation was taken; the reservation was released
     /// (no award reached the relay), so its funds are not stranded.
     Publish(JobLifecycleError),
@@ -199,6 +283,24 @@ impl std::fmt::Display for AwardError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Reserve(refused) => write!(formatter, "{refused}"),
+            // Both refusals name the operator action: an award refused for safety is only useful if
+            // the person reading the log knows what to do about it.
+            Self::PublishedButUnrecorded { job_id, award_event_id } => write!(
+                formatter,
+                "award {award_event_id} for job {job_id} is already published on the relay but has \
+                 no local awards row; refusing to publish a second award. Collect this job manually \
+                 (`collect {job_id}`) — it will not auto-settle on delivery until the row exists",
+            ),
+            Self::PresenceUnverified { job_id, detail } => write!(
+                formatter,
+                "job {job_id} has funds reserved with no local awards row, and the relay could not \
+                 confirm whether an award is already public ({detail}); refusing to publish rather \
+                 than risk a duplicate award. Check the relay for a 3405 on this job: if one exists, \
+                 collect it manually; if none does, release the reservation to re-arm the award",
+            ),
+            Self::Presence(error) => {
+                write!(formatter, "could not read local award state: {error}")
+            }
             Self::Publish(error) => write!(formatter, "{error}"),
             Self::Store(error) => write!(formatter, "{error}"),
         }
@@ -207,15 +309,35 @@ impl std::fmt::Display for AwardError {
 
 impl std::error::Error for AwardError {}
 
-/// Reserve `amount` for `job_id` FIRST, then publish the award. A refused reservation returns
-/// [`AwardError::Reserve`] without ever calling `publish` — so an award the buyer cannot afford
-/// never reaches the relay and (by [`BuyerStore::reserve`]) leaves no row. A publish that fails
-/// after the reservation releases it (no award went out) so the funds return to `available`.
+/// Check that this job is not ALREADY awarded, then reserve `amount` and publish.
+///
+/// Three orderings are load-bearing here, in this order:
+///
+/// 1. **Presence before reserve** ([`award_precheck`]): an already-awarded job returns
+///    [`AwardOutcome::AlreadyAwarded`] having published nothing and reserved nothing — the original
+///    award still holds its own reservation, so re-reserving would be a second commitment against
+///    the same debt.
+/// 2. **Reserve before publish**: a refused reservation returns [`AwardError::Reserve`] without
+///    ever calling `publish`, so an award the buyer cannot afford never reaches the relay and (by
+///    [`BuyerStore::reserve`]) leaves no row.
+/// 3. **Publish before record**: a publish that fails releases the reservation (no award went out)
+///    so the funds return to `available`.
+///
+/// `award_present_on_relay` is the relay leg, injected as a closure exactly like `publish` so this
+/// module stays free of relay I/O. It is awaited ONLY in the [`AwardPrecheck::AskRelay`] case, so
+/// the common paths — first award, and re-entry on an already-recorded award — cost no network.
+///
+/// ⚠ Both `AskRelay` branches REFUSE, and one of them is a deliberate behaviour change: a process
+/// that died between `reserve` and `publish` used to silently republish, and now stops for an
+/// operator. That is not a regression, it is the point — `false` from the relay probe does not mean
+/// "no award exists" (the probe's `fetch_events` yields `Ok(empty)` on timeout, so absence and
+/// unreachability are the same value), and publishing on an unverified absence is the duplicate.
+/// The refusal names both remedies; recovering costs one command, a duplicate award costs the money.
 ///
 /// `balance`/`total_cap`/`spent` are the honest snapshots the caller supplies (live wallet
 /// balance, budget cap, budget spent total) — the same two-ceiling inputs [`BuyerStore::reserve`]
 /// guards against.
-pub async fn award_with_reservation<F, Fut>(
+pub async fn award_with_reservation<F, Fut, P, PFut>(
     store: &BuyerStore,
     job_id: &str,
     amount: u64,
@@ -223,12 +345,54 @@ pub async fn award_with_reservation<F, Fut>(
     total_cap: u64,
     spent: u64,
     now_unix: i64,
+    award_present_on_relay: P,
     publish: F,
-) -> Result<AwardClaimOutcome, AwardError>
+) -> Result<AwardOutcome, AwardError>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<AwardClaimOutcome, JobLifecycleError>>,
+    P: FnOnce() -> PFut,
+    PFut: Future<Output = Result<Option<String>, JobLifecycleError>>,
 {
+    // Presence before anything else. A local read failure REFUSES rather than falling through to
+    // publish: local state is the authority this gate rests on, so failing to read it is not a
+    // licence to act as though it said "absent".
+    let existing = store.award_record(job_id).map_err(AwardError::Presence)?;
+    let reservation = store
+        .reservation(job_id)
+        .map_err(AwardError::Presence)?
+        .map(|(state, _)| state);
+
+    match award_precheck(existing.is_some(), reservation) {
+        AwardPrecheck::AlreadyRecorded => {
+            // Unwrap is sound by construction: `AlreadyRecorded` is returned only for
+            // `existing.is_some()`.
+            let record = existing.expect("AlreadyRecorded implies a local award record");
+            return Ok(AwardOutcome::AlreadyAwarded(record));
+        }
+        AwardPrecheck::AskRelay => {
+            return Err(match award_present_on_relay().await {
+                Ok(Some(award_event_id)) => AwardError::PublishedButUnrecorded {
+                    job_id: job_id.to_owned(),
+                    award_event_id,
+                },
+                // Ok(None) is "the relay did not return one", which is NOT "there is none" — the
+                // two are the same value out of the probe. Treated as unverified, like an error.
+                Ok(None) => AwardError::PresenceUnverified {
+                    job_id: job_id.to_owned(),
+                    detail: "relay returned no award, which is indistinguishable from a timed-out \
+                             read"
+                        .to_owned(),
+                },
+                Err(error) => AwardError::PresenceUnverified {
+                    job_id: job_id.to_owned(),
+                    detail: error.to_string(),
+                },
+            });
+        }
+        AwardPrecheck::Publish => {}
+    }
+
     // Reserve before any publish: a refusal publishes NOTHING (and writes no row).
     store
         .reserve(job_id, amount, balance, total_cap, spent, now_unix)
@@ -261,7 +425,7 @@ where
                     outcome.award_event_id
                 );
             }
-            Ok(outcome)
+            Ok(AwardOutcome::Published(outcome))
         }
         Err(error) => {
             // No award reached the relay — reclaim the reservation rather than strand the funds.
@@ -342,15 +506,24 @@ pub enum RearmAction {
     Attempt,
 }
 
-/// The idempotent re-arm decision (#126/#127 invariant A: never award twice). A job is already
-/// awarded iff a buyer AWARD (3405) is on the relay OR its reservation is already `Spent` (collect
-/// paid it). A `Reserved` row with NO relay award is the crash window between reserve and publish —
-/// the award never went out, so it must be re-attempted (republished); [`award_with_reservation`]'s
-/// reserve is idempotent for the same amount, so the re-attempt reserves once and publishes.
+/// The CHEAP first pass of the idempotent re-arm decision (#126/#127 invariant A: never award
+/// twice): skip without any further work when the relay already shows our 3405, or the reservation
+/// is already `Spent` (collect paid it).
 ///
-/// Checking BOTH the relay AND the local ledger is load-bearing: the relay catches a 3405 that
-/// published before a crash (local ledger alone would miss it → double award); the `Spent` check
-/// catches an already-paid job.
+/// ⚠ **`Attempt` does not mean "publish" — it means "go to the chokepoint and let it decide."**
+/// [`award_with_reservation`] holds the actual guard. This distinction is load-bearing because
+/// `award_on_relay == false` conflates three different things (no award; a relay error; a read that
+/// timed out, which [`crate::job_lifecycle::award_event_id_async`] also reports as no award), and
+/// only one of them means the job is unawarded.
+///
+/// In particular a `Reserved` row with no relay award is NOT necessarily the crash window between
+/// reserve and publish. It is equally the window where `publish` succeeded and `record_award` then
+/// failed — a state [`award_with_reservation`] itself creates and logs. Those two want opposite
+/// actions, and reserve-idempotency does not separate them: `reserve` returning
+/// [`super::reservations::Reserved::Idempotent`] protects the BUDGET from a second commitment, and
+/// does nothing to stop `publish` from putting a second 3405 on the relay. Deciding here would
+/// therefore be deciding on a signal that cannot tell the healthy case from the duplicate; the
+/// chokepoint decides instead, against the local `awards` row, which can.
 pub fn plan_rearm(award_on_relay: bool, reservation: Option<ReservationState>) -> RearmAction {
     if award_on_relay {
         return RearmAction::Skip;
@@ -651,7 +824,7 @@ mod tests {
         store.reserve(&job_a, 100, 100, u64::MAX, 0, 1).expect("first reserve");
 
         let published = AtomicBool::new(false);
-        let error = award_with_reservation(&store, &job_b, 40, 100, u64::MAX, 0, 2, || {
+        let error = award_with_reservation(&store, &job_b, 40, 100, u64::MAX, 0, 2, no_relay, || {
             published.store(true, Ordering::SeqCst);
             async { unreachable!("publish must not run when the reservation is refused") }
         })
@@ -671,7 +844,7 @@ mod tests {
     async fn award_publish_failure_releases_the_reservation() {
         let (store, path) = fresh_store("award-publish-fail");
         let job = "a".repeat(64);
-        let error = award_with_reservation(&store, &job, 40, 100, u64::MAX, 0, 1, || async {
+        let error = award_with_reservation(&store, &job, 40, 100, u64::MAX, 0, 1, no_relay, || async {
             Err(JobLifecycleError::Relay("relay down".into()))
         })
         .await
@@ -704,7 +877,7 @@ mod tests {
         let claim = "c".repeat(64);
         let award_event = "e".repeat(64);
 
-        let outcome = award_with_reservation(&store, &job, 40, 100, u64::MAX, 0, 7, || {
+        let outcome = award_with_reservation(&store, &job, 40, 100, u64::MAX, 0, 7, no_relay, || {
             let (job, claim, award_event) = (job.clone(), claim.clone(), award_event.clone());
             async move {
                 Ok(AwardClaimOutcome {
@@ -718,6 +891,9 @@ mod tests {
         })
         .await
         .expect("award");
+        let AwardOutcome::Published(outcome) = outcome else {
+            panic!("a fresh job must PUBLISH, not report an existing award");
+        };
         assert_eq!(outcome.award_event_id, award_event);
 
         let recorded = store.award_record(&job).expect("read").expect("award recorded");
@@ -734,6 +910,165 @@ mod tests {
             "a published award must put the job in the watcher's work set"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── §1 AWARD-PRESENCE CHOKEPOINT (never award twice) ────────────────────────────────────────
+
+    // The pure decision table. Exhaustive over (local record × reservation state), because the
+    // whole point of the gate is that ONE of these six cells may consult the relay and the other
+    // five must not — a table this small should be pinned cell by cell rather than sampled.
+    #[test]
+    fn award_precheck_asks_the_relay_only_when_local_state_is_ambiguous() {
+        use AwardPrecheck::{AlreadyRecorded, AskRelay, Publish};
+
+        // A local awards row settles it, whatever the reservation says. This is the case a relay
+        // probe CANNOT get wrong after the `#t` tag rename, which is why it is read first.
+        assert_eq!(award_precheck(true, None), AlreadyRecorded);
+        assert_eq!(award_precheck(true, Some(ReservationState::Reserved)), AlreadyRecorded);
+        assert_eq!(award_precheck(true, Some(ReservationState::Spent)), AlreadyRecorded);
+        assert_eq!(award_precheck(true, Some(ReservationState::Released)), AlreadyRecorded);
+
+        // No row, nothing reserved: nothing was ever started here — a first award.
+        assert_eq!(award_precheck(false, None), Publish);
+        // No row, funds released: the publish failed and the funds came back. Re-awarding is right.
+        assert_eq!(award_precheck(false, Some(ReservationState::Released)), Publish);
+        // No row, already spent: `reserve` refuses this downstream (`AlreadySpent`) — one authority.
+        assert_eq!(award_precheck(false, Some(ReservationState::Spent)), Publish);
+
+        // THE one ambiguous cell: money committed, no award recorded. Either the process died before
+        // publishing (republish) or `record_award` failed after publishing (a republish DUPLICATES).
+        assert_eq!(award_precheck(false, Some(ReservationState::Reserved)), AskRelay);
+    }
+
+    // A job this buyer has already awarded must not publish again — and must not RESERVE again
+    // either, because the original award still holds its own reservation. Red-on-revert: the publish
+    // closure is `unreachable!`, so deleting the precheck panics here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_recorded_award_publishes_nothing_and_reserves_nothing() {
+        let (store, path) = fresh_store("award-already-recorded");
+        let job = "a".repeat(64);
+        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+        store
+            .record_award(&job, &"c".repeat(64), &"e".repeat(64), SELLER_HEX, 40, 7)
+            .expect("record");
+
+        let outcome = award_with_reservation(&store, &job, 40, 100, u64::MAX, 0, 9, no_relay, || async {
+            unreachable!("a recorded award must not publish again")
+        })
+        .await
+        .expect("an already-awarded job is not an error");
+
+        let AwardOutcome::AlreadyAwarded(record) = outcome else {
+            panic!("expected AlreadyAwarded for a job with a local awards row");
+        };
+        // The RECORDED award is handed back, not a fabricated one. `AwardRecord` has no mint list,
+        // and the enum is what keeps "we don't store this" from being reported as "there were none".
+        assert_eq!(record.job_id, job);
+        assert_eq!(record.award_event_id, "e".repeat(64));
+        assert_eq!(record.awarded_at_unix, 7, "the ORIGINAL award time, not this call's");
+        assert_eq!(
+            store.reserved_in_flight().expect("reserved"),
+            40,
+            "a re-award must not commit a second time"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The duplicate-award hazard itself: funds reserved, no local row, and the relay says an award
+    // IS already public. Publishing here would put a SECOND 3405 on the relay for money already
+    // committed. It must refuse — and the refusal must tell the operator what to do.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unrecorded_public_award_refuses_instead_of_publishing_a_duplicate() {
+        let (store, path) = fresh_store("award-public-unrecorded");
+        let job = "a".repeat(64);
+        let award = "e".repeat(64);
+        // Exactly the `record_award`-failed window: reserved, published, no row.
+        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+
+        let found = award.clone();
+        let error = award_with_reservation(
+            &store,
+            &job,
+            40,
+            100,
+            u64::MAX,
+            0,
+            9,
+            || async move { Ok(Some(found)) },
+            || async { unreachable!("an award already on the relay must not be published again") },
+        )
+        .await
+        .expect_err("an already-public award must refuse");
+
+        assert!(
+            matches!(&error, AwardError::PublishedButUnrecorded { award_event_id, .. } if *award_event_id == award),
+            "expected PublishedButUnrecorded naming the found award, got: {error}"
+        );
+        // The refusal is only useful if it says what to do about it.
+        let message = error.to_string();
+        assert!(message.contains(&award), "the refusal must NAME the award it found: {message}");
+        assert!(
+            message.contains("collect"),
+            "the refusal must name the operator action: {message}"
+        );
+        // Nothing moved: the reservation belongs to the award that IS public.
+        assert_eq!(
+            store.reserved_in_flight().expect("reserved"),
+            40,
+            "a presence refusal must not disturb the reservation"
+        );
+        assert!(
+            store.award_record(&job).expect("read").is_none(),
+            "this gate DETECTS the missing row; repairing it is deliberately not done here"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The uninformative relay answer. `Ok(None)` is not "no award exists" — `fetch_events` yields
+    // `Ok(empty)` on timeout, so absence and unreachability are the SAME value. Both it and an
+    // outright error must refuse: publishing on an unverified absence is the duplicate.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unverifiable_presence_refuses_rather_than_publishing() {
+        for (label, probe_result) in [
+            ("empty answer", Ok(None)),
+            ("relay error", Err(JobLifecycleError::Relay("relay down".into()))),
+        ] {
+            let (store, path) = fresh_store(&format!("award-unverified-{}", label.replace(' ', "-")));
+            let job = "a".repeat(64);
+            store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+
+            let error = award_with_reservation(
+                &store,
+                &job,
+                40,
+                100,
+                u64::MAX,
+                0,
+                9,
+                || async move { probe_result },
+                || async { unreachable!("an unverified presence must not publish ({label})") },
+            )
+            .await
+            .expect_err("an unverifiable presence must refuse");
+
+            assert!(
+                matches!(error, AwardError::PresenceUnverified { .. }),
+                "{label}: expected PresenceUnverified, got: {error}"
+            );
+            // Both remedies, because the operator cannot know which state they are in without looking.
+            let message = error.to_string();
+            assert!(
+                message.contains("collect") && message.contains("release"),
+                "{label}: the refusal must name BOTH remedies (collect if an award exists, release \
+                 if none does): {message}"
+            );
+            assert_eq!(
+                store.reserved_in_flight().expect("reserved"),
+                40,
+                "{label}: an unverified presence must leave the reservation alone"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     // ORDERING tooth (red-on-revert). `settle_after_pay` must run `pay` (budget append + melt)
@@ -927,6 +1262,17 @@ mod tests {
         (home, root)
     }
 
+    /// The relay-presence probe for tests whose outcome must be decided from LOCAL state alone.
+    ///
+    /// It panics if awaited, which makes "the local-first precheck needs no network" an assertion
+    /// rather than a comment: a first award (no row, no reservation) and a re-award of a recorded
+    /// award (row present) must both resolve without it. Only the genuinely ambiguous
+    /// reserved-but-unrecorded state may reach the relay, and the tests that exercise that state
+    /// pass an explicit probe instead of this one.
+    async fn no_relay() -> Result<Option<String>, JobLifecycleError> {
+        unreachable!("presence must be decided from local state — the relay must not be consulted")
+    }
+
     /// A stand-in published-award outcome for the `award_with_reservation` publish closure (these
     /// tests never touch a relay — the money accounting is what is under test, not the wire).
     fn fake_award_outcome(job_id: &str) -> AwardClaimOutcome {
@@ -982,9 +1328,17 @@ mod tests {
                 let gate = BudgetGate::from_home(&home).expect("gate");
                 let (total_cap, spent) = (gate.total_cap(), gate.spent());
                 let job_out = job.clone();
-                award_with_reservation(&store, &job, amount, balance, total_cap, spent, 1, || async {
-                    Ok(fake_award_outcome(&job_out))
-                })
+                award_with_reservation(
+                    &store,
+                    &job,
+                    amount,
+                    balance,
+                    total_cap,
+                    spent,
+                    1,
+                    no_relay,
+                    || async { Ok(fake_award_outcome(&job_out)) },
+                )
                 .await
                 .map_err(|error| {
                     // A refused agent must be a clean insufficient-available refusal, never a panic
@@ -1025,21 +1379,30 @@ mod tests {
         );
 
         // Idempotency under concurrency: a winning agent re-awarding its own job (a client retry)
-        // must not commit a second time — the reserved total stays put.
+        // must not commit a second time — and must not PUBLISH a second time either.
         //
-        // Re-award an agent that ACTUALLY won, taken from the join results. Naming a fixed agent
-        // here is what makes this leg flaky: the winners are whichever three reached the money lock
-        // first, so a scheduling change (one more test in the binary is enough) can leave the named
-        // agent among the two refused. Then this is not a re-award at all — it is a fresh reserve of
-        // 30 against the 10 the winners left, which `reserve` correctly refuses, and the refusal
-        // reads as an idempotency failure when the code did exactly the right thing.
+        // Re-award an agent that ACTUALLY won, taken from the join results (#287). Naming a fixed
+        // agent here is what made this leg flaky: the winners are whichever three reached the money
+        // lock first, so a scheduling change (one more test in the binary is enough) can leave the
+        // named agent among the two refused. Then this is not a re-award at all — it is a fresh
+        // reserve of 30 against the 10 the winners left, which `reserve` correctly refuses, and the
+        // refusal reads as an idempotency failure when the code did exactly the right thing.
+        //
+        // The publish closure is `unreachable!`, which makes this red-on-revert for the presence
+        // gate: remove the gate and the retry republishes — a duplicate award of real money — and
+        // this test panics instead of quietly passing on the reserved total alone. Note the two
+        // failures are independent: #287 fixed WHICH job is re-awarded, this asserts WHAT a re-award
+        // may do. A winner is required for either to mean anything.
         let winner = winners[0].clone();
-        let winner_out = winner.clone();
-        let _ = award_with_reservation(&store, &winner, amount, balance, cap, 0, 2, || async {
-            Ok(fake_award_outcome(&winner_out))
+        let outcome = award_with_reservation(&store, &winner, amount, balance, cap, 0, 2, no_relay, || async {
+            unreachable!("a job with a recorded award must not publish again")
         })
         .await
         .expect("idempotent re-award");
+        assert!(
+            matches!(outcome, AwardOutcome::AlreadyAwarded(ref record) if record.job_id == winner),
+            "a re-award must report the EXISTING award, not a new publish"
+        );
         assert_eq!(
             store.reserved_in_flight().expect("reserved"),
             90,
@@ -1138,6 +1501,7 @@ mod tests {
                         cap,
                         spent,
                         4,
+                        no_relay,
                         || async { Ok(fake_award_outcome(&job_out)) },
                     )
                     .await
@@ -1204,7 +1568,7 @@ mod tests {
                     let snap = balance.load(Ordering::SeqCst);
                     let spent = BudgetGate::from_home(&home).expect("gate").spent();
                     let job_out = job_y.clone();
-                    award_with_reservation(&store, &job_y, award, snap, cap, spent, 4, || async {
+                    award_with_reservation(&store, &job_y, award, snap, cap, spent, 4, no_relay, || async {
                         Ok(fake_award_outcome(&job_out))
                     })
                     .await

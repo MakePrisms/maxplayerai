@@ -1657,16 +1657,24 @@ fn derive_claim_liveness(
 /// against `now` (a `processing` claim past the offer deadline is EXPIRED, not live). Exposed
 /// `pub(crate)` so the seller daemon can run the backfill money-safety pre-claim check
 /// (already-delivered / live-claimed-by-another) without duplicating the relay read.
-/// True when a buyer AWARD (kind-3405) authored by this buyer already exists on the relay for
-/// `job_id` — the relay half of the idempotent re-arm check (a 3405 may have published before a
+/// The event id of a buyer AWARD (kind-3405) authored by this buyer for `job_id`, if the relay
+/// returns one — the relay half of the idempotent re-arm check (a 3405 may have published before a
 /// crash, so the local ledger alone is insufficient). A relay error propagates so the caller treats
 /// it as "unknown" and does not falsely mark the intent awarded.
-pub(crate) async fn has_award_async(
+///
+/// ⚠ **`Ok(None)` means "the relay did not return an award", which is NOT "no award exists."**
+/// `fetch_events` resolves `Ok(empty)` when it simply hits `timeout`, so a slow or unreachable relay
+/// is indistinguishable here from a genuinely unawarded job. Callers that spend money on the answer
+/// must treat `Ok(None)` as UNVERIFIED, not as verified absence — see
+/// [`crate::buyer::lifecycle::award_with_reservation`], which refuses on it.
+///
+/// Returns the id rather than a bool so a caller refusing on presence can NAME the award it found.
+pub(crate) async fn award_event_id_async(
     home: &MobeeHome,
     keys: &nostr_sdk::Keys,
     job_id: &str,
     timeout: Duration,
-) -> Result<bool, JobLifecycleError> {
+) -> Result<Option<String>, JobLifecycleError> {
     use nostr_sdk::prelude::{Client, EventId, Filter, Kind};
 
     let offer_id = EventId::from_hex(job_id)
@@ -1687,7 +1695,7 @@ pub(crate) async fn has_award_async(
         .fetch_events(filter, timeout)
         .await
         .map_err(|error| JobLifecycleError::Relay(format!("fetch award: {error}")))?;
-    Ok(!events.is_empty())
+    Ok(events.first().map(|event| event.id.to_hex()))
 }
 
 pub(crate) async fn fetch_job_view_async(
@@ -4078,5 +4086,76 @@ mod tests {
         assert!(msg.contains("40") && msg.contains("21"), "{msg}");
         assert!(msg.contains("RESTART"), "{msg}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // §1 RED-PROVE — the positive control `has_award_async` has never had.
+    //
+    // The probe is the sole input to "Invariant A: never award twice", and every observation of it
+    // has been `false`. A guard whose only observed outcome is the negative one is not evidence of
+    // anything: `fetch_events` returns Ok(empty) on timeout, so `Ok(false)` conflates "the relay says
+    // there is no award" with "nothing arrived in time" — and the filter asks for our OWN authored
+    // events, which is the one case nostr-sdk is known to treat specially.
+    //
+    // So: point it at a job that PROVABLY has an award and demand `true`. TRUE means the probe works
+    // and §1 is a three-state fix. Empty means Invariant A has been decorative since it was written.
+    //
+    // Ignored because it needs a live relay and a real home. Run explicitly:
+    //   REDPROVE_HOME=<home> REDPROVE_JOB=<job_id> REDPROVE_AWARD=<award_event_id> \
+    //     cargo test -p mobee-core red_prove_has_award -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live relay and a real home; run explicitly with --ignored"]
+    async fn red_prove_has_award_async_returns_true_for_a_known_award() {
+        use nostr_sdk::prelude::{Client, EventId, Filter};
+
+        let root = std::env::var("REDPROVE_HOME").expect("REDPROVE_HOME");
+        let job_id = std::env::var("REDPROVE_JOB").expect("REDPROVE_JOB");
+        let award_id = std::env::var("REDPROVE_AWARD").expect("REDPROVE_AWARD");
+        let home = home::bootstrap(&root).expect("bootstrap home");
+        let keys = buyer_keys(&home).expect("buyer keys");
+        eprintln!(
+            "REDPROVE relay={} author={}",
+            home.config.relay_url,
+            keys.public_key().to_hex()
+        );
+
+        // POSITIVE CONTROL FIRST, built the same way the probe builds its client: fetch the known
+        // award BY ID. If this comes back empty the connection (or NIP-42 auth) is the problem, and
+        // an empty probe result below would say nothing at all about presence.
+        let client = Client::new(keys.clone());
+        client
+            .add_relay(&home.config.relay_url)
+            .await
+            .expect("add relay");
+        client.connect().await;
+        let control = client
+            .fetch_events(
+                Filter::new().id(EventId::from_hex(&award_id).expect("award id hex")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("control fetch by id");
+        eprintln!("CONTROL fetch-award-by-id -> {} event(s)", control.len());
+
+        let probe = award_event_id_async(&home, &keys, &job_id, Duration::from_secs(10)).await;
+        eprintln!("PROBE award_event_id_async -> {probe:?}");
+
+        assert!(
+            !control.is_empty(),
+            "POSITIVE CONTROL FAILED: could not read a known event by id, so the probe's result is \
+             uninterpretable — fix the connection/auth before drawing any conclusion"
+        );
+        let found = probe
+            .expect("probe should not error once the control passes")
+            .expect(
+                "award_event_id_async returned None for a job with a KNOWN award while the control \
+                 passed — the guard cannot detect the thing it exists to detect",
+            );
+        // Identity, not just presence: a probe that returns SOME award for the job would satisfy a
+        // bare `is_some()` while pointing at the wrong event, and the refusal message quotes this id
+        // to an operator.
+        assert_eq!(
+            found, award_id,
+            "the probe found an award for this job but not the KNOWN one"
+        );
     }
 }
