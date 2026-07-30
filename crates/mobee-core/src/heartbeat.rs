@@ -127,16 +127,32 @@ pub fn agents_from_tags(tags: &[TagSpec]) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Build the heartbeat for a seller's live state. `accepting` is `n` while a job holds the
-/// single-flight slot (a busy seller is not taking new work); `queue_depth` is that in-flight
-/// count; `agents` is what the resolved harness registry advertises. This is the single mapping
-/// the daemon loop uses, factored out so the flip is unit-testable without a live relay.
+/// Build the heartbeat for a seller's live state. `accepting` is `y` only when the seat has a free
+/// single-flight slot AND something is actually serving: a busy seller is not taking new work, and
+/// neither is a seat that has dropped every harness. `queue_depth` is the in-flight count; `agents`
+/// is what the live roster advertises. This is the single mapping the daemon loop uses, factored out
+/// so the flip is unit-testable without a live relay.
+///
+/// ⚠ `anything_serving` is NOT derivable from `agents`. The roster advertises NAMES, and the
+/// unlabelled `--agent-argv` hatch has none — so a seat serving only the hatch advertises an empty
+/// list while being perfectly able to work, and reading darkness off that list would take it off the
+/// market for lacking a label. The signal comes from the roster's own dispatch predicate.
+///
+/// WHY `accepting` rather than a marker on the agents tag: an ABSENT tag already means "unstated",
+/// so there is no spare state there to mean "none" without a protocol change every reader would have
+/// to learn. `accepting` has no unstated value, so the truth fits in a field that already exists.
 pub fn heartbeat_for_state(
     job_in_flight: bool,
+    anything_serving: bool,
     rate_sats: u64,
     agents: Vec<String>,
 ) -> HeartbeatDraft {
-    HeartbeatDraft::v1(!job_in_flight, u32::from(job_in_flight), rate_sats).with_agents(agents)
+    HeartbeatDraft::v1(
+        !job_in_flight && anything_serving,
+        u32::from(job_in_flight),
+        rate_sats,
+    )
+    .with_agents(agents)
 }
 
 /// A parsed heartbeat's payload. The author pubkey is NOT carried here — combine it with [`d`]
@@ -357,7 +373,7 @@ mod tests {
 
     #[test]
     fn advertises_every_harness_in_preference_order() {
-        let draft = heartbeat_for_state(false, 5, vec!["claude".into(), "codex".into()])
+        let draft = heartbeat_for_state(false, true, 5, vec!["claude".into(), "codex".into()])
             .to_event_draft();
         let tag = first_tag(&draft.tags, "mobee_agent").expect("mobee_agent tag");
         assert_eq!(tag.0, vec!["mobee_agent", "claude", "codex"]);
@@ -370,7 +386,8 @@ mod tests {
     fn a_seller_stating_no_harness_emits_a_byte_identical_heartbeat() {
         // Compat, the byte-identity half: a raw `agent_command` seller has no preset label, so it
         // advertises nothing and its heartbeat is EXACTLY the pre-registry event — no empty tag.
-        let stated_none = heartbeat_for_state(false, 5, Vec::new()).to_event_draft();
+        // It IS serving (hence `true`), which is why an unstated list must never read as dark.
+        let stated_none = heartbeat_for_state(false, true, 5, Vec::new()).to_event_draft();
         let before_registry = HeartbeatDraft::v1(true, 0, 5).to_event_draft();
         assert_eq!(stated_none, before_registry);
         assert!(
@@ -382,7 +399,7 @@ mod tests {
 
     #[test]
     fn accepting_flips_with_in_flight_state() {
-        let idle = heartbeat_for_state(false, 5, Vec::new());
+        let idle = heartbeat_for_state(false, true, 5, Vec::new());
         assert!(idle.accepting);
         assert_eq!(idle.queue_depth, 0);
         assert_eq!(
@@ -390,7 +407,7 @@ mod tests {
             Some("y")
         );
 
-        let busy = heartbeat_for_state(true, 5, Vec::new());
+        let busy = heartbeat_for_state(true, true, 5, Vec::new());
         assert!(!busy.accepting);
         assert_eq!(busy.queue_depth, 1);
         assert_eq!(
@@ -401,6 +418,37 @@ mod tests {
             first_tag_value(&busy.to_event_draft().tags, "queue_depth"),
             Some("1")
         );
+    }
+
+    /// The whole point of the change: an idle seat with nothing serving is NOT accepting.
+    ///
+    /// Written as the full truth table because the two inputs are adjacent bools — transposing them
+    /// at a call site reddens this test, since `queue_depth` tracks `job_in_flight` alone and so the
+    /// idle-and-serving row would come back as `n`/`1` instead of `y`/`0`.
+    #[test]
+    fn accepting_requires_a_free_slot_and_something_serving() {
+        let accepting_of = |job_in_flight, serving| {
+            let draft = heartbeat_for_state(job_in_flight, serving, 5, Vec::new()).to_event_draft();
+            (
+                first_tag_value(&draft.tags, "accepting")
+                    .expect("accepting tag")
+                    .to_owned(),
+                first_tag_value(&draft.tags, "queue_depth")
+                    .expect("queue_depth tag")
+                    .to_owned(),
+            )
+        };
+
+        assert_eq!(accepting_of(false, true), ("y".into(), "0".into()), "idle + serving");
+        assert_eq!(accepting_of(true, true), ("n".into(), "1".into()), "busy");
+        // The row this change adds. Before it, a fully dark seat published `y` and kept drawing work
+        // it could only decline.
+        assert_eq!(accepting_of(false, false), ("n".into(), "0".into()), "idle + dark");
+        assert_eq!(accepting_of(true, false), ("n".into(), "1".into()), "busy + dark");
+
+        // And dark is DISTINGUISHABLE from busy, which the pair could not express before: both say
+        // "not taking work", and `queue_depth` says which reason.
+        assert_ne!(accepting_of(false, false), accepting_of(true, true));
     }
 
     #[test]

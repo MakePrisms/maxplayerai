@@ -1864,10 +1864,14 @@ impl SellerNodeRunner {
             return;
         };
         let job_in_flight = self.node.store().health().map(|h| h.jobs > 0).unwrap_or(false);
+        // ONE roster read for both wire signals: a seat that has dropped every harness advertises
+        // `accepting=n`, so it stops attracting work instead of looking open and declining later.
+        let roster = self.agents.advertisement();
         let draft = crate::heartbeat::heartbeat_for_state(
             job_in_flight,
+            roster.serving,
             seller.rate_sats,
-            self.agents.advertised(),
+            roster.names,
         )
         .to_event_draft();
         match self.node.signer().sign(draft, now_unix()).await {

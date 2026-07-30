@@ -188,6 +188,19 @@ pub struct Selected<'a> {
     pub agent: &'a RegisteredAgent,
 }
 
+/// The roster as ONE wire snapshot: whether the seat is serving at all, and the names to advertise.
+///
+/// `serving` is NOT `!names.is_empty()`. The unlabelled `--agent-argv` hatch serves without a name
+/// to publish, so a working seat can advertise nothing — and a heartbeat that read darkness off the
+/// name list would take that seat off the market for having no label.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Advertisement {
+    /// At least one entry is serving ⇒ the seat can take work. The `accepting` input.
+    pub serving: bool,
+    /// Serving entries that have a name, in preference order. Empty ⇒ "states no harness".
+    pub names: Vec<String>,
+}
+
 impl LiveRoster {
     /// Wrap a resolved registry. Every entry starts serving: boot already verified each one is
     /// launchable, and launchable is the only thing boot can verify.
@@ -198,18 +211,37 @@ impl LiveRoster {
         }
     }
 
-    /// The harness names to advertise on the wire, in preference order, EXCLUDING anything not
-    /// currently serving. Exactly the set [`Self::dispatch`] can serve, which is what makes a
-    /// dropped harness stop attracting awards rather than merely failing them later.
-    pub fn advertised(&self) -> Vec<String> {
+    /// The whole wire view of the roster, read under ONE lock.
+    ///
+    /// Both halves together rather than as two calls because they are published in the SAME
+    /// heartbeat: read separately, a fault landing in between could emit `accepting=y` beside an
+    /// empty advertisement — the exact incoherence a live roster exists to make unrepresentable.
+    pub fn advertisement(&self) -> Advertisement {
         let state = self.state.lock().expect("live roster poisoned");
-        self.registry
-            .entries()
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| Self::serving(&state, index))
-            .filter_map(|(_, entry)| entry.name.clone())
-            .collect()
+        let mut ad = Advertisement {
+            serving: false,
+            names: Vec::new(),
+        };
+        for (index, entry) in self.registry.entries().iter().enumerate() {
+            if !Self::serving(&state, &index) {
+                continue;
+            }
+            ad.serving = true;
+            if let Some(name) = entry.name.clone() {
+                ad.names.push(name);
+            }
+        }
+        ad
+    }
+
+    /// The harness names to advertise on the wire, in preference order, EXCLUDING anything not
+    /// currently serving. Exactly the set [`Self::dispatch`] can serve BY NAME, which is what makes a
+    /// dropped harness stop attracting awards rather than merely failing them later.
+    ///
+    /// ⚠ Empty does NOT mean nothing serves — the unlabelled hatch has no name to publish. Ask
+    /// [`Advertisement::serving`] for that.
+    pub fn advertised(&self) -> Vec<String> {
+        self.advertisement().names
     }
 
     /// The harness that will run a job requesting `requested`, skipping anything not serving.
@@ -590,6 +622,51 @@ mod tests {
             "a dropped hatch must stop claiming untargeted work"
         );
         assert!(roster.dispatch(None).is_none());
+    }
+
+    /// Why the heartbeat's `accepting` input cannot be `!names.is_empty()`.
+    ///
+    /// This seat works and publishes no name, so an empty advertisement and a dark seat are DIFFERENT
+    /// states that a name list alone cannot tell apart. Collapse them and a hatch-only node takes
+    /// itself off the market for lacking a label; that is what `serving` exists to carry.
+    #[test]
+    fn the_advertisement_separates_having_no_name_from_having_nothing_to_serve() {
+        let roster = roster(&[None]);
+
+        let live = roster.advertisement();
+        assert!(live.names.is_empty(), "a hatch has no name to publish");
+        assert!(live.serving, "yet the seat is serving, and must advertise as accepting");
+
+        roster.fault(0, Fault::Unproven, Instant::now());
+
+        let dark = roster.advertisement();
+        assert_eq!(
+            dark.names, live.names,
+            "the name list cannot see this transition — it was empty on both sides"
+        );
+        assert!(!dark.serving, "only `serving` moves, and it is what makes the seat state `accepting=n`");
+    }
+
+    /// The named case, so the pairing is proven on both roster shapes: dropping every named harness
+    /// empties the advertisement AND reports the seat dark, under one read.
+    #[test]
+    fn a_fully_dropped_named_roster_reports_dark_alongside_an_empty_advertisement() {
+        let roster = named(&["claude", "codex"]);
+        assert_eq!(roster.advertisement().names, vec!["claude", "codex"]);
+        assert!(roster.advertisement().serving);
+
+        roster.fault(0, Fault::Unproven, Instant::now());
+        let partial = roster.advertisement();
+        assert_eq!(partial.names, vec!["codex"], "one harness left is still a working seat");
+        assert!(partial.serving);
+
+        roster.fault(1, Fault::Incapable(MissingCapability::AcpFeature), Instant::now());
+        let dark = roster.advertisement();
+        assert!(dark.names.is_empty());
+        assert!(
+            !dark.serving,
+            "both unavailability kinds count as dark, not just the droppable one"
+        );
     }
 
     #[test]
