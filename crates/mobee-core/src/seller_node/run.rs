@@ -901,11 +901,55 @@ fn harness_fault_for(error: &ExecError) -> Option<Fault> {
 /// so a harness that cannot manage that inside this window is not one to hand a paid job to either.
 const HARNESS_PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// The self-probe prompt. Asks for ONE artifact carrying a token minted for this probe.
-fn harness_probe_prompt(token: &str) -> String {
+/// Prefix of a probe sentinel.
+///
+/// Called a SENTINEL and never a "token" on purpose: in this crate a token is **Cashu ecash**, i.e.
+/// money (`payload.to_token()`, `token_hash`, "already-spent token" — all in this same file). A probe
+/// sentinel is an opaque nonce that spends nothing, and naming it "token" made a reviewer stop and ask
+/// whether probing costs sats. A name that forces that question on a money path is wrong whatever the
+/// answer is.
+const PROBE_SENTINEL_PREFIX: &str = "mobee-probe";
+
+/// Prefix of the NON-SECRET label naming a probe's workdir. Distinct from the sentinel's prefix so no
+/// sentinel value can ever be a substring of a workdir path.
+const PROBE_DIR_PREFIX: &str = "mobee-selfprobe";
+
+/// One probe's two values: a non-secret label for its workdir, and the secret it must produce.
+///
+/// **They are separate, and that separation is the property.** A workdir path is trivially observable
+/// by the harness — it *is* its own cwd — so any harness that echoes a path into a file (an error
+/// trace, a log header, a partial write) would reproduce a sentinel that lived in that path, passing
+/// the probe **without doing the task**. A discriminator must not appear in the environment it is
+/// discriminating. Keying the workdir off the sentinel is exactly that mistake.
+struct ProbeIdentity {
+    /// Names the workdir. The harness sees it and may echo it freely; nothing depends on its secrecy.
+    dir_label: String,
+    /// The secret the harness must write. Reaches it ONLY through the prompt — never through the
+    /// filesystem, the cwd, or any argv.
+    sentinel: String,
+}
+
+/// Mint one probe's identity — the ONE place either value's shape is decided.
+///
+/// Both are then PASSED to the prompt, the workdir name and the readback, so no second literal exists
+/// anywhere that could drift out of step. The sentinel carries sub-second entropy the label does not,
+/// so it is neither equal to nor derivable from anything the harness can read off its own path.
+fn mint_probe_identity(harness: usize, now_unix: u64) -> ProbeIdentity {
+    let entropy = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.subsec_nanos())
+        .unwrap_or(0);
+    ProbeIdentity {
+        dir_label: format!("{PROBE_DIR_PREFIX}-{harness}-{now_unix}"),
+        sentinel: format!("{PROBE_SENTINEL_PREFIX}-{harness}-{now_unix}-{entropy:09}"),
+    }
+}
+
+/// The self-probe prompt. Asks for ONE artifact carrying the sentinel minted for this probe.
+fn harness_probe_prompt(sentinel: &str) -> String {
     format!(
         "Create a file named `probe.txt` in your current working directory whose contents are \
-         exactly this token:\n\n{token}\n\n\
+         exactly this line:\n\n{sentinel}\n\n\
          Do nothing else. Do not explain, and do not ask a question — write the file."
     )
 }
@@ -915,7 +959,7 @@ fn harness_probe_prompt(token: &str) -> String {
 /// A positive control, not a liveness check, and the distinction is the entire reason this exists. A
 /// harness whose account is exhausted ends its turn `completed`, exits 0, and returns a perfectly
 /// non-empty message explaining that you should upgrade your plan — so exit status, turn state and
-/// response length are ALL green for exactly the harness we most need to catch. The token is the only
+/// response length are ALL green for exactly the harness we most need to catch. The sentinel is the only
 /// signal that goes red, because a harness that cannot work cannot produce it.
 ///
 /// The probe runs under the same sandbox policy as a real job. Probing an unsandboxed path while jobs
@@ -930,7 +974,7 @@ async fn run_harness_probe(
     sandbox: &SandboxPolicy,
     identity: &DeliveryAgentIdentity,
     workdir: &std::path::Path,
-    token: &str,
+    sentinel: &str,
 ) -> Result<(), (String, Fault)> {
     seller_git::init_empty_delivery_workdir_off_runtime(workdir.to_path_buf(), identity.clone())
         .await
@@ -946,7 +990,7 @@ async fn run_harness_probe(
     if let Err(error) = run_agent_job(
         argv,
         sandbox,
-        &harness_probe_prompt(token),
+        &harness_probe_prompt(sentinel),
         workdir,
         identity,
         HARNESS_PROBE_TIMEOUT,
@@ -958,13 +1002,13 @@ async fn run_harness_probe(
     }
 
     // The turn "succeeded" — now ask the only question that separates a working harness from an
-    // exhausted one: is the token actually here?
-    if probe_token_present(workdir, token) {
+    // exhausted one: is the sentinel actually here?
+    if probe_sentinel_present(workdir, sentinel) {
         Ok(())
     } else {
         Err((
             format!(
-                "probe turn reported success but produced no artifact carrying {token} — a completed \
+                "probe turn reported success but produced no artifact carrying {sentinel} — a completed \
                  turn is not delivered work"
             ),
             Fault::Unproven,
@@ -972,21 +1016,28 @@ async fn run_harness_probe(
     }
 }
 
-/// Whether any file the harness left in `workdir` carries the probe token.
+/// Whether any file the harness left in `workdir` carries the probe sentinel.
 ///
-/// Content, not filename: a harness that wrote the token somewhere sensible has demonstrated the
+/// Content, not filename: a harness that wrote the sentinel somewhere sensible has demonstrated the
 /// capability being tested, and failing it for choosing a different filename would report a working
 /// harness as broken. `.git` is skipped — the workdir is a fresh repo and its own metadata is ours.
-fn probe_token_present(workdir: &std::path::Path, token: &str) -> bool {
+///
+/// **The workdir's own path is subtracted from the content before matching.** A harness that echoes
+/// its cwd has demonstrated nothing about the task, so a sentinel reachable only through that echo
+/// must not count. [`mint_probe_identity`] already keeps the sentinel out of the path, which is the
+/// real fix; this is the belt to that braces, so a future caller that reintroduces the leak cannot
+/// silently turn a dead harness into a serving one.
+fn probe_sentinel_present(workdir: &std::path::Path, sentinel: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(workdir) else {
         return false;
     };
+    let path_text = workdir.to_string_lossy().to_string();
     entries.flatten().any(|entry| {
         if entry.file_name() == ".git" {
             return false;
         }
         std::fs::read_to_string(entry.path())
-            .map(|content| content.contains(token))
+            .map(|content| content.replace(&path_text, "").contains(sentinel))
             .unwrap_or(false)
     })
 }
@@ -2209,19 +2260,21 @@ impl SellerNodeRunner {
             let roster = Arc::clone(&self.agents);
             let sandbox = SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref());
             let identity = DeliveryAgentIdentity::for_seller(&self.seller_pubkey.to_hex());
-            // A token minted per probe, so neither a stale workdir nor a replayed transcript can
-            // satisfy one: the artifact has to be produced by THIS turn.
-            let token = format!("mobee-probe-{harness}-{}", now_unix());
-            let workdir = job_workdir(self.node.home(), &token);
+            // Minted per probe, so neither a stale workdir nor a replayed transcript can satisfy one:
+            // the artifact has to be produced by THIS turn. The workdir is named after the NON-SECRET
+            // label — never the sentinel, which the harness must not be able to read off its own cwd.
+            let probe = mint_probe_identity(harness, now_unix() as u64);
+            let workdir = job_workdir(self.node.home(), &probe.dir_label);
+            let sentinel = probe.sentinel;
             tokio::task::spawn_local(async move {
                 let label = roster
                     .label(harness)
                     .unwrap_or_else(|| "<unlabelled>".to_owned());
-                match run_harness_probe(&argv, &sandbox, &identity, &workdir, &token).await {
+                match run_harness_probe(&argv, &sandbox, &identity, &workdir, &sentinel).await {
                     Ok(()) => {
                         roster.restore(harness);
                         eprintln!(
-                            "seller node harness RESTORED {label}: self-probe delivered its token — \
+                            "seller node harness RESTORED {label}: self-probe delivered its sentinel — \
                              now advertising {:?} of {} resolved",
                             roster.advertised(),
                             roster.entry_count()
@@ -3210,20 +3263,23 @@ mod tests {
     // TOOTH (#254) — the self-probe is decided by the ARTIFACT, and nothing else it could be decided
     // by would work. A harness whose account is exhausted ends its turn `completed`, exits 0, and
     // returns a non-empty message telling you to upgrade your plan: exit status, turn state and
-    // response length are all GREEN for precisely the harness this exists to catch. Only a token it
+    // response length are all GREEN for precisely the harness this exists to catch. Only a sentinel it
     // cannot produce goes red.
     // Bite: decide the probe on turn completion, or on the workdir merely being non-empty, and the
     // billing-notice case below passes — restoring a harness that cannot do any work to the roster,
     // where it will rank as the FASTEST seat on it.
     #[test]
-    fn the_self_probe_is_decided_by_the_token_not_by_a_completed_turn() {
-        let dir = std::env::temp_dir().join(format!("mobee-probe-test-{}", std::process::id()));
+    fn the_self_probe_is_decided_by_the_sentinel_not_by_a_completed_turn() {
+        // Deliberately NOT sharing the sentinel prefix: a grep for it must return the ONE definition.
+        let dir = std::env::temp_dir().join(format!("mobee-selfprobe-td-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("probe dir");
-        let token = "mobee-probe-0-1785400000";
+        // Minted through the SAME function the probe path uses, so this test cannot pass against a
+        // sentinel shape the node would never actually produce.
+        let sentinel = mint_probe_identity(0, 1_785_400_000).sentinel;
 
         // Nothing written at all — a turn that completed having done nothing.
         assert!(
-            !probe_token_present(&dir, token),
+            !probe_sentinel_present(&dir, &sentinel),
             "an empty workdir is not a delivered artifact"
         );
 
@@ -3232,19 +3288,94 @@ mod tests {
         std::fs::write(dir.join("probe.txt"), "Upgrade your plan to continue")
             .expect("write notice");
         assert!(
-            !probe_token_present(&dir, token),
-            "a non-empty file that lacks the token must NOT pass — this is the whole failure mode"
+            !probe_sentinel_present(&dir, &sentinel),
+            "a non-empty file lacking the sentinel must NOT pass — this is the whole failure mode"
         );
 
-        // The working case. Content, not filename: a harness that put the token somewhere sensible
+        // The working case. Content, not filename: a harness that put the sentinel somewhere sensible
         // has shown the capability, and failing it over a filename would report it broken.
-        std::fs::write(dir.join("notes.md"), format!("done: {token}\n")).expect("write token");
+        std::fs::write(dir.join("notes.md"), format!("done: {sentinel}\n")).expect("write sentinel");
         assert!(
-            probe_token_present(&dir, token),
-            "the token present in any file is the capability being tested"
+            probe_sentinel_present(&dir, &sentinel),
+            "the sentinel present in any file is the capability being tested"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A probe sentinel must never be confusable with ecash. `token` in this crate means Cashu money
+    // (`payload.to_token()`, `token_hash`, "already-spent token" — same file), so the sentinel carries
+    // its own prefix from ONE definition shared by the mint site and the readback.
+    // Bite: reintroduce a second literal for the prefix and the mint and the readback can drift apart
+    // silently — which is why the assertion runs through the shared function.
+    #[test]
+    fn a_probe_sentinel_is_minted_from_one_definition_and_is_not_ecash() {
+        let a = mint_probe_identity(0, 1_785_400_000);
+        let b = mint_probe_identity(0, 1_785_400_001);
+        let other_harness = mint_probe_identity(1, 1_785_400_000);
+
+        assert!(a.sentinel.starts_with(PROBE_SENTINEL_PREFIX), "{}", a.sentinel);
+        assert_ne!(
+            a.sentinel, b.sentinel,
+            "a sentinel is per-probe, so a replay cannot satisfy a later one"
+        );
+        assert_ne!(a.sentinel, other_harness.sentinel, "and it is per-harness");
+
+        // The readback accepts exactly what the mint produced — one definition, both ends.
+        let dir = std::env::temp_dir().join(format!("mobee-sn-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("probe.txt"), &a.sentinel).expect("write");
+        assert!(probe_sentinel_present(&dir, &a.sentinel));
+        assert!(
+            !probe_sentinel_present(&dir, &b.sentinel),
+            "a DIFFERENT probe's sentinel must not be satisfied by this artifact"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // TOOTH (#254, review finding R1) — a harness must not be able to pass its probe by ECHOING ITS
+    // OWN CWD. The workdir path is the one string a harness always has without doing any work, so if
+    // the sentinel lives in that path, an error trace or a log header that mentions the cwd satisfies
+    // the probe and a dead harness is restored to the roster as "serving".
+    // ⇒ A discriminator must not appear in the environment it discriminates.
+    // Bite: key the workdir off the sentinel again (`job_workdir(home, &sentinel)`) and the first
+    // assertion below still holds, but the second fails — a file containing nothing but the cwd path
+    // passes a probe the harness did no work for.
+    #[test]
+    fn a_harness_cannot_pass_its_probe_by_echoing_its_own_workdir_path() {
+        let probe = mint_probe_identity(3, 1_785_400_000);
+
+        // ① The mint keeps them disjoint: no workdir named after the label can contain the sentinel.
+        assert!(
+            !probe.dir_label.contains(&probe.sentinel),
+            "the workdir label must never carry the sentinel: label={} sentinel={}",
+            probe.dir_label,
+            probe.sentinel
+        );
+
+        // ② And the readback refuses a path echo even when the path DOES carry the sentinel — the
+        // belt to ①'s braces, so a future caller reintroducing the leak cannot revive a dead harness.
+        let leaky = std::env::temp_dir()
+            .join(format!("mobee-leak-{}-{}", std::process::id(), probe.sentinel));
+        std::fs::create_dir_all(&leaky).expect("leaky dir");
+        std::fs::write(
+            leaky.join("trace.log"),
+            format!("error: could not write to {}\n", leaky.display()),
+        )
+        .expect("write trace");
+        assert!(
+            !probe_sentinel_present(&leaky, &probe.sentinel),
+            "a file containing only the cwd path must NOT pass — the harness did no task work"
+        );
+
+        // ③ Positive control: the SAME leaky workdir passes once the harness actually writes it.
+        std::fs::write(leaky.join("probe.txt"), &probe.sentinel).expect("write sentinel");
+        assert!(
+            probe_sentinel_present(&leaky, &probe.sentinel),
+            "real work in the same workdir must still pass, or ② is just breaking the predicate"
+        );
+
+        let _ = std::fs::remove_dir_all(&leaky);
     }
 
     // TOOTH (#254) — only failures ATTRIBUTABLE to the harness narrow the roster. Attribution, not
