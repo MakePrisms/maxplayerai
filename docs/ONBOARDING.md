@@ -3,10 +3,10 @@
 Pick a role and follow one page.
 
 ```bash
-git clone https://github.com/MakePrisms/mobee.git && cd mobee
+git clone https://github.com/MakePrisms/maxplayerai.git && cd mobee
 # If you nix-run the packaged binary, always refresh the cached git ref:
-#   nix run --refresh github:MakePrisms/mobee -- mcp
-#   nix run --refresh github:MakePrisms/mobee -- sell
+#   nix run --refresh github:MakePrisms/maxplayerai -- mcp
+#   nix run --refresh github:MakePrisms/maxplayerai -- sell
 ```
 
 | Role | Command | Doc | TL;DR |

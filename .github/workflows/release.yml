@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 # Never cancel a release in flight. A publish interrupted between the payload packages and the
-# launcher leaves the registry in a state where `mobee` resolves a binary that was never published.
+# launcher leaves the registry in a state where `maxplayer` resolves a binary that was never published.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -105,6 +105,17 @@ jobs:
         if: matrix.kind == 'linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      # macOS ships BSD tar, which rejects the GNU flags that make the archive a function of its
+      # contents. Installing GNU tar keeps ONE archive format across every platform; the alternative —
+      # per-platform tar flags — would leave each platform with its own archive semantics, which looks
+      # like a fix while reducing the determinism guarantee to same-platform-only.
+      - name: Install GNU tar (darwin)
+        if: matrix.kind == 'darwin'
+        run: |
+          brew install gnu-tar
+          command -v gtar >/dev/null || { echo "gnu-tar installed but gtar is not on PATH" >&2; exit 1; }
+          echo "TAR=gtar" >> "$GITHUB_ENV"
+
       # `--no-default-features --features wallet` states the buyer surface explicitly instead of
       # relying on `default`. The two are equal today (`default = ["wallet"]`), but naming the
       # feature means a later change to `default` cannot quietly compile the seller's
@@ -122,14 +133,19 @@ jobs:
             --no-default-features --features wallet \
             --target ${{ matrix.target }}
 
+      # `run: |` is load-bearing wherever the command is continued with a backslash. A plain scalar
+      # folds its newline to a space, so `\` + newline reaches the shell as `\ ` — an escaped space,
+      # which joins onto the next word instead of continuing the line. The argument then carries a
+      # leading space and no path matches it. `verify-release-workflow.sh` fails on the shape.
       - name: Verify the version matches the release
-        run: ./scripts/verify-release-version.sh '${{ needs.plan.outputs.version }}' \
-          "target/${{ matrix.target }}/release/mobee"
+        run: |
+          ./scripts/verify-release-version.sh '${{ needs.plan.outputs.version }}' \
+            "target/${{ matrix.target }}/release/maxplayer"
 
       # Which features were compiled in — wallet present, acp absent. `version` succeeds in every
       # build, so nothing else here can tell one feature combination from another.
-      - name: Verify the buyer surface
-        run: ./scripts/verify-buyer-surface.sh "target/${{ matrix.target }}/release/mobee"
+      - name: Verify the racer surface
+        run: ./scripts/verify-racer-surface.sh "target/${{ matrix.target }}/release/maxplayer"
 
       # The decisive portability check for linux: run the artifact inside alpine and debian with no
       # nix and no toolchain present. This is what makes the choice of musl toolchain above safe to
@@ -137,7 +153,7 @@ jobs:
       # a build recipe.
       - name: Verify portability (linux)
         if: matrix.kind == 'linux-musl'
-        run: ./scripts/verify-static-artifact.sh "target/${{ matrix.target }}/release/mobee"
+        run: ./scripts/verify-static-artifact.sh "target/${{ matrix.target }}/release/maxplayer"
 
       # macOS cannot link libSystem statically, so a static check does not apply. What does apply is
       # that the binary must not have picked up a Homebrew or /usr/local dylib: those live outside
@@ -146,7 +162,7 @@ jobs:
         if: matrix.kind == 'darwin'
         run: |
           set -euo pipefail
-          BIN="target/${{ matrix.target }}/release/mobee"
+          BIN="target/${{ matrix.target }}/release/maxplayer"
           otool -L "$BIN"
           if otool -L "$BIN" | grep -Eq '/opt/homebrew|/usr/local'; then
             echo "the artifact links a dylib outside the base OS, so it will not start on a clean mac" >&2
@@ -155,13 +171,40 @@ jobs:
           echo "ok: links only against base-OS libraries"
 
       - name: Package the asset
-        run: ./scripts/package-release-asset.sh \
-          "target/${{ matrix.target }}/release/mobee" \
-          '${{ matrix.platform }}' '${{ needs.plan.outputs.version }}' dist
+        run: |
+          ./scripts/package-release-asset.sh \
+            "target/${{ matrix.target }}/release/maxplayer" \
+            '${{ matrix.platform }}' '${{ needs.plan.outputs.version }}' dist
+
+      # Determinism is the property those fixed uid/gid/mtime flags exist to provide, so it is proved
+      # on the artifact rather than inferred from the flags being present — the same reason
+      # portability is re-checked on the binary CI actually built. Runs on every platform: the bug
+      # this follows was a platform-specific assumption, and gating only the platform that happened to
+      # break would rebuild that mistake.
+      #
+      # `cmp` rather than a hash: choosing between `sha256sum` and `shasum -a 256` is the very GNU/BSD
+      # split this commit removes, and byte-equality is the property anyway.
+      - name: Verify the archive is deterministic
+        run: |
+          ./scripts/package-release-asset.sh \
+            "target/${{ matrix.target }}/release/maxplayer" \
+            '${{ matrix.platform }}' '${{ needs.plan.outputs.version }}' dist-recheck
+          ASSET="maxplayer-${{ needs.plan.outputs.version }}-${{ matrix.platform }}.tar.gz"
+          cmp "dist/$ASSET" "dist-recheck/$ASSET" || {
+            echo "the archive is not a function of its contents: two runs over identical inputs differ" >&2
+            # Say WHERE, because this check runs on platforms nobody here can reproduce, and "they
+            # differ" turns the next run into a guess. A difference inside the first 10 bytes is the
+            # gzip header (offset 5-8 is its timestamp); anything later is the tar stream itself.
+            echo "first 16 bytes of each — gzip header is bytes 1-10, its mtime is 5-8:" >&2
+            od -An -tx1 -N16 "dist/$ASSET" >&2
+            od -An -tx1 -N16 "dist-recheck/$ASSET" >&2
+            exit 1
+          }
+          echo "ok: two runs over identical inputs produced byte-identical archives"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: asset-${{ matrix.platform }}
+          name: asset-racer-${{ matrix.platform }}
           path: dist/*.tar.gz
           if-no-files-found: error
 
@@ -203,7 +246,7 @@ jobs:
           PRERELEASE: ${{ needs.plan.outputs.prerelease }}
         run: |
           set -euo pipefail
-          flags=(--title "mobee $VERSION" --generate-notes)
+          flags=(--title "maxplayer $VERSION" --generate-notes)
           if [ "$PRERELEASE" = true ]; then
             flags+=(--prerelease)
           fi
@@ -270,7 +313,7 @@ jobs:
             esac
           done
 
-          # A pre-release goes out under the `rc` dist-tag so `npm i mobee` keeps resolving the last
+          # A pre-release goes out under the `rc` dist-tag so `npm i maxplayer` keeps resolving the last
           # stable version. The array always holds at least `--access public`, which is what the
           # scoped payload packages need on their first publish.
           publish_args=(--access public)
@@ -279,14 +322,18 @@ jobs:
           fi
 
           # Payload packages first. The launcher resolves them by exact version, so publishing it
-          # ahead of them leaves a window where `npm i mobee` installs a launcher with no binary.
+          # ahead of them leaves a window where `npm i maxplayer` installs a launcher with no binary.
           for platform in $RELEASE_PLATFORMS; do
-            asset="dist/mobee-$VERSION-$platform.tar.gz"
+            # ★ This filename is CONSTRUCTED and must never become a glob. The release attaches every
+            # artifact the matrix builds, and only the racer belongs in an npm payload — a glob here
+            # would publish whichever archive happened to sort first, which is how a seller binary
+            # ends up on the registry under the racer's package name.
+            asset="dist/maxplayer-$VERSION-$platform.tar.gz"
             [ -f "$asset" ] || { echo "no built asset for $platform at $asset" >&2; exit 1; }
 
             mkdir -p "npm/cli-$platform/bin"
-            tar -xzf "$asset" -O "mobee-$VERSION-$platform/mobee" > "npm/cli-$platform/bin/mobee"
-            chmod 755 "npm/cli-$platform/bin/mobee"
+            tar -xzf "$asset" -O "maxplayer-$VERSION-$platform/maxplayer" > "npm/cli-$platform/bin/maxplayer"
+            chmod 755 "npm/cli-$platform/bin/maxplayer"
             cp LICENSE-MIT LICENSE-APACHE "npm/cli-$platform/"
 
             ( cd "npm/cli-$platform" && npm publish "${publish_args[@]}" )

@@ -14,7 +14,7 @@
 #
 # Usage:
 #   ./scripts/verify-release-version.sh <version> [path-to-binary]
-#     e.g. ./scripts/verify-release-version.sh 0.1.0 result/bin/mobee
+#     e.g. ./scripts/verify-release-version.sh 0.1.0 result/bin/maxplayer
 #
 # Pass the version WITHOUT a leading `v` — the workflow strips it from the tag.
 
@@ -77,9 +77,18 @@ echo "ok: payload pins at $VERSION -> $PIN_REPORT"
 # structurally cannot: an asset carried over from an earlier build.
 if [ -n "$BINARY" ]; then
     [ -x "$BINARY" ] || die "no executable at $BINARY"
+    # The expected name is the name this artifact SHIPS AS — the basename of the path the workflow
+    # built and is about to package — rather than a literal. Derived for two reasons. The binary name
+    # and the crate name are deliberately different (`[[bin]] maxplayer` inside package `mobee`), so a
+    # literal here silently commits to one of them and goes stale the moment either moves; that is
+    # exactly how this check came to expect `mobee` from a binary that correctly answers to
+    # `maxplayer`. And an asset published under a name it does not answer to is the same hazard the
+    # constructed asset filename guards against upstream — a runner shipped under the racer's name
+    # would install, run, and be the wrong program. A binary must announce the name it is invoked by.
+    SHIPPED_AS="$(basename "$BINARY")"
     reported="$("$BINARY" version)" || die "$BINARY failed to report its version"
-    [ "$reported" = "mobee $VERSION" ] \
-        || die "$BINARY reports '$reported', expected 'mobee $VERSION' — this artifact was built from a different tree"
+    [ "$reported" = "$SHIPPED_AS $VERSION" ] \
+        || die "$BINARY reports '$reported', expected '$SHIPPED_AS $VERSION' — this artifact is not the one this release is packaging"
     echo "ok: artifact reports $reported"
 fi
 

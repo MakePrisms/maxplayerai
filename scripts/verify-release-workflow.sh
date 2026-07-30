@@ -40,6 +40,30 @@ if grep -Eq 'npm_[A-Za-z0-9]{30,}|_authToken\s*=' "$WORKFLOW"; then
 fi
 echo "ok: no credential literal in the workflow"
 
+# ── No `run:` continues a plain scalar with a backslash ─────────────────────────────────────────
+# A `run:` written as a plain scalar folds its newline into a space, so a trailing `\` reaches the
+# shell as `\ ` — an escaped space, which joins onto the following word instead of continuing the
+# line. The next argument silently gains a leading space. Nothing about the YAML looks wrong and the
+# step runs; it just receives a path that cannot exist. That cost a full three-platform dry-run
+# (30476367671), where the argument arrived as ` target/x86_64-unknown-linux-musl/release/mobee`.
+# Every such command belongs in a `run: |` block.
+#
+# ★ actionlint is silent on this shape — it reports zero findings on the exact file that failed — so
+#   this is not covered by the linting already in CI.
+#
+# Checked across every workflow, not only the release one: the mistake is not release-specific, and a
+# guard that watches one file while the class recurs next door is a guard in name only.
+#
+# `- run:` on one line is as common as `run:` under its own `- name:`, so both forms are anchored. An
+# expression that only allowed the second passed a broken workflow written in the first.
+folded=$(grep -nE '^[[:space:]]*(-[[:space:]]+)?run:[[:space:]]*[^|>[:space:]].*\\[[:space:]]*$' \
+    "$(dirname "$WORKFLOW")"/*.yml "$(dirname "$WORKFLOW")"/*.yaml 2>/dev/null || true)
+if [ -n "$folded" ]; then
+    echo "$folded" >&2
+    die "a plain-scalar 'run:' is continued with a backslash (see above) — use 'run: |'"
+fi
+echo "ok: every backslash-continued run: is a block scalar"
+
 # ── The privileged jobs are gated, and nothing else publishes ───────────────────────────────────
 # Job boundaries are found by their two-space-indented keys rather than parsed as YAML, so that this
 # check needs nothing installed. It fails closed: if the jobs cannot be located, it does not pass.

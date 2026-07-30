@@ -98,6 +98,16 @@ pub enum JobState {
 }
 
 impl JobState {
+    /// Every variant, so a predicate over states can be checked against all of them rather than
+    /// against the one that motivated it.
+    pub const ALL: [Self; 5] = [
+        Self::Awarded,
+        Self::Executing,
+        Self::Delivered,
+        Self::Paid,
+        Self::Failed,
+    ];
+
     fn parse(raw: &str) -> Option<Self> {
         Some(match raw {
             "awarded" => Self::Awarded,
@@ -107,6 +117,30 @@ impl JobState {
             "failed" => Self::Failed,
             _ => return None,
         })
+    }
+
+    /// The stored spelling — the same literal the write statements use.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Awarded => "awarded",
+            Self::Executing => "executing",
+            Self::Delivered => "delivered",
+            Self::Paid => "paid",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Whether a job in this state is occupying execution capacity **right now**.
+    ///
+    /// This is the single definition of "in flight". [`SellerStore::jobs_in_flight`] builds its SQL
+    /// from it and `should_resume_execution` answers with it, so the `queue_depth` on the wire and
+    /// the set a restart re-drives cannot drift apart.
+    ///
+    /// `Delivered` is deliberately excluded: execution has finished and the job is awaiting payment,
+    /// so it holds no slot — which is also why `resumable_jobs` selects it but resume does not
+    /// execute it.
+    pub fn occupies_execution_slot(self) -> bool {
+        matches!(self, Self::Awarded | Self::Executing)
     }
 }
 
@@ -1008,6 +1042,34 @@ impl SellerStore {
     }
 
     /// Read the current health view for `status`.
+    /// How many jobs are occupying execution capacity right now.
+    ///
+    /// ⚠ **Not [`HealthSnapshot::jobs`]**, which is `COUNT(*)` over every job row ever written and is
+    /// never pruned. Reading that as "in flight" is what made a seat publish `accepting=n`
+    /// permanently from its first job onward (#313): the count's healthy baseline grew with use, so
+    /// the seat that had delivered the most looked the busiest and stopped being selectable.
+    ///
+    /// The state list comes from [`JobState::occupies_execution_slot`] rather than being written out
+    /// here, so this count and the resume predicate have one definition between them.
+    pub fn jobs_in_flight(&self) -> Result<u32, StoreError> {
+        let conn = self.lock()?;
+        let occupying: Vec<String> = JobState::ALL
+            .iter()
+            .filter(|state| state.occupies_execution_slot())
+            .map(|state| format!("'{}'", state.as_str()))
+            .collect();
+        // Every element is a compile-time constant from JobState, so there is no untrusted input in
+        // this string; a bound-parameter list cannot be spliced into `IN (...)` without building it.
+        let total = count(
+            &conn,
+            &format!(
+                "SELECT COUNT(*) FROM jobs WHERE state IN ({})",
+                occupying.join(",")
+            ),
+        )?;
+        Ok(u32::try_from(total).unwrap_or(u32::MAX))
+    }
+
     pub fn health(&self) -> Result<HealthSnapshot, StoreError> {
         let conn = self.lock()?;
         let schema_version = read_meta_i64(&conn, "schema_version")?.unwrap_or(0);
@@ -1707,6 +1769,111 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = SellerStore::open(&path).expect("open");
         (store, path)
+    }
+
+    /// Put a job row in an exact state. Direct SQL on purpose: driving five states through the
+    /// public transition path would make the state-coverage test below a test of the transitions
+    /// instead of a test of the predicate.
+    fn insert_job(store: &SellerStore, job_id: &str, state: JobState) {
+        let conn = store.lock().expect("lock");
+        conn.execute(
+            "INSERT INTO jobs (job_id, offer_id, agent_name, state, created_at_unix, updated_at_unix)
+             VALUES (?1, ?2, NULL, ?3, 1, 1)",
+            params![job_id, format!("offer-{job_id}"), state.as_str()],
+        )
+        .expect("insert job");
+    }
+
+    /// The stored spellings, written out by hand.
+    ///
+    /// Deliberately NOT derived from `as_str` — the point is to disagree with it if it drifts. These
+    /// same five literals also live in the `jobs.state` CHECK constraint and in `JobState::parse`, so
+    /// a silent rename in one place would otherwise surface as a runtime CHECK violation or an
+    /// "unknown job state" error rather than a failing test.
+    #[test]
+    fn job_state_spellings_are_the_literals_the_schema_stores() {
+        assert_eq!(JobState::Awarded.as_str(), "awarded");
+        assert_eq!(JobState::Executing.as_str(), "executing");
+        assert_eq!(JobState::Delivered.as_str(), "delivered");
+        assert_eq!(JobState::Paid.as_str(), "paid");
+        assert_eq!(JobState::Failed.as_str(), "failed");
+        for state in JobState::ALL {
+            assert_eq!(
+                JobState::parse(state.as_str()),
+                Some(state),
+                "{state:?} must round-trip through its stored spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn only_awarded_and_executing_occupy_an_execution_slot() {
+        assert!(JobState::Awarded.occupies_execution_slot());
+        assert!(JobState::Executing.occupies_execution_slot());
+        // Delivered has finished executing and is awaiting payment — it holds no slot.
+        assert!(!JobState::Delivered.occupies_execution_slot());
+        assert!(!JobState::Paid.occupies_execution_slot());
+        assert!(!JobState::Failed.occupies_execution_slot());
+    }
+
+    /// Enumerated over EVERY variant rather than the two that motivated the change, so adding a state
+    /// without deciding whether it occupies a slot fails here instead of on the wire.
+    #[test]
+    fn jobs_in_flight_counts_exactly_the_occupying_states() {
+        for state in JobState::ALL {
+            let (store, path) = fresh_store(&format!("inflight-{}", state.as_str()));
+            insert_job(&store, "job-1", state);
+            let expected = u32::from(state.occupies_execution_slot());
+            assert_eq!(
+                store.jobs_in_flight().expect("count"),
+                expected,
+                "a single {state:?} job must count as {expected} in flight"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// ★ THE #313 REGRESSION, and it must start from a NON-EMPTY store.
+    ///
+    /// The old predicate was `health().jobs > 0` — `COUNT(*)` over every row ever written — so a seat
+    /// that had finished work advertised `accepting=n` forever. A fixture starting from an empty
+    /// store cannot tell the fix from the bug: both report zero. The discriminator is terminal rows
+    /// PRESENT, and this test asserts the two counts DISAGREE, which is the whole defect.
+    #[test]
+    fn a_store_holding_only_terminal_jobs_reports_none_in_flight() {
+        let (store, path) = fresh_store("terminal-only");
+        insert_job(&store, "job-paid-1", JobState::Paid);
+        insert_job(&store, "job-paid-2", JobState::Paid);
+        insert_job(&store, "job-failed", JobState::Failed);
+        insert_job(&store, "job-delivered", JobState::Delivered);
+
+        assert_eq!(
+            store.jobs_in_flight().expect("count"),
+            0,
+            "a seat whose jobs are all finished is FREE and must advertise accepting=y"
+        );
+        assert_eq!(
+            store.health().expect("health").jobs,
+            4,
+            "health().jobs stays the lifetime total — that is its job, which is why it must not be \
+             read as in-flight"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn jobs_in_flight_is_a_count_not_a_flag() {
+        let (store, path) = fresh_store("inflight-depth");
+        insert_job(&store, "job-a", JobState::Awarded);
+        insert_job(&store, "job-b", JobState::Executing);
+        insert_job(&store, "job-c", JobState::Awarded);
+        insert_job(&store, "job-done", JobState::Paid);
+        assert_eq!(
+            store.jobs_in_flight().expect("count"),
+            3,
+            "three occupying jobs must report 3 — a 0/1 answer is the #313 shape"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     fn sample_offer(id: &str) -> Offer {

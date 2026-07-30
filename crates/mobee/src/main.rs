@@ -12,6 +12,7 @@ mod sell;
 #[cfg(feature = "stub-pay")]
 mod stub_pay_cli;
 mod wallet_cli;
+mod whoami;
 
 fn main() {
     let code = cli::run(

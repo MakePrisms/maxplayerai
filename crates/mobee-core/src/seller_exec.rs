@@ -171,13 +171,14 @@ pub fn compose_agent_prompt(task: &str, git_remote: &str, memory_section: Option
     let base = format!(
         "{task}\n\n\
          ---\n\
-         DELIVERY (required). Deliver your work by committing it with git in your current \
-         working directory:\n\
-         - Make one or more non-empty commits authored by you. Do not leave the deliverable \
-         uncommitted and do not only print it to the console.\n\
-         - You do NOT need to push and you are NOT handed any credentials: the daemon pushes \
-         your committed branch to the bound git remote ({git_remote}) on your behalf.\n\
-         Anything not committed to git will not be delivered."
+         DELIVERY (required). Your deliverable is the FINAL STATE OF YOUR CURRENT WORKING \
+         DIRECTORY:\n\
+         - Leave your work as files on disk there. The daemon snapshots that directory into one \
+         commit and pushes it to the bound git remote ({git_remote}) on your behalf.\n\
+         - You do NOT need to commit or push, and you are NOT handed any credentials. Committing \
+         is harmless, but it is the directory CONTENTS that are delivered, not your commits.\n\
+         - Files excluded by .gitignore are NOT delivered, so never ignore your own deliverable.\n\
+         Anything you only print to the console is not delivered."
     );
     // Read-on-start: when memory is enabled the rendered index section is appended. When `None`
     // (memory_enabled=false, or no non-empty index) the output is byte-IDENTICAL to the
@@ -569,11 +570,26 @@ mod tests {
         assert!(prompt.starts_with("build a widget"), "task preserved: {prompt}");
         // Explicit, seller-owned delivery instructions are appended.
         assert!(prompt.contains("DELIVERY"), "has a delivery section: {prompt}");
-        assert!(
-            prompt.contains("commit") || prompt.contains("Commit"),
-            "tells the agent to commit: {prompt}"
-        );
         assert!(prompt.contains("git"), "delivery is via git: {prompt}");
+
+        // The instructions must describe what `snapshot_delivery_at` ACTUALLY delivers: the final
+        // worktree, staged with `add_all`. Telling an agent its commits are the deliverable is
+        // false — the snapshot takes `base_oid = None`, so the agent's commits are orphaned by the
+        // delivery commit and never pushed.
+        assert!(
+            prompt.contains("FINAL STATE OF YOUR CURRENT WORKING DIRECTORY"),
+            "names the worktree as the deliverable: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Anything not committed to git will not be delivered"),
+            "must NOT claim uncommitted work is undelivered — `add_all` delivers it: {prompt}"
+        );
+        // `add_all` uses IndexAddOption::DEFAULT, which honours .gitignore, so an agent that
+        // ignores its own output loses it silently. That has to be said where the agent can read it.
+        assert!(
+            prompt.contains(".gitignore"),
+            "warns that ignored files are not delivered: {prompt}"
+        );
         assert!(
             prompt.contains(remote),
             "names the bound remote so delivery is not guessed: {prompt}"

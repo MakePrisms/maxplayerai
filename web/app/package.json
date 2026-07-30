@@ -1,0 +1,10 @@
+{
+  "name": "mobee-market",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/",
+    "live-check": "node scripts/live-check.mjs"
+  }
+}

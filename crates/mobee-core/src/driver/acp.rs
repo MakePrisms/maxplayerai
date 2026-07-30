@@ -1,12 +1,15 @@
 use std::path::PathBuf;
-#[cfg(feature = "acp")]
-use std::sync::mpsc;
+// Tokio (not std) channels for the live stream: `next()` must YIELD while waiting for the agent's
+// next update — a blocking receive would freeze every sibling job on the seller node's
+// single-threaded LocalSet along with its run loop (issue #223).
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 #[cfg(feature = "acp")]
 use std::time::Duration;
+#[cfg(feature = "acp")]
+use tokio::sync::mpsc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -145,7 +148,7 @@ enum UpdateStreamInner {
     },
     #[cfg(feature = "acp")]
     Live {
-        receiver: mpsc::Receiver<SessionUpdate>,
+        receiver: mpsc::UnboundedReceiver<SessionUpdate>,
         idle_timeout: Duration,
     },
 }
@@ -163,7 +166,10 @@ impl UpdateStream {
     }
 
     #[cfg(feature = "acp")]
-    pub(crate) fn live(receiver: mpsc::Receiver<SessionUpdate>, idle_timeout: Duration) -> Self {
+    pub(crate) fn live(
+        receiver: mpsc::UnboundedReceiver<SessionUpdate>,
+        idle_timeout: Duration,
+    ) -> Self {
         Self {
             inner: UpdateStreamInner::Live {
                 receiver,
@@ -199,7 +205,10 @@ impl UpdateStream {
             UpdateStreamInner::Live {
                 receiver,
                 idle_timeout,
-            } => receiver.recv_timeout(*idle_timeout).ok(),
+            } => tokio::time::timeout(*idle_timeout, receiver.recv())
+                .await
+                .ok()
+                .flatten(),
         }
     }
 }
@@ -238,7 +247,14 @@ pub fn parse_acp_usage(result: &Value) -> Option<UsageMetadata> {
                 first_u64(u, &["inputTokens", "input_tokens"]),
                 first_u64(u, &["outputTokens", "output_tokens"]),
                 first_u64(u, &["thoughtTokens", "reasoning_output_tokens"]),
-                first_u64(u, &["cachedReadTokens", "cache_read_input_tokens", "cached_input_tokens"]),
+                first_u64(
+                    u,
+                    &[
+                        "cachedReadTokens",
+                        "cache_read_input_tokens",
+                        "cached_input_tokens",
+                    ],
+                ),
                 first_u64(u, &["cachedWriteTokens", "cache_creation_input_tokens"]),
             ),
             None => (None, None, None, None, None),

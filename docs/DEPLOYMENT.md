@@ -62,7 +62,7 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
 ### Today — what `flake.nix` actually exposes
 
 - `packages.default` — the `mobee` client binary, built with `--features acp` (buyer MCP + seller).
-- `apps.default` — `nix run --refresh github:MakePrisms/mobee/<ref> -- mcp|sell` (buyer + ad-hoc
+- `apps.default` — `nix run --refresh github:MakePrisms/maxplayerai/<ref> -- mcp|sell` (buyer + ad-hoc
   seller), no clone. Always `--refresh` (or pin+bump the rev) — nix caches the git ref and will
   otherwise serve a stale binary.
 - `devShells.default` — the workspace build/dev shell.

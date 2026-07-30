@@ -1,16 +1,16 @@
 {
-  "name": "@mobee/cli-linux-x64",
+  "name": "@maxplayerai/linux-x64",
   "version": "0.1.0",
-  "description": "mobee binary for linux-x64 — payload package, install `mobee` instead",
+  "description": "maxplayer binary for linux-x64 — payload package, install `maxplayer` instead",
   "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/MakePrisms/mobee.git"
+    "url": "git+https://github.com/MakePrisms/maxplayerai.git"
   },
   "os": ["linux"],
   "cpu": ["x64"],
   "bin": {
-    "mobee-linux-x64": "bin/mobee"
+    "maxplayer-linux-x64": "bin/maxplayer"
   },
-  "files": ["bin/mobee", "LICENSE-MIT", "LICENSE-APACHE"]
+  "files": ["bin/maxplayer", "LICENSE-MIT", "LICENSE-APACHE"]
 }

@@ -63,8 +63,11 @@ pub mod seller_agents;
 /// own module (with a neutral error) so the run loop stays focused on the relay surface.
 #[cfg(feature = "wallet")]
 pub mod seller_exec;
+/// Which of a node's resolved harnesses are serving right now: the live availability layer over the
+/// boot registry, so a harness that cannot deliver stops being advertised and stops attracting awards.
+pub mod seller_roster;
 /// Persistent per-home seller node (exclusive lock, receiving wallet + identity behind serialized
-/// actors, durable lifecycle store with a nostr event outbox, single relay ingester, agent roster).
+/// actors, durable lifecycle store with a nostr event outbox, single relay ingester).
 /// The durable substrate the live seller loop moves onto; mirrors the buyer daemon's shape. The
 /// wallet/node feature-flag structure is under review in issue #133 — do not restructure the flags
 /// here (that is #133's job).
