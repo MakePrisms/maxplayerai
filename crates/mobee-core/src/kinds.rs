@@ -1,9 +1,14 @@
 //! The single registry of every mobee nostr event kind.
 //!
-//! This module is the ONE place a kind *number* may appear. Every other site refers to a named
-//! constant from here (re-exported through [`crate::gateway`] for the trade-path kinds). The
+//! This module is the ONE place a mobee kind *number* may appear. Every other site refers to a
+//! named constant from here (re-exported through [`crate::gateway`] for the trade-path kinds). The
 //! trade kinds form a contiguous mobee-owned block — `3400`–`3405` — plus the addressable
 //! seller heartbeat `30340`.
+//!
+//! Kinds mobee does not own live with the dialect that defines them, not here: buzz's channel and
+//! membership kinds are in [`crate::seller_node::participation::dialect`], where each one cites the
+//! buzz source it was transcribed from. Mixing another protocol's numbers into this registry would
+//! make it read as though we minted them.
 //!
 //! | Kind | Object | Author |
 //! |---|---|---|

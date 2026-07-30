@@ -23,7 +23,28 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::gateway::EventDraft;
 
 /// Current on-disk schema version.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 7;
+
+/// How long a retry REQ may go unanswered before it counts as a failed attempt.
+///
+/// This is what makes "clears only on EOSE" a mechanism instead of a wish: a dropped REQ would otherwise
+/// leave the channel waiting on an answer that is never coming, which is the same permanent park the EOSE
+/// requirement exists to prevent, one level further in.
+pub const RETRY_EOSE_TIMEOUT_SECS: i64 = 60;
+
+/// How long a refused channel waits before ONE retry, by consecutive refusal count.
+///
+/// Escalating and capped, which is what lets both intents hold at once: a relay that really has revoked
+/// us is not polled (the interval decays to six-hourly), and a relay whose refusal was transient is never
+/// abandoned. The cap is the important half — retrying forever at a low frequency is bounded work, while
+/// giving up is unbounded silence.
+const SUPPRESSION_BACKOFF_SECS: [i64; 5] = [60, 300, 900, 3_600, 21_600];
+
+/// The backoff for the `attempts`-th consecutive refusal, saturating at the last step.
+pub fn suppression_backoff_secs(attempts: i64) -> i64 {
+    let index = attempts.max(1) as usize - 1;
+    SUPPRESSION_BACKOFF_SECS[index.min(SUPPRESSION_BACKOFF_SECS.len() - 1)]
+}
 
 /// A cloneable handle to the node-owned SQLite state.
 #[derive(Clone)]
@@ -167,6 +188,26 @@ pub struct OutboxItem {
     pub expires_at_unix: i64,
 }
 
+/// A message addressed to this node that has not been answered.
+///
+/// The node records the debt and nothing more — no reply is drafted, and no agent is consulted.
+/// Answering belongs to the slice that brings up the mind; until then this is a ledger a human (or
+/// a later surface) can read to see exactly what the node was asked and has not addressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwedResponse {
+    /// The asking event's id — the ledger's identity, and what makes re-delivery idempotent.
+    pub event_id: String,
+    pub relay_url: String,
+    pub channel_id: String,
+    /// Who asked.
+    pub counterparty: String,
+    /// The asking event's kind, kept so a later reader can tell a channel mention from a DM
+    /// without re-fetching the event.
+    pub kind: u16,
+    /// The author's timestamp, not ours.
+    pub created_at_unix: i64,
+}
+
 /// A point-in-time view of the store for `status` / reconcile reporting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthSnapshot {
@@ -295,7 +336,76 @@ impl SellerStore {
                  expires_at_unix    INTEGER NOT NULL,
                  published_event_id TEXT,
                  updated_at_unix    INTEGER NOT NULL
-             );",
+             );
+             -- One cursor PER FILTER, not per relay and not per connection. A relay carries many
+             -- independent subscriptions (the global membership filter, one filter per channel) and
+             -- each advances at its own rate; a single shared cursor would drag the quiet ones
+             -- forward past events they never saw. `filter_id` is the filter's stable identity
+             -- ('membership', or 'channel:<uuid>').
+             CREATE TABLE IF NOT EXISTS participation_cursors (
+                 relay_url       TEXT NOT NULL,
+                 filter_id       TEXT NOT NULL,
+                 since_unix      INTEGER NOT NULL,
+                 updated_at_unix INTEGER NOT NULL,
+                 PRIMARY KEY (relay_url, filter_id)
+             );
+             -- The channels this node belongs to, so a restart re-subscribes to the right set.
+             -- Cursors alone cannot carry this: they make the membership filter resume from where
+             -- it stopped, which means the 44100 that admitted us is exactly what we will NOT see
+             -- again. Membership has to be remembered, not re-derived.
+             CREATE TABLE IF NOT EXISTS participation_channels (
+                 relay_url       TEXT NOT NULL,
+                 channel_id      TEXT NOT NULL,
+                 -- 'joined' or 'left'. Rows are never deleted: a channel we were removed from is a
+                 -- fact worth keeping, and a re-add flips it back rather than inventing a new row.
+                 state           TEXT NOT NULL CHECK (state IN ('joined','left')),
+                 -- The relay-signed 44100/44101 that last moved this row — the provenance of our
+                 -- membership claim, so it can be checked against the relay rather than believed.
+                 source_event_id TEXT NOT NULL,
+                 -- The AUTHOR's timestamp on that event, which is what orders membership. Delivery
+                 -- order cannot: a replayed old 44100 arriving after a newer 44101 would otherwise
+                 -- flip us back to joined. Kept as a high-water mark even when the state does not
+                 -- change, or a newer add followed by an older remove would still be applied.
+                 source_created_at_unix INTEGER NOT NULL DEFAULT 0,
+                 -- A LOCAL refusal, not a membership fact: the relay CLOSED a read on this channel.
+                 -- Kept out of membership ordering entirely (see `advance_suppression`) and cleared only
+                 -- by a genuinely newer relay-signed membership event.
+                 suppressed INTEGER NOT NULL DEFAULT 0,
+                 -- When the refusal was observed, and how many times running. Together they are the
+                 -- EXIT TIMER: a suppression with no mechanism to fire is a permanent park wearing
+                 -- optimistic naming, because its only other clearer is an event the relay has no
+                 -- reason to send after a TRANSIENT refusal.
+                 suppressed_at_unix INTEGER NOT NULL DEFAULT 0,
+                 suppress_attempts INTEGER NOT NULL DEFAULT 0,
+                 -- A retry REQ is IN FLIGHT since this time. Nonzero means we have asked and are
+                 -- waiting for the relay to answer; the suppression stays raised until it does,
+                 -- because a retry that vanished is not a retry that succeeded.
+                 retry_started_unix INTEGER NOT NULL DEFAULT 0,
+                 updated_at_unix INTEGER NOT NULL,
+                 PRIMARY KEY (relay_url, channel_id)
+             );
+             -- Messages addressed to this node that nobody has answered yet.
+             --
+             -- The ledger is keyed on the EVENT ID, which is what makes ingest exactly-once. Every
+             -- reconnect deliberately re-asks from slightly before its cursor (clock skew), so
+             -- re-delivery is normal and expected; the primary key absorbs it. State is only ever
+             -- advanced by a later slice — this one records the debt and answers nothing.
+             CREATE TABLE IF NOT EXISTS participation_owed (
+                 event_id         TEXT PRIMARY KEY,
+                 relay_url        TEXT NOT NULL,
+                 channel_id       TEXT NOT NULL,
+                 counterparty     TEXT NOT NULL,
+                 kind             INTEGER NOT NULL,
+                 -- 'owed' until something answers it. 'dropped' when we lost access to the channel
+                 -- it lives in: a debt we can no longer discharge is closed, not left pending.
+                 state            TEXT NOT NULL CHECK (state IN ('owed','answered','dropped')),
+                 -- The author's timestamp (ordering, and what the cursor advances on) kept apart
+                 -- from when WE saw it (which is the only one of the two we can vouch for).
+                 created_at_unix  INTEGER NOT NULL,
+                 recorded_at_unix INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_participation_owed_state
+                 ON participation_owed (state, created_at_unix);",
         )?;
         Self::migrate(conn)?;
         conn.execute(
@@ -316,6 +426,47 @@ impl SellerStore {
     fn migrate(conn: &Connection) -> Result<(), StoreError> {
         if !Self::column_exists(conn, "offers", "requested_agent")? {
             conn.execute_batch("ALTER TABLE offers ADD COLUMN requested_agent TEXT;")?;
+        }
+        // A store written by a v3 binary has membership rows with no author timestamp. `0` is the
+        // right backfill: it makes every stored row lose to the next real membership event, so the
+        // relay's own notification re-establishes order rather than a guessed timestamp doing it.
+        if !Self::column_exists(conn, "participation_channels", "source_created_at_unix")? {
+            conn.execute_batch(
+                "ALTER TABLE participation_channels
+                     ADD COLUMN source_created_at_unix INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        // `0` = not suppressed, which is the right default: a store written before this column knew
+        // nothing about local refusals, so nothing in it was suppressed.
+        if !Self::column_exists(conn, "participation_channels", "suppressed")? {
+            conn.execute_batch(
+                "ALTER TABLE participation_channels
+                     ADD COLUMN suppressed INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        // `0` on both is right for a pre-existing suppressed row: it becomes due for retry immediately
+        // at the shortest backoff, which is the recovering direction — a store written before the exit
+        // timer existed may be sitting on exactly the permanent suppression this closes.
+        if !Self::column_exists(conn, "participation_channels", "suppressed_at_unix")? {
+            conn.execute_batch(
+                "ALTER TABLE participation_channels
+                     ADD COLUMN suppressed_at_unix INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        if !Self::column_exists(conn, "participation_channels", "suppress_attempts")? {
+            conn.execute_batch(
+                "ALTER TABLE participation_channels
+                     ADD COLUMN suppress_attempts INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        // `0` = no retry in flight, which is right: a store written before this column cannot have had
+        // one, and the effect is that any suppressed row is eligible to retry as soon as its backoff has
+        // elapsed rather than waiting on a retry that was never sent.
+        if !Self::column_exists(conn, "participation_channels", "retry_started_unix")? {
+            conn.execute_batch(
+                "ALTER TABLE participation_channels
+                     ADD COLUMN retry_started_unix INTEGER NOT NULL DEFAULT 0;",
+            )?;
         }
         Ok(())
     }
@@ -939,6 +1090,605 @@ impl SellerStore {
             pending_outbox,
         })
     }
+
+    // ── participation: cursors, membership, owed responses ───────────────────────────────────────
+    //
+    // Read/write state for the buzz participation surface. Deliberately NOT here: the per-relay
+    // access state. Admission is a grant the relay holds, not a property of ours, so it is
+    // re-proven on every boot rather than restored from disk — a cached "admitted" would let the
+    // node address a relay that revoked it while we were down.
+
+    /// The stored cursor for one filter, or `None` if it has never run on this relay.
+    pub fn participation_cursor(
+        &self,
+        relay_url: &str,
+        filter_id: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        let conn = self.lock()?;
+        let since = conn
+            .query_row(
+                "SELECT since_unix FROM participation_cursors
+                 WHERE relay_url = ?1 AND filter_id = ?2",
+                params![relay_url, filter_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(since)
+    }
+
+    /// Advance a filter's cursor.
+    ///
+    /// Monotonic by construction: the `WHERE` clause refuses to move a cursor backwards. Out-of-order
+    /// delivery is ordinary — a reconnect replays from before the cursor, and relays do not promise
+    /// ordering across a resubscribe — and a cursor that could step back would re-open a window it
+    /// had already closed, every time.
+    pub fn advance_participation_cursor(
+        &self,
+        relay_url: &str,
+        filter_id: &str,
+        since_unix: i64,
+        now_unix: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO participation_cursors (relay_url, filter_id, since_unix, updated_at_unix)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(relay_url, filter_id) DO UPDATE SET
+                 since_unix      = excluded.since_unix,
+                 updated_at_unix = excluded.updated_at_unix
+             WHERE excluded.since_unix > participation_cursors.since_unix",
+            params![relay_url, filter_id, since_unix, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Record that the relay admitted us to a channel. Idempotent on `(relay, channel)`; a re-seen
+    /// add for a channel we are already in changes nothing and returns `false`.
+    ///
+    /// This is why membership needs no event-id dedup set of its own: the effect of the notification
+    /// is the row, and writing the same row twice is writing it once.
+    /// Record a join AND seed the channel's mention cursor in ONE transaction.
+    ///
+    /// ★ The two writes cannot be separate calls. A crash between them leaves a joined channel with no
+    /// cursor, and a channel with no cursor subscribes from `now` — reopening the lost-mentions window
+    /// through a crash seam. Worse, it is unrecoverable by replay: the re-delivered `44100` finds the
+    /// row already joined, reports no transition, and a caller that seeds only on a fresh join would
+    /// skip the seed forever. Atomic here means a restart sees both or neither.
+    ///
+    /// `cursor_filter_id` is the channel's mention-filter id, and the seed is monotonic — an existing
+    /// cursor that is already further ahead is left alone.
+    pub fn record_channel_joined(
+        &self,
+        relay_url: &str,
+        channel_id: &str,
+        cursor_filter_id: &str,
+        source_event_id: &str,
+        source_created_at_unix: i64,
+        now_unix: i64,
+    ) -> Result<bool, StoreError> {
+        self.apply_membership(
+            relay_url,
+            channel_id,
+            "joined",
+            Some((cursor_filter_id, source_created_at_unix)),
+            source_event_id,
+            source_created_at_unix,
+            now_unix,
+        )
+    }
+
+    /// Record that we were removed from a channel, and close out anything still owed inside it.
+    ///
+    /// Both halves are one transaction because a half-applied removal is the worst of the three
+    /// outcomes: the node believes it left, while the ledger still shows debts in a channel it can
+    /// no longer read — permanently unanswerable, permanently pending.
+    ///
+    /// Returns whether we had believed ourselves a member.
+    pub fn record_channel_left(
+        &self,
+        relay_url: &str,
+        channel_id: &str,
+        source_event_id: &str,
+        source_created_at_unix: i64,
+        now_unix: i64,
+    ) -> Result<bool, StoreError> {
+        self.apply_membership(
+            relay_url,
+            channel_id,
+            "left",
+            None,
+            source_event_id,
+            source_created_at_unix,
+            now_unix,
+        )
+    }
+
+    /// Suppressed channels whose backoff has elapsed, with the attempt count that set it.
+    ///
+    /// This is the EXIT MECHANISM. Without it a suppression's only other clearer is a newer
+    /// relay-signed membership event — and after a *transient* refusal the relay has no reason to emit
+    /// one, because our membership never changed. A flag whose only clearer the counterparty owes us
+    /// nothing to send is a permanent flag, however provisional it is called.
+    pub fn suppressed_channels_due(
+        &self,
+        relay_url: &str,
+        now_unix: i64,
+    ) -> Result<Vec<(String, i64)>, StoreError> {
+        let conn = self.lock()?;
+        // The due-check lives in Rust, next to the backoff schedule it depends on, rather than being
+        // duplicated in SQL where the two could drift apart.
+        let mut statement = conn.prepare(
+            "SELECT channel_id, suppress_attempts, suppressed_at_unix FROM participation_channels
+             WHERE relay_url = ?1 AND state = 'joined' AND suppressed = 1 AND retry_started_unix = 0
+             ORDER BY channel_id",
+        )?;
+        let rows = statement.query_map([relay_url], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut due = Vec::new();
+        for row in rows {
+            let (channel_id, attempts, since) = row?;
+            if now_unix.saturating_sub(since) >= suppression_backoff_secs(attempts) {
+                due.push((channel_id, attempts));
+            }
+        }
+        Ok(due)
+    }
+
+    /// Record that a retry REQ has gone out. The suppression stays RAISED.
+    ///
+    /// ★ An earlier design lifted the suppression here, on the attempt. That was success-from-silence one
+    /// level up: if the REQ is dropped — socket died mid-write, relay ignored it, no answer of any kind —
+    /// then nothing ever arrives to re-suppress, so the channel sits permanently unsuppressed AND outside
+    /// the backoff cycle. Un-gated and un-retried at once, which is worse than either.
+    ///
+    /// So the flag only ever comes down on a protocol-owed [`Self::note_channel_served`], and this marks
+    /// the attempt so [`Self::expire_stale_retries`] can turn a silent one into a failed one.
+    pub fn note_retry_attempt(
+        &self,
+        relay_url: &str,
+        channel_id: &str,
+        now_unix: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE participation_channels SET retry_started_unix = ?3, updated_at_unix = ?3
+             WHERE relay_url = ?1 AND channel_id = ?2",
+            params![relay_url, channel_id, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Our own retry REQ never left — restart the wait WITHOUT escalating.
+    ///
+    /// ★ The failure is ours, not the relay's, so [`Self::advance_suppression`] would be wrong: it would
+    /// charge a backoff step for our dead socket, and a channel could reach the six-hour cap without the
+    /// relay having refused anything. But doing nothing is worse. The channel stays due with no retry armed,
+    /// so the pump re-attempts it on EVERY tick — a hot loop against a relay that is already failing, which
+    /// is exactly what the backoff exists to prevent. Not-escalating and not-waiting are different choices.
+    ///
+    /// ★★ This RE-STAMPS `suppressed_at_unix`, which is the write [`Self::advance_suppression`] refuses to
+    /// make on an unattributable refusal — and the difference is WHO CONTROLS THE RATE. There, the trigger is
+    /// a `CLOSED` the relay may send as often as it likes, so re-stamping lets it postpone the retry forever
+    /// (starvation). Here the trigger is our own send attempt, which happens at most once per backoff
+    /// interval by construction, so the wait cannot be driven by anyone else. Do not "simplify" these two
+    /// into one rule: a legitimate re-stamp and a starvation are the same write with different rate owners.
+    pub fn note_retry_send_failed(
+        &self,
+        relay_url: &str,
+        channel_id: &str,
+        now_unix: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE participation_channels SET suppressed_at_unix = ?3, updated_at_unix = ?3
+             WHERE relay_url = ?1 AND channel_id = ?2 AND suppressed = 1 AND retry_started_unix = 0",
+            params![relay_url, channel_id, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// A refusal — the first one, or a `CLOSED` answering a retry. Raises the suppression and ADVANCES
+    /// the backoff. Returns whether this raised a suppression that was not already up.
+    ///
+    /// ★ Deliberately NOT a `record_channel_left`. A `CLOSED` says one subscription attempt was refused;
+    /// it does not say the relay revoked our membership, and it carries no author timestamp to order
+    /// against events that do. Feeding it into membership ordering is a category error, and an earlier
+    /// attempt at exactly that livelocked: a synthetic marker ranked above a join at equal timestamps
+    /// could never be beaten by the replayed invite, which carries the same timestamp.
+    ///
+    /// So the membership row is left untouched and a suppression is raised instead. The channel stops
+    /// being resumed ([`Self::joined_channels`] excludes it) and its debts close, but the relay's own
+    /// assertion of our membership is preserved.
+    ///
+    /// ★ One function for the first refusal and a failed retry, on purpose: they are the same fact, and
+    /// the only difference is that the wait gets longer. A raise that fired only when the flag was down
+    /// would leave a refused retry with an unchanged backoff — retrying at a fixed interval forever.
+    ///
+    /// A refusal that is neither of those two things is a NO-OP — no counter, and no timestamp either.
+    pub fn advance_suppression(
+        &self,
+        relay_url: &str,
+        channel_id: &str,
+        now_unix: i64,
+    ) -> Result<bool, StoreError> {
+        let mut conn = self.lock()?;
+        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(i64, i64)> = transaction
+            .query_row(
+                "SELECT suppressed, retry_started_unix FROM participation_channels
+                 WHERE relay_url = ?1 AND channel_id = ?2",
+                params![relay_url, channel_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let was_clear = current.is_some_and(|(suppressed, _)| suppressed == 0);
+        let retry_outstanding = current.is_some_and(|(_, retry_started)| retry_started != 0);
+
+        // ★ Count the refusal only when it is attributable: either it is the FIRST one, or it answers a
+        // retry we actually have outstanding. `retry_started_unix` is the attribution token for both this
+        // and the `EOSE` clear — the same question ("is this about a REQ of ours?") decides both.
+        //
+        // Without the gate, a duplicate `CLOSED`, or one arriving after the timeout already expired the
+        // retry, would each add a step to the backoff for nothing. The wait would grow from the relay's
+        // chattiness rather than from our failures, and a channel could reach the six-hour cap without a
+        // single retry having been refused.
+        //
+        // ★★ And NOT COUNTING HAS TO MEAN NOT TOUCHING. An earlier cut skipped only the increment and
+        // still wrote `suppressed_at_unix = now`, which traded inflation for STARVATION — strictly worse.
+        // The due-check is `now - suppressed_at_unix >= backoff(attempts)`, so re-stamping that timestamp
+        // postpones the retry by a full backoff every time: a chatty relay would keep a channel forever
+        // un-retried AND forever un-escalated, where the bug being fixed only made the wait too long.
+        // An unattributable refusal is not news, and the correct handling of not-news is to change
+        // nothing at all.
+        //
+        // Nothing else here needs to run either. Unattributable means the suppression was already up
+        // (`!was_clear`), so `suppressed = 1` is a no-op, `retry_started_unix` is already 0, and the owed
+        // rows were dropped when the flag went up — [`Self::record_owed`] refuses to mint more while
+        // `suppressed = 1`, so there are none to find.
+        if !(was_clear || retry_outstanding) {
+            return Ok(false);
+        }
+        transaction.execute(
+            "UPDATE participation_channels
+             SET suppressed = 1, suppressed_at_unix = ?3, retry_started_unix = 0,
+                 suppress_attempts = suppress_attempts + 1, updated_at_unix = ?3
+             WHERE relay_url = ?1 AND channel_id = ?2",
+            params![relay_url, channel_id, now_unix],
+        )?;
+        transaction.execute(
+            "UPDATE participation_owed SET state = 'dropped'
+             WHERE relay_url = ?1 AND channel_id = ?2 AND state = 'owed'",
+            params![relay_url, channel_id],
+        )?;
+        transaction.commit()?;
+        Ok(was_clear)
+    }
+
+    /// Forget every retry this relay had in flight, because none of them survived the process.
+    ///
+    /// ★ `retry_started_unix` is durable; the SOCKET that carried the REQ is not. After a restart the marker
+    /// is still set and still truthful about the past, yet there is no outstanding REQ and no `EOSE` will
+    /// ever answer it — so the channel would sit ineligible until the timeout expired it. Durability and
+    /// validity are different properties: this row survived correctly and stopped meaning anything.
+    ///
+    /// Cleared rather than expired, so a restart costs no backoff: nothing was refused, we simply never
+    /// asked. Returns how many markers were dropped.
+    pub fn clear_retries_in_flight(
+        &self,
+        relay_url: &str,
+        now_unix: i64,
+    ) -> Result<u64, StoreError> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE participation_channels SET retry_started_unix = 0, updated_at_unix = ?2
+             WHERE relay_url = ?1 AND retry_started_unix <> 0",
+            params![relay_url, now_unix],
+        )?;
+        Ok(changed as u64)
+    }
+
+    /// Turn retries that were never answered into failed attempts, so the backoff keeps moving.
+    ///
+    /// ★ This is what makes "waits for EOSE" a mechanism rather than a wish. Without it a dropped REQ
+    /// would leave `retry_started_unix` set forever, the channel would never be due again, and waiting
+    /// for a protocol-owed answer would become its own permanent park — the same shape as the bug the
+    /// EOSE requirement was introduced to fix. Returns how many were expired, so it is countable.
+    pub fn expire_stale_retries(
+        &self,
+        relay_url: &str,
+        now_unix: i64,
+        timeout_secs: i64,
+    ) -> Result<u64, StoreError> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE participation_channels
+             SET suppress_attempts = suppress_attempts + 1, suppressed_at_unix = ?2,
+                 retry_started_unix = 0, updated_at_unix = ?2
+             WHERE relay_url = ?1 AND suppressed = 1 AND retry_started_unix <> 0
+               AND ?2 - retry_started_unix >= ?3",
+            params![relay_url, now_unix, timeout_secs],
+        )?;
+        Ok(changed as u64)
+    }
+
+    /// The relay SERVED a retry we sent — lift the suppression and reset the escalation.
+    ///
+    /// Gated on `EOSE`, which the relay owes us by protocol, never on silence.
+    ///
+    /// ★ AND gated on a retry actually being outstanding. The subscription id is per-CHANNEL, not
+    /// per-attempt, so an `EOSE` cannot be attributed to a particular REQ on its own: one buffered from the
+    /// subscription that existed BEFORE the suppression was raised would otherwise clear it, with no retry
+    /// ever having been sent. Being protocol-owed makes a signal TRUSTWORTHY; it does not make it
+    /// ATTRIBUTABLE, and only the second property licenses reading it as an answer to us. If we are
+    /// suppressed with nothing in flight, an `EOSE` proves nothing and is ignored.
+    pub fn note_channel_served(
+        &self,
+        relay_url: &str,
+        channel_id: &str,
+        now_unix: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE participation_channels
+             SET suppress_attempts = 0, suppressed = 0, retry_started_unix = 0, updated_at_unix = ?3
+             WHERE relay_url = ?1 AND channel_id = ?2
+               AND retry_started_unix <> 0",
+            params![relay_url, channel_id, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a channel is locally suppressed after a refused read.
+    pub fn channel_suppressed(
+        &self,
+        relay_url: &str,
+        channel_id: &str,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                "SELECT suppressed FROM participation_channels
+                 WHERE relay_url = ?1 AND channel_id = ?2",
+                params![relay_url, channel_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some_and(|flag| flag == 1))
+    }
+
+    /// Apply one relay-signed membership notification, ordered by the AUTHOR's timestamp.
+    ///
+    /// Returns whether the membership state actually transitioned — which is what decides if there
+    /// is wire work to do. A stale notification returns `false` having changed nothing, and so does
+    /// a newer one that merely re-states the state we already hold.
+    ///
+    /// The `(created_at, event_id)` high-water mark advances even when the state does not change.
+    /// Without that, `add@3` (ignored as a no-op because we are already joined) followed by
+    /// `remove@2` would compare `remove@2` against `add@1` and apply — resurrecting an ordering bug
+    /// through the one path that looked safe to skip.
+    fn apply_membership(
+        &self,
+        relay_url: &str,
+        channel_id: &str,
+        state: &str,
+        seed_cursor: Option<(&str, i64)>,
+        source_event_id: &str,
+        source_created_at_unix: i64,
+        now_unix: i64,
+    ) -> Result<bool, StoreError> {
+        let mut conn = self.lock()?;
+        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let current: Option<(String, i64, String, i64)> = transaction
+            .query_row(
+                "SELECT state, source_created_at_unix, source_event_id, suppressed
+                 FROM participation_channels WHERE relay_url = ?1 AND channel_id = ?2",
+                params![relay_url, channel_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+
+        // ★ Seed the mention cursor FIRST, and unconditionally — before the staleness check below can
+        // return early. The crash seam this closes is precisely a joined row with no cursor, whose only
+        // repair is the replayed 44100; that replay is by definition NOT newer, so a seed placed after
+        // the early return would be skipped exactly when it is the one thing needed. Monotonic, so a
+        // cursor already further ahead is left alone and re-running this is free.
+        if let Some((filter_id, since_unix)) = seed_cursor {
+            transaction.execute(
+                "INSERT INTO participation_cursors
+                     (relay_url, filter_id, since_unix, updated_at_unix)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(relay_url, filter_id) DO UPDATE SET
+                     since_unix      = excluded.since_unix,
+                     updated_at_unix = excluded.updated_at_unix
+                 WHERE excluded.since_unix > participation_cursors.since_unix",
+                params![relay_url, filter_id, since_unix, now_unix],
+            )?;
+        }
+
+        let transitioned = match current {
+            None => {
+                transaction.execute(
+                    "INSERT INTO participation_channels
+                         (relay_url, channel_id, state, source_event_id, source_created_at_unix,
+                          updated_at_unix)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        relay_url,
+                        channel_id,
+                        state,
+                        source_event_id,
+                        source_created_at_unix,
+                        now_unix
+                    ],
+                )?;
+                // A removal for a channel we hold no row for is recorded, but we were never a
+                // member of it — so there is no subscription to tear down and nothing transitioned.
+                state == "joined"
+            }
+            Some((stored_state, stored_created_at, stored_event_id, stored_suppressed)) => {
+                // ★ ONLY relay-signed membership events reach here, so `(created_at, event_id)` is a
+                // meaningful scale: both sides are the same KIND of fact — the relay asserting
+                // membership — and the author's clock orders them. A local refusal is NOT a membership
+                // fact and never enters this comparison; it goes through `advance_suppression`.
+                //
+                // That separation is the fix for a livelock an earlier attempt introduced: ranking a
+                // CLOSED-derived leave above a join at equal timestamps made the leave win, and a
+                // replayed 44100 carries the SAME `created_at` — so it could never win back, leaving us
+                // permanently out of a channel we were still a member of. Comparing two different kinds
+                // of evidence on one timestamp scale was the error; loosening the tie to `>=` would only
+                // reopen the replay hazard this ordering exists for.
+                let newer = (source_created_at_unix, source_event_id)
+                    > (stored_created_at, stored_event_id.as_str());
+                if !newer {
+                    transaction.commit()?;
+                    return Ok(false);
+                }
+                // A newer relay-signed membership event also CLEARS any local suppression: the relay is
+                // authoritative about membership, and a fresh assertion is new evidence that whatever we
+                // were refused before has changed. A mere replay does not reach here, so a stale invite
+                // cannot un-suppress a channel the relay is still refusing.
+                transaction.execute(
+                    "UPDATE participation_channels
+                     SET state = ?3, source_event_id = ?4, source_created_at_unix = ?5,
+                         updated_at_unix = ?6, suppressed = 0, retry_started_unix = 0
+                     WHERE relay_url = ?1 AND channel_id = ?2",
+                    params![
+                        relay_url,
+                        channel_id,
+                        state,
+                        source_event_id,
+                        source_created_at_unix,
+                        now_unix
+                    ],
+                )?;
+                // ★ Clearing a suppression is wire work even when the state does not change. We had
+                // stopped reading that channel, so a newer invite that un-suppresses it must produce a
+                // subscribe — otherwise the flag clears and nothing ever re-subscribes, which is the
+                // livelock again wearing a different mask.
+                stored_state != state || (state == "joined" && stored_suppressed == 1)
+            }
+        };
+
+        if state == "left" {
+            // A debt in a channel we can no longer read is a debt we cannot discharge. Closed in the
+            // same transaction as the membership change so no restart can observe one without the
+            // other.
+            transaction.execute(
+                "UPDATE participation_owed SET state = 'dropped'
+                 WHERE relay_url = ?1 AND channel_id = ?2 AND state = 'owed'",
+                params![relay_url, channel_id],
+            )?;
+        }
+
+
+        transaction.commit()?;
+        Ok(transitioned)
+    }
+
+    /// The channels to re-subscribe on boot for one relay.
+    pub fn joined_channels(&self, relay_url: &str) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock()?;
+        // Suppressed channels are excluded: the relay refused a read on them, so re-subscribing would
+        // be asking again for something already denied. They keep their membership row — that is a
+        // relay-asserted fact and only the relay revokes it — but they are not resumed.
+        let mut statement = conn.prepare(
+            "SELECT channel_id FROM participation_channels
+             WHERE relay_url = ?1 AND state = 'joined' AND suppressed = 0
+             ORDER BY channel_id",
+        )?;
+        let rows = statement.query_map([relay_url], |row| row.get::<_, String>(0))?;
+        let mut channels = Vec::new();
+        for row in rows {
+            channels.push(row?);
+        }
+        Ok(channels)
+    }
+
+    /// The event that last made us a member of this channel — the provenance of our membership
+    /// claim, so it can be checked against the relay rather than believed.
+    pub fn joined_channel_source(
+        &self,
+        relay_url: &str,
+        channel_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let conn = self.lock()?;
+        let source = conn
+            .query_row(
+                "SELECT source_event_id FROM participation_channels
+                 WHERE relay_url = ?1 AND channel_id = ?2 AND state = 'joined'",
+                params![relay_url, channel_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(source)
+    }
+
+    /// Record a message that is owed a response. Idempotent on the event id: the same message
+    /// re-delivered after a reconnect is one debt, not two. Returns whether a new debt landed.
+    pub fn record_owed(&self, owed: &OwedResponse, now_unix: i64) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        // ★ Conditional on still holding AND still reading the channel. A mention can arrive after the
+        // 44101 that removed us, or after a CLOSED suppressed us — queued behind it on the socket, or
+        // replayed within the cursor skew — and an unconditional insert would mint a debt in a channel
+        // we can no longer read OR answer. `record_channel_left` and `advance_suppression` drain the debts
+        // that exist when they run; this is the other half, for the ones that turn up afterwards.
+        //
+        // ★ `suppressed = 0` matters as much as the state: a suppressed row is still `state='joined'`,
+        // because membership is the relay's to revoke and a local refusal does not revoke it. Checking
+        // only the state would let a post-CLOSED mention recreate exactly the debt `advance_suppression`
+        // had just dropped. Every predicate that asks "can we act in this channel" has to read BOTH.
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO participation_owed
+                 (event_id, relay_url, channel_id, counterparty, kind, state, created_at_unix,
+                  recorded_at_unix)
+             SELECT ?1, ?2, ?3, ?4, ?5, 'owed', ?6, ?7
+             WHERE EXISTS (
+                 SELECT 1 FROM participation_channels
+                 WHERE relay_url = ?2 AND channel_id = ?3 AND state = 'joined' AND suppressed = 0
+             )",
+            params![
+                owed.event_id,
+                owed.relay_url,
+                owed.channel_id,
+                owed.counterparty,
+                owed.kind as i64,
+                owed.created_at_unix,
+                now_unix,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Outstanding debts, oldest first.
+    pub fn owed_responses(&self) -> Result<Vec<OwedResponse>, StoreError> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT event_id, relay_url, channel_id, counterparty, kind, created_at_unix
+             FROM participation_owed WHERE state = 'owed'
+             ORDER BY created_at_unix, event_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(OwedResponse {
+                event_id: row.get(0)?,
+                relay_url: row.get(1)?,
+                channel_id: row.get(2)?,
+                counterparty: row.get(3)?,
+                kind: row.get::<_, i64>(4)? as u16,
+                created_at_unix: row.get(5)?,
+            })
+        })?;
+        let mut owed = Vec::new();
+        for row in rows {
+            owed.push(row?);
+        }
+        Ok(owed)
+    }
 }
 
 /// Enqueue an event into the outbox within a live transaction. Idempotent on `dedup_key`: a second
@@ -1423,6 +2173,575 @@ mod tests {
             store.outbox_row(&format!("claim:{job}")).expect("row").expect("exists").0,
             "expired"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── participation ────────────────────────────────────────────────────────────────────────────
+
+    const RELAY: &str = "wss://relay.example";
+
+    fn owed(event_id: &str, channel: &str, created_at_unix: i64) -> OwedResponse {
+        OwedResponse {
+            event_id: event_id.to_owned(),
+            relay_url: RELAY.to_owned(),
+            channel_id: channel.to_owned(),
+            counterparty: "c".repeat(64),
+            kind: 9,
+            created_at_unix,
+        }
+    }
+
+    #[test]
+    fn each_filter_carries_its_own_cursor() {
+        let (store, path) = fresh_store("cursors");
+        store.advance_participation_cursor(RELAY, "membership", 500, 1).expect("membership");
+        store.advance_participation_cursor(RELAY, "channel:abc", 100, 1).expect("channel");
+
+        // The busy filter must not drag the quiet one forward past events it never saw.
+        assert_eq!(store.participation_cursor(RELAY, "membership").expect("read"), Some(500));
+        assert_eq!(store.participation_cursor(RELAY, "channel:abc").expect("read"), Some(100));
+        // Same filter id on a different relay is a different cursor.
+        assert_eq!(store.participation_cursor("wss://other", "membership").expect("read"), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_cursor_never_moves_backwards() {
+        let (store, path) = fresh_store("cursor-monotonic");
+        store.advance_participation_cursor(RELAY, "membership", 500, 1).expect("forward");
+        // A reconnect replays from before the cursor; an out-of-order event must not re-open the
+        // window that had already closed.
+        store.advance_participation_cursor(RELAY, "membership", 300, 2).expect("backward");
+        assert_eq!(store.participation_cursor(RELAY, "membership").expect("read"), Some(500));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn joining_the_same_channel_twice_is_joining_it_once() {
+        let (store, path) = fresh_store("join-idempotent");
+        assert!(store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "e1", 100, 100).expect("first"));
+        // The relay re-delivers the 44100 after a reconnect — SAME event, so same author timestamp.
+        // The effect is the row, so writing it again writes it once.
+        assert!(!store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "e1", 100, 101).expect("replay"));
+        assert_eq!(store.joined_channels(RELAY).expect("channels"), ["chan-1"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn restart_resubscribes_exactly_the_channels_we_are_still_in() {
+        let (store, path) = fresh_store("join-leave");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "e1", 100, 100).expect("join 1");
+        store.record_channel_joined(RELAY, "chan-2", "channel:chan-2", "e2", 100, 100).expect("join 2");
+        store.record_channel_left(RELAY, "chan-1", "e3", 200, 200).expect("leave 1");
+
+        assert_eq!(store.joined_channels(RELAY).expect("channels"), ["chan-2"]);
+
+        // A re-add flips the same row back rather than inventing a second one.
+        assert!(store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "e4", 300, 300).expect("re-add"));
+        assert_eq!(store.joined_channels(RELAY).expect("channels"), ["chan-1", "chan-2"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn losing_a_channel_closes_the_debts_inside_it_and_nothing_else() {
+        let (store, path) = fresh_store("owed-dropped");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "e1", 100, 100).expect("join");
+        // Both channels must be JOINED for their debts to exist at all — a debt is only recorded for
+        // a channel we hold. Without joining chan-2 this test would pass on an empty control.
+        store.record_channel_joined(RELAY, "chan-2", "channel:chan-2", "e2", 100, 100).expect("join 2");
+        store.record_owed(&owed(&"a".repeat(64), "chan-1", 110), 111).expect("owed 1");
+        store.record_owed(&owed(&"b".repeat(64), "chan-2", 120), 121).expect("owed 2");
+
+        store.record_channel_left(RELAY, "chan-1", "e3", 200, 200).expect("leave");
+
+        // A debt we can no longer discharge is closed, not left pending forever; a debt in a
+        // channel we still hold is untouched.
+        let outstanding = store.owed_responses().expect("owed");
+        assert_eq!(outstanding.len(), 1);
+        assert_eq!(outstanding[0].channel_id, "chan-2");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Membership must be ordered by the AUTHOR's clock, not by which frame the relay flushed first.
+    ///
+    /// Replay makes delivery order arbitrary: every reconnect deliberately re-asks from before its
+    /// cursor, so an old 44100 can legitimately arrive after a newer 44101. Applying that would
+    /// re-subscribe us to a channel the relay has already removed us from — and the store would look
+    /// perfectly consistent while doing it.
+    #[test]
+    fn a_replayed_old_add_cannot_undo_a_newer_removal() {
+        let (store, path) = fresh_store("membership-order");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "add-1", 100, 100).expect("join");
+        store.record_channel_left(RELAY, "chan-1", "remove-1", 200, 200).expect("leave");
+
+        // The stale 44100 the relay re-sends after a reconnect. Older by author time, later by
+        // arrival — and it must lose.
+        assert!(
+            !store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "add-1", 100, 300).expect("stale add"),
+            "a stale add reported a transition, so it was applied"
+        );
+        assert!(
+            store.joined_channels(RELAY).expect("channels").is_empty(),
+            "a replayed old 44100 resurrected a membership the relay had already revoked"
+        );
+
+        // The inverse: a stale removal must not drop a membership we legitimately re-acquired.
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "add-2", 400, 400).expect("re-add");
+        assert!(
+            !store.record_channel_left(RELAY, "chan-1", "remove-1", 200, 500).expect("stale remove"),
+            "a stale removal reported a transition"
+        );
+        assert_eq!(store.joined_channels(RELAY).expect("channels"), ["chan-1"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The high-water mark has to advance even when the state does NOT change, or ordering is only
+    /// half-enforced: `add@3` is a no-op against an existing join, so if it left the stored timestamp
+    /// at `add@1` then `remove@2` would compare against the wrong event and apply.
+    #[test]
+    fn a_newer_add_that_changes_nothing_still_advances_the_ordering_mark() {
+        let (store, path) = fresh_store("membership-highwater");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "add-1", 100, 100).expect("join");
+        // Newer add, same state — reports no transition, but must still move the mark to 300.
+        assert!(!store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "add-3", 300, 300).expect("newer add"));
+
+        assert!(
+            !store.record_channel_left(RELAY, "chan-1", "remove-2", 200, 400).expect("stale remove"),
+            "a removal older than the newest add was applied"
+        );
+        assert_eq!(
+            store.joined_channels(RELAY).expect("channels"),
+            ["chan-1"],
+            "the mark stayed at the first add, so a stale removal beat it"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The join row and the mention cursor must land together, or a crash between them leaves a joined
+    /// channel whose filter opens at `now` — the lost-mentions window, reopened through a crash seam.
+    #[test]
+    fn a_join_seeds_its_cursor_in_the_same_write() {
+        let (store, path) = fresh_store("join-seeds-cursor");
+        assert!(
+            store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "add-1", 1_000, 1_001)
+                .expect("join")
+        );
+        assert_eq!(
+            store.participation_cursor(RELAY, "channel:chan-1").expect("cursor"),
+            Some(1_000),
+            "the join committed without its cursor, so a restart would subscribe from now()"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The repair path for that crash seam. A joined row with no cursor can only be fixed by the
+    /// replayed 44100 — which is NOT newer, reports no transition, and would be skipped by any seed
+    /// placed behind the staleness check. So the seed has to be unconditional.
+    #[test]
+    fn a_replayed_invite_still_repairs_a_missing_cursor() {
+        let (store, path) = fresh_store("join-repairs-cursor");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "add-1", 1_000, 1_001)
+            .expect("join");
+        // Simulate the crash seam: the membership row survived, the cursor did not.
+        {
+            let conn = store.lock().expect("lock");
+            conn.execute("DELETE FROM participation_cursors", []).expect("drop cursor");
+        }
+        assert_eq!(store.participation_cursor(RELAY, "channel:chan-1").expect("gone"), None);
+
+        // The relay re-delivers the same 44100 after a reconnect: same id, same timestamp, no transition.
+        assert!(
+            !store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "add-1", 1_000, 9_999)
+                .expect("replay")
+        );
+        assert_eq!(
+            store.participation_cursor(RELAY, "channel:chan-1").expect("cursor"),
+            Some(1_000),
+            "the replayed invite did not restore the cursor, so the window stays open forever"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A refused read stops the channel being resumed, without pretending to be a membership change.
+    #[test]
+    fn a_refused_read_suppresses_the_channel_and_closes_its_debts() {
+        let (store, path) = fresh_store("suppress");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 500, 500)
+            .expect("join");
+        store.record_owed(&owed(&"d".repeat(64), "chan-1", 510), 511).expect("owed");
+
+        assert!(store.advance_suppression(RELAY, "chan-1", 600).expect("suppress"));
+        assert!(store.joined_channels(RELAY).expect("channels").is_empty());
+        assert!(store.channel_suppressed(RELAY, "chan-1").expect("flag"));
+        assert!(store.owed_responses().expect("owed").is_empty());
+        // A second refusal reports that the flag was already up, and with no retry outstanding it must NOT
+        // escalate — see `only_an_attributable_refusal_lengthens_the_wait`. The wait must grow from OUR
+        // failed retries, not from how often the relay repeats itself.
+        assert!(!store.advance_suppression(RELAY, "chan-1", 700).expect("again"));
+        assert_eq!(
+            store.suppressed_channels_due(RELAY, 700 + 60).expect("due"),
+            vec![("chan-1".to_string(), 1)],
+            "an unattributable second refusal escalated the backoff"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ★ THE EXIT TIMER. A suppression whose only other clearer is a newer membership event is permanent
+    /// after a TRANSIENT refusal, because the relay has no reason to emit one — our membership never
+    /// changed. So the backoff has to fire on its own.
+    #[test]
+    fn a_suppression_becomes_due_for_retry_on_an_escalating_backoff() {
+        let (store, path) = fresh_store("suppress-retry");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 100, 100)
+            .expect("join");
+        store.advance_suppression(RELAY, "chan-1", 1_000).expect("suppress");
+
+        // First refusal: 60s. Not due a second early, due on the boundary.
+        assert!(store.suppressed_channels_due(RELAY, 1_059).expect("early").is_empty());
+        assert_eq!(
+            store.suppressed_channels_due(RELAY, 1_060).expect("due"),
+            vec![("chan-1".to_string(), 1)],
+            "the suppression never became due — it is a permanent park, not a provisional one"
+        );
+
+        // The retry REQ goes out. While it is IN FLIGHT the channel is not due again — and the flag stays
+        // raised, because a REQ we sent is not a REQ the relay answered.
+        store.note_retry_attempt(RELAY, "chan-1", 1_060).expect("retry sent");
+        assert!(
+            store.channel_suppressed(RELAY, "chan-1").expect("flag"),
+            "the retry lifted the suppression before the relay had answered anything"
+        );
+        assert!(
+            store.suppressed_channels_due(RELAY, 1_060 + 99_999).expect("in flight").is_empty(),
+            "a retry already in flight was re-fired"
+        );
+
+        // The relay refuses the retry: the wait ESCALATES rather than settling into a poll.
+        store.advance_suppression(RELAY, "chan-1", 1_060).expect("refused again");
+        assert!(store.suppressed_channels_due(RELAY, 1_060 + 299).expect("early").is_empty());
+        assert_eq!(
+            store.suppressed_channels_due(RELAY, 1_060 + 300).expect("due").len(),
+            1
+        );
+        // And it is capped, so it retries forever at a bounded rate instead of being abandoned.
+        assert_eq!(suppression_backoff_secs(99), 21_600);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A refusal only counts against the backoff if it is attributable: the first one, or one answering a
+    /// retry we have outstanding. Otherwise a chatty relay could walk the wait to the six-hour cap without
+    /// a single retry of ours having been refused.
+    #[test]
+    fn only_an_attributable_refusal_lengthens_the_wait() {
+        let (store, path) = fresh_store("refusal-attribution");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 100, 100)
+            .expect("join");
+        // First refusal counts.
+        store.advance_suppression(RELAY, "chan-1", 1_000).expect("first");
+        assert_eq!(store.suppressed_channels_due(RELAY, 1_060).expect("due").len(), 1);
+
+        // Duplicate CLOSEDs with nothing outstanding must NOT escalate.
+        store.advance_suppression(RELAY, "chan-1", 1_001).expect("dup");
+        store.advance_suppression(RELAY, "chan-1", 1_002).expect("dup");
+        // ★ Measured from the FIRST refusal, not from the last dup. An earlier version of this assertion
+        // asked at `1_002 + 60` — a due time derived from the re-stamped timestamp — so it agreed with the
+        // starvation bug instead of catching it. A test whose expected value is computed the same wrong way
+        // the code is cannot disagree with it.
+        assert_eq!(
+            store.suppressed_channels_due(RELAY, 1_060).expect("due"),
+            vec![("chan-1".to_string(), 1)],
+            "unattributable CLOSEDs escalated the backoff — the wait now grows with relay chattiness"
+        );
+
+        // A CLOSED that answers a real retry does escalate.
+        store.note_retry_attempt(RELAY, "chan-1", 1_100).expect("retry");
+        store.advance_suppression(RELAY, "chan-1", 1_110).expect("refused retry");
+        assert_eq!(
+            store.suppressed_channels_due(RELAY, 1_110 + 300).expect("due"),
+            vec![("chan-1".to_string(), 2)]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ★ THE STARVATION HALF of the same gate, and the worse failure of the two. Not counting a refusal has
+    /// to mean not TOUCHING it: an earlier cut skipped the increment but still wrote `suppressed_at_unix`,
+    /// which pushes the due time out by a full backoff on EVERY unattributable `CLOSED`. Fixing an inflated
+    /// wait by making the retry never arrive is a regression, not a fix.
+    #[test]
+    fn an_unattributable_refusal_does_not_postpone_the_retry() {
+        let (store, path) = fresh_store("refusal-starvation");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 100, 100)
+            .expect("join");
+        store.advance_suppression(RELAY, "chan-1", 1_000).expect("first");
+
+        // A chatty relay, right up to the second the first backoff would elapse.
+        for now in 1_001..1_060 {
+            store.advance_suppression(RELAY, "chan-1", now).expect("dup");
+        }
+
+        assert_eq!(
+            store.suppressed_channels_due(RELAY, 1_060).expect("due"),
+            vec![("chan-1".to_string(), 1)],
+            "an unattributable CLOSED re-stamped the backoff clock, so every message the relay sends \
+             postpones the retry by another full backoff — the channel is never due and never escalates"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ★ RACE 1. The subscription id is per-CHANNEL, not per-attempt, so an `EOSE` is not attributable on
+    /// its own. One buffered from the subscription that existed BEFORE the suppression was raised must not
+    /// clear it — being protocol-owed makes a signal trustworthy, not *about us*.
+    #[test]
+    fn an_eose_with_no_retry_outstanding_proves_nothing() {
+        let (store, path) = fresh_store("eose-stale");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 100, 100)
+            .expect("join");
+        store.advance_suppression(RELAY, "chan-1", 1_000).expect("refused");
+
+        // A late EOSE from the pre-suppression subscription. No retry has been sent.
+        store.note_channel_served(RELAY, "chan-1", 1_010).expect("stale eose");
+        assert!(
+            store.channel_suppressed(RELAY, "chan-1").expect("flag"),
+            "a stale EOSE cleared a suppression no retry had been sent for"
+        );
+        assert!(store.joined_channels(RELAY).expect("channels").is_empty());
+
+        // Once a retry IS outstanding, the same call is an answer to us and does clear it.
+        store.note_retry_attempt(RELAY, "chan-1", 1_060).expect("retry");
+        store.note_channel_served(RELAY, "chan-1", 1_070).expect("real eose");
+        assert!(!store.channel_suppressed(RELAY, "chan-1").expect("flag"));
+        assert_eq!(store.joined_channels(RELAY).expect("channels"), ["chan-1"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ★ RACE 2. A retry marker is durable; the socket that carried the REQ is not. After a restart the row
+    /// is still truthful about the past and no longer means anything, so it must be forgotten rather than
+    /// waited on — and forgotten without charging a backoff, because nothing was refused.
+    #[test]
+    fn a_restart_forgets_retries_that_did_not_survive_it() {
+        let (store, path) = fresh_store("retry-phantom");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 100, 100)
+            .expect("join");
+        store.advance_suppression(RELAY, "chan-1", 1_000).expect("refused");
+        store.note_retry_attempt(RELAY, "chan-1", 1_060).expect("retry sent");
+        assert!(store.suppressed_channels_due(RELAY, 1_070).expect("in flight").is_empty());
+
+        // Restart.
+        assert_eq!(store.clear_retries_in_flight(RELAY, 1_080).expect("forget"), 1);
+        assert_eq!(
+            store.suppressed_channels_due(RELAY, 1_080).expect("due"),
+            vec![("chan-1".to_string(), 1)],
+            "a phantom retry kept the channel parked after the REQ had died with the process"
+        );
+        // And no backoff was charged for a REQ nobody refused.
+        assert_eq!(suppression_backoff_secs(1), 60);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ★ THE DEFECT THAT KILLED THE OPTIMISTIC CLEAR. A retry REQ can be silently dropped — socket died
+    /// mid-write, relay ignored it, no answer of any kind. Lifting the suppression on the attempt would
+    /// leave that channel un-gated AND outside the backoff cycle at once: nothing arrives to re-suppress
+    /// it, and nothing schedules another try. So the flag stays up until a protocol-owed `EOSE`, and a
+    /// retry nobody answered is expired back into a failed attempt by a timer.
+    #[test]
+    fn a_retry_nobody_answered_becomes_a_failed_attempt() {
+        let (store, path) = fresh_store("retry-timeout");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 100, 100)
+            .expect("join");
+        store.advance_suppression(RELAY, "chan-1", 1_000).expect("refused");
+        store.note_retry_attempt(RELAY, "chan-1", 1_060).expect("retry sent");
+
+        // Nothing comes back. Before the timeout the channel stays parked and stays GATED.
+        assert_eq!(
+            store.expire_stale_retries(RELAY, 1_060 + RETRY_EOSE_TIMEOUT_SECS - 1, RETRY_EOSE_TIMEOUT_SECS)
+                .expect("early"),
+            0
+        );
+        assert!(store.channel_suppressed(RELAY, "chan-1").expect("flag"));
+        assert!(store.joined_channels(RELAY).expect("channels").is_empty());
+
+        // At the timeout it becomes a failed attempt: backoff advances and it is schedulable again.
+        assert_eq!(
+            store.expire_stale_retries(RELAY, 1_060 + RETRY_EOSE_TIMEOUT_SECS, RETRY_EOSE_TIMEOUT_SECS)
+                .expect("expire"),
+            1,
+            "a retry nobody answered was left in flight forever — waiting for EOSE became its own park"
+        );
+        let due = store
+            .suppressed_channels_due(RELAY, 1_060 + RETRY_EOSE_TIMEOUT_SECS + 300)
+            .expect("due");
+        assert_eq!(due, vec![("chan-1".to_string(), 2)]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `EOSE` is protocol-owed, so it is the one signal that may be read as success. Without resetting on
+    /// it, the attempt count only climbs and a recovered channel carries a punishing backoff into its
+    /// next, unrelated refusal.
+    #[test]
+    fn being_served_resets_the_escalation() {
+        let (store, path) = fresh_store("suppress-reset");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 100, 100)
+            .expect("join");
+        store.advance_suppression(RELAY, "chan-1", 1_000).expect("s1");
+        store.note_retry_attempt(RELAY, "chan-1", 1_100).expect("retry sent");
+        store.advance_suppression(RELAY, "chan-1", 1_100).expect("s2");
+        assert_eq!(store.suppressed_channels_due(RELAY, 1_100 + 300).expect("due").len(), 1);
+
+        // A retry has to be outstanding for the EOSE to be attributable to us.
+        store.note_retry_attempt(RELAY, "chan-1", 1_900).expect("retry");
+        store.note_channel_served(RELAY, "chan-1", 2_000).expect("eose");
+        assert!(!store.channel_suppressed(RELAY, "chan-1").expect("flag"));
+        assert_eq!(store.joined_channels(RELAY).expect("channels"), ["chan-1"]);
+
+        // Next refusal starts from the SHORTEST backoff again, not from where the old escalation left off.
+        store.advance_suppression(RELAY, "chan-1", 3_000).expect("s3");
+        assert_eq!(
+            store.suppressed_channels_due(RELAY, 3_060).expect("due"),
+            vec![("chan-1".to_string(), 1)],
+            "the escalation was not reset by a served subscription"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A suppressed row is still `state='joined'` — membership is the relay's to revoke. So every
+    /// predicate asking "can we act in this channel" must read the suppression too, or a mention queued
+    /// behind the CLOSED recreates the debt that suppression had just dropped.
+    #[test]
+    fn a_mention_arriving_after_a_suppression_creates_no_debt() {
+        let (store, path) = fresh_store("owed-after-suppress");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 100, 100)
+            .expect("join");
+        store.record_owed(&owed(&"d".repeat(64), "chan-1", 110), 111).expect("owed");
+        store.advance_suppression(RELAY, "chan-1", 200).expect("suppress");
+        assert!(store.owed_responses().expect("drained").is_empty());
+
+        assert!(
+            !store.record_owed(&owed(&"e".repeat(64), "chan-1", 150), 300).expect("queued mention"),
+            "a mention queued behind the CLOSED recreated a debt we can neither read nor answer"
+        );
+        assert!(store.owed_responses().expect("owed").is_empty());
+
+        // Positive control: once the channel is readable again, debts record normally — otherwise this
+        // test would pass against a record_owed that never writes at all.
+        store.note_retry_attempt(RELAY, "chan-1", 390).expect("retry");
+        store.note_channel_served(RELAY, "chan-1", 400).expect("served");
+        assert!(store.record_owed(&owed(&"f".repeat(64), "chan-1", 410), 411).expect("live"));
+        assert_eq!(store.owed_responses().expect("owed").len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ★ THE LIVELOCK. A refused read must not permanently exclude us from a channel we are still a
+    /// member of. The earlier attempt ranked a synthetic `closed:` marker above a join at equal
+    /// timestamps, and since the relay replays an invite with its ORIGINAL `created_at`, nothing could
+    /// ever win the channel back. Suppression and membership are now separate kinds of fact, so a
+    /// genuinely newer relay-signed invite clears it regardless of when the refusal happened.
+    #[test]
+    fn a_newer_invite_clears_a_suppression_that_a_replay_cannot() {
+        let (store, path) = fresh_store("suppress-clear");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 500, 500)
+            .expect("join");
+        // Refused at the SAME second as the membership event — the exact tie that used to livelock.
+        store.advance_suppression(RELAY, "chan-1", 500).expect("suppress");
+        assert!(store.joined_channels(RELAY).expect("channels").is_empty());
+
+        // A REPLAY of the original invite must not un-suppress it: same id, same timestamp, no new
+        // information, and the relay may still be refusing the read.
+        assert!(
+            !store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"a".repeat(64), 500, 900)
+                .expect("replay")
+        );
+        assert!(
+            store.joined_channels(RELAY).expect("channels").is_empty(),
+            "a replayed invite un-suppressed a channel the relay is still refusing"
+        );
+
+        // A genuinely newer relay-signed invite is new evidence, and clears it.
+        assert!(
+            store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", &"b".repeat(64), 800, 900)
+                .expect("re-add")
+        );
+        assert_eq!(
+            store.joined_channels(RELAY).expect("channels"),
+            ["chan-1"],
+            "a newer invite could not clear the suppression — the channel is livelocked"
+        );
+        assert!(!store.channel_suppressed(RELAY, "chan-1").expect("flag"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A mention can arrive after the 44101 that removed us — queued behind it, or replayed inside the
+    /// cursor skew. Recording it would mint a debt in a channel we can neither read nor answer, and
+    /// nothing downstream would ever clear it.
+    #[test]
+    fn a_mention_arriving_after_we_left_creates_no_debt() {
+        let (store, path) = fresh_store("owed-after-left");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "add-1", 100, 100).expect("join");
+        store.record_channel_left(RELAY, "chan-1", "remove-1", 200, 200).expect("leave");
+
+        assert!(
+            !store.record_owed(&owed(&"f".repeat(64), "chan-1", 150), 300).expect("late mention"),
+            "a debt was recorded for a channel we had already left"
+        );
+        assert!(store.owed_responses().expect("owed").is_empty());
+
+        // And the positive control: the same call in a channel we DO hold must still record, or this
+        // test would pass just as well against a record_owed that never writes anything.
+        store.record_channel_joined(RELAY, "chan-2", "channel:chan-2", "add-2", 100, 100).expect("join 2");
+        assert!(store.record_owed(&owed(&"e".repeat(64), "chan-2", 150), 300).expect("live mention"));
+        assert_eq!(store.owed_responses().expect("owed").len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_redelivered_message_is_one_debt_not_two() {
+        let (store, path) = fresh_store("owed-dedup");
+        let event = "d".repeat(64);
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "e1", 100, 100).expect("join");
+        assert!(store.record_owed(&owed(&event, "chan-1", 110), 111).expect("first"));
+        // Every reconnect deliberately re-asks from before its cursor, so this is the normal case.
+        assert!(!store.record_owed(&owed(&event, "chan-1", 110), 999).expect("replay"));
+        assert_eq!(store.owed_responses().expect("owed").len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn debts_come_back_oldest_first_with_the_authors_timestamp() {
+        let (store, path) = fresh_store("owed-order");
+        store.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "e1", 100, 100).expect("join");
+        store.record_owed(&owed(&"2".repeat(64), "chan-1", 200), 1).expect("later");
+        store.record_owed(&owed(&"1".repeat(64), "chan-1", 100), 2).expect("earlier");
+
+        let outstanding = store.owed_responses().expect("owed");
+        // Ordered by when they were ASKED, not when we happened to ingest them.
+        assert_eq!(outstanding[0].created_at_unix, 100);
+        assert_eq!(outstanding[1].created_at_unix, 200);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_store_written_by_the_previous_binary_opens_and_carries_the_new_tables() {
+        let (store, path) = fresh_store("participation-upgrade");
+        // Simulate a v2 store: the participation tables absent, everything else present.
+        {
+            let conn = store.lock().expect("lock");
+            conn.execute_batch(
+                "DROP TABLE participation_cursors;
+                 DROP TABLE participation_channels;
+                 DROP TABLE participation_owed;",
+            )
+            .expect("drop");
+            conn.execute(
+                "UPDATE seller_meta SET value = '2' WHERE key = 'schema_version'",
+                [],
+            )
+            .expect("downgrade");
+        }
+        drop(store);
+
+        let reopened = SellerStore::open(&path).expect("reopen");
+        assert_eq!(reopened.health().expect("health").schema_version, SCHEMA_VERSION);
+        assert!(reopened.record_channel_joined(RELAY, "chan-1", "channel:chan-1", "e1", 100, 100).expect("join"));
+        assert_eq!(reopened.participation_cursor(RELAY, "membership").expect("read"), None);
         let _ = std::fs::remove_file(&path);
     }
 }
