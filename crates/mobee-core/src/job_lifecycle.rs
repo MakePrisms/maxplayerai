@@ -1665,14 +1665,47 @@ fn derive_claim_liveness(
     live_claim_id
 }
 
-/// Read one job's offer + claims + results from the relay, with claim liveness derived
-/// against `now` (a `processing` claim past the offer deadline is EXPIRED, not live). Exposed
-/// `pub(crate)` so the seller daemon can run the backfill money-safety pre-claim check
-/// (already-delivered / live-claimed-by-another) without duplicating the relay read.
-/// The event id of a buyer AWARD (kind-3405) authored by this buyer for `job_id`, if the relay
-/// returns one — the relay half of the idempotent re-arm check (a 3405 may have published before a
-/// crash, so the local ledger alone is insufficient). A relay error propagates so the caller treats
-/// it as "unknown" and does not falsely mark the intent awarded.
+/// A buyer AWARD found on the relay, parsed into exactly the fields an `awards` row needs and
+/// nothing else. Constructed ONLY when every field was read off the event itself, so a caller
+/// holding one can repair the local ledger without inferring or defaulting anything.
+///
+/// `amount_sats` is deliberately absent: the kind-3405 carries no amount tag (see
+/// [`gateway::award_draft`]), so the sum a repair records must come from the buyer's own
+/// reservation, not from this event. Leaving the field out makes that impossible to get wrong by
+/// accident — there is no plausible-looking zero here to reach for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RelayedAward {
+    pub award_event_id: String,
+    pub claim_id: String,
+    pub seller_pubkey: String,
+}
+
+/// What the relay had to say about an award for a job. `Some(..)` of either variant means an award
+/// IS public; they differ only in whether it can be trusted to rebuild a money row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AwardPresence {
+    /// Complete and unambiguous — enough to repair the ledger from.
+    Repairable(RelayedAward),
+    /// An award exists but cannot be turned into a complete, unambiguous record. Refuse and leave
+    /// the row missing; `detail` says which property failed so an operator is not left guessing.
+    Unrepairable { award_event_id: String, detail: String },
+}
+
+impl AwardPresence {
+    /// The id of the award the relay returned, whichever variant. Both variants know it — they
+    /// differ on whether the REST of the event could be trusted, not on which event it was.
+    pub(crate) fn award_event_id(&self) -> &str {
+        match self {
+            Self::Repairable(relayed) => &relayed.award_event_id,
+            Self::Unrepairable { award_event_id, .. } => award_event_id,
+        }
+    }
+}
+
+/// The buyer AWARD (kind-3405) authored by this buyer for `job_id`, if the relay returns one — the
+/// relay half of the idempotent re-arm check (a 3405 may have published before a crash, so the
+/// local ledger alone is insufficient). A relay error propagates so the caller treats it as
+/// "unknown" and does not falsely mark the intent awarded.
 ///
 /// ⚠ **`Ok(None)` means "the relay did not return an award", which is NOT "no award exists."**
 /// `fetch_events` resolves `Ok(empty)` when it simply hits `timeout`, so a slow or unreachable relay
@@ -1680,13 +1713,15 @@ fn derive_claim_liveness(
 /// must treat `Ok(None)` as UNVERIFIED, not as verified absence — see
 /// [`crate::buyer::lifecycle::award_with_reservation`], which refuses on it.
 ///
-/// Returns the id rather than a bool so a caller refusing on presence can NAME the award it found.
-pub(crate) async fn award_event_id_async(
+/// Returns the parsed award rather than a bare id so a caller can both NAME the award it found and
+/// repair the missing row from it. Parsing happens here, against the real event, so
+/// `buyer::lifecycle` stays free of nostr types and remains unit-testable with a plain closure.
+pub(crate) async fn award_presence_async(
     home: &MobeeHome,
     keys: &nostr_sdk::Keys,
     job_id: &str,
     timeout: Duration,
-) -> Result<Option<String>, JobLifecycleError> {
+) -> Result<Option<AwardPresence>, JobLifecycleError> {
     use nostr_sdk::prelude::{Client, EventId, Filter, Kind};
 
     let offer_id = EventId::from_hex(job_id)
@@ -1707,8 +1742,122 @@ pub(crate) async fn award_event_id_async(
         .fetch_events(filter, timeout)
         .await
         .map_err(|error| JobLifecycleError::Relay(format!("fetch award: {error}")))?;
-    Ok(events.first().map(|event| event.id.to_hex()))
+
+    if events.is_empty() {
+        return Ok(None);
+    }
+
+    // ⚠ TWO kind-3405s for one job is the NORMAL steady state, not an anomaly: `award_claim_async`
+    // publishes one at selection and `accept_claim_async` publishes another at pay-authorisation,
+    // both through `gateway::award_draft`, so they are identical in shape. Refusing on multiplicity
+    // alone would refuse to repair exactly the jobs that got furthest through the lifecycle.
+    //
+    // Multiplicity is only AMBIGUOUS if the events disagree about what to write. So parse them all
+    // and compare the fields that land in the row: agreement means there is nothing to choose
+    // between, and disagreement is the only case where picking one would launder a guess into a
+    // money row.
+    let buyer_pubkey_hex = keys.public_key().to_hex();
+    let mut ordered: Vec<_> = events.iter().collect();
+    // Oldest first — the award precedes the accept, and the `awards` row wants the AWARD's id.
+    // The id is a tiebreak so the choice never depends on the order the relay happened to send.
+    ordered.sort_by_key(|event| (event.created_at, event.id.to_hex()));
+
+    let mut parsed = Vec::with_capacity(ordered.len());
+    for event in &ordered {
+        match parse_relayed_award(event, &buyer_pubkey_hex, job_id) {
+            Ok(award) => parsed.push(award),
+            // One unparseable event condemns the set: it may be the very one that disagrees, and
+            // we cannot know that without parsing it.
+            Err(detail) => {
+                return Ok(Some(AwardPresence::Unrepairable {
+                    award_event_id: event.id.to_hex(),
+                    detail,
+                }));
+            }
+        }
+    }
+
+    Ok(Some(reduce_parsed_awards(parsed)))
 }
+
+/// Reduce a job's parsed awards — **oldest first** — to a single presence.
+///
+/// Split out as a pure function because the agreement rule is the part worth testing and the fetch
+/// around it needs a live relay. Ordering is the caller's job: this takes the first element as the
+/// award (the accept is the later publish) and never re-sorts.
+fn reduce_parsed_awards(parsed: Vec<RelayedAward>) -> AwardPresence {
+    // Sound by construction: every caller checks the event set is non-empty before parsing it.
+    let earliest = parsed.first().expect("a non-empty award set").clone();
+    if let Some(other) = parsed.iter().find(|award| {
+        award.claim_id != earliest.claim_id || award.seller_pubkey != earliest.seller_pubkey
+    }) {
+        return AwardPresence::Unrepairable {
+            award_event_id: earliest.award_event_id,
+            detail: format!(
+                "{} awards for this job disagree on what to record (claim {} / seller {} against \
+                 claim {} / seller {}); refusing to pick one",
+                parsed.len(),
+                earliest.claim_id,
+                earliest.seller_pubkey,
+                other.claim_id,
+                other.seller_pubkey
+            ),
+        };
+    }
+    AwardPresence::Repairable(earliest)
+}
+
+/// Parse a single award event into a [`RelayedAward`], or `Err(reason)` when any field the ledger
+/// needs is missing, malformed, or ambiguous. Every failure is a refusal — this never substitutes a
+/// default, because each field it reads goes straight into a money row.
+fn parse_relayed_award(
+    event: &nostr_sdk::Event,
+    buyer_pubkey_hex: &str,
+    job_id: &str,
+) -> Result<RelayedAward, String> {
+    let draft = event_to_draft(event);
+    let parsed = gateway::parse_award(&draft)
+        .ok_or_else(|| "award has no root `e` (offer) and non-root `e` (claim) tag pair".to_owned())?;
+
+    // The award we fetched was filtered by offer id, but verify it anyway: the filter is the
+    // relay's word for what it sent, and this is the last point where a mismatched event could be
+    // written into the ledger under the wrong job.
+    if !parsed.offer_id.eq_ignore_ascii_case(job_id) {
+        return Err(format!(
+            "award roots on offer {} but was read for job {job_id}",
+            parsed.offer_id
+        ));
+    }
+
+    // An award carries TWO `p` tags — this buyer and the seller. The seller is identified by NOT
+    // being us, never by tag order: ordering is a property of how `award_draft` happens to build
+    // the event today, and reading it positionally would silently record the buyer as the seller
+    // if that order ever changed.
+    let mut others = draft
+        .tags
+        .iter()
+        .filter(|tag| tag.first() == Some("p"))
+        .filter_map(|tag| tag.value())
+        .filter(|pubkey| !pubkey.eq_ignore_ascii_case(buyer_pubkey_hex));
+    let seller_pubkey = others
+        .next()
+        .ok_or_else(|| "award has no `p` tag other than this buyer's own".to_owned())?
+        .to_owned();
+    if others.next().is_some() {
+        return Err("award names more than one non-buyer `p`; seller is ambiguous".to_owned());
+    }
+
+    Ok(RelayedAward {
+        award_event_id: event.id.to_hex(),
+        claim_id: parsed.claim_id,
+        seller_pubkey,
+    })
+}
+
+/// Read one job's offer + claims + results from the relay, with claim liveness derived
+/// against `now` (a `processing` claim past the offer deadline is EXPIRED, not live). Exposed
+/// `pub(crate)` so the seller daemon can run the backfill money-safety pre-claim check
+/// (already-delivered / live-claimed-by-another) without duplicating the relay read.
 
 pub(crate) async fn fetch_job_view_async(
     home: &MobeeHome,
@@ -4118,6 +4267,193 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Sign an award-kind event carrying exactly `tags`. Built tag-by-tag rather than through
+    /// [`gateway::award_draft`] so a test can express shapes that helper cannot produce — a
+    /// reversed `p` order, a missing tag, a second seller — which is the whole point of testing a
+    /// parser that has to survive events it did not write.
+    async fn award_event_with(
+        signer: &nostr_sdk::Keys,
+        tags: Vec<Vec<&str>>,
+    ) -> nostr_sdk::Event {
+        use nostr_sdk::prelude::{EventBuilder, Tag};
+        let mut builder = EventBuilder::new(nostr_sdk::Kind::Custom(JOB_AWARD_KIND), "accepted");
+        for tag in tags {
+            builder = builder.tag(Tag::parse(tag).expect("tag"));
+        }
+        builder.sign(signer).await.expect("sign award")
+    }
+
+    // ★ THE DISCRIMINATING TEST for the seller field. An award carries two `p` tags — this buyer
+    // and the seller — and `award_draft` happens to write buyer-then-seller. Reading position would
+    // pass against every event we generate and silently record the BUYER as the seller the day that
+    // order changes or another client writes the award.
+    //
+    // So both orders are asserted, and the reversed one is the leg that fails under positional
+    // logic. A money row naming the wrong seller is not a cosmetic error: it is who the delivery
+    // watcher pays.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_seller_is_the_p_tag_that_is_not_us_whatever_order_it_appears_in() {
+        let buyer = nostr_sdk::Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let seller_hex = nostr_sdk::Keys::generate().public_key().to_hex();
+        let offer = "a".repeat(64);
+        let claim = "c".repeat(64);
+
+        for (label, p_tags) in [
+            ("buyer first (as award_draft writes it)", vec![&buyer_hex, &seller_hex]),
+            ("seller first (positional logic fails here)", vec![&seller_hex, &buyer_hex]),
+        ] {
+            let event = award_event_with(
+                &buyer,
+                vec![
+                    vec!["e", &offer, "", "root"],
+                    vec!["e", &claim],
+                    vec!["p", p_tags[0]],
+                    vec!["p", p_tags[1]],
+                ],
+            )
+            .await;
+
+            let parsed = parse_relayed_award(&event, &buyer_hex, &offer)
+                .unwrap_or_else(|error| panic!("{label}: expected a parse, got: {error}"));
+            assert_eq!(parsed.seller_pubkey, seller_hex, "{label}: wrong seller");
+            assert_eq!(parsed.claim_id, claim, "{label}: wrong claim");
+            assert_eq!(parsed.award_event_id, event.id.to_hex(), "{label}: wrong award id");
+        }
+    }
+
+    // RED LEGS. Every one of these fields lands in a money row, so each missing or ambiguous
+    // property must REFUSE rather than resolve to something plausible. Table-driven because the
+    // interesting claim is that the set is complete, not that any single case works.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_award_missing_any_field_the_ledger_needs_refuses_to_parse() {
+        let buyer = nostr_sdk::Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let seller_hex = nostr_sdk::Keys::generate().public_key().to_hex();
+        let other_hex = nostr_sdk::Keys::generate().public_key().to_hex();
+        let offer = "a".repeat(64);
+        let elsewhere = "b".repeat(64);
+        let claim = "c".repeat(64);
+
+        let cases: Vec<(&str, Vec<Vec<&str>>, &str)> = vec![
+            (
+                "no claim `e` — nothing says WHICH claim won",
+                vec![vec!["e", &offer, "", "root"], vec!["p", &buyer_hex], vec!["p", &seller_hex]],
+                "claim",
+            ),
+            (
+                "no root `e` — nothing says which offer it roots on",
+                vec![vec!["e", &claim], vec!["p", &buyer_hex], vec!["p", &seller_hex]],
+                "claim",
+            ),
+            (
+                "roots on a DIFFERENT offer than the job we read it for",
+                vec![
+                    vec!["e", &elsewhere, "", "root"],
+                    vec!["e", &claim],
+                    vec!["p", &buyer_hex],
+                    vec!["p", &seller_hex],
+                ],
+                "roots on offer",
+            ),
+            (
+                "only our own `p` — no seller to pay",
+                vec![vec!["e", &offer, "", "root"], vec!["e", &claim], vec!["p", &buyer_hex]],
+                "other than this buyer",
+            ),
+            (
+                "two non-buyer `p`s — the seller is ambiguous, so picking one would invent it",
+                vec![
+                    vec!["e", &offer, "", "root"],
+                    vec!["e", &claim],
+                    vec!["p", &buyer_hex],
+                    vec!["p", &seller_hex],
+                    vec!["p", &other_hex],
+                ],
+                "more than one non-buyer",
+            ),
+        ];
+
+        for (label, tags, expected_fragment) in cases {
+            let event = award_event_with(&buyer, tags).await;
+            let error = parse_relayed_award(&event, &buyer_hex, &offer)
+                .expect_err(&format!("{label}: must refuse, not resolve"));
+            assert!(
+                error.contains(expected_fragment),
+                "{label}: refusal should say why (wanted {expected_fragment:?}), got: {error}"
+            );
+        }
+    }
+
+    // ⚠ TWO 3405s per job is ROUTINE, not a fault: `award_claim_async` publishes one at selection
+    // and `accept_claim_async` another at pay-authorisation, both via `gateway::award_draft`. So
+    // refusing on count alone would refuse to repair every job that reached pay-authorisation —
+    // the ones furthest along. Multiplicity is ambiguous only when the events DISAGREE.
+    #[test]
+    fn agreeing_awards_are_not_ambiguous_and_repair_from_the_earliest() {
+        let award = |id: &str, claim: &str, seller: &str| RelayedAward {
+            award_event_id: id.to_owned(),
+            claim_id: claim.to_owned(),
+            seller_pubkey: seller.to_owned(),
+        };
+        let seller = "5".repeat(64);
+        let claim = "c".repeat(64);
+
+        // A single award repairs, obviously.
+        let one = reduce_parsed_awards(vec![award("aaa", &claim, &seller)]);
+        assert!(matches!(&one, AwardPresence::Repairable(a) if a.award_event_id == "aaa"));
+
+        // The real shape: an award and its later accept, same claim and seller. Nothing to choose
+        // between, so it repairs — and it repairs from the EARLIEST, which is the award. Caller
+        // passes them oldest-first; the accept must not win just by being last.
+        let two = reduce_parsed_awards(vec![
+            award("the-award", &claim, &seller),
+            award("the-accept", &claim, &seller),
+        ]);
+        match two {
+            AwardPresence::Repairable(a) => assert_eq!(
+                a.award_event_id, "the-award",
+                "the awards row wants the AWARD's id, not the later accept's"
+            ),
+            other => panic!("agreeing awards must repair, got: {other:?}"),
+        }
+    }
+
+    // RED LEG for the agreement rule. Two 3405s that disagree about what to write are genuinely
+    // ambiguous, and picking one would launder a guess into a money row. Both fields are checked
+    // because either alone would pass a set that disagrees only on the other.
+    #[test]
+    fn disagreeing_awards_refuse_rather_than_pick_one() {
+        let award = |id: &str, claim: &str, seller: &str| RelayedAward {
+            award_event_id: id.to_owned(),
+            claim_id: claim.to_owned(),
+            seller_pubkey: seller.to_owned(),
+        };
+        let seller = "5".repeat(64);
+        let other_seller = "6".repeat(64);
+        let claim = "c".repeat(64);
+        let other_claim = "d".repeat(64);
+
+        for (label, set) in [
+            (
+                "same seller, different claim",
+                vec![award("a", &claim, &seller), award("b", &other_claim, &seller)],
+            ),
+            (
+                "same claim, different seller — who gets paid",
+                vec![award("a", &claim, &seller), award("b", &claim, &other_seller)],
+            ),
+        ] {
+            match reduce_parsed_awards(set) {
+                AwardPresence::Unrepairable { detail, .. } => assert!(
+                    detail.contains("disagree"),
+                    "{label}: refusal should say they disagree, got: {detail}"
+                ),
+                other => panic!("{label}: must refuse, got: {other:?}"),
+            }
+        }
+    }
+
     // §1 RED-PROVE — the positive control `has_award_async` has never had.
     //
     // The probe is the sole input to "Invariant A: never award twice", and every observation of it
@@ -4166,8 +4502,8 @@ mod tests {
             .expect("control fetch by id");
         eprintln!("CONTROL fetch-award-by-id -> {} event(s)", control.len());
 
-        let probe = award_event_id_async(&home, &keys, &job_id, Duration::from_secs(10)).await;
-        eprintln!("PROBE award_event_id_async -> {probe:?}");
+        let probe = award_presence_async(&home, &keys, &job_id, Duration::from_secs(10)).await;
+        eprintln!("PROBE award_presence_async -> {probe:?}");
 
         assert!(
             !control.is_empty(),
@@ -4177,15 +4513,24 @@ mod tests {
         let found = probe
             .expect("probe should not error once the control passes")
             .expect(
-                "award_event_id_async returned None for a job with a KNOWN award while the control \
+                "award_presence_async returned None for a job with a KNOWN award while the control \
                  passed — the guard cannot detect the thing it exists to detect",
             );
         // Identity, not just presence: a probe that returns SOME award for the job would satisfy a
         // bare `is_some()` while pointing at the wrong event, and the refusal message quotes this id
         // to an operator.
         assert_eq!(
-            found, award_id,
+            found.award_event_id(),
+            award_id,
             "the probe found an award for this job but not the KNOWN one"
+        );
+        // And the parse must survive a REAL event, not just the synthetic ones the unit tests build.
+        // An award this buyer itself published is the easiest case there is; if it cannot be parsed
+        // into a complete record, repair is dead on arrival in the field however green the unit
+        // tests are.
+        assert!(
+            matches!(found, AwardPresence::Repairable(_)),
+            "a real award published by this buyer must parse into a complete record, got: {found:?}"
         );
     }
 }

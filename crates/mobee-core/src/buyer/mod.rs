@@ -581,7 +581,7 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
         spent,
         now_unix(),
         move || async move {
-            job_lifecycle::award_event_id_async(&probe_home, &probe_keys, &probe_job, RELAY_TIMEOUT)
+            job_lifecycle::award_presence_async(&probe_home, &probe_keys, &probe_job, RELAY_TIMEOUT)
                 .await
         },
         move || async move {
@@ -797,7 +797,7 @@ async fn drive_auto_award(
     // local `awards` row and REFUSED rather than republished. This check is an optimisation; the
     // chokepoint is the guard.
     let award_on_relay =
-        job_lifecycle::award_event_id_async(&context.home, &keys, job_id, RELAY_TIMEOUT)
+        job_lifecycle::award_presence_async(&context.home, &keys, job_id, RELAY_TIMEOUT)
             .await
             .ok()
             .flatten()
@@ -918,7 +918,7 @@ async fn finalize_auto_award(
         spent,
         now_unix(),
         move || async move {
-            job_lifecycle::award_event_id_async(&probe_home, &probe_keys, &probe_job, RELAY_TIMEOUT)
+            job_lifecycle::award_presence_async(&probe_home, &probe_keys, &probe_job, RELAY_TIMEOUT)
                 .await
         },
         move || async move {
