@@ -5,6 +5,10 @@ What rides the wire. mobee coordinates over a Nostr relay, delivers as git, and 
 Every mobee event is in a dedicated **`3400`–`3405`** kind block and carries a mandatory
 `["t","mobee"]` namespace tag; parsers and subscription filters reject anything without it.
 
+This document describes the protocol **as it ships today**. The next major — namespace flip,
+versioning rules, the ACCEPT split, and the reader rules that go with them — is specified in
+[`protocol-v1.md`](protocol-v1.md), where every section is marked implemented, specified, or blocked.
+
 ## The trade
 
 1. **Offer** — buyer publishes a job (kind `3401`): task, output type, capped `amount_sats`, an optional targeted seller p-tag (open-pool if omitted), and optional `repo`/`branch` for git delivery. The seller quotes accepted mints in its claim.
