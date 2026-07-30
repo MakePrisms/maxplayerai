@@ -848,10 +848,9 @@ fn should_publish_under_rate_feedback(
 /// snapshot is deterministic (stored award-date) and `deliver_and_enqueue` dedups, so a re-created
 /// delivery lands exactly once.
 fn should_resume_execution(state: super::store::JobState) -> bool {
-    matches!(
-        state,
-        super::store::JobState::Awarded | super::store::JobState::Executing
-    )
+    // Same predicate the wire's `queue_depth` counts with, so "occupies a slot" has one definition
+    // rather than one here and another in the heartbeat path.
+    state.occupies_execution_slot()
 }
 
 /// The journaled offer facts for a parsed offer — the ONE place a wire offer becomes a stored row.
@@ -1939,12 +1938,25 @@ impl SellerNodeRunner {
         let Some(seller) = self.node.home().config.seller.clone() else {
             return;
         };
-        let job_in_flight = self.node.store().health().map(|h| h.jobs > 0).unwrap_or(false);
+        // A LIVE count of jobs occupying execution capacity — never `health().jobs`, which counts
+        // every row ever written and so never returns to zero (#313).
+        let in_flight = match self.node.store().jobs_in_flight() {
+            Ok(count) => count,
+            Err(error) => {
+                // Fail toward AVAILABLE, as this path always has, but say so: a silent read failure
+                // that parked the seat would be the same invisible-refusal shape as #313 itself.
+                eprintln!(
+                    "seller node heartbeat: in-flight count unavailable ({error}); \
+                     advertising as free this tick"
+                );
+                0
+            }
+        };
         // ONE roster read for both wire signals: a seat that has dropped every harness advertises
         // `accepting=n`, so it stops attracting work instead of looking open and declining later.
         let roster = self.agents.advertisement();
         let draft = crate::heartbeat::heartbeat_for_state(
-            job_in_flight,
+            in_flight,
             roster.serving,
             seller.rate_sats,
             roster.names,
