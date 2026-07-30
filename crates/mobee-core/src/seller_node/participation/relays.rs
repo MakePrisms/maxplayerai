@@ -35,8 +35,24 @@ pub enum AccessState {
     Authed,
     /// We published an event here and read it back. The only state that licenses real work.
     Admitted,
-    /// The relay refused us, or the probe proved we cannot confirm admission. Terminal until new
-    /// signal arrives: nothing is sent to a denied relay, and no timer resurrects it.
+    /// A probe went out and nothing came back, and we do not know why — the wire ate it, the relay
+    /// was slow through the handshake, the socket died mid-flight. Not usable, because admission is
+    /// unproven and no frames may follow; but NOT a refusal, because the relay never said no. It
+    /// earns another probe once `retry_after_unix` has passed, up to [`MAX_PROBE_ATTEMPTS`].
+    ///
+    /// ★ This state exists because silence and refusal are different facts about a relay. They
+    /// shared [`AccessState::Denied`] for its no-frames property, and TERMINALITY came along
+    /// uninvited: the only exit from `Denied` fires on inbound traffic from that relay, but a probe
+    /// that timed out has already had its reader disconnected — so recovery depended on the very
+    /// transport that failed, and a briefly-slow relay was lost until process restart.
+    Quarantined {
+        reason: String,
+        retry_after_unix: i64,
+    },
+    /// The relay REFUSED us — auth rejected, admission denied, connection unusable — or a
+    /// quarantined relay exhausted [`MAX_PROBE_ATTEMPTS`] without ever proving admission. Terminal
+    /// until new signal arrives: nothing is sent to a denied relay, and no timer resurrects it,
+    /// because polling a relay that told us no is the one thing the charter forbids.
     Denied { reason: String },
 }
 
@@ -44,7 +60,11 @@ impl AccessState {
     /// Whether the node may send frames — REQ, publish, anything — to this relay.
     ///
     /// Deliberately strict. `Unprobed` is not usable (the probe itself is the exception, and it
-    /// goes through [`RelayRoster::relays_to_probe`]); `Denied` is not usable at all.
+    /// goes through [`RelayRoster::relays_to_probe`]); `Quarantined` and `Denied` are not usable at
+    /// all.
+    ///
+    /// ★ UNCHANGED by the quarantine split, and that is the point: admission stays the ONE thing
+    /// that licenses a frame, so adding a retryable state cannot widen what may be addressed.
     pub fn is_usable(&self) -> bool {
         matches!(self, AccessState::Admitted)
     }
@@ -57,6 +77,7 @@ impl AccessState {
             AccessState::Open => "open",
             AccessState::Authed => "authed",
             AccessState::Admitted => "admitted",
+            AccessState::Quarantined { .. } => "quarantined",
             AccessState::Denied { .. } => "denied",
         }
     }
@@ -103,6 +124,24 @@ pub struct RelayEntry {
 /// indefinitely: each attempt looks recoverable in isolation. Three is enough to ride out a
 /// transient, and small enough that the cost is bounded.
 pub const MAX_PROBE_ATTEMPTS: u32 = 3;
+
+/// The first quarantine wait, doubled per failed probe: 30s, then 60s, across
+/// [`MAX_PROBE_ATTEMPTS`].
+///
+/// Long enough that a relay still failing for the same reason — a slow NIP-42 handshake, a transient
+/// network fault — is not re-probed while it is still in that state; short enough that a seller does
+/// not sit deaf for minutes on a relay that has already come back.
+pub const QUARANTINE_BACKOFF_BASE_SECS: i64 = 30;
+
+/// The wait owed after `attempts` failed probes: `BASE * 2^(attempts-1)`.
+///
+/// `attempts` is the count AFTER the failed probe has been tallied, so the first quarantine waits
+/// exactly `BASE`. The shift is capped because a shift wider than the type is undefined and panics
+/// in debug; capping is harmless here because [`MAX_PROBE_ATTEMPTS`] ends the sequence far below it.
+fn quarantine_backoff_secs(attempts: u32) -> i64 {
+    let doublings = attempts.saturating_sub(1).min(16);
+    QUARANTINE_BACKOFF_BASE_SECS.saturating_mul(1i64 << doublings)
+}
 
 /// The relays this node participates on and the access proven on each.
 #[derive(Debug, Clone, Default)]
@@ -157,15 +196,29 @@ impl RelayRoster {
             .filter(|entry| entry.state.is_usable())
     }
 
-    /// The relays a probe is owed on: unprobed, and not yet out of attempts.
+    /// The relays a probe is owed on: unprobed, or quarantined with its backoff elapsed, and in
+    /// either case not yet out of attempts.
     ///
     /// ★ This is the ONLY route by which a frame reaches a relay that is not `Admitted`, and it
     /// cannot return a denied one. That is what makes "zero frames to a denied relay" a property
     /// of the type rather than a discipline.
-    pub fn relays_to_probe(&self) -> impl Iterator<Item = &RelayEntry> {
-        self.entries.values().filter(|entry| {
-            matches!(entry.state, AccessState::Unprobed)
-                && entry.probe_attempts < MAX_PROBE_ATTEMPTS
+    ///
+    /// Takes `now_unix` because a quarantined relay is owed a probe only once it is due — without a
+    /// clock this could not tell "resting" from "ready" and would have to re-probe immediately,
+    /// which is the busy-poll the backoff exists to prevent.
+    pub fn relays_to_probe(&self, now_unix: i64) -> impl Iterator<Item = &RelayEntry> {
+        self.entries.values().filter(move |entry| {
+            entry.probe_attempts < MAX_PROBE_ATTEMPTS
+                && match &entry.state {
+                    AccessState::Unprobed => true,
+                    AccessState::Quarantined {
+                        retry_after_unix, ..
+                    } => *retry_after_unix <= now_unix,
+                    AccessState::Open
+                    | AccessState::Authed
+                    | AccessState::Admitted
+                    | AccessState::Denied { .. } => false,
+                }
         })
     }
 
@@ -179,14 +232,32 @@ impl RelayRoster {
         };
         entry.last_probe_unix = Some(now_unix);
         entry.probe_attempts = entry.probe_attempts.saturating_add(1);
+        let attempts = entry.probe_attempts;
         entry.state = match outcome {
             ProbeOutcome::EchoObserved => AccessState::Admitted,
             ProbeOutcome::Authenticated => AccessState::Authed,
             ProbeOutcome::OpenRead => AccessState::Open,
+            // The relay said no. Terminal, and the charter forbids polling it.
             ProbeOutcome::Refused(reason) => AccessState::Denied { reason },
-            ProbeOutcome::EchoMissing => AccessState::Denied {
-                reason: "published but never read the event back — admission unproven".into(),
-            },
+            // The relay said NOTHING, which is a different fact: a bounded retry first, and denial
+            // only once the attempts are spent. Both arms are unusable, so no frame follows either.
+            ProbeOutcome::EchoMissing => {
+                if attempts >= MAX_PROBE_ATTEMPTS {
+                    AccessState::Denied {
+                        reason: format!(
+                            "admission unproven after {MAX_PROBE_ATTEMPTS} probes — no echo ever \
+                             came back"
+                        ),
+                    }
+                } else {
+                    AccessState::Quarantined {
+                        reason: "published but never read the event back — admission unproven"
+                            .into(),
+                        retry_after_unix: now_unix
+                            .saturating_add(quarantine_backoff_secs(attempts)),
+                    }
+                }
+            }
         };
     }
 
@@ -200,7 +271,14 @@ impl RelayRoster {
         let Some(entry) = self.entries.get_mut(url) else {
             return;
         };
-        if matches!(entry.state, AccessState::Denied { .. }) {
+        // Quarantine is included, and it short-circuits the backoff on purpose: the wait exists
+        // because we had no evidence about the transport, and inbound traffic IS that evidence. A
+        // fresh attempt budget follows for the same reason it does after denial — the relay has
+        // demonstrably just spoken to us.
+        if matches!(
+            entry.state,
+            AccessState::Denied { .. } | AccessState::Quarantined { .. }
+        ) {
             entry.state = AccessState::Unprobed;
             entry.probe_attempts = 0;
         }
@@ -252,14 +330,22 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_echo_denies_rather_than_reading_as_an_empty_relay() {
+    fn a_missing_echo_quarantines_rather_than_reading_as_an_empty_relay() {
         let mut roster = roster();
         roster.record_probe("wss://a.example", ProbeOutcome::EchoMissing, 100);
+        // ★ RENAMED, NOT REPURPOSED. The property this test has always protected is intact: a
+        // missing echo must NEVER read as "the relay is fine, it just had nothing for us". Only the
+        // state it lands in changed — silence now earns a bounded retry instead of the refusal
+        // verdict it was borrowing.
         assert!(matches!(
             roster.get("wss://a.example").unwrap().state,
-            AccessState::Denied { .. }
+            AccessState::Quarantined { .. }
         ));
-        assert_eq!(roster.usable().count(), 0);
+        assert_eq!(
+            roster.usable().count(),
+            0,
+            "unproven admission may never be addressed, quarantined or not"
+        );
     }
 
     #[test]
@@ -276,14 +362,19 @@ mod tests {
         assert!(!roster.usable().any(|entry| entry.url == "wss://a.example"));
         assert!(
             !roster
-                .relays_to_probe()
+                .relays_to_probe(100)
                 .any(|entry| entry.url == "wss://a.example")
         );
 
-        // And no amount of elapsed time changes that — there is no backoff to expire.
+        // And no amount of elapsed time changes that — a refusal has no backoff to expire.
+        //
+        // ★ This assertion USED TO BE A DUPLICATE OF THE ONE ABOVE. The comment claimed a
+        // time-invariance property, but `relays_to_probe` took no clock, so the test had no way to
+        // vary the only input the claim was about. It now passes the furthest clock there is, which
+        // is what the comment always meant.
         assert!(
             !roster
-                .relays_to_probe()
+                .relays_to_probe(i64::MAX)
                 .any(|entry| entry.url == "wss://a.example")
         );
     }
@@ -292,12 +383,12 @@ mod tests {
     fn new_signal_is_the_only_thing_that_reopens_a_denied_relay() {
         let mut roster = roster();
         roster.record_probe("wss://a.example", ProbeOutcome::Refused("nope".into()), 100);
-        assert_eq!(roster.relays_to_probe().count(), 1); // only b
+        assert_eq!(roster.relays_to_probe(100).count(), 1); // only b
 
         roster.note_new_signal("wss://a.example");
 
         let probeable: Vec<_> = roster
-            .relays_to_probe()
+            .relays_to_probe(100)
             .map(|entry| entry.url.as_str())
             .collect();
         assert_eq!(probeable, ["wss://a.example", "wss://b.example"]);
@@ -321,7 +412,7 @@ mod tests {
         let mut roster = RelayRoster::new(["wss://a.example".to_string()]);
         for attempt in 0..MAX_PROBE_ATTEMPTS {
             assert_eq!(
-                roster.relays_to_probe().count(),
+                roster.relays_to_probe(100).count(),
                 1,
                 "attempt {attempt} should still be owed"
             );
@@ -329,7 +420,115 @@ mod tests {
             roster.record_probe("wss://a.example", ProbeOutcome::OpenRead, 100);
             roster.entries.get_mut("wss://a.example").unwrap().state = AccessState::Unprobed;
         }
-        assert_eq!(roster.relays_to_probe().count(), 0);
+        assert_eq!(roster.relays_to_probe(100).count(), 0);
+    }
+
+    #[test]
+    fn a_refusal_still_denies_immediately_and_is_never_quarantined() {
+        let mut roster = roster();
+        let url = "wss://a.example";
+        roster.record_probe(url, ProbeOutcome::Refused("auth rejected".into()), 100);
+        assert!(
+            matches!(roster.get(url).unwrap().state, AccessState::Denied { .. }),
+            "a relay that SAID NO is denied on its first word — the charter forbids polling it, and \
+             the quarantine split must not have leaked into this path"
+        );
+        assert!(
+            !roster.relays_to_probe(i64::MAX).any(|e| e.url == url),
+            "no clock, however far forward, reopens a refusal"
+        );
+    }
+
+    #[test]
+    fn a_quarantined_relay_is_probed_again_only_once_its_backoff_has_passed() {
+        let mut roster = roster();
+        let url = "wss://a.example";
+        roster.record_probe(url, ProbeOutcome::EchoMissing, 1_000);
+        let due = match &roster.get(url).unwrap().state {
+            AccessState::Quarantined {
+                retry_after_unix, ..
+            } => *retry_after_unix,
+            other => panic!("expected a quarantine, got {other:?}"),
+        };
+        assert_eq!(
+            due,
+            1_000 + QUARANTINE_BACKOFF_BASE_SECS,
+            "the first quarantine waits exactly the base interval"
+        );
+        // A DISCRIMINATING PAIR, not one assertion: one tick before due proves it is resting, and
+        // due itself proves it wakes. Either alone would pass for a roster that never probes at all.
+        assert!(
+            !roster.relays_to_probe(due - 1).any(|e| e.url == url),
+            "still resting — a backoff that does not hold is a busy-poll"
+        );
+        assert!(
+            roster.relays_to_probe(due).any(|e| e.url == url),
+            "due, so owed a probe"
+        );
+
+        // ★ THE FLOOR. Without this the state machine could quarantine correctly and still have no
+        // way home, which is the half-fix the ceiling alone would hide.
+        roster.record_probe(url, ProbeOutcome::EchoObserved, due);
+        assert!(matches!(
+            roster.get(url).unwrap().state,
+            AccessState::Admitted
+        ));
+        assert_eq!(
+            roster.usable().count(),
+            1,
+            "a relay that came back is usable again"
+        );
+    }
+
+    #[test]
+    fn quarantine_ends_in_denial_once_the_attempts_are_spent() {
+        let mut roster = roster();
+        let url = "wss://a.example";
+        for attempt in 1..MAX_PROBE_ATTEMPTS {
+            roster.record_probe(url, ProbeOutcome::EchoMissing, 1_000);
+            assert!(
+                matches!(
+                    roster.get(url).unwrap().state,
+                    AccessState::Quarantined { .. }
+                ),
+                "attempt {attempt} of {MAX_PROBE_ATTEMPTS} must still be retryable"
+            );
+        }
+        roster.record_probe(url, ProbeOutcome::EchoMissing, 1_000);
+        assert!(
+            matches!(roster.get(url).unwrap().state, AccessState::Denied { .. }),
+            "★ THE CEILING: a relay that never echoes cannot be probed forever"
+        );
+        assert!(
+            !roster.relays_to_probe(i64::MAX).any(|e| e.url == url),
+            "and it is the spent ATTEMPTS that end it, not a clock that has not arrived yet"
+        );
+    }
+
+    #[test]
+    fn the_quarantine_backoff_doubles_per_failed_probe() {
+        assert_eq!(quarantine_backoff_secs(1), QUARANTINE_BACKOFF_BASE_SECS);
+        assert_eq!(quarantine_backoff_secs(2), QUARANTINE_BACKOFF_BASE_SECS * 2);
+        assert_eq!(quarantine_backoff_secs(3), QUARANTINE_BACKOFF_BASE_SECS * 4);
+        // An absurd count must neither shift past the type nor come back as a wait in the past,
+        // which would busy-probe the relay the backoff exists to rest.
+        assert!(quarantine_backoff_secs(u32::MAX) > 0);
+    }
+
+    #[test]
+    fn new_signal_short_circuits_a_quarantine_backoff() {
+        let mut roster = roster();
+        let url = "wss://a.example";
+        roster.record_probe(url, ProbeOutcome::EchoMissing, 1_000);
+        assert!(
+            !roster.relays_to_probe(1_000).any(|e| e.url == url),
+            "resting, before any signal arrives"
+        );
+        roster.note_new_signal(url);
+        assert!(
+            roster.relays_to_probe(1_000).any(|e| e.url == url),
+            "inbound traffic IS the transport evidence the backoff was waiting for, so the wait ends"
+        );
     }
 
     #[test]

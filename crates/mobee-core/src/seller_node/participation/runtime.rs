@@ -202,7 +202,7 @@ impl Participation {
         let timeout = Duration::from_secs(config.probe_timeout_secs.max(1));
 
         let candidates: Vec<String> = roster
-            .relays_to_probe()
+            .relays_to_probe(now_unix())
             .map(|entry| entry.url.clone())
             .collect();
 

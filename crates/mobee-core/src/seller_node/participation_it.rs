@@ -383,7 +383,7 @@ async fn leg3_a_message_sent_while_down_is_ingested_exactly_once() {
 // ── Leg 4: a denied relay gets ZERO frames afterwards ────────────────────────────────────────────
 
 #[tokio::test]
-async fn leg4_a_denied_relay_receives_no_wake_surface_and_is_never_polled() {
+async fn leg4_an_unproven_relay_receives_no_wake_surface_and_is_not_polled_before_its_backoff() {
     // This fixture answers every REQ with EOSE and never serves an event: a healthy, authenticated
     // connection with no read admission. Silence here is not a bug being simulated — it is the
     // production behaviour that makes read-silence unclassifiable.
@@ -407,13 +407,17 @@ async fn leg4_a_denied_relay_receives_no_wake_surface_and_is_never_polled() {
     .expect("start participation");
 
     // Classified, not merely unused — the distinction the roster exists to make.
+    //
+    // ★ This fixture drives SILENCE (the relay accepts and never echoes), not refusal, so the
+    // classification is `Quarantined`: unproven, unusable, and owed one more probe after a backoff.
+    // The relay never said no, and only a relay that says no is written off permanently.
     match participation.access_states().as_slice() {
-        [(seen, AccessState::Denied { .. })] => assert_eq!(seen, &url),
-        other => panic!("a relay that never echoed must be classified denied, got {other:?}"),
+        [(seen, AccessState::Quarantined { .. })] => assert_eq!(seen, &url),
+        other => panic!("a relay that never echoed must be classified quarantined, got {other:?}"),
     }
     assert!(
         !participation.is_live(),
-        "a denied relay must not become a live participation surface"
+        "an unproven relay must not become a live participation surface, quarantined or denied"
     );
 
     let wake_reqs = |records: Vec<super::p_gate_relay_fixture::ReqRecord>| {
@@ -428,10 +432,18 @@ async fn leg4_a_denied_relay_receives_no_wake_surface_and_is_never_polled() {
     assert_eq!(
         wake_reqs(relay.reqs().await),
         0,
-        "the wake surface must never be opened on a denied relay"
+        "the wake surface must never be opened on an unproven relay"
     );
 
     // And nothing repeats: no timer, no heartbeat, no retry. Snapshot, pump, wait, re-count.
+    //
+    // ⚠ READ THE SCOPE OF THIS ASSERTION. It used to mean "an unproven relay is NEVER retried". It
+    // now means "it is not retried BEFORE ITS BACKOFF", because the pump window below is far shorter
+    // than QUARANTINE_BACKOFF_BASE_SECS. It still passes, and it passes for a different reason than
+    // it used to — so it is no longer evidence that a refusal is left alone forever. That property
+    // moved to the roster unit tests (`a_refusal_still_denies_immediately_and_is_never_quarantined`
+    // and `a_denied_relay_is_never_probed_or_addressed_again_on_its_own`), which assert it against
+    // `i64::MAX` rather than against a short sleep.
     //
     // The count to compare against is the one taken right after classification, not zero: the
     // publisher's socket and the probe's own read REQ are both legitimate, and both happened before
