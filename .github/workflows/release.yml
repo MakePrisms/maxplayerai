@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 # Never cancel a release in flight. A publish interrupted between the payload packages and the
-# launcher leaves the registry in a state where `mobee` resolves a binary that was never published.
+# launcher leaves the registry in a state where `maxplayer` resolves a binary that was never published.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -140,12 +140,12 @@ jobs:
       - name: Verify the version matches the release
         run: |
           ./scripts/verify-release-version.sh '${{ needs.plan.outputs.version }}' \
-            "target/${{ matrix.target }}/release/mobee"
+            "target/${{ matrix.target }}/release/maxplayer"
 
       # Which features were compiled in — wallet present, acp absent. `version` succeeds in every
       # build, so nothing else here can tell one feature combination from another.
-      - name: Verify the buyer surface
-        run: ./scripts/verify-buyer-surface.sh "target/${{ matrix.target }}/release/mobee"
+      - name: Verify the racer surface
+        run: ./scripts/verify-racer-surface.sh "target/${{ matrix.target }}/release/maxplayer"
 
       # The decisive portability check for linux: run the artifact inside alpine and debian with no
       # nix and no toolchain present. This is what makes the choice of musl toolchain above safe to
@@ -153,7 +153,7 @@ jobs:
       # a build recipe.
       - name: Verify portability (linux)
         if: matrix.kind == 'linux-musl'
-        run: ./scripts/verify-static-artifact.sh "target/${{ matrix.target }}/release/mobee"
+        run: ./scripts/verify-static-artifact.sh "target/${{ matrix.target }}/release/maxplayer"
 
       # macOS cannot link libSystem statically, so a static check does not apply. What does apply is
       # that the binary must not have picked up a Homebrew or /usr/local dylib: those live outside
@@ -162,7 +162,7 @@ jobs:
         if: matrix.kind == 'darwin'
         run: |
           set -euo pipefail
-          BIN="target/${{ matrix.target }}/release/mobee"
+          BIN="target/${{ matrix.target }}/release/maxplayer"
           otool -L "$BIN"
           if otool -L "$BIN" | grep -Eq '/opt/homebrew|/usr/local'; then
             echo "the artifact links a dylib outside the base OS, so it will not start on a clean mac" >&2
@@ -173,7 +173,7 @@ jobs:
       - name: Package the asset
         run: |
           ./scripts/package-release-asset.sh \
-            "target/${{ matrix.target }}/release/mobee" \
+            "target/${{ matrix.target }}/release/maxplayer" \
             '${{ matrix.platform }}' '${{ needs.plan.outputs.version }}' dist
 
       # Determinism is the property those fixed uid/gid/mtime flags exist to provide, so it is proved
@@ -187,9 +187,9 @@ jobs:
       - name: Verify the archive is deterministic
         run: |
           ./scripts/package-release-asset.sh \
-            "target/${{ matrix.target }}/release/mobee" \
+            "target/${{ matrix.target }}/release/maxplayer" \
             '${{ matrix.platform }}' '${{ needs.plan.outputs.version }}' dist-recheck
-          ASSET="mobee-${{ needs.plan.outputs.version }}-${{ matrix.platform }}.tar.gz"
+          ASSET="maxplayer-${{ needs.plan.outputs.version }}-${{ matrix.platform }}.tar.gz"
           cmp "dist/$ASSET" "dist-recheck/$ASSET" || {
             echo "the archive is not a function of its contents: two runs over identical inputs differ" >&2
             # Say WHERE, because this check runs on platforms nobody here can reproduce, and "they
@@ -204,7 +204,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: asset-${{ matrix.platform }}
+          name: asset-racer-${{ matrix.platform }}
           path: dist/*.tar.gz
           if-no-files-found: error
 
@@ -246,7 +246,7 @@ jobs:
           PRERELEASE: ${{ needs.plan.outputs.prerelease }}
         run: |
           set -euo pipefail
-          flags=(--title "mobee $VERSION" --generate-notes)
+          flags=(--title "maxplayer $VERSION" --generate-notes)
           if [ "$PRERELEASE" = true ]; then
             flags+=(--prerelease)
           fi
@@ -313,7 +313,7 @@ jobs:
             esac
           done
 
-          # A pre-release goes out under the `rc` dist-tag so `npm i mobee` keeps resolving the last
+          # A pre-release goes out under the `rc` dist-tag so `npm i maxplayer` keeps resolving the last
           # stable version. The array always holds at least `--access public`, which is what the
           # scoped payload packages need on their first publish.
           publish_args=(--access public)
@@ -322,14 +322,18 @@ jobs:
           fi
 
           # Payload packages first. The launcher resolves them by exact version, so publishing it
-          # ahead of them leaves a window where `npm i mobee` installs a launcher with no binary.
+          # ahead of them leaves a window where `npm i maxplayer` installs a launcher with no binary.
           for platform in $RELEASE_PLATFORMS; do
-            asset="dist/mobee-$VERSION-$platform.tar.gz"
+            # ★ This filename is CONSTRUCTED and must never become a glob. The release attaches every
+            # artifact the matrix builds, and only the racer belongs in an npm payload — a glob here
+            # would publish whichever archive happened to sort first, which is how a seller binary
+            # ends up on the registry under the racer's package name.
+            asset="dist/maxplayer-$VERSION-$platform.tar.gz"
             [ -f "$asset" ] || { echo "no built asset for $platform at $asset" >&2; exit 1; }
 
             mkdir -p "npm/cli-$platform/bin"
-            tar -xzf "$asset" -O "mobee-$VERSION-$platform/mobee" > "npm/cli-$platform/bin/mobee"
-            chmod 755 "npm/cli-$platform/bin/mobee"
+            tar -xzf "$asset" -O "maxplayer-$VERSION-$platform/maxplayer" > "npm/cli-$platform/bin/maxplayer"
+            chmod 755 "npm/cli-$platform/bin/maxplayer"
             cp LICENSE-MIT LICENSE-APACHE "npm/cli-$platform/"
 
             ( cd "npm/cli-$platform" && npm publish "${publish_args[@]}" )

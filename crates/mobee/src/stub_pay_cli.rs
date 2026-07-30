@@ -1,4 +1,4 @@
-//! `mobee stub-pay` — exercise the config-bound budget gate over a mock authorization (allow/deny)
+//! `maxplayer stub-pay` — exercise the config-bound budget gate over a mock authorization (allow/deny)
 //! without touching the real pay path. Caps bind from `~/.mobee` config only; the amount is
 //! authorized against them and the durable spent counter advances on allow.
 
@@ -12,7 +12,7 @@ const SUCCESS: i32 = 0;
 const USAGE_ERROR: i32 = 1;
 const RUNTIME_ERROR: i32 = 2;
 
-/// Entry from `cli::run` for `mobee stub-pay <amount> [--home <path>]`.
+/// Entry from `cli::run` for `maxplayer stub-pay <amount> [--home <path>]`.
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let mut amount: Option<u64> = None;
     let mut root: Option<PathBuf> = None;
@@ -84,7 +84,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 fn usage(err: &mut dyn Write) -> i32 {
     let _ = writeln!(
         err,
-        "Usage:\n  mobee stub-pay <amount_sats> [--home <path>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error"
+        "Usage:\n  maxplayer stub-pay <amount_sats> [--home <path>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error"
     );
     USAGE_ERROR
 }

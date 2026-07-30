@@ -1,4 +1,4 @@
-//! `mobee doctor` — seller environment self-check.
+//! `maxplayer doctor` — seller environment self-check.
 //!
 //! Runs a registry of independent checks, each printing `PASS`/`WARN`/`FAIL` plus a one-line fix
 //! hint, and exits `0` when nothing FAILed, `1` when any check FAILed (a WARN never fails the exit).
@@ -129,7 +129,7 @@ mod checks {
     }
 
     // Blocking (issue #107): a seller can neither sign offers nor NIP-98-authenticate delivery
-    // pushes without its key, so `mobee sell` refuses to boot when this FAILs. `present` is
+    // pushes without its key, so `maxplayer sell` refuses to boot when this FAILs. `present` is
     // `home::key_file_present` (the ~/.mobee/key file). The key material itself is never read here
     // and never appears in any Check detail.
     pub(super) fn check_seller_key(present: bool) -> Check {
@@ -232,7 +232,7 @@ mod checks {
             return Check::warn(
                 AGENT_CHECK,
                 "no [seller] section configured",
-                "run `mobee sell --agent <claude|cursor|codex> --rate-sats <n>` once to configure",
+                "run `maxplayer sell --agent <claude|cursor|codex> --rate-sats <n>` once to configure",
             );
         };
         let available = agent_presets::detect_available_agents(&custom);
@@ -313,14 +313,14 @@ mod checks {
     }
 }
 
-/// Entry from `cli::run` for `mobee doctor`.
+/// Entry from `cli::run` for `maxplayer doctor`.
 pub fn run(_args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     #[cfg(not(feature = "wallet"))]
     {
         let _ = out;
         let _ = writeln!(
             err,
-            "mobee doctor requires the wallet feature (rebuild with default features)"
+            "maxplayer doctor requires the wallet feature (rebuild with default features)"
         );
         return FAILURE;
     }
@@ -331,8 +331,8 @@ pub fn run(_args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     }
 }
 
-/// Build the full check registry from a bootstrapped home. Shared by `mobee doctor` and the
-/// `mobee sell` boot-readiness gate (issue #107) so the two never drift and no check logic is
+/// Build the full check registry from a bootstrapped home. Shared by `maxplayer doctor` and the
+/// `maxplayer sell` boot-readiness gate (issue #107) so the two never drift and no check logic is
 /// duplicated. The seller key is read once only to probe NIP-42 relay auth; it is NEVER placed in
 /// any Check detail.
 #[cfg(feature = "wallet")]
@@ -379,7 +379,7 @@ fn run_doctor(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         }
     };
 
-    let _ = writeln!(out, "mobee doctor — seller environment self-check (home={})", home.root.display());
+    let _ = writeln!(out, "maxplayer doctor — seller environment self-check (home={})", home.root.display());
 
     let results = run_checks(build_checks(&home));
     for result in &results {
@@ -394,8 +394,8 @@ fn run_doctor(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     code
 }
 
-/// `mobee sell` startup readiness gate (issue #107 — auto-doctor, NOT a first-run wizard). Runs the
-/// SAME registry as `mobee doctor` via [`build_checks`] and REFUSES to boot when any BLOCKING check
+/// `maxplayer sell` startup readiness gate (issue #107 — auto-doctor, NOT a first-run wizard). Runs the
+/// SAME registry as `maxplayer doctor` via [`build_checks`] and REFUSES to boot when any BLOCKING check
 /// (`Status::Fail`) fails, echoing each failure's one-line fix hint. WARN checks are advisory: they
 /// print but never block. Returns `Ok(())` when the box can sell, `Err(())` when it must not start.
 ///
@@ -412,7 +412,7 @@ pub fn sell_readiness_gate(
 ) -> Result<(), ()> {
     let _ = writeln!(
         out,
-        "mobee sell — startup readiness checks (auto-doctor; pass --skip-doctor to bypass)"
+        "maxplayer sell — startup readiness checks (auto-doctor; pass --skip-doctor to bypass)"
     );
     let results = run_checks(build_checks(home));
     for result in &results {
@@ -438,7 +438,7 @@ pub fn sell_readiness_gate(
     }
     let _ = writeln!(
         err,
-        "resolve the item(s) above, then re-run `mobee sell`. To bypass these checks (NOT recommended), pass --skip-doctor."
+        "resolve the item(s) above, then re-run `maxplayer sell`. To bypass these checks (NOT recommended), pass --skip-doctor."
     );
     Err(())
 }
@@ -499,7 +499,7 @@ mod tests {
         assert!(Check::warn("x", "hmm", "do this").render().contains("(fix: do this)"));
     }
 
-    // Issue #107: a missing seller key must BLOCK `mobee sell` (Fail, not Warn) and carry a fix hint.
+    // Issue #107: a missing seller key must BLOCK `maxplayer sell` (Fail, not Warn) and carry a fix hint.
     #[cfg(feature = "wallet")]
     #[test]
     fn seller_key_check_blocks_when_absent() {

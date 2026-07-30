@@ -1,10 +1,10 @@
-//! `mobee buyer` — the persistent per-home daemon and its thin client.
+//! `maxplayer buyer` — the persistent per-home daemon and its thin client.
 //!
-//! - `mobee buyer` (or `mobee buyer serve`) runs the daemon: it takes the exclusive
+//! - `maxplayer buyer` (or `maxplayer buyer serve`) runs the daemon: it takes the exclusive
 //!   home lock, opens the wallet + identity behind serialized actors and the
 //!   durable state DB, and serves the local unix socket until terminated. A second
 //!   daemon on the same home fails closed.
-//! - `mobee buyer status` is the thin client: it connects to the running daemon's
+//! - `maxplayer buyer status` is the thin client: it connects to the running daemon's
 //!   socket and prints its status. It holds no wallet, key, or state — proving the
 //!   thin-client boundary.
 
@@ -25,7 +25,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 fn usage(err: &mut dyn Write) -> i32 {
     let _ = writeln!(
         err,
-        "Usage:\n  mobee buyer          # run the persistent per-home daemon (exclusive lock)\n  mobee buyer serve    # alias for `mobee buyer`\n  mobee buyer status   # thin client: query the running daemon over its socket"
+        "Usage:\n  maxplayer buyer          # run the persistent per-home daemon (exclusive lock)\n  maxplayer buyer serve    # alias for `maxplayer buyer`\n  maxplayer buyer status   # thin client: query the running daemon over its socket"
     );
     USAGE_ERROR
 }
@@ -64,7 +64,7 @@ fn serve(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 
     let _ = writeln!(
         err,
-        "mobee buyer online (home={}, socket={})",
+        "maxplayer buyer online (home={}, socket={})",
         home.root.display(),
         home.root.join(mobee_core::buyer::SOCKET_FILE).display()
     );
@@ -73,7 +73,7 @@ fn serve(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     match runtime.block_on(mobee_core::buyer::run(home)) {
         Ok(()) => SUCCESS,
         Err(error) => {
-            let _ = writeln!(err, "mobee buyer: {error}");
+            let _ = writeln!(err, "maxplayer buyer: {error}");
             RUNTIME_ERROR
         }
     }
@@ -116,7 +116,7 @@ fn status(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 fn serve(_out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let _ = writeln!(
         err,
-        "mobee buyer requires the wallet feature: rebuild with `--features wallet` (on by default)"
+        "maxplayer buyer requires the wallet feature: rebuild with `--features wallet` (on by default)"
     );
     USAGE_ERROR
 }
@@ -125,7 +125,7 @@ fn serve(_out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 fn status(_out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let _ = writeln!(
         err,
-        "mobee buyer requires the wallet feature: rebuild with `--features wallet` (on by default)"
+        "maxplayer buyer requires the wallet feature: rebuild with `--features wallet` (on by default)"
     );
     USAGE_ERROR
 }

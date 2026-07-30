@@ -8,8 +8,8 @@ const { spawnSync } = require("node:child_process");
 const os = require("node:os");
 
 const PLATFORM_PACKAGES = {
-  "linux-x64": "@mobee/cli-linux-x64",
-  "linux-arm64": "@mobee/cli-linux-arm64",
+  "linux-x64": "@maxplayerai/linux-x64",
+  "linux-arm64": "@maxplayerai/linux-arm64",
 };
 
 const key = `${process.platform}-${process.arch}`;
@@ -18,7 +18,7 @@ const pkg = PLATFORM_PACKAGES[key];
 let binary = null;
 if (pkg) {
   try {
-    binary = require.resolve(`${pkg}/bin/mobee`);
+    binary = require.resolve(`${pkg}/bin/maxplayer`);
   } catch {
     // Absent because npm skipped it on an os/cpu mismatch, or because of --no-optional.
   }
@@ -26,7 +26,7 @@ if (pkg) {
 
 if (!binary) {
   console.error(
-    `mobee: no binary for ${key}. Available: ${Object.keys(PLATFORM_PACKAGES).join(", ")}.\n` +
+    `maxplayer: no binary for ${key}. Available: ${Object.keys(PLATFORM_PACKAGES).join(", ")}.\n` +
       (pkg
         ? `Expected ${pkg} to be installed — if you used --no-optional, reinstall without it.`
         : `That platform is not published yet.`)
@@ -39,7 +39,7 @@ if (!binary) {
 const { status, signal, error } = spawnSync(binary, process.argv.slice(2), { stdio: "inherit" });
 
 if (error) {
-  console.error(`mobee: could not execute ${binary}: ${error.message}`);
+  console.error(`maxplayer: could not execute ${binary}: ${error.message}`);
   process.exit(1);
 }
 // A child killed by a signal has no exit code; report it the way a shell does.
