@@ -37,6 +37,7 @@ where
         Some("doctor") => crate::doctor::run(&args[2..], out, err),
         Some("wallet") => crate::wallet_cli::run(&args[2..], out, err),
         Some("profile") => crate::profile_cli::run(&args[2..], out, err),
+        Some("whoami") => crate::whoami::run(&args[2..], out, err),
         #[cfg(feature = "stub-pay")]
         Some("stub-pay") => crate::stub_pay_cli::run(&args[2..], out, err),
         Some("log") => run_log(&args[2..], out, err),
@@ -268,7 +269,7 @@ fn write_json_line<T: Serialize + ?Sized>(out: &mut dyn Write, value: &T) -> std
 fn usage(err: &mut dyn Write) -> i32 {
     let _ = write!(
         err,
-        "Usage:\n  maxplayer version\n  maxplayer mcp\n  maxplayer buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # runner environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n"
+        "Usage:\n  maxplayer version\n  maxplayer mcp\n  maxplayer buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # runner environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  maxplayer whoami [--home <dir>]   # print this seat's public identity (hex pubkey, npub, resolved home)\n"
     );
     #[cfg(feature = "stub-pay")]
     let _ = write!(
@@ -711,6 +712,83 @@ mod tests {
         );
     }
 
+    /// `whoami` dispatches through the real `Some("whoami")` arm and prints the seat's PUBLIC
+    /// identity — hex pubkey, npub (bech32), and the resolved `--home` — for a given home.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn whoami_prints_pubkey_npub_and_resolved_home() {
+        let home = test_home("whoami-prints");
+        let (code, out, err) = run_captured([
+            "maxplayer",
+            "whoami",
+            "--home",
+            home.to_str().unwrap(),
+        ]);
+
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(err.is_empty(), "stderr: {err}");
+
+        // The resolved home path echoed back is exactly the --home we passed.
+        assert!(
+            out.contains(&home.display().to_string()),
+            "output should echo resolved home {}, got:\n{out}",
+            home.display()
+        );
+
+        // hex pubkey: 64 hex chars.
+        let pubkey = out
+            .lines()
+            .find_map(|line| line.strip_prefix("pubkey:"))
+            .expect("pubkey line")
+            .trim();
+        assert_eq!(pubkey.len(), 64, "hex pubkey is 32 bytes: {pubkey}");
+        assert!(
+            pubkey.chars().all(|c| c.is_ascii_hexdigit()),
+            "pubkey is hex: {pubkey}"
+        );
+
+        // npub: bech32 with the `npub1` HRP.
+        let npub = out
+            .lines()
+            .find_map(|line| line.strip_prefix("npub:"))
+            .expect("npub line")
+            .trim();
+        assert!(npub.starts_with("npub1"), "npub is bech32 npub: {npub}");
+    }
+
+    /// RED-PROVE (critical security property): `whoami` must NEVER leak key material. Read the
+    /// packaged secret straight off disk and assert none of it — nor any `nsec` — appears in the
+    /// command output.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn whoami_output_never_contains_secret_key() {
+        let home = test_home("whoami-nosecret");
+        let (code, out, err) = run_captured([
+            "maxplayer",
+            "whoami",
+            "--home",
+            home.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "stderr: {err}");
+
+        // bootstrap wrote the secret to `<home>/key` (0600). Read it directly, then red-prove it
+        // is absent from stdout.
+        let secret_hex = fs::read_to_string(home.join("key"))
+            .expect("secret key file")
+            .trim()
+            .to_owned();
+        assert!(!secret_hex.is_empty(), "precondition: key file is non-empty");
+
+        assert!(
+            !out.contains(&secret_hex),
+            "SECURITY: whoami output leaked the hex secret key"
+        );
+        assert!(
+            !out.contains("nsec1"),
+            "SECURITY: whoami output contains an nsec"
+        );
+    }
+
     #[cfg(feature = "acp")]
     #[test]
     #[ignore = "requires MOBEE_ACP_SMOKE=1 and MOBEE_ACP_SMOKE_CMD"]
@@ -800,5 +878,11 @@ mod tests {
             "mobee-cli-{name}-{}-{id}.jsonl",
             std::process::id()
         ))
+    }
+
+    #[cfg(feature = "wallet")]
+    fn test_home(name: &str) -> PathBuf {
+        let id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("mobee-cli-home-{name}-{}-{id}", std::process::id()))
     }
 }
