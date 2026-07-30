@@ -1743,33 +1743,68 @@ pub(crate) async fn award_presence_async(
         .await
         .map_err(|error| JobLifecycleError::Relay(format!("fetch award: {error}")))?;
 
-    let Some(event) = events.first() else {
+    if events.is_empty() {
         return Ok(None);
-    };
-    let award_event_id = event.id.to_hex();
-
-    // More than one award for the same job is exactly the state §1 exists to stop, so it must not
-    // be repaired FROM: picking one of several to write into the ledger would launder an ambiguity
-    // into a fact. Refuse and name the count.
-    if events.len() > 1 {
-        return Ok(Some(AwardPresence::Unrepairable {
-            award_event_id,
-            detail: format!(
-                "{} awards for this job are on the relay; refusing to pick one to record",
-                events.len()
-            ),
-        }));
     }
 
-    Ok(Some(
-        parse_relayed_award(event, &keys.public_key().to_hex(), job_id).map_or_else(
-            |detail| AwardPresence::Unrepairable {
-                award_event_id: event.id.to_hex(),
-                detail,
-            },
-            AwardPresence::Repairable,
-        ),
-    ))
+    // ⚠ TWO kind-3405s for one job is the NORMAL steady state, not an anomaly: `award_claim_async`
+    // publishes one at selection and `accept_claim_async` publishes another at pay-authorisation,
+    // both through `gateway::award_draft`, so they are identical in shape. Refusing on multiplicity
+    // alone would refuse to repair exactly the jobs that got furthest through the lifecycle.
+    //
+    // Multiplicity is only AMBIGUOUS if the events disagree about what to write. So parse them all
+    // and compare the fields that land in the row: agreement means there is nothing to choose
+    // between, and disagreement is the only case where picking one would launder a guess into a
+    // money row.
+    let buyer_pubkey_hex = keys.public_key().to_hex();
+    let mut ordered: Vec<_> = events.iter().collect();
+    // Oldest first — the award precedes the accept, and the `awards` row wants the AWARD's id.
+    // The id is a tiebreak so the choice never depends on the order the relay happened to send.
+    ordered.sort_by_key(|event| (event.created_at, event.id.to_hex()));
+
+    let mut parsed = Vec::with_capacity(ordered.len());
+    for event in &ordered {
+        match parse_relayed_award(event, &buyer_pubkey_hex, job_id) {
+            Ok(award) => parsed.push(award),
+            // One unparseable event condemns the set: it may be the very one that disagrees, and
+            // we cannot know that without parsing it.
+            Err(detail) => {
+                return Ok(Some(AwardPresence::Unrepairable {
+                    award_event_id: event.id.to_hex(),
+                    detail,
+                }));
+            }
+        }
+    }
+
+    Ok(Some(reduce_parsed_awards(parsed)))
+}
+
+/// Reduce a job's parsed awards — **oldest first** — to a single presence.
+///
+/// Split out as a pure function because the agreement rule is the part worth testing and the fetch
+/// around it needs a live relay. Ordering is the caller's job: this takes the first element as the
+/// award (the accept is the later publish) and never re-sorts.
+fn reduce_parsed_awards(parsed: Vec<RelayedAward>) -> AwardPresence {
+    // Sound by construction: every caller checks the event set is non-empty before parsing it.
+    let earliest = parsed.first().expect("a non-empty award set").clone();
+    if let Some(other) = parsed.iter().find(|award| {
+        award.claim_id != earliest.claim_id || award.seller_pubkey != earliest.seller_pubkey
+    }) {
+        return AwardPresence::Unrepairable {
+            award_event_id: earliest.award_event_id,
+            detail: format!(
+                "{} awards for this job disagree on what to record (claim {} / seller {} against \
+                 claim {} / seller {}); refusing to pick one",
+                parsed.len(),
+                earliest.claim_id,
+                earliest.seller_pubkey,
+                other.claim_id,
+                other.seller_pubkey
+            ),
+        };
+    }
+    AwardPresence::Repairable(earliest)
 }
 
 /// Parse a single award event into a [`RelayedAward`], or `Err(reason)` when any field the ledger
@@ -4347,6 +4382,75 @@ mod tests {
                 error.contains(expected_fragment),
                 "{label}: refusal should say why (wanted {expected_fragment:?}), got: {error}"
             );
+        }
+    }
+
+    // ⚠ TWO 3405s per job is ROUTINE, not a fault: `award_claim_async` publishes one at selection
+    // and `accept_claim_async` another at pay-authorisation, both via `gateway::award_draft`. So
+    // refusing on count alone would refuse to repair every job that reached pay-authorisation —
+    // the ones furthest along. Multiplicity is ambiguous only when the events DISAGREE.
+    #[test]
+    fn agreeing_awards_are_not_ambiguous_and_repair_from_the_earliest() {
+        let award = |id: &str, claim: &str, seller: &str| RelayedAward {
+            award_event_id: id.to_owned(),
+            claim_id: claim.to_owned(),
+            seller_pubkey: seller.to_owned(),
+        };
+        let seller = "5".repeat(64);
+        let claim = "c".repeat(64);
+
+        // A single award repairs, obviously.
+        let one = reduce_parsed_awards(vec![award("aaa", &claim, &seller)]);
+        assert!(matches!(&one, AwardPresence::Repairable(a) if a.award_event_id == "aaa"));
+
+        // The real shape: an award and its later accept, same claim and seller. Nothing to choose
+        // between, so it repairs — and it repairs from the EARLIEST, which is the award. Caller
+        // passes them oldest-first; the accept must not win just by being last.
+        let two = reduce_parsed_awards(vec![
+            award("the-award", &claim, &seller),
+            award("the-accept", &claim, &seller),
+        ]);
+        match two {
+            AwardPresence::Repairable(a) => assert_eq!(
+                a.award_event_id, "the-award",
+                "the awards row wants the AWARD's id, not the later accept's"
+            ),
+            other => panic!("agreeing awards must repair, got: {other:?}"),
+        }
+    }
+
+    // RED LEG for the agreement rule. Two 3405s that disagree about what to write are genuinely
+    // ambiguous, and picking one would launder a guess into a money row. Both fields are checked
+    // because either alone would pass a set that disagrees only on the other.
+    #[test]
+    fn disagreeing_awards_refuse_rather_than_pick_one() {
+        let award = |id: &str, claim: &str, seller: &str| RelayedAward {
+            award_event_id: id.to_owned(),
+            claim_id: claim.to_owned(),
+            seller_pubkey: seller.to_owned(),
+        };
+        let seller = "5".repeat(64);
+        let other_seller = "6".repeat(64);
+        let claim = "c".repeat(64);
+        let other_claim = "d".repeat(64);
+
+        for (label, set) in [
+            (
+                "same seller, different claim",
+                vec![award("a", &claim, &seller), award("b", &other_claim, &seller)],
+            ),
+            (
+                "same claim, different seller — who gets paid",
+                vec![award("a", &claim, &seller), award("b", &claim, &other_seller)],
+            ),
+        ] {
+            match reduce_parsed_awards(set) {
+                AwardPresence::Unrepairable { detail, .. } => assert!(
+                    detail.contains("disagree"),
+                    "{label}: refusal should say they disagree, got: {detail}"
+                ),
+                other => panic!("{label}: must refuse, got: {other:?}"),
+            }
         }
     }
 
