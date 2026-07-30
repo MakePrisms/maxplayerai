@@ -3705,7 +3705,7 @@ mod tests {
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Delivered));
         assert!(
             !should_resume_execution(store.job_state(&job).expect("s").expect("s")),
-            "a delivered job must not re-execute on a duplicate award"
+            "a delivered job is not re-execute-eligible"
         );
 
         // Pay ⇒ state Paid ⇒ likewise not re-execute-eligible (terminal never clobbered).
@@ -3719,6 +3719,148 @@ mod tests {
             "a paid job must not re-execute"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // TOOTH (award dedup, LEG 1 — the retry shape, post-terminal). TWO DISTINCT award events for ONE
+    // job id. That is the shape a buyer retry produces, and it is NOT the shape a relay redelivery
+    // produces: the two take DIFFERENT dedup keys, so exercising one says nothing about the other.
+    // `awards.award_id` is the PK, so a RE-SEEN award id is absorbed at the record layer
+    // (`Awarded::Duplicate`, no job row touched). A FRESH award id for a job we already hold is
+    // `Awarded::New` — it reaches the spawn, takes an execution slot, and the only thing between it and
+    // a second agent run is the job-STATE guard at the top of `execute_job`. So the contract worth
+    // asserting is the COMPOSITION (record decision AND state guard), never either half alone:
+    // asserting the predicate by itself leaves the record layer's answer unstated, and that answer is
+    // what decides whether the guard is load-bearing at all.
+    #[test]
+    fn a_fresh_award_id_for_a_delivered_job_is_recorded_but_never_re_executed() {
+        use crate::seller_node::store::{Awarded, JobState};
+        let seller = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let creq = gateway::creq::build_seller_creq(
+            &"a".repeat(64),
+            21,
+            "sat",
+            &["https://testnut.cashudevkit.org".to_owned()],
+            &seller,
+        )
+        .expect("creq");
+        let job = "a".repeat(64);
+        let buyer = "b".repeat(64);
+        // The helper journals award event A (`w`×64) — that is execution #1's award.
+        let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
+        let draft = claim_draft(&job, &buyer, &seller, &creq, &[]);
+
+        // Execution #1 finished and published ⇒ Delivered.
+        assert!(
+            store
+                .deliver_and_enqueue(
+                    &job,
+                    &"c".repeat(40),
+                    &draft,
+                    5000,
+                    5000 + RESULT_PUBLISH_WINDOW_SECS,
+                    5000
+                )
+                .expect("deliver")
+        );
+        assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Delivered));
+
+        // REDELIVERY shape: award A seen a second time. The event-id key absorbs it; execute is never
+        // reached, so the state guard is not even consulted.
+        assert_eq!(
+            store.record_award(&"w".repeat(64), &job, &buyer, 6000).expect("re-see A"),
+            Awarded::Duplicate,
+            "a re-seen award id must be absorbed by the award-record key"
+        );
+
+        // RETRY shape: a DIFFERENT award event for the SAME job. The record layer does NOT catch this
+        // one — new row, and it re-attempts job creation.
+        assert_eq!(
+            store.record_award(&"d".repeat(64), &job, &buyer, 6001).expect("fresh B"),
+            Awarded::New,
+            "a fresh award id is NOT deduped at the record layer — the retry shape reaches the spawn"
+        );
+
+        // The job row survives that re-attempt, so the state guard is what refuses the second run.
+        assert_eq!(
+            store.job_state(&job).expect("state"),
+            Some(JobState::Delivered),
+            "a second award must never clobber a terminal job state back to awarded"
+        );
+        assert!(
+            !should_resume_execution(store.job_state(&job).expect("s").expect("s")),
+            "a delivered job must not re-execute when a SECOND award event arrives"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ⚠⚠ LEG 2 (#279) — THIS TEST PASSING IS NOT GOOD NEWS. It pins a known defect in executable form.
+    //
+    // Same retry shape as the test above (two distinct award ids, one job id), but arriving MID-FLIGHT
+    // while the job is still `awarded`/`executing` rather than terminal. NEITHER dedup layer catches
+    // it: the award record keys on EVENT ID (a fresh id ⇒ `Awarded::New`) and the execute guard keys on
+    // JOB STATE (`awarded`/`executing` ⇒ proceed). Nothing sits between them — there is no per-job
+    // in-flight lock — so a second `execute_job` is admitted for a job that is already running: a
+    // second agent process and a second delivery attempt.
+    //
+    // Note what it does to capacity, because it is worse than double-booking a slot: the first award
+    // already REMOVED this job's parked permit (`take_for_execution` is a map `remove`), so the second
+    // award's `take_for_execution` returns `None` and the second execution runs holding NO permit at
+    // all. It does not consume a slot — it BYPASSES slot accounting, so the node exceeds its
+    // configured concurrency without that showing up in `available()`.
+    //
+    // It is NOT a payment defect. Double payment is blocked further down the path (reservation PK, a
+    // single job-keyed watcher, outbox dedup); that path was verified by the mobee lead, not here, and
+    // this comment should not be read as this test having checked it. The costs are operator compute,
+    // slot accounting, and a second push that can move the branch tip off the journaled commit — which
+    // the buyer then refuses on tip-match, i.e. it fails toward NOT paying a seller who did the work.
+    //
+    // 🛑 IF THIS TEST GOES RED, THE FIX LANDED — do not "repair" it. Invert the final assertion to the
+    // guarded behaviour and close #279. It is written as a PASSING tripwire rather than an
+    // `#[ignore]`d failing test precisely so it cannot rot in silence: an ignored test reports nothing
+    // whether the hole is open or closed.
+    #[test]
+    fn mid_flight_second_award_is_admitted_for_execution_no_per_job_in_flight_lock() {
+        use crate::seller_node::store::{Awarded, JobState};
+        let seller = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let creq = gateway::creq::build_seller_creq(
+            &"a".repeat(64),
+            21,
+            "sat",
+            &["https://testnut.cashudevkit.org".to_owned()],
+            &seller,
+        )
+        .expect("creq");
+        let buyer = "b".repeat(64);
+
+        // Both mid-flight states, because the guard admits both and either one means a second run.
+        for (label, drive_to_executing, expected) in [
+            ("awarded", false, JobState::Awarded),
+            ("executing", true, JobState::Executing),
+        ] {
+            let job = "a".repeat(64);
+            let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
+            if drive_to_executing {
+                store.mark_executing(&job, 4300).expect("mark executing");
+            }
+            assert_eq!(
+                store.job_state(&job).expect("state"),
+                Some(expected),
+                "{label}: precondition — the job is mid-flight, not terminal"
+            );
+
+            // A DIFFERENT award event for the SAME job, landing while execution #1 is in flight.
+            assert_eq!(
+                store.record_award(&"d".repeat(64), &job, &buyer, 4400).expect("fresh award"),
+                Awarded::New,
+                "{label}: the award record keys on event id, so a fresh id is not deduped"
+            );
+            assert!(
+                should_resume_execution(store.job_state(&job).expect("s").expect("s")),
+                "{label}: MID-FLIGHT SECOND EXECUTION IS ADMITTED — if THIS line is what failed, the \
+                 per-job in-flight lock has landed: invert this assertion and close #279"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     // TOOTH (buyer-facing feedback) — an execution failure produces a buyer-addressed feedback-kind
