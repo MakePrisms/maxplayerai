@@ -171,6 +171,18 @@ pub struct JobView {
     /// buyer should re-poll (PENDING), not treat as failure.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pending: bool,
+    /// Whether the relay ANSWERED the read this view was built from.
+    ///
+    /// `fetch_events` resolves `Ok(empty)` on timeout, so an empty view cannot by itself tell
+    /// "the relay holds nothing for this job" from "we stopped waiting". Those are the same bytes
+    /// and the discriminator is one layer out, so it has to be asked for: when every filter comes
+    /// back empty we send one trivial `limit(0)` REQ and wait for the `EOSE` the relay OWES us.
+    /// Served ⇒ the emptiness is a fact about the relay. Unserved ⇒ it is a fact about our patience.
+    ///
+    /// ⚠ Any caller about to take an IRREVERSIBLE action on absence must check this first. It is
+    /// `false` on every view not built by a confirmed read, so the unsafe direction is the one you
+    /// have to opt into.
+    pub read_confirmed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -1749,6 +1761,21 @@ pub(crate) async fn fetch_job_view_async(
         .fetch_events(result_filter, timeout)
         .await
         .map_err(|error| JobLifecycleError::Relay(format!("fetch results: {error}")))?;
+
+    // ── Did the relay ANSWER, or did we merely stop waiting?
+    //
+    // Any event at all proves the session was serving us, so emptiness in the other filters is the
+    // relay's word and costs nothing to establish. Only when ALL THREE come back empty is the read
+    // ambiguous — and that is precisely the case a caller is most likely to act on. There we pay
+    // one extra round trip for something the relay OWES us: a `limit(0)` REQ's `EOSE`. Deliberately
+    // a RESPONSE and not a broadcast; an event we merely hope to receive proves nothing by its
+    // absence, because the relay may legitimately never send it.
+    let saw_any_event =
+        !offer_events.is_empty() || !feedback_events.is_empty() || !result_events.is_empty();
+    let read_confirmed = saw_any_event
+        || crate::buyer::relay::probe_relay_serves_our_reqs(&client, keys.public_key(), timeout)
+            .await;
+
     client.disconnect().await;
 
     let offer = offer_events.into_iter().next().map(|event| {
@@ -1850,6 +1877,7 @@ pub(crate) async fn fetch_job_view_async(
         live_claim_id,
         accepted,
         pending: false,
+        read_confirmed,
     };
     Ok(view)
 }
@@ -3013,6 +3041,7 @@ mod tests {
             live_claim_id: None,
             accepted: None,
             pending: false,
+            read_confirmed: true,
         }
     }
 
@@ -3308,6 +3337,7 @@ mod tests {
             live_claim_id: None,
             accepted: None,
             pending: false,
+            read_confirmed: true,
         };
         assert!(!view_is_ready(&view, WaitFor::Claim));
         assert!(!view_is_ready(&view, WaitFor::Result));
