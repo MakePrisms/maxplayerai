@@ -128,10 +128,19 @@ pub fn agents_from_tags(tags: &[TagSpec]) -> Vec<String> {
 }
 
 /// Build the heartbeat for a seller's live state. `accepting` is `y` only when the seat has a free
-/// single-flight slot AND something is actually serving: a busy seller is not taking new work, and
-/// neither is a seat that has dropped every harness. `queue_depth` is the in-flight count; `agents`
-/// is what the live roster advertises. This is the single mapping the daemon loop uses, factored out
-/// so the flip is unit-testable without a live relay.
+/// slot AND something is actually serving: a busy seller is not taking new work, and neither is a
+/// seat that has dropped every harness. `agents` is what the live roster advertises. This is the
+/// single mapping the daemon loop uses, factored out so the flip is unit-testable without a relay.
+///
+/// ⚠ **`in_flight` is a COUNT, and the type is load-bearing.** This parameter was a `bool`, which
+/// destroyed the count at the signature — the `queue_depth` on the wire could then only ever be 0 or
+/// 1 no matter what the caller knew, while this doc still claimed it was the in-flight count. The
+/// caller then supplied that bool as `COUNT(*) FROM jobs > 0`, a LIFETIME row count, so a seat
+/// published `accepting=n` permanently from its first job onward (#313).
+/// ★ The 0/1 cast is why it survived: a seat holding 5 finished jobs advertised `1`, which reads as
+/// plausible. A literal `5` on an idle seat would have looked absurd to anyone. **A lossy encoding of
+/// a quantity hides a wrong answer inside a believable one** — so keep this a count, and let the wire
+/// carry a number a reader can sanity-check.
 ///
 /// ⚠ `anything_serving` is NOT derivable from `agents`. The roster advertises NAMES, and the
 /// unlabelled `--agent-argv` hatch has none — so a seat serving only the hatch advertises an empty
@@ -142,17 +151,12 @@ pub fn agents_from_tags(tags: &[TagSpec]) -> Vec<String> {
 /// so there is no spare state there to mean "none" without a protocol change every reader would have
 /// to learn. `accepting` has no unstated value, so the truth fits in a field that already exists.
 pub fn heartbeat_for_state(
-    job_in_flight: bool,
+    in_flight: u32,
     anything_serving: bool,
     rate_sats: u64,
     agents: Vec<String>,
 ) -> HeartbeatDraft {
-    HeartbeatDraft::v1(
-        !job_in_flight && anything_serving,
-        u32::from(job_in_flight),
-        rate_sats,
-    )
-    .with_agents(agents)
+    HeartbeatDraft::v1(in_flight == 0 && anything_serving, in_flight, rate_sats).with_agents(agents)
 }
 
 /// A parsed heartbeat's payload. The author pubkey is NOT carried here — combine it with [`d`]
@@ -373,7 +377,7 @@ mod tests {
 
     #[test]
     fn advertises_every_harness_in_preference_order() {
-        let draft = heartbeat_for_state(false, true, 5, vec!["claude".into(), "codex".into()])
+        let draft = heartbeat_for_state(0, true, 5, vec!["claude".into(), "codex".into()])
             .to_event_draft();
         let tag = first_tag(&draft.tags, "mobee_agent").expect("mobee_agent tag");
         assert_eq!(tag.0, vec!["mobee_agent", "claude", "codex"]);
@@ -387,7 +391,7 @@ mod tests {
         // Compat, the byte-identity half: a raw `agent_command` seller has no preset label, so it
         // advertises nothing and its heartbeat is EXACTLY the pre-registry event — no empty tag.
         // It IS serving (hence `true`), which is why an unstated list must never read as dark.
-        let stated_none = heartbeat_for_state(false, true, 5, Vec::new()).to_event_draft();
+        let stated_none = heartbeat_for_state(0, true, 5, Vec::new()).to_event_draft();
         let before_registry = HeartbeatDraft::v1(true, 0, 5).to_event_draft();
         assert_eq!(stated_none, before_registry);
         assert!(
@@ -399,7 +403,7 @@ mod tests {
 
     #[test]
     fn accepting_flips_with_in_flight_state() {
-        let idle = heartbeat_for_state(false, true, 5, Vec::new());
+        let idle = heartbeat_for_state(0, true, 5, Vec::new());
         assert!(idle.accepting);
         assert_eq!(idle.queue_depth, 0);
         assert_eq!(
@@ -407,7 +411,7 @@ mod tests {
             Some("y")
         );
 
-        let busy = heartbeat_for_state(true, true, 5, Vec::new());
+        let busy = heartbeat_for_state(1, true, 5, Vec::new());
         assert!(!busy.accepting);
         assert_eq!(busy.queue_depth, 1);
         assert_eq!(
@@ -422,13 +426,14 @@ mod tests {
 
     /// The whole point of the change: an idle seat with nothing serving is NOT accepting.
     ///
-    /// Written as the full truth table because the two inputs are adjacent bools — transposing them
-    /// at a call site reddens this test, since `queue_depth` tracks `job_in_flight` alone and so the
-    /// idle-and-serving row would come back as `n`/`1` instead of `y`/`0`.
+    /// Written as the full truth table so every row is pinned, not just the one that motivated the
+    /// change. Transposing the two arguments no longer even compiles — `in_flight` is a `u32` and
+    /// `anything_serving` a `bool` — which is a stronger guard than the assertion below; the table
+    /// stays because it pins the four OUTPUTS, which the types cannot.
     #[test]
     fn accepting_requires_a_free_slot_and_something_serving() {
-        let accepting_of = |job_in_flight, serving| {
-            let draft = heartbeat_for_state(job_in_flight, serving, 5, Vec::new()).to_event_draft();
+        let accepting_of = |in_flight, serving| {
+            let draft = heartbeat_for_state(in_flight, serving, 5, Vec::new()).to_event_draft();
             (
                 first_tag_value(&draft.tags, "accepting")
                     .expect("accepting tag")
@@ -439,16 +444,45 @@ mod tests {
             )
         };
 
-        assert_eq!(accepting_of(false, true), ("y".into(), "0".into()), "idle + serving");
-        assert_eq!(accepting_of(true, true), ("n".into(), "1".into()), "busy");
+        assert_eq!(accepting_of(0, true), ("y".into(), "0".into()), "idle + serving");
+        assert_eq!(accepting_of(1, true), ("n".into(), "1".into()), "busy");
         // The row this change adds. Before it, a fully dark seat published `y` and kept drawing work
         // it could only decline.
-        assert_eq!(accepting_of(false, false), ("n".into(), "0".into()), "idle + dark");
-        assert_eq!(accepting_of(true, false), ("n".into(), "1".into()), "busy + dark");
+        assert_eq!(accepting_of(0, false), ("n".into(), "0".into()), "idle + dark");
+        assert_eq!(accepting_of(1, false), ("n".into(), "1".into()), "busy + dark");
 
         // And dark is DISTINGUISHABLE from busy, which the pair could not express before: both say
         // "not taking work", and `queue_depth` says which reason.
-        assert_ne!(accepting_of(false, false), accepting_of(true, true));
+        assert_ne!(accepting_of(0, false), accepting_of(1, true));
+    }
+
+    /// `queue_depth` must carry the DEPTH, not a busy flag.
+    ///
+    /// This is the assertion a `bool` parameter made unwriteable, and its absence is what let #313
+    /// live: the wire reported `1` for a seat holding five finished jobs, and `1` reads as plausible.
+    /// Any depth above 1 is therefore the discriminator — it cannot be produced by a flag.
+    #[test]
+    fn queue_depth_is_the_depth_not_a_busy_flag() {
+        for depth in [2_u32, 3, 17] {
+            let draft = heartbeat_for_state(depth, true, 5, Vec::new()).to_event_draft();
+            assert_eq!(
+                first_tag_value(&draft.tags, "queue_depth"),
+                Some(depth.to_string().as_str()),
+                "queue_depth must publish the count itself, not a 0/1 cast of it"
+            );
+            assert_eq!(
+                first_tag_value(&draft.tags, "accepting"),
+                Some("n"),
+                "any non-zero depth means the seat is occupied"
+            );
+        }
+
+        // And the boundary that #313 got wrong in the field: nothing in flight ⇒ available, no
+        // matter how much this seat has done in the past. The store-side half of this is
+        // `a_store_holding_only_terminal_jobs_reports_none_in_flight`.
+        let free = heartbeat_for_state(0, true, 5, Vec::new()).to_event_draft();
+        assert_eq!(first_tag_value(&free.tags, "accepting"), Some("y"));
+        assert_eq!(first_tag_value(&free.tags, "queue_depth"), Some("0"));
     }
 
     #[test]
