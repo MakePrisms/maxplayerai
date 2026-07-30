@@ -3102,6 +3102,44 @@ mod slot_gate_tests {
         assert_eq!(gate.available(), 1, "released by the execution ending, like every other slot");
     }
 
+    /// A queued resume waiter is not starved by incoming claims — the back-pressure #251's fix relies
+    /// on, measured rather than assumed.
+    ///
+    /// The claim path uses `try_acquire` and the resume path `acquire().await`, so "a restarted node
+    /// stops claiming while its backlog drains" holds only if tokio's semaphore is FAIR: a permit
+    /// released while a waiter is queued must go to that waiter, not to a barging `try_acquire`. If it
+    /// barged, resumed jobs could be starved indefinitely by a busy market and the bound would weaken
+    /// to "`slots` per wave".
+    ///
+    /// The discriminating instant is a release with a waiter queued AND the waiter not yet polled.
+    /// Asserting `Full` merely while the permit is still held would prove nothing — that is just "no
+    /// permits available", one state next to the one that matters.
+    #[tokio::test]
+    async fn a_queued_resume_waiter_is_not_starved_by_a_barging_claim() {
+        let gate = Arc::new(SlotGate::new(1, LONG));
+        let held = gate.acquire_for_resume().await.expect("the gate is never closed");
+
+        let waiting = Arc::clone(&gate);
+        let waiter = tokio::spawn(async move { waiting.acquire_for_resume().await.is_some() });
+        tokio::time::sleep(Duration::from_millis(50)).await; // let the waiter reach the queue
+
+        drop(held);
+        assert!(
+            !waiter.is_finished(),
+            "the waiter must still be unpolled, or this is not the contested instant"
+        );
+        assert_eq!(
+            gate.try_reserve("an offer arriving the instant a slot frees"),
+            Reserve::Full,
+            "a released permit belongs to the queued resume, never to a barging claim"
+        );
+
+        assert!(
+            waiter.await.expect("waiter task"),
+            "and the queued resume is the one that gets it"
+        );
+    }
+
     #[test]
     fn release_is_idempotent() {
         let gate = SlotGate::new(1, LONG);
