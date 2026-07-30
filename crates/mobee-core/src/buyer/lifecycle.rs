@@ -540,6 +540,66 @@ pub fn plan_rearm(award_on_relay: bool, reservation: Option<ReservationState>) -
     RearmAction::Attempt
 }
 
+/// What the auto-award loop does when the job view carries no offer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MissingOfferAction {
+    /// The relay answered and had no offer for this job. Absence is established; park is honest.
+    ParkOfferAbsent,
+    /// The read went unanswered and the retry budget remains. Read again — conclude nothing.
+    Retry,
+    /// The read never got answered and the budget is spent. Park, but on what we OBSERVED
+    /// (reads that went unanswered), never on the offer, whose presence we never established.
+    ParkUnreadable { unanswered_reads: u32 },
+}
+
+/// Decide what an empty offer read means (#291).
+///
+/// `fetch_events` resolves `Ok(empty)` on timeout, so "the relay has no offer" and "we stopped
+/// waiting" arrive as identical bytes. [`JobView::read_confirmed`] is the discriminator, obtained
+/// one layer out by asking the relay for an `EOSE` it owes us. This function is the only place that
+/// turns those two facts into an action, so the two cannot drift apart again.
+///
+/// ⚠ **The park is terminal** — the driver never retries a parked row — so `ParkOfferAbsent` may be
+/// returned only on a confirmed read. Before #291 this decision did not exist: an empty read parked
+/// a live, claimed, real-money job with 5.8 hours left on its deadline, under a reason that was
+/// false in every clause.
+///
+/// ⚠ **`ParkUnreadable` is a floor, not a fallback to the old behaviour.** Refusing forever is an
+/// infinite loop, so the budget has to end somewhere — but it ends on a statement about the READ.
+/// A bound that parked with "offer no longer on the relay" would have reintroduced the whole defect
+/// on a delay.
+pub fn plan_missing_offer(
+    read_confirmed: bool,
+    unanswered_reads: u32,
+    max_unanswered_reads: u32,
+) -> MissingOfferAction {
+    if read_confirmed {
+        return MissingOfferAction::ParkOfferAbsent;
+    }
+    if unanswered_reads < max_unanswered_reads {
+        return MissingOfferAction::Retry;
+    }
+    MissingOfferAction::ParkUnreadable { unanswered_reads }
+}
+
+/// Park reason for [`MissingOfferAction::ParkOfferAbsent`]. Says the relay ANSWERED, because that
+/// is what makes the emptiness mean anything.
+pub const PARK_REASON_OFFER_ABSENT: &str =
+    "relay answered our read and returned no offer for this job";
+
+/// Park reason for [`MissingOfferAction::ParkUnreadable`].
+///
+/// The wording lives beside the decision, not at the call site, so the reason a row carries and the
+/// evidence that produced it cannot drift. It states the observation and explicitly declines the
+/// conclusion — #291 was filed because a row asserted the offer was gone on evidence that could not
+/// establish it.
+pub fn park_reason_unreadable(unanswered_reads: u32) -> String {
+    format!(
+        "{unanswered_reads} consecutive job reads went unanswered by the relay; the offer's \
+         presence was never established either way"
+    )
+}
+
 /// Classify a reserved job for [`BuyerStore::reconcile`] from its payment progress + relay
 /// liveness. The payment journal is authoritative over relay liveness: a `Closed` payment is
 /// `Paid` regardless of whether the claim still looks live, and an ambiguous payment is KEPT
@@ -625,6 +685,7 @@ mod tests {
             live_claim_id: None,
             accepted: None,
             pending: false,
+            read_confirmed: true,
         }
     }
 
@@ -1609,5 +1670,92 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    // ── #291: an empty offer read is not proof the offer is gone.
+    //
+    // The branches are tested together, and the SECOND one is the point. It would be trivial to
+    // satisfy "a timed-out read must not park" by never parking, and a suite that only tested the
+    // timeout leg would pass on that. The confirmed-empty leg is the positive control: it shows the
+    // guard DISCRIMINATES rather than disables.
+
+    const MAX_UNANSWERED: u32 = 12;
+
+    #[test]
+    fn an_unanswered_read_does_not_park_the_job() {
+        let action = plan_missing_offer(false, 1, MAX_UNANSWERED);
+        assert_eq!(
+            action,
+            MissingOfferAction::Retry,
+            "a read the relay never answered is not evidence the offer is gone; parking is \
+             terminal, so it must not happen on an unconfirmed read (#291)"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_empty_read_still_parks() {
+        // RED LEG. If this ever returns Retry the fix has stopped being a fix and become an
+        // infinite poll on every genuinely-expired offer.
+        let action = plan_missing_offer(true, 0, MAX_UNANSWERED);
+        assert_eq!(
+            action,
+            MissingOfferAction::ParkOfferAbsent,
+            "the relay answered and had no offer: absence IS established here and park is correct"
+        );
+    }
+
+    #[test]
+    fn confirmed_reads_park_regardless_of_earlier_unanswered_ones() {
+        // The budget must not outrank the evidence: one answered read settles the question even
+        // after a long unreadable stretch.
+        let action = plan_missing_offer(true, MAX_UNANSWERED + 5, MAX_UNANSWERED);
+        assert_eq!(action, MissingOfferAction::ParkOfferAbsent);
+    }
+
+    #[test]
+    fn an_exhausted_retry_budget_parks_on_the_read_not_the_offer() {
+        let action = plan_missing_offer(false, MAX_UNANSWERED, MAX_UNANSWERED);
+        assert_eq!(
+            action,
+            MissingOfferAction::ParkUnreadable {
+                unanswered_reads: MAX_UNANSWERED
+            },
+            "refusing forever is an infinite loop, so the budget ends — but on a statement about \
+             the READ, and it has to carry the count that justifies it"
+        );
+    }
+
+    #[test]
+    fn the_unreadable_park_reason_never_asserts_the_offer_is_gone() {
+        // ANCHORED ON ABSENCE, because the defect in #291 was a reason asserting something the
+        // evidence could not support. A test that only checked for the presence of good words
+        // would pass on a string that also contained the bad ones.
+        let reason = park_reason_unreadable(12);
+        for forbidden in ["no longer on the relay", "no offer", "offer is gone", "expired"] {
+            assert!(
+                !reason.contains(forbidden),
+                "the unreadable park reason claims something the read never established \
+                 ({forbidden:?}): {reason}"
+            );
+        }
+        assert!(
+            reason.contains("unanswered"),
+            "the reason must say what was OBSERVED — reads that went unanswered: {reason}"
+        );
+        assert!(
+            reason.contains("12"),
+            "the reason must carry the count that justifies giving up: {reason}"
+        );
+    }
+
+    #[test]
+    fn the_offer_absent_park_reason_names_the_answer_it_rests_on() {
+        // Mirror of the test above: this reason MAY assert absence, but only because it also states
+        // the thing that licenses the assertion — that the relay answered.
+        assert!(
+            PARK_REASON_OFFER_ABSENT.contains("answered"),
+            "a park on absence has to name the answered read that established it: \
+             {PARK_REASON_OFFER_ABSENT}"
+        );
     }
 }

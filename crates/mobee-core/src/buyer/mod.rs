@@ -49,7 +49,10 @@ use crate::job_lifecycle::{
     self, AwardClaimRequest, ContributionSpec, GetJobRequest, JobKind, PostJobRequest, WaitFor,
 };
 use crate::payment::{PaymentMachine, PaymentRecord, PaymentState};
-use lifecycle::{AwardError, AwardFilters, AwardOutcome, PaymentProgress, RearmAction, SettleError};
+use lifecycle::{
+    AwardError, AwardFilters, AwardOutcome, MissingOfferAction, PaymentProgress, RearmAction,
+    SettleError,
+};
 use lock::{HomeLock, LockError};
 use protocol::{CODE_INTERNAL, CODE_METHOD_NOT_FOUND, CODE_NOT_IMPLEMENTED, Request, Response};
 use reservations::{Dispositions, ReconcileReport};
@@ -64,6 +67,14 @@ const RELAY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the background auto-award task re-checks the relay for a payable claim, until one
 /// appears or the offer deadline passes. Bounded polling (no tight spin on a live-but-unpayable claim).
 const AUTO_AWARD_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// How many consecutive UNANSWERED job reads the auto-award loop tolerates before it parks.
+///
+/// #291 made an unconfirmed read stop being grounds to park — but a refusal with no bound is an
+/// infinite loop, and the deadline check that bounds the normal path lives inside the branch that
+/// requires an offer, so it is never reached when the read comes back empty. A ceiling without a
+/// floor is half a fix. What this bound must NOT do is smuggle the old conclusion back in: it parks
+/// on "we could not read", never on "the offer is gone", and the recorded reason says so.
+const AUTO_AWARD_MAX_UNCONFIRMED_READS: u32 = 12;
 /// How often the delivery watcher re-checks awarded-unsettled jobs with no event to wake it. The
 /// subscription is the fast path; this backstop is what makes a dropped or missed result event a
 /// latency cost rather than a stranded payment.
@@ -583,6 +594,17 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
     )
     .await;
 
+    // #291, second defect: the intent row is advanced only by the AUTO path, so a manual award left
+    // a stale row behind and `status` went on reporting `parked / offer no longer on the relay` for
+    // a job that was awarded and running. BOTH success shapes clear it, `AlreadyAwarded` included —
+    // a parked reason sitting beside a recorded award is false whichever call published the award.
+    if matches!(
+        result,
+        Ok(AwardOutcome::Published(_) | AwardOutcome::AlreadyAwarded(_))
+    ) {
+        let _ = context.store.mark_award_awarded(&params.job_id, now_unix());
+    }
+
     match result {
         Ok(AwardOutcome::Published(outcome)) => Response::ok(
             id,
@@ -791,6 +813,7 @@ async fn drive_auto_award(
         return Ok(());
     }
 
+    let mut unconfirmed_reads: u32 = 0;
     loop {
         let view = job_lifecycle::fetch_job_view_async(
             &context.home,
@@ -802,11 +825,47 @@ async fn drive_auto_award(
         .await
         .map_err(|error| error.to_string())?;
         let Some(offer) = view.offer.as_ref() else {
-            let _ = context
-                .store
-                .mark_award_parked(job_id, "offer no longer on the relay", now_unix());
+            // An empty offer read is evidence the offer is GONE only if the relay answered us.
+            // Parking is terminal — the driver never retries a parked row — so it has to rest on a
+            // positive determination, never on the absence of a signal we may simply have missed.
+            //
+            // #291: this line parked a live, claimed, real-money job with 5.8 hours left on its
+            // deadline, because a 5s timeout and an empty relay are the same bytes here. Twenty-five
+            // lines up, the award-presence check already treats its empty read as unknown; the two
+            // sites disagreed about the same evidence, and only one of them was right.
+            if !view.read_confirmed {
+                unconfirmed_reads += 1;
+            }
+            match lifecycle::plan_missing_offer(
+                view.read_confirmed,
+                unconfirmed_reads,
+                AUTO_AWARD_MAX_UNCONFIRMED_READS,
+            ) {
+                MissingOfferAction::Retry => {
+                    tokio::time::sleep(AUTO_AWARD_POLL_INTERVAL).await;
+                    continue;
+                }
+                MissingOfferAction::ParkOfferAbsent => {
+                    let _ = context.store.mark_award_parked(
+                        job_id,
+                        lifecycle::PARK_REASON_OFFER_ABSENT,
+                        now_unix(),
+                    );
+                }
+                // The reason states what we OBSERVED. It does not say the offer is gone — we never
+                // established that — because a row that said so would be the same false status line
+                // #291 was filed about, just arriving a minute later.
+                MissingOfferAction::ParkUnreadable { unanswered_reads } => {
+                    let _ = context.store.mark_award_parked(
+                        job_id,
+                        &lifecycle::park_reason_unreadable(unanswered_reads),
+                        now_unix(),
+                    );
+                }
+            }
             return Ok(());
         };
+        unconfirmed_reads = 0;
         if now_unix() as u64 > offer.deadline_unix {
             let _ = context.store.mark_award_parked(
                 job_id,
