@@ -736,8 +736,9 @@ async fn settle_job(
         Ok(store::AttributeAward::Written) | Ok(store::AttributeAward::AlreadyAttributed) => {}
         // No awards row to land on (externally-accepted job, or an award whose record_award
         // failed and was collected manually). Only a real report is a real drop: a metadata-less
-        // outcome has nothing to lose, and externally-accepted jobs re-collect idempotently —
-        // don't cry wolf on those every time.
+        // outcome has nothing to lose, so those stay silent. A re-collect of an external job
+        // whose seller DID report still logs every time — deliberately: each re-collect genuinely
+        // re-drops a real report.
         Ok(store::AttributeAward::NoAwardRow) => {
             if outcome.agent_used.is_some() || outcome.model_used.is_some() {
                 eprintln!(
@@ -1153,20 +1154,28 @@ fn log_safe_agent(value: Option<&str>) -> String {
 }
 
 /// Unicode format/invisible characters that survive `char::is_control` (Cc only) but can still
-/// reorder, hide, or split text in terminals and downstream viewers: zero-widths + bidi marks
-/// (U+200B–200F), bidi embedding/override controls (U+202A–202E), line/paragraph separators
-/// (U+2028/9), invisible operators (U+2060–2064), bidi isolates (U+2066–2069), and the BOM/ZWNBSP
-/// (U+FEFF).
+/// reorder, hide, or split text in terminals and downstream viewers: the soft hyphen, bidi marks
+/// and overrides/isolates (incl. U+061C), zero-widths, line/paragraph separators, invisible
+/// operators, deprecated format controls, interlinear annotation anchors, musical formatting,
+/// the BOM/ZWNBSP, and the tag block (invisible ASCII smuggling into copied log text). Legit
+/// harness ids are ASCII kebab-case, so nothing real is ever stripped.
 fn is_invisible_format(c: char) -> bool {
     matches!(
         c,
-        '\u{200B}'..='\u{200F}'
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
             | '\u{202A}'..='\u{202E}'
             | '\u{2028}'
             | '\u{2029}'
             | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
+            | '\u{2066}'..='\u{206F}'
             | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
     )
 }
 
@@ -1177,6 +1186,12 @@ fn is_invisible_format(c: char) -> bool {
 /// row-level write-once gate, so healing can never rewrite a recorded attribution. Advisory like
 /// the settle write: every failure logs and boot proceeds; a bind that reported nothing leaves
 /// the honest NULL (and logs nothing — there is nothing to heal).
+///
+/// Accepted cost: never-healable rows (metadata-less sellers, pre-attribution settles, missing
+/// binds) stay in the work set FOREVER, so every boot re-runs one SELECT plus a local JSON read
+/// per such row — linear, local, silent. If fleets ever accumulate enough settled no-metadata
+/// trades for this to matter at boot, add a terminal "nothing to heal" marker; today it is
+/// milliseconds and not worth a schema state.
 fn heal_award_attribution(store: &store::BuyerStore, home: &MobeeHome) {
     let jobs = match store.unattributed_settled_award_job_ids() {
         Ok(jobs) => jobs,
@@ -1603,11 +1618,14 @@ mod tests {
     fn log_safe_agent_strips_control_and_invisible_bytes_and_caps() {
         assert_eq!(log_safe_agent(None), "unreported");
         assert_eq!(log_safe_agent(Some("claude-agent-acp")), "claude-agent-acp");
-        // Newline forgery, ESC-[ repaint, one-byte C1 CSI, bidi override, zero-width — stripped;
-        // printable residue stays (spoofed printable text is inherent to printing seller text).
+        // Newline forgery, ESC-[ repaint, one-byte C1 CSI, bidi override + ALM, zero-width, soft
+        // hyphen, tag-block smuggling — stripped; printable residue stays (spoofed printable text
+        // is inherent to printing seller text).
         assert_eq!(
-            log_safe_agent(Some("a\nb\u{1b}[31mc\u{9b}d\u{202e}e\u{200b}f")),
-            "ab[31mcdef"
+            log_safe_agent(Some(
+                "a\nb\u{1b}[31mc\u{9b}d\u{202e}e\u{200b}f\u{61c}\u{ad}\u{e0041}g"
+            )),
+            "ab[31mcdefg"
         );
         // Only-stripped-bytes input is REPORTED garbage — distinct from unreported.
         assert_eq!(log_safe_agent(Some("\u{1b}\u{9b}\r\n\u{202e}")), "unprintable");
