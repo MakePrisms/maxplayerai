@@ -146,6 +146,8 @@ async fn collect_refuses_pay_when_delivered_tip_differs_from_bound_oid() {
         creq_hash: None,
         accepted_mints: Vec::new(),
         realized_mint: None,
+        agent_used: None,
+        model_used: None,
         contribution: None,
     };
     bind.seller_signature = seller_cosig(&secret_hex, &pubkey_hex, &bind);

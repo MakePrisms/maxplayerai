@@ -274,6 +274,17 @@ pub struct ResultView {
     /// Seller schnorr signature (hex) from the result's `["sig","seller",..]` tag — the
     /// buyer counter-signs the same receipt preimage to co-sign the kind-3400.
     pub seller_signature: Option<String>,
+    /// Harness the seller claims RAN this result, read from the result's seller-claimed
+    /// exec-metadata `["harness", …]` tag (`metadata_trust=seller-claimed`). An attribution of
+    /// what executed — never the buyer's requested harness echoed back (a request is not an
+    /// attribution). `None` when the result carries no metadata block (pre-metadata sellers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// Model the harness self-reported for the run (`["model", …]`), driver-surfaced only.
+    /// Same trust class as `harness`: seller-claimed, absent-stays-absent (#233: a model string
+    /// is a claim, never a verification).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Contribution echo + authorship signature. `Some` iff the result carries a
     /// well-formed `job-class=contribution` echo AND a `sig/seller-contribution` tag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -316,6 +327,18 @@ pub struct AcceptedBind {
     /// this field existed; the pay path then falls back to the live config default (legacy behavior).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realized_mint: Option<String>,
+    /// Harness the seller claimed RAN the accepted result (its exec-metadata `["harness", …]`
+    /// tag), captured at accept so settlement can attribute the payment to the worker that earned
+    /// it (#261). Truth-only: this is what the seller says EXECUTED — never the buyer's requested
+    /// harness written upfront (a request is not an attribution). `None` when the result carried
+    /// no metadata (legacy sellers). Advisory record only — NOT in the receipt preimage, gates
+    /// nothing on the pay path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_used: Option<String>,
+    /// Model the harness self-reported for the run (`["model", …]`). Same trust class as
+    /// `agent_used`: seller-claimed attribution, absent when the driver surfaced none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_used: Option<String>,
     /// Contribution binds, recorded at accept when the OFFER is a contribution (authority
     /// = the buyer's signed offer; the result echo is equality-checked, never trusted). Absent ⇒
     /// from-scratch.
@@ -1052,6 +1075,10 @@ pub async fn accept_claim_async(
         // The realized paying mint SELECTED for this job, frozen from the buyer's configured default
         // above. Sealing the choice makes the pay-path attempt id stable across retries.
         realized_mint: Some(realized_mint),
+        // Attribution of the worker that produced THIS result (seller-claimed exec-metadata),
+        // frozen with the bind so settlement records who earned the payment (#261).
+        agent_used: result.harness.clone(),
+        model_used: result.model.clone(),
         contribution,
     };
     write_accepted_bind(home, &bind)?;
@@ -1991,6 +2018,7 @@ pub(crate) async fn fetch_job_view_async(
         let amount_sats = first_tag(&draft.tags, "amount")
             .and_then(|tag| tag.0.get(1))
             .and_then(|value| value.parse().ok());
+        let (harness, model) = result_attribution(&draft.tags);
         results.push(ResultView {
             result_id: event.id.to_hex(),
             created_at: event.created_at.as_secs(),
@@ -2004,6 +2032,8 @@ pub(crate) async fn fetch_job_view_async(
                 .map(|d| d.commit_oid().as_str().to_owned()),
             amount_sats,
             seller_signature: sig_seller_value(&draft.tags),
+            harness,
+            model,
             contribution: contribution_result_view(&draft.tags),
         });
     }
@@ -2198,6 +2228,17 @@ fn sig_seller_value(tags: &[TagSpec]) -> Option<String> {
         .map(String::to_owned)
 }
 
+/// Seller-claimed exec-metadata attribution off a result's tags: `(harness, model)` from the
+/// `["harness", …]` / `["model", …]` tags `seller_exec_metadata` stamps on the kind-3403 (#261).
+/// Absent-stays-absent: a result with no metadata block yields `(None, None)` — never a
+/// fabricated attribution, and never the buyer's requested harness echoed back.
+fn result_attribution(tags: &[TagSpec]) -> (Option<String>, Option<String>) {
+    (
+        first_tag_value(tags, "harness").map(str::to_owned),
+        first_tag_value(tags, "model").map(str::to_owned),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2266,6 +2307,8 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
         // Drifted amount → refuse.
@@ -2302,6 +2345,8 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
         // A different result for the already-bound job → refused (one settlement per job).
@@ -2387,6 +2432,8 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
         // Single-settlement still free (no prior bind), then durable write of the valid sig.
@@ -2436,6 +2483,8 @@ mod tests {
             creq_hash: Some("2ad9b34cbf8c".to_string()),
             accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
 
@@ -2491,6 +2540,8 @@ mod tests {
             creq_hash: Some("2ad9b34cbf8c".to_string()),
             accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
@@ -2539,6 +2590,8 @@ mod tests {
             creq_hash: Some("2ad9b34c".repeat(8)),
             accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
         let from_bind =
@@ -2598,6 +2651,8 @@ mod tests {
             accepted_mints: vec![bound_mint.clone()],
             // The realized-mint SELECTION is sealed in the bind (finding CC).
             realized_mint: Some(bound_mint.clone()),
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
@@ -2700,6 +2755,8 @@ mod tests {
             accepted_mints: vec![mint_a.to_string(), mint_b.to_string()],
             // Sealed at accept from the buyer's then-configured default (A).
             realized_mint: Some(mint_a.to_string()),
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
 
@@ -2809,6 +2866,10 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            // Attribution fields round-trip as written (#261) — Some values here so this test
+            // covers them, not just their absence.
+            agent_used: Some("claude-agent-acp".into()),
+            model_used: Some("claude-opus-5".into()),
             contribution: None,
         };
         write_accepted_bind(&home, &bind).expect("write");
@@ -2833,10 +2894,89 @@ mod tests {
         let bind: AcceptedBind = serde_json::from_str(legacy).expect("legacy bind deserializes");
         assert_eq!(bind.realized_mint, None, "missing field defaults to None (legacy)");
         assert_eq!(bind.accepted_mints, vec!["https://mint.example".to_string()]);
+        // v5 attribution fields (#261): same back-compat contract — a legacy bind written before
+        // they existed deserializes to None ("seller never reported"), never an error.
+        assert_eq!(bind.agent_used, None, "legacy bind has no attribution");
+        assert_eq!(bind.model_used, None, "legacy bind has no attribution");
         // And a bind with realized_mint = None does not serialize the field (skip_serializing_if),
         // so the on-disk shape is unchanged for legacy-equivalent binds.
         let json = serde_json::to_string(&bind).expect("serialize");
         assert!(!json.contains("realized_mint"), "None must not emit the field: {json}");
+        assert!(!json.contains("agent_used"), "None must not emit the field: {json}");
+        assert!(!json.contains("model_used"), "None must not emit the field: {json}");
+
+        // ROLLBACK direction: an OLDER binary reading a NEWER bind survives because AcceptedBind
+        // tolerates unknown keys. This pins that `deny_unknown_fields` (house style on config
+        // structs) never lands on the bind — adding it would make every rollback choke on binds
+        // written by a newer release.
+        let newer = r#"{
+            "job_id":"aa","claim_id":"bb","result_id":"cc","seller_pubkey":"dd",
+            "commit_oid":"ee","repo":"https://example.invalid/repo.git","branch":"master",
+            "job_hash":"ff","amount_sats":5,"accept_event_id":"11","accepted_at":1,
+            "seller_signature":"","accepted_mints":[],
+            "some_future_field":{"nested":true}
+        }"#;
+        let tolerated: AcceptedBind =
+            serde_json::from_str(newer).expect("unknown keys are ignored, never an error");
+        assert_eq!(tolerated.job_id, "aa");
+    }
+
+    // Producer/consumer drift guard (#261): the attribution the buyer reads off a result is the
+    // SAME block the seller's exec-metadata stamps. Drives the REAL producer
+    // (`seller_exec_metadata` → `git_result_draft`) into the real consumer (`result_attribution`)
+    // so a renamed tag on either side goes red here instead of silently reading None forever.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn result_attribution_reads_the_exec_metadata_the_seller_stamps() {
+        let usage = crate::driver::UsageMetadata {
+            model: Some("claude-opus-5".into()),
+            ..Default::default()
+        };
+        let exec_metadata = crate::seller_exec::seller_exec_metadata(
+            &["claude".into(), "--print".into()],
+            None,
+            1234,
+            Some(&usage),
+        );
+        let draft = crate::gateway::git_result_draft(
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            "https://example.invalid/repo.git",
+            "main",
+            &"e".repeat(40),
+            2,
+            &"f".repeat(64),
+            &"ab".repeat(32),
+            "delivery",
+            &exec_metadata,
+        );
+        let (harness, model) = result_attribution(&draft.tags);
+        assert_eq!(
+            harness.as_deref(),
+            Some("claude-agent-acp"),
+            "the RESOLVED harness id from the real producer — what ran, not what was asked for"
+        );
+        assert_eq!(
+            model.as_deref(),
+            Some("claude-opus-5"),
+            "the driver-reported model, absent unless the run surfaced one"
+        );
+
+        // Absent-stays-absent: a result with no metadata block yields no attribution — the
+        // buyer records honest NULLs, never a fabricated or requested-echo value.
+        let bare = crate::gateway::git_result_draft(
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            "https://example.invalid/repo.git",
+            "main",
+            &"e".repeat(40),
+            2,
+            &"f".repeat(64),
+            &"ab".repeat(32),
+            "delivery",
+            &[],
+        );
+        assert_eq!(result_attribution(&bare.tags), (None, None));
     }
 
     // Z1 (crash-safe durable bind write): the accept-bind is written via temp-file + sync + atomic
@@ -2873,6 +3013,8 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
         write_accepted_bind(&home, &bind).expect("write pending");
@@ -2939,6 +3081,8 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
 
@@ -3026,6 +3170,8 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
         // Phase 1: pending write is durable and reloads with the empty-id marker.
@@ -3068,6 +3214,8 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
         let err = authorize_request_from_bind(&bind, 1, String::new()).expect_err("empty hash");
@@ -3106,6 +3254,8 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
         let bad_seller = "00".repeat(32);
@@ -3126,6 +3276,8 @@ mod tests {
             commit_oid: Some("ee".repeat(20)),
             amount_sats: Some(1),
             seller_signature: Some("ab".repeat(64)),
+            harness: None,
+            model: None,
             contribution: None,
         }
     }
@@ -3284,6 +3436,8 @@ mod tests {
             commit_oid: Some("cc".repeat(20)),
             amount_sats: Some(10),
             seller_signature: Some("sig".to_owned()),
+            harness: None,
+            model: None,
             contribution: None,
         }
     }
@@ -3948,6 +4102,8 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: Some(AcceptedContribution {
                 target_owner_pubkey: "aa".repeat(32),
                 target_clone_url: "https://mobee-relay.orveth.dev/git/owner/repo.git".into(),

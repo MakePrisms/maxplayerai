@@ -2298,8 +2298,20 @@ impl SellerNodeRunner {
                         // fail_job path, and a panic (unwind drops it). `None` only on the restart
                         // path (permit not in-memory); re-acquiring for resumed jobs is P4.
                         let slot = self.slots.take_for_execution(&job_id);
+                        // `requested_agent=` is the offer's REQUEST (preset-label vocabulary,
+                        // normalized at parse) — deliberately named as a request, never `agent=`:
+                        // nothing has run yet, and a request is not an attribution. The dispatched
+                        // truth lands on the delivered line (#261). `any` = the offer stated no
+                        // preference; `unknown` = the journal could not be read — absence and
+                        // failure are never conflated.
+                        let requested_agent = match self.node.store().offer_row(&job_id) {
+                            Ok(Some(offer)) => {
+                                offer.requested_agent.unwrap_or_else(|| "any".to_owned())
+                            }
+                            Ok(None) | Err(_) => "unknown".to_owned(),
+                        };
                         eprintln!(
-                            "seller node awarded job_id={job_id} buyer={buyer} — executing (spawned; {} slot(s) free)",
+                            "seller node awarded job_id={job_id} buyer={buyer} requested_agent={requested_agent} — executing (spawned; {} slot(s) free)",
                             self.slots.available()
                         );
                         let runner = Arc::clone(self);
@@ -2687,7 +2699,21 @@ impl SellerNodeRunner {
             now,
         ) {
             Ok(true) => {
-                eprintln!("seller node delivered job_id={job_id} commit={commit} result enqueued")
+                // `agent=` is the RESOLVED harness id for this run, read from the SAME
+                // exec-metadata block stamped on the outgoing result — so the log provably
+                // matches the wire byte-for-byte (one vocabulary with the buyer's settled line;
+                // no second derivation that could drift). The preset LABEL (what `assign_agent`
+                // journals and `requested_agent=` prints) is the request-side vocabulary; the
+                // two relate only through `harness_and_transport`, never by string equality
+                // (#261).
+                let harness_id = exec_metadata
+                    .iter()
+                    .find(|tag| tag.first() == Some("harness"))
+                    .and_then(|tag| tag.value())
+                    .unwrap_or("unknown");
+                eprintln!(
+                    "seller node delivered job_id={job_id} commit={commit} agent={harness_id} result enqueued"
+                )
             }
             Ok(false) => eprintln!(
                 "seller node execute job_id={job_id}: delivery already journaled (dedup no-op)"

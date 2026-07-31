@@ -32,7 +32,11 @@ use super::reservations::{
 /// - v4 — the published-award record: the `awards` table. `pending_awards` tracks the INTENT and
 ///   its state; this records the award the buyer actually published, keyed by job, carrying the
 ///   3405 event id. Same additive forward-only upgrade.
-pub const SCHEMA_VERSION: i64 = 4;
+/// - v5 — award attribution (#261): nullable `agent_used` / `model_used` on `awards`, written at
+///   settlement from the accepted result's seller-claimed exec-metadata. Truth-only: NULL until a
+///   delivery settles (an undelivered award has no earner), never the requested harness written
+///   upfront. Additive columns via [`BuyerStore::migrate`].
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// A cloneable handle to the daemon-owned SQLite state.
 #[derive(Clone)]
@@ -133,9 +137,23 @@ impl BuyerStore {
                  award_event_id  TEXT NOT NULL,
                  seller_pubkey   TEXT NOT NULL,
                  amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
-                 awarded_at_unix INTEGER NOT NULL
+                 awarded_at_unix INTEGER NOT NULL,
+                 -- v5 (#261): who EARNED the payment, written at settlement from the accepted
+                 -- result's seller-claimed exec-metadata. NULL until a delivery settles — an
+                 -- undelivered award has no earner, and a request is not an attribution. Both
+                 -- are seller-attested claims (the buyer cannot observe the seller's process),
+                 -- the same trust class as everything else read off the claim.
+                 --
+                 -- Vocabulary: agent_used carries the result's RESOLVED harness id (e.g.
+                 -- 'claude-agent-acp' — see seller_exec::harness_and_transport), while
+                 -- pending_awards.harness records the operator's requested preset LABEL (e.g.
+                 -- 'claude'). Relate the two through harness_and_transport, never by string
+                 -- equality — an equality join would flag every honest built-in-preset job.
+                 agent_used      TEXT,
+                 model_used      TEXT
              );",
         )?;
+        Self::migrate(conn)?;
         // Forward-only, monotone schema-version bump. A fresh DB is stamped at SCHEMA_VERSION; a
         // pre-existing lower version is upgraded to it; a (hypothetical) higher version is left
         // untouched (never downgraded). Idempotent on repeated opens.
@@ -146,6 +164,32 @@ impl BuyerStore {
             [SCHEMA_VERSION.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Bring a store created by an older binary up to [`SCHEMA_VERSION`]. `CREATE TABLE IF NOT
+    /// EXISTS` never alters a table that already exists, so a column added to the schema above
+    /// reaches existing stores only through here. Every step is ADDITIVE and idempotent — a
+    /// nullable column whose absence reads the same as its default (the seller store's pattern).
+    fn migrate(conn: &Connection) -> Result<(), StoreError> {
+        // v5 (#261): settlement-time award attribution.
+        if !Self::column_exists(conn, "awards", "agent_used")? {
+            conn.execute_batch("ALTER TABLE awards ADD COLUMN agent_used TEXT;")?;
+        }
+        if !Self::column_exists(conn, "awards", "model_used")? {
+            conn.execute_batch("ALTER TABLE awards ADD COLUMN model_used TEXT;")?;
+        }
+        Ok(())
+    }
+
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+        let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            if row.get::<_, String>(1)? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Record (idempotently overwrite) the daemon's most recent start time.
@@ -539,7 +583,10 @@ impl BuyerStore {
     /// are covered by construction — recording at the two call sites instead would let one drift.
     ///
     /// Idempotent by job: a re-award that republishes the same job overwrites the row rather than
-    /// failing, matching the re-arm path's own idempotence.
+    /// failing, matching the re-arm path's own idempotence. The overwrite is deliberately PARTIAL:
+    /// the `agent_used`/`model_used` attribution columns are NOT in the upsert's SET list, so a
+    /// repaired or re-recorded award keeps its settled attribution (#261) — see
+    /// [`Self::attribute_award`] for the write-once rules that pair with this.
     pub fn record_award(
         &self,
         job_id: &str,
@@ -571,12 +618,55 @@ impl BuyerStore {
         Ok(conn
             .query_row(
                 "SELECT job_id, claim_id, award_event_id, seller_pubkey, amount_sats,
-                        awarded_at_unix
+                        awarded_at_unix, agent_used, model_used
                  FROM awards WHERE job_id = ?1",
                 [job_id],
                 row_to_award,
             )
             .optional()?)
+    }
+
+    /// Attribute a settled award to the worker that earned it (#261): the seller-claimed
+    /// harness/model captured off the accepted result at accept time. Truth-only discipline:
+    /// this is written at settlement (the first moment an earner exists) and NEVER seeded from
+    /// the buyer's requested harness — an awards row with NULL attribution honestly reads
+    /// "seller never reported", not a guess.
+    ///
+    /// Write-once is ROW-level: only a wholly-unattributed row accepts a write, so the first
+    /// settled attribution wins as a UNIT and a NULL input never erases a recorded value.
+    /// Per-column filling is deliberately refused — it could stitch a chimera row (agent from one
+    /// result, model from another) the day the TEMPORARY single-settlement guard
+    /// ([`crate::job_lifecycle`]'s `assert_single_settlement`) learns to re-bind a corrected
+    /// result. Today a re-settle re-reads the immutable per-job bind, so a repeat write carries
+    /// identical values and lands as the idempotent [`AttributeAward::AlreadyAttributed`].
+    ///
+    /// Never a silent drop: [`AttributeAward::NoAwardRow`] names the case where no awards row
+    /// exists to attribute (an externally-accepted job, or an award whose `record_award` failed
+    /// and was collected manually) — the caller logs it.
+    pub fn attribute_award(
+        &self,
+        job_id: &str,
+        agent_used: Option<&str>,
+        model_used: Option<&str>,
+    ) -> Result<AttributeAward, StoreError> {
+        let conn = self.lock()?;
+        let written = conn.execute(
+            "UPDATE awards SET agent_used = ?2, model_used = ?3
+             WHERE job_id = ?1 AND agent_used IS NULL AND model_used IS NULL",
+            params![job_id, agent_used, model_used],
+        )?;
+        if written > 0 {
+            return Ok(AttributeAward::Written);
+        }
+        let exists = conn
+            .query_row("SELECT 1 FROM awards WHERE job_id = ?1", [job_id], |_| Ok(()))
+            .optional()?
+            .is_some();
+        Ok(if exists {
+            AttributeAward::AlreadyAttributed
+        } else {
+            AttributeAward::NoAwardRow
+        })
     }
 
     /// Jobs the buyer AWARDED that have not yet settled — the delivery watcher's work set and the
@@ -593,6 +683,29 @@ impl BuyerStore {
             "SELECT a.job_id FROM awards a
              JOIN reservations r ON r.job_id = a.job_id
              WHERE r.state = 'reserved'
+             ORDER BY a.awarded_at_unix",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            jobs.push(row?);
+        }
+        Ok(jobs)
+    }
+
+    /// Jobs whose award SETTLED (reservation `spent`) but whose attribution never landed — the
+    /// boot heal's work set (#261). The settle-time attribution write is advisory and post-flip,
+    /// so a crash after `convert_to_spent`, or a pay whose flip failed and was later converged by
+    /// reconcile's `Paid` arm, strands a paid row at NULL while the durable accept-bind still
+    /// holds the seller's report. Both-NULL is the same predicate the write-once guard in
+    /// [`Self::attribute_award`] admits, so healing can never overwrite a recorded attribution.
+    pub fn unattributed_settled_award_job_ids(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT a.job_id FROM awards a
+             JOIN reservations r ON r.job_id = a.job_id
+             WHERE r.state = 'spent'
+               AND a.agent_used IS NULL AND a.model_used IS NULL
              ORDER BY a.awarded_at_unix",
         )?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -632,6 +745,23 @@ pub struct PendingAward {
     pub model: Option<String>,
 }
 
+/// Outcome of [`BuyerStore::attribute_award`], named so the settle path can log a dropped
+/// attribution instead of silently no-oping (never a silent drop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttributeAward {
+    /// The write-once guard admitted this write (the row was wholly unattributed). NOTE: an
+    /// all-NULL write also returns `Written` — it records nothing and deliberately leaves the
+    /// slot open to a later first real attribution — so `Written` means "the guard admitted the
+    /// write", never "values landed".
+    Written,
+    /// The row already carries its first settled attribution — later writes never rewrite
+    /// history (write-once is row-level; see [`BuyerStore::attribute_award`]).
+    AlreadyAttributed,
+    /// No awards row exists for this job — the attribution has nowhere to land and is dropped;
+    /// the caller logs this.
+    NoAwardRow,
+}
+
 /// An award the buyer PUBLISHED: the job it commits to, the claim it picked, and the 3405 that
 /// carries it. Distinct from [`PendingAward`], which is the intent that preceded it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -642,9 +772,16 @@ pub struct AwardRecord {
     pub seller_pubkey: String,
     pub amount_sats: u64,
     pub awarded_at_unix: i64,
+    /// Seller-claimed harness that ran the settled delivery (#261). `None` until settlement —
+    /// an undelivered award has no earner — and stays `None` for sellers that report nothing.
+    pub agent_used: Option<String>,
+    /// Model the harness self-reported; same trust class and lifecycle as `agent_used`.
+    pub model_used: Option<String>,
 }
 
-/// Map an `awards` row (in the column order both queries select) to an [`AwardRecord`].
+/// Map an `awards` row (in the column order [`BuyerStore::award_record`] — the mapper's only
+/// caller — selects) to an [`AwardRecord`]. A new query mapping through this MUST select the
+/// same 8 columns in the same order; a shorter list hits `InvalidColumnIndex` at runtime.
 fn row_to_award(row: &rusqlite::Row<'_>) -> rusqlite::Result<AwardRecord> {
     Ok(AwardRecord {
         job_id: row.get::<_, String>(0)?,
@@ -653,6 +790,8 @@ fn row_to_award(row: &rusqlite::Row<'_>) -> rusqlite::Result<AwardRecord> {
         seller_pubkey: row.get::<_, String>(3)?,
         amount_sats: row.get::<_, i64>(4)?.max(0) as u64,
         awarded_at_unix: row.get::<_, i64>(5)?,
+        agent_used: row.get::<_, Option<String>>(6)?,
+        model_used: row.get::<_, Option<String>>(7)?,
     })
 }
 
@@ -804,6 +943,179 @@ mod tests {
         // Re-open is idempotent (still current version).
         let store2 = BuyerStore::open(&path).expect("reopen");
         assert_eq!(store2.health().expect("health").schema_version, SCHEMA_VERSION);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // v4 → v5 (#261): a store whose `awards` table PRE-DATES the attribution columns gains them
+    // on open, preserving its rows. This is the path `CREATE TABLE IF NOT EXISTS` cannot reach
+    // (the table already exists) — only `migrate`'s conditional ALTERs — so it goes red if the
+    // migrate step is dropped, exactly like the seller store's `requested_agent` upgrade.
+    #[test]
+    fn a_v4_awards_table_gains_attribution_columns_on_open() {
+        let path = temp_db("migrate-v4-awards");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("raw open");
+            conn.execute_batch(
+                "CREATE TABLE buyer_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE awards (
+                     job_id          TEXT PRIMARY KEY,
+                     claim_id        TEXT NOT NULL,
+                     award_event_id  TEXT NOT NULL,
+                     seller_pubkey   TEXT NOT NULL,
+                     amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
+                     awarded_at_unix INTEGER NOT NULL
+                 );
+                 INSERT INTO buyer_meta (key, value) VALUES ('schema_version', '4');
+                 INSERT INTO awards (job_id, claim_id, award_event_id, seller_pubkey, amount_sats, awarded_at_unix)
+                 VALUES ('job-old', 'claim-old', 'award-old', 'seller-old', 3, 42);",
+            )
+            .expect("seed v4 shape");
+        }
+        let store = BuyerStore::open(&path).expect("open migrates");
+        let row = store.award_record("job-old").expect("read").expect("row survived the upgrade");
+        assert_eq!(row.amount_sats, 3, "pre-existing award data is untouched");
+        assert_eq!(row.agent_used, None, "a pre-migration row honestly reads unreported");
+        assert_eq!(row.model_used, None);
+        assert_eq!(
+            store
+                .attribute_award("job-old", Some("grok"), None)
+                .expect("attribute on upgraded db"),
+            AttributeAward::Written
+        );
+        assert_eq!(
+            store.award_record("job-old").expect("read").expect("row").agent_used.as_deref(),
+            Some("grok")
+        );
+        assert_eq!(store.health().expect("health").schema_version, SCHEMA_VERSION);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // #261 truth-only lifecycle: an award row is born with NO attribution (an undelivered award
+    // has no earner — a request is not an attribution), only the settle path's `attribute_award`
+    // fills it, and a settle with no awards row to land on is NAMED (NoAwardRow), never a silent
+    // no-op.
+    #[test]
+    fn award_attribution_is_null_at_award_and_written_at_settlement() {
+        let (store, path) = fresh_store("attribution-lifecycle");
+        let job = "a".repeat(64);
+        store
+            .record_award(&job, &"c".repeat(64), &"e".repeat(64), &"f".repeat(64), 5, 100)
+            .expect("award");
+        let at_award = store.award_record(&job).expect("read").expect("row");
+        assert_eq!(at_award.agent_used, None, "at award time nobody has earned anything yet");
+        assert_eq!(at_award.model_used, None);
+
+        assert_eq!(
+            store
+                .attribute_award(&job, Some("claude-agent-acp"), Some("claude-opus-5"))
+                .expect("attribute"),
+            AttributeAward::Written
+        );
+        let settled = store.award_record(&job).expect("read").expect("row");
+        assert_eq!(settled.agent_used.as_deref(), Some("claude-agent-acp"));
+        assert_eq!(settled.model_used.as_deref(), Some("claude-opus-5"));
+
+        // A settle for a job with no awards row names the drop instead of swallowing it.
+        assert_eq!(
+            store
+                .attribute_award(&"9".repeat(64), Some("grok"), None)
+                .expect("no-row attribute"),
+            AttributeAward::NoAwardRow
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // #261 write-once is ROW-level: the first settled attribution wins as a UNIT — a later
+    // differing write must not rewrite history OR fill columns the first settle left unreported
+    // (per-column filling could stitch a chimera row across results the day single-settlement
+    // learns to re-bind), and a None never erases a recorded value. A wholly-NULL first write
+    // does not consume the write-once: the row stays open until a real attribution lands.
+    #[test]
+    fn award_attribution_is_write_once_and_null_never_erases() {
+        let (store, path) = fresh_store("attribution-once");
+        let job = "b".repeat(64);
+        store
+            .record_award(&job, &"c".repeat(64), &"e".repeat(64), &"f".repeat(64), 5, 100)
+            .expect("award");
+
+        assert_eq!(
+            store.attribute_award(&job, Some("codex-acp-ng"), None).expect("first write"),
+            AttributeAward::Written
+        );
+        assert_eq!(
+            store
+                .attribute_award(&job, Some("claude-agent-acp"), Some("claude-opus-5"))
+                .expect("second write"),
+            AttributeAward::AlreadyAttributed
+        );
+        let row = store.award_record(&job).expect("read").expect("row");
+        assert_eq!(row.agent_used.as_deref(), Some("codex-acp-ng"), "the first attribution sticks");
+        assert_eq!(
+            row.model_used, None,
+            "a column the first settle left unreported stays unreported — write-once is \
+             row-level, never per-column stitching"
+        );
+
+        assert_eq!(
+            store.attribute_award(&job, None, None).expect("null write"),
+            AttributeAward::AlreadyAttributed
+        );
+        let after_null = store.award_record(&job).expect("read").expect("row");
+        assert_eq!(after_null.agent_used.as_deref(), Some("codex-acp-ng"), "NULL never erases");
+        assert_eq!(after_null.model_used, None);
+
+        // A metadata-less first settle (both None) leaves the row wholly unattributed and OPEN:
+        // it must not consume the write-once slot with nothing.
+        let bare = "d".repeat(64);
+        store
+            .record_award(&bare, &"c".repeat(64), &"e".repeat(64), &"f".repeat(64), 5, 100)
+            .expect("award");
+        assert_eq!(
+            store.attribute_award(&bare, None, None).expect("bare write"),
+            AttributeAward::Written
+        );
+        assert_eq!(
+            store.attribute_award(&bare, Some("grok"), None).expect("real write"),
+            AttributeAward::Written,
+            "an all-NULL write must not close the row to its first real attribution"
+        );
+        assert_eq!(
+            store.award_record(&bare).expect("read").expect("row").agent_used.as_deref(),
+            Some("grok")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // #261 boot-heal work set: exactly the SETTLED-but-unattributed awards. A reserved (not yet
+    // settled) NULL row is the watcher's business, an attributed spent row is done — only
+    // spent + wholly-NULL rows need healing.
+    #[test]
+    fn unattributed_settled_awards_selects_spent_null_rows_only() {
+        let (store, path) = fresh_store("heal-work-set");
+        let settled_null = "a".repeat(64);
+        let settled_attributed = "b".repeat(64);
+        let reserved_null = "c".repeat(64);
+        for job in [&settled_null, &settled_attributed, &reserved_null] {
+            store.reserve(job, 5, 100, NO_BUDGET, 0, 1).expect("reserve");
+            store
+                .record_award(job, &"1".repeat(64), &"2".repeat(64), &"3".repeat(64), 5, 1)
+                .expect("award");
+        }
+        store.convert_to_spent(&settled_null, 5, 2).expect("spend");
+        store.convert_to_spent(&settled_attributed, 5, 2).expect("spend");
+        assert_eq!(
+            store
+                .attribute_award(&settled_attributed, Some("claude-agent-acp"), None)
+                .expect("attribute"),
+            AttributeAward::Written
+        );
+
+        assert_eq!(
+            store.unattributed_settled_award_job_ids().expect("work set"),
+            vec![settled_null.clone()],
+            "spent + wholly-NULL only — never reserved rows, never attributed rows"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
