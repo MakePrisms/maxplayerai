@@ -718,14 +718,26 @@ async fn settle_job(
     // Attribute the settled award to the worker that EARNED it (#261): the seller-claimed
     // harness/model captured at accept off the delivered result. Settlement is the first moment
     // an earner exists (truth-only — never the requested harness written upfront). Advisory,
-    // never a gate: a failed write logs and the settle outcome stands, because the payment
-    // already happened and refusing here could only strand a paid job.
-    if let Err(error) = context.store.attribute_award(
+    // never a gate: every non-Written outcome logs and the settle outcome stands, because the
+    // payment already happened and refusing here could only strand a paid job.
+    match context.store.attribute_award(
         job_id,
         outcome.agent_used.as_deref(),
         outcome.model_used.as_deref(),
     ) {
-        eprintln!("buyer: award attribution write failed for {job_id} (continuing): {error}");
+        // First settled attribution recorded, or an idempotent re-settle of an already-attributed
+        // row (the bind is immutable per job, so a repeat carries identical values).
+        Ok(store::AttributeAward::Written) | Ok(store::AttributeAward::AlreadyAttributed) => {}
+        // No awards row to land on (externally-accepted job, or an award whose record_award
+        // failed and was collected manually) — the attribution is dropped; say so rather than
+        // letting the later NULL read as "seller never reported".
+        Ok(store::AttributeAward::NoAwardRow) => eprintln!(
+            "buyer: settled {job_id} has no awards row to attribute (externally accepted or \
+             unrecorded award) — seller-reported attribution dropped"
+        ),
+        Err(error) => {
+            eprintln!("buyer: award attribution write failed for {job_id} (continuing): {error}")
+        }
     }
 
     Ok(outcome)
@@ -1103,6 +1115,25 @@ async fn watch_loop<S, Fut>(
     }
 }
 
+/// Render a seller-claimed attribution string safely for a single operator-log line: control
+/// characters are stripped (newline injection could forge a whole settled/paid line; ANSI escapes
+/// could repaint the terminal) and the length is capped. The stored/RPC value stays raw — JSON
+/// encoding escapes it there; only the bare eprintln needs this. `unreported` = the seller
+/// stamped nothing; `unprintable` = it stamped only control bytes (reported, but garbage).
+fn log_safe_agent(value: Option<&str>) -> String {
+    match value {
+        None => "unreported".to_owned(),
+        Some(raw) => {
+            let cleaned: String = raw.chars().filter(|c| !c.is_control()).take(64).collect();
+            if cleaned.is_empty() {
+                "unprintable".to_owned()
+            } else {
+                cleaned
+            }
+        }
+    }
+}
+
 /// Settle awarded-but-unsettled jobs through the daemon's single spend path.
 ///
 /// `wake` narrows the sweep to the jobs a just-arrived result references (the fast path); `None`
@@ -1123,13 +1154,15 @@ async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Ev
         }
         match settle_job(context, &job_id, None).await {
             // `agent=` is the seller-claimed attribution off the settled result (#261);
-            // "unreported" is honest absence, never a guess at what was requested.
+            // "unreported" is honest absence, never a guess at what was requested. Rendered
+            // through `log_safe_agent`: this is the one place seller-authored free text reaches
+            // the operator's terminal, so control bytes must not survive into the log line.
             Ok(outcome) => eprintln!(
                 "buyer: delivery watcher settled {job_id} — paid {} sat for commit {} ({} file(s); agent={})",
                 outcome.pay.amount_sats,
                 outcome.commit_oid,
                 outcome.files.len(),
-                outcome.agent_used.as_deref().unwrap_or("unreported")
+                log_safe_agent(outcome.agent_used.as_deref())
             ),
             // Nothing delivered yet is the ordinary state of an awarded job, not a failure: the job
             // stays in the set and the next event or tick retries. Every OTHER outcome is a real

@@ -2904,6 +2904,21 @@ mod tests {
         assert!(!json.contains("realized_mint"), "None must not emit the field: {json}");
         assert!(!json.contains("agent_used"), "None must not emit the field: {json}");
         assert!(!json.contains("model_used"), "None must not emit the field: {json}");
+
+        // ROLLBACK direction: an OLDER binary reading a NEWER bind survives because AcceptedBind
+        // tolerates unknown keys. This pins that `deny_unknown_fields` (house style on config
+        // structs) never lands on the bind — adding it would make every rollback choke on binds
+        // written by a newer release.
+        let newer = r#"{
+            "job_id":"aa","claim_id":"bb","result_id":"cc","seller_pubkey":"dd",
+            "commit_oid":"ee","repo":"https://example.invalid/repo.git","branch":"master",
+            "job_hash":"ff","amount_sats":5,"accept_event_id":"11","accepted_at":1,
+            "seller_signature":"","accepted_mints":[],
+            "some_future_field":{"nested":true}
+        }"#;
+        let tolerated: AcceptedBind =
+            serde_json::from_str(newer).expect("unknown keys are ignored, never an error");
+        assert_eq!(tolerated.job_id, "aa");
     }
 
     // Producer/consumer drift guard (#261): the attribution the buyer reads off a result is the
