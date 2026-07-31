@@ -51,6 +51,12 @@ pub struct CollectOutcome {
     pub path: String,
     /// Sorted relative file list written under `path`.
     pub files: Vec<String>,
+    /// Seller-claimed harness that RAN the paid result, from the accept-bind (#261). An
+    /// attribution captured off the delivered result's exec-metadata — never the requested
+    /// harness written upfront. `None` when the result carried no metadata.
+    pub agent_used: Option<String>,
+    /// Model the harness self-reported for the run; same trust class as `agent_used`.
+    pub model_used: Option<String>,
 }
 
 #[derive(Debug)]
@@ -127,6 +133,10 @@ pub async fn collect_async(
         commit_oid: bind.commit_oid,
         path: dest.display().to_string(),
         files,
+        // Attribution recorded at accept from the delivered result's seller-claimed
+        // exec-metadata; the settle path persists it onto the awards row (#261).
+        agent_used: bind.agent_used,
+        model_used: bind.model_used,
     })
 }
 
@@ -397,6 +407,8 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         }
     }

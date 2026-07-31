@@ -701,7 +701,7 @@ async fn settle_job(
     };
 
     // Pay FIRST (append + melt), flip AFTER — the #123/#126 ordering, via the tested seam.
-    lifecycle::settle_after_pay(
+    let outcome = lifecycle::settle_after_pay(
         &context.store,
         job_id,
         now_unix(),
@@ -713,7 +713,22 @@ async fn settle_job(
     .map_err(|error| match error {
         SettleError::Pay(error) => SettleJobError::Pay(error),
         SettleError::Store(error) => SettleJobError::Store(error),
-    })
+    })?;
+
+    // Attribute the settled award to the worker that EARNED it (#261): the seller-claimed
+    // harness/model captured at accept off the delivered result. Settlement is the first moment
+    // an earner exists (truth-only — never the requested harness written upfront). Advisory,
+    // never a gate: a failed write logs and the settle outcome stands, because the payment
+    // already happened and refusing here could only strand a paid job.
+    if let Err(error) = context.store.attribute_award(
+        job_id,
+        outcome.agent_used.as_deref(),
+        outcome.model_used.as_deref(),
+    ) {
+        eprintln!("buyer: award attribution write failed for {job_id} (continuing): {error}");
+    }
+
+    Ok(outcome)
 }
 
 async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
@@ -736,6 +751,9 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
                 "commit_oid": outcome.commit_oid,
                 "path": outcome.path,
                 "files": outcome.files,
+                // Seller-claimed attribution of the settled delivery (#261); null = unreported.
+                "agent_used": outcome.agent_used,
+                "model_used": outcome.model_used,
             }),
         ),
         Err(error @ SettleJobError::Pay(_)) => Response::err(id, CODE_REFUSED, error.to_string()),
@@ -1104,11 +1122,14 @@ async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Ev
             }
         }
         match settle_job(context, &job_id, None).await {
+            // `agent=` is the seller-claimed attribution off the settled result (#261);
+            // "unreported" is honest absence, never a guess at what was requested.
             Ok(outcome) => eprintln!(
-                "buyer: delivery watcher settled {job_id} — paid {} sat for commit {} ({} file(s))",
+                "buyer: delivery watcher settled {job_id} — paid {} sat for commit {} ({} file(s); agent={})",
                 outcome.pay.amount_sats,
                 outcome.commit_oid,
-                outcome.files.len()
+                outcome.files.len(),
+                outcome.agent_used.as_deref().unwrap_or("unreported")
             ),
             // Nothing delivered yet is the ordinary state of an awarded job, not a failure: the job
             // stays in the set and the next event or tick retries. Every OTHER outcome is a real

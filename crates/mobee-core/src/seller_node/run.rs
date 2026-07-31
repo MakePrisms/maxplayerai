@@ -2687,7 +2687,13 @@ impl SellerNodeRunner {
             now,
         ) {
             Ok(true) => {
-                eprintln!("seller node delivered job_id={job_id} commit={commit} result enqueued")
+                // `agent=` is the harness DISPATCHED for this run (#261) — the same label
+                // `assign_agent` journaled — so the operator log attributes the delivery to the
+                // worker that produced it, not to the node total.
+                eprintln!(
+                    "seller node delivered job_id={job_id} commit={commit} agent={} result enqueued",
+                    agent_label.as_deref().unwrap_or("unlabelled")
+                )
             }
             Ok(false) => eprintln!(
                 "seller node execute job_id={job_id}: delivery already journaled (dedup no-op)"
