@@ -248,7 +248,7 @@ fn tools() -> Value {
         },
         {
             "name": "award_claim",
-            "description": "Manually award a specific seller claim (the fine-grain override of the daemon's auto-award): reserve the funds and publish the buyer AWARD (kind-3405, status=accepted) selecting that claim so the seller executes and every other claimant releases without spending compute. The daemon refuses to award a claim it cannot pay or whose price exceeds max_sats (defaults to the offer amount). No pay-bind — settle after delivery with collect. Never echoes secrets.",
+            "description": "Manually award a specific seller claim (the fine-grain override of the daemon's auto-award): reserve the funds and publish the buyer AWARD (kind-3405, status=accepted) selecting that claim so the seller executes and every other claimant releases without spending compute. The daemon refuses to award a claim it cannot pay or whose price exceeds max_sats (defaults to the offer amount). Awards are WRITE-ONCE per job: the first call pins one signed award event, and every retry re-sends that exact event — a retry can never award a different claim or publish a duplicate, so retrying after an ambiguous error (e.g. 'relay gave no verdict') is always safe and is the way to converge. A claim_id that contradicts an already-pinned attempt is refused. No pay-bind — settle after delivery with collect. Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

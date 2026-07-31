@@ -36,7 +36,11 @@ use super::reservations::{
 ///   settlement from the accepted result's seller-claimed exec-metadata. Truth-only: NULL until a
 ///   delivery settles (an undelivered award has no earner), never the requested harness written
 ///   upfront. Additive columns via [`BuyerStore::migrate`].
-pub const SCHEMA_VERSION: i64 = 5;
+/// - v6 — the award attempt outbox (#322): `award_attempts` pins the SIGNED award event (bytes and
+///   all) before the first send, so a retry re-sends the identical event instead of re-selecting a
+///   claim and minting a new one. One row per job, ever — the PK is the "never award twice"
+///   invariant made structural. Additive table; created by `init_schema` on open.
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// A cloneable handle to the daemon-owned SQLite state.
 #[derive(Clone)]
@@ -151,6 +155,34 @@ impl BuyerStore {
                  -- equality — an equality join would flag every honest built-in-preset job.
                  agent_used      TEXT,
                  model_used      TEXT
+             );
+             -- v6 (#322): the award attempt outbox. The awards table above records an award we
+             -- BELIEVE published; this row exists from the moment an award is SIGNED, before the
+             -- first send, and pins the exact signed bytes. A publish error is ambiguous (a lost
+             -- OK is indistinguishable from a rejected event, and the seller executes off the
+             -- relay's copy either way — the #322 burn), so retries re-send `event_json` verbatim:
+             -- the event id is a content hash, the relay dedups, and no retry can ever name a
+             -- different claim. job_id PRIMARY KEY is the invariant: one offer, at most one award
+             -- attempt, ever.
+             --
+             -- state: 'pending'  = signed; the relay has neither acked nor refused it yet.
+             --        'confirmed' = the relay acked it (or a probe found it) — it is PUBLIC.
+             --        'refused'  = the relay explicitly rejected the EVENT (OK:false), or the
+             --                     offer deadline passed with the award confirmed absent; nothing
+             --                     is public and nothing may be published for this job again.
+             CREATE TABLE IF NOT EXISTS award_attempts (
+                 job_id              TEXT PRIMARY KEY,
+                 claim_id            TEXT NOT NULL,
+                 seller_pubkey       TEXT NOT NULL,
+                 award_event_id      TEXT NOT NULL,
+                 event_json          TEXT NOT NULL,
+                 amount_sats         INTEGER NOT NULL CHECK (amount_sats >= 0),
+                 quoted_mints_json   TEXT NOT NULL DEFAULT '[]',
+                 offer_deadline_unix INTEGER NOT NULL,
+                 state               TEXT NOT NULL CHECK (state IN ('pending','confirmed','refused')),
+                 detail              TEXT,
+                 created_at_unix     INTEGER NOT NULL,
+                 updated_at_unix     INTEGER NOT NULL
              );",
         )?;
         Self::migrate(conn)?;
@@ -733,6 +765,145 @@ impl BuyerStore {
         }
         Ok(parked)
     }
+
+    // ---- Award attempt outbox (#322) -----------------------------------------------------------
+    //
+    // Sign once, persist, re-send the same bytes. The row is written BEFORE the first send, so
+    // "bytes on the wire ⇒ an attempt row exists" holds by construction, and every crash window
+    // in the award path is decidable from local state alone (see
+    // [`super::lifecycle::award_step`]).
+
+    /// The award attempt pinned for `job_id`, if one was ever begun.
+    pub fn award_attempt(&self, job_id: &str) -> Result<Option<AwardAttempt>, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                "SELECT job_id, claim_id, seller_pubkey, award_event_id, event_json, amount_sats,
+                        quoted_mints_json, offer_deadline_unix, state, detail
+                 FROM award_attempts WHERE job_id = ?1",
+                [job_id],
+                row_to_attempt,
+            )
+            .optional()?)
+    }
+
+    /// Pin the signed award for `job_id` — insert-once. If an attempt already exists (any state),
+    /// NOTHING is written and the existing row is returned: the first signed event is the only
+    /// event this job may ever publish, so a caller racing itself (or replaying after a crash)
+    /// gets the pinned bytes back instead of minting new ones.
+    pub fn begin_award_attempt(
+        &self,
+        attempt: &AwardAttempt,
+        now_unix: i64,
+    ) -> Result<BeginAttempt, StoreError> {
+        let conn = self.lock()?;
+        let inserted = conn.execute(
+            "INSERT INTO award_attempts
+                 (job_id, claim_id, seller_pubkey, award_event_id, event_json, amount_sats,
+                  quoted_mints_json, offer_deadline_unix, state, detail,
+                  created_at_unix, updated_at_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', NULL, ?9, ?9)
+             ON CONFLICT(job_id) DO NOTHING",
+            params![
+                attempt.job_id,
+                attempt.claim_id,
+                attempt.seller_pubkey,
+                attempt.award_event_id,
+                attempt.event_json,
+                attempt.amount_sats as i64,
+                attempt.quoted_mints_json,
+                attempt.offer_deadline_unix,
+                now_unix
+            ],
+        )?;
+        if inserted > 0 {
+            return Ok(BeginAttempt::Pinned);
+        }
+        let existing = conn
+            .query_row(
+                "SELECT job_id, claim_id, seller_pubkey, award_event_id, event_json, amount_sats,
+                        quoted_mints_json, offer_deadline_unix, state, detail
+                 FROM award_attempts WHERE job_id = ?1",
+                [&attempt.job_id],
+                row_to_attempt,
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError(format!(
+                    "award attempt insert for {} conflicted but no row reads back",
+                    attempt.job_id
+                ))
+            })?;
+        Ok(BeginAttempt::Existing(existing))
+    }
+
+    /// The relay acked this attempt's event (or a probe found it public). One-way: a confirmed
+    /// attempt never returns to pending, and a refused one is never resurrected into confirmed —
+    /// the two terminal states are reached from `pending` only.
+    pub fn mark_attempt_confirmed(&self, job_id: &str, now_unix: i64) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE award_attempts SET state = 'confirmed', updated_at_unix = ?2
+             WHERE job_id = ?1 AND state = 'pending'",
+            params![job_id, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// The relay explicitly rejected this attempt's event (OK:false), or the offer deadline passed
+    /// with the award confirmed absent. Terminal: nothing is public, and nothing may be published
+    /// for this job again — recovery is a NEW offer, never a second award on this one.
+    pub fn mark_attempt_refused(
+        &self,
+        job_id: &str,
+        detail: &str,
+        now_unix: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE award_attempts SET state = 'refused', detail = ?2, updated_at_unix = ?3
+             WHERE job_id = ?1 AND state = 'pending'",
+            params![job_id, detail, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Every attempt still awaiting a relay verdict — the boot sweep's work set, oldest first.
+    pub fn pending_award_attempts(&self) -> Result<Vec<AwardAttempt>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT job_id, claim_id, seller_pubkey, award_event_id, event_json, amount_sats,
+                    quoted_mints_json, offer_deadline_unix, state, detail
+             FROM award_attempts WHERE state = 'pending' ORDER BY created_at_unix",
+        )?;
+        let rows = stmt.query_map([], row_to_attempt)?;
+        let mut attempts = Vec::new();
+        for row in rows {
+            attempts.push(row?);
+        }
+        Ok(attempts)
+    }
+
+    /// Confirmed attempts whose `awards` row is missing — the crash window between the relay's ack
+    /// and `record_award`, healed at boot by writing the row from the attempt (which carries every
+    /// field the row needs, amount included).
+    pub fn confirmed_attempts_without_award_row(&self) -> Result<Vec<AwardAttempt>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT t.job_id, t.claim_id, t.seller_pubkey, t.award_event_id, t.event_json,
+                    t.amount_sats, t.quoted_mints_json, t.offer_deadline_unix, t.state, t.detail
+             FROM award_attempts t
+             LEFT JOIN awards a ON a.job_id = t.job_id
+             WHERE t.state = 'confirmed' AND a.job_id IS NULL
+             ORDER BY t.created_at_unix",
+        )?;
+        let rows = stmt.query_map([], row_to_attempt)?;
+        let mut attempts = Vec::new();
+        for row in rows {
+            attempts.push(row?);
+        }
+        Ok(attempts)
+    }
 }
 
 /// A still-pending auto-award intent: the job the daemon owes an award, its spend ceiling, and the
@@ -792,6 +963,91 @@ fn row_to_award(row: &rusqlite::Row<'_>) -> rusqlite::Result<AwardRecord> {
         awarded_at_unix: row.get::<_, i64>(5)?,
         agent_used: row.get::<_, Option<String>>(6)?,
         model_used: row.get::<_, Option<String>>(7)?,
+    })
+}
+
+/// One pinned award attempt (#322): the signed 3405 this job may publish — the ONLY 3405 this job
+/// may ever publish — plus everything a later `awards` row or repair needs to land without
+/// re-reading the relay. `event_json` is the signed event verbatim; re-sends transmit it
+/// unmodified, which is what makes a retry idempotent (the event id is a content hash).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwardAttempt {
+    pub job_id: String,
+    pub claim_id: String,
+    pub seller_pubkey: String,
+    pub award_event_id: String,
+    pub event_json: String,
+    pub amount_sats: u64,
+    /// JSON array of the mints the claim's creq quoted at prepare time — carried so a resumed
+    /// attempt reports the same `quoted_mints` a fresh publish would have.
+    pub quoted_mints_json: String,
+    /// The offer's deadline, captured at prepare time: past it the boot sweep resolves the attempt
+    /// by PROBE only (re-sending would knowingly inject a late award).
+    pub offer_deadline_unix: i64,
+    pub state: AttemptState,
+    /// Refusal detail (the relay's OK:false message, or the deadline-expiry reason). `None` unless
+    /// `state` is `Refused`.
+    pub detail: Option<String>,
+}
+
+/// Lifecycle of an [`AwardAttempt`]. `Pending` is the only state with an open question; both
+/// others are terminal and reached from `Pending` only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptState {
+    /// Signed and pinned; the relay has neither acked nor refused it. The event may or may not be
+    /// public — exactly the ambiguity that must never release funds or re-select a claim.
+    Pending,
+    /// The relay acked the event (or a probe found it) — the award is PUBLIC.
+    Confirmed,
+    /// The relay explicitly rejected the event, or the deadline passed with the award confirmed
+    /// absent. Nothing is public; nothing may be published for this job again.
+    Refused,
+}
+
+impl AttemptState {
+    fn parse(raw: &str) -> Option<Self> {
+        Some(match raw {
+            "pending" => Self::Pending,
+            "confirmed" => Self::Confirmed,
+            "refused" => Self::Refused,
+            _ => return None,
+        })
+    }
+}
+
+/// Outcome of [`BuyerStore::begin_award_attempt`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BeginAttempt {
+    /// The attempt was inserted — this call's signed event is the job's pinned award.
+    Pinned,
+    /// An attempt already existed (any state) — NOTHING was written. The caller must drive the
+    /// returned attempt (re-send ITS bytes / honor its terminal state), never its own candidate.
+    Existing(AwardAttempt),
+}
+
+/// Map an `award_attempts` row (in the 10-column order every attempt query selects) to an
+/// [`AwardAttempt`]. An unknown `state` label fails closed as a column-decode error rather than
+/// being misread as pending.
+fn row_to_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<AwardAttempt> {
+    let state_raw = row.get::<_, String>(8)?;
+    let state = AttemptState::parse(&state_raw).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            8,
+            rusqlite::types::Type::Text,
+            format!("unknown award attempt state '{state_raw}'").into(),
+        )
+    })?;
+    Ok(AwardAttempt {
+        job_id: row.get::<_, String>(0)?,
+        claim_id: row.get::<_, String>(1)?,
+        seller_pubkey: row.get::<_, String>(2)?,
+        award_event_id: row.get::<_, String>(3)?,
+        event_json: row.get::<_, String>(4)?,
+        amount_sats: row.get::<_, i64>(5)?.max(0) as u64,
+        quoted_mints_json: row.get::<_, String>(6)?,
+        offer_deadline_unix: row.get::<_, i64>(7)?,
+        state,
+        detail: row.get::<_, Option<String>>(9)?,
     })
 }
 
@@ -1564,6 +1820,165 @@ mod tests {
             Reserved::New { available_before: 10 }
         ));
         assert_eq!(store.reserved_in_flight().expect("r"), 10);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- Award attempt outbox (#322) -----------------------------------------------------------
+
+    fn attempt(job: &str, claim: &str) -> AwardAttempt {
+        AwardAttempt {
+            job_id: job.to_owned(),
+            claim_id: claim.to_owned(),
+            seller_pubkey: "s".repeat(64),
+            award_event_id: format!("award-for-{claim}"),
+            event_json: format!("{{\"id\":\"award-for-{claim}\",\"kind\":3405}}"),
+            amount_sats: 40,
+            quoted_mints_json: "[\"https://testnut.example\"]".to_owned(),
+            offer_deadline_unix: 9_999,
+            state: AttemptState::Pending,
+            detail: None,
+        }
+    }
+
+    // A v5 store (no award_attempts table) gains it on open, with pre-existing data untouched —
+    // the additive-forward-only contract every prior version bump kept.
+    #[test]
+    fn a_v5_store_gains_the_attempt_table_on_open() {
+        let path = temp_db("migrate-v5-attempts");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("raw open");
+            conn.execute_batch(
+                "CREATE TABLE buyer_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE awards (
+                     job_id          TEXT PRIMARY KEY,
+                     claim_id        TEXT NOT NULL,
+                     award_event_id  TEXT NOT NULL,
+                     seller_pubkey   TEXT NOT NULL,
+                     amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
+                     awarded_at_unix INTEGER NOT NULL,
+                     agent_used      TEXT,
+                     model_used      TEXT
+                 );
+                 INSERT INTO buyer_meta (key, value) VALUES ('schema_version', '5');
+                 INSERT INTO awards (job_id, claim_id, award_event_id, seller_pubkey, amount_sats, awarded_at_unix)
+                 VALUES ('job-old', 'claim-old', 'award-old', 'seller-old', 3, 42);",
+            )
+            .expect("seed v5 shape");
+        }
+        let store = BuyerStore::open(&path).expect("open migrates");
+        assert_eq!(store.health().expect("health").schema_version, SCHEMA_VERSION);
+        assert_eq!(
+            store.award_record("job-old").expect("read").expect("row survived").amount_sats,
+            3,
+            "pre-existing award data is untouched"
+        );
+        // The attempt table is usable, and a v5-era job honestly has no attempt.
+        assert!(store.award_attempt("job-old").expect("read").is_none());
+        assert!(matches!(
+            store.begin_award_attempt(&attempt("job-new", "claim-new"), 7).expect("pin"),
+            BeginAttempt::Pinned
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The PK is the invariant: a second begin — even one carrying a DIFFERENT claim and different
+    // bytes — writes nothing and hands back the pinned attempt. This is the line that makes claim
+    // re-selection structurally impossible (#322).
+    #[test]
+    fn begin_award_attempt_pins_once_and_a_rival_candidate_gets_the_original_back() {
+        let (store, path) = fresh_store("attempt-pin");
+        let job = "j".repeat(64);
+        assert!(matches!(
+            store.begin_award_attempt(&attempt(&job, "claim-first"), 1).expect("pin"),
+            BeginAttempt::Pinned
+        ));
+
+        let rival = attempt(&job, "claim-second");
+        match store.begin_award_attempt(&rival, 2).expect("second begin") {
+            BeginAttempt::Existing(existing) => {
+                assert_eq!(existing.claim_id, "claim-first", "the FIRST claim stays pinned");
+                assert_eq!(existing.award_event_id, "award-for-claim-first");
+                assert_eq!(existing.state, AttemptState::Pending);
+            }
+            BeginAttempt::Pinned => panic!("a second attempt for one job must never pin"),
+        }
+        let row = store.award_attempt(&job).expect("read").expect("row");
+        assert_eq!(row.claim_id, "claim-first", "the rival wrote nothing");
+        assert_eq!(row.event_json, attempt(&job, "claim-first").event_json, "bytes unchanged");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // State transitions are one-way and reached from `pending` only: a refusal can never overwrite
+    // a confirmation (and vice versa), so a late relay verdict cannot rewrite settled history.
+    #[test]
+    fn attempt_states_move_one_way_from_pending_only() {
+        let (store, path) = fresh_store("attempt-states");
+        let confirmed_job = "c".repeat(64);
+        let refused_job = "r".repeat(64);
+
+        store.begin_award_attempt(&attempt(&confirmed_job, "claim-c"), 1).expect("pin");
+        store.mark_attempt_confirmed(&confirmed_job, 2).expect("confirm");
+        assert_eq!(
+            store.award_attempt(&confirmed_job).expect("read").expect("row").state,
+            AttemptState::Confirmed
+        );
+        // A late refusal against a confirmed attempt is a no-op, detail stays empty.
+        store.mark_attempt_refused(&confirmed_job, "late verdict", 3).expect("refuse no-op");
+        let row = store.award_attempt(&confirmed_job).expect("read").expect("row");
+        assert_eq!(row.state, AttemptState::Confirmed, "confirmed is terminal");
+        assert_eq!(row.detail, None);
+
+        store.begin_award_attempt(&attempt(&refused_job, "claim-r"), 1).expect("pin");
+        store.mark_attempt_refused(&refused_job, "blocked: policy", 2).expect("refuse");
+        let row = store.award_attempt(&refused_job).expect("read").expect("row");
+        assert_eq!(row.state, AttemptState::Refused);
+        assert_eq!(row.detail.as_deref(), Some("blocked: policy"), "the refusal names its reason");
+        // A late confirmation against a refused attempt is a no-op.
+        store.mark_attempt_confirmed(&refused_job, 3).expect("confirm no-op");
+        assert_eq!(
+            store.award_attempt(&refused_job).expect("read").expect("row").state,
+            AttemptState::Refused,
+            "refused is terminal"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The two sweep queries select exactly their work sets: pending → the resend sweep;
+    // confirmed-without-awards-row → the crash-window heal. Terminal/covered rows appear in neither.
+    #[test]
+    fn attempt_sweep_queries_select_their_work_sets_only() {
+        let (store, path) = fresh_store("attempt-sweeps");
+        let pending_job = "p".repeat(64);
+        let healed_job = "h".repeat(64);
+        let covered_job = "d".repeat(64);
+        let refused_job = "x".repeat(64);
+
+        store.begin_award_attempt(&attempt(&pending_job, "claim-p"), 1).expect("pin");
+
+        store.begin_award_attempt(&attempt(&healed_job, "claim-h"), 2).expect("pin");
+        store.mark_attempt_confirmed(&healed_job, 3).expect("confirm");
+
+        store.begin_award_attempt(&attempt(&covered_job, "claim-d"), 4).expect("pin");
+        store.mark_attempt_confirmed(&covered_job, 5).expect("confirm");
+        store
+            .record_award(&covered_job, "claim-d", "award-for-claim-d", &"s".repeat(64), 40, 6)
+            .expect("record");
+
+        store.begin_award_attempt(&attempt(&refused_job, "claim-x"), 7).expect("pin");
+        store.mark_attempt_refused(&refused_job, "blocked", 8).expect("refuse");
+
+        let pending: Vec<String> =
+            store.pending_award_attempts().expect("pending").into_iter().map(|a| a.job_id).collect();
+        assert_eq!(pending, vec![pending_job.clone()], "only the unresolved attempt needs a resend");
+
+        let heal: Vec<String> = store
+            .confirmed_attempts_without_award_row()
+            .expect("heal set")
+            .into_iter()
+            .map(|a| a.job_id)
+            .collect();
+        assert_eq!(heal, vec![healed_job], "only confirmed-without-row needs the heal");
         let _ = std::fs::remove_file(&path);
     }
 }
