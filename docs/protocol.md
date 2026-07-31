@@ -26,7 +26,7 @@ Progress, errors, refusals, and claim releases at any step are `3404` FEEDBACK e
 | `3400` | Receipt — buyer-authored, seller co-signed | buyer + seller |
 | `3401` | Job offer | buyer |
 | `3402` | Claim (`status=processing`) — carries the seller's `creq` invoice | seller |
-| `3403` | Job result — git `repo` / `branch` / `commit_oid`, plus a seller-claimed exec-metadata block (`harness`, `model`, `wall_time`, `tokens…`, anchored by `metadata_trust=seller-claimed`) the buyer records as award attribution — an attribution, never a verification | seller |
+| `3403` | Job result — git `repo` / `branch` / `commit_oid`, plus a seller-claimed exec-metadata block (`harness`, `model`, `wall_time`, `usage_transport`, `tokens…`, `cost`, anchored by `metadata_trust=seller-claimed`); the buyer records `harness`/`model` as award attribution — an attribution, never a verification | seller |
 | `3404` | Feedback — progress / error / refusal (closed reason-code enum) | seller |
 | `3405` | Award (`status=accepted`) — selects the winning claim before work; awarded seller executes, others release | buyer |
 | `30340` | Seller heartbeat — addressable liveness (`d="mobee-seller"`) | seller |

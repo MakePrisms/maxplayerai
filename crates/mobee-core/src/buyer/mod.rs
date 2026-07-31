@@ -244,6 +244,12 @@ pub async fn run(home: MobeeHome) -> Result<(), BuyerError> {
     // fatal, for the same reason as the reconcile above: a daemon that refuses to start is a daemon
     // the operator cannot use to fix anything. An unrecoverable hop prints its own loud line.
     run_hop_sweep(&context).await;
+    // Backfill attribution for awards that settled WITHOUT it (#261): the settle-time write is
+    // advisory and post-flip, so a crash in that window — or a flip-fail later converged by the
+    // reconcile pass above — strands a paid row at NULL while the durable accept-bind still holds
+    // the seller's report. NULL must mean "seller never reported", so boot re-reads the bind and
+    // lands it through the same row-level write-once gate (it can never rewrite recorded truth).
+    heal_award_attribution(&context.store, &context.home);
     // Re-arm pending auto-awards left by a prior run: a job posted before a crash still gets its
     // award with zero manual commands. Each task re-checks the relay for an existing award first
     // (invariant A), so re-arming never double-awards.
@@ -729,12 +735,17 @@ async fn settle_job(
         // row (the bind is immutable per job, so a repeat carries identical values).
         Ok(store::AttributeAward::Written) | Ok(store::AttributeAward::AlreadyAttributed) => {}
         // No awards row to land on (externally-accepted job, or an award whose record_award
-        // failed and was collected manually) — the attribution is dropped; say so rather than
-        // letting the later NULL read as "seller never reported".
-        Ok(store::AttributeAward::NoAwardRow) => eprintln!(
-            "buyer: settled {job_id} has no awards row to attribute (externally accepted or \
-             unrecorded award) — seller-reported attribution dropped"
-        ),
+        // failed and was collected manually). Only a real report is a real drop: a metadata-less
+        // outcome has nothing to lose, and externally-accepted jobs re-collect idempotently —
+        // don't cry wolf on those every time.
+        Ok(store::AttributeAward::NoAwardRow) => {
+            if outcome.agent_used.is_some() || outcome.model_used.is_some() {
+                eprintln!(
+                    "buyer: settled {job_id} has no awards row to attribute (externally accepted \
+                     or unrecorded award) — seller-reported attribution dropped"
+                );
+            }
+        }
         Err(error) => {
             eprintln!("buyer: award attribution write failed for {job_id} (continuing): {error}")
         }
@@ -1115,20 +1126,86 @@ async fn watch_loop<S, Fut>(
     }
 }
 
-/// Render a seller-claimed attribution string safely for a single operator-log line: control
-/// characters are stripped (newline injection could forge a whole settled/paid line; ANSI escapes
-/// could repaint the terminal) and the length is capped. The stored/RPC value stays raw — JSON
+/// Render a seller-claimed attribution string safely for a single operator-log line. Stripped:
+/// control characters (newline injection could forge a whole settled/paid line; ESC/C1-CSI could
+/// repaint the terminal) AND the invisible Unicode format characters `is_control` misses (bidi
+/// reordering, zero-widths, line/paragraph separators). Length is capped. The guarantee is
+/// single-line, no terminal control, bounded — spoofed PRINTABLE text (a fake `agent=…`) is
+/// inherent to printing seller text and stays possible. The stored/RPC value stays raw — JSON
 /// encoding escapes it there; only the bare eprintln needs this. `unreported` = the seller
-/// stamped nothing; `unprintable` = it stamped only control bytes (reported, but garbage).
+/// stamped nothing; `unprintable` = it stamped only stripped bytes (reported, but garbage).
 fn log_safe_agent(value: Option<&str>) -> String {
     match value {
         None => "unreported".to_owned(),
         Some(raw) => {
-            let cleaned: String = raw.chars().filter(|c| !c.is_control()).take(64).collect();
+            let cleaned: String = raw
+                .chars()
+                .filter(|c| !c.is_control() && !is_invisible_format(*c))
+                .take(64)
+                .collect();
             if cleaned.is_empty() {
                 "unprintable".to_owned()
             } else {
                 cleaned
+            }
+        }
+    }
+}
+
+/// Unicode format/invisible characters that survive `char::is_control` (Cc only) but can still
+/// reorder, hide, or split text in terminals and downstream viewers: zero-widths + bidi marks
+/// (U+200B–200F), bidi embedding/override controls (U+202A–202E), line/paragraph separators
+/// (U+2028/9), invisible operators (U+2060–2064), bidi isolates (U+2066–2069), and the BOM/ZWNBSP
+/// (U+FEFF).
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Backfill attribution for awards that SETTLED without it (#261) — the boot heal. Work set:
+/// [`store::BuyerStore::unattributed_settled_award_job_ids`] (spent + wholly-NULL). Source of
+/// truth: the durable accept-bind, which froze the seller-reported harness/model at accept —
+/// the same values the settle-time write would have carried. Landing goes through the same
+/// row-level write-once gate, so healing can never rewrite a recorded attribution. Advisory like
+/// the settle write: every failure logs and boot proceeds; a bind that reported nothing leaves
+/// the honest NULL (and logs nothing — there is nothing to heal).
+fn heal_award_attribution(store: &store::BuyerStore, home: &MobeeHome) {
+    let jobs = match store.unattributed_settled_award_job_ids() {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            eprintln!("buyer: attribution heal could not enumerate settled awards ({error}); skipping");
+            return;
+        }
+    };
+    for job_id in jobs {
+        let bind = match job_lifecycle::load_accepted_bind(home, &job_id) {
+            Ok(Some(bind)) => bind,
+            // Settled with no local bind (pre-bind legacy state) — nothing to heal from.
+            Ok(None) => continue,
+            Err(error) => {
+                eprintln!("buyer: attribution heal could not read bind for {job_id} ({error}); skipping");
+                continue;
+            }
+        };
+        if bind.agent_used.is_none() && bind.model_used.is_none() {
+            continue;
+        }
+        match store.attribute_award(&job_id, bind.agent_used.as_deref(), bind.model_used.as_deref()) {
+            Ok(store::AttributeAward::Written) => eprintln!(
+                "buyer: healed award attribution for settled {job_id} (agent={})",
+                log_safe_agent(bind.agent_used.as_deref())
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("buyer: attribution heal write failed for {job_id} (continuing): {error}")
             }
         }
     }
@@ -1517,6 +1594,75 @@ mod tests {
     fn temp_home(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!("mobee-buyer-mod-{label}-{}-{id}", std::process::id()))
+    }
+
+    // #261: the sanitizer is the only guard between seller-authored bytes and the operator's
+    // terminal — pin exactly what it strips (Cc controls incl. ESC and the one-byte C1 CSI, plus
+    // invisible Unicode format chars) and what it deliberately keeps (printable residue).
+    #[test]
+    fn log_safe_agent_strips_control_and_invisible_bytes_and_caps() {
+        assert_eq!(log_safe_agent(None), "unreported");
+        assert_eq!(log_safe_agent(Some("claude-agent-acp")), "claude-agent-acp");
+        // Newline forgery, ESC-[ repaint, one-byte C1 CSI, bidi override, zero-width — stripped;
+        // printable residue stays (spoofed printable text is inherent to printing seller text).
+        assert_eq!(
+            log_safe_agent(Some("a\nb\u{1b}[31mc\u{9b}d\u{202e}e\u{200b}f")),
+            "ab[31mcdef"
+        );
+        // Only-stripped-bytes input is REPORTED garbage — distinct from unreported.
+        assert_eq!(log_safe_agent(Some("\u{1b}\u{9b}\r\n\u{202e}")), "unprintable");
+        assert_eq!(log_safe_agent(Some(&"x".repeat(200))).len(), 64, "length capped");
+    }
+
+    // #261 boot heal, end to end: an award that SETTLED while its attribution write was lost (the
+    // crash-after-flip window, or a flip-fail later converged by reconcile's Paid arm) is
+    // backfilled at boot from the durable accept-bind — through the same write-once gate, so a
+    // recorded attribution is never rewritten.
+    #[test]
+    fn heal_backfills_attribution_for_settled_awards_from_the_bind() {
+        let root = temp_home("attribution-heal");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let store = BuyerStore::open(home.root.join(STATE_DB_FILE)).expect("store");
+
+        // A settled award whose attribution never landed: reserved → awarded → spent, NULL/NULL.
+        let job = "a".repeat(64);
+        store.reserve(&job, 5, 100, u64::MAX, 0, 1).expect("reserve");
+        store
+            .record_award(&job, &"1".repeat(64), &"2".repeat(64), &"3".repeat(64), 5, 1)
+            .expect("award");
+        store.convert_to_spent(&job, 5, 2).expect("spend");
+
+        // The durable bind holds the seller's report (frozen at accept). Written at the exact
+        // path the production loader reads — this test doubles as a pin on that convention.
+        let jobs_dir = home.root.join("jobs");
+        std::fs::create_dir_all(&jobs_dir).expect("jobs dir");
+        std::fs::write(
+            jobs_dir.join(format!("{job}.json")),
+            format!(
+                r#"{{"job_id":"{job}","claim_id":"bb","result_id":"cc","seller_pubkey":"dd",
+                    "commit_oid":"ee","repo":"https://example.invalid/repo.git","branch":"main",
+                    "job_hash":"ff","amount_sats":5,"accept_event_id":"11","accepted_at":1,
+                    "seller_signature":"","agent_used":"claude-agent-acp","model_used":"claude-opus-5"}}"#
+            ),
+        )
+        .expect("bind file");
+
+        heal_award_attribution(&store, &home);
+        let healed = store.award_record(&job).expect("read").expect("row");
+        assert_eq!(healed.agent_used.as_deref(), Some("claude-agent-acp"));
+        assert_eq!(healed.model_used.as_deref(), Some("claude-opus-5"));
+
+        // Idempotent and write-once: the healed row leaves the work set, and a second heal
+        // changes nothing.
+        assert!(
+            store.unattributed_settled_award_job_ids().expect("work set").is_empty(),
+            "a healed row leaves the work set"
+        );
+        heal_award_attribution(&store, &home);
+        let after = store.award_record(&job).expect("read").expect("row");
+        assert_eq!(after.agent_used.as_deref(), Some("claude-agent-acp"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ★ THE MELT-TO-FLIP WINDOW TOOTH. The reconcile must not be able to release a reservation while

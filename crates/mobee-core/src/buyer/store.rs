@@ -693,6 +693,29 @@ impl BuyerStore {
         Ok(jobs)
     }
 
+    /// Jobs whose award SETTLED (reservation `spent`) but whose attribution never landed — the
+    /// boot heal's work set (#261). The settle-time attribution write is advisory and post-flip,
+    /// so a crash after `convert_to_spent`, or a pay whose flip failed and was later converged by
+    /// reconcile's `Paid` arm, strands a paid row at NULL while the durable accept-bind still
+    /// holds the seller's report. Both-NULL is the same predicate the write-once guard in
+    /// [`Self::attribute_award`] admits, so healing can never overwrite a recorded attribution.
+    pub fn unattributed_settled_award_job_ids(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT a.job_id FROM awards a
+             JOIN reservations r ON r.job_id = a.job_id
+             WHERE r.state = 'spent'
+               AND a.agent_used IS NULL AND a.model_used IS NULL
+             ORDER BY a.awarded_at_unix",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            jobs.push(row?);
+        }
+        Ok(jobs)
+    }
+
     /// Every `parked` auto-award intent as `(job_id, reason)` — surfaced in `status` so a buyer sees
     /// jobs whose award could not be placed rather than silently losing them.
     pub fn parked_awards(&self) -> Result<Vec<(String, String)>, StoreError> {
@@ -726,7 +749,10 @@ pub struct PendingAward {
 /// attribution instead of silently no-oping (never a silent drop).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttributeAward {
-    /// The row was wholly unattributed and this write recorded the attribution.
+    /// The write-once guard admitted this write (the row was wholly unattributed). NOTE: an
+    /// all-NULL write also returns `Written` — it records nothing and deliberately leaves the
+    /// slot open to a later first real attribution — so `Written` means "the guard admitted the
+    /// write", never "values landed".
     Written,
     /// The row already carries its first settled attribution — later writes never rewrite
     /// history (write-once is row-level; see [`BuyerStore::attribute_award`]).
@@ -1057,6 +1083,38 @@ mod tests {
         assert_eq!(
             store.award_record(&bare).expect("read").expect("row").agent_used.as_deref(),
             Some("grok")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // #261 boot-heal work set: exactly the SETTLED-but-unattributed awards. A reserved (not yet
+    // settled) NULL row is the watcher's business, an attributed spent row is done — only
+    // spent + wholly-NULL rows need healing.
+    #[test]
+    fn unattributed_settled_awards_selects_spent_null_rows_only() {
+        let (store, path) = fresh_store("heal-work-set");
+        let settled_null = "a".repeat(64);
+        let settled_attributed = "b".repeat(64);
+        let reserved_null = "c".repeat(64);
+        for job in [&settled_null, &settled_attributed, &reserved_null] {
+            store.reserve(job, 5, 100, NO_BUDGET, 0, 1).expect("reserve");
+            store
+                .record_award(job, &"1".repeat(64), &"2".repeat(64), &"3".repeat(64), 5, 1)
+                .expect("award");
+        }
+        store.convert_to_spent(&settled_null, 5, 2).expect("spend");
+        store.convert_to_spent(&settled_attributed, 5, 2).expect("spend");
+        assert_eq!(
+            store
+                .attribute_award(&settled_attributed, Some("claude-agent-acp"), None)
+                .expect("attribute"),
+            AttributeAward::Written
+        );
+
+        assert_eq!(
+            store.unattributed_settled_award_job_ids().expect("work set"),
+            vec![settled_null.clone()],
+            "spent + wholly-NULL only — never reserved rows, never attributed rows"
         );
         let _ = std::fs::remove_file(&path);
     }
