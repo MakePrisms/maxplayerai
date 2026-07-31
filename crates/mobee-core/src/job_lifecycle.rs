@@ -51,7 +51,7 @@ pub const CLAIM_STATUS_DELIVERED: &str = "delivered";
 /// must not be able to strand it on the short scheduling clock. The relaxation is ONLY about not
 /// rejecting a proven delivery on a timer; every money gate (creq/cosig/tip-match/budget/
 /// single-redeem) still fires downstream in [`accept_claim`] / [`crate::authorize_pay`].
-const DELIVERY_PAY_WINDOW_SECS: u64 = 7 * 24 * 3_600;
+pub(crate) const DELIVERY_PAY_WINDOW_SECS: u64 = 7 * 24 * 3_600;
 
 /// Inputs for posting a offer-kind offer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -410,6 +410,10 @@ pub struct PreparedAward {
     /// The offer's deadline at prepare time. Past it a still-unresolved attempt is settled by
     /// probe, never by re-send — re-sending would knowingly inject a late award.
     pub offer_deadline_unix: i64,
+    /// The relay these bytes are for, frozen from config now: every send and every presence
+    /// probe of this award targets THIS url, so a config change mid-attempt cannot make the
+    /// resolution interrogate a relay the bytes never went to.
+    pub relay_url: String,
 }
 
 /// The relay's verdict on one transmission of a signed event. The three-way split is the point:
@@ -417,15 +421,20 @@ pub struct PreparedAward {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SendOutcome {
     /// The relay acked the event (`OK:true`, or `OK:false duplicate:` — it already holds it).
-    /// The award is PUBLIC.
+    /// This is the relay's word that it accepted the event; durability past that word is the
+    /// relay's business, and nothing stronger exists on the wire.
     Acked,
-    /// The relay explicitly rejected the event (`OK:false` minus the duplicate/rate-limit
-    /// prefixes). It was received and refused storage: nothing is public.
+    /// The relay explicitly rejected the event with a DELIBERATE, understood refusal
+    /// (`blocked:`/`invalid:`/`pow:`/`restricted:`/`unsupported:`). It examined the event and
+    /// refused storage: nothing from THIS transmission is public. Whether that licenses
+    /// releasing funds is the caller's question — it does only when this was the event's FIRST
+    /// transmission ever (see the attempt row's `send_count`).
     Refused { detail: String },
-    /// Everything else — transport error, timeout waiting for the OK, connection lost mid-send.
-    /// The event MAY be public (a lost OK after a successful store is indistinguishable from a
-    /// lost send), so the caller must hold state and retry the same bytes, never conclude
-    /// "nothing landed" (#322).
+    /// Everything else — transport error, timeout waiting for the OK, connection lost mid-send,
+    /// `rate-limited:`, `auth-required:`, `error:`, or words we don't understand. The event MAY
+    /// be public (a lost OK after a successful store is indistinguishable from a lost send), so
+    /// the caller must hold state and retry the same bytes, never conclude "nothing landed"
+    /// (#322).
     Unresolved { detail: String },
 }
 
@@ -958,53 +967,82 @@ pub async fn prepare_award_async(
         seller_pubkey: claim.seller_pubkey.clone(),
         quoted_mints,
         offer_deadline_unix: offer.deadline_unix as i64,
+        relay_url: home.config.relay_url.clone(),
     })
 }
 
 /// How long one send waits for the relay's verdict before reporting [`SendOutcome::Unresolved`].
-/// Slightly over the SDK's own 10s wait-for-OK so the inner timeout (which proves the EVENT was
-/// transmitted) is the one that normally fires, not this backstop.
-const SEND_AWARD_TIMEOUT: Duration = Duration::from_secs(15);
+/// The SDK's real write-path worst case is WAIT_FOR_OK(10s) + WAIT_FOR_AUTHENTICATION(7s) +
+/// WAIT_FOR_OK(10s) = 27s when the relay NIP-42-gates writes and the event is resent after auth —
+/// the same arithmetic [`crate::buyer::relay`] documents for its own `PUBLISH_TIMEOUT` (45s).
+/// Matching it here keeps a slow auth round-trip from reading as an eternal `Unresolved`.
+const SEND_AWARD_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// How long to wait for the WebSocket to actually come up before sending / fetching —
+/// `connect()` only SPAWNS the connection task. Mirrors [`crate::buyer::relay`]'s CONNECT_WAIT.
+const RELAY_CONNECT_WAIT: Duration = Duration::from_secs(20);
 
 /// Transmit a pinned, signed award — [`PreparedAward::event_json`] / a stored attempt's bytes —
-/// and report the relay's verdict as a three-way [`SendOutcome`].
+/// to the relay the attempt was pinned for, and report the relay's verdict as a three-way
+/// [`SendOutcome`].
 ///
 /// Never errors: every failure mode is a verdict. In particular a transport failure or a lost
 /// `OK` reports `Unresolved`, because the relay may hold (and be fanning out) the event even
 /// though we never heard back — the seller executes off the relay's copy, not off our ack
-/// (#322). Only an explicit `OK` moves anything: `true` (or `duplicate:`) → `Acked`,
-/// `false` → `Refused`. `rate-limited:` stays `Unresolved` — the relay refused THIS transmission,
-/// not the event; the same bytes are expected to succeed later.
+/// (#322). Only an explicit `OK` moves anything: `true` (or `duplicate:`) → `Acked`, and a
+/// deliberate refusal → `Refused`. `rate-limited:` / `auth-required:` / `error:` stay
+/// `Unresolved` — verdicts about this transmission or session, not about the event.
+///
+/// `expected_event_id` re-derives nothing: the stored bytes are verified (id + signature) to BE
+/// the pinned event before anything is transmitted, so confirm/record/probe — all keyed on the
+/// pinned id — can never chase an event these bytes don't carry. A mismatch or verification
+/// failure is local corruption and reports `Unresolved` (concluding "never landed" from local
+/// damage would be #322 again); the by-id probe resolves it against the relay's copy.
 pub async fn send_signed_award_async(
-    home: &MobeeHome,
     keys: &nostr_sdk::Keys,
+    relay_url: &str,
+    expected_event_id: &str,
     event_json: &str,
 ) -> SendOutcome {
     use nostr_sdk::prelude::{Client, Event, JsonUtil};
 
     let event = match Event::from_json(event_json) {
         Ok(event) => event,
-        // A pinned event that no longer parses cannot be re-sent, but concluding "never landed"
-        // from local corruption would be #322 again — leave it unresolved; the boot sweep's
-        // by-id probe resolves it against the relay's copy.
         Err(error) => {
             return SendOutcome::Unresolved {
                 detail: format!("pinned award event does not parse ({error}); probe will resolve"),
             };
         }
     };
+    if event.id.to_hex() != expected_event_id {
+        return SendOutcome::Unresolved {
+            detail: format!(
+                "pinned bytes carry event {} but the attempt is keyed on {expected_event_id}; \
+                 refusing to transmit them — probe will resolve",
+                event.id.to_hex()
+            ),
+        };
+    }
+    if let Err(error) = event.verify() {
+        return SendOutcome::Unresolved {
+            detail: format!("pinned award event fails verification ({error}); probe will resolve"),
+        };
+    }
     let client = Client::new(keys.clone());
-    if let Err(error) = client.add_relay(&home.config.relay_url).await {
+    // Explicit, not a default we hope for: the NIP-42 resend after auth fails SILENTLY when
+    // auto-auth is off — the drift guard buyer/relay.rs pins for its own client.
+    client.automatic_authentication(true);
+    if let Err(error) = client.add_relay(relay_url).await {
         return SendOutcome::Unresolved { detail: format!("add relay: {error}") };
     }
     client.connect().await;
-    let outcome = match client.relay(&home.config.relay_url).await {
+    let outcome = match client.relay(relay_url).await {
         Err(error) => SendOutcome::Unresolved { detail: format!("relay handle: {error}") },
         Ok(relay) => {
-            // `connect()` only SPAWNS the connection task; wait briefly so the send below fails on
-            // the relay's verdict, not on a handshake race. A relay still unreachable after this
+            // `connect()` only SPAWNS the connection task; wait so the send below fails on the
+            // relay's verdict, not on a handshake race. A relay still unreachable after this
             // surfaces as `NotConnected` from the send — Unresolved, retried later.
-            relay.wait_for_connection(Duration::from_secs(3)).await;
+            relay.wait_for_connection(RELAY_CONNECT_WAIT).await;
             match tokio::time::timeout(SEND_AWARD_TIMEOUT, relay.send_event(&event)).await {
                 Err(_) => SendOutcome::Unresolved {
                     detail: "timed out waiting for the relay's OK".to_owned(),
@@ -1035,19 +1073,29 @@ fn classify_send_error(error: nostr_sdk::pool::relay::Error) -> SendOutcome {
 ///
 /// - `duplicate:` → [`SendOutcome::Acked`]: the relay already HOLDS the event; that is a
 ///   confirmation wearing an error's clothes (and exactly what a successful retry looks like).
-/// - `rate-limited:` → [`SendOutcome::Unresolved`]: the relay refused this TRANSMISSION, not the
-///   event; the same bytes are expected to succeed later.
-/// - everything else (`blocked:`, `invalid:`, `pow:`, `restricted:`, `error:`, unprefixed, …) →
-///   [`SendOutcome::Refused`]: the relay examined the event and declined to store it. Nothing is
-///   public.
+/// - `rate-limited:` / `auth-required:` → [`SendOutcome::Unresolved`]: verdicts about this
+///   TRANSMISSION or this session, not about the event — the same bytes are expected to succeed
+///   later. (These are also exactly the two CLOSED reasons the SDK itself treats as
+///   non-removing; the write side mirrors that split.)
+/// - `error:` → [`SendOutcome::Unresolved`]: the NIP-01 catch-all relays use for transient
+///   backend/storage failures. Terminalizing it would release funds over a hiccup.
+/// - an UNPREFIXED message → [`SendOutcome::Unresolved`]: words we do not understand never
+///   release funds. A relay that refuses forever in nonstandard language keeps the attempt
+///   pending until the pay window passes and the by-id probe terminalizes it honestly.
+/// - `blocked:` / `invalid:` / `pow:` / `restricted:` / `unsupported:` →
+///   [`SendOutcome::Refused`]: the relay examined the event and DELIBERATELY declined to store
+///   it. Nothing from this transmission is public.
 fn classify_ok_false(message: &str) -> SendOutcome {
     use nostr_sdk::prelude::MachineReadablePrefix;
     match MachineReadablePrefix::parse(message) {
         Some(MachineReadablePrefix::Duplicate) => SendOutcome::Acked,
-        Some(MachineReadablePrefix::RateLimited) => {
-            SendOutcome::Unresolved { detail: message.to_owned() }
-        }
-        _ => SendOutcome::Refused { detail: message.to_owned() },
+        Some(
+            MachineReadablePrefix::RateLimited
+            | MachineReadablePrefix::AuthRequired
+            | MachineReadablePrefix::Error,
+        )
+        | None => SendOutcome::Unresolved { detail: message.to_owned() },
+        Some(_) => SendOutcome::Refused { detail: message.to_owned() },
     }
 }
 
@@ -1914,33 +1962,50 @@ pub(crate) async fn award_presence_async(
     let offer_id = EventId::from_hex(job_id)
         .map_err(|error| JobLifecycleError::Input(format!("job_id: {error}")))?;
     let client = Client::new(keys.clone());
+    // Same discipline as the send path: auto-auth on (NIP-42-gated reads re-issue silently only
+    // when it is), and WAIT for the socket — `connect()` only spawns, and a fetch racing the
+    // handshake burns its whole window and reads as empty.
+    client.automatic_authentication(true);
     client
         .add_relay(&home.config.relay_url)
         .await
         .map_err(|error| JobLifecycleError::Relay(format!("add relay: {error}")))?;
     client.connect().await;
+    if let Ok(relay) = client.relay(&home.config.relay_url).await {
+        relay.wait_for_connection(RELAY_CONNECT_WAIT).await;
+    }
 
     let filter = Filter::new()
         .kind(Kind::Custom(JOB_AWARD_KIND))
         .author(keys.public_key())
         .event(offer_id)
         .hashtag(gateway::MOBEE_TAG);
-    let events = client
-        .fetch_events(filter, timeout)
+    let mut events = client
+        .fetch_events(filter.clone(), timeout)
         .await
         .map_err(|error| JobLifecycleError::Relay(format!("fetch award: {error}")))?;
 
     if events.is_empty() {
-        // Emptiness means nothing until the relay shows it is answering us at all.
+        // Emptiness means nothing until the relay shows it is answering us at all — and the
+        // proof must PRECEDE the read it vouches for. The first fetch may have spent its window
+        // on connect/auth (the pool swallows per-relay stream errors into `Ok(empty)`), so a
+        // probe answered afterwards says only "the session works NOW". Absence is therefore
+        // concluded exclusively from a SECOND read taken after the probe's EOSE.
         let confirmed =
             crate::buyer::relay::probe_relay_serves_our_reqs(&client, keys.public_key(), timeout)
                 .await;
-        client.disconnect().await;
-        return Ok(if confirmed {
-            PresenceRead::ConfirmedAbsent
-        } else {
-            PresenceRead::Unverified
-        });
+        if !confirmed {
+            client.disconnect().await;
+            return Ok(PresenceRead::Unverified);
+        }
+        events = client
+            .fetch_events(filter, timeout)
+            .await
+            .map_err(|error| JobLifecycleError::Relay(format!("fetch award (recheck): {error}")))?;
+        if events.is_empty() {
+            client.disconnect().await;
+            return Ok(PresenceRead::ConfirmedAbsent);
+        }
     }
 
     // ⚠ TWO kind-3405s for one job is the NORMAL steady state, not an anomaly: the award attempt
@@ -1965,6 +2030,7 @@ pub(crate) async fn award_presence_async(
             // One unparseable event condemns the set: it may be the very one that disagrees, and
             // we cannot know that without parsing it.
             Err(detail) => {
+                client.disconnect().await;
                 return Ok(PresenceRead::Present(AwardPresence::Unrepairable {
                     award_event_id: event.id.to_hex(),
                     detail,
@@ -1973,16 +2039,21 @@ pub(crate) async fn award_presence_async(
         }
     }
 
+    client.disconnect().await;
     Ok(PresenceRead::Present(reduce_parsed_awards(parsed)))
 }
 
-/// Whether the exact event `event_id_hex` is on the relay — the by-id probe the boot sweep uses to
-/// settle a pinned attempt it must not re-send (past the offer deadline). Because the id names one
+/// Whether the exact event `event_id_hex` is on `relay_url` — the by-id probe that settles a
+/// pinned attempt which must not be re-sent (past the offer deadline). Because the id names one
 /// specific event, this read cannot be confused by the award/accept kind-sharing that makes
-/// counting 3405s unreliable (#268): the answer is about THIS event or no event.
+/// counting 3405s unreliable (#268): the answer is about THIS event or no event. Targets the
+/// attempt's PINNED relay, never live config — the question is about the relay the bytes went to.
+///
+/// Same emptiness discipline as [`award_presence_async`]: absence is concluded only from a read
+/// taken AFTER the relay proved it serves this session's REQs.
 pub(crate) async fn event_present_async(
-    home: &MobeeHome,
     keys: &nostr_sdk::Keys,
+    relay_url: &str,
     event_id_hex: &str,
     timeout: Duration,
 ) -> Result<PresenceRead<()>, JobLifecycleError> {
@@ -1991,26 +2062,37 @@ pub(crate) async fn event_present_async(
     let event_id = EventId::from_hex(event_id_hex)
         .map_err(|error| JobLifecycleError::Input(format!("event id: {error}")))?;
     let client = Client::new(keys.clone());
+    client.automatic_authentication(true);
     client
-        .add_relay(&home.config.relay_url)
+        .add_relay(relay_url)
         .await
         .map_err(|error| JobLifecycleError::Relay(format!("add relay: {error}")))?;
     client.connect().await;
+    if let Ok(relay) = client.relay(relay_url).await {
+        relay.wait_for_connection(RELAY_CONNECT_WAIT).await;
+    }
 
-    let events = client
-        .fetch_events(Filter::new().id(event_id), timeout)
+    let filter = Filter::new().id(event_id);
+    let mut events = client
+        .fetch_events(filter.clone(), timeout)
         .await
         .map_err(|error| JobLifecycleError::Relay(format!("fetch event: {error}")))?;
-
-    let read = if events.is_empty() {
+    if events.is_empty() {
         let confirmed =
             crate::buyer::relay::probe_relay_serves_our_reqs(&client, keys.public_key(), timeout)
                 .await;
-        if confirmed {
-            PresenceRead::ConfirmedAbsent
-        } else {
-            PresenceRead::Unverified
+        if !confirmed {
+            client.disconnect().await;
+            return Ok(PresenceRead::Unverified);
         }
+        events = client
+            .fetch_events(filter, timeout)
+            .await
+            .map_err(|error| JobLifecycleError::Relay(format!("fetch event (recheck): {error}")))?;
+    }
+
+    let read = if events.is_empty() {
+        PresenceRead::ConfirmedAbsent
     } else {
         PresenceRead::Present(())
     };
@@ -4824,7 +4906,9 @@ mod tests {
     // The OK:false classifier is the one place a relay's words become a money decision (#322), so
     // pin every NIP-01 prefix to its verdict. `duplicate:` is the load-bearing surprise: on a
     // same-bytes retry it is what SUCCESS looks like, and misreading it as a refusal would release
-    // funds for an award that is public.
+    // funds for an award that is public. The Unresolved set is equally load-bearing in the other
+    // direction: session/transmission verdicts (`rate-limited:`, `auth-required:`), the NIP-01
+    // transient catch-all (`error:`), and words we don't understand must NEVER release funds.
     #[test]
     fn ok_false_classification_pins_every_prefix_to_its_verdict() {
         assert_eq!(
@@ -4832,24 +4916,29 @@ mod tests {
             SendOutcome::Acked,
             "duplicate means the relay HOLDS the event — a confirmation, not a refusal"
         );
-        assert_eq!(
-            classify_ok_false("rate-limited: slow down"),
-            SendOutcome::Unresolved { detail: "rate-limited: slow down".to_owned() },
-            "rate-limit refuses the transmission, not the event — same bytes retry later"
-        );
+        for held in [
+            "rate-limited: slow down",
+            "auth-required: we only accept events from registered users",
+            "error: could not connect to the database",
+            "a message with no machine-readable prefix at all",
+        ] {
+            assert_eq!(
+                classify_ok_false(held),
+                SendOutcome::Unresolved { detail: held.to_owned() },
+                "{held:?} judges the transmission/session, not the event — must hold, not refuse"
+            );
+        }
         for refusal in [
             "blocked: no spam",
             "invalid: bad sig",
             "pow: difficulty 28 required",
             "restricted: members only",
-            "error: internal",
             "unsupported: kind",
-            "a message with no machine-readable prefix at all",
         ] {
             assert_eq!(
                 classify_ok_false(refusal),
                 SendOutcome::Refused { detail: refusal.to_owned() },
-                "an explicit OK:false stores nothing — {refusal:?} must refuse"
+                "a deliberate, understood OK:false stores nothing — {refusal:?} must refuse"
             );
         }
     }

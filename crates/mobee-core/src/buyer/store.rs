@@ -179,6 +179,19 @@ impl BuyerStore {
                  amount_sats         INTEGER NOT NULL CHECK (amount_sats >= 0),
                  quoted_mints_json   TEXT NOT NULL DEFAULT '[]',
                  offer_deadline_unix INTEGER NOT NULL,
+                 -- How many transmissions have ever been STARTED for this event, incremented
+                 -- durably BEFORE each send. Load-bearing for refusals: an explicit OK:false is
+                 -- proof the relay stored nothing ONLY for the event's first transmission — on a
+                 -- re-send it proves nothing about the earlier sends whose verdicts were lost
+                 -- (policy drift, relay churn), so a re-send refusal must never release funds.
+                 -- A crash between the increment and the socket write inflates the count, which
+                 -- only makes later verdicts MORE conservative — the safe direction.
+                 send_count          INTEGER NOT NULL DEFAULT 0,
+                 -- The relay these bytes were pinned for, frozen from config at pin time. Every
+                 -- later send AND every presence probe targets this URL, not live config, so an
+                 -- operator repointing relay_url cannot make the resolution interrogate a relay
+                 -- the bytes never went to.
+                 relay_url           TEXT NOT NULL DEFAULT '',
                  state               TEXT NOT NULL CHECK (state IN ('pending','confirmed','refused')),
                  detail              TEXT,
                  created_at_unix     INTEGER NOT NULL,
@@ -209,6 +222,19 @@ impl BuyerStore {
         }
         if !Self::column_exists(conn, "awards", "model_used")? {
             conn.execute_batch("ALTER TABLE awards ADD COLUMN model_used TEXT;")?;
+        }
+        // v6 (#322) columns added during the same unreleased cycle as the table itself: a store
+        // created by an earlier v6 build gains them here; a store where `init_schema` just created
+        // the full table skips both (the column already exists).
+        if !Self::column_exists(conn, "award_attempts", "send_count")? {
+            conn.execute_batch(
+                "ALTER TABLE award_attempts ADD COLUMN send_count INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        if !Self::column_exists(conn, "award_attempts", "relay_url")? {
+            conn.execute_batch(
+                "ALTER TABLE award_attempts ADD COLUMN relay_url TEXT NOT NULL DEFAULT '';",
+            )?;
         }
         Ok(())
     }
@@ -779,7 +805,8 @@ impl BuyerStore {
         Ok(conn
             .query_row(
                 "SELECT job_id, claim_id, seller_pubkey, award_event_id, event_json, amount_sats,
-                        quoted_mints_json, offer_deadline_unix, state, detail
+                        quoted_mints_json, offer_deadline_unix, send_count, relay_url,
+                        state, detail
                  FROM award_attempts WHERE job_id = ?1",
                 [job_id],
                 row_to_attempt,
@@ -800,9 +827,9 @@ impl BuyerStore {
         let inserted = conn.execute(
             "INSERT INTO award_attempts
                  (job_id, claim_id, seller_pubkey, award_event_id, event_json, amount_sats,
-                  quoted_mints_json, offer_deadline_unix, state, detail,
+                  quoted_mints_json, offer_deadline_unix, send_count, relay_url, state, detail,
                   created_at_unix, updated_at_unix)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', NULL, ?9, ?9)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, 'pending', NULL, ?10, ?10)
              ON CONFLICT(job_id) DO NOTHING",
             params![
                 attempt.job_id,
@@ -813,6 +840,7 @@ impl BuyerStore {
                 attempt.amount_sats as i64,
                 attempt.quoted_mints_json,
                 attempt.offer_deadline_unix,
+                attempt.relay_url,
                 now_unix
             ],
         )?;
@@ -822,7 +850,8 @@ impl BuyerStore {
         let existing = conn
             .query_row(
                 "SELECT job_id, claim_id, seller_pubkey, award_event_id, event_json, amount_sats,
-                        quoted_mints_json, offer_deadline_unix, state, detail
+                        quoted_mints_json, offer_deadline_unix, send_count, relay_url,
+                        state, detail
                  FROM award_attempts WHERE job_id = ?1",
                 [&attempt.job_id],
                 row_to_attempt,
@@ -835,6 +864,34 @@ impl BuyerStore {
                 ))
             })?;
         Ok(BeginAttempt::Existing(existing))
+    }
+
+    /// Record that a transmission of this attempt's event is about to START, returning the number
+    /// of transmissions started BEFORE this one. Written durably ahead of the socket write, so
+    /// "bytes may be on the wire" is provable from local state: a prior count of 0 licenses
+    /// treating an explicit relay refusal as proof nothing is public; any higher value forbids it
+    /// (an earlier send's verdict may have been lost). A crash after this write but before the
+    /// send inflates the count — the conservative direction.
+    pub fn record_attempt_send(&self, job_id: &str, now_unix: i64) -> Result<u64, StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let prior: i64 = tx
+            .query_row(
+                "SELECT send_count FROM award_attempts WHERE job_id = ?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError(format!("no award attempt for {job_id} to record a send against"))
+            })?;
+        tx.execute(
+            "UPDATE award_attempts SET send_count = send_count + 1, updated_at_unix = ?2
+             WHERE job_id = ?1",
+            params![job_id, now_unix],
+        )?;
+        tx.commit()?;
+        Ok(prior.max(0) as u64)
     }
 
     /// The relay acked this attempt's event (or a probe found it public). One-way: a confirmed
@@ -873,7 +930,8 @@ impl BuyerStore {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT job_id, claim_id, seller_pubkey, award_event_id, event_json, amount_sats,
-                    quoted_mints_json, offer_deadline_unix, state, detail
+                    quoted_mints_json, offer_deadline_unix, send_count, relay_url,
+                    state, detail
              FROM award_attempts WHERE state = 'pending' ORDER BY created_at_unix",
         )?;
         let rows = stmt.query_map([], row_to_attempt)?;
@@ -891,7 +949,8 @@ impl BuyerStore {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT t.job_id, t.claim_id, t.seller_pubkey, t.award_event_id, t.event_json,
-                    t.amount_sats, t.quoted_mints_json, t.offer_deadline_unix, t.state, t.detail
+                    t.amount_sats, t.quoted_mints_json, t.offer_deadline_unix, t.send_count,
+                    t.relay_url, t.state, t.detail
              FROM award_attempts t
              LEFT JOIN awards a ON a.job_id = t.job_id
              WHERE t.state = 'confirmed' AND a.job_id IS NULL
@@ -981,12 +1040,20 @@ pub struct AwardAttempt {
     /// JSON array of the mints the claim's creq quoted at prepare time — carried so a resumed
     /// attempt reports the same `quoted_mints` a fresh publish would have.
     pub quoted_mints_json: String,
-    /// The offer's deadline, captured at prepare time: past it the boot sweep resolves the attempt
-    /// by PROBE only (re-sending would knowingly inject a late award).
+    /// The offer's deadline, captured at prepare time: past it the attempt is resolved by PROBE
+    /// only (re-sending would knowingly inject a late award).
     pub offer_deadline_unix: i64,
+    /// Transmissions STARTED for this event (incremented durably before each send). `0` means the
+    /// bytes have provably never been handed to a socket, so an explicit relay refusal of the
+    /// first transmission is proof nothing is public; any higher value means an earlier send's
+    /// verdict may have been lost, and a refusal proves nothing about it.
+    pub send_count: u64,
+    /// The relay these bytes were pinned for (config at pin time); sends and probes target THIS,
+    /// never live config.
+    pub relay_url: String,
     pub state: AttemptState,
-    /// Refusal detail (the relay's OK:false message, or the deadline-expiry reason). `None` unless
-    /// `state` is `Refused`.
+    /// Refusal detail (the relay's OK:false message, or the pay-window-expiry reason). `None`
+    /// unless `state` is `Refused`.
     pub detail: Option<String>,
 }
 
@@ -1025,14 +1092,14 @@ pub enum BeginAttempt {
     Existing(AwardAttempt),
 }
 
-/// Map an `award_attempts` row (in the 10-column order every attempt query selects) to an
+/// Map an `award_attempts` row (in the 12-column order every attempt query selects) to an
 /// [`AwardAttempt`]. An unknown `state` label fails closed as a column-decode error rather than
 /// being misread as pending.
 fn row_to_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<AwardAttempt> {
-    let state_raw = row.get::<_, String>(8)?;
+    let state_raw = row.get::<_, String>(10)?;
     let state = AttemptState::parse(&state_raw).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
-            8,
+            10,
             rusqlite::types::Type::Text,
             format!("unknown award attempt state '{state_raw}'").into(),
         )
@@ -1046,8 +1113,10 @@ fn row_to_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<AwardAttempt> {
         amount_sats: row.get::<_, i64>(5)?.max(0) as u64,
         quoted_mints_json: row.get::<_, String>(6)?,
         offer_deadline_unix: row.get::<_, i64>(7)?,
+        send_count: row.get::<_, i64>(8)?.max(0) as u64,
+        relay_url: row.get::<_, String>(9)?,
         state,
-        detail: row.get::<_, Option<String>>(9)?,
+        detail: row.get::<_, Option<String>>(11)?,
     })
 }
 
@@ -1835,9 +1904,62 @@ mod tests {
             amount_sats: 40,
             quoted_mints_json: "[\"https://testnut.example\"]".to_owned(),
             offer_deadline_unix: 9_999,
+            send_count: 0,
+            relay_url: "ws://relay.test".to_owned(),
             state: AttemptState::Pending,
             detail: None,
         }
+    }
+
+    // send_count is the refusal license: 0 = the bytes provably never reached a socket; each
+    // recorded send bumps it BEFORE transmission and hands back the PRIOR count, so the caller
+    // can tell a first transmission (refusal = proof) from a re-send (refusal = nothing).
+    #[test]
+    fn record_attempt_send_returns_the_prior_count_and_increments_durably() {
+        let (store, path) = fresh_store("attempt-send-count");
+        let job = "s".repeat(64);
+        store.begin_award_attempt(&attempt(&job, "claim-s"), 1).expect("pin");
+
+        assert_eq!(store.record_attempt_send(&job, 2).expect("first"), 0, "no prior sends");
+        assert_eq!(store.record_attempt_send(&job, 3).expect("second"), 1, "one prior send");
+        assert_eq!(
+            store.award_attempt(&job).expect("read").expect("row").send_count,
+            2,
+            "both starts recorded"
+        );
+        assert!(
+            store.record_attempt_send(&"missing".repeat(8), 4).is_err(),
+            "a send against a job with no attempt is a caller bug, not a silent zero"
+        );
+        // The pin carried the relay these bytes belong to.
+        assert_eq!(
+            store.award_attempt(&job).expect("read").expect("row").relay_url,
+            "ws://relay.test"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The stamping SQL's other half — "a (hypothetical) higher version is left untouched (never
+    // downgraded)" — is the guarantee every future rollback rests on; pin it.
+    #[test]
+    fn open_never_downgrades_a_higher_schema_version() {
+        let path = temp_db("no-downgrade");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("raw open");
+            conn.execute_batch(
+                "CREATE TABLE buyer_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO buyer_meta (key, value) VALUES ('schema_version', '99');",
+            )
+            .expect("seed future version");
+        }
+        let store = BuyerStore::open(&path).expect("an older binary still opens a newer store");
+        assert_eq!(
+            store.health().expect("health").schema_version,
+            99,
+            "opening must never stamp a LOWER version over a higher one"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     // A v5 store (no award_attempts table) gains it on open, with pre-existing data untouched —
