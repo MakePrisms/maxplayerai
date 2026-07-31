@@ -18,10 +18,13 @@ use std::future::Future;
 use cashu::{Amount, CurrencyUnit};
 
 use crate::crossmint::plan_payment;
-use crate::job_lifecycle::{AwardClaimOutcome, AwardPresence, JobLifecycleError, JobView};
+use crate::job_lifecycle::{
+    AwardClaimOutcome, AwardPresence, JobLifecycleError, JobView, PreparedAward, PresenceRead,
+    SendOutcome,
+};
 
 use super::reservations::{Converted, JobDisposition, ReservationState, ReserveRefused};
-use super::store::{AwardRecord, BuyerStore, StoreError};
+use super::store::{AttemptState, AwardAttempt, AwardRecord, BeginAttempt, BuyerStore, StoreError};
 
 /// Hard filters an awardable claim must pass (issue #126). Grounded in the wire the offer/claim
 /// actually carry: the offer's signed `amount_sats` is the fixed price, the seller's claim `creq`
@@ -182,52 +185,78 @@ fn claim_is_payable(job_id: &str, creq: Option<&str>, filters: &AwardFilters) ->
     plan_payment(filters.buyer_mint, &listed, filters.allow_real_mints).is_ok()
 }
 
-/// What [`award_with_reservation`] may do about a job, decided BEFORE any reserve or publish.
+/// What [`award_with_reservation`] may do about a job, decided BEFORE any reserve, sign, or send.
 ///
-/// The local `awards` row is consulted first because it is the only signal here that cannot lie by
-/// omission: it is a `job_id`-keyed row written AT this chokepoint, so reading it is a local
-/// point-query that either finds the award or proves it was never recorded. The relay cannot offer
-/// that — see [`AwardPrecheck::AskRelay`].
+/// The attempt row outranks the reservation because it is the only signal that knows whether
+/// SIGNED BYTES may be on the wire: it is written before the first send by construction
+/// ([`BuyerStore::begin_award_attempt`]), so "no attempt row" proves no award of ours was ever
+/// transmitted — a proof the reservation ledger cannot offer (`Released` is written by the OLD
+/// binary's publish-error path, where the event may have landed anyway; that misreading is #322).
+/// The local `awards` row is consulted before either: it is written at this chokepoint, so
+/// reading it either finds the award or proves it was never recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AwardPrecheck {
+pub enum AwardStep {
     /// A local `awards` row exists: this buyer published this award and recorded it. Return it;
-    /// publish nothing.
-    AlreadyRecorded,
-    /// No local row and no funds reserved for this job — nothing was ever started here, so this is
-    /// a first award. Publish.
-    Publish,
-    /// No local row, but funds ARE reserved. Indeterminate from local state alone, and the two
-    /// states it covers want OPPOSITE actions:
+    /// send nothing.
+    AlreadyAwarded,
+    /// The attempt is confirmed public but the `awards` row is missing — the crash window between
+    /// the relay's ack and `record_award`. Write the row FROM the attempt (which carries every
+    /// field) and report `AlreadyAwarded`; send nothing.
+    RepairFromAttempt,
+    /// The attempt was refused by the relay — terminal. Nothing is public and nothing may be
+    /// published for this job again; finish any half-done release and report the refusal.
+    RefusedTerminal,
+    /// A pinned attempt awaits its relay verdict. Re-hold the reservation (reconcile may have
+    /// released it while the question was open) and re-send THE PINNED BYTES — never re-prepare,
+    /// never re-select. The event id is a content hash, so however many sends this takes, the
+    /// relay holds at most one award for the job.
+    ResumeAttempt,
+    /// No attempt row, but a reservation exists (`Reserved` OR `Released`) — a job last touched by
+    /// a pre-attempt binary (or our own sub-second reserve→pin crash window, which is locally
+    /// indistinguishable). Only the relay can say whether an award landed: probe fail-closed.
+    /// Found → repair the row and re-hold its funds. CONFIRMED absent → release and terminalize
+    /// (recovery: a new offer) — never a second claim selection, because "absent now" is not
+    /// "never arrives" and the seller executes per-award, so a fresh event naming a different
+    /// claim re-arms the #322 burn. Unverified → refuse, holding everything.
     ///
-    /// - the process died between `reserve` and `publish` — no award went out, republishing is right;
-    /// - `publish` succeeded and `record_award` then failed (the window
-    ///   [`award_with_reservation`] logs) — the award IS public, republishing DUPLICATES it.
-    ///
-    /// Only the relay can tell these apart, so it is asked here and ONLY here.
-    AskRelay,
+    /// `Released` taking this arm (instead of publishing straight away) is the #322 fix at its
+    /// point of failure: the old binary released on any publish error, though a lost `OK` leaves
+    /// the award public — so `Released` proves nothing and must ask, exactly like `Reserved`.
+    ProbeLegacy,
+    /// Nothing was ever started here (or the ledger says `Spent`, which `reserve` itself refuses
+    /// downstream — one authority). Reserve, prepare + sign, PIN the attempt, then send.
+    Fresh,
 }
 
-/// The three-state award presence decision (#126/#127 invariant A: never award twice), local-first.
+/// The award-step decision (#126/#127 invariant A: never award twice), local-first — pure over
+/// the three local reads so the full state product is exhaustively testable.
 ///
-/// `reservations.state` alone cannot make this call: `Reserved` is the state of a healthy in-flight
-/// award AND of both failure windows above. The discriminator is the JOIN against `awards` — the
-/// same shape [`BuyerStore::awarded_unsettled_job_ids`] already relies on.
-pub fn award_precheck(
-    has_local_record: bool,
+/// `reservations.state` alone cannot make this call: `Reserved` is the state of a healthy
+/// in-flight award AND of both crash windows, and `Released` is the state of a failed publish AND
+/// of a landed-but-unacked one (#322). The discriminators are the JOIN against `awards` and the
+/// attempt row's pinned verdict.
+pub fn award_step(
+    has_award_row: bool,
+    attempt: Option<AttemptState>,
     reservation: Option<ReservationState>,
-) -> AwardPrecheck {
-    if has_local_record {
-        return AwardPrecheck::AlreadyRecorded;
+) -> AwardStep {
+    if has_award_row {
+        return AwardStep::AlreadyAwarded;
     }
-    match reservation {
-        // Funds committed but no award recorded — the one genuinely ambiguous state.
-        Some(ReservationState::Reserved) => AwardPrecheck::AskRelay,
-        // `Spent` (already paid) and `Released` (publish failed, funds reclaimed) are both decided
-        // downstream by `reserve` itself, which refuses `AlreadySpent` and re-reserves a `Released`
-        // row. Falling through keeps ONE authority for those two rather than a second opinion here.
-        Some(ReservationState::Spent) | Some(ReservationState::Released) | None => {
-            AwardPrecheck::Publish
-        }
+    match attempt {
+        Some(AttemptState::Confirmed) => AwardStep::RepairFromAttempt,
+        Some(AttemptState::Refused) => AwardStep::RefusedTerminal,
+        Some(AttemptState::Pending) => AwardStep::ResumeAttempt,
+        None => match reservation {
+            // Funds were committed by a binary that pinned no attempt — the award may or may not
+            // be public, whichever of the two states the ledger shows. Ask the relay.
+            Some(ReservationState::Reserved) | Some(ReservationState::Released) => {
+                AwardStep::ProbeLegacy
+            }
+            // `Spent` (already paid) is decided downstream by `reserve` itself, which refuses
+            // `AlreadySpent`. Falling through keeps ONE authority rather than a second opinion.
+            Some(ReservationState::Spent) | None => AwardStep::Fresh,
+        },
     }
 }
 
@@ -274,10 +303,22 @@ pub enum AwardError {
     /// reading local state first is that it is authoritative, so a failure to read it is not a
     /// licence to publish.
     Presence(StoreError),
-    /// The award publish failed after the reservation was taken; the reservation was released
-    /// (no award reached the relay), so its funds are not stranded.
+    /// PREPARE (validate + sign) failed after the reservation was taken; the reservation was
+    /// released. Releasing here is provably safe — the failure happened before anything signed
+    /// was persisted or transmitted, so nothing of ours can be on the wire.
     Publish(JobLifecycleError),
-    /// Releasing the reservation after a publish failure itself failed.
+    /// The relay explicitly rejected this job's pinned award event (`OK:false`), or the offer
+    /// deadline passed with the award confirmed absent. TERMINAL for the job: nothing is public,
+    /// the reservation was released, and no award may be published for this offer again — awards
+    /// are write-once per offer, so the recovery is a new offer, never a second award.
+    Refused { job_id: String, detail: String },
+    /// The send got no verdict — the relay may or may not hold the event (a lost `OK` after a
+    /// successful store is indistinguishable from a lost send, and the seller executes off the
+    /// relay's copy either way; #322). The signed attempt stays PINNED and the reservation stays
+    /// HELD. Retrying is safe and is the way forward: a retry re-sends the identical bytes, which
+    /// the relay dedups.
+    Unresolved { job_id: String, award_event_id: String, detail: String },
+    /// Releasing the reservation after a refusal (or a prepare failure) itself failed.
     Store(StoreError),
 }
 
@@ -302,15 +343,28 @@ impl std::fmt::Display for AwardError {
                 formatter,
                 "job {job_id} has funds reserved with no local awards row, and the relay could not \
                  confirm whether an award is already public ({detail}); refusing to publish rather \
-                 than risk a duplicate award. No operator action is required: the reconcile pass \
-                 releases this reservation once the claim is no longer live on the relay, which \
-                 re-arms the award. If you want it settled sooner, check the relay for a 3405 on \
-                 this job and, if one exists, run `collect {job_id}`",
+                 than risk a duplicate award. No operator action is required: every award call and \
+                 sweep pass re-probes, and once the relay answers, the job either repairs its row \
+                 (award found) or terminally parks with its funds returned (confirmed absence). If \
+                 you want it settled sooner, check the relay for a 3405 on this job and, if one \
+                 exists, run `collect {job_id}`",
             ),
             Self::Presence(error) => {
                 write!(formatter, "could not read local award state: {error}")
             }
             Self::Publish(error) => write!(formatter, "{error}"),
+            Self::Refused { job_id, detail } => write!(
+                formatter,
+                "the relay refused the award event for job {job_id} ({detail}); nothing is \
+                 public and the reserved funds were returned. Awards are write-once per offer, \
+                 so this job will not be awarded again — post a new offer to re-run the work",
+            ),
+            Self::Unresolved { job_id, award_event_id, detail } => write!(
+                formatter,
+                "the relay gave no verdict on award {award_event_id} for job {job_id} ({detail}); \
+                 the signed award stays pinned and its funds stay reserved. Retry the award — a \
+                 retry re-sends the SAME signed event (never a new one), so it can only converge",
+            ),
             Self::Store(error) => write!(formatter, "{error}"),
         }
     }
@@ -318,47 +372,48 @@ impl std::fmt::Display for AwardError {
 
 impl std::error::Error for AwardError {}
 
-/// Check that this job is not ALREADY awarded, then reserve `amount` and publish.
+/// Check that this job is not ALREADY awarded (or pinned), then reserve `amount`, pin the signed
+/// award, and send it.
 ///
-/// Three orderings are load-bearing here, in this order:
+/// Four orderings are load-bearing here, in this order:
 ///
-/// 1. **Presence before reserve** ([`award_precheck`]): an already-awarded job returns
-///    [`AwardOutcome::AlreadyAwarded`] having published nothing and reserved nothing — the original
+/// 1. **Presence before reserve** ([`award_step`]): an already-awarded job returns
+///    [`AwardOutcome::AlreadyAwarded`] having sent nothing and reserved nothing — the original
 ///    award still holds its own reservation, so re-reserving would be a second commitment against
-///    the same debt.
-/// 2. **Reserve before publish**: a refused reservation returns [`AwardError::Reserve`] without
-///    ever calling `publish`, so an award the buyer cannot afford never reaches the relay and (by
+///    the same debt. A pinned attempt likewise short-circuits selection: whatever claim the caller
+///    had in mind, the PINNED event is the only award this job may carry.
+/// 2. **Reserve before sign**: a refused reservation returns [`AwardError::Reserve`] without ever
+///    calling `prepare`, so an award the buyer cannot afford is never even signed and (by
 ///    [`BuyerStore::reserve`]) leaves no row.
-/// 3. **Publish before record**: a publish that fails releases the reservation (no award went out)
-///    so the funds return to `available`.
+/// 3. **Pin before send** ([`BuyerStore::begin_award_attempt`]): the signed bytes are durable
+///    before the first transmission, so "bytes on the wire ⇒ an attempt row exists" holds by
+///    construction and every later crash window is decidable from local state alone.
+/// 4. **Send resolves the attempt, never the selection**: an acked send confirms + records; an
+///    explicit relay refusal terminalizes + releases; an UNRESOLVED send (lost `OK`, timeout,
+///    transport error) changes NOTHING — the reservation stays held, the attempt stays pending,
+///    and the retry (this same function) re-sends the identical bytes. Concluding "nothing
+///    landed" from an unresolved send — and then releasing + re-selecting — is how three seats
+///    came to execute one offer (#322).
 ///
-/// `award_present_on_relay` is the relay leg, injected as a closure exactly like `publish` so this
-/// module stays free of relay I/O. It is awaited ONLY in the [`AwardPrecheck::AskRelay`] case, so
-/// the common paths — first award, and re-entry on an already-recorded award — cost no network.
+/// `award_present_on_relay` is the relay leg for PRE-ATTEMPT jobs only (rows written by a binary
+/// older than the attempt table): with no pinned verdict to consult, only the relay can say
+/// whether their award landed. It is fail-closed in every direction — `Unverified` refuses
+/// holding everything, a found award repairs the row and re-holds its funds, and a CONFIRMED
+/// absence releases and terminalizes (recovery: a new offer). A confirmed absence deliberately
+/// does NOT proceed to a fresh selection: "absent now" is not "never arrives", the seller
+/// executes per-award, and a fresh event naming a different claim would re-arm the #322 burn for
+/// exactly the population this gate exists to protect.
 ///
-/// ⚠ No `AskRelay` branch ever PUBLISHES. A process that died between `reserve` and `publish` used
-/// to silently republish; it now either repairs the missing row or stops for an operator. `Ok(None)`
-/// from the relay probe does not mean "no award exists" (the probe's `fetch_events` yields
-/// `Ok(empty)` on timeout, so absence and unreachability are the same value), and publishing on an
-/// unverified absence is the duplicate. Recovering costs one command; a duplicate award costs money.
-///
-/// When the relay returns an award this buyer can parse completely, the missing `awards` row is
-/// REPAIRED — written through the same `record_award` seam a fresh award uses — and the call
-/// reports [`AwardOutcome::AlreadyAwarded`]. Repair is fail-closed in both directions: an award
-/// that cannot be parsed into a complete, unambiguous record leaves the row missing and refuses,
-/// and a repair whose write does not read back also refuses. Nothing is ever published to make the
-/// ledger agree with itself.
-///
-/// ★ The recorded `amount_sats` comes from the job's own RESERVATION, never from this call's
-/// `amount`. `AskRelay` is reachable only with a `Reserved` row (see [`award_precheck`]), and that
-/// row is what the original award actually committed; `amount` is what THIS call was asked to
-/// spend, which may differ. The kind-3405 carries no amount tag, so the reservation is the only
-/// artifact of the sum that was really awarded.
+/// ★ The recorded `amount_sats` comes from the job's own pinned attempt or RESERVATION, never
+/// from this call's `amount`, on every non-fresh path. `amount` is what THIS call was asked to
+/// spend, which may differ; the kind-3405 carries no amount tag, so the attempt/reservation is
+/// the only artifact of the sum that was really awarded.
 ///
 /// `balance`/`total_cap`/`spent` are the honest snapshots the caller supplies (live wallet
 /// balance, budget cap, budget spent total) — the same two-ceiling inputs [`BuyerStore::reserve`]
 /// guards against.
-pub async fn award_with_reservation<F, Fut, P, PFut>(
+#[allow(clippy::too_many_arguments)]
+pub async fn award_with_reservation<P, PFut, R, RFut, S, SFut>(
     store: &BuyerStore,
     job_id: &str,
     amount: u64,
@@ -367,46 +422,180 @@ pub async fn award_with_reservation<F, Fut, P, PFut>(
     spent: u64,
     now_unix: i64,
     award_present_on_relay: P,
-    publish: F,
+    prepare: R,
+    send: S,
 ) -> Result<AwardOutcome, AwardError>
 where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<AwardClaimOutcome, JobLifecycleError>>,
     P: FnOnce() -> PFut,
-    PFut: Future<Output = Result<Option<AwardPresence>, JobLifecycleError>>,
+    PFut: Future<Output = Result<PresenceRead<AwardPresence>, JobLifecycleError>>,
+    R: FnOnce() -> RFut,
+    RFut: Future<Output = Result<PreparedAward, JobLifecycleError>>,
+    S: FnOnce(String, String) -> SFut,
+    SFut: Future<Output = SendOutcome>,
 {
     // Presence before anything else. A local read failure REFUSES rather than falling through to
-    // publish: local state is the authority this gate rests on, so failing to read it is not a
+    // send: local state is the authority this gate rests on, so failing to read it is not a
     // licence to act as though it said "absent".
     let existing = store.award_record(job_id).map_err(AwardError::Presence)?;
+    let attempt = store.award_attempt(job_id).map_err(AwardError::Presence)?;
     let reservation = store.reservation(job_id).map_err(AwardError::Presence)?;
     let reserved_amount = reservation.map(|(_, amount)| amount);
     let reservation = reservation.map(|(state, _)| state);
 
-    match award_precheck(existing.is_some(), reservation) {
-        AwardPrecheck::AlreadyRecorded => {
-            // Unwrap is sound by construction: `AlreadyRecorded` is returned only for
+    match award_step(existing.is_some(), attempt.as_ref().map(|a| a.state), reservation) {
+        AwardStep::AlreadyAwarded => {
+            // Unwrap is sound by construction: `AlreadyAwarded` is returned only for
             // `existing.is_some()`.
-            let record = existing.expect("AlreadyRecorded implies a local award record");
+            let record = existing.expect("AlreadyAwarded implies a local award record");
+            // Close the pending-forever fixed point: if `drive_send`'s confirm write failed
+            // while its `record_award` succeeded, the awards row (written ONLY on an ack or a
+            // presence-verified repair) is itself the proof the event is public — land the
+            // attempt's confirm here, the one arm every later call is guaranteed to reach.
+            // No-op unless the attempt is still `pending`; advisory like the original write.
+            let _ = store.mark_attempt_confirmed(job_id, now_unix);
             return Ok(AwardOutcome::AlreadyAwarded(record));
         }
-        AwardPrecheck::AskRelay => {
-            let relayed = match award_present_on_relay().await {
-                Ok(Some(AwardPresence::Repairable(relayed))) => relayed,
-                Ok(Some(AwardPresence::Unrepairable { award_event_id, detail })) => {
+        AwardStep::RepairFromAttempt => {
+            let attempt = attempt.expect("RepairFromAttempt implies an attempt row");
+            // Re-hold the funds first: a PUBLIC award must not sit recorded-but-unfunded.
+            // `reserve` is idempotent for a live row and re-reserves a `Released` one; a `Spent`
+            // row means the job was already paid (a manual collect can settle without the awards
+            // row), and the row is still owed for history/attribution — skip the reserve, write it.
+            match store.reserve(job_id, attempt.amount_sats, balance, total_cap, spent, now_unix) {
+                Ok(_) | Err(ReserveRefused::AlreadySpent { .. }) => {}
+                Err(refused) => {
+                    return Err(AwardError::PublishedButUnrecorded {
+                        job_id: job_id.to_owned(),
+                        award_event_id: attempt.award_event_id,
+                        detail: format!(
+                            "the award is public but re-reserving its funds was refused ({refused})"
+                        ),
+                    });
+                }
+            }
+            return record_and_read_back(store, job_id, &attempt, now_unix)
+                .map(AwardOutcome::AlreadyAwarded);
+        }
+        AwardStep::RefusedTerminal => {
+            let attempt = attempt.expect("RefusedTerminal implies an attempt row");
+            // Finish a refusal a crash left half-done: funds must not stay committed to a job
+            // that can never publish. (Refusal writes refused THEN releases, so this is the
+            // recovery for a crash between the two.)
+            if matches!(reservation, Some(ReservationState::Reserved)) {
+                store.release(job_id, now_unix).map_err(AwardError::Store)?;
+            }
+            return Err(AwardError::Refused {
+                job_id: job_id.to_owned(),
+                detail: attempt
+                    .detail
+                    .unwrap_or_else(|| "the relay refused the award event".to_owned()),
+            });
+        }
+        AwardStep::ResumeAttempt => {
+            let attempt = attempt.expect("ResumeAttempt implies an attempt row");
+            // Re-hold the reservation before re-sending: reconcile may have released it while the
+            // verdict was open (it classifies by claim liveness, not by attempt state), and a
+            // send must never race ahead of its funding. Idempotent when still `Reserved`. A
+            // `Spent` row means the job was already paid (a manual collect can settle without
+            // the awards row) — resolution is then pure bookkeeping the row is still owed for
+            // (history, #261 attribution), so it proceeds unfunded exactly as the sibling arms
+            // do.
+            match store.reserve(job_id, attempt.amount_sats, balance, total_cap, spent, now_unix) {
+                Ok(_) | Err(ReserveRefused::AlreadySpent { .. }) => {}
+                Err(refused) => return Err(AwardError::Reserve(refused)),
+            }
+            return drive_send(store, job_id, attempt, send, now_unix).await;
+        }
+        AwardStep::ProbeLegacy => {
+            match award_present_on_relay().await {
+                Ok(PresenceRead::Present(AwardPresence::Repairable(relayed))) => {
+                    // Sound by construction: `ProbeLegacy` is returned only for an existing
+                    // reservation row, whichever of the two states it is in.
+                    let amount_sats = reserved_amount
+                        .expect("ProbeLegacy implies a reservation row carrying an amount");
+                    // The award is PUBLIC: re-hold its funds (the `Released` half of this arm is
+                    // exactly the #322 ledger state — award public, funds returned) before
+                    // repairing the row. A refused re-reserve leaves a public award unfunded,
+                    // which is the loud PublishedButUnrecorded case, not a quiet skip.
+                    match store.reserve(job_id, amount_sats, balance, total_cap, spent, now_unix) {
+                        Ok(_) | Err(ReserveRefused::AlreadySpent { .. }) => {}
+                        Err(refused) => {
+                            return Err(AwardError::PublishedButUnrecorded {
+                                job_id: job_id.to_owned(),
+                                award_event_id: relayed.award_event_id,
+                                detail: format!(
+                                    "the award is public but re-reserving its funds was refused \
+                                     ({refused})"
+                                ),
+                            });
+                        }
+                    }
+
+                    // Repair through the SAME seam a fresh award records through, so the repaired
+                    // row and a freshly-awarded one cannot drift in shape. A failed write refuses:
+                    // the row really is still missing, and saying otherwise would strand the job
+                    // as silently as before.
+                    store
+                        .record_award(
+                            job_id,
+                            &relayed.claim_id,
+                            &relayed.award_event_id,
+                            &relayed.seller_pubkey,
+                            amount_sats,
+                            now_unix,
+                        )
+                        .map_err(|error| AwardError::PublishedButUnrecorded {
+                            job_id: job_id.to_owned(),
+                            award_event_id: relayed.award_event_id.clone(),
+                            detail: format!("repairing the missing awards row failed: {error}"),
+                        })?;
+
+                    // Read the row back instead of returning one assembled in memory. The caller
+                    // reads `AlreadyAwarded` as proof the ledger now knows this job, and only a
+                    // row that reads back is that proof — an in-memory copy would report the
+                    // repair we INTENDED.
+                    let record = store
+                        .award_record(job_id)
+                        .map_err(AwardError::Presence)?
+                        .ok_or_else(|| AwardError::PublishedButUnrecorded {
+                            job_id: job_id.to_owned(),
+                            award_event_id: relayed.award_event_id.clone(),
+                            detail: "the repaired awards row did not read back".to_owned(),
+                        })?;
+                    return Ok(AwardOutcome::AlreadyAwarded(record));
+                }
+                Ok(PresenceRead::Present(AwardPresence::Unrepairable { award_event_id, detail })) => {
                     return Err(AwardError::PublishedButUnrecorded {
                         job_id: job_id.to_owned(),
                         award_event_id,
                         detail,
                     });
                 }
-                // Ok(None) is "the relay did not return one", which is NOT "there is none" — the
-                // two are the same value out of the probe. Treated as unverified, like an error.
-                Ok(None) => {
+                // The relay ANSWERED (twice — the recheck read) and has no award. Even so, this
+                // job never gets a SECOND selection: a pre-attempt binary may have transmitted
+                // an award whose verdict was lost, "absent now" is not "never arrives", and the
+                // seller side executes per-award — a fresh event naming a different claim is the
+                // #322 burn re-armed, and `PresenceRead`'s own contract says re-selecting is not
+                // idempotent against a late-materializing event. Fail closed: return the funds
+                // and terminalize with the same recovery every refusal carries — a NEW offer.
+                // (This also covers OUR OWN reserve→pin crash window, which is locally
+                // indistinguishable from the legacy state; forfeiting that sub-second window's
+                // offer is the price of never re-selecting.)
+                Ok(PresenceRead::ConfirmedAbsent) => {
+                    store.release(job_id, now_unix).map_err(AwardError::Store)?;
+                    return Err(AwardError::Refused {
+                        job_id: job_id.to_owned(),
+                        detail: "this job predates the award attempt ledger and the relay \
+                                 confirms no award is public; refusing to select a claim again \
+                                 (awards are write-once per offer)"
+                            .to_owned(),
+                    });
+                }
+                Ok(PresenceRead::Unverified) => {
                     return Err(AwardError::PresenceUnverified {
                         job_id: job_id.to_owned(),
-                        detail: "relay returned no award, which is indistinguishable from a \
-                                 timed-out read"
+                        detail: "the relay did not demonstrate it was serving reads, so its empty \
+                                 answer proves nothing"
                             .to_owned(),
                     });
                 }
@@ -416,88 +605,197 @@ where
                         detail: error.to_string(),
                     });
                 }
-            };
-
-            // Sound by construction: `AskRelay` is returned only for `Some(Reserved)`.
-            let amount_sats =
-                reserved_amount.expect("AskRelay implies a Reserved reservation carrying an amount");
-
-            // Repair through the SAME seam a fresh award records through, so the repaired row and
-            // a freshly-awarded one cannot drift in shape. A failed write refuses: the row really
-            // is still missing, and saying otherwise would strand the job as silently as before.
-            store
-                .record_award(
-                    job_id,
-                    &relayed.claim_id,
-                    &relayed.award_event_id,
-                    &relayed.seller_pubkey,
-                    amount_sats,
-                    now_unix,
-                )
-                .map_err(|error| AwardError::PublishedButUnrecorded {
-                    job_id: job_id.to_owned(),
-                    award_event_id: relayed.award_event_id.clone(),
-                    detail: format!("repairing the missing awards row failed: {error}"),
-                })?;
-
-            // Read the row back instead of returning one assembled in memory. The caller reads
-            // `AlreadyAwarded` as proof the ledger now knows this job, and only a row that reads
-            // back is that proof — an in-memory copy would report the repair we INTENDED.
-            let record = store
-                .award_record(job_id)
-                .map_err(AwardError::Presence)?
-                .ok_or_else(|| AwardError::PublishedButUnrecorded {
-                    job_id: job_id.to_owned(),
-                    award_event_id: relayed.award_event_id.clone(),
-                    detail: "the repaired awards row did not read back".to_owned(),
-                })?;
-            return Ok(AwardOutcome::AlreadyAwarded(record));
+            }
         }
-        AwardPrecheck::Publish => {}
+        AwardStep::Fresh => {}
     }
 
-    // Reserve before any publish: a refusal publishes NOTHING (and writes no row).
+    // ---- Fresh: reserve → prepare (validate + sign) → pin → send --------------------------------
+
+    // Reserve before any signing: a refusal signs NOTHING (and writes no row).
     store
         .reserve(job_id, amount, balance, total_cap, spent, now_unix)
         .map_err(AwardError::Reserve)?;
 
-    match publish().await {
-        Ok(outcome) => {
-            // Record the PUBLISHED award. This is the one seam both the manual and the auto award
-            // path go through, so recording here covers both by construction — recording at the two
-            // call sites instead would let one drift silently.
-            //
-            // A store failure here does NOT fail the award: the 3405 is already public and the
-            // reservation is already held, so reporting failure would be a lie that also releases
-            // funds the buyer has genuinely committed. The window is narrow (the `reserve` write
-            // above went through the same store moments earlier), but it is not nothing, and the
-            // consequence is specific: without this row the delivery watcher cannot see the job, so
-            // it will not auto-settle. Say exactly that, unconditionally — an operator reading the
-            // log must not have to infer why one job stopped settling itself.
+    let prepared = match prepare().await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            // Provably wire-free: prepare failed before anything signed was persisted or
+            // transmitted (a signed-in-memory event that was never pinned was never sent — the
+            // send below only ever transmits pinned bytes). Releasing cannot strand an award.
+            store.release(job_id, now_unix).map_err(AwardError::Store)?;
+            return Err(AwardError::Publish(error));
+        }
+    };
+
+    let candidate = AwardAttempt {
+        job_id: job_id.to_owned(),
+        claim_id: prepared.claim_id,
+        seller_pubkey: prepared.seller_pubkey,
+        award_event_id: prepared.award_event_id,
+        event_json: prepared.event_json,
+        amount_sats: amount,
+        quoted_mints_json: serde_json::to_string(&prepared.quoted_mints)
+            .unwrap_or_else(|_| "[]".to_owned()),
+        offer_deadline_unix: prepared.offer_deadline_unix,
+        send_count: 0,
+        relay_url: prepared.relay_url,
+        state: AttemptState::Pending,
+        detail: None,
+    };
+    let attempt = match store.begin_award_attempt(&candidate, now_unix) {
+        Ok(BeginAttempt::Pinned) => candidate,
+        // An attempt appeared between this call's read and its pin. Unreachable while award calls
+        // serialize on the money lock and the daemon holds the home's run lock — so no money
+        // moves here: the reservation this call just took stays held (a retry re-reserves
+        // idempotently, or the Resume arm tolerates it), this call's candidate is discarded
+        // unsent, and the caller is told the retry-safe truth. One conservative arm instead of
+        // three unreachable money paths.
+        Ok(BeginAttempt::Existing(existing)) => {
+            return Err(AwardError::Unresolved {
+                job_id: job_id.to_owned(),
+                award_event_id: existing.award_event_id,
+                detail: "an award attempt for this job appeared concurrently; retry to resolve \
+                         the pinned attempt"
+                    .to_owned(),
+            });
+        }
+        Err(error) => {
+            // The signed event was NOT persisted, so it must not be sent (pin before send).
+            // Releasing is as safe as the prepare-failure arm: nothing of ours is on the wire.
+            store.release(job_id, now_unix).map_err(AwardError::Store)?;
+            return Err(AwardError::Presence(error));
+        }
+    };
+
+    drive_send(store, job_id, attempt, send, now_unix).await
+}
+
+/// Transmit a pinned attempt's bytes once and fold the relay's verdict into durable state — the
+/// shared tail of the fresh and resume paths, so the two cannot drift on what a verdict means.
+///
+/// The transmission is COUNTED (durably, before the socket write) because the meaning of an
+/// explicit relay refusal depends on it: `OK:false` for the event's FIRST transmission proves
+/// nothing is public and safely terminalizes; the same words for a re-send prove nothing about
+/// the earlier transmissions whose verdicts were lost, so they hold everything instead — the
+/// by-id probe terminalizes honestly after the pay window if the event really never landed.
+async fn drive_send<S, SFut>(
+    store: &BuyerStore,
+    job_id: &str,
+    attempt: super::store::AwardAttempt,
+    send: S,
+    now_unix: i64,
+) -> Result<AwardOutcome, AwardError>
+where
+    S: FnOnce(String, String) -> SFut,
+    SFut: Future<Output = SendOutcome>,
+{
+    let prior_sends = store
+        .record_attempt_send(job_id, now_unix)
+        .map_err(AwardError::Presence)?;
+    match send(attempt.event_json.clone(), attempt.award_event_id.clone()).await {
+        SendOutcome::Acked => {
+            // Confirm THEN record. Neither write failing un-acks the relay, so neither may fail
+            // the award: a failed confirm leaves the attempt pending with its awards row present,
+            // and the `AlreadyAwarded` arm re-confirms it on the next award call or sweep pass; a
+            // failed record leaves a confirmed attempt without its row — the boot heal writes it
+            // from the attempt. Both converge without an operator; say what happened either way.
+            if let Err(error) = store.mark_attempt_confirmed(job_id, now_unix) {
+                eprintln!(
+                    "buyer: award for {job_id} acked but confirming the attempt failed ({error}); \
+                     the next award call re-confirms it from the recorded award"
+                );
+            }
             if let Err(error) = store.record_award(
                 job_id,
-                &outcome.claim_id,
-                &outcome.award_event_id,
-                &outcome.seller_pubkey,
-                amount,
+                &attempt.claim_id,
+                &attempt.award_event_id,
+                &attempt.seller_pubkey,
+                attempt.amount_sats,
                 now_unix,
             ) {
                 eprintln!(
-                    "buyer: award for {job_id} published ({}) but recording it failed ({error}); \
-                     this job will NOT be auto-settled on delivery — collect it manually",
-                    outcome.award_event_id
+                    "buyer: award for {job_id} confirmed ({}) but recording it failed ({error}); \
+                     the boot heal will write the awards row from the pinned attempt",
+                    attempt.award_event_id
                 );
             }
-            Ok(AwardOutcome::Published(outcome))
+            Ok(AwardOutcome::Published(AwardClaimOutcome {
+                award_event_id: attempt.award_event_id,
+                job_id: job_id.to_owned(),
+                claim_id: attempt.claim_id,
+                seller_pubkey: attempt.seller_pubkey,
+                quoted_mints: serde_json::from_str(&attempt.quoted_mints_json).unwrap_or_default(),
+            }))
         }
-        Err(error) => {
-            // No award reached the relay — reclaim the reservation rather than strand the funds.
+        SendOutcome::Refused { detail } => {
+            // An explicit relay refusal proves "nothing is public" ONLY for the event's first
+            // transmission. On a re-send it judges THIS transmission alone — the pending state
+            // exists precisely because an earlier send's verdict was lost, and that send may
+            // have landed (relay policy drift, membership churn, an aged `created_at` bouncing
+            // off a timestamp bound). Releasing on it would repudiate a possibly-executing
+            // seller; hold instead, and let the by-id probe terminalize after the pay window.
+            if prior_sends > 0 {
+                return Err(AwardError::Unresolved {
+                    job_id: job_id.to_owned(),
+                    award_event_id: attempt.award_event_id,
+                    detail: format!(
+                        "the relay refused a RE-send ({detail}); an earlier transmission's \
+                         verdict was lost and may have landed — holding funds; the probe \
+                         resolves this after the pay window"
+                    ),
+                });
+            }
+            // Refused THEN released, so a crash between the two leaves refused+reserved — the
+            // state `RefusedTerminal` finishes — and never released+pending (which would read as
+            // a resumable attempt whose funds are gone).
             store
-                .release(job_id, now_unix)
-                .map_err(AwardError::Store)?;
-            Err(AwardError::Publish(error))
+                .mark_attempt_refused(job_id, &detail, now_unix)
+                .map_err(AwardError::Presence)?;
+            store.release(job_id, now_unix).map_err(AwardError::Store)?;
+            Err(AwardError::Refused { job_id: job_id.to_owned(), detail })
         }
+        // No verdict: hold EVERYTHING. The reservation stays, the attempt stays pending, and the
+        // caller is told retrying is safe. This arm writing nothing is the #322 fix in one line —
+        // the old path released here and re-selected a claim on the next call.
+        SendOutcome::Unresolved { detail } => Err(AwardError::Unresolved {
+            job_id: job_id.to_owned(),
+            award_event_id: attempt.award_event_id,
+            detail,
+        }),
     }
+}
+
+/// Write the `awards` row from a CONFIRMED attempt through the same `record_award` seam a fresh
+/// award uses, and read it back — only a row that reads back proves the ledger now knows the job.
+fn record_and_read_back(
+    store: &BuyerStore,
+    job_id: &str,
+    attempt: &super::store::AwardAttempt,
+    now_unix: i64,
+) -> Result<AwardRecord, AwardError> {
+    store
+        .record_award(
+            job_id,
+            &attempt.claim_id,
+            &attempt.award_event_id,
+            &attempt.seller_pubkey,
+            attempt.amount_sats,
+            now_unix,
+        )
+        .map_err(|error| AwardError::PublishedButUnrecorded {
+            job_id: job_id.to_owned(),
+            award_event_id: attempt.award_event_id.clone(),
+            detail: format!("writing the awards row from the confirmed attempt failed: {error}"),
+        })?;
+    store
+        .award_record(job_id)
+        .map_err(AwardError::Presence)?
+        .ok_or_else(|| AwardError::PublishedButUnrecorded {
+            job_id: job_id.to_owned(),
+            award_event_id: attempt.award_event_id.clone(),
+            detail: "the awards row written from the confirmed attempt did not read back".to_owned(),
+        })
 }
 
 /// Failure of [`settle_after_pay`].
@@ -936,54 +1234,82 @@ mod tests {
         );
     }
 
-    // AWARD-REFUSED tooth: when the reservation is refused, `publish` is NEVER called and NO
-    // reservation row is written. Red-on-revert: reserving AFTER the publish would fire the
-    // publish closure here (the flag flips), failing the "publish must not run" assertion.
+    // AWARD-REFUSED tooth: when the reservation is refused, `prepare` is NEVER called (nothing is
+    // even signed) and NO reservation row is written. Red-on-revert: reserving AFTER the prepare
+    // would fire the prepare closure here (the flag flips), failing the "must not sign" assertion.
     #[tokio::test(flavor = "current_thread")]
-    async fn award_refused_publishes_nothing_and_writes_no_row() {
+    async fn award_refused_signs_nothing_and_writes_no_row() {
         let (store, path) = fresh_store("award-refused");
         let job_a = "a".repeat(64);
         let job_b = "b".repeat(64);
         // Reserve the whole balance against job_a so job_b cannot fit.
         store.reserve(&job_a, 100, 100, u64::MAX, 0, 1).expect("first reserve");
 
-        let published = AtomicBool::new(false);
-        let error = award_with_reservation(&store, &job_b, 40, 100, u64::MAX, 0, 2, no_relay, || {
-            published.store(true, Ordering::SeqCst);
-            async { unreachable!("publish must not run when the reservation is refused") }
-        })
+        let prepared = AtomicBool::new(false);
+        let error = award_with_reservation(
+            &store,
+            &job_b,
+            40,
+            100,
+            u64::MAX,
+            0,
+            2,
+            no_relay,
+            || {
+                prepared.store(true, Ordering::SeqCst);
+                async { unreachable!("prepare must not run when the reservation is refused") }
+            },
+            no_send,
+        )
         .await
         .expect_err("over-available award must refuse");
 
         assert!(matches!(error, AwardError::Reserve(ReserveRefused::InsufficientAvailable { .. })));
-        assert!(!published.load(Ordering::SeqCst), "a refused reservation must publish NOTHING");
+        assert!(!prepared.load(Ordering::SeqCst), "a refused reservation must sign NOTHING");
         assert!(store.reservation(&job_b).expect("read").is_none(), "refused award writes NO row");
+        assert!(store.award_attempt(&job_b).expect("read").is_none(), "and pins NO attempt");
         assert_eq!(store.reserved_in_flight().expect("r"), 100, "only job_a's reserve stands");
         let _ = std::fs::remove_file(&path);
     }
 
-    // A publish failure after a successful reservation RELEASES it (no award reached the relay),
-    // so the funds return to available rather than stranding against a job with no live award.
+    // A PREPARE failure (validate/sign, before anything is pinned or sent) after a successful
+    // reservation RELEASES it, so the funds return to available rather than stranding against a
+    // job with no live award. This release is provably safe — the failure precedes the pin, so
+    // nothing of ours can be on the wire. Contrast the SEND-failure test below, where releasing
+    // is exactly the #322 bug.
     #[tokio::test(flavor = "current_thread")]
-    async fn award_publish_failure_releases_the_reservation() {
-        let (store, path) = fresh_store("award-publish-fail");
+    async fn award_prepare_failure_releases_the_reservation() {
+        let (store, path) = fresh_store("award-prepare-fail");
         let job = "a".repeat(64);
-        let error = award_with_reservation(&store, &job, 40, 100, u64::MAX, 0, 1, no_relay, || async {
-            Err(JobLifecycleError::Relay("relay down".into()))
-        })
+        let error = award_with_reservation(
+            &store,
+            &job,
+            40,
+            100,
+            u64::MAX,
+            0,
+            1,
+            no_relay,
+            || async { Err(JobLifecycleError::Relay("claim vanished from the relay".into())) },
+            no_send,
+        )
         .await
-        .expect_err("publish failed");
+        .expect_err("prepare failed");
         assert!(matches!(error, AwardError::Publish(_)));
-        assert_eq!(store.reserved_in_flight().expect("r"), 0, "publish failure reclaimed the reserve");
+        assert_eq!(store.reserved_in_flight().expect("r"), 0, "prepare failure reclaimed the reserve");
         assert_eq!(
             store.reservation(&job).expect("read").map(|(state, _)| state),
             Some(super::super::reservations::ReservationState::Released)
         );
-        // Nothing was published, so nothing may be recorded as awarded — otherwise the delivery
-        // watcher would sweep a job that has no award on the relay.
+        // Nothing was signed or pinned, so nothing may be recorded as awarded — otherwise the
+        // delivery watcher would sweep a job that has no award on the relay.
         assert!(
             store.award_record(&job).expect("read").is_none(),
-            "a failed publish must record no award"
+            "a failed prepare must record no award"
+        );
+        assert!(
+            store.award_attempt(&job).expect("read").is_none(),
+            "a failed prepare must pin no attempt — the job stays freely re-plannable"
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -1001,18 +1327,21 @@ mod tests {
         let claim = "c".repeat(64);
         let award_event = "e".repeat(64);
 
-        let outcome = award_with_reservation(&store, &job, 40, 100, u64::MAX, 0, 7, no_relay, || {
-            let (job, claim, award_event) = (job.clone(), claim.clone(), award_event.clone());
-            async move {
-                Ok(AwardClaimOutcome {
-                    award_event_id: award_event,
-                    job_id: job,
-                    claim_id: claim,
-                    seller_pubkey: SELLER_HEX.to_owned(),
-                    quoted_mints: Vec::new(),
-                })
-            }
-        })
+        let outcome = award_with_reservation(
+            &store,
+            &job,
+            40,
+            100,
+            u64::MAX,
+            0,
+            7,
+            no_relay,
+            || {
+                let job = job.clone();
+                async move { Ok(fake_prepared(&job)) }
+            },
+            send_acked,
+        )
         .await
         .expect("award");
         let AwardOutcome::Published(outcome) = outcome else {
@@ -1027,6 +1356,12 @@ mod tests {
         assert_eq!(recorded.amount_sats, 40, "the RESERVED amount, not a seller-quoted one");
         assert_eq!(recorded.awarded_at_unix, 7);
 
+        // The attempt is pinned AND confirmed: durable proof of exactly which bytes carry this
+        // job's award, in the state that says the relay holds them.
+        let attempt = store.award_attempt(&job).expect("read").expect("attempt pinned");
+        assert_eq!(attempt.state, super::super::store::AttemptState::Confirmed);
+        assert_eq!(attempt.award_event_id, award_event);
+
         // And the job is now the delivery watcher's work — awarded, reservation still held.
         assert_eq!(
             store.awarded_unsettled_job_ids().expect("awarded"),
@@ -1038,30 +1373,60 @@ mod tests {
 
     // ── §1 AWARD-PRESENCE CHOKEPOINT (never award twice) ────────────────────────────────────────
 
-    // The pure decision table. Exhaustive over (local record × reservation state), because the
-    // whole point of the gate is that ONE of these six cells may consult the relay and the other
-    // five must not — a table this small should be pinned cell by cell rather than sampled.
+    // The pure decision table, exhaustive over the FULL product (awards row × attempt state ×
+    // reservation state) = 2×4×4 = 32 cells. Every cell is pinned individually because the gate's
+    // whole value is which cells may touch the relay, which may send, and which are terminal —
+    // a table this central should be pinned cell by cell rather than sampled.
     #[test]
-    fn award_precheck_asks_the_relay_only_when_local_state_is_ambiguous() {
-        use AwardPrecheck::{AlreadyRecorded, AskRelay, Publish};
+    fn award_step_decides_every_cell_of_the_state_product() {
+        use super::super::store::AttemptState::{Confirmed, Pending, Refused};
+        use AwardStep::*;
+        use ReservationState::{Released, Reserved, Spent};
 
-        // A local awards row settles it, whatever the reservation says. This is the case a relay
-        // probe CANNOT get wrong after the `#t` tag rename, which is why it is read first.
-        assert_eq!(award_precheck(true, None), AlreadyRecorded);
-        assert_eq!(award_precheck(true, Some(ReservationState::Reserved)), AlreadyRecorded);
-        assert_eq!(award_precheck(true, Some(ReservationState::Spent)), AlreadyRecorded);
-        assert_eq!(award_precheck(true, Some(ReservationState::Released)), AlreadyRecorded);
+        let reservations =
+            [None, Some(Reserved), Some(Released), Some(Spent)];
 
-        // No row, nothing reserved: nothing was ever started here — a first award.
-        assert_eq!(award_precheck(false, None), Publish);
-        // No row, funds released: the publish failed and the funds came back. Re-awarding is right.
-        assert_eq!(award_precheck(false, Some(ReservationState::Released)), Publish);
-        // No row, already spent: `reserve` refuses this downstream (`AlreadySpent`) — one authority.
-        assert_eq!(award_precheck(false, Some(ReservationState::Spent)), Publish);
+        for reservation in reservations {
+            // A local awards row settles it, whatever else says — read first because it is the one
+            // signal that cannot lie by omission.
+            for attempt in [None, Some(Pending), Some(Confirmed), Some(Refused)] {
+                assert_eq!(
+                    award_step(true, attempt, reservation),
+                    AlreadyAwarded,
+                    "awards row present must always be AlreadyAwarded ({attempt:?}, {reservation:?})"
+                );
+            }
+            // No row: the pinned attempt outranks the reservation — it is the only signal that
+            // knows whether signed bytes may be on the wire.
+            assert_eq!(
+                award_step(false, Some(Confirmed), reservation),
+                RepairFromAttempt,
+                "confirmed attempt without its row must repair ({reservation:?})"
+            );
+            assert_eq!(
+                award_step(false, Some(Refused), reservation),
+                RefusedTerminal,
+                "refused attempt is terminal whatever the ledger says ({reservation:?})"
+            );
+            assert_eq!(
+                award_step(false, Some(Pending), reservation),
+                ResumeAttempt,
+                "pending attempt must resume THE PINNED BYTES ({reservation:?})"
+            );
+        }
 
-        // THE one ambiguous cell: money committed, no award recorded. Either the process died before
-        // publishing (republish) or `record_award` failed after publishing (a republish DUPLICATES).
-        assert_eq!(award_precheck(false, Some(ReservationState::Reserved)), AskRelay);
+        // No row, no attempt: the reservation is all there is, and it can only say "ask" or "go".
+        // Nothing was ever started → fresh.
+        assert_eq!(award_step(false, None, None), Fresh);
+        // Spent is adjudicated by `reserve` itself downstream (AlreadySpent) — one authority.
+        assert_eq!(award_step(false, None, Some(Spent)), Fresh);
+        // Money committed, no award recorded, no pinned verdict: only the relay knows.
+        assert_eq!(award_step(false, None, Some(Reserved)), ProbeLegacy);
+        // ★ THE #322 CELL. The old table mapped Released → Publish, on the theory that a publish
+        // error means nothing landed. A lost OK lands anyway, so Released proves nothing and must
+        // ask the relay exactly like Reserved. Red-on-revert: map this cell back to Fresh and
+        // the legacy-released repair test below fails by publishing a duplicate.
+        assert_eq!(award_step(false, None, Some(Released)), ProbeLegacy);
     }
 
     // A job this buyer has already awarded must not publish again — and must not RESERVE again
@@ -1076,9 +1441,18 @@ mod tests {
             .record_award(&job, &"c".repeat(64), &"e".repeat(64), SELLER_HEX, 40, 7)
             .expect("record");
 
-        let outcome = award_with_reservation(&store, &job, 40, 100, u64::MAX, 0, 9, no_relay, || async {
-            unreachable!("a recorded award must not publish again")
-        })
+        let outcome = award_with_reservation(
+            &store,
+            &job,
+            40,
+            100,
+            u64::MAX,
+            0,
+            9,
+            no_relay,
+            no_prepare,
+            no_send,
+        )
         .await
         .expect("an already-awarded job is not an error");
 
@@ -1127,8 +1501,9 @@ mod tests {
             u64::MAX,
             0,
             9,
-            || async move { Ok(Some(relayed)) },
-            || async { unreachable!("an award already on the relay must not be published again") },
+            || async move { Ok(PresenceRead::Present(relayed)) },
+            no_prepare,
+            no_send,
         )
         .await
         .expect("a parseable public award is repaired, not an error");
@@ -1182,8 +1557,9 @@ mod tests {
             u64::MAX,
             0,
             9,
-            || async move { Ok(Some(found)) },
-            || async { unreachable!("an award already on the relay must not be published again") },
+            || async move { Ok(PresenceRead::Present(found)) },
+            no_prepare,
+            no_send,
         )
         .await
         .expect_err("an unrepairable public award must refuse");
@@ -1214,13 +1590,14 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // The uninformative relay answer. `Ok(None)` is not "no award exists" — `fetch_events` yields
-    // `Ok(empty)` on timeout, so absence and unreachability are the SAME value. Both it and an
-    // outright error must refuse: publishing on an unverified absence is the duplicate.
+    // The uninformative relay answer. An UNVERIFIED read is not "no award exists" — the relay
+    // never demonstrated it was answering at all. Both it and an outright error must refuse:
+    // publishing on an unverified absence is the duplicate. (A CONFIRMED absence now proceeds —
+    // that is the separate `a_released_legacy_reservation_with_confirmed_absence…` test.)
     #[tokio::test(flavor = "current_thread")]
     async fn an_unverifiable_presence_refuses_rather_than_publishing() {
         for (label, probe_result) in [
-            ("empty answer", Ok(None)),
+            ("unverified answer", Ok(PresenceRead::Unverified)),
             ("relay error", Err(JobLifecycleError::Relay("relay down".into()))),
         ] {
             let (store, path) = fresh_store(&format!("award-unverified-{}", label.replace(' ', "-")));
@@ -1236,7 +1613,8 @@ mod tests {
                 0,
                 9,
                 || async move { probe_result },
-                || async { unreachable!("an unverified presence must not publish ({label})") },
+                no_prepare,
+                no_send,
             )
             .await
             .expect_err("an unverifiable presence must refuse");
@@ -1275,6 +1653,572 @@ mod tests {
             );
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    // ── #322: the award attempt outbox ──────────────────────────────────────────────────────────
+
+    // ★ THE #322 REGRESSION, send half. A send with no verdict (lost OK / timeout) must change
+    // NOTHING: the reservation stays held, the attempt stays pending — and the retry re-sends the
+    // IDENTICAL bytes without re-preparing, so no retry can ever name a different claim or mint a
+    // different event id. Red-on-revert: release on the unresolved send (the old behaviour) and
+    // the reservation assert fails; re-run prepare on the retry and `no_prepare` panics.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unresolved_send_holds_funds_and_a_retry_resends_the_identical_bytes() {
+        use std::sync::Mutex;
+
+        let (store, path) = fresh_store("attempt-unresolved-retry");
+        let job = "a".repeat(64);
+        let sent: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+        // First call: fresh prepare, send gets no verdict.
+        let error = award_with_reservation(
+            &store,
+            &job,
+            40,
+            100,
+            u64::MAX,
+            0,
+            1,
+            no_relay,
+            || {
+                let job = job.clone();
+                async move { Ok(fake_prepared(&job)) }
+            },
+            |bytes: String, _event_id: String| {
+                sent.lock().unwrap().push(bytes);
+                async { SendOutcome::Unresolved { detail: "OK never arrived".to_owned() } }
+            },
+        )
+        .await
+        .expect_err("an unresolved send is not success");
+        assert!(
+            matches!(&error, AwardError::Unresolved { .. }),
+            "expected Unresolved, got: {error}"
+        );
+        // The refusal must teach the retry: same bytes, safe to repeat.
+        let message = error.to_string();
+        assert!(message.contains("SAME signed event"), "must say the retry is same-bytes: {message}");
+
+        // NOTHING moved: funds held, attempt pending, no award recorded.
+        assert_eq!(
+            store.reservation(&job).expect("read").map(|(state, _)| state),
+            Some(super::super::reservations::ReservationState::Reserved),
+            "an unresolved send must HOLD the reservation — releasing here is #322"
+        );
+        let attempt = store.award_attempt(&job).expect("read").expect("attempt pinned");
+        assert_eq!(attempt.state, super::super::store::AttemptState::Pending);
+        assert!(store.award_record(&job).expect("read").is_none(), "no verdict, no row");
+
+        // Second call: the retry. Prepare must NOT run (no_prepare panics); the pinned bytes go
+        // out again; this time the relay acks.
+        let outcome = award_with_reservation(
+            &store,
+            &job,
+            40,
+            100,
+            u64::MAX,
+            0,
+            2,
+            no_relay,
+            no_prepare,
+            |bytes: String, _event_id: String| {
+                sent.lock().unwrap().push(bytes);
+                async { SendOutcome::Acked }
+            },
+        )
+        .await
+        .expect("the retry converges");
+
+        let sent = sent.into_inner().unwrap();
+        assert_eq!(sent.len(), 2, "one transmission per call");
+        assert_eq!(sent[0], sent[1], "the retry must transmit BYTE-IDENTICAL event JSON");
+
+        let AwardOutcome::Published(published) = outcome else {
+            panic!("the acked retry reports the publish");
+        };
+        assert_eq!(published.award_event_id, "e".repeat(64));
+        assert_eq!(published.claim_id, "c".repeat(64), "the pinned claim, never a re-selection");
+        let recorded = store.award_record(&job).expect("read").expect("recorded on ack");
+        assert_eq!(recorded.award_event_id, published.award_event_id);
+        assert_eq!(
+            store.award_attempt(&job).expect("read").expect("attempt").state,
+            super::super::store::AttemptState::Confirmed
+        );
+        assert_eq!(store.reserved_in_flight().expect("r"), 40, "still exactly one commitment");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // An explicit relay refusal (OK:false) is the one send verdict that releases — nothing is
+    // public — and it is TERMINAL: the job can never publish again, however many times the caller
+    // retries, because awards are write-once per offer. Red-on-revert: let the refused state fall
+    // through to Fresh and `no_prepare` panics on the second call.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_relay_refusal_is_terminal_and_releases_the_funds() {
+        let (store, path) = fresh_store("attempt-refused-terminal");
+        let job = "a".repeat(64);
+
+        let error = award_with_reservation(
+            &store,
+            &job,
+            40,
+            100,
+            u64::MAX,
+            0,
+            1,
+            no_relay,
+            || {
+                let job = job.clone();
+                async move { Ok(fake_prepared(&job)) }
+            },
+            |_bytes: String, _event_id: String| async {
+                SendOutcome::Refused { detail: "blocked: policy".to_owned() }
+            },
+        )
+        .await
+        .expect_err("a refused event is an error");
+        assert!(
+            matches!(&error, AwardError::Refused { detail, .. } if detail == "blocked: policy"),
+            "expected Refused carrying the relay's words, got: {error}"
+        );
+        assert_eq!(
+            store.reservation(&job).expect("read").map(|(state, _)| state),
+            Some(super::super::reservations::ReservationState::Released),
+            "an EXPLICIT refusal is the verdict that safely releases"
+        );
+        assert_eq!(
+            store.award_attempt(&job).expect("read").expect("attempt").state,
+            super::super::store::AttemptState::Refused
+        );
+
+        // Any later call — probe, prepare, send all unreachable — reports the refusal again.
+        let error = award_with_reservation(
+            &store,
+            &job,
+            40,
+            100,
+            u64::MAX,
+            0,
+            2,
+            no_relay,
+            no_prepare,
+            no_send,
+        )
+        .await
+        .expect_err("a refused job stays refused");
+        let message = error.to_string();
+        assert!(
+            matches!(&error, AwardError::Refused { .. }),
+            "terminal refusal must be reported as Refused, got: {error}"
+        );
+        assert!(
+            message.contains("new offer"),
+            "the refusal must name the real recovery (a NEW offer): {message}"
+        );
+        assert!(store.award_record(&job).expect("read").is_none(), "nothing ever recorded");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ★ THE #322 REGRESSION, ledger half — the exact field chain. The OLD binary published an
+    // award, took a publish error for it (lost OK), concluded "nothing landed", and RELEASED —
+    // leaving reservation=Released, no awards row, award public. Its next award call then sailed
+    // through the precheck (Released mapped to Publish) and PUBLISHED A SECOND AWARD to a freshly
+    // selected claim: two seats executing one offer. The fixed table sends Released to the probe;
+    // when the probe finds the award, the row is repaired, the funds are RE-HELD, and nothing is
+    // prepared or sent.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_released_legacy_reservation_probes_and_repairs_rather_than_republishing() {
+        let (store, path) = fresh_store("legacy-released-repair");
+        let job = "a".repeat(64);
+        let award = "e".repeat(64);
+        let claim = "c".repeat(64);
+
+        // The #322 ledger state, verbatim: reserve → (publish, lost OK) → release.
+        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+        store.release(&job, 2).expect("the old binary released on the publish error");
+        assert!(store.award_attempt(&job).expect("read").is_none(), "pre-attempt-era job");
+
+        let relayed = AwardPresence::Repairable(RelayedAward {
+            award_event_id: award.clone(),
+            claim_id: claim.clone(),
+            seller_pubkey: SELLER_HEX.to_owned(),
+        });
+        let outcome = award_with_reservation(
+            &store,
+            &job,
+            40,
+            100,
+            u64::MAX,
+            0,
+            3,
+            || async move { Ok(PresenceRead::Present(relayed)) },
+            no_prepare,
+            no_send,
+        )
+        .await
+        .expect("the public award is repaired, not duplicated");
+
+        let AwardOutcome::AlreadyAwarded(record) = outcome else {
+            panic!("expected AlreadyAwarded from the repair");
+        };
+        assert_eq!(record.award_event_id, award);
+        assert_eq!(record.claim_id, claim, "the claim the RELAY names, never a re-selection");
+        // The funds are committed again: a public award must not sit unfunded.
+        assert_eq!(
+            store.reservation(&job).expect("read").map(|(state, _)| state),
+            Some(super::super::reservations::ReservationState::Reserved),
+            "repairing a Released legacy row must re-hold its funds"
+        );
+        assert_eq!(store.reserved_in_flight().expect("r"), 40);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A legacy row whose relay CONFIRMS no award still never re-selects: "absent now" is not
+    // "never arrives", the seller executes per-award, and the store's own contract says a fresh
+    // selection is not idempotent against the legacy event materializing. Both legacy states
+    // terminalize with the funds returned — the recovery, as for every refusal, is a NEW offer.
+    // Red-on-revert: fall through to Fresh here (the first version of this fix did) and the
+    // prepare closure panics.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_legacy_reservation_with_confirmed_absence_refuses_and_releases() {
+        for seed_released in [true, false] {
+            let (store, path) = fresh_store(&format!("legacy-absent-{seed_released}"));
+            let job = "a".repeat(64);
+            store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+            if seed_released {
+                store.release(&job, 2).expect("release");
+            }
+
+            let error = award_with_reservation(
+                &store,
+                &job,
+                40,
+                100,
+                u64::MAX,
+                0,
+                3,
+                || async { Ok(PresenceRead::ConfirmedAbsent) },
+                no_prepare,
+                no_send,
+            )
+            .await
+            .expect_err("a confirmed absence on a legacy row is terminal");
+
+            assert!(
+                matches!(&error, AwardError::Refused { .. }),
+                "seed_released={seed_released}: expected Refused, got: {error}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("new offer"),
+                "the refusal names the real recovery: {message}"
+            );
+            assert_eq!(
+                store.reservation(&job).expect("read").map(|(state, _)| state),
+                Some(super::super::reservations::ReservationState::Released),
+                "seed_released={seed_released}: the funds come back"
+            );
+            assert!(
+                store.award_attempt(&job).expect("read").is_none(),
+                "no attempt is fabricated for a job that never pinned one"
+            );
+            assert!(store.award_record(&job).expect("read").is_none(), "and no award row");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    // The crash between `mark_attempt_refused` and `release` leaves refused+Reserved — the
+    // RefusedTerminal arm's documented recovery. It must finish the release, not just repeat the
+    // refusal. Red-on-revert: drop the release from the arm and the funds stay committed forever
+    // to a job that can never publish.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_crashed_refusal_releases_its_reservation_on_the_next_call() {
+        let (store, path) = fresh_store("refused-reserved-recovery");
+        let job = "a".repeat(64);
+        // Build the crash state directly: pinned, refused, reservation still held.
+        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+        let prepared = fake_prepared(&job);
+        store
+            .begin_award_attempt(
+                &AwardAttempt {
+                    job_id: job.clone(),
+                    claim_id: prepared.claim_id.clone(),
+                    seller_pubkey: prepared.seller_pubkey.clone(),
+                    award_event_id: prepared.award_event_id.clone(),
+                    event_json: prepared.event_json.clone(),
+                    amount_sats: 40,
+                    quoted_mints_json: "[]".to_owned(),
+                    offer_deadline_unix: prepared.offer_deadline_unix,
+                    send_count: 1,
+                    relay_url: prepared.relay_url.clone(),
+                    state: AttemptState::Pending,
+                    detail: None,
+                },
+                1,
+            )
+            .expect("pin");
+        store.mark_attempt_refused(&job, "blocked: policy", 2).expect("refuse");
+        assert_eq!(store.reserved_in_flight().expect("r"), 40, "the crash: still reserved");
+
+        let error = award_with_reservation(
+            &store,
+            &job,
+            40,
+            100,
+            u64::MAX,
+            0,
+            3,
+            no_relay,
+            no_prepare,
+            no_send,
+        )
+        .await
+        .expect_err("refused is terminal");
+        assert!(matches!(&error, AwardError::Refused { .. }), "got: {error}");
+        assert_eq!(
+            store.reserved_in_flight().expect("r"),
+            0,
+            "the recovery arm must finish the crashed release"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A pending attempt on an already-PAID job (manual collect settled it while the verdict was
+    // open) must still resolve: the reserve refuses AlreadySpent, the arm tolerates it exactly
+    // like its two siblings, and the acked resolution finally writes the awards row the history
+    // and the #261 attribution heal need. Red-on-revert: narrow the arm's tolerance to Ok(_) and
+    // this errors out before the send.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pending_attempt_on_a_spent_job_still_resolves_and_lands_its_row() {
+        let (store, path) = fresh_store("attempt-spent-resume");
+        let job = "a".repeat(64);
+        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+        let prepared = fake_prepared(&job);
+        store
+            .begin_award_attempt(
+                &AwardAttempt {
+                    job_id: job.clone(),
+                    claim_id: prepared.claim_id.clone(),
+                    seller_pubkey: prepared.seller_pubkey.clone(),
+                    award_event_id: prepared.award_event_id.clone(),
+                    event_json: prepared.event_json.clone(),
+                    amount_sats: 40,
+                    quoted_mints_json: "[]".to_owned(),
+                    offer_deadline_unix: prepared.offer_deadline_unix,
+                    send_count: 1,
+                    relay_url: prepared.relay_url.clone(),
+                    state: AttemptState::Pending,
+                    detail: None,
+                },
+                1,
+            )
+            .expect("pin");
+        // The manual collect: reserved → spent with no awards row.
+        store.convert_to_spent(&job, 40, 2).expect("spent");
+        assert!(store.award_record(&job).expect("read").is_none());
+
+        let outcome = award_with_reservation(
+            &store,
+            &job,
+            40,
+            100,
+            u64::MAX,
+            0,
+            3,
+            no_relay,
+            no_prepare,
+            send_acked,
+        )
+        .await
+        .expect("a spent job's attempt resolves as bookkeeping");
+        assert!(matches!(outcome, AwardOutcome::Published(_)));
+        assert!(store.award_record(&job).expect("read").is_some(), "the row lands at last");
+        assert_eq!(
+            store.award_attempt(&job).expect("read").expect("attempt").state,
+            AttemptState::Confirmed
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The pending-forever fixed point: awards row present (record succeeded) while the attempt's
+    // confirm write failed. Every later call short-circuits at AlreadyAwarded — which is exactly
+    // why THAT arm must land the confirm. Red-on-revert: drop the mark from the arm and the
+    // attempt stays pending for the life of the store.
+    #[tokio::test(flavor = "current_thread")]
+    async fn already_awarded_confirms_a_stranded_pending_attempt() {
+        let (store, path) = fresh_store("already-awarded-confirms");
+        let job = "a".repeat(64);
+        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+        let prepared = fake_prepared(&job);
+        store
+            .begin_award_attempt(
+                &AwardAttempt {
+                    job_id: job.clone(),
+                    claim_id: prepared.claim_id.clone(),
+                    seller_pubkey: prepared.seller_pubkey.clone(),
+                    award_event_id: prepared.award_event_id.clone(),
+                    event_json: prepared.event_json.clone(),
+                    amount_sats: 40,
+                    quoted_mints_json: "[]".to_owned(),
+                    offer_deadline_unix: prepared.offer_deadline_unix,
+                    send_count: 1,
+                    relay_url: prepared.relay_url.clone(),
+                    state: AttemptState::Pending,
+                    detail: None,
+                },
+                1,
+            )
+            .expect("pin");
+        // The crash: record_award landed, mark_attempt_confirmed did not.
+        store
+            .record_award(&job, &prepared.claim_id, &prepared.award_event_id, SELLER_HEX, 40, 2)
+            .expect("record");
+
+        let outcome = award_with_reservation(
+            &store,
+            &job,
+            40,
+            100,
+            u64::MAX,
+            0,
+            3,
+            no_relay,
+            no_prepare,
+            no_send,
+        )
+        .await
+        .expect("already awarded");
+        assert!(matches!(outcome, AwardOutcome::AlreadyAwarded(_)));
+        assert_eq!(
+            store.award_attempt(&job).expect("read").expect("attempt").state,
+            AttemptState::Confirmed,
+            "the awards row is the proof; the arm must land the confirm it implies"
+        );
+        assert!(
+            store.pending_award_attempts().expect("pending").is_empty(),
+            "the sweep set drains — no per-boot re-processing forever"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ★ A refusal on a RE-send releases nothing: the pending state exists precisely because an
+    // earlier transmission's verdict was lost, and that send may have landed — OK:false for
+    // transmission N is not evidence about transmission 1. Only a FIRST transmission's refusal
+    // (send_count 0 at entry) terminalizes. Red-on-revert: drop the prior_sends gate in
+    // drive_send's Refused arm and the funds release + the attempt terminalizes here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refusal_on_a_resend_holds_everything() {
+        let (store, path) = fresh_store("resend-refusal-holds");
+        let job = "a".repeat(64);
+
+        // First call: fresh pin, send gets no verdict (transmission 1 counted).
+        let error = award_with_reservation(
+            &store,
+            &job,
+            40,
+            100,
+            u64::MAX,
+            0,
+            1,
+            no_relay,
+            || {
+                let job = job.clone();
+                async move { Ok(fake_prepared(&job)) }
+            },
+            |_bytes: String, _event_id: String| async {
+                SendOutcome::Unresolved { detail: "OK never arrived".to_owned() }
+            },
+        )
+        .await
+        .expect_err("unresolved");
+        assert!(matches!(error, AwardError::Unresolved { .. }));
+
+        // Retry: the relay now REFUSES the re-send (policy drift). That judges transmission 2
+        // only — everything holds.
+        let error = award_with_reservation(
+            &store,
+            &job,
+            40,
+            100,
+            u64::MAX,
+            0,
+            2,
+            no_relay,
+            no_prepare,
+            |_bytes: String, _event_id: String| async {
+                SendOutcome::Refused { detail: "restricted: members only".to_owned() }
+            },
+        )
+        .await
+        .expect_err("held, not refused");
+        assert!(
+            matches!(&error, AwardError::Unresolved { .. }),
+            "a re-send refusal must HOLD, got: {error}"
+        );
+        let attempt = store.award_attempt(&job).expect("read").expect("attempt");
+        assert_eq!(attempt.state, AttemptState::Pending, "not terminalized");
+        assert_eq!(attempt.send_count, 2, "both transmissions counted");
+        assert_eq!(
+            store.reservation(&job).expect("read").map(|(state, _)| state),
+            Some(super::super::reservations::ReservationState::Reserved),
+            "funds stay held — releasing on a re-send refusal is the #322 shape again"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The crash window between the relay's ack and `record_award`: attempt confirmed, row missing.
+    // The next call repairs from the ATTEMPT — every field, amount included, no network at all
+    // (probe, prepare and send are all unreachable).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_confirmed_attempt_missing_its_row_repairs_without_any_network() {
+        let (store, path) = fresh_store("attempt-confirmed-repair");
+        let job = "a".repeat(64);
+
+        // Build the crash state: pinned + confirmed, reservation held, no awards row.
+        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+        let prepared = fake_prepared(&job);
+        let candidate = AwardAttempt {
+            job_id: job.clone(),
+            claim_id: prepared.claim_id.clone(),
+            seller_pubkey: prepared.seller_pubkey.clone(),
+            award_event_id: prepared.award_event_id.clone(),
+            event_json: prepared.event_json.clone(),
+            amount_sats: 40,
+            quoted_mints_json: "[]".to_owned(),
+            offer_deadline_unix: prepared.offer_deadline_unix,
+            send_count: 0,
+            relay_url: prepared.relay_url.clone(),
+            state: AttemptState::Pending,
+            detail: None,
+        };
+        assert!(matches!(
+            store.begin_award_attempt(&candidate, 1).expect("pin"),
+            BeginAttempt::Pinned
+        ));
+        store.mark_attempt_confirmed(&job, 2).expect("confirm");
+        assert!(store.award_record(&job).expect("read").is_none(), "the crash: no row");
+
+        let outcome = award_with_reservation(
+            &store,
+            &job,
+            40,
+            100,
+            u64::MAX,
+            0,
+            3,
+            no_relay,
+            no_prepare,
+            no_send,
+        )
+        .await
+        .expect("repair from the attempt");
+
+        let AwardOutcome::AlreadyAwarded(record) = outcome else {
+            panic!("expected AlreadyAwarded from the attempt repair");
+        };
+        assert_eq!(record.award_event_id, prepared.award_event_id);
+        assert_eq!(record.amount_sats, 40, "the attempt carries the committed amount");
+        assert!(store.award_record(&job).expect("read").is_some(), "the row exists now");
+        let _ = std::fs::remove_file(&path);
     }
 
     // ORDERING tooth (red-on-revert). `settle_after_pay` must run `pay` (budget append + melt)
@@ -1470,25 +2414,44 @@ mod tests {
 
     /// The relay-presence probe for tests whose outcome must be decided from LOCAL state alone.
     ///
-    /// It panics if awaited, which makes "the local-first precheck needs no network" an assertion
-    /// rather than a comment: a first award (no row, no reservation) and a re-award of a recorded
-    /// award (row present) must both resolve without it. Only the genuinely ambiguous
-    /// reserved-but-unrecorded state may reach the relay, and the tests that exercise that state
-    /// pass an explicit probe instead of this one.
-    async fn no_relay() -> Result<Option<AwardPresence>, JobLifecycleError> {
+    /// It panics if awaited, which makes "the local-first decision needs no network" an assertion
+    /// rather than a comment: a first award (no row, no reservation), a re-award of a recorded
+    /// award (row present), and every attempt-era state (the pinned verdict outranks the relay)
+    /// must all resolve without it. Only the legacy reserved/released-but-unrecorded states may
+    /// reach the relay, and the tests that exercise those pass an explicit probe instead of this.
+    async fn no_relay() -> Result<PresenceRead<AwardPresence>, JobLifecycleError> {
         unreachable!("presence must be decided from local state — the relay must not be consulted")
     }
 
-    /// A stand-in published-award outcome for the `award_with_reservation` publish closure (these
+    /// A stand-in prepared (signed) award for the `award_with_reservation` prepare closure (these
     /// tests never touch a relay — the money accounting is what is under test, not the wire).
-    fn fake_award_outcome(job_id: &str) -> AwardClaimOutcome {
-        AwardClaimOutcome {
+    /// `event_json` is distinct per award id so a byte-identity assertion means something.
+    fn fake_prepared(job_id: &str) -> PreparedAward {
+        PreparedAward {
             award_event_id: "e".repeat(64),
+            event_json: format!("{{\"id\":\"{}\",\"job\":\"{job_id}\"}}", "e".repeat(64)),
             job_id: job_id.to_owned(),
             claim_id: "c".repeat(64),
             seller_pubkey: SELLER_HEX.to_owned(),
             quoted_mints: Vec::new(),
+            offer_deadline_unix: 9_999,
+            relay_url: "ws://relay.test".to_owned(),
         }
+    }
+
+    /// A send that acks — the happy wire for tests about the money accounting around it.
+    async fn send_acked(_bytes: String, _event_id: String) -> SendOutcome {
+        SendOutcome::Acked
+    }
+
+    /// A send that must never run: pinned/refused/repaired paths transmit nothing.
+    async fn no_send(_bytes: String, _event_id: String) -> SendOutcome {
+        unreachable!("nothing may be sent on this path")
+    }
+
+    /// A prepare that must never run: any path with an existing attempt or award never re-selects.
+    async fn no_prepare() -> Result<PreparedAward, JobLifecycleError> {
+        unreachable!("nothing may be prepared (signed) on this path")
     }
 
     // ★ N-AGENT NO-OVERSPEND TOOTH. The buyer daemon serves N MCP agents that all draw the SAME
@@ -1543,7 +2506,8 @@ mod tests {
                     spent,
                     1,
                     no_relay,
-                    || async { Ok(fake_award_outcome(&job_out)) },
+                    || async move { Ok(fake_prepared(&job_out)) },
+                    send_acked,
                 )
                 .await
                 .map_err(|error| {
@@ -1594,15 +2558,24 @@ mod tests {
         // reserve of 30 against the 10 the winners left, which `reserve` correctly refuses, and the
         // refusal reads as an idempotency failure when the code did exactly the right thing.
         //
-        // The publish closure is `unreachable!`, which makes this red-on-revert for the presence
-        // gate: remove the gate and the retry republishes — a duplicate award of real money — and
-        // this test panics instead of quietly passing on the reserved total alone. Note the two
-        // failures are independent: #287 fixed WHICH job is re-awarded, this asserts WHAT a re-award
-        // may do. A winner is required for either to mean anything.
+        // The prepare/send closures are `unreachable!`, which makes this red-on-revert for the
+        // presence gate: remove the gate and the retry republishes — a duplicate award of real
+        // money — and this test panics instead of quietly passing on the reserved total alone.
+        // Note the two failures are independent: #287 fixed WHICH job is re-awarded, this asserts
+        // WHAT a re-award may do. A winner is required for either to mean anything.
         let winner = winners[0].clone();
-        let outcome = award_with_reservation(&store, &winner, amount, balance, cap, 0, 2, no_relay, || async {
-            unreachable!("a job with a recorded award must not publish again")
-        })
+        let outcome = award_with_reservation(
+            &store,
+            &winner,
+            amount,
+            balance,
+            cap,
+            0,
+            2,
+            no_relay,
+            no_prepare,
+            no_send,
+        )
         .await
         .expect("idempotent re-award");
         assert!(
@@ -1708,7 +2681,8 @@ mod tests {
                         spent,
                         4,
                         no_relay,
-                        || async { Ok(fake_award_outcome(&job_out)) },
+                        || async move { Ok(fake_prepared(&job_out)) },
+                        send_acked,
                     )
                     .await
                 })
@@ -1774,9 +2748,18 @@ mod tests {
                     let snap = balance.load(Ordering::SeqCst);
                     let spent = BudgetGate::from_home(&home).expect("gate").spent();
                     let job_out = job_y.clone();
-                    award_with_reservation(&store, &job_y, award, snap, cap, spent, 4, no_relay, || async {
-                        Ok(fake_award_outcome(&job_out))
-                    })
+                    award_with_reservation(
+                        &store,
+                        &job_y,
+                        award,
+                        snap,
+                        cap,
+                        spent,
+                        4,
+                        no_relay,
+                        || async move { Ok(fake_prepared(&job_out)) },
+                        send_acked,
+                    )
                     .await
                 })
             };

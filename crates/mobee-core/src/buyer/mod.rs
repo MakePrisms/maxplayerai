@@ -250,6 +250,21 @@ pub async fn run(home: MobeeHome) -> Result<(), BuyerError> {
     // the seller's report. NULL must mean "seller never reported", so boot re-reads the bind and
     // lands it through the same row-level write-once gate (it can never rewrite recorded truth).
     heal_award_attribution(&context.store, &context.home);
+    // Resolve award attempts a prior run left open (#322): heal confirmed-but-unrecorded rows,
+    // re-send (or, past the deadline, probe) still-pending pinned awards. SPAWNED, not awaited:
+    // one slow relay would otherwise eat the socket's 10s readiness budget (`daemon::ensure`
+    // gives up and every cold-start MCP call fails). Ordering against the re-armed tasks below
+    // is not load-bearing — every money decision both make happens inside the chokepoint under
+    // the money lock, and both converge on the pinned attempt. The attribution heal re-runs
+    // after the sweep because the sweep CREATES the awards rows it backfills (write-once gated,
+    // so the re-run can never rewrite what the boot-path run above already landed).
+    {
+        let context = context.clone();
+        tokio::spawn(async move {
+            resolve_award_attempts(&context).await;
+            heal_award_attribution(&context.store, &context.home);
+        });
+    }
     // Re-arm pending auto-awards left by a prior run: a job posted before a crash still gets its
     // award with zero manual commands. Each task re-checks the relay for an existing award first
     // (invariant A), so re-arming never double-awards.
@@ -503,6 +518,14 @@ struct AwardParams {
     max_sats: Option<u64>,
 }
 
+/// Whether a manual award call NAMES a claim that contradicts the pinned attempt (#322). Pinned
+/// awards are write-once, so a different `claim_id` can never be honored — refusing loudly beats
+/// silently awarding a claim the caller did not sanction. Omitting `claim_id`, or naming the
+/// pinned one, resolves the pinned attempt. Pure so the refusal is unit-testable.
+fn pinned_claim_conflict(pinned_claim_id: &str, named: Option<&str>) -> bool {
+    named.is_some_and(|named| named != pinned_claim_id)
+}
+
 /// Award a claim, reserving its funds FIRST. Reserve refusal ⇒ no award is published and no row is
 /// written (the #126 mandatory guard). Snapshots are honest: live wallet balance, budget cap, and
 /// budget spent total.
@@ -520,51 +543,139 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
     // concurrent melt.
     let _guard = context.money_lock.lock().await;
 
-    let view = match job_lifecycle::fetch_job_view_async(
-        &context.home,
-        &keys,
-        &params.job_id,
-        RELAY_TIMEOUT,
-        now_unix() as u64,
-    )
-    .await
-    {
-        Ok(view) => view,
+    // A pinned attempt short-circuits selection (#322): once a signed award exists for this job —
+    // whatever its verdict so far — its claim and its exact bytes ARE the job's award, and this
+    // call's task is to resolve THAT attempt, not to choose again. Skipping the view fetch is not
+    // an optimisation but the point: re-validating a sealed decision would be deciding twice.
+    // (`max_sats` is likewise sealed: the amount was fixed when the attempt was pinned, so the
+    // parameter applies to first calls only — documented on the MCP tool.)
+    let attempt = match context.store.award_attempt(&params.job_id) {
+        Ok(attempt) => attempt,
         Err(error) => return Response::err(id, CODE_INTERNAL, error.to_string()),
     };
-    let Some(offer) = view.offer.as_ref() else {
-        return Response::err(id, CODE_INTERNAL, format!("no offer on the relay for job {}", params.job_id));
-    };
-    let offer_amount = offer.amount_sats;
-    let max_sats = params.max_sats.unwrap_or(offer_amount);
-    let filters = AwardFilters {
-        offer_amount_sats: offer_amount,
-        max_sats,
-        buyer_mint: context.home.config.default_mint(),
-        allow_real_mints: context.home.config.allow_real_mints,
-        requested_agent: offer.requested_agent.as_deref(),
-    };
-
-    // Manual award names the claim but applies the SAME hard filters (max_sats, price, mint) as
-    // auto-award — max_sats is enforced, not ignored, on the manual path. Auto-award selects the
-    // first live payable claim.
-    let claim_id = match params.claim_id {
-        Some(claim_id) => {
-            if let Err(refused) = lifecycle::named_claim_awardable(&view, &claim_id, &filters) {
-                return Response::err(id, CODE_REFUSED, refused.to_string());
-            }
-            claim_id
+    if let Some(attempt) = &attempt {
+        if pinned_claim_conflict(&attempt.claim_id, params.claim_id.as_deref()) {
+            return Response::err(
+                id,
+                CODE_REFUSED,
+                format!(
+                    "job {} already has a pinned award attempt for claim {} (state: {:?}); \
+                     awards are write-once per offer, so another claim can never be awarded \
+                     here. Retry without claim_id (or with the pinned one) to resolve the \
+                     existing attempt",
+                    params.job_id, attempt.claim_id, attempt.state
+                ),
+            );
         }
-        None => match lifecycle::select_awardable_claim(&view, &filters) {
-            Some(claim_id) => claim_id,
-            None => {
-                return Response::err(
+        // Past the offer deadline nothing may be transmitted — a retry here would inject a LATE
+        // award the seller would burn compute on (its award arm has no deadline check). Resolve
+        // by probe instead, exactly as the sweep does, and report the durable truth.
+        if attempt.state == store::AttemptState::Pending
+            && now_unix() > attempt.offer_deadline_unix
+        {
+            resolve_expired_attempt(context, &keys, attempt).await;
+            if let Ok(Some(record)) = context.store.award_record(&params.job_id) {
+                let _ = context.store.mark_award_awarded(&params.job_id, now_unix());
+                return Response::ok(
                     id,
-                    CODE_REFUSED,
-                    format!("no awardable claim for job {} (none live/payable/mint-compatible)", params.job_id),
+                    json!({
+                        "already_awarded": {
+                            "job_id": record.job_id,
+                            "claim_id": record.claim_id,
+                            "award_event_id": record.award_event_id,
+                            "seller_pubkey": record.seller_pubkey,
+                            "amount_sats": record.amount_sats,
+                            "awarded_at_unix": record.awarded_at_unix,
+                        },
+                        "published_now": false,
+                        "reserved_for": params.job_id,
+                    }),
                 );
             }
-        },
+            return match context.store.award_attempt(&params.job_id) {
+                Ok(Some(after)) if after.state == store::AttemptState::Refused => Response::err(
+                    id,
+                    CODE_REFUSED,
+                    format!(
+                        "the pinned award for job {} was refused: {}",
+                        params.job_id,
+                        after.detail.unwrap_or_else(|| "no detail recorded".to_owned())
+                    ),
+                ),
+                _ => Response::err(
+                    id,
+                    CODE_INTERNAL,
+                    format!(
+                        "the pinned award for job {} is past its offer deadline and its relay \
+                         verdict is still unresolved; nothing was transmitted (a late send would \
+                         burn seller compute) and the probe re-runs on every pass — retry later; \
+                         retries never mint a second award",
+                        params.job_id
+                    ),
+                ),
+            };
+        }
+    }
+    let (award_amount, claim_id, send_relay) = match &attempt {
+        Some(attempt) => {
+            (attempt.amount_sats, attempt.claim_id.clone(), attempt.relay_url.clone())
+        }
+        None => {
+            let view = match job_lifecycle::fetch_job_view_async(
+                &context.home,
+                &keys,
+                &params.job_id,
+                RELAY_TIMEOUT,
+                now_unix() as u64,
+            )
+            .await
+            {
+                Ok(view) => view,
+                Err(error) => return Response::err(id, CODE_INTERNAL, error.to_string()),
+            };
+            let Some(offer) = view.offer.as_ref() else {
+                return Response::err(
+                    id,
+                    CODE_INTERNAL,
+                    format!("no offer on the relay for job {}", params.job_id),
+                );
+            };
+            let offer_amount = offer.amount_sats;
+            let max_sats = params.max_sats.unwrap_or(offer_amount);
+            let filters = AwardFilters {
+                offer_amount_sats: offer_amount,
+                max_sats,
+                buyer_mint: context.home.config.default_mint(),
+                allow_real_mints: context.home.config.allow_real_mints,
+                requested_agent: offer.requested_agent.as_deref(),
+            };
+
+            // Manual award names the claim but applies the SAME hard filters (max_sats, price,
+            // mint) as auto-award — max_sats is enforced, not ignored, on the manual path.
+            // Auto-award selects the first live payable claim.
+            let claim_id = match params.claim_id {
+                Some(claim_id) => {
+                    if let Err(refused) = lifecycle::named_claim_awardable(&view, &claim_id, &filters) {
+                        return Response::err(id, CODE_REFUSED, refused.to_string());
+                    }
+                    claim_id
+                }
+                None => match lifecycle::select_awardable_claim(&view, &filters) {
+                    Some(claim_id) => claim_id,
+                    None => {
+                        return Response::err(
+                            id,
+                            CODE_REFUSED,
+                            format!(
+                                "no awardable claim for job {} (none live/payable/mint-compatible)",
+                                params.job_id
+                            ),
+                        );
+                    }
+                },
+            };
+            (offer_amount, claim_id, context.home.config.relay_url.clone())
+        }
     };
 
     let (balance, total_cap, spent) = match money_snapshot(context).await {
@@ -578,10 +689,11 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
     let probe_home = context.home.clone();
     let probe_keys = keys.clone();
     let probe_job = params.job_id.clone();
+    let send_keys = keys.clone();
     let result = lifecycle::award_with_reservation(
         &context.store,
         &params.job_id,
-        offer_amount,
+        award_amount,
         balance,
         total_cap,
         spent,
@@ -591,9 +703,19 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
                 .await
         },
         move || async move {
-            job_lifecycle::award_claim_async(
+            job_lifecycle::prepare_award_async(
                 &home,
                 AwardClaimRequest { job_id, claim_id: publish_claim },
+            )
+            .await
+        },
+        // Targets the PINNED relay on a resume (the bytes' relay), live config on a first call.
+        move |event_json: String, expected_event_id: String| async move {
+            job_lifecycle::send_signed_award_async(
+                &send_keys,
+                &send_relay,
+                &expected_event_id,
+                &event_json,
             )
             .await
         },
@@ -616,7 +738,7 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
             id,
             json!({
                 "awarded": outcome,
-                "reserved_sats": offer_amount,
+                "reserved_sats": award_amount,
                 "reserved_for": params.job_id,
             }),
         ),
@@ -639,9 +761,19 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
         ),
         Err(AwardError::Reserve(refused)) => Response::err(id, CODE_REFUSED, refused.to_string()),
         // Presence refusals are REFUSED, not INTERNAL: nothing broke, the daemon declined to
-        // publish a second award. The message names the operator action.
-        Err(error @ (AwardError::PublishedButUnrecorded { .. } | AwardError::PresenceUnverified { .. })) => {
-            Response::err(id, CODE_REFUSED, error.to_string())
+        // publish a second award. The message names the operator action. A relay REFUSAL of the
+        // pinned event is the same class — the daemon is reporting a terminal verdict, not a
+        // fault; the message names the recovery (a new offer).
+        Err(
+            error @ (AwardError::PublishedButUnrecorded { .. }
+            | AwardError::PresenceUnverified { .. }
+            | AwardError::Refused { .. }),
+        ) => Response::err(id, CODE_REFUSED, error.to_string()),
+        // Unresolved is transient and RETRY-SAFE by construction (the retry re-sends the same
+        // signed event), which the message says outright — an agent that reads it can converge
+        // by simply calling `award_claim` again.
+        Err(error @ AwardError::Unresolved { .. }) => {
+            Response::err(id, CODE_INTERNAL, error.to_string())
         }
         Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
     }
@@ -834,16 +966,14 @@ async fn drive_auto_award(
     let keys = buyer_keys(&context.home)?;
 
     // Invariant A, first pass: skip cheaply if the relay already shows our award. An unknown answer
-    // (error, or `Ok(None)`, which a timed-out read also produces) does NOT skip — it falls through
-    // to `award_with_reservation`, which is where an unverified presence is adjudicated against the
-    // local `awards` row and REFUSED rather than republished. This check is an optimisation; the
-    // chokepoint is the guard.
-    let award_on_relay =
-        job_lifecycle::award_presence_async(&context.home, &keys, job_id, RELAY_TIMEOUT)
-            .await
-            .ok()
-            .flatten()
-            .is_some();
+    // (an error, or an unverified/empty read) does NOT skip — it falls through to
+    // `award_with_reservation`, which is where an unverified presence is adjudicated against the
+    // local `awards` row + pinned attempt and REFUSED rather than republished. This check is an
+    // optimisation; the chokepoint is the guard.
+    let award_on_relay = matches!(
+        job_lifecycle::award_presence_async(&context.home, &keys, job_id, RELAY_TIMEOUT).await,
+        Ok(job_lifecycle::PresenceRead::Present(_))
+    );
     let reservation = context
         .store
         .reservation(job_id)
@@ -909,6 +1039,21 @@ async fn drive_auto_award(
         };
         unconfirmed_reads = 0;
         if now_unix() as u64 > offer.deadline_unix {
+            // A pinned attempt past its deadline is NOT "no awardable claim appeared" — a claim
+            // was selected and signed for; only its relay verdict is open. Resolve it by probe
+            // (never a late transmit) and reflect the truth on the intent; the periodic sweep
+            // continues anything still unresolved.
+            if let Ok(Some(attempt)) = context.store.award_attempt(job_id) {
+                if attempt.state == store::AttemptState::Pending {
+                    resolve_expired_attempt(context, &keys, &attempt).await;
+                    if context.store.award_record(job_id).ok().flatten().is_some() {
+                        let _ = context.store.mark_award_awarded(job_id, now_unix());
+                    }
+                    // A refusal already parked the intent with its reason; anything else stays
+                    // pending for the sweep. Either way this task's work is done.
+                    return Ok(());
+                }
+            }
             let _ = context.store.mark_award_parked(
                 job_id,
                 "offer deadline passed before an awardable claim appeared",
@@ -948,9 +1093,20 @@ async fn finalize_auto_award(
     let home = context.home.clone();
     let job = job_id.to_owned();
     let publish_claim = claim_id.clone();
-    let probe_keys = buyer_keys(&context.home)?;
+    let keys = buyer_keys(&context.home)?;
+    let probe_keys = keys.clone();
     let probe_home = context.home.clone();
     let probe_job = job_id.to_owned();
+    // A resume must transmit to the relay the bytes were PINNED for; only a first call may use
+    // live config (and pins it, so the two agree by construction).
+    let send_relay = context
+        .store
+        .award_attempt(job_id)
+        .ok()
+        .flatten()
+        .map(|attempt| attempt.relay_url)
+        .unwrap_or_else(|| context.home.config.relay_url.clone());
+    let send_keys = keys;
     let result = lifecycle::award_with_reservation(
         &context.store,
         job_id,
@@ -964,8 +1120,20 @@ async fn finalize_auto_award(
                 .await
         },
         move || async move {
-            job_lifecycle::award_claim_async(&home, AwardClaimRequest { job_id: job, claim_id: publish_claim })
-                .await
+            job_lifecycle::prepare_award_async(
+                &home,
+                AwardClaimRequest { job_id: job, claim_id: publish_claim },
+            )
+            .await
+        },
+        move |event_json: String, expected_event_id: String| async move {
+            job_lifecycle::send_signed_award_async(
+                &send_keys,
+                &send_relay,
+                &expected_event_id,
+                &event_json,
+            )
+            .await
         },
     )
     .await;
@@ -994,15 +1162,17 @@ async fn finalize_auto_award(
                 .mark_award_parked(job_id, &error.to_string(), now_unix());
             Ok(())
         }
-        // Presence could not be verified, or local state could not be read: UNKNOWN, and possibly a
-        // transient relay/DB blip. Return Err so the intent stays `pending` and re-arms on the next
-        // start (this function's contract) instead of demanding an operator for a 10-second hiccup.
-        // Re-arming is safe by construction: the chokepoint refuses again on every unverified pass,
-        // so retrying can never publish a duplicate — it can only later succeed once the answer is
-        // knowable.
-        Err(error @ (AwardError::PresenceUnverified { .. } | AwardError::Presence(_))) => {
-            Err(error.to_string())
-        }
+        // Presence could not be verified, local state could not be read, or the send got no
+        // verdict: UNKNOWN, and possibly a transient relay/DB blip. Return Err so the intent stays
+        // `pending` and re-arms on the next start (this function's contract) instead of demanding
+        // an operator for a 10-second hiccup. Re-arming is safe by construction: the chokepoint
+        // refuses again on every unverified pass, and an UNRESOLVED attempt re-sends its own
+        // pinned bytes — so retrying can never publish a duplicate; it can only converge.
+        Err(
+            error @ (AwardError::PresenceUnverified { .. }
+            | AwardError::Presence(_)
+            | AwardError::Unresolved { .. }),
+        ) => Err(error.to_string()),
         Err(error) => {
             let _ = context
                 .store
@@ -1226,6 +1396,261 @@ fn heal_award_attribution(store: &store::BuyerStore, home: &MobeeHome) {
     }
 }
 
+/// Drive one attempt-holding job through the [`lifecycle::award_with_reservation`] chokepoint —
+/// the money mechanics (re-hold, repair, confirm, record) live THERE, never re-implemented here.
+/// `live_send` chooses the send leg: the real relay transmission for a resumable (pre-deadline)
+/// attempt, or a defensive no-op that reports `Unresolved` for callers that must not transmit
+/// (the heal of an already-confirmed attempt, where no send arm is reachable at all).
+async fn resolve_attempt_via_chokepoint(
+    context: &BuyerContext,
+    keys: &nostr_sdk::Keys,
+    job_id: &str,
+    amount_sats: u64,
+    relay_url: String,
+    live_send: bool,
+) -> Result<AwardOutcome, AwardError> {
+    let _guard = context.money_lock.lock().await;
+    let (balance, total_cap, spent) = match money_snapshot(context).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return Err(AwardError::Presence(StoreError(format!(
+                "no money snapshot for the attempt sweep: {error}"
+            ))));
+        }
+    };
+    let probe_home = context.home.clone();
+    let probe_keys = keys.clone();
+    let probe_job = job_id.to_owned();
+    let send_keys = keys.clone();
+    lifecycle::award_with_reservation(
+        &context.store,
+        job_id,
+        amount_sats,
+        balance,
+        total_cap,
+        spent,
+        now_unix(),
+        move || async move {
+            job_lifecycle::award_presence_async(&probe_home, &probe_keys, &probe_job, RELAY_TIMEOUT)
+                .await
+        },
+        // A pinned attempt never re-prepares; defensive error rather than a daemon panic.
+        || async {
+            Err(job_lifecycle::JobLifecycleError::Input(
+                "a pinned attempt must not re-prepare".to_owned(),
+            ))
+        },
+        move |event_json: String, expected_event_id: String| async move {
+            if live_send {
+                job_lifecycle::send_signed_award_async(
+                    &send_keys,
+                    &relay_url,
+                    &expected_event_id,
+                    &event_json,
+                )
+                .await
+            } else {
+                job_lifecycle::SendOutcome::Unresolved {
+                    detail: "this resolution path does not transmit".to_owned(),
+                }
+            }
+        },
+    )
+    .await
+}
+
+/// Resolve one pending attempt whose offer deadline has PASSED. Never transmits — re-sending
+/// would knowingly inject a late award — so the verdict comes from the by-id probe against the
+/// attempt's pinned relay, and it terminalizes only with maximal honesty:
+///
+/// - **Present** → the award IS public: confirm the attempt, then heal row + funds through the
+///   chokepoint's repair arm.
+/// - **Confirmed absent, pay window also passed** → nothing can land inside its window anymore:
+///   refuse the attempt, return the funds, park the intent. The pay window
+///   ([`job_lifecycle::DELIVERY_PAY_WINDOW_SECS`]) is the grace that keeps one relay hiccup at
+///   one boot from repudiating work a seller may be mid-delivery on.
+/// - **Confirmed absent, inside the window / unverified** → hold everything; re-probed next pass.
+async fn resolve_expired_attempt(
+    context: &BuyerContext,
+    keys: &nostr_sdk::Keys,
+    attempt: &store::AwardAttempt,
+) {
+    let job_id = &attempt.job_id;
+    match job_lifecycle::event_present_async(
+        keys,
+        &attempt.relay_url,
+        &attempt.award_event_id,
+        RELAY_TIMEOUT,
+    )
+    .await
+    {
+        Ok(job_lifecycle::PresenceRead::Present(())) => {
+            let _ = context.store.mark_attempt_confirmed(job_id, now_unix());
+            match resolve_attempt_via_chokepoint(
+                context,
+                keys,
+                job_id,
+                attempt.amount_sats,
+                attempt.relay_url.clone(),
+                false,
+            )
+            .await
+            {
+                Ok(_) => {
+                    let _ = context.store.mark_award_awarded(job_id, now_unix());
+                    eprintln!(
+                        "buyer: pending award attempt for {job_id} resolved — award {} is on the \
+                         relay (found by probe)",
+                        attempt.award_event_id
+                    );
+                }
+                Err(error) => eprintln!(
+                    "buyer: award {} for {job_id} is on the relay but the row/funds heal failed \
+                     ({error}); will retry next pass",
+                    attempt.award_event_id
+                ),
+            }
+        }
+        Ok(job_lifecycle::PresenceRead::ConfirmedAbsent) => {
+            let pay_window_end = attempt
+                .offer_deadline_unix
+                .saturating_add(job_lifecycle::DELIVERY_PAY_WINDOW_SECS as i64);
+            if now_unix() > pay_window_end {
+                let detail = "offer deadline and pay window passed with the award confirmed \
+                              absent from its relay; nothing can settle inside the window now";
+                let _ = context.store.mark_attempt_refused(job_id, detail, now_unix());
+                let _ = context.store.release(job_id, now_unix());
+                let _ = context.store.mark_award_parked(job_id, detail, now_unix());
+                eprintln!("buyer: pending award attempt for {job_id} refused: {detail}");
+            } else {
+                eprintln!(
+                    "buyer: pending award attempt for {job_id} confirmed absent but inside the \
+                     pay window; holding until {pay_window_end}"
+                );
+            }
+        }
+        Ok(job_lifecycle::PresenceRead::Unverified) => {
+            eprintln!(
+                "buyer: pending award attempt for {job_id} unresolved (relay did not confirm \
+                 presence or absence); will retry next pass"
+            );
+        }
+        Err(error) => {
+            eprintln!("buyer: pending award attempt for {job_id} probe failed: {error}");
+        }
+    }
+}
+
+/// Resolve award attempts a prior run left open (#322) — runs at boot (spawned, off the socket's
+/// 10s readiness budget) and on every reconcile tick, so a lost `OK` stalls a live trade for
+/// minutes, not for the daemon's lifetime.
+///
+/// Two work sets, both from durable state:
+///
+/// - **Heal**: attempts CONFIRMED public whose `awards` row is missing (the crash window between
+///   the relay's ack and `record_award`). Healed through the chokepoint's repair arm — which
+///   re-holds the funds `record_award` alone would leave dangling (the reconcile pass may have
+///   released them while the row was missing; an awards row without its reservation is invisible
+///   to the delivery watcher and over-states `available`).
+/// - **Resolve**: attempts still PENDING. Before the offer deadline the pinned bytes are re-sent
+///   through the chokepoint (an already-stored event acks as `duplicate:`, so the send doubles as
+///   the probe). Past the deadline nothing is transmitted — [`resolve_expired_attempt`] probes by
+///   id and terminalizes only past the pay window.
+///
+/// Concurrency-safe by construction: every money decision happens inside the chokepoint under
+/// `money_lock`, so this can run alongside the serving RPCs and re-armed auto-award tasks.
+async fn resolve_award_attempts(context: &BuyerContext) {
+    let keys = match buyer_keys(&context.home) {
+        Ok(keys) => keys,
+        Err(error) => {
+            eprintln!("buyer: award attempt sweep skipped (no keys): {error}");
+            return;
+        }
+    };
+
+    match context.store.confirmed_attempts_without_award_row() {
+        Ok(attempts) => {
+            for attempt in attempts {
+                match resolve_attempt_via_chokepoint(
+                    context,
+                    &keys,
+                    &attempt.job_id,
+                    attempt.amount_sats,
+                    attempt.relay_url.clone(),
+                    false,
+                )
+                .await
+                {
+                    Ok(_) => eprintln!(
+                        "buyer: healed awards row for {} from its confirmed attempt ({})",
+                        attempt.job_id, attempt.award_event_id
+                    ),
+                    Err(error) => eprintln!(
+                        "buyer: healing awards row for {} failed ({error}); will retry next pass",
+                        attempt.job_id
+                    ),
+                }
+            }
+        }
+        Err(error) => eprintln!("buyer: could not enumerate confirmed attempts to heal: {error}"),
+    }
+
+    let pending = match context.store.pending_award_attempts() {
+        Ok(pending) => pending,
+        Err(error) => {
+            eprintln!("buyer: could not enumerate pending award attempts: {error}");
+            return;
+        }
+    };
+    for attempt in pending {
+        let job_id = attempt.job_id.clone();
+        if now_unix() > attempt.offer_deadline_unix {
+            resolve_expired_attempt(context, &keys, &attempt).await;
+            continue;
+        }
+        let result = resolve_attempt_via_chokepoint(
+            context,
+            &keys,
+            &job_id,
+            attempt.amount_sats,
+            attempt.relay_url.clone(),
+            true,
+        )
+        .await;
+        match result {
+            Ok(AwardOutcome::Published(outcome)) => {
+                let _ = context.store.mark_award_awarded(&job_id, now_unix());
+                eprintln!(
+                    "buyer: pending award attempt for {job_id} resolved — award {} is on the relay",
+                    outcome.award_event_id
+                );
+            }
+            Ok(AwardOutcome::AlreadyAwarded(record)) => {
+                let _ = context.store.mark_award_awarded(&job_id, now_unix());
+                eprintln!(
+                    "buyer: pending award attempt for {job_id} resolved — award {} was already \
+                     recorded",
+                    record.award_event_id
+                );
+            }
+            Err(error @ AwardError::Refused { .. }) => {
+                // Terminal: surfaced on the intent row (no-op for manual-path attempts) AND logged.
+                let _ = context.store.mark_award_parked(&job_id, &error.to_string(), now_unix());
+                eprintln!("buyer: pending award attempt for {job_id} refused: {error}");
+            }
+            Err(error @ AwardError::Unresolved { .. }) => {
+                eprintln!(
+                    "buyer: pending award attempt for {job_id} still unresolved ({error}); will \
+                     retry next pass"
+                );
+            }
+            Err(error) => {
+                eprintln!("buyer: pending award attempt for {job_id} not resolved: {error}");
+            }
+        }
+    }
+}
+
 /// Settle awarded-but-unsettled jobs through the daemon's single spend path.
 ///
 /// `wake` narrows the sweep to the jobs a just-arrived result references (the fast path); `None`
@@ -1437,7 +1862,15 @@ where
 
 fn spawn_reconcile_loop(context: Arc<BuyerContext>) {
     tokio::spawn(async move {
-        reconcile_loop(RECONCILE_INTERVAL, || run_reconcile_pass(&context)).await;
+        reconcile_loop(RECONCILE_INTERVAL, || async {
+            run_reconcile_pass(&context).await;
+            // Attempts are resolved on the same cadence, not only at boot: the lost-OK failure
+            // this ledger exists for (#322) otherwise stalls a live trade for the daemon's
+            // whole lifetime — award public, seller delivering, nothing settled until a
+            // restart. Ten minutes bounds that staleness.
+            resolve_award_attempts(&context).await;
+        })
+        .await;
     });
 }
 
@@ -1609,6 +2042,18 @@ mod tests {
     fn temp_home(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!("mobee-buyer-mod-{label}-{}-{id}", std::process::id()))
+    }
+
+    // #322: the manual award RPC's write-once gate. A named claim contradicting the pinned one
+    // is the ONLY conflict; omitting the claim, or naming the pinned one, resolves the attempt.
+    #[test]
+    fn pinned_claim_conflict_refuses_only_a_contradicting_name() {
+        assert!(!pinned_claim_conflict("claim-a", None), "omitting claim_id resolves the pin");
+        assert!(!pinned_claim_conflict("claim-a", Some("claim-a")), "naming the pin resolves it");
+        assert!(
+            pinned_claim_conflict("claim-a", Some("claim-b")),
+            "naming another claim is refused — awards are write-once per offer"
+        );
     }
 
     // #261: the sanitizer is the only guard between seller-authored bytes and the operator's
