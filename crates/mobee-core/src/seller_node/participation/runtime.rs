@@ -178,6 +178,10 @@ pub struct Participation {
     publisher: Client,
     carrier: Event,
     probe_timeout: Duration,
+    /// Kept so a relay admitted AFTER boot can be given an [`Engine`]. Before the quarantine retry
+    /// existed, every engine was built inside `start` where the store was still a parameter — a relay
+    /// could only ever join the live set at boot, so nothing needed the store later.
+    store: SellerStore,
 }
 
 impl Participation {
@@ -187,9 +191,10 @@ impl Participation {
     /// `publisher` publishes the probe carrier; `carrier` is the event to use (the node's persona).
     /// Neither is retained: this module holds no way to publish anything after start-up.
     ///
-    /// A relay that fails to connect or fails the probe is recorded denied and then left entirely
-    /// alone. Start-up never fails because of a relay — a social surface must not be able to stop
-    /// the node that earns money.
+    /// A relay that REFUSES us is recorded denied and then left entirely alone. One that merely fails
+    /// to answer is quarantined and tried again on a backoff — see [`AccessState::Quarantined`].
+    /// Start-up never fails because of a relay — a social surface must not be able to stop the node
+    /// that earns money.
     pub async fn start(
         config: &ParticipationConfig,
         store: SellerStore,
@@ -197,70 +202,108 @@ impl Participation {
         publisher: &Client,
         carrier: &Event,
     ) -> Result<Self, ParticipationError> {
-        let mut roster = RelayRoster::new(config.relays.clone());
-        let mut live = BTreeMap::new();
-        let timeout = Duration::from_secs(config.probe_timeout_secs.max(1));
-
-        let candidates: Vec<String> = roster
-            .relays_to_probe(now_unix())
-            .map(|entry| entry.url.clone())
-            .collect();
-
-        for url in candidates {
-            let reader = match connect_reader(&url, publisher).await {
-                Ok(reader) => reader,
-                Err(error) => {
-                    roster.record_probe(&url, ProbeOutcome::Refused(error), now_unix());
-                    continue;
-                }
-            };
-
-            let outcome = probe::probe_access(publisher, &url, &reader, carrier, timeout).await;
-            let admitted = matches!(outcome, ProbeOutcome::EchoObserved);
-            roster.record_probe(&url, outcome, now_unix());
-
-            if !admitted {
-                // Close the socket we opened to probe. A denied relay gets nothing further — not a
-                // REQ, not a retry, not a heartbeat.
-                reader.disconnect().await;
-                continue;
-            }
-
-            let engine = Engine::new(store.clone(), url.clone(), me);
-            // No REQ we sent before this process started is still outstanding, so any retry marked in
-            // flight is a phantom: truthful about the past, meaningless now. Cleared rather than expired —
-            // nothing was refused, we simply never got to ask.
-            engine.forget_retries_in_flight(now_unix())?;
-            // Subscribe to the notification stream BEFORE the first REQ goes out, or the events
-            // that REQ produces are broadcast to nobody.
-            let notifications = reader.notifications();
-            subscribe_wake_surface(&reader, &engine, me).await?;
-            live.insert(
-                url.clone(),
-                Live {
-                    reader,
-                    notifications,
-                    engine,
-                    progress_since_resync: 0,
-                    last_resync_unix: 0,
-                    resync_pending: false,
-                    resend_due: BTreeMap::new(),
-                    reprove_due: None,
-                },
-            );
-        }
-
-        Ok(Self {
-            live,
-            roster,
+        let mut participation = Self {
+            live: BTreeMap::new(),
+            roster: RelayRoster::new(config.relays.clone()),
             me,
             lagged: 0,
             forced_progress: 0,
             relay_faults: 0,
             publisher: publisher.clone(),
             carrier: carrier.clone(),
-            probe_timeout: timeout,
-        })
+            probe_timeout: Duration::from_secs(config.probe_timeout_secs.max(1)),
+            store,
+        };
+
+        // Boot drains every relay that is owed a probe; the runtime tick takes at most one per pass.
+        // ★ BOTH GO THROUGH THE SAME BODY on purpose — two copies of "how access is established" would
+        // drift, and the copy that drifted would be the one that only runs in production.
+        while participation.probe_one_due(now_unix()).await? {}
+
+        Ok(participation)
+    }
+
+    /// Establish access on ONE relay that the roster says is owed a probe and that holds no live
+    /// socket. `Ok(false)` ⇒ nothing was due, which is how a caller draining to exhaustion stops.
+    ///
+    /// ★★ THIS IS WHAT MAKES A QUARANTINE A RETRY RATHER THAN A LABEL. [`RelayRoster::relays_to_probe`]
+    /// used to be read only at boot, so a relay quarantined at runtime waited on a caller that never
+    /// came — the backoff was inert and a briefly-slow relay was lost until process restart.
+    ///
+    /// ★ ONE PER CALL, for the same reason [`Self::drain_reproves`] is capped: a probe WAITS, up to
+    /// `probe_timeout`, so draining every due relay in one pass would spend the pump's whole budget on
+    /// the relays that are by definition not the ones carrying work.
+    ///
+    /// The errors are the STORE's and the subscription's, never the relay's. Boot propagates them — a
+    /// broken store must stop the node — while the tick logs and moves on.
+    async fn probe_one_due(&mut self, now: i64) -> Result<bool, ParticipationError> {
+        let due: Vec<String> = self
+            .roster
+            .relays_to_probe(now)
+            .map(|entry| entry.url.clone())
+            .collect();
+        let Some(url) = due.into_iter().find(|url| !self.live.contains_key(url)) else {
+            return Ok(false);
+        };
+
+        let reader = match connect_reader(&url, &self.publisher).await {
+            Ok(reader) => reader,
+            Err(error) => {
+                // The socket never opened, so the relay never said anything: SILENCE, not refusal.
+                // Recording this as a refusal is what turned one unreachable moment into a permanent
+                // loss. See [`ProbeOutcome::Unreachable`].
+                self.roster
+                    .record_probe(&url, ProbeOutcome::Unreachable(error), now);
+                return Ok(true);
+            }
+        };
+
+        let outcome = probe::probe_access(
+            &self.publisher,
+            &url,
+            &reader,
+            &self.carrier,
+            self.probe_timeout,
+        )
+        .await;
+        let admitted = matches!(outcome, ProbeOutcome::EchoObserved);
+        self.roster.record_probe(&url, outcome, now);
+
+        if !admitted {
+            // Close the socket we opened to probe. An unproven relay gets nothing further — not a REQ,
+            // not a heartbeat. A quarantined one comes back through THIS path once its backoff
+            // elapses, on a socket opened fresh.
+            reader.disconnect().await;
+            return Ok(true);
+        }
+
+        let engine = Engine::new(self.store.clone(), url.clone(), self.me);
+        // No REQ is outstanding on a socket we do not hold, so any retry marked in flight for this
+        // relay is a phantom: truthful about the past, meaningless now. Cleared rather than expired —
+        // nothing was refused, we simply never got to ask.
+        //
+        // ★ That invariant is about the SOCKET, not about boot. It was written when this ran only at
+        // start-up ("nothing we sent before this process began is still outstanding") and it holds
+        // just as well for a relay re-admitted mid-process, whose old socket is equally gone.
+        engine.forget_retries_in_flight(now)?;
+        // Subscribe to the notification stream BEFORE the first REQ goes out, or the events that REQ
+        // produces are broadcast to nobody.
+        let notifications = reader.notifications();
+        subscribe_wake_surface(&reader, &engine, self.me).await?;
+        self.live.insert(
+            url,
+            Live {
+                reader,
+                notifications,
+                engine,
+                progress_since_resync: 0,
+                last_resync_unix: 0,
+                resync_pending: false,
+                resend_due: BTreeMap::new(),
+                reprove_due: None,
+            },
+        );
+        Ok(true)
     }
 
     /// The per-relay access states, for `status` and for tests that need to prove a relay was
@@ -456,6 +499,21 @@ impl Participation {
             self.drain_resends(now).await;
             self.drain_reproves(now).await;
 
+            // A relay whose quarantine backoff has elapsed and that holds NO live socket. Deliberately
+            // outside the four-lane gate above: those lanes recover an existing socket and so depend on
+            // "will this relay still talk to us", whereas this one has no socket to recover and exists
+            // precisely to ask that question again.
+            //
+            // Best-effort by construction. The error can only be the store's or the subscription's, and
+            // a relay we are not yet serving must not be able to empty this batch or wedge the pump —
+            // the next tick tries again, and the attempt ceiling stops it being forever.
+            if let Err(error) = self.probe_one_due(now).await {
+                eprintln!(
+                    "participation: re-probe of a due relay failed ({error}); it stays unproven and \
+                     is retried on the next tick"
+                );
+            }
+
             // ★ THE `?`s BELOW CARRY ONLY `Store` ERRORS, BY CONSTRUCTION — and that is a property to
             // re-check, not to trust, because it is what keeps one relay from emptying this batch.
             // A `Relay` error here would abort mid-batch and drop every message after it, INCLUDING other
@@ -551,7 +609,7 @@ impl Participation {
             Live {
                 reader,
                 notifications,
-                engine: Engine::new(store, url.to_string(), me),
+                engine: Engine::new(store.clone(), url.to_string(), me),
                 progress_since_resync,
                 last_resync_unix,
                 resync_pending: false,
@@ -574,6 +632,7 @@ impl Participation {
             .sign_with_keys(&nostr_sdk::prelude::Keys::generate())
             .expect("sign carrier"),
             probe_timeout: Duration::from_secs(1),
+            store,
         }
     }
 
@@ -661,6 +720,7 @@ impl Participation {
             .sign_with_keys(&nostr_sdk::prelude::Keys::generate())
             .expect("sign carrier"),
             probe_timeout: Duration::from_secs(1),
+            store,
         }
     }
 
@@ -679,7 +739,22 @@ impl Participation {
     #[cfg(test)]
     async fn for_live_test(url: &str, store: SellerStore, keys: nostr_sdk::prelude::Keys) -> Self {
         let me = keys.public_key();
-        let publisher = Client::new(keys);
+        // ★★ THE PUBLISHER IS CONNECTED AND AUTHENTICATED, LIKE PRODUCTION'S. `start` receives a
+        // publisher its caller already connected; a seam that hands over a bare `Client::new` has a
+        // publisher that reaches nothing, so EVERY probe through it resolves `EchoMissing` — not
+        // because admission failed but because the publish never left the process. That made the
+        // echo leg of revive → probe → echo → install unreachable from this seam, and any test that
+        // advanced past `reprove_due` measured the seam's own wiring instead of the code.
+        let publisher = Client::new(keys.clone());
+        publisher.automatic_authentication(true);
+        publisher
+            .add_relay(url)
+            .await
+            .expect("add the fixture relay to the publisher");
+        publisher.connect().await;
+        publisher
+            .wait_for_connection(Duration::from_secs(5))
+            .await;
         let reader = connect_reader(url, &publisher)
             .await
             .expect("connect reader to the fixture relay");
@@ -690,7 +765,7 @@ impl Participation {
             Live {
                 reader,
                 notifications,
-                engine: Engine::new(store, url.to_string(), me),
+                engine: Engine::new(store.clone(), url.to_string(), me),
                 progress_since_resync: 1,
                 last_resync_unix: now_unix(),
                 resync_pending: false,
@@ -706,13 +781,20 @@ impl Participation {
             roster: RelayRoster::new(vec![url.to_string()]),
             me,
             publisher,
+            // ★★ SIGNED WITH `keys` — OUR identity, not a stranger's. The probe publishes the carrier
+            // and reads it back BY ID to prove admission; a carrier signed by a generated throwaway
+            // is a foreign event, which a gating relay may refuse and which an author-scoped read
+            // never matches. Either way the echo cannot arrive, so this seam could only ever
+            // demonstrate failure. Same lesson as the `keys` note above, one field over — that note
+            // had learned it for the READER and not yet for the CARRIER.
             carrier: nostr_sdk::prelude::EventBuilder::new(
                 nostr_sdk::prelude::Kind::Metadata,
-                "{}",
+                r#"{"name":"mobee-acceptance"}"#,
             )
-            .sign_with_keys(&nostr_sdk::prelude::Keys::generate())
+            .sign_with_keys(&keys)
             .expect("sign carrier"),
             probe_timeout: Duration::from_secs(1),
+            store,
         }
     }
 
@@ -2863,10 +2945,16 @@ mod tests {
              owed for a reason that has nothing to do with a dead socket — every assertion below would be \
              measuring that refusal"
         );
+        // TWO sockets, and both are ours by construction: the publisher — which this seam now connects
+        // exactly like production's — and the reader under test. The exact number is a positive control
+        // on the fixture: if anything else were opening sockets, a later count could not mean a
+        // reconnect. It read 1 while the seam's publisher was an unconnected `Client` that reached
+        // nothing.
+        let settled = relay.connections();
         assert_eq!(
-            relay.connections(),
-            1,
-            "the reader did not settle on a single socket, so a later count cannot mean a reconnect"
+            settled, 2,
+            "expected exactly the publisher plus the reader; a different baseline means something else \
+             is connecting, and then a later count cannot mean a reconnect"
         );
         let sent_before = relay.reqs().await.len();
 
@@ -2874,9 +2962,12 @@ mod tests {
         relay.drop_socket_now().await;
         tokio::time::sleep(Duration::from_secs(14)).await;
 
+        // Compared against the BASELINE, not a literal: the property is "unchanged", and spelling it
+        // as a number would silently become a different claim the next time the seam legitimately
+        // opens one more socket — which is exactly what just happened to the literal above.
         assert_eq!(
             relay.connections(),
-            1,
+            settled,
             "the SDK reconnected this reader by itself — and `post_connection` replays every registered \
              subscription, so the whole wake surface goes back out on a socket our quarantine never saw"
         );
@@ -2913,7 +3004,7 @@ mod tests {
         // the settle — a relay whose socket keeps dying deciding when its own access gets re-checked.
         assert!(
             tokio::time::timeout(Duration::from_secs(5), async {
-                while relay.connections() < 2 {
+                while relay.connections() < settled + 1 {
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
             })
@@ -2927,9 +3018,12 @@ mod tests {
             .pump(Duration::from_millis(1))
             .await
             .expect("pump");
+        // Baseline plus EXACTLY ONE revive — expressed relative to `settled` for the same reason as
+        // above: a literal here silently becomes a different claim whenever the seam's own socket count
+        // changes, and it just did.
         assert_eq!(
             relay.connections(),
-            2,
+            settled + 1,
             "a quarantined relay was reconnected again while its probe was still pending — the settle \
              restarts every tick the socket stays down, so the access re-check never arrives"
         );

@@ -101,8 +101,15 @@ pub enum ProbeOutcome {
     /// is empty or broken — a claim that admission is UNPROVEN, which is the only thing we may act
     /// on. Treated as denial so that no frames follow.
     EchoMissing,
-    /// The relay refused us outright — auth rejected, admission denied, connection unusable.
+    /// The relay refused us outright — auth rejected, admission denied.
     Refused(String),
+    /// The socket never opened at all, so the relay had no chance to say anything.
+    ///
+    /// ★ NOT a refusal, and recording it as one was the SAME conflation as `EchoMissing` — one step
+    /// earlier in the sequence. A relay that is briefly unreachable has not denied us access; it has
+    /// told us nothing, which is exactly the fact a bounded retry is for. Mapping this to `Refused`
+    /// meant a relay that was down for one attempt was written off until process restart.
+    Unreachable(String),
 }
 
 /// One relay's entry in the roster.
@@ -222,6 +229,25 @@ impl RelayRoster {
         })
     }
 
+    /// The state a relay lands in when it told us NOTHING: quarantined with a backoff while attempts
+    /// remain, denied once they are spent.
+    ///
+    /// ★ Shared by BOTH silences — no socket, and a socket that swallowed the probe — so the two can
+    /// never drift into different verdicts for the same fact. `attempts` is the count AFTER this
+    /// probe was tallied.
+    fn silence_state(attempts: u32, now_unix: i64, reason: &str) -> AccessState {
+        if attempts >= MAX_PROBE_ATTEMPTS {
+            AccessState::Denied {
+                reason: format!("admission unproven after {MAX_PROBE_ATTEMPTS} probes: {reason}"),
+            }
+        } else {
+            AccessState::Quarantined {
+                reason: reason.to_owned(),
+                retry_after_unix: now_unix.saturating_add(quarantine_backoff_secs(attempts)),
+            }
+        }
+    }
+
     /// Fold a probe result into the roster.
     ///
     /// Promotion is monotonic within one probe cycle but never sticky across signal: a relay that
@@ -239,25 +265,20 @@ impl RelayRoster {
             ProbeOutcome::OpenRead => AccessState::Open,
             // The relay said no. Terminal, and the charter forbids polling it.
             ProbeOutcome::Refused(reason) => AccessState::Denied { reason },
-            // The relay said NOTHING, which is a different fact: a bounded retry first, and denial
-            // only once the attempts are spent. Both arms are unusable, so no frame follows either.
-            ProbeOutcome::EchoMissing => {
-                if attempts >= MAX_PROBE_ATTEMPTS {
-                    AccessState::Denied {
-                        reason: format!(
-                            "admission unproven after {MAX_PROBE_ATTEMPTS} probes — no echo ever \
-                             came back"
-                        ),
-                    }
-                } else {
-                    AccessState::Quarantined {
-                        reason: "published but never read the event back — admission unproven"
-                            .into(),
-                        retry_after_unix: now_unix
-                            .saturating_add(quarantine_backoff_secs(attempts)),
-                    }
-                }
-            }
+            // The relay said NOTHING — either the socket never opened, or it opened and swallowed the
+            // probe. Different moments, one fact: admission is unproven and nobody refused us. A
+            // bounded retry first, denial only once the attempts are spent. Both silences go through
+            // ONE function so they cannot drift apart later.
+            ProbeOutcome::EchoMissing => Self::silence_state(
+                attempts,
+                now_unix,
+                "published but never read the event back — admission unproven",
+            ),
+            ProbeOutcome::Unreachable(error) => Self::silence_state(
+                attempts,
+                now_unix,
+                &format!("could not open a socket — admission unproven ({error})"),
+            ),
         };
     }
 
