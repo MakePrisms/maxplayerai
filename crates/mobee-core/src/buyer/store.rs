@@ -226,9 +226,17 @@ impl BuyerStore {
         // v6 (#322) columns added during the same unreleased cycle as the table itself: a store
         // created by an earlier v6 build gains them here; a store where `init_schema` just created
         // the full table skips both (the column already exists).
+        //
+        // The backfill DEFAULTs are the conservative direction, not the fresh-row values:
+        // - `send_count 1`, not 0 — a pre-column row's event may already have been transmitted
+        //   (that build counted nothing), and 0 is the license to treat an OK:false as proof
+        //   nothing is public. Assuming one prior send costs at most a slower terminalization;
+        //   assuming zero re-opens the #322 burn for exactly the migrated population.
+        // - `relay_url ''` is a sentinel the resolution paths translate to live config
+        //   (`attempt_relay`): the pre-column build only ever sent to its configured relay.
         if !Self::column_exists(conn, "award_attempts", "send_count")? {
             conn.execute_batch(
-                "ALTER TABLE award_attempts ADD COLUMN send_count INTEGER NOT NULL DEFAULT 0;",
+                "ALTER TABLE award_attempts ADD COLUMN send_count INTEGER NOT NULL DEFAULT 1;",
             )?;
         }
         if !Self::column_exists(conn, "award_attempts", "relay_url")? {
@@ -897,32 +905,42 @@ impl BuyerStore {
     /// The relay acked this attempt's event (or a probe found it public). One-way: a confirmed
     /// attempt never returns to pending, and a refused one is never resurrected into confirmed —
     /// the two terminal states are reached from `pending` only.
-    pub fn mark_attempt_confirmed(&self, job_id: &str, now_unix: i64) -> Result<(), StoreError> {
+    ///
+    /// Returns whether THIS call performed the transition. `false` means the attempt was already
+    /// terminal — load-bearing for callers whose follow-up writes are licensed by the transition
+    /// itself (see [`Self::mark_attempt_refused`]).
+    pub fn mark_attempt_confirmed(&self, job_id: &str, now_unix: i64) -> Result<bool, StoreError> {
         let conn = self.lock()?;
-        conn.execute(
+        let changed = conn.execute(
             "UPDATE award_attempts SET state = 'confirmed', updated_at_unix = ?2
              WHERE job_id = ?1 AND state = 'pending'",
             params![job_id, now_unix],
         )?;
-        Ok(())
+        Ok(changed > 0)
     }
 
-    /// The relay explicitly rejected this attempt's event (OK:false), or the offer deadline passed
+    /// The relay explicitly rejected this attempt's event (OK:false), or the pay window closed
     /// with the award confirmed absent. Terminal: nothing is public, and nothing may be published
     /// for this job again — recovery is a NEW offer, never a second award on this one.
+    ///
+    /// Returns whether THIS call performed the `pending → refused` transition. The caller may
+    /// release the reservation and park the intent ONLY on `true`: a `false` means another
+    /// resolver already terminalized the attempt (possibly as CONFIRMED — its award is public and
+    /// its funds re-held), and acting anyway would strip funds from a recorded award (#322 review
+    /// round 2).
     pub fn mark_attempt_refused(
         &self,
         job_id: &str,
         detail: &str,
         now_unix: i64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let conn = self.lock()?;
-        conn.execute(
+        let changed = conn.execute(
             "UPDATE award_attempts SET state = 'refused', detail = ?2, updated_at_unix = ?3
              WHERE job_id = ?1 AND state = 'pending'",
             params![job_id, detail, now_unix],
         )?;
-        Ok(())
+        Ok(changed > 0)
     }
 
     /// Every attempt still awaiting a relay verdict — the boot sweep's work set, oldest first.
@@ -940,6 +958,63 @@ impl BuyerStore {
             attempts.push(row?);
         }
         Ok(attempts)
+    }
+
+    /// Refused attempts whose reservation is still `reserved` — the crash window between
+    /// `mark_attempt_refused` and `release`, finished by the sweep through the chokepoint's
+    /// `RefusedTerminal` arm (which releases exactly this state). Without this set the state is
+    /// invisible: refused attempts appear in no other sweep, and funds would stay committed
+    /// forever to a job that can never publish.
+    pub fn refused_attempts_still_reserved(&self) -> Result<Vec<AwardAttempt>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT t.job_id, t.claim_id, t.seller_pubkey, t.award_event_id, t.event_json,
+                    t.amount_sats, t.quoted_mints_json, t.offer_deadline_unix, t.send_count,
+                    t.relay_url, t.state, t.detail
+             FROM award_attempts t
+             JOIN reservations r ON r.job_id = t.job_id
+             WHERE t.state = 'refused' AND r.state = 'reserved'
+             ORDER BY t.created_at_unix",
+        )?;
+        let rows = stmt.query_map([], row_to_attempt)?;
+        let mut attempts = Vec::new();
+        for row in rows {
+            attempts.push(row?);
+        }
+        Ok(attempts)
+    }
+
+    /// Job ids whose RELEASE decision the attempt machinery owns. Reconcile keeps these jobs in
+    /// its pass and still acts on every other verdict — notably `Paid → spent`, the only converger
+    /// for a pay whose `reserved → spent` flip failed — and only their `Dead` verdict is
+    /// downgraded to `Payable` (see [`super::plan_reconcile`]). The two populations:
+    ///
+    /// - **pending** attempts hold their funds deliberately while the award's relay verdict is
+    ///   open; releasing them only produces a release→re-reserve flip-flop with the sweep (plus a
+    ///   stranding race when the freed capacity is taken in between).
+    /// - **confirmed** attempts whose `awards` row is missing are the crash window between the
+    ///   relay's ack and `record_award`. Their award is PROVABLY public (the row is written only
+    ///   on an ack or a presence-verified repair), so reconcile classifying them `Dead` and
+    ///   releasing would produce #322's exact harm ledger: award public, funds returned. The
+    ///   sweep's heal re-reserves and writes the row; until it succeeds the funds stay put.
+    ///
+    /// A confirmed attempt that HAS its row is not listed — the normal awarded state, which
+    /// reconcile has always been allowed to judge on its own evidence.
+    pub fn attempt_held_job_ids(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT t.job_id FROM award_attempts t
+             LEFT JOIN awards a ON a.job_id = t.job_id
+             WHERE t.state = 'pending'
+                OR (t.state = 'confirmed' AND a.job_id IS NULL)
+             ORDER BY t.job_id",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            jobs.push(row?);
+        }
+        Ok(jobs)
     }
 
     /// Confirmed attempts whose `awards` row is missing — the crash window between the relay's ack
@@ -2033,6 +2108,9 @@ mod tests {
 
     // State transitions are one-way and reached from `pending` only: a refusal can never overwrite
     // a confirmation (and vice versa), so a late relay verdict cannot rewrite settled history.
+    // The RETURN VALUE is the license callers act on (#322 round 2): `true` = this call performed
+    // the transition (a release it implies is yours to do); `false` = someone else already
+    // terminalized it (write nothing).
     #[test]
     fn attempt_states_move_one_way_from_pending_only() {
         let (store, path) = fresh_store("attempt-states");
@@ -2040,28 +2118,161 @@ mod tests {
         let refused_job = "r".repeat(64);
 
         store.begin_award_attempt(&attempt(&confirmed_job, "claim-c"), 1).expect("pin");
-        store.mark_attempt_confirmed(&confirmed_job, 2).expect("confirm");
+        assert!(
+            store.mark_attempt_confirmed(&confirmed_job, 2).expect("confirm"),
+            "the transition is this call's"
+        );
         assert_eq!(
             store.award_attempt(&confirmed_job).expect("read").expect("row").state,
             AttemptState::Confirmed
         );
-        // A late refusal against a confirmed attempt is a no-op, detail stays empty.
-        store.mark_attempt_refused(&confirmed_job, "late verdict", 3).expect("refuse no-op");
+        assert!(
+            !store.mark_attempt_confirmed(&confirmed_job, 2).expect("confirm replay"),
+            "a replay reports it did nothing"
+        );
+        // A late refusal against a confirmed attempt is a no-op that SAYS SO, detail stays empty.
+        assert!(
+            !store.mark_attempt_refused(&confirmed_job, "late verdict", 3).expect("refuse no-op"),
+            "losing the race must return false — the caller's release is licensed by true"
+        );
         let row = store.award_attempt(&confirmed_job).expect("read").expect("row");
         assert_eq!(row.state, AttemptState::Confirmed, "confirmed is terminal");
         assert_eq!(row.detail, None);
 
         store.begin_award_attempt(&attempt(&refused_job, "claim-r"), 1).expect("pin");
-        store.mark_attempt_refused(&refused_job, "blocked: policy", 2).expect("refuse");
+        assert!(store.mark_attempt_refused(&refused_job, "blocked: policy", 2).expect("refuse"));
         let row = store.award_attempt(&refused_job).expect("read").expect("row");
         assert_eq!(row.state, AttemptState::Refused);
         assert_eq!(row.detail.as_deref(), Some("blocked: policy"), "the refusal names its reason");
         // A late confirmation against a refused attempt is a no-op.
-        store.mark_attempt_confirmed(&refused_job, 3).expect("confirm no-op");
+        assert!(!store.mark_attempt_confirmed(&refused_job, 3).expect("confirm no-op"));
         assert_eq!(
             store.award_attempt(&refused_job).expect("read").expect("row").state,
             AttemptState::Refused,
             "refused is terminal"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The two round-2 work sets: crashed refusals (refused + still reserved) get finished by the
+    // sweep; pending-attempt jobs are the set reconcile must leave alone.
+    #[test]
+    fn refused_reserved_and_pending_attempt_work_sets_select_correctly() {
+        let (store, path) = fresh_store("r2-work-sets");
+        let crashed = "a".repeat(64);
+        let finished = "b".repeat(64);
+        let pending = "p".repeat(64);
+
+        // Crashed refusal: refused attempt, reservation still held.
+        store.reserve(&crashed, 40, 200, u64::MAX, 0, 1).expect("reserve");
+        store.begin_award_attempt(&attempt(&crashed, "claim-a"), 1).expect("pin");
+        assert!(store.mark_attempt_refused(&crashed, "blocked", 2).expect("refuse"));
+
+        // Finished refusal: refused attempt, funds released — nothing left to do.
+        store.reserve(&finished, 40, 200, u64::MAX, 0, 3).expect("reserve");
+        store.begin_award_attempt(&attempt(&finished, "claim-b"), 3).expect("pin");
+        assert!(store.mark_attempt_refused(&finished, "blocked", 4).expect("refuse"));
+        store.release(&finished, 5).expect("release");
+
+        // Pending attempt: reconcile must skip it.
+        store.reserve(&pending, 40, 200, u64::MAX, 0, 6).expect("reserve");
+        store.begin_award_attempt(&attempt(&pending, "claim-p"), 6).expect("pin");
+
+        // Refused attempt on an already-PAID job: correctly in neither set — there is nothing
+        // to release and nothing open.
+        let paid = "q".repeat(64);
+        store.reserve(&paid, 40, 200, u64::MAX, 0, 7).expect("reserve");
+        store.begin_award_attempt(&attempt(&paid, "claim-q"), 7).expect("pin");
+        assert!(store.mark_attempt_refused(&paid, "blocked", 8).expect("refuse"));
+        store.convert_to_spent(&paid, 40, 9).expect("spent");
+
+        let crashed_set: Vec<String> = store
+            .refused_attempts_still_reserved()
+            .expect("set")
+            .into_iter()
+            .map(|a| a.job_id)
+            .collect();
+        assert_eq!(crashed_set, vec![crashed], "only the refused+reserved crash state");
+
+        // The shield covers open-verdict PENDING rows and CONFIRMED rows whose awards row is
+        // missing (their award is provably public — releasing would be #322's harm ledger). A
+        // confirmed row WITH its awards row is not shielded: that is the normal awarded state.
+        let confirmed_no_row = "z".repeat(64);
+        store.reserve(&confirmed_no_row, 40, 400, u64::MAX, 0, 10).expect("reserve");
+        store.begin_award_attempt(&attempt(&confirmed_no_row, "claim-z"), 10).expect("pin");
+        assert!(store.mark_attempt_confirmed(&confirmed_no_row, 11).expect("confirm"));
+        let confirmed_with_row = "y".repeat(64);
+        store.reserve(&confirmed_with_row, 40, 400, u64::MAX, 0, 12).expect("reserve");
+        store.begin_award_attempt(&attempt(&confirmed_with_row, "claim-y"), 12).expect("pin");
+        assert!(store.mark_attempt_confirmed(&confirmed_with_row, 13).expect("confirm"));
+        store
+            .record_award(&confirmed_with_row, "claim-y", "award-y", &"s".repeat(64), 40, 14)
+            .expect("record");
+
+        let mut held = store.attempt_held_job_ids().expect("held set");
+        held.sort();
+        let mut want = vec![pending.clone(), confirmed_no_row.clone()];
+        want.sort();
+        assert_eq!(
+            held, want,
+            "the release shield must cover open verdicts AND public-but-unrecorded awards, \
+             nothing else"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The v6 in-cycle column migration's backfill DEFAULTS are the conservative direction, and
+    // that sentence has to have a tooth (#322 round 3): a pre-column row gets `send_count = 1` —
+    // its event may already have been transmitted, and 0 is the license to treat an OK:false as
+    // proof nothing is public — and the `''` relay sentinel the resolution paths translate to
+    // live config. Red-on-revert: flip the ALTER's DEFAULT back to 0 and this fails.
+    #[test]
+    fn a_pre_column_attempt_row_backfills_conservative_defaults_on_open() {
+        let path = temp_db("migrate-v6-columns");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("raw open");
+            conn.execute_batch(
+                "CREATE TABLE buyer_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE award_attempts (
+                     job_id              TEXT PRIMARY KEY,
+                     claim_id            TEXT NOT NULL,
+                     seller_pubkey       TEXT NOT NULL,
+                     award_event_id      TEXT NOT NULL,
+                     event_json          TEXT NOT NULL,
+                     amount_sats         INTEGER NOT NULL CHECK (amount_sats >= 0),
+                     quoted_mints_json   TEXT NOT NULL DEFAULT '[]',
+                     offer_deadline_unix INTEGER NOT NULL,
+                     state               TEXT NOT NULL CHECK (state IN ('pending','confirmed','refused')),
+                     detail              TEXT,
+                     created_at_unix     INTEGER NOT NULL,
+                     updated_at_unix     INTEGER NOT NULL
+                 );
+                 INSERT INTO buyer_meta (key, value) VALUES ('schema_version', '6');
+                 INSERT INTO award_attempts (job_id, claim_id, seller_pubkey, award_event_id,
+                                             event_json, amount_sats, quoted_mints_json,
+                                             offer_deadline_unix, state, detail,
+                                             created_at_unix, updated_at_unix)
+                 VALUES ('job-old', 'claim-old', 'seller-old', 'award-old', '{}', 3, '[]',
+                         9999, 'pending', NULL, 1, 1);",
+            )
+            .expect("seed pre-column v6 shape");
+        }
+        let store = BuyerStore::open(&path).expect("open migrates the columns in");
+        let row = store.award_attempt("job-old").expect("read").expect("row survived");
+        assert_eq!(
+            row.send_count, 1,
+            "a pre-column row may already have transmitted — backfill must assume ONE prior \
+             send, never zero (zero licenses a terminal refusal)"
+        );
+        assert_eq!(row.relay_url, "", "the relay sentinel resolves to live config at use sites");
+        // And a FRESH pin in the same store still starts at zero — the backfill is for existing
+        // rows only.
+        store.begin_award_attempt(&attempt(&"n".repeat(64), "claim-n"), 2).expect("pin");
+        assert_eq!(
+            store.award_attempt(&"n".repeat(64)).expect("read").expect("row").send_count,
+            0,
+            "fresh rows keep the genuine never-transmitted license"
         );
         let _ = std::fs::remove_file(&path);
     }

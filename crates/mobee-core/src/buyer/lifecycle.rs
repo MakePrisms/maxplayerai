@@ -343,11 +343,11 @@ impl std::fmt::Display for AwardError {
                 formatter,
                 "job {job_id} has funds reserved with no local awards row, and the relay could not \
                  confirm whether an award is already public ({detail}); refusing to publish rather \
-                 than risk a duplicate award. No operator action is required: every award call and \
-                 sweep pass re-probes, and once the relay answers, the job either repairs its row \
-                 (award found) or terminally parks with its funds returned (confirmed absence). If \
-                 you want it settled sooner, check the relay for a 3405 on this job and, if one \
-                 exists, run `collect {job_id}`",
+                 than risk a duplicate award. No operator action is required: every award call for \
+                 this job re-probes, and the auto path re-checks at the next daemon start; once \
+                 the relay answers, the job either repairs its row (award found) or terminally \
+                 parks with its funds returned (confirmed absence). If you want it settled sooner, \
+                 check the relay for a 3405 on this job and, if one exists, run `collect {job_id}`",
             ),
             Self::Presence(error) => {
                 write!(formatter, "could not read local award state: {error}")
@@ -424,6 +424,7 @@ pub async fn award_with_reservation<P, PFut, R, RFut, S, SFut>(
     award_present_on_relay: P,
     prepare: R,
     send: S,
+    licensed_prior_sends: Option<u64>,
 ) -> Result<AwardOutcome, AwardError>
 where
     P: FnOnce() -> PFut,
@@ -504,7 +505,8 @@ where
                 Ok(_) | Err(ReserveRefused::AlreadySpent { .. }) => {}
                 Err(refused) => return Err(AwardError::Reserve(refused)),
             }
-            return drive_send(store, job_id, attempt, send, now_unix).await;
+            return drive_send(store, job_id, attempt, send, now_unix, licensed_prior_sends)
+                .await;
         }
         AwardStep::ProbeLegacy => {
             match award_present_on_relay().await {
@@ -668,7 +670,9 @@ where
         }
     };
 
-    drive_send(store, job_id, attempt, send, now_unix).await
+    // A FRESH pin owns its own license: the caller cannot have taken one for bytes that did
+    // not exist before this call.
+    drive_send(store, job_id, attempt, send, now_unix, None).await
 }
 
 /// Transmit a pinned attempt's bytes once and fold the relay's verdict into durable state — the
@@ -685,14 +689,43 @@ async fn drive_send<S, SFut>(
     attempt: super::store::AwardAttempt,
     send: S,
     now_unix: i64,
+    licensed_prior_sends: Option<u64>,
 ) -> Result<AwardOutcome, AwardError>
 where
     S: FnOnce(String, String) -> SFut,
     SFut: Future<Output = SendOutcome>,
 {
-    let prior_sends = store
-        .record_attempt_send(job_id, now_unix)
-        .map_err(AwardError::Presence)?;
+    // `licensed_prior_sends` is `Some` when the CALLER already took the transmission license
+    // (the sweep counts, then transmits outside the money lock, then replays the verdict here):
+    // counting again would push a genuinely-first transmission to `prior == 1`, and a deliberate
+    // relay refusal of it would then hold funds for the whole pay window instead of releasing at
+    // once. `None` means this call owns the license and takes it now, before the socket write.
+    //
+    // ⚠ A CARRIED license is license-order truth, not WIRE-order truth, so it is reconciled
+    // against the freshly-read row before it may license anything. The sweep transmits outside
+    // the money lock, so another path can license AND transmit its own copy of these bytes
+    // meanwhile — and that copy may have LANDED with its `OK` lost. `attempt` here is the
+    // chokepoint's under-guard read (see the reads at the top of `award_with_reservation`), so
+    // `attempt.send_count` counts every transmission ever started, including that one. Taking the
+    // max means a stale `prior == 0` can never license a terminal refusal for bytes a concurrent
+    // sender may have made public (round-5 review): the verdict folds to a hold instead.
+    let prior_sends = match licensed_prior_sends {
+        Some(prior) => {
+            let observed = prior.max(attempt.send_count.saturating_sub(1));
+            if observed != prior {
+                eprintln!(
+                    "buyer: award {} for {job_id} was transmitted concurrently (licensed after \
+                     {prior} starts, {} recorded now); this verdict judges one copy only and \
+                     cannot be terminal",
+                    attempt.award_event_id, attempt.send_count
+                );
+            }
+            observed
+        }
+        None => store
+            .record_attempt_send(job_id, now_unix)
+            .map_err(AwardError::Presence)?,
+    };
     match send(attempt.event_json.clone(), attempt.award_event_id.clone()).await {
         SendOutcome::Acked => {
             // Confirm THEN record. Neither write failing un-acks the relay, so neither may fail
@@ -748,10 +781,24 @@ where
             }
             // Refused THEN released, so a crash between the two leaves refused+reserved — the
             // state `RefusedTerminal` finishes — and never released+pending (which would read as
-            // a resumable attempt whose funds are gone).
-            store
+            // a resumable attempt whose funds are gone). The release is licensed by WINNING the
+            // transition: `false` here means another resolver terminalized the attempt while our
+            // send was in flight (all drive_send callers hold the money lock, so this is
+            // belt-and-braces — but the check costs nothing and the release must never rest on
+            // an assumption when the store can state the fact).
+            if !store
                 .mark_attempt_refused(job_id, &detail, now_unix)
-                .map_err(AwardError::Presence)?;
+                .map_err(AwardError::Presence)?
+            {
+                return Err(AwardError::Unresolved {
+                    job_id: job_id.to_owned(),
+                    award_event_id: attempt.award_event_id,
+                    detail: format!(
+                        "the relay refused this transmission ({detail}), but the attempt was \
+                         resolved concurrently — leaving the other resolver's verdict in place"
+                    ),
+                });
+            }
             store.release(job_id, now_unix).map_err(AwardError::Store)?;
             Err(AwardError::Refused { job_id: job_id.to_owned(), detail })
         }
@@ -1260,6 +1307,7 @@ mod tests {
                 async { unreachable!("prepare must not run when the reservation is refused") }
             },
             no_send,
+            None,
         )
         .await
         .expect_err("over-available award must refuse");
@@ -1292,6 +1340,7 @@ mod tests {
             no_relay,
             || async { Err(JobLifecycleError::Relay("claim vanished from the relay".into())) },
             no_send,
+            None,
         )
         .await
         .expect_err("prepare failed");
@@ -1341,6 +1390,7 @@ mod tests {
                 async move { Ok(fake_prepared(&job)) }
             },
             send_acked,
+            None,
         )
         .await
         .expect("award");
@@ -1452,6 +1502,7 @@ mod tests {
             no_relay,
             no_prepare,
             no_send,
+            None,
         )
         .await
         .expect("an already-awarded job is not an error");
@@ -1504,6 +1555,7 @@ mod tests {
             || async move { Ok(PresenceRead::Present(relayed)) },
             no_prepare,
             no_send,
+            None,
         )
         .await
         .expect("a parseable public award is repaired, not an error");
@@ -1560,6 +1612,7 @@ mod tests {
             || async move { Ok(PresenceRead::Present(found)) },
             no_prepare,
             no_send,
+            None,
         )
         .await
         .expect_err("an unrepairable public award must refuse");
@@ -1615,6 +1668,7 @@ mod tests {
                 || async move { probe_result },
                 no_prepare,
                 no_send,
+                None,
             )
             .await
             .expect_err("an unverifiable presence must refuse");
@@ -1688,6 +1742,7 @@ mod tests {
                 sent.lock().unwrap().push(bytes);
                 async { SendOutcome::Unresolved { detail: "OK never arrived".to_owned() } }
             },
+            None,
         )
         .await
         .expect_err("an unresolved send is not success");
@@ -1725,6 +1780,7 @@ mod tests {
                 sent.lock().unwrap().push(bytes);
                 async { SendOutcome::Acked }
             },
+            None,
         )
         .await
         .expect("the retry converges");
@@ -1773,6 +1829,7 @@ mod tests {
             |_bytes: String, _event_id: String| async {
                 SendOutcome::Refused { detail: "blocked: policy".to_owned() }
             },
+            None,
         )
         .await
         .expect_err("a refused event is an error");
@@ -1802,6 +1859,7 @@ mod tests {
             no_relay,
             no_prepare,
             no_send,
+            None,
         )
         .await
         .expect_err("a refused job stays refused");
@@ -1853,6 +1911,7 @@ mod tests {
             || async move { Ok(PresenceRead::Present(relayed)) },
             no_prepare,
             no_send,
+            None,
         )
         .await
         .expect("the public award is repaired, not duplicated");
@@ -1899,6 +1958,7 @@ mod tests {
                 || async { Ok(PresenceRead::ConfirmedAbsent) },
                 no_prepare,
                 no_send,
+                None,
             )
             .await
             .expect_err("a confirmed absence on a legacy row is terminal");
@@ -1970,6 +2030,7 @@ mod tests {
             no_relay,
             no_prepare,
             no_send,
+            None,
         )
         .await
         .expect_err("refused is terminal");
@@ -2027,6 +2088,7 @@ mod tests {
             no_relay,
             no_prepare,
             send_acked,
+            None,
         )
         .await
         .expect("a spent job's attempt resolves as bookkeeping");
@@ -2084,6 +2146,7 @@ mod tests {
             no_relay,
             no_prepare,
             no_send,
+            None,
         )
         .await
         .expect("already awarded");
@@ -2096,6 +2159,149 @@ mod tests {
         assert!(
             store.pending_award_attempts().expect("pending").is_empty(),
             "the sweep set drains — no per-boot re-processing forever"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ★ #322 round 4: a caller that already took the transmission license (the sweep counts, then
+    // transmits outside the money lock, then replays the verdict) must hand its PRIOR count in —
+    // re-counting inside drive_send would push a genuinely-first transmission to prior==1, and a
+    // deliberate relay refusal of it would then hold the funds for the whole pay window instead
+    // of releasing at once. Red-on-revert: ignore `licensed_prior_sends` and take a fresh count,
+    // and the release assertion below fails.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_carried_license_keeps_the_first_transmission_refusal_immediate() {
+        let (store, path) = fresh_store("carried-license");
+        let job = "a".repeat(64);
+        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+        let prepared = fake_prepared(&job);
+        store
+            .begin_award_attempt(
+                &AwardAttempt {
+                    job_id: job.clone(),
+                    claim_id: prepared.claim_id.clone(),
+                    seller_pubkey: prepared.seller_pubkey.clone(),
+                    award_event_id: prepared.award_event_id.clone(),
+                    event_json: prepared.event_json.clone(),
+                    amount_sats: 40,
+                    quoted_mints_json: "[]".to_owned(),
+                    offer_deadline_unix: prepared.offer_deadline_unix,
+                    send_count: 0,
+                    relay_url: prepared.relay_url.clone(),
+                    state: AttemptState::Pending,
+                    detail: None,
+                },
+                1,
+            )
+            .expect("pin");
+        // The caller's license: this IS the first transmission (prior == 0).
+        let prior = store.record_attempt_send(&job, 2).expect("license");
+        assert_eq!(prior, 0, "the sweep observes a never-transmitted attempt");
+
+        let error = award_with_reservation(
+            &store,
+            &job,
+            40,
+            100,
+            u64::MAX,
+            0,
+            3,
+            no_relay,
+            no_prepare,
+            |_bytes: String, _event_id: String| async {
+                SendOutcome::Refused { detail: "blocked: policy".to_owned() }
+            },
+            Some(prior),
+        )
+        .await
+        .expect_err("a deliberate refusal of the FIRST transmission is terminal");
+        assert!(
+            matches!(&error, AwardError::Refused { .. }),
+            "the carried prior==0 must keep the terminal license, got: {error}"
+        );
+        assert_eq!(
+            store.reservation(&job).expect("read").map(|(state, _)| state),
+            Some(super::super::reservations::ReservationState::Released),
+            "and the funds come back at once, not after the 7-day pay window"
+        );
+        assert_eq!(
+            store.award_attempt(&job).expect("read").expect("row").send_count,
+            1,
+            "the license was counted ONCE, not twice"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ★ #322 round 5: a carried license is license-order truth, not WIRE-order truth. The sweep
+    // licenses (prior=0), drops the money lock, and transmits; meanwhile an RPC retry licenses
+    // AND transmits its own copy under the lock, and that copy may have LANDED with its OK lost.
+    // If the sweep's copy is then deliberately refused (policy flip mid-window), a naive
+    // prior==0 would terminalize and release funds for an award that is public. The freshly-read
+    // send_count states the truth: it exceeds licensed_prior+1, so the verdict must HOLD.
+    // Red-on-revert: in drive_send, take the carried `prior` verbatim instead of reconciling it
+    // against the fresh row (`prior.max(send_count - 1)`), and this releases.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stale_carried_license_cannot_terminalize_after_a_concurrent_transmission() {
+        let (store, path) = fresh_store("stale-carried-license");
+        let job = "a".repeat(64);
+        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+        let prepared = fake_prepared(&job);
+        store
+            .begin_award_attempt(
+                &AwardAttempt {
+                    job_id: job.clone(),
+                    claim_id: prepared.claim_id.clone(),
+                    seller_pubkey: prepared.seller_pubkey.clone(),
+                    award_event_id: prepared.award_event_id.clone(),
+                    event_json: prepared.event_json.clone(),
+                    amount_sats: 40,
+                    quoted_mints_json: "[]".to_owned(),
+                    offer_deadline_unix: prepared.offer_deadline_unix,
+                    send_count: 0,
+                    relay_url: prepared.relay_url.clone(),
+                    state: AttemptState::Pending,
+                    detail: None,
+                },
+                1,
+            )
+            .expect("pin");
+        // The sweep's license: this looked like the first transmission.
+        let prior = store.record_attempt_send(&job, 2).expect("sweep license");
+        assert_eq!(prior, 0);
+        // ...and while the sweep's copy was in flight OUTSIDE the lock, another path licensed and
+        // transmitted its own copy (whose OK was lost, so nothing was recorded).
+        let _ = store.record_attempt_send(&job, 3).expect("concurrent license");
+
+        let error = award_with_reservation(
+            &store,
+            &job,
+            40,
+            100,
+            u64::MAX,
+            0,
+            4,
+            no_relay,
+            no_prepare,
+            |_bytes: String, _event_id: String| async {
+                SendOutcome::Refused { detail: "restricted: members only".to_owned() }
+            },
+            Some(prior),
+        )
+        .await
+        .expect_err("the refusal is reported, not applied");
+        assert!(
+            matches!(&error, AwardError::Unresolved { .. }),
+            "a STALE carried license must fold to Unresolved, not terminalize: {error}"
+        );
+        assert_eq!(
+            store.reservation(&job).expect("read").map(|(state, _)| state),
+            Some(super::super::reservations::ReservationState::Reserved),
+            "the funds stay held — the concurrent copy may be public"
+        );
+        assert_eq!(
+            store.award_attempt(&job).expect("read").expect("row").state,
+            AttemptState::Pending,
+            "and the attempt stays resolvable"
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -2127,6 +2333,7 @@ mod tests {
             |_bytes: String, _event_id: String| async {
                 SendOutcome::Unresolved { detail: "OK never arrived".to_owned() }
             },
+            None,
         )
         .await
         .expect_err("unresolved");
@@ -2147,6 +2354,7 @@ mod tests {
             |_bytes: String, _event_id: String| async {
                 SendOutcome::Refused { detail: "restricted: members only".to_owned() }
             },
+            None,
         )
         .await
         .expect_err("held, not refused");
@@ -2208,6 +2416,7 @@ mod tests {
             no_relay,
             no_prepare,
             no_send,
+            None,
         )
         .await
         .expect("repair from the attempt");
@@ -2508,6 +2717,7 @@ mod tests {
                     no_relay,
                     || async move { Ok(fake_prepared(&job_out)) },
                     send_acked,
+                    None,
                 )
                 .await
                 .map_err(|error| {
@@ -2575,6 +2785,7 @@ mod tests {
             no_relay,
             no_prepare,
             no_send,
+            None,
         )
         .await
         .expect("idempotent re-award");
@@ -2683,6 +2894,7 @@ mod tests {
                         no_relay,
                         || async move { Ok(fake_prepared(&job_out)) },
                         send_acked,
+                        None,
                     )
                     .await
                 })
@@ -2759,6 +2971,7 @@ mod tests {
                         no_relay,
                         || async move { Ok(fake_prepared(&job_out)) },
                         send_acked,
+                        None,
                     )
                     .await
                 })

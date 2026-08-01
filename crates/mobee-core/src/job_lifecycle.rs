@@ -1039,11 +1039,15 @@ pub async fn send_signed_award_async(
     let outcome = match client.relay(relay_url).await {
         Err(error) => SendOutcome::Unresolved { detail: format!("relay handle: {error}") },
         Ok(relay) => {
-            // `connect()` only SPAWNS the connection task; wait so the send below fails on the
-            // relay's verdict, not on a handshake race. A relay still unreachable after this
-            // surfaces as `NotConnected` from the send — Unresolved, retried later.
-            relay.wait_for_connection(RELAY_CONNECT_WAIT).await;
-            match tokio::time::timeout(SEND_AWARD_TIMEOUT, relay.send_event(&event)).await {
+            // ONE wall-clock budget for connect + send: `connect()` only SPAWNS the connection
+            // task, so the wait keeps the send from failing on a handshake race — but it must
+            // live INSIDE the timeout, or the worst case is their sum (65s) held under the
+            // caller's money lock rather than the stated 45s.
+            let attempt = async {
+                relay.wait_for_connection(RELAY_CONNECT_WAIT).await;
+                relay.send_event(&event).await
+            };
+            match tokio::time::timeout(SEND_AWARD_TIMEOUT, attempt).await {
                 Err(_) => SendOutcome::Unresolved {
                     detail: "timed out waiting for the relay's OK".to_owned(),
                 },
@@ -1974,26 +1978,33 @@ pub(crate) async fn award_presence_async(
         .await
         .map_err(|error| JobLifecycleError::Relay(format!("add relay: {error}")))?;
     client.connect().await;
-    if let Ok(relay) = client.relay(&home.config.relay_url).await {
-        relay.wait_for_connection(RELAY_CONNECT_WAIT).await;
-    }
+    let relay = client
+        .relay(&home.config.relay_url)
+        .await
+        .map_err(|error| JobLifecycleError::Relay(format!("relay handle: {error}")))?;
+    relay.wait_for_connection(RELAY_CONNECT_WAIT).await;
 
     let filter = Filter::new()
         .kind(Kind::Custom(JOB_AWARD_KIND))
         .author(keys.public_key())
         .event(offer_id)
         .hashtag(gateway::MOBEE_TAG);
-    let mut events = client
-        .fetch_events(filter.clone(), timeout)
+    // Fetch through the single-relay API, not the pool: the pool SWALLOWS per-relay stream
+    // errors into `Ok(empty)`, so a relay REFUSING this REQ (CLOSED with a reason, auth failure)
+    // would read as emptiness. Here a refusal surfaces as `Err` → the caller's Unverified — a
+    // refused read is not an answered one.
+    use nostr_sdk::pool::relay::ReqExitPolicy;
+    let mut events = relay
+        .fetch_events(filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
         .await
         .map_err(|error| JobLifecycleError::Relay(format!("fetch award: {error}")))?;
 
     if events.is_empty() {
         // Emptiness means nothing until the relay shows it is answering us at all — and the
         // proof must PRECEDE the read it vouches for. The first fetch may have spent its window
-        // on connect/auth (the pool swallows per-relay stream errors into `Ok(empty)`), so a
-        // probe answered afterwards says only "the session works NOW". Absence is therefore
-        // concluded exclusively from a SECOND read taken after the probe's EOSE.
+        // on connect/auth, so a probe answered afterwards says only "the session works NOW".
+        // Absence is therefore concluded exclusively from a SECOND read taken after the probe's
+        // EOSE.
         let confirmed =
             crate::buyer::relay::probe_relay_serves_our_reqs(&client, keys.public_key(), timeout)
                 .await;
@@ -2001,8 +2012,8 @@ pub(crate) async fn award_presence_async(
             client.disconnect().await;
             return Ok(PresenceRead::Unverified);
         }
-        events = client
-            .fetch_events(filter, timeout)
+        events = relay
+            .fetch_events(filter, timeout, ReqExitPolicy::ExitOnEOSE)
             .await
             .map_err(|error| JobLifecycleError::Relay(format!("fetch award (recheck): {error}")))?;
         if events.is_empty() {
@@ -2064,10 +2075,58 @@ pub(crate) async fn event_present_async(
     event_id_hex: &str,
     timeout: Duration,
 ) -> Result<PresenceRead<()>, JobLifecycleError> {
-    use nostr_sdk::prelude::{Client, EventId, Filter};
+    use nostr_sdk::prelude::{EventId, Filter};
 
     let event_id = EventId::from_hex(event_id_hex)
         .map_err(|error| JobLifecycleError::Input(format!("event id: {error}")))?;
+    let filter = Filter::new().id(event_id);
+    presence_of_filter(keys, relay_url, filter, timeout).await
+}
+
+/// Whether a kind-3403 RESULT by `seller_pubkey` — the PINNED, awarded seller — exists for
+/// `job_id` on `relay_url`. Positive evidence that seller executed, which (for a pinned attempt)
+/// means our award almost certainly WAS public and has merely aged out of the probe's view.
+/// Consulted before the pay-window termination: refusing an attempt whose awarded seller
+/// delivered would repudiate work that happened.
+///
+/// The author filter is load-bearing, not an optimisation: this probe's `Present` verdict HOLDS
+/// the terminalization (and therefore the refund) indefinitely, and without the filter any
+/// pubkey could publish one junk 3403 e-tagging the job and permanently pin the buyer's funds —
+/// a griefing vector with no exit, since a forged result can never be collected (round-3
+/// review). Only the awarded seller's delivery is evidence OUR award was public.
+pub(crate) async fn job_has_results_async(
+    keys: &nostr_sdk::Keys,
+    relay_url: &str,
+    job_id: &str,
+    seller_pubkey: &str,
+    timeout: Duration,
+) -> Result<PresenceRead<()>, JobLifecycleError> {
+    use nostr_sdk::prelude::{EventId, Filter, Kind, PublicKey};
+
+    let offer_id = EventId::from_hex(job_id)
+        .map_err(|error| JobLifecycleError::Input(format!("job_id: {error}")))?;
+    let seller = PublicKey::from_hex(seller_pubkey)
+        .map_err(|error| JobLifecycleError::Input(format!("seller pubkey: {error}")))?;
+    let filter = Filter::new()
+        .kind(Kind::Custom(JOB_RESULT_KIND))
+        .author(seller)
+        .event(offer_id)
+        .hashtag(gateway::MOBEE_TAG);
+    presence_of_filter(keys, relay_url, filter, timeout).await
+}
+
+/// The shared presence read: one filter against one relay, with the full emptiness discipline —
+/// single-relay fetches (a refused REQ surfaces as `Err`, never as emptiness), connection wait,
+/// auto-auth, and absence concluded only from a SECOND read taken after the relay's EOSE proof.
+async fn presence_of_filter(
+    keys: &nostr_sdk::Keys,
+    relay_url: &str,
+    filter: nostr_sdk::prelude::Filter,
+    timeout: Duration,
+) -> Result<PresenceRead<()>, JobLifecycleError> {
+    use nostr_sdk::pool::relay::ReqExitPolicy;
+    use nostr_sdk::prelude::Client;
+
     let client = Client::new(keys.clone());
     client.automatic_authentication(true);
     client
@@ -2075,15 +2134,16 @@ pub(crate) async fn event_present_async(
         .await
         .map_err(|error| JobLifecycleError::Relay(format!("add relay: {error}")))?;
     client.connect().await;
-    if let Ok(relay) = client.relay(relay_url).await {
-        relay.wait_for_connection(RELAY_CONNECT_WAIT).await;
-    }
-
-    let filter = Filter::new().id(event_id);
-    let mut events = client
-        .fetch_events(filter.clone(), timeout)
+    let relay = client
+        .relay(relay_url)
         .await
-        .map_err(|error| JobLifecycleError::Relay(format!("fetch event: {error}")))?;
+        .map_err(|error| JobLifecycleError::Relay(format!("relay handle: {error}")))?;
+    relay.wait_for_connection(RELAY_CONNECT_WAIT).await;
+
+    let mut events = relay
+        .fetch_events(filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
+        .await
+        .map_err(|error| JobLifecycleError::Relay(format!("fetch: {error}")))?;
     if events.is_empty() {
         let confirmed =
             crate::buyer::relay::probe_relay_serves_our_reqs(&client, keys.public_key(), timeout)
@@ -2092,10 +2152,10 @@ pub(crate) async fn event_present_async(
             client.disconnect().await;
             return Ok(PresenceRead::Unverified);
         }
-        events = client
-            .fetch_events(filter, timeout)
+        events = relay
+            .fetch_events(filter, timeout, ReqExitPolicy::ExitOnEOSE)
             .await
-            .map_err(|error| JobLifecycleError::Relay(format!("fetch event (recheck): {error}")))?;
+            .map_err(|error| JobLifecycleError::Relay(format!("fetch (recheck): {error}")))?;
     }
 
     let read = if events.is_empty() {
@@ -2111,7 +2171,13 @@ pub(crate) async fn event_present_async(
 ///
 /// Split out as a pure function because the agreement rule is the part worth testing and the fetch
 /// around it needs a live relay. Ordering is the caller's job: this takes the first element as the
-/// award (the accept is the later publish) and never re-sorts.
+/// award and never re-sorts.
+///
+/// Since #329 moved ACCEPT to its own kind (3406), a 3405 multiplicity is no longer the routine
+/// award+accept pair it used to be — the probe's filter now returns SELECTIONS only. So the
+/// agreement rule below got strictly stronger without changing: two 3405s that disagree on claim
+/// or seller are now a genuine duplicate award (#322's harm), not a normal lifecycle artifact,
+/// and refusing to pick between them is exactly right.
 fn reduce_parsed_awards(parsed: Vec<RelayedAward>) -> AwardPresence {
     // Sound by construction: every caller checks the event set is non-empty before parsing it.
     let earliest = parsed.first().expect("a non-empty award set").clone();
@@ -4950,6 +5016,43 @@ mod tests {
         }
     }
 
+    // The two pre-network guards in `send_signed_award_async` run BEFORE any client exists, so
+    // they are pure in-process assertions — and load-bearing: transmitting bytes that are not
+    // the pinned event would make confirm/record/probe chase an event that is not public, and
+    // the pay-window terminalizer would then repudiate a possibly-public award. Both damage
+    // classes report Unresolved (local corruption is never "never landed") and transmit nothing
+    // (the relay URL below is a closed port that would error loudly if dialled — but the guards
+    // return first).
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_refuses_to_transmit_bytes_that_are_not_the_pinned_event() {
+        use nostr_sdk::prelude::{EventBuilder, JsonUtil, Keys, Kind};
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(3405), "")
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let json = event.as_json();
+
+        // Bytes carrying a DIFFERENT id than the attempt is keyed on: refused locally.
+        let outcome =
+            send_signed_award_async(&keys, "ws://127.0.0.1:1", &"f".repeat(64), &json).await;
+        assert!(
+            matches!(&outcome, SendOutcome::Unresolved { detail } if detail.contains("keyed on")),
+            "wrong-id bytes must not transmit: {outcome:?}"
+        );
+
+        // Tampered content under the stored id: the id field still matches the attempt, so the
+        // id check passes and `verify()` is what catches it (the id no longer hashes the body).
+        let tampered = json.replace("\"content\":\"\"", "\"content\":\"x\"");
+        assert_ne!(tampered, json, "the tamper must actually change the bytes");
+        let outcome =
+            send_signed_award_async(&keys, "ws://127.0.0.1:1", &event.id.to_hex(), &tampered)
+                .await;
+        assert!(
+            matches!(&outcome, SendOutcome::Unresolved { detail } if detail.contains("verification")),
+            "tampered bytes must not transmit: {outcome:?}"
+        );
+    }
+
     // Only the relay's own `OK:false` may produce Refused. Every OTHER failure of a send —
     // timeout, transport, not-connected — says nothing about whether the event landed, and
     // mapping any of them to Refused would re-open #322 (release + re-select on a lost OK).
@@ -4974,7 +5077,7 @@ mod tests {
         ));
     }
 
-    // §1 RED-PROVE — the positive control `has_award_async` has never had.
+    // §1 RED-PROVE — the positive control `award_presence_async` (né `has_award_async`) never had.
     //
     // The probe is the sole input to "Invariant A: never award twice", and every observation of it
     // has been `false`. A guard whose only observed outcome is the negative one is not evidence of
