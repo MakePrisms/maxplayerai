@@ -2238,8 +2238,8 @@ mod tests {
     // If the sweep's copy is then deliberately refused (policy flip mid-window), a naive
     // prior==0 would terminalize and release funds for an award that is public. The freshly-read
     // send_count states the truth: it exceeds licensed_prior+1, so the verdict must HOLD.
-    // Red-on-revert: drop the `attempt.send_count == prior + 1` condition in drive_send and this
-    // releases.
+    // Red-on-revert: in drive_send, take the carried `prior` verbatim instead of reconciling it
+    // against the fresh row (`prior.max(send_count - 1)`), and this releases.
     #[tokio::test(flavor = "current_thread")]
     async fn a_stale_carried_license_cannot_terminalize_after_a_concurrent_transmission() {
         let (store, path) = fresh_store("stale-carried-license");
