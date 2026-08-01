@@ -1746,6 +1746,12 @@ async fn resolve_expired_attempt(
             // positive evidence the award WAS public and the probe's absence is retention, not
             // history. Filtered to the pinned seller — an unauthenticated hold here would let
             // any pubkey pin the buyer's funds forever with one junk 3403 (round-3 review).
+            //
+            // This guard also carries a fail-safe that #329's kind split retired elsewhere: while
+            // ACCEPT shared kind 3405, an accept made the award-presence probe answer "present"
+            // even for a job whose award itself had aged off the relay. Post-split it no longer
+            // does — and a job that reached accept has a delivery by definition (an accept binds
+            // a verified result), so this delivery probe is what now holds that population.
             match job_lifecycle::job_has_results_async(
                 keys,
                 &relay_url,

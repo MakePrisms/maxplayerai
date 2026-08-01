@@ -2171,7 +2171,13 @@ async fn presence_of_filter(
 ///
 /// Split out as a pure function because the agreement rule is the part worth testing and the fetch
 /// around it needs a live relay. Ordering is the caller's job: this takes the first element as the
-/// award (the accept is the later publish) and never re-sorts.
+/// award and never re-sorts.
+///
+/// Since #329 moved ACCEPT to its own kind (3406), a 3405 multiplicity is no longer the routine
+/// award+accept pair it used to be — the probe's filter now returns SELECTIONS only. So the
+/// agreement rule below got strictly stronger without changing: two 3405s that disagree on claim
+/// or seller are now a genuine duplicate award (#322's harm), not a normal lifecycle artifact,
+/// and refusing to pick between them is exactly right.
 fn reduce_parsed_awards(parsed: Vec<RelayedAward>) -> AwardPresence {
     // Sound by construction: every caller checks the event set is non-empty before parsing it.
     let earliest = parsed.first().expect("a non-empty award set").clone();
