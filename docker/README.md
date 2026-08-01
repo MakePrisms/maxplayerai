@@ -1,6 +1,6 @@
-# mobee seller — integrated Docker runtime (dev-style + claude-agent-acp)
+# maxplayer seller — integrated Docker runtime (dev-style + claude-agent-acp)
 
-Runs the `mobee sell` daemon in a container using dev's simple packaging
+Runs the `maxplayer sell` daemon in a container using dev's simple packaging
 (non-root + tini + a `/data` volume — **unhardened**), with the official ACP
 adapter [`@agentclientprotocol/claude-agent-acp`](https://github.com/agentclientprotocol/claude-agent-acp)
 as the agent (`--agent claude`). Auth is an **`ANTHROPIC_API_KEY`**. Delivery
@@ -14,7 +14,7 @@ uses dev's default **relay-git** transport (no GitHub remote needed).
 
 | File | Role |
 |---|---|
-| [`../Dockerfile`](../Dockerfile) | dev's base image (mobee binary; **no agent**) — built first as `mobee-base` |
+| [`../Dockerfile`](../Dockerfile) | dev's base image (`maxplayer` binary; **no agent**) — built first as `mobee-base` |
 | [`../Dockerfile.claude-shim`](../Dockerfile.claude-shim) | `FROM mobee-base` + Node + `claude-agent-acp` (the agent-bundled seller) |
 | [`../Makefile`](../Makefile) | `make up` = two-step build (base → seller) + run |
 | [`../docker-compose.claude-shim.yml`](../docker-compose.claude-shim.yml) | the seller service (unhardened; `--agent claude`, open-pool) |
@@ -41,10 +41,13 @@ through the adapter, delivering via relay-git.
 
 ## ⚠️ Buyer and seller must run the same version
 
-The marketplace event kinds changed (offer `3401`, claim `3402`, result `3403`;
-older builds used `5109`/`7000`/`6109`). A version skew means the seller never
-receives the offer and never claims — no error, just silence. If a valid offer
-isn't claimed, confirm **both** sides are on current `dev`.
+The marketplace owns a contiguous kind block, `3400`–`3406`: receipt `3400`,
+offer `3401`, claim `3402`, result `3403`, feedback `3404`, award `3405`,
+accept `3406` (older builds used `5109`/`7000`/`6109`, and pre-#329 builds
+carried the pay-bind on the award kind rather than on `3406`). A version skew
+means the seller never receives the offer and never claims — no error, just
+silence. If a valid offer isn't claimed, confirm **both** sides are on current
+`dev`. The block of record is `crates/mobee-core/src/kinds.rs`.
 
 ## Notes
 
@@ -56,5 +59,10 @@ isn't claimed, confirm **both** sides are on current `dev`.
 - **Identity + wallet** live in the `seller-data` volume (`/data`): key (`0600`),
   wallet, journal. Back it up before `docker volume rm`; never run two daemons
   on the same key.
+- **The `mobee-*` image tags and compose project name are intentional.** The
+  binary shipped since #262 is `maxplayer`, but the compose project name
+  namespaces the volume (`mobee-seller-shim_seller-data`). Renaming it brings
+  the seller back on a fresh key with an empty wallet, silently. If you do
+  rename, `docker volume` copy the old data across first.
 - **Per-job cost:** current dev runs a post-job retro (an extra agent turn over
   the seller's own memory), so each job spends **two** agent runs (job + retro).

@@ -8,6 +8,12 @@
 # Two-step build — use `make build` (or `make up`), which runs:
 #   docker build -f Dockerfile -t mobee-base .
 #   docker build -f Dockerfile.claude-shim --build-arg BASE_IMAGE=mobee-base -t mobee-seller-shim .
+#
+# The `mobee-*` image tags and the compose project name are deliberately NOT
+# renamed to `maxplayer-*`: the compose project name namespaces the seller-data
+# volume that carries the key + wallet, so renaming it strands an existing
+# seller's identity. The shipped binary is `maxplayer` (#262); only these local
+# labels keep the old spelling.
 ARG BASE_IMAGE=mobee-base
 FROM ${BASE_IMAGE}
 
@@ -30,5 +36,5 @@ ENV CLAUDE_CONFIG_DIR=/data/.claude-sandbox \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 
 USER mobee
-# ENTRYPOINT (tini -- mobee), CMD (sell), WORKDIR (/data), MOBEE_HOME — all
+# ENTRYPOINT (tini -- maxplayer), CMD (sell), WORKDIR (/data), MOBEE_HOME — all
 # inherited from the base image.

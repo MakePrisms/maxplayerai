@@ -1,5 +1,5 @@
 # Build + run the claude-seller (dev's base image + the ACP adapter).
-# For testers of the mobee seller — not a merge target.
+# For testers of the maxplayer seller — not a merge target.
 #
 #   make up      # build (two-step) + run the seller
 #   make logs    # follow the daemon
@@ -7,13 +7,16 @@
 #
 # Needs docker/seller.env with ANTHROPIC_API_KEY (see docker/seller.env.example).
 
+# Image tags keep the `mobee-` spelling on purpose — see the note in
+# Dockerfile.claude-shim. Renaming the compose project would strand the
+# seller-data volume holding an existing seller's key + wallet.
 IMAGE   ?= mobee-seller-shim
 BASE    ?= mobee-base
 COMPOSE  = docker compose -f docker-compose.claude-shim.yml
 
 .PHONY: build up down logs base
 
-base:                ## build dev's base image (mobee binary; no agent)
+base:                ## build dev's base image (maxplayer binary; no agent)
 	docker build -f Dockerfile -t $(BASE) .
 
 build: base          ## base image, then the claude-agent-acp seller on top
