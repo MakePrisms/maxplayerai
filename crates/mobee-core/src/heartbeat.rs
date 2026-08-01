@@ -15,10 +15,7 @@ use serde::Serialize;
 use crate::gateway::{EventDraft, MOBEE_TAG, PROTOCOL_VERSION, TagSpec};
 use crate::seller_agents::AGENT_TAG;
 
-/// Addressable kind for the seller heartbeat. MUST be in NIP-01's `30000..=39999` addressable
-/// range so the relay replaces it in place keyed by `(pubkey, d)` — hence `30340`, not a `34xx`
-/// value.
-pub const SELLER_HEARTBEAT_KIND: u16 = 30340;
+pub use crate::kinds::SELLER_HEARTBEAT_KIND;
 
 /// The addressable `d` identifier for the seller heartbeat.
 pub const SELLER_HEARTBEAT_D: &str = "mobee-seller";
