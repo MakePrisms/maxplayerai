@@ -3099,6 +3099,12 @@ mod tests {
         client.send_event(&delivered).await.expect("relay stores the seller's result");
         client.disconnect().await;
 
+        assert!(
+            past_pay_window(now_unix(), pinned.offer_deadline_unix),
+            "premise: the fixture must be past the pay window, or the hold below proves nothing \
+             (every early return in resolve_expired_attempt leaves the same Pending/Reserved)"
+        );
+
         resolve_award_attempts(&context).await;
 
         let after = context.store.award_attempt(&job).expect("read").expect("row");
@@ -3156,14 +3162,13 @@ mod tests {
         pinned.amount_sats = 4;
         pinned.award_event_id = event.id.to_hex();
         pinned.event_json = event.as_json();
-        // Ahead of the deadline now (pre-lock gate passes), crossing during the lock hold below.
-        pinned.offer_deadline_unix = now_unix() + 2;
-        context.store.begin_award_attempt(&pinned, now_unix()).expect("pin");
-
         // THE DISCRIMINATOR: the pinned award is already ON the relay. A pre-lock divert probes
         // by id, finds it, and confirms the attempt (+ heals its awards row) — a state visibly
         // different from the under-lock refusal's `Pending` + no row. Without this the two paths
         // are byte-identical in durable state and the test cannot tell them apart.
+        //
+        // Published BEFORE the pin so the deadline margin below covers only the 200ms lock
+        // handoff, not a connect/send/disconnect round-trip as well (round-9 review).
         {
             use nostr_sdk::prelude::Client;
             let publisher = Client::new(keys.clone());
@@ -3176,9 +3181,16 @@ mod tests {
             publisher.disconnect().await;
         }
 
-        // A CONTROL job in the same sweep, far from its deadline. Its send_count == 1 is the only
-        // tooth for the sweep's carried-license wiring (round-7 review); it does NOT attribute the
-        // crossed job's zero — see the ATTRIBUTION note above for what does.
+        // Ahead of the deadline now (so the pre-lock gate passes), crossing during the lock hold.
+        pinned.offer_deadline_unix = now_unix() + 2;
+        context.store.begin_award_attempt(&pinned, now_unix()).expect("pin");
+
+        // A CONTROL job in the same sweep, far from its deadline. It does NOT attribute the
+        // crossed job's zero (see the ATTRIBUTION note above for what does), and it is NOT the
+        // tooth for the carried license — the sweep test pins that independently. What it
+        // uniquely proves is that the sweep CONTINUES past a job whose license was refused: the
+        // bounce is a `continue`, not a `return`. Nothing else in the suite notices if one
+        // diverted job aborts the whole pass (round-9 review).
         let control = "c".repeat(64);
         context.store.reserve(&control, 4, 1_000, u64::MAX, 0, now_unix()).expect("reserve");
         let control_event = EventBuilder::new(Kind::Custom(3405), "control")
@@ -3221,8 +3233,8 @@ mod tests {
         assert_eq!(
             context.store.award_attempt(&control).expect("read").expect("row").send_count,
             1,
-            "the control's license proves the sweep reached the license section at all (and is \
-             the tooth for its carried-license wiring)"
+            "the sweep must CONTINUE past the bounced job and license this one — a `return` \
+             instead of a `continue` would strand every later attempt in the pass"
         );
         let _ = std::fs::remove_dir_all(&root);
         drop(relay);
