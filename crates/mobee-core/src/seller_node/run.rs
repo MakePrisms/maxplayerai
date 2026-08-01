@@ -25,7 +25,7 @@ use crate::gateway::{
 };
 use crate::home::{self, MobeeHome};
 use crate::job_lifecycle::{event_to_draft, job_hash_for_offer};
-use crate::kinds::{JOB_AWARD_KIND, JOB_OFFER_KIND};
+use crate::kinds::{JOB_ACCEPT_KIND, JOB_AWARD_KIND, JOB_OFFER_KIND};
 use crate::receipt::{ReceiptPreimage, EXEC_METADATA_COMMITMENT_EMPTY};
 use crate::relay_auth::{self, AuthWait};
 use crate::seller::rate_gate_allows;
@@ -1312,8 +1312,12 @@ impl SellerNodeRunner {
             return self.subscribe_offers(since, self.claim_open_pool()).await;
         }
         let base = match id {
+            // One subscription carries both buyer-authored decisions about our claims: the AWARD
+            // that selects one, and the ACCEPT that pay-binds a delivered result. Sharing the REQ
+            // (rather than adding a sub id) keeps them under the same CLOSED handling and the same
+            // stall watchdog — a second subscription would be a second thing that can die quietly.
             AWARD_SUB_ID => Filter::new()
-                .kind(Kind::Custom(JOB_AWARD_KIND))
+                .kinds([Kind::Custom(JOB_AWARD_KIND), Kind::Custom(JOB_ACCEPT_KIND)])
                 .hashtag(crate::gateway::MOBEE_TAG)
                 .pubkey(self.seller_pubkey),
             WRAP_SUB_ID => Filter::new()
@@ -1626,6 +1630,7 @@ impl SellerNodeRunner {
                             match event.kind {
                                 k if k.as_u16() == JOB_OFFER_KIND => self.on_offer(&event).await,
                                 k if k.as_u16() == JOB_AWARD_KIND => self.on_award(&event).await,
+                                k if k.as_u16() == JOB_ACCEPT_KIND => self.on_accept(&event).await,
                                 Kind::GiftWrap => self.on_gift_wrap(&event).await,
                                 _ => {}
                             }
@@ -2238,6 +2243,95 @@ impl SellerNodeRunner {
             Err(error) => {
                 eprintln!("seller node claim failed job_id={job_id}: {error}");
                 release_on_no_claim(self);
+            }
+        }
+    }
+
+    /// Handle one ACCEPT (kind-3406): the buyer's pay-bind against a delivered result. Binds a
+    /// still-unbound claim and **never executes**.
+    ///
+    /// The seller subscribes to ACCEPT for exactly one reason: it is a second, later event naming
+    /// our claim, so it is the only remaining way to bind a claim whose AWARD never reached us —
+    /// the across-restart re-bind of TOOTH 3 (#143), where the award is delivered only to the
+    /// reopened node. While ACCEPT shared the award kind, `on_award` absorbed it and that re-bind
+    /// worked by accident; splitting the kinds would have narrowed it silently, so the path is made
+    /// explicit here instead.
+    ///
+    /// Bind-if-unbound is a real precondition, not a formality. `record_award` is unconditional
+    /// once entered — it `UPDATE claims SET state = 'awarded'`, which for an already-delivered job
+    /// would regress a terminal claim row — and it inserts an `awards` row keyed by award id, so a
+    /// second row for one job makes [`Store::job_award_time`] depend on which row SQLite returns
+    /// first. That value is the delivery commit's authored-at, the thing that keeps a re-created
+    /// delivery byte-identical (invariant 2). So: read first, write only when there is nothing there.
+    ///
+    /// Never executes, in either branch. Execution follows the AWARD. An ACCEPT arrives after a
+    /// delivery the buyer has already verified, so there is nothing left to run, and
+    /// `execute_job`'s state guard would refuse it anyway — this handler does not lean on that
+    /// guard, it simply has no execute path to reach.
+    async fn on_accept(self: &Arc<Self>, event: &nostr_sdk::Event) {
+        let draft = event_to_draft(event);
+        let Some(accept) = crate::gateway::parse_accept(&draft) else {
+            return;
+        };
+        let job_id = accept.offer_id.clone();
+
+        // Same authorization as the award path: only the offer's own buyer may bind it.
+        let buyer = match self.node.store().offer_facts(&job_id) {
+            Ok(Some((buyer, _, _))) => buyer,
+            Ok(None) => {
+                eprintln!("seller node accept ignore job_id={job_id}: no offer of ours recorded");
+                return;
+            }
+            Err(error) => {
+                eprintln!("seller node accept ignore job_id={job_id}: offer read failed ({error})");
+                return;
+            }
+        };
+        if event.pubkey.to_hex() != buyer {
+            eprintln!(
+                "seller node accept ignore job_id={job_id}: author is not the offer's buyer"
+            );
+            return;
+        }
+        match self.node.store().job_creq(&job_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                eprintln!("seller node accept ignore job_id={job_id}: no claim of ours");
+                return;
+            }
+            Err(error) => {
+                eprintln!("seller node accept ignore job_id={job_id}: claim read failed ({error})");
+                return;
+            }
+        }
+
+        match self.node.store().job_award_time(&job_id) {
+            // The overwhelmingly common case: the AWARD already bound this job. The ACCEPT is
+            // information, not instruction — record nothing, run nothing.
+            Ok(Some(_)) => {
+                eprintln!(
+                    "seller node accept job_id={job_id} buyer={buyer}: pay-bind observed (already awarded — no action)"
+                );
+            }
+            // The award never reached us. This ACCEPT is the only evidence our claim was selected,
+            // so bind from it — and stop there.
+            Ok(None) => {
+                match self.node.store().record_award(
+                    &event.id.to_hex(),
+                    &job_id,
+                    &buyer,
+                    now_unix(),
+                ) {
+                    Ok(outcome) => eprintln!(
+                        "seller node accept job_id={job_id} buyer={buyer}: bound from ACCEPT with no prior award ({outcome:?}) — NOT executing"
+                    ),
+                    Err(error) => eprintln!(
+                        "seller node accept job_id={job_id}: bind from accept failed ({error})"
+                    ),
+                }
+            }
+            Err(error) => {
+                eprintln!("seller node accept ignore job_id={job_id}: award read failed ({error})")
             }
         }
     }

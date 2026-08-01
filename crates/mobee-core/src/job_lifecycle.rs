@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::gateway::{
-    self, award_draft, parse_git_result_delivery, parse_offer, EventDraft, OfferDraft, TagSpec,
-    JOB_AWARD_KIND, JOB_CLAIM_KIND, JOB_FEEDBACK_KIND, JOB_OFFER_KIND, JOB_RESULT_KIND,
+    self, accept_draft, award_draft, parse_git_result_delivery, parse_offer, EventDraft, OfferDraft,
+    TagSpec, JOB_AWARD_KIND, JOB_CLAIM_KIND, JOB_FEEDBACK_KIND, JOB_OFFER_KIND, JOB_RESULT_KIND,
 };
 use crate::home::{self, HomeError, MobeeHome};
 #[cfg(feature = "wallet")]
@@ -1231,7 +1231,10 @@ pub async fn accept_claim_async(
     .to_string();
 
     let buyer_pubkey = keys.public_key().to_hex();
-    let draft = award_draft(
+    // ACCEPT is its own kind. This is the pay-bind, not the selection — `prepare_award_async` owns
+    // the selection and keeps `award_draft`. While both rode `JOB_AWARD_KIND`, a job's normal
+    // steady state was two indistinguishable events and no reader could tell which was which.
+    let draft = accept_draft(
         &request.job_id,
         &request.claim_id,
         &buyer_pubkey,
