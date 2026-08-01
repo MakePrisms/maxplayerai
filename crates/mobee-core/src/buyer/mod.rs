@@ -1864,10 +1864,24 @@ async fn resolve_award_attempts(context: &BuyerContext) {
                             attempt.job_id, attempt.award_event_id
                         );
                     }
-                    Err(error) => eprintln!(
-                        "buyer: healing awards row for {} failed ({error}); will retry next pass",
-                        attempt.job_id
-                    ),
+                    // An unrepairable heal (the award is public, but its row cannot be written or
+                    // funded — e.g. the balance shrank below the pinned amount) parks the intent
+                    // with that error. A confirmed attempt is in NO status surface otherwise:
+                    // `pending_award_attempts` selects only pending rows, so without this park a
+                    // seller is owed money and `status` says nothing (round-5 review). On the
+                    // manual path the park is a no-op (no intent row) and stderr remains the
+                    // only signal — the sweep re-runs the heal every tick either way.
+                    Err(error) => {
+                        let _ = context.store.mark_award_parked(
+                            &attempt.job_id,
+                            &error.to_string(),
+                            now_unix(),
+                        );
+                        eprintln!(
+                            "buyer: healing awards row for {} failed ({error}); will retry next pass",
+                            attempt.job_id
+                        );
+                    }
                 }
             }
         }
@@ -2921,6 +2935,66 @@ mod tests {
         drop(relay);
     }
 
+    // ★ #322 round 5: the SWEEP's under-lock deadline re-check is wired too, not just `award()`'s
+    // twin. The pre-lock gate passes (deadline ahead), the deadline crosses while the license
+    // section waits on the money lock, and the sweep must transmit NOTHING — a late award is
+    // compute the seller burns unpaid. Red-on-revert: delete the sweep's
+    // `resume_crossed_deadline` arm and the send goes out (send_count becomes 2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sweep_deadline_crossed_while_waiting_for_the_money_lock_transmits_nothing() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::{EventBuilder, JsonUtil, Kind};
+
+        let root = temp_home("sweep-deadline-toctou");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap_home(&root).expect("bootstrap home");
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        home.config.relay_url = relay.url().await.to_string();
+
+        let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
+        let job = "a".repeat(64);
+        context.store.reserve(&job, 4, 1_000, u64::MAX, 0, now_unix()).expect("reserve");
+        let keys = buyer_keys(&context.home).expect("keys");
+        // Real signed bytes: with the fixture placeholder the send would bail locally on parse,
+        // making the no-transmit assertion vacuous.
+        let event = EventBuilder::new(Kind::Custom(3405), "")
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let mut pinned = attempt_fixture(&job, &context.home.config.relay_url);
+        pinned.amount_sats = 4;
+        pinned.award_event_id = event.id.to_hex();
+        pinned.event_json = event.as_json();
+        // Ahead of the deadline now (pre-lock gate passes), crossing during the lock hold below.
+        pinned.offer_deadline_unix = now_unix() + 2;
+        context.store.begin_award_attempt(&pinned, now_unix()).expect("pin");
+
+        let holder = {
+            let context = context.clone();
+            tokio::spawn(async move {
+                let _guard = context.money_lock.lock().await;
+                tokio::time::sleep(Duration::from_secs(4)).await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await; // let the holder take it first
+
+        resolve_award_attempts(&context).await;
+        holder.await.expect("holder task");
+
+        let after = context.store.award_attempt(&job).expect("read").expect("row");
+        assert_eq!(
+            after.send_count, 0,
+            "a deadline that crossed while the license section queued must transmit NOTHING"
+        );
+        assert_eq!(
+            after.state,
+            store::AttemptState::Pending,
+            "and the attempt stays pending for the probe path to resolve"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
+    }
+
     // ★ #322 round 3: the sweep WIRES its legs — heal (confirmed-without-row lands the row),
     // finish (refused+reserved releases), resolve (pending pre-deadline re-sends the pinned
     // bytes and confirms on the relay's ack), and the expired-inside-window HOLD (nothing
@@ -3013,6 +3087,13 @@ mod tests {
         assert!(
             context.store.award_record(&resolve_job).expect("read").is_some(),
             "and records the award"
+        );
+        assert_eq!(
+            context.store.award_attempt(&resolve_job).expect("read").expect("row").send_count,
+            1,
+            "the sweep's license is CARRIED to the chokepoint, counted exactly once — a second \
+             count would make a genuinely-first transmission read as a re-send, so a deliberate \
+             refusal of it would hold the funds for the whole pay window instead of releasing"
         );
 
         // (d) held: still pending, still funded, nothing on the relay for it.
