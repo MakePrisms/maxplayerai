@@ -700,8 +700,28 @@ where
     // counting again would push a genuinely-first transmission to `prior == 1`, and a deliberate
     // relay refusal of it would then hold funds for the whole pay window instead of releasing at
     // once. `None` means this call owns the license and takes it now, before the socket write.
+    //
+    // ⚠ A CARRIED license is license-order truth, not WIRE-order truth, so it is reconciled
+    // against the freshly-read row before it may license anything. The sweep transmits outside
+    // the money lock, so another path can license AND transmit its own copy of these bytes
+    // meanwhile — and that copy may have LANDED with its `OK` lost. `attempt` here is the
+    // chokepoint's under-guard read (see the reads at the top of `award_with_reservation`), so
+    // `attempt.send_count` counts every transmission ever started, including that one. Taking the
+    // max means a stale `prior == 0` can never license a terminal refusal for bytes a concurrent
+    // sender may have made public (round-5 review): the verdict folds to a hold instead.
     let prior_sends = match licensed_prior_sends {
-        Some(prior) => prior,
+        Some(prior) => {
+            let observed = prior.max(attempt.send_count.saturating_sub(1));
+            if observed != prior {
+                eprintln!(
+                    "buyer: award {} for {job_id} was transmitted concurrently (licensed after \
+                     {prior} starts, {} recorded now); this verdict judges one copy only and \
+                     cannot be terminal",
+                    attempt.award_event_id, attempt.send_count
+                );
+            }
+            observed
+        }
         None => store
             .record_attempt_send(job_id, now_unix)
             .map_err(AwardError::Presence)?,
@@ -2208,6 +2228,80 @@ mod tests {
             store.award_attempt(&job).expect("read").expect("row").send_count,
             1,
             "the license was counted ONCE, not twice"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ★ #322 round 5: a carried license is license-order truth, not WIRE-order truth. The sweep
+    // licenses (prior=0), drops the money lock, and transmits; meanwhile an RPC retry licenses
+    // AND transmits its own copy under the lock, and that copy may have LANDED with its OK lost.
+    // If the sweep's copy is then deliberately refused (policy flip mid-window), a naive
+    // prior==0 would terminalize and release funds for an award that is public. The freshly-read
+    // send_count states the truth: it exceeds licensed_prior+1, so the verdict must HOLD.
+    // Red-on-revert: drop the `attempt.send_count == prior + 1` condition in drive_send and this
+    // releases.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stale_carried_license_cannot_terminalize_after_a_concurrent_transmission() {
+        let (store, path) = fresh_store("stale-carried-license");
+        let job = "a".repeat(64);
+        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+        let prepared = fake_prepared(&job);
+        store
+            .begin_award_attempt(
+                &AwardAttempt {
+                    job_id: job.clone(),
+                    claim_id: prepared.claim_id.clone(),
+                    seller_pubkey: prepared.seller_pubkey.clone(),
+                    award_event_id: prepared.award_event_id.clone(),
+                    event_json: prepared.event_json.clone(),
+                    amount_sats: 40,
+                    quoted_mints_json: "[]".to_owned(),
+                    offer_deadline_unix: prepared.offer_deadline_unix,
+                    send_count: 0,
+                    relay_url: prepared.relay_url.clone(),
+                    state: AttemptState::Pending,
+                    detail: None,
+                },
+                1,
+            )
+            .expect("pin");
+        // The sweep's license: this looked like the first transmission.
+        let prior = store.record_attempt_send(&job, 2).expect("sweep license");
+        assert_eq!(prior, 0);
+        // ...and while the sweep's copy was in flight OUTSIDE the lock, another path licensed and
+        // transmitted its own copy (whose OK was lost, so nothing was recorded).
+        let _ = store.record_attempt_send(&job, 3).expect("concurrent license");
+
+        let error = award_with_reservation(
+            &store,
+            &job,
+            40,
+            100,
+            u64::MAX,
+            0,
+            4,
+            no_relay,
+            no_prepare,
+            |_bytes: String, _event_id: String| async {
+                SendOutcome::Refused { detail: "restricted: members only".to_owned() }
+            },
+            Some(prior),
+        )
+        .await
+        .expect_err("the refusal is reported, not applied");
+        assert!(
+            matches!(&error, AwardError::Unresolved { .. }),
+            "a STALE carried license must fold to Unresolved, not terminalize: {error}"
+        );
+        assert_eq!(
+            store.reservation(&job).expect("read").map(|(state, _)| state),
+            Some(super::super::reservations::ReservationState::Reserved),
+            "the funds stay held — the concurrent copy may be public"
+        );
+        assert_eq!(
+            store.award_attempt(&job).expect("read").expect("row").state,
+            AttemptState::Pending,
+            "and the attempt stays resolvable"
         );
         let _ = std::fs::remove_file(&path);
     }
