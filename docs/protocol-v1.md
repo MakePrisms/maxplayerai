@@ -274,16 +274,17 @@ A reader MUST reject `ACCEPT` if any required binding field is absent.
 
 #### 7.8.1 What the availability tags do not mean
 
-Neither `accepting` nor `queue_depth` gates claim eligibility -- not in this specification, and not in any implementation measured to date. Four independent measurements agree:
+`accepting` and `queue_depth` describe a seat. They do not govern it.
 
-- **No reader exists.** Across the Rust crates, every occurrence of either token is a doc comment, the emit-side input, or a test. The web bundles that parse kind `30340` read neither field. Claim eligibility is gated instead by a semaphore permit, taken when the node claims an offer and released when the job reaches a terminal outcome; with no free permit the node does not claim, so a full seat is *absent* from the market rather than visibly busy.
-- **Measured on the wire, on live paid jobs.** Seats advertising `accepting=n, queue_depth=1` across repeated polls spanning 25+ minutes claimed targeted offers within minutes of being asked. The citable half of that observation is the seat's `CLAIM` event, which is immutable and timestamped. The heartbeat half is a logged reading and can never be more than that, because kind `30340` is replaceable and the event that stood at claim time no longer exists (see 6.4) -- which is why the mechanism below matters more than the reading.
-- **`queue_depth` cannot express a depth.** It is computed as `u32::from(lifetime_job_row_count > 0)` over an unpruned table holding every job row in every state. It is a monotone flag meaning "this seat has ever run a job": it saturates at `1` on the seat's first job and can never return to `0`. A seat with five lifetime rows and nothing in flight advertises `queue_depth=1`. A reader treating a persistent `1` as a busy or stalled seat is reading a field whose resting state is `1`.
-- **`accepting` is not about capacity.** It is derived from whether the seat's harness roster is serving. `accepting=n` says the seat advertises no working harness. It does not say the seat is busy, and it does not stop the seat from claiming.
-
-> v1 rule: `queue_depth` MUST be the count of jobs in a named non-terminal state -- awarded or executing -- and MUST return to `0` when none remain. `accepting` MUST be the seller's assertion that it intends to take new work.
+> v1 rule: `queue_depth` MUST be the count of jobs in a named non-terminal state -- awarded or executing -- and MUST return to `0` when none remain. It is a live occupancy count, never a lifetime total and never a flag.
 >
-> Readers MUST NOT infer claim eligibility, capacity, or stall from either tag. Both are seller-asserted hints, for display and ranking only. The authoritative signal that a seat will take a job is that it claims one; the authoritative signal that it will not is a `FEEDBACK` refusal carrying `at_capacity` (see 10).
+> `accepting` MUST be the seller's assertion that it intends to take new work: free of in-flight work AND with at least one harness serving. A seat is free to define either more conservatively; neither may be defined more loosely.
+>
+> Readers MUST NOT infer claim eligibility from either tag. Both are advertisements, for display and ranking. Claim eligibility is a seller-internal capacity decision, and the protocol deliberately does not expose it: a seat at capacity does not publish a "busy" flag, it simply does not claim, so a full seat is **absent** from the market rather than visibly present and declining.
+>
+> The authoritative signal that a seat will take a job is that it claims one. The authoritative signal that it will not is a `FEEDBACK` refusal carrying `at_capacity` (see 10). A reader that waits on `accepting` instead is waiting on a field no implementation is required to consult.
+
+Both tags are seller-asserted (see 17), and both are published on a replaceable event, so a past value of either is unciteable after the fact (see 6.4). Their observed values across the fleet at any moment are therefore a statement about the publishing implementations in the fleet, not about this protocol -- which is the rule in 7.0 applied to a value rather than an absence.
 
 A seat MAY publish no `mobee_agent` tag while running a harness it never advertised; several field seats do exactly that. Because a named-agent request is exact-or-nothing, and a claim advertising nothing satisfies no request, naming a harness against such a seat refuses the award and is indistinguishable from an unresponsive seat. Readers MUST treat an absent `mobee_agent` as *unstated*, never as *none*.
 
