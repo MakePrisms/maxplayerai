@@ -5,9 +5,9 @@
 //! - [`accept_claim`] records a local pay-bind for
 //!   [`authorize_pay`](crate::authorize_pay) (seller / result / commit) — written BEFORE the
 //!   publish, so a crash cannot leave a public accept with no bind — then publishes an
-//!   `accepted` AWARD (kind-3405 via [`award_draft`]; the same kind [`prepare_award_async`]
-//!   signs at selection, so an already-awarded claim gets a second kind-3405 on the
-//!   relay). Claims/results themselves remain relay-truth.
+//!   `accepted` ACCEPT (kind-3406 via [`accept_draft`]). [`prepare_award_async`] signs the
+//!   SELECTION as a kind-3405 AWARD — separate kinds, so a reader can tell a pay-bind from a
+//!   choice of seller. Claims/results themselves remain relay-truth.
 //!
 //! Local bind under `~/.mobee/jobs/<job_id>.json` is accept-state only.
 
@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::gateway::{
-    self, award_draft, parse_git_result_delivery, parse_offer, EventDraft, OfferDraft, TagSpec,
-    JOB_AWARD_KIND, JOB_CLAIM_KIND, JOB_FEEDBACK_KIND, JOB_OFFER_KIND, JOB_RESULT_KIND,
+    self, accept_draft, award_draft, parse_git_result_delivery, parse_offer, EventDraft, OfferDraft,
+    TagSpec, JOB_AWARD_KIND, JOB_CLAIM_KIND, JOB_FEEDBACK_KIND, JOB_OFFER_KIND, JOB_RESULT_KIND,
 };
 use crate::home::{self, HomeError, MobeeHome};
 #[cfg(feature = "wallet")]
@@ -872,7 +872,7 @@ pub(crate) fn event_references_job(event: &nostr_sdk::Event, job_id: &str) -> bo
     })
 }
 
-/// Accept a live claim: persist the pay-bind, then publish the `accepted` AWARD (kind-3405).
+/// Accept a live claim: persist the pay-bind, then publish the `accepted` ACCEPT (kind-3406).
 /// Sync entry for CLI/tests — nested call fails fast; MCP uses [`accept_claim_async`].
 pub fn accept_claim(
     home: &MobeeHome,
@@ -1231,7 +1231,10 @@ pub async fn accept_claim_async(
     .to_string();
 
     let buyer_pubkey = keys.public_key().to_hex();
-    let draft = award_draft(
+    // ACCEPT is its own kind: this is the pay-bind, not the selection — `prepare_award_async` owns
+    // the selection and signs `award_draft`. Distinct kinds are what let a reader tell the two
+    // apart, because a count of same-kind events cannot: a repeat of one is shaped like the other.
+    let draft = accept_draft(
         &request.job_id,
         &request.claim_id,
         &buyer_pubkey,
@@ -2008,10 +2011,14 @@ pub(crate) async fn award_presence_async(
         }
     }
 
-    // ⚠ TWO kind-3405s for one job is the NORMAL steady state, not an anomaly: the award attempt
-    // publishes one at selection and `accept_claim_async` publishes another at pay-authorisation,
-    // both through `gateway::award_draft`, so they are identical in shape. Refusing on multiplicity
-    // alone would refuse to repair exactly the jobs that got furthest through the lifecycle.
+    // This filter asks for AWARDs alone (the accept is kind-3406), so every event here is a
+    // selection. One is the intended state: the award is signed once and persisted before the
+    // first send, and every retry re-transmits those exact bytes, so the relay dedups them by id.
+    //
+    // This read must not DEPEND on that. It exists to report what the relay actually holds for a
+    // ledger that may be missing a row, so its soundness cannot rest on the very emit discipline
+    // it is checking — and refusing on multiplicity ALONE would refuse to repair a row precisely
+    // when that row is most likely absent.
     //
     // Multiplicity is only AMBIGUOUS if the events disagree about what to write. So parse them all
     // and compare the fields that land in the row: agreement means there is nothing to choose
@@ -2019,8 +2026,8 @@ pub(crate) async fn award_presence_async(
     // money row.
     let buyer_pubkey_hex = keys.public_key().to_hex();
     let mut ordered: Vec<_> = events.iter().collect();
-    // Oldest first — the award precedes the accept, and the `awards` row wants the AWARD's id.
-    // The id is a tiebreak so the choice never depends on the order the relay happened to send.
+    // Oldest first — a repair records the selection that has been public longest, never whichever
+    // the relay happened to send first. The id is a tiebreak, so the choice is total and stable.
     ordered.sort_by_key(|event| (event.created_at, event.id.to_hex()));
 
     let mut parsed = Vec::with_capacity(ordered.len());
@@ -2045,8 +2052,8 @@ pub(crate) async fn award_presence_async(
 
 /// Whether the exact event `event_id_hex` is on `relay_url` — the by-id probe that settles a
 /// pinned attempt which must not be re-sent (past the offer deadline). Because the id names one
-/// specific event, this read cannot be confused by the award/accept kind-sharing that makes
-/// counting 3405s unreliable (#268): the answer is about THIS event or no event. Targets the
+/// specific event, this read cannot be confused by event multiplicity at all (#268) — the kind of
+/// ambiguity that makes a COUNT unreliable: the answer is about THIS event or no event. Targets the
 /// attempt's PINNED relay, never live config — the question is about the relay the bytes went to.
 ///
 /// Same emptiness discipline as [`award_presence_async`]: absence is concluded only from a read
@@ -4834,10 +4841,10 @@ mod tests {
         }
     }
 
-    // ⚠ TWO 3405s per job is ROUTINE, not a fault: the award attempt publishes one at selection
-    // and `accept_claim_async` another at pay-authorisation, both via `gateway::award_draft`. So
-    // refusing on count alone would refuse to repair every job that reached pay-authorisation —
-    // the ones furthest along. Multiplicity is ambiguous only when the events DISAGREE.
+    // ⚠ Two AWARDs for one job are not a fault on their own: `award_presence_async` reports what
+    // the relay holds for a ledger that may be missing a row, so refusing on count alone would
+    // refuse to repair precisely when a repair is what is needed. Multiplicity is ambiguous only
+    // when the events DISAGREE about what to write.
     #[test]
     fn agreeing_awards_are_not_ambiguous_and_repair_from_the_earliest() {
         let award = |id: &str, claim: &str, seller: &str| RelayedAward {
@@ -4852,17 +4859,17 @@ mod tests {
         let one = reduce_parsed_awards(vec![award("aaa", &claim, &seller)]);
         assert!(matches!(&one, AwardPresence::Repairable(a) if a.award_event_id == "aaa"));
 
-        // The real shape: an award and its later accept, same claim and seller. Nothing to choose
-        // between, so it repairs — and it repairs from the EARLIEST, which is the award. Caller
-        // passes them oldest-first; the accept must not win just by being last.
+        // Two selections that agree: same claim, same seller. Nothing to choose between, so it
+        // repairs — and from the EARLIEST. The caller passes them oldest-first; a later duplicate
+        // must not win just by arriving last.
         let two = reduce_parsed_awards(vec![
-            award("the-award", &claim, &seller),
-            award("the-accept", &claim, &seller),
+            award("the-earliest", &claim, &seller),
+            award("the-later", &claim, &seller),
         ]);
         match two {
             AwardPresence::Repairable(a) => assert_eq!(
-                a.award_event_id, "the-award",
-                "the awards row wants the AWARD's id, not the later accept's"
+                a.award_event_id, "the-earliest",
+                "a repair takes the earliest agreeing award, never the last one seen"
             ),
             other => panic!("agreeing awards must repair, got: {other:?}"),
         }

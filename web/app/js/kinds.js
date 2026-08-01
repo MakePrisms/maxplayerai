@@ -19,6 +19,15 @@ export const FEEDBACK = 3404;
 /** Buyer award — selects a claim, e-tagging the offer and the winning claim. */
 export const AWARD = 3405;
 /**
+ * Buyer accept — the pay-bind against one verified result, e-tagging the offer and the claim.
+ *
+ * Its own kind, not a second AWARD. While the two shared 3405, two events per job was the
+ * NORMAL steady state, so award and accept were indistinguishable here: every
+ * awarded-then-accepted job counted as two awards, and no reader could tell a selection
+ * from a pay-authorisation.
+ */
+export const ACCEPT = 3406;
+/**
  * Co-signed payment receipt.
  *
  * OPTIONAL, and that is load-bearing: settlement can complete with no receipt
@@ -52,7 +61,7 @@ export const SELF_TRADE_TAG = "self-trade";
  * Kinds that carry `["t","mobee"]` — requested with a `#t` filter.
  */
 export const MOBEE_TAGGED_KINDS = Object.freeze([
-  OFFER, CLAIM, RESULT, FEEDBACK, AWARD, RECEIPT, HEARTBEAT,
+  OFFER, CLAIM, RESULT, FEEDBACK, AWARD, ACCEPT, RECEIPT, HEARTBEAT,
 ]);
 
 /**
@@ -78,6 +87,7 @@ export const TRADE_STAGES = Object.freeze({
   [CLAIM]: "claim",
   [AWARD]: "award",
   [RESULT]: "result",
+  [ACCEPT]: "accept",
   [RECEIPT]: "receipt",
   [FEEDBACK]: "feedback",
 });
@@ -97,6 +107,7 @@ export const KIND_LABELS = Object.freeze({
   [RESULT]: "result",
   [FEEDBACK]: "feedback",
   [AWARD]: "award",
+  [ACCEPT]: "accept",
   [RECEIPT]: "receipt",
   [HANDLER]: "handler",
   [HEARTBEAT]: "heartbeat",

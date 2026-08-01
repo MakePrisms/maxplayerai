@@ -7,8 +7,8 @@
  * open relay must never take the page down.
  */
 import {
-  AWARD, CLAIM, FEEDBACK, HANDLER, HEARTBEAT, OFFER, PROFILE, RECEIPT, RESULT,
-  SELF_TRADE_TAG, TRADE_STAGES,
+  ACCEPT, AWARD, CLAIM, FEEDBACK, HANDLER, HEARTBEAT, OFFER, PROFILE, RECEIPT,
+  RESULT, SELF_TRADE_TAG, TRADE_STAGES,
 } from "./kinds.js";
 
 const tagsNamed = (event, name) => (event.tags || []).filter((t) => t[0] === name);
@@ -120,7 +120,11 @@ export function parseEvent(event) {
     case CLAIM:
       return { ...base, offerId: rootOfferId(event), seller: event.pubkey,
                status: firstTag(event, "status"), hasPaymentRequest: Boolean(firstTag(event, "creq")) };
+    // AWARD and ACCEPT are both buyer-authored and carry the same tags, so they
+    // parse identically. The kind is what says whether it selects a claim or
+    // binds payment to a result, and `base.stage` already carries that.
     case AWARD:
+    case ACCEPT:
       return { ...base, offerId: rootOfferId(event), buyer: event.pubkey,
                status: firstTag(event, "status") };
     case RESULT:

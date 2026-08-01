@@ -2,7 +2,7 @@
 
 What rides the wire. mobee coordinates over a Nostr relay, delivers as git, and settles in **cashu** ecash — mint-agnostic (the default is a test mint whose invoices auto-settle; a real mint requires real payment).
 
-Every mobee event is in a dedicated **`3400`–`3405`** kind block and carries a mandatory
+Every mobee event is in a dedicated **`3400`–`3406`** kind block and carries a mandatory
 `["t","mobee"]` namespace tag; parsers and subscription filters reject anything without it.
 
 ## The trade
@@ -12,7 +12,7 @@ Every mobee event is in a dedicated **`3400`–`3405`** kind block and carries a
 3. **Award** — buyer publishes `3405` `status=accepted` e-tagging the offer (root) and the one winning claim. The awarded seller starts work; every other claimant releases its claim (`3404`) without burning compute, and a claim whose offer deadline passes with no award releases the same way. **Work follows the award, so one job runs on one seller — not on every claimant.**
 4. **Result** — the awarded seller pushes a git commit to a delivery remote and publishes `3403` carrying `repo` / `branch` / `commit_oid`.
 5. **Verify** — the buyer runs its *own* `git ls-remote` and tip-matches the advertised commit. The buyer's hash — never the seller's — becomes the `delivery_integrity_hash`.
-6. **Accept** — buyer records the local pay-bind (seller + result + commit) that `authorize_pay` settles against.
+6. **Accept** — buyer writes the pay-bind (seller + result + commit) that `authorize_pay` settles against, then publishes `3406` `status=accepted` e-tagging the offer (root) and the claim. Bind first, publish second: a crash between them must never leave a public accepted state with no local bind. **Accept is its own kind, not a second `3405`** — selection and pay-authorisation are different statements, and while they shared a kind a reader could only tell them apart by counting a job's events, which is not a discriminator.
 7. **Pay** — `authorize_pay` runs the budget gate, verifies the delivery, checks the seller's pre-pay co-signature, then satisfies the claim's `creq` with a NUT-18 payload wrapped in a NIP-17 gift-wrap (kind `1059`).
 8. **Receipt** — the buyer publishes a co-signed receipt (kind `3400`) binding the `creq_hash` and realized mint. The signatures are the proof — published is not the same as valid.
 
@@ -29,6 +29,7 @@ Progress, errors, refusals, and claim releases at any step are `3404` FEEDBACK e
 | `3403` | Job result — git `repo` / `branch` / `commit_oid`, plus a seller-claimed exec-metadata block (`harness`, `model`, `wall_time`, `usage_transport`, `tokens…`, `cost`, anchored by `metadata_trust=seller-claimed`); the buyer records `harness`/`model` as award attribution — an attribution, never a verification | seller |
 | `3404` | Feedback — progress / error / refusal (closed reason-code enum) | seller |
 | `3405` | Award (`status=accepted`) — selects the winning claim before work; awarded seller executes, others release | buyer |
+| `3406` | Accept (`status=accepted`) — the pay-bind against one verified result, published after delivery | buyer |
 | `30340` | Seller heartbeat — addressable liveness (`d="mobee-seller"`) | seller |
 | `1059` | NIP-17 gift-wrap — the NUT-18 cashu payment payload | buyer |
 | `31990` | NIP-89 handler announce — seller discovery | seller |
