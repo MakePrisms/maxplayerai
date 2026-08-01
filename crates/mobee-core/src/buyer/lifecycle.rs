@@ -343,11 +343,11 @@ impl std::fmt::Display for AwardError {
                 formatter,
                 "job {job_id} has funds reserved with no local awards row, and the relay could not \
                  confirm whether an award is already public ({detail}); refusing to publish rather \
-                 than risk a duplicate award. No operator action is required: every award call and \
-                 sweep pass re-probes, and once the relay answers, the job either repairs its row \
-                 (award found) or terminally parks with its funds returned (confirmed absence). If \
-                 you want it settled sooner, check the relay for a 3405 on this job and, if one \
-                 exists, run `collect {job_id}`",
+                 than risk a duplicate award. No operator action is required: every award call for \
+                 this job re-probes, and the auto path re-checks at the next daemon start; once \
+                 the relay answers, the job either repairs its row (award found) or terminally \
+                 parks with its funds returned (confirmed absence). If you want it settled sooner, \
+                 check the relay for a 3405 on this job and, if one exists, run `collect {job_id}`",
             ),
             Self::Presence(error) => {
                 write!(formatter, "could not read local award state: {error}")
