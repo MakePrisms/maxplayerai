@@ -689,6 +689,25 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
     // a concurrent melt. Held across the whole chokepoint call (see the deadlock note above for
     // why not earlier).
     let _guard = context.money_lock.lock().await;
+    // Deadline TOCTOU re-check, under the guard: the gate above ran before the lock, and the
+    // wait to get here (view fetches, then the guard itself — unbounded behind a settle) can
+    // cross the offer deadline. The ResumeAttempt arm re-sends without re-deriving liveness, so
+    // a crossed deadline must bounce to the probe path instead of transmitting late. Read fresh:
+    // an attempt may also have been PINNED by a concurrent path while this call was fetching.
+    if let Ok(Some(current)) = context.store.award_attempt(&params.job_id) {
+        if resume_crossed_deadline(&current, now_unix()) {
+            return Response::err(
+                id,
+                CODE_REFUSED,
+                format!(
+                    "the offer deadline for job {} passed while this call was queued; nothing \
+                     was transmitted (a late send would burn seller compute) — retry to resolve \
+                     the pinned attempt by probe",
+                    params.job_id
+                ),
+            );
+        }
+    }
     let (balance, total_cap, spent) = match money_snapshot(context).await {
         Ok(snapshot) => snapshot,
         Err(error) => return Response::err(id, CODE_INTERNAL, error),
@@ -1029,6 +1048,13 @@ async fn drive_auto_award(
                     continue;
                 }
                 MissingOfferAction::ParkOfferAbsent => {
+                    // A pinned attempt outranks the offer-shaped reason: an offer that aged off
+                    // the relay says nothing about the claim that was already selected, signed
+                    // for, and possibly awarded (round-3 review — this is the state a crashed
+                    // refusal reboots into, and it must not park as "offer absent").
+                    if settle_intent_from_attempt(context, &keys, job_id).await {
+                        return Ok(());
+                    }
                     let _ = context.store.mark_award_parked(
                         job_id,
                         lifecycle::PARK_REASON_OFFER_ABSENT,
@@ -1039,6 +1065,9 @@ async fn drive_auto_award(
                 // established that — because a row that said so would be the same false status line
                 // #291 was filed about, just arriving a minute later.
                 MissingOfferAction::ParkUnreadable { unanswered_reads } => {
+                    if settle_intent_from_attempt(context, &keys, job_id).await {
+                        return Ok(());
+                    }
                     let _ = context.store.mark_award_parked(
                         job_id,
                         &lifecycle::park_reason_unreadable(unanswered_reads),
@@ -1052,48 +1081,8 @@ async fn drive_auto_award(
         if now_unix() as u64 > offer.deadline_unix {
             // A pinned attempt past its deadline is NOT "no awardable claim appeared" — a claim
             // was selected and signed for. Reflect the ATTEMPT's truth on the intent instead of
-            // a false park reason, finishing any half-done terminal state via the chokepoint;
-            // the periodic sweep continues anything still unresolved.
-            if let Ok(Some(attempt)) = context.store.award_attempt(job_id) {
-                match attempt.state {
-                    store::AttemptState::Pending => {
-                        // Resolve by probe (never a late transmit).
-                        resolve_expired_attempt(context, &keys, &attempt).await;
-                        if context.store.award_record(job_id).ok().flatten().is_some() {
-                            let _ = context.store.mark_award_awarded(job_id, now_unix());
-                        }
-                        // A refusal already parked the intent with its reason; anything else
-                        // stays pending for the sweep. Either way this task's work is done.
-                    }
-                    store::AttemptState::Confirmed => {
-                        // The award is public; heal row/funds if a crash left them behind.
-                        let _ = resolve_attempt_via_chokepoint(
-                            context,
-                            &keys,
-                            job_id,
-                            attempt.amount_sats,
-                            None,
-                        )
-                        .await;
-                        let _ = context.store.mark_award_awarded(job_id, now_unix());
-                    }
-                    store::AttemptState::Refused => {
-                        // Finish a crashed refusal (RefusedTerminal releases any held funds)
-                        // and surface the REAL reason on the intent.
-                        let _ = resolve_attempt_via_chokepoint(
-                            context,
-                            &keys,
-                            job_id,
-                            attempt.amount_sats,
-                            None,
-                        )
-                        .await;
-                        let detail = attempt
-                            .detail
-                            .unwrap_or_else(|| "the relay refused the award event".to_owned());
-                        let _ = context.store.mark_award_parked(job_id, &detail, now_unix());
-                    }
-                }
+            // a false park reason; the periodic sweep continues anything still unresolved.
+            if settle_intent_from_attempt(context, &keys, job_id).await {
                 return Ok(());
             }
             let _ = context.store.mark_award_parked(
@@ -1131,6 +1120,17 @@ async fn finalize_auto_award(
     claim_id: String,
 ) -> Result<(), String> {
     let _guard = context.money_lock.lock().await;
+    // Deadline TOCTOU re-check under the guard (same as the manual RPC): the caller's deadline
+    // gate ran before this lock, whose wait is unbounded behind a settle. Err keeps the intent
+    // pending — the deadline arm / the sweep resolves the pinned attempt by probe.
+    if let Ok(Some(current)) = context.store.award_attempt(job_id) {
+        if resume_crossed_deadline(&current, now_unix()) {
+            return Err(format!(
+                "offer deadline for {job_id} crossed while awaiting the money lock; the pinned \
+                 attempt resolves by probe"
+            ));
+        }
+    }
     let (balance, total_cap, spent) = money_snapshot(context).await?;
     let home = context.home.clone();
     let job = job_id.to_owned();
@@ -1452,23 +1452,116 @@ fn attempt_relay(attempt: &store::AwardAttempt, home: &MobeeHome) -> String {
 }
 
 /// Whether `now` is past the deadline's pay-window grace — the earliest moment a
-/// confirmed-absent award may be terminalized. Pure for the boundary tests.
+/// confirmed-absent award may be terminalized. Pure for the boundary tests. (`saturating_add`
+/// is the intended overflow mechanism: a deadline near `i64::MAX` clamps to `i64::MAX` and can
+/// never read as past its own window — the test pins the semantics, not a debug-overflow panic.)
 fn past_pay_window(now: i64, offer_deadline_unix: i64) -> bool {
     now > offer_deadline_unix.saturating_add(job_lifecycle::DELIVERY_PAY_WINDOW_SECS as i64)
 }
 
+/// Whether a pinned attempt's LIVE re-send must be blocked because the offer deadline crossed
+/// while the caller was queued (view fetches, then an unbounded money-lock wait behind a settle):
+/// the pre-lock deadline gate is a TOCTOU without this re-check under the guard, and the
+/// `ResumeAttempt` arm re-sends without re-deriving liveness (round-3 review). Only a PENDING
+/// attempt transmits, so only it can cross. Pure for the test.
+fn resume_crossed_deadline(attempt: &store::AwardAttempt, now: i64) -> bool {
+    attempt.state == store::AttemptState::Pending && now > attempt.offer_deadline_unix
+}
+
+/// Reflect a pinned attempt's truth on its auto-award INTENT when the offer can no longer drive
+/// the loop — its deadline passed, or it aged off the relay entirely. Terminal attempt states
+/// are finished through the chokepoint (heal / release) and stamped with their REAL reason; a
+/// pending attempt past its own deadline resolves by probe. Returns `true` when an attempt
+/// existed and was handled — the caller's offer-shaped park must then NOT run, because "no
+/// awardable claim appeared" / "offer no longer on the relay" are false for a job whose claim
+/// was selected and signed for (round-3 review: without this, the boot re-arm parked crashed
+/// refusals under `PARK_REASON_OFFER_ABSENT` and the round-2 finisher arms were dead code for
+/// their own population).
+///
+/// A pending attempt still INSIDE its deadline returns `false`: the sweep owns its resolution,
+/// and the caller's own report about the offer remains accurate.
+async fn settle_intent_from_attempt(
+    context: &BuyerContext,
+    keys: &nostr_sdk::Keys,
+    job_id: &str,
+) -> bool {
+    let attempt = match context.store.award_attempt(job_id) {
+        Ok(Some(attempt)) => attempt,
+        _ => return false,
+    };
+    match attempt.state {
+        store::AttemptState::Pending => {
+            if now_unix() <= attempt.offer_deadline_unix {
+                return false;
+            }
+            // Resolve by probe (never a late transmit).
+            resolve_expired_attempt(context, keys, &attempt).await;
+            if context.store.award_record(job_id).ok().flatten().is_some() {
+                let _ = context.store.mark_award_awarded(job_id, now_unix());
+            }
+            // A refusal already parked the intent with its reason; anything else stays pending
+            // for the sweep.
+            true
+        }
+        store::AttemptState::Confirmed => {
+            // The award is public; heal row/funds if a crash left them behind. The intent is
+            // stamped `awarded` only when the heal actually LANDED — an unrepairable heal
+            // (`PublishedButUnrecorded`: the row cannot be written or funded) parks with that
+            // error exactly as `finalize_auto_award` does, and a transient failure leaves the
+            // intent for the sweep's retry (round-3 review: an unconditional `awarded` mark hid
+            // a permanently-unrepairable job from every surface).
+            match resolve_attempt_via_chokepoint(context, keys, job_id, attempt.amount_sats, None)
+                .await
+            {
+                Ok(_) => {
+                    let _ = context.store.mark_award_awarded(job_id, now_unix());
+                }
+                Err(error @ AwardError::PublishedButUnrecorded { .. }) => {
+                    let _ = context.store.mark_award_parked(job_id, &error.to_string(), now_unix());
+                }
+                Err(error) => eprintln!(
+                    "buyer: confirmed attempt for {job_id} could not be healed ({error}); the \
+                     sweep retries"
+                ),
+            }
+            true
+        }
+        store::AttemptState::Refused => {
+            // Finish a crashed refusal (RefusedTerminal releases any held funds) and surface
+            // the REAL reason on the intent.
+            let _ =
+                resolve_attempt_via_chokepoint(context, keys, job_id, attempt.amount_sats, None)
+                    .await;
+            let detail = attempt
+                .detail
+                .unwrap_or_else(|| "the relay refused the award event".to_owned());
+            let _ = context.store.mark_award_parked(job_id, &detail, now_unix());
+            true
+        }
+    }
+}
+
 /// Terminalize a pending attempt whose award is CONFIRMED ABSENT past the pay window: refuse,
-/// release, park — but ONLY if this call wins the `pending → refused` transition. The transition
-/// is the license for the release: a `false` means another resolver already terminalized the
-/// attempt (possibly as CONFIRMED, its award public and its funds re-held), and releasing anyway
-/// would strip funds from a recorded award (round-2 review). Pure over the store so the gate is
-/// unit-testable; the caller holds `money_lock`.
+/// release, park — but ONLY if (a) no `awards` row exists and (b) this call wins the
+/// `pending → refused` transition.
+///
+/// (a) mirrors the chokepoint's own first read: the awards row is written exclusively on an ack
+/// or a presence-verified repair, so its existence is direct proof the award IS public, and no
+/// probe emptiness (relay pruning, months later) may overrule it. Without this guard the
+/// confirm-write-failed crash state (attempt still `pending`, row present) could be refused and
+/// its RECORDED award's funds released (round-3 review). (b) is the transition license: `false`
+/// means another resolver already terminalized the attempt, and releasing anyway would strip
+/// funds it may have just re-held. Pure over the store so both gates are unit-testable; the
+/// caller holds `money_lock`.
 fn terminalize_absent_attempt(
     store: &store::BuyerStore,
     job_id: &str,
     detail: &str,
     now_unix: i64,
 ) -> Result<bool, StoreError> {
+    if store.award_record(job_id)?.is_some() {
+        return Ok(false);
+    }
     if !store.mark_attempt_refused(job_id, detail, now_unix)? {
         return Ok(false);
     }
@@ -1564,7 +1657,41 @@ async fn resolve_expired_attempt(
     .await
     {
         Ok(job_lifecycle::PresenceRead::Present(())) => {
-            let _ = context.store.mark_attempt_confirmed(job_id, now_unix());
+            // The transition result is load-bearing: `false` with a REFUSED row means a
+            // concurrent resolver terminalized on a divergent (absent) probe while we hold
+            // positive proof the award is public — an unhealable one-way divergence that must be
+            // surfaced truthfully, never logged as a retryable heal failure (round-3 review; no
+            // work set revisits a refused+released attempt).
+            match context.store.mark_attempt_confirmed(job_id, now_unix()) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let state = context
+                        .store
+                        .award_attempt(job_id)
+                        .ok()
+                        .flatten()
+                        .map(|after| after.state);
+                    if state == Some(store::AttemptState::Refused) {
+                        eprintln!(
+                            "buyer: ⚠ award {} for {job_id} IS on the relay, but a concurrent \
+                             resolver terminalized the attempt as refused (probes diverged); \
+                             the refusal is one-way and this cannot self-heal — if the seller \
+                             delivers, settle manually with `collect {job_id}`",
+                            attempt.award_event_id
+                        );
+                        return;
+                    }
+                    // Already confirmed (by us on an earlier pass, or a concurrent resolver) —
+                    // proceed to the heal exactly as if our mark had won.
+                }
+                Err(error) => {
+                    eprintln!(
+                        "buyer: award attempt for {job_id} could not be confirmed ({error}); \
+                         will retry next pass"
+                    );
+                    return;
+                }
+            }
             match resolve_attempt_via_chokepoint(context, keys, job_id, attempt.amount_sats, None)
                 .await
             {
@@ -1591,10 +1718,18 @@ async fn resolve_expired_attempt(
                 );
                 return;
             }
-            // The stronger guard before the terminal write: a delivery for the job is positive
-            // evidence the award WAS public and the probe's absence is retention, not history.
-            match job_lifecycle::job_has_results_async(keys, &relay_url, job_id, RELAY_TIMEOUT)
-                .await
+            // The stronger guard before the terminal write: a delivery BY THE AWARDED SELLER is
+            // positive evidence the award WAS public and the probe's absence is retention, not
+            // history. Filtered to the pinned seller — an unauthenticated hold here would let
+            // any pubkey pin the buyer's funds forever with one junk 3403 (round-3 review).
+            match job_lifecycle::job_has_results_async(
+                keys,
+                &relay_url,
+                job_id,
+                &attempt.seller_pubkey,
+                RELAY_TIMEOUT,
+            )
+            .await
             {
                 Ok(job_lifecycle::PresenceRead::ConfirmedAbsent) => {}
                 Ok(job_lifecycle::PresenceRead::Present(())) => {
@@ -1694,10 +1829,16 @@ async fn resolve_award_attempts(context: &BuyerContext) {
                 )
                 .await
                 {
-                    Ok(_) => eprintln!(
-                        "buyer: healed awards row for {} from its confirmed attempt ({})",
-                        attempt.job_id, attempt.award_event_id
-                    ),
+                    Ok(_) => {
+                        // Clear any stale parked reason: a heal that lands the row supersedes an
+                        // earlier failed-repair park, and this attempt now leaves the work set,
+                        // so nothing later would correct the intent (round-3 review).
+                        let _ = context.store.mark_award_awarded(&attempt.job_id, now_unix());
+                        eprintln!(
+                            "buyer: healed awards row for {} from its confirmed attempt ({})",
+                            attempt.job_id, attempt.award_event_id
+                        );
+                    }
                     Err(error) => eprintln!(
                         "buyer: healing awards row for {} failed ({error}); will retry next pass",
                         attempt.job_id
@@ -1724,10 +1865,20 @@ async fn resolve_award_attempts(context: &BuyerContext) {
                 .await
                 {
                     // RefusedTerminal reports as an error by design; the release is the point.
-                    Err(AwardError::Refused { .. }) | Ok(_) => eprintln!(
-                        "buyer: finished the crashed refusal for {} — funds released",
-                        attempt.job_id
-                    ),
+                    // Surface the REAL refusal reason on the intent too — a crash between the
+                    // release and the park otherwise leaves the intent pending until the boot
+                    // re-arm parks it under a wrong reason (round-3 review).
+                    Err(AwardError::Refused { .. }) | Ok(_) => {
+                        let detail = attempt
+                            .detail
+                            .clone()
+                            .unwrap_or_else(|| "the relay refused the award event".to_owned());
+                        let _ = context.store.mark_award_parked(&attempt.job_id, &detail, now_unix());
+                        eprintln!(
+                            "buyer: finished the crashed refusal for {} — funds released",
+                            attempt.job_id
+                        );
+                    }
                     Err(error) => eprintln!(
                         "buyer: finishing the crashed refusal for {} failed ({error}); will \
                          retry next pass",
@@ -1752,27 +1903,103 @@ async fn resolve_award_attempts(context: &BuyerContext) {
             resolve_expired_attempt(context, &keys, &attempt).await;
             continue;
         }
-        // Transmit OUTSIDE the money lock — a send budgets up to 45s of relay I/O, and holding
-        // the lock across it would stall every collect/award for its duration (round-2 review).
-        // The transmission license (the durable send-count increment) is taken here, before the
-        // socket write; the chokepoint's own increment inside drive_send is then a phantom +1,
-        // which only biases the refusal gate conservative (a sweep-observed OK:false reads as a
-        // re-send refusal and HOLDS — the pay-window terminalizer owns that case).
-        let verdict = match context.store.record_attempt_send(&job_id, now_unix()) {
-            Ok(_prior) => {
-                job_lifecycle::send_signed_award_async(
+        // An awards row means the award already resolved (ack recorded, or probe-repaired) and
+        // only the attempt's confirm is owed — transmit nothing; the AlreadyAwarded arm drains
+        // it, and skipping here saves a send license + a relay round trip per tick.
+        match context.store.award_record(&job_id) {
+            Ok(Some(_)) => {
+                let _ = resolve_attempt_via_chokepoint(
+                    context,
                     &keys,
-                    &attempt_relay(&attempt, &context.home),
-                    &attempt.award_event_id,
-                    &attempt.event_json,
+                    &job_id,
+                    attempt.amount_sats,
+                    None,
                 )
-                .await
-            }
-            Err(error) => {
-                eprintln!("buyer: attempt sweep for {job_id} could not license a send: {error}");
+                .await;
+                let _ = context.store.mark_award_awarded(&job_id, now_unix());
+                eprintln!(
+                    "buyer: pending award attempt for {job_id} re-confirmed from its recorded \
+                     award"
+                );
                 continue;
             }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("buyer: attempt sweep could not read {job_id}'s award row: {error}");
+                continue;
+            }
+        }
+        // THE LICENSE SECTION — under the money lock, but for milliseconds only. Serializing the
+        // license here is what keeps the `prior == 0` refusal rule sound: an in-flight RPC send
+        // holds this lock for its whole transmission, so by the time we hold it that send has a
+        // verdict and the re-read below sees it — the sweep can never put a concurrent copy on
+        // the wire beside a FIRST transmission whose refusal would then terminalize (round-3
+        // review). Funding precedes the license (reserve is a local write; a spent row is
+        // bookkeeping-only and proceeds), so bytes never race ahead of their funding either.
+        // The 45s transmission itself happens after the guard drops.
+        let snapshot = money_snapshot(context).await;
+        let licensed = {
+            let _guard = context.money_lock.lock().await;
+            match context.store.award_attempt(&job_id) {
+                Ok(Some(current)) if current.state == store::AttemptState::Pending => {
+                    match &snapshot {
+                        Ok((balance, total_cap, spent)) => {
+                            match context.store.reserve(
+                                &job_id,
+                                attempt.amount_sats,
+                                *balance,
+                                *total_cap,
+                                *spent,
+                                now_unix(),
+                            ) {
+                                Ok(_)
+                                | Err(reservations::ReserveRefused::AlreadySpent { .. }) => {
+                                    match context.store.record_attempt_send(&job_id, now_unix()) {
+                                        Ok(_prior) => true,
+                                        Err(error) => {
+                                            eprintln!(
+                                                "buyer: attempt sweep for {job_id} could not \
+                                                 license a send: {error}"
+                                            );
+                                            false
+                                        }
+                                    }
+                                }
+                                Err(refused) => {
+                                    eprintln!(
+                                        "buyer: attempt sweep cannot fund {job_id}'s re-send \
+                                         ({refused}); holding until funds return"
+                                    );
+                                    false
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "buyer: attempt sweep for {job_id} has no money snapshot \
+                                 ({error}); holding"
+                            );
+                            false
+                        }
+                    }
+                }
+                Ok(_) => false, // resolved while we gathered — nothing to send
+                Err(error) => {
+                    eprintln!("buyer: attempt sweep could not re-read {job_id}: {error}");
+                    false
+                }
+            }
         };
+        if !licensed {
+            continue;
+        }
+        let verdict = job_lifecycle::send_signed_award_async(
+            &keys,
+            &attempt_relay(&attempt, &context.home),
+            &attempt.award_event_id,
+            &attempt.event_json,
+        )
+        .await;
         let result =
             resolve_attempt_via_chokepoint(context, &keys, &job_id, attempt.amount_sats, Some(verdict))
                 .await;
@@ -2186,6 +2413,27 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
         .map(|(job_id, reason)| json!({ "job_id": job_id, "reason": reason }))
         .collect();
 
+    // Surface open award attempts (#322): a pending attempt HOLDS its reservation on purpose —
+    // reconcile skips it while the relay verdict is open — and without this field that hold is
+    // invisible everywhere but stderr, leaving "why is my available low?" unanswerable from
+    // status (round-3 review). Manual-path attempts have no intent row, so `parked_awards`
+    // alone cannot cover them.
+    let pending_attempts: Vec<Value> = context
+        .store
+        .pending_award_attempts()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|attempt| {
+            json!({
+                "job_id": attempt.job_id,
+                "award_event_id": attempt.award_event_id,
+                "amount_sats": attempt.amount_sats,
+                "offer_deadline_unix": attempt.offer_deadline_unix,
+                "send_count": attempt.send_count,
+            })
+        })
+        .collect();
+
     Response::ok(
         id,
         json!({
@@ -2203,6 +2451,7 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
             },
             "reconcile": reconcile,
             "parked_awards": parked_awards,
+            "pending_award_attempts": pending_attempts,
             // The relay the buyer's one long-lived session is bound to. Deliberately NOT a liveness
             // probe: `status` is what connect-or-spawn polls to decide the daemon is up, and a probe
             // bounded at 10s would push that poll past its own readiness deadline. Liveness belongs
@@ -2241,7 +2490,10 @@ mod tests {
         store::AwardAttempt {
             job_id: job.to_owned(),
             claim_id: "c".repeat(64),
-            seller_pubkey: "s".repeat(64),
+            // A REAL point: the delivery probe parses this as a nostr pubkey (its author filter
+            // is the round-3 anti-griefing guard), so a non-hex placeholder would turn every
+            // probe into an error-hold and mask the arm under test.
+            seller_pubkey: nostr_sdk::prelude::Keys::generate().public_key().to_hex(),
             award_event_id: "e".repeat(64),
             event_json: "{\"id\":\"x\"}".to_owned(),
             amount_sats: 40,
@@ -2346,7 +2598,256 @@ mod tests {
                 .expect("replay"),
             "a replay must be a no-op"
         );
+
+        // Case 4 (round 3): an awards ROW outranks any probe emptiness — it is written only on
+        // an ack or a presence-verified repair, so a pending attempt WITH its row (the
+        // confirm-write-failed crash) must never be refused, however absent the probes read.
+        let recorded_job = "d".repeat(64);
+        store.reserve(&recorded_job, 40, 100, u64::MAX, 0, 7).expect("reserve");
+        store
+            .begin_award_attempt(&attempt_fixture(&recorded_job, "ws://relay.test"), 7)
+            .expect("pin");
+        store
+            .record_award(&recorded_job, &"c".repeat(64), &"e".repeat(64), &"s".repeat(64), 40, 8)
+            .expect("record");
+        assert!(
+            !terminalize_absent_attempt(&store, &recorded_job, "absent past window", 9)
+                .expect("gated"),
+            "a recorded award must never be terminalized by probe emptiness"
+        );
+        assert_eq!(
+            store.reservation(&recorded_job).expect("read").map(|(state, _)| state),
+            Some(super::reservations::ReservationState::Reserved),
+            "the recorded award keeps its funds"
+        );
+        assert_eq!(
+            store.award_attempt(&recorded_job).expect("read").expect("row").state,
+            store::AttemptState::Pending,
+            "and its attempt stays pending for the AlreadyAwarded confirm"
+        );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // #322 round 3: the deadline TOCTOU predicate — only a PENDING attempt can cross (terminal
+    // states never transmit), and the crossing is strict.
+    #[test]
+    fn resume_crossed_deadline_blocks_only_a_pending_attempt_past_its_deadline() {
+        let mut attempt = attempt_fixture(&"a".repeat(64), "ws://relay.test");
+        attempt.offer_deadline_unix = 1_000;
+        assert!(!resume_crossed_deadline(&attempt, 1_000), "AT the deadline still sends");
+        assert!(resume_crossed_deadline(&attempt, 1_001), "past it blocks");
+        attempt.state = store::AttemptState::Confirmed;
+        assert!(!resume_crossed_deadline(&attempt, 1_001), "a terminal state never transmits");
+        attempt.state = store::AttemptState::Refused;
+        assert!(!resume_crossed_deadline(&attempt, 1_001));
+    }
+
+    // ★ #322 round 3: reconcile must LEAVE pending-attempt jobs alone — their funds are held on
+    // purpose while the award's relay verdict is open. Premise-checked like the mid-settle tooth:
+    // the job WOULD classify Dead, so without the skip it is genuinely at risk. Red-on-revert:
+    // delete the `pending_attempt_job_ids` filter in `reconcile_reservations` and the release
+    // lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_leaves_a_pending_attempts_reservation_alone() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let root = temp_home("reconcile-skips-attempts");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap_home(&root).expect("bootstrap home");
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        home.config.relay_url = relay.url().await.to_string();
+
+        let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
+        let job = "a".repeat(64);
+        context.store.reserve(&job, 4, 1_000, u64::MAX, 0, now_unix()).expect("reserve");
+        let mut pinned = attempt_fixture(&job, &context.home.config.relay_url);
+        pinned.amount_sats = 4;
+        context.store.begin_award_attempt(&pinned, now_unix()).expect("pin");
+
+        // Non-vacuity: without the skip this job classifies Dead and WOULD be released.
+        let would_release = plan_reconcile(
+            &[job.clone()],
+            &BTreeMap::new(),
+            &BTreeMap::from([(job.clone(), false)]),
+        );
+        assert_eq!(would_release[&job], reservations::JobDisposition::Dead);
+
+        let report = reconcile_reservations(&context).await.expect("reconcile");
+        assert!(
+            !report.released.contains(&job),
+            "a pending attempt's reservation is held ON PURPOSE; reconcile released it: {report:?}"
+        );
+        assert_eq!(
+            context.store.reservation(&job).expect("read").map(|(state, _)| state),
+            Some(reservations::ReservationState::Reserved),
+            "the funds stay committed while the verdict is open"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
+    }
+
+    // ★ #322 round 3, the triple tooth: the manual award RPC on a past-pay-window pinned attempt
+    // (award confirmed absent) must TERMINALIZE and ANSWER — not deadlock. This is the exact call
+    // shape that self-deadlocked in round 2 (the RPC held money_lock into a helper that re-locks
+    // it), so the whole call runs under a hard timeout: a re-introduced nesting wedges the task
+    // and the timeout fails the test. It also pins the expired-branch response and the
+    // ConfirmedAbsent-past-window arm end to end against a real (empty) relay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_expired_award_retry_terminalizes_and_answers_without_wedging_the_daemon() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let root = temp_home("expired-award-rpc");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap_home(&root).expect("bootstrap home");
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        home.config.relay_url = relay.url().await.to_string();
+
+        let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
+        let job = "a".repeat(64);
+        context.store.reserve(&job, 4, 1_000, u64::MAX, 0, now_unix()).expect("reserve");
+        let mut pinned = attempt_fixture(&job, &context.home.config.relay_url);
+        pinned.amount_sats = 4;
+        // Past the offer deadline AND the 7-day pay window: the probe (confirmed absent against
+        // the empty relay, twice — no award event, no delivery) licenses the terminalization.
+        pinned.offer_deadline_unix = now_unix() - 9 * 24 * 3_600;
+        context.store.begin_award_attempt(&pinned, now_unix()).expect("pin");
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(60),
+            award(&context, json!(1), json!({ "job_id": job })),
+        )
+        .await
+        .expect("the award RPC must ANSWER — a timeout here is the round-2 deadlock resurfacing");
+
+        let error = response.error.expect("a refused terminal attempt is an error response");
+        assert!(
+            error.message.contains("was refused"),
+            "the response names the refusal: {}",
+            error.message
+        );
+        let after = context.store.award_attempt(&job).expect("read").expect("row");
+        assert_eq!(after.state, store::AttemptState::Refused, "terminalized");
+        assert_eq!(
+            context.store.reservation(&job).expect("read").map(|(state, _)| state),
+            Some(reservations::ReservationState::Released),
+            "the funds came back"
+        );
+        assert!(context.store.award_record(&job).expect("read").is_none(), "nothing recorded");
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
+    }
+
+    // ★ #322 round 3: the sweep WIRES its legs — heal (confirmed-without-row lands the row),
+    // finish (refused+reserved releases), resolve (pending pre-deadline re-sends the pinned
+    // bytes and confirms on the relay's ack), and the expired-inside-window HOLD (nothing
+    // transmitted, nothing released). Each leg is unit-tested at the chokepoint/store layer;
+    // this proves resolve_award_attempts actually drives them. Red-on-revert: no-op the sweep
+    // and every assertion below fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_attempt_sweep_drives_all_three_legs_and_holds_inside_the_window() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::{EventBuilder, JsonUtil, Kind};
+
+        let root = temp_home("sweep-wiring");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap_home(&root).expect("bootstrap home");
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        home.config.relay_url = relay.url().await.to_string();
+
+        let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
+        let relay_url = context.home.config.relay_url.clone();
+        let now = now_unix();
+
+        // (a) HEAL: confirmed attempt, no awards row, reservation held.
+        let heal_job = "a".repeat(64);
+        context.store.reserve(&heal_job, 4, 1_000, u64::MAX, 0, now).expect("reserve");
+        let mut heal = attempt_fixture(&heal_job, &relay_url);
+        heal.amount_sats = 4;
+        context.store.begin_award_attempt(&heal, now).expect("pin");
+        assert!(context.store.mark_attempt_confirmed(&heal_job, now).expect("confirm"));
+
+        // (b) FINISH: refused attempt whose release crashed — funds still reserved.
+        let finish_job = "b".repeat(64);
+        context.store.reserve(&finish_job, 4, 1_000, u64::MAX, 0, now).expect("reserve");
+        let mut finish = attempt_fixture(&finish_job, &relay_url);
+        finish.amount_sats = 4;
+        context.store.begin_award_attempt(&finish, now).expect("pin");
+        assert!(context.store.mark_attempt_refused(&finish_job, "blocked: policy", now).expect("refuse"));
+
+        // (c) RESOLVE: pending attempt, deadline ahead, REAL signed bytes the relay will ack.
+        let keys = buyer_keys(&context.home).expect("keys");
+        let event = EventBuilder::new(Kind::Custom(3405), "")
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let resolve_job = "c".repeat(64);
+        context.store.reserve(&resolve_job, 4, 1_000, u64::MAX, 0, now).expect("reserve");
+        let resolve = store::AwardAttempt {
+            job_id: resolve_job.clone(),
+            claim_id: "c".repeat(64),
+            seller_pubkey: "s".repeat(64),
+            award_event_id: event.id.to_hex(),
+            event_json: event.as_json(),
+            amount_sats: 4,
+            quoted_mints_json: "[]".to_owned(),
+            offer_deadline_unix: now + 3_600,
+            send_count: 0,
+            relay_url: relay_url.clone(),
+            state: store::AttemptState::Pending,
+            detail: None,
+        };
+        context.store.begin_award_attempt(&resolve, now).expect("pin");
+
+        // (d) HOLD: pending, deadline passed but inside the 7-day pay window — the sweep must
+        // neither transmit (late award) nor release (window still open).
+        let hold_job = "d".repeat(64);
+        context.store.reserve(&hold_job, 4, 1_000, u64::MAX, 0, now).expect("reserve");
+        let mut hold = attempt_fixture(&hold_job, &relay_url);
+        hold.amount_sats = 4;
+        hold.offer_deadline_unix = now - 100;
+        context.store.begin_award_attempt(&hold, now).expect("pin");
+
+        resolve_award_attempts(&context).await;
+
+        // (a) healed: the row exists, written from the attempt.
+        let healed = context.store.award_record(&heal_job).expect("read").expect("healed row");
+        assert_eq!(healed.award_event_id, heal.award_event_id);
+
+        // (b) finished: the crashed refusal's funds are back.
+        assert_eq!(
+            context.store.reservation(&finish_job).expect("read").map(|(state, _)| state),
+            Some(reservations::ReservationState::Released),
+            "the finisher leg releases the crashed refusal"
+        );
+
+        // (c) resolved: the relay acked the pinned bytes; confirmed + recorded.
+        assert_eq!(
+            context.store.award_attempt(&resolve_job).expect("read").expect("row").state,
+            store::AttemptState::Confirmed,
+            "the pending leg transmits and folds the ack in"
+        );
+        assert!(
+            context.store.award_record(&resolve_job).expect("read").is_some(),
+            "and records the award"
+        );
+
+        // (d) held: still pending, still funded, nothing on the relay for it.
+        let held = context.store.award_attempt(&hold_job).expect("read").expect("row");
+        assert_eq!(held.state, store::AttemptState::Pending, "inside the window: hold");
+        assert_eq!(
+            held.send_count, 0,
+            "and NOTHING was transmitted for it — no send license was ever taken (a re-send \
+             past the deadline is the late-award injection the design forbids)"
+        );
+        assert_eq!(
+            context.store.reservation(&hold_job).expect("read").map(|(state, _)| state),
+            Some(reservations::ReservationState::Reserved),
+            "its funds stay held"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
     }
 
     // #261: the sanitizer is the only guard between seller-authored bytes and the operator's

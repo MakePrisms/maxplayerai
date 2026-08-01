@@ -2076,22 +2076,33 @@ pub(crate) async fn event_present_async(
     presence_of_filter(keys, relay_url, filter, timeout).await
 }
 
-/// Whether any kind-3403 RESULT exists for `job_id` on `relay_url` — positive evidence a seller
-/// executed, which (for a pinned attempt) means our award almost certainly WAS public and has
-/// merely aged out of the probe's view. Consulted before the pay-window termination: refusing an
-/// attempt whose job has deliveries would repudiate work that happened.
+/// Whether a kind-3403 RESULT by `seller_pubkey` — the PINNED, awarded seller — exists for
+/// `job_id` on `relay_url`. Positive evidence that seller executed, which (for a pinned attempt)
+/// means our award almost certainly WAS public and has merely aged out of the probe's view.
+/// Consulted before the pay-window termination: refusing an attempt whose awarded seller
+/// delivered would repudiate work that happened.
+///
+/// The author filter is load-bearing, not an optimisation: this probe's `Present` verdict HOLDS
+/// the terminalization (and therefore the refund) indefinitely, and without the filter any
+/// pubkey could publish one junk 3403 e-tagging the job and permanently pin the buyer's funds —
+/// a griefing vector with no exit, since a forged result can never be collected (round-3
+/// review). Only the awarded seller's delivery is evidence OUR award was public.
 pub(crate) async fn job_has_results_async(
     keys: &nostr_sdk::Keys,
     relay_url: &str,
     job_id: &str,
+    seller_pubkey: &str,
     timeout: Duration,
 ) -> Result<PresenceRead<()>, JobLifecycleError> {
-    use nostr_sdk::prelude::{EventId, Filter, Kind};
+    use nostr_sdk::prelude::{EventId, Filter, Kind, PublicKey};
 
     let offer_id = EventId::from_hex(job_id)
         .map_err(|error| JobLifecycleError::Input(format!("job_id: {error}")))?;
+    let seller = PublicKey::from_hex(seller_pubkey)
+        .map_err(|error| JobLifecycleError::Input(format!("seller pubkey: {error}")))?;
     let filter = Filter::new()
         .kind(Kind::Custom(JOB_RESULT_KIND))
+        .author(seller)
         .event(offer_id)
         .hashtag(gateway::MOBEE_TAG);
     presence_of_filter(keys, relay_url, filter, timeout).await
