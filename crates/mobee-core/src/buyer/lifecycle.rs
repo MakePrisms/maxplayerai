@@ -748,10 +748,24 @@ where
             }
             // Refused THEN released, so a crash between the two leaves refused+reserved — the
             // state `RefusedTerminal` finishes — and never released+pending (which would read as
-            // a resumable attempt whose funds are gone).
-            store
+            // a resumable attempt whose funds are gone). The release is licensed by WINNING the
+            // transition: `false` here means another resolver terminalized the attempt while our
+            // send was in flight (all drive_send callers hold the money lock, so this is
+            // belt-and-braces — but the check costs nothing and the release must never rest on
+            // an assumption when the store can state the fact).
+            if !store
                 .mark_attempt_refused(job_id, &detail, now_unix)
-                .map_err(AwardError::Presence)?;
+                .map_err(AwardError::Presence)?
+            {
+                return Err(AwardError::Unresolved {
+                    job_id: job_id.to_owned(),
+                    award_event_id: attempt.award_event_id,
+                    detail: format!(
+                        "the relay refused this transmission ({detail}), but the attempt was \
+                         resolved concurrently — leaving the other resolver's verdict in place"
+                    ),
+                });
+            }
             store.release(job_id, now_unix).map_err(AwardError::Store)?;
             Err(AwardError::Refused { job_id: job_id.to_owned(), detail })
         }

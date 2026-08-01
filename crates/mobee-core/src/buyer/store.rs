@@ -2161,6 +2161,14 @@ mod tests {
         store.reserve(&pending, 40, 200, u64::MAX, 0, 6).expect("reserve");
         store.begin_award_attempt(&attempt(&pending, "claim-p"), 6).expect("pin");
 
+        // Refused attempt on an already-PAID job: correctly in neither set — there is nothing
+        // to release and nothing open.
+        let paid = "q".repeat(64);
+        store.reserve(&paid, 40, 200, u64::MAX, 0, 7).expect("reserve");
+        store.begin_award_attempt(&attempt(&paid, "claim-q"), 7).expect("pin");
+        assert!(store.mark_attempt_refused(&paid, "blocked", 8).expect("refuse"));
+        store.convert_to_spent(&paid, 40, 9).expect("spent");
+
         let crashed_set: Vec<String> = store
             .refused_attempts_still_reserved()
             .expect("set")
@@ -2173,6 +2181,62 @@ mod tests {
             store.pending_attempt_job_ids().expect("pending set"),
             vec![pending],
             "only the open-verdict job is shielded from reconcile"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The v6 in-cycle column migration's backfill DEFAULTS are the conservative direction, and
+    // that sentence has to have a tooth (#322 round 3): a pre-column row gets `send_count = 1` —
+    // its event may already have been transmitted, and 0 is the license to treat an OK:false as
+    // proof nothing is public — and the `''` relay sentinel the resolution paths translate to
+    // live config. Red-on-revert: flip the ALTER's DEFAULT back to 0 and this fails.
+    #[test]
+    fn a_pre_column_attempt_row_backfills_conservative_defaults_on_open() {
+        let path = temp_db("migrate-v6-columns");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("raw open");
+            conn.execute_batch(
+                "CREATE TABLE buyer_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE award_attempts (
+                     job_id              TEXT PRIMARY KEY,
+                     claim_id            TEXT NOT NULL,
+                     seller_pubkey       TEXT NOT NULL,
+                     award_event_id      TEXT NOT NULL,
+                     event_json          TEXT NOT NULL,
+                     amount_sats         INTEGER NOT NULL CHECK (amount_sats >= 0),
+                     quoted_mints_json   TEXT NOT NULL DEFAULT '[]',
+                     offer_deadline_unix INTEGER NOT NULL,
+                     state               TEXT NOT NULL CHECK (state IN ('pending','confirmed','refused')),
+                     detail              TEXT,
+                     created_at_unix     INTEGER NOT NULL,
+                     updated_at_unix     INTEGER NOT NULL
+                 );
+                 INSERT INTO buyer_meta (key, value) VALUES ('schema_version', '6');
+                 INSERT INTO award_attempts (job_id, claim_id, seller_pubkey, award_event_id,
+                                             event_json, amount_sats, quoted_mints_json,
+                                             offer_deadline_unix, state, detail,
+                                             created_at_unix, updated_at_unix)
+                 VALUES ('job-old', 'claim-old', 'seller-old', 'award-old', '{}', 3, '[]',
+                         9999, 'pending', NULL, 1, 1);",
+            )
+            .expect("seed pre-column v6 shape");
+        }
+        let store = BuyerStore::open(&path).expect("open migrates the columns in");
+        let row = store.award_attempt("job-old").expect("read").expect("row survived");
+        assert_eq!(
+            row.send_count, 1,
+            "a pre-column row may already have transmitted — backfill must assume ONE prior \
+             send, never zero (zero licenses a terminal refusal)"
+        );
+        assert_eq!(row.relay_url, "", "the relay sentinel resolves to live config at use sites");
+        // And a FRESH pin in the same store still starts at zero — the backfill is for existing
+        // rows only.
+        store.begin_award_attempt(&attempt(&"n".repeat(64), "claim-n"), 2).expect("pin");
+        assert_eq!(
+            store.award_attempt(&"n".repeat(64)).expect("read").expect("row").send_count,
+            0,
+            "fresh rows keep the genuine never-transmitted license"
         );
         let _ = std::fs::remove_file(&path);
     }
