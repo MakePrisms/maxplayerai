@@ -55,7 +55,7 @@ use lifecycle::{
 };
 use lock::{HomeLock, LockError};
 use protocol::{CODE_INTERNAL, CODE_METHOD_NOT_FOUND, CODE_NOT_IMPLEMENTED, Request, Response};
-use reservations::{Dispositions, ReconcileReport};
+use reservations::{Dispositions, JobDisposition, ReconcileReport};
 use signer::SignerHandle;
 use store::{BuyerStore, StoreError};
 use wallet_actor::WalletHandle;
@@ -2172,7 +2172,7 @@ async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Ev
 /// on the state it expects), so a disposition that went stale during gather is a no-op rather than a
 /// wrong write.
 async fn reconcile_reservations(context: &BuyerContext) -> Result<ReconcileReport, String> {
-    let mut reserved = context
+    let reserved = context
         .store
         .reserved_job_ids()
         .map_err(|error| error.to_string())?;
@@ -2183,17 +2183,16 @@ async fn reconcile_reservations(context: &BuyerContext) -> Result<ReconcileRepor
     // an award that IS public — #322's harm ledger (round-6 review). The sweep owns their
     // resolution: re-send, probe, heal, or the gated pay-window terminalization, which does its
     // own release.
-    match context.store.attempt_held_job_ids() {
-        Ok(pending_attempts) if !pending_attempts.is_empty() => {
-            let held: std::collections::BTreeSet<String> = pending_attempts.into_iter().collect();
-            reserved.retain(|job_id| !held.contains(job_id));
-        }
-        Ok(_) => {}
-        Err(error) => {
-            // Fail toward keeping funds: an unreadable attempt set must not license releases.
-            return Err(format!("could not read attempt-held jobs: {error}"));
-        }
-    }
+    // They stay IN the batch so the Paid arm can still converge them (round-7 review); only
+    // their Dead verdict is downgraded, in `plan_reconcile`.
+    let attempt_held: std::collections::BTreeSet<String> =
+        match context.store.attempt_held_job_ids() {
+            Ok(held) => held.into_iter().collect(),
+            Err(error) => {
+                // Fail toward keeping funds: an unreadable attempt set must not license releases.
+                return Err(format!("could not read attempt-held jobs: {error}"));
+            }
+        };
     if reserved.is_empty() {
         return Ok(ReconcileReport::default());
     }
@@ -2225,7 +2224,7 @@ async fn reconcile_reservations(context: &BuyerContext) -> Result<ReconcileRepor
         payable.insert(job_id.clone(), claim_live || has_bind);
     }
 
-    let dispositions = plan_reconcile(&reserved, &progress, &payable);
+    let dispositions = plan_reconcile(&reserved, &progress, &payable, &attempt_held);
     let _guard = context.money_lock.lock().await;
     context
         .store
@@ -2367,15 +2366,23 @@ fn plan_reconcile(
     reserved: &[String],
     progress: &BTreeMap<String, PaymentProgress>,
     payable: &BTreeMap<String, bool>,
+    attempt_held: &std::collections::BTreeSet<String>,
 ) -> Dispositions {
     let mut dispositions: Dispositions = BTreeMap::new();
     for job_id in reserved {
         let payment = progress.get(job_id).copied().unwrap_or(PaymentProgress::None);
         let claim_payable = payable.get(job_id).copied().unwrap_or(true);
-        dispositions.insert(
-            job_id.clone(),
-            lifecycle::classify_disposition(payment, claim_payable),
-        );
+        let verdict = lifecycle::classify_disposition(payment, claim_payable);
+        // The attempt machinery owns the RELEASE decision for jobs it holds — but ONLY that
+        // decision. Downgrading `Dead → Payable` (keep the funds) leaves `Paid → spent`
+        // untouched, which matters: reconcile's Paid arm is the only converger for a pay whose
+        // `reserved → spent` flip failed, so dropping these jobs from the batch entirely would
+        // suppress a correction that frees a double-count (round-7 review).
+        let verdict = match verdict {
+            JobDisposition::Dead if attempt_held.contains(job_id) => JobDisposition::Payable,
+            other => other,
+        };
+        dispositions.insert(job_id.clone(), verdict);
     }
     dispositions
 }
@@ -2779,6 +2786,7 @@ mod tests {
             &[job.clone()],
             &BTreeMap::new(),
             &BTreeMap::from([(job.clone(), false)]),
+            &std::collections::BTreeSet::new(),
         );
         assert_eq!(would_release[&job], reservations::JobDisposition::Dead);
 
@@ -3019,8 +3027,9 @@ mod tests {
                 panic!("an unrepairable public award must be parked so status can show the debt")
             });
         assert!(
-            reason.contains("re-reserving") || reason.contains("already published"),
-            "the parked reason must name why the row is missing: {reason}"
+            reason.contains("re-reserving"),
+            "the parked reason must name the CAUSE, not just the wrapper (`already published` is \
+             in every PublishedButUnrecorded Display): {reason}"
         );
         let _ = std::fs::remove_dir_all(&root);
         drop(relay);
@@ -3091,7 +3100,7 @@ mod tests {
     // twin. The pre-lock gate passes (deadline ahead), the deadline crosses while the license
     // section waits on the money lock, and the sweep must transmit NOTHING — a late award is
     // compute the seller burns unpaid. Red-on-revert: delete the sweep's
-    // `resume_crossed_deadline` arm and the send goes out (send_count becomes 2).
+    // `resume_crossed_deadline` arm and the send goes out (send_count becomes 1, not 0).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_sweep_deadline_crossed_while_waiting_for_the_money_lock_transmits_nothing() {
         use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
@@ -3121,6 +3130,23 @@ mod tests {
         pinned.offer_deadline_unix = now_unix() + 2;
         context.store.begin_award_attempt(&pinned, now_unix()).expect("pin");
 
+        // A CONTROL job in the same sweep, far from its deadline. Its send_count == 1 proves the
+        // license section was actually reached on this pass — without it both assertions below are
+        // pure negatives that the PRE-lock gate satisfies identically (it diverts to the probe
+        // path, which also leaves send_count 0 / Pending), so a slow prologue would make this test
+        // silently green instead of red (round-7 review).
+        let control = "c".repeat(64);
+        context.store.reserve(&control, 4, 1_000, u64::MAX, 0, now_unix()).expect("reserve");
+        let control_event = EventBuilder::new(Kind::Custom(3405), "control")
+            .sign_with_keys(&keys)
+            .expect("sign control");
+        let mut control_pinned = attempt_fixture(&control, &context.home.config.relay_url);
+        control_pinned.amount_sats = 4;
+        control_pinned.award_event_id = control_event.id.to_hex();
+        control_pinned.event_json = control_event.as_json();
+        control_pinned.offer_deadline_unix = now_unix() + 3_600;
+        context.store.begin_award_attempt(&control_pinned, now_unix()).expect("pin control");
+
         let holder = {
             let context = context.clone();
             tokio::spawn(async move {
@@ -3143,8 +3169,57 @@ mod tests {
             store::AttemptState::Pending,
             "and the attempt stays pending for the probe path to resolve"
         );
+        assert_eq!(
+            context.store.award_attempt(&control).expect("read").expect("row").send_count,
+            1,
+            "ATTRIBUTION: the control job's license proves the license section ran on this sweep, \
+             so the crossed job's 0 is the under-lock re-check and not a pre-lock divert"
+        );
         let _ = std::fs::remove_dir_all(&root);
         drop(relay);
+    }
+
+    // ★ #322 round 7: the shield covers the RELEASE decision only. A held job's `Dead` verdict is
+    // downgraded to `Payable` (funds stay), but its `Paid` verdict must still convert — reconcile's
+    // Paid arm is the ONLY converger for a pay whose `reserved → spent` flip failed, and dropping
+    // held jobs from the batch entirely would suppress a correction that frees a double-count.
+    // Red-on-revert: drop held jobs from `reserved` instead of downgrading their verdict, and the
+    // Paid assertion below fails.
+    #[test]
+    fn the_attempt_shield_keeps_dead_jobs_but_still_converges_paid_ones() {
+        let held_dead = "a".repeat(64);
+        let held_paid = "b".repeat(64);
+        let free_dead = "c".repeat(64);
+        let held: std::collections::BTreeSet<String> =
+            [held_dead.clone(), held_paid.clone()].into_iter().collect();
+
+        let dispositions = plan_reconcile(
+            &[held_dead.clone(), held_paid.clone(), free_dead.clone()],
+            &BTreeMap::from([(held_paid.clone(), PaymentProgress::Closed)]),
+            &BTreeMap::from([
+                (held_dead.clone(), false),
+                (held_paid.clone(), false),
+                (free_dead.clone(), false),
+            ]),
+            &held,
+        );
+
+        assert_eq!(
+            dispositions[&held_dead],
+            reservations::JobDisposition::Payable,
+            "a held job's Dead verdict is downgraded — the attempt machinery owns its release"
+        );
+        assert_eq!(
+            dispositions[&held_paid],
+            reservations::JobDisposition::Paid,
+            "but a held job that PAID must still converge: this arm frees a double-count and is \
+             the only path that does"
+        );
+        assert_eq!(
+            dispositions[&free_dead],
+            reservations::JobDisposition::Dead,
+            "and an unheld dead job is still released — the shield is not a blanket"
+        );
     }
 
     // ★ #322 round 3: the sweep WIRES its legs — heal (confirmed-without-row lands the row),
@@ -3388,6 +3463,7 @@ mod tests {
             &[job.clone()],
             &BTreeMap::new(),
             &BTreeMap::from([(job.clone(), false)]),
+            &std::collections::BTreeSet::new(),
         );
         assert_eq!(
             would_release[&job],
@@ -3965,7 +4041,7 @@ mod tests {
         payable.insert(live.clone(), true);
         payable.insert(dead.clone(), false);
 
-        let dispositions = plan_reconcile(&reserved, &progress, &payable);
+        let dispositions = plan_reconcile(&reserved, &progress, &payable, &std::collections::BTreeSet::new());
         assert_eq!(dispositions[&paid], reservations::JobDisposition::Paid);
         assert_eq!(dispositions[&uncertain], reservations::JobDisposition::Payable);
         assert_eq!(dispositions[&live], reservations::JobDisposition::Payable);
@@ -3977,7 +4053,7 @@ mod tests {
     #[test]
     fn plan_reconcile_missing_payable_defaults_to_kept() {
         let job = "e".repeat(64);
-        let dispositions = plan_reconcile(&[job.clone()], &BTreeMap::new(), &BTreeMap::new());
+        let dispositions = plan_reconcile(&[job.clone()], &BTreeMap::new(), &BTreeMap::new(), &std::collections::BTreeSet::new());
         assert_eq!(dispositions[&job], reservations::JobDisposition::Payable);
     }
 
