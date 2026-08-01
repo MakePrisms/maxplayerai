@@ -2360,8 +2360,13 @@ fn spawn_reconcile_loop(context: Arc<BuyerContext>) {
 
 /// Pure reconcile planning: map each reserved job to a disposition from its folded payment progress
 /// and whether it is still payable. Kept pure (no relay/disk I/O) so the reserved-job → disposition
-/// mapping is exhaustively testable; [`reconcile_on_start`] gathers the inputs. A job absent from
-/// `payable` defaults to payable (conservative — never release without positive evidence of death).
+/// mapping is exhaustively testable; [`reconcile_reservations`] gathers the inputs. A job absent
+/// from `payable` defaults to payable (conservative — never release without positive evidence of
+/// death).
+///
+/// `attempt_held` is the set whose RELEASE decision the award-attempt machinery owns (see
+/// [`store::BuyerStore::attempt_held_job_ids`]): their `Dead` verdict is downgraded to `Payable`
+/// so the funds stay, while every other verdict — notably `Paid` — is left to act.
 fn plan_reconcile(
     reserved: &[String],
     progress: &BTreeMap<String, PaymentProgress>,
@@ -2761,7 +2766,8 @@ mod tests {
     // ★ #322 round 3: reconcile must LEAVE pending-attempt jobs alone — their funds are held on
     // purpose while the award's relay verdict is open. Premise-checked like the mid-settle tooth:
     // the job WOULD classify Dead, so without the skip it is genuinely at risk. Red-on-revert:
-    // delete the `attempt_held_job_ids` filter in `reconcile_reservations` and the release
+    // drop the `Dead if attempt_held.contains(..) => Payable` downgrade in `plan_reconcile` (or
+    // pass an empty held set) and the release
     // lands.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn reconcile_leaves_a_pending_attempts_reservation_alone() {
@@ -2794,6 +2800,15 @@ mod tests {
         assert!(
             !report.released.contains(&job),
             "a pending attempt's reservation is held ON PURPOSE; reconcile released it: {report:?}"
+        );
+        // ATTRIBUTION (round-8 review): the held job must be KEPT, not absent. The two negatives
+        // above are satisfied identically by dropping it from the batch — which is exactly the
+        // round-6 defect, and which would also suppress reconcile's `Paid → spent` convergence
+        // (the only converger for a pay whose flip failed). Only a positive `kept` assertion
+        // proves the shield downgrades the VERDICT and leaves the job in the pass.
+        assert!(
+            report.kept.contains(&job),
+            "the held job must stay IN the batch (kept), not be dropped from it: {report:?}"
         );
         assert_eq!(
             context.store.reservation(&job).expect("read").map(|(state, _)| state),
@@ -3101,6 +3116,15 @@ mod tests {
     // section waits on the money lock, and the sweep must transmit NOTHING — a late award is
     // compute the seller burns unpaid. Red-on-revert: delete the sweep's
     // `resume_crossed_deadline` arm and the send goes out (send_count becomes 1, not 0).
+    //
+    // ★ ATTRIBUTION (round-8 review). The two negatives this test wants (`send_count == 0`,
+    // still `Pending`) are ALSO produced by the PRE-lock gate diverting to the probe path — so a
+    // prologue slower than the deadline margin would make the test pass while never reaching the
+    // arm under test. A per-attempt `send_count` on some other job cannot fix that (it witnesses
+    // only its own row). The discriminator is the award EVENT: it is published to the relay up
+    // front, so a pre-lock divert would probe it, find it Present, and CONFIRM the attempt with
+    // an awards row. Asserting `Pending` + no row therefore fails on a divert instead of passing
+    // — the test now says "I did not test what I meant to" rather than going quietly green.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_sweep_deadline_crossed_while_waiting_for_the_money_lock_transmits_nothing() {
         use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
@@ -3130,11 +3154,25 @@ mod tests {
         pinned.offer_deadline_unix = now_unix() + 2;
         context.store.begin_award_attempt(&pinned, now_unix()).expect("pin");
 
-        // A CONTROL job in the same sweep, far from its deadline. Its send_count == 1 proves the
-        // license section was actually reached on this pass — without it both assertions below are
-        // pure negatives that the PRE-lock gate satisfies identically (it diverts to the probe
-        // path, which also leaves send_count 0 / Pending), so a slow prologue would make this test
-        // silently green instead of red (round-7 review).
+        // THE DISCRIMINATOR: the pinned award is already ON the relay. A pre-lock divert probes
+        // by id, finds it, and confirms the attempt (+ heals its awards row) — a state visibly
+        // different from the under-lock refusal's `Pending` + no row. Without this the two paths
+        // are byte-identical in durable state and the test cannot tell them apart.
+        {
+            use nostr_sdk::prelude::Client;
+            let publisher = Client::new(keys.clone());
+            publisher
+                .add_relay(&context.home.config.relay_url)
+                .await
+                .expect("add relay");
+            publisher.connect().await;
+            publisher.send_event(&event).await.expect("relay stores the pinned award");
+            publisher.disconnect().await;
+        }
+
+        // A CONTROL job in the same sweep, far from its deadline. Its send_count == 1 is the only
+        // tooth for the sweep's carried-license wiring (round-7 review); it does NOT attribute the
+        // crossed job's zero — see the ATTRIBUTION note above for what does.
         let control = "c".repeat(64);
         context.store.reserve(&control, 4, 1_000, u64::MAX, 0, now_unix()).expect("reserve");
         let control_event = EventBuilder::new(Kind::Custom(3405), "control")
@@ -3167,13 +3205,18 @@ mod tests {
         assert_eq!(
             after.state,
             store::AttemptState::Pending,
-            "and the attempt stays pending for the probe path to resolve"
+            "a PRE-lock divert would have probed the (published) award and CONFIRMED it, so \
+             `Pending` proves the under-lock re-check is what stopped this send"
+        );
+        assert!(
+            context.store.award_record(&job).expect("read").is_none(),
+            "and no awards row: the divert path would have healed one from the probe's Present"
         );
         assert_eq!(
             context.store.award_attempt(&control).expect("read").expect("row").send_count,
             1,
-            "ATTRIBUTION: the control job's license proves the license section ran on this sweep, \
-             so the crossed job's 0 is the under-lock re-check and not a pre-lock divert"
+            "the control's license proves the sweep reached the license section at all (and is \
+             the tooth for its carried-license wiring)"
         );
         let _ = std::fs::remove_dir_all(&root);
         drop(relay);

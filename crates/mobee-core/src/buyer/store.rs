@@ -984,8 +984,10 @@ impl BuyerStore {
         Ok(attempts)
     }
 
-    /// Job ids whose reservations the reconcile pass must LEAVE ALONE — the attempt machinery owns
-    /// them:
+    /// Job ids whose RELEASE decision the attempt machinery owns. Reconcile keeps these jobs in
+    /// its pass and still acts on every other verdict — notably `Paid → spent`, the only converger
+    /// for a pay whose `reserved → spent` flip failed — and only their `Dead` verdict is
+    /// downgraded to `Payable` (see [`super::plan_reconcile`]). The two populations:
     ///
     /// - **pending** attempts hold their funds deliberately while the award's relay verdict is
     ///   open; releasing them only produces a release→re-reserve flip-flop with the sweep (plus a
@@ -2213,7 +2215,8 @@ mod tests {
         want.sort();
         assert_eq!(
             held, want,
-            "reconcile must skip open verdicts AND public-but-unrecorded awards, nothing else"
+            "the release shield must cover open verdicts AND public-but-unrecorded awards, \
+             nothing else"
         );
         let _ = std::fs::remove_file(&path);
     }
