@@ -984,14 +984,29 @@ impl BuyerStore {
         Ok(attempts)
     }
 
-    /// Job ids with a PENDING award attempt — the set whose reservations the reconcile pass must
-    /// leave alone: their funds are deliberately held while the award's relay verdict is open,
-    /// and releasing them only produces a release→re-reserve flip-flop with the sweep (plus a
-    /// stranding race when the freed capacity is taken in between).
-    pub fn pending_attempt_job_ids(&self) -> Result<Vec<String>, StoreError> {
+    /// Job ids whose reservations the reconcile pass must LEAVE ALONE — the attempt machinery owns
+    /// them:
+    ///
+    /// - **pending** attempts hold their funds deliberately while the award's relay verdict is
+    ///   open; releasing them only produces a release→re-reserve flip-flop with the sweep (plus a
+    ///   stranding race when the freed capacity is taken in between).
+    /// - **confirmed** attempts whose `awards` row is missing are the crash window between the
+    ///   relay's ack and `record_award`. Their award is PROVABLY public (the row is written only
+    ///   on an ack or a presence-verified repair), so reconcile classifying them `Dead` and
+    ///   releasing would produce #322's exact harm ledger: award public, funds returned. The
+    ///   sweep's heal re-reserves and writes the row; until it succeeds the funds stay put.
+    ///
+    /// A confirmed attempt that HAS its row is not listed — the normal awarded state, which
+    /// reconcile has always been allowed to judge on its own evidence.
+    pub fn attempt_held_job_ids(&self) -> Result<Vec<String>, StoreError> {
         let conn = self.lock()?;
-        let mut stmt = conn
-            .prepare("SELECT job_id FROM award_attempts WHERE state = 'pending' ORDER BY job_id")?;
+        let mut stmt = conn.prepare(
+            "SELECT t.job_id FROM award_attempts t
+             LEFT JOIN awards a ON a.job_id = t.job_id
+             WHERE t.state = 'pending'
+                OR (t.state = 'confirmed' AND a.job_id IS NULL)
+             ORDER BY t.job_id",
+        )?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         let mut jobs = Vec::new();
         for row in rows {
@@ -2177,10 +2192,28 @@ mod tests {
             .collect();
         assert_eq!(crashed_set, vec![crashed], "only the refused+reserved crash state");
 
+        // The shield covers open-verdict PENDING rows and CONFIRMED rows whose awards row is
+        // missing (their award is provably public — releasing would be #322's harm ledger). A
+        // confirmed row WITH its awards row is not shielded: that is the normal awarded state.
+        let confirmed_no_row = "z".repeat(64);
+        store.reserve(&confirmed_no_row, 40, 400, u64::MAX, 0, 10).expect("reserve");
+        store.begin_award_attempt(&attempt(&confirmed_no_row, "claim-z"), 10).expect("pin");
+        assert!(store.mark_attempt_confirmed(&confirmed_no_row, 11).expect("confirm"));
+        let confirmed_with_row = "y".repeat(64);
+        store.reserve(&confirmed_with_row, 40, 400, u64::MAX, 0, 12).expect("reserve");
+        store.begin_award_attempt(&attempt(&confirmed_with_row, "claim-y"), 12).expect("pin");
+        assert!(store.mark_attempt_confirmed(&confirmed_with_row, 13).expect("confirm"));
+        store
+            .record_award(&confirmed_with_row, "claim-y", "award-y", &"s".repeat(64), 40, 14)
+            .expect("record");
+
+        let mut held = store.attempt_held_job_ids().expect("held set");
+        held.sort();
+        let mut want = vec![pending.clone(), confirmed_no_row.clone()];
+        want.sort();
         assert_eq!(
-            store.pending_attempt_job_ids().expect("pending set"),
-            vec![pending],
-            "only the open-verdict job is shielded from reconcile"
+            held, want,
+            "reconcile must skip open verdicts AND public-but-unrecorded awards, nothing else"
         );
         let _ = std::fs::remove_file(&path);
     }

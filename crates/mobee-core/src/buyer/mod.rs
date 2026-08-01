@@ -1864,24 +1864,32 @@ async fn resolve_award_attempts(context: &BuyerContext) {
                             attempt.job_id, attempt.award_event_id
                         );
                     }
-                    // An unrepairable heal (the award is public, but its row cannot be written or
-                    // funded — e.g. the balance shrank below the pinned amount) parks the intent
-                    // with that error. A confirmed attempt is in NO status surface otherwise:
-                    // `pending_award_attempts` selects only pending rows, so without this park a
-                    // seller is owed money and `status` says nothing (round-5 review). On the
-                    // manual path the park is a no-op (no intent row) and stderr remains the
-                    // only signal — the sweep re-runs the heal every tick either way.
-                    Err(error) => {
+                    // Only an UNREPAIRABLE heal parks: the award is public but its row cannot be
+                    // written or funded (`PublishedButUnrecorded` — e.g. the balance shrank below
+                    // the pinned amount), and a confirmed attempt is in no other status surface
+                    // (`pending_award_attempts` selects only pending rows), so a seller owed
+                    // money would otherwise be invisible outside stderr (round-5 review). A
+                    // TRANSIENT error (an unreadable money snapshot, a store blip) must NOT park:
+                    // parking says "the award could not be placed" about a job whose award is
+                    // public and whose seller is executing, and an operator acting on that list
+                    // could post a duplicate offer. Transients stay for the next tick's retry —
+                    // the same discipline `settle_intent_from_attempt`'s Confirmed arm keeps.
+                    Err(error @ AwardError::PublishedButUnrecorded { .. }) => {
                         let _ = context.store.mark_award_parked(
                             &attempt.job_id,
                             &error.to_string(),
                             now_unix(),
                         );
                         eprintln!(
-                            "buyer: healing awards row for {} failed ({error}); will retry next pass",
+                            "buyer: award for {} is public but unrepairable ({error}); parked for \
+                             an operator — the sweep keeps retrying the heal",
                             attempt.job_id
                         );
                     }
+                    Err(error) => eprintln!(
+                        "buyer: healing awards row for {} failed ({error}); will retry next pass",
+                        attempt.job_id
+                    ),
                 }
             }
         }
@@ -2168,12 +2176,14 @@ async fn reconcile_reservations(context: &BuyerContext) -> Result<ReconcileRepor
         .store
         .reserved_job_ids()
         .map_err(|error| error.to_string())?;
-    // A job with a PENDING award attempt holds its funds ON PURPOSE — the award's relay verdict
-    // is open, and the attempt sweep owns its resolution (re-send, probe, or the gated pay-window
-    // terminalization, which does its own release). Reconciling it here only manufactures a
-    // release→re-reserve flip-flop with the sweep on every tick, plus a stranding race when the
-    // freed capacity is taken in between (#322 round-2 review).
-    match context.store.pending_attempt_job_ids() {
+    // Jobs the attempt machinery owns hold their funds ON PURPOSE: a PENDING attempt's relay
+    // verdict is still open, and a CONFIRMED attempt without its awards row has a provably PUBLIC
+    // award awaiting the sweep's heal. Reconciling either here manufactures a release→re-reserve
+    // flip-flop with the sweep (round-2 review) or, for the confirmed case, releases the funds of
+    // an award that IS public — #322's harm ledger (round-6 review). The sweep owns their
+    // resolution: re-send, probe, heal, or the gated pay-window terminalization, which does its
+    // own release.
+    match context.store.attempt_held_job_ids() {
         Ok(pending_attempts) if !pending_attempts.is_empty() => {
             let held: std::collections::BTreeSet<String> = pending_attempts.into_iter().collect();
             reserved.retain(|job_id| !held.contains(job_id));
@@ -2181,7 +2191,7 @@ async fn reconcile_reservations(context: &BuyerContext) -> Result<ReconcileRepor
         Ok(_) => {}
         Err(error) => {
             // Fail toward keeping funds: an unreadable attempt set must not license releases.
-            return Err(format!("could not read pending award attempts: {error}"));
+            return Err(format!("could not read attempt-held jobs: {error}"));
         }
     }
     if reserved.is_empty() {
@@ -2501,6 +2511,26 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
         })
         .collect();
 
+    // Surface awards that are PUBLIC but whose local row is missing (#322 round-6 review): the
+    // crash window between the relay's ack and `record_award`, or a repair the wallet cannot
+    // currently fund. A seller is owed money in this state and it is enumerable in no other
+    // field — `pending_award_attempts` selects only pending rows, and on the manual path there is
+    // no intent row for `parked_awards` to carry. Intent-independent, so it covers both paths.
+    let unrecorded_confirmed_awards: Vec<Value> = context
+        .store
+        .confirmed_attempts_without_award_row()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|attempt| {
+            json!({
+                "job_id": attempt.job_id,
+                "award_event_id": attempt.award_event_id,
+                "amount_sats": attempt.amount_sats,
+                "seller_pubkey": attempt.seller_pubkey,
+            })
+        })
+        .collect();
+
     Response::ok(
         id,
         json!({
@@ -2519,6 +2549,7 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
             "reconcile": reconcile,
             "parked_awards": parked_awards,
             "pending_award_attempts": pending_attempts,
+            "unrecorded_confirmed_awards": unrecorded_confirmed_awards,
             // The relay the buyer's one long-lived session is bound to. Deliberately NOT a liveness
             // probe: `status` is what connect-or-spawn polls to decide the daemon is up, and a probe
             // bounded at 10s would push that poll past its own readiness deadline. Liveness belongs
@@ -2639,8 +2670,11 @@ mod tests {
             "and must not rewrite the verdict"
         );
 
-        // Case 2: a genuinely pending attempt — the gate wins, refuses, and releases.
+        // Case 2: a genuinely pending attempt — the gate wins, refuses, releases, AND parks the
+        // intent (the third write, so the refusal reason reaches `status`; without an intent row
+        // the park would be a silent no-op and the assertion below could not see it).
         let pending_job = "b".repeat(64);
+        store.put_pending_award(&pending_job, 40, None, None, 4).expect("intent");
         store.reserve(&pending_job, 40, 100, u64::MAX, 0, 4).expect("reserve");
         store
             .begin_award_attempt(&attempt_fixture(&pending_job, "ws://relay.test"), 4)
@@ -2657,6 +2691,14 @@ mod tests {
             store.reservation(&pending_job).expect("read").map(|(state, _)| state),
             Some(super::reservations::ReservationState::Released),
             "the winner releases the funds"
+        );
+        assert!(
+            store
+                .parked_awards()
+                .expect("parked")
+                .iter()
+                .any(|(job, reason)| job == &pending_job && reason == "absent past window"),
+            "and parks the intent with the refusal reason — never a silent drop"
         );
 
         // Case 3: idempotent replay — the second call loses the (now spent) transition.
@@ -2712,7 +2754,7 @@ mod tests {
     // ★ #322 round 3: reconcile must LEAVE pending-attempt jobs alone — their funds are held on
     // purpose while the award's relay verdict is open. Premise-checked like the mid-settle tooth:
     // the job WOULD classify Dead, so without the skip it is genuinely at risk. Red-on-revert:
-    // delete the `pending_attempt_job_ids` filter in `reconcile_reservations` and the release
+    // delete the `attempt_held_job_ids` filter in `reconcile_reservations` and the release
     // lands.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn reconcile_leaves_a_pending_attempts_reservation_alone() {
@@ -2930,6 +2972,116 @@ mod tests {
             context.store.award_attempt(&job).expect("read").expect("row").send_count,
             0,
             "NOTHING may be transmitted for a deadline that crossed during the wait"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
+    }
+
+    // ★ #322 round 6: an UNREPAIRABLE heal parks the intent — the only status surface for a job
+    // whose award is public but whose row cannot be written or funded. Hermetic: the repair's
+    // re-reserve hits AmountMismatch (evaluated before the available-check, so no funded wallet is
+    // needed) and yields PublishedButUnrecorded. Red-on-revert: delete the park in the heal leg's
+    // PublishedButUnrecorded arm and `parked_awards` goes silent while a seller is owed money.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unrepairable_heal_parks_the_intent_so_the_debt_is_visible() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let root = temp_home("unrepairable-heal-parks");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap_home(&root).expect("bootstrap home");
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        home.config.relay_url = relay.url().await.to_string();
+
+        let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
+        let job = "a".repeat(64);
+        context.store.put_pending_award(&job, 4, None, None, now_unix()).expect("intent");
+        context.store.reserve(&job, 4, 1_000, u64::MAX, 0, now_unix()).expect("reserve");
+        // The attempt's amount DISAGREES with the held reservation, so the repair's re-reserve is
+        // refused (AmountMismatch) — the award is public and its row cannot be written.
+        let mut pinned = attempt_fixture(&job, &context.home.config.relay_url);
+        pinned.amount_sats = 5;
+        context.store.begin_award_attempt(&pinned, now_unix()).expect("pin");
+        assert!(context.store.mark_attempt_confirmed(&job, now_unix()).expect("confirm"));
+
+        resolve_award_attempts(&context).await;
+
+        assert!(
+            context.store.award_record(&job).expect("read").is_none(),
+            "premise: the row genuinely could not be written, or nothing is unrepairable"
+        );
+        let parked = context.store.parked_awards().expect("parked");
+        let reason = parked
+            .iter()
+            .find(|(parked_job, _)| parked_job == &job)
+            .map(|(_, reason)| reason.clone())
+            .unwrap_or_else(|| {
+                panic!("an unrepairable public award must be parked so status can show the debt")
+            });
+        assert!(
+            reason.contains("re-reserving") || reason.contains("already published"),
+            "the parked reason must name why the row is missing: {reason}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
+    }
+
+    // ★ #322 round 6: the MIRROR of the junk-delivery test, and the direction that costs a seller
+    // their pay. A delivery by the PINNED seller is positive evidence our award WAS public (the
+    // probe's absence is retention, not history), so the terminalization must HOLD. Without this
+    // the guard is only protected against being too permissive: an INERT guard — one that never
+    // returns `Present` — satisfies the junk test's assertions identically, and would refuse +
+    // release funds for work the awarded seller actually delivered, one-way and unrecoverable
+    // (round-6 review). Red-on-revert: make the `Present` arm fall through to terminalize, or
+    // stub the probe to always answer absent, and this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_pinned_sellers_delivery_holds_the_refund() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::{Client, EventBuilder, Keys, Kind, Tag};
+
+        let root = temp_home("seller-delivery-holds");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap_home(&root).expect("bootstrap home");
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        home.config.relay_url = relay.url().await.to_string();
+
+        let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
+        let job = "a".repeat(64);
+        context.store.reserve(&job, 4, 1_000, u64::MAX, 0, now_unix()).expect("reserve");
+        let mut pinned = attempt_fixture(&job, &context.home.config.relay_url);
+        pinned.amount_sats = 4;
+        pinned.offer_deadline_unix = now_unix() - 9 * 24 * 3_600; // past deadline AND pay window
+        // The award is pinned to THIS seller — the one whose delivery is evidence.
+        let seller = Keys::generate();
+        pinned.seller_pubkey = seller.public_key().to_hex();
+        context.store.begin_award_attempt(&pinned, now_unix()).expect("pin");
+
+        // The AWARDED seller publishes a result for the job.
+        let client = Client::new(seller.clone());
+        client.add_relay(&context.home.config.relay_url).await.expect("add relay");
+        client.connect().await;
+        let delivered = EventBuilder::new(Kind::Custom(3403), "")
+            .tag(Tag::parse(vec!["e".to_owned(), job.clone()]).expect("e tag"))
+            .tag(Tag::parse(vec!["t".to_owned(), crate::gateway::MOBEE_TAG.to_owned()]).expect("t tag"))
+            .sign_with_keys(&seller)
+            .expect("sign delivery");
+        client.send_event(&delivered).await.expect("relay stores the seller's result");
+        client.disconnect().await;
+
+        resolve_award_attempts(&context).await;
+
+        let after = context.store.award_attempt(&job).expect("read").expect("row");
+        assert_eq!(
+            after.state,
+            store::AttemptState::Pending,
+            "the awarded seller DELIVERED — refusing here would repudiate work that happened, \
+             one-way and unrecoverable"
+        );
+        assert_eq!(
+            context.store.reservation(&job).expect("read").map(|(state, _)| state),
+            Some(reservations::ReservationState::Reserved),
+            "and the funds must stay held for the seller, not returned to the buyer"
         );
         let _ = std::fs::remove_dir_all(&root);
         drop(relay);
