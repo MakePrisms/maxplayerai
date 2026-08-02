@@ -29,6 +29,16 @@ services:
       - "1"
       # open for ANY work: claim untargeted/open-pool offers, not just #p==self.
       - --claim-open-pool
+    environment:
+      # Homogeneous execution slots — the max awarded jobs run at once.
+      # There is NO --slots CLI flag; concurrency is `[seller] slots` in
+      # config.toml, which this env override writes (same mechanism the
+      # slot-rig uses). Unset = 1 = serial.
+      #
+      # Each slot is a concurrent claude-agent-acp run, and a job costs TWO
+      # agent turns (job + retro), so N slots can mean 2N turns in flight.
+      # Raise with SELLER_SLOTS=n make up once you've watched the spend.
+      MOBEE_SELLER__SLOTS: "${SELLER_SLOTS:-3}"
     volumes:
       # persistent state: key (0600), wallet, config, journal.
       - seller-data:/data

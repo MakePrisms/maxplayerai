@@ -39,6 +39,29 @@ Expect `seller daemon online pubkey=… nip42=authenticated`. Record the pubkey.
 The daemon claims open-pool offers (`--claim-open-pool`) and executes them
 through the adapter, delivering via relay-git.
 
+## Execution slots (concurrency)
+
+There is **no `--slots` CLI flag**. Concurrency is `[seller] slots` in
+`config.toml`, and it defaults to **1 — serial**. The compose file sets it
+through the `MOBEE_SELLER__SLOTS` env override:
+
+```bash
+make up                  # 3 slots (the compose default)
+SELLER_SLOTS=7 make up   # 7 slots
+```
+
+Confirm what the daemon actually took, rather than what you asked for:
+
+```bash
+docker logs mobee-seller-shim-seller-1 2>&1 | grep 'execution slots'
+# seller node execution slots: 3 (claim-lapse timeout …s)
+```
+
+Two things to size against. Each slot is a concurrent `claude-agent-acp` run,
+and a job costs **two** agent turns (job + retro), so N slots can put 2N turns
+in flight — the API spend scales with the slot count, not the job count. And
+`total_budget_sats` still caps the node regardless of slots.
+
 ## ⚠️ Buyer and seller must run the same version
 
 The marketplace owns a contiguous kind block, `3400`–`3406`: receipt `3400`,
