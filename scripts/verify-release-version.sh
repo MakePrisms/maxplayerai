@@ -86,10 +86,19 @@ if [ -n "$BINARY" ]; then
     # constructed asset filename guards against upstream — a runner shipped under the racer's name
     # would install, run, and be the wrong program. A binary must announce the name it is invoked by.
     SHIPPED_AS="$(basename "$BINARY")"
-    reported="$("$BINARY" version)" || die "$BINARY failed to report its version"
-    [ "$reported" = "$SHIPPED_AS $VERSION" ] \
-        || die "$BINARY reports '$reported', expected '$SHIPPED_AS $VERSION' — this artifact is not the one this release is packaging"
-    echo "ok: artifact reports $reported"
+    EXPECTED="$SHIPPED_AS $VERSION"
+    # Both forms, `--version` first. They are separate dispatch arms, so a check that asks only the
+    # subcommand measures the path next to the one a stranger takes: it passes an artifact whose
+    # `--version` prints usage and exits 1, which is the state this repo actually shipped in. Asking
+    # the flag alone would trade one blind spot for the other, so assert that both answer, and that
+    # they answer the same thing.
+    for form in --version version; do
+        reported="$("$BINARY" "$form")" \
+            || die "$BINARY $form did not report a version — every release artifact must answer both '$SHIPPED_AS --version' and '$SHIPPED_AS version'"
+        [ "$reported" = "$EXPECTED" ] \
+            || die "$BINARY $form reports '$reported', expected '$EXPECTED' — this artifact is not the one this release is packaging"
+        echo "ok: artifact reports $reported ($form)"
+    done
 fi
 
 echo "PASS: everything states $VERSION"
