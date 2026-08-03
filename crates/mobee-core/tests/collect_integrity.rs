@@ -10,6 +10,12 @@
 //! `spent()==0` and the "no results" assertion.
 #![cfg(all(unix, feature = "wallet"))]
 
+// This binary needs the fixture only to serve the repo (`spawn` + `repo_url`); its
+// request-recording surface is what `relay_git_http_auth` asserts the NIP-98 wire against. Each
+// integration binary compiles its own copy of the module, so the parts this one does not call read
+// as dead here. Allowed at this `mod` site rather than inside the fixture, so dead-code analysis
+// stays live in the binary that does use them.
+#[allow(dead_code)]
 mod git_http_fixture;
 
 use std::fs;

@@ -125,6 +125,10 @@ pub(crate) struct AllowlistedDeliveryVerifier<V> {
 }
 
 impl<V> AllowlistedDeliveryVerifier<V> {
+    // Composed only by `delivery_git::PayPathDeliveryVerifier`, which is itself behind
+    // `git-delivery`; with that feature off there is no fetch-capable verifier to wrap. Gated
+    // rather than blanket-allowed so the dead-code signal survives where the caller exists.
+    #[cfg(any(feature = "git-delivery", test))]
     pub(crate) fn new(inner: V) -> Self {
         Self { inner }
     }
@@ -134,6 +138,7 @@ impl<V> AllowlistedDeliveryVerifier<V> {
         self.inner
     }
 
+    #[cfg(feature = "git-delivery")]
     pub(crate) fn inner(&self) -> &V {
         &self.inner
     }
