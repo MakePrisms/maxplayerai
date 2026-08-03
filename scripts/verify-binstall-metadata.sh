@@ -31,22 +31,66 @@
 
 set -euo pipefail
 
-VERSION="${1:-}"
-MANIFEST="${2:-crates/mobee/Cargo.toml}"
+VERSION=""
+MANIFEST=""
+# Targets whose asset this particular release is known not to publish. Nothing is skipped silently:
+# an override whose asset is absent FAILS unless the caller names the target here, and naming it
+# prints a loud UNVERIFIED line instead of an ok. See the waiver rules below.
+UNRELEASED=""
 
 REPO_HOST_PATH="github.com/MakePrisms/maxplayerai"
 # The supported platform set, which must be the same one install.sh enforces. Keeping the two in step
 # is the point: a target released here but refused there (or the reverse) is a user finding out from a
 # 404 which install paths were really meant to work.
-SUPPORTED_TARGETS=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl)
+#
+# `x86_64-apple-darwin` is deliberately absent — the matrix builds Apple Silicon only, and install.sh
+# refuses an Intel mac for exactly that reason.
+SUPPORTED_TARGETS=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin)
 
 die() { echo "verify-binstall-metadata: $*" >&2; exit 1; }
+usage() {
+    echo "usage: verify-binstall-metadata.sh <version> [path-to-manifest] [--unreleased <target>[,<target>…]]" >&2
+}
 
-[ -n "$VERSION" ] || die "usage: verify-binstall-metadata.sh <version> [path-to-manifest]"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --unreleased)
+            shift; [ $# -gt 0 ] || { usage; die "--unreleased needs a target"; }
+            UNRELEASED="$UNRELEASED $(printf '%s' "$1" | tr ',' ' ')" ;;
+        --unreleased=*)
+            UNRELEASED="$UNRELEASED $(printf '%s' "${1#--unreleased=}" | tr ',' ' ')" ;;
+        -h | --help) usage; exit 0 ;;
+        -*) usage; die "unknown option '$1'" ;;
+        *)
+            if [ -z "$VERSION" ]; then VERSION="$1"
+            elif [ -z "$MANIFEST" ]; then MANIFEST="$1"
+            else usage; die "unexpected argument '$1'"
+            fi ;;
+    esac
+    shift
+done
+
+[ -n "$VERSION" ] || { usage; die "a version is required"; }
+[ -n "$MANIFEST" ] || MANIFEST="crates/mobee/Cargo.toml"
 case "$VERSION" in
     v*) die "pass the version without a leading 'v' (got '$VERSION')" ;;
 esac
 [ -f "$MANIFEST" ] || die "no manifest at $MANIFEST"
+
+is_waived() {
+    case " $UNRELEASED " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
+# A waiver naming something outside the supported set is a typo, and a typo'd waiver waives nothing
+# while looking like it waived something.
+for t in $UNRELEASED; do
+    found=0
+    for supported in "${SUPPORTED_TARGETS[@]}"; do
+        [ "$t" != "$supported" ] || found=1
+    done
+    [ "$found" -eq 1 ] || die "--unreleased names '$t', which is not in the supported set (${SUPPORTED_TARGETS[*]})"
+done
 
 # Fail closed on tools rather than skipping a check.
 for t in curl tar awk; do
@@ -108,6 +152,18 @@ echo "ok: v$VERSION publishes:"
 sed 's/^/     /' "$WORK/published"
 
 # ── Every supported target has both settings, and they resolve ───────────────────────────────────
+# Two outcomes are possible per target and they are NOT the same result:
+#
+#   VERIFIED   — the asset is in this release's SHA256SUMS, downloaded, and bin-dir is a real member.
+#   UNVERIFIED — this release publishes no such asset. Permitted only when the caller named the
+#                target in --unreleased, and reported as UNVERIFIED, never as ok.
+#
+# ★ The reason for the waiver rather than a silent skip: `aarch64-apple-darwin` is real and supported,
+#   but v0.0.1 was cut from a linux-only matrix, so there is no darwin asset to resolve against yet. A
+#   check that quietly passed on the absent one would report three verified targets while having
+#   touched two — the shape where a skip is indistinguishable from a pass.
+verified=0
+unverified=""
 for target in "${SUPPORTED_TARGETS[@]}"; do
     table="package.metadata.binstall.overrides.$target"
 
@@ -135,8 +191,24 @@ for target in "${SUPPORTED_TARGETS[@]}"; do
     esac
 
     asset="${url##*/}"
-    grep -qxF "$asset" "$WORK/published" \
-        || die "$target: pkg-url resolves to '$asset', which v$VERSION does not publish. It publishes: $(tr '\n' ' ' < "$WORK/published")"
+
+    if ! grep -qxF "$asset" "$WORK/published"; then
+        # Absent from the release. Only a named waiver makes this anything other than a failure.
+        is_waived "$target" \
+            || die "$target: pkg-url resolves to '$asset', which v$VERSION does not publish. It publishes: $(tr '\n' ' ' < "$WORK/published"). If this release genuinely predates that platform, say so explicitly: --unreleased $target"
+        echo "⚠ UNVERIFIED: $target"
+        echo "     pkg-url -> $asset — v$VERSION publishes NO such asset (waived via --unreleased)"
+        echo "     bin-dir -> $dir — NOT checked against any archive; nothing here proves it"
+        unverified="$unverified $target"
+        continue
+    fi
+
+    # A waiver for a target the release DOES publish is stale, and a stale waiver is permanent
+    # blindness: it would keep excusing a real failure long after the reason expired. Fail so the
+    # waiver has to be removed on the first release that carries the asset.
+    if is_waived "$target"; then
+        die "$target: --unreleased says v$VERSION has no '$asset', but the release publishes it — drop the waiver so this target is actually checked"
+    fi
 
     # ── bin-dir against the real archive ────────────────────────────────────────────────────────
     curl -fsSL --proto '=https' -o "$WORK/$asset" "$url" \
@@ -149,6 +221,7 @@ for target in "${SUPPORTED_TARGETS[@]}"; do
     echo "ok: $target"
     echo "     pkg-url -> $asset (published)"
     echo "     bin-dir -> $dir (present in the archive)"
+    verified=$((verified + 1))
 done
 
 # ── Nothing is configured for a target we do not release ─────────────────────────────────────────
@@ -168,4 +241,15 @@ for target in $declared; do
 done
 echo "ok: overrides cover exactly ${SUPPORTED_TARGETS[*]}"
 
-echo "PASS: the binstall templates resolve to v$VERSION assets that exist, at paths that exist inside them"
+# ── The denominator, always ─────────────────────────────────────────────────────────────────────
+# The verdict states how many targets were actually resolved against the release, out of how many
+# exist. A bare "PASS" over a waived target would be the claim this whole waiver mechanism exists to
+# avoid making.
+total="${#SUPPORTED_TARGETS[@]}"
+if [ -n "$unverified" ]; then
+    echo "PARTIAL: $verified/$total targets resolved against v$VERSION assets that exist, at paths inside them."
+    echo "         NOT verified (v$VERSION publishes no asset for them):$unverified"
+    echo "         Their templates are shape-checked only — re-run against a release that carries them."
+else
+    echo "PASS: all $total targets resolve to v$VERSION assets that exist, at paths that exist inside them"
+fi

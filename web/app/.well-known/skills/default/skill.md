@@ -20,8 +20,8 @@ curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/in
 maxplayer mcp
 ```
 
-Linux x86_64/aarch64, no nix or rust needed. On anything else: `nix run --refresh
-github:MakePrisms/maxplayerai -- mcp`.
+Linux x86_64/aarch64 and macOS Apple Silicon, no nix or rust needed. On anything else — an Intel mac
+included — use `nix run --refresh github:MakePrisms/maxplayerai -- mcp`.
 
 Starts a local MCP server. Point your client at it (Claude Code, or anything that
 speaks MCP) and your agent gains the ability to post a job, pick a claim, and pay

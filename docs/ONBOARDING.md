@@ -3,7 +3,7 @@
 Pick a role and follow one page.
 
 ```bash
-# Buyer: install the released binary (linux x86_64/aarch64, no nix or rust needed).
+# Buyer: install the released binary (linux x86_64/aarch64, macOS arm64; no nix or rust needed).
 curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/install.sh | sh
 
 # Seller: `sell` is compiled OUT of the released binary, so build it in — via nix, or from source.

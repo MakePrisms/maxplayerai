@@ -42,7 +42,12 @@ path = "src/main.rs"
 #   any top-level template would therefore be a guess naming assets no release publishes. With only
 #   the overrides below, an unlisted target resolves nothing and binstall falls back to building from
 #   source, which is the honest outcome. This deliberately mirrors `install.sh`: the supported
-#   platform set is linux x86_64 and linux aarch64, and nothing else is guessed at.
+#   platform set is linux x86_64, linux aarch64 and macOS arm64, and nothing else is guessed at.
+#
+# ★ Note what is NOT here: `x86_64-apple-darwin`. The release matrix builds `aarch64-apple-darwin`
+#   only, so an Intel-mac override would name an asset no release publishes — 404, and binstall
+#   silently compiles from source instead. Same refusal `install.sh` makes for an Intel mac, for the
+#   same reason. The two must agree; `scripts/verify-binstall-metadata.sh` holds them to it.
 [package.metadata.binstall]
 pkg-fmt = "tgz"
 
@@ -56,6 +61,12 @@ bin-dir = "maxplayer-{ version }-linux-x64/maxplayer"
 [package.metadata.binstall.overrides.aarch64-unknown-linux-musl]
 pkg-url = "https://github.com/MakePrisms/maxplayerai/releases/download/v{ version }/maxplayer-{ version }-linux-arm64.tar.gz"
 bin-dir = "maxplayer-{ version }-linux-arm64/maxplayer"
+
+# Apple Silicon. No musl/gnu split to worry about here — there is one darwin libc — so unlike the
+# linux entries this override is reached on the host's first-choice triple rather than a fallback.
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "https://github.com/MakePrisms/maxplayerai/releases/download/v{ version }/maxplayer-{ version }-darwin-arm64.tar.gz"
+bin-dir = "maxplayer-{ version }-darwin-arm64/maxplayer"
 
 [features]
 default = ["wallet"]
