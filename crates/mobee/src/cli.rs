@@ -35,6 +35,9 @@ where
         }
         Some("mcp") if args.len() == 2 => crate::mcp::run(out, err),
         Some("buyer") => crate::buyer::run(&args[2..], out, err),
+        // Seller advertise surface — compiled in only with `acp` (#360). On a buyer-only build this
+        // falls through to `usage`, so `sell` cannot boot or publish a seat it can never deliver on.
+        #[cfg(feature = "acp")]
         Some("sell") => crate::sell::run(&args[2..], out, err),
         Some("accept") => crate::accept_cli::run(&args[2..], out, err),
         Some("collect") => crate::collect_cli::run(&args[2..], out, err),
@@ -287,9 +290,17 @@ fn write_usage(out: &mut dyn Write) {
         out,
         "  maxplayer stub-pay <amount_sats>   # exercise the config-bound budget gate\n"
     );
+    // The seller surface is listed only when it is compiled in (`acp`); a buyer-only build must not
+    // advertise a command that would publish a seat it cannot deliver on (#360). `run`/`mock` stay
+    // on every build — they fail honestly with a rebuild hint and never publish anything.
+    #[cfg(feature = "acp")]
+    let _ = write!(
+        out,
+        "  maxplayer sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool]\n  maxplayer sell   # zero-prompt relaunch from config.toml\n"
+    );
     let _ = writeln!(
         out,
-        "  maxplayer sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool]\n  maxplayer sell   # zero-prompt relaunch from config.toml\n  maxplayer accept <job_id> <claim_id> [--result-id <id>]   # buyer: bind a delivered result (collect folds this in)\n  maxplayer collect <job_id> [--out <folder>]   # buyer: accept-if-needed + verify + pay + materialize\n  maxplayer log replay <path>\n  maxplayer mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n  maxplayer run --agent-command <cmd> --task <text> --log <path> [--cwd <dir>] [--job-id <id>] [--permission-policy allow|allow-always|deny] [--idle-timeout <secs>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error"
+        "  maxplayer accept <job_id> <claim_id> [--result-id <id>]   # buyer: bind a delivered result (collect folds this in)\n  maxplayer collect <job_id> [--out <folder>]   # buyer: accept-if-needed + verify + pay + materialize\n  maxplayer log replay <path>\n  maxplayer mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n  maxplayer run --agent-command <cmd> --task <text> --log <path> [--cwd <dir>] [--job-id <id>] [--permission-policy allow|allow-always|deny] [--idle-timeout <secs>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error"
     );
 }
 
@@ -516,6 +527,38 @@ mod tests {
         assert_eq!(code, 1);
         assert!(out.is_empty());
         assert!(err.contains("Usage:"));
+    }
+
+    // #360: the seller advertise surface is gated on `acp`. These two tests are the same assertion
+    // read from opposite feature builds — the verdict must MOVE with the feature, which is what
+    // proves the gate binds `sell` rather than something incidental.
+    #[cfg(not(feature = "acp"))]
+    #[test]
+    fn sell_is_absent_from_the_buyer_surface() {
+        // Not advertised in help — a buyer-only build never names a command it cannot honour.
+        let (code, out, _err) = run_captured(["maxplayer", "--help"]);
+        assert_eq!(code, 0);
+        assert!(
+            !out.contains("maxplayer sell"),
+            "buyer build must not list `sell` in usage:\n{out}"
+        );
+        // Invoking it cannot boot the seller: it is a plain usage error, identical to any unknown
+        // command, and never reaches the discoverability/heartbeat publish.
+        let (code, out, err) = run_captured(["maxplayer", "sell", "--agent", "claude", "--rate-sats", "100"]);
+        assert_eq!(code, 1);
+        assert!(out.is_empty());
+        assert!(err.contains("Usage:"));
+    }
+
+    #[cfg(feature = "acp")]
+    #[test]
+    fn sell_is_present_on_the_seller_surface() {
+        let (code, out, _err) = run_captured(["maxplayer", "--help"]);
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("maxplayer sell"),
+            "acp build must list `sell` in usage:\n{out}"
+        );
     }
 
     #[test]

@@ -8,6 +8,11 @@ mod doctor;
 mod exec;
 mod mcp;
 mod profile_cli;
+// The `sell` surface is the seller advertise path: it publishes kind-0 + NIP-89 discoverability and
+// boots the heartbeat loop. `acp` compiles in the agent-execution that lets a seat actually deliver;
+// without it a booted seller advertises a seat it can never run a job on and a buyer loses the sats
+// at award (#360). Gate the whole surface on `acp` so a buyer-only build cannot advertise at all.
+#[cfg(feature = "acp")]
 mod sell;
 #[cfg(feature = "stub-pay")]
 mod stub_pay_cli;
