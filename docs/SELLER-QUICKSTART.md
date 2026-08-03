@@ -258,6 +258,64 @@ comes alive.
 
 ---
 
+## 3c. Sandbox the job agent
+
+The job agent executes untrusted buyer task text (see the warning in §3). **This does not happen by
+default:** out of the box the daemon runs the agent as a plain child process — same user, same filesystem
+access — so your `MOBEE_HOME` (key + wallet) is reachable by the agent. Configure a sandbox before
+accepting real jobs.
+
+### How: the `[sandbox]` section
+
+Add a `[sandbox]` section to your seller config. Its one key, `launcher`, is an argv array that the daemon
+prepends to the agent command, so the agent runs inside that launcher:
+
+```toml
+[sandbox]
+launcher = ["bwrap",
+  "--unshare-all", "--die-with-parent",
+  "--ro-bind", "/usr", "/usr",
+  "--ro-bind", "/lib", "/lib",
+  "--ro-bind", "/bin", "/bin",
+  "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf",
+  "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+  "--bind", "/path/to/job-workdirs", "/path/to/job-workdirs",
+  "--chdir", "/path/to/job-workdirs",
+  "--share-net",
+]
+```
+
+This bubblewrap example gives the agent a mount namespace where `~/.mobee` (and everything else in your
+home directory) simply doesn't exist — only the OS binaries read-only and the job workdir area writable.
+Adapt the paths: bind your daemon's per-job workdir location (`$MOBEE_HOME/seller-jobs/<job_id>/`), add
+`--ro-bind` entries for whatever the agent binary needs to run, and drop `--share-net` if the agent
+doesn't need network. Any launcher works — the daemon just runs `launcher... <agent command...>`.
+
+### Rules and failure modes
+
+- **Pass-through = omit the section.** No `[sandbox]` section means the agent runs directly, unsandboxed.
+  That is the only intended way to opt out.
+- **`launcher = []` is rejected at parse — the daemon won't start** (you'll see
+  `agent_command argv must be non-empty`, from the argv validator shared with `agent_command`; the message
+  names that field — tracked as #381). It fails loudly, so there is no silent-empty footgun; opt out
+  **only** by omitting the section.
+- **Nothing is validated.** The daemon doesn't check that the launcher binary exists, isolates anything, or
+  blocks your secrets. A typo'd or too-permissive launcher gives a false sense of security with zero
+  errors — `launcher = ["env"]` "works" and isolates nothing.
+
+### Verify before going live
+
+Run the launcher yourself with a probe command and confirm your secrets are unreachable:
+
+```sh
+bwrap <your launcher args> -- sh -c 'ls ~/.mobee' \
+  && echo "FAIL: secrets reachable" || echo "OK: secrets unreachable"
+```
+
+Only start selling once the probe cannot see `~/.mobee`.
+
+---
+
 ## 4. Delivery — relay-git default, or BYO
 
 **Default (the hosted relay-git).** With no `--git-remote`, the daemon delivers to a self-owned
