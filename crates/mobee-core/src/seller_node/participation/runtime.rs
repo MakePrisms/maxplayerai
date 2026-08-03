@@ -559,7 +559,7 @@ impl Participation {
             // will still talk to us is a precondition of all of them, and it belongs to none of them.
             // `drain_reproves` is the exception because it IS that gate.
             self.drain_resends(now).await;
-            self.drain_reproves(now).await;
+            self.drain_reproves(now).await?;
 
             // ★ THE `?`s BELOW CARRY ONLY `Store` ERRORS, BY CONSTRUCTION — and that is a property to
             // re-check, not to trust, because it is what keeps one relay from emptying this batch.
@@ -1115,19 +1115,19 @@ impl Participation {
     /// re-proving together would serialise N timeouts while every healthy relay's traffic waited. Taking one
     /// caps the pump's exposure at a single probe regardless of how many relays failed at once; the rest keep
     /// their deadline and are picked up on later ticks.
-    async fn drain_reproves(&mut self, now: i64) {
+    async fn drain_reproves(&mut self, now: i64) -> Result<(), ParticipationError> {
         let Some(url) = self
             .live
             .iter()
             .find(|(_, live)| live.reprove_due.is_some_and(|at| now >= at))
             .map(|(url, _)| url.clone())
         else {
-            return;
+            return Ok(());
         };
         // `Client` is `Arc`-backed, so cloning the handle costs a refcount and frees the borrow on
         // `self.live` — which matters because the denial path REMOVES the entry.
         let Some(reader) = self.live.get(&url).map(|live| live.reader.clone()) else {
-            return;
+            return Ok(());
         };
 
         let outcome = probe::probe_access(
@@ -1143,7 +1143,7 @@ impl Participation {
             if let Some(entry) = self.live.remove(&url) {
                 entry.reader.disconnect().await;
             }
-            return;
+            return Ok(());
         }
 
         // ⛔ THE QUARANTINE IS **NOT** LIFTED HERE, AND IT USED TO BE. Clearing `reprove_due` before the
@@ -1154,7 +1154,7 @@ impl Participation {
         // arm, with the rest of what success earns.
         let rebuilt = {
             let Some(entry) = self.live.get(&url) else {
-                return;
+                return Ok(());
             };
             subscribe_wake_surface(&entry.reader, &entry.engine, self.me).await
         };
@@ -1207,6 +1207,16 @@ impl Participation {
             // is `PGateRelay` plus stored-event service plus a close-after-serving-the-echo control. Until
             // then this is insurance with a reason, and its presence is not coverage.
             Err(error) => {
+                // ★★★ AND THE STORE IS SPLIT OUT HERE TOO — THE FOURTH SITE, AND I HAD ALREADY WRITTEN
+                // THIS EXACT SPLIT IN `probe_one_due` ONE FUNCTION AWAY. `subscribe_wake_surface` reads
+                // cursors, so it returns `Store` as readily as `Relay`, and folding both into the relay's
+                // silence budget charges OUR sqlite to a healthy peer — the same misattribution the last
+                // three rounds each fixed in a different place. A local failure is identical across every
+                // relay, which is exactly why it cannot be any relay's fault.
+                if let ParticipationError::Store(_) = error {
+                    self.relay_faults = self.relay_faults.saturating_add(1);
+                    return Err(error);
+                }
                 self.relay_faults = self.relay_faults.saturating_add(1);
                 self.roster.record_probe(
                     &url,
@@ -1220,6 +1230,7 @@ impl Participation {
                 }
             }
         }
+        Ok(())
     }
 
     /// Re-subscribe every channel whose suppression backoff has elapsed, one attempt each.
