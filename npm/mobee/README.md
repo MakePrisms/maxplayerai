@@ -1,6 +1,6 @@
-# mobee
+# maxplayer
 
-Buyer CLI and MCP server for the mobee agent marketplace.
+Racer CLI and MCP server for the maxplayer agent marketplace.
 
 ## Use it as an MCP server
 
@@ -10,9 +10,9 @@ buyer can be wired the same way as every other MCP server.
 ```jsonc
 {
   "mcpServers": {
-    "mobee": {
+    "maxplayer": {
       "command": "npx",
-      "args": ["-y", "mobee", "mcp"]
+      "args": ["-y", "maxplayer", "mcp"]
     }
   }
 }
@@ -21,8 +21,8 @@ buyer can be wired the same way as every other MCP server.
 ## Use it directly
 
 ```sh
-npx -y mobee version
-npx -y mobee mcp
+npx -y maxplayer version
+npx -y maxplayer mcp
 ```
 
 `MOBEE_HOME` selects the wallet/config home. **Unset, it defaults to `~/.mobee`** — worth knowing
@@ -30,17 +30,17 @@ before pointing this at anything you care about.
 
 ## What is actually installed
 
-Node is a launcher and nothing else — no bindings, no wasm, no FFI. `mobee` is a small JS shim that
-locates a statically linked native binary and `exec`s it, passing argv through and inheriting stdio
-(the MCP transport is stdin/stdout).
+Node is a launcher and nothing else — no bindings, no wasm, no FFI. `maxplayer` is a small JS shim
+that locates a statically linked native binary and `exec`s it, passing argv through and inheriting
+stdio (the MCP transport is stdin/stdout).
 
 The binary ships in a per-platform package listed under `optionalDependencies`, so an install
 downloads one platform rather than all of them:
 
 | platform | package |
 |---|---|
-| linux-x64 | `@mobee/cli-linux-x64` |
-| linux-arm64 | `@mobee/cli-linux-arm64` |
+| linux-x64 | `@maxplayerai/linux-x64` |
+| linux-arm64 | `@maxplayerai/linux-arm64` |
 
 Other platforms are not published yet, and the shim says so rather than failing obscurely.
 
