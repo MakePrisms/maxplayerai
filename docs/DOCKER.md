@@ -89,6 +89,94 @@ base image. Two options:
   Then pass the agent's credential (never bake it in) at run time, e.g.
   `-e ANTHROPIC_API_KEY=...`. Consult the agent's own docs for auth.
 
+## Sandbox the job agent
+
+**The shipped image does NOT satisfy this by default.** With no sandbox configured, the daemon spawns
+the job agent as a direct child process — same UID as the daemon, working directory `/data`. That means
+`/data` (your key, wallet, config, and journal) is fully readable and writable by the agent out of the
+box. Configure the `[sandbox]` section below so the agent gets no `~/.mobee`/`/data` access, no wallet
+tools or keys, and no host secrets.
+
+### The `[sandbox]` config section
+
+The seller config supports an optional `[sandbox]` section with a single key, `launcher` — an argv
+array. When the section is present, the launcher argv is **prepended** to the agent command, so the
+agent runs inside whatever OS-level sandbox the launcher provides:
+
+```toml
+[sandbox]
+launcher = ["<sandbox-binary>", "<arg1>", "<arg2>", "..."]
+```
+
+Semantics, exactly as implemented:
+
+- **Section present** → the daemon runs `launcher... <agent command...>` as one command line. The
+  launcher is responsible for all isolation; the daemon does nothing else.
+- **Section absent** → pass-through: the agent command runs directly as a child of the daemon, with the
+  daemon's UID and filesystem access. **This is the only supported way to express pass-through.**
+- **`launcher = []` (empty array)** → **rejected at config parse — the daemon refuses to start** (the
+  shared argv validator errors `agent_command argv must be non-empty`; it is shared with `agent_command`,
+  so the message names that field — tracked as #381). Fail-closed: you cannot accidentally ship an empty
+  launcher that silently disables the sandbox. Opt out **only** by omitting the whole `[sandbox]` section.
+
+**The daemon does NOT validate the launcher.** It does not check that the binary exists, that it is
+actually a sandboxing tool, or that `/data` is unreachable from inside it. It blindly prepends the argv.
+`launcher = ["env"]` would "work" and isolate nothing. Verifying that your launcher actually blocks
+`/data` is entirely your responsibility — see "Verify" below.
+
+### Working example: bubblewrap inside the container
+
+Install `bubblewrap` in your image (e.g. `apk add bubblewrap` / `apt-get install bubblewrap`), then add
+to your seller config (the config file lives under `MOBEE_HOME`, i.e. `/data` in this image):
+
+```toml
+[sandbox]
+launcher = [
+  "bwrap",
+  "--unshare-all",
+  "--die-with-parent",
+  "--ro-bind", "/usr", "/usr",
+  "--ro-bind", "/lib", "/lib",
+  "--ro-bind", "/bin", "/bin",
+  "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf",
+  "--proc", "/proc",
+  "--dev", "/dev",
+  "--tmpfs", "/tmp",
+  "--bind", "/work/jobs", "/work/jobs",
+  "--chdir", "/work/jobs",
+  "--share-net",
+]
+```
+
+Key points about this example:
+
+- `/data` is **not bound at all**, so the key and wallet simply do not exist inside the agent's mount
+  namespace. Not binding it is stronger than binding it read-only.
+- Only the per-job work area (`/work/jobs` here — adapt to wherever your daemon places job workdirs) is
+  writable. Give the agent only the per-job workdir it needs, nothing more.
+- Adjust the read-only binds (`/usr`, `/lib`, `/bin`, `/lib64` on glibc systems, etc.) to whatever your
+  agent binary needs to execute. Drop `--share-net` if the agent doesn't need network access.
+- Because `WORKDIR` in the image is `/data`, use `--chdir` so the agent does not start (and fail) in a
+  directory that doesn't exist inside the sandbox.
+- `bwrap` needs user namespaces; depending on your container runtime you may need to run the container
+  with a seccomp/apparmor profile that permits them (e.g. `--security-opt seccomp=unconfined` or a custom
+  profile). Alternatives if you can't grant that: a launcher argv invoking `setpriv`/`runuser` to drop to
+  a UID with no permission on `/data`, or `systemd-run --user` with sandboxing properties on non-container
+  hosts.
+
+### Verify the sandbox actually works
+
+The daemon won't check this for you. After configuring, run your launcher by hand with a probe in place
+of the agent command and confirm `/data` is gone:
+
+```sh
+bwrap <your args from launcher> -- sh -c 'ls /data' \
+  && echo "FAIL: /data reachable" || echo "OK: /data unreachable"
+```
+
+Do the same for any other secret paths on the host. Only put the seller into service once this probe
+fails to see `/data`.
+
 ## Bring your own key
 
 The default is fine for most operators: the key auto-generates in the volume and
