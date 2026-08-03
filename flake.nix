@@ -73,6 +73,25 @@
               nativeBuildInputs = [ pkgs.pkg-config ];
             }
           );
+
+          # The strfry write-policy plugin (crate `mobee-relay-write-policy`, binary
+          # `mobee-write-policy`). A separate derivation, not a `mobeeArgs` variant: it builds only
+          # this one workspace crate — serde/serde_json, no C deps — so it needs neither the `acp`
+          # feature nor pkg-config, and must not pull in the egui/sqlite/libgit2 members. Deps still
+          # vendor from the one workspace `Cargo.lock`; `-p` keeps the compile to this crate.
+          # `lib.getExe` in `nixosModules.relay` resolves `meta.mainProgram`.
+          relay-write-policy = pkgs.rustPlatform.buildRustPackage {
+            pname = "mobee-relay-write-policy";
+            version = "0.1.0";
+            src = self;
+            cargoLock.lockFile = ./Cargo.lock;
+            cargoBuildFlags = [
+              "-p"
+              "mobee-relay-write-policy"
+            ];
+            doCheck = false;
+            meta.mainProgram = "mobee-write-policy";
+          };
         }
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           # For the system doing the building.
@@ -85,6 +104,13 @@
           buyer-static-aarch64 = buyerStatic pkgs.pkgsCross.aarch64-multiplatform-musl.pkgsStatic;
         }
       );
+
+      # NixOS module for the launch relay: `services.maxplayer.relay`, a strfry relay whose write
+      # policy enforces a single namespace and is born empty. The host repo imports this and wires
+      # the plugin as `writePolicyPackage = <this flake>.packages.<system>.relay-write-policy`,
+      # supplying hostname/hardware/secrets itself. Dot-form on purpose: a sibling `nixosModules.runner`
+      # (#280) then merges as its own line rather than a conflicting `nixosModules` block.
+      nixosModules.relay = import ./nix/relay.nix;
 
       apps = forAllSystems (system: {
         default = {
