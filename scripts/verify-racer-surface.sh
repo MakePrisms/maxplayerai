@@ -82,15 +82,21 @@ set -e
 if grep -q 'maxplayer sell' <<<"$help_out"; then
     die "\`maxplayer sell\` is listed in --help — the seller advertise surface is compiled into the racer artifact, which must ship buyer-only (#360):"$'\n'"$help_out"
 fi
-# Belt-and-suspenders: invoking it must not reach the advertise/boot path — a plain usage error only.
+# Belt-and-suspenders: invoking it must land on the SAME generic usage error an unknown command
+# gets — positive proof the arm fell through to `usage`, not that `sell` booted and happened to fail
+# early (which would still be nonzero and might not print any of the advertise log strings below).
 set +e
 sell_out="$("$BINARY" sell --agent claude --rate-sats 100 2>&1)"
 sell_rc=$?
 set -e
-if [ "$sell_rc" -eq 0 ]; then
-    die "\`maxplayer sell\` succeeded on the racer artifact — the seller surface is compiled in"
+if [ "$sell_rc" -ne 1 ]; then
+    die "\`maxplayer sell\` exited $sell_rc, not the usage-error 1 an absent command falls through to — the seller surface may be compiled in:"$'\n'"$sell_out"
 fi
-if grep -qE 'discoverable kind0=|relay-git seed probe|discoverability publish' <<<"$sell_out"; then
+if ! grep -q 'Usage:' <<<"$sell_out"; then
+    die "\`maxplayer sell\` did not print the generic usage text, so it did not fall through to \`usage\` — the seller surface may be compiled in and failing after boot:"$'\n'"$sell_out"
+fi
+# Secondary: it must never have reached any advertise/boot log line (kind-0/NIP-89/heartbeat/NIP-34).
+if grep -qE 'discoverable kind0=|relay-git seed probe|relay-git NIP-34 announce|discoverability publish' <<<"$sell_out"; then
     die "\`maxplayer sell\` reached the discoverability/boot path on the racer artifact:"$'\n'"$sell_out"
 fi
 echo "ok: sell absent — the seller advertise surface (kind-0/NIP-89/heartbeat) is not compiled in"
