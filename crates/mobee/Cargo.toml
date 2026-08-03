@@ -18,7 +18,12 @@ path = "src/main.rs"
 
 [features]
 default = ["wallet"]
-acp = ["mobee-core/acp"]
+# `acp` compiles in the seller surface (agent execution + the `sell` advertise path). That surface
+# is a marketplace participant — it signs, delivers over relay-git, and settles — so it requires
+# `wallet` (keys, mint, git2, nostr-sdk). Pulling `wallet` here states that dependency in the graph:
+# there is no acp-without-wallet build, so the `#[cfg(feature = "acp")]` gates on the seller surface
+# are sound (they can rely on the wallet-gated code being present). #360.
+acp = ["wallet", "mobee-core/acp"]
 wallet = ["mobee-core/wallet", "dep:git2", "dep:nostr-sdk"]
 # Dev-only: exposes `mobee stub-pay` (budget-gate exercise). Not on the settlement
 # path and not part of the default user CLI surface.
