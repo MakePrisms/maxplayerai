@@ -132,8 +132,8 @@ git cat-file -e "$TAG":.github/workflows/release.yml && echo present || echo abs
 
 | platform | runner | shipped as |
 |---|---|---|
-| linux-x64 | `ubuntu-latest` | archive + `@maxplayerai/linux-x64` |
-| linux-arm64 | `ubuntu-24.04-arm` | archive + `@maxplayerai/linux-arm64` |
+| linux-x64 | `ubuntu-latest` | archive + `maxplayer-linux-x64` |
+| linux-arm64 | `ubuntu-24.04-arm` | archive + `maxplayer-linux-arm64` |
 | darwin-arm64 | `macos-14` | archive only |
 
 darwin-arm64 has no npm payload package yet, so macOS users download the archive; `npx maxplayer` tells
