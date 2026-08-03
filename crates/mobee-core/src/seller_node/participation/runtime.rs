@@ -322,7 +322,9 @@ impl Participation {
             // raced rather than arranged. The ORDERING above is what the fix actually is — the record
             // follows the insert — and that much is plain in the control flow. Treat this handler as
             // insurance with a reason, not as a proven repair, and do not let its presence read as
-            // coverage. Same standing as [`clear_registrations`]'s per-id loop, one lane over.
+            // coverage. Same standing as [`clear_registrations`]'s per-id loop, one lane over. The
+            // `Store` split just above and the pump's propagation of it are untested for the same
+            // reason — reaching either needs this branch.
             self.roster.record_probe(
                 &url,
                 ProbeOutcome::Unreachable(format!(
@@ -610,11 +612,23 @@ impl Participation {
             // Traffic we have already read is now judged first, and the relay we are not yet serving
             // waits for the tail of the tick instead of the head of it.
             //
-            // Best-effort by construction. The error can only be the store's or the subscription's, and
-            // a relay we are not yet serving must not be able to empty a batch or wedge the pump. Its
-            // failure is recorded as a silence, so the backoff brings it round again and the attempt
-            // ceiling stops that being forever.
+            // Best-effort FOR A RELAY'S OWN FAILURE, and only that. A relay we are not yet serving must
+            // not be able to empty a batch or wedge the pump, so a subscribe that failed on the wire is
+            // logged; it was recorded as a silence, and the backoff brings it round again while the
+            // attempt ceiling stops that being forever.
+            //
+            // ★★ A `Store` ERROR IS NOT THAT, AND SWALLOWING IT SPINS. It is recorded against no relay —
+            // deliberately, because our sqlite failing is not any peer's fault — which means nothing
+            // moves: the relay stays due, and the next tick spends another connect and another probe on
+            // a HEALTHY relay to fail in the same place, every pass, forever. Fixing the misattribution
+            // without fixing the loop just traded a wrong verdict for a hot one.
+            //
+            // So it propagates, which is what every other `Store` error in this pump already does for
+            // the reason given below: OUR persistence failing is not a thing to carry on through.
             if let Err(error) = self.probe_one_due(now).await {
+                if let ParticipationError::Store(_) = error {
+                    return Err(error);
+                }
                 eprintln!(
                     "participation: re-probe of a due relay failed ({error}); it stays unproven and \
                      comes back once its backoff elapses"

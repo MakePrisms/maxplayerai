@@ -170,10 +170,18 @@ pub async fn probe_access(
         // on the same side" described the code accurately and the word chosen did not matter.
         // Splitting the verdicts falsified it in place, and a comment cannot recompile.
         //
-        // ⚠ THE QUALIFIER IS LOAD-BEARING. `fetch_events` folds a relay's `CLOSED` into the same
-        // `Err` as a timeout or a dead socket, so this branch carries both a relay that spoke and a
-        // transport that did not. Same prefix test as the publish path, same default: a reason we
-        // failed to OBTAIN is not a refusal we were GIVEN, unless the relay put its name to it.
+        // ⚠ THE QUALIFIER IS LOAD-BEARING, AND WHAT IT GUARDS IS NOT SETTLED. Whether a relay's
+        // `CLOSED` ever reaches this `Err` at all is a question about `fetch_events` that two review
+        // passes answered in OPPOSITE directions — one said the pool folds `CLOSED` into
+        // `Error::RelayMessage`, the other that per-relay stream errors are logged and the fetch just
+        // ends empty. Neither was checked against the SDK source, so nothing here claims it: the
+        // prefix test runs because it is free and correct IF a relay's words arrive, and if they
+        // never do this branch simply carries transport failures and the durable arm is unreachable.
+        // Either way the verdict is right; only the reachability is unknown, and it is written down
+        // as unknown rather than asserted in whichever direction was read most recently.
+        //
+        // The case that is KNOWN to lose the relay's words is the other one — a refusal arriving as
+        // `Ok(empty)`, indistinguishable from an empty relay. That is #346, and it fails safe.
         Err(error) => {
             let reason = error.to_string();
             if is_relay_refusal(&reason) {
@@ -204,13 +212,29 @@ pub async fn probe_access(
 /// better prefix — the one string least entitled to a permanent verdict. Anything unrecognised falls
 /// through to `false` on purpose: an unknown reason has not demonstrated that the relay refused us,
 /// and the mistake that costs a relay for the life of the process is the one on the other side.
+/// ★★ WHICHEVER PREFIX COMES FIRST WINS, and that is the whole of the algorithm. A bare
+/// `contains` over the durable set read `"error: restricted: try later"` as terminal — the relay's
+/// own words are `error:`, the catch-all this function deliberately treats as retryable, and the
+/// `restricted:` after it is prose. That is a false positive in the expensive direction, which is
+/// the one thing this function exists to avoid.
+///
+/// `starts_with` cannot be used instead: the reason arrives WRAPPED, because `undelivered` prepends
+/// the relay URL and the SDK embeds a relay's message inside its own error Display. Position 0 is
+/// therefore ours, not the relay's. Taking the EARLIEST known prefix finds the relay's own opening
+/// word wherever the wrapper put it, and a later prefix cannot overrule an earlier one.
 fn is_relay_refusal(reason: &str) -> bool {
-    const DURABLE_REFUSALS: [&str; 4] = ["blocked:", "restricted:", "invalid:", "pow:"];
-    // `contains` rather than `starts_with`: these reasons arrive wrapped — `undelivered` prefixes the
-    // relay URL, and the SDK embeds a relay's words inside its own error Display.
-    DURABLE_REFUSALS
-        .iter()
-        .any(|prefix| reason.contains(prefix))
+    /// The relay refusing durably: it will keep saying no, or the event is ours to fix.
+    const DURABLE: [&str; 4] = ["blocked:", "restricted:", "invalid:", "pow:"];
+    /// The relay declining FOR NOW. `error:` is NIP-01's catch-all and belongs here for that reason.
+    const TRANSIENT: [&str; 3] = ["auth-required:", "rate-limited:", "error:"];
+
+    let earliest = |set: &[&str]| set.iter().filter_map(|token| reason.find(token)).min();
+    match (earliest(&DURABLE), earliest(&TRANSIENT)) {
+        (Some(durable), Some(transient)) => durable < transient,
+        (Some(_), None) => true,
+        // No durable prefix at all, or only a transient one: not a refusal we were given.
+        (None, _) => false,
+    }
 }
 
 /// Whether a relay will retain this event long enough to answer for it.
@@ -537,6 +561,13 @@ mod tests {
             ("auth-required: authenticate first", false),
             ("rate-limited: slow down", false),
             ("error: could not connect to the database", false),
+            // ★ THE WRAPPER CASES, and the first is why this is not a `contains`. The relay's own
+            // opening word is `error:`; the `restricted:` after it is prose inside that message, and
+            // reading it as the verdict makes the catch-all terminal — the exact prefix this function
+            // is most careful to keep retryable.
+            ("error: upstream said restricted: reindexing, try later", false),
+            // Ours wrapping theirs: the URL is at position 0, so the relay's word is not.
+            ("ws://relay.example:7777: blocked: not on the allow list", true),
             // What our own transport failing actually looks like, measured not imagined.
             ("ws://127.0.0.1:44487: relay is initialized but not ready", false),
             ("no relays", false),
