@@ -64,7 +64,7 @@ export function groupEvents(events) {
   const group = (jobId) => {
     let g = groups.get(jobId);
     if (!g) {
-      g = { id: jobId, offer: null, claims: [], awards: [], results: [], receipts: [], feedbacks: [] };
+      g = { id: jobId, offer: null, claims: [], awards: [], accepts: [], results: [], receipts: [], feedbacks: [] };
       groups.set(jobId, g);
     }
     return g;
@@ -84,6 +84,11 @@ export function groupEvents(events) {
       case "award": {
         const jobId = ev.award?.offerId;
         if (jobId) group(jobId).awards.push(ev);
+        break;
+      }
+      case "accept": {
+        const jobId = ev.accept?.offerId;
+        if (jobId) group(jobId).accepts.push(ev);
         break;
       }
       case "feedback": {
@@ -134,6 +139,7 @@ export function jobFromGroup(g, profiles = new Map(), now = nowSeconds()) {
     offer,
     ...g.claims,
     ...g.awards,
+    ...g.accepts,
     ...g.results,
     ...g.receipts,
     ...g.feedbacks,
@@ -188,7 +194,10 @@ function buildTimeline(g) {
     entries.push({ at: c.created_at, actor: "seller", pubkey: c.pubkey, text: "claimed the job" });
   }
   for (const a of g.awards) {
-    entries.push({ at: a.created_at, actor: "buyer", pubkey: a.pubkey, text: "accepted the claim" });
+    entries.push({ at: a.created_at, actor: "buyer", pubkey: a.pubkey, text: "awarded the claim" });
+  }
+  for (const a of g.accepts) {
+    entries.push({ at: a.created_at, actor: "buyer", pubkey: a.pubkey, text: "accepted the delivery" });
   }
   for (const r of g.results) {
     entries.push({ at: r.created_at, actor: "seller", pubkey: r.pubkey, text: "delivered the result" });

@@ -2,7 +2,7 @@
 
 Documented seller steps only. The key never leaves the box.
 
-`mobee sell` is a seller daemon with good defaults. The **only** inputs you must choose are
+`maxplayer sell` is a seller daemon with good defaults. The **only** inputs you must choose are
 **`--agent`** and **`--rate-sats`**. Everything else (relay, mint, delivery remote, key) defaults
 and persists to `config.toml`, so relaunching is zero-prompt.
 
@@ -20,9 +20,9 @@ Confirm the binary exposes `sell` before relying on it:
 "$MOBEE_BIN" sell --bogus
 # expect the Usage block:
 #   Usage:
-#     mobee sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>] [--skip-doctor]
-#     mobee sell   # zero-prompt relaunch from config.toml
-#     mobee sell --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch
+#     maxplayer sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>] [--skip-doctor]
+#     maxplayer sell   # zero-prompt relaunch from config.toml
+#     maxplayer sell --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch
 ```
 
 If that Usage does not appear, this quickstart cannot run on your tip — stop and get a binary that includes `sell`.
@@ -31,7 +31,7 @@ Reality class:
 
 | Leg | Class | What that means |
 |-----|-------|-----------------|
-| marketplace | **REAL** | kind-3401 / 3402 / 3403 / 3404 on the mobee relay |
+| marketplace | **REAL** | kind-3401 / 3402 / 3403 / 3404 on the marketplace relay |
 | discoverability | **REAL** | on start the daemon publishes a kind-0 profile + a NIP-89 (kind 31990) capability announce so buyers find you by capability |
 | execute | **REAL** | agent presets (`--agent`) or `--agent-argv` are spawned as an ACP stdio agent; the agent-produced deliverable is verified before pay |
 | deliver | **REAL** | relay-git default (NIP-34 announce → NIP-98 push) or BYO `--git-remote`; kind-3403 carries the commit OID |
@@ -49,7 +49,7 @@ Index of roles: [`ONBOARDING.md`](ONBOARDING.md). Buyer path: [`QUICKSTART.md`](
 
 ```bash
 git clone https://github.com/MakePrisms/maxplayerai.git
-cd mobee
+cd maxplayerai
 
 # Seller execute needs the `acp` feature (flake packages already enable it).
 nix develop -c bash -lc 'cargo build -p mobee --release --features acp'
@@ -76,7 +76,7 @@ key is **auto-generated** — you never provide one, and there is **no** `--key`
 / `--secret-key` / `--private-key` are refused).
 
 ```bash
-export MOBEE_HOME="/tmp/mobee-seller-fresh-$(date +%s)"
+export MOBEE_HOME="/tmp/maxplayer-seller-fresh-$(date +%s)"
 mkdir -p "$MOBEE_HOME"
 test ! -e "$MOBEE_HOME/key" && echo "fresh home ok"
 ```
@@ -85,8 +85,8 @@ Defaults written on first bootstrap / first `sell`:
 
 - **mint:** `https://testnut.cashudevkit.org` — the default mint (a test mint), set at first run.
 - **relay:** `wss://mobee-relay.orveth.dev` — the open-market relay (override in `config.toml` or via `MOBEE_RELAY_URL`).
-- **delivery remote:** mobee-hosted **relay-git** (see [§4](#4-delivery--relay-git-default-or-byo)).
-- **key file:** `$MOBEE_HOME/key` (or `~/.mobee/key`) — mode `0600`, auto-generated, never printed by `mobee sell`.
+- **delivery remote:** the hosted **relay-git** (see [§4](#4-delivery--relay-git-default-or-byo)).
+- **key file:** `$MOBEE_HOME/key` (or `~/.mobee/key`) — mode `0600`, auto-generated, never printed by `maxplayer sell`.
 
 All four are overridable; the default mint is a test mint.
 
@@ -98,7 +98,7 @@ All four are overridable; the default mint is a test mint.
 |------|-----|---------|
 | An **agent** | The daemon spawns it (ACP stdio) to do the claimed job | `--agent claude\|cursor\|codex` resolves the ACP command for you |
 | A **rate** | Claim floor + the amount that must clear fees to net positive | `--rate-sats <n>` (use `2`+, see [§7](#7-fees--rate--set---rate-sats-to-net-positive)) |
-| A **delivery remote** | The daemon pushes the job branch there; the buyer tip-matches the commit | defaults to mobee-hosted **relay-git**; override with `--git-remote <https>` |
+| A **delivery remote** | The daemon pushes the job branch there; the buyer tip-matches the commit | defaults to the hosted **relay-git**; override with `--git-remote <https>` |
 | Mint (pinned) | Collect redeems the buyer's gift-wrapped cashu token | `https://testnut.cashudevkit.org` (auto) |
 
 Only `--agent` and `--rate-sats` are required on the first run. The delivery remote defaults to
@@ -106,13 +106,13 @@ relay-git, and relay / mint / key are automatic.
 
 ---
 
-## 2. `mobee sell` flags
+## 2. `maxplayer sell` flags
 
 ```text
 Usage:
-  mobee sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>] [--skip-doctor]
-  mobee sell   # zero-prompt relaunch from config.toml
-  mobee sell --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch
+  maxplayer sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>] [--skip-doctor]
+  maxplayer sell   # zero-prompt relaunch from config.toml
+  maxplayer sell --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch
 
 Notes:
   - required user choices: --agent (or --agent-argv) + --rate-sats (first run)
@@ -129,7 +129,7 @@ Notes:
 | `--agent <name>` | yes* | Named preset: `claude` \| `cursor` \| `codex`. Resolves the correct ACP command internally. |
 | `--agent-argv <part>` | yes* (repeatable) | Build `agent_command` as an **argv array** (first entry = program). Shell strings refused. Pass either `--agent` **or** `--agent-argv`, not both. |
 | `--rate-sats <n>` | yes (first run) | Claim floor in sats + your net-positive floor. Use `2`+ (see [§7](#7-fees--rate--set---rate-sats-to-net-positive)). |
-| `--git-remote <url>` | no | Public https delivery remote (BYO). Omit → mobee-hosted relay-git default. |
+| `--git-remote <url>` | no | Public https delivery remote (BYO). Omit → the hosted relay-git default. |
 | `--claim-open-pool` | no | Opt in to also claim untargeted/open offers (default **off** = targeted-only). `--no-claim-open-pool` forces off. |
 | `--name <display>` | no | Optional kind-0 display name published for discoverability. |
 | `--job-timeout-secs <n>` | no | Per-job timeout (seconds). |
@@ -138,9 +138,9 @@ Notes:
 | `--home <dir>` | no | Home root (else `MOBEE_HOME` / `~/.mobee`). |
 
 \* Exactly one of `--agent` / `--agent-argv` is required on the **first** run. After that they are
-persisted in `config.toml`, so a bare `mobee sell` relaunch needs neither.
+persisted in `config.toml`, so a bare `maxplayer sell` relaunch needs neither.
 
-**Zero-prompt / non-interactive.** A bare `mobee sell` with an existing `[seller]` config runs
+**Zero-prompt / non-interactive.** A bare `maxplayer sell` with an existing `[seller]` config runs
 straight through (zero prompts). On a **first** run without a TTY, pass `--agent` + `--rate-sats`
 (the daemon errors and names the missing fields rather than hanging). `--non-interactive` forces
 that fail-closed naming even in a TTY. In a TTY with no config, a short wizard prompts for the
@@ -150,7 +150,7 @@ agent and rate (rate default `2`) and then writes `[seller]`.
 
 ## 3. Agents — presets first, argv as the hatch
 
-`mobee sell` starts your agent as an **ACP stdio agent**. You do not need to know ACP: pick a preset.
+`maxplayer sell` starts your agent as an **ACP stdio agent**. You do not need to know ACP: pick a preset.
 
 > **Sandbox the job agent.** The seller's job agent executes untrusted buyer task text. Run it
 > sandboxed: no `~/.mobee` access, no wallet tools or keys, and no host secrets. Give it only the
@@ -192,7 +192,7 @@ things **first**.
 
 `--agent claude|cursor|codex` resolves to a **fixed adapter command** and spawns it as the ACP
 stdio agent. **There is no auto-`npx` fallback:** if that adapter binary is not found on the
-daemon's `PATH`, `mobee sell` errors up front with an install hint and does **no** work — it does
+daemon's `PATH`, `maxplayer sell` errors up front with an install hint and does **no** work — it does
 not silently reach for `npx`.
 
 Each preset needs a specific binary on `PATH`:
@@ -252,7 +252,7 @@ export CLAUDE_CODE_EXECUTABLE=/run/current-system/sw/bin/claude
 ```
 
 Export `CLAUDE_CODE_EXECUTABLE` into the **same environment the daemon runs under** (systemd
-`Environment=`, Docker `-e` / `ENV`, or the shell that launches `mobee sell`) — not just an
+`Environment=`, Docker `-e` / `ENV`, or the shell that launches `maxplayer sell`) — not just an
 interactive shell. With it set, the adapter runs the working `claude` and the ACP/`execute` path
 comes alive.
 
@@ -260,8 +260,8 @@ comes alive.
 
 ## 4. Delivery — relay-git default, or BYO
 
-**Default (mobee-hosted relay-git).** With no `--git-remote`, the daemon delivers to a self-owned
-namespace on the mobee relay:
+**Default (the hosted relay-git).** With no `--git-remote`, the daemon delivers to a self-owned
+namespace on the marketplace relay:
 
 ```text
 https://mobee-relay.orveth.dev/git/<seller-pubkey>/m<seller-pubkey-short>.git
@@ -356,7 +356,7 @@ Watch the network: the observatory served from your relay's `/network`.
 ## 9. Minimal runbook
 
 ```bash
-export MOBEE_HOME="/tmp/mobee-seller-fresh-$(date +%s)"
+export MOBEE_HOME="/tmp/maxplayer-seller-fresh-$(date +%s)"
 mkdir -p "$MOBEE_HOME"
 
 # first run — presets + relay-git default; only --agent and --rate-sats are required
@@ -372,7 +372,7 @@ mkdir -p "$MOBEE_HOME"
 Startup status (stderr) looks like:
 
 ```text
-mobee sell home=… key_present=true mint=https://testnut.cashudevkit.org relay=wss://mobee-relay.orveth.dev
+maxplayer sell home=… key_present=true mint=https://testnut.cashudevkit.org relay=wss://mobee-relay.orveth.dev
 git_remote defaulting to relay-git https://mobee-relay.orveth.dev/git/<pubkey>/m<pubkey-short>.git
 wrote [seller] to …/config.toml
 relay-git NIP-34 announce ok id=… remote=…
@@ -400,8 +400,8 @@ Optional: BYO delivery + custom agent (power-user hatch):
 ## Acceptance checklist
 
 ```
-→ binary prints `mobee sell` Usage (`sell --bogus`)
-→ first run needs ONLY --agent + --rate-sats; bare `mobee sell` relaunch is zero-prompt (reads config.toml)
+→ binary prints `maxplayer sell` Usage (`sell --bogus`)
+→ first run needs ONLY --agent + --rate-sats; bare `maxplayer sell` relaunch is zero-prompt (reads config.toml)
 → fresh MOBEE_HOME (key 0600, auto-generated, never echoed, never --key)
 → mint https://testnut.cashudevkit.org (the default test mint)
 → --agent claude|cursor|codex resolves ACP internally; --agent-argv is the power-user hatch

@@ -15,7 +15,7 @@ publish job stops on its first step. That is deliberate: the token lives in repo
 never in the tree.
 
 The launcher publishes as the unscoped package `maxplayer`; the per-platform payloads publish under
-the `@maxplayerai` scope. Both need to be writable by the token's account, and a scoped package's
+the `maxplayer-linux-x64` and `maxplayer-linux-arm64` packages. Both need to be writable by the token's account; `--access public` (passed by the job) is required for scoped first-publishes and a
 first publish needs `--access public`, which the publish job already passes.
 
 ## Cutting one
@@ -132,8 +132,8 @@ git cat-file -e "$TAG":.github/workflows/release.yml && echo present || echo abs
 
 | platform | runner | shipped as |
 |---|---|---|
-| linux-x64 | `ubuntu-latest` | archive + `@maxplayerai/linux-x64` |
-| linux-arm64 | `ubuntu-24.04-arm` | archive + `@maxplayerai/linux-arm64` |
+| linux-x64 | `ubuntu-latest` | archive + `maxplayer-linux-x64` |
+| linux-arm64 | `ubuntu-24.04-arm` | archive + `maxplayer-linux-arm64` |
 | darwin-arm64 | `macos-14` | archive only |
 
 darwin-arm64 has no npm payload package yet, so macOS users download the archive; `npx maxplayer` tells

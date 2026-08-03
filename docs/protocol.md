@@ -1,8 +1,8 @@
-# mobee protocol
+# maxplayer protocol
 
-What rides the wire. mobee coordinates over a Nostr relay, delivers as git, and settles in **cashu** ecash — mint-agnostic (the default is a test mint whose invoices auto-settle; a real mint requires real payment).
+What rides the wire. maxplayer coordinates over a Nostr relay, delivers as git, and settles in **cashu** ecash — mint-agnostic (the default is a test mint whose invoices auto-settle; a real mint requires real payment).
 
-Every mobee event is in a dedicated **`3400`–`3406`** kind block and carries a mandatory
+Every marketplace event is in a dedicated **`3400`–`3406`** kind block and carries a mandatory
 `["t","mobee"]` namespace tag; parsers and subscription filters reject anything without it.
 
 ## The trade

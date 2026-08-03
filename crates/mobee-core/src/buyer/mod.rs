@@ -2230,11 +2230,23 @@ async fn reconcile_reservations(context: &BuyerContext) -> Result<ReconcileRepor
         payable.insert(job_id.clone(), claim_live || has_bind);
     }
 
-    let dispositions = plan_reconcile(&reserved, &progress, &payable, &attempt_held);
+    // ONE `now` for both the ages and the reconcile write: reading the clock twice would let a
+    // reservation be aged against one instant and released against another.
+    let now = now_unix();
+    let ages = context
+        .store
+        .reserved_ages(now)
+        .map_err(|error| error.to_string())?;
+    let floor_config = &context.home.config.buyer_reservation_floor;
+    let floor = lifecycle::UnattemptedFloor {
+        enabled: floor_config.enabled,
+        grace_secs: floor_config.grace_secs,
+    };
+    let dispositions = plan_reconcile(&reserved, &progress, &payable, &attempt_held, &ages, floor);
     let _guard = context.money_lock.lock().await;
     context
         .store
-        .reconcile(&dispositions, now_unix())
+        .reconcile(&dispositions, now)
         .map_err(|error| error.to_string())
 }
 
@@ -2306,21 +2318,33 @@ fn report_reconcile(report: &ReconcileReport) {
 /// testable rather than something a reader has to trust.
 fn reconcile_line(report: &ReconcileReport) -> String {
     let examined = report.released.len() + report.converted.len() + report.kept.len();
+    let age = oldest_held_phrase(report.oldest_kept_age_secs);
     if report.released.is_empty() {
         format!(
-            "buyer: reconcile examined {examined} reserved job(s) — released nothing, converted {}, kept {}",
+            "buyer: reconcile examined {examined} reserved job(s) — released nothing, converted {}, kept {}{age}",
             report.converted.len(),
             report.kept.len()
         )
     } else {
         format!(
             "buyer: reconcile examined {examined} reserved job(s) — RELEASED {} (no longer payable \
-             on the relay and no funds left: {}), converted {}, kept {}",
+             on the relay and no funds left: {}), converted {}, kept {}{age}",
             report.released.len(),
             report.released.join(", "),
             report.converted.len(),
             report.kept.len()
         )
+    }
+}
+
+/// Render the oldest-still-held age as a log suffix, or nothing when the buyer holds no
+/// reservation. Split out so the wording is testable, and so the empty case — the one that must
+/// NOT print a misleading `oldest held 0m` — is a single explicit branch.
+fn oldest_held_phrase(age_secs: Option<u64>) -> String {
+    match age_secs {
+        None => String::new(),
+        Some(secs) if secs < 3_600 => format!(", oldest held {}m", secs / 60),
+        Some(secs) => format!(", oldest held {:.1}h", secs as f64 / 3_600.0),
     }
 }
 
@@ -2378,12 +2402,20 @@ fn plan_reconcile(
     progress: &BTreeMap<String, PaymentProgress>,
     payable: &BTreeMap<String, bool>,
     attempt_held: &std::collections::BTreeSet<String>,
+    ages: &BTreeMap<String, u64>,
+    floor: lifecycle::UnattemptedFloor,
 ) -> Dispositions {
     let mut dispositions: Dispositions = BTreeMap::new();
     for job_id in reserved {
         let payment = progress.get(job_id).copied().unwrap_or(PaymentProgress::None);
         let claim_payable = payable.get(job_id).copied().unwrap_or(true);
         let verdict = lifecycle::classify_disposition(payment, claim_payable);
+        // The local-clock floor runs BEFORE the attempt-held downgrade below, so a job the attempt
+        // machinery owns still wins: the floor can propose `Dead`, and the downgrade then takes it
+        // back to `Payable`. Ordering them the other way would let the floor override the one
+        // component that knows a send is in flight.
+        let verdict =
+            lifecycle::apply_unattempted_floor(verdict, payment, ages.get(job_id).copied(), floor);
         // The attempt machinery owns the RELEASE decision for jobs it holds — but ONLY that
         // decision. Downgrading `Dead → Payable` (keep the funds) leaves `Paid → spent`
         // untouched, which matters: reconcile's Paid arm is the only converger for a pay whose
@@ -2446,20 +2478,25 @@ fn progress_from_state(state: Option<&PaymentState>) -> PaymentProgress {
         Some(PaymentState::Sent { .. }) | Some(PaymentState::ReceiptPublished { .. }) => {
             PaymentProgress::Uncertain
         }
-        Some(PaymentState::Intent { .. }) | Some(PaymentState::Locked { .. }) | None => {
-            PaymentProgress::None
+        Some(PaymentState::Intent { .. }) | Some(PaymentState::Locked { .. }) => {
+            PaymentProgress::Attempted
         }
+        None => PaymentProgress::None,
     }
 }
 
-/// The more-advanced of two progresses (`Closed` > `Uncertain` > `None`) — a job with any Closed
-/// attempt is Paid regardless of an earlier abandoned attempt.
+/// The more-advanced of two progresses (`Closed` > `Uncertain` > `Attempted` > `None`) — a job with
+/// any Closed attempt is Paid regardless of an earlier abandoned attempt.
+///
+/// `Attempted` outranks `None` for the same reason the others are ordered: across two journals for
+/// one job, evidence that an attempt happened must not be masked by a journal that shows none.
 fn merge_progress(existing: Option<PaymentProgress>, next: PaymentProgress) -> PaymentProgress {
     fn rank(progress: PaymentProgress) -> u8 {
         match progress {
             PaymentProgress::None => 0,
-            PaymentProgress::Uncertain => 1,
-            PaymentProgress::Closed => 2,
+            PaymentProgress::Attempted => 1,
+            PaymentProgress::Uncertain => 2,
+            PaymentProgress::Closed => 3,
         }
     }
     match existing {
@@ -2579,6 +2616,13 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
 
 #[cfg(test)]
 mod tests {
+    /// Every pre-existing reconcile test runs with the local-clock floor OFF, which is how it
+    /// ships. Naming it here means each call site states that rather than leaving it implied.
+    const FLOOR_OFF: lifecycle::UnattemptedFloor = lifecycle::UnattemptedFloor {
+        enabled: false,
+        grace_secs: 0,
+    };
+
     use super::*;
     use crate::home::bootstrap as bootstrap_home;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2799,6 +2843,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::from([(job.clone(), false)]),
             &std::collections::BTreeSet::new(),
+            &BTreeMap::new(),
+            FLOOR_OFF,
         );
         assert_eq!(would_release[&job], reservations::JobDisposition::Dead);
 
@@ -3263,6 +3309,8 @@ mod tests {
                 (free_dead.clone(), false),
             ]),
             &held,
+            &BTreeMap::new(),
+            FLOOR_OFF,
         );
 
         assert_eq!(
@@ -3525,6 +3573,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::from([(job.clone(), false)]),
             &std::collections::BTreeSet::new(),
+            &BTreeMap::new(),
+            FLOOR_OFF,
         );
         assert_eq!(
             would_release[&job],
@@ -3600,6 +3650,193 @@ mod tests {
         assert!(line.contains("examined 2 reserved job(s)"), "unexpected: {line}");
         assert!(line.contains(&"c".repeat(64)), "the released job must be named: {line}");
         assert!(line.contains("no longer payable"), "the reason must be stated: {line}");
+    }
+
+    // ★ THE AGE IS THE ONLY TERM THAT SEPARATES A HEALTHY HOLD FROM A STUCK ONE.
+    //
+    // #273: a reservation sat `reserved` for 20 hours while 92 consecutive passes printed
+    // `examined 1 reserved job(s) — released nothing, converted 0, kept 1`. Every one of those is
+    // also what a perfectly healthy pass prints, so the ramp was invisible while it happened. The
+    // job-id lists cannot distinguish the two cases; only the age can.
+    //
+    // Red-on-revert: drop the age from the line and the 10-minute hold and the 20-hour hold become
+    // byte-identical again — exactly the state that hid #273.
+    #[test]
+    fn a_kept_reservation_reports_its_age_so_a_ramp_is_visible_while_it_happens() {
+        let fresh = ReconcileReport {
+            kept: vec!["a".repeat(64)],
+            oldest_kept_age_secs: Some(600),
+            ..ReconcileReport::default()
+        };
+        let stuck = ReconcileReport {
+            kept: vec!["a".repeat(64)],
+            oldest_kept_age_secs: Some(20 * 3_600),
+            ..ReconcileReport::default()
+        };
+        let fresh_line = reconcile_line(&fresh);
+        let stuck_line = reconcile_line(&stuck);
+        assert!(fresh_line.contains("oldest held 10m"), "unexpected: {fresh_line}");
+        assert!(stuck_line.contains("oldest held 20.0h"), "unexpected: {stuck_line}");
+        assert_ne!(
+            fresh_line, stuck_line,
+            "a 10-minute hold and a 20-hour hold must not print the same line — that identity IS #273",
+        );
+    }
+
+    // Holding NOTHING must not render as an age. `oldest held 0m` on an empty ledger would be a
+    // number that answers a question nobody asked, and it would make the genuinely-informative
+    // `0m` (a reservation taken seconds ago) unreadable.
+    #[test]
+    fn a_pass_holding_no_reservation_prints_no_age_at_all() {
+        assert_eq!(oldest_held_phrase(None), "");
+        let line = reconcile_line(&ReconcileReport::default());
+        assert!(!line.contains("oldest held"), "empty ledger must not claim an age: {line}");
+    }
+
+    // ★ THE DISCRIMINATOR #273 NEEDED WAS ALREADY ON DISK, DISCARDED ONE FUNCTION EARLY.
+    //
+    // `Intent`/`Locked` mean a payment was attempted and never left funds; no journal means nothing
+    // was ever attempted. Only the second is a leaked reservation — the first is a debt being
+    // retried, and the real-money row `2ba4045a` proved it by settling 4.5h after it looked stuck.
+    // Folding both into `None` is what made those two indistinguishable.
+    //
+    // Red-on-revert: map `Intent`/`Locked` back to `None` and the two branches collide again.
+    #[test]
+    fn an_attempted_payment_is_distinguishable_from_one_never_attempted() {
+        let key = payment_key(&"a".repeat(64));
+        let attempted = progress_from_state(Some(&PaymentState::Intent {
+            attempt_id: key.attempt_id(),
+        }));
+        let locked = progress_from_state(Some(&PaymentState::Locked {
+            attempt_id: key.attempt_id(),
+        }));
+        assert_eq!(attempted, PaymentProgress::Attempted);
+        assert_eq!(locked, PaymentProgress::Attempted, "Locked is also an attempt");
+        assert_eq!(progress_from_state(None), PaymentProgress::None);
+        assert_ne!(
+            progress_from_state(None),
+            attempted,
+            "never-attempted and attempted-but-unsent must not be the same value",
+        );
+    }
+
+    // ★ THE FLOOR SHIPS OFF, AND OFF MUST BE THE IDENTITY — no age, payment state, or verdict may
+    // produce a release while `enabled` is false. This is the property the enable decision rests
+    // on, so it is asserted across the whole cross-product rather than at one point.
+    //
+    // Red-on-revert: drop the `if !floor.enabled` early return and this fails on the first row.
+    #[test]
+    fn the_disabled_floor_is_the_identity_function_across_every_input() {
+        let ages = [None, Some(0), Some(u64::MAX)];
+        let payments = [
+            PaymentProgress::None,
+            PaymentProgress::Attempted,
+            PaymentProgress::Uncertain,
+            PaymentProgress::Closed,
+        ];
+        let verdicts = [
+            reservations::JobDisposition::Payable,
+            reservations::JobDisposition::Dead,
+            reservations::JobDisposition::Paid,
+        ];
+        let mut checked = 0;
+        for age in ages {
+            for payment in payments {
+                for verdict in verdicts {
+                    checked += 1;
+                    assert_eq!(
+                        lifecycle::apply_unattempted_floor(verdict, payment, age, FLOOR_OFF),
+                        verdict,
+                        "disabled floor changed {verdict:?} for {payment:?} at age {age:?}",
+                    );
+                }
+            }
+        }
+        assert_eq!(checked, 36, "the cross-product must actually have been walked");
+    }
+
+    // ★ ENABLED, THE FLOOR MUST STILL REFUSE EVERY CASE THAT IS NOT A LEAK.
+    //
+    // Each row is a distinct way this could free money that is genuinely owed. The `Attempted` row
+    // is the real one: `2ba4045a` sat `reserved` with `updated_at == created_at` well past its
+    // deadline and looked exactly like a leak — it was a debt, and it settled 4.5h later.
+    #[test]
+    fn the_enabled_floor_releases_only_a_never_attempted_reservation_past_its_grace() {
+        const ON: lifecycle::UnattemptedFloor = lifecycle::UnattemptedFloor {
+            enabled: true,
+            grace_secs: 3_600,
+        };
+        use reservations::JobDisposition as D;
+        let old = Some(7_200);
+
+        // The one release this feature exists for.
+        assert_eq!(
+            lifecycle::apply_unattempted_floor(D::Payable, PaymentProgress::None, old, ON),
+            D::Dead,
+        );
+        // A debt being retried is NOT a leak, however old it looks.
+        assert_eq!(
+            lifecycle::apply_unattempted_floor(D::Payable, PaymentProgress::Attempted, old, ON),
+            D::Payable,
+            "an attempted-but-unsent payment is owed — releasing it is the 2ba4045a mistake",
+        );
+        // Ambiguous payments belong to the phase-3 saga, never to a clock.
+        assert_eq!(
+            lifecycle::apply_unattempted_floor(D::Payable, PaymentProgress::Uncertain, old, ON),
+            D::Payable,
+        );
+        // Paid is untouched, so reconcile's Paid arm stays the sole converger for a failed flip.
+        assert_eq!(
+            lifecycle::apply_unattempted_floor(D::Paid, PaymentProgress::None, old, ON),
+            D::Paid,
+        );
+        // Inside the grace: not yet a candidate. The boundary is strictly greater-than.
+        assert_eq!(
+            lifecycle::apply_unattempted_floor(D::Payable, PaymentProgress::None, Some(3_600), ON),
+            D::Payable,
+            "a reservation exactly at the grace must not release — the boundary is >, not >=",
+        );
+        // An unreadable row has an unknown age; absence of evidence is not evidence of a leak.
+        assert_eq!(
+            lifecycle::apply_unattempted_floor(D::Payable, PaymentProgress::None, None, ON),
+            D::Payable,
+            "an unknown age must never release",
+        );
+    }
+
+    // The shipped config must be OFF. A default that quietly enabled an automatic money-state
+    // transition would make every other guarantee here moot.
+    #[test]
+    fn the_reservation_floor_ships_disabled() {
+        let shipped = crate::home::BuyerReservationFloorConfig::default();
+        assert!(!shipped.enabled, "the floor must ship OFF");
+        assert!(
+            shipped.grace_secs > 3_600,
+            "the grace must exceed the default job deadline so a live job is never a candidate",
+        );
+        assert!(!crate::home::MobeeConfig::default().buyer_reservation_floor.enabled);
+    }
+
+    // Across two journals for one job, evidence that an attempt happened must not be masked by a
+    // journal showing none — the same reason `Closed` outranks the rest.
+    #[test]
+    fn merge_progress_ranks_attempted_above_none_and_below_uncertain() {
+        assert_eq!(
+            merge_progress(Some(PaymentProgress::None), PaymentProgress::Attempted),
+            PaymentProgress::Attempted,
+        );
+        assert_eq!(
+            merge_progress(Some(PaymentProgress::Attempted), PaymentProgress::None),
+            PaymentProgress::Attempted,
+        );
+        assert_eq!(
+            merge_progress(Some(PaymentProgress::Attempted), PaymentProgress::Uncertain),
+            PaymentProgress::Uncertain,
+        );
+        assert_eq!(
+            merge_progress(Some(PaymentProgress::Closed), PaymentProgress::Attempted),
+            PaymentProgress::Closed,
+        );
     }
 
     // ★ NO-OVERLAP TOOTH: reconcile passes must never run concurrently.
@@ -4037,10 +4274,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // An Intent-only journal folds to Intent ⇒ no funds have left ⇒ PaymentProgress::None. Proves
-    // scan walks the dir, parses real PaymentRecords, folds them, and maps by job id.
+    // An Intent-only journal folds to Intent ⇒ no funds have left, but an attempt DID happen ⇒
+    // PaymentProgress::Attempted. Proves scan walks the dir, parses real PaymentRecords, folds
+    // them, and maps by job id.
+    //
+    // This asserted `None` until #273. Both still classify identically today, so the change is
+    // behaviour-preserving — but they are no longer the same VALUE, because "retried and refused"
+    // and "never attempted" must be separable before any rule may release the second one. A home
+    // with no journal at all is the `None` case, covered by
+    // `scan_payment_progress_absent_journal_is_empty` above.
     #[test]
-    fn scan_payment_progress_folds_intent_to_none() {
+    fn scan_payment_progress_folds_intent_to_attempted() {
         let root = temp_home("scan-intent");
         let _ = std::fs::remove_dir_all(&root);
         let job = "a".repeat(64);
@@ -4051,7 +4295,12 @@ mod tests {
             &[PaymentRecord { key: key.clone(), value: PaymentState::Intent { attempt_id: key.attempt_id() } }],
         );
         let progress = scan_payment_progress_at(&root);
-        assert_eq!(progress.get(&job), Some(&PaymentProgress::None));
+        assert_eq!(progress.get(&job), Some(&PaymentProgress::Attempted));
+        assert_ne!(
+            progress.get(&job),
+            Some(&PaymentProgress::None),
+            "an attempted-but-unsent payment must not read as never-attempted — that collapse is #273",
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4102,7 +4351,7 @@ mod tests {
         payable.insert(live.clone(), true);
         payable.insert(dead.clone(), false);
 
-        let dispositions = plan_reconcile(&reserved, &progress, &payable, &std::collections::BTreeSet::new());
+        let dispositions = plan_reconcile(&reserved, &progress, &payable, &std::collections::BTreeSet::new(), &BTreeMap::new(), FLOOR_OFF);
         assert_eq!(dispositions[&paid], reservations::JobDisposition::Paid);
         assert_eq!(dispositions[&uncertain], reservations::JobDisposition::Payable);
         assert_eq!(dispositions[&live], reservations::JobDisposition::Payable);
@@ -4114,7 +4363,7 @@ mod tests {
     #[test]
     fn plan_reconcile_missing_payable_defaults_to_kept() {
         let job = "e".repeat(64);
-        let dispositions = plan_reconcile(&[job.clone()], &BTreeMap::new(), &BTreeMap::new(), &std::collections::BTreeSet::new());
+        let dispositions = plan_reconcile(&[job.clone()], &BTreeMap::new(), &BTreeMap::new(), &std::collections::BTreeSet::new(), &BTreeMap::new(), FLOOR_OFF);
         assert_eq!(dispositions[&job], reservations::JobDisposition::Payable);
     }
 

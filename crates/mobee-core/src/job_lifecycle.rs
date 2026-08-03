@@ -1920,6 +1920,14 @@ pub(crate) enum AwardPresence {
 impl AwardPresence {
     /// The id of the award the relay returned, whichever variant. Both variants know it — they
     /// differ on whether the REST of the event could be trusted, not on which event it was.
+    ///
+    /// Test-only, and deliberately kept rather than deleted. Its one caller is the live-relay
+    /// red-prove, which asserts the probe found the KNOWN award and not merely SOME award for the
+    /// job — an identity check a bare `is_some()` would pass while pointing at the wrong event.
+    /// Deleting the accessor would force that assertion down to presence, which is the weaker
+    /// property the red-prove exists to rule out. `#[cfg(test)]` retires the dead-code warning
+    /// without retiring the check.
+    #[cfg(test)]
     pub(crate) fn award_event_id(&self) -> &str {
         match self {
             Self::Repairable(relayed) => &relayed.award_event_id,

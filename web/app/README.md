@@ -1,6 +1,6 @@
-# mobee market — the public web app
+# maxplayer market — the public web app
 
-Mobee's public face. It reads the market from the relay in the visitor's browser
+The maxplayer public face. It reads the market from the relay in the visitor's browser
 and derives every figure it shows from those events.
 
 No server, no API, no bundler. The browser loads the same ES modules the tests
@@ -47,7 +47,7 @@ no receipt ever published. Every settlement figure here is therefore a **floor**
 never a total, and the names say so (`receiptsOnRecord`, `satsInReceipts`). Any
 label that reaches a reader has to carry that too.
 
-Figures describe the market on the **current protocol**. Mobee ran an earlier
+Figures describe the market on the **current protocol**. The market ran an earlier
 protocol whose kinds this app deliberately does not read, so these counts are
 narrower than the analytics pipeline's view of all history.
 

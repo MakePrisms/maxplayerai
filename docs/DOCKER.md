@@ -1,15 +1,15 @@
-# Running mobee with Docker
+# Running maxplayer with Docker
 
-Run a mobee seller (or the buyer MCP) with nothing on your host but Docker — no
-Rust, no git, no build tools. The image carries a self-contained `mobee` binary;
+Run a maxplayer seller (or the buyer MCP) with nothing on your host but Docker — no
+Rust, no git, no build tools. The image carries a self-contained `maxplayer` binary;
 git delivery runs in-process and TLS roots are bundled.
 
 ## What the image is
 
-- **Binary:** `mobee`, built with the `acp` + `wallet` features.
+- **Binary:** `maxplayer`, built with the `acp` + `wallet` features.
 - **Home:** `MOBEE_HOME=/data`, a mounted volume holding your key, wallet,
   `config.toml`, and delivery journal.
-- **Entrypoint:** `mobee`. Default command: `sell`.
+- **Entrypoint:** `maxplayer`. Default command: `sell`.
 - **User:** unprivileged (`uid 10001`).
 - **Defaults baked in:** relay `wss://mobee-relay.orveth.dev` (the open-market
   relay; override in `config.toml` or via `MOBEE_RELAY_URL` to sell against your
@@ -18,7 +18,7 @@ git delivery runs in-process and TLS roots are bundled.
 ## Build
 
 ```bash
-docker build -t mobee:latest .
+docker build -t maxplayer:latest .
 ```
 
 ## Run a seller (quickstart)
@@ -50,10 +50,10 @@ Without `docker compose`, the same thing by hand:
 
 ```bash
 docker volume create seller-data
-docker run -d --name mobee-seller --restart unless-stopped \
+docker run -d --name maxplayer-seller --restart unless-stopped \
   -v seller-data:/data \
-  mobee:latest sell --non-interactive --agent claude --rate-sats 2
-docker logs -f mobee-seller
+  maxplayer:latest sell --non-interactive --agent claude --rate-sats 2
+docker logs -f maxplayer-seller
 ```
 
 ## Fulfilling jobs (bring an agent)
@@ -78,7 +78,7 @@ base image. Two options:
   `claude` preset, install `claude-agent-acp` into the image:
 
   ```dockerfile
-  FROM mobee:latest
+  FROM maxplayer:latest
   USER root
   RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
       && npm i -g @agentclientprotocol/claude-agent-acp \
@@ -112,21 +112,21 @@ Compose:
 Requirements and caveats:
 
 - The file must be **64 hex characters** and owned/readable by the container
-  user (`uid 10001`); mobee refuses a key that is all zeros or wrong length.
-- mobee requires the key to be `0600`. A read-only bind mount you `chmod 600`
+  user (`uid 10001`); maxplayer refuses a key that is all zeros or wrong length.
+- maxplayer requires the key to be `0600`. A read-only bind mount you `chmod 600`
   on the host works. A Docker/Swarm *secret* mounts world-readable (`0444`) and
-  read-only, so mobee cannot tighten it and will refuse to boot — prefer a
+  read-only, so maxplayer cannot tighten it and will refuse to boot — prefer a
   bind-mounted file you have chmod'd, or let the key auto-generate.
-- The key is never logged or printed by mobee.
+- The key is never logged or printed by maxplayer.
 
 ## Buyer MCP
 
-`mobee mcp` is a STDIO MCP server, not a network service — run it attached and
+`maxplayer mcp` is a STDIO MCP server, not a network service — run it attached and
 point your MCP client (Claude Code, Cursor, …) at the command:
 
 ```bash
 docker volume create buyer-data
-docker run -i --rm -v buyer-data:/data mobee:latest mcp
+docker run -i --rm -v buyer-data:/data maxplayer:latest mcp
 ```
 
 It uses the same `/data` home (its own key + wallet). Fund the buyer wallet
@@ -139,7 +139,7 @@ the image. To upgrade, rebuild/pull and recreate the container — the volume
 carries forward:
 
 ```bash
-docker build -t mobee:latest .        # or: docker pull mobee:latest
+docker build -t maxplayer:latest .        # or: docker pull maxplayer:latest
 docker compose up -d seller           # recreates the container, keeps the volume
 ```
 
@@ -149,7 +149,7 @@ its wallet balance.
 ## Troubleshooting
 
 - **No `nip42=authenticated` line:** the relay is unreachable or refused auth.
-  Run the self-check: `docker compose exec seller mobee doctor`.
+  Run the self-check: `docker compose exec seller maxplayer doctor`.
 - **Config change ignored:** `config.toml` is read once at startup. Recreate the
   container after editing it: `docker compose up -d --force-recreate seller`.
 - **Daemon claims a job but fails it:** it has no ACP agent — see

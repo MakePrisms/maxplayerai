@@ -8,8 +8,8 @@ const { spawnSync } = require("node:child_process");
 const os = require("node:os");
 
 const PLATFORM_PACKAGES = {
-  "linux-x64": "@maxplayerai/linux-x64",
-  "linux-arm64": "@maxplayerai/linux-arm64",
+  "linux-x64": "maxplayer-linux-x64",
+  "linux-arm64": "maxplayer-linux-arm64",
 };
 
 const key = `${process.platform}-${process.arch}`;

@@ -1,15 +1,15 @@
-# Mobee deployment & packaging
+# maxplayer deployment & packaging
 
 > **Status (dev tip) — read this first.** Today `flake.nix` ships exactly one artifact:
-> `packages.default` — the `mobee` client binary (built with `--features acp`) — plus
+> `packages.default` — the `maxplayer` client binary (built with `--features acp`) — plus
 > `apps.default` (`nix run … -- mcp|sell`) and a `devShells.default`. A root `Dockerfile` and
-> `docker-compose.yml` also exist, but they package only the **mobee client** (a `sell` daemon /
+> `docker-compose.yml` also exist, but they package only the **maxplayer client** (a `sell` daemon /
 > buyer `mcp` container — see [`DOCKER.md`](DOCKER.md)), not the backend below. The multi-service
 > backend described below (relay / relay-git / blossom / Caddy / Postgres bundle, NixOS modules,
 > split `packages.*`) is the **target architecture — not yet in-tree.** Read the rest of this file as
 > the deployment *design + roadmap*; verify any target against `flake.nix` before relying on it.
 
-This is the self-host design for the mobee marketplace: one Rust workspace, Nix as the packaging
+This is the self-host design for the maxplayer marketplace: one Rust workspace, Nix as the packaging
 foundation, targeting two runtimes (Docker, NixOS/systemd) across three operator personas
 (relay-operator, seller, buyer). Only the client binary (native, flake, and the client Docker image)
 exists today; the backend bundle is roadmap.
@@ -26,10 +26,10 @@ Nix packages is roadmap.
 
 ## Components (the backend bundle)
 
-A mobee marketplace backend is three services behind one reverse proxy:
+A maxplayer marketplace backend is three services behind one reverse proxy:
 
 1. **Relay** — a nostr relay in *open mode* (open ingest + open read) accepting
-   the mobee event kinds: 0 (profiles), 3401 (offer), 3402/3404 (claim/feedback),
+   the marketplace event kinds: 0 (profiles), 3401 (offer), 3402/3404 (claim/feedback),
    3403 (result), 3400 (receipt), 31990 (NIP-89 announce), 1059 (NIP-17
    gift-wrap payment). This is the coordination surface. Reference impl =
    buzz-relay in open mode; the contract is "any nostr relay that accepts these
@@ -61,13 +61,13 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
 
 ### Today — what `flake.nix` actually exposes
 
-- `packages.default` — the `mobee` client binary, built with `--features acp` (buyer MCP + seller).
+- `packages.default` — the `maxplayer` client binary, built with `--features acp` (buyer MCP + seller).
 - `apps.default` — `nix run --refresh github:MakePrisms/maxplayerai/<ref> -- mcp|sell` (buyer + ad-hoc
   seller), no clone. Always `--refresh` (or pin+bump the rev) — nix caches the git ref and will
   otherwise serve a stale binary.
 - `devShells.default` — the workspace build/dev shell.
-- Root `Dockerfile` + `docker-compose.yml` — a **client** container only: a `mobee sell` daemon
-  (the compose `seller` service) or an attached buyer `mobee mcp`. Standalone cargo build, not
+- Root `Dockerfile` + `docker-compose.yml` — a **client** container only: a `maxplayer sell` daemon
+  (the compose `seller` service) or an attached buyer `maxplayer mcp`. Standalone cargo build, not
   derived from the flake. See [`DOCKER.md`](DOCKER.md).
 
 That is the whole packaged surface right now: one client binary, one run app, one dev shell, and one
@@ -80,14 +80,14 @@ Postgres), no blossom crate, no NixOS module, and no split `packages.*` / `apps.
 Postgres (relay DB) + an object store (S3 or local for blossom/media). Images
 built from the Nix packages. `docker compose up` = a running marketplace backend.
 
-**Nix** — split the flake into `packages.{relay,relay-git,blossom,mobee}`, one per
+**Nix** — split the flake into `packages.{relay,relay-git,blossom,maxplayer}`, one per
 component plus the client binary, so each service builds from the same source and
 `Cargo.lock` as the client.
 
 ## Personas
 
 - **relay-operator** — deploys the backend bundle with `docker compose up`.
-- **seller** — `mobee sell`, run two ways by taste: `nix run --refresh … -- sell`
+- **seller** — `maxplayer sell`, run two ways by taste: `nix run --refresh … -- sell`
   (quick) or the Docker image. Same binary, same config contract.
 - **buyer** — `nix run --refresh … -- mcp` wired into their agent (Claude etc.).
   Zero clone.
@@ -104,7 +104,7 @@ perms, never baked into images or the nix store.
    docker-compose bundle.
 3. **Blossom**: add the blob server to the bundle + the `delivery_integrity_hash`
    accepting a blob sha256.
-4. **Persona modules**: `mobee-seller` / buyer NixOS modules.
+4. **Persona modules**: `maxplayer-seller` / buyer NixOS modules.
 
 Build the loop working (seller slice) and the client runnable (flake) before the
 self-host bundle — strangers should run a working marketplace before deploying

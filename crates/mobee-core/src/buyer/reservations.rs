@@ -256,6 +256,11 @@ pub struct ReconcileReport {
     pub converted: Vec<String>,
     /// Job ids left `Reserved` (`Payable`, or already terminal).
     pub kept: Vec<String>,
+    /// Age in seconds of the oldest reservation still `Reserved` after this pass, or `None` when
+    /// none are held. This is the term that distinguishes a healthy hold from a stuck one — the
+    /// job-id lists cannot, because a pass keeping a live job and a pass keeping a reservation
+    /// nothing will ever resolve produce identical output.
+    pub oldest_kept_age_secs: Option<u64>,
 }
 
 /// `available` plus which ceiling bound it — the min of the two independent ceilings.

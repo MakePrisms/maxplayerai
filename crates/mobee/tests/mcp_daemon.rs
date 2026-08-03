@@ -24,7 +24,7 @@ fn temp_home(label: &str) -> PathBuf {
 
 /// A `mobee` command pinned to `home` with a dead relay (fast, network-free relay failures).
 fn mobee(home: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_mobee"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_maxplayer"));
     command
         .env("MOBEE_HOME", home)
         .env("MOBEE_RELAY_URL", "ws://127.0.0.1:1");

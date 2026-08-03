@@ -776,7 +776,17 @@ mod contribution_tests {
             .expect("deep-history contribution must verify");
         assert_eq!(verified.verified().commit_oid(), &fx.fork_tip);
         assert_eq!(verified.store_ref(), PayPathDeliveryVerifier::store_ref_for(fx.fork_tip.as_str()));
-        assert!(!verified.changed_paths().is_empty());
+        // The scenario's 5 commits all touch the one path, so the diff against base_oid names
+        // exactly it. Asserting only that the list is non-empty would pass on a walk that
+        // collected the base commit's README as well.
+        assert_eq!(
+            verified
+                .changed_paths()
+                .iter()
+                .map(|changed: &ChangedPath| changed.path.as_str())
+                .collect::<Vec<_>>(),
+            ["src/feature.rs"]
+        );
     }
 
     // ── Descendant gate refuses unrelated history / swapped base ──────────────────────────────

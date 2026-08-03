@@ -103,6 +103,10 @@ impl SandboxPolicy {
 /// The `(program, args)` the ACP driver actually spawns for `agent_command` under `policy`: wrap
 /// the command in the policy's launcher, then split argv0 from the rest. Fails closed when the
 /// agent command is empty (a launcher alone is not a runnable command).
+///
+/// Gated to match its only production caller, `run_acp_job`: without `acp` there is no spawn path
+/// to build argv for, and the wrap/refuse behaviour is still covered by the tests below.
+#[cfg(any(feature = "acp", test))]
 fn launch_argv(
     policy: &SandboxPolicy,
     agent_command: &[String],
