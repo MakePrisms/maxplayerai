@@ -1031,6 +1031,49 @@ pub fn classify_disposition(payment: PaymentProgress, claim_payable: bool) -> Jo
     }
 }
 
+/// The local-clock floor's policy, read from `[buyer_reservation_floor]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnattemptedFloor {
+    /// Ships **false**. While false this is the identity function, unconditionally.
+    pub enabled: bool,
+    /// Seconds past `reservations.created_at_unix` before a release is permitted.
+    pub grace_secs: u64,
+}
+
+/// Upgrade `Payable → Dead` for a reservation nothing ever attempted to pay, once it is older than
+/// the floor — WITHOUT consulting the relay.
+///
+/// This exists because every other exit from `reserved` needs the relay to supply something: the
+/// offer, so a claim can be derived expired, or the claim's disappearance. When neither arrives the
+/// funds stay committed with no local recourse. `created_at_unix` cannot become unreachable.
+///
+/// Four properties hold it narrow, each one a way this could wrongly free money:
+/// - **Disabled is the identity.** No age, payment state, or verdict can produce a release.
+/// - **[`PaymentProgress::None`] only.** [`PaymentProgress::Attempted`] is a debt being retried and
+///   is indistinguishable from a leak in the reservation row alone — that collapse is exactly what
+///   this change split apart, and releasing it would free money the buyer genuinely owes.
+/// - **`Payable → Dead` only.** `Paid` is untouched, so reconcile's `Paid` arm remains the sole
+///   converger for a pay whose `reserved → spent` flip failed.
+/// - **An unknown age never releases.** `None` means the row was not read, and absence of evidence
+///   is not evidence of a leak.
+pub fn apply_unattempted_floor(
+    verdict: JobDisposition,
+    payment: PaymentProgress,
+    age_secs: Option<u64>,
+    floor: UnattemptedFloor,
+) -> JobDisposition {
+    if !floor.enabled {
+        return verdict;
+    }
+    match (verdict, payment, age_secs) {
+        (JobDisposition::Payable, PaymentProgress::None, Some(age)) if age > floor.grace_secs => {
+            JobDisposition::Dead
+        }
+        (other, _, _) => other,
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

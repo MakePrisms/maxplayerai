@@ -2230,11 +2230,23 @@ async fn reconcile_reservations(context: &BuyerContext) -> Result<ReconcileRepor
         payable.insert(job_id.clone(), claim_live || has_bind);
     }
 
-    let dispositions = plan_reconcile(&reserved, &progress, &payable, &attempt_held);
+    // ONE `now` for both the ages and the reconcile write: reading the clock twice would let a
+    // reservation be aged against one instant and released against another.
+    let now = now_unix();
+    let ages = context
+        .store
+        .reserved_ages(now)
+        .map_err(|error| error.to_string())?;
+    let floor_config = &context.home.config.buyer_reservation_floor;
+    let floor = lifecycle::UnattemptedFloor {
+        enabled: floor_config.enabled,
+        grace_secs: floor_config.grace_secs,
+    };
+    let dispositions = plan_reconcile(&reserved, &progress, &payable, &attempt_held, &ages, floor);
     let _guard = context.money_lock.lock().await;
     context
         .store
-        .reconcile(&dispositions, now_unix())
+        .reconcile(&dispositions, now)
         .map_err(|error| error.to_string())
 }
 
@@ -2390,12 +2402,20 @@ fn plan_reconcile(
     progress: &BTreeMap<String, PaymentProgress>,
     payable: &BTreeMap<String, bool>,
     attempt_held: &std::collections::BTreeSet<String>,
+    ages: &BTreeMap<String, u64>,
+    floor: lifecycle::UnattemptedFloor,
 ) -> Dispositions {
     let mut dispositions: Dispositions = BTreeMap::new();
     for job_id in reserved {
         let payment = progress.get(job_id).copied().unwrap_or(PaymentProgress::None);
         let claim_payable = payable.get(job_id).copied().unwrap_or(true);
         let verdict = lifecycle::classify_disposition(payment, claim_payable);
+        // The local-clock floor runs BEFORE the attempt-held downgrade below, so a job the attempt
+        // machinery owns still wins: the floor can propose `Dead`, and the downgrade then takes it
+        // back to `Payable`. Ordering them the other way would let the floor override the one
+        // component that knows a send is in flight.
+        let verdict =
+            lifecycle::apply_unattempted_floor(verdict, payment, ages.get(job_id).copied(), floor);
         // The attempt machinery owns the RELEASE decision for jobs it holds — but ONLY that
         // decision. Downgrading `Dead → Payable` (keep the funds) leaves `Paid → spent`
         // untouched, which matters: reconcile's Paid arm is the only converger for a pay whose
@@ -2596,6 +2616,13 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
 
 #[cfg(test)]
 mod tests {
+    /// Every pre-existing reconcile test runs with the local-clock floor OFF, which is how it
+    /// ships. Naming it here means each call site states that rather than leaving it implied.
+    const FLOOR_OFF: lifecycle::UnattemptedFloor = lifecycle::UnattemptedFloor {
+        enabled: false,
+        grace_secs: 0,
+    };
+
     use super::*;
     use crate::home::bootstrap as bootstrap_home;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2816,6 +2843,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::from([(job.clone(), false)]),
             &std::collections::BTreeSet::new(),
+            &BTreeMap::new(),
+            FLOOR_OFF,
         );
         assert_eq!(would_release[&job], reservations::JobDisposition::Dead);
 
@@ -3280,6 +3309,8 @@ mod tests {
                 (free_dead.clone(), false),
             ]),
             &held,
+            &BTreeMap::new(),
+            FLOOR_OFF,
         );
 
         assert_eq!(
@@ -3542,6 +3573,8 @@ mod tests {
             &BTreeMap::new(),
             &BTreeMap::from([(job.clone(), false)]),
             &std::collections::BTreeSet::new(),
+            &BTreeMap::new(),
+            FLOOR_OFF,
         );
         assert_eq!(
             would_release[&job],
@@ -3685,6 +3718,103 @@ mod tests {
             attempted,
             "never-attempted and attempted-but-unsent must not be the same value",
         );
+    }
+
+    // ★ THE FLOOR SHIPS OFF, AND OFF MUST BE THE IDENTITY — no age, payment state, or verdict may
+    // produce a release while `enabled` is false. This is the property the enable decision rests
+    // on, so it is asserted across the whole cross-product rather than at one point.
+    //
+    // Red-on-revert: drop the `if !floor.enabled` early return and this fails on the first row.
+    #[test]
+    fn the_disabled_floor_is_the_identity_function_across_every_input() {
+        let ages = [None, Some(0), Some(u64::MAX)];
+        let payments = [
+            PaymentProgress::None,
+            PaymentProgress::Attempted,
+            PaymentProgress::Uncertain,
+            PaymentProgress::Closed,
+        ];
+        let verdicts = [
+            reservations::JobDisposition::Payable,
+            reservations::JobDisposition::Dead,
+            reservations::JobDisposition::Paid,
+        ];
+        let mut checked = 0;
+        for age in ages {
+            for payment in payments {
+                for verdict in verdicts {
+                    checked += 1;
+                    assert_eq!(
+                        lifecycle::apply_unattempted_floor(verdict, payment, age, FLOOR_OFF),
+                        verdict,
+                        "disabled floor changed {verdict:?} for {payment:?} at age {age:?}",
+                    );
+                }
+            }
+        }
+        assert_eq!(checked, 36, "the cross-product must actually have been walked");
+    }
+
+    // ★ ENABLED, THE FLOOR MUST STILL REFUSE EVERY CASE THAT IS NOT A LEAK.
+    //
+    // Each row is a distinct way this could free money that is genuinely owed. The `Attempted` row
+    // is the real one: `2ba4045a` sat `reserved` with `updated_at == created_at` well past its
+    // deadline and looked exactly like a leak — it was a debt, and it settled 4.5h later.
+    #[test]
+    fn the_enabled_floor_releases_only_a_never_attempted_reservation_past_its_grace() {
+        const ON: lifecycle::UnattemptedFloor = lifecycle::UnattemptedFloor {
+            enabled: true,
+            grace_secs: 3_600,
+        };
+        use reservations::JobDisposition as D;
+        let old = Some(7_200);
+
+        // The one release this feature exists for.
+        assert_eq!(
+            lifecycle::apply_unattempted_floor(D::Payable, PaymentProgress::None, old, ON),
+            D::Dead,
+        );
+        // A debt being retried is NOT a leak, however old it looks.
+        assert_eq!(
+            lifecycle::apply_unattempted_floor(D::Payable, PaymentProgress::Attempted, old, ON),
+            D::Payable,
+            "an attempted-but-unsent payment is owed — releasing it is the 2ba4045a mistake",
+        );
+        // Ambiguous payments belong to the phase-3 saga, never to a clock.
+        assert_eq!(
+            lifecycle::apply_unattempted_floor(D::Payable, PaymentProgress::Uncertain, old, ON),
+            D::Payable,
+        );
+        // Paid is untouched, so reconcile's Paid arm stays the sole converger for a failed flip.
+        assert_eq!(
+            lifecycle::apply_unattempted_floor(D::Paid, PaymentProgress::None, old, ON),
+            D::Paid,
+        );
+        // Inside the grace: not yet a candidate. The boundary is strictly greater-than.
+        assert_eq!(
+            lifecycle::apply_unattempted_floor(D::Payable, PaymentProgress::None, Some(3_600), ON),
+            D::Payable,
+            "a reservation exactly at the grace must not release — the boundary is >, not >=",
+        );
+        // An unreadable row has an unknown age; absence of evidence is not evidence of a leak.
+        assert_eq!(
+            lifecycle::apply_unattempted_floor(D::Payable, PaymentProgress::None, None, ON),
+            D::Payable,
+            "an unknown age must never release",
+        );
+    }
+
+    // The shipped config must be OFF. A default that quietly enabled an automatic money-state
+    // transition would make every other guarantee here moot.
+    #[test]
+    fn the_reservation_floor_ships_disabled() {
+        let shipped = crate::home::BuyerReservationFloorConfig::default();
+        assert!(!shipped.enabled, "the floor must ship OFF");
+        assert!(
+            shipped.grace_secs > 3_600,
+            "the grace must exceed the default job deadline so a live job is never a candidate",
+        );
+        assert!(!crate::home::MobeeConfig::default().buyer_reservation_floor.enabled);
     }
 
     // Across two journals for one job, evidence that an attempt happened must not be masked by a
@@ -4221,7 +4351,7 @@ mod tests {
         payable.insert(live.clone(), true);
         payable.insert(dead.clone(), false);
 
-        let dispositions = plan_reconcile(&reserved, &progress, &payable, &std::collections::BTreeSet::new());
+        let dispositions = plan_reconcile(&reserved, &progress, &payable, &std::collections::BTreeSet::new(), &BTreeMap::new(), FLOOR_OFF);
         assert_eq!(dispositions[&paid], reservations::JobDisposition::Paid);
         assert_eq!(dispositions[&uncertain], reservations::JobDisposition::Payable);
         assert_eq!(dispositions[&live], reservations::JobDisposition::Payable);
@@ -4233,7 +4363,7 @@ mod tests {
     #[test]
     fn plan_reconcile_missing_payable_defaults_to_kept() {
         let job = "e".repeat(64);
-        let dispositions = plan_reconcile(&[job.clone()], &BTreeMap::new(), &BTreeMap::new(), &std::collections::BTreeSet::new());
+        let dispositions = plan_reconcile(&[job.clone()], &BTreeMap::new(), &BTreeMap::new(), &std::collections::BTreeSet::new(), &BTreeMap::new(), FLOOR_OFF);
         assert_eq!(dispositions[&job], reservations::JobDisposition::Payable);
     }
 

@@ -561,6 +561,31 @@ impl BuyerStore {
         Ok(ids)
     }
 
+    /// Age in seconds, per still-`Reserved` job, measured from `created_at_unix` against the
+    /// caller's `now_unix`. Clamped at 0 so a clock that moved backwards reads as "brand new"
+    /// rather than as a huge age that would trip a floor.
+    ///
+    /// A job absent from this map has no readable row, which callers must treat as "unknown age"
+    /// and never as "old enough to release".
+    pub fn reserved_ages(
+        &self,
+        now_unix: i64,
+    ) -> Result<std::collections::BTreeMap<String, u64>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT job_id, created_at_unix FROM reservations WHERE state = 'reserved'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut ages = std::collections::BTreeMap::new();
+        for row in rows {
+            let (job_id, created) = row?;
+            ages.insert(job_id, (now_unix - created).max(0) as u64);
+        }
+        Ok(ages)
+    }
+
     /// The `(state, amount)` of a job's reservation, if any. Inspection / tests.
     pub fn reservation(&self, job_id: &str) -> Result<Option<(ReservationState, u64)>, StoreError> {
         let conn = self.lock()?;

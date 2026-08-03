@@ -411,6 +411,56 @@ pub fn default_telemetry_timeout_ms() -> u64 {
     2000
 }
 
+/// `[buyer_reservation_floor]` — release a reservation nothing ever tried to pay, on the buyer's
+/// own clock.
+///
+/// **Feature OFF by default.** Today a dead reservation is freed only when the relay stops
+/// answering for its job, so the buyer's release of its own funds is gated on a third party's
+/// retention policy. `reservations.created_at_unix` is the one clock that cannot become
+/// unreachable: local, written at award, immutable.
+///
+/// The floor is deliberately narrow. It applies ONLY where the payment journal shows that nothing
+/// was ever attempted ([`crate::buyer::lifecycle::PaymentProgress::None`]) — never to a debt that
+/// was attempted and refused, which looks identical in the reservation row and is genuinely owed.
+///
+/// Enabling this is a money decision, not a tuning knob: a released reserve can fund a new award
+/// while the old row later converts `Released → Spent`, so an over-eager floor spends past the
+/// intended ceiling rather than losing funds outright. It ships off, and it stays off until
+/// someone decides the grace is right for their deployment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuyerReservationFloorConfig {
+    /// Release unattempted reservations past the grace. Default **false**.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Seconds past a reservation's creation before the floor may release it. Default **21600**
+    /// (6h) — comfortably beyond the 3600 s default job deadline plus reconcile cadence, so a job
+    /// still inside its own lifetime is never a candidate.
+    #[serde(default = "default_reservation_floor_grace_secs")]
+    pub grace_secs: u64,
+}
+
+impl Default for BuyerReservationFloorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            grace_secs: default_reservation_floor_grace_secs(),
+        }
+    }
+}
+
+impl BuyerReservationFloorConfig {
+    /// True when every field is at its shipped default, so `config.toml` stays clean.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// serde default for [`BuyerReservationFloorConfig::grace_secs`] — 6 hours.
+pub fn default_reservation_floor_grace_secs() -> u64 {
+    21_600
+}
+
 /// `[seller_heartbeat]` — cadence + enablement for the addressable kind-30340 liveness event.
 /// **Feature ON by default**: a running seller advertises liveness every
 /// [`interval_secs`](SellerHeartbeatConfig::interval_secs) seconds. The heartbeat is
@@ -797,6 +847,10 @@ pub struct MobeeConfig {
     /// `[seller_preflight]` boot push-probe config. Defaults (probe ON) when absent.
     #[serde(default, skip_serializing_if = "SellerPreflightConfig::is_default")]
     pub seller_preflight: SellerPreflightConfig,
+    /// `[buyer_reservation_floor]` local-clock release of an unattempted reservation.
+    /// Defaults (feature OFF) when absent.
+    #[serde(default, skip_serializing_if = "BuyerReservationFloorConfig::is_default")]
+    pub buyer_reservation_floor: BuyerReservationFloorConfig,
     /// Optional buyer-side contribution content policy (the content-policy hook). Absent
     /// ⇒ the FLOOR (refuse only empty diffs). Present ⇒ tighten pre-pay with a path allowlist /
     /// forbidden paths / max diff size.
@@ -894,6 +948,7 @@ impl Default for MobeeConfig {
             telemetry: TelemetryConfig::default(),
             seller_heartbeat: SellerHeartbeatConfig::default(),
             seller_preflight: SellerPreflightConfig::default(),
+            buyer_reservation_floor: BuyerReservationFloorConfig::default(),
             contribution: None,
             sandbox: None,
         }
