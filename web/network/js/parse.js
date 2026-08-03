@@ -3,7 +3,7 @@
  * One malformed / hostile event must never throw into the page.
  */
 
-import { AWARD, CLAIM, FEEDBACK, HANDLER, HEARTBEAT, OFFER, PROFILE, RECEIPT, RESULT } from "./kinds.js";
+import { ACCEPT, AWARD, CLAIM, FEEDBACK, HANDLER, HEARTBEAT, OFFER, PROFILE, RECEIPT, RESULT } from "./kinds.js";
 
 /**
  * @param {unknown} raw
@@ -37,6 +37,10 @@ export function parseEvent(raw) {
     if (kind === OFFER) return { ...base, role: "offer", offer: parseOffer(base) };
     if (kind === CLAIM) return { ...base, role: "claim", claim: parseClaim(base) };
     if (kind === AWARD) return { ...base, role: "award", award: parseAward(base) };
+    // A distinct role, deliberately. Accept carries the same tags as award, so routing
+    // it to role "award" would parse cleanly and re-create the double-count the 3405/3406
+    // split removed — anything counting awards by role would count every job twice.
+    if (kind === ACCEPT) return { ...base, role: "accept", accept: parseAccept(base) };
     if (kind === FEEDBACK) return { ...base, role: "feedback", feedback: parseFeedback(base) };
     if (kind === RESULT) return { ...base, role: "result", result: parseResult(base) };
     if (kind === RECEIPT) return { ...base, role: "receipt", receipt: parseReceipt(base) };
@@ -254,6 +258,15 @@ function parseAward(base) {
     }
   }
   return { offerId, claimId };
+}
+
+/**
+ * A buyer's accept: it binds payment to one verified result, e-tagging the offer (root)
+ * and the claim. The tags match an award's, so the reader is shared; the KIND is what
+ * says whether the buyer was choosing a seller or authorising payment for finished work.
+ */
+function parseAccept(base) {
+  return parseAward(base);
 }
 
 /** A seller's feedback: a progress note, or an error/refusal that fails the job. */
