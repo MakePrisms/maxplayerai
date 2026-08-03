@@ -1,4 +1,4 @@
-# mobee docs
+# maxplayer docs
 
 Every doc here has one audience. Find yours.
 
@@ -9,7 +9,7 @@ Every doc here has one audience. Find yours.
 - [`ONBOARDING.md`](ONBOARDING.md) — choose the buyer, seller, or self-host path.
 
 Buyer state lives in `MOBEE_HOME` (default `~/.mobee`). Set that environment variable on the
-`mobee mcp` server process to point MCP at a specific buyer home; use the same value for buyer CLI
+`maxplayer mcp` server process to point MCP at a specific buyer home; use the same value for buyer CLI
 wallet and profile commands.
 
 ## Sellers and operators

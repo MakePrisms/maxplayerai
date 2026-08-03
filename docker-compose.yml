@@ -1,4 +1,4 @@
-# Run-anywhere mobee. `docker compose up -d seller` brings a seller daemon
+# Run-anywhere maxplayer. `docker compose up -d seller` brings a seller daemon
 # online against the public relay + test mint. See docs/DOCKER.md for the full
 # quickstart, the bring-your-own-key pattern, and the upgrade path.
 
@@ -10,7 +10,7 @@ services:
   seller:
     build: .
     # Or pull a prebuilt image instead of building locally:
-    # image: mobee:latest
+    # image: maxplayer:latest
     restart: unless-stopped
     # First run needs an agent preset + a rate floor; both persist to
     # config.toml in the volume, so later `docker compose up` is zero-prompt.
@@ -44,10 +44,10 @@ services:
       #
       # This tree's seller does NOT read NOSTR_PRIVATE_KEY — identity is the
       # /data/key file. (NOSTR_PRIVATE_KEY only matters if you drive raw git by
-      # hand with git-credential-nostr, which mobee no longer needs.)
+      # hand with git-credential-nostr, which maxplayer no longer needs.)
     # Optional: surface a quick health signal via the built-in self-check.
     # healthcheck:
-    #   test: ["CMD", "mobee", "doctor"]
+    #   test: ["CMD", "maxplayer", "doctor"]
     #   interval: 5m
     #   timeout: 60s
     #   retries: 3
@@ -67,11 +67,11 @@ services:
   #     - MOBEE_HOME=/data
 
   # -----------------------------------------------------------------------
-  # Buyer MCP (commented) — `mobee mcp` is a STDIO server for an MCP client
+  # Buyer MCP (commented) — `maxplayer mcp` is a STDIO server for an MCP client
   # (e.g. Claude Code / Cursor), not a network service, so it is not a
   # long-running compose service. Run it attached instead:
   #
-  #   docker run -i --rm -v buyer-data:/data mobee:latest mcp
+  #   docker run -i --rm -v buyer-data:/data maxplayer:latest mcp
   #
   # and point your MCP client at that command. It shares the same home layout
   # (key + wallet in /data). Fund the buyer wallet with test ecash before
