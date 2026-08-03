@@ -1817,13 +1817,33 @@ mod tests {
     const TEST_RELAY: &str = "wss://relay.invalid";
 
     fn test_store(label: &str) -> SellerStore {
+        test_store_with_path(label).0
+    }
+
+    /// The same store, and the path it lives at — which is what lets a test take a table away.
+    fn test_store_with_path(label: &str) -> (SellerStore, std::path::PathBuf) {
         let id = SEQ.fetch_add(1, Ordering::SeqCst);
         let path = std::env::temp_dir().join(format!(
             "mobee-participation-lag-{label}-{}-{id}.sqlite",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
-        SellerStore::open(path).expect("open store")
+        let store = SellerStore::open(&path).expect("open store");
+        (store, path)
+    }
+
+    /// Take away exactly the table one store read needs, from a second connection, so that read fails and
+    /// nothing else does.
+    ///
+    /// ★★★ THE ONLY STORE FAULT THIS SUITE CAN INJECT, and the four lines are why three sites stayed wrong
+    /// until round 20: with no way to make a store read fail, "a store failure is not the relay's fault"
+    /// was a comment everywhere and a check nowhere — one site said it in words and counted one on the very
+    /// next line. `SellerStore::open` sets WAL and `synchronous=FULL` per connection and leaves
+    /// `locking_mode` at NORMAL, so a second writer is permitted.
+    fn take_away_table(path: &std::path::Path, table: &str) {
+        let conn = rusqlite::Connection::open(path).expect("open the store a second time");
+        conn.execute(&format!("DROP TABLE {table}"), [])
+            .expect("drop the table");
     }
 
     /// Overflow a small broadcast channel so the receiver is guaranteed to report `Lagged`.
@@ -2835,6 +2855,134 @@ mod tests {
                 .resend_deadline(BAD_RELAY, Some("chan-x"))
                 .is_none(),
             "the debt was neither sent nor cancelled, so it will be tried again forever"
+        );
+    }
+
+    /// ★★★ WHOSE FAULT IS A FAILED STORE READ. Three sites answered "the relay's", and the reason all three
+    /// survived four reviews is that nothing here could make a store read fail — so the rule was documented
+    /// and never measured.
+    ///
+    /// Both resend tests drive the drain TWICE: once with the store intact, which must charge the relay for
+    /// the WIRE failure, and once with the table gone. The first run is the positive control, because "no
+    /// fault was charged" is equally true of a drain that never ran at all.
+    #[tokio::test]
+    async fn a_store_fault_in_the_resend_drain_is_ours_not_the_relays() {
+        let (store, path) = test_store_with_path("resend-store-fault");
+        let me = Keys::generate().public_key();
+        joined(&store, BAD_RELAY, "chan-x", now_unix() - 100);
+        let (_tx, rx) = broadcast::channel(8);
+        let mut participation =
+            Participation::for_wire_test_many(vec![(BAD_RELAY, false, rx)], store, me, 0).await;
+
+        participation.owe_resend(BAD_RELAY, Some("chan-x"), now_unix());
+        let intact = participation.drain_resends(now_unix()).await;
+        assert!(
+            intact.is_ok(),
+            "the drain failed with the store still intact, so the fault below would not be the injected \
+             one: {intact:?}"
+        );
+        assert_eq!(
+            participation.relay_faults(),
+            1,
+            "the drain never reached the wire, so the store half of this test would measure nothing"
+        );
+
+        // `is_resumable` returns `StoreError`, so this arm has no wire failure it could be describing.
+        take_away_table(&path, "participation_channels");
+        participation.owe_resend(BAD_RELAY, Some("chan-x"), now_unix());
+        let charged = participation.relay_faults();
+        let outcome = participation.drain_resends(now_unix()).await;
+
+        assert!(
+            matches!(outcome, Err(ParticipationError::Store(_))),
+            "the drain either never ran or swallowed a store fault — it returned {outcome:?}"
+        );
+        assert_eq!(
+            participation.relay_faults(),
+            charged,
+            "our sqlite failing was charged to the relay, which makes relay_faults accuse every relay of \
+             one fault that belongs to none of them"
+        );
+    }
+
+    /// The same fault one read later: membership succeeds and the CURSOR read fails. This is the site where
+    /// the store error was WRAPPED into the send's own `Result`, so `outcome.is_ok()` held "the relay
+    /// refused" and "our sqlite is down" in one bucket and answered as the first. The fix deleted the
+    /// wrapping rather than testing for it, and this proves the read is still made.
+    #[tokio::test]
+    async fn a_store_fault_reading_the_resend_cursor_is_ours_too() {
+        let (store, path) = test_store_with_path("resend-cursor-fault");
+        let me = Keys::generate().public_key();
+        joined(&store, BAD_RELAY, "chan-y", now_unix() - 100);
+        let (_tx, rx) = broadcast::channel(8);
+        let mut participation =
+            Participation::for_wire_test_many(vec![(BAD_RELAY, false, rx)], store, me, 0).await;
+
+        participation.owe_resend(BAD_RELAY, Some("chan-y"), now_unix());
+        let intact = participation.drain_resends(now_unix()).await;
+        assert!(intact.is_ok(), "the drain failed with the store intact: {intact:?}");
+        assert_eq!(
+            participation.relay_faults(),
+            1,
+            "the drain never reached the wire, so the store half of this test would measure nothing"
+        );
+
+        take_away_table(&path, "participation_cursors");
+        participation.owe_resend(BAD_RELAY, Some("chan-y"), now_unix());
+        let charged = participation.relay_faults();
+        let outcome = participation.drain_resends(now_unix()).await;
+
+        assert!(
+            matches!(outcome, Err(ParticipationError::Store(_))),
+            "the cursor read no longer happens, or its failure was swallowed — the drain returned \
+             {outcome:?}"
+        );
+        assert_eq!(
+            participation.relay_faults(),
+            charged,
+            "our sqlite failing was charged to the relay as a refused subscribe"
+        );
+    }
+
+    /// The third site, in the pump itself: `resync_relay` reads three cursors before it sends anything, and
+    /// its failure arm swallowed the store error eighteen lines above the `?` that propagates the same error
+    /// out of the same helper.
+    ///
+    /// ★ The positive control is NOT re-run inside this test, and cannot be — the failure arm advances the
+    /// rate floor, so a second resync on the same relay is throttled by design.
+    /// `a_failed_resync_still_advances_the_rate_floor` IS that control: same fixture, same arm, a wire
+    /// failure, exactly one fault charged. Here the `Err` carries the evidence instead, because a resync
+    /// that never fired leaves the pump returning `Ok`.
+    #[tokio::test]
+    async fn a_store_fault_in_the_resync_is_not_charged_to_the_relay() {
+        let (store, path) = test_store_with_path("resync-store-fault");
+        let (_tx, rx) = broadcast::channel(8);
+        let mut participation = Participation::for_wire_test_many(
+            vec![(BAD_RELAY, false, rx)],
+            store,
+            Keys::generate().public_key(),
+            0,
+        )
+        .await;
+        // `membership_cursor` is the first thing `subscribe_wake_surface` reads, so the store fails before
+        // the wire is touched at all.
+        take_away_table(&path, "participation_cursors");
+        participation.owe_resync(BAD_RELAY);
+
+        let outcome = participation.pump(Duration::from_millis(1)).await;
+
+        assert!(
+            matches!(outcome, Err(ParticipationError::Store(_))),
+            "the resync arm either never ran or swallowed a store fault — the pump returned {outcome:?}"
+        );
+        assert_eq!(
+            participation.relay_faults(),
+            0,
+            "our sqlite failing was charged to the relay, and the relay did nothing"
+        );
+        assert!(
+            participation.resync_pending(BAD_RELAY),
+            "the debt was discharged by a resync that never happened"
         );
     }
 
