@@ -1146,12 +1146,12 @@ impl Participation {
             return;
         }
 
-        // ★ Cleared because the thing the deadline was FOR — re-proving access — has now happened. This is
-        // not the arm-on-the-way-in mistake: the wake surface is a separate debt, and it gets its own
-        // marker below rather than riding on this one.
-        if let Some(live) = self.live.get_mut(&url) {
-            live.reprove_due = None;
-        }
+        // ⛔ THE QUARANTINE IS **NOT** LIFTED HERE, AND IT USED TO BE. Clearing `reprove_due` before the
+        // rebuild was the arm-before-the-event mistake wearing its opposite face: `Live::quarantined` reads
+        // this field, and it is the gate on all four recovery lanes — so lifting it on the strength of the
+        // ECHO alone declared the relay fit to be sent to before anything had been re-subscribed on it.
+        // The echo proves the transport; only the rebuild proves the access. It is cleared in the success
+        // arm, with the rest of what success earns.
         let rebuilt = {
             let Some(entry) = self.live.get(&url) else {
                 return;
@@ -1176,12 +1176,47 @@ impl Participation {
                 // this right by construction — it records after the install — and this path did not.
                 self.roster
                     .record_probe(&url, ProbeOutcome::EchoObserved, now);
+                if let Some(live) = self.live.get_mut(&url) {
+                    live.reprove_due = None;
+                }
                 self.settle_wake_surface(&url, &installed, now)
             }
-            Err(_) => {
+            // ★★★ THE FAILURE IS FOLDED INTO THE ROSTER, and leaving it out was the SAME FIX HALF-DONE for
+            // the third time on this branch. Moving the budget reset into the success arm stopped the
+            // roster being wrongly cleared; it did nothing about the failure, which recorded NOTHING. So the
+            // relay stayed live, stayed `Admitted`, had its quarantine lifted by the echo, and was retried
+            // by the RESYNC lane at the floor rate — forever, because nothing on that path can ever reach
+            // the attempt ceiling. The ping-pong did not die; it changed lanes.
+            //
+            // ⇒ SHAPE, and it has cost three rounds: WHEN A SUCCESS PATH AND A FAILURE PATH SHARE A
+            // PREAMBLE, FIXING THE SUCCESS PATH DOES NOT FIX THE PREAMBLE — and the failure path is where
+            // the unbounded behaviour lives, because that is the one that repeats.
+            //
+            // Now it is shaped exactly like the probe-failure branch at the top of this function: record the
+            // silence, drop the socket, and let `relays_to_probe` own the backoff, the ceiling and the
+            // eventual denial. One body decides how a relay that will not serve us is treated.
+            //
+            // ⛔ UNTESTED, AND IT IS THE THIRD BRANCH IN THIS FAMILY BLOCKED BY ONE MISSING FIXTURE
+            // CAPABILITY — worth stating as a set rather than three times as an apology. All three need a
+            // relay that ECHOES the carrier and THEN fails a subscribe: this one, `probe_one_due`'s install
+            // failure, and the `Store` split inside it. `PGateRelay` gates `#p` and answers `restricted:`
+            // but cannot serve a stored event back, so it can never get past the echo; `LocalRelay` serves
+            // events but cannot gate, so it can never fail the subscribe. Note a CLOSED will NOT do it —
+            // `subscribe_with_id` returns once the REQ is sent, so a refusal arrives too late to become an
+            // `Err`; the socket has to be GONE by subscribe time. ⇒ the one fixture that unblocks all three
+            // is `PGateRelay` plus stored-event service plus a close-after-serving-the-echo control. Until
+            // then this is insurance with a reason, and its presence is not coverage.
+            Err(error) => {
                 self.relay_faults = self.relay_faults.saturating_add(1);
-                if let Some(live) = self.live.get_mut(&url) {
-                    live.resync_pending = true;
+                self.roster.record_probe(
+                    &url,
+                    ProbeOutcome::Unreachable(format!(
+                        "echoed the carrier but the wake surface could not be rebuilt: {error}"
+                    )),
+                    now,
+                );
+                if let Some(entry) = self.live.remove(&url) {
+                    entry.reader.disconnect().await;
                 }
             }
         }
