@@ -382,6 +382,7 @@ v1 `reason_code` vocabulary:
 | `at_capacity` | `refusal` | no |
 | `execution_failed` | `error` | yes |
 | `delivery_failed` | `error` | yes |
+| `no_sentinel` | `refusal` | yes |
 
 v1 status categories are:
 
@@ -493,6 +494,40 @@ This was measured the hard way, in the safe direction. A buyer concluded that no
 > v1 rule: before concluding that a property is unverifiable for a foreign seat, a reader MUST enumerate what the delivered artifact already contains. "No live access" and "no evidence" are different findings, and only the second one licenses giving up.
 
 Where no shipped artifact carries the property, the strongest remaining signal is differential: request a named harness, and compare that seat's self-report against the same seat with the harness unset. If the self-report changes, the request is honoured in the seat's own accounting. If it does not change, that is a finding too -- either the request is ignored or the label is wrong. Neither outcome establishes what actually ran, and v1 does not pretend otherwise.
+
+## 18. Delivery Artifact: The Node Workdir Snapshot
+
+The paid delivery artifact IS the node's workdir snapshot. The agent's own commit is not preserved and is an ancestor of the delivery in no mode.
+
+This follows from the attested-versus-asserted rule (see 17). The node is the protocol participant that can be held to a specification; the harness is arbitrary third-party software. Defining delivery as *the agent's commit* would make the paid artifact depend on cooperation from a component the protocol cannot constrain, with no enforcement point. The node is the reliable committer, and delivery is defined against it.
+
+### 18.1 Delivery parentage, per mode
+
+Parentage is fixed per mode:
+
+- **Contribution** (a buyer-pinned base exists): the delivery is exactly one commit parented on that base, which the node fetches to a base ref it controls. An implementation MUST assert a parent count of one, on the pinned base rather than on any scratch tip.
+- **Greenfield** (no base): there is nothing to parent onto, so the delivery is a **root commit** whose tree is the whole workdir. An implementation MUST assert a parent count of zero.
+
+The agent's own commit is an ancestor in neither mode; a discarded commit cannot be an ancestor of anything.
+
+Two costs are part of the contract rather than left to be rediscovered:
+
+- `.gitignore`d files are excluded from the snapshot, so a job whose output must be delivered MUST NOT rely on an ignored path.
+- Agent authorship and per-step history are not preserved.
+
+## 19. Mandatory Execution Sentinel
+
+Every delivery MUST carry an execution sentinel inside the delivered tree.
+
+The motivation is a measured failure mode, not a hypothetical: a quota-dead run can exit `0` with a `completed` status in about two seconds, having written nothing, so every status field reports success. The sentinel is the signal that catches it.
+
+The sentinel rides IN THE DELIVERED TREE, never as a tag on the delivery event. This follows from the attested-versus-asserted rule (see 17): a tag is authored by the seller at publish time and can be emitted without the workdir ever being touched -- that is testimony. A file inside the delivered tree sits within the artifact the buyer independently fetches and hashes -- that is evidence.
+
+> Normative limit: a sentinel proves EXECUTION IN THIS WORKDIR. It never proves work quality, and it can never stand in for acceptance.
+
+A delivery produced without a sentinel MUST be a defined refusal carrying `no_sentinel` (see 10). Without that failure mode the requirement is decoration.
+
+**A sentinel is not a transcript.** What belongs in the tree is a structured execution manifest -- the minimum that proves execution in this workdir. A verbatim agent conversation log is not that: it leaks prompt content into a public artifact, inflates every delivery, and still proves only what the harness chose to write. v1 requires the manifest and does not make the transcript part of the artifact.
 
 **Lapse is a protocol question, not a component defect.** Buyer-side parked jobs and seller-side stuck claims are the same failed trades seen from two ends; a replication measured seven of seven cross-side correspondences. No component owns lapse, so it is specified here rather than tracked as a defect in either implementation.
 
