@@ -239,6 +239,25 @@ jobs:
           sha256sum -- *.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
+      # `install.sh` is attached from the checkout rather than built, and it is attached to EVERY
+      # release on purpose: the canonical one-liner docs point at is
+      # `releases/latest/download/install.sh`, which GitHub resolves against whichever release is
+      # currently latest. A release published without it silently breaks that URL for everyone, not
+      # just for users of that version.
+      #
+      # Asserted before `gh release create` rather than relying on gh's own "file not found": a
+      # release that has already been created cannot be un-created, and gh uploads assets after
+      # creating it — so a missing file discovered there leaves a published release with no installer.
+      - name: Require the installer
+        run: |
+          set -euo pipefail
+          [ -f install.sh ] || {
+            echo "install.sh is missing from the checkout — the release would publish without the installer that docs' one-liner points at" >&2
+            exit 1
+          }
+          sh -n install.sh || { echo "install.sh is not valid POSIX sh" >&2; exit 1; }
+          echo "ok: install.sh present and parses"
+
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -250,7 +269,7 @@ jobs:
           if [ "$PRERELEASE" = true ]; then
             flags+=(--prerelease)
           fi
-          gh release create "$GITHUB_REF_NAME" "${flags[@]}" dist/*.tar.gz dist/SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" "${flags[@]}" dist/*.tar.gz dist/SHA256SUMS install.sh
 
   publish:
     name: npm publish
