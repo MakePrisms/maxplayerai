@@ -149,6 +149,10 @@ function feedLine(e) {
     // No harness tag here — the activity stream reads as a sentence, and the
     // runtime is noise in it. Still on the seller row and in the event sheet.
     case "result": return `${who} delivered`;
+    // "accepted the delivery", not "authorised payment": this sits directly
+    // above "paid" in the feed, where a sentence about authorising payment
+    // reads as the settlement itself rather than the step before it.
+    case "accept": return `${who} accepted the delivery`;
     case "receipt": return `paid${e.amount != null ? ` · <span class="sats">${usd(e.amount)}</span>` : ""} · receipt co-signed`;
     case "feedback": return `${who} · ${esc(e.reason || "feedback")}`;
     default: return who;
