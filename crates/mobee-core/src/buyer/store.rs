@@ -508,6 +508,17 @@ impl BuyerStore {
                 _ => report.kept.push(job_id.clone()),
             }
         }
+        // Age of the oldest reservation STILL held after this pass's own writes — read inside the
+        // same transaction so it can never describe a row this pass just released. `kept N` alone
+        // cannot distinguish a healthy hold from a reservation nothing will ever resolve: both
+        // print the identical line, forever. The age is the only term that separates them, so a
+        // reader watching it climb sees the ramp while it happens rather than afterwards (#273).
+        let oldest_created: Option<i64> = tx.query_row(
+            "SELECT MIN(created_at_unix) FROM reservations WHERE state = 'reserved'",
+            [],
+            |row| row.get(0),
+        )?;
+        report.oldest_kept_age_secs = oldest_created.map(|created| (now_unix - created).max(0) as u64);
         tx.commit()?;
         Ok(report)
     }

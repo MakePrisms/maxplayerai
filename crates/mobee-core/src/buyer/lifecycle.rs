@@ -900,7 +900,14 @@ pub enum PaymentProgress {
     /// (PAYMENT_UNCERTAIN): the ecash may already have left. Must NOT auto-release; the phase-3
     /// payment saga (#127) resolves it.
     Uncertain,
-    /// No payment attempt has left funds for this job (no journal, or only `Intent`/`Locked`).
+    /// A payment attempt exists but never left funds — the journal folded to `Intent`/`Locked`.
+    ///
+    /// Distinct from [`Self::None`] because "a debt being retried" and "an award nothing ever
+    /// attempted to pay" are different facts, and only the second is a leaked reservation. The
+    /// journal already records the difference; folding both into one variant discarded it one
+    /// step before the decision that needs it.
+    Attempted,
+    /// No payment attempt exists at all — this job has no payment journal.
     None,
 }
 
@@ -1007,12 +1014,20 @@ pub fn park_reason_unreadable(unanswered_reads: u32) -> String {
 /// `Paid` regardless of whether the claim still looks live, and an ambiguous payment is KEPT
 /// (`Payable`) even if the claim looks dead — the funds may have moved, so only the phase-3 saga
 /// may resolve it. A job with no payment is `Dead` only when it is no longer payable on the relay.
+///
+/// [`PaymentProgress::Attempted`] and [`PaymentProgress::None`] classify identically here: both are
+/// "no funds have left", so both are `Dead` exactly when the relay says the claim is gone. The two
+/// are separate variants so a *later* rule can tell them apart — an unattempted award past its
+/// deadline is a leak, whereas a retried-and-refused debt is correctly held — without this
+/// classifier changing behaviour today.
 pub fn classify_disposition(payment: PaymentProgress, claim_payable: bool) -> JobDisposition {
     match payment {
         PaymentProgress::Closed => JobDisposition::Paid,
         PaymentProgress::Uncertain => JobDisposition::Payable,
-        PaymentProgress::None if claim_payable => JobDisposition::Payable,
-        PaymentProgress::None => JobDisposition::Dead,
+        PaymentProgress::Attempted | PaymentProgress::None if claim_payable => {
+            JobDisposition::Payable
+        }
+        PaymentProgress::Attempted | PaymentProgress::None => JobDisposition::Dead,
     }
 }
 
