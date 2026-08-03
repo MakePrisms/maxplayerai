@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use git2::build::CheckoutBuilder;
 use git2::{Commit, Direction, IndexAddOption, Oid, Repository, Signature};
 
+use crate::delivery_sentinel::{self, DeliveryMode};
 use crate::delivery_transport::{assert_allowed_repo_locator, TransportRefuse};
 use crate::git_transport::{self, TransportError};
 
@@ -35,6 +36,13 @@ pub enum SellerGitError {
     CommandFailed(&'static str),
     AuthFailed(String),
     Io(String),
+    /// The completion gate found nothing the node itself observed executing — an empty from-scratch
+    /// tree, or a contribution tree identical to its base. Distinct from [`Self::Io`] because it is
+    /// the exact quota-dead-harness case §19 exists to catch (a "completed" turn that wrote nothing):
+    /// the daemon maps THIS to a `no_sentinel` refusal, and the node refuses to mint a sentinel over
+    /// work it never saw happen. An unconditional sentinel write would make this state deliver a
+    /// passing sentinel and prove nothing, so the gate — not the write — is the check.
+    NoExecutionObserved(String),
 }
 
 impl std::fmt::Display for SellerGitError {
@@ -45,6 +53,9 @@ impl std::fmt::Display for SellerGitError {
             Self::CommandFailed(op) => write!(f, "seller git {op} failed"),
             Self::AuthFailed(message) => write!(f, "seller git auth failed: {message}"),
             Self::Io(message) => write!(f, "seller git io error: {message}"),
+            Self::NoExecutionObserved(message) => {
+                write!(f, "seller git no execution observed: {message}")
+            }
         }
     }
 }
@@ -220,6 +231,7 @@ pub fn snapshot_delivery(
     base_oid: Option<&str>,
     branch: &str,
     message: &str,
+    job_hash: &str,
 ) -> Result<String, SellerGitError> {
     // Wall-clock authored-at. The node's resume-safe path calls `snapshot_delivery_at` with a
     // journaled date instead so a re-created delivery commit keeps the same oid across a restart.
@@ -227,7 +239,7 @@ pub fn snapshot_delivery(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    snapshot_delivery_at(workdir, identity, base_oid, branch, message, now)
+    snapshot_delivery_at(workdir, identity, base_oid, branch, message, now, job_hash)
 }
 
 /// Snapshot the delivery commit with an EXPLICIT authored-at second (`author_date_unix`) for both
@@ -236,6 +248,17 @@ pub fn snapshot_delivery(
 /// that crashed after snapshotting but before recording the delivery re-creates the SAME commit and
 /// the re-push is a no-op instead of a divergent second tip. The seller node journals the date at
 /// claim/award time (a value stable across restarts) and passes it here.
+///
+/// ## Execution sentinel (§19)
+/// Every delivery MUST carry an execution sentinel inside the delivered tree. This function is where
+/// the node writes it: after staging the RAW workdir it decides whether execution actually happened
+/// (the completion gate below), and ONLY when it did does it mint the structured manifest — seeded
+/// from `job_hash` for replay resistance — and force-stage it into the delivered tree. The gate, not
+/// the write, is the check: an UNCONDITIONAL sentinel write would hand the exact quota-dead case §19
+/// exists to catch (a "completed" turn that wrote nothing) a passing sentinel and prove nothing, so
+/// a no-execution tree is refused as [`SellerGitError::NoExecutionObserved`] and no sentinel is
+/// authored. The manifest is deterministic (no wall-clock/entropy) and is minted from the raw tree
+/// AFTER any prior sentinel we wrote is removed, so a re-snapshot re-creates the identical oid.
 pub fn snapshot_delivery_at(
     workdir: &Path,
     identity: &DeliveryAgentIdentity,
@@ -243,6 +266,7 @@ pub fn snapshot_delivery_at(
     branch: &str,
     message: &str,
     author_date_unix: i64,
+    job_hash: &str,
 ) -> Result<String, SellerGitError> {
     let repo = Repository::open(workdir)
         .map_err(|error| SellerGitError::Io(format!("snapshot: open workdir: {error}")))?;
@@ -259,8 +283,14 @@ pub fn snapshot_delivery_at(
         None => None,
     };
 
-    // Stage the full workdir tree: new + modified tracked files (add_all skips ignored) and
-    // removals of tracked files gone from the workdir (update_all). `.git` is never walked.
+    // A sentinel we wrote on an earlier snapshot of THIS workdir is our artifact, not the agent's
+    // work. Remove it before staging so the gate and the observed facts reflect what the harness
+    // actually produced, and so a re-snapshot re-mints an identical manifest from an identical raw
+    // tree (the re-push determinism invariant). An absent file is a no-op.
+    let _ = std::fs::remove_file(workdir.join(delivery_sentinel::SENTINEL_FILE));
+
+    // Stage the full workdir tree — RAW, no sentinel yet: new + modified tracked files (add_all skips
+    // ignored) and removals of tracked files gone from the workdir (update_all). `.git` is never walked.
     let mut index = repo
         .index()
         .map_err(|_| SellerGitError::CommandFailed("snapshot-index"))?;
@@ -270,27 +300,52 @@ pub fn snapshot_delivery_at(
     index
         .update_all(["*"].iter(), None)
         .map_err(|_| SellerGitError::CommandFailed("snapshot-update"))?;
-    let tree_oid = index
+    let raw_tree_oid = index
         .write_tree()
         .map_err(|_| SellerGitError::CommandFailed("snapshot-write-tree"))?;
-    let tree = repo
-        .find_tree(tree_oid)
+    let raw_tree = repo
+        .find_tree(raw_tree_oid)
         .map_err(|_| SellerGitError::CommandFailed("snapshot-tree"))?;
 
-    // Completion gate: there must be something to deliver.
-    match base.as_ref().map(|c| c.tree_id()) {
-        Some(base_tree) if base_tree == tree_oid => {
-            return Err(SellerGitError::Io(
-                "delivery refused: nothing to deliver (workdir identical to base)".into(),
+    // Completion gate == the execution-observed gate (§19). Nothing the node observed executing — an
+    // empty from-scratch tree, or a contribution tree byte-identical to its base — is the quota-dead
+    // case: refuse `no_sentinel` HERE and mint no sentinel, rather than certify work that never
+    // happened. `NoExecutionObserved` (not a bare Io) so the daemon maps it to the no_sentinel refusal.
+    let mode = match base.as_ref().map(|c| c.tree_id()) {
+        Some(base_tree) if base_tree == raw_tree_oid => {
+            return Err(SellerGitError::NoExecutionObserved(
+                "workdir identical to base — no execution observed".into(),
             ));
         }
-        None if tree.is_empty() => {
-            return Err(SellerGitError::Io(
-                "delivery refused: nothing to deliver (empty tree)".into(),
+        None if raw_tree.is_empty() => {
+            return Err(SellerGitError::NoExecutionObserved(
+                "empty tree — no execution observed".into(),
             ));
         }
-        _ => {}
-    }
+        Some(_) => DeliveryMode::Contribution,
+        None => DeliveryMode::FromScratch,
+    };
+
+    // Node-observed execution facts over the RAW tree (the sentinel is not in it yet): the delivered
+    // work's file count and total byte size, recorded in the manifest as evidence of what the node saw.
+    let (files, bytes) = observe_tree(&repo, &raw_tree)?;
+
+    // §19: write the structured execution manifest into the delivered tree and FORCE-stage it —
+    // `add_path` bypasses `.gitignore`, so a coincidental or hostile ignore rule can never drop the
+    // sentinel from the snapshot. The manifest is deterministic and seeded from this job's `job_hash`,
+    // so the final tree (and the delivery oid) stay a pure function of (raw tree, job_hash, date).
+    let manifest = delivery_sentinel::render_manifest(job_hash, mode, files, bytes);
+    std::fs::write(workdir.join(delivery_sentinel::SENTINEL_FILE), manifest)
+        .map_err(|error| SellerGitError::Io(format!("snapshot: write sentinel: {error}")))?;
+    index
+        .add_path(Path::new(delivery_sentinel::SENTINEL_FILE))
+        .map_err(|_| SellerGitError::CommandFailed("snapshot-add-sentinel"))?;
+    let tree_oid = index
+        .write_tree()
+        .map_err(|_| SellerGitError::CommandFailed("snapshot-write-tree-final"))?;
+    let tree = repo
+        .find_tree(tree_oid)
+        .map_err(|_| SellerGitError::CommandFailed("snapshot-tree-final"))?;
 
     index
         .write()
@@ -314,6 +369,38 @@ pub fn snapshot_delivery_at(
     repo.set_head(&refname)
         .map_err(|_| SellerGitError::CommandFailed("snapshot-set-head"))?;
     Ok(commit.to_string())
+}
+
+/// Count the blobs in `tree` and sum their byte sizes — the node-observed execution facts recorded
+/// in the manifest. Walks the tree (not the workdir), so it measures exactly what will be delivered.
+/// Fail-closed: an unreadable object aborts rather than under-counting the delivered work.
+fn observe_tree(repo: &Repository, tree: &git2::Tree) -> Result<(usize, u64), SellerGitError> {
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    let mut failed = false;
+    tree.walk(git2::TreeWalkMode::PreOrder, |_root, entry| {
+        if entry.kind() != Some(git2::ObjectType::Blob) {
+            return git2::TreeWalkResult::Ok;
+        }
+        match entry.to_object(repo) {
+            Ok(object) => {
+                if let Some(blob) = object.as_blob() {
+                    files += 1;
+                    bytes += blob.size() as u64;
+                }
+                git2::TreeWalkResult::Ok
+            }
+            Err(_) => {
+                failed = true;
+                git2::TreeWalkResult::Abort
+            }
+        }
+    })
+    .map_err(|_| SellerGitError::CommandFailed("snapshot-observe"))?;
+    if failed {
+        return Err(SellerGitError::CommandFailed("snapshot-observe"));
+    }
+    Ok((files, bytes))
 }
 
 /// Optional NIP-98 auth for relay-git push/fetch (key never logged / never on argv).
@@ -441,6 +528,7 @@ pub async fn snapshot_delivery_at_off_runtime(
     branch: String,
     message: String,
     author_date_unix: i64,
+    job_hash: String,
 ) -> Result<String, SellerGitError> {
     off_runtime(move || {
         snapshot_delivery_at(
@@ -450,6 +538,7 @@ pub async fn snapshot_delivery_at_off_runtime(
             &branch,
             &message,
             author_date_unix,
+            &job_hash,
         )
     })
     .await
@@ -672,6 +761,41 @@ mod snapshot_tests {
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
+    /// A fixed job hash for the snapshot fixtures — every §19 delivery now carries a job-bound
+    /// sentinel, so the tests supply one. The two shims below shadow the real entry points (a local
+    /// item shadows the `use super::*` glob) so the existing call sites keep their signatures while
+    /// every delivery gets a sentinel seeded from this hash.
+    const TEST_JOB_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn snapshot_delivery(
+        workdir: &Path,
+        identity: &DeliveryAgentIdentity,
+        base_oid: Option<&str>,
+        branch: &str,
+        message: &str,
+    ) -> Result<String, SellerGitError> {
+        super::snapshot_delivery(workdir, identity, base_oid, branch, message, TEST_JOB_HASH)
+    }
+
+    fn snapshot_delivery_at(
+        workdir: &Path,
+        identity: &DeliveryAgentIdentity,
+        base_oid: Option<&str>,
+        branch: &str,
+        message: &str,
+        author_date_unix: i64,
+    ) -> Result<String, SellerGitError> {
+        super::snapshot_delivery_at(
+            workdir,
+            identity,
+            base_oid,
+            branch,
+            message,
+            author_date_unix,
+            TEST_JOB_HASH,
+        )
+    }
+
     fn workdir(label: &str) -> PathBuf {
         let id = SEQ.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir()
@@ -877,6 +1001,61 @@ mod snapshot_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Read the execution-sentinel manifest blob out of a delivered tree (the well-known path).
+    fn sentinel_blob(dir: &Path, oid: &str) -> String {
+        let repo = Repository::open(dir).expect("open");
+        let tree = repo
+            .find_commit(Oid::from_str(oid).unwrap())
+            .unwrap()
+            .tree()
+            .unwrap();
+        let entry = tree
+            .get_path(Path::new(crate::delivery_sentinel::SENTINEL_FILE))
+            .expect("delivered tree must carry the sentinel manifest");
+        let blob = repo.find_blob(entry.id()).expect("sentinel blob");
+        String::from_utf8(blob.content().to_vec()).expect("sentinel is utf-8")
+    }
+
+    // TOOTH (#374 §19) — the delivered tree CARRIES this job's execution sentinel. A genuine
+    // from-scratch run is snapshotted; the delivery tree must contain the sentinel manifest whose
+    // job-bound token matches THIS job's hash, checked through the SAME shared matcher the buyer uses
+    // (one definition, both ends). A DIFFERENT job's hash must NOT match the same tree — the replay
+    // resistance the buyer relies on, proven at the seat that authors it.
+    //
+    // Red-on-revert: neuter the sentinel write in `snapshot_delivery_at` (skip render + add_path) and
+    // the delivered tree carries no manifest — `sentinel_blob` panics / the match goes false — so this
+    // test goes red. An unconditional write cannot make it pass over a no-execution tree either,
+    // because the completion gate refuses that case before any write (see the gate tests below).
+    #[test]
+    fn delivery_tree_carries_this_jobs_execution_sentinel() {
+        let dir = workdir("sentinel");
+        let id = identity();
+        init_empty_delivery_workdir(&dir, &id).expect("init");
+        write(&dir, "out.rs", "real work\n");
+        let job_hash = "9".repeat(64);
+        let other_job = "7".repeat(64);
+
+        let oid = super::snapshot_delivery(&dir, &id, None, "mobee/job", "msg", &job_hash)
+            .expect("snapshot");
+
+        let content = sentinel_blob(&dir, &oid);
+        assert!(
+            crate::delivery_sentinel::content_carries_sentinel(&content, &job_hash, ""),
+            "the delivered tree must carry THIS job's sentinel; manifest was: {content:?}"
+        );
+        assert!(
+            !crate::delivery_sentinel::content_carries_sentinel(&content, &other_job, ""),
+            "a DIFFERENT job's hash must not match the same tree (replay resistance)"
+        );
+        let paths = tree_paths(&dir, &oid);
+        assert!(
+            paths.contains(&crate::delivery_sentinel::SENTINEL_FILE.to_owned()),
+            "the sentinel rides at its well-known path in the delivered tree"
+        );
+        assert!(paths.contains(&"out.rs".to_owned()), "and the real work rides too");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     // ── Completion gate: nothing to deliver refuses cleanly (both floors) ──────────────────────
     #[test]
     fn nothing_to_deliver_contribution_refuses() {
@@ -886,6 +1065,10 @@ mod snapshot_tests {
         // Workdir untouched — identical to base.
         let err = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg")
             .expect_err("must refuse");
+        assert!(
+            matches!(err, SellerGitError::NoExecutionObserved(_)),
+            "a nothing-to-deliver contribution is a no-execution refusal (maps to no_sentinel), got: {err}"
+        );
         assert!(err.to_string().contains("identical to base"), "got: {err}");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -896,6 +1079,10 @@ mod snapshot_tests {
         let id = identity();
         init_empty_delivery_workdir(&dir, &id).expect("init");
         let err = snapshot_delivery(&dir, &id, None, "mobee/job", "msg").expect_err("must refuse");
+        assert!(
+            matches!(err, SellerGitError::NoExecutionObserved(_)),
+            "an empty from-scratch tree is a no-execution refusal (maps to no_sentinel), got: {err}"
+        );
         assert!(err.to_string().contains("empty tree"), "got: {err}");
         let _ = fs::remove_dir_all(&dir);
     }

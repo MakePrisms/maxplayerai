@@ -15,6 +15,7 @@ pub mod crossmint;
 #[cfg(all(feature = "wallet", feature = "gateway"))]
 pub mod crossmint_hop;
 pub mod delivery;
+pub mod delivery_sentinel;
 #[cfg(feature = "git-delivery")]
 pub mod delivery_git;
 #[cfg(feature = "git-delivery")]

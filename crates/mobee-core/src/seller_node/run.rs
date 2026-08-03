@@ -21,7 +21,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::gateway::{
     self, claim_draft, error_draft, git_result_draft, parse_award, parse_offer, OfferParseError,
-    ParsedOffer,
+    ParsedOffer, ReasonCode,
 };
 use crate::home::{self, MobeeHome};
 use crate::job_lifecycle::{event_to_draft, job_hash_for_offer};
@@ -57,6 +57,14 @@ const RESULT_PUBLISH_WINDOW_SECS: i64 = 86_400;
 /// error detail — the operator log carries the specifics) but enough that the buyer learns the job
 /// failed instead of waiting on a delivery that will never come.
 const EXEC_FAILURE_FEEDBACK: &str = "seller could not complete the job (execution failed before delivery)";
+/// Buyer-facing reason when execution succeeded but the delivery (snapshot/push/publish) failed —
+/// a display-only mirror of the `delivery_failed` reason_code (§10; the tag governs).
+const DELIVERY_FAILURE_FEEDBACK: &str =
+    "seller executed the job but delivery failed before it reached you";
+/// Buyer-facing reason when the node observed no genuine execution (the quota-dead case §19 catches),
+/// so it refused to deliver without a sentinel — a display-only mirror of the `no_sentinel` reason_code.
+const NO_SENTINEL_FEEDBACK: &str =
+    "seller refused delivery: no execution was observed, so no execution sentinel was produced";
 
 // TODO(multi-slot): this default is a placeholder pending real award-latency measurement — how long
 // a live buyer actually takes between our claim and its award. It is deliberately far below
@@ -1936,15 +1944,28 @@ impl SellerNodeRunner {
     /// deliver — so the buyer learns the reason instead of getting silence. Best-effort: signed
     /// through the signer actor and sent on the shared client; a failure is logged, never wedges the
     /// loop. Used for both the targeted under-rate refusal and an execution failure.
-    async fn publish_buyer_feedback(&self, offer_id: &str, buyer_pubkey: &str, reason: &str) {
-        let draft = error_draft(offer_id, buyer_pubkey, &self.seller_pubkey.to_hex(), reason);
+    async fn publish_buyer_feedback(
+        &self,
+        offer_id: &str,
+        buyer_pubkey: &str,
+        reason_code: ReasonCode,
+        reason: &str,
+    ) {
+        let draft = error_draft(
+            offer_id,
+            buyer_pubkey,
+            &self.seller_pubkey.to_hex(),
+            reason_code,
+            reason,
+        );
         match self.node.signer().sign(draft, now_unix()).await {
             Ok(Ok(signed)) => {
                 use nostr_sdk::JsonUtil as _;
                 match nostr_sdk::Event::from_json(&signed.json) {
                     Ok(feedback) => match self.client.send_event_to([&self.relay_url], &feedback).await {
                         Ok(_) => eprintln!(
-                            "seller node buyer feedback surfaced: offer={offer_id} reason={reason}"
+                            "seller node buyer feedback surfaced: offer={offer_id} reason_code={} reason={reason}",
+                            reason_code.as_str()
                         ),
                         Err(error) => eprintln!(
                             "seller node WARN: buyer feedback publish failed offer={offer_id} ({error})"
@@ -1964,10 +1985,16 @@ impl SellerNodeRunner {
         }
     }
 
-    /// The targeted under-rate refusal feedback (see [`should_publish_under_rate_feedback`]).
+    /// The targeted under-rate refusal feedback (see [`should_publish_under_rate_feedback`]) — a price
+    /// decline, so it carries the `below_rate` reason_code (§10 `refusal` class, does not score).
     async fn publish_under_rate_feedback(&self, event: &nostr_sdk::Event, reason: &str) {
-        self.publish_buyer_feedback(&event.id.to_hex(), &event.pubkey.to_hex(), reason)
-            .await;
+        self.publish_buyer_feedback(
+            &event.id.to_hex(),
+            &event.pubkey.to_hex(),
+            ReasonCode::BelowRate,
+            reason,
+        )
+        .await;
     }
 
     /// Re-ask the relay for stored payment gift-wraps and ingest whatever comes back.
@@ -2695,7 +2722,7 @@ impl SellerNodeRunner {
             Ok(Some(creq)) => creq,
             _ => {
                 eprintln!("seller node execute fail job_id={job_id}: stored creq missing");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK).await;
                 return;
             }
         };
@@ -2718,7 +2745,7 @@ impl SellerNodeRunner {
                  this node (never substituted)",
                 requested_agent.as_deref().unwrap_or("<any>")
             );
-            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK).await;
             return;
         };
         let agent_command = selected.agent.argv.clone();
@@ -2752,7 +2779,7 @@ impl SellerNodeRunner {
         .await
         {
             eprintln!("seller node execute fail job_id={job_id}: workdir init failed ({error})");
-            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK).await;
             return;
         }
 
@@ -2779,15 +2806,21 @@ impl SellerNodeRunner {
             Err(error) => {
                 eprintln!("seller node execute fail job_id={job_id}: agent run failed ({error})");
                 self.drop_harness(harness, harness_fault_for(&error));
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK).await;
                 return;
             }
         };
 
         // Snapshot the agent's final workdir tree into ONE delivery commit at the stored author date.
-        // An empty / no-op tree is refused with a precise reason (nothing to deliver).
+        // §19: the snapshot writes the execution sentinel into the delivered tree, seeded from this
+        // job's job_hash (replay-resistant; the buyer holds the same value on its accept-bind). When
+        // the node observed no genuine execution — the quota-dead case, an empty / base-identical tree
+        // — the snapshot refuses `NoExecutionObserved` and writes no sentinel, which is mapped here to
+        // the `no_sentinel` refusal so the buyer learns delivery was refused for want of a sentinel
+        // (distinct from a crash). The gate, not an unconditional write, is the check.
         let branch = format!("mobee/{}", &job_id[..8.min(job_id.len())]);
         let message = delivery_message(&offer.task);
+        let job_hash = job_hash_for_offer(job_id, &offer.task, offer.amount_sats);
         if let Err(error) = seller_git::snapshot_delivery_at_off_runtime(
             workdir.clone(),
             identity.clone(),
@@ -2795,15 +2828,30 @@ impl SellerNodeRunner {
             branch.clone(),
             message,
             author_date,
+            job_hash,
         )
         .await
         {
-            eprintln!("seller node execute fail job_id={job_id}: delivery snapshot refused ({error})");
             // Harness-attributable: the agent returned success having left nothing to deliver. This
             // is the site that fires on a quota-dead harness — its turn "completes", so the agent-run
             // arm above sees no error at all — which is why the trigger cannot live at one site.
             self.drop_harness(harness, Some(Fault::Unproven));
-            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+            let (reason_code, feedback) = match error {
+                seller_git::SellerGitError::NoExecutionObserved(_) => {
+                    eprintln!(
+                        "seller node execute fail job_id={job_id}: delivery refused no_sentinel — {error}"
+                    );
+                    (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
+                }
+                _ => {
+                    eprintln!(
+                        "seller node execute fail job_id={job_id}: delivery snapshot failed ({error})"
+                    );
+                    (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
+                }
+            };
+            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, reason_code, feedback)
+                .await;
             return;
         }
 
@@ -2816,12 +2864,12 @@ impl SellerNodeRunner {
                 Ok(Ok(header)) => Some(header),
                 Ok(Err(error)) => {
                     eprintln!("seller node execute fail job_id={job_id}: push auth sign failed ({error})");
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                     return;
                 }
                 Err(error) => {
                     eprintln!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                     return;
                 }
             }
@@ -2839,7 +2887,7 @@ impl SellerNodeRunner {
             Ok(oid) => oid,
             Err(error) => {
                 eprintln!("seller node execute fail job_id={job_id}: git push failed ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                 return;
             }
         };
@@ -2850,7 +2898,7 @@ impl SellerNodeRunner {
             Ok(kind) => kind,
             Err(error) => {
                 eprintln!("seller node execute fail job_id={job_id}: delivery kind typing failed ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                 return;
             }
         };
@@ -2868,12 +2916,12 @@ impl SellerNodeRunner {
             Ok(Ok(sig)) => sig,
             Ok(Err(error)) => {
                 eprintln!("seller node execute fail job_id={job_id}: receipt sign refused ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                 return;
             }
             Err(error) => {
                 eprintln!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                 return;
             }
         };
@@ -2931,7 +2979,7 @@ impl SellerNodeRunner {
             ),
             Err(error) => {
                 eprintln!("seller node execute fail job_id={job_id}: deliver journal failed ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                 return;
             }
         }
@@ -3168,12 +3216,21 @@ impl SellerNodeRunner {
         }
     }
 
-    /// Fail the job AND tell the buyer why (a feedback-kind `status=error`), so an execution failure
-    /// is not silent on the wire (the buyer waits on a delivery that will never come otherwise). Used
-    /// at the post-offer execute fail points where the offer buyer is known.
-    async fn fail_job_with_feedback(&self, job_id: &str, buyer_pubkey: &str, reason: &str) {
+    /// Fail the job AND tell the buyer why (a feedback-kind carrying the §10 `reason_code` tag), so a
+    /// failure is not silent on the wire (the buyer waits on a delivery that will never come
+    /// otherwise). Used at the post-offer execute fail points where the offer buyer is known; the
+    /// caller passes the reason_code that names WHICH failure this is (execution vs delivery vs
+    /// no_sentinel), so the buyer can class it without parsing the human-readable reason.
+    async fn fail_job_with_feedback(
+        &self,
+        job_id: &str,
+        buyer_pubkey: &str,
+        reason_code: ReasonCode,
+        reason: &str,
+    ) {
         self.fail_job(job_id).await;
-        self.publish_buyer_feedback(job_id, buyer_pubkey, reason).await;
+        self.publish_buyer_feedback(job_id, buyer_pubkey, reason_code, reason)
+            .await;
     }
 
     /// One outbox drain pass over the shared authenticated client. Log-and-continue: a publish
@@ -4797,11 +4854,18 @@ mod tests {
     }
 
     // TOOTH (buyer-facing feedback) — an execution failure produces a buyer-addressed feedback-kind
-    // `status=error` carrying the (path-free) reason, so the buyer learns the job failed instead of
-    // waiting on a delivery that never comes (the silence the live smoke's first attempt exposed).
+    // `status=error` carrying the (path-free) reason AND the §10 `reason_code=execution_failed` tag,
+    // so the buyer learns the job failed and can CLASS it without parsing prose (the silence the live
+    // smoke's first attempt exposed).
     #[test]
     fn execution_failure_feedback_is_a_buyer_addressed_error() {
-        let draft = error_draft("offer1", "buyerpk", &"s".repeat(64), EXEC_FAILURE_FEEDBACK);
+        let draft = error_draft(
+            "offer1",
+            "buyerpk",
+            &"s".repeat(64),
+            ReasonCode::ExecutionFailed,
+            EXEC_FAILURE_FEEDBACK,
+        );
         assert_eq!(draft.kind, crate::kinds::JOB_FEEDBACK_KIND);
         assert_eq!(draft.content, EXEC_FAILURE_FEEDBACK);
         let has = |name: &str, val: &str| {
@@ -4810,9 +4874,40 @@ mod tests {
                     && tag.0.get(1).map(String::as_str) == Some(val)
             })
         };
-        assert!(has("status", "error"), "feedback carries status=error");
+        assert!(has("status", "error"), "an execution failure is the error class");
+        assert!(has("reason_code", "execution_failed"), "carries the authoritative §10 code");
         assert!(has("p", "buyerpk"), "addressed to the buyer");
         assert!(has("e", "offer1"), "references the offer");
+    }
+
+    // TOOTH (#374 §10) — every emitting site rides the authoritative `reason_code` tag; a reader keys
+    // on it, not on parsing content. The coarse `status` stays `error` for now (the buyer claim-list
+    // view keys on it — re-classing refusals to `status=refusal` is a deliberate view change left as a
+    // follow-up, not smuggled in here). Bite: drop the reason_code tag from `error_draft` and the code
+    // assertions go red.
+    #[test]
+    fn feedback_rides_the_authoritative_reason_code_tag() {
+        let tag = |code: ReasonCode, name: &str| {
+            let draft = error_draft("offer1", "buyerpk", &"s".repeat(64), code, "why");
+            draft
+                .tags
+                .iter()
+                .find(|t| t.0.first().map(String::as_str) == Some(name))
+                .and_then(|t| t.0.get(1).cloned())
+        };
+        assert_eq!(tag(ReasonCode::BelowRate, "reason_code").as_deref(), Some("below_rate"));
+        assert_eq!(tag(ReasonCode::NoSentinel, "reason_code").as_deref(), Some("no_sentinel"));
+        assert_eq!(
+            tag(ReasonCode::DeliveryFailed, "reason_code").as_deref(),
+            Some("delivery_failed")
+        );
+        assert_eq!(
+            tag(ReasonCode::ExecutionFailed, "reason_code").as_deref(),
+            Some("execution_failed")
+        );
+        // Coarse status is unchanged (historical `error`) for every code — the tag is the discriminator.
+        assert_eq!(tag(ReasonCode::BelowRate, "status").as_deref(), Some("error"));
+        assert_eq!(tag(ReasonCode::NoSentinel, "status").as_deref(), Some("error"));
     }
 
     // ── Execute-body delivery contract (invariants 2 & 8), no network ────────────────────────────
@@ -4937,9 +5032,18 @@ mod tests {
             let _ = std::fs::remove_dir_all(&wd);
             seller_git::init_empty_delivery_workdir(&wd, &identity).expect("init workdir");
             std::fs::write(wd.join("deliverable.txt"), b"the widget\n").expect("write file");
-            let commit =
-                seller_git::snapshot_delivery_at(&wd, &identity, None, branch, "mobee delivery: build a widget", author_date)
-                    .expect("snapshot");
+            // Same job hash on both passes: the sentinel is seeded from it, so a deterministic
+            // manifest is part of what keeps the re-created delivery oid identical across a resume.
+            let commit = seller_git::snapshot_delivery_at(
+                &wd,
+                &identity,
+                None,
+                branch,
+                "mobee delivery: build a widget",
+                author_date,
+                &"c".repeat(64),
+            )
+            .expect("snapshot");
             let _ = std::fs::remove_dir_all(&wd);
             commit
         };

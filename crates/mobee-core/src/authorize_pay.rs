@@ -5,6 +5,7 @@
 //! no [`PaymentService::advance`] from this surface.
 
 use std::fmt;
+use std::path::Path;
 use std::str::FromStr;
 
 use cashu::{Amount, CurrencyUnit, PublicKey as CashuPublicKey};
@@ -134,6 +135,10 @@ pub enum AuthorizePayError {
     /// Pre-pay seller co-signature refusal, carrying the buyer's computed preimage fields + digest
     /// (public trade data, no secrets) so the divergent field self-identifies (diagnostic).
     CosigRefused(String),
+    /// Pre-pay execution-sentinel refusal (§19): the independently-fetched delivery tree carries no
+    /// job-bound execution sentinel — missing, invalid, or replayed from another job. A refusal, not a
+    /// crash: ZERO spend, no journal, and a durable local sentinel-refusal record for §17 reputation.
+    NoSentinel(String),
 }
 
 impl fmt::Display for AuthorizePayError {
@@ -149,6 +154,7 @@ impl fmt::Display for AuthorizePayError {
             Self::CosigRefused(message) => write!(formatter, "authorize_pay payment: {message}"),
             Self::Home(message) => write!(formatter, "authorize_pay home: {message}"),
             Self::Effects(message) => write!(formatter, "authorize_pay effects: {message}"),
+            Self::NoSentinel(message) => write!(formatter, "authorize_pay no_sentinel: {message}"),
         }
     }
 }
@@ -245,6 +251,10 @@ pub async fn authorize_pay_async(
         .map_err(|error| AuthorizePayError::Input(error.to_string()))?;
     let delivery_integrity_hash = DeliveryIntegrityHash::from_hex(request.delivery_integrity_hash)
         .map_err(|error| AuthorizePayError::Input(error.to_string()))?;
+    // Kept before the parse consumes `request.job_hash`: the §19 sentinel check below asserts the
+    // delivered tree carries THIS job's hash (buyer-controlled, from the accept-bind — never a seller
+    // echo), which is what makes a replayed sentinel from another job fail.
+    let expected_job_hash = request.job_hash.clone();
     let job_hash = JobHash::from_hex(request.job_hash)
         .map_err(|error| AuthorizePayError::Input(error.to_string()))?;
     let seller_nostr = NostrPublicKey::parse(&request.seller_pubkey)
@@ -398,6 +408,47 @@ pub async fn authorize_pay_async(
     crate::payment::verify_pay_path_delivery(&mut verifier, &delivery, &key)
         .map_err(AuthorizePayError::Payment)?;
 
+    // THE §19 EXECUTION-SENTINEL TOOTH (from-scratch money path). The delivery the buyer just fetched
+    // + tip-matched into its OWN store MUST carry this job's execution sentinel inside the delivered
+    // tree — evidence the buyer independently reads, never the seller's testimony. Runs BEFORE the
+    // budget gate / wallet / journal below, so a missing / invalid / replayed sentinel refuses with
+    // ZERO spend and no journal, and durably records the refusal for §17 (the JOURNAL is the artifact,
+    // never the silence — an absent record is never read as a refusal, §7.0). Contribution deliveries
+    // are gated by verify_contribution's content path and are not served by the node yet; their
+    // buyer-side sentinel check is a later slice.
+    if request.job_class == JobClass::FromScratch {
+        let commit_hex = delivery.commit_oid().as_str();
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(commit_hex);
+        // The verifier owns the store path it just fetched the delivery into (`store` was moved into
+        // it); read the tree back from that same store.
+        match delivery_tree_carries_sentinel(
+            verifier.repository(),
+            &store_ref,
+            commit_hex,
+            &expected_job_hash,
+            &request.job_id,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                journal_sentinel_refusal(home, &request.job_id, commit_hex, "missing_or_replayed");
+                return Err(AuthorizePayError::NoSentinel(format!(
+                    "delivery {commit_hex} carries no execution sentinel bound to job {} (§19); \
+                     refusing no_sentinel with zero spend",
+                    request.job_id
+                )));
+            }
+            Err(reason) => {
+                // A store-read failure is a positive failure to VERIFY, not silence: fail closed
+                // (refuse, zero spend) rather than pay a tree we could not read. Journalled with a
+                // distinct class so §17 does not misattribute a buyer-side read fault to the seller.
+                journal_sentinel_refusal(home, &request.job_id, commit_hex, "verify_error");
+                return Err(AuthorizePayError::NoSentinel(format!(
+                    "delivery {commit_hex} sentinel could not be verified ({reason}); fail-closed, zero spend"
+                )));
+            }
+        }
+    }
+
     let amount = request.amount_sats;
     // Cross-mint hop planning. Pre-budget and pre-spend: raising quotes moves no money, so a hop
     // that cannot be priced refuses having spent nothing. Delivery is PINNED here — the quote at the
@@ -484,6 +535,87 @@ pub async fn authorize_pay_async(
         charged_sats: charged,
         spent_total_sats: gate.spent(),
     })
+}
+
+/// Whether the delivered tree retained in the buyer store carries THIS job's execution sentinel
+/// (§19). Opens the buyer store (the bare repo the pay path fetched the delivery into), resolves the
+/// delivery commit's tree, reads the sentinel manifest at its well-known path, and matches it through
+/// the SHARED [`crate::delivery_sentinel::content_carries_sentinel`] — one definition with the seller
+/// writer, so a format drift at either end fails the match rather than passing silently. `subtract_path`
+/// (the `job_id`, the seller's workdir label the buyer already knows) is removed before matching so a
+/// token reachable only through a path echo cannot count. `Ok(false)` = read fine, no job-bound
+/// sentinel present (missing or replayed); `Err` = the tree could not be read (the caller fails closed).
+fn delivery_tree_carries_sentinel(
+    store: &Path,
+    store_ref: &str,
+    commit_hex: &str,
+    expected_job_hash: &str,
+    subtract_path: &str,
+) -> Result<bool, String> {
+    let repo = git2::Repository::open_bare(store)
+        .map_err(|error| format!("open buyer store {}: {error}", store.display()))?;
+    let commit = repo
+        .revparse_single(store_ref)
+        .or_else(|_| repo.revparse_single(commit_hex))
+        .map_err(|error| {
+            format!("delivery {commit_hex} not found in buyer store (ref {store_ref}): {error}")
+        })?
+        .peel_to_commit()
+        .map_err(|error| error.to_string())?;
+    let tree = commit.tree().map_err(|error| error.to_string())?;
+
+    // The node writes the manifest at a fixed, well-known path (both ends share the const). An absent
+    // entry is a delivery with no sentinel — present, but not a read failure — so it is Ok(false), a
+    // refusal, never an Err.
+    let entry = match tree.get_path(Path::new(crate::delivery_sentinel::SENTINEL_FILE)) {
+        Ok(entry) => entry,
+        Err(_) => return Ok(false),
+    };
+    let object = entry
+        .to_object(&repo)
+        .map_err(|error| format!("read sentinel object: {error}"))?;
+    let blob = object
+        .as_blob()
+        .ok_or_else(|| "sentinel path is not a blob".to_string())?;
+    // A non-UTF-8 sentinel cannot be a genuine manifest (it is text); treat it as not-present rather
+    // than a hard read error — the delivery simply lacks a usable sentinel.
+    let Ok(text) = std::str::from_utf8(blob.content()) else {
+        return Ok(false);
+    };
+    Ok(crate::delivery_sentinel::content_carries_sentinel(
+        text,
+        expected_job_hash,
+        subtract_path,
+    ))
+}
+
+/// Durably record a pre-pay execution-sentinel refusal as a LOCAL artifact for §17 reputation to
+/// consume later. The record's PRESENCE is the refusal — never the silence (§7.0: an absent record is
+/// not a refusal). `class` distinguishes a genuine missing/replayed sentinel (a seller-attributable
+/// `no_sentinel`) from a buyer-side verify error, so reputation does not misattribute the latter to
+/// the seller. Best-effort: a journal write that itself fails is logged, never converted into a spend
+/// — the refusal already stands on the returned error.
+fn journal_sentinel_refusal(home: &MobeeHome, job_id: &str, commit_oid: &str, class: &str) {
+    let dir = home.root.join("sentinel-refusals");
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        eprintln!("authorize_pay: sentinel-refusal journal dir failed (continuing): {error}");
+        return;
+    }
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let record = serde_json::json!({
+        "job_id": job_id,
+        "commit_oid": commit_oid,
+        "reason_code": crate::gateway::ReasonCode::NoSentinel.as_str(),
+        "class": class,
+        "at": at,
+    });
+    let path = dir.join(format!("{job_id}-{commit_oid}.json"));
+    if let Err(error) = std::fs::write(&path, format!("{record}\n")) {
+        eprintln!("authorize_pay: sentinel-refusal journal write failed (continuing): {error}");
+    }
 }
 
 /// Resolve the buyer's content policy hook from `[contribution]` config, or the
@@ -937,6 +1069,135 @@ mod tests {
             .build()
             .expect("current-thread runtime")
             .block_on(authorize_pay_async(home, gate, request))
+    }
+
+    // ── #374 §19 buyer-side execution-sentinel gate (the from-scratch money decision) ──────────
+    //
+    // The buyer's pre-pay decision turns on `delivery_tree_carries_sentinel`, reading the delivered
+    // tree the pay path retained into the buyer store. These drive it directly against a seeded store
+    // (the same store `verify_pay_path_delivery` populates), so the artifact predicate is proven
+    // without a live mint / network fetch. On `Ok(false)` the from-scratch arm of `authorize_pay_async`
+    // returns `NoSentinel` BEFORE the budget gate — the identical pre-spend return that
+    // `collect_forged_cosig_blocks_pay_and_materialize_zero_spend` proves burns zero spend and leaves
+    // no journal. The full-path spent==0 red-prove (through `collect_async`) is integration-level
+    // (needs the git_http delivery fixture) — see `tests/collect_integrity.rs`.
+
+    fn temp_dir_374(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "mobee-sentinel-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// Seed a buyer store (bare repo) with a delivered commit (README + optionally the sentinel
+    /// manifest at its well-known path) retained under its store ref — mirrors what the pay path
+    /// retains post-verify. Returns the delivery commit hex.
+    fn seed_store_delivery(store: &Path, sentinel: Option<&str>) -> String {
+        let repo = git2::Repository::init_bare(store).expect("init store");
+        let readme = repo.blob(b"# delivered\n").expect("blob readme");
+        let mut top = repo.treebuilder(None).expect("tree");
+        top.insert("README.md", readme, 0o100644).expect("insert readme");
+        if let Some(content) = sentinel {
+            let blob = repo.blob(content.as_bytes()).expect("blob sentinel");
+            top.insert(crate::delivery_sentinel::SENTINEL_FILE, blob, 0o100644)
+                .expect("insert sentinel");
+        }
+        let tree_oid = top.write().expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let sig = git2::Signature::now("t", "t@e").expect("sig");
+        let commit_oid = repo
+            .commit(None, &sig, &sig, "delivery", &tree, &[])
+            .expect("commit");
+        let commit_hex = commit_oid.to_string();
+        repo.reference(
+            &PayPathDeliveryVerifier::store_ref_for(&commit_hex),
+            commit_oid,
+            true,
+            "retain",
+        )
+        .expect("retain ref");
+        commit_hex
+    }
+
+    // Positive control — a delivery carrying THIS job's sentinel is accepted, so the red refusals
+    // below are meaningful (the predicate reaches its healthy state).
+    #[test]
+    fn buyer_accepts_a_delivery_carrying_this_jobs_sentinel() {
+        let root = temp_dir_374("ok");
+        let store = root.join("store");
+        let job_hash = "1a".repeat(32);
+        let manifest = crate::delivery_sentinel::render_manifest(
+            &job_hash,
+            crate::delivery_sentinel::DeliveryMode::FromScratch,
+            1,
+            12,
+        );
+        let commit = seed_store_delivery(&store, Some(&manifest));
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit);
+        let job_id = "9c".repeat(32);
+        assert_eq!(
+            delivery_tree_carries_sentinel(&store, &store_ref, &commit, &job_hash, &job_id),
+            Ok(true),
+            "a delivery carrying THIS job's sentinel is accepted (positive control)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // RED-PROVE (missing) — a sentinel-less delivery (old seller build, or a quota-dead run the seller
+    // did not catch) refuses. This is the `Ok(false)` that drives `NoSentinel` + zero spend in the
+    // from-scratch arm. Revert `delivery_tree_carries_sentinel` to a blanket `Ok(true)` and the buyer
+    // pays a sentinel-less delivery — this assertion goes red.
+    #[test]
+    fn buyer_refuses_a_delivery_with_no_sentinel() {
+        let root = temp_dir_374("missing");
+        let store = root.join("store");
+        let commit = seed_store_delivery(&store, None);
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit);
+        let job_hash = "1a".repeat(32);
+        let job_id = "9c".repeat(32);
+        assert_eq!(
+            delivery_tree_carries_sentinel(&store, &store_ref, &commit, &job_hash, &job_id),
+            Ok(false),
+            "a delivery with no sentinel must refuse (drives NoSentinel + zero spend)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // RED-PROVE (replay) — a delivery carrying a VALID sentinel minted for a DIFFERENT job must still
+    // refuse: presence is not enough, the job binding must match. Proves job-binding, not mere
+    // presence — a blanket-`Ok(true)` revert also fails this.
+    #[test]
+    fn buyer_refuses_a_replayed_sentinel_from_a_different_job() {
+        let root = temp_dir_374("replay");
+        let store = root.join("store");
+        let other_job = "bb".repeat(32);
+        let this_job = "1a".repeat(32);
+        let manifest = crate::delivery_sentinel::render_manifest(
+            &other_job,
+            crate::delivery_sentinel::DeliveryMode::FromScratch,
+            1,
+            12,
+        );
+        let commit = seed_store_delivery(&store, Some(&manifest));
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit);
+        let job_id = "9c".repeat(32);
+        assert_eq!(
+            delivery_tree_carries_sentinel(&store, &store_ref, &commit, &this_job, &job_id),
+            Ok(false),
+            "a sentinel bound to another job is a replay and must refuse (job-binding, not presence)"
+        );
+        // The SAME tree validates for the job it WAS minted for — the refusal above is binding, not a
+        // broken read.
+        assert_eq!(
+            delivery_tree_carries_sentinel(&store, &store_ref, &commit, &other_job, &job_id),
+            Ok(true),
+            "and it validates for its own job (the refusal is binding, not a read failure)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
