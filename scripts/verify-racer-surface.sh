@@ -65,6 +65,36 @@ if ! grep -q "$ACP_ABSENT" <<<"$acp_out"; then
 fi
 echo "ok: acp absent — the seller agent-execution path is not compiled in"
 
+# ── the seller ADVERTISE surface must be ABSENT ─────────────────────────────────────────────────
+# `sell` is the ONLY CLI entry that publishes seller discoverability (kind-0 + NIP-89) and boots the
+# heartbeat loop (#360). On the racer artifact (acp out) it is compiled out — not merely refused — so
+# a buyer-only build cannot advertise a seat it can never deliver on and cost a buyer their sats at
+# award. `run` above stays present on both builds and fails honestly; `sell` is the one that would
+# PUBLISH before it could fail, so it must be GONE. The usage text is where a compiled-in `sell`
+# still shows — an acp build lists it, the racer must not — which is what moves this check's verdict
+# with the feature rather than with anything incidental.
+set +e
+help_out="$("$BINARY" --help 2>&1)"
+help_rc=$?
+set -e
+[ "$help_rc" -eq 0 ] \
+    || die "\`maxplayer --help\` exited $help_rc — cannot read the surface to check for \`sell\`:"$'\n'"$help_out"
+if grep -q 'maxplayer sell' <<<"$help_out"; then
+    die "\`maxplayer sell\` is listed in --help — the seller advertise surface is compiled into the racer artifact, which must ship buyer-only (#360):"$'\n'"$help_out"
+fi
+# Belt-and-suspenders: invoking it must not reach the advertise/boot path — a plain usage error only.
+set +e
+sell_out="$("$BINARY" sell --agent claude --rate-sats 100 2>&1)"
+sell_rc=$?
+set -e
+if [ "$sell_rc" -eq 0 ]; then
+    die "\`maxplayer sell\` succeeded on the racer artifact — the seller surface is compiled in"
+fi
+if grep -qE 'discoverable kind0=|relay-git seed probe|discoverability publish' <<<"$sell_out"; then
+    die "\`maxplayer sell\` reached the discoverability/boot path on the racer artifact:"$'\n'"$sell_out"
+fi
+echo "ok: sell absent — the seller advertise surface (kind-0/NIP-89/heartbeat) is not compiled in"
+
 # ── wallet must be PRESENT ──────────────────────────────────────────────────────────────────────
 # A local read of the wallet store in the scratch home: it reports a configured mint and a zero
 # balance without touching the network.

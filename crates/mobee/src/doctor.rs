@@ -83,6 +83,9 @@ fn exit_code(results: &[Check]) -> i32 {
 
 /// Boot-readiness verdict over a completed check set: the seller may start only when NO check
 /// FAILed. WARN is advisory and never blocks. The pure core of [`sell_readiness_gate`].
+// Its only non-test caller is `sell_readiness_gate` (acp); the boot-gate unit tests below also use
+// it, so keep it under `test` too — same shape as the seller surface it serves (#360).
+#[cfg(any(feature = "acp", test))]
 fn readiness_ok(results: &[Check]) -> bool {
     !results.iter().any(|c| c.status == Status::Fail)
 }
@@ -482,7 +485,10 @@ fn run_doctor(
 /// path, so the gate needs no separate severity table. The mint check is deliberately aggregate:
 /// it blocks only when EVERY accepted mint is unreachable (a single degraded mint is a `Warn`).
 /// Non-critical checks (credential helper, telemetry) report `Pass`/`Warn` and never block.
-#[cfg(feature = "wallet")]
+// Gated with the seller surface it gates (#360): `sell` is the sole caller and is `acp`-only, so on
+// a buyer-only (wallet, no-acp) build this is correctly absent rather than dead. Every shipped build
+// carrying `acp` also carries `wallet`, so the wallet-gated `checks` it calls are present.
+#[cfg(feature = "acp")]
 pub fn sell_readiness_gate(
     home: &mobee_core::home::MobeeHome,
     out: &mut dyn Write,
