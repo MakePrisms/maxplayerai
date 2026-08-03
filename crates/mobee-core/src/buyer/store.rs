@@ -508,6 +508,17 @@ impl BuyerStore {
                 _ => report.kept.push(job_id.clone()),
             }
         }
+        // Age of the oldest reservation STILL held after this pass's own writes — read inside the
+        // same transaction so it can never describe a row this pass just released. `kept N` alone
+        // cannot distinguish a healthy hold from a reservation nothing will ever resolve: both
+        // print the identical line, forever. The age is the only term that separates them, so a
+        // reader watching it climb sees the ramp while it happens rather than afterwards (#273).
+        let oldest_created: Option<i64> = tx.query_row(
+            "SELECT MIN(created_at_unix) FROM reservations WHERE state = 'reserved'",
+            [],
+            |row| row.get(0),
+        )?;
+        report.oldest_kept_age_secs = oldest_created.map(|created| (now_unix - created).max(0) as u64);
         tx.commit()?;
         Ok(report)
     }
@@ -548,6 +559,31 @@ impl BuyerStore {
             ids.push(row?);
         }
         Ok(ids)
+    }
+
+    /// Age in seconds, per still-`Reserved` job, measured from `created_at_unix` against the
+    /// caller's `now_unix`. Clamped at 0 so a clock that moved backwards reads as "brand new"
+    /// rather than as a huge age that would trip a floor.
+    ///
+    /// A job absent from this map has no readable row, which callers must treat as "unknown age"
+    /// and never as "old enough to release".
+    pub fn reserved_ages(
+        &self,
+        now_unix: i64,
+    ) -> Result<std::collections::BTreeMap<String, u64>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT job_id, created_at_unix FROM reservations WHERE state = 'reserved'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut ages = std::collections::BTreeMap::new();
+        for row in rows {
+            let (job_id, created) = row?;
+            ages.insert(job_id, (now_unix - created).max(0) as u64);
+        }
+        Ok(ages)
     }
 
     /// The `(state, amount)` of a job's reservation, if any. Inspection / tests.

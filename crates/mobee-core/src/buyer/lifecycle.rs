@@ -900,7 +900,14 @@ pub enum PaymentProgress {
     /// (PAYMENT_UNCERTAIN): the ecash may already have left. Must NOT auto-release; the phase-3
     /// payment saga (#127) resolves it.
     Uncertain,
-    /// No payment attempt has left funds for this job (no journal, or only `Intent`/`Locked`).
+    /// A payment attempt exists but never left funds — the journal folded to `Intent`/`Locked`.
+    ///
+    /// Distinct from [`Self::None`] because "a debt being retried" and "an award nothing ever
+    /// attempted to pay" are different facts, and only the second is a leaked reservation. The
+    /// journal already records the difference; folding both into one variant discarded it one
+    /// step before the decision that needs it.
+    Attempted,
+    /// No payment attempt exists at all — this job has no payment journal.
     None,
 }
 
@@ -1007,14 +1014,65 @@ pub fn park_reason_unreadable(unanswered_reads: u32) -> String {
 /// `Paid` regardless of whether the claim still looks live, and an ambiguous payment is KEPT
 /// (`Payable`) even if the claim looks dead — the funds may have moved, so only the phase-3 saga
 /// may resolve it. A job with no payment is `Dead` only when it is no longer payable on the relay.
+///
+/// [`PaymentProgress::Attempted`] and [`PaymentProgress::None`] classify identically here: both are
+/// "no funds have left", so both are `Dead` exactly when the relay says the claim is gone. The two
+/// are separate variants so a *later* rule can tell them apart — an unattempted award past its
+/// deadline is a leak, whereas a retried-and-refused debt is correctly held — without this
+/// classifier changing behaviour today.
 pub fn classify_disposition(payment: PaymentProgress, claim_payable: bool) -> JobDisposition {
     match payment {
         PaymentProgress::Closed => JobDisposition::Paid,
         PaymentProgress::Uncertain => JobDisposition::Payable,
-        PaymentProgress::None if claim_payable => JobDisposition::Payable,
-        PaymentProgress::None => JobDisposition::Dead,
+        PaymentProgress::Attempted | PaymentProgress::None if claim_payable => {
+            JobDisposition::Payable
+        }
+        PaymentProgress::Attempted | PaymentProgress::None => JobDisposition::Dead,
     }
 }
+
+/// The local-clock floor's policy, read from `[buyer_reservation_floor]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnattemptedFloor {
+    /// Ships **false**. While false this is the identity function, unconditionally.
+    pub enabled: bool,
+    /// Seconds past `reservations.created_at_unix` before a release is permitted.
+    pub grace_secs: u64,
+}
+
+/// Upgrade `Payable → Dead` for a reservation nothing ever attempted to pay, once it is older than
+/// the floor — WITHOUT consulting the relay.
+///
+/// This exists because every other exit from `reserved` needs the relay to supply something: the
+/// offer, so a claim can be derived expired, or the claim's disappearance. When neither arrives the
+/// funds stay committed with no local recourse. `created_at_unix` cannot become unreachable.
+///
+/// Four properties hold it narrow, each one a way this could wrongly free money:
+/// - **Disabled is the identity.** No age, payment state, or verdict can produce a release.
+/// - **[`PaymentProgress::None`] only.** [`PaymentProgress::Attempted`] is a debt being retried and
+///   is indistinguishable from a leak in the reservation row alone — that collapse is exactly what
+///   this change split apart, and releasing it would free money the buyer genuinely owes.
+/// - **`Payable → Dead` only.** `Paid` is untouched, so reconcile's `Paid` arm remains the sole
+///   converger for a pay whose `reserved → spent` flip failed.
+/// - **An unknown age never releases.** `None` means the row was not read, and absence of evidence
+///   is not evidence of a leak.
+pub fn apply_unattempted_floor(
+    verdict: JobDisposition,
+    payment: PaymentProgress,
+    age_secs: Option<u64>,
+    floor: UnattemptedFloor,
+) -> JobDisposition {
+    if !floor.enabled {
+        return verdict;
+    }
+    match (verdict, payment, age_secs) {
+        (JobDisposition::Payable, PaymentProgress::None, Some(age)) if age > floor.grace_secs => {
+            JobDisposition::Dead
+        }
+        (other, _, _) => other,
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
