@@ -452,8 +452,8 @@ fn ensure_seller_config(
         // sellers. Operators disable it by editing `[seller] contribution_enabled = false`.
         contribution_enabled: true,
         // Serial execution by default; operators raise concurrency by editing `[seller] slots = N`.
-        slots: home::default_slots(),
-        claim_award_timeout_secs: None,
+        slots: existing.as_ref().map(|s| s.slots).unwrap_or_else(home::default_slots),
+        claim_award_timeout_secs: existing.as_ref().and_then(|s| s.claim_award_timeout_secs),
     };
     home::save_config(home, |config| {
         config.seller = Some(seller);
@@ -786,5 +786,91 @@ mod tests {
             "stderr={rendered}"
         );
         assert!(!rendered.to_ascii_lowercase().contains("nsec"));
+    }
+
+    // Red-prove for #369. A steady-state `maxplayer sell` relaunch (an existing `[seller]` on disk,
+    // no CLI flags) MUST carry the operator's `slots` and `claim_award_timeout_secs` through the
+    // config write-back — the same way `agents` is already carried from `existing`. Pre-fix
+    // `ensure_seller_config` hardcoded `slots: home::default_slots()` (=1) and
+    // `claim_award_timeout_secs: None`, so a `slots = 2` an operator set was reset to 1 on every
+    // boot, before the seller node read it. The assertion is on the PERSISTED (reloaded-from-disk)
+    // config because that disk value is exactly what the next boot reads for capacity
+    // (`mobee_core::seller_node::run` derives it from `config.seller.slots` with no ceiling clamp).
+    #[test]
+    fn sell_writeback_preserves_operator_slots_and_claim_timeout() {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-369-slots-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = home::bootstrap(&root).expect("bootstrap temp home");
+
+        // The pre-relaunch on-disk state: an operator-configured `[seller]` with slots = 2 and a set
+        // claim-award timeout, plus the fields a steady-state relaunch reads back for every choice.
+        home::save_config(&mut home, |config| {
+            config.seller = Some(SellerConfig {
+                agent_command: vec!["claude".to_owned()],
+                rate_sats: 5,
+                git_remote: "https://example.invalid/seller.git".to_owned(),
+                job_timeout_secs: None,
+                agent: Some("claude".to_owned()),
+                agents: Vec::new(),
+                claim_open_pool: false,
+                offer_backfill_secs: home::default_offer_backfill_secs(),
+                contribution_enabled: true,
+                slots: 2,
+                claim_award_timeout_secs: Some(777),
+            });
+        })
+        .expect("seed existing [seller]");
+
+        // Guard: the seed truly reached disk with slots = 2 before the relaunch runs.
+        let seeded = std::fs::read_to_string(root.join("config.toml")).expect("read seeded config");
+        assert!(
+            seeded.contains("slots = 2"),
+            "seed must persist slots = 2, got:\n{seeded}"
+        );
+
+        // Steady-state relaunch: `SellOptions::default()` (no --agent / --rate-sats / --git-remote)
+        // ⇒ `existing.is_some()` drives every field from the loaded config. This is the exact
+        // zero-prompt `maxplayer sell` write-back path.
+        let options = SellOptions::default();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        ensure_seller_config(&mut home, &options, &mut out, &mut err).unwrap_or_else(|code| {
+            panic!(
+                "ensure_seller_config failed code={code} err={}",
+                String::from_utf8_lossy(&err)
+            )
+        });
+
+        // Assert the PERSISTED config, reloaded from disk exactly as the next boot loads it.
+        let reloaded = home::bootstrap(&root).expect("reload persisted config");
+        let seller = reloaded.config.seller.expect("[seller] persisted after write-back");
+        assert_eq!(
+            seller.slots, 2,
+            "operator slots must survive the write-back; pre-#369 clobbered it to \
+             default_slots()={}",
+            home::default_slots()
+        );
+        assert_eq!(
+            seller.claim_award_timeout_secs,
+            Some(777),
+            "operator claim_award_timeout_secs must survive the write-back"
+        );
+
+        // Disk-content proof, independent of the deserializer round-trip.
+        let persisted =
+            std::fs::read_to_string(root.join("config.toml")).expect("read persisted config");
+        assert!(
+            persisted.contains("slots = 2"),
+            "config.toml must still carry slots = 2 after the write-back, got:\n{persisted}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
