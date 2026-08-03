@@ -25,8 +25,12 @@ where
 {
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
     match args.get(1).map(String::as_str) {
-        Some("version") if args.len() == 2 => {
+        Some("version" | "--version") if args.len() == 2 => {
             let _ = writeln!(out, "maxplayer {}", mobee_core::version());
+            SUCCESS
+        }
+        Some("--help") if args.len() == 2 => {
+            write_usage(out);
             SUCCESS
         }
         Some("mcp") if args.len() == 2 => crate::mcp::run(out, err),
@@ -267,20 +271,26 @@ fn write_json_line<T: Serialize + ?Sized>(out: &mut dyn Write, value: &T) -> std
 }
 
 fn usage(err: &mut dyn Write) -> i32 {
+    write_usage(err);
+    USAGE_ERROR
+}
+
+/// Help that was asked for goes to stdout and succeeds; the same text on stderr means the
+/// invocation was wrong. Only the destination and the exit code differ, so both paths render here.
+fn write_usage(out: &mut dyn Write) {
     let _ = write!(
-        err,
-        "Usage:\n  maxplayer version\n  maxplayer mcp\n  maxplayer buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # runner environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  maxplayer whoami [--home <dir>]   # print this seat's public identity (hex pubkey, npub, resolved home)\n"
+        out,
+        "Usage:\n  maxplayer [--help | --version]\n  maxplayer version\n  maxplayer mcp\n  maxplayer buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # runner environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  maxplayer whoami [--home <dir>]   # print this seat's public identity (hex pubkey, npub, resolved home)\n"
     );
     #[cfg(feature = "stub-pay")]
     let _ = write!(
-        err,
+        out,
         "  maxplayer stub-pay <amount_sats>   # exercise the config-bound budget gate\n"
     );
     let _ = writeln!(
-        err,
+        out,
         "  maxplayer sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool]\n  maxplayer sell   # zero-prompt relaunch from config.toml\n  maxplayer accept <job_id> <claim_id> [--result-id <id>]   # buyer: bind a delivered result (collect folds this in)\n  maxplayer collect <job_id> [--out <folder>]   # buyer: accept-if-needed + verify + pay + materialize\n  maxplayer log replay <path>\n  maxplayer mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n  maxplayer run --agent-command <cmd> --task <text> --log <path> [--cwd <dir>] [--job-id <id>] [--permission-policy allow|allow-always|deny] [--idle-timeout <secs>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error"
     );
-    USAGE_ERROR
 }
 
 struct MockRunOptions {
@@ -487,6 +497,25 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(out, format!("maxplayer {}\n", mobee_core::version()));
         assert!(err.is_empty());
+    }
+
+    #[test]
+    fn help_and_version_flags_succeed_on_stdout() {
+        let (code, out, err) = run_captured(["maxplayer", "--help"]);
+        assert_eq!(code, 0);
+        assert!(out.contains("Usage:"));
+        assert!(err.is_empty());
+
+        let (code, out, err) = run_captured(["maxplayer", "--version"]);
+        assert_eq!(code, 0);
+        assert_eq!(out, format!("maxplayer {}\n", mobee_core::version()));
+        assert!(err.is_empty());
+
+        // Trailing arguments are still a usage error, so `--help` cannot swallow a mistyped command.
+        let (code, out, err) = run_captured(["maxplayer", "--help", "extra"]);
+        assert_eq!(code, 1);
+        assert!(out.is_empty());
+        assert!(err.contains("Usage:"));
     }
 
     #[test]

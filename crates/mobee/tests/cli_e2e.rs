@@ -27,7 +27,7 @@ fn mock_run_then_log_replay_round_trips_envelope_payloads() {
         },
     );
 
-    let run_output = Command::new(env!("CARGO_BIN_EXE_mobee"))
+    let run_output = Command::new(env!("CARGO_BIN_EXE_maxplayer"))
         .args([
             "mock",
             "run",
@@ -37,17 +37,17 @@ fn mock_run_then_log_replay_round_trips_envelope_payloads() {
             log.to_str().unwrap(),
         ])
         .output()
-        .expect("run mobee mock");
+        .expect("run maxplayer mock");
     assert!(
         run_output.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&run_output.stderr)
     );
 
-    let replay_output = Command::new(env!("CARGO_BIN_EXE_mobee"))
+    let replay_output = Command::new(env!("CARGO_BIN_EXE_maxplayer"))
         .args(["log", "replay", log.to_str().unwrap()])
         .output()
-        .expect("run mobee replay");
+        .expect("run maxplayer replay");
     assert!(
         replay_output.status.success(),
         "stderr: {}",
@@ -86,6 +86,35 @@ fn mock_run_then_log_replay_round_trips_envelope_payloads() {
             },
         ]
     );
+}
+
+/// The exit codes a stranger meets first. Asserted against the real executable because the
+/// process exit status is what scripts probe, and `cli::run`'s return value only becomes one in
+/// `main`.
+#[test]
+fn help_and_version_flags_exit_zero_on_the_real_binary() {
+    let help = Command::new(env!("CARGO_BIN_EXE_maxplayer"))
+        .arg("--help")
+        .output()
+        .expect("run maxplayer --help");
+    assert_eq!(help.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Usage:"));
+
+    let version = Command::new(env!("CARGO_BIN_EXE_maxplayer"))
+        .arg("--version")
+        .output()
+        .expect("run maxplayer --version");
+    assert_eq!(version.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout),
+        format!("maxplayer {}\n", mobee_core::version())
+    );
+
+    let no_args = Command::new(env!("CARGO_BIN_EXE_maxplayer"))
+        .output()
+        .expect("run maxplayer");
+    assert_eq!(no_args.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&no_args.stderr).contains("Usage:"));
 }
 
 fn write_script(path: &Path, script: ScriptedSession) {
