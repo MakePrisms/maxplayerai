@@ -16,6 +16,47 @@ publish.workspace = true
 name = "maxplayer"
 path = "src/main.rs"
 
+# ── cargo-binstall: the fallback install path ────────────────────────────────────────────────────
+#
+# `install.sh` is the blessed path (#125). This exists for the rust-native user who already has
+# cargo-binstall and would otherwise compile the whole workspace: it points binstall at the same
+# GitHub Release assets, which it then verifies and unpacks itself.
+#
+# ★ What this does NOT do: make `cargo binstall maxplayer` work. binstall reads this metadata out of
+#   the registry entry for the crate, and `publish = false` in [workspace.package] means there is no
+#   registry entry — neither `maxplayer` nor `mobee` exists on crates.io. Until something is
+#   published, the working invocation is the one that reads this manifest directly:
+#
+#     cargo binstall --git https://github.com/MakePrisms/maxplayerai mobee
+#
+#   Note `mobee`, not `maxplayer`: binstall resolves a PACKAGE, and the package keeps its name while
+#   `[[bin]]` above renames the executable.
+#
+# ★ Why the URL is written out instead of using `{ repo }`. That template expands to the manifest's
+#   `repository` field, which is the buzzrelay mirror, not GitHub — so `{ repo }` here would send
+#   every binstall user to a host that publishes no release assets. `scripts/verify-binstall-metadata.sh`
+#   asserts the host these URLs actually resolve to.
+#
+# ★ Why there is no top-level `pkg-url`. Our assets are named by platform (`linux-x64`,
+#   `linux-arm64`), and no binstall template variable maps a rust target triple onto those names —
+#   any top-level template would therefore be a guess naming assets no release publishes. With only
+#   the overrides below, an unlisted target resolves nothing and binstall falls back to building from
+#   source, which is the honest outcome. This deliberately mirrors `install.sh`: the supported
+#   platform set is linux x86_64 and linux aarch64, and nothing else is guessed at.
+[package.metadata.binstall]
+pkg-fmt = "tgz"
+
+# musl, because that is what the release matrix builds. A glibc host is still served: binstall's
+# target detection offers both the gnu and the musl triple for a linux host, so the override below is
+# reached — and the artifact is statically linked, which release.yml re-proves on debian every run.
+[package.metadata.binstall.overrides.x86_64-unknown-linux-musl]
+pkg-url = "https://github.com/MakePrisms/maxplayerai/releases/download/v{ version }/maxplayer-{ version }-linux-x64.tar.gz"
+bin-dir = "maxplayer-{ version }-linux-x64/maxplayer"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-musl]
+pkg-url = "https://github.com/MakePrisms/maxplayerai/releases/download/v{ version }/maxplayer-{ version }-linux-arm64.tar.gz"
+bin-dir = "maxplayer-{ version }-linux-arm64/maxplayer"
+
 [features]
 default = ["wallet"]
 # `acp` compiles in the seller surface (agent execution + the `sell` advertise path). That surface

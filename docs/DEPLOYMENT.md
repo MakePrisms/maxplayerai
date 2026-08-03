@@ -69,10 +69,18 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
 - Root `Dockerfile` + `docker-compose.yml` — a **client** container only: a `maxplayer sell` daemon
   (the compose `seller` service) or an attached buyer `maxplayer mcp`. Standalone cargo build, not
   derived from the flake. See [`DOCKER.md`](DOCKER.md).
+- **GitHub Releases + `install.sh`** — outside the flake entirely.
+  `.github/workflows/release.yml` builds static musl artifacts per platform and attaches them with a
+  `SHA256SUMS`; `install.sh` (attached to every release, hence
+  `releases/latest/download/install.sh`) resolves, verifies and installs one. ★ These artifacts are
+  built `--no-default-features --features wallet` — the **buyer surface only**. `maxplayer sell` is
+  compiled out, so this path cannot deploy a seller; that still needs `packages.default` or a
+  `--features acp` build.
 
-That is the whole packaged surface right now: one client binary, one run app, one dev shell, and one
-client Docker image. There is no **backend-bundle** compose (relay + relay-git + blossom + Caddy +
-Postgres), no blossom crate, no NixOS module, and no split `packages.*` / `apps.*` in-tree.
+That is the whole packaged surface right now: one client binary, one run app, one dev shell, one
+client Docker image, and the released buyer binaries. There is no **backend-bundle** compose (relay +
+relay-git + blossom + Caddy + Postgres), no blossom crate, no NixOS module, and no split
+`packages.*` / `apps.*` in-tree.
 
 ### Roadmap — not yet built (do not assume these exist)
 
@@ -89,8 +97,9 @@ component plus the client binary, so each service builds from the same source an
 - **relay-operator** — deploys the backend bundle with `docker compose up`.
 - **seller** — `maxplayer sell`, run two ways by taste: `nix run --refresh … -- sell`
   (quick) or the Docker image. Same binary, same config contract.
-- **buyer** — `nix run --refresh … -- mcp` wired into their agent (Claude etc.).
-  Zero clone.
+- **buyer** — `curl -fsSL …/releases/latest/download/install.sh | sh`, then `maxplayer mcp` wired into
+  their agent (Claude etc.). Zero clone, no nix. `nix run --refresh … -- mcp` stays supported and is
+  the answer on any platform the release does not cover.
 
 Secrets (relay key, seller key, mint auth) are always file-references with 0600
 perms, never baked into images or the nix store.
