@@ -138,23 +138,21 @@ pub async fn probe_access(
         // disconnected socket, after burning the full probe timeout waiting for an echo of nothing.
         Ok(output) => {
             if let Some(why) = super::undelivered(&output) {
-                // ★★ SILENCE, AND DELIBERATELY NOT A DISCRIMINATED VERDICT. The tempting split is
-                // `output.failed`: non-empty looks like the relay answering `OK: false`, empty like
-                // nothing ever taking the event. It does not hold — the pool puts SEND failures in
-                // that same map, so `failed` sits NEXT TO "the relay refused us" rather than meaning
-                // it, and a socket that died mid-publish would be read as a policy rejection. The
-                // property wanted is "did the relay speak?", and nothing reachable here has access
-                // to it.
+                // ★★ THE SPLIT IS ON WHAT THE RELAY SAID, NOT ON WHICH MAP THE FAILURE LANDED IN.
+                // `output.failed` being non-empty looks like the relay answering `OK: false`; it is
+                // not, because the pool files SEND errors there too, so that map sits NEXT TO "the
+                // relay refused us" rather than meaning it. [`is_relay_refusal`] reads the thing that
+                // does mean it — a NIP-01 prefix only a relay composes.
                 //
-                // So it goes to the side whose mistake is survivable, and the asymmetry is not
-                // close: a refusal misread as silence costs THREE bounded attempts and then denies
-                // itself anyway, while a silence misread as a refusal costs the relay permanently —
-                // and, with `note_new_signal` currently wired to nothing, permanently means for the
-                // life of the process. The charter's "never poll a refusal" is kept in substance:
-                // this stops, for good, after a bounded count.
-                return ProbeOutcome::Unreachable(format!(
-                    "the probe publish reached no relay: {why}"
-                ));
+                // Unrecognised goes to silence, and the asymmetry behind that default is not close:
+                // a refusal misread as silence costs THREE bounded attempts and then denies itself
+                // anyway, while a silence misread as a refusal costs the relay permanently — and with
+                // `note_new_signal` wired to nothing, permanently means for the life of the process.
+                return if output.failed.values().any(|why| is_relay_refusal(why)) {
+                    ProbeOutcome::Refused(format!("the relay refused the probe publish: {why}"))
+                } else {
+                    ProbeOutcome::Unreachable(format!("the probe publish reached no relay: {why}"))
+                };
             }
         }
     }
@@ -165,16 +163,54 @@ pub async fn probe_access(
     {
         Ok(events) if events.iter().any(|event| event.id == event_id) => ProbeOutcome::EchoObserved,
         Ok(_) => ProbeOutcome::EchoMissing,
-        // A failed read is not a denial of access — it is a failure to learn.
+        // A failed read is USUALLY not a denial of access — it is a failure to learn.
         //
-        // ★ THAT SENTENCE WAS ALREADY HERE, ABOVE A `Refused`. It was TRUE when it was written: a
-        // missing echo and a refusal both meant unproven-therefore-unused, so "lands on the same
-        // side" described the code accurately and the word chosen did not matter. Splitting the
-        // verdicts falsified it in place, and a comment cannot recompile — so the sentence went on
-        // asserting a property the code had lost. A reason we failed to OBTAIN is not a refusal we
-        // were GIVEN, and now the label says so.
-        Err(error) => ProbeOutcome::Unreachable(format!("could not read the probe back: {error}")),
+        // ★ THAT SENTENCE WAS ALREADY HERE, ABOVE A `Refused`, WITHOUT THE "USUALLY". It was TRUE
+        // when written: a missing echo and a refusal both meant unproven-therefore-unused, so "lands
+        // on the same side" described the code accurately and the word chosen did not matter.
+        // Splitting the verdicts falsified it in place, and a comment cannot recompile.
+        //
+        // ⚠ THE QUALIFIER IS LOAD-BEARING. `fetch_events` folds a relay's `CLOSED` into the same
+        // `Err` as a timeout or a dead socket, so this branch carries both a relay that spoke and a
+        // transport that did not. Same prefix test as the publish path, same default: a reason we
+        // failed to OBTAIN is not a refusal we were GIVEN, unless the relay put its name to it.
+        Err(error) => {
+            let reason = error.to_string();
+            if is_relay_refusal(&reason) {
+                ProbeOutcome::Refused(format!("the relay refused the probe read-back: {reason}"))
+            } else {
+                ProbeOutcome::Unreachable(format!("could not read the probe back: {reason}"))
+            }
+        }
     }
+}
+
+/// Whether a failure reason is the RELAY REFUSING, as opposed to our transport failing to reach it.
+///
+/// ★★ THIS IS THE DISCRIMINATOR THE `failed` MAP IS NOT. That map holds both — an `OK: false` the
+/// relay sent, and a send error the pool generated — so its emptiness answers a question next to
+/// this one. NIP-01 machine-readable prefixes answer THIS one: they exist on messages a relay
+/// composes, and no SDK transport error carries one. The observed transport string is
+/// `"relay is initialized but not ready"`, which matches nothing here, and that is the point.
+///
+/// ★ ONLY THE DURABLE REFUSALS ARE LISTED, because the verdict they buy is permanent:
+/// - `blocked:` / `restricted:` — the relay's policy says no, and it will keep saying no.
+/// - `invalid:` — the event is malformed. Ours to fix; re-sending the same bytes cannot help.
+/// - `pow:` — insufficient work on this event, which re-sending does not add.
+///
+/// ⚠ AND THE ONES DELIBERATELY ABSENT, because they are the relay declining FOR NOW: `auth-required:`
+/// (the reader authenticates and the next attempt differs), `rate-limited:` (a throttle, which is
+/// what a backoff is for), and `error:`, which NIP-01 defines as the catch-all for everything with no
+/// better prefix — the one string least entitled to a permanent verdict. Anything unrecognised falls
+/// through to `false` on purpose: an unknown reason has not demonstrated that the relay refused us,
+/// and the mistake that costs a relay for the life of the process is the one on the other side.
+fn is_relay_refusal(reason: &str) -> bool {
+    const DURABLE_REFUSALS: [&str; 4] = ["blocked:", "restricted:", "invalid:", "pow:"];
+    // `contains` rather than `starts_with`: these reasons arrive wrapped — `undelivered` prefixes the
+    // relay URL, and the SDK embeds a relay's words inside its own error Display.
+    DURABLE_REFUSALS
+        .iter()
+        .any(|prefix| reason.contains(prefix))
 }
 
 /// Whether a relay will retain this event long enough to answer for it.
@@ -433,7 +469,15 @@ mod tests {
             probe_access(&publisher, &url, &reader, &persona(&keys), Duration::from_secs(2)).await;
 
         match outcome {
-            ProbeOutcome::Unreachable(_) => {}
+            // ★ THE REASON IS ASSERTED, NOT JUST THE VARIANT. Both publish failures now yield
+            // `Unreachable`, so the variant alone cannot say which branch ran — and this test is
+            // paid for by covering the send that never happens. Pinning the wording is what stops it
+            // quietly becoming a second copy of its neighbour.
+            ProbeOutcome::Unreachable(reason) => assert!(
+                reason.contains("could not be sent"),
+                "right verdict, wrong branch: this test covers the send failing outright, and the \
+                 delivery check below it is a different path with its own test: {reason}"
+            ),
             other => panic!(
                 "a publish that reached no socket is SILENCE, and silence is retryable — `Refused` \
                  denies this relay for the life of the process over a fault that was ours: {other:?}"
@@ -463,11 +507,46 @@ mod tests {
             probe_access(&publisher, &url, &reader, &persona(&keys), Duration::from_secs(2)).await;
 
         match outcome {
-            ProbeOutcome::Unreachable(_) => {}
+            ProbeOutcome::Unreachable(reason) => assert!(
+                reason.contains("reached no relay"),
+                "right verdict, wrong branch: this test exists for the DELIVERY check, and a send \
+                 that failed outright would satisfy the variant without ever reaching it: {reason}"
+            ),
             other => panic!(
                 "an undelivered publish is SILENCE — reading `failed` as a refusal denies a relay \
                  permanently for a socket that was never dialled: {other:?}"
             ),
+        }
+    }
+
+    /// ★★ THE DISCRIMINATOR ITSELF, PINNED — because the whole verdict split now rests on it and it
+    /// is the one piece of this that can be tested without a relay at all.
+    ///
+    /// The two rows that matter most are the last two: the transport string is VERBATIM what the SDK
+    /// produced during this module's own red-prove, and `error:` is the prefix a relay reaches for
+    /// when it has nothing more specific to say — the string least entitled to cost a relay
+    /// permanently.
+    #[test]
+    fn only_a_relays_own_durable_refusal_reads_as_a_refusal() {
+        for (reason, refusal) in [
+            ("blocked: not on the allow list", true),
+            ("restricted: p-gated events require #p matching your pubkey", true),
+            ("invalid: bad signature", true),
+            ("pow: difficulty 28 required", true),
+            // Declining FOR NOW. A backoff is the right answer to each of these, not a denial.
+            ("auth-required: authenticate first", false),
+            ("rate-limited: slow down", false),
+            ("error: could not connect to the database", false),
+            // What our own transport failing actually looks like, measured not imagined.
+            ("ws://127.0.0.1:44487: relay is initialized but not ready", false),
+            ("no relays", false),
+        ] {
+            assert_eq!(
+                is_relay_refusal(reason),
+                refusal,
+                "misclassified {reason:?} — a false positive costs the relay for the life of the \
+                 process, a false negative costs three bounded attempts"
+            );
         }
     }
 

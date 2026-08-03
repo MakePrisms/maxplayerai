@@ -293,7 +293,18 @@ impl Participation {
                 .map(|_| ()),
         };
 
+        // ★★ A BROKEN STORE IS NOT THIS RELAY'S FAULT AND MUST NOT BE CHARGED TO ITS BUDGET. The two
+        // failures above are not the same kind of fact: a failed subscribe is the wire, and this
+        // relay's admission is genuinely back in doubt — but `forget_retries_in_flight` failing is
+        // OUR sqlite, and it would fail identically against every relay in the config. Folded into
+        // the silence budget it denies three PROVEN relays in three ticks and blames them for it,
+        // which is the round-13 defect wearing a local error's clothes. So it propagates unrecorded:
+        // boot stops the node, the tick logs it every pass, and the relay keeps the state it had.
         if let Err(error) = installed {
+            if let ParticipationError::Store(_) = error {
+                reader.disconnect().await;
+                return Err(error);
+            }
             // ★★ ADMISSION WAS PROVEN AND WE STILL HOLD NOTHING — and recording the admission before
             // finding that out is what stranded the relay. `Admitted` is excluded by
             // [`RelayRoster::relays_to_probe`], and every recovery lane iterates `self.live`, which
