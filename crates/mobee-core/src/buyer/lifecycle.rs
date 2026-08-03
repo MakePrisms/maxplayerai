@@ -413,7 +413,7 @@ impl std::error::Error for AwardError {}
 /// balance, budget cap, budget spent total) — the same two-ceiling inputs [`BuyerStore::reserve`]
 /// guards against.
 #[allow(clippy::too_many_arguments)]
-pub async fn award_with_reservation<P, PFut, R, RFut, S, SFut>(
+pub(crate) async fn award_with_reservation<P, PFut, R, RFut, S, SFut>(
     store: &BuyerStore,
     job_id: &str,
     amount: u64,
