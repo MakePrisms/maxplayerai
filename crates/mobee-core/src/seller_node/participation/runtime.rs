@@ -1941,10 +1941,22 @@ mod tests {
             0,
         );
 
-        let ingested = participation
-            .pump(Duration::from_millis(1))
-            .await
-            .expect("pump");
+        // ★★★ TWO PUMPS, AND A ZERO BUDGET ON PURPOSE — "two drains" IS NOT A DURATION. `try_recv`
+        // reports `Lagged` BEFORE it yields the messages that survived the overflow, so the first drain's
+        // batch is empty and its `ingested` is 0 by construction; the processing this test is about
+        // happens on the NEXT drain. Spelling that as a 1 ms budget made it a race the pump lost whenever
+        // its first iteration — revive, a due resync, both debt drains, the re-probe, the retry lane —
+        // ran longer than a millisecond: a flake at 1 in 40 measured, never a defect in the code under
+        // test. A wider budget would only have made it rarer, because the requirement was never temporal.
+        // The deadline is checked at the BOTTOM of the pump's loop, so each call runs exactly one full
+        // iteration whatever the budget ⇒ with `ZERO` the wall clock cannot decide this test at all.
+        let first = participation.pump(Duration::ZERO).await.expect("first pump");
+        assert_eq!(
+            first, 0,
+            "the first drain processed something, so `Lagged`-before-the-survivors — the ordering this \
+             test is built on — no longer holds, and the second pump is now measuring the wrong thing"
+        );
+        let ingested = participation.pump(Duration::ZERO).await.expect("second pump");
 
         assert!(
             participation.lagged() > 0,
