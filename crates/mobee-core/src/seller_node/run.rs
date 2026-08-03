@@ -1105,6 +1105,103 @@ fn probe_sentinel_present(workdir: &std::path::Path, sentinel: &str) -> bool {
     })
 }
 
+/// One configured harness's pre-advertise probe verdict: which registry index it is, its name (for
+/// logs), and whether it PROVED it can deliver. `Err` carries the operator reason and the `Fault` to
+/// record against the roster — the same `(reason, Fault)` a real job's failure produces, so a dead
+/// harness narrows the roster identically whether the fault is found here or at runtime.
+pub struct HarnessProbeVerdict {
+    pub index: usize,
+    pub name: Option<String>,
+    pub result: Result<(), (String, Fault)>,
+}
+
+/// Probe EVERY configured harness once, before anything goes on the wire.
+///
+/// Local compute only — no sats, no mint, no award (`run_harness_probe` runs the harness in a
+/// throwaway workdir to write a sentinel and decides on the artifact). It is ours to run and ours to
+/// pay for, exactly like the restore-timer self-probe — but here it gates the FIRST advertisement
+/// rather than a restoration, so a seat that cannot deliver never advertises at all (#357). Inputs
+/// are derived from `home` the same way `start_due_harness_probes` derives them for the restore probe.
+pub async fn probe_configured_harnesses(
+    home: &MobeeHome,
+) -> Result<Vec<HarnessProbeVerdict>, NodeError> {
+    let registry = boot_agent_registry(home)?;
+    let sandbox = SandboxPolicy::from_config(home.config.sandbox.as_ref());
+    let identity = DeliveryAgentIdentity::for_seller(&home::public_key_hex(home)?);
+    let mut verdicts = Vec::with_capacity(registry.entries().len());
+    for (index, entry) in registry.entries().iter().enumerate() {
+        let probe = mint_probe_identity(index, now_unix() as u64);
+        let workdir = job_workdir(home, &probe.dir_label);
+        let result =
+            run_harness_probe(&entry.argv, &sandbox, &identity, &workdir, &probe.sentinel).await;
+        let _ = std::fs::remove_dir_all(&workdir);
+        verdicts.push(HarnessProbeVerdict {
+            index,
+            name: entry.name.clone(),
+            result,
+        });
+    }
+    Ok(verdicts)
+}
+
+/// The pure decision the pre-advertise gate turns on: the registry indices that PROVED they can
+/// serve. No I/O, so the healthy direction is testable by injecting outcomes — no agent spawn.
+pub fn proven_serving_indices(verdicts: &[HarnessProbeVerdict]) -> Vec<usize> {
+    verdicts
+        .iter()
+        .filter(|verdict| verdict.result.is_ok())
+        .map(|verdict| verdict.index)
+        .collect()
+}
+
+/// Prove-before-advertise: publish discoverability and boot serving ONLY the harnesses that proved
+/// they can deliver.
+///
+/// `verdicts` is the outcome of [`probe_configured_harnesses`], taken as a parameter so a caller can
+/// inject a passing result without spawning an agent. Two outcomes:
+///
+/// - **None proved out** → publish NOTHING (0×kind-31990) and refuse to boot (0×kind-30340). Fail
+///   loud, non-zero: a seat that cannot deliver any harness must not advertise, and lingering while
+///   advertising nothing only hides the fault from the operator.
+/// - **Some proved out** → publish discoverability as before, boot, then pre-narrow the live roster
+///   to the provers so the kind-30340 heartbeat (which reads the roster) is honest for free.
+///
+/// The gate is the `is_empty` block below; reverting it — publishing unconditionally — reproduces the
+/// #357 bug (advertise, then fail every job).
+pub async fn boot_advertising_only_proven(
+    mut home: MobeeHome,
+    verdicts: Vec<HarnessProbeVerdict>,
+) -> Result<SellerNodeRunner, NodeError> {
+    if proven_serving_indices(&verdicts).is_empty() {
+        for verdict in &verdicts {
+            if let Err((reason, _)) = &verdict.result {
+                let label = verdict.name.as_deref().unwrap_or("<unlabelled>");
+                eprintln!("seller node pre-advertise probe FAILED {label}: {reason}");
+            }
+        }
+        return Err(NodeError::NoProvenHarness(format!(
+            "none of {} configured harness(es) produced a probe artifact; refusing to advertise \
+             (fix the harness/launcher, then restart)",
+            verdicts.len()
+        )));
+    }
+
+    let disco = crate::profile::publish_seller_discoverability_async(&mut home)
+        .await
+        .map_err(|error| NodeError::Relay(format!("discoverability publish failed: {error}")))?;
+    eprintln!(
+        "seller node discoverable kind0={} nip89={} name={} pubkey={}",
+        disco.kind0_event_id,
+        disco.nip89_event_id,
+        disco.name.as_deref().unwrap_or(""),
+        disco.pubkey
+    );
+
+    let runner = SellerNodeRunner::boot(home).await?;
+    runner.narrow_roster_to(&verdicts);
+    Ok(runner)
+}
+
 /// How long boot waits for the relay connection and the NIP-42 challenge.
 const CONNECT_WAIT: Duration = Duration::from_secs(20);
 /// Cadence of the outbox drain / housekeeping tick.
@@ -2488,6 +2585,26 @@ impl SellerNodeRunner {
                 }
                 let _ = std::fs::remove_dir_all(&workdir);
             });
+        }
+    }
+
+    /// Pre-narrow the live roster to the harnesses that PROVED they can deliver: every FAILED
+    /// pre-advertise probe faults its index with the fault it produced, exactly as the restore-timer
+    /// verdict does — so the kind-30340 heartbeat, which reads the roster, advertises only provers
+    /// from the very first tick (#357). Provers are left untouched (boot already starts them serving).
+    fn narrow_roster_to(&self, verdicts: &[HarnessProbeVerdict]) {
+        for verdict in verdicts {
+            if let Err((reason, fault)) = &verdict.result {
+                let state = self.agents.fault(verdict.index, fault.clone(), Instant::now());
+                let label = self
+                    .agents
+                    .label(verdict.index)
+                    .unwrap_or_else(|| "<unlabelled>".to_owned());
+                eprintln!(
+                    "seller node pre-advertise DROPPED {label}: {reason} — {}",
+                    state.reason()
+                );
+            }
         }
     }
 
@@ -5720,5 +5837,109 @@ mod tests {
 
         assert_eq!(state.on_tick(), RearmStep::Wait, "cooling down");
         assert_eq!(state.on_tick(), RearmStep::Attempt, "then attempting again");
+    }
+
+    // ---- #357 prove-before-advertise -----------------------------------------------------------
+    //
+    // These drive `boot_advertising_only_proven` against the fixture relay and assert what reached
+    // the wire BY KIND (kind-31990 handler ad, kind-30340 heartbeat). Safe: the bogus case fails at
+    // spawn with ENOENT (no process created), and the healthy case injects a passing verdict so no
+    // agent is ever spawned.
+
+    /// A seat whose every configured harness FAILS its pre-advertise probe must publish nothing: no
+    /// kind-31990 handler ad and no kind-30340 heartbeat. The `[sandbox]` launcher is unresolvable, so
+    /// the probe's spawn fails ENOENT before any agent runs.
+    ///
+    /// RED ON REVERT: delete the `is_empty` gate block in `boot_advertising_only_proven` (publish
+    /// unconditionally) and the relay sees ≥1 kind-31990 — the #357 bug, advertise-then-fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_seat_whose_harness_fails_its_probe_advertises_nothing() {
+        use crate::home::SandboxConfig;
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("noprobe");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        // Persist seller + fixture relay + the bogus launcher. The launcher resolves to nothing, so
+        // every probe spawn fails ENOENT (no child — `AcpDriver::spawn` is a synchronous
+        // `std::process::Command::spawn` that errors first). Persisting the FIXTURE relay is
+        // load-bearing for the red-prove: reverting the gate makes the disco publish run, and the
+        // `reload_config` inside it must read the fixture url, never a real relay.
+        crate::home::save_config(&mut home, |config| {
+            config.seller = Some(seller_cfg(1, false));
+            config.relay_url = fixture.url();
+            config.sandbox = Some(SandboxConfig {
+                launcher: vec!["definitely-not-a-real-binary-xyz".to_owned()],
+            });
+        })
+        .expect("persist config");
+
+        let verdicts = probe_configured_harnesses(&home)
+            .await
+            .expect("probe returns verdicts");
+        assert!(
+            verdicts.iter().all(|verdict| verdict.result.is_err()),
+            "harness check: a bogus launcher must fail every probe"
+        );
+
+        let outcome = boot_advertising_only_proven(home, verdicts).await;
+
+        // The load-bearing property: a seat whose harness failed its probe put NOTHING on the wire.
+        assert_eq!(
+            fixture.event_kind_count(31990).await,
+            0,
+            "a dead seat must NOT publish the kind-31990 handler ad"
+        );
+        assert_eq!(
+            fixture.event_kind_count(30340).await,
+            0,
+            "a dead seat must NOT publish a kind-30340 heartbeat"
+        );
+        // …and it refused to boot rather than lingering while advertising nothing (fail loud).
+        match outcome {
+            Err(NodeError::NoProvenHarness(_)) => {}
+            Err(other) => panic!("expected NoProvenHarness, got: {other}"),
+            Ok(_) => panic!("no prover must refuse to boot"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A seat with a PROVEN harness advertises as before: discoverability (kind-31990) is published
+    /// and the live roster serves. The passing verdict is INJECTED — no agent is spawned — which is
+    /// exactly why the orchestrator takes probe outcomes as a parameter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_seat_with_a_proven_harness_still_advertises_and_serves() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("proven");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        // The discoverability publish reloads config from disk, so the seller + fixture relay must be
+        // PERSISTED, not merely set in memory.
+        crate::home::save_config(&mut home, |config| {
+            config.seller = Some(seller_cfg(1, false));
+            config.relay_url = fixture.url();
+        })
+        .expect("persist config");
+
+        // Index 0 — the single `claude` preset — proved out. Injected: no agent spawn.
+        let verdicts = vec![HarnessProbeVerdict {
+            index: 0,
+            name: Some("claude".to_owned()),
+            result: Ok(()),
+        }];
+
+        let runner = boot_advertising_only_proven(home, verdicts)
+            .await
+            .expect("a proven seat must boot");
+
+        assert!(
+            fixture.event_kind_count(31990).await >= 1,
+            "a proven seat MUST publish the kind-31990 handler ad"
+        );
+        assert!(
+            runner.agents.advertisement().serving,
+            "the live roster must serve the proven harness"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

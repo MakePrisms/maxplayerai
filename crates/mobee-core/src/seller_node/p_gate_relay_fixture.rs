@@ -52,6 +52,14 @@ pub(super) struct ReqRecord {
     pub verdict: Verdict,
 }
 
+/// One EVENT frame the client published, as the relay saw it. Recorded by KIND because "advertised"
+/// is a claim about which kinds reached the wire — the pre-advertise gate (#357) is exactly a test of
+/// what a publish path put here, so the fixture that used to reply OK and DROP the event now keeps it.
+#[derive(Debug, Clone)]
+pub(super) struct PublishedEvent {
+    pub kind: u64,
+}
+
 /// A refusal the test has armed, spent on the next `REQ` for this subscription that carries an
 /// un-pinned filter.
 ///
@@ -77,6 +85,9 @@ struct Controls {
 pub(super) struct PGateRelay {
     url: String,
     transcript: Arc<Mutex<Vec<ReqRecord>>>,
+    /// Every EVENT the client published, in arrival order — the wire record the pre-advertise gate is
+    /// asserted against.
+    events: Arc<Mutex<Vec<PublishedEvent>>>,
     controls: Arc<Controls>,
     /// Sockets accepted so far. A reconnect is the only thing that increments this, which makes
     /// "no reconnect was required" an observable rather than an inference.
@@ -97,20 +108,24 @@ impl PGateRelay {
             .expect("bind fixture relay");
         let addr: SocketAddr = listener.local_addr().expect("fixture relay addr");
         let transcript: Arc<Mutex<Vec<ReqRecord>>> = Arc::new(Mutex::new(Vec::new()));
+        let events: Arc<Mutex<Vec<PublishedEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let controls: Arc<Controls> = Arc::new(Controls::default());
 
         let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let accept = tokio::spawn({
             let transcript = Arc::clone(&transcript);
+            let events = Arc::clone(&events);
             let controls = Arc::clone(&controls);
             let connections = Arc::clone(&connections);
             async move {
                 while let Ok((stream, _)) = listener.accept().await {
                     connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let transcript = Arc::clone(&transcript);
+                    let events = Arc::clone(&events);
                     let controls = Arc::clone(&controls);
                     tokio::spawn(async move {
-                        let _ = serve_connection(stream, auth_delay, transcript, controls).await;
+                        let _ =
+                            serve_connection(stream, auth_delay, transcript, events, controls).await;
                     });
                 }
             }
@@ -119,6 +134,7 @@ impl PGateRelay {
         Self {
             url: format!("ws://{addr}"),
             transcript,
+            events,
             controls,
             connections,
             _accept: accept,
@@ -169,6 +185,20 @@ impl PGateRelay {
             .collect()
     }
 
+    /// Every EVENT the relay has received, in arrival order.
+    pub(super) async fn events(&self) -> Vec<PublishedEvent> {
+        self.events.lock().await.clone()
+    }
+
+    /// How many EVENTs of `kind` the relay received — what a publish path actually put on the wire.
+    pub(super) async fn event_kind_count(&self, kind: u64) -> usize {
+        self.events()
+            .await
+            .iter()
+            .filter(|event| event.kind == kind)
+            .count()
+    }
+
     /// Wait until `predicate` holds over the transcript, or give up. Returns whether it held —
     /// the caller asserts, so a timeout reads as the failure it is rather than a hang.
     pub(super) async fn wait_until<F>(&self, timeout: Duration, predicate: F) -> bool
@@ -193,6 +223,7 @@ async fn serve_connection(
     stream: tokio::net::TcpStream,
     auth_delay: Duration,
     transcript: Arc<Mutex<Vec<ReqRecord>>>,
+    events: Arc<Mutex<Vec<PublishedEvent>>>,
     controls: Arc<Controls>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ws = tokio_tungstenite::accept_async(stream).await?;
@@ -241,6 +272,11 @@ async fn serve_connection(
             Some("EVENT") => {
                 let Some(event) = frame.get(1) else { continue };
                 let id = event.get("id").and_then(Value::as_str).unwrap_or_default();
+                // Record what was published, by kind, BEFORE the OK: what reaches the wire is exactly
+                // the property the pre-advertise gate is asserted against (#357).
+                if let Some(kind) = event.get("kind").and_then(Value::as_u64) {
+                    events.lock().await.push(PublishedEvent { kind });
+                }
                 send(&writer, json!(["OK", id, true, ""])).await?;
             }
             Some("REQ") => {

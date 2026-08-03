@@ -211,23 +211,6 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
         let _ = writeln!(err, "relay-git seed probe ok (info/refs reachable)");
     }
 
-    // Discoverability: clobber-safe kind-0 + idempotent NIP-89.
-    let disco = profile::publish_seller_discoverability(&mut home).map_err(|error| {
-        let _ = writeln!(
-            err,
-            "discoverability publish failed (fail-closed): {error}"
-        );
-        RUNTIME_ERROR
-    })?;
-    let _ = writeln!(
-        err,
-        "discoverable kind0={} nip89={} name={} pubkey={}",
-        disco.kind0_event_id,
-        disco.nip89_event_id,
-        disco.name.as_deref().unwrap_or(""),
-        disco.pubkey
-    );
-
     // Boot the durable seller node (sqlite store + outbox + reconcile_on_start) as the seller path.
     // run_sell is synchronous, so it owns a runtime here and block_on's the async boot + run loop.
     //
@@ -246,8 +229,19 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
             let _ = writeln!(err, "tokio runtime: {error}");
             RUNTIME_ERROR
         })?;
+
+    // Prove-before-advertise (#357): probe each configured harness once, THEN publish discoverability
+    // (clobber-safe kind-0 + idempotent kind-31990) and boot serving ONLY the harnesses that proved
+    // they can deliver a probe artifact. If NONE prove out, advertise nothing and refuse to start
+    // (fail loud) — a seat that cannot deliver must never appear on the market, because under
+    // award-is-payment a buyer commits the sats at award. The probe is local compute only (no
+    // sats/mint); the gate + roster narrowing live in mobee-core so the kind-30340 heartbeat is
+    // honest for free.
     let runner = runtime
-        .block_on(mobee_core::seller_node::run::SellerNodeRunner::boot(home))
+        .block_on(async {
+            let verdicts = mobee_core::seller_node::run::probe_configured_harnesses(&home).await?;
+            mobee_core::seller_node::run::boot_advertising_only_proven(home, verdicts).await
+        })
         .map_err(|error| {
             let _ = writeln!(err, "{error}");
             RUNTIME_ERROR
