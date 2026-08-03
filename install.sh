@@ -45,42 +45,71 @@ say()  { printf '%s\n' "$*"; }
 warn() { printf 'install.sh: %s\n' "$*" >&2; }
 die()  { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
+# An explicit mktemp template, because a bare `mktemp -d` is not portable in the direction that
+# matters here. GNU mktemp defaults the template; BSD mktemp — which is what macOS ships — documents
+# one as required, and this script now runs on macOS. Naming the template makes the call mean the
+# same thing on GNU, BSD and busybox, and it is cheaper than being wrong on the platform that cannot
+# be tested from linux. `$TMPDIR` is honoured because macOS sets it to a per-user directory.
+tmpl() { printf '%s/maxplayer-install-%s.XXXXXX\n' "${TMPDIR:-/tmp}" "$1"; }
+
 # ── Platform ────────────────────────────────────────────────────────────────────────────────────
-# Sets PLATFORM to a release platform name (`linux-x64`, `linux-arm64`). Those are NOT rust target
-# triples — the asset filenames are what this has to agree with.
+# Sets PLATFORM to a release platform name (`linux-x64`, `linux-arm64`, `darwin-arm64`). Those are
+# NOT rust target triples — the asset filenames are what this has to agree with.
 #
-# Everything unlisted is refused by name. macOS is refused explicitly rather than falling into the
-# generic arm: the release matrix does build a darwin asset, so a reader who sees one may reasonably
-# expect this to install it, and "unsupported" without a reason invites a retry. Silence there would
-# be the worse failure anyway — the alternative to refusing is downloading a linux tarball onto a
-# mac, which installs a file that cannot exec.
+# The OS and the architecture are resolved TOGETHER, in one nested case, because the supported set is
+# not a product of the two: linux ships both architectures, macOS ships only arm64. Checking them in
+# sequence — an OS gate, then an arch gate — cannot express that, and the arch arm would have to
+# either accept x86_64 on macOS (an asset no release publishes) or refuse it on linux.
+#
+# Everything unlisted is refused BY NAME, with the reason. Silence would be the worse failure: the
+# alternative to refusing is downloading some other platform's tarball, which installs a file that
+# cannot exec.
 detect_platform() {
     _os="$(uname -s)"
     _arch="$(uname -m)"
 
     case "$_os" in
-        Linux) ;;
+        Linux)
+            case "$_arch" in
+                x86_64 | amd64)  PLATFORM="linux-x64" ;;
+                aarch64 | arm64) PLATFORM="linux-arm64" ;;
+                *) die "unsupported architecture '$_arch' on linux — the released linux platforms are x86_64 and aarch64" ;;
+            esac
+            ;;
         Darwin)
-            die "macOS is not supported yet — this installer covers linux only. Build from source, or use nix: nix run --refresh github:$REPO -- mcp"
+            case "$_arch" in
+                arm64 | aarch64) PLATFORM="darwin-arm64" ;;
+                x86_64)
+                    # ★ `uname -m` reports the architecture of THIS PROCESS, not of the machine.
+                    # Under Rosetta 2 an Apple Silicon mac answers `x86_64`, so refusing on `uname`
+                    # alone would turn away a machine we do support — and it is easy to be in a
+                    # translated shell without knowing (an x86_64 Homebrew, a terminal opened with
+                    # "Open using Rosetta"). The discriminator is one layer out and has to be asked
+                    # for: `hw.optional.arm64` is a property of the HARDWARE.
+                    #
+                    # Fails closed toward the refusal — if sysctl is unavailable we refuse rather
+                    # than assume. Either direction is safe (the prove-step below rejects a binary
+                    # that cannot exec), but a named refusal beats a confusing "did not run".
+                    if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = 1 ]; then
+                        PLATFORM="darwin-arm64"
+                        warn "this shell reports x86_64 because it is running under Rosetta; the machine is Apple Silicon, so installing the native arm64 build"
+                    else
+                        die "Intel macs are not supported — the release builds an Apple Silicon (arm64) mac asset only. Build from source, or use nix: nix run --refresh github:$REPO -- mcp"
+                    fi
+                    ;;
+                *) die "unsupported architecture '$_arch' on macOS — the released mac platform is Apple Silicon (arm64)" ;;
+            esac
             ;;
         *)
-            die "unsupported operating system '$_os' — this installer covers linux only (x86_64, aarch64)"
-            ;;
-    esac
-
-    case "$_arch" in
-        x86_64 | amd64)  PLATFORM="linux-x64" ;;
-        aarch64 | arm64) PLATFORM="linux-arm64" ;;
-        *)
-            die "unsupported architecture '$_arch' on $_os — released platforms are linux x86_64 and linux aarch64"
+            die "unsupported operating system '$_os' — this installer covers linux (x86_64, aarch64) and macOS (arm64)"
             ;;
     esac
 }
 
 # ── Transport ───────────────────────────────────────────────────────────────────────────────────
 # Sets DOWNLOADER. curl or wget, whichever is present: neither is guaranteed — debian-slim ships no
-# downloader at all and alpine's is busybox wget — so committing to curl would fail on the very
-# images the release is portability-tested against.
+# downloader at all, alpine's is busybox wget, and macOS ships curl but no wget — so committing to
+# either one alone would fail on a platform this installer supports.
 pick_downloader() {
     if command -v curl >/dev/null 2>&1; then
         DOWNLOADER=curl
@@ -121,7 +150,7 @@ fetch() {
 # That is reported as the specific thing it is, with the way out, rather than as a download failure.
 resolve_latest_version() {
     _api="https://api.github.com/repos/$REPO/releases/latest"
-    _body="$(mktemp)" || die "cannot create a temporary file"
+    _body="$(mktemp "$(tmpl api)")" || die "cannot create a temporary file"
     if ! fetch "$_api" "$_body"; then
         rm -f "$_body"
         die "could not ask GitHub for the latest release of $REPO. If every release is still a pre-release, or the API is rate-limiting this host, name a version instead: MAXPLAYER_VERSION=x.y.z"
@@ -143,6 +172,10 @@ resolve_latest_version() {
 # Sets HASHER, failing closed when there is none. `command -v sha256sum >/dev/null && verify` is the
 # shape that turns verification into a coin flip decided by the host's package list; a host that
 # cannot hash must not get an install.
+#
+# The fallback chain is load-bearing on macOS, not decoration: macOS ships NO `sha256sum`. It has
+# `shasum` (perl) and `openssl`, which is why both are here — on darwin the second arm is the one
+# that runs, so a chain that stopped at `sha256sum` would refuse every mac.
 pick_hasher() {
     if command -v sha256sum >/dev/null 2>&1; then
         HASHER=sha256sum
@@ -273,7 +306,7 @@ main() {
     asset="$BIN_NAME-$VERSION-$PLATFORM.tar.gz"
     base="https://github.com/$REPO/releases/download/v$VERSION"
 
-    tmp="$(mktemp -d)" || die "cannot create a temporary directory"
+    tmp="$(mktemp -d "$(tmpl dl)")" || die "cannot create a temporary directory"
     # `staged` is cleaned by the trap too: it is a file inside the destination directory, so leaving
     # it behind on a failure would litter a directory that is on the user's PATH.
     staged=""

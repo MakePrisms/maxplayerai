@@ -70,9 +70,12 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
   (the compose `seller` service) or an attached buyer `maxplayer mcp`. Standalone cargo build, not
   derived from the flake. See [`DOCKER.md`](DOCKER.md).
 - **GitHub Releases + `install.sh`** — outside the flake entirely.
-  `.github/workflows/release.yml` builds static musl artifacts per platform and attaches them with a
-  `SHA256SUMS`; `install.sh` (attached to every release, hence
-  `releases/latest/download/install.sh`) resolves, verifies and installs one. ★ These artifacts are
+  `.github/workflows/release.yml` builds one artifact per platform — `linux-x64` and `linux-arm64`
+  statically linked against musl, `darwin-arm64` linked against the base macOS libraries (macOS cannot
+  link libSystem statically, so the check there is that it pulls in no Homebrew or `/usr/local`
+  dylib) — and attaches them with a `SHA256SUMS`. `install.sh` (attached to every release, hence
+  `releases/latest/download/install.sh`) resolves, verifies and installs one. Intel macs are not
+  covered: the matrix builds `aarch64-apple-darwin` only. ★ These artifacts are
   built `--no-default-features --features wallet` — the **buyer surface only**. `maxplayer sell` is
   compiled out, so this path cannot deploy a seller; that still needs `packages.default` or a
   `--features acp` build.
@@ -98,8 +101,9 @@ component plus the client binary, so each service builds from the same source an
 - **seller** — `maxplayer sell`, run two ways by taste: `nix run --refresh … -- sell`
   (quick) or the Docker image. Same binary, same config contract.
 - **buyer** — `curl -fsSL …/releases/latest/download/install.sh | sh`, then `maxplayer mcp` wired into
-  their agent (Claude etc.). Zero clone, no nix. `nix run --refresh … -- mcp` stays supported and is
-  the answer on any platform the release does not cover.
+  their agent (Claude etc.). Zero clone, no nix; linux x86_64/aarch64 and macOS Apple Silicon.
+  `nix run --refresh … -- mcp` stays supported and is the answer on any platform the release does not
+  cover — an Intel mac, or a linux architecture outside those two.
 
 Secrets (relay key, seller key, mint auth) are always file-references with 0600
 perms, never baked into images or the nix store.

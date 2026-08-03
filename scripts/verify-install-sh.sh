@@ -156,10 +156,19 @@ got="$(maxplayer version)" || fail "maxplayer version exited non-zero after the 
 [ "$got" = "maxplayer $VERSION" ] || fail "after the second run, version is '$got'"
 ok "two runs, rc=0 both times, exactly one maxplayer on PATH, still $got"
 
-# ── Leg 4/5 — unsupported platforms refuse ──────────────────────────────────────────────────────
-# `uname` is shimmed rather than the check being called directly: the property under test is that
-# the whole installer refuses, and a unit-level call would not show that it refuses BEFORE
-# downloading or installing anything.
+# ── Legs 4-5b — platform detection ──────────────────────────────────────────────────────────────
+# `uname` (and, for the Rosetta case, `sysctl`) is shimmed rather than the check being called
+# directly: the property under test is what the WHOLE installer does, and a unit-level call could not
+# show that it refuses BEFORE downloading or installing anything.
+#
+# ★★ WHAT THE DARWIN LEGS DO AND DO NOT PROVE. They run on linux, so they prove the PLATFORM
+#    RESOLUTION — that Darwin+arm64 resolves to `darwin-arm64` and therefore constructs the
+#    darwin asset name, that an Intel mac is refused, that the Rosetta branch fires. That logic is
+#    plain shell and platform-independent, so exercising it here is real.
+#    They CANNOT prove a darwin install works: no mac binary can execute in a linux container, and
+#    this box has no mac emulation of any kind. `install.sh`'s own prove-step (run the binary, match
+#    the version) is therefore unexercised on darwin, and stays unproven until a mac runs it — the
+#    #249 rule that nothing darwin counts as proven until a mac runs the artifact.
 shim_uname() {
     mkdir -p /shim
     cat > /shim/uname <<EOF
@@ -173,17 +182,91 @@ EOF
     chmod 755 /shim/uname
 }
 
-echo "leg 4: macOS is refused by name"
-BIN4="$(leg_dir darwin)"
+# $1 = arm64 → the machine IS Apple Silicon (hw.optional.arm64 = 1)
+# $1 = intel → the key does not exist, which is how a real Intel mac's sysctl answers it
+shim_sysctl() {
+    mkdir -p /shim
+    if [ "$1" = arm64 ]; then
+        cat > /shim/sysctl <<'EOF'
+#!/bin/sh
+case "$*" in
+    "-n hw.optional.arm64") echo 1 ;;
+    *) exit 1 ;;
+esac
+EOF
+    else
+        cat > /shim/sysctl <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+    fi
+    chmod 755 /shim/sysctl
+}
+
+# The mapping assertion the three darwin legs share. Requires: the installer announced the platform
+# it resolved, installed nothing, and exited non-zero (a linux box must never end up holding a mac
+# binary, whichever way the run failed).
+assert_resolved_platform() {
+    _out="$1"; _bin="$2"; _want="$3"; _label="$4"
+    grep -q "for $_want" "$_out" \
+        || fail "$_label: the installer did not resolve the platform to '$_want'. Output: $(cat "$_out")"
+    assert_empty "$_bin" "$_label"
+    ok "$_label -> resolved '$_want'; stopped without installing ($(grep -c . "$_out") lines, last: $(tail -n 1 "$_out" | cut -c1-72))"
+}
+
+echo "leg 4: Darwin + arm64 resolves to the darwin-arm64 asset"
+BIN4="$(leg_dir darwin-arm)"
 shim_uname Darwin arm64
+shim_sysctl arm64
 if PATH="/shim:$PATH" MAXPLAYER_VERSION="$VERSION" MAXPLAYER_BIN_DIR="$BIN4" \
-        sh "$INSTALLER" >/legs/darwin.out 2>&1; then
-    fail "the installer exited 0 on Darwin"
+        sh "$INSTALLER" >/legs/darwin-arm.out 2>&1; then
+    fail "the installer exited 0 while installing a mac binary on linux"
 fi
-grep -qi 'macOS is not supported' /legs/darwin.out \
-    || fail "refused on Darwin, but not by name. Output: $(cat /legs/darwin.out)"
-assert_empty "$BIN4" "leg 4"
-ok "Darwin -> $(grep -i 'macOS' /legs/darwin.out | head -n 1) (non-zero, nothing installed)"
+assert_resolved_platform /legs/darwin-arm.out "$BIN4" darwin-arm64 "leg 4 (Darwin/arm64)"
+# Record which failure mode this release produced, because it differs by release and a reader should
+# not have to guess: no darwin asset yet ⇒ the download refuses and NAMES the constructed asset;
+# once one exists ⇒ the download succeeds and the prove-step refuses because it cannot exec.
+if grep -q "maxplayer-$VERSION-darwin-arm64.tar.gz" /legs/darwin-arm.out; then
+    ok "  …and the constructed asset name appears: maxplayer-$VERSION-darwin-arm64.tar.gz"
+fi
+
+echo "leg 4b: an Intel mac is refused by name, before any download"
+BIN4B="$(leg_dir darwin-intel)"
+shim_uname Darwin x86_64
+shim_sysctl intel
+if PATH="/shim:$PATH" MAXPLAYER_VERSION="$VERSION" MAXPLAYER_BIN_DIR="$BIN4B" \
+        sh "$INSTALLER" >/legs/darwin-intel.out 2>&1; then
+    fail "the installer exited 0 on an Intel mac, for which no asset is built"
+fi
+grep -qi 'Intel macs are not supported' /legs/darwin-intel.out \
+    || fail "refused on an Intel mac, but not by name. Output: $(cat /legs/darwin-intel.out)"
+# Refused at DETECTION, not after fetching something. `installing maxplayer …` is the first thing a
+# run prints once it has committed to a platform, so its absence places the refusal before that.
+# `if`, not `grep … && fail`: under `set -e` an AND-list whose left side fails takes the whole list
+# non-zero and kills the driver — so the good case would abort the run instead of passing.
+if grep -q 'installing maxplayer' /legs/darwin-intel.out; then
+    fail "the Intel-mac refusal happened after the installer had already committed to a platform"
+fi
+assert_empty "$BIN4B" "leg 4b"
+ok "Intel mac -> $(grep -i 'Intel macs' /legs/darwin-intel.out | head -n 1 | cut -c1-88) (non-zero, no download)"
+
+echo "leg 4c: Apple Silicon under Rosetta is detected despite uname saying x86_64"
+BIN4C="$(leg_dir darwin-rosetta)"
+shim_uname Darwin x86_64
+shim_sysctl arm64
+if PATH="/shim:$PATH" MAXPLAYER_VERSION="$VERSION" MAXPLAYER_BIN_DIR="$BIN4C" \
+        sh "$INSTALLER" >/legs/darwin-rosetta.out 2>&1; then
+    fail "the installer exited 0 while installing a mac binary on linux"
+fi
+grep -qi 'running under Rosetta' /legs/darwin-rosetta.out \
+    || fail "the Rosetta branch did not fire, so an Apple Silicon mac in a translated shell would be refused. Output: $(cat /legs/darwin-rosetta.out)"
+assert_resolved_platform /legs/darwin-rosetta.out "$BIN4C" darwin-arm64 "leg 4c (Darwin/x86_64 + Rosetta)"
+
+# ★ Control on 4b vs 4c: the two runs differ ONLY in what sysctl answers — same uname, same args. So
+#   the different verdicts are attributable to the hardware probe and to nothing else. Without this
+#   pairing, 4c could have been passing because of the `x86_64` uname rather than the sysctl.
+ok "control: 4b and 4c differ only in sysctl's answer, so the hardware probe is what decides"
+rm -f /shim/sysctl
 
 echo "leg 5: an unsupported architecture is refused by name"
 BIN5="$(leg_dir riscv)"
@@ -196,6 +279,18 @@ grep -q 'riscv64' /legs/riscv.out \
     || fail "refused on riscv64 without naming the architecture. Output: $(cat /legs/riscv.out)"
 assert_empty "$BIN5" "leg 5"
 ok "riscv64 -> $(grep 'riscv64' /legs/riscv.out | head -n 1) (non-zero, nothing installed)"
+
+echo "leg 5b: an unsupported OS is refused by name"
+BIN5B="$(leg_dir freebsd)"
+shim_uname FreeBSD amd64
+if PATH="/shim:$PATH" MAXPLAYER_VERSION="$VERSION" MAXPLAYER_BIN_DIR="$BIN5B" \
+        sh "$INSTALLER" >/legs/freebsd.out 2>&1; then
+    fail "the installer exited 0 on FreeBSD"
+fi
+grep -q 'FreeBSD' /legs/freebsd.out \
+    || fail "refused on FreeBSD without naming the OS. Output: $(cat /legs/freebsd.out)"
+assert_empty "$BIN5B" "leg 5b"
+ok "FreeBSD -> $(grep 'unsupported operating system' /legs/freebsd.out | head -n 1) (non-zero, nothing installed)"
 rm -f /shim/uname
 
 # ── The download shim ───────────────────────────────────────────────────────────────────────────
