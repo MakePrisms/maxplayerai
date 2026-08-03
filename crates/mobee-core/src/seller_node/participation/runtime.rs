@@ -266,10 +266,8 @@ impl Participation {
             self.probe_timeout,
         )
         .await;
-        let admitted = matches!(outcome, ProbeOutcome::EchoObserved);
-        self.roster.record_probe(&url, outcome, now);
-
-        if !admitted {
+        if !matches!(outcome, ProbeOutcome::EchoObserved) {
+            self.roster.record_probe(&url, outcome, now);
             // Close the socket we opened to probe. An unproven relay gets nothing further — not a REQ,
             // not a heartbeat. A quarantined one comes back through THIS path once its backoff
             // elapses, on a socket opened fresh.
@@ -285,13 +283,48 @@ impl Participation {
         // ★ That invariant is about the SOCKET, not about boot. It was written when this ran only at
         // start-up ("nothing we sent before this process began is still outstanding") and it holds
         // just as well for a relay re-admitted mid-process, whose old socket is equally gone.
-        engine.forget_retries_in_flight(now)?;
         // Subscribe to the notification stream BEFORE the first REQ goes out, or the events that REQ
         // produces are broadcast to nobody.
         let notifications = reader.notifications();
-        subscribe_wake_surface(&reader, &engine, self.me).await?;
+        let installed = match engine.forget_retries_in_flight(now) {
+            Err(error) => Err(ParticipationError::from(error)),
+            Ok(_) => subscribe_wake_surface(&reader, &engine, self.me)
+                .await
+                .map(|_| ()),
+        };
+
+        if let Err(error) = installed {
+            // ★★ ADMISSION WAS PROVEN AND WE STILL HOLD NOTHING — and recording the admission before
+            // finding that out is what stranded the relay. `Admitted` is excluded by
+            // [`RelayRoster::relays_to_probe`], and every recovery lane iterates `self.live`, which
+            // has no entry for a relay whose install failed. So the one state reachable by NO lane at
+            // all was the state a relay landed in after its probe SUCCEEDED — strictly worse than
+            // failing it, and the tick path reached it by logging this error and carrying on.
+            //
+            // The verdict is a silence because that is what the node is experiencing: it is not being
+            // served by this relay and nobody refused it. That buys the backoff, the attempt ceiling,
+            // and an end — the machinery already built for exactly this shape.
+            //
+            // ⚠ NO TEST IN THIS SUITE REDDENS FOR THIS BRANCH, and it is stated rather than implied.
+            // Reaching it needs a relay that serves the carrier back AND then fails the subscribe:
+            // `LocalRelay` can do the first and `PGateRelay` neither, so the failure would have to be
+            // raced rather than arranged. The ORDERING above is what the fix actually is — the record
+            // follows the insert — and that much is plain in the control flow. Treat this handler as
+            // insurance with a reason, not as a proven repair, and do not let its presence read as
+            // coverage. Same standing as [`clear_registrations`]'s per-id loop, one lane over.
+            self.roster.record_probe(
+                &url,
+                ProbeOutcome::Unreachable(format!(
+                    "admitted, but the wake surface could not be installed: {error}"
+                )),
+                now,
+            );
+            reader.disconnect().await;
+            return Err(error);
+        }
+
         self.live.insert(
-            url,
+            url.clone(),
             Live {
                 reader,
                 notifications,
@@ -303,6 +336,12 @@ impl Participation {
                 reprove_due: None,
             },
         );
+        // ★ AFTER the insert, not before it. The admission is recorded once the thing it entitles us
+        // to — a live, subscribed socket — actually exists. Nothing between here and the insert can
+        // fail, so the ordering costs one `String` clone and removes the window entirely rather than
+        // arguing about how narrow it is.
+        self.roster
+            .record_probe(&url, ProbeOutcome::EchoObserved, now);
         Ok(true)
     }
 
@@ -499,21 +538,6 @@ impl Participation {
             self.drain_resends(now).await;
             self.drain_reproves(now).await;
 
-            // A relay whose quarantine backoff has elapsed and that holds NO live socket. Deliberately
-            // outside the four-lane gate above: those lanes recover an existing socket and so depend on
-            // "will this relay still talk to us", whereas this one has no socket to recover and exists
-            // precisely to ask that question again.
-            //
-            // Best-effort by construction. The error can only be the store's or the subscription's, and
-            // a relay we are not yet serving must not be able to empty this batch or wedge the pump —
-            // the next tick tries again, and the attempt ceiling stops it being forever.
-            if let Err(error) = self.probe_one_due(now).await {
-                eprintln!(
-                    "participation: re-probe of a due relay failed ({error}); it stays unproven and \
-                     is retried on the next tick"
-                );
-            }
-
             // ★ THE `?`s BELOW CARRY ONLY `Store` ERRORS, BY CONSTRUCTION — and that is a property to
             // re-check, not to trust, because it is what keeps one relay from emptying this batch.
             // A `Relay` error here would abort mid-batch and drop every message after it, INCLUDING other
@@ -561,6 +585,29 @@ impl Participation {
                     }
                     _ => continue,
                 }
+            }
+
+            // A relay whose quarantine backoff has elapsed and that holds NO live socket. Deliberately
+            // outside the four-lane gate above: those lanes recover an existing socket and so depend on
+            // "will this relay still talk to us", whereas this one has no socket to recover and exists
+            // precisely to ask that question again.
+            //
+            // ★ AFTER THE BATCH, AND THAT IS THE POINT OF THE PLACEMENT. This call BLOCKS — a connect
+            // waits, then the probe waits — and `drain_reproves` above can block on a probe of its own
+            // in the same pass. Sitting ahead of the batch, the two of them held messages ALREADY IN
+            // HAND behind two round trips to relays that are by definition not the ones carrying work.
+            // Traffic we have already read is now judged first, and the relay we are not yet serving
+            // waits for the tail of the tick instead of the head of it.
+            //
+            // Best-effort by construction. The error can only be the store's or the subscription's, and
+            // a relay we are not yet serving must not be able to empty a batch or wedge the pump. Its
+            // failure is recorded as a silence, so the backoff brings it round again and the attempt
+            // ceiling stops that being forever.
+            if let Err(error) = self.probe_one_due(now).await {
+                eprintln!(
+                    "participation: re-probe of a due relay failed ({error}); it stays unproven and \
+                     comes back once its backoff elapses"
+                );
             }
 
             // Retry channels whose suppression backoff has elapsed. This is the exit from a refusal whose
@@ -737,13 +784,19 @@ impl Participation {
     /// every test on this seam pass or fail for that reason instead of its own; it cost one round-13
     /// assertion that read as green while measuring a refusal.
     ///
-    /// ⚠ WHAT THIS SEAM STILL CANNOT REACH: `ProbeOutcome::EchoObserved`. The fixture acknowledges an
+    /// ⚠ WHAT THIS SEAM CANNOT REACH: `ProbeOutcome::EchoObserved`. [`PGateRelay`] acknowledges an
     /// `EVENT` without storing it and answers every `REQ` with a bare `EOSE`, so the read-back finds
     /// nothing and a probe through here resolves `EchoMissing` however healthy the transport is. The
     /// publisher and carrier below are what make the probe REACH the relay; they cannot make it come
-    /// back. So a test on this seam can assert that a probe was ATTEMPTED — the fixture counts the
-    /// socket — and must not assert re-admission, which would be an assertion about a branch no
-    /// in-process fixture can enter.
+    /// back. A test on this seam can therefore assert that a probe was ATTEMPTED — the fixture counts
+    /// the socket — and must not assert re-admission.
+    ///
+    /// ★ THE LIMIT IS THIS FIXTURE'S, NOT THE SUITE'S, and the distinction matters to anyone deciding
+    /// where to put the next test. `nostr_relay_builder`'s `LocalRelay` DOES store and serve, which is
+    /// how [`super::probe`]'s own tests reach `EchoObserved` — what it cannot do is answer a `#p`
+    /// filter with `restricted:`, which is the whole reason this seam uses the other one. Neither
+    /// fixture is a superset of the other, so a test wanting both admission AND the gate has no home
+    /// in process yet.
     #[cfg(test)]
     async fn for_live_test(url: &str, store: SellerStore, keys: nostr_sdk::prelude::Keys) -> Self {
         let me = keys.public_key();
@@ -1049,6 +1102,14 @@ impl Participation {
             }
             return;
         }
+
+        // ★ THE SUCCESS IS RECORDED TOO, and not as bookkeeping for its own sake: `record_probe` is
+        // what clears the consecutive-silence budget, so a re-prove that PASSES has to go through it
+        // or a relay that recovers here goes on carrying the tally of the silences it just recovered
+        // from — and is denied early on the next unrelated one. Both probe paths write to the same
+        // roster; only one of them was telling it about success.
+        self.roster
+            .record_probe(&url, ProbeOutcome::EchoObserved, now);
 
         // ★ Cleared because the thing the deadline was FOR — re-proving access — has now happened. This is
         // not the arm-on-the-way-in mistake: the wake surface is a separate debt, and it gets its own

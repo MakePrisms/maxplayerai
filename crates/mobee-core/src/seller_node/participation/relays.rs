@@ -259,7 +259,7 @@ impl RelayRoster {
         entry.last_probe_unix = Some(now_unix);
         entry.probe_attempts = entry.probe_attempts.saturating_add(1);
         let attempts = entry.probe_attempts;
-        entry.state = match outcome {
+        let state = match outcome {
             ProbeOutcome::EchoObserved => AccessState::Admitted,
             ProbeOutcome::Authenticated => AccessState::Authed,
             ProbeOutcome::OpenRead => AccessState::Open,
@@ -280,6 +280,18 @@ impl RelayRoster {
                 &format!("could not open a socket — admission unproven ({error})"),
             ),
         };
+        // ★★ THE BUDGET IS FOR CONSECUTIVE SILENCES, SO PROOF OF ADMISSION CLEARS IT. Left cumulative,
+        // the ceiling counted a relay's whole history instead of its current episode: a relay admitted
+        // once and then silent twice was denied on its SECOND silence, and one re-admitted twice on its
+        // FIRST — a tolerance that SHRINKS the more successfully a relay is used, which is exactly
+        // backwards. The bug was dormant while `relays_to_probe` was consulted only at boot, because
+        // nothing accumulated within a process; driving it from the tick is what woke it up. Same
+        // reasoning as [`Self::note_new_signal`]'s reset, on a stronger demonstration — an echo is the
+        // relay speaking to us, not merely something arriving from its direction.
+        if matches!(state, AccessState::Admitted) {
+            entry.probe_attempts = 0;
+        }
+        entry.state = state;
     }
 
     /// Re-open a relay for probing because something new happened: an inbound event arrived from
@@ -565,6 +577,40 @@ mod tests {
             roster.get("wss://a.example").unwrap().state,
             AccessState::Denied { .. }
         ));
+    }
+
+    /// ★★ THE ATTEMPT BUDGET IS FOR THE CURRENT EPISODE, NOT FOR THE RELAY'S WHOLE LIFE.
+    ///
+    /// Left cumulative, the ceiling punishes use: a successful admission spends one of the three, so
+    /// a relay admitted once is denied on its SECOND silence and one admitted twice on its FIRST —
+    /// tolerance that shrinks the more a relay is successfully used, which is backwards. It was
+    /// unreachable while the roster was consulted only at boot, because nothing accumulated within a
+    /// process; driving the retry from the tick is what woke it up.
+    #[test]
+    fn a_proven_admission_clears_the_silence_budget() {
+        let mut roster = roster();
+        let url = "wss://a.example";
+
+        roster.record_probe(url, ProbeOutcome::EchoMissing, 100);
+        roster.record_probe(url, ProbeOutcome::EchoObserved, 200);
+        assert_eq!(
+            roster.get(url).unwrap().probe_attempts,
+            0,
+            "the echo PROVED admission, and the silences before it are still being charged to the \
+             next unproven episode"
+        );
+
+        // A fresh episode is entitled to the whole budget: two silences rest it, they do not end it.
+        roster.record_probe(url, ProbeOutcome::EchoMissing, 300);
+        roster.record_probe(url, ProbeOutcome::EchoMissing, 400);
+        assert!(
+            matches!(
+                roster.get(url).unwrap().state,
+                AccessState::Quarantined { .. }
+            ),
+            "denied on the second silence of a fresh episode — the ceiling is counting the relay's \
+             history instead of what is happening to it now"
+        );
     }
 
     #[test]

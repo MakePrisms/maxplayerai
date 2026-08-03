@@ -100,6 +100,13 @@ pub async fn probe_access(
     if !carrier_is_storable(carrier) {
         // Refuse rather than run: an ephemeral carrier would deny every relay it touched, and the
         // denial would look exactly like a relay refusing us.
+        //
+        // ★ THE ONE `Refused` HERE THAT IS NOT THE RELAY SPEAKING, AND IT KEEPS THE TERMINAL VERDICT
+        // ANYWAY. Everything else in this function that fails without a word from the relay is a
+        // silence, because a silence may pass; this cannot. The carrier is ours, the kind is ours,
+        // and no number of retries turns an ephemeral event into a stored one — a bounded retry here
+        // would spend the whole attempt budget of every relay in the config to learn the same thing
+        // three times. Terminal is the accurate verdict; only the word is borrowed.
         return ProbeOutcome::Refused(format!(
             "probe carrier is kind {} — ephemeral kinds are not stored by relays, so the echo can \
              never arrive; use a stored kind (the persona) as the carrier",
@@ -115,8 +122,14 @@ pub async fn probe_access(
     // ADDRESS, but it cannot gate a client that was handed the whole list; targeting the URL here is
     // what makes "a denied relay gets nothing" true of the publish path too, not just the REQ path.
     match publisher.send_event_to([relay_url], carrier).await {
+        // ★ SILENCE, NOT REFUSAL. This is the SDK failing to hand the event to a socket; the relay
+        // has not said a word. The label was free while `Refused` and `EchoMissing` differed only in
+        // their wording — both meant unproven, therefore unused. Once refusal became TERMINAL and
+        // silence became a bounded retry, the same label started costing the relay permanently.
         Err(error) => {
-            return ProbeOutcome::Refused(format!("relay refused the probe publish: {error}"));
+            return ProbeOutcome::Unreachable(format!(
+                "the probe publish could not be sent: {error}"
+            ));
         }
         // ★ A pool `Ok` is acceptance, not delivery — see [`super::undelivered`]. Both outcomes are
         // fail-closed, so this is not an admission bug; it is a DIAGNOSIS bug, and those are the ones
@@ -125,7 +138,23 @@ pub async fn probe_access(
         // disconnected socket, after burning the full probe timeout waiting for an echo of nothing.
         Ok(output) => {
             if let Some(why) = super::undelivered(&output) {
-                return ProbeOutcome::Refused(format!("the probe publish reached no relay: {why}"));
+                // ★★ SILENCE, AND DELIBERATELY NOT A DISCRIMINATED VERDICT. The tempting split is
+                // `output.failed`: non-empty looks like the relay answering `OK: false`, empty like
+                // nothing ever taking the event. It does not hold — the pool puts SEND failures in
+                // that same map, so `failed` sits NEXT TO "the relay refused us" rather than meaning
+                // it, and a socket that died mid-publish would be read as a policy rejection. The
+                // property wanted is "did the relay speak?", and nothing reachable here has access
+                // to it.
+                //
+                // So it goes to the side whose mistake is survivable, and the asymmetry is not
+                // close: a refusal misread as silence costs THREE bounded attempts and then denies
+                // itself anyway, while a silence misread as a refusal costs the relay permanently —
+                // and, with `note_new_signal` currently wired to nothing, permanently means for the
+                // life of the process. The charter's "never poll a refusal" is kept in substance:
+                // this stops, for good, after a bounded count.
+                return ProbeOutcome::Unreachable(format!(
+                    "the probe publish reached no relay: {why}"
+                ));
             }
         }
     }
@@ -136,9 +165,15 @@ pub async fn probe_access(
     {
         Ok(events) if events.iter().any(|event| event.id == event_id) => ProbeOutcome::EchoObserved,
         Ok(_) => ProbeOutcome::EchoMissing,
-        // A failed read is not a denial of access — it is a failure to learn. It lands on the same
-        // side as a missing echo (unproven ⇒ unused) but says so in its own words.
-        Err(error) => ProbeOutcome::Refused(format!("could not read the probe back: {error}")),
+        // A failed read is not a denial of access — it is a failure to learn.
+        //
+        // ★ THAT SENTENCE WAS ALREADY HERE, ABOVE A `Refused`. It was TRUE when it was written: a
+        // missing echo and a refusal both meant unproven-therefore-unused, so "lands on the same
+        // side" described the code accurately and the word chosen did not matter. Splitting the
+        // verdicts falsified it in place, and a comment cannot recompile — so the sentence went on
+        // asserting a property the code had lost. A reason we failed to OBTAIN is not a refusal we
+        // were GIVEN, and now the label says so.
+        Err(error) => ProbeOutcome::Unreachable(format!("could not read the probe back: {error}")),
     }
 }
 
@@ -378,8 +413,70 @@ mod tests {
         assert_eq!(outcome, ProbeOutcome::EchoMissing);
     }
 
+    /// ★★ THE SAFE SIDE OF THE VERDICT SPLIT. `Refused` is terminal and `Unreachable` is a bounded
+    /// retry, so every site that reaches a verdict WITHOUT a word from the relay has to reach the
+    /// second one. This publisher holds no relay and no socket, so the publish cannot leave the
+    /// process — while the relay being judged is healthy, listening, and has refused nothing.
+    ///
+    /// Reading that as a refusal is how a momentary transport fault cost a relay permanently. It was
+    /// harmless for as long as `Refused` and `EchoMissing` differed only in their wording; splitting
+    /// them is what put a price on it, and this is the shape a seam in this module actually shipped.
+    #[tokio::test]
+    async fn a_publish_that_never_left_the_process_is_silence_not_refusal() {
+        let (_relay, url) = start_relay().await;
+        let keys = Keys::generate();
+        // Deliberately NOT `connect`: no relay added, nothing dialled.
+        let publisher = Client::new(keys.clone());
+        let reader = connect(&url, Keys::generate()).await;
+
+        let outcome =
+            probe_access(&publisher, &url, &reader, &persona(&keys), Duration::from_secs(2)).await;
+
+        match outcome {
+            ProbeOutcome::Unreachable(_) => {}
+            other => panic!(
+                "a publish that reached no socket is SILENCE, and silence is retryable — `Refused` \
+                 denies this relay for the life of the process over a fault that was ours: {other:?}"
+            ),
+        }
+    }
+
+    /// ★ THE SECOND WAY A PUBLISH FAILS WITHOUT THE RELAY SPEAKING, and it is a different branch —
+    /// the test above dies inside `send_event_to` with "no relays", never reaching the delivery
+    /// check. Here the pool HOLDS the relay and simply never connected it, so the send returns `Ok`
+    /// and the relay lands in `failed`; `Ok` from the pool is acceptance, not delivery.
+    ///
+    /// Worth its own test because `failed` is the map a discriminator wants to read — non-empty
+    /// looks exactly like the relay answering `OK: false`. It is not: send failures land there too,
+    /// so the map sits NEXT TO "the relay refused us" rather than meaning it. This is the case that
+    /// would be misread, and it must come out retryable.
+    #[tokio::test]
+    async fn a_publish_the_pool_accepted_but_never_delivered_is_silence_too() {
+        let (_relay, url) = start_relay().await;
+        let keys = Keys::generate();
+        let publisher = Client::new(keys.clone());
+        publisher.add_relay(&url).await.expect("add relay");
+        // No `connect()`. The pool knows the relay and holds no socket to it.
+        let reader = connect(&url, Keys::generate()).await;
+
+        let outcome =
+            probe_access(&publisher, &url, &reader, &persona(&keys), Duration::from_secs(2)).await;
+
+        match outcome {
+            ProbeOutcome::Unreachable(_) => {}
+            other => panic!(
+                "an undelivered publish is SILENCE — reading `failed` as a refusal denies a relay \
+                 permanently for a socket that was never dialled: {other:?}"
+            ),
+        }
+    }
+
     /// Guarding the caller mistake that would otherwise deny every relay it touched, while looking
     /// identical to a fleet-wide access revocation.
+    ///
+    /// ★ AND IT IS THE ONE `Refused` THIS FUNCTION STILL PRODUCES, which is why it is worth keeping
+    /// sharp: everything that fails without the relay speaking is now a silence, so if this test ever
+    /// goes green for an `Unreachable` the terminal branch has stopped being reachable at all.
     #[tokio::test]
     async fn an_ephemeral_carrier_is_refused_before_anything_goes_on_the_wire() {
         let (_relay, url) = start_relay().await;
