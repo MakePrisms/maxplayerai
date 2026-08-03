@@ -98,7 +98,8 @@ mod checks {
     use std::time::Duration;
 
     use mobee_core::doctor::{self, RelayProbe};
-    use mobee_core::home::{AgentPresetConfig, SellerConfig, TelemetryConfig};
+    use mobee_core::home::{AgentPresetConfig, SandboxConfig, SellerConfig, TelemetryConfig};
+    use mobee_core::seller_exec::SandboxPolicy;
     use mobee_core::seller_git;
 
     use super::Check;
@@ -113,6 +114,7 @@ mod checks {
     const MINT_CHECK: &str = "mint reachability";
     const AGENT_CHECK: &str = "agent preset";
     const TELEMETRY_CHECK: &str = "telemetry";
+    const SANDBOX_CHECK: &str = "sandbox launcher";
 
     // Informational only: the seller signs NIP-98 in-process (libgit2 transport), so the
     // external `git-credential-nostr` helper is not required for delivery push / base fetch.
@@ -317,6 +319,32 @@ mod checks {
         }
     }
 
+    /// The sandbox launcher (`[sandbox] launcher`) must resolve, or the seller advertises a capability
+    /// it cannot deliver: a launcher that is neither on PATH nor an existing file makes EVERY awarded
+    /// job — and the pre-advertise self-probe — die at spawn with ENOENT before any agent runs
+    /// (#357/#358). A pass-through policy (no `[sandbox]` section) launches the agent directly, so
+    /// there is nothing to resolve: a no-op Pass, never a spurious Fail.
+    pub(super) fn check_sandbox_launcher(sandbox: Option<SandboxConfig>) -> Check {
+        let policy = SandboxPolicy::from_config(sandbox.as_ref());
+        match policy.launcher().first() {
+            None => Check::pass(
+                SANDBOX_CHECK,
+                "no [sandbox] launcher configured — agent runs directly (unsandboxed)",
+            ),
+            Some(argv0) if argv0_resolvable(argv0) => {
+                Check::pass(SANDBOX_CHECK, format!("launcher '{argv0}' resolvable"))
+            }
+            Some(argv0) => Check::fail(
+                SANDBOX_CHECK,
+                format!(
+                    "launcher '{argv0}' is neither on PATH nor an existing file — every job and the \
+                     pre-advertise self-probe would fail at spawn (ENOENT)"
+                ),
+                "install the launcher program or fix [sandbox] launcher (or remove [sandbox] to run unsandboxed)",
+            ),
+        }
+    }
+
     fn build_runtime() -> Result<tokio::runtime::Runtime, String> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -417,6 +445,7 @@ fn build_checks(home: &mobee_core::home::MobeeHome) -> Vec<Box<dyn FnOnce() -> C
     let seller = home.config.seller.clone();
     let custom_agents = home.config.agents.clone();
     let telemetry = home.config.telemetry.clone();
+    let sandbox = home.config.sandbox.clone();
 
     let mut checks: Vec<Box<dyn FnOnce() -> Check>> = vec![
         Box::new(checks::check_credential_helper),
@@ -427,6 +456,9 @@ fn build_checks(home: &mobee_core::home::MobeeHome) -> Vec<Box<dyn FnOnce() -> C
     ];
     checks.push(Box::new(move || checks::check_agent_registry(seller, custom_agents)));
     checks.push(Box::new(move || checks::check_telemetry(telemetry)));
+    // The seller boot gate blocks on this (issue #357): a launcher that cannot spawn would let the
+    // node advertise and then fail every job. Bypassable, like every check, via --skip-doctor.
+    checks.push(Box::new(move || checks::check_sandbox_launcher(sandbox)));
     checks
 }
 
@@ -669,6 +701,83 @@ mod tests {
         assert!(
             detail.contains(&tmp.display().to_string()),
             "key check must name the overridden home: {detail}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ---- Issue #357: the sandbox launcher must resolve before the seat advertises ----
+
+    // The check is non-inert: a launcher that cannot spawn FAILs, a resolvable one PASSes, and an
+    // unsandboxed seat (no launcher) is a no-op PASS rather than a spurious FAIL. No network / no
+    // spawn — `argv0_resolvable` is a PATH/file lookup only.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn sandbox_launcher_check_fails_only_on_an_unresolvable_launcher() {
+        use mobee_core::home::SandboxConfig;
+
+        let bogus = checks::check_sandbox_launcher(Some(SandboxConfig {
+            launcher: vec!["definitely-not-a-real-binary-xyz".into()],
+        }));
+        assert_eq!(
+            bogus.status,
+            Status::Fail,
+            "an unresolvable launcher must block boot: {}",
+            bogus.render()
+        );
+        assert!(bogus.render().contains("fix:"), "a FAIL must carry a fix hint");
+
+        // An existing file always resolves; the test binary itself is one, so this holds on any box.
+        let real = std::env::current_exe()
+            .expect("current exe")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            checks::check_sandbox_launcher(Some(SandboxConfig { launcher: vec![real] })).status,
+            Status::Pass,
+            "a resolvable launcher must PASS"
+        );
+
+        assert_eq!(
+            checks::check_sandbox_launcher(None).status,
+            Status::Pass,
+            "an unsandboxed seat (no [sandbox]) must not FAIL"
+        );
+    }
+
+    // RED-PROVE (wiring): the sandbox launcher check must be part of the seller boot gate registry,
+    // or a box with an unresolvable launcher boots and then fails EVERY job. Drop the
+    // `check_sandbox_launcher` push from `build_checks` and this goes red — no boot-gate result names
+    // the bogus launcher. Network-free: `relay_url` is unparseable (add_relay fails fast) and no mints
+    // are configured (mint reachability folds without I/O), so only the sandbox verdict is exercised.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn sandbox_launcher_check_is_wired_into_the_boot_gate() {
+        use mobee_core::home::SandboxConfig;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "mobee-doctor-sandbox-357-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut home = resolve_doctor_home(Some(tmp.clone())).expect("bootstrap the home");
+        home.config.sandbox = Some(SandboxConfig {
+            launcher: vec!["definitely-not-a-real-binary-xyz".into()],
+        });
+        home.config.relay_url = "not-a-relay-url".into();
+        home.config.accepted_mints = Vec::new();
+
+        let results = run_checks(build_checks(&home));
+        assert!(
+            results
+                .iter()
+                .any(|c| c.status == Status::Fail
+                    && c.detail.contains("definitely-not-a-real-binary-xyz")),
+            "build_checks must run the sandbox launcher check and FAIL on a bogus launcher; got: {:?}",
+            results.iter().map(Check::render).collect::<Vec<_>>()
         );
 
         std::fs::remove_dir_all(&tmp).ok();

@@ -87,6 +87,14 @@ impl SandboxPolicy {
         self.launcher.is_empty()
     }
 
+    /// The launcher argv this policy prepends, empty under a pass-through policy. The seller boot
+    /// gate's doctor check reads argv0 from here to verify the launcher resolves BEFORE it can break
+    /// every job at spawn — the same structure [`Self::wrap`] prepends, so the check tests exactly
+    /// what the exec path runs.
+    pub fn launcher(&self) -> &[String] {
+        &self.launcher
+    }
+
     /// The full argv to spawn: the agent command unchanged under a pass-through policy, otherwise
     /// the launcher argv followed by the agent command.
     pub fn wrap(&self, agent_command: &[String]) -> Vec<String> {

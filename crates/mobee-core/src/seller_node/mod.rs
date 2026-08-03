@@ -58,6 +58,11 @@ pub enum NodeError {
     /// The configured agent harnesses could not be resolved into a registry the node can serve
     /// with — boot refuses rather than advertise work it cannot run.
     Agents(crate::seller_agents::RegistryError),
+    /// Every configured harness LAUNCHES but none produced a pre-advertise self-probe artifact, so
+    /// there is nothing honest to advertise. Boot refuses rather than list work it cannot deliver:
+    /// under award-is-payment a buyer commits the sats at award, so advertising a dead capability
+    /// makes the buyer pay for our outage (#357).
+    NoProvenHarness(String),
 }
 
 impl std::fmt::Display for NodeError {
@@ -69,6 +74,9 @@ impl std::fmt::Display for NodeError {
             Self::Identity(error) => write!(formatter, "seller node identity error: {error}"),
             Self::Relay(message) => write!(formatter, "seller node relay error: {message}"),
             Self::Agents(error) => write!(formatter, "seller node agent config error: {error}"),
+            Self::NoProvenHarness(message) => {
+                write!(formatter, "seller node prove-before-advertise: {message}")
+            }
         }
     }
 }
