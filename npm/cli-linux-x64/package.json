@@ -1,5 +1,5 @@
 {
-  "name": "@maxplayerai/linux-x64",
+  "name": "maxplayer-linux-x64",
   "version": "0.1.0",
   "description": "maxplayer binary for linux-x64 — payload package, install `maxplayer` instead",
   "license": "MIT OR Apache-2.0",
