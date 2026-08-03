@@ -250,7 +250,7 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
         err,
         "seller node starting pubkey={} agent={} rate_sats={} claim_open_pool={} git_remote={} (never-echo: key omitted)",
         runner.seller_pubkey(),
-        seller.agent.as_deref().unwrap_or("custom"),
+        seller.agents.first().map(String::as_str).unwrap_or("custom"),
         seller.rate_sats,
         seller.claim_open_pool,
         seller.git_remote
@@ -270,7 +270,9 @@ fn ensure_seller_config(
     err: &mut dyn Write,
 ) -> Result<(), i32> {
     let existing = home.config.seller.clone();
-    let existing_agent = existing.as_ref().and_then(|s| s.agent.clone());
+    // Advertised label of an existing config = its first `agents` entry (issue #378 removed the
+    // singular `agent` field).
+    let existing_agent = existing.as_ref().and_then(|s| s.agents.first().cloned());
     let steady_state = existing.is_some()
         && options.agent.is_none()
         && options.agent_argv.is_empty()
@@ -385,41 +387,35 @@ fn ensure_seller_config(
         return Err(USAGE_ERROR);
     }
 
-    // Prefer the resolved preset label (the configured/normalized name) — it is the harness
-    // identity reported in results.
-    let agent = agent_label
+    // The advertised harness label. Prefer the resolved preset label (the configured/normalized
+    // name); issue #378 removed the singular `agent` field, so this label lives in `agents` below —
+    // the wire name is `agents.first()`.
+    let agent_label = agent_label
         .or_else(|| options.agent.clone())
         .or(existing_agent);
 
-    // The harness registry. Every named preset is resolved here so a typo or a missing adapter is
-    // a config-time refusal, not a boot-time degrade. A single `--agent` writes no list: it is the
-    // one-harness case the fallback already serves identically, and leaving the list out keeps a
-    // single-harness config exactly the shape it has always been.
+    // The harness registry (`Vec<String>` of preset names since #378). Every named preset is resolved
+    // here so a typo or a missing adapter is a config-time refusal, not a boot-time degrade. A
+    // multi-`--agents` list resolves each name in preference order; a single resolved harness becomes
+    // a one-entry list so it keeps its advertised name (the exact shape a pre-#378 `agent = "x"`
+    // migrates to); the raw-argv hatch resolves to no label and leaves the list empty, serving
+    // unlabelled through the `agent_command` fallback.
     let agents = if options.agents.len() > 1 {
-        let mut resolved = Vec::with_capacity(options.agents.len());
+        let mut resolved: Vec<String> = Vec::with_capacity(options.agents.len());
         for name in &options.agents {
             let (label, _argv) = agent_presets::resolve_agent_preset(name, &custom_agents)
                 .map_err(|message| {
                     let _ = writeln!(err, "{message}");
                     USAGE_ERROR
                 })?;
-            if !resolved
-                .iter()
-                .any(|slot: &home::AgentSlotConfig| slot.name == label)
-            {
-                resolved.push(home::AgentSlotConfig::named(label));
+            if !resolved.iter().any(|existing| existing == &label) {
+                resolved.push(label);
             }
         }
-        let _ = writeln!(
-            err,
-            "agent registry: {}",
-            resolved
-                .iter()
-                .map(|slot| slot.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        let _ = writeln!(err, "agent registry: {}", resolved.join(", "));
         resolved
+    } else if let Some(label) = agent_label {
+        vec![label]
     } else {
         existing
             .as_ref()
@@ -438,14 +434,18 @@ fn ensure_seller_config(
             USAGE_ERROR
         })?,
         job_timeout_secs,
-        agent,
         agents,
         claim_open_pool,
         offer_backfill_secs,
-        // Contribution (freelance-PR fork) support is ON by default for CLI-configured
-        // sellers. Operators disable it by editing `[seller] contribution_enabled = false`.
-        contribution_enabled: true,
-        // Serial execution by default; operators raise concurrency by editing `[seller] slots = N`.
+        // Contribution (freelance-PR fork) support: carried from an existing config so a relaunch
+        // never clobbers an operator's `contribution_enabled = false` back to true (#369-class); a
+        // fresh config defaults ON. Operators toggle it by editing `[seller] contribution_enabled`.
+        contribution_enabled: existing
+            .as_ref()
+            .map(|s| s.contribution_enabled)
+            .unwrap_or(true),
+        // Concurrency inherits an existing config, else the built-in default (3 since #378);
+        // operators tune it by editing `[seller] slots = N`.
         slots: existing.as_ref().map(|s| s.slots).unwrap_or_else(home::default_slots),
         claim_award_timeout_secs: existing.as_ref().and_then(|s| s.claim_award_timeout_secs),
     };
@@ -489,7 +489,7 @@ fn resolve_agent(
         return Ok((Some(label), argv));
     }
     if let Some(seller) = existing {
-        return Ok((seller.agent.clone(), seller.agent_command.clone()));
+        return Ok((seller.agents.first().cloned(), seller.agent_command.clone()));
     }
     Ok((None, Vec::new()))
 }
@@ -791,6 +791,60 @@ mod tests {
     // config because that disk value is exactly what the next boot reads for capacity
     // (`mobee_core::seller_node::run` derives it from `config.seller.slots` with no ceiling clamp).
     #[test]
+    fn sell_writeback_preserves_operator_contribution_disabled_and_agent_label() {
+        // #369-class: a steady-state relaunch must NOT clobber contribution_enabled=false back to
+        // true, and must keep a single-harness wire label in `agents`.
+        let root = std::env::temp_dir().join(format!(
+            "mobee-369-contrib-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = home::bootstrap(&root).expect("bootstrap temp home");
+        home::save_config(&mut home, |config| {
+            config.seller = Some(SellerConfig {
+                agent_command: vec!["claude".to_owned()],
+                rate_sats: 5,
+                git_remote: "https://example.invalid/seller.git".to_owned(),
+                job_timeout_secs: None,
+                agents: vec!["claude".to_owned()],
+                claim_open_pool: false,
+                offer_backfill_secs: home::default_offer_backfill_secs(),
+                contribution_enabled: false,
+                slots: 3,
+                claim_award_timeout_secs: None,
+            });
+        })
+        .expect("seed [seller] with contribution disabled");
+
+        let options = SellOptions::default();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        ensure_seller_config(&mut home, &options, &mut out, &mut err).unwrap_or_else(|code| {
+            panic!(
+                "ensure_seller_config failed code={code} err={}",
+                String::from_utf8_lossy(&err)
+            )
+        });
+
+        let reloaded = home::bootstrap(&root).expect("reload persisted config");
+        let seller = reloaded.config.seller.expect("[seller] persisted");
+        assert!(
+            !seller.contribution_enabled,
+            "operator contribution_enabled=false must survive relaunch (pre-fix clobbered to true)"
+        );
+        assert_eq!(
+            seller.agents,
+            vec!["claude".to_owned()],
+            "single-harness wire label must survive relaunch"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn sell_writeback_preserves_operator_slots_and_claim_timeout() {
         let root = std::env::temp_dir().join(format!(
             "mobee-369-slots-{}-{}",
@@ -811,7 +865,6 @@ mod tests {
                 rate_sats: 5,
                 git_remote: "https://example.invalid/seller.git".to_owned(),
                 job_timeout_secs: None,
-                agent: Some("claude".to_owned()),
                 agents: Vec::new(),
                 claim_open_pool: false,
                 offer_backfill_secs: home::default_offer_backfill_secs(),

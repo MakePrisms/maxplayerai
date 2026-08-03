@@ -409,17 +409,14 @@ impl std::error::Error for AwardError {}
 /// spend, which may differ; the kind-3405 carries no amount tag, so the attempt/reservation is
 /// the only artifact of the sum that was really awarded.
 ///
-/// `balance`/`total_cap`/`spent` are the honest snapshots the caller supplies (live wallet
-/// balance, budget cap, budget spent total) — the same two-ceiling inputs [`BuyerStore::reserve`]
-/// guards against.
+/// `balance` is the honest live-wallet snapshot the caller supplies — the wallet-ceiling input
+/// [`BuyerStore::reserve`] guards against (issue #378 removed the budget ceiling's `total_cap`/`spent`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn award_with_reservation<P, PFut, R, RFut, S, SFut>(
     store: &BuyerStore,
     job_id: &str,
     amount: u64,
     balance: u64,
-    total_cap: u64,
-    spent: u64,
     now_unix: i64,
     award_present_on_relay: P,
     prepare: R,
@@ -462,7 +459,7 @@ where
             // `reserve` is idempotent for a live row and re-reserves a `Released` one; a `Spent`
             // row means the job was already paid (a manual collect can settle without the awards
             // row), and the row is still owed for history/attribution — skip the reserve, write it.
-            match store.reserve(job_id, attempt.amount_sats, balance, total_cap, spent, now_unix) {
+            match store.reserve(job_id, attempt.amount_sats, balance, now_unix) {
                 Ok(_) | Err(ReserveRefused::AlreadySpent { .. }) => {}
                 Err(refused) => {
                     return Err(AwardError::PublishedButUnrecorded {
@@ -501,7 +498,7 @@ where
             // the awards row) — resolution is then pure bookkeeping the row is still owed for
             // (history, #261 attribution), so it proceeds unfunded exactly as the sibling arms
             // do.
-            match store.reserve(job_id, attempt.amount_sats, balance, total_cap, spent, now_unix) {
+            match store.reserve(job_id, attempt.amount_sats, balance, now_unix) {
                 Ok(_) | Err(ReserveRefused::AlreadySpent { .. }) => {}
                 Err(refused) => return Err(AwardError::Reserve(refused)),
             }
@@ -519,7 +516,7 @@ where
                     // exactly the #322 ledger state — award public, funds returned) before
                     // repairing the row. A refused re-reserve leaves a public award unfunded,
                     // which is the loud PublishedButUnrecorded case, not a quiet skip.
-                    match store.reserve(job_id, amount_sats, balance, total_cap, spent, now_unix) {
+                    match store.reserve(job_id, amount_sats, balance, now_unix) {
                         Ok(_) | Err(ReserveRefused::AlreadySpent { .. }) => {}
                         Err(refused) => {
                             return Err(AwardError::PublishedButUnrecorded {
@@ -616,7 +613,7 @@ where
 
     // Reserve before any signing: a refusal signs NOTHING (and writes no row).
     store
-        .reserve(job_id, amount, balance, total_cap, spent, now_unix)
+        .reserve(job_id, amount, balance, now_unix)
         .map_err(AwardError::Reserve)?;
 
     let prepared = match prepare().await {
@@ -1348,17 +1345,14 @@ mod tests {
         let job_a = "a".repeat(64);
         let job_b = "b".repeat(64);
         // Reserve the whole balance against job_a so job_b cannot fit.
-        store.reserve(&job_a, 100, 100, u64::MAX, 0, 1).expect("first reserve");
+        store.reserve(&job_a, 100, 100, 1).expect("first reserve");
 
         let prepared = AtomicBool::new(false);
         let error = award_with_reservation(
             &store,
             &job_b,
             40,
-            100,
-            u64::MAX,
-            0,
-            2,
+            100,            2,
             no_relay,
             || {
                 prepared.store(true, Ordering::SeqCst);
@@ -1391,10 +1385,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,
-            u64::MAX,
-            0,
-            1,
+            100,            1,
             no_relay,
             || async { Err(JobLifecycleError::Relay("claim vanished from the relay".into())) },
             no_send,
@@ -1438,10 +1429,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,
-            u64::MAX,
-            0,
-            7,
+            100,            7,
             no_relay,
             || {
                 let job = job.clone();
@@ -1544,7 +1532,7 @@ mod tests {
     async fn a_recorded_award_publishes_nothing_and_reserves_nothing() {
         let (store, path) = fresh_store("award-already-recorded");
         let job = "a".repeat(64);
-        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+        store.reserve(&job, 40, 100, 1).expect("reserve");
         store
             .record_award(&job, &"c".repeat(64), &"e".repeat(64), SELLER_HEX, 40, 7)
             .expect("record");
@@ -1553,10 +1541,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,
-            u64::MAX,
-            0,
-            9,
+            100,            9,
             no_relay,
             no_prepare,
             no_send,
@@ -1595,7 +1580,7 @@ mod tests {
         let award = "e".repeat(64);
         let claim = "c".repeat(64);
         // Exactly the `record_award`-failed window: reserved, published, no row.
-        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+        store.reserve(&job, 40, 100, 1).expect("reserve");
 
         let relayed = AwardPresence::Repairable(RelayedAward {
             award_event_id: award.clone(),
@@ -1606,10 +1591,7 @@ mod tests {
             &store,
             &job,
             99,
-            100,
-            u64::MAX,
-            0,
-            9,
+            100,            9,
             || async move { Ok(PresenceRead::Present(relayed)) },
             no_prepare,
             no_send,
@@ -1653,7 +1635,7 @@ mod tests {
         let (store, path) = fresh_store("award-public-unrepairable");
         let job = "a".repeat(64);
         let award = "e".repeat(64);
-        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+        store.reserve(&job, 40, 100, 1).expect("reserve");
 
         let found = AwardPresence::Unrepairable {
             award_event_id: award.clone(),
@@ -1663,10 +1645,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,
-            u64::MAX,
-            0,
-            9,
+            100,            9,
             || async move { Ok(PresenceRead::Present(found)) },
             no_prepare,
             no_send,
@@ -1713,16 +1692,13 @@ mod tests {
         ] {
             let (store, path) = fresh_store(&format!("award-unverified-{}", label.replace(' ', "-")));
             let job = "a".repeat(64);
-            store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+            store.reserve(&job, 40, 100, 1).expect("reserve");
 
             let error = award_with_reservation(
                 &store,
                 &job,
                 40,
-                100,
-                u64::MAX,
-                0,
-                9,
+                100,                9,
                 || async move { probe_result },
                 no_prepare,
                 no_send,
@@ -1787,10 +1763,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,
-            u64::MAX,
-            0,
-            1,
+            100,            1,
             no_relay,
             || {
                 let job = job.clone();
@@ -1828,10 +1801,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,
-            u64::MAX,
-            0,
-            2,
+            100,            2,
             no_relay,
             no_prepare,
             |bytes: String, _event_id: String| {
@@ -1875,10 +1845,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,
-            u64::MAX,
-            0,
-            1,
+            100,            1,
             no_relay,
             || {
                 let job = job.clone();
@@ -1910,10 +1877,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,
-            u64::MAX,
-            0,
-            2,
+            100,            2,
             no_relay,
             no_prepare,
             no_send,
@@ -1949,7 +1913,7 @@ mod tests {
         let claim = "c".repeat(64);
 
         // The #322 ledger state, verbatim: reserve → (publish, lost OK) → release.
-        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+        store.reserve(&job, 40, 100, 1).expect("reserve");
         store.release(&job, 2).expect("the old binary released on the publish error");
         assert!(store.award_attempt(&job).expect("read").is_none(), "pre-attempt-era job");
 
@@ -1962,10 +1926,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,
-            u64::MAX,
-            0,
-            3,
+            100,            3,
             || async move { Ok(PresenceRead::Present(relayed)) },
             no_prepare,
             no_send,
@@ -2000,7 +1961,7 @@ mod tests {
         for seed_released in [true, false] {
             let (store, path) = fresh_store(&format!("legacy-absent-{seed_released}"));
             let job = "a".repeat(64);
-            store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+            store.reserve(&job, 40, 100, 1).expect("reserve");
             if seed_released {
                 store.release(&job, 2).expect("release");
             }
@@ -2009,10 +1970,7 @@ mod tests {
                 &store,
                 &job,
                 40,
-                100,
-                u64::MAX,
-                0,
-                3,
+                100,                3,
                 || async { Ok(PresenceRead::ConfirmedAbsent) },
                 no_prepare,
                 no_send,
@@ -2053,7 +2011,7 @@ mod tests {
         let (store, path) = fresh_store("refused-reserved-recovery");
         let job = "a".repeat(64);
         // Build the crash state directly: pinned, refused, reservation still held.
-        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+        store.reserve(&job, 40, 100, 1).expect("reserve");
         let prepared = fake_prepared(&job);
         store
             .begin_award_attempt(
@@ -2081,10 +2039,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,
-            u64::MAX,
-            0,
-            3,
+            100,            3,
             no_relay,
             no_prepare,
             no_send,
@@ -2110,7 +2065,7 @@ mod tests {
     async fn a_pending_attempt_on_a_spent_job_still_resolves_and_lands_its_row() {
         let (store, path) = fresh_store("attempt-spent-resume");
         let job = "a".repeat(64);
-        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+        store.reserve(&job, 40, 100, 1).expect("reserve");
         let prepared = fake_prepared(&job);
         store
             .begin_award_attempt(
@@ -2139,10 +2094,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,
-            u64::MAX,
-            0,
-            3,
+            100,            3,
             no_relay,
             no_prepare,
             send_acked,
@@ -2167,7 +2119,7 @@ mod tests {
     async fn already_awarded_confirms_a_stranded_pending_attempt() {
         let (store, path) = fresh_store("already-awarded-confirms");
         let job = "a".repeat(64);
-        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+        store.reserve(&job, 40, 100, 1).expect("reserve");
         let prepared = fake_prepared(&job);
         store
             .begin_award_attempt(
@@ -2197,10 +2149,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,
-            u64::MAX,
-            0,
-            3,
+            100,            3,
             no_relay,
             no_prepare,
             no_send,
@@ -2231,7 +2180,7 @@ mod tests {
     async fn a_carried_license_keeps_the_first_transmission_refusal_immediate() {
         let (store, path) = fresh_store("carried-license");
         let job = "a".repeat(64);
-        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+        store.reserve(&job, 40, 100, 1).expect("reserve");
         let prepared = fake_prepared(&job);
         store
             .begin_award_attempt(
@@ -2260,10 +2209,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,
-            u64::MAX,
-            0,
-            3,
+            100,            3,
             no_relay,
             no_prepare,
             |_bytes: String, _event_id: String| async {
@@ -2302,7 +2248,7 @@ mod tests {
     async fn a_stale_carried_license_cannot_terminalize_after_a_concurrent_transmission() {
         let (store, path) = fresh_store("stale-carried-license");
         let job = "a".repeat(64);
-        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+        store.reserve(&job, 40, 100, 1).expect("reserve");
         let prepared = fake_prepared(&job);
         store
             .begin_award_attempt(
@@ -2334,10 +2280,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,
-            u64::MAX,
-            0,
-            4,
+            100,            4,
             no_relay,
             no_prepare,
             |_bytes: String, _event_id: String| async {
@@ -2379,10 +2322,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,
-            u64::MAX,
-            0,
-            1,
+            100,            1,
             no_relay,
             || {
                 let job = job.clone();
@@ -2403,10 +2343,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,
-            u64::MAX,
-            0,
-            2,
+            100,            2,
             no_relay,
             no_prepare,
             |_bytes: String, _event_id: String| async {
@@ -2440,7 +2377,7 @@ mod tests {
         let job = "a".repeat(64);
 
         // Build the crash state: pinned + confirmed, reservation held, no awards row.
-        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+        store.reserve(&job, 40, 100, 1).expect("reserve");
         let prepared = fake_prepared(&job);
         let candidate = AwardAttempt {
             job_id: job.clone(),
@@ -2467,10 +2404,7 @@ mod tests {
             &store,
             &job,
             40,
-            100,
-            u64::MAX,
-            0,
-            3,
+            100,            3,
             no_relay,
             no_prepare,
             no_send,
@@ -2497,8 +2431,8 @@ mod tests {
     async fn settle_flips_only_after_pay_succeeds() {
         let (store, path) = fresh_store("settle-ordering");
         let job = "a".repeat(64);
-        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
-        assert_eq!(store.available(100, u64::MAX, 0).expect("avail"), 60);
+        store.reserve(&job, 40, 100, 1).expect("reserve");
+        assert_eq!(store.available(100).expect("avail"), 60);
 
         // A pay that fails must NOT flip the reservation.
         let result: Result<(u64, Converted), SettleError<&str>> =
@@ -2510,7 +2444,7 @@ mod tests {
             "a failed pay must leave the reservation reserved (funds still committed)"
         );
         assert_eq!(store.reserved_in_flight().expect("r"), 40, "reserved unchanged after failed pay");
-        assert_eq!(store.available(100, u64::MAX, 0).expect("avail"), 60, "available NOT over-stated");
+        assert_eq!(store.available(100).expect("avail"), 60, "available NOT over-stated");
 
         // A pay that succeeds flips reserved → spent exactly once.
         let (_, converted) =
@@ -2525,10 +2459,12 @@ mod tests {
     // CRASH-RECOVERY tooth (the #123→#126 obligation). Simulate a crash BETWEEN the budget append +
     // melt and the reserved→spent flip: the budget spend is durable and the wallet has melted, but
     // the reservation is still `reserved`. Throughout that window `available` is only ever
-    // UNDER-stated (the amount is counted in BOTH terms — never in neither) — never over-stated. On
-    // restart, reconcile with a `Paid` disposition converges the dangling reservation to `spent`,
-    // and `available` returns to the correct post-settle value. Uses the REAL durable store + the
-    // REAL durable BudgetGate (spent.jsonl), not a model.
+    // UNDER-stated (the amount is counted twice in the wallet ceiling — the melt already dropped the
+    // balance AND reserved still holds it) — never over-stated. On restart, reconcile with a `Paid`
+    // disposition converges the dangling reservation to `spent`, and `available` returns to the
+    // correct post-settle value. Uses the REAL durable store + the REAL durable BudgetGate
+    // (spent.jsonl) for the audit spend, not a model. Issue #378 removed the budget ceiling, so the
+    // wallet ceiling is the sole ceiling under test here.
     #[test]
     fn crash_between_pay_and_flip_never_overstates_available_and_reconcile_converges() {
         let root = std::env::temp_dir().join(format!(
@@ -2538,22 +2474,21 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         let mut home = home::bootstrap(&root).expect("home");
-        home.config.total_budget_sats = 1000;
         home.config.per_job_budget_sats = 100;
         let db = root.join("buyer.sqlite");
         let job = "a".repeat(64);
 
-        let cap = home.config.total_budget_sats; // 1000
         let starting_balance = 100u64;
         let amount = 40u64;
 
-        // True post-settle available if the flip HAD happened: min(balance-amount, cap-amount).
-        let true_available_after = std::cmp::min(starting_balance - amount, cap - amount);
+        // True post-settle available if the flip HAD happened: the wallet ceiling balance-amount
+        // (issue #378 removed the budget ceiling, so the wallet is the sole ceiling).
+        let true_available_after = starting_balance - amount;
 
         {
             let store = BuyerStore::open(&db).expect("open");
             store
-                .reserve(&job, amount, starting_balance, cap, 0, 1)
+                .reserve(&job, amount, starting_balance, 1)
                 .expect("reserve");
 
             // PAY: budget append (durable) + melt. The melt drops the live wallet balance by
@@ -2564,10 +2499,10 @@ mod tests {
             let melted_balance = starting_balance - amount;
 
             // WINDOW (crash before the flip): the reservation is still `reserved`, budget spent is
-            // `amount`, the wallet has melted. available must be conservative — counted in BOTH the
-            // wallet ceiling (balance already dropped, reserved still holds it) and the budget
-            // ceiling (spent rose, reserved still holds it) — hence UNDER-stated, never over.
-            let windowed = store.available(melted_balance, cap, amount).expect("windowed avail");
+            // `amount` (durable for audit), the wallet has melted. available must be conservative —
+            // the wallet ceiling counts the amount twice (balance already dropped AND reserved still
+            // holds it) — hence UNDER-stated, never over.
+            let windowed = store.available(melted_balance).expect("windowed avail");
             assert!(
                 windowed <= true_available_after,
                 "available in the crash window ({windowed}) must never exceed the true \
@@ -2591,10 +2526,11 @@ mod tests {
         assert_eq!(report.converted, vec![job.clone()]);
         assert_eq!(store.reserved_in_flight().expect("r"), 0, "dangling reservation converged to spent");
 
-        // CONVERGED: available now equals the true post-settle value (reserved cleared, spent held
-        // by the budget ledger, wallet already melted). Neither over- nor under-stated.
+        // CONVERGED: available now equals the true post-settle value (reserved cleared, wallet
+        // already melted; the budget ledger still records the spend for audit but no longer bounds
+        // available). Neither over- nor under-stated.
         assert_eq!(
-            store.available(melted_balance, cap, reloaded.spent()).expect("avail"),
+            store.available(melted_balance).expect("avail"),
             true_available_after,
             "post-reconcile available is exactly the true settled value"
         );
@@ -2613,7 +2549,7 @@ mod tests {
         // And the store honours a `Payable` verdict by KEEPING the reserved row.
         let (store, path) = fresh_store("uncertain-kept");
         let job = "a".repeat(64);
-        store.reserve(&job, 30, 100, u64::MAX, 0, 1).expect("reserve");
+        store.reserve(&job, 30, 100, 1).expect("reserve");
         let mut dispositions = super::super::reservations::Dispositions::new();
         dispositions.insert(job.clone(), classify_disposition(PaymentProgress::Uncertain, false));
         let report = store.reconcile(&dispositions, 2).expect("reconcile");
@@ -2632,14 +2568,14 @@ mod tests {
 
         let (store, path) = fresh_store("dead-release");
         let job = "a".repeat(64);
-        store.reserve(&job, 100, 100, u64::MAX, 0, 1).expect("reserve");
-        assert_eq!(store.available(100, u64::MAX, 0).expect("avail"), 0, "all funds committed");
+        store.reserve(&job, 100, 100, 1).expect("reserve");
+        assert_eq!(store.available(100).expect("avail"), 0, "all funds committed");
 
         let mut dispositions = super::super::reservations::Dispositions::new();
         dispositions.insert(job.clone(), classify_disposition(PaymentProgress::None, false));
         let report = store.reconcile(&dispositions, 2).expect("reconcile");
         assert_eq!(report.released, vec![job.clone()]);
-        assert_eq!(store.available(100, u64::MAX, 0).expect("avail"), 100, "dead job's funds reclaimed");
+        assert_eq!(store.available(100).expect("avail"), 100, "dead job's funds reclaimed");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2664,8 +2600,9 @@ mod tests {
 
     // ── CONCURRENCY test helpers ────────────────────────────────────────────────────────────────
 
-    /// A home with the given budget cap, on a scratch dir. `per_job` is set equal to `cap` so the
-    /// per-job ceiling never masks the total/wallet ceilings these tests exercise.
+    /// A home with the given per-job cap, on a scratch dir. `per_job` is set equal to `cap` so the
+    /// per-job ceiling never masks the wallet ceiling these tests exercise (issue #378 removed the
+    /// rolling total ceiling; the wallet balance is the sole shared limit).
     fn conc_home(label: &str, cap: u64) -> (crate::home::MobeeHome, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "mobee-buyer-lifecycle-conc-{label}-{}-{}",
@@ -2674,7 +2611,6 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         let mut home = home::bootstrap(&root).expect("home");
-        home.config.total_budget_sats = cap;
         home.config.per_job_budget_sats = cap;
         (home, root)
     }
@@ -2722,55 +2658,50 @@ mod tests {
     }
 
     // ★ N-AGENT NO-OVERSPEND TOOTH. The buyer daemon serves N MCP agents that all draw the SAME
-    // wallet + budget (gudnuf's product decision: one wallet, one budget, N equal agents, no
-    // per-agent caps). This is the assembled-money invariant at that scale: no matter how the awards
-    // interleave, the funds committed across every agent can never exceed what the buyer actually
-    // has — the smaller of the live wallet balance and the budget cap.
+    // wallet (gudnuf's product decision: one wallet, N equal agents, no per-agent caps). This is the
+    // assembled-money invariant at that scale: no matter how the awards interleave, the funds
+    // committed across every agent can never exceed the live wallet balance (issue #378 removed the
+    // rolling budget ceiling, so the wallet is the sole shared limit).
     //
-    // It composes the SAME seam the daemon's `award` RPC uses — a balance/spent snapshot then
+    // It composes the SAME seam the daemon's `award` RPC uses — a balance snapshot then
     // `award_with_reservation` — serialized behind the SAME kind of async money lock the daemon
-    // holds (`BuyerContext::money_lock`), over the REAL durable store + REAL budget ledger. Five
-    // agents each try to reserve 30 against a shared 100: at most three fit (90), the other two must
-    // get a clean insufficient-available refusal, and the total reserved must land at exactly 90.
+    // holds (`BuyerContext::money_lock`), over the REAL durable store. Five agents each try to
+    // reserve 30 against a shared wallet of 100: at most three fit (90), the other two must get a
+    // clean insufficient-available refusal, and the total reserved must land at exactly 90.
     //
     // The reserved-accumulation race itself is closed one layer down by the store's `BEGIN
-    // IMMEDIATE` (store `tooth2`); this proves the assembled award path — snapshot + reserve seam +
-    // budget ledger — enforces the two-ceiling cap under many concurrent agents, and that idempotent
-    // re-awards never inflate the committed total.
+    // IMMEDIATE` (store `tooth2`); this proves the assembled award path — snapshot + reserve seam —
+    // enforces the wallet ceiling under many concurrent agents, and that idempotent re-awards never
+    // inflate the committed total.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn n_equal_agents_cannot_overspend_the_shared_budget() {
         use std::sync::Arc;
         use tokio::sync::Mutex;
 
-        let cap = 100u64;
+        let cap = 100u64; // per-job cap (via conc_home); slack here so the wallet ceiling binds
         let balance = 100u64; // modeled wallet ecash; no settle in this test, so it never moves
-        let amount = 30u64; // min(cap, balance) = 100 ⇒ exactly 3 fit (90), 2 must be refused
+        let amount = 30u64; // wallet balance 100 ⇒ exactly 3 fit (90), 2 must be refused
         let agents = 5usize;
 
-        let (home, root) = conc_home("n-agents", cap);
-        let home = Arc::new(home);
+        let (_home, root) = conc_home("n-agents", cap);
         let store = Arc::new(BuyerStore::open(root.join("buyer.sqlite")).expect("store"));
         let money_lock = Arc::new(Mutex::new(()));
 
         let mut set = tokio::task::JoinSet::new();
         for agent in 0..agents {
-            let (home, store, money_lock) = (home.clone(), store.clone(), money_lock.clone());
+            let (store, money_lock) = (store.clone(), money_lock.clone());
             // A distinct 64-hex job id per agent.
             let job = format!("{agent:064x}");
             set.spawn(async move {
                 // The daemon's money lock, held across the snapshot AND the reserve — exactly as
                 // `award` composes it, so no agent's snapshot races another's commit.
                 let _guard = money_lock.lock().await;
-                let gate = BudgetGate::from_home(&home).expect("gate");
-                let (total_cap, spent) = (gate.total_cap(), gate.spent());
                 let job_out = job.clone();
                 award_with_reservation(
                     &store,
                     &job,
                     amount,
                     balance,
-                    total_cap,
-                    spent,
                     1,
                     no_relay,
                     || async move { Ok(fake_prepared(&job_out)) },
@@ -2811,9 +2742,8 @@ mod tests {
         let reserved = store.reserved_in_flight().expect("reserved");
         assert_eq!(reserved, 90, "total committed is exactly the three winners' 90");
         assert!(
-            reserved <= cap.min(balance),
-            "committed {reserved} must never exceed min(cap, balance) = {}",
-            cap.min(balance)
+            reserved <= balance,
+            "committed {reserved} must never exceed the wallet balance {balance}"
         );
 
         // Idempotency under concurrency: a winning agent re-awarding its own job (a client retry)
@@ -2837,8 +2767,6 @@ mod tests {
             &winner,
             amount,
             balance,
-            cap,
-            0,
             2,
             no_relay,
             no_prepare,
@@ -2885,7 +2813,7 @@ mod tests {
         use tokio::sync::{Mutex, Notify};
 
         let start_balance = 100u64; // wallet ecash on hand
-        let cap = 1_000u64; // budget cap deliberately NOT the binding ceiling — the wallet is
+        let cap = 1_000u64; // per-job cap (via conc_home), slack — the wallet is the binding ceiling
         let paid = 60u64; // the in-flight job being settled
         let award = 60u64; // the new award racing it; 60 + 60 = 120 > 100 ecash if both commit
 
@@ -2898,7 +2826,7 @@ mod tests {
             let store = Arc::new(BuyerStore::open(root.join("buyer.sqlite")).expect("store"));
             let balance = Arc::new(AtomicU64::new(start_balance));
             store
-                .reserve(&job_x, paid, start_balance, cap, 0, 1)
+                .reserve(&job_x, paid, start_balance, 1)
                 .expect("pre-reserve the in-flight job");
 
             let snapshot_taken = Arc::new(Notify::new());
@@ -2931,7 +2859,7 @@ mod tests {
 
             let awarding = {
                 let (store, balance) = (store.clone(), balance.clone());
-                let (home, job_y) = (home.clone(), job_y.clone());
+                let job_y = job_y.clone();
                 let (snapshot_taken, settle_done) = (snapshot_taken.clone(), settle_done.clone());
                 tokio::spawn(async move {
                     // Read the balance snapshot BEFORE the settle melts it…
@@ -2939,15 +2867,12 @@ mod tests {
                     snapshot_taken.notify_one();
                     // …then reserve AFTER the settle's flip has cleared job_x from `reserved`.
                     settle_done.notified().await;
-                    let spent = BudgetGate::from_home(&home).expect("gate").spent();
                     let job_out = job_y.clone();
                     award_with_reservation(
                         &store,
                         &job_y,
                         award,
                         stale_balance,
-                        cap,
-                        spent,
                         4,
                         no_relay,
                         || async move { Ok(fake_prepared(&job_out)) },
@@ -2981,7 +2906,7 @@ mod tests {
             let balance = Arc::new(AtomicU64::new(start_balance));
             let money_lock = Arc::new(Mutex::new(()));
             store
-                .reserve(&job_x, paid, start_balance, cap, 0, 1)
+                .reserve(&job_x, paid, start_balance, 1)
                 .expect("pre-reserve the in-flight job");
 
             let settle = {
@@ -3011,20 +2936,17 @@ mod tests {
             let awarding = {
                 let (store, balance, money_lock) =
                     (store.clone(), balance.clone(), money_lock.clone());
-                let (home, job_y) = (home.clone(), job_y.clone());
+                let job_y = job_y.clone();
                 tokio::spawn(async move {
                     // The daemon's `award` holds money_lock across snapshot + reserve.
                     let _guard = money_lock.lock().await;
                     let snap = balance.load(Ordering::SeqCst);
-                    let spent = BudgetGate::from_home(&home).expect("gate").spent();
                     let job_out = job_y.clone();
                     award_with_reservation(
                         &store,
                         &job_y,
                         award,
                         snap,
-                        cap,
-                        spent,
                         4,
                         no_relay,
                         || async move { Ok(fake_prepared(&job_out)) },

@@ -3537,7 +3537,6 @@ mod tests {
             rate_sats,
             git_remote: "https://example.invalid/repo.git".to_owned(),
             job_timeout_secs: None,
-            agent: Some("claude".to_owned()),
             agents: Vec::new(),
             claim_open_pool,
             offer_backfill_secs: 0,

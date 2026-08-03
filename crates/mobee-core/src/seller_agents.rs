@@ -18,10 +18,9 @@
 //!   the buyer did not ask for is the failure this registry exists to prevent.
 //!
 //! How many awarded jobs run at once is governed by the homogeneous node-level `[seller] slots`
-//! (see [`crate::home::SellerConfig::slots`]) — every slot runs whichever harness the job asked
-//! for. The PER-ENTRY pool count (`agents = [{ name, slots }]`) is a different, heterogeneous knob
-//! and is still parsed and REFUSED above 1 (see [`RegistryError::ParallelismUnsupported`]):
-//! per-harness slot pools are out of scope for V1, whose slots are homogeneous.
+//! (see [`crate::home::SellerConfig::slots`]) — every slot runs whichever harness the job asked for.
+//! Issue #378 removed the per-entry `{ name, slots }` pool count: `agents` is a plain list of harness
+//! names, and this homogeneous node-level count is the only concurrency knob.
 
 use std::collections::BTreeMap;
 
@@ -87,10 +86,6 @@ impl AgentVerdict {
 pub enum RegistryError {
     /// Every listed preset failed to resolve — there is nothing to run jobs with.
     AllFailed(Vec<AgentVerdict>),
-    /// The config declares a pool larger than one. Parallel execution is not implemented; running
-    /// such a config SERIALLY would quietly deliver a fraction of the declared capacity, so it is
-    /// refused rather than downgraded.
-    ParallelismUnsupported { name: String, slots: u32 },
     /// No harness at all: neither an `agents` list nor an `agent_command` to fall back to.
     Empty,
 }
@@ -109,11 +104,6 @@ impl std::fmt::Display for RegistryError {
                         .join("; ")
                 )
             }
-            Self::ParallelismUnsupported { name, slots } => write!(
-                formatter,
-                "agent {name:?} declares slots={slots}: per-harness slot pools are not supported \
-                 (V1 slots are homogeneous — use node-level `[seller] slots` instead). Set slots = 1."
-            ),
             Self::Empty => write!(
                 formatter,
                 "no agent harness configured: set [seller] agents = [\"claude\", …] or agent_command"
@@ -222,9 +212,9 @@ impl ResolvedRegistry {
 ///
 /// `[seller] agents` is the registry when present: each name resolves through the preset table,
 /// every listed name gets a verdict, and the node serves with whatever resolved. When the list is
-/// absent the node falls back to the single configured harness — the stored `agent_command` under
-/// its `agent` preset label — so a seller written before this existed resolves to the identical
-/// one-entry registry and dispatches the identical argv.
+/// absent the node falls back to the single configured harness — the raw `agent_command`, UNLABELLED
+/// (issue #378 removed the singular `agent` label; a wire harness name comes from listing it in
+/// `agents`). The stored argv is dispatched verbatim, never re-resolved.
 pub fn resolve(
     seller: &SellerConfig,
     presets: &BTreeMap<String, AgentPresetConfig>,
@@ -235,14 +225,8 @@ pub fn resolve(
 
     let mut verdicts = Vec::with_capacity(seller.agents.len());
     let mut entries = Vec::new();
-    for slot in &seller.agents {
-        if slot.slots != 1 {
-            return Err(RegistryError::ParallelismUnsupported {
-                name: slot.name.clone(),
-                slots: slot.slots,
-            });
-        }
-        match resolve_agent_preset(&slot.name, presets) {
+    for name in &seller.agents {
+        match resolve_agent_preset(name, presets) {
             Ok((label, argv)) => {
                 verdicts.push(AgentVerdict {
                     name: label.clone(),
@@ -261,7 +245,7 @@ pub fn resolve(
                 }
             }
             Err(reason) => verdicts.push(AgentVerdict {
-                name: slot.name.clone(),
+                name: name.clone(),
                 outcome: Err(reason),
             }),
         }
@@ -276,21 +260,17 @@ pub fn resolve(
     })
 }
 
-/// The single-harness registry: the stored `agent_command` labelled by the configured preset (or
-/// unlabelled for the raw-argv hatch). The argv is taken from config as-is and never re-resolved,
-/// so an existing seller launches the same binary it launched before.
+/// The single-harness registry: the stored `agent_command`, UNLABELLED — the raw-argv hatch. Issue
+/// #378 removed the singular `agent` label, so a fallback harness has no wire name (a seller that
+/// wants one lists the harness in `agents`). The argv is taken from config as-is and never
+/// re-resolved, so an existing seller launches the same binary it launched before.
 fn fallback_registry(seller: &SellerConfig) -> Result<ResolvedRegistry, RegistryError> {
     if seller.agent_command.is_empty() {
         return Err(RegistryError::Empty);
     }
-    let name = seller
-        .agent
-        .as_ref()
-        .map(|label| label.trim().to_ascii_lowercase())
-        .filter(|label| !label.is_empty());
     Ok(ResolvedRegistry {
         registry: AgentRegistry::new(vec![RegisteredAgent {
-            name,
+            name: None,
             argv: seller.agent_command.clone(),
         }]),
         verdicts: Vec::new(),
@@ -300,15 +280,13 @@ fn fallback_registry(seller: &SellerConfig) -> Result<ResolvedRegistry, Registry
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::home::AgentSlotConfig;
 
-    fn seller_with(agents: Vec<AgentSlotConfig>, label: Option<&str>) -> SellerConfig {
+    fn seller_with(agents: Vec<String>) -> SellerConfig {
         SellerConfig {
             agent_command: vec!["fallback-bin".into()],
             rate_sats: 5,
             git_remote: "https://example.invalid/repo".into(),
             job_timeout_secs: None,
-            agent: label.map(str::to_owned),
             agents,
             claim_open_pool: false,
             offer_backfill_secs: 0,
@@ -316,6 +294,11 @@ mod tests {
             slots: 1,
             claim_award_timeout_secs: None,
         }
+    }
+
+    /// `["a", "b"]` as owned Strings — the shape `[seller] agents` now parses to.
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
     }
 
     fn presets(entries: &[(&str, &[&str])]) -> BTreeMap<String, AgentPresetConfig> {
@@ -394,7 +377,7 @@ mod tests {
 
     #[test]
     fn unlabelled_argv_hatch_advertises_nothing_but_still_runs_untargeted_jobs() {
-        let seller = seller_with(Vec::new(), None);
+        let seller = seller_with(Vec::new());
         let resolved = resolve(&seller, &BTreeMap::new()).expect("hatch resolves");
         assert!(
             resolved.registry.advertised().is_empty(),
@@ -409,31 +392,26 @@ mod tests {
     }
 
     #[test]
-    fn single_preset_config_resolves_to_the_same_one_entry_registry_and_argv() {
-        // Compat: a seller written before `agents` existed keeps its stored argv verbatim (never
-        // re-resolved off PATH) and advertises exactly its one configured harness.
-        let seller = seller_with(Vec::new(), Some("claude"));
-        let resolved = resolve(&seller, &BTreeMap::new()).expect("single preset resolves");
+    fn a_single_agents_entry_resolves_the_preset_and_advertises_its_name() {
+        // Issue #378: the singular `agent` label is gone; a one-harness seller lists it in `agents`,
+        // which resolves through the preset table and advertises exactly that name.
+        let table = presets(&[("claude", &["claude-acp"])]);
+        let seller = seller_with(names(&["claude"]));
+        let resolved = resolve(&seller, &table).expect("single preset resolves");
         assert_eq!(resolved.registry.advertised(), vec!["claude"]);
         assert_eq!(
             resolved.registry.dispatch(None).map(|a| a.argv.clone()),
-            Some(vec!["fallback-bin".to_owned()]),
-            "the stored agent_command is the truth for an existing seller"
+            Some(vec!["claude-acp".to_owned()]),
+            "a listed preset resolves through the preset table"
         );
-        assert!(resolved.verdicts.is_empty());
+        assert_eq!(resolved.verdicts.len(), 1);
         assert!(resolved.degrade_line().is_none());
     }
 
     #[test]
     fn partial_failure_degrades_loud_and_serves_with_the_remainder() {
         let table = presets(&[("good", &["/bin/sh"])]);
-        let seller = seller_with(
-            vec![
-                AgentSlotConfig::named("good"),
-                AgentSlotConfig::named("nope-not-a-preset"),
-            ],
-            None,
-        );
+        let seller = seller_with(names(&["good", "nope-not-a-preset"]));
         let resolved = resolve(&seller, &table).expect("partial failure still serves");
         assert_eq!(resolved.registry.advertised(), vec!["good"]);
         assert_eq!(resolved.failures().len(), 1);
@@ -448,13 +426,7 @@ mod tests {
 
     #[test]
     fn every_preset_failing_refuses_rather_than_serving_nothing() {
-        let seller = seller_with(
-            vec![
-                AgentSlotConfig::named("nope-one"),
-                AgentSlotConfig::named("nope-two"),
-            ],
-            None,
-        );
+        let seller = seller_with(names(&["nope-one", "nope-two"]));
         match resolve(&seller, &BTreeMap::new()) {
             Err(RegistryError::AllFailed(verdicts)) => {
                 assert_eq!(verdicts.len(), 2);
@@ -467,22 +439,9 @@ mod tests {
     }
 
     #[test]
-    fn a_pool_larger_than_one_is_refused_never_silently_serialized() {
-        let table = presets(&[("good", &["/bin/sh"])]);
-        let seller = seller_with(vec![AgentSlotConfig { name: "good".into(), slots: 2 }], None);
-        assert_eq!(
-            resolve(&seller, &table),
-            Err(RegistryError::ParallelismUnsupported { name: "good".into(), slots: 2 })
-        );
-    }
-
-    #[test]
     fn a_duplicate_listing_keeps_one_entry_so_advertisement_matches_dispatch() {
         let table = presets(&[("good", &["/bin/sh"])]);
-        let seller = seller_with(
-            vec![AgentSlotConfig::named("good"), AgentSlotConfig::named("good")],
-            None,
-        );
+        let seller = seller_with(names(&["good", "good"]));
         let resolved = resolve(&seller, &table).expect("duplicates resolve");
         assert_eq!(resolved.registry.advertised(), vec!["good"]);
         assert_eq!(resolved.registry.entries().len(), 1);
@@ -490,7 +449,7 @@ mod tests {
 
     #[test]
     fn no_harness_at_all_refuses() {
-        let mut seller = seller_with(Vec::new(), None);
+        let mut seller = seller_with(Vec::new());
         seller.agent_command = Vec::new();
         assert_eq!(resolve(&seller, &BTreeMap::new()), Err(RegistryError::Empty));
     }

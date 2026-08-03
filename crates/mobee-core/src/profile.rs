@@ -151,7 +151,8 @@ pub async fn publish_seller_discoverability_async(
     })?;
     let rate_sats = seller.rate_sats;
     let claim_open_pool = seller.claim_open_pool;
-    let agent = seller.agent.clone();
+    // Advertised harness label = the first configured harness (issue #378 dropped the singular `agent`).
+    let agent = seller.agents.first().cloned();
 
     // Ensure a display name exists (config or short-hex default).
     let pubkey = home::public_key_hex(home)?;
