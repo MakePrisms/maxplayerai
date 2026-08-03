@@ -12,8 +12,8 @@ pub const PROTOCOL_VERSION: &str = "0";
 // All kind NUMBERS live in `crate::kinds` (the one registry); re-exported here so the historical
 // `gateway::JOB_*_KIND` paths keep resolving.
 pub use crate::kinds::{
-    JOB_AWARD_KIND, JOB_CLAIM_KIND, JOB_FEEDBACK_KIND, JOB_OFFER_KIND, JOB_RECEIPT_KIND,
-    JOB_RESULT_KIND,
+    JOB_ACCEPT_KIND, JOB_AWARD_KIND, JOB_CLAIM_KIND, JOB_FEEDBACK_KIND, JOB_OFFER_KIND,
+    JOB_RECEIPT_KIND, JOB_RESULT_KIND,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -447,9 +447,36 @@ pub fn award_draft(
     )
 }
 
-/// The two ids a kind-award AWARD selects: the offer it roots on and the winning claim. Both are
-/// read from the award's `e` tags — the `root`-marked `e` is the offer, the other `e` the claim.
-/// A seller matches `claim_id` against its own published claim to decide execute-versus-release.
+/// Kind-accept ACCEPT draft (`status=accepted`). Buyer-authored pay-bind against one verified
+/// result — same tag shape as [`award_draft`], on its own kind.
+///
+/// The kind is the whole point. Selection and pay-authorisation are different statements about a
+/// job, and while they shared `JOB_AWARD_KIND` the only way to tell them apart was to count events
+/// for that job — which is not a discriminator, because two events of one kind is also what a
+/// re-publish looks like. A seller could not distinguish claim-won from pay-authorised, and any
+/// award-presence read had to reconcile a multiplicity it could not interpret.
+pub fn accept_draft(
+    offer_id: &str,
+    claim_id: &str,
+    buyer_pubkey: &str,
+    seller_pubkey: &str,
+) -> EventDraft {
+    status_draft(
+        JOB_ACCEPT_KIND,
+        "accepted",
+        vec![
+            TagSpec::new(["e", offer_id, "", "root"]),
+            TagSpec::new(["e", claim_id]),
+            TagSpec::new(["p", buyer_pubkey]),
+            TagSpec::new(["p", seller_pubkey]),
+        ],
+    )
+}
+
+/// The two ids a buyer-authored selection or pay-bind carries: the offer it roots on and the claim
+/// it names. Both are read from the event's `e` tags — the `root`-marked `e` is the offer, the other
+/// `e` the claim. A seller matches `claim_id` against its own published claim to decide
+/// execute-versus-release.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedAward {
     pub offer_id: String,
@@ -457,12 +484,32 @@ pub struct ParsedAward {
 }
 
 /// Parse a kind-award AWARD event into the offer + winning-claim ids it selects, or `None` when the
-/// event is not an award or lacks the two `e` tags. The `root`-marked `e` is the offer; the other
-/// `e` is the awarded claim. Pure over the draft so the seller's match logic is unit-testable.
+/// event is not an award or lacks the two `e` tags. Pure over the draft so the seller's match logic
+/// is unit-testable.
 pub fn parse_award(event: &EventDraft) -> Option<ParsedAward> {
     if event.kind != JOB_AWARD_KIND {
         return None;
     }
+    parse_offer_and_claim_tags(event)
+}
+
+/// Parse a kind-accept ACCEPT event into the offer + claim ids its pay-bind names, or `None` when
+/// the event is not an accept or lacks the two `e` tags.
+///
+/// Deliberately a separate entry point rather than a widened [`parse_award`]: a caller that means
+/// "is this a selection?" and a caller that means "is this a pay-bind?" must not be able to satisfy
+/// each other by accident, which is the failure the shared kind produced.
+pub fn parse_accept(event: &EventDraft) -> Option<ParsedAward> {
+    if event.kind != JOB_ACCEPT_KIND {
+        return None;
+    }
+    parse_offer_and_claim_tags(event)
+}
+
+/// The offer + claim `e`-tag shape shared by AWARD and ACCEPT. Written once: the two events carry
+/// identical tags and differ only by kind, so duplicating this would be one fact in two places.
+/// Each public parser gates on its own kind before calling in.
+fn parse_offer_and_claim_tags(event: &EventDraft) -> Option<ParsedAward> {
     let e_tags: Vec<&TagSpec> = event
         .tags
         .iter()

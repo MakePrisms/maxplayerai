@@ -20,6 +20,13 @@ export const RESULT = 3403;
 export const FEEDBACK = 3404;
 /** Buyer award — selects a claim, e-tagging the offer and the winning claim. */
 export const AWARD = 3405;
+/**
+ * Buyer accept — the pay-bind against one verified result, e-tagging the offer and the claim.
+ * Its own kind, not a second AWARD: a job's normal steady state used to be two events of the
+ * same kind, so award and accept were indistinguishable and every awarded-then-accepted job
+ * rendered as a double award.
+ */
+export const ACCEPT = 3406;
 /** Co-signed payment receipt — the settlement proof. */
 export const RECEIPT = 3400;
 /** NIP-89 seller handler announce (a seller capability advert). Carries no mobee tag. */
@@ -43,6 +50,7 @@ export const KIND_LABELS = Object.freeze({
   [RESULT]: "result",
   [FEEDBACK]: "feedback",
   [AWARD]: "award",
+  [ACCEPT]: "accept",
   [RECEIPT]: "receipt",
   [HANDLER]: "handler (NIP-89)",
   [HEARTBEAT]: "heartbeat",
@@ -58,6 +66,7 @@ export const MOBEE_TAGGED_KINDS = Object.freeze([
   RESULT,
   FEEDBACK,
   AWARD,
+  ACCEPT,
   RECEIPT,
   HEARTBEAT,
 ]);

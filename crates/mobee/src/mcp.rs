@@ -161,7 +161,7 @@ fn tools() -> Value {
     json!([
         {
             "name": "post_job",
-            "description": "Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness/model are recorded auto-award preferences. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. Never echoes secrets.",
+            "description": "Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness is a hard award filter (only a seller advertising it can be awarded); model is a recorded auto-award preference. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -175,7 +175,7 @@ fn tools() -> Value {
                     },
                     "harness": {
                         "type": "string",
-                        "description": "Preferred seller harness (e.g. claude|cursor|codex). Recorded as an auto-award preference; not yet a hard filter (no claim wire field carries it)."
+                        "description": "Request a specific seller harness (e.g. claude|cursor|codex). Posted on the offer as [\"param\",\"agent\",<name>] and enforced as a HARD award filter: only a seller advertising that harness on its claim can be awarded, and a seller that cannot run it will not claim at all. Omit it (or pass \"any\") for no preference. Also recorded as the auto-award preference it always was. NOTE: this is the REQUEST vocabulary (preset labels); attribution surfaces (get_job results[].harness, collect agent_used) return the RESOLVED harness id (e.g. claude → claude-agent-acp) — relate the two semantically, never by string equality."
                     },
                     "model": {
                         "type": "string",
@@ -220,7 +220,7 @@ fn tools() -> Value {
         },
         {
             "name": "get_job",
-            "description": "Read job state from the relay (offer + claims + results). Surfaces claim created_at and flags the most-recent LIVE claim. Optional include_display_names=true adds best-effort cosmetic kind-0 names; the default skips that extra network fetch and hex pubkeys remain authoritative. Optional wait_for=claim|result long-poll. Local accept-bind attached if present. Never invents claims/results.",
+            "description": "Read job state from the relay (offer + claims + results). Surfaces claim created_at and flags the most-recent LIVE claim. Optional include_display_names=true adds best-effort cosmetic kind-0 names; the default skips that extra network fetch and hex pubkeys remain authoritative. Optional wait_for=claim|result long-poll. Local accept-bind attached if present. Results may carry seller-claimed exec-metadata attribution (harness, model): harness is the RESOLVED id (e.g. claude-agent-acp) — a DIFFERENT vocabulary from post_job's harness labels (claude), so never string-compare the two — and every such value is an attribution, not a verification. Never invents claims/results.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -235,7 +235,7 @@ fn tools() -> Value {
         },
         {
             "name": "collect",
-            "description": "Single-call buyer collect: if no accept-bind exists yet, accept the delivered claim itself (fetch the seller's result from the relay and record the co-signed pay-bind — the same accept path `maxplayer accept` runs), verify the delivery integrity (the delivered branch must tip at the accepted commit — the PayPathDeliveryVerifier tip-match), auto-pay the seller through the sealed money path (BudgetGate → PaymentService::run, single-redeem + mint-compat intact), then materialize the paid files into <home>/results/<job_id>. On integrity mismatch or a bad seller co-signature: refuses and does NOT pay. Idempotent: re-collecting an already-paid job re-materializes without a second payment. If the wallet holds no funds it refuses with a message pointing at `maxplayer wallet setup`. Returns {amount_sats, attempt_id, spent_total_sats, remaining_sats, state, commit, path, files}. Never echoes secrets.",
+            "description": "Single-call buyer collect: if no accept-bind exists yet, accept the delivered claim itself (fetch the seller's result from the relay and record the co-signed pay-bind — the same accept path `maxplayer accept` runs), verify the delivery integrity (the delivered branch must tip at the accepted commit — the PayPathDeliveryVerifier tip-match), auto-pay the seller through the sealed money path (BudgetGate → PaymentService::run, single-redeem + mint-compat intact), then materialize the paid files into <home>/results/<job_id>. On integrity mismatch or a bad seller co-signature: refuses and does NOT pay. Idempotent: re-collecting an already-paid job re-materializes without a second payment. If the wallet holds no funds it refuses with a message pointing at `maxplayer wallet setup`. Returns {pay: {state, attempt_id, amount_sats, spent_total_sats, remaining_sats}, commit_oid, path, files, agent_used, model_used} — agent_used/model_used are the seller-claimed harness/model that produced the paid result (null = the seller reported nothing; an attribution, never a verification). agent_used is the RESOLVED harness id (e.g. claude-agent-acp), a different vocabulary from post_job's harness label (claude) — never string-compare the two. Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -248,7 +248,7 @@ fn tools() -> Value {
         },
         {
             "name": "award_claim",
-            "description": "Manually award a specific seller claim (the fine-grain override of the daemon's auto-award): reserve the funds and publish the buyer AWARD (kind-3405, status=accepted) selecting that claim so the seller executes and every other claimant releases without spending compute. The daemon refuses to award a claim it cannot pay or whose price exceeds max_sats (defaults to the offer amount). No pay-bind — settle after delivery with collect. Never echoes secrets.",
+            "description": "Manually award a specific seller claim (the fine-grain override of the daemon's auto-award): reserve the funds and publish the buyer AWARD (kind-3405, status=accepted) selecting that claim so the seller executes and every other claimant releases without spending compute. The daemon refuses to award a claim it cannot pay or whose price exceeds max_sats (defaults to the offer amount). Awards are WRITE-ONCE per job: the first call pins one signed award event (sealing the claim AND the amount — max_sats applies to the first call only), and every retry re-sends that exact event — a retry can never award a different claim or publish a duplicate, so retrying after an ambiguous error (e.g. 'relay gave no verdict') is always safe and is the way to converge. A claim_id that contradicts an already-pinned attempt is refused. No pay-bind — settle after delivery with collect. Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

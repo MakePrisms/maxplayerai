@@ -14,7 +14,10 @@ default = []
 # `spawn_local` task on ONE LocalSet thread, so a blocking wait in the driver serializes all jobs
 # and deafens the run loop (issue #223).
 acp = ["tokio/sync", "tokio/time"]
-gateway = ["dep:nostr-sdk"]
+# `tokio/time` is declared here because the gateway's relay-auth window uses `tokio::time::timeout`.
+# On native it also arrives transitively through nostr-sdk, but that supplier's tokio feature
+# selection is target-conditional and does not provide it on wasm32 (issue #214).
+gateway = ["dep:nostr-sdk", "tokio/time"]
 # All git legs (seller push/fetch, buyer verify-fetch, ref-advertisement probes) run in-process
 # via libgit2 — NO system `git` on any product path (issue #55). Needs nostr-sdk (NIP-98 signing)
 # so it composes gateway; git2 (rustls-backed) + reqwest + base64 carry the smart-HTTP transport.

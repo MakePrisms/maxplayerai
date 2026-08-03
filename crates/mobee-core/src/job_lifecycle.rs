@@ -5,9 +5,9 @@
 //! - [`accept_claim`] records a local pay-bind for
 //!   [`authorize_pay`](crate::authorize_pay) (seller / result / commit) — written BEFORE the
 //!   publish, so a crash cannot leave a public accept with no bind — then publishes an
-//!   `accepted` AWARD (kind-3405 via [`award_draft`]; the same kind [`award_claim_async`]
-//!   publishes at selection, so an already-awarded claim gets a second kind-3405 on the
-//!   relay). Claims/results themselves remain relay-truth.
+//!   `accepted` ACCEPT (kind-3406 via [`accept_draft`]). [`prepare_award_async`] signs the
+//!   SELECTION as a kind-3405 AWARD — separate kinds, so a reader can tell a pay-bind from a
+//!   choice of seller. Claims/results themselves remain relay-truth.
 //!
 //! Local bind under `~/.mobee/jobs/<job_id>.json` is accept-state only.
 
@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::gateway::{
-    self, award_draft, parse_git_result_delivery, parse_offer, EventDraft, OfferDraft, TagSpec,
-    JOB_AWARD_KIND, JOB_CLAIM_KIND, JOB_FEEDBACK_KIND, JOB_OFFER_KIND, JOB_RESULT_KIND,
+    self, accept_draft, award_draft, parse_git_result_delivery, parse_offer, EventDraft, OfferDraft,
+    TagSpec, JOB_AWARD_KIND, JOB_CLAIM_KIND, JOB_FEEDBACK_KIND, JOB_OFFER_KIND, JOB_RESULT_KIND,
 };
 use crate::home::{self, HomeError, MobeeHome};
 #[cfg(feature = "wallet")]
@@ -51,7 +51,7 @@ pub const CLAIM_STATUS_DELIVERED: &str = "delivered";
 /// must not be able to strand it on the short scheduling clock. The relaxation is ONLY about not
 /// rejecting a proven delivery on a timer; every money gate (creq/cosig/tip-match/budget/
 /// single-redeem) still fires downstream in [`accept_claim`] / [`crate::authorize_pay`].
-const DELIVERY_PAY_WINDOW_SECS: u64 = 7 * 24 * 3_600;
+pub(crate) const DELIVERY_PAY_WINDOW_SECS: u64 = 7 * 24 * 3_600;
 
 /// Inputs for posting a offer-kind offer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,6 +171,18 @@ pub struct JobView {
     /// buyer should re-poll (PENDING), not treat as failure.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pending: bool,
+    /// Whether the relay ANSWERED the read this view was built from.
+    ///
+    /// `fetch_events` resolves `Ok(empty)` on timeout, so an empty view cannot by itself tell
+    /// "the relay holds nothing for this job" from "we stopped waiting". Those are the same bytes
+    /// and the discriminator is one layer out, so it has to be asked for: when every filter comes
+    /// back empty we send one trivial `limit(0)` REQ and wait for the `EOSE` the relay OWES us.
+    /// Served ⇒ the emptiness is a fact about the relay. Unserved ⇒ it is a fact about our patience.
+    ///
+    /// ⚠ Any caller about to take an IRREVERSIBLE action on absence must check this first. It is
+    /// `false` on every view not built by a confirmed read, so the unsafe direction is the one you
+    /// have to opt into.
+    pub read_confirmed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -262,6 +274,17 @@ pub struct ResultView {
     /// Seller schnorr signature (hex) from the result's `["sig","seller",..]` tag — the
     /// buyer counter-signs the same receipt preimage to co-sign the kind-3400.
     pub seller_signature: Option<String>,
+    /// Harness the seller claims RAN this result, read from the result's seller-claimed
+    /// exec-metadata `["harness", …]` tag (`metadata_trust=seller-claimed`). An attribution of
+    /// what executed — never the buyer's requested harness echoed back (a request is not an
+    /// attribution). `None` when the result carries no metadata block (pre-metadata sellers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// Model the harness self-reported for the run (`["model", …]`), driver-surfaced only.
+    /// Same trust class as `harness`: seller-claimed, absent-stays-absent (#233: a model string
+    /// is a claim, never a verification).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Contribution echo + authorship signature. `Some` iff the result carries a
     /// well-formed `job-class=contribution` echo AND a `sig/seller-contribution` tag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -304,6 +327,18 @@ pub struct AcceptedBind {
     /// this field existed; the pay path then falls back to the live config default (legacy behavior).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realized_mint: Option<String>,
+    /// Harness the seller claimed RAN the accepted result (its exec-metadata `["harness", …]`
+    /// tag), captured at accept so settlement can attribute the payment to the worker that earned
+    /// it (#261). Truth-only: this is what the seller says EXECUTED — never the buyer's requested
+    /// harness written upfront (a request is not an attribution). `None` when the result carried
+    /// no metadata (legacy sellers). Advisory record only — NOT in the receipt preimage, gates
+    /// nothing on the pay path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_used: Option<String>,
+    /// Model the harness self-reported for the run (`["model", …]`). Same trust class as
+    /// `agent_used`: seller-claimed attribution, absent when the driver surfaced none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_used: Option<String>,
     /// Contribution binds, recorded at accept when the OFFER is a contribution (authority
     /// = the buyer's signed offer; the result echo is equality-checked, never trusted). Absent ⇒
     /// from-scratch.
@@ -355,6 +390,52 @@ pub struct AwardClaimOutcome {
     /// the award commits it to paying at — awarding a claim it cannot settle is visible here, not a
     /// surprise at pay time. Empty when the claim carried no parseable `creq`.
     pub quoted_mints: Vec<String>,
+}
+
+/// An award validated and SIGNED but not yet sent (#322). `event_json` is the signed kind-3405
+/// verbatim; its `award_event_id` is the content hash, fixed the moment this struct exists. The
+/// caller persists it before the first send ([`crate::buyer::store::BuyerStore::begin_award_attempt`])
+/// and every send — first or retry — transmits these bytes unmodified, so no publish ambiguity can
+/// ever mint a second award for the job. Signing happens here (not at send time) precisely because
+/// a re-signed draft gets a fresh `created_at` and therefore a fresh id: that near-identical
+/// second event is how #322's three seats all came to execute one offer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedAward {
+    pub job_id: String,
+    pub claim_id: String,
+    pub seller_pubkey: String,
+    pub award_event_id: String,
+    pub event_json: String,
+    pub quoted_mints: Vec<String>,
+    /// The offer's deadline at prepare time. Past it a still-unresolved attempt is settled by
+    /// probe, never by re-send — re-sending would knowingly inject a late award.
+    pub offer_deadline_unix: i64,
+    /// The relay these bytes are for, frozen from config now: every send and every presence
+    /// probe of this award targets THIS url, so a config change mid-attempt cannot make the
+    /// resolution interrogate a relay the bytes never went to.
+    pub relay_url: String,
+}
+
+/// The relay's verdict on one transmission of a signed event. The three-way split is the point:
+/// only an explicit `OK` moves money state, in either direction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// The relay acked the event (`OK:true`, or `OK:false duplicate:` — it already holds it).
+    /// This is the relay's word that it accepted the event; durability past that word is the
+    /// relay's business, and nothing stronger exists on the wire.
+    Acked,
+    /// The relay explicitly rejected the event with a DELIBERATE, understood refusal
+    /// (`blocked:`/`invalid:`/`pow:`/`restricted:`/`unsupported:`). It examined the event and
+    /// refused storage: nothing from THIS transmission is public. Whether that licenses
+    /// releasing funds is the caller's question — it does only when this was the event's FIRST
+    /// transmission ever (see the attempt row's `send_count`).
+    Refused { detail: String },
+    /// Everything else — transport error, timeout waiting for the OK, connection lost mid-send,
+    /// `rate-limited:`, `auth-required:`, `error:`, or words we don't understand. The event MAY
+    /// be public (a lost OK after a successful store is indistinguishable from a lost send), so
+    /// the caller must hold state and retry the same bytes, never conclude "nothing landed"
+    /// (#322).
+    Unresolved { detail: String },
 }
 
 #[derive(Debug)]
@@ -791,7 +872,7 @@ pub(crate) fn event_references_job(event: &nostr_sdk::Event, job_id: &str) -> bo
     })
 }
 
-/// Accept a live claim: persist the pay-bind, then publish the `accepted` AWARD (kind-3405).
+/// Accept a live claim: persist the pay-bind, then publish the `accepted` ACCEPT (kind-3406).
 /// Sync entry for CLI/tests — nested call fails fast; MCP uses [`accept_claim_async`].
 pub fn accept_claim(
     home: &MobeeHome,
@@ -806,17 +887,25 @@ pub fn accept_claim(
     runtime.block_on(accept_claim_async(home, request))
 }
 
-/// Publish the buyer's kind-award AWARD selecting `claim_id` for `job_id` BEFORE the seller runs.
-/// The awarded seller executes; every other claimant releases its claim without spending compute.
+/// Validate and SIGN the buyer's kind-award AWARD selecting `claim_id` for `job_id` — without
+/// sending it. The awarded seller executes; every other claimant releases its claim without
+/// spending compute.
 ///
 /// This is the pre-work counterpart to [`accept_claim_async`], which runs AFTER delivery to bind
 /// payment to a verified result. The award carries no pay-bind — it only names the winning claim.
 /// The claim must be present and still `processing`, and (for a targeted offer) authored by the
 /// targeted seller; otherwise the award is refused.
-pub async fn award_claim_async(
+///
+/// Prepare and send are split (#322) so the signed bytes can be PERSISTED before the first
+/// transmission: `award_with_reservation` pins the [`PreparedAward`] as a durable attempt, then
+/// drives [`send_signed_award_async`] against it — first send and every retry alike — so a publish
+/// whose `OK` never arrives is retried with the identical event instead of a re-selected claim
+/// and a fresh id. A failure HERE (validation or signing) is provably wire-free: nothing signed
+/// has been persisted or transmitted, so the caller may safely release and re-plan.
+pub async fn prepare_award_async(
     home: &MobeeHome,
     request: AwardClaimRequest,
-) -> Result<AwardClaimOutcome, JobLifecycleError> {
+) -> Result<PreparedAward, JobLifecycleError> {
     let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
     let keys = buyer_keys(home)?;
     // Injected `now` derives claim liveness — a claim past the offer deadline surfaces as
@@ -862,14 +951,156 @@ pub async fn award_claim_async(
         &buyer_pubkey,
         &claim.seller_pubkey,
     );
-    let award_event_id = publish_draft_async(home, &keys, &draft).await?;
-    Ok(AwardClaimOutcome {
-        award_event_id,
+    // Sign NOW: from here the event id is fixed, and only these bytes may ever carry this job's
+    // award. (`sign_with_keys` stamps `created_at`, so signing at send time would mint a new id
+    // per retry — the exact duplication this function exists to prevent.)
+    let event = gateway::nostr::event_builder(&draft)
+        .map_err(|error| JobLifecycleError::Relay(format!("event builder: {error}")))?
+        .sign_with_keys(&keys)
+        .map_err(|error| JobLifecycleError::Relay(format!("sign award: {error}")))?;
+    use nostr_sdk::JsonUtil;
+    Ok(PreparedAward {
+        award_event_id: event.id.to_hex(),
+        event_json: event.as_json(),
         job_id: request.job_id,
         claim_id: request.claim_id,
         seller_pubkey: claim.seller_pubkey.clone(),
         quoted_mints,
+        offer_deadline_unix: offer.deadline_unix as i64,
+        relay_url: home.config.relay_url.clone(),
     })
+}
+
+/// How long one send waits for the relay's verdict before reporting [`SendOutcome::Unresolved`].
+/// The SDK's real write-path worst case is WAIT_FOR_OK(10s) + WAIT_FOR_AUTHENTICATION(7s) +
+/// WAIT_FOR_OK(10s) = 27s when the relay NIP-42-gates writes and the event is resent after auth —
+/// the same arithmetic [`crate::buyer::relay`] documents for its own `PUBLISH_TIMEOUT` (45s).
+/// Matching it here keeps a slow auth round-trip from reading as an eternal `Unresolved`.
+const SEND_AWARD_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// How long to wait for the WebSocket to actually come up before sending / fetching —
+/// `connect()` only SPAWNS the connection task. Mirrors [`crate::buyer::relay`]'s CONNECT_WAIT.
+const RELAY_CONNECT_WAIT: Duration = Duration::from_secs(20);
+
+/// Transmit a pinned, signed award — [`PreparedAward::event_json`] / a stored attempt's bytes —
+/// to the relay the attempt was pinned for, and report the relay's verdict as a three-way
+/// [`SendOutcome`].
+///
+/// Never errors: every failure mode is a verdict. In particular a transport failure or a lost
+/// `OK` reports `Unresolved`, because the relay may hold (and be fanning out) the event even
+/// though we never heard back — the seller executes off the relay's copy, not off our ack
+/// (#322). Only an explicit `OK` moves anything: `true` (or `duplicate:`) → `Acked`, and a
+/// deliberate refusal → `Refused`. `rate-limited:` / `auth-required:` / `error:` stay
+/// `Unresolved` — verdicts about this transmission or session, not about the event.
+///
+/// `expected_event_id` re-derives nothing: the stored bytes are verified (id + signature) to BE
+/// the pinned event before anything is transmitted, so confirm/record/probe — all keyed on the
+/// pinned id — can never chase an event these bytes don't carry. A mismatch or verification
+/// failure is local corruption and reports `Unresolved` (concluding "never landed" from local
+/// damage would be #322 again); the by-id probe resolves it against the relay's copy.
+pub async fn send_signed_award_async(
+    keys: &nostr_sdk::Keys,
+    relay_url: &str,
+    expected_event_id: &str,
+    event_json: &str,
+) -> SendOutcome {
+    use nostr_sdk::prelude::{Client, Event, JsonUtil};
+
+    let event = match Event::from_json(event_json) {
+        Ok(event) => event,
+        Err(error) => {
+            return SendOutcome::Unresolved {
+                detail: format!("pinned award event does not parse ({error}); probe will resolve"),
+            };
+        }
+    };
+    if event.id.to_hex() != expected_event_id {
+        return SendOutcome::Unresolved {
+            detail: format!(
+                "pinned bytes carry event {} but the attempt is keyed on {expected_event_id}; \
+                 refusing to transmit them — probe will resolve",
+                event.id.to_hex()
+            ),
+        };
+    }
+    if let Err(error) = event.verify() {
+        return SendOutcome::Unresolved {
+            detail: format!("pinned award event fails verification ({error}); probe will resolve"),
+        };
+    }
+    let client = Client::new(keys.clone());
+    // Explicit, not a default we hope for: the NIP-42 resend after auth fails SILENTLY when
+    // auto-auth is off — the drift guard buyer/relay.rs pins for its own client.
+    client.automatic_authentication(true);
+    if let Err(error) = client.add_relay(relay_url).await {
+        return SendOutcome::Unresolved { detail: format!("add relay: {error}") };
+    }
+    client.connect().await;
+    let outcome = match client.relay(relay_url).await {
+        Err(error) => SendOutcome::Unresolved { detail: format!("relay handle: {error}") },
+        Ok(relay) => {
+            // ONE wall-clock budget for connect + send: `connect()` only SPAWNS the connection
+            // task, so the wait keeps the send from failing on a handshake race — but it must
+            // live INSIDE the timeout, or the worst case is their sum (65s) held under the
+            // caller's money lock rather than the stated 45s.
+            let attempt = async {
+                relay.wait_for_connection(RELAY_CONNECT_WAIT).await;
+                relay.send_event(&event).await
+            };
+            match tokio::time::timeout(SEND_AWARD_TIMEOUT, attempt).await {
+                Err(_) => SendOutcome::Unresolved {
+                    detail: "timed out waiting for the relay's OK".to_owned(),
+                },
+                Ok(Ok(_)) => SendOutcome::Acked,
+                Ok(Err(error)) => classify_send_error(error),
+            }
+        }
+    };
+    client.disconnect().await;
+    outcome
+}
+
+/// Classify one send's typed failure into a [`SendOutcome`]. Only [`RelayMessage`] — the relay's
+/// own explicit `OK:false` — can ever produce `Refused`; every other variant (timeout, transport,
+/// not-connected, …) says nothing about whether the event landed and stays `Unresolved`.
+///
+/// [`RelayMessage`]: nostr_sdk::pool::relay::Error::RelayMessage
+fn classify_send_error(error: nostr_sdk::pool::relay::Error) -> SendOutcome {
+    match error {
+        nostr_sdk::pool::relay::Error::RelayMessage(message) => classify_ok_false(&message),
+        other => SendOutcome::Unresolved { detail: other.to_string() },
+    }
+}
+
+/// Classify the relay's `OK:false` message by its NIP-01 machine-readable prefix. Pure, so the
+/// mapping — the one place a relay's words become a money decision — is unit-testable.
+///
+/// - `duplicate:` → [`SendOutcome::Acked`]: the relay already HOLDS the event; that is a
+///   confirmation wearing an error's clothes (and exactly what a successful retry looks like).
+/// - `rate-limited:` / `auth-required:` → [`SendOutcome::Unresolved`]: verdicts about this
+///   TRANSMISSION or this session, not about the event — the same bytes are expected to succeed
+///   later. (These are also exactly the two CLOSED reasons the SDK itself treats as
+///   non-removing; the write side mirrors that split.)
+/// - `error:` → [`SendOutcome::Unresolved`]: the NIP-01 catch-all relays use for transient
+///   backend/storage failures. Terminalizing it would release funds over a hiccup.
+/// - an UNPREFIXED message → [`SendOutcome::Unresolved`]: words we do not understand never
+///   release funds. A relay that refuses forever in nonstandard language keeps the attempt
+///   pending until the pay window passes and the by-id probe terminalizes it honestly.
+/// - `blocked:` / `invalid:` / `pow:` / `restricted:` / `unsupported:` →
+///   [`SendOutcome::Refused`]: the relay examined the event and DELIBERATELY declined to store
+///   it. Nothing from this transmission is public.
+fn classify_ok_false(message: &str) -> SendOutcome {
+    use nostr_sdk::prelude::MachineReadablePrefix;
+    match MachineReadablePrefix::parse(message) {
+        Some(MachineReadablePrefix::Duplicate) => SendOutcome::Acked,
+        Some(
+            MachineReadablePrefix::RateLimited
+            | MachineReadablePrefix::AuthRequired
+            | MachineReadablePrefix::Error,
+        )
+        | None => SendOutcome::Unresolved { detail: message.to_owned() },
+        Some(_) => SendOutcome::Refused { detail: message.to_owned() },
+    }
 }
 
 /// Async `accept_claim` for callers already on a Tokio runtime (MCP dispatch).
@@ -1004,7 +1235,10 @@ pub async fn accept_claim_async(
     .to_string();
 
     let buyer_pubkey = keys.public_key().to_hex();
-    let draft = award_draft(
+    // ACCEPT is its own kind: this is the pay-bind, not the selection — `prepare_award_async` owns
+    // the selection and signs `award_draft`. Distinct kinds are what let a reader tell the two
+    // apart, because a count of same-kind events cannot: a repeat of one is shaped like the other.
+    let draft = accept_draft(
         &request.job_id,
         &request.claim_id,
         &buyer_pubkey,
@@ -1040,6 +1274,10 @@ pub async fn accept_claim_async(
         // The realized paying mint SELECTED for this job, frozen from the buyer's configured default
         // above. Sealing the choice makes the pay-path attempt id stable across retries.
         realized_mint: Some(realized_mint),
+        // Attribution of the worker that produced THIS result (seller-claimed exec-metadata),
+        // frozen with the bind so settlement records who earned the payment (#261).
+        agent_used: result.harness.clone(),
+        model_used: result.model.clone(),
         contribution,
     };
     write_accepted_bind(home, &bind)?;
@@ -1653,42 +1891,366 @@ fn derive_claim_liveness(
     live_claim_id
 }
 
-/// Read one job's offer + claims + results from the relay, with claim liveness derived
-/// against `now` (a `processing` claim past the offer deadline is EXPIRED, not live). Exposed
-/// `pub(crate)` so the seller daemon can run the backfill money-safety pre-claim check
-/// (already-delivered / live-claimed-by-another) without duplicating the relay read.
-/// True when a buyer AWARD (kind-3405) authored by this buyer already exists on the relay for
-/// `job_id` — the relay half of the idempotent re-arm check (a 3405 may have published before a
-/// crash, so the local ledger alone is insufficient). A relay error propagates so the caller treats
-/// it as "unknown" and does not falsely mark the intent awarded.
-pub(crate) async fn has_award_async(
+/// A buyer AWARD found on the relay, parsed into exactly the fields an `awards` row needs and
+/// nothing else. Constructed ONLY when every field was read off the event itself, so a caller
+/// holding one can repair the local ledger without inferring or defaulting anything.
+///
+/// `amount_sats` is deliberately absent: the kind-3405 carries no amount tag (see
+/// [`gateway::award_draft`]), so the sum a repair records must come from the buyer's own
+/// reservation, not from this event. Leaving the field out makes that impossible to get wrong by
+/// accident — there is no plausible-looking zero here to reach for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RelayedAward {
+    pub award_event_id: String,
+    pub claim_id: String,
+    pub seller_pubkey: String,
+}
+
+/// What the relay had to say about an award for a job. `Some(..)` of either variant means an award
+/// IS public; they differ only in whether it can be trusted to rebuild a money row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AwardPresence {
+    /// Complete and unambiguous — enough to repair the ledger from.
+    Repairable(RelayedAward),
+    /// An award exists but cannot be turned into a complete, unambiguous record. Refuse and leave
+    /// the row missing; `detail` says which property failed so an operator is not left guessing.
+    Unrepairable { award_event_id: String, detail: String },
+}
+
+impl AwardPresence {
+    /// The id of the award the relay returned, whichever variant. Both variants know it — they
+    /// differ on whether the REST of the event could be trusted, not on which event it was.
+    pub(crate) fn award_event_id(&self) -> &str {
+        match self {
+            Self::Repairable(relayed) => &relayed.award_event_id,
+            Self::Unrepairable { award_event_id, .. } => award_event_id,
+        }
+    }
+}
+
+/// A three-way relay read: what the relay had to say, distinguishing an ANSWERED emptiness from a
+/// read that merely went unanswered. `fetch_events` resolves `Ok(empty)` on timeout, so emptiness
+/// alone proves nothing — [`ConfirmedAbsent`](PresenceRead::ConfirmedAbsent) is returned only when
+/// the relay demonstrably served the session (an `EOSE` it owed us), the same discipline
+/// [`JobView::read_confirmed`] applies to offer reads (#291).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PresenceRead<T> {
+    /// The relay returned the thing.
+    Present(T),
+    /// The relay answered and does not have it. Still a statement about NOW — an event in flight
+    /// this instant lands after the answer — so a caller acting on this must be idempotent
+    /// against that event materializing (re-sending pinned bytes is; re-selecting a claim is not).
+    ConfirmedAbsent,
+    /// The read went unanswered — a slow or unreachable relay. Concluding absence here is #322.
+    Unverified,
+}
+
+/// The buyer AWARD (kind-3405) authored by this buyer for `job_id`, if the relay returns one — the
+/// relay half of the idempotent re-arm check (a 3405 may have published before a crash, so the
+/// local ledger alone is insufficient). A relay error propagates so the caller treats it as
+/// "unknown" and does not falsely mark the intent awarded.
+///
+/// Emptiness is disambiguated before it is reported: an empty read is `ConfirmedAbsent` only once
+/// the relay proves it is serving this session's REQs, and `Unverified` otherwise — callers that
+/// spend money on the answer refuse on `Unverified`
+/// (see [`crate::buyer::lifecycle::award_with_reservation`]).
+///
+/// Returns the parsed award rather than a bare id so a caller can both NAME the award it found and
+/// repair the missing row from it. Parsing happens here, against the real event, so
+/// `buyer::lifecycle` stays free of nostr types and remains unit-testable with a plain closure.
+pub(crate) async fn award_presence_async(
     home: &MobeeHome,
     keys: &nostr_sdk::Keys,
     job_id: &str,
     timeout: Duration,
-) -> Result<bool, JobLifecycleError> {
+) -> Result<PresenceRead<AwardPresence>, JobLifecycleError> {
     use nostr_sdk::prelude::{Client, EventId, Filter, Kind};
 
     let offer_id = EventId::from_hex(job_id)
         .map_err(|error| JobLifecycleError::Input(format!("job_id: {error}")))?;
     let client = Client::new(keys.clone());
+    // Same discipline as the send path: auto-auth on (NIP-42-gated reads re-issue silently only
+    // when it is), and WAIT for the socket — `connect()` only spawns, and a fetch racing the
+    // handshake burns its whole window and reads as empty.
+    client.automatic_authentication(true);
     client
         .add_relay(&home.config.relay_url)
         .await
         .map_err(|error| JobLifecycleError::Relay(format!("add relay: {error}")))?;
     client.connect().await;
+    let relay = client
+        .relay(&home.config.relay_url)
+        .await
+        .map_err(|error| JobLifecycleError::Relay(format!("relay handle: {error}")))?;
+    relay.wait_for_connection(RELAY_CONNECT_WAIT).await;
 
     let filter = Filter::new()
         .kind(Kind::Custom(JOB_AWARD_KIND))
         .author(keys.public_key())
         .event(offer_id)
         .hashtag(gateway::MOBEE_TAG);
-    let events = client
-        .fetch_events(filter, timeout)
+    // Fetch through the single-relay API, not the pool: the pool SWALLOWS per-relay stream
+    // errors into `Ok(empty)`, so a relay REFUSING this REQ (CLOSED with a reason, auth failure)
+    // would read as emptiness. Here a refusal surfaces as `Err` → the caller's Unverified — a
+    // refused read is not an answered one.
+    use nostr_sdk::pool::relay::ReqExitPolicy;
+    let mut events = relay
+        .fetch_events(filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
         .await
         .map_err(|error| JobLifecycleError::Relay(format!("fetch award: {error}")))?;
-    Ok(!events.is_empty())
+
+    if events.is_empty() {
+        // Emptiness means nothing until the relay shows it is answering us at all — and the
+        // proof must PRECEDE the read it vouches for. The first fetch may have spent its window
+        // on connect/auth, so a probe answered afterwards says only "the session works NOW".
+        // Absence is therefore concluded exclusively from a SECOND read taken after the probe's
+        // EOSE.
+        let confirmed =
+            crate::buyer::relay::probe_relay_serves_our_reqs(&client, keys.public_key(), timeout)
+                .await;
+        if !confirmed {
+            client.disconnect().await;
+            return Ok(PresenceRead::Unverified);
+        }
+        events = relay
+            .fetch_events(filter, timeout, ReqExitPolicy::ExitOnEOSE)
+            .await
+            .map_err(|error| JobLifecycleError::Relay(format!("fetch award (recheck): {error}")))?;
+        if events.is_empty() {
+            client.disconnect().await;
+            return Ok(PresenceRead::ConfirmedAbsent);
+        }
+    }
+
+    // This filter asks for AWARDs alone (the accept is kind-3406), so every event here is a
+    // selection. One is the intended state: the award is signed once and persisted before the
+    // first send, and every retry re-transmits those exact bytes, so the relay dedups them by id.
+    //
+    // This read must not DEPEND on that. It exists to report what the relay actually holds for a
+    // ledger that may be missing a row, so its soundness cannot rest on the very emit discipline
+    // it is checking — and refusing on multiplicity ALONE would refuse to repair a row precisely
+    // when that row is most likely absent.
+    //
+    // Multiplicity is only AMBIGUOUS if the events disagree about what to write. So parse them all
+    // and compare the fields that land in the row: agreement means there is nothing to choose
+    // between, and disagreement is the only case where picking one would launder a guess into a
+    // money row.
+    let buyer_pubkey_hex = keys.public_key().to_hex();
+    let mut ordered: Vec<_> = events.iter().collect();
+    // Oldest first — a repair records the selection that has been public longest, never whichever
+    // the relay happened to send first. The id is a tiebreak, so the choice is total and stable.
+    ordered.sort_by_key(|event| (event.created_at, event.id.to_hex()));
+
+    let mut parsed = Vec::with_capacity(ordered.len());
+    for event in &ordered {
+        match parse_relayed_award(event, &buyer_pubkey_hex, job_id) {
+            Ok(award) => parsed.push(award),
+            // One unparseable event condemns the set: it may be the very one that disagrees, and
+            // we cannot know that without parsing it.
+            Err(detail) => {
+                client.disconnect().await;
+                return Ok(PresenceRead::Present(AwardPresence::Unrepairable {
+                    award_event_id: event.id.to_hex(),
+                    detail,
+                }));
+            }
+        }
+    }
+
+    client.disconnect().await;
+    Ok(PresenceRead::Present(reduce_parsed_awards(parsed)))
 }
+
+/// Whether the exact event `event_id_hex` is on `relay_url` — the by-id probe that settles a
+/// pinned attempt which must not be re-sent (past the offer deadline). Because the id names one
+/// specific event, this read cannot be confused by event multiplicity at all (#268) — the kind of
+/// ambiguity that makes a COUNT unreliable: the answer is about THIS event or no event. Targets the
+/// attempt's PINNED relay, never live config — the question is about the relay the bytes went to.
+///
+/// Same emptiness discipline as [`award_presence_async`]: absence is concluded only from a read
+/// taken AFTER the relay proved it serves this session's REQs.
+pub(crate) async fn event_present_async(
+    keys: &nostr_sdk::Keys,
+    relay_url: &str,
+    event_id_hex: &str,
+    timeout: Duration,
+) -> Result<PresenceRead<()>, JobLifecycleError> {
+    use nostr_sdk::prelude::{EventId, Filter};
+
+    let event_id = EventId::from_hex(event_id_hex)
+        .map_err(|error| JobLifecycleError::Input(format!("event id: {error}")))?;
+    let filter = Filter::new().id(event_id);
+    presence_of_filter(keys, relay_url, filter, timeout).await
+}
+
+/// Whether a kind-3403 RESULT by `seller_pubkey` — the PINNED, awarded seller — exists for
+/// `job_id` on `relay_url`. Positive evidence that seller executed, which (for a pinned attempt)
+/// means our award almost certainly WAS public and has merely aged out of the probe's view.
+/// Consulted before the pay-window termination: refusing an attempt whose awarded seller
+/// delivered would repudiate work that happened.
+///
+/// The author filter is load-bearing, not an optimisation: this probe's `Present` verdict HOLDS
+/// the terminalization (and therefore the refund) indefinitely, and without the filter any
+/// pubkey could publish one junk 3403 e-tagging the job and permanently pin the buyer's funds —
+/// a griefing vector with no exit, since a forged result can never be collected (round-3
+/// review). Only the awarded seller's delivery is evidence OUR award was public.
+pub(crate) async fn job_has_results_async(
+    keys: &nostr_sdk::Keys,
+    relay_url: &str,
+    job_id: &str,
+    seller_pubkey: &str,
+    timeout: Duration,
+) -> Result<PresenceRead<()>, JobLifecycleError> {
+    use nostr_sdk::prelude::{EventId, Filter, Kind, PublicKey};
+
+    let offer_id = EventId::from_hex(job_id)
+        .map_err(|error| JobLifecycleError::Input(format!("job_id: {error}")))?;
+    let seller = PublicKey::from_hex(seller_pubkey)
+        .map_err(|error| JobLifecycleError::Input(format!("seller pubkey: {error}")))?;
+    let filter = Filter::new()
+        .kind(Kind::Custom(JOB_RESULT_KIND))
+        .author(seller)
+        .event(offer_id)
+        .hashtag(gateway::MOBEE_TAG);
+    presence_of_filter(keys, relay_url, filter, timeout).await
+}
+
+/// The shared presence read: one filter against one relay, with the full emptiness discipline —
+/// single-relay fetches (a refused REQ surfaces as `Err`, never as emptiness), connection wait,
+/// auto-auth, and absence concluded only from a SECOND read taken after the relay's EOSE proof.
+async fn presence_of_filter(
+    keys: &nostr_sdk::Keys,
+    relay_url: &str,
+    filter: nostr_sdk::prelude::Filter,
+    timeout: Duration,
+) -> Result<PresenceRead<()>, JobLifecycleError> {
+    use nostr_sdk::pool::relay::ReqExitPolicy;
+    use nostr_sdk::prelude::Client;
+
+    let client = Client::new(keys.clone());
+    client.automatic_authentication(true);
+    client
+        .add_relay(relay_url)
+        .await
+        .map_err(|error| JobLifecycleError::Relay(format!("add relay: {error}")))?;
+    client.connect().await;
+    let relay = client
+        .relay(relay_url)
+        .await
+        .map_err(|error| JobLifecycleError::Relay(format!("relay handle: {error}")))?;
+    relay.wait_for_connection(RELAY_CONNECT_WAIT).await;
+
+    let mut events = relay
+        .fetch_events(filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
+        .await
+        .map_err(|error| JobLifecycleError::Relay(format!("fetch: {error}")))?;
+    if events.is_empty() {
+        let confirmed =
+            crate::buyer::relay::probe_relay_serves_our_reqs(&client, keys.public_key(), timeout)
+                .await;
+        if !confirmed {
+            client.disconnect().await;
+            return Ok(PresenceRead::Unverified);
+        }
+        events = relay
+            .fetch_events(filter, timeout, ReqExitPolicy::ExitOnEOSE)
+            .await
+            .map_err(|error| JobLifecycleError::Relay(format!("fetch (recheck): {error}")))?;
+    }
+
+    let read = if events.is_empty() {
+        PresenceRead::ConfirmedAbsent
+    } else {
+        PresenceRead::Present(())
+    };
+    client.disconnect().await;
+    Ok(read)
+}
+
+/// Reduce a job's parsed awards — **oldest first** — to a single presence.
+///
+/// Split out as a pure function because the agreement rule is the part worth testing and the fetch
+/// around it needs a live relay. Ordering is the caller's job: this takes the first element as the
+/// award and never re-sorts.
+///
+/// Since #329 moved ACCEPT to its own kind (3406), a 3405 multiplicity is no longer the routine
+/// award+accept pair it used to be — the probe's filter now returns SELECTIONS only. So the
+/// agreement rule below got strictly stronger without changing: two 3405s that disagree on claim
+/// or seller are now a genuine duplicate award (#322's harm), not a normal lifecycle artifact,
+/// and refusing to pick between them is exactly right.
+fn reduce_parsed_awards(parsed: Vec<RelayedAward>) -> AwardPresence {
+    // Sound by construction: every caller checks the event set is non-empty before parsing it.
+    let earliest = parsed.first().expect("a non-empty award set").clone();
+    if let Some(other) = parsed.iter().find(|award| {
+        award.claim_id != earliest.claim_id || award.seller_pubkey != earliest.seller_pubkey
+    }) {
+        return AwardPresence::Unrepairable {
+            award_event_id: earliest.award_event_id,
+            detail: format!(
+                "{} awards for this job disagree on what to record (claim {} / seller {} against \
+                 claim {} / seller {}); refusing to pick one",
+                parsed.len(),
+                earliest.claim_id,
+                earliest.seller_pubkey,
+                other.claim_id,
+                other.seller_pubkey
+            ),
+        };
+    }
+    AwardPresence::Repairable(earliest)
+}
+
+/// Parse a single award event into a [`RelayedAward`], or `Err(reason)` when any field the ledger
+/// needs is missing, malformed, or ambiguous. Every failure is a refusal — this never substitutes a
+/// default, because each field it reads goes straight into a money row.
+fn parse_relayed_award(
+    event: &nostr_sdk::Event,
+    buyer_pubkey_hex: &str,
+    job_id: &str,
+) -> Result<RelayedAward, String> {
+    let draft = event_to_draft(event);
+    let parsed = gateway::parse_award(&draft)
+        .ok_or_else(|| "award has no root `e` (offer) and non-root `e` (claim) tag pair".to_owned())?;
+
+    // The award we fetched was filtered by offer id, but verify it anyway: the filter is the
+    // relay's word for what it sent, and this is the last point where a mismatched event could be
+    // written into the ledger under the wrong job.
+    if !parsed.offer_id.eq_ignore_ascii_case(job_id) {
+        return Err(format!(
+            "award roots on offer {} but was read for job {job_id}",
+            parsed.offer_id
+        ));
+    }
+
+    // An award carries TWO `p` tags — this buyer and the seller. The seller is identified by NOT
+    // being us, never by tag order: ordering is a property of how `award_draft` happens to build
+    // the event today, and reading it positionally would silently record the buyer as the seller
+    // if that order ever changed.
+    let mut others = draft
+        .tags
+        .iter()
+        .filter(|tag| tag.first() == Some("p"))
+        .filter_map(|tag| tag.value())
+        .filter(|pubkey| !pubkey.eq_ignore_ascii_case(buyer_pubkey_hex));
+    let seller_pubkey = others
+        .next()
+        .ok_or_else(|| "award has no `p` tag other than this buyer's own".to_owned())?
+        .to_owned();
+    if others.next().is_some() {
+        return Err("award names more than one non-buyer `p`; seller is ambiguous".to_owned());
+    }
+
+    Ok(RelayedAward {
+        award_event_id: event.id.to_hex(),
+        claim_id: parsed.claim_id,
+        seller_pubkey,
+    })
+}
+
+/// Read one job's offer + claims + results from the relay, with claim liveness derived
+/// against `now` (a `processing` claim past the offer deadline is EXPIRED, not live). Exposed
+/// `pub(crate)` so the seller daemon can run the backfill money-safety pre-claim check
+/// (already-delivered / live-claimed-by-another) without duplicating the relay read.
 
 pub(crate) async fn fetch_job_view_async(
     home: &MobeeHome,
@@ -1741,6 +2303,21 @@ pub(crate) async fn fetch_job_view_async(
         .fetch_events(result_filter, timeout)
         .await
         .map_err(|error| JobLifecycleError::Relay(format!("fetch results: {error}")))?;
+
+    // ── Did the relay ANSWER, or did we merely stop waiting?
+    //
+    // Any event at all proves the session was serving us, so emptiness in the other filters is the
+    // relay's word and costs nothing to establish. Only when ALL THREE come back empty is the read
+    // ambiguous — and that is precisely the case a caller is most likely to act on. There we pay
+    // one extra round trip for something the relay OWES us: a `limit(0)` REQ's `EOSE`. Deliberately
+    // a RESPONSE and not a broadcast; an event we merely hope to receive proves nothing by its
+    // absence, because the relay may legitimately never send it.
+    let saw_any_event =
+        !offer_events.is_empty() || !feedback_events.is_empty() || !result_events.is_empty();
+    let read_confirmed = saw_any_event
+        || crate::buyer::relay::probe_relay_serves_our_reqs(&client, keys.public_key(), timeout)
+            .await;
+
     client.disconnect().await;
 
     let offer = offer_events.into_iter().next().map(|event| {
@@ -1807,6 +2384,7 @@ pub(crate) async fn fetch_job_view_async(
         let amount_sats = first_tag(&draft.tags, "amount")
             .and_then(|tag| tag.0.get(1))
             .and_then(|value| value.parse().ok());
+        let (harness, model) = result_attribution(&draft.tags);
         results.push(ResultView {
             result_id: event.id.to_hex(),
             created_at: event.created_at.as_secs(),
@@ -1820,6 +2398,8 @@ pub(crate) async fn fetch_job_view_async(
                 .map(|d| d.commit_oid().as_str().to_owned()),
             amount_sats,
             seller_signature: sig_seller_value(&draft.tags),
+            harness,
+            model,
             contribution: contribution_result_view(&draft.tags),
         });
     }
@@ -1842,6 +2422,7 @@ pub(crate) async fn fetch_job_view_async(
         live_claim_id,
         accepted,
         pending: false,
+        read_confirmed,
     };
     Ok(view)
 }
@@ -2013,6 +2594,17 @@ fn sig_seller_value(tags: &[TagSpec]) -> Option<String> {
         .map(String::to_owned)
 }
 
+/// Seller-claimed exec-metadata attribution off a result's tags: `(harness, model)` from the
+/// `["harness", …]` / `["model", …]` tags `seller_exec_metadata` stamps on the kind-3403 (#261).
+/// Absent-stays-absent: a result with no metadata block yields `(None, None)` — never a
+/// fabricated attribution, and never the buyer's requested harness echoed back.
+fn result_attribution(tags: &[TagSpec]) -> (Option<String>, Option<String>) {
+    (
+        first_tag_value(tags, "harness").map(str::to_owned),
+        first_tag_value(tags, "model").map(str::to_owned),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2081,6 +2673,8 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
         // Drifted amount → refuse.
@@ -2117,6 +2711,8 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
         // A different result for the already-bound job → refused (one settlement per job).
@@ -2202,6 +2798,8 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
         // Single-settlement still free (no prior bind), then durable write of the valid sig.
@@ -2251,6 +2849,8 @@ mod tests {
             creq_hash: Some("2ad9b34cbf8c".to_string()),
             accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
 
@@ -2306,6 +2906,8 @@ mod tests {
             creq_hash: Some("2ad9b34cbf8c".to_string()),
             accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
@@ -2354,6 +2956,8 @@ mod tests {
             creq_hash: Some("2ad9b34c".repeat(8)),
             accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
         let from_bind =
@@ -2413,6 +3017,8 @@ mod tests {
             accepted_mints: vec![bound_mint.clone()],
             // The realized-mint SELECTION is sealed in the bind (finding CC).
             realized_mint: Some(bound_mint.clone()),
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
@@ -2515,6 +3121,8 @@ mod tests {
             accepted_mints: vec![mint_a.to_string(), mint_b.to_string()],
             // Sealed at accept from the buyer's then-configured default (A).
             realized_mint: Some(mint_a.to_string()),
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
 
@@ -2624,6 +3232,10 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            // Attribution fields round-trip as written (#261) — Some values here so this test
+            // covers them, not just their absence.
+            agent_used: Some("claude-agent-acp".into()),
+            model_used: Some("claude-opus-5".into()),
             contribution: None,
         };
         write_accepted_bind(&home, &bind).expect("write");
@@ -2648,10 +3260,89 @@ mod tests {
         let bind: AcceptedBind = serde_json::from_str(legacy).expect("legacy bind deserializes");
         assert_eq!(bind.realized_mint, None, "missing field defaults to None (legacy)");
         assert_eq!(bind.accepted_mints, vec!["https://mint.example".to_string()]);
+        // v5 attribution fields (#261): same back-compat contract — a legacy bind written before
+        // they existed deserializes to None ("seller never reported"), never an error.
+        assert_eq!(bind.agent_used, None, "legacy bind has no attribution");
+        assert_eq!(bind.model_used, None, "legacy bind has no attribution");
         // And a bind with realized_mint = None does not serialize the field (skip_serializing_if),
         // so the on-disk shape is unchanged for legacy-equivalent binds.
         let json = serde_json::to_string(&bind).expect("serialize");
         assert!(!json.contains("realized_mint"), "None must not emit the field: {json}");
+        assert!(!json.contains("agent_used"), "None must not emit the field: {json}");
+        assert!(!json.contains("model_used"), "None must not emit the field: {json}");
+
+        // ROLLBACK direction: an OLDER binary reading a NEWER bind survives because AcceptedBind
+        // tolerates unknown keys. This pins that `deny_unknown_fields` (house style on config
+        // structs) never lands on the bind — adding it would make every rollback choke on binds
+        // written by a newer release.
+        let newer = r#"{
+            "job_id":"aa","claim_id":"bb","result_id":"cc","seller_pubkey":"dd",
+            "commit_oid":"ee","repo":"https://example.invalid/repo.git","branch":"master",
+            "job_hash":"ff","amount_sats":5,"accept_event_id":"11","accepted_at":1,
+            "seller_signature":"","accepted_mints":[],
+            "some_future_field":{"nested":true}
+        }"#;
+        let tolerated: AcceptedBind =
+            serde_json::from_str(newer).expect("unknown keys are ignored, never an error");
+        assert_eq!(tolerated.job_id, "aa");
+    }
+
+    // Producer/consumer drift guard (#261): the attribution the buyer reads off a result is the
+    // SAME block the seller's exec-metadata stamps. Drives the REAL producer
+    // (`seller_exec_metadata` → `git_result_draft`) into the real consumer (`result_attribution`)
+    // so a renamed tag on either side goes red here instead of silently reading None forever.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn result_attribution_reads_the_exec_metadata_the_seller_stamps() {
+        let usage = crate::driver::UsageMetadata {
+            model: Some("claude-opus-5".into()),
+            ..Default::default()
+        };
+        let exec_metadata = crate::seller_exec::seller_exec_metadata(
+            &["claude".into(), "--print".into()],
+            None,
+            1234,
+            Some(&usage),
+        );
+        let draft = crate::gateway::git_result_draft(
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            "https://example.invalid/repo.git",
+            "main",
+            &"e".repeat(40),
+            2,
+            &"f".repeat(64),
+            &"ab".repeat(32),
+            "delivery",
+            &exec_metadata,
+        );
+        let (harness, model) = result_attribution(&draft.tags);
+        assert_eq!(
+            harness.as_deref(),
+            Some("claude-agent-acp"),
+            "the RESOLVED harness id from the real producer — what ran, not what was asked for"
+        );
+        assert_eq!(
+            model.as_deref(),
+            Some("claude-opus-5"),
+            "the driver-reported model, absent unless the run surfaced one"
+        );
+
+        // Absent-stays-absent: a result with no metadata block yields no attribution — the
+        // buyer records honest NULLs, never a fabricated or requested-echo value.
+        let bare = crate::gateway::git_result_draft(
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            "https://example.invalid/repo.git",
+            "main",
+            &"e".repeat(40),
+            2,
+            &"f".repeat(64),
+            &"ab".repeat(32),
+            "delivery",
+            &[],
+        );
+        assert_eq!(result_attribution(&bare.tags), (None, None));
     }
 
     // Z1 (crash-safe durable bind write): the accept-bind is written via temp-file + sync + atomic
@@ -2688,6 +3379,8 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
         write_accepted_bind(&home, &bind).expect("write pending");
@@ -2754,6 +3447,8 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
 
@@ -2841,6 +3536,8 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
         // Phase 1: pending write is durable and reloads with the empty-id marker.
@@ -2883,6 +3580,8 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
         let err = authorize_request_from_bind(&bind, 1, String::new()).expect_err("empty hash");
@@ -2921,6 +3620,8 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: None,
         };
         let bad_seller = "00".repeat(32);
@@ -2941,6 +3642,8 @@ mod tests {
             commit_oid: Some("ee".repeat(20)),
             amount_sats: Some(1),
             seller_signature: Some("ab".repeat(64)),
+            harness: None,
+            model: None,
             contribution: None,
         }
     }
@@ -3005,6 +3708,7 @@ mod tests {
             live_claim_id: None,
             accepted: None,
             pending: false,
+            read_confirmed: true,
         }
     }
 
@@ -3098,6 +3802,8 @@ mod tests {
             commit_oid: Some("cc".repeat(20)),
             amount_sats: Some(10),
             seller_signature: Some("sig".to_owned()),
+            harness: None,
+            model: None,
             contribution: None,
         }
     }
@@ -3300,6 +4006,7 @@ mod tests {
             live_claim_id: None,
             accepted: None,
             pending: false,
+            read_confirmed: true,
         };
         assert!(!view_is_ready(&view, WaitFor::Claim));
         assert!(!view_is_ready(&view, WaitFor::Result));
@@ -3761,6 +4468,8 @@ mod tests {
             creq_hash: None,
             accepted_mints: Vec::new(),
             realized_mint: None,
+            agent_used: None,
+            model_used: None,
             contribution: Some(AcceptedContribution {
                 target_owner_pubkey: "aa".repeat(32),
                 target_clone_url: "https://mobee-relay.orveth.dev/git/owner/repo.git".into(),
@@ -4078,5 +4787,374 @@ mod tests {
         assert!(msg.contains("40") && msg.contains("21"), "{msg}");
         assert!(msg.contains("RESTART"), "{msg}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Sign an award-kind event carrying exactly `tags`. Built tag-by-tag rather than through
+    /// [`gateway::award_draft`] so a test can express shapes that helper cannot produce — a
+    /// reversed `p` order, a missing tag, a second seller — which is the whole point of testing a
+    /// parser that has to survive events it did not write.
+    async fn award_event_with(
+        signer: &nostr_sdk::Keys,
+        tags: Vec<Vec<&str>>,
+    ) -> nostr_sdk::Event {
+        use nostr_sdk::prelude::{EventBuilder, Tag};
+        let mut builder = EventBuilder::new(nostr_sdk::Kind::Custom(JOB_AWARD_KIND), "accepted");
+        for tag in tags {
+            builder = builder.tag(Tag::parse(tag).expect("tag"));
+        }
+        builder.sign(signer).await.expect("sign award")
+    }
+
+    // ★ THE DISCRIMINATING TEST for the seller field. An award carries two `p` tags — this buyer
+    // and the seller — and `award_draft` happens to write buyer-then-seller. Reading position would
+    // pass against every event we generate and silently record the BUYER as the seller the day that
+    // order changes or another client writes the award.
+    //
+    // So both orders are asserted, and the reversed one is the leg that fails under positional
+    // logic. A money row naming the wrong seller is not a cosmetic error: it is who the delivery
+    // watcher pays.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_seller_is_the_p_tag_that_is_not_us_whatever_order_it_appears_in() {
+        let buyer = nostr_sdk::Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let seller_hex = nostr_sdk::Keys::generate().public_key().to_hex();
+        let offer = "a".repeat(64);
+        let claim = "c".repeat(64);
+
+        for (label, p_tags) in [
+            ("buyer first (as award_draft writes it)", vec![&buyer_hex, &seller_hex]),
+            ("seller first (positional logic fails here)", vec![&seller_hex, &buyer_hex]),
+        ] {
+            let event = award_event_with(
+                &buyer,
+                vec![
+                    vec!["e", &offer, "", "root"],
+                    vec!["e", &claim],
+                    vec!["p", p_tags[0]],
+                    vec!["p", p_tags[1]],
+                ],
+            )
+            .await;
+
+            let parsed = parse_relayed_award(&event, &buyer_hex, &offer)
+                .unwrap_or_else(|error| panic!("{label}: expected a parse, got: {error}"));
+            assert_eq!(parsed.seller_pubkey, seller_hex, "{label}: wrong seller");
+            assert_eq!(parsed.claim_id, claim, "{label}: wrong claim");
+            assert_eq!(parsed.award_event_id, event.id.to_hex(), "{label}: wrong award id");
+        }
+    }
+
+    // RED LEGS. Every one of these fields lands in a money row, so each missing or ambiguous
+    // property must REFUSE rather than resolve to something plausible. Table-driven because the
+    // interesting claim is that the set is complete, not that any single case works.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_award_missing_any_field_the_ledger_needs_refuses_to_parse() {
+        let buyer = nostr_sdk::Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let seller_hex = nostr_sdk::Keys::generate().public_key().to_hex();
+        let other_hex = nostr_sdk::Keys::generate().public_key().to_hex();
+        let offer = "a".repeat(64);
+        let elsewhere = "b".repeat(64);
+        let claim = "c".repeat(64);
+
+        let cases: Vec<(&str, Vec<Vec<&str>>, &str)> = vec![
+            (
+                "no claim `e` — nothing says WHICH claim won",
+                vec![vec!["e", &offer, "", "root"], vec!["p", &buyer_hex], vec!["p", &seller_hex]],
+                "claim",
+            ),
+            (
+                "no root `e` — nothing says which offer it roots on",
+                vec![vec!["e", &claim], vec!["p", &buyer_hex], vec!["p", &seller_hex]],
+                "claim",
+            ),
+            (
+                "roots on a DIFFERENT offer than the job we read it for",
+                vec![
+                    vec!["e", &elsewhere, "", "root"],
+                    vec!["e", &claim],
+                    vec!["p", &buyer_hex],
+                    vec!["p", &seller_hex],
+                ],
+                "roots on offer",
+            ),
+            (
+                "only our own `p` — no seller to pay",
+                vec![vec!["e", &offer, "", "root"], vec!["e", &claim], vec!["p", &buyer_hex]],
+                "other than this buyer",
+            ),
+            (
+                "two non-buyer `p`s — the seller is ambiguous, so picking one would invent it",
+                vec![
+                    vec!["e", &offer, "", "root"],
+                    vec!["e", &claim],
+                    vec!["p", &buyer_hex],
+                    vec!["p", &seller_hex],
+                    vec!["p", &other_hex],
+                ],
+                "more than one non-buyer",
+            ),
+        ];
+
+        for (label, tags, expected_fragment) in cases {
+            let event = award_event_with(&buyer, tags).await;
+            let error = parse_relayed_award(&event, &buyer_hex, &offer)
+                .expect_err(&format!("{label}: must refuse, not resolve"));
+            assert!(
+                error.contains(expected_fragment),
+                "{label}: refusal should say why (wanted {expected_fragment:?}), got: {error}"
+            );
+        }
+    }
+
+    // ⚠ Two AWARDs for one job are not a fault on their own: `award_presence_async` reports what
+    // the relay holds for a ledger that may be missing a row, so refusing on count alone would
+    // refuse to repair precisely when a repair is what is needed. Multiplicity is ambiguous only
+    // when the events DISAGREE about what to write.
+    #[test]
+    fn agreeing_awards_are_not_ambiguous_and_repair_from_the_earliest() {
+        let award = |id: &str, claim: &str, seller: &str| RelayedAward {
+            award_event_id: id.to_owned(),
+            claim_id: claim.to_owned(),
+            seller_pubkey: seller.to_owned(),
+        };
+        let seller = "5".repeat(64);
+        let claim = "c".repeat(64);
+
+        // A single award repairs, obviously.
+        let one = reduce_parsed_awards(vec![award("aaa", &claim, &seller)]);
+        assert!(matches!(&one, AwardPresence::Repairable(a) if a.award_event_id == "aaa"));
+
+        // Two selections that agree: same claim, same seller. Nothing to choose between, so it
+        // repairs — and from the EARLIEST. The caller passes them oldest-first; a later duplicate
+        // must not win just by arriving last.
+        let two = reduce_parsed_awards(vec![
+            award("the-earliest", &claim, &seller),
+            award("the-later", &claim, &seller),
+        ]);
+        match two {
+            AwardPresence::Repairable(a) => assert_eq!(
+                a.award_event_id, "the-earliest",
+                "a repair takes the earliest agreeing award, never the last one seen"
+            ),
+            other => panic!("agreeing awards must repair, got: {other:?}"),
+        }
+    }
+
+    // RED LEG for the agreement rule. Two 3405s that disagree about what to write are genuinely
+    // ambiguous, and picking one would launder a guess into a money row. Both fields are checked
+    // because either alone would pass a set that disagrees only on the other.
+    #[test]
+    fn disagreeing_awards_refuse_rather_than_pick_one() {
+        let award = |id: &str, claim: &str, seller: &str| RelayedAward {
+            award_event_id: id.to_owned(),
+            claim_id: claim.to_owned(),
+            seller_pubkey: seller.to_owned(),
+        };
+        let seller = "5".repeat(64);
+        let other_seller = "6".repeat(64);
+        let claim = "c".repeat(64);
+        let other_claim = "d".repeat(64);
+
+        for (label, set) in [
+            (
+                "same seller, different claim",
+                vec![award("a", &claim, &seller), award("b", &other_claim, &seller)],
+            ),
+            (
+                "same claim, different seller — who gets paid",
+                vec![award("a", &claim, &seller), award("b", &claim, &other_seller)],
+            ),
+        ] {
+            match reduce_parsed_awards(set) {
+                AwardPresence::Unrepairable { detail, .. } => assert!(
+                    detail.contains("disagree"),
+                    "{label}: refusal should say they disagree, got: {detail}"
+                ),
+                other => panic!("{label}: must refuse, got: {other:?}"),
+            }
+        }
+    }
+
+    // The OK:false classifier is the one place a relay's words become a money decision (#322), so
+    // pin every NIP-01 prefix to its verdict. `duplicate:` is the load-bearing surprise: on a
+    // same-bytes retry it is what SUCCESS looks like, and misreading it as a refusal would release
+    // funds for an award that is public. The Unresolved set is equally load-bearing in the other
+    // direction: session/transmission verdicts (`rate-limited:`, `auth-required:`), the NIP-01
+    // transient catch-all (`error:`), and words we don't understand must NEVER release funds.
+    #[test]
+    fn ok_false_classification_pins_every_prefix_to_its_verdict() {
+        assert_eq!(
+            classify_ok_false("duplicate: already have this event"),
+            SendOutcome::Acked,
+            "duplicate means the relay HOLDS the event — a confirmation, not a refusal"
+        );
+        for held in [
+            "rate-limited: slow down",
+            "auth-required: we only accept events from registered users",
+            "error: could not connect to the database",
+            "a message with no machine-readable prefix at all",
+        ] {
+            assert_eq!(
+                classify_ok_false(held),
+                SendOutcome::Unresolved { detail: held.to_owned() },
+                "{held:?} judges the transmission/session, not the event — must hold, not refuse"
+            );
+        }
+        for refusal in [
+            "blocked: no spam",
+            "invalid: bad sig",
+            "pow: difficulty 28 required",
+            "restricted: members only",
+            "unsupported: kind",
+        ] {
+            assert_eq!(
+                classify_ok_false(refusal),
+                SendOutcome::Refused { detail: refusal.to_owned() },
+                "a deliberate, understood OK:false stores nothing — {refusal:?} must refuse"
+            );
+        }
+    }
+
+    // The two pre-network guards in `send_signed_award_async` run BEFORE any client exists, so
+    // they are pure in-process assertions — and load-bearing: transmitting bytes that are not
+    // the pinned event would make confirm/record/probe chase an event that is not public, and
+    // the pay-window terminalizer would then repudiate a possibly-public award. Both damage
+    // classes report Unresolved (local corruption is never "never landed") and transmit nothing
+    // (the relay URL below is a closed port that would error loudly if dialled — but the guards
+    // return first).
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_refuses_to_transmit_bytes_that_are_not_the_pinned_event() {
+        use nostr_sdk::prelude::{EventBuilder, JsonUtil, Keys, Kind};
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(3405), "")
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let json = event.as_json();
+
+        // Bytes carrying a DIFFERENT id than the attempt is keyed on: refused locally.
+        let outcome =
+            send_signed_award_async(&keys, "ws://127.0.0.1:1", &"f".repeat(64), &json).await;
+        assert!(
+            matches!(&outcome, SendOutcome::Unresolved { detail } if detail.contains("keyed on")),
+            "wrong-id bytes must not transmit: {outcome:?}"
+        );
+
+        // Tampered content under the stored id: the id field still matches the attempt, so the
+        // id check passes and `verify()` is what catches it (the id no longer hashes the body).
+        let tampered = json.replace("\"content\":\"\"", "\"content\":\"x\"");
+        assert_ne!(tampered, json, "the tamper must actually change the bytes");
+        let outcome =
+            send_signed_award_async(&keys, "ws://127.0.0.1:1", &event.id.to_hex(), &tampered)
+                .await;
+        assert!(
+            matches!(&outcome, SendOutcome::Unresolved { detail } if detail.contains("verification")),
+            "tampered bytes must not transmit: {outcome:?}"
+        );
+    }
+
+    // Only the relay's own `OK:false` may produce Refused. Every OTHER failure of a send —
+    // timeout, transport, not-connected — says nothing about whether the event landed, and
+    // mapping any of them to Refused would re-open #322 (release + re-select on a lost OK).
+    #[test]
+    fn only_an_explicit_ok_false_can_refuse() {
+        use nostr_sdk::pool::relay::Error as RelayError;
+        assert!(matches!(
+            classify_send_error(RelayError::Timeout),
+            SendOutcome::Unresolved { .. }
+        ));
+        assert!(matches!(
+            classify_send_error(RelayError::NotConnected),
+            SendOutcome::Unresolved { .. }
+        ));
+        assert!(matches!(
+            classify_send_error(RelayError::RelayMessage("blocked: policy".to_owned())),
+            SendOutcome::Refused { .. }
+        ));
+        assert!(matches!(
+            classify_send_error(RelayError::RelayMessage("duplicate: seen".to_owned())),
+            SendOutcome::Acked
+        ));
+    }
+
+    // §1 RED-PROVE — the positive control `award_presence_async` (né `has_award_async`) never had.
+    //
+    // The probe is the sole input to "Invariant A: never award twice", and every observation of it
+    // has been `false`. A guard whose only observed outcome is the negative one is not evidence of
+    // anything: `fetch_events` returns Ok(empty) on timeout, so `Ok(false)` conflates "the relay says
+    // there is no award" with "nothing arrived in time" — and the filter asks for our OWN authored
+    // events, which is the one case nostr-sdk is known to treat specially.
+    //
+    // So: point it at a job that PROVABLY has an award and demand `true`. TRUE means the probe works
+    // and §1 is a three-state fix. Empty means Invariant A has been decorative since it was written.
+    //
+    // Ignored because it needs a live relay and a real home. Run explicitly:
+    //   REDPROVE_HOME=<home> REDPROVE_JOB=<job_id> REDPROVE_AWARD=<award_event_id> \
+    //     cargo test -p mobee-core red_prove_has_award -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a live relay and a real home; run explicitly with --ignored"]
+    async fn red_prove_has_award_async_returns_true_for_a_known_award() {
+        use nostr_sdk::prelude::{Client, EventId, Filter};
+
+        let root = std::env::var("REDPROVE_HOME").expect("REDPROVE_HOME");
+        let job_id = std::env::var("REDPROVE_JOB").expect("REDPROVE_JOB");
+        let award_id = std::env::var("REDPROVE_AWARD").expect("REDPROVE_AWARD");
+        let home = home::bootstrap(&root).expect("bootstrap home");
+        let keys = buyer_keys(&home).expect("buyer keys");
+        eprintln!(
+            "REDPROVE relay={} author={}",
+            home.config.relay_url,
+            keys.public_key().to_hex()
+        );
+
+        // POSITIVE CONTROL FIRST, built the same way the probe builds its client: fetch the known
+        // award BY ID. If this comes back empty the connection (or NIP-42 auth) is the problem, and
+        // an empty probe result below would say nothing at all about presence.
+        let client = Client::new(keys.clone());
+        client
+            .add_relay(&home.config.relay_url)
+            .await
+            .expect("add relay");
+        client.connect().await;
+        let control = client
+            .fetch_events(
+                Filter::new().id(EventId::from_hex(&award_id).expect("award id hex")),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("control fetch by id");
+        eprintln!("CONTROL fetch-award-by-id -> {} event(s)", control.len());
+
+        let probe = award_presence_async(&home, &keys, &job_id, Duration::from_secs(10)).await;
+        eprintln!("PROBE award_presence_async -> {probe:?}");
+
+        assert!(
+            !control.is_empty(),
+            "POSITIVE CONTROL FAILED: could not read a known event by id, so the probe's result is \
+             uninterpretable — fix the connection/auth before drawing any conclusion"
+        );
+        let found = match probe.expect("probe should not error once the control passes") {
+            PresenceRead::Present(found) => found,
+            other => panic!(
+                "award_presence_async returned {other:?} for a job with a KNOWN award while the \
+                 control passed — the guard cannot detect the thing it exists to detect"
+            ),
+        };
+        // Identity, not just presence: a probe that returns SOME award for the job would satisfy a
+        // bare `is_some()` while pointing at the wrong event, and the refusal message quotes this id
+        // to an operator.
+        assert_eq!(
+            found.award_event_id(),
+            award_id,
+            "the probe found an award for this job but not the KNOWN one"
+        );
+        // And the parse must survive a REAL event, not just the synthetic ones the unit tests build.
+        // An award this buyer itself published is the easiest case there is; if it cannot be parsed
+        // into a complete record, repair is dead on arrival in the field however green the unit
+        // tests are.
+        assert!(
+            matches!(found, AwardPresence::Repairable(_)),
+            "a real award published by this buyer must parse into a complete record, got: {found:?}"
+        );
     }
 }

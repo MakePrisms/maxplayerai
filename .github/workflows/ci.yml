@@ -19,6 +19,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build workspace (default features)
         run: cargo build --workspace --locked
+      # The release workflow is the only other caller of this script, and it runs on a tag — so
+      # until now the script itself was unverified code on every PR that changed what it checks,
+      # and a broken release verifier reached main invisibly (#278, #262). The binary argument is
+      # the load-bearing part: the artifact leg is the only one that inspects a built executable
+      # rather than the tree, and it is the leg that actually failed. A tree-only invocation here
+      # would be a green row blind to exactly the class of failure this guards.
+      - name: Verify the release version check agrees with the built binary
+        run: |
+          VERSION="$(cargo metadata --no-deps --format-version 1 \
+            | node -e 'const m=JSON.parse(require("fs").readFileSync(0,"utf8"));const p=m.packages.find(p=>p.name==="mobee");if(!p){process.stderr.write("no mobee package in cargo metadata\n");process.exit(1)}process.stdout.write(p.version)')"
+          ./scripts/verify-release-version.sh "$VERSION" target/debug/maxplayer
       - name: Test mobee-core (default features)
         run: cargo test -p mobee-core --locked
 
