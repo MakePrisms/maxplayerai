@@ -15,7 +15,7 @@ publish job stops on its first step. That is deliberate: the token lives in repo
 never in the tree.
 
 The launcher publishes as the unscoped package `maxplayer`; the per-platform payloads publish under
-the `@maxplayerai` scope. Both need to be writable by the token's account, and a scoped package's
+the `maxplayer-linux-x64` and `maxplayer-linux-arm64` packages. Both need to be writable by the token's account; `--access public` (passed by the job) is required for scoped first-publishes and a
 first publish needs `--access public`, which the publish job already passes.
 
 ## Cutting one
