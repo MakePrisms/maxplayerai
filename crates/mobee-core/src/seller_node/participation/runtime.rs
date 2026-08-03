@@ -736,6 +736,14 @@ impl Participation {
     /// pubkey — with `restricted:`, which this module turns into a reconnect. Signing as anyone else makes
     /// every test on this seam pass or fail for that reason instead of its own; it cost one round-13
     /// assertion that read as green while measuring a refusal.
+    ///
+    /// ⚠ WHAT THIS SEAM STILL CANNOT REACH: `ProbeOutcome::EchoObserved`. The fixture acknowledges an
+    /// `EVENT` without storing it and answers every `REQ` with a bare `EOSE`, so the read-back finds
+    /// nothing and a probe through here resolves `EchoMissing` however healthy the transport is. The
+    /// publisher and carrier below are what make the probe REACH the relay; they cannot make it come
+    /// back. So a test on this seam can assert that a probe was ATTEMPTED — the fixture counts the
+    /// socket — and must not assert re-admission, which would be an assertion about a branch no
+    /// in-process fixture can enter.
     #[cfg(test)]
     async fn for_live_test(url: &str, store: SellerStore, keys: nostr_sdk::prelude::Keys) -> Self {
         let me = keys.public_key();
@@ -3032,6 +3040,156 @@ mod tests {
             1,
             "the same dead socket was counted twice, so one flapping relay inflates the fault count \
              without anything new having failed"
+        );
+    }
+
+    /// ★★ THE ONE THING THE ROSTER'S OWN TESTS CANNOT SAY: THAT ANYTHING EVER CALLS IT.
+    ///
+    /// [`RelayRoster`] knows exactly when a quarantine comes due, and unit tests pin that arithmetic to
+    /// the second. But a backoff nobody reads is a label rather than a retry —
+    /// [`RelayRoster::relays_to_probe`] was for a long while consulted only at boot, so a relay
+    /// quarantined at runtime waited on a caller that never came and was lost until the process
+    /// restarted. The property here is therefore the WIRING: the pump, driven normally, goes back to
+    /// the wire for a relay whose backoff has elapsed — and does not before it has, nor after its
+    /// attempts are spent.
+    ///
+    /// The walk is the production one, end to end. The relay goes silent on a re-prove, which is the
+    /// path that quarantines a relay we are ALREADY SERVING and takes its socket away with it; the tick
+    /// then has to open a fresh one to ask again. `connections()` on the fixture is what makes that an
+    /// observation about the wire instead of an inference from our own bookkeeping — the roster could
+    /// record a probe that never left the process, and did, before the seam was rebuilt.
+    ///
+    /// ⚠ THE FIXTURE ACKNOWLEDGES AN `EVENT` WITHOUT STORING IT and answers every read with an empty
+    /// `EOSE`, so a probe through it can only ever resolve `EchoMissing`. That is why this test is about
+    /// the ATTEMPT and never about re-admission: `EchoObserved` is not reachable from any in-process
+    /// fixture we have, and an assertion about a state we cannot produce is an assertion about a path
+    /// that never runs.
+    #[tokio::test]
+    async fn the_tick_re_probes_a_quarantined_relay_once_its_backoff_has_elapsed() {
+        use super::super::relays::{MAX_PROBE_ATTEMPTS, QUARANTINE_BACKOFF_BASE_SECS};
+
+        let relay = PGateRelay::start(Duration::ZERO).await;
+        let url = relay.url();
+        let store = test_store("quarantine-tick");
+        let keys = Keys::generate();
+
+        let mut participation = Participation::for_live_test(&url, store, keys).await;
+        // The publisher and the reader, and nothing else — the same positive control the supervision
+        // test above rests on. Every count below is read against this, so a third party opening sockets
+        // is caught here rather than misread as a probe.
+        let settled = relay.connections();
+        assert_eq!(
+            settled, 2,
+            "expected exactly the publisher plus the reader; a different baseline means something else \
+             is connecting, and then a later count cannot mean a probe"
+        );
+
+        // ── The relay goes silent on a re-prove. This is the path that quarantines a live relay, and
+        //    the one that removes its socket — which is what leaves the retry with no caller at all
+        //    unless the tick provides one.
+        participation.owe_reprove(&url, now_unix());
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+
+        let entry = participation
+            .roster
+            .get(&url)
+            .expect("the roster still holds the relay it just judged");
+        assert!(
+            matches!(entry.state, AccessState::Quarantined { .. }),
+            "a relay that told us NOTHING landed in {:?}; the re-prove path has stopped producing the \
+             state whose retry this test is about, so everything below measures a different bug",
+            entry.state
+        );
+        assert!(
+            !participation.is_live(),
+            "the quarantined socket was kept, so `probe_one_due` would skip this relay for having one \
+             — and every count below would then mean nothing about its backoff"
+        );
+        // ★ THE FIRST NEGATIVE CONTROL, and it costs nothing: the very tick that quarantined this relay
+        // must not turn round and probe it. A pass that came from probing everything every tick is the
+        // busy-poll the backoff exists to prevent, and it would satisfy the positive assertion below
+        // just as well.
+        //
+        // ⚠ IT IS ORDERED AHEAD OF THE ATTEMPT COUNT DELIBERATELY. Both catch a backoff that is written
+        // and then ignored — the extra probe shows up as a socket AND as a second tally — but only this
+        // one NAMES it. Read the count first and the failure reports a silence that "was not tallied",
+        // which is the opposite of what happened and sends the next reader looking in the wrong place.
+        assert_eq!(
+            relay.connections(),
+            settled,
+            "the tick that quarantined this relay probed it again in the same pass — the backoff is \
+             being recorded and then ignored"
+        );
+        assert_eq!(
+            entry.probe_attempts, 1,
+            "one silence was not tallied exactly once, so the ceiling that ends this retry does not \
+             count what it is counting"
+        );
+
+        // ── Age the quarantine rather than sleeping through it. A second silence, recorded as if it had
+        //    happened a second before its backoff would have expired, is exactly the roster a node
+        //    running that long would hold. The second quarantine is one doubling, hence `2 *`; deriving
+        //    it from the constant means a change to the base cannot leave this test quietly waiting on a
+        //    deadline that has not arrived.
+        let aged = now_unix() - (2 * QUARANTINE_BACKOFF_BASE_SECS + 1);
+        participation
+            .roster
+            .record_probe(&url, ProbeOutcome::EchoMissing, aged);
+        // ★ THE PRECONDITION, STATED. Without this, a tick that never probes anything would pass the
+        // assertion below by agreeing with a roster that considered nothing due — the wiring would go
+        // unmeasured and the test would report that as a green.
+        assert!(
+            participation
+                .roster
+                .relays_to_probe(now_unix())
+                .any(|entry| entry.url == url),
+            "the roster does not consider this relay due, so the pump has nothing to be right or wrong \
+             about and the wiring is not under test"
+        );
+
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+        assert_eq!(
+            relay.connections(),
+            settled + 1,
+            "the pump never went back to a relay whose backoff had elapsed: nothing reaches \
+             `probe_one_due` from the tick, so a quarantine is a label and a briefly-silent relay is \
+             lost until the process restarts"
+        );
+
+        let entry = participation
+            .roster
+            .get(&url)
+            .expect("the roster still holds the relay the tick just probed");
+        assert_eq!(
+            entry.probe_attempts, MAX_PROBE_ATTEMPTS,
+            "the probe the tick opened a socket for was never folded back into the roster, so the \
+             attempts never run out and the retry has no end"
+        );
+        assert!(
+            matches!(entry.state, AccessState::Denied { .. }),
+            "three silences did not spend the ceiling ({:?}) — this walk retried until the budget was \
+             gone, and if that does not end in denial the bound is not the one the roster advertises",
+            entry.state
+        );
+
+        // ── And the bound holds ON THE WIRE, not only in the roster's arithmetic. A fourth pump must go
+        //    nowhere: a tick that kept asking a relay which has told us nothing three times is the
+        //    timer-less poll this module refuses everywhere else.
+        participation
+            .pump(Duration::from_millis(1))
+            .await
+            .expect("pump");
+        assert_eq!(
+            relay.connections(),
+            settled + 1,
+            "the tick probed a relay whose attempts are spent — the ceiling holds in the roster but not \
+             in the caller, so the backoff ends in a hot loop instead of a denial"
         );
     }
 
