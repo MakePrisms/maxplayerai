@@ -189,7 +189,10 @@ impl Participation {
     /// proved admission.
     ///
     /// `publisher` publishes the probe carrier; `carrier` is the event to use (the node's persona).
-    /// Neither is retained: this module holds no way to publish anything after start-up.
+    /// ★ BOTH ARE RETAINED, and the comment here used to say they were not — true when the only probe
+    /// happened at start-up, falsified in place once the tick began re-probing due quarantines. They are
+    /// held for THAT and nothing else: the sole publish this module performs is the access probe's own
+    /// persona write. There is still no path by which participation publishes anything else.
     ///
     /// A relay that REFUSES us is recorded denied and then left entirely alone. One that merely fails
     /// to answer is quarantined and tried again on a backoff — see [`AccessState::Quarantined`].
@@ -333,7 +336,14 @@ impl Participation {
                 now,
             );
             reader.disconnect().await;
-            return Err(error);
+            // ★★ `Ok`, NOT `Err`, AND THIS FUNCTION'S OWN DOC SAYS WHY: "start-up never fails because of
+            // a relay — a social surface must not be able to stop the node that earns money."
+            // Returning `Err` here handed exactly that power to one peer: `start` drains this with `?`, so
+            // a single relay that echoed the carrier and then dropped the subscribe aborted participation
+            // start-up for EVERY relay. The silence is recorded, so the backoff and the ceiling still
+            // apply to the relay that failed — and only to it. Same rule the resync lane already spells
+            // out one screen down: an error path that halts the loop turns one dead peer into an outage.
+            return Ok(true);
         }
 
         self.live.insert(
@@ -611,6 +621,14 @@ impl Participation {
             // HAND behind two round trips to relays that are by definition not the ones carrying work.
             // Traffic we have already read is now judged first, and the relay we are not yet serving
             // waits for the tail of the tick instead of the head of it.
+            //
+            // ⛔ NEITHER THE PLACEMENT NOR THE ONE-PER-TICK CAP IS PROTECTED AS A SET, and the surviving
+            // mutations are named because "untested" is too vague to act on: moving this call back ABOVE
+            // the batch loop, or changing it to drain every due probe instead of one, would both leave the
+            // whole suite green. The guard test that exists uses ONE relay with no buffered traffic, so it
+            // cannot see either. What it would take is two fixture relays, buffered live traffic, and
+            // several due quarantines, asserting the buffered traffic is ingested first and exactly one
+            // probe goes out. Not built; do not read the comment above as coverage.
             //
             // Best-effort FOR A RELAY'S OWN FAILURE, and only that. A relay we are not yet serving must
             // not be able to empty a batch or wedge the pump, so a subscribe that failed on the wire is
@@ -1128,14 +1146,6 @@ impl Participation {
             return;
         }
 
-        // ★ THE SUCCESS IS RECORDED TOO, and not as bookkeeping for its own sake: `record_probe` is
-        // what clears the consecutive-silence budget, so a re-prove that PASSES has to go through it
-        // or a relay that recovers here goes on carrying the tally of the silences it just recovered
-        // from — and is denied early on the next unrelated one. Both probe paths write to the same
-        // roster; only one of them was telling it about success.
-        self.roster
-            .record_probe(&url, ProbeOutcome::EchoObserved, now);
-
         // ★ Cleared because the thing the deadline was FOR — re-proving access — has now happened. This is
         // not the arm-on-the-way-in mistake: the wake surface is a separate debt, and it gets its own
         // marker below rather than riding on this one.
@@ -1152,7 +1162,22 @@ impl Participation {
             // ★ The rebuild that ends a quarantine pays whatever the quarantine held: the resync that could
             // not run, the re-sends that could not go out. Same settlement as the resync drain, because it
             // is the same install — see [`Self::settle_wake_surface`].
-            Ok(installed) => self.settle_wake_surface(&url, &installed, now),
+            Ok(installed) => {
+                // ★★★ AND ONLY HERE IS THE BUDGET CLEARED, because only here has this relay proved it will
+                // SERVE us. Recording the success straight after the echo — which is where it was — reset
+                // the attempt tally on the strength of a kind-0 read, and [`super::probe`]'s own doc warns
+                // that a relay may serve public metadata while refusing every `#p`-gated read. So a relay
+                // that echoed the carrier and then `CLOSED auth-required:` the membership filter on every
+                // cycle had its budget cleared each time and could NEVER reach `Denied`: an unbounded
+                // ping-pong, built by a fix whose whole purpose was to make the retry terminate.
+                //
+                // ⇒ THE BUDGET MUST BE CLEARED BY THE PROOF THAT MATTERS, NOT THE ONE THAT ARRIVES FIRST.
+                // The echo proves the transport; the wake surface proves the access. `probe_one_due` got
+                // this right by construction — it records after the install — and this path did not.
+                self.roster
+                    .record_probe(&url, ProbeOutcome::EchoObserved, now);
+                self.settle_wake_surface(&url, &installed, now)
+            }
             Err(_) => {
                 self.relay_faults = self.relay_faults.saturating_add(1);
                 if let Some(live) = self.live.get_mut(&url) {

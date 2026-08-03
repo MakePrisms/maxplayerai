@@ -127,9 +127,18 @@ pub async fn probe_access(
         // their wording — both meant unproven, therefore unused. Once refusal became TERMINAL and
         // silence became a bounded retry, the same label started costing the relay permanently.
         Err(error) => {
-            return ProbeOutcome::Unreachable(format!(
-                "the probe publish could not be sent: {error}"
-            ));
+            // ★ DEFENSIVE, AND SAID TO BE SO RATHER THAN IMPLIED. A refusal does NOT arrive here — that
+            // was measured, not assumed: with the fixture answering `OK: false`, the verdict came out of
+            // the delivery check below, carrying `"<url>: blocked: ..."`. So no known path reaches this
+            // arm with a relay's words in it. The test runs anyway because the cost is one string compare
+            // and the alternative is an arm that would quarantine a durable refusal if the SDK ever did
+            // route one here. ⇒ insurance with a reason; do not read it as covered.
+            let reason = error.to_string();
+            return if is_relay_refusal(&reason) {
+                ProbeOutcome::Refused(format!("the relay refused the probe publish: {reason}"))
+            } else {
+                ProbeOutcome::Unreachable(format!("the probe publish could not be sent: {reason}"))
+            };
         }
         // ★ A pool `Ok` is acceptance, not delivery — see [`super::undelivered`]. Both outcomes are
         // fail-closed, so this is not an admission bug; it is a DIAGNOSIS bug, and those are the ones
@@ -218,10 +227,12 @@ pub async fn probe_access(
 /// `restricted:` after it is prose. That is a false positive in the expensive direction, which is
 /// the one thing this function exists to avoid.
 ///
-/// `starts_with` cannot be used instead: the reason arrives WRAPPED, because `undelivered` prepends
-/// the relay URL and the SDK embeds a relay's message inside its own error Display. Position 0 is
-/// therefore ours, not the relay's. Taking the EARLIEST known prefix finds the relay's own opening
-/// word wherever the wrapper put it, and a later prefix cannot overrule an earlier one.
+/// `starts_with` cannot be used instead, and that is MEASURED rather than argued: a fixture answering
+/// `OK: false` with `"blocked: not on the allow list"` produced the pool value
+/// `"ws://127.0.0.1:45167: blocked: not on the allow list"`. **Position 0 is the URL — ours, not the
+/// relay's** — so a prefix test anchored at the start reads every refusal as no refusal at all. Taking
+/// the EARLIEST known prefix finds the relay's own opening word wherever the wrapper put it, and a
+/// later prefix cannot overrule an earlier one.
 fn is_relay_refusal(reason: &str) -> bool {
     /// The relay refusing durably: it will keep saying no, or the event is ours to fix.
     const DURABLE: [&str; 4] = ["blocked:", "restricted:", "invalid:", "pow:"];
@@ -249,6 +260,7 @@ pub fn carrier_is_storable(event: &Event) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::seller_node::p_gate_relay_fixture::PGateRelay;
     use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
     use nostr_sdk::prelude::{EventBuilder, Keys, Kind, RelayPoolNotification};
 
@@ -539,6 +551,43 @@ mod tests {
             other => panic!(
                 "an undelivered publish is SILENCE — reading `failed` as a refusal denies a relay \
                  permanently for a socket that was never dialled: {other:?}"
+            ),
+        }
+    }
+
+    /// ★★ THE HELPER IS TESTED BELOW; THIS IS WHETHER ANYTHING CALLS IT.
+    ///
+    /// Round 17 named the surviving mutation exactly: replace a call-site condition with `false` and the
+    /// table test still passes, because a unit test on a predicate says nothing about the branch that
+    /// consults it. So this is the integration half — a relay that really answers `OK: false blocked:`
+    /// on the wire, through the whole of `probe_access`.
+    ///
+    /// ★ IT ALSO ANSWERS A QUESTION THE UNIT TEST CANNOT: WHICH arm the SDK routes an `OK: false` to.
+    /// The publish has a send-`Err` arm and a delivery-check arm, and a durable refusal must come out
+    /// `Refused` from whichever one it lands in — so both now consult the discriminator, and this test
+    /// is what proves the reachable one does.
+    #[tokio::test]
+    async fn a_relay_that_rejects_the_publish_outright_is_refused_not_quarantined() {
+        let fixture = PGateRelay::start(Duration::ZERO).await;
+        fixture.reject_publishes("blocked: not on the allow list").await;
+        let url = fixture.url();
+        let keys = Keys::generate();
+        let publisher = connect(&url, keys.clone()).await;
+        let reader = connect(&url, Keys::generate()).await;
+
+        let outcome =
+            probe_access(&publisher, &url, &reader, &persona(&keys), Duration::from_secs(2)).await;
+
+        match outcome {
+            ProbeOutcome::Refused(reason) => assert!(
+                reason.contains("blocked:"),
+                "the verdict is right but it must carry the RELAY'S OWN WORDS — without them an operator \
+                 cannot tell a policy refusal from our transport, and this reason string is the only \
+                 place that distinction survives: {reason}"
+            ),
+            other => panic!(
+                "a relay that answered OK:false with a durable prefix must be REFUSED. Quarantining it \
+                 retries a relay that told us NO, which the charter forbids outright: {other:?}"
             ),
         }
     }

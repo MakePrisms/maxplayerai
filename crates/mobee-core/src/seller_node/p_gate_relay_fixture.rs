@@ -71,6 +71,13 @@ struct Controls {
     /// Writer for the most recently accepted socket, so a test can push an UNSOLICITED `CLOSED` —
     /// which is what the deployed relay does, and what neither a REQ nor a policy hook can model.
     live: Mutex<Option<Arc<Mutex<Writer>>>>,
+    /// When set, every `EVENT` is answered `OK: false` with this reason instead of accepted.
+    ///
+    /// Exists because a relay REFUSING A WRITE is not reachable any other way in process: the read
+    /// gate above refuses `REQ`s, and `nostr-relay-builder` accepts whatever it is given. A publish
+    /// refusal is the one thing that must come out `Refused` rather than quarantined, so it needs a
+    /// relay that will actually say no on the wire.
+    reject_publish: Mutex<Option<String>>,
 }
 
 /// A running fixture relay. Dropping it stops accepting new connections.
@@ -154,6 +161,14 @@ impl PGateRelay {
         if let Some(writer) = live {
             let _ = writer.lock().await.close().await;
         }
+    }
+
+    /// Answer every `EVENT` with `OK: false` and this reason — a relay that refuses our WRITES.
+    ///
+    /// `reason` should carry a NIP-01 machine-readable prefix, because that is what a caller has to
+    /// tell a policy refusal apart from a transport fault.
+    pub(super) async fn reject_publishes(&self, reason: &str) {
+        *self.controls.reject_publish.lock().await = Some(reason.to_string());
     }
 
     /// Refuse the next `count` `REQ`s for `subscription_id` that carry an un-pinned filter — i.e. a
@@ -254,7 +269,10 @@ async fn serve_connection(
             Some("EVENT") => {
                 let Some(event) = frame.get(1) else { continue };
                 let id = event.get("id").and_then(Value::as_str).unwrap_or_default();
-                send(&writer, json!(["OK", id, true, ""])).await?;
+                match controls.reject_publish.lock().await.clone() {
+                    Some(reason) => send(&writer, json!(["OK", id, false, reason])).await?,
+                    None => send(&writer, json!(["OK", id, true, ""])).await?,
+                }
             }
             Some("REQ") => {
                 let Some(subscription_id) =
