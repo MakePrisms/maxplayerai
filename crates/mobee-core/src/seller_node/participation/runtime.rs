@@ -540,7 +540,16 @@ impl Participation {
                     // ★ And success discharges EVERY debt this install paid, not just the one that asked
                     // for it — see [`Self::settle_wake_surface`]. It advances the floor too.
                     Ok(installed) => self.settle_wake_surface(url, &installed, now),
-                    Err(_) => {
+                    Err(error) => {
+                        // ★★★ OUR STORE IS NOT THIS RELAY'S FAULT, and this helper fails as either.
+                        // `resync_relay` reads three cursors before it sends anything, so an `Err` here is
+                        // a wire failure OR our sqlite — and one handling is wrong for both: the relay is
+                        // charged a fault that belongs to no relay, and the only condition that will not
+                        // heal on its own is swallowed by the `_`. The same split `drain_reproves` makes
+                        // below, on the same error out of the same helper.
+                        if let ParticipationError::Store(_) = error {
+                            return Err(error);
+                        }
                         self.relay_faults = self.relay_faults.saturating_add(1);
                         if let Some(live) = self.live.get_mut(url) {
                             live.last_resync_unix = now;
@@ -558,7 +567,7 @@ impl Participation {
             // being individually right about their own preconditions was not enough: whether the relay
             // will still talk to us is a precondition of all of them, and it belongs to none of them.
             // `drain_reproves` is the exception because it IS that gate.
-            self.drain_resends(now).await;
+            self.drain_resends(now).await?;
             self.drain_reproves(now).await?;
 
             // ★ THE `?`s BELOW CARRY ONLY `Store` ERRORS, BY CONSTRUCTION — and that is a property to
@@ -1030,7 +1039,7 @@ impl Participation {
     /// leaves the channel un-resumable while the debt still says "ask for this". Record-time truth is not
     /// fire-time truth. So the gate is checked HERE as well as at the set-sites, and the debt is dropped
     /// rather than sent.
-    async fn drain_resends(&mut self, now: i64) {
+    async fn drain_resends(&mut self, now: i64) -> Result<(), ParticipationError> {
         let due: Vec<(String, Option<String>)> = self
             .live
             .iter()
@@ -1065,34 +1074,38 @@ impl Participation {
                     }
                     continue;
                 }
-                // A store read failing decides nothing either way, so the debt keeps its turn.
-                Err(_) => {
-                    self.relay_faults = self.relay_faults.saturating_add(1);
-                    if let Some(live) = self.live.get_mut(&url) {
-                        live.resend_due
-                            .insert(target, now.saturating_add(MIN_RESYNC_INTERVAL_SECS));
-                    }
-                    continue;
-                }
+                // ★★★ THE TYPE PROVES WHOSE FAULT THIS IS: `is_resumable` returns `StoreError`, so there
+                // is no wire failure this arm could be describing. It used to charge the relay a fault and
+                // push the debt out a whole interval — wrong on both counts, because the relay did nothing
+                // and the store failure was never reported. It leaves by the one door that names it.
+                Err(error) => return Err(ParticipationError::Store(error)),
             }
             let Some(entry) = self.live.get(&url) else {
                 continue;
             };
+            // ★★★ THE CURSOR READ IS LIFTED OUT OF `outcome`, so that what remains can only be a wire
+            // result — `subscribe_channel` and `subscribe_membership` return nothing but
+            // `ParticipationError::Relay`. Folding the store failure into the same `Result` as the send
+            // made `outcome.is_ok()` a question not worth asking: one bucket holding both "the relay
+            // refused" and "our sqlite is down", handled as the first. Reading the cursor with `?` DELETES
+            // that ambiguity instead of testing for it — the best fix removes the surface. The comment
+            // that stood here said "a store read failing is not a relay fault" and the next line counted
+            // one anyway, which is how it survived four reviews: a comment cannot recompile.
             let outcome = match &target {
-                Some(channel_id) => match entry.engine.channel_cursor(channel_id) {
-                    Ok(since) => subscribe_channel(&entry.reader, channel_id, self.me, since).await,
-                    // A store read failing is not a relay fault, but it is also not a reason to stop
-                    // serving other relays. Count it and move on; the entry stays owed.
-                    Err(error) => Err(ParticipationError::Store(error)),
-                },
-                None => match entry.engine.membership_cursor() {
-                    Ok(since) => subscribe_membership(&entry.reader, self.me, since).await,
-                    Err(error) => Err(ParticipationError::Store(error)),
-                },
+                Some(channel_id) => {
+                    let since = entry.engine.channel_cursor(channel_id)?;
+                    subscribe_channel(&entry.reader, channel_id, self.me, since).await
+                }
+                None => {
+                    let since = entry.engine.membership_cursor()?;
+                    subscribe_membership(&entry.reader, self.me, since).await
+                }
             };
             let Some(live) = self.live.get_mut(&url) else {
                 continue;
             };
+            // `outcome` can only be a wire result by the construction above, so this fault is honestly the
+            // relay's and the deferral is charged to the party that earned it.
             if outcome.is_ok() {
                 live.resend_due.remove(&target);
             } else {
@@ -1101,6 +1114,7 @@ impl Participation {
                     .insert(target, now.saturating_add(MIN_RESYNC_INTERVAL_SECS));
             }
         }
+        Ok(())
     }
 
     /// Re-prove access on ONE relay whose reconnect has settled, and rebuild its wake surface.
