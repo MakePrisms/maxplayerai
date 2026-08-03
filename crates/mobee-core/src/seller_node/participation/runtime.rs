@@ -1210,16 +1210,24 @@ impl Participation {
             // silence, drop the socket, and let `relays_to_probe` own the backoff, the ceiling and the
             // eventual denial. One body decides how a relay that will not serve us is treated.
             //
-            // ⛔ UNTESTED, AND IT IS THE THIRD BRANCH IN THIS FAMILY BLOCKED BY ONE MISSING FIXTURE
-            // CAPABILITY — worth stating as a set rather than three times as an apology. All three need a
-            // relay that ECHOES the carrier and THEN fails a subscribe: this one, `probe_one_due`'s install
-            // failure, and the `Store` split inside it. `PGateRelay` gates `#p` and answers `restricted:`
-            // but cannot serve a stored event back, so it can never get past the echo; `LocalRelay` serves
+            // ⛔ THE WIRE HALF OF THIS ARM IS UNTESTED, AND IT IS ONE OF TWO BRANCHES BLOCKED BY ONE
+            // MISSING FIXTURE CAPABILITY — worth stating as a set rather than twice as an apology. Both
+            // need a relay that ECHOES the carrier and THEN fails a subscribe: this one and
+            // `probe_one_due`'s install failure. `PGateRelay` gates `#p` and answers `restricted:` but
+            // cannot serve a stored event back, so it can never get past the echo; `LocalRelay` serves
             // events but cannot gate, so it can never fail the subscribe. Note a CLOSED will NOT do it —
             // `subscribe_with_id` returns once the REQ is sent, so a refusal arrives too late to become an
-            // `Err`; the socket has to be GONE by subscribe time. ⇒ the one fixture that unblocks all three
-            // is `PGateRelay` plus stored-event service plus a close-after-serving-the-echo control. Until
-            // then this is insurance with a reason, and its presence is not coverage.
+            // `Err`; the socket has to be GONE by subscribe time. ⇒ the one fixture that unblocks both is
+            // `PGateRelay` plus stored-event service plus a close-after-serving-the-echo control. Until
+            // then the wire half is insurance with a reason, and its presence is not coverage.
+            //
+            // ★★★ THE STORE HALF WAS NEVER BLOCKED, THOUGH THIS LIST CLAIMED IT WAS — a reasoning error
+            // wearing a fixture gap's clothes, and it kept a reachable branch untested for a whole round.
+            // A store failure needs no failed subscribe at all: `probe_access` reads no store, and
+            // `subscribe_wake_surface` reads `membership_cursor` BEFORE it touches the wire, so a relay
+            // that merely PASSES the probe is enough — and `LocalRelay` does that, already a
+            // dev-dependency. Covered by
+            // `a_store_fault_rebuilding_the_wake_surface_is_not_charged_to_the_relay`.
             Err(error) => {
                 // ★★★ AND THE STORE IS SPLIT OUT HERE TOO — THE FOURTH SITE, AND I HAD ALREADY WRITTEN
                 // THIS EXACT SPLIT IN `probe_one_due` ONE FUNCTION AWAY. `subscribe_wake_surface` reads
@@ -1227,8 +1235,12 @@ impl Participation {
                 // silence budget charges OUR sqlite to a healthy peer — the same misattribution the last
                 // three rounds each fixed in a different place. A local failure is identical across every
                 // relay, which is exactly why it cannot be any relay's fault.
+                // ★★★ AND NOT COUNTED, WHICH IS THE HALF THIS BLOCK GOT WRONG WHILE EXPLAINING IT. The
+                // split above sends the store error home instead of the roster, so the QUARANTINE budget
+                // is clean — and then the fault counter was charged anyway, one line under a comment
+                // arguing it must not be. TWO BUDGETS LIVE IN THIS ARM, `record_probe` and
+                // `relay_faults`, and fixing the one being thought about is not fixing the arm.
                 if let ParticipationError::Store(_) = error {
-                    self.relay_faults = self.relay_faults.saturating_add(1);
                     return Err(error);
                 }
                 self.relay_faults = self.relay_faults.saturating_add(1);
@@ -1810,6 +1822,7 @@ mod tests {
     use super::*;
     use crate::seller_node::p_gate_relay_fixture::{PGateRelay, Verdict};
     use crate::seller_node::store::RETRY_EOSE_TIMEOUT_SECS;
+    use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
     use nostr_sdk::prelude::{EventBuilder as TestEventBuilder, Keys, Kind};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2983,6 +2996,53 @@ mod tests {
         assert!(
             participation.resync_pending(BAD_RELAY),
             "the debt was discharged by a resync that never happened"
+        );
+    }
+
+    /// The fourth site, and the one my own enumeration missed — found by review, not by the grep.
+    ///
+    /// ★★★ TWO BUDGETS LIVED IN ONE ARM. Round 19 split the store out of `record_probe`, so the
+    /// QUARANTINE budget was clean, and left `relay_faults` charged one line below a comment explaining
+    /// why it must not be. I then classified the site as handled because the function HAD a `Store`
+    /// guard — judging the arm by the guard's EXISTENCE rather than by what sat inside it. A guard is not
+    /// a certificate for everything in its block.
+    ///
+    /// ★★ AND THIS BRANCH WAS NEVER FIXTURE-BLOCKED, though the module said it was. The declaration next
+    /// to it lists the store split among three branches needing a relay that echoes the carrier and THEN
+    /// fails a subscribe — but a STORE failure does not need the subscribe to fail at all.
+    /// `probe_access` touches no store, and `subscribe_wake_surface` reads `membership_cursor` before it
+    /// reaches the wire, so all this needs is a relay that PASSES the probe. `LocalRelay` does that, and
+    /// was already a dev-dependency. The gap was in the reasoning, not the fixtures.
+    #[tokio::test]
+    async fn a_store_fault_rebuilding_the_wake_surface_is_not_charged_to_the_relay() {
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("run the local relay");
+        let url = relay.url().await.to_string();
+        let (store, path) = test_store_with_path("reprove-store-fault");
+        let mut participation =
+            Participation::for_live_test(&url, store, Keys::generate()).await;
+
+        // Safe to take away before the probe: the probe publishes the carrier and reads it back BY ID,
+        // touching no store at all, so this cannot reach the echo — only the rebuild after it.
+        take_away_table(&path, "participation_cursors");
+        participation.owe_reprove(&url, now_unix());
+
+        let outcome = participation.drain_reproves(now_unix()).await;
+
+        // ★ The `Err` IS the positive control here. A probe resolving anything other than `EchoObserved`
+        // returns `Ok(())` without reaching the rebuild, and the rebuild is the only store read in this
+        // function — so this cannot be green for a probe that failed, and cannot be reached by any other
+        // store error.
+        assert!(
+            matches!(outcome, Err(ParticipationError::Store(_))),
+            "either the probe never reached EchoObserved, or the rebuild's store failure was swallowed \
+             — drain_reproves returned {outcome:?}"
+        );
+        assert_eq!(
+            participation.relay_faults(),
+            0,
+            "our sqlite failing was charged to a relay that had just proved its transport works, which \
+             is the misattribution this whole family of fixes exists to remove"
         );
     }
 
