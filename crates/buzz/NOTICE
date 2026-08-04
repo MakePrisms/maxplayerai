@@ -1,0 +1,51 @@
+Buzz relay — vendored into maxplayerai
+======================================
+
+The code under `crates/buzz/` is a vendored subset of the Buzz communications
+platform, copied so the maxplayerai project can own, build, and deploy the
+events + git + payments relay directly.
+
+    Upstream:  github.com/gudnuf/buzz  (a fork of github.com/block/buzz)
+    Branch:    sync/upstream-recarry-2026-07-24
+    Commit:    e18020a63
+    License:   Apache-2.0 (see ./LICENSE)
+
+Buzz is Copyright the Buzz / Block authors, licensed under the Apache License,
+Version 2.0. maxplayerai is MIT-OR-Apache-2.0; vendoring Apache-2.0 code in is
+compatible. This NOTICE and the per-file notes below satisfy Apache-2.0 §4(b)
+("You must cause any modified files to carry prominent notices stating that You
+changed the files").
+
+MODIFICATIONS relative to the upstream branch above
+---------------------------------------------------
+Every file under `crates/buzz/` is a byte-verbatim copy of the upstream source
+EXCEPT the three changes below. The layout mirrors the upstream repo root (its
+`crates/`, `migrations/`, `Dockerfile`, `LICENSE`) so `git diff` against
+block/buzz stays meaningful and upstream commits remain scannable/pullable.
+
+1. `Cargo.toml` — workspace `members` trimmed from the upstream ~27-crate set to
+   the 12-crate transitive `[dependencies]` closure of `buzz-relay`, so the
+   relay compiles standalone. `exclude = ["desktop/src-tauri"]` dropped (desktop
+   not vendored). No dependency versions or `[patch.crates-io]` entries changed.
+
+2. `rust-toolchain.toml` (upstream pins channel 1.95.0) intentionally NOT
+   vendored — maxplayerai supplies the Rust toolchain via nix. NOTE: the relay's
+   sqlx 0.9 requires rustc >= 1.94, which is newer than the maxplayerai nix
+   devShell default (nixos-25.11 -> 1.91.1); the build toolchain must provide
+   >= 1.94.
+
+3. `crates/buzz-relay/src/handlers/ingest.rs` — added the MakePrisms/maxplayerai
+   #397 payment/DoS bound on NIP-17 gift wraps (kind 1059): a gift wrap must
+   carry at least one `p` tag and its content must be <= 128 KB. Marked inline
+   with a `#397` comment. No other source (`.rs`) files were modified; the Mobee
+   job kinds already present upstream are carried verbatim.
+
+Vendored (the 12-crate relay build closure): buzz-relay, buzz-core,
+buzz-conformance, buzz-db, buzz-pubsub, buzz-auth, buzz-search, buzz-audit,
+buzz-workflow, buzz-media, buzz-sdk, buzz-relay-mesh.
+
+Left behind (not in the relay's build closure): the AI-agent harness (buzz-acp,
+buzz-agent, buzz-dev-mcp, buzz-persona), device pairing (buzz-pair-relay,
+buzz-pairing-cli), desktop / mobile / web clients, CLIs (buzz-cli, buzz-admin),
+buzz-push-gateway, buzz-test-client, buzz-ws-client, sprig, the git-*-nostr
+credential helpers, and examples/countdown-bot.
