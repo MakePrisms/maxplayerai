@@ -477,13 +477,13 @@ pub async fn authorize_pay_async(
 
     let wallet = buyer_fund::open_wallet_at_mint_async(home, &wallet_open_mint_url(home, &terms))
         .await?;
-    // The N=1 dust guard runs INSIDE lock_or_reconcile on the wallet worker
-    // (`require_fee_safe_amount`, payment_wallet.rs:252), never here. A pre-spawn call at this site
-    // ran wallet HTTP on the CALLER runtime; on the current-thread runtime `collect_blocking` builds
-    // (collect.rs), that primed a reqwest pooled connection whose IO driver task lived on the caller.
-    // The worker then blocked that same caller runtime on the effects bridge's `recv`, so the pooled
-    // connection its `prepare_send` needed could never be driven — both parked forever
-    // (MakePrisms/maxplayerai#387). Invariant: wallet HTTP runs ONLY on the worker runtime.
+    // Wallet HTTP must run ONLY on the wallet worker, never on this caller runtime. A pre-spawn dust
+    // check here ran on the current-thread runtime `collect_blocking` builds (collect.rs), priming a
+    // reqwest pooled connection whose IO driver task lived on the caller; the worker then blocked that
+    // same runtime on the effects bridge `recv`, so the pooled connection its `prepare_send` needed
+    // could never be driven — both parked forever (MakePrisms/maxplayerai#387). The N=1 dust guard is
+    // instead run as a WORKER preflight just below (pre-reserve, so a dead mint burns zero budget) and
+    // re-checked inside lock_or_reconcile (payment_wallet.rs).
     let payment_send = NostrPaymentSend::new(home.config.relay_url.clone(), keys);
     let mut effects = CdkPaymentEffects::spawn(
         wallet,
@@ -500,6 +500,15 @@ pub async fn authorize_pay_async(
         },
     )
     .map_err(|error| AuthorizePayError::Effects(error.to_string()))?;
+
+    // Pre-reserve dust/liveness guard, run on the WORKER runtime (see above). A dead/hung mint refuses
+    // HERE — before the budget gate below — so it burns ZERO spend, exactly as the removed pre-spawn
+    // check did, but with wallet HTTP on the worker (no cross-runtime deadlock). Bounded by
+    // MINT_TOUCH_TIMEOUT (inside the check) + the bridge recv ceiling. lock_or_reconcile re-checks the
+    // real input-count fee after prepare_send; this only refuses the dead-mint / N=1-dust cases early.
+    effects
+        .preflight_fee(terms.amount)
+        .map_err(|error| AuthorizePayError::Effects(error.to_string()))?;
 
     // Payment journal — created only AFTER the pre-pay seam passed (a pre-pay refusal leaves no
     // journal on disk, preserving the zero-spend / no-record invariant).

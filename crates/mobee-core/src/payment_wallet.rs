@@ -1418,6 +1418,13 @@ pub struct CdkSellerReceive<'a> {
 }
 
 enum BuyerCommand {
+    /// Pre-reserve dust/liveness probe: runs `require_fee_safe_amount` ON THE WORKER runtime so a
+    /// dead/hung mint refuses BEFORE the caller commits budget — and without the caller-runtime wallet
+    /// HTTP that deadlocked #387. Read-only (queries the keyset fee); no proofs move.
+    PreflightFee {
+        amount: Amount,
+        response: mpsc::SyncSender<Result<(), PaymentWalletError>>,
+    },
     Lock {
         attempt_id: AttemptId,
         terms: PaymentTerms,
@@ -1529,6 +1536,13 @@ impl<R> CdkPaymentEffects<R> {
                 runtime.block_on(async move {
                     while let Some(command) = requests.recv().await {
                         match command {
+                            BuyerCommand::PreflightFee { amount, response } => {
+                                // Read-only dust/liveness probe on the worker runtime; a dead mint
+                                // fails closed (bounded by MINT_TOUCH_TIMEOUT) before any budget commit.
+                                let result =
+                                    require_fee_safe_amount(&wallet, amount).await.map(|_fee| ());
+                                let _ = response.send(result);
+                            }
                             BuyerCommand::Lock {
                                 attempt_id,
                                 terms,
@@ -1612,6 +1626,14 @@ impl<R> CdkPaymentEffects<R> {
                 self.recv_timeout
             ))),
         }
+    }
+
+    /// Pre-reserve dust/liveness guard, executed on the wallet worker (never the caller runtime). A
+    /// dead/hung mint refuses with a bounded fail-closed error; the pay path returns BEFORE the budget
+    /// gate, so a refusal burns ZERO spend — the property the removed pre-spawn check gave, minus the
+    /// #387 cross-runtime deadlock. Read-only: queries the keyset fee, no proofs move.
+    pub fn preflight_fee(&self, amount: Amount) -> Result<(), EffectError> {
+        self.request(|response| BuyerCommand::PreflightFee { amount, response })
     }
 }
 
@@ -3230,6 +3252,62 @@ mod tests {
         );
         drop(ctl_tx); // Disconnected ⇒ the control thread returns and exits — no leaked thread
         handle.join().unwrap();
+    }
+
+    // PAY-PATH ZERO-SPEND + NO-PARK RED-PROVE (#387) — pins BOTH properties on the SAME
+    // never-answering-mint scenario, in ONE test, so neither regresses silently (the see-saw: the
+    // pre-fix code was zero-spend but PARKED; bounding the bridge alone was no-park but LEAKED).
+    // Mirrors authorize_pay's real order: a PRE-RESERVE worker preflight, THEN the gated pay. A worker
+    // that never answers fails the preflight, so the budget gate is never entered.
+    // Non-vacuity (closes the see-saw): drop the recv_timeout ⇒ the preflight parks and THIS test
+    // hangs; drop the preflight (as the deadlock fix alone did) ⇒ the never-answer reaches the gate and
+    // leaks (gate.spent() != 0, the phantom spend keeper flagged).
+    #[test]
+    fn pay_path_timeout_refuses_bounded_without_charging_the_budget() {
+        let terms = wallet_terms(secret_key(9).public_key());
+        let key = payment_key(&terms);
+        let attempt = key.attempt_id();
+        let authority = authority();
+        let journal = MemoryPaymentJournal::default();
+
+        // Never-answering worker: command Receiver kept alive but never drained ⇒ every command is
+        // buffered forever with no answer coming (the wedged-worker / dead-mint condition).
+        let (commands, _requests) = tokio::sync::mpsc::channel::<BuyerCommand>(1);
+        let mut effects = CdkPaymentEffects {
+            commands: Some(commands),
+            worker: None,
+            receipt: move |key: &PaymentKey, _: &PaymentSent| Ok(cosigned_receipt(key)),
+            recv_timeout: Duration::from_millis(150),
+        };
+
+        let mut gate = crate::budget::BudgetGate::new(1_000, 1_000);
+        let charged = 7u64; // == terms.amount (Amount::from(7))
+
+        let start = std::time::Instant::now();
+        // authorize_pay runs this PRE-RESERVE preflight on the worker, then only reserves + pays if it
+        // passed. A never-answering mint fails it, so the gate below is never entered.
+        let preflight = effects.preflight_fee(terms.amount);
+        let mut entered_gate = false;
+        if preflight.is_ok() {
+            entered_gate = true;
+            let _ = gate.authorize_then_attempt(attempt.as_str(), charged, || {
+                PaymentService::new(&journal).run_verified(&key, &terms, &authority, &mut effects)
+            });
+        }
+        let elapsed = start.elapsed();
+
+        // (i) fail-closed refusal at the pre-reserve preflight (the never-answering mint).
+        assert!(preflight.is_err(), "a never-answering mint must fail the pre-reserve preflight");
+        assert!(!entered_gate, "a failed preflight must short-circuit BEFORE the budget gate");
+        // (ii) bounded — no park (without the recv_timeout this line is unreachable; the test hangs).
+        assert!(elapsed < Duration::from_secs(5), "must be bounded (no park), took {elapsed:?}");
+        // (iii) ZERO SPEND — the reserve never ran, so the never-answer burns no budget.
+        assert_eq!(
+            gate.spent(),
+            0,
+            "PHANTOM SPEND (#387): a never-answer pay-path timeout charged {} sats — a hang traded for a leak",
+            gate.spent()
+        );
     }
 
     #[test]
