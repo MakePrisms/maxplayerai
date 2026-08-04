@@ -387,3 +387,116 @@ async fn collect_passes_the_sentinel_gate_for_a_valid_delivery() {
     }
     let _ = fs::remove_dir_all(&root);
 }
+
+// ── #387 preflight-before-reserve ORDER gate — a dead mint burns ZERO budget, over the REAL path ───
+//
+// The see-saw (2eda85d → ef7a49e): the cross-runtime deadlock fix unparked the hang but LEAKED budget
+// — a dead mint left `gate.spent()==charged` because `authorize_then_attempt` reserves BEFORE the
+// effect and never rolls back. Option A (ef7a49e) runs `require_fee_safe_amount` as a WORKER-side
+// `PreflightFee` in `authorize_pay_async` AFTER `spawn_effects` and BEFORE `gate.authorize_then_attempt`,
+// so a dead mint refuses BEFORE the budget reserve (zero spend). A primitive unit test
+// (`pay_path_timeout_refuses_bounded_without_charging_the_budget`, payment_wallet.rs) pins that ORDER
+// at the unit level; here the SAME order is an EXECUTING guard over the real `collect_async` →
+// `authorize_pay_async` entrypoint — the buyer watcher's own melt path (see the §19 note above) — driven
+// through a real HTTPS delivery fetch.
+//
+// The delivery is pinned + cosigned + carries THIS job's execution sentinel, so the cosig tooth, the
+// tip-match and the §19 gate all PASS and the flow reaches the wallet; the wallet then opens at a DEAD
+// realized mint (127.0.0.1:1, TCP connect refused), so the pre-reserve preflight is the one thing left
+// to refuse. It must refuse `mint_unreachable_pay` with ZERO spend, bounded (no park), no journal.
+//
+// Red-on-reorder (measured, non-vacuous): move the `effects.preflight_fee(..)?` guard BELOW
+// `gate.authorize_then_attempt` and the dead mint reaches the gate first — the reserve commits
+// (`gate.spent()==charged`, and a journal is written) before the preflight ever runs, so every ZERO
+// assertion below flips and this test goes RED. That is the exact budget leak Option A closes.
+//
+// `allow_real_mints=true` is ISOLATED to this test home so the pay path will resolve + open the wallet
+// at the (dead) real mint; 127.0.0.1:1 refuses the connect, so NO real mint is contacted and no money
+// can move. The cosig is unaffected — the `ReceiptPreimage` binds no mint
+// (`receipt_preimage_digest_is_independent_of_realized_mint`, authorize_pay.rs).
+#[tokio::test(flavor = "current_thread")]
+async fn collect_refuses_dead_mint_at_preflight_before_the_budget_reserve() {
+    init_test_env();
+    // An unroutable mint URL that refuses the TCP connect instantly — the deterministic dead-mint
+    // stand-in the pay-path dust guard's own unit test uses (payment_wallet.rs `DEAD_MINT`); no live
+    // network, no real hang wait.
+    const DEAD_MINT: &str = "https://127.0.0.1:1";
+
+    // A from-scratch delivery whose tip carries THIS job's execution sentinel, so cosig + tip-match +
+    // §19 all pass and the only remaining refusal point is the wallet.
+    let job_hash = "1a".repeat(32);
+    let manifest = mobee_core::delivery_sentinel::render_manifest(
+        &job_hash,
+        mobee_core::delivery_sentinel::DeliveryMode::FromScratch,
+        1,
+        12,
+    );
+    let (upstream, tip_oid) = make_upstream_delivery("deadmint", Some(&manifest));
+    let mount = format!("/git/{}/repo.git", "34".repeat(32));
+    let server = GitHttpAuthServer::spawn(&upstream, &mount);
+    let repo_url = server.repo_url();
+
+    let root = temp("home-deadmint");
+    let _ = fs::remove_dir_all(&root);
+    let mut home = home::bootstrap(&root).expect("home");
+    // Real-mint opt-in ISOLATED to this test home: lets `plan_payment` + `open_wallet_at_mint_async`
+    // resolve/open the wallet at the (dead) real mint so the preflight is actually exercised. The mint
+    // is connection-refused loopback, so this opts in to no real money.
+    home.config.allow_real_mints = true;
+    let secret_hex = home::read_secret_key_hex(&home).expect("secret");
+    let pubkey_hex = home::public_key_hex(&home).expect("pubkey");
+
+    let job_id = "a".repeat(64);
+    let mut bind = from_scratch_bind(&job_id, &pubkey_hex, &tip_oid, &repo_url, &job_hash);
+    // Seal the DEAD mint as the realized paying mint AND put it in the accepted set, so `plan_payment`
+    // resolves a DIRECT pay at it (no cross-mint hop — that would touch other mints). The cosig is
+    // computed AFTER, but the receipt preimage binds no mint, so it still passes.
+    bind.realized_mint = Some(DEAD_MINT.to_owned());
+    bind.accepted_mints = vec![DEAD_MINT.to_owned()];
+    bind.seller_signature = seller_cosig(&secret_hex, &pubkey_hex, &bind);
+    write_bind(&home, &bind);
+
+    let mut gate = BudgetGate::from_home(&home).expect("gate");
+    let started = std::time::Instant::now();
+    let result =
+        collect_async(&home, &mut gate, CollectRequest { job_id: job_id.clone(), out: None }).await;
+    let elapsed = started.elapsed();
+
+    drop(server);
+    let _ = fs::remove_dir_all(&upstream);
+
+    // (a) The pre-reserve preflight refuses the dead mint with `mint_unreachable_pay` — NOT success,
+    // NOT the §19 `no_sentinel` gate (that PASSED, this job's sentinel is present), NOT a hang.
+    let error = result.expect_err("a dead realized mint must refuse the pay BEFORE the budget reserve");
+    assert!(matches!(error, CollectError::Pay(_)), "must be a pay refusal: {error}");
+    let message = error.to_string();
+    assert!(
+        message.contains("mint_unreachable_pay"),
+        "must refuse at the pre-reserve fee-safe preflight (dead mint), got: {error}"
+    );
+    assert!(
+        !message.contains("no_sentinel"),
+        "the §19 gate must have PASSED (job-bound sentinel present) — the refusal is the wallet \
+         preflight, not the sentinel gate, got: {error}"
+    );
+    // (b) ZERO SPEND — the preflight refused BEFORE `gate.authorize_then_attempt` reserved any budget.
+    // In-memory AND durable, and NO journal is written (the journal is created only after the preflight
+    // passes). Reorder the preflight below the gate and the dead mint reaches the reserve first: this
+    // flips to `spent()==charged` (the phantom spend #387 closes).
+    assert_eq!(gate.spent(), 0, "a dead-mint preflight refusal must burn ZERO spend (see the #387 see-saw)");
+    assert_eq!(
+        BudgetGate::from_home(&home::bootstrap(&root).expect("reload home")).expect("reload").spent(),
+        0,
+        "durable spent must stay 0 after a pre-reserve preflight refusal"
+    );
+    assert!(!root.join("payment-journal").exists(), "no payment journal on a pre-reserve refusal");
+    // (c) Bounded — no park. The preflight is `MINT_TOUCH_TIMEOUT`-bounded and 127.0.0.1:1 refuses the
+    // connect fast; the whole worker round-trip is capped by the bridge recv ceiling (20s). A
+    // regression to the pre-#387 caller-runtime deadlock would park forever (the see-saw's other end).
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "must be bounded (no park), took {elapsed:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
