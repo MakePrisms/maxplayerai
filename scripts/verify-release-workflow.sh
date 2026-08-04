@@ -2,11 +2,11 @@
 #
 # Assert the release workflow cannot publish by accident.
 #
-# The properties below are the reason the workflow is safe to merge with no token configured, and
-# every one of them is a single edit away from being lost — moving a gate, adding a trigger, or
-# copying an `npm publish` into another job. None of that breaks anything visibly: the workflow keeps
-# working, and the next release is simply published from somewhere it should not have been. This
-# script is what makes such an edit fail.
+# The properties below are the reason the workflow is safe to merge before any trusted publisher is
+# configured, and every one of them is a single edit away from being lost — moving a gate, adding a
+# trigger, or copying an `npm publish` into another job. None of that breaks anything visibly: the
+# workflow keeps working, and the next release is simply published from somewhere it should not have
+# been. This script is what makes such an edit fail.
 #
 # ★ This checks the workflow's STRUCTURE, which is what can be checked without GitHub. It cannot
 #   evaluate the `if:` expressions the way Actions does — observing the publish job actually skip on
@@ -115,16 +115,55 @@ if (!jobs.get("publish").some((l) => l.includes("npm publish"))) {
   fail("the publish job does not run 'npm publish' — this check is out of date with the workflow");
 }
 
-// The token half of the gate cannot be a job-level `if:` (the secrets context is unavailable there),
-// so it must be a step that stops the job when the secret is empty.
-const publish = jobs.get("publish").join("\n");
-if (!/NPM_TOKEN/.test(publish) || !/-z\s+"\$\{NPM_TOKEN/.test(publish)) {
-  fail("the publish job does not fail closed on an empty NPM_TOKEN");
+// ── The publish job cannot skip quietly ─────────────────────────────────────────────────────────
+// Authentication is npm trusted publishing (OIDC), so there is no secret to be empty and nothing to
+// check for emptiness. The property that guard existed to protect is unchanged and still checked
+// here: a publish that cannot happen must FAIL, never pass quietly. A silent skip is
+// indistinguishable from a successful release, and stays that way until somebody tries to install
+// what was never published.
+//
+// Under OIDC that property has two halves — the job must be able to authenticate at all, and
+// nothing may swallow the failure when it cannot.
+const publishBody = jobs.get("publish");
+
+// Half one. Without `id-token: write` no OIDC token is minted, npm falls back to looking for a
+// credential that no longer exists, and the job fails for a reason that reads like a registry
+// problem. The permissions block is matched at its own indentation so that a permissions block
+// belonging to some other job cannot satisfy this.
+if (!/^ {4}permissions:\s*$/m.test(publishBody.join("\n")) ||
+    !/^ {6}id-token:\s*write\s*$/m.test(publishBody.join("\n"))) {
+  fail("the publish job does not request 'id-token: write' — trusted publishing has no token to exchange");
+}
+
+// Half two. Comment-only lines are dropped first: this half searches for shapes that would suppress
+// a failure, and the prose around them necessarily describes those same shapes. A check that reads
+// its own explanation is a check that fails on documentation.
+const publishCode = publishBody.filter((l) => !/^\s*#/.test(l)).join("\n");
+
+// An early return reports success for a job that published nothing — the exact shape the deleted
+// token guard was careful NOT to have (it exited 1, not 0).
+if (/\bexit\s+0\b/.test(publishCode)) {
+  fail("the publish job can 'exit 0' early — a job that returns success without publishing is the silent skip");
+}
+// A step-level `if:` conditionally skips its step, and a skipped step is reported green. The job's
+// one legitimate gate is the job-level `if:` checked above, at four spaces; step keys sit at eight.
+if (/^ {8}if:/m.test(publishCode)) {
+  fail("a step in the publish job carries an 'if:' — a skipped publish step is green, which is the silent skip");
+}
+// `continue-on-error` turns a failed publish into a passing job, which is the same failure wearing
+// a different hat.
+if (/continue-on-error/.test(publishCode)) {
+  fail("the publish job uses 'continue-on-error' — a failed publish would be reported as a success");
+}
+// Nothing should be reaching for the retired token. Its presence means auth quietly went back to a
+// secret, and with it the expiry that trusted publishing was adopted to remove.
+if (/NODE_AUTH_TOKEN|secrets\.NPM_TOKEN/.test(publishCode)) {
+  fail("the publish job still references an npm token — authentication is trusted publishing (OIDC)");
 }
 
 console.log("ok: release and publish are gated on a tag push");
 console.log("ok: 'npm publish' appears only in the publish job");
-console.log("ok: the publish job fails closed without NPM_TOKEN");
+console.log("ok: the publish job requests id-token: write and has no silent-skip path");
 NODE
 
-echo "PASS: $WORKFLOW publishes nothing without both a pushed tag and the secret"
+echo "PASS: $WORKFLOW publishes nothing without a pushed tag, and cannot skip publishing quietly"
