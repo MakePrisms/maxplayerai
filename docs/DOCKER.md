@@ -13,7 +13,10 @@ git delivery runs in-process and TLS roots are bundled.
 - **User:** unprivileged (`uid 10001`).
 - **Defaults baked in:** relay `wss://relay.maxplayer.ai` (the open-market
   relay; override in `config.toml` or via `MOBEE_RELAY_URL` to sell against your
-  own), the default mint `https://testnut.cashudevkit.org` (a test mint).
+  own), and a **real** default mint `https://mint.minibits.cash/Bitcoin` with
+  `allow_real_mints = true` — **real sats move.** The image pins no test mint, so the real default
+  rides through. For local development, set the testnut dev mint (`https://testnut.cashudevkit.org`)
+  in `config.toml`, or set `allow_real_mints = false`.
 
 ## Build
 
