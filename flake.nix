@@ -189,8 +189,6 @@
           ./nix/relay-host.nix
           {
             services.maxplayer.relay.package = self.packages.x86_64-linux.maxplayer-relay;
-            # In-tree schema path: the vendor worker brings buzz's `schema/` into the vendored subtree.
-            services.maxplayer.relay.schemaFile = "${self}/crates/buzz/schema/schema.sql";
           }
         ];
       };

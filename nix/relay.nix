@@ -21,44 +21,6 @@
 let
   cfg = config.services.maxplayer.relay;
 
-  # pgschema: pinned release binary (not in nixpkgs). buzz applies its schema declaratively at
-  # ExecStartPre; pinning the migrator means a nixpkgs bump cannot silently change how the schema is
-  # applied. Same version buzz-nix proved (1.7.4).
-  pgschemaVersion = "1.7.4";
-  pgschemaBin = pkgs.stdenvNoCC.mkDerivation {
-    pname = "pgschema";
-    version = pgschemaVersion;
-    src =
-      let
-        plat =
-          {
-            x86_64-linux = {
-              suffix = "linux-amd64";
-              hash = "sha256-aCaRotGGmbYzvskE5lJulMPfVrSzZtrxJVRresad5Mg=";
-            };
-            aarch64-linux = {
-              suffix = "linux-arm64";
-              hash = "sha256-LYwV87bxHc1g0vhIV8rWU3TaF2EoHpcqrSHX32SjQKw=";
-            };
-          }
-          .${pkgs.stdenv.hostPlatform.system}
-            or (throw "pgschema: unsupported system ${pkgs.stdenv.hostPlatform.system}");
-      in
-      pkgs.fetchurl {
-        url = "https://github.com/pgplex/pgschema/releases/download/v${pgschemaVersion}/pgschema-${pgschemaVersion}-${plat.suffix}";
-        inherit (plat) hash;
-      };
-    dontUnpack = true;
-    nativeBuildInputs = [ pkgs.autoPatchelfHook ];
-    buildInputs = [ pkgs.stdenv.cc.cc.lib ];
-    installPhase = ''
-      runHook preInstall
-      install -Dm755 "$src" "$out/bin/pgschema"
-      runHook postInstall
-    '';
-    meta.mainProgram = "pgschema";
-  };
-
   # Environment the buzz-relay binary reads. Loopback bind (nginx fronts). Open membership: a public
   # marketplace where any NIP-42-authed key may write — buzz still MANDATES a signed NIP-42 handshake
   # on every write, so "open" means "not membership-gated", never "anonymous". The compiled kind
@@ -72,6 +34,12 @@ let
   baseEnv = {
     BUZZ_BIND_ADDR = cfg.bindAddr;
     DATABASE_URL = "postgresql:///${cfg.database}?host=/run/postgresql&user=${cfg.user}";
+
+    # Schema: buzz applies its OWN, via the embedded sqlx migrator (sqlx::migrate!(migrations/), 24
+    # files 0001_initial_schema..0024) when this is enabled — main.rs gates db.migrate() on it. The
+    # migration set is the COMPLETE source of truth (git_* is 0002, the replica fence floor is 0021);
+    # schema/schema.sql is only the initial snapshot and is deliberately NOT applied. "1" = on.
+    BUZZ_AUTO_MIGRATE = "1";
     REDIS_URL = "redis://127.0.0.1:6379";
     RELAY_URL = cfg.relayUrl;
     BUZZ_HEALTH_PORT = toString cfg.healthPort;
@@ -106,15 +74,6 @@ in
       description = ''
         The buzz-relay package to run. Wired from the flake (`packages.maxplayer-relay`, the in-tree
         vendored crate). `lib.getExe` resolves its `meta.mainProgram` (buzz-relay).
-      '';
-    };
-
-    schemaFile = lib.mkOption {
-      type = lib.types.path;
-      description = ''
-        buzz's schema.sql, applied declaratively by pgschema at ExecStartPre. Wired from the flake to
-        the vendored package source's schema so it always tracks the code being deployed
-        (`''${self}/crates/buzz/schema/schema.sql`).
       '';
     };
 
@@ -336,11 +295,9 @@ in
       ];
       wants = [ "network-online.target" ];
 
-      # buzz shells out to git (receive-pack for the CAS) and psql (schema apply).
-      path = [
-        pkgs.git
-        pkgs.postgresql
-      ];
+      # buzz shells out to git (receive-pack for the CAS). The schema is applied by buzz's own embedded
+      # sqlx migrator at boot (BUZZ_AUTO_MIGRATE=1), so there is no psql/pgschema apply step here.
+      path = [ pkgs.git ];
 
       environment = baseEnv;
 
@@ -356,29 +313,6 @@ in
 
         # Carries BUZZ_RELAY_PRIVATE_KEY=<hex>. The preflight above has already asserted it is present.
         EnvironmentFile = [ cfg.privateKeyFile ];
-
-        ExecStartPre = [
-          (pkgs.writeShellScript "buzz-relay-migrate" ''
-            set -euo pipefail
-            export PGHOST=/run/postgresql
-            export PGPORT=5432
-            export PGUSER=${lib.escapeShellArg cfg.user}
-            export PGDATABASE=${lib.escapeShellArg cfg.database}
-
-            # buzz perf index, created idempotently. On a born-empty db the `events` table does not
-            # exist yet, so this no-ops (ON_ERROR_STOP=0 || true) and the schema apply below creates
-            # it; on later boots it is a cheap IF NOT EXISTS.
-            ${pkgs.postgresql}/bin/psql -v ON_ERROR_STOP=0 -q -c \
-              "CREATE INDEX IF NOT EXISTS idx_events_parameterized ON events (kind, pubkey, d_tag, deleted_at) WHERE d_tag IS NOT NULL;" \
-              2>/dev/null || true
-
-            ${lib.getExe pgschemaBin} apply \
-              --host "$PGHOST" --port "$PGPORT" --user "$PGUSER" --db "$PGDATABASE" \
-              --plan-host "$PGHOST" --plan-port "$PGPORT" --plan-user "$PGUSER" --plan-db "$PGDATABASE" \
-              --file ${cfg.schemaFile} \
-              --auto-approve
-          '')
-        ];
 
         NoNewPrivileges = true;
         PrivateTmp = true;
