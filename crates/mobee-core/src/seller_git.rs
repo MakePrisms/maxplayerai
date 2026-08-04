@@ -209,6 +209,22 @@ fn checkout_base_branch(
     Ok(())
 }
 
+/// The seller node's own ACP run transcript, written into the job workdir at run time by the seller
+/// exec path (`seller_exec::run_agent_job` opens `workdir.join(SELLER_RUN_LOG)`). It is the node's
+/// event log — node bookkeeping, never the agent's deliverable — so the delivery snapshot excludes it
+/// (see [`RUNTIME_ARTIFACT_EXCLUSIONS`]). Single-sourced here: the one write site and the exclusion
+/// below share this constant, so the name they agree on can never drift. Homed in this
+/// (`git-delivery`) module rather than `seller_exec` because `wallet` implies `git-delivery` but not
+/// the reverse, so this module is the one always present wherever either the writer or the excluder
+/// compiles.
+pub const SELLER_RUN_LOG: &str = "seller-run.jsonl";
+
+/// Node runtime artifacts written into the job workdir — excluded from every delivery; never the
+/// agent's deliverable. Un-staged from the snapshot index before the delivered tree is built (see
+/// [`snapshot_delivery_at`]), so they ride in no delivery and inflate neither the §19 completion gate
+/// nor the sentinel's file/byte counts. Extend this slice as new node-authored workdir artifacts appear.
+const RUNTIME_ARTIFACT_EXCLUSIONS: &[&str] = &[SELLER_RUN_LOG];
+
 /// Snapshot the final workdir tree into ONE delivery commit under `identity` and point `branch`
 /// at it. This is the whole delivery step: the agent never commits (any commits it makes are
 /// scratch and ignored), so the daemon authors the deliverable itself from the workdir contents.
@@ -300,6 +316,15 @@ pub fn snapshot_delivery_at(
     index
         .update_all(["*"].iter(), None)
         .map_err(|_| SellerGitError::CommandFailed("snapshot-update"))?;
+    // Un-stage node runtime artifacts (e.g. the ACP run transcript) BEFORE the raw tree is written.
+    // They are the node's own bookkeeping written into the workdir, never the agent's deliverable, so
+    // they must ride in no delivery — and must not inflate the §19 completion gate or the sentinel's
+    // file/byte counts, both of which derive from THIS raw tree below. `remove_path` un-stages only:
+    // the file stays on disk so the node keeps its run log; only the DELIVERY drops it. Tolerant of
+    // absence, exactly like the prior-sentinel scrub above.
+    for name in RUNTIME_ARTIFACT_EXCLUSIONS {
+        let _ = index.remove_path(Path::new(name));
+    }
     let raw_tree_oid = index
         .write_tree()
         .map_err(|_| SellerGitError::CommandFailed("snapshot-write-tree"))?;
@@ -1053,6 +1078,113 @@ mod snapshot_tests {
             "the sentinel rides at its well-known path in the delivered tree"
         );
         assert!(paths.contains(&"out.rs".to_owned()), "and the real work rides too");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Parse the `files:` / `bytes:` facts out of a rendered §19 execution manifest.
+    fn manifest_files_bytes(manifest: &str) -> (usize, u64) {
+        let mut files = None;
+        let mut bytes = None;
+        for line in manifest.lines() {
+            if let Some(v) = line.strip_prefix("files: ") {
+                files = Some(v.trim().parse().expect("files: is a number"));
+            } else if let Some(v) = line.strip_prefix("bytes: ") {
+                bytes = Some(v.trim().parse().expect("bytes: is a number"));
+            }
+        }
+        (
+            files.expect("manifest carries a files: line"),
+            bytes.expect("manifest carries a bytes: line"),
+        )
+    }
+
+    /// Count, and total the byte size of, every NON-sentinel blob in a delivered tree — what the
+    /// sentinel's own `files`/`bytes` must equal (the sentinel measures the delivered work, itself
+    /// excluded). A join over the ACTUAL delivered tree, independent of what the manifest claims.
+    fn non_sentinel_blob_stats(dir: &Path, oid: &str) -> (usize, u64) {
+        let repo = Repository::open(dir).expect("open");
+        let tree = repo
+            .find_commit(Oid::from_str(oid).unwrap())
+            .unwrap()
+            .tree()
+            .unwrap();
+        let mut files = 0usize;
+        let mut bytes = 0u64;
+        tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            if entry.kind() == Some(git2::ObjectType::Blob) {
+                let path = format!("{root}{}", entry.name().unwrap_or(""));
+                if path != crate::delivery_sentinel::SENTINEL_FILE {
+                    let blob = repo.find_blob(entry.id()).expect("blob");
+                    files += 1;
+                    bytes += blob.size() as u64;
+                }
+            }
+            git2::TreeWalkResult::Ok
+        })
+        .unwrap();
+        (files, bytes)
+    }
+
+    // TOOTH (#410) — the seller node's own ACP run transcript (`SELLER_RUN_LOG`) must NEVER ride in a
+    // delivered tree: it is node bookkeeping (the event log), not the agent's deliverable. A
+    // from-scratch workdir carries BOTH a real agent file AND the transcript; the delivery must carry
+    // the deliverable (b), drop the transcript (a), and the §19 sentinel's own file/byte facts must
+    // describe the POST-exclusion tree (c) — so the sentinel stays honest about what was actually
+    // delivered (after the fix, just `answer.txt`), because the exclusion runs before the raw tree the
+    // manifest is minted from.
+    //
+    // Red-on-revert (non-vacuous): neuter the `RUNTIME_ARTIFACT_EXCLUSIONS` un-stage in
+    // `snapshot_delivery_at` and the transcript rides into the delivered tree again — assertion (a)
+    // trips first. (The count assertions would follow: the sentinel would then count the transcript's
+    // bytes too, so the delivered work is no longer exactly the one deliverable.)
+    #[test]
+    fn delivery_excludes_seller_run_transcript_and_sentinel_counts_only_the_deliverable() {
+        let dir = workdir("exclude-runtime");
+        let id = identity();
+        init_empty_delivery_workdir(&dir, &id).expect("init");
+
+        // A genuine agent deliverable AND the node's own run transcript, side by side in the workdir.
+        let answer = "the agent's real answer\n";
+        write(&dir, "answer.txt", answer);
+        write(
+            &dir,
+            super::SELLER_RUN_LOG,
+            "{\"event\":\"node run transcript — not a deliverable\"}\n",
+        );
+
+        let oid = snapshot_delivery(&dir, &id, None, "mobee/job", "msg").expect("snapshot");
+        let paths = tree_paths(&dir, &oid);
+
+        // (a) the node's run transcript is NOT delivered — the whole point of #410.
+        assert!(
+            !paths.contains(&super::SELLER_RUN_LOG.to_owned()),
+            "the seller run transcript must be excluded from the delivered tree; tree carried: {paths:?}"
+        );
+        // (b) the real deliverable survives the exclusion.
+        assert!(
+            paths.contains(&"answer.txt".to_owned()),
+            "the agent's deliverable must survive; tree carried: {paths:?}"
+        );
+
+        // (c) the §19 sentinel honestly describes the POST-exclusion deliverable: its files/bytes equal
+        // the actual count and total size of the delivered non-sentinel blobs (after the fix, exactly
+        // `answer.txt`). The transcript on disk is not counted — it was un-staged before the raw tree
+        // the manifest is minted from.
+        let manifest = sentinel_blob(&dir, &oid);
+        let (manifest_files, manifest_bytes) = manifest_files_bytes(&manifest);
+        let (actual_files, actual_bytes) = non_sentinel_blob_stats(&dir, &oid);
+        assert_eq!(
+            manifest_files, actual_files,
+            "sentinel `files` must equal the delivered non-sentinel blob count; manifest: {manifest:?}"
+        );
+        assert_eq!(
+            manifest_bytes, actual_bytes,
+            "sentinel `bytes` must equal the delivered non-sentinel total size; manifest: {manifest:?}"
+        );
+        // And concretely: exactly the one deliverable at its exact byte size (the transcript is gone).
+        assert_eq!(actual_files, 1, "only answer.txt should be delivered");
+        assert_eq!(actual_bytes, answer.len() as u64, "at answer.txt's exact byte size");
+
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -384,7 +384,7 @@ pub async fn run_agent_job(
         crate::driver::PermissionOutcome::Allow,
         timeout,
     );
-    let log_path = workdir.join("seller-run.jsonl");
+    let log_path = workdir.join(crate::seller_git::SELLER_RUN_LOG);
     let mut log = EventLog::open(&log_path).map_err(|error| ExecError::Agent(error.to_string()))?;
     let params = RunParams {
         session_config: SessionConfig {
