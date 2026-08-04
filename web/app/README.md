@@ -18,7 +18,7 @@ npm run build     # flat static dist/
 |---|---|
 | `js/kinds.js` | Every Nostr kind the app touches. The only file allowed to contain a kind number — a test enforces it. |
 | `js/relay.js` | Read-only relay client: pages history, then stays subscribed. |
-| `js/cache.js` | Event store: dedup by id, replaceable events resolved by author+kind+d. |
+| `js/cache.js` | Event store: dedup by id; addressable events resolved by author+kind+d, replaceable by author+kind. |
 | `js/model.js` | Raw events in, typed records out. Nothing downstream touches a tag array. |
 | `js/trades.js` | Joins events into trades and derives the market metrics. |
 | `js/app.js` | Presentation. The core modules never touch the DOM. |
