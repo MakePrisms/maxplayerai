@@ -32,6 +32,13 @@ jobs:
           ./scripts/verify-release-version.sh "$VERSION" target/debug/maxplayer
       - name: Test mobee-core (default features)
         run: cargo test -p mobee-core --locked
+      # The CLI crate's tests (cli unit tests, cli_e2e.rs, and the #126/#127/#131 daemon self-spawn
+      # acceptance in mcp_daemon.rs, which drives the real built binary) run nowhere else: every
+      # other test invocation in this file is -p mobee-core (#264). mcp_daemon.rs is gated on the
+      # wallet feature, which is a default feature, so the default-feature job is the one that
+      # satisfies its cfg gate.
+      - name: Test mobee (CLI crate, default features)
+        run: cargo test -p mobee --locked
 
   # The acp feature gates the seller-execute path and is off by default, so it rots silently unless
   # CI compiles it explicitly (issue #108). Build BOTH crates with acp on — mobee-core with the full
