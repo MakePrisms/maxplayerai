@@ -54,6 +54,21 @@ const KIND_MOBEE_JOB_OFFER: u32 = 5109;
 const KIND_MOBEE_JOB_RESULT: u32 = 6109;
 const KIND_MOBEE_JOB_FEEDBACK: u32 = 7000;
 
+// Mobee trade path — the contiguous mobee-owned block 3400-3406, plus the
+// addressable seller heartbeat (30340) and the NIP-89 handler advertisement
+// (31990) that mobee-core writers emit on the wire. Mirrors the authoritative
+// registry in maxplayerai crates/mobee-core/src/kinds.rs (3400 RECEIPT is shared
+// with the DVM const above; kind-0 profile and the 30617 git-repo announcement
+// mobee also emits are already scoped by KIND_PROFILE / KIND_GIT_REPO_ANNOUNCEMENT).
+const KIND_MOBEE_TRADE_OFFER: u32 = 3401;
+const KIND_MOBEE_TRADE_CLAIM: u32 = 3402;
+const KIND_MOBEE_TRADE_RESULT: u32 = 3403;
+const KIND_MOBEE_TRADE_FEEDBACK: u32 = 3404;
+const KIND_MOBEE_TRADE_AWARD: u32 = 3405;
+const KIND_MOBEE_TRADE_ACCEPT: u32 = 3406;
+const KIND_MOBEE_SELLER_HEARTBEAT: u32 = 30340;
+const KIND_MOBEE_NIP89_HANDLER: u32 = 31990;
+
 /// How the HTTP caller authenticated (for [`IngestAuth::Http`]).
 #[derive(Debug, Clone)]
 pub enum HttpAuthMethod {
@@ -328,6 +343,17 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_MOBEE_JOB_RESULT
         | KIND_MOBEE_JOB_FEEDBACK
         | KIND_MOBEE_JOB_RECEIPT => Ok(Scope::MessagesWrite),
+        // Mobee trade path (mobee-core kind registry): buyer/seller trade events,
+        // the seller liveness heartbeat, and the NIP-89 handler advertisement —
+        // all authenticated writes by mobee buyers/sellers.
+        KIND_MOBEE_TRADE_OFFER
+        | KIND_MOBEE_TRADE_CLAIM
+        | KIND_MOBEE_TRADE_RESULT
+        | KIND_MOBEE_TRADE_FEEDBACK
+        | KIND_MOBEE_TRADE_AWARD
+        | KIND_MOBEE_TRADE_ACCEPT
+        | KIND_MOBEE_SELLER_HEARTBEAT
+        | KIND_MOBEE_NIP89_HANDLER => Ok(Scope::MessagesWrite),
         _ => {
             if open_ingest_enabled() {
                 Ok(Scope::MessagesWrite)
@@ -2765,6 +2791,14 @@ mod tests {
             KIND_MOBEE_JOB_RESULT,
             KIND_MOBEE_JOB_FEEDBACK,
             KIND_MOBEE_JOB_RECEIPT,
+            KIND_MOBEE_TRADE_OFFER,
+            KIND_MOBEE_TRADE_CLAIM,
+            KIND_MOBEE_TRADE_RESULT,
+            KIND_MOBEE_TRADE_FEEDBACK,
+            KIND_MOBEE_TRADE_AWARD,
+            KIND_MOBEE_TRADE_ACCEPT,
+            KIND_MOBEE_SELLER_HEARTBEAT,
+            KIND_MOBEE_NIP89_HANDLER,
         ] {
             assert_eq!(
                 required_scope_for_kind(kind, &dummy).unwrap(),

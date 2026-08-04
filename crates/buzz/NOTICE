@@ -34,11 +34,17 @@ block/buzz stays meaningful and upstream commits remain scannable/pullable.
    devShell default (nixos-25.11 -> 1.91.1); the build toolchain must provide
    >= 1.94.
 
-3. `crates/buzz-relay/src/handlers/ingest.rs` — added the MakePrisms/maxplayerai
-   #397 payment/DoS bound on NIP-17 gift wraps (kind 1059): a gift wrap must
-   carry at least one `p` tag and its content must be <= 128 KB. Marked inline
-   with a `#397` comment. No other source (`.rs`) files were modified; the Mobee
-   job kinds already present upstream are carried verbatim.
+3. `crates/buzz-relay/src/handlers/ingest.rs` — two additions, each marked inline
+   with a comment:
+   (a) the mobee-core kind superset: `KIND_MOBEE_TRADE_*` consts plus a
+       `required_scope_for_kind` arm (-> `MessagesWrite`) for the trade block
+       3401-3406, the seller heartbeat 30340, and the NIP-89 handler 31990, with
+       the scope test extended to cover them. The fork's original DVM arms
+       (3400/5109/6109/7000) are left untouched.
+   (b) the MakePrisms/maxplayerai #397 payment/DoS bound on NIP-17 gift wraps
+       (kind 1059): a gift wrap must carry at least one `p` tag and content
+       <= 128 KB.
+   No other source (`.rs`) files were modified.
 
 Vendored (the 12-crate relay build closure): buzz-relay, buzz-core,
 buzz-conformance, buzz-db, buzz-pubsub, buzz-auth, buzz-search, buzz-audit,

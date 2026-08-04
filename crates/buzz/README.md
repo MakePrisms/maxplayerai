@@ -19,24 +19,53 @@ Chosen over `metadex/mobee-kind-scope` (`c2499afd9`) because:
   is the fresher base, closest to what orveth actually deploys.
 - Both branches carry the **identical** Mobee kind set.
 
-### Mobee kinds carried (verbatim from the source branch)
-Defined in `crates/buzz-relay/src/handlers/ingest.rs` and scoped in
-`required_scope_for_kind` -> `Scope::MessagesWrite`; covered by the existing test
-`mobee_job_kinds_require_messages_write_scope`:
+### Mobee kinds accepted
+Both families below are defined as consts in
+`crates/buzz-relay/src/handlers/ingest.rs`, mapped to `Scope::MessagesWrite` in
+`required_scope_for_kind`, and covered by `mobee_job_kinds_require_messages_write_scope`.
+
+**A. The fork's DVM kinds** (carried verbatim from the source branch, untouched):
 
 | const | kind | note |
 |-------|------|------|
 | `KIND_MOBEE_JOB_RECEIPT`  | 3400 | co-signed receipt |
 | `KIND_MOBEE_JOB_OFFER`    | 5109 | NIP-90 job-request range |
 | `KIND_MOBEE_JOB_RESULT`   | 6109 | NIP-90 job-result range |
-| `KIND_MOBEE_JOB_FEEDBACK` | 7000 | NIP-90 feedback; claim/accept folded here |
+| `KIND_MOBEE_JOB_FEEDBACK` | 7000 | NIP-90 feedback |
 
-> **Discrepancy flagged:** the build task described an 8-kind set
-> (3400/3401/3402/3403/3404/3405 + 30340 heartbeat + 31990 discovery). That set
-> does **not** exist in either gudnuf branch. Ground truth is the **4 NIP-90**
-> kinds above. They are carried as-is rather than inventing kinds the deployed
-> relay does not have. If the extra kinds are actually intended, adding them is a
-> follow-up.
+**B. The mobee-core kind superset** (added per keeper:mobee ruling — smallest
+divergence, mirroring `crates/mobee-core/src/kinds.rs`):
+
+| const | kind | note |
+|-------|------|------|
+| `KIND_MOBEE_TRADE_OFFER`      | 3401 | buyer offer |
+| `KIND_MOBEE_TRADE_CLAIM`      | 3402 | seller claim (bid + creq invoice) |
+| `KIND_MOBEE_TRADE_RESULT`     | 3403 | seller result |
+| `KIND_MOBEE_TRADE_FEEDBACK`   | 3404 | seller progress / error / refusal |
+| `KIND_MOBEE_TRADE_AWARD`      | 3405 | buyer award (claim selection) |
+| `KIND_MOBEE_TRADE_ACCEPT`     | 3406 | buyer accept (pay-bind, #329) |
+| `KIND_MOBEE_SELLER_HEARTBEAT` | 30340 | addressable seller liveness |
+| `KIND_MOBEE_NIP89_HANDLER`    | 31990 | NIP-89 handler advertisement |
+
+3400 is shared between the two families. kind-0 profile and the 30617 NIP-34
+git-repo announcement mobee also emits are **already** scoped by the relay
+(`KIND_PROFILE` -> `UsersWrite`, `KIND_GIT_REPO_ANNOUNCEMENT` -> `ReposWrite`).
+
+> **Two flags for reviewers:**
+> 1. **Numbering mismatch (DVM vs mobee-core).** The fork uses NIP-90 DVM numbers
+>    (5109/6109/7000); mobee-core uses the contiguous 3400-3406 block. Both are now
+>    accepted. The brief's "3401-3405 + 31990" was close but off: mobee-core's block
+>    runs to **3406** (ACCEPT #329 — omitting it would reject live pay-bind events),
+>    and 31990 lives in `mobee-relay-write-policy`'s `DISCOVERY_KINDS`, not `kinds.rs`.
+> 2. **Provenance.** Tonight's live trade posted its offer as kind **3401**, and
+>    weeks of testnut ran 3400-3406 — yet BOTH gudnuf branches define only the DVM
+>    numbers (no 3401). So the **deployed relay matches neither vendored branch**;
+>    the fork here is an older DVM iteration. Worth locating the branch/rev that
+>    actually carries 3401 — but the superset accepts both, so nothing gates on it.
+>
+> **Scope note:** all eight added kinds use `MessagesWrite` (matching the DVM arm).
+> 31990 is discovery-class (grouped with kind-0 in mobee's `DISCOVERY_KINDS`); if
+> keeper:mobee prefers `UsersWrite` for it, that is a one-line change.
 
 ### Crates taken vs left
 Taken (12 = the relay's transitive `[dependencies]` closure):
