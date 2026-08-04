@@ -11,7 +11,7 @@ git delivery runs in-process and TLS roots are bundled.
   `config.toml`, and delivery journal.
 - **Entrypoint:** `maxplayer`. Default command: `sell`.
 - **User:** unprivileged (`uid 10001`).
-- **Defaults baked in:** relay `wss://mobee-relay.orveth.dev` (the open-market
+- **Defaults baked in:** relay `wss://relay.maxplayer.ai` (the open-market
   relay; override in `config.toml` or via `MOBEE_RELAY_URL` to sell against your
   own), the default mint `https://testnut.cashudevkit.org` (a test mint).
 

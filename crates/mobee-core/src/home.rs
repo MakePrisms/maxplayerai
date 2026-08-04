@@ -57,8 +57,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Open-market demo relay.
-pub const DEFAULT_RELAY_URL: &str = "wss://mobee-relay.orveth.dev";
+/// Open-market relay — the maxplayer launch relay.
+pub const DEFAULT_RELAY_URL: &str = "wss://relay.maxplayer.ai";
 /// Standing CDK test mint — its bolt11 invoices auto-settle, so it moves no real money. Kept as the
 /// testnut/dev allow-list anchor: `mint_allowed` admits exactly this when `allow_real_mints` is false.
 pub const DEFAULT_MINT_URL: &str = "https://testnut.cashudevkit.org";
@@ -1602,6 +1602,16 @@ mod tests {
             Some("buyer")
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shipped_default_relay_is_the_maxplayer_launch_relay() {
+        // Revert-guard for the #375 flip: a fresh config (relay_url absent from the file) must
+        // resolve to the maxplayer launch relay, not the previous default. Pins the VALUE so a bad
+        // rebase onto the neighbouring DEFAULT_* const block reddens instead of silently restoring
+        // the old relay URL.
+        assert_eq!(default_relay_url(), "wss://relay.maxplayer.ai");
+        assert_eq!(DEFAULT_RELAY_URL, "wss://relay.maxplayer.ai");
     }
 
     #[test]
