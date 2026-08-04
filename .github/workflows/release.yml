@@ -301,10 +301,13 @@ jobs:
           # also where OIDC exchange happens.
           registry-url: https://registry.npmjs.org
 
+      # Pinned to the 11 line: @latest crossed into npm@12, whose engine floor (node >=22) rejects
+      # the node this job runs — and an install-time engine refusal here fails the publish before
+      # any OIDC exchange happens.
       # Trusted publishing landed in npm 11.5; the npm bundled with any current setup-node runtime is
       # older than that and would fall back to looking for a token that no longer exists.
       - name: Upgrade npm for trusted publishing
-        run: npm install -g npm@latest
+        run: npm install -g npm@11
 
       - uses: actions/download-artifact@v4
         with:
