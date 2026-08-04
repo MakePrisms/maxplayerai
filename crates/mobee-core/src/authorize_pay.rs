@@ -155,7 +155,6 @@ pub struct CompleteLockedOutcome {
     pub attempt_id: String,
     pub amount_sats: u64,
     pub spent_total_sats: u64,
-    pub remaining_sats: u64,
 }
 
 #[derive(Debug)]
@@ -742,7 +741,6 @@ pub async fn complete_recovered_locked_async(
         attempt_id: attempt_id.as_str().to_owned(),
         amount_sats: request.amount_sats,
         spent_total_sats: gate.spent(),
-        remaining_sats: gate.remaining(),
     })
 }
 

@@ -596,7 +596,7 @@ mod tests {
     // `complete_recovered_locked_async` relies on to avoid double-charging a reused token.
     #[test]
     fn operator_completion_reattempt_reuses_the_charge_without_double_counting() {
-        let mut gate = BudgetGate::new(100, 100);
+        let mut gate = BudgetGate::new(100);
         gate.authorize_then_attempt("attempt-x", 40, || ())
             .expect("original award charges");
         assert_eq!(gate.spent(), 40);
@@ -611,7 +611,6 @@ mod tests {
             40,
             "completion reuses the already-charged attempt — no second charge"
         );
-        assert_eq!(gate.remaining(), 60);
     }
 
     #[test]

@@ -426,12 +426,11 @@ fn report_complete_locked(
         Ok(outcome) => {
             let _ = writeln!(
                 out,
-                "complete-locked ok state={} attempt_id={} amount_sats={} spent_total_sats={} remaining_sats={}",
+                "complete-locked ok state={} attempt_id={} amount_sats={} spent_total_sats={}",
                 payment_state_label(&outcome.state),
                 outcome.attempt_id,
                 outcome.amount_sats,
                 outcome.spent_total_sats,
-                outcome.remaining_sats,
             );
             SUCCESS
         }
