@@ -7,6 +7,8 @@ about a specified thing rather than about a vibe.
 
 Every measurement below was taken against `dev` @ `8debf43`.
 
+> **Update — partially superseded.** Since `8debf43`, Track A has shipped: `.github/workflows/release.yml` (tag-triggered on `v*`, builds the musl/darwin assets, cuts a GitHub Release with `install.sh`, and runs `npm publish`), the `packages.buyer-static` / `buyer-static-aarch64` static musl builds in `flake.nix`, and a top-level `install.sh`. The "zero GitHub releases / no release workflow / `ci.yml` is the only workflow" findings in §2 below are therefore historical — read them as the state at `8debf43`, not the current tree.
+
 ---
 
 ## 1. What installing `mobee` means today
@@ -315,6 +317,8 @@ wirable the way every other MCP server is wired.
 Names are free as of 2026-07-28: `mobee`, `mobee-cli`, and the `@mobee` scope all return 404 from
 the npm registry. Claiming the name is cheap and worth doing before someone else does, independent
 of when the work lands.
+
+> **Update — rename landed.** The published npm names are `maxplayer` (the shim, `npm/mobee/package.json`) and the `@maxplayerai/*` scope (`@maxplayerai/linux-x64`, `@maxplayerai/linux-arm64`), not `mobee` / `@mobee`. The `mobee` / `@mobee` name analysis in this Track B section is historical.
 
 ```acceptance
 # On a box with node but no nix, no rust, and no prior mobee:
