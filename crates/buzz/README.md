@@ -48,6 +48,11 @@ the relay and cannot be dropped without editing relay source, so they are in
 despite being client/harness-adjacent. The AI-agent harness, device pairing,
 desktop/mobile/web clients, and CLIs are left behind (see `NOTICE`).
 
+Also vendored (verbatim, DB artifacts the relay's schema layer needs):
+`migrations/` (embedded at compile time by `buzz-db`'s
+`sqlx::migrate!("../../migrations")`) and `schema/schema.sql` (the canonical
+fresh-database schema; drift-checked against `migrations/0001_initial_schema.sql`).
+
 ### Dependency alignment
 - **nostr-sdk: no collision.** maxplayerai `mobee-core` pins `nostr-sdk 0.44.1`;
   this vendored relay resolves `nostr 0.44.x` / `nostr-sdk 0.44.1`. Both on 0.44.
