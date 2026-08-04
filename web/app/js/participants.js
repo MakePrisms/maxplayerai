@@ -9,7 +9,7 @@
  */
 import { buildTrades } from "./trades.js";
 import { parseEvent } from "./model.js";
-import { HANDLER, HEARTBEAT, RESULT } from "./kinds.js";
+import { HANDLER, HEARTBEAT, PROFILE, RESULT } from "./kinds.js";
 
 /** Selectable periods, longest label first so the UI can render them in order. */
 export const WINDOWS = Object.freeze([
@@ -142,19 +142,26 @@ export function sellerBoard(events, now) {
       r.lastSeen = Math.max(r.lastSeen, p.created_at);
       if (now - p.created_at <= LIVE_WITHIN_SECONDS) r.online = true;
     } else if (p.kind === HANDLER) {
-      // The advert is what a seller says about itself: its name, its asking
-      // rate, and whether it will take work nobody offered it directly. Kept
-      // distinct from measured behaviour — a claim, not a track record.
+      // The advert is what a seller says about itself: its asking rate and
+      // whether it will take work nobody offered it directly. Kept distinct
+      // from measured behaviour — a claim, not a track record. The seat NAME is
+      // no longer read here: kind-0 metadata is its single publisher (§6.1 /
+      // #275), resolved in the PROFILE arm below.
       const r = get(p.pubkey);
       if (p.name && !r.capabilities.includes(p.name)) r.capabilities.push(p.name);
       if (p.created_at >= r.advertisedAt) {
         r.advertisedAt = p.created_at;
-        r.name = p.name || r.name;
         r.about = p.about || r.about;
         r.askSats = p.askSats != null ? p.askSats : r.askSats;
         r.openPool = p.openPool;
         r.mint = p.mint || r.mint;
       }
+    } else if (p.kind === PROFILE) {
+      // kind-0 metadata is the single publisher of the seat name (§6.1 / #275);
+      // the 31990 handler no longer carries it, so the directory name resolves
+      // here. `profile set --name` republishes kind-0, so this stays current.
+      const r = get(p.pubkey);
+      if (p.name) r.name = p.name;
     } else if (p.kind === RESULT && p.harness) {
       const r = get(p.pubkey);
       r.harnessCounts[p.harness] = (r.harnessCounts[p.harness] || 0) + 1;

@@ -359,6 +359,10 @@ fn default_seller_about(agent: Option<&str>, rate_sats: u64, accepted_mints: &[S
 /// Wire shape keeps `"mint"` as a single URL string (primary = first accepted mint) so
 /// existing orderbook consumers stay compatible; the full list is also advertised under
 /// `"accepted_mints"` so a buyer can match membership on any accepted mint.
+///
+/// The seat name is deliberately NOT carried here: kind-0 metadata is its single publisher
+/// (§6.1 one value, one publisher / #275). `profile set --name` republishes kind-0 only, so a
+/// name embedded here would drift stale on every rename — readers resolve the name from kind-0.
 fn nip89_handler_content(
     profile: &ProfileConfig,
     rate_sats: u64,
@@ -368,7 +372,6 @@ fn nip89_handler_content(
 ) -> String {
     let primary_mint = accepted_mints.first().map(String::as_str).unwrap_or("");
     serde_json::json!({
-        "name": profile.name,
         "about": profile.about,
         "rate_sats": rate_sats,
         "claim_open_pool": claim_open_pool,
@@ -807,5 +810,34 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn nip89_announce_omits_name_kind0_is_the_single_publisher() {
+        // §6.1 / #275: the seat name has ONE publisher — kind-0 metadata. The kind-31990 handler
+        // content must NOT carry it, or a `profile set --name` rename (which republishes kind-0
+        // only) drifts stale against a 31990-sourced directory. Red-on-revert: re-adding
+        // `"name": profile.name` reintroduces the drift and fails both assertions below.
+        let profile = ProfileConfig {
+            name: Some("frogger".into()),
+            about: Some("about".into()),
+        };
+        let content = nip89_handler_content(
+            &profile,
+            100,
+            true,
+            Some("grok-4.5"),
+            &["https://mint.example/x".to_owned()],
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("announce content is JSON");
+        assert!(
+            parsed.get("name").is_none(),
+            "kind-31990 content must not carry a name (kind-0 is the single publisher); got: {content}"
+        );
+        assert!(
+            !content.contains("frogger"),
+            "the seat name must not ride in the 31990 announce; got: {content}"
+        );
     }
 }
