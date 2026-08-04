@@ -48,14 +48,8 @@ const LOCK_FILE: &str = "spent.lock";
 /// Fail-closed refusal — never a silent clamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BudgetRefuse {
-    /// Amount exceeds the per-job cap (checked first).
+    /// Amount exceeds the per-job cap — the sole spend gate (issue #378 removed the rolling total cap).
     PerJob { amount: u64, per_job_cap: u64 },
-    /// Amount fits per-job but exceeds remaining total budget.
-    Total {
-        amount: u64,
-        remaining: u64,
-        total_cap: u64,
-    },
     /// Durable spent persist failed — effect must not run.
     Persist(String),
 }
@@ -69,14 +63,6 @@ impl std::fmt::Display for BudgetRefuse {
             } => write!(
                 formatter,
                 "budget refused: amount {amount} exceeds per-job cap {per_job_cap}"
-            ),
-            Self::Total {
-                amount,
-                remaining,
-                total_cap,
-            } => write!(
-                formatter,
-                "budget refused: amount {amount} exceeds remaining total {remaining} (total cap {total_cap})"
             ),
             Self::Persist(detail) => write!(formatter, "budget spent persist failed: {detail}"),
         }
@@ -120,7 +106,6 @@ struct FoldedSpent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BudgetGate {
     per_job_cap: u64,
-    total_cap: u64,
     /// Cache of the last fold; refreshed from disk before every durable cap check and
     /// used directly as the store for the non-durable (in-memory) gate.
     spent: u64,
@@ -135,10 +120,9 @@ pub struct BudgetGate {
 
 impl BudgetGate {
     /// In-memory gate (tests / callers that do not need durability).
-    pub fn new(per_job_cap: u64, total_cap: u64) -> Self {
+    pub fn new(per_job_cap: u64) -> Self {
         Self {
             per_job_cap,
-            total_cap,
             spent: 0,
             counted_attempts: BTreeSet::new(),
             ledger_path: None,
@@ -146,12 +130,12 @@ impl BudgetGate {
         }
     }
 
-    /// Caps from config; spent starts at 0 and is not durable.
+    /// Per-job cap from config; spent starts at 0 and is not durable.
     pub fn from_config(config: &MobeeConfig) -> Self {
-        Self::new(config.per_job_budget_sats, config.total_budget_sats)
+        Self::new(config.per_job_budget_sats)
     }
 
-    /// Caps from home config; spent folded from the append-only ledger at
+    /// Per-job cap from home config; spent folded from the append-only ledger at
     /// `~/.mobee/spent.jsonl` (created on first append). A legacy `spent.toml`, if
     /// present, is folded in as an opening base so no pre-#22 spend history is lost;
     /// it is left in place and never rewritten.
@@ -161,7 +145,6 @@ impl BudgetGate {
         let folded = fold_ledger(&ledger_path, legacy_base.as_ref())?;
         Ok(Self {
             per_job_cap: home.config.per_job_budget_sats,
-            total_cap: home.config.total_budget_sats,
             spent: folded.spent,
             counted_attempts: folded.counted_attempts,
             ledger_path: Some(ledger_path),
@@ -173,16 +156,8 @@ impl BudgetGate {
         self.per_job_cap
     }
 
-    pub fn total_cap(&self) -> u64 {
-        self.total_cap
-    }
-
     pub fn spent(&self) -> u64 {
         self.spent
-    }
-
-    pub fn remaining(&self) -> u64 {
-        self.total_cap.saturating_sub(self.spent)
     }
 
     /// Path to the append-only spend ledger (`spent.jsonl`), when durable.
@@ -195,20 +170,13 @@ impl BudgetGate {
         self.counted_attempts.contains(attempt_id)
     }
 
-    /// Check only — does not mutate. Distinct errors for per-job vs total.
+    /// Check only — does not mutate. The per-job cap is the sole spend gate (issue #378 removed the
+    /// rolling total cap); it is stateless, so it does not read `spent`.
     pub fn check(&self, amount: u64) -> Result<(), BudgetRefuse> {
         if amount > self.per_job_cap {
             return Err(BudgetRefuse::PerJob {
                 amount,
                 per_job_cap: self.per_job_cap,
-            });
-        }
-        let remaining = self.remaining();
-        if amount > remaining {
-            return Err(BudgetRefuse::Total {
-                amount,
-                remaining,
-                total_cap: self.total_cap,
             });
         }
         Ok(())
@@ -438,7 +406,7 @@ mod tests {
 
     #[test]
     fn exceed_per_job_refuses_with_distinct_error() {
-        let mut gate = BudgetGate::new(21, 100);
+        let mut gate = BudgetGate::new(21);
         let err = gate.authorize_and_commit(22).expect_err("refuse");
         assert!(matches!(
             err,
@@ -453,7 +421,7 @@ mod tests {
 
     #[test]
     fn boundary_per_job_pass_then_plus_one_refuse() {
-        let mut gate = BudgetGate::new(21, 100);
+        let mut gate = BudgetGate::new(21);
         gate.authorize_and_commit(21).expect("boundary pass");
         assert_eq!(gate.spent(), 21);
         let err = gate.authorize_and_commit(22).expect_err("plus one");
@@ -462,39 +430,42 @@ mod tests {
     }
 
     #[test]
-    fn boundary_remaining_total_pass_then_plus_one_refuse() {
-        let mut gate = BudgetGate::new(50, 100);
-        gate.authorize_and_commit(50).expect("first");
-        gate.authorize_and_commit(50).expect("exact remaining");
-        assert_eq!(gate.spent(), 100);
-        let err = gate.authorize_and_commit(1).expect_err("over total");
-        assert!(matches!(
-            err,
-            BudgetRefuse::Total {
-                amount: 1,
-                remaining: 0,
-                total_cap: 100
-            }
-        ));
-        assert!(err.to_string().contains("remaining total"));
+    fn per_job_over_cap_refuses_distinctly() {
+        // Issue #378 removed the rolling total cap and its `BudgetRefuse::Total` branch; the per-job
+        // cap is the sole spend gate. An amount over it refuses with the distinct `PerJob` error and
+        // spends nothing. (The per-job cap is stateless — a gate may commit many in-cap spends.)
+        let mut gate = BudgetGate::new(30);
+        let job_err = gate.authorize_and_commit(31).expect_err("per-job");
+        assert!(matches!(job_err, BudgetRefuse::PerJob { .. }));
+        assert_eq!(gate.spent(), 0);
     }
 
     #[test]
-    fn per_job_vs_total_distinct_errors() {
-        let mut gate = BudgetGate::new(30, 50);
-        gate.authorize_and_commit(30).expect("seed spend");
-        let total_err = gate.authorize_and_commit(25).expect_err("total");
-        assert!(matches!(total_err, BudgetRefuse::Total { remaining: 20, .. }));
-
-        let mut gate2 = BudgetGate::new(30, 100);
-        let job_err = gate2.authorize_and_commit(31).expect_err("per-job");
-        assert!(matches!(job_err, BudgetRefuse::PerJob { .. }));
-        assert_eq!(gate2.spent(), 0);
+    fn default_config_binds_the_shipped_30k_per_job_gate() {
+        // Ties the SHIPPED default (30_000, #378) to the per-job gate. Reddens if the default reverts
+        // OR the per-job check is removed. (from_config_binds_cap_not_tool_args uses an arbitrary 7.)
+        assert_eq!(crate::home::DEFAULT_PER_JOB_BUDGET_SATS, 30_000, "shipped per-job default");
+        assert_eq!(
+            MobeeConfig::default().per_job_budget_sats,
+            crate::home::DEFAULT_PER_JOB_BUDGET_SATS
+        );
+        assert_eq!(
+            BudgetGate::from_config(&MobeeConfig::default()).per_job_cap(),
+            30_000,
+            "the gate binds the shipped default cap"
+        );
+        // At the shipped cap: one over refuses with PerJob and spends nothing; exactly at-cap passes.
+        let mut gate = BudgetGate::new(crate::home::DEFAULT_PER_JOB_BUDGET_SATS);
+        let err = gate.authorize_and_commit(30_001).expect_err("one over the shipped default refuses");
+        assert!(matches!(err, BudgetRefuse::PerJob { .. }));
+        assert_eq!(gate.spent(), 0);
+        gate.authorize_and_commit(30_000).expect("exactly at the shipped default passes");
+        assert_eq!(gate.spent(), 30_000);
     }
 
     #[test]
     fn refuse_before_effect() {
-        let mut gate = BudgetGate::new(10, 10);
+        let mut gate = BudgetGate::new(10);
         let mut fired = false;
         let err = gate
             .authorize_then(11, || {
@@ -517,37 +488,39 @@ mod tests {
         assert_eq!(gate.spent(), 10);
     }
 
+    // Issue #378 removed the total cap this once proved; the serialization it rode on now protects
+    // attempt-id idempotency. Eight concurrent committers of the SAME attempt id, serialized behind
+    // one lock, must count the spend exactly ONCE — never eight times — while every call still
+    // returns Ok (an idempotent replay succeeds).
     #[test]
-    fn concurrent_spends_never_exceed_total() {
-        let gate = Arc::new(Mutex::new(BudgetGate::new(50, 100)));
+    fn concurrent_same_attempt_id_counts_spent_once() {
+        let gate = Arc::new(Mutex::new(BudgetGate::new(50)));
         let mut handles = Vec::new();
         for _ in 0..8 {
             let gate = Arc::clone(&gate);
             handles.push(thread::spawn(move || {
                 let mut guard = gate.lock().expect("lock");
-                guard.authorize_and_commit(50).is_ok()
+                guard.authorize_then_attempt("shared-id", 50, || ()).is_ok()
             }));
         }
         let oks: usize = handles
             .into_iter()
             .map(|handle| usize::from(handle.join().expect("join")))
             .sum();
-        let spent = gate.lock().expect("lock").spent();
-        assert!(oks <= 2, "oks={oks}");
-        assert!(spent <= 100, "spent={spent}");
-        assert_eq!(spent, oks as u64 * 50);
+        let gate = gate.lock().expect("lock");
+        assert_eq!(oks, 8, "every committer of a counted attempt returns Ok idempotently");
+        assert_eq!(gate.spent(), 50, "the shared attempt id is counted exactly once, never 8×");
+        assert!(gate.has_counted_attempt("shared-id"));
     }
 
     #[test]
-    fn from_config_binds_caps_not_tool_args() {
+    fn from_config_binds_cap_not_tool_args() {
         let config = MobeeConfig {
             per_job_budget_sats: 7,
-            total_budget_sats: 21,
             ..MobeeConfig::default()
         };
         let gate = BudgetGate::from_config(&config);
         assert_eq!(gate.per_job_cap(), 7);
-        assert_eq!(gate.total_cap(), 21);
         assert_ne!(gate.per_job_cap(), 999);
     }
 
@@ -572,7 +545,6 @@ mod tests {
 
         let reloaded = BudgetGate::from_home(&home).expect("reload");
         assert_eq!(reloaded.spent(), 21);
-        assert_eq!(reloaded.remaining(), home.config.total_budget_sats - 21);
     }
 
     #[test]
@@ -592,7 +564,7 @@ mod tests {
 
     #[test]
     fn attempt_id_retry_does_not_double_count_spent() {
-        let mut gate = BudgetGate::new(50, 100);
+        let mut gate = BudgetGate::new(50);
         let mut fires = 0u32;
         gate.authorize_then_attempt("att-1", 21, || {
             fires += 1;
@@ -656,10 +628,9 @@ mod tests {
         let root = temp_home("two-handle");
         let _ = fs::remove_dir_all(&root);
         let home = home::bootstrap(&root).expect("bootstrap");
-        // per_job high enough, total high enough that all four spends fit.
+        // per_job high enough that all four spends fit (issue #378 removed the total cap).
         let mut home = home;
         home.config.per_job_budget_sats = 100;
-        home.config.total_budget_sats = 1000;
 
         // Both handles load at the same "start" — each sees spent == 0.
         let mut gate_a = BudgetGate::from_home(&home).expect("gate a");
@@ -693,7 +664,6 @@ mod tests {
         let root = temp_home("legacy");
         let _ = fs::remove_dir_all(&root);
         let mut home = home::bootstrap(&root).expect("bootstrap");
-        home.config.total_budget_sats = 1000;
         home.config.per_job_budget_sats = 100;
 
         // Seed a legacy whole-file total with an already-counted attempt id.
@@ -703,7 +673,6 @@ mod tests {
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         assert_eq!(gate.spent(), 100, "legacy total folded as base");
         assert!(gate.has_counted_attempt("old-1"));
-        assert_eq!(gate.remaining(), 900);
 
         // A retry of the legacy attempt must not re-count.
         gate.authorize_then_attempt("old-1", 50, || ())
@@ -779,22 +748,23 @@ mod tests {
         assert!(matches!(err, BudgetRefuse::Persist(_)));
     }
 
-    // Fix O — cross-process TOCTOU closed. "Process 1" holds the advisory lock (its critical
-    // section). A second handle's `authorize_and_commit` MUST block on the lock rather than
-    // fold-then-append against a stale (0) view. While blocked, process 1 records a 40-sat spend
-    // and releases; the second handle then refolds (sees 40) and refuses the 40 that would take
-    // total to 80 > cap 60 — the cap can never be exceeded. Reverting the lock lets the second
-    // handle fold the stale 0, pass the check, and overspend (append a second 40), so this test
-    // goes red on revert.
+    // Fix O (repurposed for #378): the cross-process lock still serializes the fold→check→append.
+    // The total cap it used to enforce is gone; the property it now protects is attempt-id append
+    // integrity. "Process 1" holds the advisory lock (its critical section). A second handle's
+    // `authorize_then_attempt` for the SAME attempt id MUST block on the lock rather than
+    // fold-then-append against a stale (empty) view. While blocked, process 1 appends that attempt's
+    // 40-sat record and releases; the second handle then refolds (sees the attempt already counted)
+    // and appends NOTHING — one record on disk, counted once. Reverting the lock lets the second
+    // handle run before process-1's append lands: it does NOT block (its completion signal arrives,
+    // failing the block assertion) and appends a duplicate — so this test goes red on revert.
     #[test]
-    fn budget_lock_serializes_reserve_and_enforces_cap() {
+    fn budget_lock_serializes_reserve_and_dedupes_attempt_id() {
         use std::sync::mpsc;
         use std::time::Duration;
 
         let root = temp_home("budget-lock");
         let _ = fs::remove_dir_all(&root);
         let mut home = home::bootstrap(&root).expect("bootstrap");
-        home.config.total_budget_sats = 60;
         home.config.per_job_budget_sats = 40;
 
         let ledger = root.join(LEDGER_FILE);
@@ -811,9 +781,9 @@ mod tests {
         let home2 = home.clone();
         let handle = thread::spawn(move || {
             let mut gate = BudgetGate::from_home(&home2).expect("gate");
-            let result = gate.authorize_and_commit(40);
+            let result = gate.authorize_then_attempt("shared", 40, || ());
             tx.send(()).expect("signal completion");
-            result
+            result.map(|()| gate.spent())
         });
 
         // Process 2 must be blocked on the lock — no completion signal yet.
@@ -822,21 +792,26 @@ mod tests {
             "reserve ran while another process held the lock (TOCTOU not closed)"
         );
 
-        // Process 1 records its own 40-sat spend, then releases the lock.
+        // Process 1 records the SAME attempt's 40-sat spend, then releases the lock.
         append_record(
             &ledger,
-            &LedgerRecord { amount_sats: 40, attempt_id: None, recorded_at: 0 },
+            &LedgerRecord { amount_sats: 40, attempt_id: Some("shared".into()), recorded_at: 0 },
         )
         .expect("process-1 spend");
         held.unlock().expect("release lock");
 
-        // Process 2 now refolds (sees 40); its 40 would take total to 80 > cap 60 → refused.
-        let result = handle.join().expect("join");
-        assert!(
-            matches!(result, Err(BudgetRefuse::Total { remaining: 20, .. })),
-            "second reserve must refuse after seeing process-1's spend, got {result:?}"
+        // Process 2 now refolds (sees "shared" already counted) and dedupes: no second append.
+        let spent = handle.join().expect("join").expect("second commit is idempotent");
+        assert_eq!(spent, 40, "the shared attempt id is counted once, not twice");
+        let records = fs::read_to_string(&ledger)
+            .expect("read ledger")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        assert_eq!(
+            records, 1,
+            "exactly one append survives — the lock closed the duplicate-append window"
         );
-        assert_eq!(load_spent(&ledger).expect("load"), 40, "cap must not be exceeded");
         let _ = fs::remove_dir_all(&root);
     }
 

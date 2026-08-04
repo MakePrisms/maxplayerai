@@ -116,7 +116,6 @@ pub struct AuthorizePayOutcome {
     /// differ and the gap is the hop's cost rather than anything the seller was paid.
     pub charged_sats: u64,
     pub spent_total_sats: u64,
-    pub remaining_sats: u64,
 }
 
 #[derive(Debug)]
@@ -484,7 +483,6 @@ pub async fn authorize_pay_async(
         amount_sats: amount,
         charged_sats: charged,
         spent_total_sats: gate.spent(),
-        remaining_sats: gate.remaining(),
     })
 }
 
@@ -896,10 +894,10 @@ mod tests {
         );
     }
 
-    // Real-mint switch: a buyer configured at a real mint X is REFUSED by the fence when
-    // `allow_real_mints` is false (default safety posture)...
+    // Real-mint switch: a buyer configured at a real mint X is REFUSED by the fence when the
+    // operator sets `allow_real_mints = false` (opt-out; since #378 the default is true)...
     #[test]
-    fn pay_plan_real_mint_refused_by_default() {
+    fn pay_plan_real_mint_refused_when_flag_false() {
         let error =
             crate::crossmint::plan_payment(REAL_MINT, &[REAL_MINT.to_string()], false).unwrap_err();
         assert!(matches!(error, AuthorizePayError::Input(_)));
@@ -1024,10 +1022,13 @@ mod tests {
                 .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let home = home::bootstrap(&root).expect("home");
+        let mut home = home::bootstrap(&root).expect("home");
+        // Issue #378 made allow_real_mints default TRUE; force the fenced posture this test needs so
+        // the seller's real mint stays inadmissible and the hop has nowhere to land.
+        home.config.allow_real_mints = false;
         assert!(
             !home.config.allow_real_mints,
-            "the default posture is what makes this refuse"
+            "fenced posture (allow_real_mints = false) is what makes this refuse"
         );
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let request = AuthorizePayRequest {

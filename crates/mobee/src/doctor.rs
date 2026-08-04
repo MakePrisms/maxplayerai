@@ -812,7 +812,6 @@ mod tests {
             rate_sats: 5,
             git_remote: "https://example.invalid/repo".into(),
             job_timeout_secs: None,
-            agent: Some("myabsent".to_owned()),
             agents: Vec::new(), // empty ⇒ boot uses fallback_registry (agent_command VERBATIM)
             claim_open_pool: false,
             offer_backfill_secs: 0,
@@ -853,8 +852,7 @@ mod tests {
             rate_sats: 5,
             git_remote: "https://example.invalid/repo".into(),
             job_timeout_secs: None,
-            agent: Some("ghostxyz-not-a-preset".to_owned()),
-            agents: vec![mobee_core::home::AgentSlotConfig::named("ghostxyz-not-a-preset")],
+            agents: vec!["ghostxyz-not-a-preset".to_owned()],
             claim_open_pool: false,
             offer_backfill_secs: 0,
             contribution_enabled: true,

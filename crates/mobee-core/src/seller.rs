@@ -808,8 +808,6 @@ mod tests {
 relay_url = "wss://example.invalid"
 accepted_mints = ["https://testnut.cashudevkit.org"]
 per_job_budget_sats = 21
-total_budget_sats = 100
-
 [seller]
 agent_command = "claude --print"
 rate_sats = 1
@@ -822,16 +820,17 @@ git_remote = "https://example.invalid/repo.git"
         );
     }
 
-    // TOOTH (compat) — a seller config written before the registry existed parses unchanged, with
-    // an EMPTY agents list. It is the fallback path that then serves it, not a silently invented
-    // registry.
+    // TOOTH (compat/migration #378) — a pre-#378 seller config with the singular `agent` label and a
+    // top-level `total_budget_sats` key still loads: the read-time migration drops `total_budget_sats`
+    // and folds `agent = "x"` into `agents = ["x"]`. Raw `toml::from_str` would reject both under
+    // `deny_unknown_fields`; `home::parse_config_toml` is the seam that folds them forward.
     #[test]
-    fn a_config_without_an_agents_list_parses_with_none() {
+    fn a_pre_378_config_migrates_agent_label_into_the_agents_list() {
         let raw = r#"
 relay_url = "wss://example.invalid"
 accepted_mints = ["https://testnut.cashudevkit.org"]
 per_job_budget_sats = 21
-total_budget_sats = 100
+total_budget_sats = 42
 
 [seller]
 agent_command = ["claude-agent-acp"]
@@ -839,21 +838,48 @@ agent = "claude"
 rate_sats = 7
 git_remote = "https://example.invalid/repo.git"
 "#;
-        let seller = toml::from_str::<MobeeConfig>(raw).expect("parse").seller.expect("seller");
-        assert!(seller.agents.is_empty());
-        assert_eq!(seller.agent.as_deref(), Some("claude"));
+        // Without the migration seam, deny_unknown_fields BRICKS this pre-#378 config — the exact
+        // failure the fold prevents. THIS contrast is the red-prove (lead's explicit ask).
+        assert!(
+            toml::from_str::<MobeeConfig>(raw).is_err(),
+            "raw parse must brick on total_budget_sats + singular agent under deny_unknown_fields"
+        );
+        let seller = crate::home::parse_config_toml(raw)
+            .expect("migration folds the legacy fields")
+            .seller
+            .expect("seller");
+        assert_eq!(
+            seller.agents,
+            vec!["claude".to_owned()],
+            "the singular agent label folds into the agents list"
+        );
     }
 
-    // TOOTH — the `agents` list takes bare names AND `{ name, slots }` tables in the SAME list, and
-    // a single-slot entry serializes back to the bare name. This is the growth seam: adding pool
-    // counts later means adding a field to an entry, never reshaping a config an operator wrote.
+    // TOOTH (#378) — `[seller] agents` is a plain list of harness names (`Vec<String>`). A pre-#378
+    // config that wrote `{ name, slots }` table entries still loads: the read-time migration collapses
+    // each table entry to its bare `name` (the per-entry `slots` knob was removed as dead weight).
     #[test]
-    fn the_agents_list_accepts_bare_names_and_tables_together() {
-        let raw = r#"
+    fn the_agents_list_is_bare_names_and_migrates_table_entries() {
+        // The shipped shape: a bare-name list round-trips through raw parse.
+        let bare = r#"
 relay_url = "wss://example.invalid"
 accepted_mints = ["https://testnut.cashudevkit.org"]
 per_job_budget_sats = 21
-total_budget_sats = 100
+
+[seller]
+agent_command = ["claude-agent-acp"]
+rate_sats = 7
+git_remote = "https://example.invalid/repo.git"
+agents = ["claude", "codex"]
+"#;
+        let seller = toml::from_str::<MobeeConfig>(bare).expect("parse").seller.expect("seller");
+        assert_eq!(seller.agents, vec!["claude".to_owned(), "codex".to_owned()]);
+
+        // A pre-#378 config with `{ name, slots }` table entries migrates to bare names, in order.
+        let tables = r#"
+relay_url = "wss://example.invalid"
+accepted_mints = ["https://testnut.cashudevkit.org"]
+per_job_budget_sats = 21
 
 [seller]
 agent_command = ["claude-agent-acp"]
@@ -861,26 +887,15 @@ rate_sats = 7
 git_remote = "https://example.invalid/repo.git"
 agents = ["claude", { name = "codex" }, { name = "cursor", slots = 3 }]
 "#;
-        let seller = toml::from_str::<MobeeConfig>(raw).expect("parse").seller.expect("seller");
-        let listed: Vec<(&str, u32)> = seller
-            .agents
-            .iter()
-            .map(|slot| (slot.name.as_str(), slot.slots))
-            .collect();
+        let migrated = crate::home::parse_config_toml(tables)
+            .expect("migration folds table entries to bare names")
+            .seller
+            .expect("seller");
         assert_eq!(
-            listed,
-            vec![("claude", 1), ("codex", 1), ("cursor", 3)],
-            "order is preference order; an omitted slots defaults to 1"
+            migrated.agents,
+            vec!["claude".to_owned(), "codex".to_owned(), "cursor".to_owned()],
+            "each name/slots table entry collapses to its bare name"
         );
-
-        // Single-slot entries round-trip as bare names, so the CLI keeps writing the simple form.
-        let rendered = toml::to_string(&seller).expect("serialize");
-        assert!(rendered.contains("\"claude\""), "{rendered}");
-        assert!(rendered.contains("slots = 3"), "{rendered}");
-
-        // A nameless or unknown-field entry is refused rather than half-understood.
-        assert!(toml::from_str::<crate::home::AgentSlotConfig>("slots = 2").is_err());
-        assert!(toml::from_str::<crate::home::AgentSlotConfig>("name = \"x\"\nrate = 2").is_err());
     }
 
     #[test]
@@ -889,8 +904,6 @@ agents = ["claude", { name = "codex" }, { name = "cursor", slots = 3 }]
 relay_url = "wss://example.invalid"
 accepted_mints = ["https://testnut.cashudevkit.org"]
 per_job_budget_sats = 21
-total_budget_sats = 100
-
 [seller]
 agent_command = ["claude", "--print"]
 rate_sats = 7
@@ -915,8 +928,6 @@ git_remote = "https://example.invalid/repo.git"
 relay_url = "wss://example.invalid"
 accepted_mints = ["https://testnut.cashudevkit.org"]
 per_job_budget_sats = 21
-total_budget_sats = 100
-
 [seller]
 agent_command = ["claude", "--print"]
 rate_sats = 7
@@ -948,7 +959,6 @@ offer_backfill_secs = {backfill}
                 rate_sats: 1,
                 git_remote: "https://example.invalid/repo.git".into(),
                 job_timeout_secs: None,
-                agent: None,
                 agents: Vec::new(),
                 claim_open_pool: false,
                 offer_backfill_secs: 0,

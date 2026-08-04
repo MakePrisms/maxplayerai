@@ -297,22 +297,19 @@ impl BuyerStore {
     // transaction under the connection mutex.
 
     /// Reserve `amount` sats for `job_id`, refusing atomically if it would exceed
-    /// `available = min(balance − reserved, total_cap − spent − reserved)` (see the module docs
-    /// for the two-ceiling model). On refusal ZERO is written. Re-reserving the same amount for a
-    /// still-`Reserved` job is an idempotent no-op; a previously-`Released` row is re-reserved
-    /// (subject to the check); a `Spent` row is refused.
+    /// `available = balance − reserved` (the wallet ceiling; see the module docs). On refusal ZERO
+    /// is written. Re-reserving the same amount for a still-`Reserved` job is an idempotent no-op; a
+    /// previously-`Released` row is re-reserved (subject to the check); a `Spent` row is refused.
     ///
-    /// `balance` (live wallet ecash), `total_cap` (budget policy cap), and `spent` (budget ledger
-    /// total) are snapshots the caller supplies — the store does not open the wallet or the budget
-    /// ledger. The transaction serializes only the `reserved` accumulation, which is the sole
-    /// quantity concurrent awards race on.
+    /// `balance` (live wallet ecash) is a snapshot the caller supplies — the store does not open the
+    /// wallet. The transaction serializes only the `reserved` accumulation, which is the sole
+    /// quantity concurrent awards race on. Issue #378 removed the budget ceiling, so the store no
+    /// longer takes `total_cap`/`spent`.
     pub fn reserve(
         &self,
         job_id: &str,
         amount: u64,
         balance: u64,
-        total_cap: u64,
-        spent: u64,
         now_unix: i64,
     ) -> Result<Reserved, ReserveRefused> {
         let mut conn = self
@@ -357,7 +354,7 @@ impl BuyerStore {
         // `Reserved`-state rows and therefore excludes this job (fresh, or currently released).
         let reserved =
             sum_reserved(&tx).map_err(|error| ReserveRefused::Store(error.to_string()))?;
-        let breakdown = available_breakdown(balance, total_cap, reserved, spent);
+        let breakdown = available_breakdown(balance, reserved);
         if amount > breakdown.available {
             // Refuse with ZERO written — the transaction rolls back on drop, so no released→reserved
             // flip and no INSERT leak.
@@ -416,20 +413,17 @@ impl BuyerStore {
     ///
     /// # Ordering obligation (the #126 wiring)
     ///
-    /// This flip moves `amount` out of `reserved`. For BOTH ceilings to stay correct across the
-    /// flip, the two effects that take `amount` up elsewhere MUST have already landed before this
-    /// call:
+    /// This flip moves `amount` out of `reserved`. For the wallet ceiling to stay correct across the
+    /// flip, the effect that takes `amount` up elsewhere MUST have already landed before this call:
+    /// the wallet melt (the reduction the live `wallet_balance` reports) — else the wallet ceiling
+    /// `wallet_balance − reserved` is transiently over-stated by `amount` (reserved dropped but the
+    /// balance has not yet fallen).
     ///
-    /// - the budget ledger's `spent`-append ([`crate::budget`]) — else the budget ceiling
-    ///   `total_cap − spent − reserved` is transiently over-stated by `amount` (reserved dropped but
-    ///   spent has not yet risen);
-    /// - the wallet melt (the reduction the live `wallet_balance` reports) — else the wallet ceiling
-    ///   `wallet_balance − reserved` is transiently over-stated by `amount` (reserved dropped but the
-    ///   balance has not yet fallen).
-    ///
-    /// Sequenced correctly (append-spent + melt, THEN convert) the amount is never in two terms at
-    /// once and never in neither: each ceiling sees a single, once-only reduction with no transient
-    /// over-statement and no gap. The daemon that wires collect (#126) owns this ordering.
+    /// Sequenced correctly (melt, THEN convert) the amount is never in two terms at once and never in
+    /// neither: the ceiling sees a single, once-only reduction with no transient over-statement and no
+    /// gap. The daemon that wires collect (#126) owns this ordering. (The budget ledger's `spent`
+    /// append still happens on a paid collect for audit, but #378 removed the budget ceiling, so it no
+    /// longer participates in this ordering obligation.)
     pub fn convert_to_spent(
         &self,
         job_id: &str,
@@ -535,16 +529,10 @@ impl BuyerStore {
         Ok(reserved.max(0) as u64)
     }
 
-    /// `available = min(balance − reserved, total_cap − spent − reserved)`, saturating at 0.
-    /// `balance` (live wallet ecash), `total_cap` (budget policy cap), and `spent` (budget ledger
-    /// total) are caller snapshots. See the module docs for the two-ceiling model.
-    pub fn available(&self, balance: u64, total_cap: u64, spent: u64) -> Result<u64, StoreError> {
-        Ok(compute_available(
-            balance,
-            total_cap,
-            self.reserved_in_flight()?,
-            spent,
-        ))
+    /// `available = balance − reserved`, saturating at 0. `balance` (live wallet ecash) is a caller
+    /// snapshot. See the module docs for the wallet-ceiling model.
+    pub fn available(&self, balance: u64) -> Result<u64, StoreError> {
+        Ok(compute_available(balance, self.reserved_in_flight()?))
     }
 
     /// Job ids of every still-`Reserved` row — the set the daemon must resolve to dispositions at
@@ -1328,10 +1316,6 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
-    /// A budget cap so large only the wallet ceiling can bind — lets a test isolate the wallet
-    /// ceiling (`balance − reserved`) from the budget ceiling.
-    const NO_BUDGET: u64 = u64::MAX;
-
     fn fresh_store(label: &str) -> (BuyerStore, std::path::PathBuf) {
         let path = temp_db(label);
         let _ = std::fs::remove_file(&path);
@@ -1360,7 +1344,7 @@ mod tests {
         // The reservations table is now usable.
         assert_eq!(store.reserved_in_flight().expect("reserved"), 0);
         store
-            .reserve(&"a".repeat(64), 10, 100, NO_BUDGET, 0, 1)
+            .reserve(&"a".repeat(64), 10, 100, 1)
             .expect("reserve on upgraded db");
         // The pending_awards table is now usable too.
         store
@@ -1533,7 +1517,7 @@ mod tests {
         let settled_attributed = "b".repeat(64);
         let reserved_null = "c".repeat(64);
         for job in [&settled_null, &settled_attributed, &reserved_null] {
-            store.reserve(job, 5, 100, NO_BUDGET, 0, 1).expect("reserve");
+            store.reserve(job, 5, 100, 1).expect("reserve");
             store
                 .record_award(job, &"1".repeat(64), &"2".repeat(64), &"3".repeat(64), 5, 1)
                 .expect("award");
@@ -1568,7 +1552,7 @@ mod tests {
         let waiting = "c".repeat(64);
 
         for (job, amount) in [(&paid, 10u64), (&dropped, 20), (&waiting, 30)] {
-            store.reserve(job, amount, 1_000, NO_BUDGET, 0, 1).expect("reserve");
+            store.reserve(job, amount, 1_000, 1).expect("reserve");
             store
                 .record_award(job, &"c".repeat(64), &"e".repeat(64), &"f".repeat(64), amount, 1)
                 .expect("record award");
@@ -1590,7 +1574,7 @@ mod tests {
 
         // A reservation with no award row is NOT the watcher's business — it never awarded it.
         let foreign = "d".repeat(64);
-        store.reserve(&foreign, 5, 1_000, NO_BUDGET, 0, 3).expect("reserve foreign");
+        store.reserve(&foreign, 5, 1_000, 3).expect("reserve foreign");
         assert_eq!(
             store.awarded_unsettled_job_ids().expect("awarded"),
             vec![waiting],
@@ -1638,29 +1622,23 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // available = min(balance − reserved, total_cap − spent − reserved), saturating at 0.
+    // available = balance − reserved, saturating at 0 (issue #378 removed the budget ceiling; the
+    // wallet is the sole ceiling).
     #[test]
-    fn available_is_min_of_wallet_and_budget_ceilings() {
+    fn available_is_the_wallet_ceiling() {
         let (store, path) = fresh_store("available");
-        // No reservations, no budget constraint: available is the whole wallet balance.
-        assert_eq!(store.available(100, NO_BUDGET, 0).expect("avail"), 100);
-        store.reserve(&"a".repeat(64), 30, 100, NO_BUDGET, 0, 1).expect("reserve");
+        // No reservations: available is the whole wallet balance.
+        assert_eq!(store.available(100).expect("avail"), 100);
+        store.reserve(&"a".repeat(64), 30, 100, 1).expect("reserve");
         assert_eq!(store.reserved_in_flight().expect("r"), 30);
 
-        // Wallet ceiling binds: wallet balance 100 − reserved 30 = 70; the huge budget cap does not
-        // bite, and spent is NOT subtracted from the wallet ceiling (the live balance already
-        // netted completed spends). So spent=20 does not drag this below 70.
-        assert_eq!(store.available(100, NO_BUDGET, 20).expect("avail"), 70);
-
-        // Budget ceiling binds: total_cap 60 − spent 20 − reserved 30 = 10, which is below the
-        // wallet ceiling 70. available = min(70, 10) = 10.
-        assert_eq!(store.available(100, 60, 20).expect("avail"), 10);
+        // Wallet ceiling binds: wallet balance 100 − reserved 30 = 70. `spent` is NOT part of this —
+        // the live balance already netted every completed spend, so cumulative spend never drags it.
+        assert_eq!(store.available(100).expect("avail"), 70);
 
         // Wallet ceiling saturates at 0: reserved alone exceeds a tiny live balance (never
         // underflows). balance 10 − reserved 30 → 0.
-        assert_eq!(store.available(10, NO_BUDGET, 0).expect("avail"), 0);
-        // Budget ceiling saturates at 0: total_cap 40 − spent 20 − reserved 30 → 0.
-        assert_eq!(store.available(1000, 40, 20).expect("avail"), 0);
+        assert_eq!(store.available(10).expect("avail"), 0);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1674,13 +1652,13 @@ mod tests {
         let job_a = "a".repeat(64);
         let job_b = "b".repeat(64);
         // balance 100, spent 0, no budget constraint. Reserve 80 → available becomes 20.
-        store.reserve(&job_a, 80, 100, NO_BUDGET, 0, 1).expect("first reserve fits");
+        store.reserve(&job_a, 80, 100, 1).expect("first reserve fits");
         assert_eq!(store.reserved_in_flight().expect("r"), 80);
-        assert_eq!(store.available(100, NO_BUDGET, 0).expect("avail"), 20);
+        assert_eq!(store.available(100).expect("avail"), 20);
 
         // A 40-sat award would push reserved to 120 > balance 100 → refuse, bound by the wallet.
         let refused = store
-            .reserve(&job_b, 40, 100, NO_BUDGET, 0, 2)
+            .reserve(&job_b, 40, 100, 2)
             .expect_err("over-available award must refuse");
         assert!(
             matches!(refused, ReserveRefused::InsufficientAvailable { requested: 40, available: 20, bound: Ceiling::Wallet }),
@@ -1689,7 +1667,7 @@ mod tests {
         // ZERO written: no row for job_b, reserved + available unchanged.
         assert!(store.reservation(&job_b).expect("read").is_none(), "refused award must write NO row");
         assert_eq!(store.reserved_in_flight().expect("r"), 80, "reserved must be unchanged");
-        assert_eq!(store.available(100, NO_BUDGET, 0).expect("avail"), 20, "available must be unchanged");
+        assert_eq!(store.available(100).expect("avail"), 20, "available must be unchanged");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1719,7 +1697,7 @@ mod tests {
             std::thread::spawn(move || {
                 let store = BuyerStore::open(&path).expect("open");
                 barrier.wait();
-                store.reserve(&job, 60, 100, NO_BUDGET, 0, 1)
+                store.reserve(&job, 60, 100, 1)
             })
         };
         let h_a = run(job_a.clone(), path.clone(), barrier.clone());
@@ -1752,7 +1730,7 @@ mod tests {
     fn tooth3_reserve_to_spent_is_exactly_once() {
         let (store, path) = fresh_store("tooth3");
         let job = "a".repeat(64);
-        store.reserve(&job, 60, 100, NO_BUDGET, 0, 1).expect("reserve");
+        store.reserve(&job, 60, 100, 1).expect("reserve");
         assert_eq!(store.reserved_in_flight().expect("r"), 60);
 
         // First collect converts reserve → spent.
@@ -1774,7 +1752,7 @@ mod tests {
         assert_eq!(store.reserved_in_flight().expect("r"), 0);
 
         // Re-reserving a spent job is refused (already paid) — no phantom re-commitment.
-        let refused = store.reserve(&job, 60, 100, NO_BUDGET, 0, 4).expect_err("spent job re-reserve refused");
+        let refused = store.reserve(&job, 60, 100, 4).expect_err("spent job re-reserve refused");
         assert!(matches!(refused, ReserveRefused::AlreadySpent { .. }), "got {refused:?}");
         let _ = std::fs::remove_file(&path);
     }
@@ -1790,23 +1768,23 @@ mod tests {
         let dead = "a".repeat(64);
         let fresh = "b".repeat(64);
         // Whole balance reserved against `dead`.
-        store.reserve(&dead, 100, 100, NO_BUDGET, 0, 1).expect("reserve dead");
-        assert_eq!(store.available(100, NO_BUDGET, 0).expect("avail"), 0);
+        store.reserve(&dead, 100, 100, 1).expect("reserve dead");
+        assert_eq!(store.available(100).expect("avail"), 0);
 
         // A new payable job is refused — the classic lock-up symptom.
         let refused = store
-            .reserve(&fresh, 100, 100, NO_BUDGET, 0, 2)
+            .reserve(&fresh, 100, 100, 2)
             .expect_err("no funds while dead job holds them");
         assert!(matches!(refused, ReserveRefused::InsufficientAvailable { available: 0, .. }), "got {refused:?}");
 
         // The dead job is released (offer expired / declined / pay-window lapsed / …).
         assert_eq!(store.release(&dead, 3).expect("release"), Released::Freed { amount: 100 });
         assert_eq!(store.reserved_in_flight().expect("r"), 0);
-        assert_eq!(store.available(100, NO_BUDGET, 0).expect("avail"), 100, "funds reclaimed, not stuck");
+        assert_eq!(store.available(100).expect("avail"), 100, "funds reclaimed, not stuck");
 
         // The previously-refused award now succeeds against the reclaimed funds.
         assert!(matches!(
-            store.reserve(&fresh, 100, 100, NO_BUDGET, 0, 4).expect("now fits"),
+            store.reserve(&fresh, 100, 100, 4).expect("now fits"),
             Reserved::New { .. }
         ));
         assert_eq!(store.reserved_in_flight().expect("r"), 100);
@@ -1830,8 +1808,8 @@ mod tests {
         let live = "b".repeat(64);
         {
             let store = BuyerStore::open(&path).expect("open");
-            store.reserve(&dead, 60, 100, NO_BUDGET, 0, 1).expect("reserve dead");
-            store.reserve(&live, 20, 100, NO_BUDGET, 0, 1).expect("reserve live");
+            store.reserve(&dead, 60, 100, 1).expect("reserve dead");
+            store.reserve(&live, 20, 100, 1).expect("reserve live");
         } // daemon "crashes" — in-memory tracking is lost, the DB persists.
 
         // Restart: the reservations are still on disk.
@@ -1849,7 +1827,7 @@ mod tests {
         assert_eq!(report.released, vec![dead.clone()]);
         assert_eq!(report.kept, vec![live.clone()]);
         assert_eq!(store.reserved_in_flight().expect("r"), 20, "only the live reservation remains");
-        assert_eq!(store.available(100, NO_BUDGET, 0).expect("avail"), 80, "dead funds restored");
+        assert_eq!(store.available(100).expect("avail"), 80, "dead funds restored");
 
         // Idempotent — a second reconcile with the same truth changes nothing.
         let again = store.reconcile(&dispositions, 11).expect("reconcile again");
@@ -1864,7 +1842,7 @@ mod tests {
     fn reconcile_paid_job_converts_dangling_reserve_to_spent() {
         let (store, path) = fresh_store("reconcile-paid");
         let paid = "a".repeat(64);
-        store.reserve(&paid, 40, 100, NO_BUDGET, 0, 1).expect("reserve");
+        store.reserve(&paid, 40, 100, 1).expect("reserve");
         let mut dispositions: BTreeMap<String, JobDisposition> = BTreeMap::new();
         dispositions.insert(paid.clone(), JobDisposition::Paid);
         let report = store.reconcile(&dispositions, 2).expect("reconcile");
@@ -1880,13 +1858,13 @@ mod tests {
     fn re_award_same_amount_idempotent_different_amount_refused() {
         let (store, path) = fresh_store("re-award");
         let job = "a".repeat(64);
-        store.reserve(&job, 50, 100, NO_BUDGET, 0, 1).expect("reserve");
+        store.reserve(&job, 50, 100, 1).expect("reserve");
         assert_eq!(
-            store.reserve(&job, 50, 100, NO_BUDGET, 0, 2).expect("idempotent"),
+            store.reserve(&job, 50, 100, 2).expect("idempotent"),
             Reserved::Idempotent
         );
         assert_eq!(store.reserved_in_flight().expect("r"), 50, "no double-count");
-        let refused = store.reserve(&job, 70, 100, NO_BUDGET, 0, 3).expect_err("amount mismatch refused");
+        let refused = store.reserve(&job, 70, 100, 3).expect_err("amount mismatch refused");
         assert!(matches!(refused, ReserveRefused::AmountMismatch { existing: 50, requested: 70, .. }), "got {refused:?}");
         let _ = std::fs::remove_file(&path);
     }
@@ -1897,11 +1875,11 @@ mod tests {
     fn released_row_can_be_re_reserved() {
         let (store, path) = fresh_store("re-reserve");
         let job = "a".repeat(64);
-        store.reserve(&job, 30, 100, NO_BUDGET, 0, 1).expect("reserve");
+        store.reserve(&job, 30, 100, 1).expect("reserve");
         assert_eq!(store.release(&job, 2).expect("release"), Released::Freed { amount: 30 });
         assert_eq!(store.reserved_in_flight().expect("r"), 0);
         assert!(matches!(
-            store.reserve(&job, 30, 100, NO_BUDGET, 0, 3).expect("re-reserve"),
+            store.reserve(&job, 30, 100, 3).expect("re-reserve"),
             Reserved::New { .. }
         ));
         assert_eq!(store.reserved_in_flight().expect("r"), 30);
@@ -1915,7 +1893,7 @@ mod tests {
         let (store, path) = fresh_store("release-guards");
         let job = "a".repeat(64);
         let absent = "b".repeat(64);
-        store.reserve(&job, 40, 100, NO_BUDGET, 0, 1).expect("reserve");
+        store.reserve(&job, 40, 100, 1).expect("reserve");
         store.convert_to_spent(&job, 40, 2).expect("convert");
         assert_eq!(store.release(&job, 3).expect("release spent"), Released::WasSpent);
         assert_eq!(
@@ -1949,57 +1927,24 @@ mod tests {
     // REGRESSION (gudnuf's double-count bug) — the OLD formula `available = balance − reserved −
     // spent` subtracted cumulative `spent` from the LIVE wallet balance, double-counting every
     // completed payment (the melt already reduced the balance) and progressively refusing awards the
-    // buyer can actually afford. Here the wallet holds 40 ecash after 60 sat of completed spends
-    // under a 1000 budget cap; a 40-sat award is affordable. The corrected two-ceiling formula
-    // ALLOWS it: wallet ceiling = 40 − 0 = 40, budget ceiling = 1000 − 60 − 0 = 940, available = 40.
+    // buyer can actually afford. The wallet ceiling is `balance − reserved` ONLY; issue #378 removed
+    // the `spent`/budget term from the reservation store entirely, so the bug cannot re-enter through
+    // this API. Here the wallet holds 40 ecash after earlier completed spends (already netted by the
+    // melt); a 40-sat award is affordable: wallet ceiling = 40 − 0 = 40, so it lands.
     //
-    // Red-on-revert: revert `compute_available` to `balance − reserved − spent` and it returns
-    // 40 − 0 − 60 = 0 (saturated), so the award is wrongly refused and this test's `expect` fails.
+    // Red-on-revert: reintroduce a `− spent` term in `compute_available` (subtracting a cumulative
+    // spend the live balance already reflects) and the affordable award is wrongly refused.
     #[test]
     fn regression_completed_spend_not_double_counted_against_live_wallet() {
         let (store, path) = fresh_store("regression-double-count");
         let job = "a".repeat(64);
-        // wallet_balance 40 (post-melt), total_cap 1000, spent 60, reserved 0. Award 40.
+        // wallet_balance 40 (post-melt; earlier spends already netted), reserved 0. Award 40.
         let breakdown = store
-            .reserve(&job, 40, 40, 1000, 60, 1)
-            .expect("affordable award must be allowed under the two-ceiling formula");
+            .reserve(&job, 40, 40, 1)
+            .expect("affordable award must be allowed by the wallet ceiling");
         assert!(matches!(breakdown, Reserved::New { available_before: 40 }), "got {breakdown:?}");
         assert_eq!(store.reserved_in_flight().expect("r"), 40, "the 40-sat award landed");
-        assert_eq!(store.available(40, 1000, 60).expect("avail"), 0, "wallet ceiling now 40 − 40 = 0");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    // The budget ceiling still BITES: with plenty of ecash on hand (wallet 1000) but the budget cap
-    // nearly exhausted (total_cap 100, spent 90 → budget headroom 10), an award over the budget
-    // headroom is refused even though the wallet could physically cover it — and the refusal names
-    // the budget ceiling. An award within the headroom succeeds.
-    //
-    // Red-on-revert: drop the budget ceiling from `available_breakdown` (min only the wallet
-    // ceiling) and available becomes 1000, so the 40 is wrongly allowed and the refuse assert fails.
-    #[test]
-    fn budget_ceiling_bites_even_when_wallet_could_cover() {
-        let (store, path) = fresh_store("budget-ceiling");
-        let over = "a".repeat(64);
-        let fits = "b".repeat(64);
-        // wallet 1000, total_cap 100, spent 90, reserved 0 → budget ceiling 10, wallet ceiling 1000.
-        assert_eq!(store.available(1000, 100, 90).expect("avail"), 10, "budget headroom binds");
-
-        let refused = store
-            .reserve(&over, 40, 1000, 100, 90, 1)
-            .expect_err("over-budget award must refuse even though the wallet could cover it");
-        assert!(
-            matches!(refused, ReserveRefused::InsufficientAvailable { requested: 40, available: 10, bound: Ceiling::Budget }),
-            "must refuse bound by the budget ceiling: {refused:?}"
-        );
-        assert!(store.reservation(&over).expect("read").is_none(), "refused award writes NO row");
-        assert!(refused.to_string().contains("budget"), "message names the budget ceiling: {refused}");
-
-        // An award within the budget headroom succeeds.
-        assert!(matches!(
-            store.reserve(&fits, 10, 1000, 100, 90, 2).expect("within budget headroom"),
-            Reserved::New { available_before: 10 }
-        ));
-        assert_eq!(store.reserved_in_flight().expect("r"), 10);
+        assert_eq!(store.available(40).expect("avail"), 0, "wallet ceiling now 40 − 40 = 0");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2200,24 +2145,24 @@ mod tests {
         let pending = "p".repeat(64);
 
         // Crashed refusal: refused attempt, reservation still held.
-        store.reserve(&crashed, 40, 200, u64::MAX, 0, 1).expect("reserve");
+        store.reserve(&crashed, 40, 200, 1).expect("reserve");
         store.begin_award_attempt(&attempt(&crashed, "claim-a"), 1).expect("pin");
         assert!(store.mark_attempt_refused(&crashed, "blocked", 2).expect("refuse"));
 
         // Finished refusal: refused attempt, funds released — nothing left to do.
-        store.reserve(&finished, 40, 200, u64::MAX, 0, 3).expect("reserve");
+        store.reserve(&finished, 40, 200, 3).expect("reserve");
         store.begin_award_attempt(&attempt(&finished, "claim-b"), 3).expect("pin");
         assert!(store.mark_attempt_refused(&finished, "blocked", 4).expect("refuse"));
         store.release(&finished, 5).expect("release");
 
         // Pending attempt: reconcile must skip it.
-        store.reserve(&pending, 40, 200, u64::MAX, 0, 6).expect("reserve");
+        store.reserve(&pending, 40, 200, 6).expect("reserve");
         store.begin_award_attempt(&attempt(&pending, "claim-p"), 6).expect("pin");
 
         // Refused attempt on an already-PAID job: correctly in neither set — there is nothing
         // to release and nothing open.
         let paid = "q".repeat(64);
-        store.reserve(&paid, 40, 200, u64::MAX, 0, 7).expect("reserve");
+        store.reserve(&paid, 40, 200, 7).expect("reserve");
         store.begin_award_attempt(&attempt(&paid, "claim-q"), 7).expect("pin");
         assert!(store.mark_attempt_refused(&paid, "blocked", 8).expect("refuse"));
         store.convert_to_spent(&paid, 40, 9).expect("spent");
@@ -2234,11 +2179,11 @@ mod tests {
         // missing (their award is provably public — releasing would be #322's harm ledger). A
         // confirmed row WITH its awards row is not shielded: that is the normal awarded state.
         let confirmed_no_row = "z".repeat(64);
-        store.reserve(&confirmed_no_row, 40, 400, u64::MAX, 0, 10).expect("reserve");
+        store.reserve(&confirmed_no_row, 40, 400, 10).expect("reserve");
         store.begin_award_attempt(&attempt(&confirmed_no_row, "claim-z"), 10).expect("pin");
         assert!(store.mark_attempt_confirmed(&confirmed_no_row, 11).expect("confirm"));
         let confirmed_with_row = "y".repeat(64);
-        store.reserve(&confirmed_with_row, 40, 400, u64::MAX, 0, 12).expect("reserve");
+        store.reserve(&confirmed_with_row, 40, 400, 12).expect("reserve");
         store.begin_award_attempt(&attempt(&confirmed_with_row, "claim-y"), 12).expect("pin");
         assert!(store.mark_attempt_confirmed(&confirmed_with_row, 13).expect("confirm"));
         store
