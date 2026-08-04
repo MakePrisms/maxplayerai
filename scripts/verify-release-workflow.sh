@@ -2,11 +2,11 @@
 #
 # Assert the release workflow cannot publish by accident.
 #
-# The properties below are the reason the workflow is safe to merge before any publisher is
+# The properties below are the reason the workflow is safe to merge before any trusted publisher is
 # configured, and every one of them is a single edit away from being lost — moving a gate, adding a
-# trigger, or copying an `npm publish` into another job. None of that breaks anything visibly: the workflow keeps
-# working, and the next release is simply published from somewhere it should not have been. This
-# script is what makes such an edit fail.
+# trigger, or copying an `npm publish` into another job. None of that breaks anything visibly: the
+# workflow keeps working, and the next release is simply published from somewhere it should not have
+# been. This script is what makes such an edit fail.
 #
 # ★ This checks the workflow's STRUCTURE, which is what can be checked without GitHub. It cannot
 #   evaluate the `if:` expressions the way Actions does — observing the publish job actually skip on
