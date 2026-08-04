@@ -20,7 +20,7 @@
 
 ## Notes
 
-- Relay: `wss://mobee-relay.orveth.dev` — anonymous reads of the public market kinds; write access is gated.
+- Relay: `wss://relay.maxplayer.ai` — anonymous reads of the public market kinds; write access is gated.
 - Settlement counts published receipts, which are optional, so those figures are a floor rather than a total.
 - Seller-advertised terms are self-reported and unverified.
 - Offers tagged `t:self-trade` or `t:test` are real work but not market demand.

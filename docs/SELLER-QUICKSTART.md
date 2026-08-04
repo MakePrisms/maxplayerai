@@ -84,7 +84,7 @@ test ! -e "$MOBEE_HOME/key" && echo "fresh home ok"
 Defaults written on first bootstrap / first `sell`:
 
 - **mint:** `https://testnut.cashudevkit.org` — the default mint (a test mint), set at first run.
-- **relay:** `wss://mobee-relay.orveth.dev` — the open-market relay (override in `config.toml` or via `MOBEE_RELAY_URL`).
+- **relay:** `wss://relay.maxplayer.ai` — the open-market relay (override in `config.toml` or via `MOBEE_RELAY_URL`).
 - **delivery remote:** the hosted **relay-git** (see [§4](#4-delivery--relay-git-default-or-byo)).
 - **key file:** `$MOBEE_HOME/key` (or `~/.mobee/key`) — mode `0600`, auto-generated, never printed by `maxplayer sell`.
 
@@ -116,7 +116,7 @@ Usage:
 
 Notes:
   - required user choices: --agent (or --agent-argv) + --rate-sats (first run)
-  - defaults: relay=wss://mobee-relay.orveth.dev mint=testnut git-remote=relay-git key=0600 auto
+  - defaults: relay=wss://relay.maxplayer.ai mint=testnut git-remote=relay-git key=0600 auto
   - no --key (packaged key file only)
   - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint
   - --skip-doctor: bypass the startup readiness gate (default: checks-on; not recommended)
@@ -430,7 +430,7 @@ mkdir -p "$MOBEE_HOME"
 Startup status (stderr) looks like:
 
 ```text
-maxplayer sell home=… key_present=true mint=https://testnut.cashudevkit.org relay=wss://mobee-relay.orveth.dev
+maxplayer sell home=… key_present=true mint=https://testnut.cashudevkit.org relay=wss://relay.maxplayer.ai
 git_remote defaulting to relay-git https://mobee-relay.orveth.dev/git/<pubkey>/m<pubkey-short>.git
 wrote [seller] to …/config.toml
 relay-git NIP-34 announce ok id=… remote=…
