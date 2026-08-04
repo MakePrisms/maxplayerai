@@ -39,6 +39,11 @@ jobs:
       # satisfies its cfg gate.
       - name: Test mobee (CLI crate, default features)
         run: cargo test -p mobee --locked
+      # Same gap, other crate (#264): the relay write-policy plugin's tests (the #372 config-flip
+      # red-prove, #397 NIP-17 admission) are built by the workspace build but named by no test
+      # invocation. The crate has no feature gates, so it runs here too.
+      - name: Test mobee-relay-write-policy
+        run: cargo test -p mobee-relay-write-policy --locked
 
   # The acp feature gates the seller-execute path and is off by default, so it rots silently unless
   # CI compiles it explicitly (issue #108). Build BOTH crates with acp on — mobee-core with the full
