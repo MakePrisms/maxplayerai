@@ -40,6 +40,16 @@ pub const MINT_UNREACHABLE_POST: &str = "mint_unreachable";
 /// Reason code surfaced when a dead mint blocks the pay path.
 pub const MINT_UNREACHABLE_PAY: &str = "mint_unreachable_pay";
 
+/// Last-resort ceiling on ONE buyer-worker round-trip across the synchronous bridge in
+/// [`CdkPaymentEffects::request`].
+///
+/// Every mint-touching leg the worker runs is already bounded at [`MINT_TOUCH_TIMEOUT`]; this ceiling
+/// sits well above their worst-case sum (`4 × MINT_TOUCH_TIMEOUT`), so a worker that fails closed on
+/// its own always surfaces that specific refusal first. The bridge timeout only fires if the worker
+/// is wedged in a leg no inner bound covers — turning a would-be infinite park
+/// (MakePrisms/maxplayerai#387) into a bounded, logged, fail-closed refusal that moves no money.
+const BRIDGE_RECV_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Outcome of retiring incomplete send sagas that are safe to clean up.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RetireReport {
@@ -257,11 +267,25 @@ impl<'a> CdkBuyerMint<'a> {
         options
             .metadata
             .insert(ATTEMPT_METADATA.into(), attempt_id.as_str().into());
-        let prepared = self
-            .wallet
-            .prepare_send(terms.amount, options)
-            .await
-            .map_err(wallet_error)?;
+        // Bounded like every other mint touch (MINT_TOUCH_TIMEOUT). The P2PK send options force cdk's
+        // `force_swap` branch, whose mint HTTP cdk leaves un-timed; a stalled mint here would otherwise
+        // park the worker (and, through the bridge, the caller) forever (#387). On timeout we fail
+        // closed: no `prepared`, no proofs committed, no money moved.
+        let prepared = match tokio::time::timeout(
+            MINT_TOUCH_TIMEOUT,
+            self.wallet.prepare_send(terms.amount, options),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(wallet_error)?,
+            Err(_elapsed) => {
+                return Err(mint_unreachable(
+                    self.wallet,
+                    MINT_UNREACHABLE_PAY,
+                    format!("prepare_send exceeded {MINT_TOUCH_TIMEOUT:?}"),
+                ));
+            }
+        };
         // Redeem fee = CDK input-count fee on the proofs the seller will present.
         // prepared.send_fee() is that same fee API the send path uses.
         let send_fee = prepared.send_fee();
@@ -272,12 +296,23 @@ impl<'a> CdkBuyerMint<'a> {
                 terms.amount
             )));
         }
-        let token = match prepared.confirm(None).await {
-            Ok(token) => token,
-            Err(error) => {
+        // Same bound: confirm settles the swap over mint HTTP cdk leaves un-timed. On timeout we fail
+        // closed and return NO token, so no money reaches the seller this run. A ProofsReserved left
+        // mid-swap is compensated exactly as a definitive confirm failure is — the ATTEMPT_METADATA tag
+        // lets the next recover/reconcile map it, so a later retry never double-spends.
+        let token = match tokio::time::timeout(MINT_TOUCH_TIMEOUT, prepared.confirm(None)).await {
+            Ok(Ok(token)) => token,
+            Ok(Err(error)) => {
                 // Definitive confirm failure should leave no residual ProofsReserved
                 // (CDK compensates). Any leftover is handled on the next recover.
                 return Err(wallet_error(error));
+            }
+            Err(_elapsed) => {
+                return Err(mint_unreachable(
+                    self.wallet,
+                    MINT_UNREACHABLE_PAY,
+                    format!("confirm exceeded {MINT_TOUCH_TIMEOUT:?}"),
+                ));
             }
         };
         if let Err(error) = require_realized_locked_token(&token, terms) {
@@ -1442,6 +1477,10 @@ pub struct CdkPaymentEffects<R> {
     commands: Option<tokio::sync::mpsc::Sender<BuyerCommand>>,
     worker: Option<thread::JoinHandle<()>>,
     receipt: R,
+    /// Ceiling on one worker round-trip at the sync bridge; see [`BRIDGE_RECV_TIMEOUT`]. Held as a
+    /// field (not read straight from the const) so a hermetic test can drive the fail-closed timeout
+    /// path in milliseconds.
+    recv_timeout: Duration,
 }
 
 impl<R> CdkPaymentEffects<R> {
@@ -1544,6 +1583,7 @@ impl<R> CdkPaymentEffects<R> {
             commands: Some(commands),
             worker: Some(worker),
             receipt,
+            recv_timeout: BRIDGE_RECV_TIMEOUT,
         })
     }
 
@@ -1559,10 +1599,19 @@ impl<R> CdkPaymentEffects<R> {
             .map_err(|error| {
                 EffectError::new(format!("payment wallet worker unavailable: {error}"))
             })?;
-        result
-            .recv()
-            .map_err(|_| EffectError::new("payment wallet worker dropped its response"))?
-            .map_err(|error| EffectError::new(error.to_string()))
+        match result.recv_timeout(self.recv_timeout) {
+            Ok(inner) => inner.map_err(|error| EffectError::new(error.to_string())),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(EffectError::new("payment wallet worker dropped its response"))
+            }
+            // Fail closed: a worker that has not answered within the bridge ceiling is treated as
+            // wedged (MakePrisms/maxplayerai#387), never awaited forever. No response means no token
+            // was handed back to the caller, so no money moved.
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(EffectError::new(format!(
+                "payment wallet worker did not respond within {:?}; fail-closed refusal, no funds moved (see MakePrisms/maxplayerai#387)",
+                self.recv_timeout
+            ))),
+        }
     }
 }
 
@@ -3118,6 +3167,69 @@ mod tests {
 
         assert!(matches!(state, PaymentState::Closed { .. }));
         assert_eq!(send_count.load(Ordering::SeqCst), 1);
+    }
+
+    // RED-PROVE (#387) — when the wallet worker NEVER answers, the sync bridge must fail closed with a
+    // bounded refusal, never park. Before the fix `request()` blocked on a timer-less `recv()`; a
+    // caller runtime stuck there (as `collect_blocking` was) is exactly the deadlock. Here the command
+    // Receiver is kept alive but never drained, so the Lock — and the std response SyncSender it
+    // carries — sits buffered forever with no answer coming: the pure "worker wedged" condition.
+    #[test]
+    fn bridge_recv_fails_closed_when_the_worker_never_answers() {
+        let terms = wallet_terms(secret_key(9).public_key());
+        let attempt_id = payment_key(&terms).attempt_id();
+
+        // Kept alive to the end of the test; never received from ⇒ nothing ever answers, and the
+        // buffered command's response sender never drops (a drop would be Disconnected, a DIFFERENT
+        // arm — we are proving the Timeout arm).
+        let (commands, _requests) = tokio::sync::mpsc::channel::<BuyerCommand>(1);
+        let recv_timeout = Duration::from_millis(150);
+        let effects = CdkPaymentEffects {
+            commands: Some(commands),
+            worker: None,
+            receipt: (),
+            recv_timeout,
+        };
+
+        let start = std::time::Instant::now();
+        let result: Result<LockedPayment, EffectError> =
+            effects.request(|response| BuyerCommand::Lock { attempt_id, terms, response });
+        let elapsed = start.elapsed();
+
+        // Not `expect_err`: LockedPayment is intentionally not Debug (it wraps a token).
+        let err = match result {
+            Ok(_) => panic!("a worker that never answers must refuse, not return Ok"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("did not respond")
+                && err.to_string().contains("fail-closed"),
+            "must be the bridge fail-closed refusal, got: {err}"
+        );
+        // Bounded at ~recv_timeout: it actually waited the timeout (not an early unrelated error) and
+        // it RETURNED (no park). Without the recv_timeout this line is unreachable — the test hangs.
+        assert!(
+            elapsed >= Duration::from_millis(120) && elapsed < Duration::from_secs(5),
+            "expected a bounded return near recv_timeout, got {elapsed:?}"
+        );
+
+        // CONTROL — under the SAME condition (a live sender, nothing ever sent), the timer-less
+        // `recv()` the bridge used before #387 blocks indefinitely. Prove it is still parked well past
+        // the window the recv_timeout already returned in, then release it so the thread exits cleanly.
+        let (ctl_tx, ctl_rx) = mpsc::sync_channel::<u8>(1);
+        let returned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = returned.clone();
+        let handle = std::thread::spawn(move || {
+            let _ = ctl_rx.recv(); // timer-less: parks until a send or all senders drop
+            flag.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(350)); // > recv_timeout above
+        assert!(
+            !returned.load(Ordering::SeqCst),
+            "timer-less recv() must still be parked past the recv_timeout window (this is the #387 park)"
+        );
+        drop(ctl_tx); // Disconnected ⇒ the control thread returns and exits — no leaked thread
+        handle.join().unwrap();
     }
 
     #[test]

@@ -477,11 +477,13 @@ pub async fn authorize_pay_async(
 
     let wallet = buyer_fund::open_wallet_at_mint_async(home, &wallet_open_mint_url(home, &terms))
         .await?;
-    // Dust guard (live keyset N=1 floor, fail-closed). lock_or_reconcile re-checks
-    // against CDK input-count send_fee after prepare_send.
-    crate::payment_wallet::require_fee_safe_amount(&wallet, terms.amount)
-        .await
-        .map_err(AuthorizePayError::Wallet)?;
+    // The N=1 dust guard runs INSIDE lock_or_reconcile on the wallet worker
+    // (`require_fee_safe_amount`, payment_wallet.rs:252), never here. A pre-spawn call at this site
+    // ran wallet HTTP on the CALLER runtime; on the current-thread runtime `collect_blocking` builds
+    // (collect.rs), that primed a reqwest pooled connection whose IO driver task lived on the caller.
+    // The worker then blocked that same caller runtime on the effects bridge's `recv`, so the pooled
+    // connection its `prepare_send` needed could never be driven — both parked forever
+    // (MakePrisms/maxplayerai#387). Invariant: wallet HTTP runs ONLY on the worker runtime.
     let payment_send = NostrPaymentSend::new(home.config.relay_url.clone(), keys);
     let mut effects = CdkPaymentEffects::spawn(
         wallet,
