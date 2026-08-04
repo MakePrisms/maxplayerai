@@ -30,7 +30,7 @@ impl std::fmt::Display for ClientError {
         match self {
             Self::NotRunning(message) => write!(
                 formatter,
-                "no mobee buyer is listening ({message}); start it with `mobee buyer`"
+                "no mobee buyer is listening ({message}); start it with `maxplayer buyer`"
             ),
             Self::Io(message) => write!(formatter, "buyer client io error: {message}"),
             Self::Decode(message) => write!(formatter, "buyer client decode error: {message}"),
