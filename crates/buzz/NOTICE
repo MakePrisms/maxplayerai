@@ -36,14 +36,15 @@ block/buzz stays meaningful and upstream commits remain scannable/pullable.
 
 3. `crates/buzz-relay/src/handlers/ingest.rs` — two additions, each marked inline
    with a comment:
-   (a) the mobee-core kind superset: `KIND_MOBEE_TRADE_*` consts plus a
+   (a) the mobee-core kind superset: `KIND_MOBEE_*` consts plus a
        `required_scope_for_kind` arm (-> `MessagesWrite`) for the trade block
-       3401-3406, the seller heartbeat 30340, and the NIP-89 handler 31990, with
-       the scope test extended to cover them. The fork's original DVM arms
-       (3400/5109/6109/7000) are left untouched.
-   (b) the MakePrisms/maxplayerai #397 payment/DoS bound on NIP-17 gift wraps
-       (kind 1059): a gift wrap must carry at least one `p` tag and content
-       <= 128 KB.
+       3401-3406, the seller heartbeat 30340, the NIP-89 handler 31990, and the
+       NIP-17 DM-relay list 10050, with the scope test rewritten to assert the
+       mobee numbers. The fork's original DVM arms (3400/5109/6109/7000) are left
+       untouched.
+   (b) the MakePrisms/maxplayerai #397 payment/DoS bound on NIP-17 events: the
+       gift wrap (1059) and the DM-relay list (10050) are capped at 128 KB of
+       content, and the gift wrap must additionally carry at least one `p` tag.
    No other source (`.rs`) files were modified.
 
 Vendored (the 12-crate relay build closure): buzz-relay, buzz-core,

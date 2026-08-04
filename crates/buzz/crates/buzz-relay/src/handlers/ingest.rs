@@ -68,6 +68,10 @@ const KIND_MOBEE_TRADE_AWARD: u32 = 3405;
 const KIND_MOBEE_TRADE_ACCEPT: u32 = 3406;
 const KIND_MOBEE_SELLER_HEARTBEAT: u32 = 30340;
 const KIND_MOBEE_NIP89_HANDLER: u32 = 31990;
+// NIP-17 DM-relay list (standard kind 10050). Pre-allowed by mobee for future
+// DM-inbox discovery; size-bounded like the gift wrap below, but with no `p`-tag
+// requirement (it carries relay tags, not recipients).
+const KIND_MOBEE_DM_RELAY_LIST: u32 = 10050;
 
 /// How the HTTP caller authenticated (for [`IngestAuth::Http`]).
 #[derive(Debug, Clone)]
@@ -344,8 +348,8 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_MOBEE_JOB_FEEDBACK
         | KIND_MOBEE_JOB_RECEIPT => Ok(Scope::MessagesWrite),
         // Mobee trade path (mobee-core kind registry): buyer/seller trade events,
-        // the seller liveness heartbeat, and the NIP-89 handler advertisement —
-        // all authenticated writes by mobee buyers/sellers.
+        // the seller liveness heartbeat, the NIP-89 handler advertisement, and the
+        // NIP-17 DM-relay list — all authenticated writes by mobee buyers/sellers.
         KIND_MOBEE_TRADE_OFFER
         | KIND_MOBEE_TRADE_CLAIM
         | KIND_MOBEE_TRADE_RESULT
@@ -353,7 +357,8 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_MOBEE_TRADE_AWARD
         | KIND_MOBEE_TRADE_ACCEPT
         | KIND_MOBEE_SELLER_HEARTBEAT
-        | KIND_MOBEE_NIP89_HANDLER => Ok(Scope::MessagesWrite),
+        | KIND_MOBEE_NIP89_HANDLER
+        | KIND_MOBEE_DM_RELAY_LIST => Ok(Scope::MessagesWrite),
         _ => {
             if open_ingest_enabled() {
                 Ok(Scope::MessagesWrite)
@@ -1562,19 +1567,24 @@ async fn ingest_event_inner(
         ));
     }
 
-    // #397: bound NIP-17 gift wraps (kind 1059) at ingest as a payment/DoS guard
-    // native to the relay — a gift wrap must address at least one recipient
-    // (`p` tag) and stay within the NIP-17 content ceiling (tighter than the
-    // generic 256 KB cap above). See MakePrisms/maxplayerai#397.
-    if is_gift_wrap {
+    // #397: bound NIP-17 events at ingest as a payment/DoS guard native to the
+    // relay. The content ceiling (tighter than the generic 256 KB cap above)
+    // applies to the gift wrap (1059) and the DM-relay list (10050). See
+    // MakePrisms/maxplayerai#397.
+    if is_gift_wrap || kind_u32 == KIND_MOBEE_DM_RELAY_LIST {
         const MAX_NIP17_CONTENT_BYTES: usize = 128 * 1024; // 128 KB
         if event.content.len() > MAX_NIP17_CONTENT_BYTES {
             return Err(IngestError::Rejected(format!(
-                "invalid: gift wrap content exceeds maximum size of {} bytes (got {})",
+                "invalid: NIP-17 content exceeds maximum size of {} bytes (got {})",
                 MAX_NIP17_CONTENT_BYTES,
                 event.content.len()
             )));
         }
+    }
+    // A gift wrap must additionally address at least one recipient (`p` tag). The
+    // DM-relay list carries relay tags rather than recipients, so it is
+    // size-bounded only.
+    if is_gift_wrap {
         let has_p_tag = event
             .tags
             .iter()
@@ -2784,26 +2794,47 @@ mod tests {
     }
 
     #[test]
-    fn mobee_job_kinds_require_messages_write_scope() {
+    fn mobee_kinds_require_messages_write_scope() {
         let dummy = make_dummy_event();
+        // The deployed mobee protocol is the contiguous 3400-3406 trade block plus
+        // 30340 heartbeat, 31990 NIP-89 discovery, and 10050 NIP-17 DM-relay list.
+        // Asserting KIND_MOBEE_TRADE_OFFER (3401) is the load-bearing acceptance
+        // check: 3401 discriminates the mobee-core scheme from the fork's DVM-only
+        // numbering (3400 is shared by both, so a 3400-only assertion would green
+        // over the wrong property).
         for kind in [
-            KIND_MOBEE_JOB_OFFER,
-            KIND_MOBEE_JOB_RESULT,
-            KIND_MOBEE_JOB_FEEDBACK,
-            KIND_MOBEE_JOB_RECEIPT,
-            KIND_MOBEE_TRADE_OFFER,
-            KIND_MOBEE_TRADE_CLAIM,
-            KIND_MOBEE_TRADE_RESULT,
-            KIND_MOBEE_TRADE_FEEDBACK,
-            KIND_MOBEE_TRADE_AWARD,
-            KIND_MOBEE_TRADE_ACCEPT,
-            KIND_MOBEE_SELLER_HEARTBEAT,
-            KIND_MOBEE_NIP89_HANDLER,
+            KIND_MOBEE_JOB_RECEIPT,      // 3400 (shared with the DVM set)
+            KIND_MOBEE_TRADE_OFFER,      // 3401 — discriminator
+            KIND_MOBEE_TRADE_CLAIM,      // 3402
+            KIND_MOBEE_TRADE_RESULT,     // 3403
+            KIND_MOBEE_TRADE_FEEDBACK,   // 3404
+            KIND_MOBEE_TRADE_AWARD,      // 3405
+            KIND_MOBEE_TRADE_ACCEPT,     // 3406 (pay-bind, #329)
+            KIND_MOBEE_SELLER_HEARTBEAT, // 30340
+            KIND_MOBEE_NIP89_HANDLER,    // 31990
+            KIND_MOBEE_DM_RELAY_LIST,    // 10050
         ] {
             assert_eq!(
                 required_scope_for_kind(kind, &dummy).unwrap(),
                 Scope::MessagesWrite,
-                "Mobee kind {kind} should require MessagesWrite scope"
+                "mobee kind {kind} should require MessagesWrite scope"
+            );
+        }
+        // Literal 3401: fails if the relay only knows the fork's DVM numbering.
+        assert_eq!(
+            required_scope_for_kind(3401, &dummy).unwrap(),
+            Scope::MessagesWrite,
+            "mobee OFFER kind 3401 must be accepted"
+        );
+        // The fork's original DVM kinds remain accepted too (near-verbatim copy).
+        for kind in [
+            KIND_MOBEE_JOB_OFFER,
+            KIND_MOBEE_JOB_RESULT,
+            KIND_MOBEE_JOB_FEEDBACK,
+        ] {
+            assert_eq!(
+                required_scope_for_kind(kind, &dummy).unwrap(),
+                Scope::MessagesWrite
             );
         }
     }
