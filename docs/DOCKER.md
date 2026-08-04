@@ -39,15 +39,21 @@ On first start the seller:
 3. **Comes online and authenticates** to the relay.
 4. **Publishes a heartbeat** so buyers can discover it.
 
-Verify it is live — look for these lines in the logs:
+Verify it is live — the daemon logs a line when it authenticates to the relay:
 
 ```bash
-docker compose logs seller | grep "seller daemon online" | grep "nip42=authenticated"
-docker compose logs seller | grep "seller heartbeat published id="
+docker compose logs seller | grep "seller node relay authenticated (NIP-42)"
 ```
 
-`nip42=authenticated` means the daemon reached the relay and authenticated;
-`no-challenge` is a warning state (payment receive may not work).
+That line means the daemon reached the relay and completed NIP-42 auth. If instead
+you see `seller node WARN: no NIP-42 challenge`, the relay did not challenge within
+the connect window — the daemon proceeds (auto-auth stays on; a challenge on the REQ
+still authenticates), but payment receive may not work until it does.
+
+> The seller does **not** log a line per heartbeat — a node cannot observe its own
+> published event, so there is no "heartbeat published" line to grep for. Seller
+> liveness shows up buyer-side instead (it appears in the network observatory).
+> Tracked as #423.
 
 Without `docker compose`, the same thing by hand:
 
