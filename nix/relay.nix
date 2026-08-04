@@ -7,9 +7,10 @@
 # this module binds loopback only and never touches ACME. Postgres + Redis are provisioned here; the
 # relay's stable identity key is supplied by the host as a file PATH (never in the repo).
 #
-# The package is wired from the flake as an option (`services.maxplayer.relay.package`), the same way
-# the strfry module took `writePolicyPackage` — so `.#relay` (in-tree vendored crate) and
-# `.#relay-forkpin` (pinned fork) share this one module and differ only in the package they inject.
+# The package is wired from the flake as an option (`services.maxplayer.relay.package`): `.#relay`
+# injects the in-tree vendored `buzz-relay` crate. Git-CAS + media objects live in S3 (the box's
+# instance IAM role authorizes the bucket), so the box itself keeps only Postgres, Redis, the relay
+# identity key, and a rehydratable local working cache.
 {
   config,
   lib,
@@ -62,6 +63,12 @@ let
   # marketplace where any NIP-42-authed key may write — buzz still MANDATES a signed NIP-42 handshake
   # on every write, so "open" means "not membership-gated", never "anonymous". The compiled kind
   # allowlist is what scopes the namespace to mobee.
+  # The S3 endpoint the git-CAS + media client talks to. Region::Custom uses it verbatim
+  # (store.rs GitStore::new), so default to the AWS regional endpoint derived from s3Region; an
+  # explicit s3Endpoint overrides it (an S3-compatible store on another host).
+  s3Endpoint =
+    if cfg.s3Endpoint != null then cfg.s3Endpoint else "https://s3.${cfg.s3Region}.amazonaws.com";
+
   baseEnv = {
     BUZZ_BIND_ADDR = cfg.bindAddr;
     DATABASE_URL = "postgresql:///${cfg.database}?host=/run/postgresql&user=${cfg.user}";
@@ -70,6 +77,21 @@ let
     BUZZ_HEALTH_PORT = toString cfg.healthPort;
     BUZZ_METRICS_PORT = toString cfg.metricsPort;
     BUZZ_GIT_REPO_PATH = "${cfg.dataDir}/repos";
+
+    # Git-on-object-storage: buzz-relay stores the git-CAS (delivered-repo packs + manifests) AND
+    # media in S3, and runs a FATAL linearizable conditional-write conformance probe (the A3 gate,
+    # main.rs) against it AT BOOT, before it binds. The git store borrows this same media S3 config
+    # (state.rs GitStore::new), so one bucket backs both. Real AWS S3 via the instance IAM role:
+    # access/secret are the EMPTY STRING on purpose — an UNSET key defaults to buzz's "buzz_dev" dev
+    # value (config.rs), which takes the static-credential branch and 403s against real S3; EMPTY
+    # selects the AWS credential chain → the IMDS instance role (store.rs GitStore::new). No
+    # credential ever enters the repo or the world-readable nix store.
+    BUZZ_S3_ENDPOINT = s3Endpoint;
+    BUZZ_S3_BUCKET = cfg.s3Bucket;
+    BUZZ_S3_REGION = cfg.s3Region;
+    BUZZ_S3_ACCESS_KEY = "";
+    BUZZ_S3_SECRET_KEY = "";
+
     BUZZ_REQUIRE_AUTH_TOKEN = lib.boolToString cfg.requireAuthToken;
     BUZZ_REQUIRE_RELAY_MEMBERSHIP = lib.boolToString cfg.requireRelayMembership;
   }
@@ -82,9 +104,8 @@ in
     package = lib.mkOption {
       type = lib.types.package;
       description = ''
-        The buzz-relay package to run. Wired from the flake:
-        `packages.maxplayer-relay` (in-tree vendored crate) or `packages.maxplayer-relay-forkpin`
-        (pinned gudnuf/buzz fork). `lib.getExe` resolves its `meta.mainProgram` (buzz-relay).
+        The buzz-relay package to run. Wired from the flake (`packages.maxplayer-relay`, the in-tree
+        vendored crate). `lib.getExe` resolves its `meta.mainProgram` (buzz-relay).
       '';
     };
 
@@ -100,7 +121,10 @@ in
     dataDir = lib.mkOption {
       type = lib.types.str;
       default = "/var/lib/buzz";
-      description = "State directory: git name-reservation index + `<dataDir>/repos` content store.";
+      description = ''
+        Local state directory: the relay's working files + `<dataDir>/repos` git working cache. This
+        is scratch, rehydratable from S3 — the durable git-CAS + media objects live in s3Bucket, not here.
+      '';
     };
 
     bindAddr = lib.mkOption {
@@ -177,6 +201,36 @@ in
       '';
     };
 
+    s3Bucket = lib.mkOption {
+      type = lib.types.str;
+      default = "maxplayer-relay-media";
+      description = ''
+        S3 bucket holding the git-CAS (delivered-repo packs + manifests) + media objects. buzz-relay
+        reads/writes/lists/deletes here (storage_sweep prunes, hence DeleteObject), so the box's
+        instance IAM role must grant Get/Put/List/DeleteObject on it. Durability is S3-native
+        (versioned, off-box), so there is deliberately no on-box object backup.
+      '';
+    };
+
+    s3Region = lib.mkOption {
+      type = lib.types.str;
+      default = "us-east-1";
+      description = ''
+        AWS region of s3Bucket. Drives the default endpoint AND the SigV4 signing region, so it must
+        match the bucket's real region or every request is signed for the wrong one.
+      '';
+    };
+
+    s3Endpoint = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Override the S3 endpoint URL. null → the AWS regional endpoint https://s3.<s3Region>.amazonaws.com.
+        Set only for an S3-compatible backend on another host. buzz uses path-style addressing, which
+        real S3 also accepts (store.rs GitStore::new).
+      '';
+    };
+
     backup = {
       destination = lib.mkOption {
         type = lib.types.str;
@@ -235,8 +289,11 @@ in
     # Assert the key file up front so the failure is loud and pre-start, not silent and in-service.
     systemd.services.buzz-relay-preflight = {
       description = "maxplayer relay preflight — refuse to start rather than half-start";
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
       before = [ "buzz-relay.service" ];
       requiredBy = [ "buzz-relay.service" ];
+      path = [ pkgs.awscli2 ];
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
@@ -250,7 +307,18 @@ in
         ${pkgs.gnugrep}/bin/grep -q '^BUZZ_RELAY_PRIVATE_KEY=' "$keyfile" \
           || fail "$keyfile exists but does not set BUZZ_RELAY_PRIVATE_KEY=<hex>"
 
-        echo "preflight ok: relay identity key present"
+        # Object store reachable + authorized BEFORE the relay starts: buzz-relay runs a FATAL
+        # git-object-store conformance probe (the A3 gate) against s3Bucket at boot, so a missing
+        # bucket or an unattached/under-scoped IAM role should fail loud HERE with a clear message,
+        # not as a silent relay crash-loop. HeadBucket exercises the real endpoint + the instance role.
+        # Caveat (adjacency): this uses aws-cli's credential resolver, NOT buzz's rust-s3 0.37 one — it
+        # proves the bucket + role + network, but the DEFINITIVE proof of buzz's own client is its boot
+        # probe. An IMDSv2-only box that starves rust-s3 would still pass this check.
+        aws s3api head-bucket --bucket ${lib.escapeShellArg cfg.s3Bucket} --region ${lib.escapeShellArg cfg.s3Region} \
+          || fail "cannot HeadBucket s3://${cfg.s3Bucket} in ${cfg.s3Region} via the instance role — \
+            missing bucket, insufficient IAM (need Get/Put/List/DeleteObject), or no role attached"
+
+        echo "preflight ok: relay identity key present; s3://${cfg.s3Bucket} reachable via instance role"
       '';
     };
 
@@ -328,16 +396,14 @@ in
       };
     };
 
-    # Off-box backup, two artifacts, both shipped by the instance IAM role (no creds on the box):
-    #   1. Postgres  — the event log        -> pg_dump | gzip
-    #   2. Git CAS   — delivered-job repos   -> tar | gzip
-    # Buzz keeps git objects on the local filesystem (BUZZ_GIT_REPO_PATH), NOT in Postgres, so a
-    # pg_dump alone would leave delivered repos un-backed-up and the box only half-disposable. Both
-    # dumps together are the durability story: restore = pg_restore + untar into dataDir/repos.
-    # (Fast-follow, deferred: point buzz-media at S3 for LIVE off-box object storage — needs a
-    # buzz-media instance-role-vs-static-creds answer. See the relay OPEN ITEMS in the deploy block.)
+    # Off-box backup of the one piece of durable state not ALREADY off-box: the Postgres event log
+    # -> pg_dump | gzip -> S3 via the instance IAM role (no creds on the box). The git-CAS
+    # (delivered-repo packs + manifests) and media objects live in S3 (s3Bucket) — versioned and
+    # off-box by construction — so they need no separate on-box backup; restore = pg_restore, and the
+    # objects sit untouched in S3. (The local <dataDir>/repos + pack cache are a rehydratable working
+    # cache of those S3 objects, not a source of truth, so they are deliberately not dumped.)
     systemd.services.buzz-relay-backup = {
-      description = "maxplayer relay backup — Postgres + git CAS to ${cfg.backup.destination}";
+      description = "maxplayer relay backup — Postgres event log to ${cfg.backup.destination}";
       serviceConfig = {
         Type = "oneshot";
         User = cfg.user;
@@ -352,7 +418,6 @@ in
       };
       path = [
         pkgs.postgresql
-        pkgs.gnutar
         pkgs.gzip
         pkgs.coreutils
       ];
@@ -363,21 +428,11 @@ in
         STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
         export DESTINATION STAMP
 
-        # 1. Postgres event log.
+        # Postgres event log — the only durable state not already in S3.
         DUMP="$RUNTIME_DIRECTORY/buzz-$STAMP.sql.gz"
         PGHOST=/run/postgresql pg_dump ${lib.escapeShellArg cfg.database} | gzip > "$DUMP"
         echo "pg dump ok: $(wc -c < "$DUMP") bytes"
         FILE="$DUMP" KEY="pg/buzz-$STAMP.sql.gz" ${cfg.backup.uploadCommand}
-
-        # 2. Git CAS (delivered-job repos). Absent on a born-empty relay — skip cleanly until it exists.
-        if [ -d ${lib.escapeShellArg "${cfg.dataDir}/repos"} ]; then
-          REPOS="$RUNTIME_DIRECTORY/repos-$STAMP.tar.gz"
-          tar czf "$REPOS" -C ${lib.escapeShellArg cfg.dataDir} repos
-          echo "repos dump ok: $(wc -c < "$REPOS") bytes"
-          FILE="$REPOS" KEY="repos/repos-$STAMP.tar.gz" ${cfg.backup.uploadCommand}
-        else
-          echo "repos dump skipped: ${cfg.dataDir}/repos does not exist yet (born-empty relay)"
-        fi
       '';
     };
 

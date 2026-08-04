@@ -55,10 +55,19 @@
     # relay if this file is missing or empty. Nothing here is a credential; the material is on the box.
     privateKeyFile = "/var/lib/secrets/buzz-relay.env";
 
-    # Off-box backup — Postgres (event log) + git CAS (delivered repos), both shipped to S3 by the
-    # instance's IAM role (maxplayer-relay-backups). No static credentials on the box. The module
-    # mandates a destination + uploadCommand; a launch relay holding trade history ships dumps off-box
-    # by construction, so there is no "skip backup" here.
+    # Git-CAS + media object store: REAL AWS S3, reached via the box's instance IAM role — no static
+    # creds (the module sets BUZZ_S3_ACCESS_KEY/SECRET_KEY empty to select the AWS credential chain →
+    # IMDS). The role MUST grant Get/Put/List/DeleteObject on this bucket (buzz's storage_sweep prunes,
+    # hence Delete); s3Region MUST match the bucket's real region. buzz-relay runs a FATAL git
+    # object-store conformance probe against this bucket at boot, so the bucket must exist and the role
+    # be attached BEFORE the first switch (the preflight HeadBuckets it and fails loud otherwise).
+    s3Bucket = "maxplayer-relay-media";
+    s3Region = "us-east-1";
+
+    # Off-box backup — the Postgres event log only, shipped to S3 by the instance IAM role
+    # (maxplayer-relay-backups). The git-CAS + media objects are already in S3 (s3Bucket above),
+    # versioned and off-box, so they are not re-dumped. No static credentials on the box; the module
+    # mandates a destination + uploadCommand, so there is no "skip backup" here.
     backup = {
       destination = "s3://maxplayer-relay-backup/launch";
       # Invoked once per artifact with $FILE (local path) and $KEY (destination suffix) in env.
