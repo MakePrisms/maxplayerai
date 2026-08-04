@@ -203,3 +203,300 @@ async fn collect_refuses_pay_when_delivered_tip_differs_from_bound_oid() {
     let _ = fs::remove_dir_all(&upstream);
     let _ = fs::remove_dir_all(&root);
 }
+
+// ── #374 §19 buyer-side execution-sentinel gate — full-path red-prove over a real HTTPS fetch ────
+//
+// These bind the DELIVERED TIP (so tip-match PASSES) with a valid cosig (so the cosig tooth PASSES),
+// leaving the §19 execution-sentinel gate as the one thing that can refuse. A sentinel-less or
+// replayed delivery must refuse `no_sentinel` with ZERO spend, no journal, no files; a delivery
+// carrying THIS job's sentinel must get PAST the gate (whatever happens downstream is not the gate's
+// concern). Red-on-revert: neuter `delivery_tree_carries_sentinel` to a blanket accept and the two
+// refusals below pay a sentinel-less / replayed delivery — they go red.
+//
+// WHY collect_async IS the watcher proof: the buyer's auto-settle delivery watcher pays through
+// `settle_job` → `settle_after_pay(|| collect_async(...))` (buyer/mod.rs:2139) — the SAME pay closure
+// manual collect uses (buyer/mod.rs:946), and `collect_async` is the ONLY caller of
+// `authorize_pay_async`, the sole ecash-melt chokepoint. So a refusal here refuses on the watcher's
+// own melt path; and `settle_after_pay` flips `reserved → spent` ONLY on Ok, so `spent_total` cannot
+// move on this Err.
+//
+// NOTE: integration binary — NOT run in the implementer's sandbox (integration tests group-signal on
+// this box). Verified to COMPILE (`cargo test --test collect_integrity --features wallet --no-run`);
+// the unblinded CI gate (pr-feedback) runs it.
+
+/// An upstream repo whose `main` tip is a from-scratch delivery tree (README + optionally the
+/// execution-sentinel manifest at its well-known path). Returns (dir, tip_oid).
+fn make_upstream_delivery(label: &str, sentinel: Option<&str>) -> (PathBuf, String) {
+    let dir = temp(label);
+    fs::create_dir_all(&dir).expect("upstream dir");
+    git_in(&dir, &["init", "--initial-branch=main"]);
+    git_in(&dir, &["config", "user.name", "Upstream Author"]);
+    git_in(&dir, &["config", "user.email", "upstream@example.invalid"]);
+    fs::write(dir.join("README.md"), "delivered\n").expect("write readme");
+    if let Some(content) = sentinel {
+        fs::write(
+            dir.join(mobee_core::delivery_sentinel::SENTINEL_FILE),
+            content,
+        )
+        .expect("write sentinel");
+    }
+    git_in(&dir, &["add", "-A"]);
+    git_in(&dir, &["commit", "-m", "delivery"]);
+    let tip_oid = git_stdout(&dir, &["rev-parse", "HEAD"]);
+    (dir, tip_oid)
+}
+
+/// A from-scratch accept-bind pinning the DELIVERED tip (tip-match passes) with the given job hash.
+fn from_scratch_bind(
+    job_id: &str,
+    pubkey_hex: &str,
+    tip_oid: &str,
+    repo_url: &str,
+    job_hash: &str,
+) -> AcceptedBind {
+    AcceptedBind {
+        job_id: job_id.to_owned(),
+        claim_id: "c".repeat(64),
+        result_id: "d".repeat(64),
+        seller_pubkey: pubkey_hex.to_owned(),
+        commit_oid: tip_oid.to_owned(),
+        repo: repo_url.to_owned(),
+        branch: "main".into(),
+        job_hash: job_hash.to_owned(),
+        amount_sats: 2,
+        accept_event_id: "f".repeat(64),
+        accepted_at: 1,
+        seller_signature: String::new(),
+        creq_hash: None,
+        accepted_mints: Vec::new(),
+        realized_mint: None,
+        agent_used: None,
+        model_used: None,
+        contribution: None,
+    }
+}
+
+fn write_bind(home: &mobee_core::home::MobeeHome, bind: &AcceptedBind) {
+    let jobs = home.root.join("jobs");
+    fs::create_dir_all(&jobs).expect("jobs dir");
+    fs::write(
+        jobs.join(format!("{}.json", bind.job_id)),
+        serde_json::to_string(bind).expect("serialize bind"),
+    )
+    .expect("write bind");
+}
+
+/// Drive collect against a delivery whose tip carries `sentinel` (or none), pinned + cosigned so the
+/// only refusal point is the §19 gate. Returns the collect result plus the gate for spend assertions.
+async fn collect_over_delivery(
+    label: &str,
+    mount_seed: &str,
+    job_hash: &str,
+    sentinel: Option<&str>,
+) -> (Result<mobee_core::collect::CollectOutcome, CollectError>, BudgetGate, PathBuf) {
+    init_test_env();
+    let (upstream, tip_oid) = make_upstream_delivery(label, sentinel);
+    let mount = format!("/git/{}/repo.git", mount_seed);
+    let server = GitHttpAuthServer::spawn(&upstream, &mount);
+    let repo_url = server.repo_url();
+
+    let root = temp(&format!("home-{label}"));
+    let _ = fs::remove_dir_all(&root);
+    let home = home::bootstrap(&root).expect("home");
+    let secret_hex = home::read_secret_key_hex(&home).expect("secret");
+    let pubkey_hex = home::public_key_hex(&home).expect("pubkey");
+
+    let job_id = "a".repeat(64);
+    let mut bind = from_scratch_bind(&job_id, &pubkey_hex, &tip_oid, &repo_url, job_hash);
+    bind.seller_signature = seller_cosig(&secret_hex, &pubkey_hex, &bind);
+    write_bind(&home, &bind);
+
+    let mut gate = BudgetGate::from_home(&home).expect("gate");
+    let result = collect_async(&home, &mut gate, CollectRequest { job_id, out: None }).await;
+
+    drop(server);
+    let _ = fs::remove_dir_all(&upstream);
+    (result, gate, root)
+}
+
+// RED-PROVE (missing) — a sentinel-less delivery refuses `no_sentinel` with ZERO spend, no journal,
+// no files; the refusal is durably journalled for §17.
+#[tokio::test(flavor = "current_thread")]
+async fn collect_refuses_no_sentinel_when_delivery_carries_none() {
+    let job_hash = "1a".repeat(32);
+    let (result, gate, root) = collect_over_delivery("nosentinel", &"cd".repeat(32), &job_hash, None).await;
+
+    let error = result.expect_err("a sentinel-less delivery must refuse");
+    assert!(matches!(error, CollectError::Pay(_)), "must be a pay refusal: {error}");
+    assert!(error.to_string().contains("no_sentinel"), "refuses no_sentinel, got: {error}");
+    assert_eq!(gate.spent(), 0, "a no_sentinel refusal must burn ZERO spend");
+    assert_eq!(
+        BudgetGate::from_home(&home::bootstrap(&root).expect("reload home")).expect("reload").spent(),
+        0,
+        "durable spent must stay 0"
+    );
+    assert!(!root.join("payment-journal").exists(), "no payment journal on a no_sentinel refusal");
+    assert!(!root.join("results").join("a".repeat(64)).exists(), "no files materialized on refusal");
+    assert!(root.join("sentinel-refusals").exists(), "the refusal is journalled for §17 (the artifact, not silence)");
+    let _ = fs::remove_dir_all(&root);
+}
+
+// RED-PROVE (replay) — a delivery carrying a VALID sentinel minted for a DIFFERENT job still refuses:
+// job-binding, not mere presence.
+#[tokio::test(flavor = "current_thread")]
+async fn collect_refuses_no_sentinel_on_a_replayed_sentinel_from_another_job() {
+    let this_job = "1a".repeat(32);
+    let other_job = "bb".repeat(32);
+    let replayed = mobee_core::delivery_sentinel::render_manifest(
+        &other_job,
+        mobee_core::delivery_sentinel::DeliveryMode::FromScratch,
+        1,
+        12,
+    );
+    let (result, gate, root) =
+        collect_over_delivery("replay", &"ef".repeat(32), &this_job, Some(&replayed)).await;
+
+    let error = result.expect_err("a replayed sentinel must refuse");
+    assert!(matches!(error, CollectError::Pay(_)), "must be a pay refusal: {error}");
+    assert!(error.to_string().contains("no_sentinel"), "refuses no_sentinel (replay), got: {error}");
+    assert_eq!(gate.spent(), 0, "a replay refusal must burn ZERO spend");
+    let _ = fs::remove_dir_all(&root);
+}
+
+// POSITIVE CONTROL — a delivery carrying THIS job's sentinel gets PAST the §19 gate. Whatever refuses
+// downstream (no live wallet/mint in this test) is NOT a no_sentinel refusal — proving the gate does
+// not false-refuse a genuine delivery.
+#[tokio::test(flavor = "current_thread")]
+async fn collect_passes_the_sentinel_gate_for_a_valid_delivery() {
+    let job_hash = "1a".repeat(32);
+    let manifest = mobee_core::delivery_sentinel::render_manifest(
+        &job_hash,
+        mobee_core::delivery_sentinel::DeliveryMode::FromScratch,
+        1,
+        12,
+    );
+    let (result, _gate, root) =
+        collect_over_delivery("valid", &"12".repeat(32), &job_hash, Some(&manifest)).await;
+
+    // It may still fail downstream (no funded wallet here), but it must NOT be the sentinel gate.
+    if let Err(error) = &result {
+        assert!(
+            !error.to_string().contains("no_sentinel"),
+            "a valid job-bound sentinel must pass the gate (downstream failure is fine), got: {error}"
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+// ── #387 preflight-before-reserve ORDER gate — a dead mint burns ZERO budget, over the REAL path ───
+//
+// The see-saw (2eda85d → ef7a49e): the cross-runtime deadlock fix unparked the hang but LEAKED budget
+// — a dead mint left `gate.spent()==charged` because `authorize_then_attempt` reserves BEFORE the
+// effect and never rolls back. Option A (ef7a49e) runs `require_fee_safe_amount` as a WORKER-side
+// `PreflightFee` in `authorize_pay_async` AFTER `spawn_effects` and BEFORE `gate.authorize_then_attempt`,
+// so a dead mint refuses BEFORE the budget reserve (zero spend). A primitive unit test
+// (`pay_path_timeout_refuses_bounded_without_charging_the_budget`, payment_wallet.rs) pins that ORDER
+// at the unit level; here the SAME order is an EXECUTING guard over the real `collect_async` →
+// `authorize_pay_async` entrypoint — the buyer watcher's own melt path (see the §19 note above) — driven
+// through a real HTTPS delivery fetch.
+//
+// The delivery is pinned + cosigned + carries THIS job's execution sentinel, so the cosig tooth, the
+// tip-match and the §19 gate all PASS and the flow reaches the wallet; the wallet then opens at a DEAD
+// realized mint (127.0.0.1:1, TCP connect refused), so the pre-reserve preflight is the one thing left
+// to refuse. It must refuse `mint_unreachable_pay` with ZERO spend, bounded (no park), no journal.
+//
+// Red-on-reorder (measured, non-vacuous): move the `effects.preflight_fee(..)?` guard BELOW
+// `gate.authorize_then_attempt` and the dead mint reaches the gate first — the reserve commits
+// (`gate.spent()==charged`, and a journal is written) before the preflight ever runs, so every ZERO
+// assertion below flips and this test goes RED. That is the exact budget leak Option A closes.
+//
+// `allow_real_mints=true` is ISOLATED to this test home so the pay path will resolve + open the wallet
+// at the (dead) real mint; 127.0.0.1:1 refuses the connect, so NO real mint is contacted and no money
+// can move. The cosig is unaffected — the `ReceiptPreimage` binds no mint
+// (`receipt_preimage_digest_is_independent_of_realized_mint`, authorize_pay.rs).
+#[tokio::test(flavor = "current_thread")]
+async fn collect_refuses_dead_mint_at_preflight_before_the_budget_reserve() {
+    init_test_env();
+    // An unroutable mint URL that refuses the TCP connect instantly — the deterministic dead-mint
+    // stand-in the pay-path dust guard's own unit test uses (payment_wallet.rs `DEAD_MINT`); no live
+    // network, no real hang wait.
+    const DEAD_MINT: &str = "https://127.0.0.1:1";
+
+    // A from-scratch delivery whose tip carries THIS job's execution sentinel, so cosig + tip-match +
+    // §19 all pass and the only remaining refusal point is the wallet.
+    let job_hash = "1a".repeat(32);
+    let manifest = mobee_core::delivery_sentinel::render_manifest(
+        &job_hash,
+        mobee_core::delivery_sentinel::DeliveryMode::FromScratch,
+        1,
+        12,
+    );
+    let (upstream, tip_oid) = make_upstream_delivery("deadmint", Some(&manifest));
+    let mount = format!("/git/{}/repo.git", "34".repeat(32));
+    let server = GitHttpAuthServer::spawn(&upstream, &mount);
+    let repo_url = server.repo_url();
+
+    let root = temp("home-deadmint");
+    let _ = fs::remove_dir_all(&root);
+    let mut home = home::bootstrap(&root).expect("home");
+    // Real-mint opt-in ISOLATED to this test home: lets `plan_payment` + `open_wallet_at_mint_async`
+    // resolve/open the wallet at the (dead) real mint so the preflight is actually exercised. The mint
+    // is connection-refused loopback, so this opts in to no real money.
+    home.config.allow_real_mints = true;
+    let secret_hex = home::read_secret_key_hex(&home).expect("secret");
+    let pubkey_hex = home::public_key_hex(&home).expect("pubkey");
+
+    let job_id = "a".repeat(64);
+    let mut bind = from_scratch_bind(&job_id, &pubkey_hex, &tip_oid, &repo_url, &job_hash);
+    // Seal the DEAD mint as the realized paying mint AND put it in the accepted set, so `plan_payment`
+    // resolves a DIRECT pay at it (no cross-mint hop — that would touch other mints). The cosig is
+    // computed AFTER, but the receipt preimage binds no mint, so it still passes.
+    bind.realized_mint = Some(DEAD_MINT.to_owned());
+    bind.accepted_mints = vec![DEAD_MINT.to_owned()];
+    bind.seller_signature = seller_cosig(&secret_hex, &pubkey_hex, &bind);
+    write_bind(&home, &bind);
+
+    let mut gate = BudgetGate::from_home(&home).expect("gate");
+    let started = std::time::Instant::now();
+    let result =
+        collect_async(&home, &mut gate, CollectRequest { job_id: job_id.clone(), out: None }).await;
+    let elapsed = started.elapsed();
+
+    drop(server);
+    let _ = fs::remove_dir_all(&upstream);
+
+    // (a) The pre-reserve preflight refuses the dead mint with `mint_unreachable_pay` — NOT success,
+    // NOT the §19 `no_sentinel` gate (that PASSED, this job's sentinel is present), NOT a hang.
+    let error = result.expect_err("a dead realized mint must refuse the pay BEFORE the budget reserve");
+    assert!(matches!(error, CollectError::Pay(_)), "must be a pay refusal: {error}");
+    let message = error.to_string();
+    assert!(
+        message.contains("mint_unreachable_pay"),
+        "must refuse at the pre-reserve fee-safe preflight (dead mint), got: {error}"
+    );
+    assert!(
+        !message.contains("no_sentinel"),
+        "the §19 gate must have PASSED (job-bound sentinel present) — the refusal is the wallet \
+         preflight, not the sentinel gate, got: {error}"
+    );
+    // (b) ZERO SPEND — the preflight refused BEFORE `gate.authorize_then_attempt` reserved any budget.
+    // In-memory AND durable, and NO journal is written (the journal is created only after the preflight
+    // passes). Reorder the preflight below the gate and the dead mint reaches the reserve first: this
+    // flips to `spent()==charged` (the phantom spend #387 closes).
+    assert_eq!(gate.spent(), 0, "a dead-mint preflight refusal must burn ZERO spend (see the #387 see-saw)");
+    assert_eq!(
+        BudgetGate::from_home(&home::bootstrap(&root).expect("reload home")).expect("reload").spent(),
+        0,
+        "durable spent must stay 0 after a pre-reserve preflight refusal"
+    );
+    assert!(!root.join("payment-journal").exists(), "no payment journal on a pre-reserve refusal");
+    // (c) Bounded — no park. The preflight is `MINT_TOUCH_TIMEOUT`-bounded and 127.0.0.1:1 refuses the
+    // connect fast; the whole worker round-trip is capped by the bridge recv ceiling (20s). A
+    // regression to the pre-#387 caller-runtime deadlock would park forever (the see-saw's other end).
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "must be bounded (no park), took {elapsed:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

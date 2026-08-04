@@ -605,14 +605,60 @@ pub fn git_result_draft(
     )
 }
 
-/// Kind-feedback FEEDBACK draft (`status=error`; timeout / push-fail / refuse paths).
+/// The protocol-v1 §10 feedback reason-code vocabulary. A `FEEDBACK` carries the code as an
+/// authoritative `["reason_code", <code>]` tag; `content` stays human-readable and is explanatory
+/// only. A reader MUST treat the tag as authoritative for the class and MUST NOT parse `content` to
+/// determine it; an unrecognised code falls back to the coarse class named by `status` (the code is a
+/// newer peer, not a broken one), so the vocabulary is extensible.
 ///
-/// `content` carries a machine-readable reason when one is available (e.g. rate-gate
-/// refusal); empty string preserves the historical empty-content callers.
+/// The set is deliberately COMPLETE, not just the code that prompted its introduction (`no_sentinel`):
+/// per §10, a vocabulary added only at the site that happened to prompt it reproduces the original
+/// class-ambiguity defect with a tag sitting on top of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReasonCode {
+    /// Offer amount is below the seller's rate floor — a price decline, not a work error.
+    BelowRate,
+    /// Offer speaks a protocol major this seat does not — a version reject, distinct from malformed.
+    UnsupportedVersion,
+    /// The trade's mint set does not intersect the seat's accepted mints.
+    MintIncompatible,
+    /// The seat is at capacity and declines to take the work.
+    AtCapacity,
+    /// The work execution failed (the agent could not produce the deliverable).
+    ExecutionFailed,
+    /// Execution succeeded but the delivery (snapshot/push/publish) failed.
+    DeliveryFailed,
+    /// The delivery carried no execution sentinel — a refusal that DOES count against the seller (§19).
+    NoSentinel,
+}
+
+impl ReasonCode {
+    /// The stable `reason_code` tag value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BelowRate => "below_rate",
+            Self::UnsupportedVersion => "unsupported_version",
+            Self::MintIncompatible => "mint_incompatible",
+            Self::AtCapacity => "at_capacity",
+            Self::ExecutionFailed => "execution_failed",
+            Self::DeliveryFailed => "delivery_failed",
+            Self::NoSentinel => "no_sentinel",
+        }
+    }
+}
+
+/// Kind-feedback FEEDBACK draft carrying the §10 `reason_code` tag — the authoritative class
+/// discriminator a reader keys on. The `status` tag stays `error` (as every emitting site here
+/// always has): the coarse status is a fallback for readers that do not know a code, and the buyer's
+/// claim-list view keys on it, so re-classing it (a `below_rate`/`no_sentinel` refusal is `refusal`
+/// per §10's table) is a deliberate view change left as a follow-up, not smuggled in here. `content`
+/// carries the human-readable reason (a display-only mirror of the code); empty preserves the
+/// historical empty-content callers.
 pub fn error_draft(
     offer_id: &str,
     buyer_pubkey: &str,
     seller_pubkey: &str,
+    reason_code: ReasonCode,
     content: impl Into<String>,
 ) -> EventDraft {
     let mut draft = status_draft(
@@ -622,6 +668,7 @@ pub fn error_draft(
             TagSpec::new(["e", offer_id]),
             TagSpec::new(["p", buyer_pubkey]),
             TagSpec::new(["p", seller_pubkey]),
+            TagSpec::new(["reason_code", reason_code.as_str()]),
         ],
     );
     draft.content = content.into();
