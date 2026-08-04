@@ -36,12 +36,12 @@ block/buzz stays meaningful and upstream commits remain scannable/pullable.
 
 3. `crates/buzz-relay/src/handlers/ingest.rs` — two additions, each marked inline
    with a comment:
-   (a) the mobee-core kind superset: `KIND_MOBEE_*` consts plus a
-       `required_scope_for_kind` arm (-> `MessagesWrite`) for the trade block
-       3401-3406, the seller heartbeat 30340, the NIP-89 handler 31990, and the
-       NIP-17 DM-relay list 10050, with the scope test rewritten to assert the
-       mobee numbers. The fork's original DVM arms (3400/5109/6109/7000) are left
-       untouched.
+   (a) the mobee-core kind superset: `KIND_MOBEE_*` consts plus
+       `required_scope_for_kind` arms — the trade block 3401-3406 and the seller
+       heartbeat 30340 -> `MessagesWrite`; the self-describing discovery/config
+       kinds (NIP-89 handler 31990, NIP-17 DM-relay list 10050) -> `UsersWrite`
+       (kind-0's class) — with the scope test rewritten to assert the mobee
+       numbers. The fork's original DVM arms (3400/5109/6109/7000) are untouched.
    (b) the MakePrisms/maxplayerai #397 payment/DoS bound on NIP-17 events: the
        gift wrap (1059) and the DM-relay list (10050) are capped at 128 KB of
        content, and the gift wrap must additionally carry at least one `p` tag.

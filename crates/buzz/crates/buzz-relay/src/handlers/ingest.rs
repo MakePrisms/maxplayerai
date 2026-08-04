@@ -347,18 +347,21 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_MOBEE_JOB_RESULT
         | KIND_MOBEE_JOB_FEEDBACK
         | KIND_MOBEE_JOB_RECEIPT => Ok(Scope::MessagesWrite),
-        // Mobee trade path (mobee-core kind registry): buyer/seller trade events,
-        // the seller liveness heartbeat, the NIP-89 handler advertisement, and the
-        // NIP-17 DM-relay list — all authenticated writes by mobee buyers/sellers.
+        // Mobee trade path (mobee-core kind registry): buyer/seller trade events
+        // plus the seller liveness heartbeat — authenticated writes by mobee
+        // buyers/sellers.
         KIND_MOBEE_TRADE_OFFER
         | KIND_MOBEE_TRADE_CLAIM
         | KIND_MOBEE_TRADE_RESULT
         | KIND_MOBEE_TRADE_FEEDBACK
         | KIND_MOBEE_TRADE_AWARD
         | KIND_MOBEE_TRADE_ACCEPT
-        | KIND_MOBEE_SELLER_HEARTBEAT
-        | KIND_MOBEE_NIP89_HANDLER
-        | KIND_MOBEE_DM_RELAY_LIST => Ok(Scope::MessagesWrite),
+        | KIND_MOBEE_SELLER_HEARTBEAT => Ok(Scope::MessagesWrite),
+        // Mobee self-describing discovery/config kinds — the NIP-89 handler
+        // advertisement and the NIP-17 DM-relay list. Grouped with kind-0's
+        // UsersWrite (identity/discovery) class per keeper:mobee, so an
+        // auth-tiered deploy inherits the right permission surface.
+        KIND_MOBEE_NIP89_HANDLER | KIND_MOBEE_DM_RELAY_LIST => Ok(Scope::UsersWrite),
         _ => {
             if open_ingest_enabled() {
                 Ok(Scope::MessagesWrite)
@@ -2811,13 +2814,23 @@ mod tests {
             KIND_MOBEE_TRADE_AWARD,      // 3405
             KIND_MOBEE_TRADE_ACCEPT,     // 3406 (pay-bind, #329)
             KIND_MOBEE_SELLER_HEARTBEAT, // 30340
-            KIND_MOBEE_NIP89_HANDLER,    // 31990
-            KIND_MOBEE_DM_RELAY_LIST,    // 10050
         ] {
             assert_eq!(
                 required_scope_for_kind(kind, &dummy).unwrap(),
                 Scope::MessagesWrite,
                 "mobee kind {kind} should require MessagesWrite scope"
+            );
+        }
+        // Self-describing discovery/config kinds are UsersWrite (kind-0's class),
+        // per keeper:mobee.
+        for kind in [
+            KIND_MOBEE_NIP89_HANDLER, // 31990
+            KIND_MOBEE_DM_RELAY_LIST, // 10050
+        ] {
+            assert_eq!(
+                required_scope_for_kind(kind, &dummy).unwrap(),
+                Scope::UsersWrite,
+                "mobee discovery kind {kind} should require UsersWrite scope"
             );
         }
         // Literal 3401: fails if the relay only knows the fork's DVM numbering.

@@ -21,8 +21,9 @@ Chosen over `metadex/mobee-kind-scope` (`c2499afd9`) because:
 
 ### Mobee kinds accepted
 Both families below are defined as consts in
-`crates/buzz-relay/src/handlers/ingest.rs`, mapped to `Scope::MessagesWrite` in
-`required_scope_for_kind`, and covered by `mobee_job_kinds_require_messages_write_scope`.
+`crates/buzz-relay/src/handlers/ingest.rs` and scoped in `required_scope_for_kind`
+(trade block + heartbeat -> `MessagesWrite`; the discovery/config kinds 31990 &
+10050 -> `UsersWrite`), covered by `mobee_kinds_require_messages_write_scope`.
 
 **A. The fork's DVM kinds** (carried verbatim from the source branch, untouched):
 
@@ -64,9 +65,11 @@ git-repo announcement mobee also emits are **already** scoped by the relay
 >    the fork here is an older DVM iteration. Worth locating the branch/rev that
 >    actually carries 3401 — but the superset accepts both, so nothing gates on it.
 >
-> **Scope note:** all eight added kinds use `MessagesWrite` (matching the DVM arm).
-> 31990 is discovery-class (grouped with kind-0 in mobee's `DISCOVERY_KINDS`); if
-> keeper:mobee prefers `UsersWrite` for it, that is a one-line change.
+> **Scope (keeper:mobee-ruled):** the trade block 3400-3406 and heartbeat 30340
+> → `MessagesWrite`; the self-describing discovery/config kinds 31990 (NIP-89) and
+> 10050 (DM-relay list) → `UsersWrite`, grouped with kind-0's identity class so an
+> auth-tiered deploy inherits the right permission surface. (Moot on today's open
+> relay, where every authed key holds all scopes.)
 
 ### Crates taken vs left
 Taken (12 = the relay's transitive `[dependencies]` closure):
