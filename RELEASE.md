@@ -32,7 +32,9 @@ fails outright.
 
 ## Cutting one
 
-1. **Bump the version.** `[workspace.package].version` in `Cargo.toml`, and `version` in every
+1. **Bump the version.** `[workspace.package].version` in `Cargo.toml`, the workspace crate
+   entries in `Cargo.lock` (refreshed by any `cargo` invocation — e.g. `cargo build` — since the
+   release build passes `--locked` and fails on a stale lockfile), and `version` in every
    `npm/*/package.json`, and the `optionalDependencies` pins in `npm/mobee/package.json`. All of
    them must read the same string, and it must match the tag with the `v` dropped — the build
    asserts this and stops if anything disagrees.
