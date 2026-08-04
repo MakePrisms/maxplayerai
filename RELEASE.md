@@ -5,18 +5,24 @@ npm. Both come out of `.github/workflows/release.yml`, which runs on a pushed `v
 
 ## Before the first release
 
-One setup step, done once, and it is the only thing standing between a tag and a publish:
+One setup step, done once **per package**, and it is the only thing standing between a tag and a
+publish. On npmjs.com, for each of `maxplayer`, `maxplayer-linux-x64` and `maxplayer-linux-arm64`:
 
-- Add an npm **automation** token as the repository secret `NPM_TOKEN`
-  (Settings → Secrets and variables → Actions).
+- Settings → **Trusted publishing** → add a GitHub Actions publisher: organization `MakePrisms`,
+  repository `maxplayerai`, workflow `release.yml`.
 
-Until that secret exists the workflow builds, verifies and creates GitHub Releases as normal, and the
-publish job stops on its first step. That is deliberate: the token lives in repository secrets and
-never in the tree.
+There is no repository secret to add. The workflow authenticates by trusted publishing (OIDC): the
+`publish` job mints a short-lived GitHub identity token and npm exchanges it for publish rights, so
+no long-lived credential exists to expire, leak, or be rotated.
+
+Until a package's trusted publisher is configured the workflow builds, verifies and creates GitHub
+Releases as normal, and `npm publish` fails loudly for that package. There is no silent skip — an
+unconfigured package fails the job rather than producing a release that looks published.
 
 The launcher publishes as the unscoped package `maxplayer`; the per-platform payloads publish under
-the `maxplayer-linux-x64` and `maxplayer-linux-arm64` packages. Both need to be writable by the token's account; `--access public` (passed by the job) is required for scoped first-publishes and a
-first publish needs `--access public`, which the publish job already passes.
+the `maxplayer-linux-x64` and `maxplayer-linux-arm64` packages. All three need their own trusted
+publisher entry — the setting is per package, not per account. `--access public`, which the publish
+job already passes, is what a first publish needs.
 
 ## Cutting one
 
