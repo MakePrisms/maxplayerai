@@ -1288,7 +1288,8 @@ impl fmt::Display for PaymentError {
             }
             Self::LockedTokenSpent(detail) => write!(
                 formatter,
-                "recovered locked token is spent at the mint; refusing resend (accounting gap): {detail}"
+                "recovered locked token is spent at the mint; refusing resend (verify our own prior \
+                 interrupted send vs an unaccounted redemption): {detail}"
             ),
             Self::LockedTokenMissing(detail) => write!(
                 formatter,
@@ -2625,7 +2626,9 @@ mod tests {
             }
             if self.locked_gate_spent {
                 return Err(LockedTokenGate::Spent(
-                    "a proof reads Spent at the mint (seller already redeemed)".into(),
+                    "a proof reads Spent at the mint (seller redeemed — our own prior interrupted \
+                     send or an unaccounted redemption)"
+                        .into(),
                 ));
             }
             // All-`Unspent`: reuse the already-minted token (no mint) exactly as reconcile would.

@@ -442,8 +442,10 @@ fn report_complete_locked(
         Err(AuthorizePayError::Payment(PaymentError::LockedTokenSpent(detail))) => {
             let _ = writeln!(
                 err,
-                "ALARM complete-locked spent-token: {detail}. NOT resending — the seller was already \
-                 paid by some path; escalate the accounting gap. Journal left unchanged."
+                "ALARM complete-locked spent-token: {detail}. NOT resending. VERIFY whether our own \
+                 prior (interrupted) send delivered — a spent proof during interrupt-recovery is \
+                 benign — versus an unaccounted redemption; escalate the accounting gap only if \
+                 unexplained. Journal left unchanged."
             );
             COMPLETE_LOCKED_SPENT_ALARM
         }

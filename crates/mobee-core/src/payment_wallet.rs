@@ -489,8 +489,10 @@ impl<'a> CdkBuyerMint<'a> {
             Ok(LockedPayment::new(token))
         } else {
             Err(LockedTokenGate::Spent(format!(
-                "a proof is not Unspent at the mint for attempt {} (proofs are P2PK-locked to the \
-                 seller — only the seller can spend them; already redeemed by some path)",
+                "a proof is not Unspent at the mint for attempt {} — the P2PK-locked proofs were \
+                 redeemed by the seller. Do NOT resend. This may be BENIGN (our own prior, \
+                 interrupted send delivered and the seller redeemed it) OR an unaccounted \
+                 redemption; verify which before treating it as an accounting gap.",
                 attempt_id.as_str()
             )))
         }
@@ -1544,7 +1546,10 @@ enum BuyerCommand {
     AssertLockedUnspent {
         attempt_id: AttemptId,
         terms: PaymentTerms,
-        response: mpsc::SyncSender<Result<LockedPayment, LockedTokenGate>>,
+        /// Two layers: the OUTER `PaymentWalletError` is the shared [`CdkPaymentEffects::request`]
+        /// transport channel (so this command rides the SAME bounded worker bridge as `Send` — no
+        /// bespoke recv), and the INNER `Result` is the proof-gate verdict.
+        response: mpsc::SyncSender<Result<Result<LockedPayment, LockedTokenGate>, PaymentWalletError>>,
     },
 }
 
@@ -1694,10 +1699,15 @@ impl<R> CdkPaymentEffects<R> {
                                 terms,
                                 response,
                             } => {
-                                let result = CdkBuyerMint::new(&wallet)
+                                // The reconcile + NUT-07 proof check runs HERE, on the WORKER
+                                // runtime (identical to `Send`) — never a caller-runtime mint call.
+                                // The gate verdict is the inner Result; the outer `Ok` marks the
+                                // request itself as delivered (transport failures surface via
+                                // `request()`'s own recv).
+                                let verdict = CdkBuyerMint::new(&wallet)
                                     .reconcile_locked_token_if_unspent(&attempt_id, &terms)
                                     .await;
-                                let _ = response.send(result);
+                                let _ = response.send(Ok(verdict));
                             }
                         }
                     }
@@ -1825,29 +1835,19 @@ where
         attempt_id: &AttemptId,
         terms: &PaymentTerms,
     ) -> Result<LockedPayment, LockedTokenGate> {
-        // Bespoke channel dance (not the generic `request`): the worker answers with the DISTINCT
-        // `LockedTokenGate`, which must survive to the caller intact (Spent ≠ Missing ≠ Effect).
-        // Only the transport failures — a stopped/unavailable worker or a dropped response — fold
-        // into the fail-closed `Effect` arm.
-        let (response, result) = mpsc::sync_channel(1);
-        self.commands
-            .as_ref()
-            .ok_or_else(|| {
-                LockedTokenGate::Effect(EffectError::new("payment wallet worker is stopped"))
-            })?
-            .try_send(BuyerCommand::AssertLockedUnspent {
-                attempt_id: attempt_id.clone(),
-                terms: terms.clone(),
-                response,
-            })
-            .map_err(|error| {
-                LockedTokenGate::Effect(EffectError::new(format!(
-                    "payment wallet worker unavailable: {error}"
-                )))
-            })?;
-        result.recv().map_err(|_| {
-            LockedTokenGate::Effect(EffectError::new("payment wallet worker dropped its response"))
-        })?
+        // Ride the SHARED `request()` worker bridge — the SAME path `send_payment` uses — so the
+        // reconcile + NUT-07 proof check runs on the WORKER runtime and this leg inherits the
+        // bounded worker recv (no bespoke recv/timeout that would collide with it at rebase). A
+        // transport failure (`request` → EffectError) folds into the fail-closed `Effect` arm; the
+        // inner Result is the distinct gate verdict (Spent / Missing / Ok token), preserved intact.
+        match self.request(|response| BuyerCommand::AssertLockedUnspent {
+            attempt_id: attempt_id.clone(),
+            terms: terms.clone(),
+            response,
+        }) {
+            Ok(verdict) => verdict,
+            Err(effect_error) => Err(LockedTokenGate::Effect(effect_error)),
+        }
     }
 }
 
