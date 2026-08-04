@@ -589,6 +589,30 @@ mod tests {
         assert_eq!(gate.spent(), 42);
     }
 
+    // Constraint #4 (operator completion): the original award charges the attempt; the operator
+    // completion routes the SAME attempt id through `authorize_then_attempt` AGAIN (passing the
+    // amount again, because the token is REUSED not re-minted). The gate no-ops the second reserve —
+    // the completion effect still runs, but spent does NOT move. This is the exact gate interaction
+    // `complete_recovered_locked_async` relies on to avoid double-charging a reused token.
+    #[test]
+    fn operator_completion_reattempt_reuses_the_charge_without_double_counting() {
+        let mut gate = BudgetGate::new(100);
+        gate.authorize_then_attempt("attempt-x", 40, || ())
+            .expect("original award charges");
+        assert_eq!(gate.spent(), 40);
+        assert!(gate.has_counted_attempt("attempt-x"));
+
+        let completed = gate
+            .authorize_then_attempt("attempt-x", 40, || "completed")
+            .expect("completion runs its effect");
+        assert_eq!(completed, "completed", "completion effect must still run");
+        assert_eq!(
+            gate.spent(),
+            40,
+            "completion reuses the already-charged attempt — no second charge"
+        );
+    }
+
     #[test]
     fn attempt_id_write_before_effect_and_survives_reload() {
         let root = temp_home("attempt-durable");

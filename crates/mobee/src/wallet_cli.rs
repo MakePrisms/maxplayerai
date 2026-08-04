@@ -37,6 +37,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         Some("invoice") => cmd_invoice(&args[1..], out, err),
         Some("mints") => cmd_mints(&args[1..], out, err),
         Some("reconcile") => cmd_reconcile(&args[1..], out, err),
+        Some("complete-locked") => cmd_complete_locked(&args[1..], out, err),
         _ => {
             wallet_usage(err);
             USAGE_ERROR
@@ -60,6 +61,8 @@ fn wallet_usage(err: &mut dyn Write) {
          \x20 maxplayer wallet mints add <url> [--home <path>]\n\
          \x20 maxplayer wallet mints remove <url> [--home <path>]\n\
          \x20 maxplayer wallet reconcile [--home <path>]   # retire eligible incomplete send sagas (no receipt/credit)\n\
+         \x20 maxplayer wallet complete-locked --job-id <id> --result-id <id> --delivery-integrity-hash <hex> --job-hash <hex> --seller-pubkey <hex> --amount <sats> --seller-signature <hex> [--creq-hash <hex>] [--accepted-mint <url> ...] [--realized-mint <url>] [--home <path>]\n\
+         \x20\x20\x20# operator: complete ONE payment wedged at Locked by proof-gated REUSE of the already-minted token (never re-mints; STOPS + alarms if the token reads spent)\n\
          \n\
          Default mint is testnut (pinned). Extra mints are opt-in via `mints add`.\n\
          Exit codes: 0 success, 1 usage error, 2 runtime error"
@@ -168,6 +171,10 @@ fn cmd_invoice(_args: &[String], _out: &mut dyn Write, err: &mut dyn Write) -> i
 }
 #[cfg(not(feature = "wallet"))]
 fn cmd_mints(_args: &[String], _out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    cmd_balance(_args, _out, err)
+}
+#[cfg(not(feature = "wallet"))]
+fn cmd_complete_locked(_args: &[String], _out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     cmd_balance(_args, _out, err)
 }
 
@@ -349,6 +356,246 @@ fn cmd_reconcile(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
             RUNTIME_ERROR
         }
     }
+}
+
+/// Distinct exit code for the STOP+alarm path: the recovered token read spent at the mint. Kept
+/// apart from the ordinary runtime-error code so a monitoring wrapper can page a human on the
+/// accounting gap specifically.
+#[cfg(feature = "wallet")]
+const COMPLETE_LOCKED_SPENT_ALARM: i32 = 3;
+
+/// `maxplayer wallet complete-locked` — operator-invoked completion of ONE payment wedged at a
+/// recovered `Locked`. Proof-gates the already-minted P2PK-locked token at the mint and, only if
+/// every proof is Unspent, REUSES it (never re-mints). A spent token STOPS and emits a loud ALARM.
+#[cfg(feature = "wallet")]
+fn cmd_complete_locked(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    use mobee_core::authorize_pay::complete_recovered_locked_async;
+    use mobee_core::budget::BudgetGate;
+
+    let (home_path, request) = match parse_complete_locked(args) {
+        Ok(value) => value,
+        Err(message) => {
+            let _ = writeln!(err, "{message}");
+            complete_locked_usage(err);
+            return USAGE_ERROR;
+        }
+    };
+    let opts = CommonOpts {
+        home: home_path,
+        ..CommonOpts::default()
+    };
+    let home = match bootstrap_home(&opts, err) {
+        Ok(home) => home,
+        Err(code) => return code,
+    };
+    let mut gate = match BudgetGate::from_home(&home) {
+        Ok(gate) => gate,
+        Err(error) => {
+            let _ = writeln!(err, "{error}");
+            return RUNTIME_ERROR;
+        }
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = writeln!(err, "complete-locked runtime: {error}");
+            return RUNTIME_ERROR;
+        }
+    };
+    let result = runtime.block_on(complete_recovered_locked_async(&home, &mut gate, request));
+    report_complete_locked(result, out, err)
+}
+
+/// Map the completion outcome to operator output + exit code. Pure (no I/O beyond the writers) so
+/// the STOP+alarm behavior is unit-testable without a live wallet.
+#[cfg(feature = "wallet")]
+fn report_complete_locked(
+    result: Result<
+        mobee_core::authorize_pay::CompleteLockedOutcome,
+        mobee_core::authorize_pay::AuthorizePayError,
+    >,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    use mobee_core::authorize_pay::AuthorizePayError;
+    use mobee_core::payment::PaymentError;
+    match result {
+        Ok(outcome) => {
+            let _ = writeln!(
+                out,
+                "complete-locked ok state={} attempt_id={} amount_sats={} spent_total_sats={}",
+                payment_state_label(&outcome.state),
+                outcome.attempt_id,
+                outcome.amount_sats,
+                outcome.spent_total_sats,
+            );
+            SUCCESS
+        }
+        // STOP + ALARM: the recovered token's proofs read spent — the P2PK-locked proofs can only be
+        // spent by the seller, so the seller was ALREADY paid by some path we did not record. Loud,
+        // greppable, DISTINCT exit so a monitor can page a human. The core entrypoint left the
+        // journal untouched (it never advanced), so there is no partial state to unwind.
+        Err(AuthorizePayError::Payment(PaymentError::LockedTokenSpent(detail))) => {
+            let _ = writeln!(
+                err,
+                "ALARM complete-locked spent-token: {detail}. NOT resending. VERIFY whether our own \
+                 prior (interrupted) send delivered — a spent proof during interrupt-recovery is \
+                 benign — versus an unaccounted redemption; escalate the accounting gap only if \
+                 unexplained. Journal left unchanged."
+            );
+            COMPLETE_LOCKED_SPENT_ALARM
+        }
+        // STOP (not the accounting-gap alarm): no token reconciled for this attempt — refuse rather
+        // than blind-remint a token we cannot account for.
+        Err(AuthorizePayError::Payment(PaymentError::LockedTokenMissing(detail))) => {
+            let _ = writeln!(
+                err,
+                "complete-locked refused: {detail}. No token reconciled for this attempt — refusing \
+                 to remint. Journal left unchanged."
+            );
+            RUNTIME_ERROR
+        }
+        Err(error) => {
+            let _ = writeln!(err, "complete-locked: {error}");
+            RUNTIME_ERROR
+        }
+    }
+}
+
+/// Human label for a folded payment state (no field echo).
+#[cfg(feature = "wallet")]
+fn payment_state_label(state: &mobee_core::payment::PaymentState) -> &'static str {
+    use mobee_core::payment::PaymentState;
+    match state {
+        PaymentState::Intent { .. } => "Intent",
+        PaymentState::Locked { .. } => "Locked",
+        PaymentState::Sent { .. } => "Sent",
+        PaymentState::ReceiptPublished { .. } => "ReceiptPublished",
+        PaymentState::Closed { .. } => "Closed",
+    }
+}
+
+/// Fetch the value that must follow a flag at `args[index]`.
+#[cfg(feature = "wallet")]
+fn require_value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str, String> {
+    args.get(index)
+        .map(String::as_str)
+        .ok_or_else(|| format!("{flag} requires a value"))
+}
+
+/// Unwrap a required flag, naming it in the error.
+#[cfg(feature = "wallet")]
+fn required(value: Option<String>, flag: &str) -> Result<String, String> {
+    value.ok_or_else(|| format!("{flag} is required"))
+}
+
+/// Parse `complete-locked` flags into `(home, request)`. All identity flags are required so the
+/// SAME attempt id (and journal) as the original pay is targeted; `--creq-hash`, `--accepted-mint`
+/// (repeatable), and `--realized-mint` are optional and mirror the accept-bind.
+#[cfg(feature = "wallet")]
+fn parse_complete_locked(
+    args: &[String],
+) -> Result<(Option<PathBuf>, mobee_core::authorize_pay::CompleteLockedRequest), String> {
+    use mobee_core::authorize_pay::CompleteLockedRequest;
+
+    let mut home: Option<PathBuf> = None;
+    let mut job_id: Option<String> = None;
+    let mut result_id: Option<String> = None;
+    let mut delivery_integrity_hash: Option<String> = None;
+    let mut job_hash: Option<String> = None;
+    let mut seller_pubkey: Option<String> = None;
+    let mut amount_sats: Option<u64> = None;
+    let mut seller_signature: Option<String> = None;
+    let mut creq_hash: Option<String> = None;
+    let mut realized_mint: Option<String> = None;
+    let mut accepted_mints: Vec<String> = Vec::new();
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--home" => {
+                index += 1;
+                home = Some(PathBuf::from(require_value(args, index, "--home")?));
+            }
+            "--job-id" => {
+                index += 1;
+                job_id = Some(require_value(args, index, "--job-id")?.to_owned());
+            }
+            "--result-id" => {
+                index += 1;
+                result_id = Some(require_value(args, index, "--result-id")?.to_owned());
+            }
+            "--delivery-integrity-hash" => {
+                index += 1;
+                delivery_integrity_hash =
+                    Some(require_value(args, index, "--delivery-integrity-hash")?.to_owned());
+            }
+            "--job-hash" => {
+                index += 1;
+                job_hash = Some(require_value(args, index, "--job-hash")?.to_owned());
+            }
+            "--seller-pubkey" => {
+                index += 1;
+                seller_pubkey = Some(require_value(args, index, "--seller-pubkey")?.to_owned());
+            }
+            "--amount" => {
+                index += 1;
+                amount_sats = Some(parse_amount(require_value(args, index, "--amount")?)?);
+            }
+            "--seller-signature" => {
+                index += 1;
+                seller_signature =
+                    Some(require_value(args, index, "--seller-signature")?.to_owned());
+            }
+            "--creq-hash" => {
+                index += 1;
+                creq_hash = Some(require_value(args, index, "--creq-hash")?.to_owned());
+            }
+            "--realized-mint" => {
+                index += 1;
+                realized_mint = Some(require_value(args, index, "--realized-mint")?.to_owned());
+            }
+            "--accepted-mint" => {
+                index += 1;
+                accepted_mints.push(require_value(args, index, "--accepted-mint")?.to_owned());
+            }
+            flag if flag.starts_with("--") => return Err(format!("unknown flag: {flag}")),
+            other => return Err(format!("unexpected positional argument: {other}")),
+        }
+        index += 1;
+    }
+
+    let request = CompleteLockedRequest {
+        job_id: required(job_id, "--job-id")?,
+        result_id: required(result_id, "--result-id")?,
+        delivery_integrity_hash: required(delivery_integrity_hash, "--delivery-integrity-hash")?,
+        job_hash: required(job_hash, "--job-hash")?,
+        seller_pubkey: required(seller_pubkey, "--seller-pubkey")?,
+        amount_sats: amount_sats.ok_or_else(|| "--amount is required".to_owned())?,
+        seller_signature: required(seller_signature, "--seller-signature")?,
+        creq_hash,
+        accepted_mints,
+        realized_mint,
+    };
+    Ok((home, request))
+}
+
+#[cfg(feature = "wallet")]
+fn complete_locked_usage(err: &mut dyn Write) {
+    let _ = writeln!(
+        err,
+        "Usage:\n  maxplayer wallet complete-locked --job-id <id> --result-id <id> \
+         --delivery-integrity-hash <hex> --job-hash <hex> --seller-pubkey <hex> --amount <sats> \
+         --seller-signature <hex> [--creq-hash <hex>] [--accepted-mint <url> ...] \
+         [--realized-mint <url>] [--home <path>]\n\n\
+         Completes ONE payment wedged at Locked by proof-gated REUSE of the already-minted token \
+         (never re-mints). If the token reads spent at the mint it STOPS, emits an ALARM, and \
+         leaves the journal unchanged.\n\
+         Exit codes: 0 success, 1 usage error, 2 runtime error, 3 SPENT alarm (accounting gap)"
+    );
 }
 
 #[cfg(feature = "wallet")]
@@ -728,5 +975,91 @@ mod tests {
         let mut err = Vec::new();
         let code = run(&["mint-complete".into()], &mut out, &mut err);
         assert_eq!(code, USAGE_ERROR);
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn parse_complete_locked_requires_the_identity_flags() {
+        // Missing --amount (a required identity flag) refuses at parse — before any home/gate/wallet.
+        let args: Vec<String> = [
+            "--job-id", "j", "--result-id", "r", "--delivery-integrity-hash", "aa",
+            "--job-hash", "bb", "--seller-pubkey", "cc", "--seller-signature", "dd",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        let err = parse_complete_locked(&args).expect_err("must refuse without --amount");
+        assert!(err.contains("--amount"), "error should name the missing flag, got: {err}");
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn parse_complete_locked_collects_repeated_accepted_mints() {
+        let args: Vec<String> = [
+            "--job-id", "job1", "--result-id", "res1", "--delivery-integrity-hash", "11",
+            "--job-hash", "22", "--seller-pubkey", "ab", "--amount", "100",
+            "--seller-signature", "ff", "--accepted-mint", "https://m1", "--accepted-mint",
+            "https://m2", "--realized-mint", "https://m1", "--home", "/tmp/x",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        let (home, request) = parse_complete_locked(&args).expect("parse");
+        assert_eq!(home, Some(PathBuf::from("/tmp/x")));
+        assert_eq!(request.job_id, "job1");
+        assert_eq!(request.amount_sats, 100);
+        assert_eq!(request.seller_signature, "ff");
+        assert_eq!(request.accepted_mints, vec!["https://m1".to_owned(), "https://m2".to_owned()]);
+        assert_eq!(request.realized_mint, Some("https://m1".to_owned()));
+    }
+
+    // RED-PROVE (operator surface): a spent-token completion outcome emits a loud ALARM to stderr and
+    // returns the DISTINCT alarm exit code, with nothing on stdout. Pairs with the core red-prove
+    // (payment.rs) that the entrypoint refuses and leaves the journal unchanged.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn spent_completion_emits_alarm_and_distinct_exit_code() {
+        use mobee_core::authorize_pay::AuthorizePayError;
+        use mobee_core::payment::PaymentError;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = report_complete_locked(
+            Err(AuthorizePayError::Payment(PaymentError::LockedTokenSpent(
+                "attempt 247ad2e6: a proof reads Spent at the mint".into(),
+            ))),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(
+            code, COMPLETE_LOCKED_SPENT_ALARM,
+            "spent must return the distinct alarm exit code, not the generic runtime error"
+        );
+        let err_text = String::from_utf8(err).expect("utf8");
+        assert!(err_text.starts_with("ALARM"), "must lead with a greppable ALARM, got: {err_text}");
+        assert!(err_text.contains("NOT resending"), "alarm must state it is not resending");
+        assert!(err_text.contains("Journal left unchanged"));
+        assert!(out.is_empty(), "no success output on the alarm path");
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn missing_token_completion_refuses_without_the_spent_alarm() {
+        use mobee_core::authorize_pay::AuthorizePayError;
+        use mobee_core::payment::PaymentError;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = report_complete_locked(
+            Err(AuthorizePayError::Payment(PaymentError::LockedTokenMissing(
+                "no confirmed send transaction".into(),
+            ))),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, RUNTIME_ERROR, "missing is a refuse, not the spent alarm");
+        let err_text = String::from_utf8(err).expect("utf8");
+        assert!(!err_text.starts_with("ALARM"), "missing must NOT masquerade as the accounting-gap alarm");
+        assert!(err_text.contains("refusing to remint"), "got: {err_text}");
     }
 }
