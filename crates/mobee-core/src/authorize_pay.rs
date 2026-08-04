@@ -119,6 +119,45 @@ pub struct AuthorizePayOutcome {
     pub spent_total_sats: u64,
 }
 
+/// Inputs for the operator completion path ([`complete_recovered_locked_async`]).
+///
+/// Mirrors the IDENTITY inputs of [`AuthorizePayRequest`] so the SAME attempt id (and journal file)
+/// is targeted, and adds only `seller_signature` — the seller cosig the completion still needs to
+/// publish the receipt. It carries NO new spend authority: the token was minted and the budget
+/// charged at the original award; completion REUSES that token and re-checks the same attempt id
+/// against the gate (never a second charge). There is deliberately no `repo`/`branch`/`commit_oid`
+/// or contribution binds — completion re-checks proof state and re-sends the existing token; it does
+/// not re-verify delivery (that gated the ORIGINAL spend, which already happened).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompleteLockedRequest {
+    pub job_id: String,
+    pub result_id: String,
+    pub delivery_integrity_hash: String,
+    pub job_hash: String,
+    pub seller_pubkey: String,
+    pub amount_sats: u64,
+    /// Seller schnorr signature (hex) over the receipt preimage — read from the accepted result's
+    /// `sig/seller` tag, exactly as the pay path reads it. Required: the buyer cannot co-sign a
+    /// valid receipt without it, so completion would stall at the receipt leg.
+    pub seller_signature: String,
+    pub creq_hash: Option<String>,
+    pub accepted_mints: Vec<String>,
+    pub realized_mint: Option<String>,
+}
+
+/// Successful operator-completion outcome. `state` is the folded payment state after the run —
+/// `Closed` on a full completion, or an earlier state if a later leg (e.g. the receipt publish) is
+/// left to a subsequent run. `spent_total_sats` is UNCHANGED from before the call when the attempt
+/// was already charged (the common case), because completion never re-charges.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompleteLockedOutcome {
+    pub state: PaymentState,
+    pub attempt_id: String,
+    pub amount_sats: u64,
+    pub spent_total_sats: u64,
+    pub remaining_sats: u64,
+}
+
 #[derive(Debug)]
 pub enum AuthorizePayError {
     Input(String),
@@ -245,56 +284,31 @@ pub async fn authorize_pay_async(
         ));
     }
 
-    let job_id = JobId::new(request.job_id.clone())
-        .map_err(|error| AuthorizePayError::Input(error.to_string()))?;
-    let result_id = ResultId::new(request.result_id.clone())
-        .map_err(|error| AuthorizePayError::Input(error.to_string()))?;
-    let delivery_integrity_hash = DeliveryIntegrityHash::from_hex(request.delivery_integrity_hash)
-        .map_err(|error| AuthorizePayError::Input(error.to_string()))?;
-    // Kept before the parse consumes `request.job_hash`: the §19 sentinel check below asserts the
-    // delivered tree carries THIS job's hash (buyer-controlled, from the accept-bind — never a seller
-    // echo), which is what makes a replayed sentinel from another job fail.
+    // Buyer-controlled job hash (from the accept-bind, never a seller echo) kept for the §19 sentinel
+    // check below, which asserts the delivered tree carries THIS job's hash — so a replayed sentinel
+    // from another job fails the match. `derive_payment` only borrows `request.job_hash`, so it stays
+    // available here.
     let expected_job_hash = request.job_hash.clone();
-    let job_hash = JobHash::from_hex(request.job_hash)
-        .map_err(|error| AuthorizePayError::Input(error.to_string()))?;
-    let seller_nostr = NostrPublicKey::parse(&request.seller_pubkey)
-        .map_err(|error| AuthorizePayError::Input(format!("seller_pubkey: {error}")))?;
-    let seller_p2pk = cashu_compressed_from_nostr(&seller_nostr)?;
-    // Choose the realized mint the buyer pays at from the seller's `creq` `m` list. The SELECTION is
-    // the mint FROZEN into the accept-bind at accept (`request.realized_mint`), not the live config
-    // default — so a config-default change between attempts cannot shift the mint and mint a second
-    // attempt id (double-pay). `resolve_realized_mint` still enforces accepted-set membership + the
-    // real-mint fence over that frozen selection. A legacy bind (no sealed mint) falls back to the
-    // live config default (pre-seal behavior).
-    let buyer_selected_mint = request
-        .realized_mint
-        .as_deref()
-        .unwrap_or_else(|| home.config.default_mint());
-    // A buyer funded only at mints the seller does not accept still has a way through: melt at a
-    // funded mint to pay a mint quote raised at one the seller does accept, and pay from there. The
-    // plan decides which of those two shapes this payment is; the realized mint is where the ecash
-    // the seller receives ends up, so for a hop it is the TARGET, and the terms, the attempt id and
-    // the receipt all bind that one mint exactly as they do on the direct path.
-    let plan = crate::crossmint::plan_payment(
-        buyer_selected_mint,
-        &request.accepted_mints,
-        home.config.allow_real_mints,
-    )?;
-    let terms = PaymentTerms::new(
-        plan.realized_mint().clone(),
-        Amount::from(request.amount_sats),
-        CurrencyUnit::Sat,
+    // Single derivation of the stable payment terms + key (⇒ attempt id) from the trade identity,
+    // shared byte-for-byte with `complete_recovered_locked_async` so a completion re-derives the
+    // EXACT same attempt id and journal file (a drift here would double-pay). See `derive_payment`.
+    let DerivedPayment {
+        terms,
+        key,
         seller_nostr,
-        seller_p2pk,
-    );
-    let key = PaymentKey::new(
-        job_id,
-        result_id,
-        delivery_integrity_hash,
-        job_hash,
-        &terms,
+        plan,
+    } = derive_payment(
+        home,
+        &request.job_id,
+        &request.result_id,
+        &request.delivery_integrity_hash,
+        &request.job_hash,
+        &request.seller_pubkey,
+        request.amount_sats,
+        &request.accepted_mints,
+        request.realized_mint.as_deref(),
         request.creq_hash.clone(),
-    );
+    )?;
     let attempt_id = key.attempt_id();
 
     let commit_oid = CommitOid::parse(request.commit_oid)?;
@@ -629,6 +643,109 @@ fn journal_sentinel_refusal(home: &MobeeHome, job_id: &str, commit_oid: &str, cl
     }
 }
 
+/// Operator-invoked completion of ONE payment wedged at a recovered `Locked` — the state the AUTO
+/// pay path fails closed on as [`PaymentError::AmbiguousSendRefused`].
+///
+/// Re-derives the SAME terms/key/attempt id as the original pay (via the shared [`derive_payment`]),
+/// opens the SAME `<attempt_id>.jsonl` journal, and drives
+/// [`PaymentService::complete_recovered_locked`] — which proof-gates the already-minted P2PK-locked
+/// token at the mint (LIVE, never cached) and, only if every proof is Unspent, REUSES that token
+/// through the same settlement legs. It NEVER re-mints and NEVER re-verifies delivery (that gated
+/// the original spend, which already happened).
+///
+/// Budget (constraint #4): routed THROUGH [`BudgetGate::authorize_then_attempt`] keyed by the same
+/// attempt id, which the original award already counted, so the reserve is a no-op — no bypass, no
+/// double charge. The `amount_sats` passed is only ever charged if the id is somehow uncounted (a
+/// fail-closed safety net; a genuinely-`Locked` attempt is always already counted).
+///
+/// NEVER wired into boot or the settle watcher — the only caller is the explicit
+/// `maxplayer wallet complete-locked` CLI subcommand.
+pub async fn complete_recovered_locked_async(
+    home: &MobeeHome,
+    gate: &mut BudgetGate,
+    request: CompleteLockedRequest,
+) -> Result<CompleteLockedOutcome, AuthorizePayError> {
+    if request.seller_signature.trim().is_empty() {
+        return Err(AuthorizePayError::Input(
+            "seller_signature is required to co-sign the receipt on completion".into(),
+        ));
+    }
+
+    let DerivedPayment {
+        terms,
+        key,
+        seller_nostr,
+        plan: _,
+    } = derive_payment(
+        home,
+        &request.job_id,
+        &request.result_id,
+        &request.delivery_integrity_hash,
+        &request.job_hash,
+        &request.seller_pubkey,
+        request.amount_sats,
+        &request.accepted_mints,
+        request.realized_mint.as_deref(),
+        request.creq_hash.clone(),
+    )?;
+    let attempt_id = key.attempt_id();
+
+    let secret_hex = home::read_secret_key_hex(home)
+        .map_err(|error| AuthorizePayError::Home(error.to_string()))?;
+    let keys = Keys::parse(&secret_hex)
+        .map_err(|error| AuthorizePayError::Home(format!("buyer key parse: {error}")))?;
+    let authority = ReceiptAuthority {
+        // External anchors: buyer == this buyer's own key, seller == the accepted-claim seller.
+        buyer: keys.public_key(),
+        seller: seller_nostr,
+    };
+    // Receipt-publish inputs captured before `keys` moves into the payment sender.
+    let buyer_receipt_keys = keys.clone();
+    let receipt_relay = home.config.relay_url.clone();
+    let seller_hex = seller_nostr.to_hex();
+    let seller_signature = request.seller_signature.clone();
+    // Live delivery is fork-only ([`DeliveryKind::Fork`]); the receipt preimage the seller signed at
+    // delivery used that kind, so completion reconstructs byte-identical bytes.
+    let delivery_kind = DeliveryKind::Fork;
+
+    let wallet = buyer_fund::open_wallet_at_mint_async(home, &wallet_open_mint_url(home, &terms))
+        .await?;
+    let payment_send = NostrPaymentSend::new(home.config.relay_url.clone(), keys);
+    let mut effects = CdkPaymentEffects::spawn(
+        wallet,
+        payment_send,
+        move |key: &PaymentKey, _payment: &crate::payment_send::PaymentSent| {
+            build_and_publish_receipt(
+                &buyer_receipt_keys,
+                &receipt_relay,
+                &seller_hex,
+                &seller_signature,
+                delivery_kind,
+                key,
+            )
+        },
+    )
+    .map_err(|error| AuthorizePayError::Effects(error.to_string()))?;
+
+    // Same journal file the pay path writes — completion advances THIS attempt's wedge, never a new one.
+    let journal_dir = home.root.join("payment-journal");
+    let journal = FsPaymentJournal::new(journal_dir.join(format!("{}.jsonl", attempt_id.as_str())));
+
+    // Route through the gate (no bypass) keyed by the already-counted attempt id (no double charge).
+    // The completion runs under the same cross-process spend lock + ledger discipline as the pay path.
+    let state = gate.authorize_then_attempt(attempt_id.as_str(), request.amount_sats, || {
+        PaymentService::new(&journal).complete_recovered_locked(&key, &terms, &authority, &mut effects)
+    })??;
+
+    Ok(CompleteLockedOutcome {
+        state,
+        attempt_id: attempt_id.as_str().to_owned(),
+        amount_sats: request.amount_sats,
+        spent_total_sats: gate.spent(),
+        remaining_sats: gate.remaining(),
+    })
+}
+
 /// Resolve the buyer's content policy hook from `[contribution]` config, or the
 /// FLOOR (refuse only empty diffs) when unconfigured. Buyer-side; never seller-influenced.
 fn contribution_policy(home: &MobeeHome) -> crate::contribution::ContentPolicy {
@@ -700,6 +817,83 @@ fn cosig_refusal_diagnostic(preimage: &ReceiptPreimage) -> String {
 fn cashu_compressed_from_nostr(key: &NostrPublicKey) -> Result<CashuPublicKey, AuthorizePayError> {
     CashuPublicKey::from_str(&format!("02{}", key.to_hex())).map_err(|error| {
         AuthorizePayError::Input(format!("cashu pubkey from nostr key: {error}"))
+    })
+}
+
+/// The stable payment terms + key (⇒ attempt id) derived from a trade's identity inputs, plus the
+/// pay plan. Returned by [`derive_payment`], the SINGLE derivation shared by the pay path and the
+/// operator completion path.
+struct DerivedPayment {
+    terms: PaymentTerms,
+    key: PaymentKey,
+    /// The seller's nostr key (Copy) — reused for the receipt authority + receipt co-sign so callers
+    /// do not re-parse it.
+    seller_nostr: NostrPublicKey,
+    plan: crate::crossmint::PayPlan,
+}
+
+/// Derive the stable [`PaymentTerms`] + [`PaymentKey`] (and thus the attempt id) from a trade's
+/// identity inputs. This is the ONE derivation both [`authorize_pay_async`] and
+/// [`complete_recovered_locked_async`] call, so both compute the IDENTICAL attempt id for the same
+/// job — a re-derivation drift would target a different journal file and could double-pay. Pure
+/// beyond reading the home config's default mint + real-mint policy.
+///
+/// The realized mint is chosen from the seller's `creq` `m` list via the SELECTION frozen into the
+/// accept-bind (`realized_mint`), not the live config default — so a config-default change between
+/// attempts cannot shift the mint and mint a second attempt id. `plan_payment` still enforces
+/// accepted-set membership + the real-mint fence over that selection (and plans a cross-mint hop
+/// when the buyer holds nothing at an accepted mint); a legacy bind (no sealed mint) falls back to
+/// the live default.
+#[allow(clippy::too_many_arguments)]
+fn derive_payment(
+    home: &MobeeHome,
+    job_id: &str,
+    result_id: &str,
+    delivery_integrity_hash: &str,
+    job_hash: &str,
+    seller_pubkey: &str,
+    amount_sats: u64,
+    accepted_mints: &[String],
+    realized_mint: Option<&str>,
+    creq_hash: Option<String>,
+) -> Result<DerivedPayment, AuthorizePayError> {
+    let job_id =
+        JobId::new(job_id.to_owned()).map_err(|error| AuthorizePayError::Input(error.to_string()))?;
+    let result_id = ResultId::new(result_id.to_owned())
+        .map_err(|error| AuthorizePayError::Input(error.to_string()))?;
+    let delivery_integrity_hash = DeliveryIntegrityHash::from_hex(delivery_integrity_hash)
+        .map_err(|error| AuthorizePayError::Input(error.to_string()))?;
+    let job_hash =
+        JobHash::from_hex(job_hash).map_err(|error| AuthorizePayError::Input(error.to_string()))?;
+    let seller_nostr = NostrPublicKey::parse(seller_pubkey)
+        .map_err(|error| AuthorizePayError::Input(format!("seller_pubkey: {error}")))?;
+    let seller_p2pk = cashu_compressed_from_nostr(&seller_nostr)?;
+    let buyer_selected_mint = realized_mint.unwrap_or_else(|| home.config.default_mint());
+    let plan = crate::crossmint::plan_payment(
+        buyer_selected_mint,
+        accepted_mints,
+        home.config.allow_real_mints,
+    )?;
+    let terms = PaymentTerms::new(
+        plan.realized_mint().clone(),
+        Amount::from(amount_sats),
+        CurrencyUnit::Sat,
+        seller_nostr,
+        seller_p2pk,
+    );
+    let key = PaymentKey::new(
+        job_id,
+        result_id,
+        delivery_integrity_hash,
+        job_hash,
+        &terms,
+        creq_hash,
+    );
+    Ok(DerivedPayment {
+        terms,
+        key,
+        seller_nostr,
+        plan,
     })
 }
 

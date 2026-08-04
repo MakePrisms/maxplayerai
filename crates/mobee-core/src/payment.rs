@@ -746,6 +746,22 @@ pub(crate) trait PaymentEffects {
         key: &PaymentKey,
         payment: &PaymentSent,
     ) -> Result<ReceiptEvidence, EffectError>;
+
+    /// LIVE mint proof-state gate for a recovered `Locked` token (operator completion only).
+    ///
+    /// Reconciles the already-minted, P2PK-locked token for `attempt_id` (REUSE — never mints) and
+    /// checks its proofs at the mint via the non-mutating NUT-07 path. Returns the reconciled token
+    /// IFF EVERY proof reads `Unspent`; otherwise fails with a DISTINCT [`LockedTokenGate`] variant
+    /// so the caller can STOP + alarm on `Spent` and STOP (never remint) on `Missing`.
+    ///
+    /// Re-checked LIVE at call time (never cached). This is the ONLY gate that may authorize driving
+    /// a recovered `Locked` forward — [`PaymentService::advance`] never calls it (it fails closed on
+    /// a recovered `Locked` instead).
+    fn assert_locked_token_unspent(
+        &mut self,
+        attempt_id: &AttemptId,
+        terms: &PaymentTerms,
+    ) -> Result<LockedPayment, LockedTokenGate>;
 }
 
 /// Guarded payment workflow orchestrator.
@@ -861,10 +877,44 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
             state = Some(locked);
         }
 
+        // Recovered-`Locked` fail-closed refusal — UNCHANGED auto behavior. A lock folded from a
+        // PRIOR run is delivery-ambiguous: a relay reject (never delivered) and a seller receipt
+        // (delivered, DM just not re-journaled) are indistinguishable from the journal alone, so the
+        // AUTO path NEVER resends. The operator-invoked [`Self::complete_recovered_locked`] is the
+        // only path that may drive such a lock forward, and only behind a LIVE mint proof-state gate.
         if matches!(state, Some(PaymentState::Locked { .. })) {
             if recovered_locked {
                 return Err(PaymentError::AmbiguousSendRefused);
             }
+        }
+
+        // Fresh-lock send + settle, plus recovery of a folded `Sent`/`ReceiptPublished`. Factored so
+        // the money legs live in ONE place, shared with [`Self::complete_recovered_locked`]; on the
+        // AUTO path this is only ever reached for a FRESH lock (the recovered-`Locked` refusal above
+        // returns first) or a genuinely-later state.
+        self.drive_settlement_legs(&mut guard, key, terms, authority, effects, state, locked_payment)
+    }
+
+    /// The money legs `Locked → Sent → ReceiptPublished → Closed`, driven as a fall-through so a
+    /// state folded to any of `Sent`/`ReceiptPublished` also resumes from there.
+    ///
+    /// The `Locked` leg is entered ONLY with a supplied `locked` token — the fresh lock from
+    /// [`Self::advance`] or the proof-gated reconciled token from
+    /// [`Self::complete_recovered_locked`]. Callers MUST have already cleared the recovered-`Locked`
+    /// ambiguity before calling (advance refuses it outright; complete_recovered_locked proof-gates
+    /// it); this helper never re-checks that and so must never be reached for a recovered lock whose
+    /// gate has not passed.
+    fn drive_settlement_legs<G: PaymentJournalGuard, E: PaymentEffects>(
+        &self,
+        guard: &mut G,
+        key: &PaymentKey,
+        terms: &PaymentTerms,
+        authority: &ReceiptAuthority,
+        effects: &mut E,
+        mut state: Option<PaymentState>,
+        locked_payment: Option<LockedPayment>,
+    ) -> Result<PaymentState, PaymentError> {
+        if matches!(state, Some(PaymentState::Locked { .. })) {
             let attempt_id = state
                 .as_ref()
                 .expect("locked state exists")
@@ -883,7 +933,7 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
                 attempt_id,
                 payment,
             };
-            append_transition(&mut guard, key, state.as_ref(), &sent)?;
+            append_transition(guard, key, state.as_ref(), &sent)?;
             state = Some(sent);
         }
 
@@ -897,7 +947,7 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
                 attempt_id,
                 receipt,
             };
-            append_transition(&mut guard, key, state.as_ref(), &published)?;
+            append_transition(guard, key, state.as_ref(), &published)?;
             state = Some(published);
         }
 
@@ -920,11 +970,71 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
                 attempt_id,
                 receipt,
             };
-            append_transition(&mut guard, key, state.as_ref(), &closed)?;
+            append_transition(guard, key, state.as_ref(), &closed)?;
             state = Some(closed);
         }
 
         state.ok_or_else(|| PaymentError::Refused("payment state is absent".into()))
+    }
+
+    /// Operator-invoked completion of ONE payment wedged at a recovered `Locked` — the state the
+    /// AUTO path ([`Self::advance`]) fails closed on as [`PaymentError::AmbiguousSendRefused`].
+    ///
+    /// Resolves the send ambiguity the daemon refuses to guess at, using the authoritative source:
+    /// the mint's proof-state for the already-minted, P2PK-locked token. It REUSES that token (never
+    /// re-mints, never re-charges — the attempt was charged at the original reserve) and drives it
+    /// through the SAME [`Self::drive_settlement_legs`] as a fresh send.
+    ///
+    /// Fail-closed at every step:
+    /// 1. folded state MUST be EXACTLY `Locked` with an attempt id matching the key — any other
+    ///    state (None / Intent / Sent / ReceiptPublished / Closed) refuses and does NOTHING;
+    /// 2. the token's proofs MUST ALL read `Unspent` at the mint, RE-CHECKED LIVE here (never
+    ///    cached), via [`PaymentEffects::assert_locked_token_unspent`]. A Spent/Pending proof STOPS
+    ///    with [`PaymentError::LockedTokenSpent`] (the operator surface alarms the accounting gap);
+    ///    a missing token STOPS with [`PaymentError::LockedTokenMissing`]. Neither advances the
+    ///    journal.
+    ///
+    /// Crate-private and NEVER wired into boot or the settle watcher — the only caller is the
+    /// operator entrypoint in `authorize_pay`, behind an explicit CLI subcommand.
+    pub(crate) fn complete_recovered_locked<E: PaymentEffects>(
+        &self,
+        key: &PaymentKey,
+        terms: &PaymentTerms,
+        authority: &ReceiptAuthority,
+        effects: &mut E,
+    ) -> Result<PaymentState, PaymentError> {
+        require_key_matches_terms(key, terms)?;
+        let mut guard = self.journal.lock(key)?;
+        let records = guard.replay()?;
+        guard.sync_replay()?;
+        let state = PaymentMachine::fold(key, &records)?;
+
+        // STRICT predicate: EXACTLY a recovered `Locked` for THIS attempt. Anything else refuses
+        // having done nothing — this entrypoint completes a wedge, it does not create or repair one.
+        let attempt_id = match &state {
+            Some(PaymentState::Locked { attempt_id }) => attempt_id.clone(),
+            other => {
+                return Err(PaymentError::Refused(format!(
+                    "complete-locked refused: journal state is {}, expected Locked (nothing done)",
+                    other.as_ref().map_or("None", state_name),
+                )));
+            }
+        };
+        if attempt_id != key.attempt_id() {
+            return Err(PaymentError::Refused(
+                "complete-locked refused: journal attempt_id does not match the payment key (nothing done)"
+                    .into(),
+            ));
+        }
+
+        // LIVE mint proof-state gate. Reuses the already-minted P2PK-locked token; Spent ⇒ STOP +
+        // alarm (seller already redeemed — accounting gap), Missing ⇒ STOP (never remint). Only an
+        // all-`Unspent` answer returns the token and lets the settlement legs run.
+        let locked = effects
+            .assert_locked_token_unspent(&attempt_id, terms)
+            .map_err(PaymentError::from)?;
+
+        self.drive_settlement_legs(&mut guard, key, terms, authority, effects, state, Some(locked))
     }
 }
 
@@ -1071,6 +1181,33 @@ impl fmt::Display for EffectError {
 
 impl std::error::Error for EffectError {}
 
+/// Distinct outcome of the recovered-`Locked` proof-state gate
+/// ([`PaymentEffects::assert_locked_token_unspent`]).
+///
+/// The variants are kept apart on purpose: the completion entrypoint STOPS + alarms on `Spent`
+/// (a proof P2PK-locked to the seller reading spent means the seller already redeemed by some
+/// path — an accounting gap, never a resend) and STOPS on `Missing` (never blind-remint a token
+/// it cannot account for). Each maps to its own [`PaymentError`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LockedTokenGate {
+    /// At least one proof is not `Unspent` at the mint (Spent / Pending / mixed / unknown).
+    Spent(String),
+    /// `reconcile` found no token for the attempt.
+    Missing(String),
+    /// Any other failure obtaining the token or reaching the mint (fail-closed).
+    Effect(EffectError),
+}
+
+impl fmt::Display for LockedTokenGate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Spent(detail) => write!(formatter, "locked token spent at mint: {detail}"),
+            Self::Missing(detail) => write!(formatter, "locked token missing: {detail}"),
+            Self::Effect(error) => write!(formatter, "locked token check failed: {error}"),
+        }
+    }
+}
+
 #[derive(Debug)]
 /// Durable journal failure.
 pub enum JournalError {
@@ -1123,6 +1260,14 @@ pub enum PaymentError {
     Effect(EffectError),
     NoRelayAccepted,
     AmbiguousSendRefused,
+    /// A recovered `Locked` token's proofs read Spent/Pending at the mint during operator
+    /// completion — the seller already redeemed by some path. Completion STOPS (never resends)
+    /// and the operator surface alarms the accounting gap. Distinct from every other refusal so it
+    /// is impossible to confuse with a benign "wrong state" refusal.
+    LockedTokenSpent(String),
+    /// Operator completion reconciled no token for a recovered `Locked` attempt. STOP — never
+    /// blind-remint a token that cannot be accounted for.
+    LockedTokenMissing(String),
     ForgedReceipt,
     Refused(String),
 }
@@ -1141,6 +1286,14 @@ impl fmt::Display for PaymentError {
             Self::AmbiguousSendRefused => {
                 formatter.write_str("payment send state is ambiguous; refusing automatic resend")
             }
+            Self::LockedTokenSpent(detail) => write!(
+                formatter,
+                "recovered locked token is spent at the mint; refusing resend (accounting gap): {detail}"
+            ),
+            Self::LockedTokenMissing(detail) => write!(
+                formatter,
+                "recovered locked token could not be reconciled; refusing to remint: {detail}"
+            ),
             Self::ForgedReceipt => formatter.write_str("receipt author or signatures are invalid"),
             Self::Refused(message) => write!(formatter, "payment refused: {message}"),
         }
@@ -1158,6 +1311,19 @@ impl From<JournalError> for PaymentError {
 impl From<EffectError> for PaymentError {
     fn from(error: EffectError) -> Self {
         Self::Effect(error)
+    }
+}
+
+impl From<LockedTokenGate> for PaymentError {
+    /// Preserve the gate's distinction all the way to the operator surface: `Spent` and `Missing`
+    /// each get their own [`PaymentError`] variant (STOP + alarm vs STOP), and a transport/other
+    /// failure folds into the ordinary [`PaymentError::Effect`] fail-closed path.
+    fn from(gate: LockedTokenGate) -> Self {
+        match gate {
+            LockedTokenGate::Spent(detail) => Self::LockedTokenSpent(detail),
+            LockedTokenGate::Missing(detail) => Self::LockedTokenMissing(detail),
+            LockedTokenGate::Effect(error) => Self::Effect(error),
+        }
     }
 }
 
@@ -1667,6 +1833,278 @@ mod tests {
         assert_eq!(shared.receipt_count.load(Ordering::SeqCst), 0);
     }
 
+    // ---- Operator completion of a recovered `Locked` (complete_recovered_locked) ----
+
+    /// Seed a journal that folds to exactly the given states (the same append pattern the recovery
+    /// tests use).
+    fn seed_journal(states: &[PaymentState]) -> MemoryPaymentJournal {
+        let journal = MemoryPaymentJournal::default();
+        let payment_key = key();
+        let mut guard = journal.lock(&payment_key).unwrap();
+        for state in states {
+            guard
+                .append_sync(&PaymentRecord {
+                    key: payment_key.clone(),
+                    value: state.clone(),
+                })
+                .unwrap();
+        }
+        drop(guard);
+        journal
+    }
+
+    /// A journal wedged at a RECOVERED `Locked` — intent then locked, nothing after (the two-record
+    /// wedge the design describes).
+    fn recovered_locked_journal() -> MemoryPaymentJournal {
+        let attempt_id = key().attempt_id();
+        seed_journal(&[
+            PaymentState::Intent {
+                attempt_id: attempt_id.clone(),
+            },
+            PaymentState::Locked { attempt_id },
+        ])
+    }
+
+    // RED-PROVE (acceptance centerpiece, constraint #2): a recovered `Locked` whose token reads SPENT
+    // at the mint makes completion REFUSE with the DISTINCT `LockedTokenSpent`, appends NOTHING (the
+    // journal still folds to `Locked`), and never touches the money legs. This is the STOP the whole
+    // entrypoint exists to guarantee.
+    #[test]
+    fn spent_recovered_locked_refuses_and_leaves_the_journal_unchanged() {
+        let journal = recovered_locked_journal();
+        let before = journal.records().len();
+        let shared = FakeShared::default();
+        let mut effects = FakeEffects::new(shared.clone());
+        effects.locked_gate_spent = true;
+
+        let error = PaymentService::new(&journal)
+            .complete_recovered_locked(&key(), &terms(), &authority(), &mut effects)
+            .unwrap_err();
+
+        assert!(
+            matches!(error, PaymentError::LockedTokenSpent(_)),
+            "spent proofs must surface the DISTINCT accounting-gap error, got {error:?}"
+        );
+        // Journal byte-count unchanged and still `Locked` — no `Sent` was appended.
+        assert_eq!(
+            journal.records().len(),
+            before,
+            "the spent gate must append no record"
+        );
+        assert!(matches!(
+            journal.records().last().map(|record| &record.value),
+            Some(PaymentState::Locked { .. })
+        ));
+        // The live gate WAS consulted; verify/send/mint never ran.
+        assert_eq!(shared.gate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(shared.verify_count.load(Ordering::SeqCst), 0);
+        assert_eq!(shared.send_count.load(Ordering::SeqCst), 0);
+        assert_eq!(shared.mint_count.load(Ordering::SeqCst), 0);
+    }
+
+    // A reconcile that finds NO token STOPS with the DISTINCT `LockedTokenMissing` and never
+    // blind-remints — journal unchanged.
+    #[test]
+    fn missing_recovered_locked_token_refuses_and_never_remints() {
+        let journal = recovered_locked_journal();
+        let before = journal.records().len();
+        let shared = FakeShared::default();
+        let mut effects = FakeEffects::new(shared.clone());
+        effects.locked_gate_missing = true;
+
+        let error = PaymentService::new(&journal)
+            .complete_recovered_locked(&key(), &terms(), &authority(), &mut effects)
+            .unwrap_err();
+
+        assert!(
+            matches!(error, PaymentError::LockedTokenMissing(_)),
+            "a missing token must surface the DISTINCT missing error, got {error:?}"
+        );
+        assert_eq!(journal.records().len(), before);
+        assert_eq!(shared.send_count.load(Ordering::SeqCst), 0);
+        assert_eq!(shared.mint_count.load(Ordering::SeqCst), 0);
+    }
+
+    // The happy path: all proofs UNSPENT ⇒ completion REUSES the already-minted token (no
+    // lock_or_reconcile, no second mint) and drives `Locked → … → Closed`, sending exactly once.
+    #[test]
+    fn unspent_recovered_locked_completes_to_closed_reusing_the_token() {
+        let journal = recovered_locked_journal();
+        let shared = FakeShared::default();
+        let mut effects = FakeEffects::new(shared.clone());
+
+        let state = PaymentService::new(&journal)
+            .complete_recovered_locked(&key(), &terms(), &authority(), &mut effects)
+            .unwrap();
+
+        assert!(matches!(state, PaymentState::Closed { .. }));
+        assert!(matches!(
+            journal.records().last().map(|record| &record.value),
+            Some(PaymentState::Closed { .. })
+        ));
+        assert_eq!(shared.gate_calls.load(Ordering::SeqCst), 1);
+        // REUSE, not remint: the gate returned the token, so the mint/lock path never ran.
+        assert_eq!(
+            shared.lock_calls.load(Ordering::SeqCst),
+            0,
+            "completion must not call lock_or_reconcile — the token is reused"
+        );
+        assert_eq!(shared.mint_count.load(Ordering::SeqCst), 0, "never re-mint");
+        assert_eq!(
+            shared.send_count.load(Ordering::SeqCst),
+            1,
+            "the reused token is delivered exactly once"
+        );
+        assert_eq!(shared.receipt_count.load(Ordering::SeqCst), 1);
+    }
+
+    // STRICT predicate (constraint #1): completion refuses EVERY non-`Locked` folded state — None,
+    // Intent, Sent, ReceiptPublished, Closed — doing nothing (no gate call, no money).
+    #[test]
+    fn complete_locked_refuses_every_non_locked_state() {
+        let attempt_id = key().attempt_id();
+        let receipt = ReceiptRecord {
+            receipt_id: "receipt".into(),
+            receipt_kind: RECEIPT_EVENT_KIND,
+        };
+        let cases: Vec<Vec<PaymentState>> = vec![
+            vec![], // None — no journal records at all
+            vec![PaymentState::Intent {
+                attempt_id: attempt_id.clone(),
+            }],
+            vec![
+                PaymentState::Intent {
+                    attempt_id: attempt_id.clone(),
+                },
+                PaymentState::Locked {
+                    attempt_id: attempt_id.clone(),
+                },
+                PaymentState::Sent {
+                    attempt_id: attempt_id.clone(),
+                    payment: sent(),
+                },
+            ],
+            vec![
+                PaymentState::Intent {
+                    attempt_id: attempt_id.clone(),
+                },
+                PaymentState::Locked {
+                    attempt_id: attempt_id.clone(),
+                },
+                PaymentState::Sent {
+                    attempt_id: attempt_id.clone(),
+                    payment: sent(),
+                },
+                PaymentState::ReceiptPublished {
+                    attempt_id: attempt_id.clone(),
+                    receipt: receipt.clone(),
+                },
+            ],
+            vec![
+                PaymentState::Intent {
+                    attempt_id: attempt_id.clone(),
+                },
+                PaymentState::Locked {
+                    attempt_id: attempt_id.clone(),
+                },
+                PaymentState::Sent {
+                    attempt_id: attempt_id.clone(),
+                    payment: sent(),
+                },
+                PaymentState::ReceiptPublished {
+                    attempt_id: attempt_id.clone(),
+                    receipt: receipt.clone(),
+                },
+                PaymentState::Closed {
+                    attempt_id: attempt_id.clone(),
+                    receipt: receipt.clone(),
+                },
+            ],
+        ];
+
+        for states in cases {
+            let journal = seed_journal(&states);
+            let before = journal.records().len();
+            let shared = FakeShared::default();
+            let mut effects = FakeEffects::new(shared.clone());
+
+            let error = PaymentService::new(&journal)
+                .complete_recovered_locked(&key(), &terms(), &authority(), &mut effects)
+                .unwrap_err();
+
+            assert!(
+                matches!(error, PaymentError::Refused(message) if message.contains("expected Locked")),
+                "state set {states:?} must refuse as a non-Locked state"
+            );
+            assert_eq!(journal.records().len(), before, "refusal must append nothing");
+            // The proof gate is NEVER reached for a non-Locked state.
+            assert_eq!(shared.gate_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(shared.send_count.load(Ordering::SeqCst), 0);
+            assert_eq!(shared.mint_count.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    // Constraint #3 red-prove: the AUTO path STILL fails closed on a recovered `Locked`
+    // (`AmbiguousSendRefused`, byte-unchanged behavior), while the OPERATOR path drives the SAME
+    // wedge to `Closed` behind its proof gate. The two paths, contrasted on one journal.
+    #[test]
+    fn auto_advance_refuses_recovered_locked_but_operator_completion_drives_it() {
+        let journal = recovered_locked_journal();
+        let shared = FakeShared::default();
+
+        let mut auto = FakeEffects::new(shared.clone());
+        assert!(
+            matches!(
+                PaymentService::new(&journal).advance(&key(), &terms(), &authority(), &mut auto),
+                Err(PaymentError::AmbiguousSendRefused)
+            ),
+            "the auto path must keep refusing a recovered Locked"
+        );
+        assert_eq!(
+            shared.send_count.load(Ordering::SeqCst),
+            0,
+            "the auto refusal touches no money"
+        );
+        assert!(matches!(
+            journal.records().last().map(|record| &record.value),
+            Some(PaymentState::Locked { .. })
+        ));
+
+        let mut operator = FakeEffects::new(shared.clone());
+        assert!(matches!(
+            PaymentService::new(&journal)
+                .complete_recovered_locked(&key(), &terms(), &authority(), &mut operator)
+                .unwrap(),
+            PaymentState::Closed { .. }
+        ));
+        assert_eq!(
+            shared.send_count.load(Ordering::SeqCst),
+            1,
+            "the operator path delivers the reused token exactly once"
+        );
+    }
+
+    // A relay that keeps rejecting (empty relay_success) during completion leaves the journal at
+    // `Locked` and surfaces `NoRelayAccepted` — no false advance, safe to retry once the relay heals.
+    #[test]
+    fn completion_with_no_relay_stays_locked() {
+        let journal = recovered_locked_journal();
+        let before = journal.records().len();
+        let shared = FakeShared::default();
+        let mut effects = FakeEffects::new(shared.clone());
+        effects.empty_send = true;
+
+        let error = PaymentService::new(&journal)
+            .complete_recovered_locked(&key(), &terms(), &authority(), &mut effects)
+            .unwrap_err();
+        assert!(matches!(error, PaymentError::NoRelayAccepted));
+        assert_eq!(journal.records().len(), before, "no Sent appended on relay reject");
+        assert!(matches!(
+            journal.records().last().map(|record| &record.value),
+            Some(PaymentState::Locked { .. })
+        ));
+    }
+
     // Finding H: a receipt correctly co-signed by the right parties but bound to a DIFFERENT
     // payment's terms must not verify/close this payment. Same anchors + valid schnorr, but the
     // preimage's amount is another payment's ⇒ Refused at the terms-binding gate.
@@ -2009,6 +2447,7 @@ mod tests {
         verify_count: Arc<AtomicUsize>,
         send_count: Arc<AtomicUsize>,
         receipt_count: Arc<AtomicUsize>,
+        gate_calls: Arc<AtomicUsize>,
     }
 
     struct FakeEffects {
@@ -2022,6 +2461,10 @@ mod tests {
         empty_receipt_relay: bool,
         ordering_journal: Option<MemoryPaymentJournal>,
         replay_sync_journal: Option<MemoryPaymentJournal>,
+        /// The recovered-`Locked` proof-state gate reports a Spent proof (STOP + alarm path).
+        locked_gate_spent: bool,
+        /// The recovered-`Locked` proof-state gate reports the token missing (STOP, never remint).
+        locked_gate_missing: bool,
     }
 
     struct RejectDelivery;
@@ -2062,6 +2505,8 @@ mod tests {
                 empty_receipt_relay: false,
                 ordering_journal: None,
                 replay_sync_journal: None,
+                locked_gate_spent: false,
+                locked_gate_missing: false,
             }
         }
     }
@@ -2167,6 +2612,24 @@ mod tests {
                 evidence.relay_success.clear();
             }
             Ok(evidence)
+        }
+
+        fn assert_locked_token_unspent(
+            &mut self,
+            _attempt_id: &AttemptId,
+            terms: &PaymentTerms,
+        ) -> Result<LockedPayment, LockedTokenGate> {
+            self.shared.gate_calls.fetch_add(1, Ordering::SeqCst);
+            if self.locked_gate_missing {
+                return Err(LockedTokenGate::Missing("no wallet transaction for attempt".into()));
+            }
+            if self.locked_gate_spent {
+                return Err(LockedTokenGate::Spent(
+                    "a proof reads Spent at the mint (seller already redeemed)".into(),
+                ));
+            }
+            // All-`Unspent`: reuse the already-minted token (no mint) exactly as reconcile would.
+            Ok(locked_payment(self.locked_terms.as_ref().unwrap_or(terms)))
         }
     }
 

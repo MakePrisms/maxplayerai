@@ -20,8 +20,8 @@ use nostr_sdk::PublicKey as NostrPublicKey;
 
 use crate::gateway::ParsedOffer;
 use crate::payment::{
-    AttemptId, EffectError, LockedPayment, PaymentEffects, PaymentKey, PaymentTerms,
-    ReceiptEvidence,
+    AttemptId, EffectError, LockedPayment, LockedTokenGate, PaymentEffects, PaymentKey,
+    PaymentTerms, ReceiptEvidence,
 };
 use crate::payment_send::{PaymentPayload, PaymentSend, PaymentSent};
 use crate::wallet::{TradeLock, VerifiedPayment, verify_trade_p2pk_with_connector};
@@ -429,6 +429,73 @@ impl<'a> CdkBuyerMint<'a> {
         Ok(Some(token))
     }
 
+    /// Reconcile the already-minted P2PK-locked token for `attempt_id` and gate it on a LIVE mint
+    /// proof-state check. Returns the token IFF EVERY proof reads `Unspent` at the mint; otherwise a
+    /// DISTINCT [`LockedTokenGate`].
+    ///
+    /// REUSE, never re-mint: this only reads the existing confirmed send transaction (via
+    /// [`Self::reconcile`]) and asks the mint about its proofs — it NEVER calls
+    /// `prepare_send`/`confirm`, so it debits nothing. The proof-state query is the non-mutating
+    /// NUT-07 [`nut07_check_state_non_mutating`] every retire/reconcile path uses; CDK
+    /// `check_proofs_spent` is forbidden here (it deletes mint-Spent `y`s from localstore).
+    ///
+    /// Classification (the recovered-`Locked` discriminator, design §4):
+    /// - complete answer, ALL `Unspent` ⇒ `Ok(token)` — the seller never redeemed, safe to deliver;
+    /// - complete answer, ANY proof not `Unspent` (Spent/Pending/unknown) ⇒ [`LockedTokenGate::Spent`]
+    ///   — the proofs are P2PK-locked to the seller, so only the seller can spend them; a non-unspent
+    ///   proof means the seller already redeemed by some path ⇒ STOP + alarm the accounting gap;
+    /// - no confirmed transaction ⇒ [`LockedTokenGate::Missing`] — STOP, never blind-remint;
+    /// - incomplete/mismatched NUT-07 answer or any transport failure ⇒ [`LockedTokenGate::Effect`]
+    ///   — cannot verify, fail closed (never treated as all-`Unspent`; not a false spend alarm).
+    async fn reconcile_locked_token_if_unspent(
+        &self,
+        attempt_id: &AttemptId,
+        terms: &PaymentTerms,
+    ) -> Result<LockedPayment, LockedTokenGate> {
+        require_wallet_matches(self.wallet, terms).map_err(gate_effect)?;
+        let token = match self.reconcile(attempt_id, terms).await {
+            Ok(Some(token)) => token,
+            Ok(None) => {
+                return Err(LockedTokenGate::Missing(format!(
+                    "no confirmed send transaction for attempt {}",
+                    attempt_id.as_str()
+                )));
+            }
+            Err(error) => return Err(gate_effect(error)),
+        };
+        // Decompose the reconciled token into proofs (needs the wallet's mint keysets to expand a
+        // TokenV4's short keyset ids) and compute each proof Y for the NUT-07 query — the same
+        // `token.proofs` + `proof.y()` calculation the send payload build and `reconcile` use.
+        let ys = token_proof_ys(self.wallet, &token).await.map_err(gate_effect)?;
+        // Non-mutating NUT-07 — NEVER `check_proofs_spent` (it deletes mint-Spent `y`s).
+        let states = nut07_check_state_non_mutating(self.wallet, ys.clone())
+            .await
+            .map_err(gate_effect)?;
+        let requested: HashSet<_> = ys.iter().copied().collect();
+        let reported: HashSet<_> = states.iter().map(|proof_state| proof_state.y).collect();
+        if requested.is_empty() || requested != reported {
+            // Incomplete/partial/wrong-y answer: we cannot verify the token is unspent. Fail closed
+            // as an Effect error (a check we could not complete), NOT a false "seller redeemed"
+            // alarm — treating this as all-`Unspent` is exactly the phantom-credit hazard the retire
+            // path refuses.
+            return Err(LockedTokenGate::Effect(EffectError::new(
+                "NUT-07 proof-state answer incomplete/mismatched; cannot verify locked token unspent (fail-closed, no resend)",
+            )));
+        }
+        if states
+            .iter()
+            .all(|proof_state| proof_state.state == State::Unspent)
+        {
+            Ok(LockedPayment::new(token))
+        } else {
+            Err(LockedTokenGate::Spent(format!(
+                "a proof is not Unspent at the mint for attempt {} (proofs are P2PK-locked to the \
+                 seller — only the seller can spend them; already redeemed by some path)",
+                attempt_id.as_str()
+            )))
+        }
+    }
+
     async fn recover_unmapped_sagas(&self) -> Result<(), PaymentWalletError> {
         retire_eligible_incomplete_sagas(self.wallet).await?;
         let incomplete = self
@@ -780,6 +847,32 @@ async fn nut07_check_state_non_mutating(
             ))
         })?;
     Ok(response.states)
+}
+
+/// Fold a wallet/reconcile failure into the fail-closed [`LockedTokenGate::Effect`] arm — a check
+/// we could not complete, distinct from a proof that verifiably read spent.
+fn gate_effect(error: PaymentWalletError) -> LockedTokenGate {
+    LockedTokenGate::Effect(EffectError::new(error.to_string()))
+}
+
+/// Compute the NUT-07 `Y` for every proof in a reconciled token. Expands the token into proofs
+/// using the wallet's mint keysets (a TokenV4 stores short keyset ids that must be expanded), then
+/// `proof.y()` each — the SAME decomposition [`build_nut18_payload`] performs and the same `y()`
+/// [`CdkBuyerMint::reconcile`] validates against the confirmed transaction.
+async fn token_proof_ys(
+    wallet: &Wallet,
+    token: &Token,
+) -> Result<Vec<CashuPublicKey>, PaymentWalletError> {
+    let keysets = wallet
+        .get_mint_keysets(KeysetFilter::All)
+        .await
+        .map_err(wallet_error)?;
+    let proofs = token.proofs(&keysets).map_err(wallet_error)?;
+    proofs
+        .iter()
+        .map(|proof| proof.y())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(wallet_error)
 }
 
 /// Require a complete NUT-07 answer: response `Y` set == requested ys, and every
@@ -1445,6 +1538,14 @@ enum BuyerCommand {
         token: Token,
         response: mpsc::SyncSender<Result<PaymentSent, PaymentWalletError>>,
     },
+    /// Operator-completion proof-state gate: reconcile the already-minted token for `attempt_id`
+    /// and check its proofs at the mint (non-mutating NUT-07). Returns the token IFF all-`Unspent`;
+    /// distinct [`LockedTokenGate`] otherwise. REUSE — never mints, never debits.
+    AssertLockedUnspent {
+        attempt_id: AttemptId,
+        terms: PaymentTerms,
+        response: mpsc::SyncSender<Result<LockedPayment, LockedTokenGate>>,
+    },
 }
 
 /// Build the buyer's NUT-18 [`PaymentRequestPayload`] from a locked token. Decomposes the token
@@ -1588,6 +1689,16 @@ impl<R> CdkPaymentEffects<R> {
                                 };
                                 let _ = response.send(result);
                             }
+                            BuyerCommand::AssertLockedUnspent {
+                                attempt_id,
+                                terms,
+                                response,
+                            } => {
+                                let result = CdkBuyerMint::new(&wallet)
+                                    .reconcile_locked_token_if_unspent(&attempt_id, &terms)
+                                    .await;
+                                let _ = response.send(result);
+                            }
                         }
                     }
                 });
@@ -1707,6 +1818,36 @@ where
         payment: &PaymentSent,
     ) -> Result<ReceiptEvidence, EffectError> {
         (self.receipt)(key, payment)
+    }
+
+    fn assert_locked_token_unspent(
+        &mut self,
+        attempt_id: &AttemptId,
+        terms: &PaymentTerms,
+    ) -> Result<LockedPayment, LockedTokenGate> {
+        // Bespoke channel dance (not the generic `request`): the worker answers with the DISTINCT
+        // `LockedTokenGate`, which must survive to the caller intact (Spent ≠ Missing ≠ Effect).
+        // Only the transport failures — a stopped/unavailable worker or a dropped response — fold
+        // into the fail-closed `Effect` arm.
+        let (response, result) = mpsc::sync_channel(1);
+        self.commands
+            .as_ref()
+            .ok_or_else(|| {
+                LockedTokenGate::Effect(EffectError::new("payment wallet worker is stopped"))
+            })?
+            .try_send(BuyerCommand::AssertLockedUnspent {
+                attempt_id: attempt_id.clone(),
+                terms: terms.clone(),
+                response,
+            })
+            .map_err(|error| {
+                LockedTokenGate::Effect(EffectError::new(format!(
+                    "payment wallet worker unavailable: {error}"
+                )))
+            })?;
+        result.recv().map_err(|_| {
+            LockedTokenGate::Effect(EffectError::new("payment wallet worker dropped its response"))
+        })?
     }
 }
 
