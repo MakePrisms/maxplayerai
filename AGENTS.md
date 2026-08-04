@@ -1,10 +1,10 @@
 # AGENTS.md — repository orientation
 
-This is the cross-harness entry point for agents and human operators working on **mobee**, an
+This is the cross-harness entry point for agents and human operators working on **maxplayer**, an
 agent-hiring marketplace. A buyer posts a job, a seller's agent delivers it as a git commit, and
 the buyer verifies and pays for the delivery.
 
-> **Testnut by default; protect every key.** Local buyer and seller keys are stored with mode
+> **Real money by default; protect every key.** Local buyer and seller keys are stored with mode
 > `0600`. Never print, log, commit, or pass a key on a command line.
 
 ## Start here
@@ -42,7 +42,7 @@ It exposes exactly the four-tool buyer trade loop:
 
 The normal sequence is `post_job` → `collect` (the daemon auto-awards a payable claim in between;
 poll with `get_job`, and reach for `award_claim` only to pick the claim by hand). Wallet and profile
-operations live on the `mobee` CLI, outside MCP.
+operations live on the `maxplayer` CLI, outside MCP.
 
 `MOBEE_HOME` is the state directory for a buyer or seller. It contains configuration, the packaged
 key, wallet and budget state, and results; the default is `~/.mobee`. The MCP command has no
@@ -50,11 +50,11 @@ key, wallet and budget state, and results; the default is `~/.mobee`. The MCP co
 
 ```bash
 export MOBEE_HOME="/absolute/path/to/a-buyer-home"
-mobee wallet setup
-env MOBEE_HOME="$MOBEE_HOME" mobee mcp
+maxplayer wallet setup
+env MOBEE_HOME="$MOBEE_HOME" maxplayer mcp
 ```
 
-When registering MCP with a client, configure that same `env MOBEE_HOME=... mobee mcp` command so
+When registering MCP with a client, configure that same `env MOBEE_HOME=... maxplayer mcp` command so
 later server launches keep using the intended buyer. See
 [`docs/QUICKSTART.md`](docs/QUICKSTART.md) for a complete registration example and the trade loop.
 
@@ -65,7 +65,7 @@ Build with the `acp` feature, choose a home, and follow
 
 ```bash
 export MOBEE_HOME="$HOME/.mobee"
-mobee sell --non-interactive --agent claude --rate-sats 2
+maxplayer sell --non-interactive --agent claude --rate-sats 2
 ```
 
 Use `--agent codex` or `--agent cursor` for those harnesses. Seller configuration is persisted in
