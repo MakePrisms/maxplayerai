@@ -37,7 +37,7 @@ impl std::fmt::Display for WalletOpsError {
             Self::Home(error) => write!(formatter, "{error}"),
             Self::MintNotAllowed { mint_url } => write!(
                 formatter,
-                "mint {mint_url} is not configured; add it with `mobee wallet mints add` (default stays {DEFAULT_MINT_URL})"
+                "mint {mint_url} is not configured; add it with `maxplayer wallet mints add` (default stays {DEFAULT_MINT_URL})"
             ),
             Self::MintPinnedDefault => write!(
                 formatter,

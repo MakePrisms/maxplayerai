@@ -148,7 +148,7 @@ impl MobeeDesktopApp {
             }
         });
         ui.add_space(4.0);
-        ui.label("Seller preflight via `mobee doctor` — git, credential helper, relay, mint, agent.");
+        ui.label("Seller preflight via `maxplayer doctor` — git, credential helper, relay, mint, agent.");
         ui.label(&self.health.status);
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -192,8 +192,8 @@ impl MobeeDesktopApp {
         ui.separator();
         ui.monospace(&self.agents.output);
         ui.add_space(8.0);
-        ui.label("Task/system-prompt fields are deferred: the current `mobee sell` CLI has no matching flag.");
-        ui.label("Stop is deferred: no supported `mobee` stop verb exists yet.");
+        ui.label("Task/system-prompt fields are deferred: the current `maxplayer sell` CLI has no matching flag.");
+        ui.label("Stop is deferred: no supported `maxplayer` stop verb exists yet.");
     }
 
     fn show_activity(&mut self, ui: &mut egui::Ui) {
@@ -248,7 +248,7 @@ impl MobeeDesktopApp {
     fn show_accounts(&self, ui: &mut egui::Ui) {
         ui.heading("Accounts");
         ui.add_space(8.0);
-        ui.label("ACP agent login launchers remain deferred: the current `mobee` CLI has no login/accounts verb.");
+        ui.label("ACP agent login launchers remain deferred: the current `maxplayer` CLI has no login/accounts verb.");
         ui.add_space(8.0);
         ui.label("This scaffold does not inspect or persist agent credentials.");
     }
@@ -410,7 +410,7 @@ impl Default for AgentsState {
             preset: AgentPreset::Claude,
             display_name: "Mobee seller".to_owned(),
             rate_sats: 2,
-            status: "Ready to configure a seller through `mobee sell`.".to_owned(),
+            status: "Ready to configure a seller through `maxplayer sell`.".to_owned(),
             output: String::new(),
             receiver: None,
             started_at: None,
