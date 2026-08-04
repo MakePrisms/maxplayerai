@@ -39,7 +39,7 @@ use crate::seller_git::{self, DeliveryAgentIdentity};
 
 use super::outbox::drain_once;
 use super::publisher::RelayPublisher;
-use super::{now_unix, NodeError, SellerNode};
+use super::{buzz, now_unix, NodeError, SellerNode};
 
 /// How long (seconds) the outbox publisher keeps retrying a claim event before it expires. Matches
 /// the legacy claim TTL: a claim outlives a slow relay but never lingers indefinitely.
@@ -1206,6 +1206,11 @@ pub async fn boot_advertising_only_proven(
 const CONNECT_WAIT: Duration = Duration::from_secs(20);
 /// Cadence of the outbox drain / housekeeping tick.
 const DRAIN_INTERVAL: Duration = Duration::from_secs(5);
+/// Upper bound on the buzz persona bring-up at boot. The legs inside [`buzz::start`] are individually
+/// bounded (connect, kind-0 fetch) but the publish is not, and the persona is discovery context that
+/// the money path never reads — so one outer bound keeps a sick buzz relay from delaying the moment
+/// this seller is ready to claim.
+pub(super) const BUZZ_START_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// A booted seller node with its live relay surface.
 pub struct SellerNodeRunner {
@@ -1228,6 +1233,148 @@ pub struct SellerNodeRunner {
     /// Homogeneous execution-slot admission (reserve-at-claim). Behind an `Arc` so it is shared with
     /// the off-loop execution tasks; see [`SlotGate`].
     slots: Arc<SlotGate>,
+    /// The live buzz persona, held for the node's lifetime so presence stays up (see
+    /// [`start_buzz_or_degrade`]). `None` when `[buzz]` is absent — or when the bring-up degraded.
+    ///
+    /// Behind a `Mutex` because the clean-exit path must TAKE the handle:
+    /// [`buzz::BuzzHandle::shutdown`] consumes it to join the presence task, while the loop holds
+    /// `Arc<Self>` (execution runs off the loop), so there is no owned `self` to move out of and a
+    /// borrow will not do. The lock is never held across an await.
+    buzz: Mutex<Option<buzz::BuzzHandle>>,
+}
+
+/// What the bounded bring-up did. The arms are named rather than collapsed into an `Option` because
+/// "the relay refused us inside its own bounds" and "we outran our own backstop" are the same value
+/// to the caller and completely different facts about [`BUZZ_START_TIMEOUT`] — the second one says
+/// the backstop is bearing load, which is the thing worth noticing.
+///
+/// `Live` is far larger than the other variants, and boxing it would buy nothing: exactly one of
+/// these exists per process boot and it is destructured immediately, so the size difference costs a
+/// few hundred stack bytes once — where an allocation would cost one every time.
+#[allow(clippy::large_enum_variant)]
+pub(super) enum BuzzStartOutcome {
+    /// A live persona; the handle is held for the node's lifetime.
+    Live(buzz::BuzzHandle),
+    /// `[buzz]` absent — inert by contract: no connection, no publish.
+    Inert,
+    /// The bring-up failed within its own bounds (relay refused, clobber guard, signer).
+    Failed(buzz::BuzzError),
+    /// The bring-up outran [`BUZZ_START_TIMEOUT`].
+    TimedOut,
+}
+
+/// Run the persona bring-up under [`BUZZ_START_TIMEOUT`] and report which arm ran. Silent — the boot
+/// path logs (see [`start_buzz_or_degrade`]), so a test can assert the arm without parsing output.
+pub(super) async fn start_buzz_bounded(node: &SellerNode) -> BuzzStartOutcome {
+    match tokio::time::timeout(BUZZ_START_TIMEOUT, node.start_buzz()).await {
+        Ok(Ok(Some(handle))) => BuzzStartOutcome::Live(handle),
+        Ok(Ok(None)) => BuzzStartOutcome::Inert,
+        Ok(Err(error)) => BuzzStartOutcome::Failed(error),
+        Err(_) => BuzzStartOutcome::TimedOut,
+    }
+}
+
+/// Bring up the node's buzz persona at boot when `[buzz]` is configured, bounded by
+/// [`BUZZ_START_TIMEOUT`].
+///
+/// The persona is discovery/identity only — nothing here feeds the pay gate — so NO buzz outcome may
+/// stop this node from selling: an absent section is inert and silent, and a bring-up that fails or
+/// outruns the bound degrades to no persona with a loud line. Only a live persona yields a handle.
+async fn start_buzz_or_degrade(node: &SellerNode) -> Option<buzz::BuzzHandle> {
+    match start_buzz_bounded(node).await {
+        BuzzStartOutcome::Live(handle) => {
+            eprintln!(
+                "seller node buzz persona live: pubkey={} kind0={}",
+                handle.pubkey_hex(),
+                handle.kind0_event_id
+            );
+            Some(handle)
+        }
+        // Inert by contract: nothing opened, nothing published, and no line to log.
+        BuzzStartOutcome::Inert => None,
+        BuzzStartOutcome::Failed(error) => {
+            eprintln!(
+                "seller node BUZZ DEGRADE: persona bring-up failed; selling continues with no \
+                 persona: {error}"
+            );
+            None
+        }
+        BuzzStartOutcome::TimedOut => {
+            eprintln!(
+                "seller node BUZZ DEGRADE: persona bring-up exceeded {}s; selling continues with no \
+                 persona",
+                BUZZ_START_TIMEOUT.as_secs()
+            );
+            None
+        }
+    }
+}
+
+/// The operator's stop request for a daemon carrying a live buzz persona: SIGTERM (what a supervisor
+/// sends) or SIGINT (Ctrl-C in a terminal).
+///
+/// INSTALLED ONLY WHEN A PERSONA IS LIVE. Registering a signal receiver REPLACES the process default
+/// for that signal, so installing one unconditionally would change how every seller daemon dies. A
+/// buzz-inert node installs nothing ([`ShutdownSignals::install`] answers `None`) and keeps exactly
+/// today's behaviour: the signal terminates the process and there is no presence to clear.
+pub(super) struct ShutdownSignals {
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    /// Install the receivers when a persona is live. `None` ⇒ nothing is registered — for a
+    /// buzz-inert node, for a platform without unix signals, and for the (logged) case where the
+    /// runtime refuses the registration, which degrades to TTL expiry rather than failing the boot.
+    pub(super) fn install(persona_live: bool) -> Option<Self> {
+        if !persona_live {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            match (
+                signal(SignalKind::terminate()),
+                signal(SignalKind::interrupt()),
+            ) {
+                (Ok(terminate), Ok(interrupt)) => Some(Self {
+                    terminate,
+                    interrupt,
+                }),
+                (Err(error), _) | (_, Err(error)) => {
+                    eprintln!(
+                        "seller node WARN: shutdown signal handlers unavailable ({error}); buzz \
+                         presence will clear on the relay's TTL instead of at exit"
+                    );
+                    None
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        None
+    }
+
+    /// Resolve on the first stop request.
+    async fn requested(&mut self) {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = self.terminate.recv() => {}
+            _ = self.interrupt.recv() => {}
+        }
+        #[cfg(not(unix))]
+        std::future::pending::<()>().await
+    }
+}
+
+/// The run loop's stop-request future: the installed signals when a persona is live, and a future
+/// that never resolves otherwise (belt to the loop branch's own guard).
+async fn shutdown_requested(signals: Option<&mut ShutdownSignals>) {
+    match signals {
+        Some(signals) => signals.requested().await,
+        None => std::future::pending().await,
+    }
 }
 
 impl SellerNodeRunner {
@@ -1331,6 +1478,10 @@ impl SellerNodeRunner {
             lapse_secs.unwrap_or(DEFAULT_CLAIM_AWARD_TIMEOUT_SECS)
         );
 
+        // The persona comes up LAST, once the marketplace surface is authenticated and ready: buzz is
+        // discovery context, so it may never sit in front of the money path's connect.
+        let buzz = start_buzz_or_degrade(&node).await;
+
         Ok(Self {
             node,
             client,
@@ -1340,12 +1491,22 @@ impl SellerNodeRunner {
             boot_auth,
             agents,
             slots,
+            buzz: Mutex::new(buzz),
         })
     }
 
     /// The seller public key (hex).
     pub fn seller_pubkey(&self) -> String {
         self.seller_pubkey.to_hex()
+    }
+
+    /// Whether a live persona is held — the single reader of that fact, so the signal-handler
+    /// decision and the clean-exit clear cannot disagree about it.
+    ///
+    /// A poisoned lock reads as NO persona: that installs no signal handlers and leaves presence to
+    /// expire on the relay's TTL, which is the documented degrade path rather than a panic at boot.
+    fn persona_live(&self) -> bool {
+        self.buzz.lock().map(|slot| slot.is_some()).unwrap_or(false)
     }
 
     /// Subscribe (or re-subscribe) the offer REQ. `open_pool` false forces the targeted-only shape —
@@ -1591,8 +1752,18 @@ impl SellerNodeRunner {
         // never once succeeded went unnoticed (#171). The next answered probe names it.
         let mut stalled_since_recovery = false;
         let mut manual_recovery_succeeded = false;
+        // Registered only for a daemon carrying a live persona — see [`ShutdownSignals`].
+        let mut shutdown = ShutdownSignals::install(self.persona_live());
         loop {
             tokio::select! {
+                // A stop request exists only when a persona is live: end the loop so presence is
+                // cleared on the way out instead of lingering until the relay's TTL expires it. With
+                // no persona the branch is disabled and no handler was ever installed, so the signal
+                // terminates the process exactly as it does today.
+                _ = shutdown_requested(shutdown.as_mut()), if shutdown.is_some() => {
+                    eprintln!("seller node: stop requested; clearing the buzz persona and ending the loop");
+                    break;
+                }
                 _ = drain_tick.tick() => {
                     self.sweep_lapsed_claims();
                     self.start_due_harness_probes();
@@ -1928,6 +2099,15 @@ impl SellerNodeRunner {
                     }
                 }
             }
+        }
+        // Clean exit: clear presence NOW rather than leaving the persona advertised as online until
+        // the relay's TTL expires it. A crash still falls back to that TTL — this is the clean path.
+        // Taken in one statement so the guard is released before the await below — the lock never
+        // spans a suspension point, and a second exit path finds `None` rather than a live handle.
+        let persona = self.buzz.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(buzz) = persona {
+            buzz.shutdown().await;
+            eprintln!("seller node buzz persona cleared (clean shutdown)");
         }
         Ok(())
     }

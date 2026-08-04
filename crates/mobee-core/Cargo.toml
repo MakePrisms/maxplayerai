@@ -25,7 +25,7 @@ git-delivery = ["gateway", "dep:git2", "dep:reqwest", "dep:base64"]
 # The `wallet` feature also brings up the persistent buyer daemon (crate::buyer): the
 # exclusive home lock (libc flock), the durable state DB (rusqlite, bundled sqlite so
 # there is no system dependency), and the async unix-socket surface (tokio net + io-util).
-wallet = ["git-delivery", "gateway", "dep:cashu", "dep:cdk", "dep:cdk-sqlite", "dep:nostr-sdk", "dep:rusqlite", "dep:libc", "tokio/sync", "tokio/time", "tokio/net", "tokio/io-util"]
+wallet = ["git-delivery", "gateway", "dep:cashu", "dep:cdk", "dep:cdk-sqlite", "dep:nostr-sdk", "dep:rusqlite", "dep:libc", "tokio/sync", "tokio/time", "tokio/net", "tokio/io-util", "tokio/signal"]
 test-support = []
 
 [dependencies]
