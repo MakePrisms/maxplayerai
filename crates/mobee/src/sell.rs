@@ -395,12 +395,10 @@ fn ensure_seller_config(
         .or(existing_agent);
 
     // The harness registry (`Vec<String>` of preset names since #378). Every named preset is resolved
-    // here so a typo or a missing adapter is a config-time refusal, not a boot-time degrade. A
-    // multi-`--agents` list resolves each name in preference order; a single resolved harness becomes
-    // a one-entry list so it keeps its advertised name (the exact shape a pre-#378 `agent = "x"`
-    // migrates to); the raw-argv hatch resolves to no label and leaves the list empty, serving
-    // unlabelled through the `agent_command` fallback.
+    // here so a typo or a missing adapter is a config-time refusal, not a boot-time degrade. A bare
+    // relaunch preserves the existing registry IN FULL; explicit `--agent`s rebuild it.
     let agents = if options.agents.len() > 1 {
+        // Multiple `--agent`s: resolve each named preset in preference order (dedup, order kept).
         let mut resolved: Vec<String> = Vec::with_capacity(options.agents.len());
         for name in &options.agents {
             let (label, _argv) = agent_presets::resolve_agent_preset(name, &custom_agents)
@@ -414,13 +412,25 @@ fn ensure_seller_config(
         }
         let _ = writeln!(err, "agent registry: {}", resolved.join(", "));
         resolved
+    } else if options.agents.is_empty()
+        && options.agent.is_none()
+        && options.agent_argv.is_empty()
+    {
+        // No explicit agent input this run (a bare relaunch): carry the existing registry IN FULL so a
+        // multi-harness `agents` list is never truncated to its first entry (#369 clobber class — the
+        // member `agents` itself, alongside slots/contribution/claim-timeout). With no existing registry
+        // to preserve, fall through to the freshly-resolved single label (first-time wizard) or nothing.
+        match existing.as_ref().map(|seller| seller.agents.clone()) {
+            Some(list) if !list.is_empty() => list,
+            _ => agent_label.map(|label| vec![label]).unwrap_or_default(),
+        }
     } else if let Some(label) = agent_label {
+        // A single explicit `--agent` (or wizard pick): a one-entry registry keeping its advertised name
+        // (the exact shape a pre-#378 `agent = "x"` migrates to).
         vec![label]
     } else {
-        existing
-            .as_ref()
-            .map(|seller| seller.agents.clone())
-            .unwrap_or_default()
+        // Raw-argv hatch: no label — serves unlabelled through the `agent_command` fallback.
+        Vec::new()
     };
 
     let seller = SellerConfig {
@@ -790,6 +800,59 @@ mod tests {
     // boot, before the seller node read it. The assertion is on the PERSISTED (reloaded-from-disk)
     // config because that disk value is exactly what the next boot reads for capacity
     // (`mobee_core::seller_node::run` derives it from `config.seller.slots` with no ceiling clamp).
+    #[test]
+    fn sell_writeback_preserves_operator_multi_harness_agents() {
+        // #369-class (seller-orch comment 5173135097): a bare relaunch must carry a multi-harness
+        // `agents` list IN FULL, never truncate it to the first entry. RED-PROVES the carry — reverting
+        // to the pre-fix `else if let Some(label) { vec![label] }` reloads ["claude"] and reddens both
+        // asserts below.
+        let root = std::env::temp_dir().join(format!(
+            "mobee-369-multi-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = home::bootstrap(&root).expect("bootstrap temp home");
+        home::save_config(&mut home, |config| {
+            config.seller = Some(SellerConfig {
+                agent_command: vec!["claude".to_owned()],
+                rate_sats: 5,
+                git_remote: "https://example.invalid/seller.git".to_owned(),
+                job_timeout_secs: None,
+                agents: vec!["claude".to_owned(), "codex".to_owned()],
+                claim_open_pool: false,
+                offer_backfill_secs: home::default_offer_backfill_secs(),
+                contribution_enabled: true,
+                slots: 3,
+                claim_award_timeout_secs: None,
+            });
+        })
+        .expect("seed multi-harness [seller]");
+
+        let options = SellOptions::default();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        ensure_seller_config(&mut home, &options, &mut out, &mut err).unwrap_or_else(|code| {
+            panic!(
+                "ensure_seller_config failed code={code} err={}",
+                String::from_utf8_lossy(&err)
+            )
+        });
+
+        // Reload from DISK exactly as the next boot loads it.
+        let reloaded = home::bootstrap(&root).expect("reload persisted config");
+        let seller = reloaded.config.seller.expect("[seller] persisted");
+        assert_eq!(
+            seller.agents,
+            vec!["claude".to_owned(), "codex".to_owned()],
+            "a bare relaunch must carry the full multi-harness registry, not truncate to first"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn sell_writeback_preserves_operator_contribution_disabled_and_agent_label() {
         // #369-class: a steady-state relaunch must NOT clobber contribution_enabled=false back to
