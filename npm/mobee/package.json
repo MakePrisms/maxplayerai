@@ -13,8 +13,8 @@
   },
   "files": ["bin/maxplayer.js", "README.md", "LICENSE-MIT", "LICENSE-APACHE"],
   "optionalDependencies": {
-    "maxplayer-linux-x64": "0.1.0",
-    "maxplayer-linux-arm64": "0.1.0"
+    "@maxplayerai/linux-x64": "0.1.0",
+    "@maxplayerai/linux-arm64": "0.1.0"
   },
   "engines": {
     "node": ">=18"

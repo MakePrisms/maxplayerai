@@ -6,7 +6,8 @@ npm. Both come out of `.github/workflows/release.yml`, which runs on a pushed `v
 ## Before the first release
 
 One setup step, done once **per package**, and it is the only thing standing between a tag and a
-publish. On npmjs.com, for each of `maxplayer`, `maxplayer-linux-x64` and `maxplayer-linux-arm64`:
+publish. On npmjs.com, for each of `maxplayer`, `@maxplayerai/linux-x64` and
+`@maxplayerai/linux-arm64`:
 
 - Settings → **Trusted publishing** → add a GitHub Actions publisher: organization `MakePrisms`,
   repository `maxplayerai`, workflow `release.yml`.
@@ -20,9 +21,14 @@ Releases as normal, and `npm publish` fails loudly for that package. There is no
 unconfigured package fails the job rather than producing a release that looks published.
 
 The launcher publishes as the unscoped package `maxplayer`; the per-platform payloads publish under
-the `maxplayer-linux-x64` and `maxplayer-linux-arm64` packages. All three need their own trusted
-publisher entry — the setting is per package, not per account. `--access public`, which the publish
-job already passes, is what a first publish needs.
+the `@maxplayerai/linux-x64` and `@maxplayerai/linux-arm64` packages, in the npm organization
+`maxplayerai`. All three need their own trusted publisher entry — the setting is per package, not
+per account or per org. The GitHub side of that entry is the same for all three, and is unaffected
+by the npm scope: organization `MakePrisms`, repository `maxplayerai`.
+
+`--access public`, which the publish job already passes on every publish, is what the scoped payload
+packages need on a first publish — a scoped package defaults to restricted, which on a free account
+fails outright.
 
 ## Cutting one
 
@@ -138,8 +144,8 @@ git cat-file -e "$TAG":.github/workflows/release.yml && echo present || echo abs
 
 | platform | runner | shipped as |
 |---|---|---|
-| linux-x64 | `ubuntu-latest` | archive + `maxplayer-linux-x64` |
-| linux-arm64 | `ubuntu-24.04-arm` | archive + `maxplayer-linux-arm64` |
+| linux-x64 | `ubuntu-latest` | archive + `@maxplayerai/linux-x64` |
+| linux-arm64 | `ubuntu-24.04-arm` | archive + `@maxplayerai/linux-arm64` |
 | darwin-arm64 | `macos-14` | archive only |
 
 darwin-arm64 has no npm payload package yet, so macOS users download the archive; `npx maxplayer` tells
