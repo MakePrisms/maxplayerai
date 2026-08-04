@@ -2106,6 +2106,46 @@ mod tests {
         ));
     }
 
+    // STRICT predicate, part 2 (constraint #1): a journal that folds to `Locked` but whose
+    // attempt_id belongs to a DIFFERENT key is REFUSED before the proof gate — completion never
+    // sends on a mismatched identity, and the live gate is never even consulted.
+    #[test]
+    fn complete_locked_refuses_a_locked_journal_whose_attempt_id_mismatches_the_key() {
+        let other_attempt = git_key().attempt_id();
+        assert_ne!(
+            other_attempt,
+            key().attempt_id(),
+            "fixture must supply a DIFFERENT attempt id"
+        );
+        let journal = seed_journal(&[
+            PaymentState::Intent {
+                attempt_id: other_attempt.clone(),
+            },
+            PaymentState::Locked {
+                attempt_id: other_attempt,
+            },
+        ]);
+        let before = journal.records().len();
+        let shared = FakeShared::default();
+        let mut effects = FakeEffects::new(shared.clone());
+
+        let error = PaymentService::new(&journal)
+            .complete_recovered_locked(&key(), &terms(), &authority(), &mut effects)
+            .unwrap_err();
+
+        assert!(
+            matches!(error, PaymentError::Refused(ref message) if message.contains("attempt_id does not match")),
+            "got {error:?}"
+        );
+        assert_eq!(journal.records().len(), before, "refusal must append nothing");
+        assert_eq!(
+            shared.gate_calls.load(Ordering::SeqCst),
+            0,
+            "the proof gate must NOT be consulted on an attempt-id mismatch"
+        );
+        assert_eq!(shared.send_count.load(Ordering::SeqCst), 0);
+    }
+
     // Finding H: a receipt correctly co-signed by the right parties but bound to a DIFFERENT
     // payment's terms must not verify/close this payment. Same anchors + valid schnorr, but the
     // preimage's amount is another payment's ⇒ Refused at the terms-binding gate.
