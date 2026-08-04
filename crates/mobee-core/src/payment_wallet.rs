@@ -3280,7 +3280,7 @@ mod tests {
             recv_timeout: Duration::from_millis(150),
         };
 
-        let mut gate = crate::budget::BudgetGate::new(1_000, 1_000);
+        let mut gate = crate::budget::BudgetGate::new(1_000);
         let charged = 7u64; // == terms.amount (Amount::from(7))
 
         let start = std::time::Instant::now();
