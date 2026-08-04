@@ -112,17 +112,17 @@
       # (#280) then merges as its own line rather than a conflicting `nixosModules` block.
       nixosModules.relay = import ./nix/relay.nix;
 
-      # The launch relay as a deployable box: EC2 t4g.small (aarch64) built from `nixosModules.relay`.
-      # Deploy, building ON the target so nothing cross-compiles from an x86 workstation:
+      # The launch relay as a deployable box: EC2 t3.small (x86_64) built from `nixosModules.relay`.
+      # Deploy, building ON the target so nothing cross-compiles from the workstation:
       #   nixos-rebuild switch --flake .#relay --target-host root@<IP> --build-host root@<IP>
       # `nix/relay-host.nix` carries the human-owned config (NIP-11 identity, backup, TLS); the two
       # flake-local references (the module + the write-policy package) are wired here where `self` is in scope.
       nixosConfigurations.relay = nixpkgs.lib.nixosSystem {
-        system = "aarch64-linux";
+        system = "x86_64-linux";
         modules = [
           self.nixosModules.relay
           ./nix/relay-host.nix
-          { services.maxplayer.relay.writePolicyPackage = self.packages.aarch64-linux.relay-write-policy; }
+          { services.maxplayer.relay.writePolicyPackage = self.packages.x86_64-linux.relay-write-policy; }
         ];
       };
 

@@ -3,9 +3,18 @@
 #
 #   nixos-rebuild switch --flake .#relay --target-host root@34.225.223.145 --build-host root@34.225.223.145
 #
-# Target: AWS EC2 t4g.small (aarch64), first booted from a NixOS 26.05 aarch64 AMI. The AMI is only the
-# bootstrap — after the first switch the running system is whatever this flake's nixpkgs (25.11) builds, so
-# the box converges to 25.11 regardless of the AMI channel.
+# Target: AWS EC2 t3.small-class (x86_64, 2 vCPU / 2 GB), first booted from a NixOS 26.05 x86_64 AMI. The AMI
+# is only the bootstrap — after the first switch the running system is whatever this flake's nixpkgs (25.11)
+# builds, so the box converges to 25.11 regardless of the AMI channel.
+#
+# FIRST switch on a fresh AMI needs a reboot to finish, and `nixos-rebuild` will NOT tell you: the 26.05 AMI
+# runs dbus-broker while 25.11 uses dbus-daemon, so activation stops the very bus `switch-to-configuration` is
+# talking to and then spins at 100% CPU on "Transport endpoint is not connected". It exited 0 while
+# /run/current-system still pointed at the old 26.05 generation — a green deploy that changed nothing. The
+# profile and GRUB are already correct at that point, so `reboot` activates the new generation cleanly.
+# Verify the switch actually took by comparing, never by exit code:
+#   readlink -f /run/current-system   # must equal /nix/var/nix/profiles/system
+# Later switches within 25.11 do not cross the bus implementation and activate in place.
 #
 # Secrets are referenced by PATH only; gudnuf places the material on the box. Nothing here is a credential.
 {
@@ -42,7 +51,7 @@
     backup = {
       destination = "s3://maxplayer-relay-backup/launch";
       uploadCommand = ''${pkgs.awscli2}/bin/aws s3 cp "$DUMP" "$DESTINATION/$STAMP.jsonl"'';
-      # null by design: the EC2 instance's IAM role (maxplayer-relay-backup) grants S3 write, so there is
+      # null by design: the EC2 instance's IAM role (maxplayer-relay-backups) grants S3 write, so there is
       # no static credentials file on the box.
       environmentFile = null;
     };
@@ -81,6 +90,21 @@
     80
     443
   ];
+
+  # A t3.small has 2 GB and no swap, but `nixos-rebuild --build-host` builds this box's own closure ON the box:
+  # the coordinating `nix` process alone peaked at 1.57 GB RSS and was OOM-killed, taking the deploy with it
+  # (ssh exit 255). Swap is what makes the box able to build itself. 4 GB on a 59 GB root volume is free real
+  # estate; without it every future switch is a coin flip against the OOM killer.
+  swapDevices = [
+    {
+      device = "/var/lib/swapfile";
+      size = 4096; # MiB
+    }
+  ];
+
+  # Default is 60 — too eager to page out a live relay's LMDB working set. Swap here is headroom for build
+  # spikes, not a place to keep the running relay, so only lean on it under real pressure.
+  boot.kernel.sysctl."vm.swappiness" = 10;
 
   # The release this box's stateful defaults are pinned to. It is the flake's nixpkgs (25.11), NOT the AMI's
   # channel — the system converges to what this flake builds on first switch.
