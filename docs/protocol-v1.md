@@ -4,6 +4,8 @@
 
 This protocol coordinates buyer-posted jobs over Nostr, delivers completed work over git, and settles payment in Cashu ecash carried over NIP-17 gift-wrap. It defines the public wire artifacts needed for a third party to implement a buyer, a seller, or a market observer.
 
+> **Status.** This document specifies the flag-day target (#355). The wire that ships today is `t=mobee`, `v=0`, `d=mobee-seller`; the `t=maxplayer` / `v=1` / `maxplayer-seller` values below are the post-flip target — do not implement them against the live network yet.
+
 This protocol does not define escrow, relay policy, wallet internals, artifact execution attestation, or any proof that a seller’s self-description is true. A seller’s claim about itself is testimony. The independent settlement artifact is the receipt.
 
 ## 2. Scope And Terms
@@ -84,6 +86,8 @@ A reader of those kinds MUST reject an event that lacks that exact tag.
 Kinds `0`, `1059`, `31990`, and `30617` are borrowed kinds and MUST NOT be required to carry `["t","maxplayer"]`. A reader MUST ignore `t` on those kinds.
 
 A market observer that subscribes by `#t` MUST request the maxplayer-owned kinds separately from untagged borrowed kinds. Adding a kind to the wire without adding it to the observer’s kind allow-list makes that kind invisible to the site.
+
+The `["mobee_agent", ...]` capability tag (7.1, 7.8) is a deliberate exception to this namespace rename: its tag name stays `mobee_agent` across the flag day — matching the shipped `AGENT_TAG` — and is intentionally **not** renamed to `maxplayer_agent`.
 
 ## 6. Identity, Capability, And Delivery Discovery
 
