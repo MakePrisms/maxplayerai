@@ -81,6 +81,10 @@ pub enum HomeError {
     Io(String),
     Config(String),
     Key(String),
+    /// The default home moved (`~/.mobee` → `~/.maxplayer`) but the new path is absent while the old
+    /// one exists. Refuse to boot rather than silently create an empty home and strand the old
+    /// wallet/keys. Carries both paths so the message prints the exact `mv` fix.
+    OldHomeNeedsMigration { old: PathBuf, new: PathBuf },
 }
 
 impl std::fmt::Display for HomeError {
@@ -89,6 +93,15 @@ impl std::fmt::Display for HomeError {
             Self::Io(message) => write!(formatter, "home io error: {message}"),
             Self::Config(message) => write!(formatter, "home config error: {message}"),
             Self::Key(message) => write!(formatter, "home key error: {message}"),
+            Self::OldHomeNeedsMigration { old, new } => write!(
+                formatter,
+                "refusing to start: no home at {new} but a pre-rename home exists at {old}. The \
+                 default home moved from ~/.mobee to ~/.maxplayer; move it into place with:\n\n    \
+                 mv {old} {new}\n\n(or set MAXPLAYER_HOME to choose a location). Booting with an \
+                 empty home would strand the funds and keys in {old}.",
+                old = old.display(),
+                new = new.display()
+            ),
         }
     }
 }
@@ -876,7 +889,29 @@ pub fn default_home_dir() -> Result<PathBuf, HomeError> {
     }
     let home = std::env::var_os("HOME")
         .ok_or_else(|| HomeError::Io("HOME is unset and MAXPLAYER_HOME was not provided".into()))?;
-    Ok(PathBuf::from(home).join(".maxplayer"))
+    default_home_under(Path::new(&home))
+}
+
+/// Resolve the default home under `home_base` (`$HOME`) and apply the mobee→maxplayer migration
+/// guard. Split out from [`default_home_dir`] so the guard is unit-testable against a temp dir
+/// without mutating the process `$HOME`.
+///
+/// The default home moved from `~/.mobee` to `~/.maxplayer`. If the new path is absent but the old
+/// one exists, REFUSE to boot: booting would bootstrap a fresh empty `~/.maxplayer` and leave the
+/// wallet, keys, and state stranded in `~/.mobee`. No read-fallback and no auto-move (a move can
+/// race a running daemon or cross filesystems); the operator runs the printed one-liner. A fresh
+/// box — neither directory present — is NOT caught: it falls through and `bootstrap` creates
+/// `~/.maxplayer` normally.
+fn default_home_under(home_base: &Path) -> Result<PathBuf, HomeError> {
+    let new_default = home_base.join(".maxplayer");
+    let old_default = home_base.join(".mobee");
+    if !new_default.exists() && old_default.exists() {
+        return Err(HomeError::OldHomeNeedsMigration {
+            old: old_default,
+            new: new_default,
+        });
+    }
+    Ok(new_default)
 }
 
 /// Ensure `root` exists with config, key (`0600`), and `wallet/` dir.
@@ -1422,6 +1457,44 @@ mod tests {
             None => unsafe { std::env::remove_var("MAXPLAYER_HOME") },
         }
         assert_eq!(resolved, root);
+    }
+
+    // Money hard-boot guard (mobee→maxplayer home migration). Pure over `default_home_under`, so it
+    // exercises the real filesystem-existence logic without mutating the process `$HOME`.
+    #[test]
+    fn default_home_guard_refuses_when_only_old_home_exists() {
+        let base = temp_home("migrate-old-only");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join(".mobee")).expect("mk ~/.mobee");
+        // new (~/.maxplayer) absent, old (~/.mobee) present ⇒ MUST refuse (funds would be stranded).
+        let err = default_home_under(&base).expect_err("must refuse when only ~/.mobee exists");
+        assert!(
+            matches!(err, HomeError::OldHomeNeedsMigration { .. }),
+            "expected OldHomeNeedsMigration, got {err:?}"
+        );
+        // the refusal names the exact `mv` fix so the operator is not left going in circles.
+        let msg = err.to_string();
+        assert!(msg.contains("mv "), "refusal must print the mv fix: {msg}");
+    }
+
+    #[test]
+    fn default_home_guard_does_not_false_positive() {
+        // Fresh box: NEITHER dir ⇒ falls through to ~/.maxplayer (must not strand a brand-new user).
+        let fresh = temp_home("migrate-fresh");
+        let _ = fs::remove_dir_all(&fresh);
+        assert_eq!(
+            default_home_under(&fresh).expect("fresh box must resolve, not refuse"),
+            fresh.join(".maxplayer")
+        );
+        // Already migrated (or normal): ~/.maxplayer present ⇒ OK even if a stale ~/.mobee lingers.
+        let migrated = temp_home("migrate-done");
+        let _ = fs::remove_dir_all(&migrated);
+        fs::create_dir_all(migrated.join(".maxplayer")).expect("mk ~/.maxplayer");
+        fs::create_dir_all(migrated.join(".mobee")).expect("mk stale ~/.mobee");
+        assert_eq!(
+            default_home_under(&migrated).expect("migrated home must resolve"),
+            migrated.join(".maxplayer")
+        );
     }
 
     #[cfg(unix)]
