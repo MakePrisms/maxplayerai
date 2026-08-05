@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# maxplayer installer — get the buyer CLI onto a machine that has never heard of nix.
+# maxplayer installer — get the CLI onto a machine that has never heard of nix.
 #
 #   curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/install.sh | sh
 #
@@ -11,6 +11,19 @@
 # Options (flags and environment are equivalent; the flag wins):
 #   --version <x.y.z>   MAXPLAYER_VERSION   install this exact version instead of the latest release
 #   --bin-dir <dir>     MAXPLAYER_BIN_DIR   install here instead of ~/.local/bin
+#   --seller            MAXPLAYER_SELLER=1  install the seller artifact instead of the buyer one
+#
+# ── The two artifacts ───────────────────────────────────────────────────────────────────────────
+# A release publishes two builds of the same binary, and this installs ONE of them. The buyer
+# artifact is the default and carries no agent-execution path: `maxplayer run` and `maxplayer sell`
+# are compiled out of it, so nothing a buyer installs can spawn an agent. `--seller` selects the
+# build with `acp` compiled in, which is what a seller needs to claim a job, execute it and
+# advertise a seat.
+#
+# Both install as `maxplayer`, at the same path, and one replaces the other — the seller surface is
+# a superset, so a seller's binary is also a working buyer. Which one is installed is a property of
+# the ASSET, never of a runtime flag: the artifact handed to someone who asked for the buyer cannot
+# be talked into executing an agent.
 #
 # Through a pipe, flags need `sh -s --`:
 #   curl -fsSL <url> | sh -s -- --version 0.1.0 --bin-dir /usr/local/bin
@@ -252,9 +265,10 @@ dir_on_path() {
 }
 
 usage() {
-    say "usage: install.sh [--version <x.y.z>] [--bin-dir <dir>]"
+    say "usage: install.sh [--version <x.y.z>] [--bin-dir <dir>] [--seller]"
+    say '  --seller         install the seller build, which adds sell and agent execution'
     say "  through a pipe:  curl -fsSL <url> | sh -s -- --version 0.1.0"
-    say "  environment:     MAXPLAYER_VERSION, MAXPLAYER_BIN_DIR"
+    say "  environment:     MAXPLAYER_VERSION, MAXPLAYER_BIN_DIR, MAXPLAYER_SELLER=1"
 }
 
 main() {
@@ -263,6 +277,9 @@ main() {
     DOWNLOADER=""
     HASHER=""
     bin_dir="${MAXPLAYER_BIN_DIR:-}"
+    # Any non-empty value selects the seller artifact, so `MAXPLAYER_SELLER=1` and
+    # `MAXPLAYER_SELLER=yes` mean the same thing rather than one of them silently meaning "buyer".
+    seller="${MAXPLAYER_SELLER:-}"
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -270,6 +287,7 @@ main() {
             --version=*) VERSION="${1#--version=}" ;;
             --bin-dir)   shift; [ $# -gt 0 ] || die "--bin-dir needs a value"; bin_dir="$1" ;;
             --bin-dir=*) bin_dir="${1#--bin-dir=}" ;;
+            --seller)    seller=1 ;;
             -h | --help) usage; return 0 ;;
             *) usage >&2; die "unknown option '$1'" ;;
         esac
@@ -296,14 +314,26 @@ main() {
     command -v tar >/dev/null 2>&1 || die "tar not found — needed to unpack the release asset"
     command -v awk >/dev/null 2>&1 || die "awk not found — needed to read the release's SHA256SUMS"
 
-    if [ -n "$VERSION" ]; then
-        say "installing $BIN_NAME $VERSION for $PLATFORM"
+    # The asset carrying the surface that was asked for. The seller artifact is published under its
+    # own name, so the choice is made HERE and shows up in the download URL — the buyer asset cannot
+    # be turned into a seller one, and a release missing the seller assets fails loudly at the
+    # download rather than installing a buyer binary to someone who asked for a seller.
+    if [ -n "$seller" ]; then
+        asset_stem="$BIN_NAME-seller"
+        surface="seller"
     else
-        resolve_latest_version
-        say "latest release is $VERSION; installing for $PLATFORM"
+        asset_stem="$BIN_NAME"
+        surface="buyer"
     fi
 
-    asset="$BIN_NAME-$VERSION-$PLATFORM.tar.gz"
+    if [ -n "$VERSION" ]; then
+        say "installing $BIN_NAME $VERSION ($surface) for $PLATFORM"
+    else
+        resolve_latest_version
+        say "latest release is $VERSION; installing the $surface build for $PLATFORM"
+    fi
+
+    asset="$asset_stem-$VERSION-$PLATFORM.tar.gz"
     base="https://github.com/$REPO/releases/download/v$VERSION"
 
     tmp="$(mktemp -d "$(tmpl dl)")" || die "cannot create a temporary directory"
@@ -313,7 +343,7 @@ main() {
     trap 'rm -rf "$tmp"; [ -z "$staged" ] || rm -f "$staged"' EXIT HUP INT TERM
 
     fetch "$base/$asset" "$tmp/$asset" \
-        || die "could not download $base/$asset — check that release v$VERSION exists and publishes a $PLATFORM asset"
+        || die "could not download $base/$asset — check that release v$VERSION exists and publishes a $PLATFORM $surface asset"
     fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" \
         || die "could not download $base/SHA256SUMS — refusing to install an unverified download"
 
@@ -321,9 +351,13 @@ main() {
 
     tar -xzf "$tmp/$asset" -C "$tmp" || die "could not unpack $asset"
 
-    unpacked="$tmp/$BIN_NAME-$VERSION-$PLATFORM/$BIN_NAME"
+    # The directory inside the archive is named after the ASSET, the executable inside it after the
+    # binary — a seller tarball holds `maxplayer-seller-<version>-<platform>/maxplayer`. The two
+    # differ on purpose: the archive says which build it is, and the binary answers to the name it
+    # is invoked by, which is what the version check below compares against.
+    unpacked="$tmp/$asset_stem-$VERSION-$PLATFORM/$BIN_NAME"
     [ -f "$unpacked" ] \
-        || die "$asset does not contain $BIN_NAME-$VERSION-$PLATFORM/$BIN_NAME — this is not the asset layout this installer expects"
+        || die "$asset does not contain $asset_stem-$VERSION-$PLATFORM/$BIN_NAME — this is not the asset layout this installer expects"
     chmod 755 "$unpacked"
 
     # ── Prove it before installing it ───────────────────────────────────────────────────────────

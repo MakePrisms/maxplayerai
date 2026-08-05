@@ -30,6 +30,12 @@ jobs:
           VERSION="$(cargo metadata --no-deps --format-version 1 \
             | node -e 'const m=JSON.parse(require("fs").readFileSync(0,"utf8"));const p=m.packages.find(p=>p.name==="mobee");if(!p){process.stderr.write("no mobee package in cargo metadata\n");process.exit(1)}process.stdout.write(p.version)')"
           ./scripts/verify-release-version.sh "$VERSION" target/debug/maxplayer
+      # One half of a pair — this build has `acp` off, and the acp job below runs the other verifier
+      # on a build that has it on. Both surface verifiers otherwise run only on a tag, which leaves
+      # them unexecuted on every pull request that changes what they check, and a surface verifier
+      # that has never run is not a guard.
+      - name: Verify the racer surface (default features)
+        run: ./scripts/verify-racer-surface.sh target/debug/maxplayer
       - name: Test mobee-core (default features)
         run: cargo test -p mobee-core --locked
       # The CLI crate's tests (cli unit tests, cli_e2e.rs, and the #126/#127/#131 daemon self-spawn
@@ -64,6 +70,11 @@ jobs:
       # the acp feature — the default-feature job above compiles them out, so run them here.
       - name: Test mobee-core (acp)
         run: cargo test -p mobee-core --features acp --locked
+      # Paired with the racer check in the default-feature job: the two scripts must reach opposite
+      # verdicts on the two builds, which is what shows each one moves with the feature rather than
+      # with something incidental to the binary it happens to be handed.
+      - name: Verify the seller surface (acp)
+        run: ./scripts/verify-seller-surface.sh target/release/maxplayer
 
   # The money path runs in its OWN job, on its own runner, with no `needs:` — the isolation IS the
   # feature here, not an accident of layout (#271). Sharing a job means sharing fate: when the acp

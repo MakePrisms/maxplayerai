@@ -64,7 +64,7 @@ jobs:
           echo "Building $version (prerelease=$prerelease)"
 
   build:
-    name: Build ${{ matrix.platform }}
+    name: Build ${{ matrix.surface }} ${{ matrix.platform }}
     needs: plan
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -72,6 +72,13 @@ jobs:
       # about every platform at once.
       fail-fast: false
       matrix:
+        # Two dimensions that CROSS: every platform is built at both surfaces. Written as dimensions
+        # rather than six spelled-out entries because a platform added to one list and forgotten in
+        # the other is exactly the shape that ships a release where sellers can install on x86 and
+        # not on arm. The `include:` entries below match on an existing value, so each adds its
+        # fields to the combinations that already exist instead of creating new ones.
+        platform: [linux-x64, linux-arm64, darwin-arm64]
+        surface: [racer, seller]
         include:
           # Native runners throughout. Cross-building the aarch64 static artifact through nix
           # compiles rustc from source, which dominates the build; a native runner per platform
@@ -88,6 +95,18 @@ jobs:
             runner: macos-14
             target: aarch64-apple-darwin
             kind: darwin
+          # The two surfaces, each with the verifier that asserts it. The racer is what buyers
+          # install and it must not carry the agent-execution path; the seller artifact is the same
+          # binary with `acp` compiled in, published under its own name so neither can be reached by
+          # a user who asked for the other.
+          - surface: racer
+            features: wallet
+            asset: maxplayer
+            verifier: scripts/verify-racer-surface.sh
+          - surface: seller
+            features: wallet,acp
+            asset: maxplayer-seller
+            verifier: scripts/verify-seller-surface.sh
     steps:
       - uses: actions/checkout@v4
 
@@ -97,7 +116,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.target }}
+          # Keyed on the surface as well as the target: the two feature sets compile different
+          # crates, and one cache shared between them would be evicted and refilled on every run.
+          key: release-${{ matrix.target }}-${{ matrix.surface }}
 
       # musl-gcc, for the C dependencies. secp256k1-sys, libsqlite3-sys and the vendored libgit2-sys
       # each compile C, and they need a compiler targeting musl rather than the host's glibc.
@@ -116,10 +137,11 @@ jobs:
           command -v gtar >/dev/null || { echo "gnu-tar installed but gtar is not on PATH" >&2; exit 1; }
           echo "TAR=gtar" >> "$GITHUB_ENV"
 
-      # `--no-default-features --features wallet` states the buyer surface explicitly instead of
-      # relying on `default`. The two are equal today (`default = ["wallet"]`), but naming the
-      # feature means a later change to `default` cannot quietly compile the seller's
-      # agent-execution path into the artifact handed to buyers.
+      # `--no-default-features` with the feature set named states each surface explicitly instead of
+      # relying on `default`. For the racer that is what keeps a later change to `default`
+      # (`["wallet"]` today) from quietly compiling the seller's agent-execution path into the
+      # artifact handed to buyers; for the seller it states that `acp` is the whole of the
+      # difference between the two artifacts.
       - name: Build
         env:
           # Both linux targets are built on a runner of their own architecture, so `musl-gcc` is a
@@ -130,7 +152,7 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: |
           cargo build -p mobee --release --locked \
-            --no-default-features --features wallet \
+            --no-default-features --features ${{ matrix.features }} \
             --target ${{ matrix.target }}
 
       # `run: |` is load-bearing wherever the command is continued with a backslash. A plain scalar
@@ -142,10 +164,13 @@ jobs:
           ./scripts/verify-release-version.sh '${{ needs.plan.outputs.version }}' \
             "target/${{ matrix.target }}/release/maxplayer"
 
-      # Which features were compiled in — wallet present, acp absent. `version` succeeds in every
-      # build, so nothing else here can tell one feature combination from another.
-      - name: Verify the racer surface
-        run: ./scripts/verify-racer-surface.sh "target/${{ matrix.target }}/release/maxplayer"
+      # Which features were compiled in. `version` succeeds in every build, so nothing else here can
+      # tell one feature combination from another. Each surface is verified by the script that
+      # asserts ITS OWN shape — acp out for the racer, acp and `sell` in for the seller — so a
+      # feature set that silently swapped between the two artifacts fails on both sides rather than
+      # passing a check that only ever looked at one of them.
+      - name: Verify the ${{ matrix.surface }} surface
+        run: ./${{ matrix.verifier }} "target/${{ matrix.target }}/release/maxplayer"
 
       # The decisive portability check for linux: run the artifact inside alpine and debian with no
       # nix and no toolchain present. This is what makes the choice of musl toolchain above safe to
@@ -174,7 +199,8 @@ jobs:
         run: |
           ./scripts/package-release-asset.sh \
             "target/${{ matrix.target }}/release/maxplayer" \
-            '${{ matrix.platform }}' '${{ needs.plan.outputs.version }}' dist
+            '${{ matrix.platform }}' '${{ needs.plan.outputs.version }}' dist \
+            '${{ matrix.asset }}'
 
       # Determinism is the property those fixed uid/gid/mtime flags exist to provide, so it is proved
       # on the artifact rather than inferred from the flags being present — the same reason
@@ -188,8 +214,9 @@ jobs:
         run: |
           ./scripts/package-release-asset.sh \
             "target/${{ matrix.target }}/release/maxplayer" \
-            '${{ matrix.platform }}' '${{ needs.plan.outputs.version }}' dist-recheck
-          ASSET="maxplayer-${{ needs.plan.outputs.version }}-${{ matrix.platform }}.tar.gz"
+            '${{ matrix.platform }}' '${{ needs.plan.outputs.version }}' dist-recheck \
+            '${{ matrix.asset }}'
+          ASSET="${{ matrix.asset }}-${{ needs.plan.outputs.version }}-${{ matrix.platform }}.tar.gz"
           cmp "dist/$ASSET" "dist-recheck/$ASSET" || {
             echo "the archive is not a function of its contents: two runs over identical inputs differ" >&2
             # Say WHERE, because this check runs on platforms nobody here can reproduce, and "they
@@ -204,7 +231,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: asset-racer-${{ matrix.platform }}
+          name: asset-${{ matrix.surface }}-${{ matrix.platform }}
           path: dist/*.tar.gz
           if-no-files-found: error
 
@@ -227,13 +254,24 @@ jobs:
           merge-multiple: true
 
       - name: Checksum
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
           cd dist
-          # Guard the glob: with no assets, `sha256sum *.tar.gz` would write a SHA256SUMS naming a
-          # literal `*.tar.gz`, and the release would carry a checksum file for nothing.
-          count=$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)
-          [ "$count" -gt 0 ] || { echo "no assets were downloaded" >&2; exit 1; }
+          # Every asset the matrix builds, named — which also guards the glob below: with no assets
+          # at all, `sha256sum *.tar.gz` would write a SHA256SUMS naming a literal `*.tar.gz`.
+          #
+          # Named rather than counted because a count cannot tell a complete release from one missing
+          # a whole surface: the racer assets alone satisfy "some artifacts arrived", and the release
+          # would publish with `install.sh --seller` 404ing on every platform. A build job that
+          # failed, or an upload whose name drifted, stops the release rather than shrinking it.
+          for prefix in maxplayer maxplayer-seller; do
+            for platform in linux-x64 linux-arm64 darwin-arm64; do
+              asset="$prefix-$VERSION-$platform.tar.gz"
+              [ -f "$asset" ] || { echo "$asset is missing — the release would ship without it" >&2; exit 1; }
+            done
+          done
           # `--` rather than `./*.tar.gz`: it stops option parsing without prefixing every path in
           # SHA256SUMS, which keeps `sha256sum -c SHA256SUMS` usable next to the downloaded files.
           sha256sum -- *.tar.gz > SHA256SUMS
@@ -321,7 +359,7 @@ jobs:
           PRERELEASE: ${{ needs.plan.outputs.prerelease }}
           # Every platform whose payload package is published. Adding a platform package under npm/
           # without adding it here is caught below rather than silently never shipping.
-          RELEASE_PLATFORMS: linux-x64 linux-arm64
+          RELEASE_PLATFORMS: linux-x64 linux-arm64 darwin-arm64
         run: |
           set -euo pipefail
 
@@ -333,6 +371,25 @@ jobs:
             case " $RELEASE_PLATFORMS " in
               *" $platform "*) ;;
               *) echo "npm/$(basename "$dir") exists but $platform is not in RELEASE_PLATFORMS — add it or the launcher will pin an unpublished package" >&2; exit 1 ;;
+            esac
+          done
+
+          # The other direction, and the one that shipped #446: a platform the release BUILDS with no
+          # npm payload behind it. The two lists — what the build matrix produces and what npm
+          # publishes — were independent, so darwin could be a first-class release artifact for two
+          # releases while `npm i maxplayer` answered "no binary for darwin-arm64" on every mac. The
+          # buyer assets in dist are the authority; nothing else here knows what was actually built.
+          #
+          # `maxplayer-$VERSION-*` cannot match a seller asset: those carry `-seller` before the
+          # version.
+          for asset in dist/maxplayer-"$VERSION"-*.tar.gz; do
+            # An unmatched glob arrives as the literal pattern, and this loop would then report a
+            # platform named `*` rather than the download having produced nothing.
+            [ -f "$asset" ] || { echo "no buyer assets in dist — nothing was downloaded to publish from" >&2; exit 1; }
+            platform="$(basename "$asset" .tar.gz)"; platform="${platform#maxplayer-$VERSION-}"
+            case " $RELEASE_PLATFORMS " in
+              *" $platform "*) ;;
+              *) echo "the release builds a $platform buyer artifact but publishes no npm payload for it — add npm/cli-$platform and $platform to RELEASE_PLATFORMS, or state here why that platform is archive-only" >&2; exit 1 ;;
             esac
           done
 
