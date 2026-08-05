@@ -48,8 +48,18 @@ Three things about it are load-bearing:
   `npm-oidc-probe.yml` — a credential no release uses. A green run there would look like proof and
   be worth nothing.
 - **A green run covers ONE package.** The entry is per package. Probing the darwin payload says
-  nothing about the launcher or the linux payloads.
+  nothing about the launcher or the linux payloads — those are proven by something else, not by this
+  run: `maxplayer`, `@maxplayerai/linux-x64` and `@maxplayerai/linux-arm64` published through this
+  same workflow file, tokenless, in the rc.1 and rc.2 releases. Production runs are the strongest
+  evidence an entry exists. `@maxplayerai/darwin-arm64` is the only one with no such run behind it,
+  which is why it is the one to probe.
 - **Bump the version every run.** npm never allows reusing a version, probe or not.
+
+A red has three causes that look identical — npm answers a trusted-publishing mismatch with a 404 or
+ENEEDAUTH, which reads like a registry problem. The job prints them at the point of failure: the
+version already exists; no entry for the package at all; or an entry that exists but names a
+different workflow file (npm matches org, repo and FILENAME exactly, case-sensitively). The last two
+are the same red and a different repair.
 
 Leaving `npm_probe_package` blank is an ordinary dry run and publishes nothing. Every fence on that
 job — dispatch-only, an explicitly named package, `0.0.<n>` only, payload packages only, the `probe`

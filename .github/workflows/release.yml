@@ -537,3 +537,28 @@ jobs:
           echo
           echo "Not proven: the other packages. npm scopes a publisher entry per PACKAGE, so a green"
           echo "run here says nothing about the launcher or the other payloads — probe each one."
+
+      # A red here has three causes that look identical from the log — npm answers a trusted-publishing
+      # mismatch with a 404 or ENEEDAUTH, which reads like a registry outage. Naming them at the point
+      # of failure is the difference between a five-second fix and a re-derivation.
+      - name: How to read this failure
+        if: failure()
+        env:
+          PACKAGE: ${{ inputs.npm_probe_package }}
+          VERSION: ${{ inputs.npm_probe_version }}
+        run: |
+          echo "The probe did not publish $PACKAGE@$VERSION. Three different things look like this:"
+          echo
+          echo "1. THIS VERSION ALREADY EXISTS. npm never allows republishing a version, probe or not."
+          echo "   Re-run with a higher npm_probe_version. Check: npm view $PACKAGE versions"
+          echo
+          echo "2. NO TRUSTED PUBLISHER for $PACKAGE at all. The package has no entry, so nothing"
+          echo "   could match. Fix: npmjs.com -> $PACKAGE -> Settings -> Trusted publishing -> add."
+          echo
+          echo "3. AN ENTRY EXISTS BUT NAMES SOMETHING ELSE. npm matches organization, repository AND"
+          echo "   WORKFLOW FILENAME exactly, case-sensitively — plus the environment when one is set."
+          echo "   This job runs from release.yml, so an entry naming any other workflow file will not"
+          echo "   match no matter how correct it looks. Fix: edit the entry to say release.yml."
+          echo
+          echo "2 and 3 are the same red and a different repair, which is why this job exists: the"
+          echo "alternative was finding out during a tag, after the packages ahead of it published."
