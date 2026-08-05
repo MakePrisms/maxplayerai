@@ -127,15 +127,76 @@ for (const name of ["release", "publish"]) {
   }
 }
 
-// `npm publish` must live in exactly one job. A copy anywhere else would not be covered by the gate
-// checked above.
+// `npm publish` may appear in exactly two jobs, and the second one is a deliberate exception whose
+// fences are checked below. A copy in any THIRD job would be covered by no gate at all.
+const PUBLISHING_JOBS = ["publish", "npm-probe"];
 for (const [name, body] of jobs) {
-  if (name === "publish") continue;
+  if (PUBLISHING_JOBS.includes(name)) continue;
   const at = body.findIndex((l) => l.includes("npm publish"));
-  if (at >= 0) fail(`job '${name}' runs 'npm publish' — publishing belongs only in the gated publish job`);
+  if (at >= 0) fail(`job '${name}' runs 'npm publish' — only the gated publish job and the fenced npm-probe job may publish`);
 }
 if (!jobs.get("publish").some((l) => l.includes("npm publish"))) {
   fail("the publish job does not run 'npm publish' — this check is out of date with the workflow");
+}
+
+// ── The probe may publish, so what it CANNOT publish is the property ────────────────────────────
+// The probe exists because npm scopes a trusted publisher to a workflow FILENAME: a credential probe
+// living in its own workflow would exercise a publisher entry for that file, which is not the entry
+// a release depends on. So it publishes from here, and every fence that keeps it from reaching a
+// real version is asserted rather than trusted — an edit that removes one leaves a dispatch-triggered
+// path to the registry that looks exactly like the one that was safe.
+const probeBody = jobs.get("npm-probe");
+if (probeBody) {
+  const probeText = probeBody.join("\n");
+  const probeGate = probeText.match(/^ {4}if:(.*)$/m);
+  if (!probeGate) fail("job 'npm-probe' has no if: gate — it would run on a tag push, publishing a probe version during a real release");
+  if (!probeGate[1].includes("github.event_name == 'workflow_dispatch'")) {
+    fail("job 'npm-probe' is not gated on a workflow_dispatch — a tag push must never reach it");
+  }
+  // Without this half, an ordinary dry run — the thing this workflow is dispatched for most often —
+  // would publish to the registry every time somebody exercised the build.
+  if (!probeGate[1].includes("inputs.npm_probe_package != ''")) {
+    fail("job 'npm-probe' does not require an explicitly named package — an ordinary dry run would publish");
+  }
+
+  const probeCode = probeBody.filter((l) => !/^\s*#/.test(l)).join("\n");
+
+  // The version fence. `0.0.<n>` is a shape no release can name, which is what makes it safe rather
+  // than a blocklist that has to keep up with what looks dangerous.
+  if (!/0\.0\.\[0-9\]/.test(probeCode) || !probeCode.includes("may only publish 0.0.")) {
+    fail("job 'npm-probe' has lost its 0.0.<n> version fence — it could publish over a version a release wants");
+  }
+  // The package fence. `type: choice` constrains the dispatch form, not the REST API.
+  if (!probeCode.includes("only the @maxplayerai payload packages may be probed")) {
+    fail("job 'npm-probe' has lost its package allow-list — a dispatch sent through the API names any package it likes");
+  }
+  // The launcher is the package users type. It must not be probeable at all: its dist-tags are how
+  // `npx maxplayer` resolves, and the allow-list arm is what keeps it out.
+  if (/'maxplayer'\s*\)/.test(probeCode)) {
+    fail("job 'npm-probe' admits the launcher package — only the scoped payload packages may be probed");
+  }
+  // Publishing under `latest` would repoint what a bare install of a payload package resolves.
+  if (!probeCode.includes("--tag probe")) {
+    fail("job 'npm-probe' does not publish under the 'probe' dist-tag — it would move 'latest'");
+  }
+  // No checkout: with no repository content in the job there is no path by which a real payload
+  // package or the launcher could be published from it, whatever the inputs say.
+  if (probeCode.includes("actions/checkout")) {
+    fail("job 'npm-probe' checks out the repository — the probe must have no tree to publish from");
+  }
+}
+
+// A probe in a workflow of its own would prove a DIFFERENT credential (npm matches the workflow
+// filename), so a green run there would say nothing about the release path while looking like it
+// did. Nothing else in .github/workflows may publish.
+const nodePath = require("path");
+const workflowDir = nodePath.dirname(path);
+for (const entry of fs.readdirSync(workflowDir)) {
+  if (!/\.ya?ml$/.test(entry) || entry === nodePath.basename(path)) continue;
+  const text = fs.readFileSync(nodePath.join(workflowDir, entry), "utf8");
+  if (text.split("\n").filter((l) => !/^\s*#/.test(l)).some((l) => l.includes("npm publish"))) {
+    fail(`${entry} runs 'npm publish' — npm scopes a trusted publisher to a workflow filename, so publishing from any file but ${nodePath.basename(path)} exercises a credential no release uses`);
+  }
 }
 
 // ── The publish job cannot skip quietly ─────────────────────────────────────────────────────────
@@ -185,8 +246,10 @@ if (/NODE_AUTH_TOKEN|secrets\.NPM_TOKEN/.test(publishCode)) {
 }
 
 console.log("ok: release and publish are gated on a tag push");
-console.log("ok: 'npm publish' appears only in the publish job");
+console.log("ok: 'npm publish' appears only in the publish job and the fenced npm-probe job");
+console.log("ok: npm-probe is dispatch-only, needs a named package, and can publish 0.0.<n> of a payload package only");
+console.log("ok: no other workflow publishes to npm");
 console.log("ok: the publish job requests id-token: write and has no silent-skip path");
 NODE
 
-echo "PASS: $WORKFLOW publishes nothing without a pushed tag, and cannot skip publishing quietly"
+echo "PASS: $WORKFLOW publishes no RELEASE without a pushed tag, cannot skip publishing quietly, and its one dispatch-triggered publish reaches nothing a release can name"

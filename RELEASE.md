@@ -26,9 +26,34 @@ the npm organization `maxplayerai`. All four need their own trusted publisher en
 per package, not per account or per org. The GitHub side of that entry is the same for all four, and
 is unaffected by the npm scope: organization `MakePrisms`, repository `maxplayerai`.
 
-⚠ `@maxplayerai/darwin-arm64` is new (#446) and has no entry yet. It must be added before the tag
-that first publishes it. Nothing in this repo can check that for you: the setting lives on npmjs.com
-and needs an org admin.
+⚠ `@maxplayerai/darwin-arm64` is new (#446) and needs its entry before the tag that first publishes
+it. The setting lives on npmjs.com and needs an org admin — but whether it is really there is a
+question this repo CAN answer, by publishing something worthless through the same path. See below.
+
+### Proving an entry exists, before the tag
+
+`npm publish` fails only after the packages ahead of it in the release loop have already published,
+and npm does not allow republishing a version — so a missing entry discovered at tag time costs a
+version, not a re-run. "I think I added it" is not worth that. Run the probe instead:
+
+**Actions → Release → Run workflow**, set **npm_probe_package** to the package under test and
+**npm_probe_version** to a fresh `0.0.<n>`. The `npm-probe` job publishes a placeholder — no binary,
+no launcher, `probe` dist-tag, content generated in the job — through the same OIDC exchange the
+release uses. Green means that package's trusted-publisher entry exists and admits this workflow.
+
+Three things about it are load-bearing:
+
+- **It runs from `release.yml`, not a workflow of its own.** npm scopes a trusted publisher to a
+  workflow FILENAME, so a probe in `npm-oidc-probe.yml` would test a publisher entry for
+  `npm-oidc-probe.yml` — a credential no release uses. A green run there would look like proof and
+  be worth nothing.
+- **A green run covers ONE package.** The entry is per package. Probing the darwin payload says
+  nothing about the launcher or the linux payloads.
+- **Bump the version every run.** npm never allows reusing a version, probe or not.
+
+Leaving `npm_probe_package` blank is an ordinary dry run and publishes nothing. Every fence on that
+job — dispatch-only, an explicitly named package, `0.0.<n>` only, payload packages only, the `probe`
+dist-tag, and no checkout — is asserted by `verify-release-workflow.sh`, each one red-proven.
 
 `--access public`, which the publish job already passes on every publish, is what the scoped payload
 packages need on a first publish — a scoped package defaults to restricted, which on a free account
