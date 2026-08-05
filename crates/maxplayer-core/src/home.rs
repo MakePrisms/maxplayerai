@@ -1,4 +1,4 @@
-//! Packaged buyer home under `~/.mobee` (or `MOBEE_HOME`).
+//! Packaged buyer home under `~/.maxplayer` (or `MAXPLAYER_HOME`).
 //!
 //! First-run bootstrap writes working defaults: a REAL minibits mint, maxplayer-relay, budget caps,
 //! autogen key (`0600`), and an empty `wallet/` dir. The secret key is never returned.
@@ -8,7 +8,7 @@
 //! [`MaxplayerConfig`] resolves in three layers, later winning:
 //!
 //! 1. **built-in defaults** — [`MaxplayerConfig::default`].
-//! 2. **file** — `~/.mobee/config.toml` (if present). Absent fields fall back to the defaults;
+//! 2. **file** — `~/.maxplayer/config.toml` (if present). Absent fields fall back to the defaults;
 //!    unknown fields refuse (`deny_unknown_fields`). The single-mint legacy `mint_url = "…"` key
 //!    folds into `accepted_mints`.
 //! 3. **environment** — `MAXPLAYER_*` variables. Every field is reachable: uppercase the field path,
@@ -39,7 +39,7 @@
 //!
 //! List fields comma-split only for the paths in [`LIST_ENV_KEYS`]. The `agents` map is file-only
 //! via env: its keys are dynamic, so a nested `argv` list path cannot be pre-registered for
-//! splitting. `MAXPLAYER_`-prefixed operational/test seams ([`RESERVED_ENV_VARS`], e.g. `MOBEE_HOME`)
+//! splitting. `MAXPLAYER_`-prefixed operational/test seams ([`RESERVED_ENV_VARS`], e.g. `MAXPLAYER_HOME`)
 //! are excluded from the config layer.
 //!
 //! ## Minimal env-only boot (file-less container)
@@ -152,7 +152,7 @@ pub fn default_buzz_heartbeat_secs() -> u64 {
 /// the seed probe then checks (#394: splitting announce-host from git-host bricked fresh sellers).
 pub const DEFAULT_RELAY_GIT_BASE: &str = "https://relay.maxplayer.ai/git";
 /// Shared leaf name — NOT used as default (relay name registry is global).
-pub const DEFAULT_RELAY_GIT_REPO: &str = "mobee-seller";
+pub const DEFAULT_RELAY_GIT_REPO: &str = "maxplayer-seller";
 
 /// Seller daemon config (`[seller]` in config.toml). Key never lives here.
 ///
@@ -597,7 +597,7 @@ pub fn default_offer_backfill_secs() -> u64 {
 }
 
 /// Per-seller NIP-34 `d` / path leaf. Relay `.names/` registry is GLOBAL across
-/// owners — a shared constant like `mobee-seller` collides and seeds fail silently.
+/// owners — a shared constant like `maxplayer-seller` collides and seeds fail silently.
 pub fn default_relay_git_repo_id(seller_pubkey_hex: &str) -> String {
     let pk = seller_pubkey_hex.trim().to_ascii_lowercase();
     let short = &pk[..16.min(pk.len())];
@@ -679,7 +679,7 @@ pub struct AgentPresetConfig {
     pub argv: Vec<String>,
 }
 
-/// Buyer-facing packaged config (`~/.mobee/config.toml`).
+/// Buyer-facing packaged config (`~/.maxplayer/config.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MaxplayerConfig {
@@ -865,18 +865,18 @@ pub struct MaxplayerHome {
     pub key_created: bool,
 }
 
-/// Default home root: `MOBEE_HOME` if set, else `~/.mobee`.
+/// Default home root: `MAXPLAYER_HOME` if set, else `~/.maxplayer`.
 pub fn default_home_dir() -> Result<PathBuf, HomeError> {
-    if let Ok(override_dir) = std::env::var("MOBEE_HOME") {
+    if let Ok(override_dir) = std::env::var("MAXPLAYER_HOME") {
         let path = PathBuf::from(override_dir);
         if path.as_os_str().is_empty() {
-            return Err(HomeError::Io("MOBEE_HOME is empty".into()));
+            return Err(HomeError::Io("MAXPLAYER_HOME is empty".into()));
         }
         return Ok(path);
     }
     let home = std::env::var_os("HOME")
-        .ok_or_else(|| HomeError::Io("HOME is unset and MOBEE_HOME was not provided".into()))?;
-    Ok(PathBuf::from(home).join(".mobee"))
+        .ok_or_else(|| HomeError::Io("HOME is unset and MAXPLAYER_HOME was not provided".into()))?;
+    Ok(PathBuf::from(home).join(".maxplayer"))
 }
 
 /// Ensure `root` exists with config, key (`0600`), and `wallet/` dir.
@@ -1065,7 +1065,7 @@ pub(crate) fn parse_config_toml(raw: &str) -> Result<MaxplayerConfig, HomeError>
 /// `deny_unknown_fields` — refuse resolution. None of these collide with a real field's canonical
 /// `MAXPLAYER_*` spelling, so excluding them costs no config coverage.
 const RESERVED_ENV_VARS: &[&str] = &[
-    "MOBEE_HOME",
+    "MAXPLAYER_HOME",
     "MAXPLAYER_HEARTBEAT_INTERVAL_SECS",
     "MAXPLAYER_HEARTBEAT_ENABLED",
     "MAXPLAYER_HEARTBEAT_STALL_MISSED_INTERVALS",
@@ -1414,12 +1414,12 @@ mod tests {
     fn default_home_dir_honors_maxplayer_home() {
         let root = temp_home("env");
         // Safety: test process isolation — restore after.
-        let previous = std::env::var_os("MOBEE_HOME");
-        unsafe { std::env::set_var("MOBEE_HOME", &root) };
+        let previous = std::env::var_os("MAXPLAYER_HOME");
+        unsafe { std::env::set_var("MAXPLAYER_HOME", &root) };
         let resolved = default_home_dir().expect("resolve");
         match previous {
-            Some(value) => unsafe { std::env::set_var("MOBEE_HOME", value) },
-            None => unsafe { std::env::remove_var("MOBEE_HOME") },
+            Some(value) => unsafe { std::env::set_var("MAXPLAYER_HOME", value) },
+            None => unsafe { std::env::remove_var("MAXPLAYER_HOME") },
         }
         assert_eq!(resolved, root);
     }
@@ -1737,10 +1737,10 @@ mod tests {
 
     #[test]
     fn reserved_env_seams_never_reach_the_config_layer() {
-        // MOBEE_HOME (and the daemon test seams) map to no field; excluding them is what keeps
+        // MAXPLAYER_HOME (and the daemon test seams) map to no field; excluding them is what keeps
         // resolution from refusing when they are set. The filtered map must drop them.
         let raw = env(&[
-            ("MOBEE_HOME", "/tmp/x"),
+            ("MAXPLAYER_HOME", "/tmp/x"),
             ("MAXPLAYER_HEARTBEAT_INTERVAL_SECS", "9"),
             ("MAXPLAYER_RELAY_URL", "wss://kept"),
         ]);

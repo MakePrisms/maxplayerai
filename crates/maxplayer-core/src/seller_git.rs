@@ -80,7 +80,7 @@ impl From<TransportError> for SellerGitError {
     }
 }
 
-/// The deterministic identity every delivery commit carries: `mobee-seller-<pubkey16>` /
+/// The deterministic identity every delivery commit carries: `maxplayer-seller-<pubkey16>` /
 /// `<pubkey16>@seller.maxplayer.invalid`. The daemon authors the snapshot commit under this identity,
 /// so the delivered commit is provably the seat's — the seller's signature over the result and
 /// receipt is the binding attribution.
@@ -98,7 +98,7 @@ impl DeliveryAgentIdentity {
             .unwrap_or(seller_pubkey_hex)
             .to_ascii_lowercase();
         Self {
-            name: format!("mobee-seller-{short}"),
+            name: format!("maxplayer-seller-{short}"),
             email: format!("{short}@seller.maxplayer.invalid"),
         }
     }
@@ -174,7 +174,7 @@ pub fn init_contribution_workdir(
     // Full-depth fetch of the base branch from the pinned target into a local ref. maxplayer relay-git
     // requires NIP-98 auth for READS, so present the seller secret for relay-git bases; public /
     // anonymous https bases fetch without it (git_transport gates the header on is_relay_git).
-    let refspec = format!("+refs/heads/{base_branch}:refs/mobee/base");
+    let refspec = format!("+refs/heads/{base_branch}:refs/maxplayer/base");
     git_transport::fetch_refspecs(
         &repo,
         base_clone_url,
@@ -606,7 +606,7 @@ mod tests {
     fn temp(label: &str) -> std::path::PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!(
-            "mobee-seller-git-{label}-{}-{id}",
+            "maxplayer-seller-git-{label}-{}-{id}",
             std::process::id()
         ))
     }
@@ -727,7 +727,7 @@ mod tests {
             "ext::sh -c evil",
             "main",
             &"a".repeat(40),
-            "mobee/contribution/job",
+            "maxplayer/contribution/job",
             None,
         )
         .expect_err("ext base must be refused by the transport allowlist");
@@ -749,7 +749,7 @@ mod tests {
             String::from_utf8(out.stdout).unwrap().trim().to_owned()
         };
 
-        checkout_base_branch(&root, "mobee/contribution/job", &base_oid)
+        checkout_base_branch(&root, "maxplayer/contribution/job", &base_oid)
             .expect("checkout of a valid base_oid onto the fork branch must succeed");
 
         let branch = Command::new("git")
@@ -759,7 +759,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             String::from_utf8(branch.stdout).unwrap().trim(),
-            "mobee/contribution/job"
+            "maxplayer/contribution/job"
         );
         let head = Command::new("git")
             .args(["rev-parse", "HEAD"])
@@ -915,11 +915,11 @@ mod snapshot_tests {
     #[test]
     fn snapshots_uncommitted_workdir_onto_base() {
         let dir = workdir("uncommitted");
-        let base = init_with_base(&dir, "mobee/job");
+        let base = init_with_base(&dir, "maxplayer/job");
         write(&dir, "src/feature.rs", "agent work, never committed\n");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "maxplayer delivery: task")
+        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "maxplayer delivery: task")
             .expect("snapshot");
 
         let c = commit(&dir, &oid);
@@ -946,10 +946,10 @@ mod snapshot_tests {
         const DATE: i64 = 1_700_000_000; // fixed, in the past — never equals the wall clock.
 
         let dir = workdir("determinism");
-        let base = init_with_base(&dir, "mobee/job");
+        let base = init_with_base(&dir, "maxplayer/job");
         write(&dir, "src/feature.rs", "identical agent output\n");
         let id = identity();
-        let oid_a = snapshot_delivery_at(&dir, &id, Some(&base), "mobee/job", "msg", DATE)
+        let oid_a = snapshot_delivery_at(&dir, &id, Some(&base), "maxplayer/job", "msg", DATE)
             .expect("snapshot a");
 
         // The committed author/committer time IS the journaled date (not now()). This is the
@@ -966,12 +966,12 @@ mod snapshot_tests {
         // Re-snapshotting the SAME base + tree + identity at the SAME date re-creates the SAME oid —
         // the property that makes a post-crash re-push idempotent (deterministic, so not a divergent
         // second tip). Same base commit on both passes, so the parent is fixed.
-        let oid_a2 = snapshot_delivery_at(&dir, &id, Some(&base), "mobee/job", "msg", DATE)
+        let oid_a2 = snapshot_delivery_at(&dir, &id, Some(&base), "maxplayer/job", "msg", DATE)
             .expect("snapshot a2");
         assert_eq!(oid_a, oid_a2, "same inputs + journaled date ⇒ identical delivery commit oid");
 
         // And the date is genuinely folded into the oid: a different date ⇒ a different commit.
-        let oid_b = snapshot_delivery_at(&dir, &id, Some(&base), "mobee/job", "msg", DATE + 1)
+        let oid_b = snapshot_delivery_at(&dir, &id, Some(&base), "maxplayer/job", "msg", DATE + 1)
             .expect("snapshot b");
         assert_ne!(oid_a, oid_b, "a different authored-at must change the delivery oid");
 
@@ -982,7 +982,7 @@ mod snapshot_tests {
     #[test]
     fn ignores_agent_scratch_commits_delivers_single_commit_on_base() {
         let dir = workdir("scratch");
-        let base = init_with_base(&dir, "mobee/job");
+        let base = init_with_base(&dir, "maxplayer/job");
         // Agent makes two scratch commits under a foreign identity.
         write(&dir, "a.rs", "one\n");
         git(&dir, ["add", "-A"]);
@@ -992,7 +992,7 @@ mod snapshot_tests {
         run_env(&dir, ["commit", "-m", "scratch 2"], Some(("Claude", "c@anthropic.invalid")));
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg").expect("snapshot");
+        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         let c = commit(&dir, &oid);
         assert_eq!(c.parent_id(0).unwrap().to_string(), base, "parented on base, not the scratch tip");
@@ -1017,7 +1017,7 @@ mod snapshot_tests {
         init_empty_delivery_workdir(&dir, &id).expect("init");
         write(&dir, "out.rs", "work\n");
 
-        let oid = snapshot_delivery(&dir, &id, None, "mobee/job", "msg").expect("snapshot");
+        let oid = snapshot_delivery(&dir, &id, None, "maxplayer/job", "msg").expect("snapshot");
 
         let c = commit(&dir, &oid);
         assert_eq!(c.parent_count(), 0, "from-scratch delivery is a root commit");
@@ -1060,7 +1060,7 @@ mod snapshot_tests {
         let job_hash = "9".repeat(64);
         let other_job = "7".repeat(64);
 
-        let oid = super::snapshot_delivery(&dir, &id, None, "mobee/job", "msg", &job_hash)
+        let oid = super::snapshot_delivery(&dir, &id, None, "maxplayer/job", "msg", &job_hash)
             .expect("snapshot");
 
         let content = sentinel_blob(&dir, &oid);
@@ -1152,7 +1152,7 @@ mod snapshot_tests {
             "{\"event\":\"node run transcript — not a deliverable\"}\n",
         );
 
-        let oid = snapshot_delivery(&dir, &id, None, "mobee/job", "msg").expect("snapshot");
+        let oid = snapshot_delivery(&dir, &id, None, "maxplayer/job", "msg").expect("snapshot");
         let paths = tree_paths(&dir, &oid);
 
         // (a) the node's run transcript is NOT delivered — the whole point of #410.
@@ -1192,10 +1192,10 @@ mod snapshot_tests {
     #[test]
     fn nothing_to_deliver_contribution_refuses() {
         let dir = workdir("empty-contrib");
-        let base = init_with_base(&dir, "mobee/job");
+        let base = init_with_base(&dir, "maxplayer/job");
         let id = identity();
         // Workdir untouched — identical to base.
-        let err = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg")
+        let err = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg")
             .expect_err("must refuse");
         assert!(
             matches!(err, SellerGitError::NoExecutionObserved(_)),
@@ -1210,7 +1210,7 @@ mod snapshot_tests {
         let dir = workdir("empty-scratch");
         let id = identity();
         init_empty_delivery_workdir(&dir, &id).expect("init");
-        let err = snapshot_delivery(&dir, &id, None, "mobee/job", "msg").expect_err("must refuse");
+        let err = snapshot_delivery(&dir, &id, None, "maxplayer/job", "msg").expect_err("must refuse");
         assert!(
             matches!(err, SellerGitError::NoExecutionObserved(_)),
             "an empty from-scratch tree is a no-execution refusal (maps to no_sentinel), got: {err}"
@@ -1223,13 +1223,13 @@ mod snapshot_tests {
     #[test]
     fn snapshot_excludes_gitignored_files() {
         let dir = workdir("ignore");
-        let base = init_with_base(&dir, "mobee/job");
+        let base = init_with_base(&dir, "maxplayer/job");
         write(&dir, ".gitignore", "secret.txt\n");
         write(&dir, "secret.txt", "do not deliver\n");
         write(&dir, "real.rs", "delivered\n");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg").expect("snapshot");
+        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         let paths = tree_paths(&dir, &oid);
         assert!(paths.contains(&"real.rs".to_owned()));
@@ -1241,11 +1241,11 @@ mod snapshot_tests {
     #[test]
     fn snapshot_never_includes_git_internals() {
         let dir = workdir("gitinternals");
-        let base = init_with_base(&dir, "mobee/job");
+        let base = init_with_base(&dir, "maxplayer/job");
         write(&dir, "work.rs", "work\n");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg").expect("snapshot");
+        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         for path in tree_paths(&dir, &oid) {
             assert!(!path.starts_with(".git/") && path != ".git", "git internals leaked: {path}");
@@ -1257,13 +1257,13 @@ mod snapshot_tests {
     #[test]
     fn snapshot_commit_is_never_signed() {
         let dir = workdir("gpgsign");
-        let base = init_with_base(&dir, "mobee/job");
+        let base = init_with_base(&dir, "maxplayer/job");
         git(&dir, ["config", "commit.gpgsign", "true"]);
         git(&dir, ["config", "user.signingkey", "DEADBEEF"]);
         write(&dir, "work.rs", "work\n");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg").expect("snapshot");
+        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         assert!(
             !commit(&dir, &oid).raw_header().unwrap().contains("gpgsig"),
@@ -1276,14 +1276,14 @@ mod snapshot_tests {
     #[test]
     fn snapshot_bypasses_base_repo_hooks() {
         let dir = workdir("hooks");
-        let base = init_with_base(&dir, "mobee/job");
+        let base = init_with_base(&dir, "maxplayer/job");
         let hook = dir.join(".git/hooks/pre-commit");
         fs::write(&hook, "#!/bin/sh\nexit 1\n").expect("write hook");
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod hook");
         write(&dir, "work.rs", "work\n");
         let id = identity();
 
-        snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg")
+        snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg")
             .expect("libgit2 runs no hooks, so a failing pre-commit cannot block delivery");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1292,13 +1292,13 @@ mod snapshot_tests {
     #[test]
     fn snapshot_preserves_executable_bit() {
         let dir = workdir("execbit");
-        let base = init_with_base(&dir, "mobee/job");
+        let base = init_with_base(&dir, "maxplayer/job");
         let script = dir.join("run.sh");
         fs::write(&script, "#!/bin/sh\necho hi\n").expect("write script");
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg").expect("snapshot");
+        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         let repo = Repository::open(&dir).unwrap();
         let entry = repo
@@ -1316,13 +1316,13 @@ mod snapshot_tests {
     #[test]
     fn snapshot_reflects_deletions() {
         let dir = workdir("delete");
-        let base = init_with_base(&dir, "mobee/job");
+        let base = init_with_base(&dir, "maxplayer/job");
         // README.md exists in base; the agent deletes it and adds a replacement.
         fs::remove_file(dir.join("README.md")).expect("rm");
         write(&dir, "new.rs", "replacement\n");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg").expect("snapshot");
+        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         let paths = tree_paths(&dir, &oid);
         assert!(!paths.contains(&"README.md".to_owned()), "deleted file must not be delivered");
@@ -1352,7 +1352,7 @@ mod snapshot_tests {
         fs::write(dir.join("feature.rs"), "work\n").expect("write");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg")
+        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg")
             .expect("git2-only snapshot");
 
         assert_eq!(commit(&dir, &oid).parent_id(0).unwrap().to_string(), base);
@@ -1363,7 +1363,7 @@ mod snapshot_tests {
     #[test]
     fn deliver_after_snapshot_pushes_branch() {
         let dir = workdir("e2e");
-        let base = init_with_base(&dir, "mobee/job");
+        let base = init_with_base(&dir, "maxplayer/job");
         // Agent left scratch commits AND uncommitted edits — the daemon ignores all of it.
         write(&dir, "feature.rs", "impl\n");
         git(&dir, ["add", "-A"]);
@@ -1371,14 +1371,14 @@ mod snapshot_tests {
         write(&dir, "extra.rs", "more, uncommitted\n");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg").expect("snapshot");
+        let oid = snapshot_delivery(&dir, &id, Some(&base), "maxplayer/job", "msg").expect("snapshot");
 
         let remote = workdir("e2e-remote.git");
         git(&remote, ["init", "--bare", "--initial-branch=main"]);
         git(&dir, ["remote", "add", "origin", remote.to_str().unwrap()]);
-        git(&dir, ["push", "origin", "mobee/job"]);
+        git(&dir, ["push", "origin", "maxplayer/job"]);
         let out = Command::new("git")
-            .args(["rev-parse", "refs/heads/mobee/job"])
+            .args(["rev-parse", "refs/heads/maxplayer/job"])
             .current_dir(&remote)
             .output()
             .unwrap();

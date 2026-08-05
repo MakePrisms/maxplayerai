@@ -1,4 +1,4 @@
-//! Buyer wallet setup for packaged `~/.mobee`: open the CDK wallet at a mint, derive its seed from
+//! Buyer wallet setup for packaged `~/.maxplayer`: open the CDK wallet at a mint, derive its seed from
 //! the nostr secret, and read its balance. The wallet opens at the configured mint
 //! ([`crate::home::MaxplayerConfig::default_mint`]) or at an explicit realized mint
 //! ([`open_wallet_at_mint_async`]); the real-mint fence gates non-testnut mints.

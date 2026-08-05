@@ -1,8 +1,8 @@
 //! The persistent per-home **maxplayer seller node**.
 //!
-//! One node owns a home. It takes an exclusive OS lock on `$MOBEE_HOME/seller.lock` (a second node
+//! One node owns a home. It takes an exclusive OS lock on `$MAXPLAYER_HOME/seller.lock` (a second node
 //! on the same home fails closed), opens the receiving CDK wallet and the seller Nostr identity
-//! behind serialized in-process actors, and opens the durable lifecycle DB `$MOBEE_HOME/seller.sqlite`
+//! behind serialized in-process actors, and opens the durable lifecycle DB `$MAXPLAYER_HOME/seller.sqlite`
 //! — the source of truth for offers, claims, awards, jobs, deliveries, receipts, and the nostr event
 //! outbox. A single relay ingester ([`ingester`]) writes marketplace events into the store; an async
 //! publisher ([`outbox`]) drains published events to the relay with crash-idempotent retries; a
@@ -256,7 +256,7 @@ mod tests {
     fn temp_home(label: &str) -> std::path::PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!(
-            "mobee-seller-node-{label}-{}-{id}",
+            "maxplayer-seller-node-{label}-{}-{id}",
             std::process::id()
         ))
     }

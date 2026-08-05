@@ -690,7 +690,7 @@ fn offer_subscription_filters(
 ) -> Vec<Filter> {
     let targeted = Filter::new()
         .kind(Kind::Custom(JOB_OFFER_KIND))
-        .hashtag(crate::gateway::MOBEE_TAG)
+        .hashtag(crate::gateway::MAXPLAYER_TAG)
         .pubkey(seller_pubkey);
     let mut filters = vec![match since {
         Some(cursor) => targeted.since(cursor),
@@ -699,7 +699,7 @@ fn offer_subscription_filters(
     if open_pool {
         let untargeted = Filter::new()
             .kind(Kind::Custom(JOB_OFFER_KIND))
-            .hashtag(crate::gateway::MOBEE_TAG);
+            .hashtag(crate::gateway::MAXPLAYER_TAG);
         filters.push(match since {
             Some(cursor) => untargeted.since(cursor).limit(OFFER_BACKFILL_LIMIT),
             None if offer_backfill_secs > 0 => untargeted
@@ -979,11 +979,11 @@ const HARNESS_PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 /// sentinel is an opaque nonce that spends nothing, and naming it "token" made a reviewer stop and ask
 /// whether probing costs sats. A name that forces that question on a money path is wrong whatever the
 /// answer is.
-const PROBE_SENTINEL_PREFIX: &str = "mobee-probe";
+const PROBE_SENTINEL_PREFIX: &str = "maxplayer-probe";
 
 /// Prefix of the NON-SECRET label naming a probe's workdir. Distinct from the sentinel's prefix so no
 /// sentinel value can ever be a substring of a workdir path.
-const PROBE_DIR_PREFIX: &str = "mobee-selfprobe";
+const PROBE_DIR_PREFIX: &str = "maxplayer-selfprobe";
 
 /// One probe's two values: a non-secret label for its workdir, and the secret it must produce.
 ///
@@ -1423,7 +1423,7 @@ impl SellerNodeRunner {
             // stall watchdog — a second subscription would be a second thing that can die quietly.
             AWARD_SUB_ID => Filter::new()
                 .kinds([Kind::Custom(JOB_AWARD_KIND), Kind::Custom(JOB_ACCEPT_KIND)])
-                .hashtag(crate::gateway::MOBEE_TAG)
+                .hashtag(crate::gateway::MAXPLAYER_TAG)
                 .pubkey(self.seller_pubkey),
             WRAP_SUB_ID => Filter::new()
                 .kind(Kind::GiftWrap)
@@ -2861,7 +2861,7 @@ impl SellerNodeRunner {
         // — the snapshot refuses `NoExecutionObserved` and writes no sentinel, which is mapped here to
         // the `no_sentinel` refusal so the buyer learns delivery was refused for want of a sentinel
         // (distinct from a crash). The gate, not an unconditional write, is the check.
-        let branch = format!("mobee/{}", &job_id[..8.min(job_id.len())]);
+        let branch = format!("maxplayer/{}", &job_id[..8.min(job_id.len())]);
         let message = delivery_message(&offer.task);
         let job_hash = job_hash_for_offer(job_id, &offer.task, offer.amount_sats);
         if let Err(error) = seller_git::snapshot_delivery_at_off_runtime(
@@ -3842,7 +3842,7 @@ mod tests {
     #[test]
     fn the_self_probe_is_decided_by_the_sentinel_not_by_a_completed_turn() {
         // Deliberately NOT sharing the sentinel prefix: a grep for it must return the ONE definition.
-        let dir = std::env::temp_dir().join(format!("mobee-selfprobe-td-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("maxplayer-selfprobe-td-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("probe dir");
         // Minted through the SAME function the probe path uses, so this test cannot pass against a
         // sentinel shape the node would never actually produce.
@@ -4195,7 +4195,7 @@ mod tests {
         for (index, filter) in open_pool.iter().enumerate() {
             assert_eq!(
                 filter.generic_tags.get(&hashtag),
-                Some(&[crate::gateway::MOBEE_TAG.to_owned()].into_iter().collect()),
+                Some(&[crate::gateway::MAXPLAYER_TAG.to_owned()].into_iter().collect()),
                 "offer filter {index} must carry the #t=maxplayer namespace guard"
             );
         }
@@ -5065,7 +5065,7 @@ mod tests {
         let buyer = "b".repeat(64);
         let job = "a".repeat(64);
         let author_date = 4242_i64;
-        let branch = "mobee/aaaaaaaa";
+        let branch = "maxplayer/aaaaaaaa";
         let identity = DeliveryAgentIdentity::for_seller(&seller);
 
         // Two independent workdirs with byte-identical trees, each snapshotted at the SAME journaled

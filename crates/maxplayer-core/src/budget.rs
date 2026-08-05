@@ -1,9 +1,9 @@
 //! MCP spend authority — budget caps before any pay reaches the payment state machine.
 //!
-//! Caps bind from `~/.mobee` config only. Tool args that try to set/override
+//! Caps bind from `~/.maxplayer` config only. Tool args that try to set/override
 //! `per_job` / `total` are ignored by callers; this gate never reads them.
 //!
-//! Spent is durable as an **append-only ledger** under `~/.mobee/spent.jsonl`: one
+//! Spent is durable as an **append-only ledger** under `~/.maxplayer/spent.jsonl`: one
 //! JSON record per spend attempt, appended (never rewritten) before the pay effect
 //! (write-before-effect). The spent total is **folded over the records at read time**
 //! — a fresh fold happens before every cap check. Concurrent buyer processes each
@@ -15,7 +15,7 @@
 //!
 //! The refresh→check→append→in-memory-update critical section is serialized ACROSS
 //! processes by an advisory exclusive lock (`flock` via [`std::fs::File::lock`]) held over
-//! `spent.lock` next to the ledger. Two buyers sharing one `~/.mobee` therefore cannot both
+//! `spent.lock` next to the ledger. Two buyers sharing one `~/.maxplayer` therefore cannot both
 //! fold-then-append in a tight interleave and each pass a check their combined spend would
 //! exceed — the TOCTOU is closed, so the ledger cap is a real cross-process guard (not merely an
 //! accounting record backstopped by the wallet balance). The lock is released BEFORE the wallet
@@ -136,7 +136,7 @@ impl BudgetGate {
     }
 
     /// Per-job cap from home config; spent folded from the append-only ledger at
-    /// `~/.mobee/spent.jsonl` (created on first append). A legacy `spent.toml`, if
+    /// `~/.maxplayer/spent.jsonl` (created on first append). A legacy `spent.toml`, if
     /// present, is folded in as an opening base so no pre-#22 spend history is lost;
     /// it is left in place and never rewritten.
     pub fn from_home(home: &MaxplayerHome) -> Result<Self, BudgetRefuse> {

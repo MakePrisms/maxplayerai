@@ -1,7 +1,7 @@
 //! The thin client half of the buyer boundary.
 //!
 //! A client (an MCP session, the CLI, a future seller surface) connects to
-//! `$MOBEE_HOME/buyer.sock`, writes one JSON request line, and reads one JSON
+//! `$MAXPLAYER_HOME/buyer.sock`, writes one JSON request line, and reads one JSON
 //! response line. It holds no wallet, no key, and no state — the daemon is the
 //! single owner. This is a plain synchronous `UnixStream`, so a caller needs no
 //! async runtime to talk to the buyer.

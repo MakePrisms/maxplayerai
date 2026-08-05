@@ -9,7 +9,7 @@
 //!   SELECTION as a kind-3405 AWARD — separate kinds, so a reader can tell a pay-bind from a
 //!   choice of seller. Claims/results themselves remain relay-truth.
 //!
-//! Local bind under `~/.mobee/jobs/<job_id>.json` is accept-state only.
+//! Local bind under `~/.maxplayer/jobs/<job_id>.json` is accept-state only.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -1996,7 +1996,7 @@ pub(crate) async fn award_presence_async(
         .kind(Kind::Custom(JOB_AWARD_KIND))
         .author(keys.public_key())
         .event(offer_id)
-        .hashtag(gateway::MOBEE_TAG);
+        .hashtag(gateway::MAXPLAYER_TAG);
     // Fetch through the single-relay API, not the pool: the pool SWALLOWS per-relay stream
     // errors into `Ok(empty)`, so a relay REFUSING this REQ (CLOSED with a reason, auth failure)
     // would read as emptiness. Here a refusal surfaces as `Err` → the caller's Unverified — a
@@ -2119,7 +2119,7 @@ pub(crate) async fn job_has_results_async(
         .kind(Kind::Custom(JOB_RESULT_KIND))
         .author(seller)
         .event(offer_id)
-        .hashtag(gateway::MOBEE_TAG);
+        .hashtag(gateway::MAXPLAYER_TAG);
     presence_of_filter(keys, relay_url, filter, timeout).await
 }
 
@@ -2284,7 +2284,7 @@ pub(crate) async fn fetch_job_view_async(
     let offer_filter = Filter::new()
         .id(offer_id)
         .kind(Kind::Custom(JOB_OFFER_KIND))
-        .hashtag(gateway::MOBEE_TAG);
+        .hashtag(gateway::MAXPLAYER_TAG);
     // Claims (processing) and feedback (error) are distinct kinds — fetch both so the claim
     // view surfaces both.
     let feedback_filter = Filter::new()
@@ -2292,11 +2292,11 @@ pub(crate) async fn fetch_job_view_async(
             Kind::Custom(JOB_CLAIM_KIND),
             Kind::Custom(JOB_FEEDBACK_KIND),
         ])
-        .hashtag(gateway::MOBEE_TAG)
+        .hashtag(gateway::MAXPLAYER_TAG)
         .event(offer_id);
     let result_filter = Filter::new()
         .kind(Kind::Custom(JOB_RESULT_KIND))
-        .hashtag(gateway::MOBEE_TAG)
+        .hashtag(gateway::MAXPLAYER_TAG)
         .event(offer_id);
 
     let offer_events = client
@@ -2848,7 +2848,7 @@ mod tests {
             seller_pubkey: "aa".repeat(32),
             commit_oid: "bb".repeat(20),
             repo: "https://example.invalid/repo.git".into(),
-            branch: "mobee/job".into(),
+            branch: "maxplayer/job".into(),
             job_hash: "cc".repeat(32),
             amount_sats: 5,
             accept_event_id: "accept-x".into(),
@@ -2905,7 +2905,7 @@ mod tests {
             seller_pubkey: "aa".repeat(32),
             commit_oid: "bb".repeat(20),
             repo: "https://bound.invalid/repo.git".into(),
-            branch: "mobee/bound-branch".into(),
+            branch: "maxplayer/bound-branch".into(),
             job_hash: "cc".repeat(32),
             amount_sats: 5,
             accept_event_id: "accept-x".into(),
@@ -2928,7 +2928,7 @@ mod tests {
             amount_sats: 5,
             // Caller supplies a DIFFERENT allowlisted locator for the same commit.
             repo: "https://caller.invalid/mirror.git".into(),
-            branch: "mobee/caller-branch".into(),
+            branch: "maxplayer/caller-branch".into(),
             commit_oid: bind.commit_oid.clone(),
             seller_signature: String::new(),
             creq_hash: None,
@@ -2955,7 +2955,7 @@ mod tests {
             seller_pubkey: "aa".repeat(32),
             commit_oid: "5ce37eeb".repeat(5),
             repo: "https://example.invalid/repo.git".into(),
-            branch: "mobee/job".into(),
+            branch: "maxplayer/job".into(),
             job_hash: "699c9230".repeat(8),
             amount_sats: 5,
             accept_event_id: "accept-x".into(),
@@ -3806,7 +3806,7 @@ mod tests {
             display_name: None,
             job_hash: Some("jh".to_owned()),
             repo: Some("relay://repo".to_owned()),
-            branch: Some("mobee/delivery".to_owned()),
+            branch: Some("maxplayer/delivery".to_owned()),
             commit_oid: Some("cc".repeat(20)),
             amount_sats: Some(10),
             seller_signature: Some("sig".to_owned()),
@@ -4467,7 +4467,7 @@ mod tests {
             seller_pubkey: "dd".repeat(32),
             commit_oid: "ee".repeat(20),
             repo: "https://relay.maxplayer.test/git/seller/fork.git".into(),
-            branch: "mobee/contribution/x".into(),
+            branch: "maxplayer/contribution/x".into(),
             job_hash: "ff".repeat(32),
             amount_sats: 1,
             accept_event_id: "11".repeat(32),
@@ -4484,7 +4484,7 @@ mod tests {
                 base_branch: "main".into(),
                 base_oid: "77".repeat(20),
                 tuple_signature: "cafe".into(),
-                store_ref: "refs/mobee/deliveries/eeee".into(),
+                store_ref: "refs/maxplayer/deliveries/eeee".into(),
             }),
         };
         let req = authorize_request_from_bind(&bind, 1, bind.commit_oid.clone()).expect("ok");

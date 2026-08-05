@@ -33,10 +33,9 @@
   services.maxplayer.relay = {
     enable = true;
 
-    # Keep "mobee": the #t flip to "maxplayer" is waived out of 0.1.0, so day-one events still carry
-    # t=mobee. Hardcoding "maxplayer" would reject every real event while looking like a healthy quiet relay.
-    # The flip is then a one-line change riding flag-day.
-    namespaceTag = "mobee";
+    # The namespace this relay accepts. Every real market event carries ["t","maxplayer"]; a relay set
+    # to any other value would reject every real event while looking like a healthy quiet relay.
+    namespaceTag = "maxplayer";
 
     # NIP-11 identity every client reads (drafted — correct freely). `contact` is optional.
     info = {

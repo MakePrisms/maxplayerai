@@ -1,5 +1,5 @@
 //! `maxplayer stub-pay` — exercise the config-bound budget gate over a mock authorization (allow/deny)
-//! without touching the real pay path. Caps bind from `~/.mobee` config only; the amount is
+//! without touching the real pay path. Caps bind from `~/.maxplayer` config only; the amount is
 //! authorized against them and the durable spent counter advances on allow.
 
 use std::io::Write;

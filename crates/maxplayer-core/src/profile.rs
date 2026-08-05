@@ -50,7 +50,7 @@ pub struct SellerDiscoverabilityOutcome {
 
 /// NIP-89 handler information (kind 31990) — parameterized replaceable via `d`.
 const NIP89_HANDLER_KIND: u16 = 31990;
-const NIP89_HANDLER_D: &str = "mobee-seller";
+const NIP89_HANDLER_D: &str = "maxplayer-seller";
 
 #[derive(Debug)]
 pub enum ProfileError {
@@ -125,7 +125,7 @@ pub async fn set_profile_async(
     })
 }
 
-/// Seller start: publish clobber-safe kind-0 + idempotent NIP-89 (d=`mobee-seller`).
+/// Seller start: publish clobber-safe kind-0 + idempotent NIP-89 (d=`maxplayer-seller`).
 ///
 /// Kind-0: fetch → merge name/about → publish; **abort on fetch failure**.
 /// NIP-89: same `d` tag every launch (parameterized replaceable — not spam).
@@ -165,7 +165,7 @@ pub async fn publish_seller_discoverability_async(
         .map(|n| n.trim().is_empty())
         .unwrap_or(true)
     {
-        let name = format!("mobee-seller-{short}");
+        let name = format!("maxplayer-seller-{short}");
         home::save_config(home, |config| {
             config.profile.get_or_insert_with(ProfileConfig::default).name = Some(name);
         })?;
@@ -378,7 +378,7 @@ fn nip89_handler_content(
         "agent": agent,
         "mint": primary_mint,
         "accepted_mints": accepted_mints,
-        "protocol": "mobee-seller",
+        "protocol": "maxplayer-seller",
     })
     .to_string()
 }

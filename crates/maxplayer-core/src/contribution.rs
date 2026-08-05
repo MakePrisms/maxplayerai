@@ -27,7 +27,7 @@ pub const ACCEPTS_FORK: &str = "fork";
 /// Domain separator for the seller's signed-result authorship tuple. DISTINCT from the
 /// receipt-preimage domain (`maxplayer/v1/receipt-preimage`) so the two seller signatures can never
 /// collide — the receipt cosig and the contribution cosig are independent binds at the one seam.
-pub const CONTRIBUTION_TUPLE_DOMAIN: &str = "mobee/v1/contribution-tuple";
+pub const CONTRIBUTION_TUPLE_DOMAIN: &str = "maxplayer/v1/contribution-tuple";
 
 /// Offer/result tag names (additive; from-scratch offers carry none of them).
 pub const TAG_JOB_CLASS: &str = "job-class";
@@ -189,7 +189,7 @@ impl ForkRef {
     /// `maxplayer/<job_id[:8]>` prefix collides — a real field collision already occurred between two
     /// sellers sharing a remote — so the full id + owner-scoped namespaces is the shape.
     pub fn unique_branch(job_id: &str) -> String {
-        format!("mobee/contribution/{job_id}")
+        format!("maxplayer/contribution/{job_id}")
     }
 }
 
@@ -620,7 +620,7 @@ mod tests {
         let branch = ForkRef::unique_branch(&job_id);
         assert!(branch.contains(&job_id), "full job id must be in the ref (MUST-6)");
         // The colliding `[:8]` prefix must NOT be the whole leaf.
-        assert_ne!(branch, format!("mobee/{}", &job_id[..8]));
+        assert_ne!(branch, format!("maxplayer/{}", &job_id[..8]));
     }
 
     #[test]
@@ -630,7 +630,7 @@ mod tests {
             seller_pubkey: "cc".repeat(32),
             target: pin(),
             base_oid: "a".repeat(40),
-            fork: ForkRef::new("https://x/git/seller/fork.git", "mobee/contribution/job").unwrap(),
+            fork: ForkRef::new("https://x/git/seller/fork.git", "maxplayer/contribution/job").unwrap(),
             commit_oid: "d".repeat(40),
         };
         let d0 = base.digest_hex();
@@ -730,7 +730,7 @@ mod tests {
             seller_pubkey: seller.public_key().to_hex(),
             target: pin(),
             base_oid: "a".repeat(40),
-            fork: ForkRef::new("https://x/git/seller/fork.git", "mobee/contribution/job").unwrap(),
+            fork: ForkRef::new("https://x/git/seller/fork.git", "maxplayer/contribution/job").unwrap(),
             commit_oid: "d".repeat(40),
         };
         let sig = sign_authorship_tuple(&seller, &tuple);
@@ -757,7 +757,7 @@ mod tests {
 
     #[test]
     fn non_contribution_tags_parse_to_none() {
-        let tags = vec![TagSpec::new(["output", "text"]), TagSpec::new(["t", "mobee"])];
+        let tags = vec![TagSpec::new(["output", "text"]), TagSpec::new(["t", "maxplayer"])];
         assert_eq!(parse_contribution_offer(&tags), Ok(None));
     }
 

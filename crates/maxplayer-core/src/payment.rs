@@ -19,7 +19,7 @@ use crate::payment_send::PaymentSent;
 use crate::receipt::ReceiptPreimage;
 use crate::wallet::VerifiedPayment;
 
-const ATTEMPT_DOMAIN: &[u8] = b"mobee/v1/payment-attempt";
+const ATTEMPT_DOMAIN: &[u8] = b"maxplayer/v1/payment-attempt";
 
 /// Nostr event kind of a co-signed settlement receipt. Stamped on [`ReceiptRecord`] so a consumer
 /// discriminates a co-signed receipt (kind-3400) from a record with no co-signed receipt with a
@@ -2700,7 +2700,7 @@ mod tests {
     fn git_delivery() -> GitDelivery {
         GitDelivery::new(
             "https://example.invalid/repo.git",
-            "mobee/job",
+            "maxplayer/job",
             crate::delivery::CommitOid::parse("33".repeat(20)).unwrap(),
         )
         .unwrap()
@@ -2775,7 +2775,7 @@ mod tests {
             base_oid: "77".repeat(20),
             fork: crate::contribution::ForkRef::new(
                 "https://relay.maxplayer.test/git/seller/fork.git",
-                "mobee/contribution/job",
+                "maxplayer/contribution/job",
             )
             .unwrap(),
             commit_oid: commit_oid.to_owned(),

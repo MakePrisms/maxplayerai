@@ -2,7 +2,7 @@
 //!
 //! The MCP and the CLI money commands never own the wallet, key, or budget ledger — the buyer
 //! daemon does, guarded by the exclusive home lock. A caller that needs the daemon calls
-//! [`ensure`], which connects to `$MOBEE_HOME/buyer.sock` if a daemon is already serving, or spawns
+//! [`ensure`], which connects to `$MAXPLAYER_HOME/buyer.sock` if a daemon is already serving, or spawns
 //! one (this same binary, `maxplayer buyer serve`, detached) and waits for it to come up. A concurrent
 //! double-spawn is safe: the loser fails closed at the exclusive home lock and exits, the winner
 //! binds the socket, and both callers connect to the winner. No manual `maxplayer buyer` command is
@@ -62,9 +62,9 @@ fn spawn_detached(home_root: &Path) -> Result<(), String> {
     command
         .arg("buyer")
         .arg("serve")
-        // Pin the daemon to exactly this home so it serves the caller's home (default, MOBEE_HOME,
+        // Pin the daemon to exactly this home so it serves the caller's home (default, MAXPLAYER_HOME,
         // or a --home path) rather than whatever the ambient env resolves to.
-        .env("MOBEE_HOME", home_root)
+        .env("MAXPLAYER_HOME", home_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

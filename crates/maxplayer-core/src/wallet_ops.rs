@@ -1,5 +1,5 @@
 //! Flexible ecash wallet ops for `maxplayer wallet` / MCP mirrors, over the packaged CDK wallet at
-//! `home/.mobee/wallet`. This module owns the mint-fund path: [`begin_mint_async`] creates a mint
+//! `home/.maxplayer/wallet`. This module owns the mint-fund path: [`begin_mint_async`] creates a mint
 //! quote and returns the bolt11 invoice up front, then [`complete_mint_async`] mints once it is
 //! paid. ([`crate::buyer_fund`] covers wallet open, seed derivation, and balance read.)
 //!

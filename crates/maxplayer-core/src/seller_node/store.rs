@@ -1,4 +1,4 @@
-//! The seller node's durable lifecycle state: `$MOBEE_HOME/seller.sqlite`.
+//! The seller node's durable lifecycle state: `$MAXPLAYER_HOME/seller.sqlite`.
 //!
 //! Opened only by the node (single-owner, guaranteed by the home lock). This SQLite database — in
 //! WAL mode, `synchronous=FULL`, foreign keys on — is the **source of truth** for the seller's
@@ -153,7 +153,7 @@ pub enum Collected {
 }
 
 /// A pending outbox row the publisher must send. `draft` is the FULL event to sign — kind, content,
-/// and every protocol/routing tag (`["v","0"]`, `["t","mobee"]`, the `e`/`p` tags) — so what the
+/// and every protocol/routing tag (`["v","1"]`, `["t","maxplayer"]`, the `e`/`p` tags) — so what the
 /// publisher signs is wire-valid by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxItem {
@@ -1009,7 +1009,7 @@ mod tests {
     fn temp_db(label: &str) -> std::path::PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!(
-            "mobee-seller-store-{label}-{}-{id}.sqlite",
+            "maxplayer-seller-store-{label}-{}-{id}.sqlite",
             std::process::id()
         ))
     }
@@ -1141,11 +1141,11 @@ mod tests {
 
     /// A wire-valid draft carrying the protocol tags every maxplayer event needs.
     fn wire_draft(kind: u16) -> EventDraft {
-        use crate::gateway::{MOBEE_TAG, PROTOCOL_VERSION};
+        use crate::gateway::{MAXPLAYER_TAG, PROTOCOL_VERSION};
         EventDraft::new(
             kind,
             vec![
-                TagSpec::new(["t", MOBEE_TAG]),
+                TagSpec::new(["t", MAXPLAYER_TAG]),
                 TagSpec::new(["v", PROTOCOL_VERSION]),
             ],
             "content",
@@ -1260,13 +1260,13 @@ mod tests {
 
     // TOOTH 2 (charter) — RED ON REVERT for the outbox. `claim_and_enqueue` must write the claim
     // row AND the outbox row atomically. This asserts the outbox MUTATION LANDED (a pending row
-    // carrying the full wire-valid draft — right kind AND the `["v","0"]` + `["t","mobee"]` protocol
+    // carrying the full wire-valid draft — right kind AND the `["v","1"]` + `["t","maxplayer"]` protocol
     // tags a live buyer requires), not merely that no error was returned. Deleting the
     // `enqueue_event` call in `claim_and_enqueue` leaves the claim row but no outbox row, so the
     // length / kind / tag assertions fail — the revert turns this test red.
     #[test]
     fn tooth_outbox_write_lands_atomically_with_the_claim() {
-        use crate::gateway::{JOB_CLAIM_KIND, MOBEE_TAG, PROTOCOL_VERSION};
+        use crate::gateway::{JOB_CLAIM_KIND, MAXPLAYER_TAG, PROTOCOL_VERSION};
         let (store, path) = fresh_store("outbox-redonrevert");
         let job = "j".repeat(64);
         let offer = "o".repeat(64);
@@ -1287,8 +1287,8 @@ mod tests {
         assert_eq!(item.attempts, 0);
         // The enqueued draft is wire-valid: it carries the version + namespace tags parse_offer/
         // the buyer require, so a signed event from it is not rejected on the wire.
-        assert!(has_tag(&item.draft, "v", PROTOCOL_VERSION), "draft must carry [\"v\",\"0\"]");
-        assert!(has_tag(&item.draft, "t", MOBEE_TAG), "draft must carry [\"t\",\"mobee\"]");
+        assert!(has_tag(&item.draft, "v", PROTOCOL_VERSION), "draft must carry [\"v\",\"1\"]");
+        assert!(has_tag(&item.draft, "t", MAXPLAYER_TAG), "draft must carry [\"t\",\"maxplayer\"]");
 
         let row = store.outbox_row(&format!("claim:{job}")).expect("row").expect("exists");
         assert_eq!(row.0, "pending");

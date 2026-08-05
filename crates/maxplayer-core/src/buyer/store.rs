@@ -1,4 +1,4 @@
-//! The buyer's durable application state: `$MOBEE_HOME/buyer.sqlite`.
+//! The buyer's durable application state: `$MAXPLAYER_HOME/buyer.sqlite`.
 //!
 //! Opened only by the daemon (guaranteed single-owner by the home lock). This is
 //! the state home the later phases build on — the reservation ledger, payment

@@ -1,4 +1,4 @@
-//! Distilled memory (Layer 1): `MOBEE_HOME/memory/` — a `MEMORY.md` index plus topic
+//! Distilled memory (Layer 1): `MAXPLAYER_HOME/memory/` — a `MEMORY.md` index plus topic
 //! files (plain markdown, `[[wikilinks]]`), read at job start and written by the seller's own
 //! agent in a post-job retro.
 //!
@@ -15,7 +15,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Sub-directory of `MOBEE_HOME` holding the distilled memory.
+/// Sub-directory of `MAXPLAYER_HOME` holding the distilled memory.
 pub const MEMORY_DIR_NAME: &str = "memory";
 /// Upper bound, in bytes, on the `MEMORY.md` index injected into the job prompt (issue #81).
 /// Steady state is ~1–5 KB and the observed worst case ~10 KB; 16 KiB is generous headroom for a
@@ -80,7 +80,7 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// The memory dir path for a given `MOBEE_HOME` root.
+/// The memory dir path for a given `MAXPLAYER_HOME` root.
 pub fn memory_dir(home_root: &Path) -> PathBuf {
     home_root.join(MEMORY_DIR_NAME)
 }

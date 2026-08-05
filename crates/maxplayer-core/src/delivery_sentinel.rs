@@ -35,10 +35,10 @@
 /// pathspec walk and reads as protocol metadata rather than job output. The node force-stages it
 /// (bypassing any `.gitignore`) so a coincidental or hostile ignore rule can never drop it from the
 /// snapshot — see [`crate::seller_git::snapshot_delivery_at`].
-pub const SENTINEL_FILE: &str = "MOBEE_EXECUTION_SENTINEL";
+pub const SENTINEL_FILE: &str = "MAXPLAYER_EXECUTION_SENTINEL";
 
 /// The non-secret marker that labels the manifest as a v1 execution sentinel. Distinct from #357's
-/// `mobee-probe`/`mobee-selfprobe` prefixes on purpose: those mean a throwaway pre-advertise
+/// `maxplayer-probe`/`maxplayer-selfprobe` prefixes on purpose: those mean a throwaway pre-advertise
 /// capability probe; THIS means a per-job, buyer-verified delivery proof. A grep for either must land
 /// on one meaning.
 pub const SENTINEL_MARKER: &str = "maxplayer-execution-sentinel/v1";

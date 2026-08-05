@@ -1287,7 +1287,7 @@ mod tests {
 
     fn temp_dir_374(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "mobee-sentinel-{label}-{}-{}",
+            "maxplayer-sentinel-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

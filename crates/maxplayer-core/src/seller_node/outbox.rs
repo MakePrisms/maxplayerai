@@ -71,7 +71,7 @@ mod tests {
     fn fresh_store(label: &str) -> (SellerStore, std::path::PathBuf) {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         let path = std::env::temp_dir().join(format!(
-            "mobee-seller-outbox-{label}-{}-{id}.sqlite",
+            "maxplayer-seller-outbox-{label}-{}-{id}.sqlite",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);

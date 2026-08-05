@@ -128,7 +128,7 @@ fn authenticated_fetch_base_succeeds_via_fork_path() {
     let auth = PushAuth {
         secret_key_hex: "22".repeat(32),
     };
-    let branch = "mobee/contribution/relay-auth-itest";
+    let branch = "maxplayer/contribution/relay-auth-itest";
 
     init_contribution_workdir(
         &workdir, &identity, &url, "main", &base_oid, branch,
@@ -186,7 +186,7 @@ fn unauthenticated_fetch_of_protected_repo_fails_closed() {
     // failure, never a success or a pack transfer.
     let err = init_contribution_workdir(
         &workdir, &identity, &url, "main", &base_oid,
-        "mobee/contribution/unauth-itest",
+        "maxplayer/contribution/unauth-itest",
         None,
     )
     .expect_err("fetch of an auth-required repo without credentials must fail closed");
@@ -208,13 +208,13 @@ fn unauthenticated_fetch_of_protected_repo_fails_closed() {
     );
     // And nothing landed locally.
     let probe = Command::new("git")
-        .args(["rev-parse", "--verify", "refs/mobee/base"])
+        .args(["rev-parse", "--verify", "refs/maxplayer/base"])
         .current_dir(&workdir)
         .output()
         .expect("probe base ref");
     assert!(
         !probe.status.success(),
-        "refused fetch must leave no refs/mobee/base"
+        "refused fetch must leave no refs/maxplayer/base"
     );
 
     drop(server);

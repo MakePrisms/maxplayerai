@@ -8,7 +8,7 @@
 //! check fails (agent unresolvable, no mint reachable, seller key missing, relay unreachable),
 //! printing a per-failure fix hint. Pass `--skip-doctor` to bypass the gate (default: checks-on).
 //!
-//! Never accepts `--key` (key stays in `~/.mobee/key`; never argv).
+//! Never accepts `--key` (key stays in `~/.maxplayer/key`; never argv).
 
 use std::io::{self, Write};
 use std::path::PathBuf;
