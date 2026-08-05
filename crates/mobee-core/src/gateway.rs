@@ -608,7 +608,7 @@ pub fn git_result_draft(
     )
 }
 
-/// The protocol-v1 §10 feedback reason-code vocabulary. A `FEEDBACK` carries the code as an
+/// The protocol §10 feedback reason-code vocabulary. A `FEEDBACK` carries the code as an
 /// authoritative `["reason_code", <code>]` tag; `content` stays human-readable and is explanatory
 /// only. A reader MUST treat the tag as authoritative for the class and MUST NOT parse `content` to
 /// determine it; an unrecognised code falls back to the coarse class named by `status` (the code is a
