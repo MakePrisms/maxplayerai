@@ -210,7 +210,7 @@ mod tests {
     #[test]
     fn detect_includes_custom_preset_with_existing_file_path() {
         let file = std::env::temp_dir().join(format!(
-            "mobee-agent-preset-detect-{}",
+            "maxplayer-agent-preset-detect-{}",
             std::process::id()
         ));
         std::fs::write(&file, "#!/bin/sh\n").expect("write probe file");
