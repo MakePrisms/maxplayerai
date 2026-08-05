@@ -317,20 +317,46 @@ doesn't need network. Any launcher works — the daemon just runs `launcher... <
   `agent_command argv must be non-empty`, from the argv validator shared with `agent_command`; the message
   names that field — tracked as #381). It fails loudly, so there is no silent-empty footgun; opt out
   **only** by omitting the section.
-- **Nothing is validated.** The daemon doesn't check that the launcher binary exists, isolates anything, or
-  blocks your secrets. A typo'd or too-permissive launcher gives a false sense of security with zero
-  errors — `launcher = ["env"]` "works" and isolates nothing.
+- **A seat serving the OPEN POOL must be contained, and this is checked at boot.** `maxplayer sell`
+  runs the launcher and reads what it did: a file beside your key must be unreadable from inside it,
+  and the job workdir must be writable. Fail either leg and the seat refuses to start (#451).
+  `launcher = ["env"]` resolves perfectly and confines nothing — it is refused on the second leg,
+  not the first.
+- **Targeted-only seats stay advisory.** Without `claim_open_pool`, the same probe reports as a WARN:
+  you run work from counterparties you accepted, rather than whatever the market posts.
+- **The escape hatch is one flag, and it is narrow on purpose.** `maxplayer sell --unsafe-no-sandbox`
+  serves the open pool uncontained. It waives THIS check only — the relay, mint, key and agent gates
+  stay blocking, so accepting the code-execution exposure never means switching the rest off.
 
 ### Verify before going live
 
-Run the launcher yourself with a probe command and confirm your secrets are unreachable:
+The boot gate runs this for you, but you can run it by hand — it is the same probe, so a green here
+is the thing `sell` will check:
 
 ```sh
-bwrap <your launcher args> -- sh -c 'ls ~/.maxplayer' \
-  && echo "FAIL: secrets reachable" || echo "OK: secrets unreachable"
+maxplayer doctor            # look for: PASS sandbox containment
 ```
 
-Only start selling once the probe cannot see `~/.maxplayer`.
+A launcher that passes has to bind two things: the job tree (`$MAXPLAYER_HOME/seller-jobs`) so the agent
+can work, and the `maxplayer` binary so the probe can run inside it. Binding your whole `MAXPLAYER_HOME`
+fails the probe, correctly — your key is in there. A working shape:
+
+```toml
+[sandbox]
+launcher = ["bwrap",
+  "--unshare-all", "--die-with-parent",
+  "--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin", "--ro-bind", "/lib", "/lib",
+  "--ro-bind", "/path/to/maxplayer", "/path/to/maxplayer",
+  "--bind", "/home/you/.maxplayer/seller-jobs", "/home/you/.maxplayer/seller-jobs",
+  "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+  "--share-net",
+]
+```
+
+★ On some hosts bubblewrap installs cleanly and then FAILS at spawn — `setting up uid map: Permission
+denied`, the AppArmor unprivileged-userns restriction on Ubuntu 24.04. The launcher resolves; it
+confines nothing, because it never runs. The boot gate catches that as an unusable launcher rather
+than passing it, which is the reason it runs the launcher instead of looking for the file.
 
 ---
 

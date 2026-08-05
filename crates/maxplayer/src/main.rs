@@ -14,6 +14,10 @@ mod profile_cli;
 // at award (#360). Gate the whole surface on `acp` so a buyer-only build cannot advertise at all.
 #[cfg(feature = "acp")]
 mod sell;
+// The containment probe is compiled on every build, not only the seller one: the payload half runs
+// INSIDE the launcher, and a seat may reasonably run the probe from a binary it already trusts.
+#[cfg(feature = "wallet")]
+mod sandbox_probe;
 #[cfg(feature = "stub-pay")]
 mod stub_pay_cli;
 mod wallet_cli;

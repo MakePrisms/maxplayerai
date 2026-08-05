@@ -42,6 +42,11 @@ where
         Some("accept") => crate::accept_cli::run(&args[2..], out, err),
         Some("collect") => crate::collect_cli::run(&args[2..], out, err),
         Some("doctor") => crate::doctor::run(&args[2..], out, err),
+        // Run BY the boot gate, inside the configured launcher, to report what the launcher let it
+        // do. Reachable by hand too: an operator debugging a sandbox wants to run exactly what the
+        // gate runs rather than a description of it.
+        #[cfg(feature = "wallet")]
+        Some("sandbox-probe") => crate::sandbox_probe::run(&args[2..], out, err),
         Some("wallet") => crate::wallet_cli::run(&args[2..], out, err),
         Some("profile") => crate::profile_cli::run(&args[2..], out, err),
         Some("whoami") => crate::whoami::run(&args[2..], out, err),
