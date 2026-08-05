@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { classifyClosed, createRelayClient, historyFilter, historyStreams, liveFilters } from "../js/relay.js";
-import { MOBEE_TAG, OFFER } from "../js/kinds.js";
+import { MAXPLAYER_TAG, OFFER } from "../js/kinds.js";
 
 /** A scriptable stand-in for a relay socket. */
 function fakeSocket() {
@@ -45,12 +45,12 @@ test("classifyClosed separates our own CLOSE ack from a real refusal", () => {
   assert.equal(classifyClosed("", false), "unknown");
 });
 
-test("history requests carry the mobee tag filter and page limits", () => {
+test("history requests carry the maxplayer tag filter and page limits", () => {
   const [tagged, untagged] = historyStreams();
-  assert.deepEqual(tagged.filter["#t"], [MOBEE_TAG]);
+  assert.deepEqual(tagged.filter["#t"], [MAXPLAYER_TAG]);
   assert.ok(tagged.filter.limit > 0);
   assert.equal(historyFilter(tagged, null).until, undefined);
-  assert.equal(untagged.filter["#t"], undefined, "the handler advert carries no mobee tag");
+  assert.equal(untagged.filter["#t"], undefined, "the handler advert carries no maxplayer tag");
   assert.equal(historyFilter(tagged, 1234).until, 1234);
 });
 

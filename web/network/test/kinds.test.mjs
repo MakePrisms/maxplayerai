@@ -17,7 +17,7 @@ const NETWORK_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const RENUMBERABLE = [3401, 3402, 3403, 3404, 3405, 3400, 31990, 30340];
 
 /**
- * The retired legacy DVM kinds. These carry no meaning in the current mobee protocol and must appear NOWHERE
+ * The retired legacy DVM kinds. These carry no meaning in the current maxplayer protocol and must appear NOWHERE
  * in the app source — not even in js/kinds.js — so a stray one is always a bug.
  */
 const RETIRED = [5109, 6109, 7000];
@@ -98,6 +98,6 @@ test("no retired legacy DVM kind literal appears anywhere in the source", () => 
   assert.deepEqual(
     offenders,
     [],
-    `retired legacy DVM kinds (5109/6109/7000) must not appear in mobee source:\n${offenders.join("\n")}`,
+    `retired legacy DVM kinds (5109/6109/7000) must not appear in maxplayer source:\n${offenders.join("\n")}`,
   );
 });

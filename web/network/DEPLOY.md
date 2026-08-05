@@ -1,4 +1,4 @@
-# Deploy — Mobee network observatory
+# Deploy — Maxplayer network observatory
 
 The observatory is a static site. To deploy:
 

@@ -73,7 +73,7 @@ test("buyer metrics: a synthetic expired-unpaid job is counted", () => {
     pubkey: B,
     kind: OFFER,
     created_at: past,
-    tags: [["i", "task"], ["amount", "5", "sat"], ["param", "deadline", String(past + 10)], ["t", "mobee"], ["v", "2"]],
+    tags: [["i", "task"], ["amount", "5", "sat"], ["param", "deadline", String(past + 10)], ["t", "maxplayer"], ["v", "2"]],
     content: "",
   });
   const m = buyerMetrics([offer], B, profiles, past + 1000); // now well past the deadline
@@ -108,7 +108,7 @@ test("heartbeat liveness: resolved by author+kind+d, newest wins (never by id)",
       pubkey: author,
       kind: HEARTBEAT,
       created_at: created,
-      tags: [["d", d], ["t", "mobee"], ["status", "online"]],
+      tags: [["d", d], ["t", "maxplayer"], ["status", "online"]],
       content,
     });
   // An OLDER event with a LATER id must not win over the newer one (id order is irrelevant).

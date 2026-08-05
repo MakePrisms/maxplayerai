@@ -75,7 +75,7 @@ store.ingest(
     tags: [
       ["i", "task"],
       ["amount", "21", "sat"],
-      ["t", "mobee"],
+      ["t", "maxplayer"],
       ["v", "2"],
     ],
     content: "",
@@ -199,7 +199,7 @@ store.ingest(
     tags: [
       ["status", "processing"],
       ["e", offerId],
-      ["t", "mobee"],
+      ["t", "maxplayer"],
       ["v", "2"],
     ],
     content: "",
@@ -214,7 +214,7 @@ store.ingest(
     tags: [
       ["e", offerId, "", "root"],
       ["amount", "21", "sat"],
-      ["t", "mobee"],
+      ["t", "maxplayer"],
       ["v", "2"],
     ],
     content: "done",
@@ -281,7 +281,7 @@ const older = ok({
   tags: [
     ["i", "task"],
     ["amount", "1", "sat"],
-    ["t", "mobee"],
+    ["t", "maxplayer"],
     ["v", "2"],
   ],
   content: "",
@@ -294,7 +294,7 @@ const newer = ok({
   tags: [
     ["i", "task"],
     ["amount", "1", "sat"],
-    ["t", "mobee"],
+    ["t", "maxplayer"],
     ["v", "2"],
   ],
   content: "",
@@ -328,7 +328,7 @@ const untaggedResult = ok({
   tags: [
     ["e", offerId, "", "root"],
     ["amount", "21", "sat"],
-    ["t", "mobee"],
+    ["t", "maxplayer"],
     ["v", "2"],
   ],
   content: "delivery commit abcdef0123",
@@ -367,7 +367,7 @@ const taggedResult = ok({
     ["tokens", "4096", "cache_read"],
     ["cost", "0.0123", "usd", "harness-reported-usd"],
     ["wall_time", "4321", "ms"],
-    ["t", "mobee"],
+    ["t", "maxplayer"],
     ["v", "2"],
   ],
   content: "delivery commit abcdef0123",
