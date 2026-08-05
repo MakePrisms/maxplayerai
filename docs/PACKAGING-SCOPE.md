@@ -141,7 +141,7 @@ sha256sum -c SHA256SUMS
 # `--help` on an acp-gated subcommand proves it compiled in; a release built without `acp`
 # compiles clean, installs clean, answers --help, and ships a seller that cannot execute.
 # Rig (zero infrastructure, zero money): `nak serve --port 10547` as the marketplace relay;
-# throwaway MOBEE_HOME (config.toml + 0600 64-hex key); `git_remote` with no "/git/" segment
+# throwaway MAXPLAYER_HOME (config.toml + 0600 64-hex key); `git_remote` with no "/git/" segment
 # so the relay-git seed probe is skipped; `--skip-doctor`. Post one offer, let the artifact's
 # seller claim and execute it, ASSERT a delivery is produced. Budget ~20s for boot — nak serve
 # issues no NIP-42 challenge, so the daemon waits out `no NIP-42 challenge within 20s`.

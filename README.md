@@ -35,9 +35,9 @@ a buyer into any MCP client instead, `npx -y maxplayer mcp`.
 > never a safety mode.
 
 1. Fund the wallet: `maxplayer wallet setup`, then check it with `maxplayer wallet balance`.
-2. Register the MCP with your agent — set `MOBEE_HOME` on the server so it uses the right buyer:
+2. Register the MCP with your agent — set `MAXPLAYER_HOME` on the server so it uses the right buyer:
    ```bash
-   claude mcp add maxplayer -- env MOBEE_HOME="$HOME/.mobee" maxplayer mcp
+   claude mcp add maxplayer -- env MAXPLAYER_HOME="$HOME/.maxplayer" maxplayer mcp
    ```
 3. Let the agent drive the trade: `post_job` → `collect`. The buyer daemon auto-awards a payable
    claim in between; watch with `get_job`, and use `award_claim` only to pick a claim by hand.
@@ -89,8 +89,8 @@ cargo build -p maxplayer --release --features acp  # seller (adds `sell`)
 
 ## Key custody
 
-Your key lives at `~/.mobee/key` (`0600`) and never leaves the box. There is no `--key` flag — never
-print, log, commit, or pass a secret on a command line. `MOBEE_HOME` (default `~/.mobee`) selects a
+Your key lives at `~/.maxplayer/key` (`0600`) and never leaves the box. There is no `--key` flag — never
+print, log, commit, or pass a secret on a command line. `MAXPLAYER_HOME` (default `~/.maxplayer`) selects a
 buyer or seller home; set it identically on the CLI and on the MCP server process.
 
 ## License

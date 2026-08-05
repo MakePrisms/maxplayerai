@@ -58,8 +58,8 @@ TARGET_MINT="${TARGET_MINT:-}"         # the mint the seller accepts — MUST di
 MAXPLAYER="${MAXPLAYER:-/srv/forge/workspaces/.crossmint-target/release/maxplayer}"
 RUN_DIR="${RUN_DIR:-/tmp/crossmint-smoke-run}"
 
-# The marker that makes a directory a legitimate target. Bootstrap WRITES into MOBEE_HOME, and an
-# unset MOBEE_HOME falls back to ~/.mobee — a real home with a real key and wallet. So no maxplayer
+# The marker that makes a directory a legitimate target. Bootstrap WRITES into MAXPLAYER_HOME, and an
+# unset MAXPLAYER_HOME falls back to ~/.maxplayer — a real home with a real key and wallet. So no maxplayer
 # command in this script is reachable except through maxplayer_at(), which refuses any directory this
 # run did not itself create and mark.
 MARKER=".crossmint-smoke-throwaway"
@@ -172,28 +172,28 @@ no $MARKER, so this tooling did not create it."
 }
 
 assert_throwaway() { # <path>
-    [ -n "${1:-}" ] || die "MOBEE_HOME is empty — refusing (an unset home falls back to ~/.mobee)"
+    [ -n "${1:-}" ] || die "MAXPLAYER_HOME is empty — refusing (an unset home falls back to ~/.maxplayer)"
     [ -d "$1" ]     || die "not a directory: $1"
     [ -f "$1/$MARKER" ] || die "refusing to touch $1: no $MARKER. This run did not create it, so it
 may be a real funded home. Every maxplayer invocation is gated on this marker precisely because an
-unset or wrong MOBEE_HOME resolves to ~/.mobee, which holds a real key and wallet."
+unset or wrong MAXPLAYER_HOME resolves to ~/.maxplayer, which holds a real key and wallet."
     case "$(cd "$1" && pwd -P)" in
-        "$HOME/.mobee"|"$HOME/.mobee/"*) die "refusing: $1 resolves into ~/.mobee" ;;
+        "$HOME/.maxplayer"|"$HOME/.maxplayer/"*) die "refusing: $1 resolves into ~/.maxplayer" ;;
     esac
 }
 
-# The ONLY way this script invokes maxplayer. Asserts the marker, then exports MOBEE_HOME explicitly so
+# The ONLY way this script invokes maxplayer. Asserts the marker, then exports MAXPLAYER_HOME explicitly so
 # the fallback path is never reachable even if a caller forgets.
 maxplayer_at() { # <home> <args...>
     local home="$1"; shift
     assert_throwaway "$home"
-    MOBEE_HOME="$home" "$MAXPLAYER" "$@" --home "$home"
+    MAXPLAYER_HOME="$home" "$MAXPLAYER" "$@" --home "$home"
 }
-# Same, for the non-wallet commands that take no --home flag and read MOBEE_HOME from the env.
+# Same, for the non-wallet commands that take no --home flag and read MAXPLAYER_HOME from the env.
 maxplayer_env() { # <home> <args...>
     local home="$1"; shift
     assert_throwaway "$home"
-    MOBEE_HOME="$home" "$MAXPLAYER" "$@"
+    MAXPLAYER_HOME="$home" "$MAXPLAYER" "$@"
 }
 
 # ── Authorization ───────────────────────────────────────────────────────────────────────────────
@@ -343,7 +343,7 @@ unpaid. STOP HERE and report. Do not run mint-complete."
 ${TARGET_MINT} failed for quote ${quote_id}. The money left the source and is not yet ecash at the
 target. It is RECOVERABLE and no sats are lost — re-run exactly:
 
-  MOBEE_HOME=${home} MAXPLAYER_ALLOW_REAL_MINTS=true MAXPLAYER_ACCEPTED_MINTS=${SOURCE_MINT} \\
+  MAXPLAYER_HOME=${home} MAXPLAYER_ALLOW_REAL_MINTS=true MAXPLAYER_ACCEPTED_MINTS=${SOURCE_MINT} \\
   MAXPLAYER_EXTRA_MINTS=${TARGET_MINT} ${MAXPLAYER} wallet mint-complete ${quote_id} \\
   --amount ${PROBE_SATS} --mint ${TARGET_MINT} --home ${home}
 
@@ -395,7 +395,7 @@ remove: the previous version of this file invoked eleven commands that do not ex
 of them returned rc=1 against the real binary.
 
 What Stage B requires, all verified against the merged tree:
-  - buyer:  post_job over the daemon socket (\$MOBEE_HOME/buyer.sock, newline-delimited JSON;
+  - buyer:  post_job over the daemon socket (\$MAXPLAYER_HOME/buyer.sock, newline-delimited JSON;
             methods status|post_job|get_job|award|collect). There is NO 'maxplayer job' CLI.
             'maxplayer collect <job_id>' auto-spawns the daemon, so no manual daemon step is needed.
   - seller: a throwaway seller home with MAXPLAYER_SELLER__AGENT_COMMAND / __RATE_SATS / __GIT_REMOTE,
@@ -421,7 +421,7 @@ dry_run() {
     fi
     say "  refused an unmarked home"
     if ( assert_throwaway "" 2>/dev/null ); then die "GATE BROKEN: empty home accepted"; fi
-    say "  refused an empty MOBEE_HOME (the ~/.mobee fallback path)"
+    say "  refused an empty MAXPLAYER_HOME (the ~/.maxplayer fallback path)"
 
     rule "fund on testnut"
     maxplayer_at "$home" wallet mint 5 2>&1 | command head -2

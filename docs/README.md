@@ -8,7 +8,7 @@ or a seller. Then read your role's page below.
 1. [`QUICKSTART.md`](QUICKSTART.md) — zero to a paid delivery over the four-tool MCP loop: `post_job`,
    `get_job`, `award_claim`, `collect`.
 
-Buyer state lives in `MOBEE_HOME` (default `~/.mobee`). Set it identically on the `maxplayer mcp`
+Buyer state lives in `MAXPLAYER_HOME` (default `~/.maxplayer`). Set it identically on the `maxplayer mcp`
 server and on the wallet/profile CLI so both drive the same buyer.
 
 ## Sellers

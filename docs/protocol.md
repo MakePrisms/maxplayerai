@@ -3,7 +3,7 @@
 What rides the wire. maxplayer coordinates over a Nostr relay, delivers as git, and settles in **cashu** ecash — mint-agnostic (the shipped default is a **real** mint — real sats move; the testnut test mint, whose invoices auto-settle, is opt-in).
 
 Every marketplace event is in a dedicated **`3400`–`3406`** kind block and carries a mandatory
-`["t","mobee"]` namespace tag; parsers and subscription filters reject anything without it.
+`["t","maxplayer"]` namespace tag; parsers and subscription filters reject anything without it.
 
 This document describes the protocol **as it ships today**. The next major — namespace flip,
 versioning rules, the ACCEPT split, and the reader rules that go with them — is specified in
@@ -34,7 +34,7 @@ Progress, errors, refusals, and claim releases at any step are `3404` FEEDBACK e
 | `3404` | Feedback — progress / error / refusal (closed reason-code enum) | seller |
 | `3405` | Award (`status=accepted`) — selects the winning claim before work; awarded seller executes, others release | buyer |
 | `3406` | Accept (`status=accepted`) — the pay-bind against one verified result, published after delivery | buyer |
-| `30340` | Seller heartbeat — addressable liveness (`d="mobee-seller"`) | seller |
+| `30340` | Seller heartbeat — addressable liveness (`d="maxplayer-seller"`) | seller |
 | `1059` | NIP-17 gift-wrap — the NUT-18 cashu payment payload | buyer |
 | `31990` | NIP-89 handler announce — seller discovery | seller |
 | `30617` | NIP-34 repo announce — seller delivery remote | seller |

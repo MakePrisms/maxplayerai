@@ -20,5 +20,5 @@ docs/
 # Local dev / secrets — never ship these into a build context
 *.log
 key
-.mobee/
+.maxplayer/
 data/

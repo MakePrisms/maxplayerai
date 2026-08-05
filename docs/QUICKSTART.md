@@ -17,21 +17,21 @@ MAXPLAYER_BIN="$(pwd)/target/release/maxplayer"
 
 ## 2. Choose the buyer home
 
-`MOBEE_HOME` is the directory where maxplayer keeps one buyer's configuration, key, wallet state,
-budget state, and collected results. It defaults to `~/.mobee`.
+`MAXPLAYER_HOME` is the directory where maxplayer keeps one buyer's configuration, key, wallet state,
+budget state, and collected results. It defaults to `~/.maxplayer`.
 
 Set it on every buyer CLI command and, importantly, on the MCP server process to make them operate
 on the same buyer:
 
 ```bash
-export MOBEE_HOME="$HOME/.mobee"
+export MAXPLAYER_HOME="$HOME/.maxplayer"
 "$MAXPLAYER_BIN" wallet setup
 ```
 
 To use a different buyer, choose a different absolute directory:
 
 ```bash
-export MOBEE_HOME="/absolute/path/to/a-buyer-home"
+export MAXPLAYER_HOME="/absolute/path/to/a-buyer-home"
 "$MAXPLAYER_BIN" wallet setup
 ```
 
@@ -52,18 +52,18 @@ The wallet and profile are managed through the CLI. For example, inspect funds w
 
 ## 3. Add the MCP to your agent
 
-`maxplayer mcp` is a stdio MCP server. Its command has no `--home` option, so set `MOBEE_HOME` in the
+`maxplayer mcp` is a stdio MCP server. Its command has no `--home` option, so set `MAXPLAYER_HOME` in the
 server's environment. Registering `env` as part of the server command makes the selected home
 unambiguous even when the MCP client starts it later:
 
 ```bash
-claude mcp add maxplayer -- env MOBEE_HOME="$MOBEE_HOME" "$MAXPLAYER_BIN" mcp
+claude mcp add maxplayer -- env MAXPLAYER_HOME="$MAXPLAYER_HOME" "$MAXPLAYER_BIN" mcp
 ```
 
 For another MCP client, configure the equivalent command and arguments:
 
 ```text
-env MOBEE_HOME=/absolute/path/to/a-buyer-home /absolute/path/to/maxplayer mcp
+env MAXPLAYER_HOME=/absolute/path/to/a-buyer-home /absolute/path/to/maxplayer mcp
 ```
 
 On first use maxplayer creates the selected home if necessary, including `config.toml` and an
@@ -86,7 +86,7 @@ The buyer MCP exposes exactly these four tools, as registered in
 4. **`collect`** — after the awarded seller delivers, accept and pay in one call. It verifies that
    the delivered branch tips at the accepted commit, verifies the seller's co-signature, applies
    the budget gate, pays once, and writes the paid files below
-   `$MOBEE_HOME/results/<job_id>`. Repeating it for an already-paid job does not pay twice.
+   `$MAXPLAYER_HOME/results/<job_id>`. Repeating it for an already-paid job does not pay twice.
 
 In practice: `post_job`, then `collect` once the delivery lands — the daemon auto-awards a payable
 claim in between (use `get_job` to watch, and `award_claim` only to pick the claim by hand). Wallet
