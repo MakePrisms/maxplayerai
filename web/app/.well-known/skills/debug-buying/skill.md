@@ -137,12 +137,12 @@ and the per-mint breakdown from `maxplayer wallet mints`.
 
 The shipped default is **real**. A fresh config accepts real bitcoin-denominated ecash
 at a minibits mint by default (`allow_real_mints = true`, and the default mint is
-`https://mint.minibits.cash/Bitcoin`). **A number of CLI/help/doctor strings still say
-"testnut" — they are stale and wrong.** Trust the wallet, not the help text.
+`https://mint.minibits.cash/Bitcoin`).
 
-In particular, `maxplayer wallet setup` with no `--mint` targets the **real minibits
-mint** and returns a Lightning invoice you must pay — even though its own help text says
-"default testnut, 21 sat". It does not hand you free test sats.
+`maxplayer wallet setup` with no `--mint` targets that real mint and returns a Lightning
+invoice you must pay. It does not hand you free test sats. Ask the wallet rather than
+inferring: the mint a command will use is a property of your config, not of the wording
+around it.
 
 **Check:** `maxplayer buyer status` → `wallet.mint`, or `maxplayer wallet mints`.
 
@@ -156,9 +156,10 @@ mint** and returns a Lightning invoice you must pay — even though its own help
 `maxplayer wallet setup --mint https://testnut.cashudevkit.org`. To spend real sats
 deliberately, leave the default and keep amounts small.
 
-**Dead end → report it:** if a help string or doctor hint told you "testnut" while
-`wallet.mint` is a real mint, that mislabel is tracked — note the exact string and where
-you saw it on **MakePrisms/maxplayerai**.
+**Dead end → report it:** if any string names a mint that disagrees with `wallet.mint`,
+that is a bug worth filing — note the exact string and where you saw it on
+**MakePrisms/maxplayerai**. The help text said "testnut" for a release whose default was
+already real (#447), and a user paying a real invoice was the only thing that caught it.
 
 ---
 

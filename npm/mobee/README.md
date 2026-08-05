@@ -41,8 +41,10 @@ downloads one platform rather than all of them:
 |---|---|
 | linux-x64 | `@maxplayerai/linux-x64` |
 | linux-arm64 | `@maxplayerai/linux-arm64` |
+| darwin-arm64 | `@maxplayerai/darwin-arm64` |
 
-Other platforms are not published yet, and the shim says so rather than failing obscurely.
+Other platforms — Intel macs and Windows among them — are not published, and the shim says so rather
+than failing obscurely.
 
 Because the binary arrives as a dependency instead of a `postinstall` download, installs work under
 `--ignore-scripts`.

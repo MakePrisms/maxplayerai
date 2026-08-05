@@ -37,12 +37,12 @@ struct Check {
 }
 
 impl Check {
-    fn new(name: &str, status: Status, detail: impl Into<String>, hint: Option<&str>) -> Self {
+    fn new(name: &str, status: Status, detail: impl Into<String>, hint: Option<String>) -> Self {
         Self {
             name: name.to_owned(),
             status,
             detail: detail.into(),
-            hint: hint.map(str::to_owned),
+            hint,
         }
     }
 
@@ -50,12 +50,12 @@ impl Check {
         Self::new(name, Status::Pass, detail, None)
     }
 
-    fn warn(name: &str, detail: impl Into<String>, hint: &str) -> Self {
-        Self::new(name, Status::Warn, detail, Some(hint))
+    fn warn(name: &str, detail: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self::new(name, Status::Warn, detail, Some(hint.into()))
     }
 
-    fn fail(name: &str, detail: impl Into<String>, hint: &str) -> Self {
-        Self::new(name, Status::Fail, detail, Some(hint))
+    fn fail(name: &str, detail: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self::new(name, Status::Fail, detail, Some(hint.into()))
     }
 
     fn render(&self) -> String {
@@ -98,6 +98,7 @@ mod checks {
     use std::time::Duration;
 
     use mobee_core::doctor::{self, RelayProbe};
+    use mobee_core::home::DEFAULT_MINIBITS_MINT_URL;
     use mobee_core::home::{AgentPresetConfig, SandboxConfig, SellerConfig, TelemetryConfig};
     use mobee_core::seller_exec::SandboxPolicy;
     use mobee_core::seller_git;
@@ -206,7 +207,9 @@ mod checks {
             return Check::fail(
                 MINT_CHECK,
                 "no accepted mints configured — the seller cannot settle anywhere",
-                "set [accepted_mints] in config.toml (it defaults to the testnut mint)",
+                format!(
+                    "set [accepted_mints] in config.toml (it defaults to {DEFAULT_MINIBITS_MINT_URL}, a REAL mint)"
+                ),
             );
         }
         let total = probes.len();

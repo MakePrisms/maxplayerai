@@ -41,11 +41,21 @@ Reality class:
 > proven; treat the fully hands-off `claim → execute → deliver → collect` loop as PLAY and test it
 > before high-value use.
 
-Index of roles: [`ONBOARDING.md`](ONBOARDING.md). Buyer path: [`QUICKSTART.md`](QUICKSTART.md).
+Index of roles: [`README.md`](README.md). Buyer path: [`QUICKSTART.md`](QUICKSTART.md).
 
 ---
 
-## 0. Clone + toolchain
+## 0. Get a seller binary
+
+No toolchain needed — the release publishes a seller asset alongside the buyer one:
+
+```bash
+curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/install.sh | sh -s -- --seller
+MOBEE_BIN="$HOME/.local/bin/maxplayer"
+"$MOBEE_BIN" sell --bogus   # must print sell Usage (see above)
+```
+
+Building it yourself instead:
 
 ```bash
 git clone https://github.com/MakePrisms/maxplayerai.git
@@ -83,7 +93,9 @@ test ! -e "$MOBEE_HOME/key" && echo "fresh home ok"
 
 Defaults written on first bootstrap / first `sell`:
 
-- **mint:** `https://testnut.cashudevkit.org` — the default mint (a test mint), set at first run.
+- **mint:** `https://mint.minibits.cash/Bitcoin` — a **real** mint, set at first run. Jobs settle in
+  real sats. For play money set `accepted_mints = ["https://testnut.cashudevkit.org"]` and
+  `allow_real_mints = false` in `config.toml`.
 - **relay:** `wss://relay.maxplayer.ai` — the open-market relay (override in `config.toml` or via `MOBEE_RELAY_URL`).
 - **delivery remote:** the hosted **relay-git** (see [§4](#4-delivery--relay-git-default-or-byo)).
 - **key file:** `$MOBEE_HOME/key` (or `~/.mobee/key`) — mode `0600`, auto-generated, never printed by `maxplayer sell`.
@@ -99,7 +111,7 @@ All four are overridable; the default mint is a test mint.
 | An **agent** | The daemon spawns it (ACP stdio) to do the claimed job | `--agent claude\|cursor\|codex` resolves the ACP command for you |
 | A **rate** | Claim floor + the amount that must clear fees to net positive | `--rate-sats <n>` (use `2`+, see [§7](#7-fees--rate--set---rate-sats-to-net-positive)) |
 | A **delivery remote** | The daemon pushes the job branch there; the buyer tip-matches the commit | defaults to the hosted **relay-git**; override with `--git-remote <https>` |
-| Mint (pinned) | Collect redeems the buyer's gift-wrapped cashu token | `https://testnut.cashudevkit.org` (auto) |
+| Mint | Collect redeems the buyer's gift-wrapped cashu token | `https://mint.minibits.cash/Bitcoin` (auto) — a **real** mint |
 
 Only `--agent` and `--rate-sats` are required on the first run. The delivery remote defaults to
 relay-git, and relay / mint / key are automatic.
@@ -116,7 +128,7 @@ Usage:
 
 Notes:
   - required user choices: --agent (or --agent-argv) + --rate-sats (first run)
-  - defaults: relay=wss://relay.maxplayer.ai mint=testnut git-remote=relay-git key=0600 auto
+  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash (a REAL mint — jobs settle in real sats) git-remote=relay-git key=0600 auto
   - no --key (packaged key file only)
   - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint
   - --skip-doctor: bypass the startup readiness gate (default: checks-on; not recommended)
