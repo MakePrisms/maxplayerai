@@ -359,7 +359,7 @@ jobs:
           PRERELEASE: ${{ needs.plan.outputs.prerelease }}
           # Every platform whose payload package is published. Adding a platform package under npm/
           # without adding it here is caught below rather than silently never shipping.
-          RELEASE_PLATFORMS: linux-x64 linux-arm64
+          RELEASE_PLATFORMS: linux-x64 linux-arm64 darwin-arm64
         run: |
           set -euo pipefail
 
@@ -371,6 +371,25 @@ jobs:
             case " $RELEASE_PLATFORMS " in
               *" $platform "*) ;;
               *) echo "npm/$(basename "$dir") exists but $platform is not in RELEASE_PLATFORMS — add it or the launcher will pin an unpublished package" >&2; exit 1 ;;
+            esac
+          done
+
+          # The other direction, and the one that shipped #446: a platform the release BUILDS with no
+          # npm payload behind it. The two lists — what the build matrix produces and what npm
+          # publishes — were independent, so darwin could be a first-class release artifact for two
+          # releases while `npm i maxplayer` answered "no binary for darwin-arm64" on every mac. The
+          # buyer assets in dist are the authority; nothing else here knows what was actually built.
+          #
+          # `maxplayer-$VERSION-*` cannot match a seller asset: those carry `-seller` before the
+          # version.
+          for asset in dist/maxplayer-"$VERSION"-*.tar.gz; do
+            # An unmatched glob arrives as the literal pattern, and this loop would then report a
+            # platform named `*` rather than the download having produced nothing.
+            [ -f "$asset" ] || { echo "no buyer assets in dist — nothing was downloaded to publish from" >&2; exit 1; }
+            platform="$(basename "$asset" .tar.gz)"; platform="${platform#maxplayer-$VERSION-}"
+            case " $RELEASE_PLATFORMS " in
+              *" $platform "*) ;;
+              *) echo "the release builds a $platform buyer artifact but publishes no npm payload for it — add npm/cli-$platform and $platform to RELEASE_PLATFORMS, or state here why that platform is archive-only" >&2; exit 1 ;;
             esac
           done
 
