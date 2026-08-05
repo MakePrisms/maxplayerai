@@ -38,7 +38,7 @@ use cdk::wallet::Wallet;
 
 use crate::buyer_fund;
 use crate::crossmint::{HopCost, HopJournal};
-use crate::home::MobeeHome;
+use crate::home::MaxplayerHome;
 use crate::payment_wallet::MINT_TOUCH_TIMEOUT;
 
 /// What the source mint says about the melt leg.
@@ -562,7 +562,7 @@ pub(crate) struct CdkHopEffects {
 impl CdkHopEffects {
     /// Open the buyer's wallet at both mints. One sqlite store, two bound mints.
     pub(crate) async fn open(
-        home: &MobeeHome,
+        home: &MaxplayerHome,
         source_mint: &str,
         target_mint: &str,
     ) -> Result<Self, HopError> {
@@ -781,7 +781,7 @@ pub struct SweptHop {
 }
 
 /// The directory a home keeps its hop pairings in.
-pub fn hop_journal_dir(home: &MobeeHome) -> PathBuf {
+pub fn hop_journal_dir(home: &MaxplayerHome) -> PathBuf {
     home.root.join("crossmint-journal")
 }
 
@@ -799,7 +799,7 @@ pub fn hop_journal_dir(home: &MobeeHome) -> PathBuf {
 /// Every hop is attempted independently, and a hop that cannot be finished says so on stderr rather
 /// than being dropped from the report — including a hop whose mints the fence no longer admits,
 /// which is stuck by design but must not be stuck in silence.
-pub async fn sweep_hops(home: &MobeeHome) -> Result<Vec<SweptHop>, HopError> {
+pub async fn sweep_hops(home: &MaxplayerHome) -> Result<Vec<SweptHop>, HopError> {
     let store = FsHopJournal::new(hop_journal_dir(home));
     let mut swept = Vec::new();
     for attempt_id in store.attempt_ids()? {
@@ -849,7 +849,7 @@ fn require_both_mints_recovered(
 }
 
 async fn sweep_one(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     store: &FsHopJournal,
     pairing: HopJournal,
 ) -> Result<HopSettled, HopError> {

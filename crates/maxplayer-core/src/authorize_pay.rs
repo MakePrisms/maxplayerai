@@ -20,7 +20,7 @@ use crate::crossmint_hop::{self, CdkHopEffects, FsHopJournal, HopError};
 use crate::delivery::{CommitOid, DeliveryError, GitDelivery};
 use crate::delivery_git::PayPathDeliveryVerifier;
 use crate::gateway;
-use crate::home::{self, MobeeHome};
+use crate::home::{self, MaxplayerHome};
 use crate::payment::{
     DeliveryIntegrityHash, EffectError, FsPaymentJournal, JobHash, JobId, PaymentError, PaymentKey,
     PaymentService, PaymentState, PaymentTerms, ReceiptAuthority, ReceiptEvidence, ResultId,
@@ -252,7 +252,7 @@ impl From<HopError> for AuthorizePayError {
 /// class and refuses fail-closed; a bind-built request resolves it at accept). A new caller
 /// that skips this check reopens the gate bypass this contract exists to prevent.
 pub async fn authorize_pay_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     gate: &mut BudgetGate,
     request: AuthorizePayRequest,
 ) -> Result<AuthorizePayOutcome, AuthorizePayError> {
@@ -619,7 +619,7 @@ fn delivery_tree_carries_sentinel(
 /// `no_sentinel`) from a buyer-side verify error, so reputation does not misattribute the latter to
 /// the seller. Best-effort: a journal write that itself fails is logged, never converted into a spend
 /// — the refusal already stands on the returned error.
-fn journal_sentinel_refusal(home: &MobeeHome, job_id: &str, commit_oid: &str, class: &str) {
+fn journal_sentinel_refusal(home: &MaxplayerHome, job_id: &str, commit_oid: &str, class: &str) {
     let dir = home.root.join("sentinel-refusals");
     if let Err(error) = std::fs::create_dir_all(&dir) {
         eprintln!("authorize_pay: sentinel-refusal journal dir failed (continuing): {error}");
@@ -660,7 +660,7 @@ fn journal_sentinel_refusal(home: &MobeeHome, job_id: &str, commit_oid: &str, cl
 /// NEVER wired into boot or the settle watcher — the only caller is the explicit
 /// `maxplayer wallet complete-locked` CLI subcommand.
 pub async fn complete_recovered_locked_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     gate: &mut BudgetGate,
     request: CompleteLockedRequest,
 ) -> Result<CompleteLockedOutcome, AuthorizePayError> {
@@ -746,7 +746,7 @@ pub async fn complete_recovered_locked_async(
 
 /// Resolve the buyer's content policy hook from `[contribution]` config, or the
 /// FLOOR (refuse only empty diffs) when unconfigured. Buyer-side; never seller-influenced.
-fn contribution_policy(home: &MobeeHome) -> crate::contribution::ContentPolicy {
+fn contribution_policy(home: &MaxplayerHome) -> crate::contribution::ContentPolicy {
     match &home.config.contribution {
         Some(cfg) => crate::contribution::ContentPolicy {
             allowed_paths: cfg.allowed_paths.clone(),
@@ -766,7 +766,7 @@ fn contribution_policy(home: &MobeeHome) -> crate::contribution::ContentPolicy {
 /// Taking the mint from the sealed terms keeps the wallet, the attempt id, and the send all on one
 /// mint. `home` is passed so the already-fenced invariant is asserted at this seam (the realized
 /// mint was fenced while planning; `open_wallet_at_mint_async` re-checks, redundant-safe).
-pub(crate) fn wallet_open_mint_url(home: &MobeeHome, terms: &PaymentTerms) -> String {
+pub(crate) fn wallet_open_mint_url(home: &MaxplayerHome, terms: &PaymentTerms) -> String {
     let mint_url = terms.mint.to_string();
     debug_assert!(
         crate::home::mint_allowed(&mint_url, home.config.allow_real_mints),
@@ -844,7 +844,7 @@ struct DerivedPayment {
 /// the live default.
 #[allow(clippy::too_many_arguments)]
 fn derive_payment(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     job_id: &str,
     result_id: &str,
     delivery_integrity_hash: &str,
@@ -1263,7 +1263,7 @@ mod tests {
     // dispatch's own runtime provides in production. Lets the sync `#[test]` cases drive the async
     // authorize path directly.
     fn authorize_pay_blocking(
-        home: &MobeeHome,
+        home: &MaxplayerHome,
         gate: &mut BudgetGate,
         request: AuthorizePayRequest,
     ) -> Result<AuthorizePayOutcome, AuthorizePayError> {
@@ -1796,7 +1796,7 @@ mod tests {
     }
 
     fn prepay_preimage(
-        home: &MobeeHome,
+        home: &MaxplayerHome,
         job_id: &str,
         result_id: &str,
         job_hash: &str,
@@ -1825,7 +1825,7 @@ mod tests {
         receipt_preimage_for(&key, &hex, &hex, DeliveryKind::Fork)
     }
 
-    fn seller_cosig(home: &MobeeHome, preimage: &ReceiptPreimage) -> String {
+    fn seller_cosig(home: &MaxplayerHome, preimage: &ReceiptPreimage) -> String {
         let secret = home::read_secret_key_hex(home).expect("secret");
         let keys = Keys::parse(&secret).expect("keys");
         keys.sign_schnorr(&Message::from_digest(preimage.digest_bytes()))

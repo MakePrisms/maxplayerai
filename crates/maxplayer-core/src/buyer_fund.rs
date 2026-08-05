@@ -1,6 +1,6 @@
 //! Buyer wallet setup for packaged `~/.mobee`: open the CDK wallet at a mint, derive its seed from
 //! the nostr secret, and read its balance. The wallet opens at the configured mint
-//! ([`crate::home::MobeeConfig::default_mint`]) or at an explicit realized mint
+//! ([`crate::home::MaxplayerConfig::default_mint`]) or at an explicit realized mint
 //! ([`open_wallet_at_mint_async`]); the real-mint fence gates non-testnut mints.
 //!
 //! Funding a wallet (mint quote → surface the bolt11 invoice → wait for payment → mint) lives in
@@ -15,7 +15,7 @@ use cdk::wallet::Wallet;
 use cdk_sqlite::wallet::WalletSqliteDatabase;
 use sha2::{Digest, Sha256};
 
-use crate::home::{self, HomeError, MobeeHome};
+use crate::home::{self, HomeError, MaxplayerHome};
 
 #[derive(Debug)]
 pub enum FundError {
@@ -33,7 +33,7 @@ impl std::fmt::Display for FundError {
             Self::Wallet(message) => write!(formatter, "wallet fund error: {message}"),
             Self::MintNotAllowed { mint_url } => write!(
                 formatter,
-                "mint {mint_url} not allowed (allow_real_mints is off; set MOBEE_ALLOW_REAL_MINTS to opt in)"
+                "mint {mint_url} not allowed (allow_real_mints is off; set MAXPLAYER_ALLOW_REAL_MINTS to opt in)"
             ),
         }
     }
@@ -71,8 +71,8 @@ fn sqlite_path(wallet_dir: &Path) -> std::path::PathBuf {
 /// Open the wallet at the configured default mint (async). Prefer this inside an existing
 /// runtime — [`open_wallet_blocking`] fails fast if a Tokio runtime is
 /// already current (no nested `block_on` panic).
-pub async fn open_wallet_async(home: &MobeeHome) -> Result<Wallet, FundError> {
-    // The wallet opens at the CONFIGURED mint (`MobeeConfig::default_mint`), the same
+pub async fn open_wallet_async(home: &MaxplayerHome) -> Result<Wallet, FundError> {
+    // The wallet opens at the CONFIGURED mint (`MaxplayerConfig::default_mint`), the same
     // source of truth the pay path resolves the realized mint from — no compile-time pin.
     open_wallet_at_mint_async(home, home.config.default_mint()).await
 }
@@ -83,7 +83,7 @@ pub async fn open_wallet_async(home: &MobeeHome) -> Result<Wallet, FundError> {
 /// `require_wallet_matches` refuses every non-default-mint payment. The store (sqlite) is shared
 /// across mints; only the `Wallet`'s bound mint differs.
 pub async fn open_wallet_at_mint_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     mint_url: &str,
 ) -> Result<Wallet, FundError> {
     // Real-mint fence (issue #49): fail closed BEFORE opening/quoting if this mint is a real mint
@@ -108,7 +108,7 @@ pub async fn open_wallet_at_mint_async(
 /// Thin sync wrapper for non-async callers (CLI / tests).
 /// Do **not** call from inside an existing tokio runtime — use
 /// [`open_wallet_async`] instead. Nested call fails fast (no panic).
-pub fn open_wallet_blocking(home: &MobeeHome) -> Result<Wallet, FundError> {
+pub fn open_wallet_blocking(home: &MaxplayerHome) -> Result<Wallet, FundError> {
     crate::runtime_guard::refuse_nested_block_on("open_wallet_blocking")
         .map_err(FundError::Wallet)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -119,7 +119,7 @@ pub fn open_wallet_blocking(home: &MobeeHome) -> Result<Wallet, FundError> {
 }
 
 /// Read current wallet balance against the configured default mint.
-pub async fn wallet_balance_sats(home: &MobeeHome) -> Result<u64, FundError> {
+pub async fn wallet_balance_sats(home: &MaxplayerHome) -> Result<u64, FundError> {
     let wallet = open_wallet_async(home).await?;
     let balance = wallet
         .total_balance()
@@ -131,7 +131,7 @@ pub async fn wallet_balance_sats(home: &MobeeHome) -> Result<u64, FundError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::home::{bootstrap, MobeeConfig};
+    use crate::home::{bootstrap, MaxplayerConfig};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -230,7 +230,7 @@ mod tests {
         // Issue #378 flipped the shipped default mint from testnut to a REAL minibits mint (paired
         // with allow_real_mints = true). A fresh config's default mint is that minibits mint.
         assert_eq!(
-            MobeeConfig::default().default_mint(),
+            MaxplayerConfig::default().default_mint(),
             crate::home::DEFAULT_MINIBITS_MINT_URL
         );
     }

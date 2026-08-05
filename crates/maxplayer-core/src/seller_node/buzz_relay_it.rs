@@ -56,7 +56,7 @@ async fn connect_admitted_observer(relay_url: &str, secret_hex: &str) -> Client 
 }
 
 /// Bootstrap a seller home wired with a `[buzz]` persona bound to `relay_url` (fast 1s heartbeat).
-fn buzz_home(root: &std::path::Path, relay_url: &str) -> home::MobeeHome {
+fn buzz_home(root: &std::path::Path, relay_url: &str) -> home::MaxplayerHome {
     let mut h = home::bootstrap(root).expect("bootstrap home");
     h.config.buzz = Some(BuzzConfig {
         relay_url: relay_url.to_string(),
@@ -145,7 +145,7 @@ async fn foreign_kind0_refuses_clobber() {
     let (relay, relay_url) = start_relay().await;
     let root = unique_root("foreign");
     let home = buzz_home(&root, &relay_url);
-    // Seed a FOREIGN kind-0 (no mobee marker) on the seller's own key, as if the key were already a
+    // Seed a FOREIGN kind-0 (no maxplayer marker) on the seller's own key, as if the key were already a
     // buzz inhabitant published by something else.
     let secret = home::read_secret_key_hex(&home).expect("secret");
     let keys = Keys::parse(&secret).expect("keys");

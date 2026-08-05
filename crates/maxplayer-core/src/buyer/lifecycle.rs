@@ -2603,7 +2603,7 @@ mod tests {
     /// A home with the given per-job cap, on a scratch dir. `per_job` is set equal to `cap` so the
     /// per-job ceiling never masks the wallet ceiling these tests exercise (issue #378 removed the
     /// rolling total ceiling; the wallet balance is the sole shared limit).
-    fn conc_home(label: &str, cap: u64) -> (crate::home::MobeeHome, std::path::PathBuf) {
+    fn conc_home(label: &str, cap: u64) -> (crate::home::MaxplayerHome, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "mobee-buyer-lifecycle-conc-{label}-{}-{}",
             std::process::id(),

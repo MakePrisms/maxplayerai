@@ -13,7 +13,7 @@
 //!    nothing (see [`super::SellerNode::start_buzz`]).
 //!  * **Clobber guard.** kind-0 is one-per-key replaceable, so a publish CLOBBERS any existing
 //!    kind-0 on the key. Before the first publish the node fetches the key's current kind-0; if one
-//!    exists that this node did not write (no mobee marker) it REFUSES rather than overwrite a
+//!    exists that this node did not write (no maxplayer marker) it REFUSES rather than overwrite a
 //!    foreign persona ([`clobber_decision`]).
 //!  * **Presence.** Deployed-relay presence is a live WS connection + a Redis TTL (~90s), refreshed
 //!    by a periodic ephemeral kind-20001 `"online"` status (30s cadence) — NOT stored events. A
@@ -64,7 +64,7 @@ pub use super::signer::{
 /// Marker tag stamped on every kind-0 this node publishes, so a later boot can tell ITS OWN
 /// persona (safe to replace) from a FOREIGN kind-0 on the same key (must not be clobbered). A
 /// buzz client renders kind-0 by its metadata content and ignores this tag.
-pub const MOBEE_MARKER_TAG: &str = "mobee_persona";
+pub const MOBEE_MARKER_TAG: &str = "maxplayer_persona";
 /// The marker tag's value.
 pub const MOBEE_MARKER_VALUE: &str = "seller";
 
@@ -122,7 +122,7 @@ pub fn clobber_decision(existing_marker: Option<bool>) -> ClobberDecision {
     }
 }
 
-/// True when a fetched kind-0 event carries this node's mobee marker tag.
+/// True when a fetched kind-0 event carries this node's maxplayer marker tag.
 pub fn event_has_marker(event: &Event) -> bool {
     event.tags.iter().any(|tag| {
         let parts = tag.as_slice();
@@ -311,7 +311,7 @@ pub async fn start(
                 client.disconnect().await;
                 return Err(BuzzError::Clobber(format!(
                     "a kind-0 already exists on this key ({}) that this node did not write \
-                     (missing the mobee marker); refusing to clobber a foreign buzz persona — \
+                     (missing the maxplayer marker); refusing to clobber a foreign buzz persona — \
                      use a fresh key for the seller or clear the existing kind-0 first",
                     pubkey.to_hex()
                 )));
@@ -364,7 +364,7 @@ async fn fetch_kind0_marker(client: &Client, pubkey: PublicKey) -> Result<Option
     Ok(newest.map(|event| event_has_marker(&event)))
 }
 
-/// Build + sign (via the allowlisted adapter) the persona's kind-0 metadata event with the mobee
+/// Build + sign (via the allowlisted adapter) the persona's kind-0 metadata event with the maxplayer
 /// marker tag.
 async fn build_kind0(
     adapter: &NodeNostrSigner,

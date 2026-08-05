@@ -1139,7 +1139,7 @@ mod tests {
         }
     }
 
-    /// A wire-valid draft carrying the protocol tags every mobee event needs.
+    /// A wire-valid draft carrying the protocol tags every maxplayer event needs.
     fn wire_draft(kind: u16) -> EventDraft {
         use crate::gateway::{MOBEE_TAG, PROTOCOL_VERSION};
         EventDraft::new(

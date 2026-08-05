@@ -1,4 +1,4 @@
-//! The persistent per-home **mobee seller node**.
+//! The persistent per-home **maxplayer seller node**.
 //!
 //! One node owns a home. It takes an exclusive OS lock on `$MOBEE_HOME/seller.lock` (a second node
 //! on the same home fails closed), opens the receiving CDK wallet and the seller Nostr identity
@@ -35,7 +35,7 @@ pub mod wallet_actor;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::buyer_fund::{self, FundError};
-use crate::home::{HomeError, MobeeHome};
+use crate::home::{HomeError, MaxplayerHome};
 use lock::{HomeLock, LockError};
 use signer::SignerHandle;
 use store::{HealthSnapshot, SellerStore, StoreError};
@@ -133,7 +133,7 @@ fn now_unix() -> i64 {
 
 /// The persistent seller node: exclusive lock + durable store + serialized wallet/identity actors.
 pub struct SellerNode {
-    home: MobeeHome,
+    home: MaxplayerHome,
     store: SellerStore,
     wallet: WalletHandle,
     signer: SignerHandle,
@@ -147,7 +147,7 @@ impl SellerNode {
     /// the start, then open the receiving wallet and seller identity behind their serialized actors.
     ///
     /// Fails closed at the lock step if another node already owns this home.
-    pub async fn open(home: MobeeHome) -> Result<Self, NodeError> {
+    pub async fn open(home: MaxplayerHome) -> Result<Self, NodeError> {
         let lock = HomeLock::acquire(home.root.join(LOCK_FILE))?;
 
         let store = SellerStore::open(home.root.join(STATE_DB_FILE))?;
@@ -191,7 +191,7 @@ impl SellerNode {
     }
 
     /// The home this node owns.
-    pub fn home(&self) -> &MobeeHome {
+    pub fn home(&self) -> &MaxplayerHome {
         &self.home
     }
 

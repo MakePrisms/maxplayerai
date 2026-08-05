@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Launcher for the mobee binary. Node finds the executable and hands off — no bindings, no wasm,
+// Launcher for the maxplayer binary. Node finds the executable and hands off — no bindings, no wasm,
 // no FFI. The binary is a statically linked ELF carried in a per-platform package that npm installs
 // only when its os/cpu match, so an install pulls one platform rather than all of them.
 "use strict";

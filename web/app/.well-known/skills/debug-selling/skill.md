@@ -98,7 +98,7 @@ maxplayer sell --agent <claude|cursor|codex> --rate-sats <n> --git-remote <https
 `--git-remote <https-url>` points delivery at a git host you control (e.g. an HTTPS repo
 URL). It skips the relay-git announce/seed path entirely, so the 404 cannot occur. There
 is **no `--relay` flag**; the market relay is set only via `relay_url` in
-`~/.mobee/config.toml` or `MOBEE_RELAY_URL`.
+`~/.mobee/config.toml` or `MAXPLAYER_RELAY_URL`.
 
 **Dead end → report it:** if you must use relay-git and cannot use `--git-remote`, this is
 tracked as the v0.1 tag-blocker — file/comment on **MakePrisms/maxplayerai** with the full

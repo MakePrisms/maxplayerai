@@ -20,9 +20,9 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "Mobee Seller Hub",
+        "Maxplayer Seller Hub",
         options,
-        Box::new(|_cc| Ok(Box::new(MobeeDesktopApp::new()))),
+        Box::new(|_cc| Ok(Box::new(MaxplayerDesktopApp::new()))),
     )
 }
 
@@ -55,7 +55,7 @@ impl Tab {
     }
 }
 
-struct MobeeDesktopApp {
+struct MaxplayerDesktopApp {
     home: HomeState,
     active_tab: Tab,
     agents: AgentsState,
@@ -64,7 +64,7 @@ struct MobeeDesktopApp {
     health: HealthState,
 }
 
-impl MobeeDesktopApp {
+impl MaxplayerDesktopApp {
     fn new() -> Self {
         let home = HomeState::resolve();
         let mut money = MoneyState::default();
@@ -83,7 +83,7 @@ impl MobeeDesktopApp {
     }
 }
 
-impl eframe::App for MobeeDesktopApp {
+impl eframe::App for MaxplayerDesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.money.poll();
         self.activity.poll();
@@ -92,7 +92,7 @@ impl eframe::App for MobeeDesktopApp {
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.heading("Mobee Seller Hub");
+                ui.heading("Maxplayer Seller Hub");
                 ui.separator();
                 ui.label("pass-one scaffold");
             });
@@ -123,11 +123,11 @@ impl eframe::App for MobeeDesktopApp {
     }
 }
 
-impl MobeeDesktopApp {
+impl MaxplayerDesktopApp {
     fn show_home(&mut self, ui: &mut egui::Ui) {
         ui.heading("Home");
         ui.add_space(8.0);
-        ui.label("Desktop scaffold is running against one resolved Mobee home.");
+        ui.label("Desktop scaffold is running against one resolved Maxplayer home.");
         ui.add_space(8.0);
         ui.monospace(self.home.path.display().to_string());
         if let Some(error) = &self.home.error {
@@ -408,7 +408,7 @@ impl Default for AgentsState {
     fn default() -> Self {
         Self {
             preset: AgentPreset::Claude,
-            display_name: "Mobee seller".to_owned(),
+            display_name: "Maxplayer seller".to_owned(),
             rate_sats: 2,
             status: "Ready to configure a seller through `maxplayer sell`.".to_owned(),
             output: String::new(),
@@ -472,7 +472,7 @@ struct AgentsResult {
 }
 
 fn seller_start_command(request: &StartSellerRequest) -> Command {
-    let mut command = mobee_command();
+    let mut command = maxplayer_command();
     command.args([
         "sell",
         "--non-interactive",
@@ -508,7 +508,7 @@ fn spawn_seller_daemon(request: &StartSellerRequest) -> AgentsResult {
 }
 
 fn run_wallet_balance(home: &Path) -> MoneyResult {
-    let mut command = mobee_command();
+    let mut command = maxplayer_command();
     command.args(["wallet", "balance", "--home"]);
     command.arg(home);
 
@@ -539,10 +539,10 @@ fn run_wallet_balance(home: &Path) -> MoneyResult {
 }
 
 fn doctor_command(home: &Path) -> Command {
-    // `mobee doctor` ignores argv and resolves its own home via `MOBEE_HOME`
+    // `maxplayer doctor` ignores argv and resolves its own home via `MOBEE_HOME`
     // (maxplayer_core::home::default_home_dir). Pin it to the desktop's resolved
     // home so the probe reports on the same home the Home tab displays.
-    let mut command = mobee_command();
+    let mut command = maxplayer_command();
     command.arg("doctor");
     command.env("MOBEE_HOME", home);
     command
@@ -582,8 +582,8 @@ fn run_doctor(home: &Path) -> HealthResult {
 /// name so the three resolution sites cannot drift apart again.
 const CLI_BIN: &str = "maxplayer";
 
-fn mobee_command() -> Command {
-    if let Some(path) = env::var_os("MOBEE_BIN").filter(|value| !value.is_empty()) {
+fn maxplayer_command() -> Command {
+    if let Some(path) = env::var_os("MAXPLAYER_BIN").filter(|value| !value.is_empty()) {
         return Command::new(path);
     }
 
@@ -592,7 +592,7 @@ fn mobee_command() -> Command {
 
 /// Resolve the CLI command for `bin`, preferring a sibling next to the desktop
 /// executable and otherwise falling back to `bin` on `PATH`. Split out from
-/// `mobee_command` so the spawned name can be asserted in a unit test without
+/// `maxplayer_command` so the spawned name can be asserted in a unit test without
 /// depending on the process' real `current_exe`.
 fn resolve_cli_command(bin: &str, current_exe: Option<&Path>) -> Command {
     if let Some(dir) = current_exe.and_then(Path::parent) {
@@ -831,7 +831,7 @@ mod tests {
         );
 
         // Red leg / positive control: the same resolver pointed at the retired
-        // `mobee` name resolves to `mobee` — a binary nothing has installed
+        // `maxplayer` name resolves to `maxplayer` — a binary nothing has installed
         // since #262. If this differed from the assertion above the test would
         // be a no-op guard; instead it proves the name is what makes it pass.
         let retired = resolve_cli_command("mobee", Some(no_sibling));
@@ -844,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn seller_start_command_uses_mobee_sell_without_secret_args() {
+    fn seller_start_command_uses_maxplayer_sell_without_secret_args() {
         let request = StartSellerRequest {
             home: PathBuf::from("/tmp/mobee-home"),
             preset: AgentPreset::Codex,
@@ -873,12 +873,12 @@ mod tests {
 
         // doctor ignores argv --home; the home is pinned through MOBEE_HOME instead.
         assert!(!rendered.contains("--home"));
-        let mobee_home = command
+        let maxplayer_home = command
             .get_envs()
             .find(|(key, _)| *key == std::ffi::OsStr::new("MOBEE_HOME"))
             .and_then(|(_, value)| value)
             .expect("MOBEE_HOME env set");
-        assert_eq!(mobee_home, home.as_os_str());
+        assert_eq!(maxplayer_home, home.as_os_str());
     }
 
     #[test]

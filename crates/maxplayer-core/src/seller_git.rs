@@ -171,7 +171,7 @@ pub fn init_contribution_workdir(
 ) -> Result<(), SellerGitError> {
     assert_allowed_repo_locator(base_clone_url)?;
     let repo = init_repo_with_identity(workdir, identity)?;
-    // Full-depth fetch of the base branch from the pinned target into a local ref. mobee relay-git
+    // Full-depth fetch of the base branch from the pinned target into a local ref. maxplayer relay-git
     // requires NIP-98 auth for READS, so present the seller secret for relay-git bases; public /
     // anonymous https bases fetch without it (git_transport gates the header on is_relay_git).
     let refspec = format!("+refs/heads/{base_branch}:refs/mobee/base");
@@ -498,12 +498,12 @@ pub fn preflight_push_probe(
     .map_err(SellerGitError::from)
 }
 
-/// Resolve `git-credential-nostr` absolute path (`MOBEE_GIT_CREDENTIAL_NOSTR` override, then PATH).
+/// Resolve `git-credential-nostr` absolute path (`MAXPLAYER_GIT_CREDENTIAL_NOSTR` override, then PATH).
 ///
-/// Used by `mobee doctor`'s informational check only — the seller's own git legs are all
+/// Used by `maxplayer doctor`'s informational check only — the seller's own git legs are all
 /// in-process libgit2 with NIP-98 signed in this process, so the helper is not required.
 pub fn resolve_git_credential_nostr() -> Option<PathBuf> {
-    if let Ok(override_path) = std::env::var("MOBEE_GIT_CREDENTIAL_NOSTR") {
+    if let Ok(override_path) = std::env::var("MAXPLAYER_GIT_CREDENTIAL_NOSTR") {
         let path = PathBuf::from(override_path);
         if path.is_file() {
             return Some(path);
@@ -620,7 +620,7 @@ mod tests {
             .expect("git init");
         assert!(status.success());
         let _ = Command::new("git")
-            .args(["config", "user.name", "Mobee Seller Test"])
+            .args(["config", "user.name", "Maxplayer Seller Test"])
             .current_dir(path)
             .status();
         let _ = Command::new("git")

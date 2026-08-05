@@ -59,8 +59,8 @@ MOBEE="${MOBEE:-/srv/forge/workspaces/.crossmint-target/release/maxplayer}"
 RUN_DIR="${RUN_DIR:-/tmp/crossmint-smoke-run}"
 
 # The marker that makes a directory a legitimate target. Bootstrap WRITES into MOBEE_HOME, and an
-# unset MOBEE_HOME falls back to ~/.mobee — a real home with a real key and wallet. So no mobee
-# command in this script is reachable except through mobee_at(), which refuses any directory this
+# unset MOBEE_HOME falls back to ~/.mobee — a real home with a real key and wallet. So no maxplayer
+# command in this script is reachable except through maxplayer_at(), which refuses any directory this
 # run did not itself create and mark.
 MARKER=".crossmint-smoke-throwaway"
 
@@ -175,22 +175,22 @@ assert_throwaway() { # <path>
     [ -n "${1:-}" ] || die "MOBEE_HOME is empty — refusing (an unset home falls back to ~/.mobee)"
     [ -d "$1" ]     || die "not a directory: $1"
     [ -f "$1/$MARKER" ] || die "refusing to touch $1: no $MARKER. This run did not create it, so it
-may be a real funded home. Every mobee invocation is gated on this marker precisely because an
+may be a real funded home. Every maxplayer invocation is gated on this marker precisely because an
 unset or wrong MOBEE_HOME resolves to ~/.mobee, which holds a real key and wallet."
     case "$(cd "$1" && pwd -P)" in
         "$HOME/.mobee"|"$HOME/.mobee/"*) die "refusing: $1 resolves into ~/.mobee" ;;
     esac
 }
 
-# The ONLY way this script invokes mobee. Asserts the marker, then exports MOBEE_HOME explicitly so
+# The ONLY way this script invokes maxplayer. Asserts the marker, then exports MOBEE_HOME explicitly so
 # the fallback path is never reachable even if a caller forgets.
-mobee_at() { # <home> <args...>
+maxplayer_at() { # <home> <args...>
     local home="$1"; shift
     assert_throwaway "$home"
     MOBEE_HOME="$home" "$MOBEE" "$@" --home "$home"
 }
 # Same, for the non-wallet commands that take no --home flag and read MOBEE_HOME from the env.
-mobee_env() { # <home> <args...>
+maxplayer_env() { # <home> <args...>
     local home="$1"; shift
     assert_throwaway "$home"
     MOBEE_HOME="$home" "$MOBEE" "$@"
@@ -219,22 +219,22 @@ agent and never by a retry."
 }
 
 # Config is supplied ENTIRELY by environment. Measured: env overrides are never persisted — a home
-# booted with MOBEE_ALLOW_REAL_MINTS=true still has `allow_real_mints = false` in its config.toml.
+# booted with MAXPLAYER_ALLOW_REAL_MINTS=true still has `allow_real_mints = false` in its config.toml.
 # So the real-mint fence is process-scoped and evaporates on exit. There is no fence to restore and
 # no EXIT trap that could fail to restore it.
 #
-# These are EXPORTED rather than prefixed onto each call: mobee_at is a shell function, and `env
-# VAR=x mobee_at ...` cannot work — env execs a binary and would never see the function. Exporting
+# These are EXPORTED rather than prefixed onto each call: maxplayer_at is a shell function, and `env
+# VAR=x maxplayer_at ...` cannot work — env execs a binary and would never see the function. Exporting
 # also means the fence and the cap apply to every invocation in the stage, not just the ones a
 # caller remembered to prefix.
 arm_real_mints() {
-    export MOBEE_ALLOW_REAL_MINTS=true
-    export MOBEE_ACCEPTED_MINTS="$SOURCE_MINT"
-    export MOBEE_EXTRA_MINTS="$TARGET_MINT"
+    export MAXPLAYER_ALLOW_REAL_MINTS=true
+    export MAXPLAYER_ACCEPTED_MINTS="$SOURCE_MINT"
+    export MAXPLAYER_EXTRA_MINTS="$TARGET_MINT"
     # The exposure cap as a RUNTIME gate rather than a matter of discipline: the budget gate
     # charges the hop's full cost (delivery + fee reserve + input fee), so this bounds real
     # exposure independently of anything this script asserts afterwards.
-    export MOBEE_TOTAL_BUDGET_SATS="$EXPOSURE_CAP_SATS"
+    export MAXPLAYER_TOTAL_BUDGET_SATS="$EXPOSURE_CAP_SATS"
 }
 
 # ── Funding ─────────────────────────────────────────────────────────────────────────────────────
@@ -249,7 +249,7 @@ fund() {
     ensure_home "$home"
 
     local invoice quote_out quote_id
-    invoice=$(mobee_at "$home" wallet mint "$FUND_SATS" --mint "$SOURCE_MINT" 2>"$RUN_DIR/fund.err") \
+    invoice=$(maxplayer_at "$home" wallet mint "$FUND_SATS" --mint "$SOURCE_MINT" 2>"$RUN_DIR/fund.err") \
         || die "mint quote at the source failed: $(command cat "$RUN_DIR/fund.err" 2>/dev/null)"
     quote_out=$(command cat "$RUN_DIR/fund.err" 2>/dev/null || true)
     say "$quote_out"
@@ -278,11 +278,11 @@ fund_complete() { # <quote_id>
     # --amount here is a CROSS-CHECK, not a fix. When the quote is found, mint-complete refuses if
     # the passed amount differs from the stored one, so this pins that we are completing the quote
     # we raised. It is NOT what cured the live failure — the truncated id was (see parse_quote_id).
-    mobee_at "$home" wallet mint-complete "$quote_id" --amount "$FUND_SATS" --mint "$SOURCE_MINT" 2>&1 \
+    maxplayer_at "$home" wallet mint-complete "$quote_id" --amount "$FUND_SATS" --mint "$SOURCE_MINT" 2>&1 \
         || die "mint-complete failed for quote ${quote_id}. If the invoice IS paid, the sats are at
 the mint and recoverable — re-run this exact command. Do not re-pay the invoice."
     rule "balance at the source"
-    mobee_at "$home" wallet balance 2>&1
+    maxplayer_at "$home" wallet balance 2>&1
     say ""
     say "Funded. Next: $0 --stage-a"
 }
@@ -299,7 +299,7 @@ stage_a() {
     # list` reports role=default and role=extra respectively under the two env vars armed above.
 
     rule "balances before"
-    local before; before=$(mobee_at "$home" wallet balance 2>&1) || die "balance failed: $before"
+    local before; before=$(maxplayer_at "$home" wallet balance 2>&1) || die "balance failed: $before"
     say "$before"
     local src_before tgt_before
     src_before=$(parse_balance_for_mint "$before" "$SOURCE_MINT"); src_before="${src_before:-0}"
@@ -310,7 +310,7 @@ stage_a() {
     # 1. Raise a mint quote at the TARGET — a real bolt11 the source must pay.
     rule "1/3 mint quote at the target"
     local quote_out invoice quote_id
-    invoice=$(mobee_at "$home" wallet mint "$PROBE_SATS" --mint "$TARGET_MINT" 2>"$RUN_DIR/quote.err") \
+    invoice=$(maxplayer_at "$home" wallet mint "$PROBE_SATS" --mint "$TARGET_MINT" 2>"$RUN_DIR/quote.err") \
         || die "mint quote at target failed: $(command cat "$RUN_DIR/quote.err" 2>/dev/null)"
     quote_out=$(command cat "$RUN_DIR/quote.err" 2>/dev/null || true)
     say "$quote_out"
@@ -324,7 +324,7 @@ If it auto-funded instead, the target is a TEST mint and this probe proves nothi
     # 2. Melt at the SOURCE to pay it. THIS is the leg no hermetic test can reach.
     rule "2/3 melt at the source to pay that invoice"
     local melt_out melt_rc=0
-    melt_out=$(mobee_at "$home" wallet melt "$invoice" --mint "$SOURCE_MINT" 2>&1) || melt_rc=$?
+    melt_out=$(maxplayer_at "$home" wallet melt "$invoice" --mint "$SOURCE_MINT" 2>&1) || melt_rc=$?
     say "$melt_out"
     [ "$melt_rc" -eq 0 ] || die "MELT FAILED (rc=$melt_rc) — nothing was issued at the target and no
 ecash is stranded: the money either never left the source, or it left and the target quote stays
@@ -338,19 +338,19 @@ unpaid. STOP HERE and report. Do not run mint-complete."
     rule "3/3 issue the ecash at the target"
     # As in fund(): a cross-check that refuses a mismatched completion, not the cure for the
     # truncation bug.
-    mobee_at "$home" wallet mint-complete "$quote_id" --amount "$PROBE_SATS" --mint "$TARGET_MINT" 2>&1 \
+    maxplayer_at "$home" wallet mint-complete "$quote_id" --amount "$PROBE_SATS" --mint "$TARGET_MINT" 2>&1 \
         || die "THE STRAND: the melt at ${SOURCE_MINT} PAID (${paid} sats, fee ${fee}) but issuing at
 ${TARGET_MINT} failed for quote ${quote_id}. The money left the source and is not yet ecash at the
 target. It is RECOVERABLE and no sats are lost — re-run exactly:
 
-  MOBEE_HOME=${home} MOBEE_ALLOW_REAL_MINTS=true MOBEE_ACCEPTED_MINTS=${SOURCE_MINT} \\
-  MOBEE_EXTRA_MINTS=${TARGET_MINT} ${MOBEE} wallet mint-complete ${quote_id} \\
+  MOBEE_HOME=${home} MAXPLAYER_ALLOW_REAL_MINTS=true MAXPLAYER_ACCEPTED_MINTS=${SOURCE_MINT} \\
+  MAXPLAYER_EXTRA_MINTS=${TARGET_MINT} ${MOBEE} wallet mint-complete ${quote_id} \\
   --amount ${PROBE_SATS} --mint ${TARGET_MINT} --home ${home}
 
 Copy the quote id from THIS line, not from any earlier output. Report before retrying."
 
     rule "balances after"
-    local after; after=$(mobee_at "$home" wallet balance 2>&1)
+    local after; after=$(maxplayer_at "$home" wallet balance 2>&1)
     say "$after"
     local src_after tgt_after
     src_after=$(parse_balance_for_mint "$after" "$SOURCE_MINT"); src_after="${src_after:-0}"
@@ -398,7 +398,7 @@ What Stage B requires, all verified against the merged tree:
   - buyer:  post_job over the daemon socket (\$MOBEE_HOME/buyer.sock, newline-delimited JSON;
             methods status|post_job|get_job|award|collect). There is NO 'maxplayer job' CLI.
             'maxplayer collect <job_id>' auto-spawns the daemon, so no manual daemon step is needed.
-  - seller: a throwaway seller home with MOBEE_SELLER__AGENT_COMMAND / __RATE_SATS / __GIT_REMOTE,
+  - seller: a throwaway seller home with MAXPLAYER_SELLER__AGENT_COMMAND / __RATE_SATS / __GIT_REMOTE,
             plus a delivery path (git) and a relay both sides can see.
   - award protocol: post -> award -> deliver -> collect. accept_claim and authorize_pay are FOLDED
             INTO collect; calling them directly returns NOT_IMPLEMENTED.
@@ -416,7 +416,7 @@ dry_run() {
 
     rule "home discipline refuses an unmarked directory"
     local unmarked="$RUN_DIR/unmarked"; mkdir -p "$unmarked"
-    if ( mobee_at "$unmarked" wallet balance >/dev/null 2>&1 ); then
+    if ( maxplayer_at "$unmarked" wallet balance >/dev/null 2>&1 ); then
         die "GATE BROKEN: an unmarked directory was accepted"
     fi
     say "  refused an unmarked home"
@@ -424,20 +424,20 @@ dry_run() {
     say "  refused an empty MOBEE_HOME (the ~/.mobee fallback path)"
 
     rule "fund on testnut"
-    mobee_at "$home" wallet mint 5 2>&1 | command head -2
+    maxplayer_at "$home" wallet mint 5 2>&1 | command head -2
 
     rule "balance parses"
-    local bal; bal=$(mobee_at "$home" wallet balance 2>&1); say "$bal"
+    local bal; bal=$(maxplayer_at "$home" wallet balance 2>&1); say "$bal"
     local got; got=$(parse_balance_for_mint "$bal" "https://testnut.cashudevkit.org")
     [ -n "$got" ] && [ "$got" -ge 5 ] || die "expected >=5 sats parsed from the balance, got '${got:-}'"
     say "  parsed balance_sats=$got"
 
     rule "a FAILED melt halts the script (the safety-critical behaviour)"
     local inv rc=0
-    inv=$(mobee_at "$home" wallet invoice 2 2>/dev/null) || die "invoice failed"
+    inv=$(maxplayer_at "$home" wallet invoice 2 2>/dev/null) || die "invoice failed"
     [ -n "$inv" ] || die "no bolt11 from wallet invoice"
     say "  got a real bolt11: ${inv:0:32}..."
-    mobee_at "$home" wallet melt "$inv" >/dev/null 2>&1 || rc=$?
+    maxplayer_at "$home" wallet melt "$inv" >/dev/null 2>&1 || rc=$?
     # A test mint cannot route, so this MUST fail — and must fail with a non-zero code, or every
     # `|| die` guarding a real melt is decorative.
     [ "$rc" -ne 0 ] || die "GATE BROKEN: a melt that cannot route returned rc=0. Every melt guard in

@@ -1,5 +1,5 @@
 {
-  description = "Mobee";
+  description = "Maxplayer";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
 
@@ -20,7 +20,7 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
 
-          # Args common to every `mobee` build.
+          # Args common to every `maxplayer` build.
           mobeeArgs = {
             pname = "maxplayer";
             version = "0.1.0";

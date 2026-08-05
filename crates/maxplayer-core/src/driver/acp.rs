@@ -356,7 +356,7 @@ mod usage_tests {
 
     // --- Compatibility with the maintained ACP harnesses ---------------------------------------
     //
-    // The mobee repo carries no captured ACP-usage fixtures, so these payloads are constructed
+    // The maxplayer repo carries no captured ACP-usage fixtures, so these payloads are constructed
     // from verified sources (cited per test), not from a live capture:
     //   - ACP `Usage` schema: agent-client-protocol-schema/src/v1/agent.rs (PromptResponse.usage,
     //     serde rename_all = "camelCase").

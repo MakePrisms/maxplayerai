@@ -9,7 +9,7 @@
 # re-cut, shipping a tarball whose contents belong to a different commit than its name suggests.
 #
 # The `optionalDependencies` pin is the subtlest of the four. The launcher package resolves its
-# payload by exact version, so a pin left behind means `mobee@0.2.0` installs the 0.1.0 binary — an
+# payload by exact version, so a pin left behind means `maxplayer@0.2.0` installs the 0.1.0 binary — an
 # install that succeeds and silently runs last release's code.
 #
 # Usage:
@@ -44,8 +44,8 @@ CRATE_VERSION="$(cargo metadata --no-deps --format-version 1 \
     | node -e 'const m=JSON.parse(require("fs").readFileSync(0,"utf8"));const p=m.packages.find(p=>p.name==="maxplayer");if(!p){process.stderr.write("no maxplayer package in cargo metadata\n");process.exit(1)}process.stdout.write(p.version)')"
 
 [ "$CRATE_VERSION" = "$VERSION" ] \
-    || die "crate mobee is $CRATE_VERSION but the release is $VERSION — bump [workspace.package] version in Cargo.toml before tagging"
-echo "ok: crate mobee $CRATE_VERSION"
+    || die "crate maxplayer is $CRATE_VERSION but the release is $VERSION — bump [workspace.package] version in Cargo.toml before tagging"
+echo "ok: crate maxplayer $CRATE_VERSION"
 
 # ── The npm manifests ───────────────────────────────────────────────────────────────────────────
 # Every directory under npm/ is checked, including any not yet wired into a build, so a package
@@ -64,12 +64,12 @@ PIN_REPORT="$(node -e '
 const pkg = require(process.argv[1]);
 const deps = pkg.optionalDependencies || {};
 const names = Object.keys(deps);
-if (names.length === 0) { console.error("npm/mobee/package.json declares no optionalDependencies — the launcher has no payload to resolve"); process.exit(1); }
+if (names.length === 0) { console.error("npm/maxplayer/package.json declares no optionalDependencies — the launcher has no payload to resolve"); process.exit(1); }
 const wrong = names.filter((n) => deps[n] !== process.argv[2]);
 if (wrong.length) { console.error("stale payload pins: " + wrong.map((n) => n + "@" + deps[n]).join(", ")); process.exit(1); }
 process.stdout.write(names.join(", "));
-' "$PWD/npm/mobee/package.json" "$VERSION")" \
-    || die "npm/mobee/package.json payload pins are not all $VERSION"
+' "$PWD/npm/maxplayer/package.json" "$VERSION")" \
+    || die "npm/maxplayer/package.json payload pins are not all $VERSION"
 echo "ok: payload pins at $VERSION -> $PIN_REPORT"
 
 # ── The built binary ────────────────────────────────────────────────────────────────────────────
@@ -79,9 +79,9 @@ if [ -n "$BINARY" ]; then
     [ -x "$BINARY" ] || die "no executable at $BINARY"
     # The expected name is the name this artifact SHIPS AS — the basename of the path the workflow
     # built and is about to package — rather than a literal. Derived for two reasons. The binary name
-    # and the crate name are deliberately different (`[[bin]] maxplayer` inside package `mobee`), so a
+    # and the crate name are deliberately different (`[[bin]] maxplayer` inside package `maxplayer`), so a
     # literal here silently commits to one of them and goes stale the moment either moves; that is
-    # exactly how this check came to expect `mobee` from a binary that correctly answers to
+    # exactly how this check came to expect `maxplayer` from a binary that correctly answers to
     # `maxplayer`. And an asset published under a name it does not answer to is the same hazard the
     # constructed asset filename guards against upstream — a runner shipped under the racer's name
     # would install, run, and be the wrong program. A binary must announce the name it is invoked by.

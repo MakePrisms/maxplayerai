@@ -35,7 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::home::{MobeeConfig, MobeeHome};
+use crate::home::{MaxplayerConfig, MaxplayerHome};
 
 /// Append-only spend ledger (one JSON record per line). Source of truth for spent.
 const LEDGER_FILE: &str = "spent.jsonl";
@@ -131,7 +131,7 @@ impl BudgetGate {
     }
 
     /// Per-job cap from config; spent starts at 0 and is not durable.
-    pub fn from_config(config: &MobeeConfig) -> Self {
+    pub fn from_config(config: &MaxplayerConfig) -> Self {
         Self::new(config.per_job_budget_sats)
     }
 
@@ -139,7 +139,7 @@ impl BudgetGate {
     /// `~/.mobee/spent.jsonl` (created on first append). A legacy `spent.toml`, if
     /// present, is folded in as an opening base so no pre-#22 spend history is lost;
     /// it is left in place and never rewritten.
-    pub fn from_home(home: &MobeeHome) -> Result<Self, BudgetRefuse> {
+    pub fn from_home(home: &MaxplayerHome) -> Result<Self, BudgetRefuse> {
         let ledger_path = home.root.join(LEDGER_FILE);
         let legacy_base = load_legacy_base(&home.root.join(LEGACY_SPENT_FILE))?;
         let folded = fold_ledger(&ledger_path, legacy_base.as_ref())?;
@@ -446,11 +446,11 @@ mod tests {
         // OR the per-job check is removed. (from_config_binds_cap_not_tool_args uses an arbitrary 7.)
         assert_eq!(crate::home::DEFAULT_PER_JOB_BUDGET_SATS, 30_000, "shipped per-job default");
         assert_eq!(
-            MobeeConfig::default().per_job_budget_sats,
+            MaxplayerConfig::default().per_job_budget_sats,
             crate::home::DEFAULT_PER_JOB_BUDGET_SATS
         );
         assert_eq!(
-            BudgetGate::from_config(&MobeeConfig::default()).per_job_cap(),
+            BudgetGate::from_config(&MaxplayerConfig::default()).per_job_cap(),
             30_000,
             "the gate binds the shipped default cap"
         );
@@ -515,9 +515,9 @@ mod tests {
 
     #[test]
     fn from_config_binds_cap_not_tool_args() {
-        let config = MobeeConfig {
+        let config = MaxplayerConfig {
             per_job_budget_sats: 7,
-            ..MobeeConfig::default()
+            ..MaxplayerConfig::default()
         };
         let gate = BudgetGate::from_config(&config);
         assert_eq!(gate.per_job_cap(), 7);

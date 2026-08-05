@@ -1,4 +1,4 @@
-# Packaging scope — getting `mobee` onto a machine that has never heard of nix
+# Packaging scope — getting `maxplayer` onto a machine that has never heard of nix
 
 Scope of work only. Nothing here is built, and nothing here is approved: the prebuilt-binary path
 was downgraded to later on 2026-07-23 ([#125](https://github.com/MakePrisms/maxplayerai/issues/125)) and
@@ -11,7 +11,7 @@ Every measurement below was taken against `dev` @ `8debf43`.
 
 ---
 
-## 1. What installing `mobee` means today
+## 1. What installing `maxplayer` means today
 
 One path:
 
@@ -37,7 +37,7 @@ It has three properties that only start to hurt once someone outside the team ar
   Wiring the buyer MCP today means putting `nix run --refresh github:…` into
   `claude_desktop_config.json`, which is both unusual and slow on every cold start.
 - **`--refresh` is load-bearing and easy to omit.** Without it the flake ref is served from cache,
-  so the user silently runs an old `mobee`. Every doc that states the command states the flag; a
+  so the user silently runs an old `maxplayer`. Every doc that states the command states the flag; a
   user who retypes it from memory gets a stale binary and no warning.
 
 ## 2. There is no artifact to install
@@ -97,8 +97,8 @@ execute, and it compiles cleanly, so nothing catches it downstream.
 
 ### 2.3 `cargo install` is not a fallback today
 
-`publish = false` in `[workspace.package]`, so `mobee` is not on crates.io and
-`cargo install mobee` cannot work. `cargo install --git` works but requires a Rust toolchain —
+`publish = false` in `[workspace.package]`, so `maxplayer` is not on crates.io and
+`cargo install maxplayer` cannot work. `cargo install --git` works but requires a Rust toolchain —
 the same class of prerequisite the whole exercise is trying to remove. `cargo-binstall`, named as
 a fallback in #125, resolves through crates.io metadata or GitHub releases; with neither present
 it has nothing to bind to. **It becomes available as a fallback only after track A ships**, not
@@ -216,7 +216,7 @@ mobee-x86_64-unknown-linux-musl          # static ELF, no interpreter, no DT_NEE
 SHA256SUMS                                # one line per artifact
 ```
 
-That file *is* the payload of the track B per-platform sub-package (`@mobee/cli-linux-x64`), so the
+That file *is* the payload of the track B per-platform sub-package (`@maxplayer/cli-linux-x64`), so the
 npm side never compiles anything and never runs a postinstall downloader.
 
 ```acceptance
@@ -263,8 +263,8 @@ Not a projection. Built 2026-07-28 against the pinned nixpkgs, `nix build .#buye
 size            39,816,976 bytes (38M), already stripped by the fixup phase
 ldd             statically linked
 /nix/store refs 0 occurrences in the binary
-alpine:3 (musl, no /nix)             mobee version → "mobee 0.1.0"  rc=0
-debian:bookworm-slim (glibc, no /nix) mobee version → "mobee 0.1.0"  rc=0
+alpine:3 (musl, no /nix)             maxplayer version → "mobee 0.1.0"  rc=0
+debian:bookworm-slim (glibc, no /nix) maxplayer version → "mobee 0.1.0"  rc=0
 bogus subcommand                                                     rc=1   (control)
 sha256 de0b96258aa4dc83c6b72ba3a3e604de8bd91175d70dbfb0c957414a01b4f1bf
 ```
@@ -297,11 +297,11 @@ and a test enforces it (`crates/maxplayer-core/src/agent_presets.rs`, asserting 
 an npx fallback`). A missing adapter must fail with an install hint rather than silently reach for
 `npx`. **That stays true and is not in scope here.**
 
-Track B is npx as *distribution of the mobee binary itself* — the standard esbuild/swc pattern:
+Track B is npx as *distribution of the maxplayer binary itself* — the standard esbuild/swc pattern:
 
 - npm package whose `bin` shim resolves a platform-specific binary and `exec`s it, forwarding argv
   and exit codes verbatim.
-- Per-platform binaries as `optionalDependencies` (`@mobee/cli-linux-x64` etc.) so the install
+- Per-platform binaries as `optionalDependencies` (`@maxplayer/cli-linux-x64` etc.) so the install
   downloads one platform, or a `postinstall` fetch from the track A release. Preference:
   optionalDependencies — a postinstall downloader breaks under `--ignore-scripts`, which security-
   conscious users and many CI setups set by default.
@@ -314,17 +314,17 @@ wirable the way every other MCP server is wired.
 { "mcpServers": { "mobee": { "command": "npx", "args": ["-y", "mobee", "mcp"] } } }
 ```
 
-Names are free as of 2026-07-28: `mobee`, `mobee-cli`, and the `@mobee` scope all return 404 from
+Names are free as of 2026-07-28: `maxplayer`, `mobee-cli`, and the `@maxplayer` scope all return 404 from
 the npm registry. Claiming the name is cheap and worth doing before someone else does, independent
 of when the work lands.
 
-> **Update — rename landed.** The published npm names are `maxplayer` (the shim, `npm/mobee/package.json`) and the `@maxplayerai/*` scope (`@maxplayerai/linux-x64`, `@maxplayerai/linux-arm64`), not `mobee` / `@mobee`. The `mobee` / `@mobee` name analysis in this Track B section is historical.
+> **Update — rename landed.** The published npm names are `maxplayer` (the shim, `npm/maxplayer/package.json`) and the `@maxplayerai/*` scope (`@maxplayerai/linux-x64`, `@maxplayerai/linux-arm64`), not `maxplayer` / `@maxplayer`. The `maxplayer` / `@maxplayer` name analysis in this Track B section is historical.
 
 ```acceptance
-# On a box with node but no nix, no rust, and no prior mobee:
-npx -y mobee@<version> version          # → prints <version>, rc=0
-npx -y mobee@<version> --this-is-not-a-flag; echo "rc=$?"   # → argv forwarded, non-zero rc preserved
-npm install --ignore-scripts -g mobee@<version> && mobee version   # → still works (no postinstall dependence)
+# On a box with node but no nix, no rust, and no prior maxplayer:
+npx -y maxplayer@<version> version          # → prints <version>, rc=0
+npx -y maxplayer@<version> --this-is-not-a-flag; echo "rc=$?"   # → argv forwarded, non-zero rc preserved
+npm install --ignore-scripts -g maxplayer@<version> && maxplayer version   # → still works (no postinstall dependence)
 # The ban this track must not undo:
 cargo test -p maxplayer-core builtin_presets_resolve_to_binary_or_install_hint
 ```
@@ -346,11 +346,11 @@ was made.
 
 ```acceptance
 # Clean container, no nix, no rust:
-curl -fsSL <url> | sh && mobee version    # → rc=0, prints version
+curl -fsSL <url> | sh && maxplayer version    # → rc=0, prints version
 # Verification is real, not decorative — corrupt the artifact and it must refuse:
 #   (point the installer at a tampered binary; expect non-zero rc and no install)
 # Idempotent:
-curl -fsSL <url> | sh && curl -fsSL <url> | sh && mobee version   # → rc=0, one binary on PATH
+curl -fsSL <url> | sh && curl -fsSL <url> | sh && maxplayer version   # → rc=0, one binary on PATH
 # Unsupported platform refuses rather than installing something wrong:
 #   (run under an unsupported uname; expect a named refusal, non-zero rc)
 ```
@@ -383,7 +383,7 @@ curl -fsSL <url> | sh && curl -fsSL <url> | sh && mobee version   # → rc=0, on
 3. **Which platforms are actually required at first cut.** The flake claims four. Shipping four
    costs macOS runners and a musl cross; shipping `x86_64-linux` alone is a fraction of the work
    and covers most servers. This is a scope dial, and it is his to set.
-4. **npm namespace.** Bare `mobee` or the `@mobee` scope. All variants are unregistered today;
+4. **npm namespace.** Bare `maxplayer` or the `@maxplayer` scope. All variants are unregistered today;
    the scope is easier to defend long-term, the bare name is what people will type.
 5. **Signing.** Checksums are specified above; signatures are not. Whether release artifacts get
    signed (and with what) is a call, not an omission.

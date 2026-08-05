@@ -44,7 +44,7 @@ impl std::fmt::Display for LockError {
             Self::Open(message) => write!(formatter, "seller lock open error: {message}"),
             Self::Held { path } => write!(
                 formatter,
-                "another mobee seller already owns this home (lock held: {}); refusing to start a second owner",
+                "another maxplayer seller already owns this home (lock held: {}); refusing to start a second owner",
                 path.display()
             ),
             Self::Flock(message) => write!(formatter, "seller lock flock error: {message}"),

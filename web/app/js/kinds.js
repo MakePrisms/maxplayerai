@@ -60,7 +60,7 @@ export const SELF_TRADE_TAG = "self-trade";
 /**
  * Kinds that carry `["t","mobee"]` — requested with a `#t` filter.
  */
-export const MOBEE_TAGGED_KINDS = Object.freeze([
+export const MAXPLAYER_TAGGED_KINDS = Object.freeze([
   OFFER, CLAIM, RESULT, FEEDBACK, AWARD, ACCEPT, RECEIPT, HEARTBEAT,
 ]);
 

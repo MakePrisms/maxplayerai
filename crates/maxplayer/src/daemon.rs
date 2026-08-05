@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use maxplayer_core::buyer::{client, SOCKET_FILE};
-use maxplayer_core::home::MobeeHome;
+use maxplayer_core::home::MaxplayerHome;
 use serde_json::Value;
 
 /// How long to wait for a freshly spawned daemon to bind its socket before giving up. Kept under the
@@ -23,13 +23,13 @@ const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The daemon socket path for a home.
-pub fn socket_path(home: &MobeeHome) -> PathBuf {
+pub fn socket_path(home: &MaxplayerHome) -> PathBuf {
     home.root.join(SOCKET_FILE)
 }
 
 /// Connect to the home's buyer daemon, spawning it if none is serving. Returns the socket path a
 /// thin client can call. Never runs a money op itself — it only guarantees a daemon owns the home.
-pub fn ensure(home: &MobeeHome) -> Result<PathBuf, String> {
+pub fn ensure(home: &MaxplayerHome) -> Result<PathBuf, String> {
     let sock = socket_path(home);
     if client::status(&sock).is_ok() {
         return Ok(sock); // a daemon is already serving this home.
@@ -93,7 +93,7 @@ pub fn call(sock: &Path, method: &str, params: Value) -> Result<Value, String> {
 }
 
 /// Ensure a daemon is serving `home`, then call `method` — the one-shot the MCP and CLI use.
-pub fn ensure_then_call(home: &MobeeHome, method: &str, params: Value) -> Result<Value, String> {
+pub fn ensure_then_call(home: &MaxplayerHome, method: &str, params: Value) -> Result<Value, String> {
     let sock = ensure(home)?;
     call(&sock, method, params)
 }

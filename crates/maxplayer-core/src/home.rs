@@ -5,14 +5,14 @@
 //!
 //! # Layered configuration
 //!
-//! [`MobeeConfig`] resolves in three layers, later winning:
+//! [`MaxplayerConfig`] resolves in three layers, later winning:
 //!
-//! 1. **built-in defaults** — [`MobeeConfig::default`].
+//! 1. **built-in defaults** — [`MaxplayerConfig::default`].
 //! 2. **file** — `~/.mobee/config.toml` (if present). Absent fields fall back to the defaults;
 //!    unknown fields refuse (`deny_unknown_fields`). The single-mint legacy `mint_url = "…"` key
 //!    folds into `accepted_mints`.
-//! 3. **environment** — `MOBEE_*` variables. Every field is reachable: uppercase the field path,
-//!    prefix `MOBEE_`, join nested fields with `__` (double underscore). Comma-separated for lists.
+//! 3. **environment** — `MAXPLAYER_*` variables. Every field is reachable: uppercase the field path,
+//!    prefix `MAXPLAYER_`, join nested fields with `__` (double underscore). Comma-separated for lists.
 //!
 //! The typed struct is the single in-process representation — only its *construction* is layered
 //! (the one seam is [`bootstrap`] / [`reload_config`], both routed through the env overlay). Every
@@ -23,30 +23,30 @@
 //!
 //! | Field | Variable |
 //! |-------|----------|
-//! | `relay_url` | `MOBEE_RELAY_URL` |
-//! | `accepted_mints` (list) | `MOBEE_ACCEPTED_MINTS=a,b` |
-//! | `per_job_budget_sats` | `MOBEE_PER_JOB_BUDGET_SATS` |
-//! | `extra_mints` (list) | `MOBEE_EXTRA_MINTS=a,b` |
-//! | `allow_real_mints` | `MOBEE_ALLOW_REAL_MINTS` |
-//! | `profile.name` | `MOBEE_PROFILE__NAME` |
-//! | `seller.rate_sats` | `MOBEE_SELLER__RATE_SATS` |
-//! | `seller.agent_command` (list) | `MOBEE_SELLER__AGENT_COMMAND=claude,--flag` |
-//! | `seller_announce.command` (list) | `MOBEE_SELLER_ANNOUNCE__COMMAND=…` |
-//! | `telemetry.mirror_file` | `MOBEE_TELEMETRY__MIRROR_FILE` |
-//! | `seller_heartbeat.interval_secs` | `MOBEE_SELLER_HEARTBEAT__INTERVAL_SECS` |
-//! | `seller_preflight.boot_push_preflight` | `MOBEE_SELLER_PREFLIGHT__BOOT_PUSH_PREFLIGHT` |
-//! | `contribution.allowed_paths` (list) | `MOBEE_CONTRIBUTION__ALLOWED_PATHS=…` |
+//! | `relay_url` | `MAXPLAYER_RELAY_URL` |
+//! | `accepted_mints` (list) | `MAXPLAYER_ACCEPTED_MINTS=a,b` |
+//! | `per_job_budget_sats` | `MAXPLAYER_PER_JOB_BUDGET_SATS` |
+//! | `extra_mints` (list) | `MAXPLAYER_EXTRA_MINTS=a,b` |
+//! | `allow_real_mints` | `MAXPLAYER_ALLOW_REAL_MINTS` |
+//! | `profile.name` | `MAXPLAYER_PROFILE__NAME` |
+//! | `seller.rate_sats` | `MAXPLAYER_SELLER__RATE_SATS` |
+//! | `seller.agent_command` (list) | `MAXPLAYER_SELLER__AGENT_COMMAND=claude,--flag` |
+//! | `seller_announce.command` (list) | `MAXPLAYER_SELLER_ANNOUNCE__COMMAND=…` |
+//! | `telemetry.mirror_file` | `MAXPLAYER_TELEMETRY__MIRROR_FILE` |
+//! | `seller_heartbeat.interval_secs` | `MAXPLAYER_SELLER_HEARTBEAT__INTERVAL_SECS` |
+//! | `seller_preflight.boot_push_preflight` | `MAXPLAYER_SELLER_PREFLIGHT__BOOT_PUSH_PREFLIGHT` |
+//! | `contribution.allowed_paths` (list) | `MAXPLAYER_CONTRIBUTION__ALLOWED_PATHS=…` |
 //!
 //! List fields comma-split only for the paths in [`LIST_ENV_KEYS`]. The `agents` map is file-only
 //! via env: its keys are dynamic, so a nested `argv` list path cannot be pre-registered for
-//! splitting. `MOBEE_`-prefixed operational/test seams ([`RESERVED_ENV_VARS`], e.g. `MOBEE_HOME`)
+//! splitting. `MAXPLAYER_`-prefixed operational/test seams ([`RESERVED_ENV_VARS`], e.g. `MOBEE_HOME`)
 //! are excluded from the config layer.
 //!
 //! ## Minimal env-only boot (file-less container)
 //!
 //! With no `config.toml`, the built-in defaults already boot a **buyer** (real minibits mint, mobee-relay,
 //! budget caps). A **seller** additionally needs the seller table, whose minimal env set is:
-//! `MOBEE_SELLER__AGENT_COMMAND`, `MOBEE_SELLER__RATE_SATS`, `MOBEE_SELLER__GIT_REMOTE`. The key is
+//! `MAXPLAYER_SELLER__AGENT_COMMAND`, `MAXPLAYER_SELLER__RATE_SATS`, `MAXPLAYER_SELLER__GIT_REMOTE`. The key is
 //! still auto-generated on bootstrap (or supplied out-of-band); `NOSTR_PRIVATE_KEY` handling is
 //! unchanged and never read here.
 
@@ -225,7 +225,7 @@ pub struct SellerConfig {
 /// sandbox. Present ⇒ the launcher argv is prepended to the agent command so it runs inside an OS
 /// sandbox, without the run/exec path knowing which launcher.
 ///
-/// Top-level on `MobeeConfig`, not nested under `[seller]`: `SellerConfig`'s literal is built in
+/// Top-level on `MaxplayerConfig`, not nested under `[seller]`: `SellerConfig`'s literal is built in
 /// the money-path `seller.rs`, which this must not touch (same placement rationale as
 /// [`SellerAnnounceConfig`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,7 +242,7 @@ pub struct SandboxConfig {
 /// retro-write-back knobs and the two plugin seams (prompt template paths). Every field has a
 /// serde default so a config written before this section existed parses to the shipped defaults.
 ///
-/// Placed top-level on `MobeeConfig` rather than nested under `[seller]`, so it needs no required
+/// Placed top-level on `MaxplayerConfig` rather than nested under `[seller]`, so it needs no required
 /// field on `SellerConfig`; the knobs and seams are identical either way.
 ///
 /// This is **diagnostic/economic** context only. Nothing here ever feeds the pay gate, the
@@ -286,7 +286,7 @@ impl Default for SellerMemoryConfig {
 /// NOTE (same build judgment call as [`SellerMemoryConfig`]): the natural spelling would nest
 /// this under `[seller]`, but `SellerConfig`'s literal is constructed in `seller.rs` — a money-
 /// path file the gateway build must not touch. Placing it top-level as `[seller_announce]` on
-/// `MobeeConfig` (built only via `Default`) delivers the identical knob without touching any
+/// `MaxplayerConfig` (built only via `Default`) delivers the identical knob without touching any
 /// money file. Cosmetic nesting only; behavior is unchanged.
 ///
 /// **Feature OFF by default**: an absent section (or an empty `command`) means the daemon emits
@@ -347,7 +347,7 @@ pub fn default_announce_timeout_ms() -> u64 {
 /// does not silently duplicate `episodes.jsonl` to a new file.
 ///
 /// NOTE (same money-path build boundary as [`SellerMemoryConfig`] / [`SellerAnnounceConfig`]):
-/// top-level on `MobeeConfig` (built only via `Default`) so no money-path file is touched.
+/// top-level on `MaxplayerConfig` (built only via `Default`) so no money-path file is touched.
 ///
 /// Diagnostic/observability only, sharing the episode's guarantees: an event NEVER carries a
 /// token/key/proof-secret (it wraps an `Episode`, which holds none — see `episode.rs`), emission is
@@ -526,7 +526,7 @@ pub fn default_heartbeat_stall_missed_intervals() -> u32 {
 /// NOTE (same money-path build boundary as [`SellerMemoryConfig`] / [`SellerAnnounceConfig`]): the
 /// natural spelling would nest this under `[seller]`, but `SellerConfig`'s literal is constructed
 /// in `seller.rs` — a money-path file this change must not touch. A new required field there would
-/// force editing that literal. Placing it top-level as `[seller_preflight]` on `MobeeConfig` (built
+/// force editing that literal. Placing it top-level as `[seller_preflight]` on `MaxplayerConfig` (built
 /// only via `Default`) delivers the identical knob without touching any money file. Cosmetic only;
 /// the probe is diagnostic — it NEVER feeds the pay gate, journal, or receipt bind, and NEVER
 /// refuses boot.
@@ -534,7 +534,7 @@ pub fn default_heartbeat_stall_missed_intervals() -> u32 {
 #[serde(deny_unknown_fields)]
 pub struct SellerPreflightConfig {
     /// Run the boot-time dry-run push probe. Default **true**. Set false (or the env override
-    /// `MOBEE_SELLER_BOOT_PUSH_PREFLIGHT=0`) to skip — e.g. tests, or air-gapped first boots.
+    /// `MAXPLAYER_SELLER_BOOT_PUSH_PREFLIGHT=0`) to skip — e.g. tests, or air-gapped first boots.
     #[serde(default = "default_boot_push_preflight")]
     pub boot_push_preflight: bool,
 }
@@ -682,13 +682,13 @@ pub struct AgentPresetConfig {
 /// Buyer-facing packaged config (`~/.mobee/config.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct MobeeConfig {
+pub struct MaxplayerConfig {
     /// Open-market relay. Absent in the file ⇒ the built-in [`DEFAULT_RELAY_URL`].
     #[serde(default = "default_relay_url")]
     pub relay_url: String,
     /// Seller-side accept policy: the mints this seller will accept payment at. The first
     /// entry is the mint the seller advertises first and also the buyer-side wallet default
-    /// mint (read via [`MobeeConfig::default_mint`]). Defaults to `[DEFAULT_MINT_URL]`.
+    /// mint (read via [`MaxplayerConfig::default_mint`]). Defaults to `[DEFAULT_MINT_URL]`.
     ///
     /// NOTE: distinct from `extra_mints`. `accepted_mints` is the SELLER accept-policy list;
     /// `extra_mints` is the BUYER wallet's *additional allowed* mints. They are separate
@@ -701,8 +701,8 @@ pub struct MobeeConfig {
     /// is the only gate — every posted and paid job is bounded by this one number.
     #[serde(default = "default_per_job_budget_sats")]
     pub per_job_budget_sats: u64,
-    /// Opt-in additional mints for the BUYER wallet (`mobee wallet mints add`). The buyer's
-    /// default mint stays the first `accepted_mints` entry ([`MobeeConfig::default_mint`]);
+    /// Opt-in additional mints for the BUYER wallet (`maxplayer wallet mints add`). The buyer's
+    /// default mint stays the first `accepted_mints` entry ([`MaxplayerConfig::default_mint`]);
     /// never invents spendable credit by itself.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_mints: Vec<String>,
@@ -718,7 +718,7 @@ pub struct MobeeConfig {
     /// Optional `[profile] name / about`. Skipped when absent so fresh homes stay unnamed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ProfileConfig>,
-    /// Optional `[seller]` daemon config. Absent until `mobee sell` setup writes it.
+    /// Optional `[seller]` daemon config. Absent until `maxplayer sell` setup writes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seller: Option<SellerConfig>,
     /// Optional `[buzz]` persona config. Absent ⇒ the buzz persona feature is inert.
@@ -774,25 +774,25 @@ pub struct ContributionPolicyConfig {
     pub max_diff_bytes: Option<u64>,
 }
 
-/// Serde/default seed for [`MobeeConfig::accepted_mints`] (issue #378): a single REAL minibits mint.
-/// A fresh config accepts real sats here by default — which is why [`MobeeConfig::default`] also flips
+/// Serde/default seed for [`MaxplayerConfig::accepted_mints`] (issue #378): a single REAL minibits mint.
+/// A fresh config accepts real sats here by default — which is why [`MaxplayerConfig::default`] also flips
 /// `allow_real_mints` true, without which `mint_allowed` would refuse this very default. Mint VARIETY
 /// (multiple real mints) lives in the market-mode loop, not the shipped default pool.
 fn default_accepted_mints() -> Vec<String> {
     vec![DEFAULT_MINIBITS_MINT_URL.to_owned()]
 }
 
-/// Serde default for [`MobeeConfig::relay_url`] — the built-in [`DEFAULT_RELAY_URL`].
+/// Serde default for [`MaxplayerConfig::relay_url`] — the built-in [`DEFAULT_RELAY_URL`].
 fn default_relay_url() -> String {
     DEFAULT_RELAY_URL.to_owned()
 }
 
-/// Serde default for [`MobeeConfig::per_job_budget_sats`] — [`DEFAULT_PER_JOB_BUDGET_SATS`].
+/// Serde default for [`MaxplayerConfig::per_job_budget_sats`] — [`DEFAULT_PER_JOB_BUDGET_SATS`].
 fn default_per_job_budget_sats() -> u64 {
     DEFAULT_PER_JOB_BUDGET_SATS
 }
 
-/// Serde default for [`MobeeConfig::allow_real_mints`] — `true` (issue #378). The shipped
+/// Serde default for [`MaxplayerConfig::allow_real_mints`] — `true` (issue #378). The shipped
 /// `accepted_mints` default is a real mint, so the fence must admit it; `false` here would make the
 /// default config refuse its own default mint. Set `allow_real_mints = false` to force testnut-only.
 fn default_allow_real_mints() -> bool {
@@ -817,7 +817,7 @@ pub fn mint_allowed(mint_url: &str, allow_real_mints: bool) -> bool {
     }
 }
 
-impl MobeeConfig {
+impl MaxplayerConfig {
     /// Buyer-side default mint: the first accepted mint. Falls back to [`DEFAULT_MINT_URL`]
     /// only if the list is empty (boot validation refuses an empty list for sellers). Buyer
     /// wallet ops read a single default mint through this accessor; the seller accept policy
@@ -830,7 +830,7 @@ impl MobeeConfig {
     }
 }
 
-impl Default for MobeeConfig {
+impl Default for MaxplayerConfig {
     fn default() -> Self {
         Self {
             relay_url: DEFAULT_RELAY_URL.to_owned(),
@@ -856,9 +856,9 @@ impl Default for MobeeConfig {
 
 /// Resolved packaged home after bootstrap.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MobeeHome {
+pub struct MaxplayerHome {
     pub root: PathBuf,
-    pub config: MobeeConfig,
+    pub config: MaxplayerConfig,
     pub key_path: PathBuf,
     pub wallet_dir: PathBuf,
     /// True when this bootstrap call created the key file.
@@ -883,9 +883,9 @@ pub fn default_home_dir() -> Result<PathBuf, HomeError> {
 ///
 /// Idempotent: existing config/key are left in place except dead-mint migration
 /// (`testnut.cashu.space` → [`DEFAULT_MINT_URL`]). The persisted `config.toml` is the file layer;
-/// the returned [`MobeeHome::config`] additionally carries the `MOBEE_*` environment overlay (see
+/// the returned [`MaxplayerHome::config`] additionally carries the `MAXPLAYER_*` environment overlay (see
 /// the module docs). Never returns the secret key.
-pub fn bootstrap(root: impl AsRef<Path>) -> Result<MobeeHome, HomeError> {
+pub fn bootstrap(root: impl AsRef<Path>) -> Result<MaxplayerHome, HomeError> {
     let root = root.as_ref().to_path_buf();
     fs::create_dir_all(&root).map_err(|error| HomeError::Io(error.to_string()))?;
 
@@ -900,7 +900,7 @@ pub fn bootstrap(root: impl AsRef<Path>) -> Result<MobeeHome, HomeError> {
         }
         config
     } else {
-        let config = MobeeConfig::default();
+        let config = MaxplayerConfig::default();
         // First run: write config.toml WITH short per-field doc comments (issue #376).
         write_config_documented(&config_path, &config)?;
         config
@@ -918,7 +918,7 @@ pub fn bootstrap(root: impl AsRef<Path>) -> Result<MobeeHome, HomeError> {
 
     let config = apply_env_layer(&file_config, config_env_from_process())?;
 
-    Ok(MobeeHome {
+    Ok(MaxplayerHome {
         root,
         config,
         key_path,
@@ -929,7 +929,7 @@ pub fn bootstrap(root: impl AsRef<Path>) -> Result<MobeeHome, HomeError> {
 
 /// Rewrite dead `.cashu.space` testnut hosts to [`DEFAULT_MINT_URL`] across every
 /// `accepted_mints` entry. Returns true when any entry changed.
-pub fn migrate_dead_mint_url(config: &mut MobeeConfig) -> bool {
+pub fn migrate_dead_mint_url(config: &mut MaxplayerConfig) -> bool {
     let mut changed = false;
     for mint in &mut config.accepted_mints {
         if mint.to_ascii_lowercase().contains(DEAD_TESTNUT_MINT_HOST) {
@@ -1012,12 +1012,12 @@ fn fold_removed_config_fields(table: &mut toml::Table) {
 /// Hex-encode the secp256k1 x-only/public view is deferred; this returns the *public* key
 /// only when a caller supplies a derived pubkey. For bootstrap status we expose whether a
 /// key file exists — use [`read_secret_key_hex`] only inside trusted surfaces that never log it.
-pub fn key_file_present(home: &MobeeHome) -> bool {
+pub fn key_file_present(home: &MaxplayerHome) -> bool {
     home.key_path.is_file()
 }
 
 /// Read the secret key hex from disk. Callers must not log, print, or put this in MCP tool output.
-pub fn read_secret_key_hex(home: &MobeeHome) -> Result<String, HomeError> {
+pub fn read_secret_key_hex(home: &MaxplayerHome) -> Result<String, HomeError> {
     let mut file =
         File::open(&home.key_path).map_err(|error| HomeError::Key(error.to_string()))?;
     let mut contents = String::new();
@@ -1031,25 +1031,25 @@ pub fn read_secret_key_hex(home: &MobeeHome) -> Result<String, HomeError> {
 /// Hex-encode the buyer's nostr public key derived from the packaged secret.
 /// Safe to return on MCP surfaces (not secret material).
 #[cfg(feature = "wallet")]
-pub fn public_key_hex(home: &MobeeHome) -> Result<String, HomeError> {
+pub fn public_key_hex(home: &MaxplayerHome) -> Result<String, HomeError> {
     let secret = read_secret_key_hex(home)?;
     let keys = nostr_sdk::Keys::parse(&secret)
         .map_err(|error| HomeError::Key(format!("key parse for pubkey: {error}")))?;
     Ok(keys.public_key().to_hex())
 }
 
-/// The FILE layer: read `config.toml` into the typed [`MobeeConfig`]. Absent fields fall back to
+/// The FILE layer: read `config.toml` into the typed [`MaxplayerConfig`]. Absent fields fall back to
 /// the built-in defaults (so this is already the defaults→file merge); unknown fields refuse with
 /// the offending key named. The legacy single `mint_url` folds into `accepted_mints` first.
-fn load_config(path: &Path) -> Result<MobeeConfig, HomeError> {
+fn load_config(path: &Path) -> Result<MaxplayerConfig, HomeError> {
     let raw = fs::read_to_string(path).map_err(|error| HomeError::Config(error.to_string()))?;
     parse_config_toml(&raw)
 }
 
-/// Parse a `config.toml` document into the file-layer [`MobeeConfig`]. Fold legacy `mint_url` and the
+/// Parse a `config.toml` document into the file-layer [`MaxplayerConfig`]. Fold legacy `mint_url` and the
 /// issue #378 removed fields, then typed-parse under `deny_unknown_fields` so any other unknown key
 /// (at any depth) refuses. `pub(crate)` so sibling modules' tests can exercise the read-time migration.
-pub(crate) fn parse_config_toml(raw: &str) -> Result<MobeeConfig, HomeError> {
+pub(crate) fn parse_config_toml(raw: &str) -> Result<MaxplayerConfig, HomeError> {
     let mut table: toml::Table =
         toml::from_str(raw).map_err(|error| HomeError::Config(format!("config.toml: {error}")))?;
     fold_legacy_mint_url(&mut table);
@@ -1059,26 +1059,26 @@ pub(crate) fn parse_config_toml(raw: &str) -> Result<MobeeConfig, HomeError> {
         .map_err(|error| HomeError::Config(format!("config.toml: {error}")))
 }
 
-/// `MOBEE_`-prefixed environment variables that are operational/test seams, **not**
-/// [`MobeeConfig`] fields (home resolution and the daemon test overrides read these directly). They
+/// `MAXPLAYER_`-prefixed environment variables that are operational/test seams, **not**
+/// [`MaxplayerConfig`] fields (home resolution and the daemon test overrides read these directly). They
 /// are excluded from the env config layer so they neither collide with a field nor — under
 /// `deny_unknown_fields` — refuse resolution. None of these collide with a real field's canonical
-/// `MOBEE_*` spelling, so excluding them costs no config coverage.
+/// `MAXPLAYER_*` spelling, so excluding them costs no config coverage.
 const RESERVED_ENV_VARS: &[&str] = &[
     "MOBEE_HOME",
-    "MOBEE_HEARTBEAT_INTERVAL_SECS",
-    "MOBEE_HEARTBEAT_ENABLED",
-    "MOBEE_HEARTBEAT_STALL_MISSED_INTERVALS",
-    "MOBEE_WRAP_BACKFILL_INTERVAL_SECS",
-    "MOBEE_AWARD_SWEEP_INTERVAL_SECS",
-    "MOBEE_SELLER_BOOT_PUSH_PREFLIGHT",
-    "MOBEE_GIT_CREDENTIAL_NOSTR",
-    "MOBEE_ACP_SMOKE",
-    "MOBEE_ACP_SMOKE_CMD",
-    "MOBEE_EVALS_SNAPSHOT_DIR",
+    "MAXPLAYER_HEARTBEAT_INTERVAL_SECS",
+    "MAXPLAYER_HEARTBEAT_ENABLED",
+    "MAXPLAYER_HEARTBEAT_STALL_MISSED_INTERVALS",
+    "MAXPLAYER_WRAP_BACKFILL_INTERVAL_SECS",
+    "MAXPLAYER_AWARD_SWEEP_INTERVAL_SECS",
+    "MAXPLAYER_SELLER_BOOT_PUSH_PREFLIGHT",
+    "MAXPLAYER_GIT_CREDENTIAL_NOSTR",
+    "MAXPLAYER_ACP_SMOKE",
+    "MAXPLAYER_ACP_SMOKE_CMD",
+    "MAXPLAYER_EVALS_SNAPSHOT_DIR",
 ];
 
-/// [`MobeeConfig`] fields whose env value is a comma-separated list. The env source must be told
+/// [`MaxplayerConfig`] fields whose env value is a comma-separated list. The env source must be told
 /// which keys parse into a sequence — a scalar `String` field must not be split. Keyed by the
 /// resolved (lowercase, `.`-nested) config path. `agents.<name>.argv` is intentionally absent: the
 /// map keys are dynamic and cannot be pre-registered, so multi-token agent argv is file-only.
@@ -1092,19 +1092,19 @@ const LIST_ENV_KEYS: &[&str] = &[
     "contribution.forbidden_paths",
 ];
 
-/// The process environment's config-layer variables: every `MOBEE_`-prefixed var that is not a
+/// The process environment's config-layer variables: every `MAXPLAYER_`-prefixed var that is not a
 /// reserved operational seam ([`RESERVED_ENV_VARS`]).
 fn config_env_from_process() -> HashMap<String, String> {
     std::env::vars()
-        .filter(|(key, _)| key.starts_with("MOBEE_") && !RESERVED_ENV_VARS.contains(&key.as_str()))
+        .filter(|(key, _)| key.starts_with("MAXPLAYER_") && !RESERVED_ENV_VARS.contains(&key.as_str()))
         .collect()
 }
 
-/// Overlay the ENV layer on a resolved defaults/file [`MobeeConfig`]. `env` is the pre-filtered
-/// `MOBEE_*` map ([`config_env_from_process`] in production; tests inject one). A malformed value
-/// (wrong type) or an unknown `MOBEE_<FIELD>` refuses fail-closed, naming the offending key.
-fn apply_env_layer(base: &MobeeConfig, env: HashMap<String, String>) -> Result<MobeeConfig, HomeError> {
-    let mut environment = config::Environment::with_prefix("MOBEE")
+/// Overlay the ENV layer on a resolved defaults/file [`MaxplayerConfig`]. `env` is the pre-filtered
+/// `MAXPLAYER_*` map ([`config_env_from_process`] in production; tests inject one). A malformed value
+/// (wrong type) or an unknown `MAXPLAYER_<FIELD>` refuses fail-closed, naming the offending key.
+fn apply_env_layer(base: &MaxplayerConfig, env: HashMap<String, String>) -> Result<MaxplayerConfig, HomeError> {
+    let mut environment = config::Environment::with_prefix("MAXPLAYER")
         .prefix_separator("_")
         .separator("__")
         .try_parsing(true)
@@ -1117,17 +1117,17 @@ fn apply_env_layer(base: &MobeeConfig, env: HashMap<String, String>) -> Result<M
     config::Config::builder()
         .add_source(
             config::Config::try_from(base).map_err(|error| {
-                HomeError::Config(format!("MOBEE_* environment layer: {error}"))
+                HomeError::Config(format!("MAXPLAYER_* environment layer: {error}"))
             })?,
         )
         .add_source(environment)
         .build()
-        .map_err(|error| HomeError::Config(format!("MOBEE_* environment layer: {error}")))?
-        .try_deserialize::<MobeeConfig>()
-        .map_err(|error| HomeError::Config(format!("MOBEE_* environment layer: {error}")))
+        .map_err(|error| HomeError::Config(format!("MAXPLAYER_* environment layer: {error}")))?
+        .try_deserialize::<MaxplayerConfig>()
+        .map_err(|error| HomeError::Config(format!("MAXPLAYER_* environment layer: {error}")))
 }
 
-fn write_config(path: &Path, config: &MobeeConfig) -> Result<(), HomeError> {
+fn write_config(path: &Path, config: &MaxplayerConfig) -> Result<(), HomeError> {
     let raw = toml::to_string_pretty(config)
         .map_err(|error| HomeError::Config(error.to_string()))?;
     // Crash-atomic rewrite: config.toml holds money-adjacent state (budget caps, accepted mints), so
@@ -1143,7 +1143,7 @@ fn write_config(path: &Path, config: &MobeeConfig) -> Result<(), HomeError> {
 /// comments are TOML comments (ignored on parse), so the file still round-trips byte-for-byte through
 /// [`parse_config_toml`]. Only bootstrap's fresh-config branch uses this; later `save_config` rewrites
 /// are bare, so an operator's edited value is never re-annotated with a default they changed.
-fn write_config_documented(path: &Path, config: &MobeeConfig) -> Result<(), HomeError> {
+fn write_config_documented(path: &Path, config: &MaxplayerConfig) -> Result<(), HomeError> {
     let raw = documented_config_toml(config)?;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     crate::durable::write_atomic(dir, path, raw.as_bytes())
@@ -1154,7 +1154,7 @@ fn write_config_documented(path: &Path, config: &MobeeConfig) -> Result<(), Home
 /// default keys (issue #376). The body is the ordinary `toml::to_string_pretty` output, so the result
 /// parses back to an equal config; the comments are onboarding for the operator who first opens the
 /// file — most importantly, that the shipped defaults move REAL sats.
-fn documented_config_toml(config: &MobeeConfig) -> Result<String, HomeError> {
+fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError> {
     // Doc lines injected above the first serialized line whose key matches. Keyed by field name, so
     // order-independent; a key not present in the (skip-defaulted) output is simply not annotated.
     const FIELD_DOCS: &[(&str, &[&str])] = &[
@@ -1205,22 +1205,22 @@ fn documented_config_toml(config: &MobeeConfig) -> Result<String, HomeError> {
     Ok(out)
 }
 
-/// Persist an explicit config change to `config.toml`, keeping `MOBEE_*` overrides runtime-only.
+/// Persist an explicit config change to `config.toml`, keeping `MAXPLAYER_*` overrides runtime-only.
 ///
-/// The file is the durable layer; the `MOBEE_*` environment is an overlay applied at load
+/// The file is the durable layer; the `MAXPLAYER_*` environment is an overlay applied at load
 /// ([`apply_env_layer`]) and never written back. `edit` receives the file-only view (defaults +
 /// current file, no env) and applies the caller's explicit change; that view is written, so an
 /// env-origin value the caller did not choose cannot leak into the file. `home.config` is then
 /// refreshed through the full layer pipeline so the in-process struct still reflects env.
 pub fn save_config(
-    home: &mut MobeeHome,
-    edit: impl FnOnce(&mut MobeeConfig),
+    home: &mut MaxplayerHome,
+    edit: impl FnOnce(&mut MaxplayerConfig),
 ) -> Result<(), HomeError> {
     let config_path = home.root.join(CONFIG_FILE);
     let mut file_config = if config_path.exists() {
         load_config(&config_path)?
     } else {
-        MobeeConfig::default()
+        MaxplayerConfig::default()
     };
     edit(&mut file_config);
     write_config(&config_path, &file_config)?;
@@ -1229,8 +1229,8 @@ pub fn save_config(
 }
 
 /// Reload `config.toml` into `home.config` without touching the key file. Routes through the same
-/// layer pipeline as [`bootstrap`]: file layer then `MOBEE_*` environment overlay.
-pub fn reload_config(home: &mut MobeeHome) -> Result<(), HomeError> {
+/// layer pipeline as [`bootstrap`]: file layer then `MAXPLAYER_*` environment overlay.
+pub fn reload_config(home: &mut MaxplayerHome) -> Result<(), HomeError> {
     let mut file_config = load_config(&home.root.join(CONFIG_FILE))?;
     if migrate_dead_mint_url(&mut file_config) {
         write_config(&home.root.join(CONFIG_FILE), &file_config)?;
@@ -1356,7 +1356,7 @@ mod tests {
         );
 
         let serialized = toml::to_string_pretty(&config).expect("serialize");
-        let reloaded: MobeeConfig = toml::from_str(&serialized).expect("reparse");
+        let reloaded: MaxplayerConfig = toml::from_str(&serialized).expect("reparse");
         assert_eq!(reloaded, config);
 
         // Same no-shell rule as `agent_command`: a string argv is refused at parse.
@@ -1380,7 +1380,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let home = bootstrap(&root).expect("bootstrap");
         assert!(home.key_created);
-        assert_eq!(home.config, MobeeConfig::default());
+        assert_eq!(home.config, MaxplayerConfig::default());
         assert!(home.root.join(CONFIG_FILE).is_file());
         assert!(home.key_path.is_file());
         assert!(home.wallet_dir.is_dir());
@@ -1411,7 +1411,7 @@ mod tests {
     }
 
     #[test]
-    fn default_home_dir_honors_mobee_home() {
+    fn default_home_dir_honors_maxplayer_home() {
         let root = temp_home("env");
         // Safety: test process isolation — restore after.
         let previous = std::env::var_os("MOBEE_HOME");
@@ -1456,9 +1456,9 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("mkdir");
         let config_path = root.join(CONFIG_FILE);
-        let stale = MobeeConfig {
+        let stale = MaxplayerConfig {
             accepted_mints: vec![format!("https://{DEAD_TESTNUT_MINT_HOST}")],
-            ..MobeeConfig::default()
+            ..MaxplayerConfig::default()
         };
         write_config(&config_path, &stale).expect("write stale");
         let home = bootstrap(&root).expect("bootstrap migrates");
@@ -1471,13 +1471,13 @@ mod tests {
     fn accepted_mints_default() {
         // Issue #378: a config that names no mint yields the shipped default — a single REAL minibits
         // mint (paired with allow_real_mints = true; see `default_allow_real_mints`).
-        let config: MobeeConfig = toml::from_str(
+        let config: MaxplayerConfig = toml::from_str(
             "relay_url = 'r'\nper_job_budget_sats = 1\n",
         )
         .expect("parse mint-less config");
         assert_eq!(config.accepted_mints, vec![DEFAULT_MINIBITS_MINT_URL.to_owned()]);
         assert_eq!(
-            MobeeConfig::default().accepted_mints,
+            MaxplayerConfig::default().accepted_mints,
             vec![DEFAULT_MINIBITS_MINT_URL.to_owned()]
         );
     }
@@ -1486,11 +1486,11 @@ mod tests {
     fn documented_config_round_trips_and_warns_of_real_money() {
         // #376: the first-run config.toml carries `#` comments; they must not break parse, and the
         // file must round-trip to the exact default it serialized (comments are TOML comments).
-        let rendered = documented_config_toml(&MobeeConfig::default()).expect("render documented");
+        let rendered = documented_config_toml(&MaxplayerConfig::default()).expect("render documented");
         let reparsed = parse_config_toml(&rendered).expect("documented config must parse");
         assert_eq!(
             toml::to_string_pretty(&reparsed).expect("ser"),
-            toml::to_string_pretty(&MobeeConfig::default()).expect("ser"),
+            toml::to_string_pretty(&MaxplayerConfig::default()).expect("ser"),
             "documented first-run config must round-trip to the default"
         );
         assert!(rendered.contains("REAL sats"), "must warn the shipped defaults move real sats");
@@ -1503,7 +1503,7 @@ mod tests {
         // #378 flipped fresh nodes real-money-capable. The whole default posture in one place; the
         // load-bearing part is that mint_allowed ADMITS the shipped default mint (it would REFUSE it
         // if allow_real_mints had stayed false, or if the mint reverted to testnut).
-        let d = MobeeConfig::default();
+        let d = MaxplayerConfig::default();
         assert_eq!(d.accepted_mints, vec![DEFAULT_MINIBITS_MINT_URL.to_owned()]);
         assert!(d.allow_real_mints, "fresh nodes are real-money-capable by default");
         assert_eq!(d.per_job_budget_sats, 30_000);
@@ -1570,7 +1570,7 @@ mod tests {
 
     #[test]
     fn save_does_not_persist_env_override_values() {
-        // A field whose value came only from a MOBEE_* env override must stay runtime-only:
+        // A field whose value came only from a MAXPLAYER_* env override must stay runtime-only:
         // saving an UNRELATED field must not bake the env value into config.toml.
         let root = temp_home("save-env-noleak");
         let _ = fs::remove_dir_all(&root);
@@ -1578,7 +1578,7 @@ mod tests {
 
         // Resolve an env override into the in-process config, as a live process would.
         let file_before = load_config(&home.root.join(CONFIG_FILE)).expect("file before");
-        home.config = apply_env_layer(&file_before, env(&[("MOBEE_RELAY_URL", "wss://from-env")]))
+        home.config = apply_env_layer(&file_before, env(&[("MAXPLAYER_RELAY_URL", "wss://from-env")]))
             .expect("env layer");
         assert_eq!(home.config.relay_url, "wss://from-env");
 
@@ -1639,7 +1639,7 @@ mod tests {
         let mut home = bootstrap(&root).expect("bootstrap");
 
         let file_before = load_config(&home.root.join(CONFIG_FILE)).expect("file before");
-        home.config = apply_env_layer(&file_before, env(&[("MOBEE_RELAY_URL", "wss://from-env")]))
+        home.config = apply_env_layer(&file_before, env(&[("MAXPLAYER_RELAY_URL", "wss://from-env")]))
             .expect("env layer");
 
         save_config(&mut home, |config| {
@@ -1682,9 +1682,9 @@ mod tests {
         let resolved = apply_env_layer(
             &file,
             env(&[
-                ("MOBEE_RELAY_URL", "wss://from-env"),
-                ("MOBEE_PER_JOB_BUDGET_SATS", "7"),
-                ("MOBEE_ACCEPTED_MINTS", "https://env-a,https://env-b"),
+                ("MAXPLAYER_RELAY_URL", "wss://from-env"),
+                ("MAXPLAYER_PER_JOB_BUDGET_SATS", "7"),
+                ("MAXPLAYER_ACCEPTED_MINTS", "https://env-a,https://env-b"),
             ]),
         )
         .expect("env layer");
@@ -1700,10 +1700,10 @@ mod tests {
 
     #[test]
     fn env_layer_overrides_nested_field() {
-        let base = MobeeConfig::default();
+        let base = MaxplayerConfig::default();
         let resolved = apply_env_layer(
             &base,
-            env(&[("MOBEE_SELLER_HEARTBEAT__INTERVAL_SECS", "42")]),
+            env(&[("MAXPLAYER_SELLER_HEARTBEAT__INTERVAL_SECS", "42")]),
         )
         .expect("nested env");
         assert_eq!(resolved.seller_heartbeat.interval_secs, 42);
@@ -1713,8 +1713,8 @@ mod tests {
     #[test]
     fn env_layer_refuses_malformed_value_naming_the_key() {
         let error = apply_env_layer(
-            &MobeeConfig::default(),
-            env(&[("MOBEE_PER_JOB_BUDGET_SATS", "not-a-number")]),
+            &MaxplayerConfig::default(),
+            env(&[("MAXPLAYER_PER_JOB_BUDGET_SATS", "not-a-number")]),
         )
         .expect_err("malformed env must refuse");
         let message = error.to_string();
@@ -1726,10 +1726,10 @@ mod tests {
 
     #[test]
     fn env_layer_refuses_unknown_variable() {
-        // A MOBEE_-prefixed var that is neither a field nor a reserved seam fails closed.
+        // A MAXPLAYER_-prefixed var that is neither a field nor a reserved seam fails closed.
         let error = apply_env_layer(
-            &MobeeConfig::default(),
-            env(&[("MOBEE_NO_SUCH_FIELD", "x")]),
+            &MaxplayerConfig::default(),
+            env(&[("MAXPLAYER_NO_SUCH_FIELD", "x")]),
         )
         .expect_err("unknown env must refuse");
         assert!(error.to_string().contains("environment"));
@@ -1741,17 +1741,17 @@ mod tests {
         // resolution from refusing when they are set. The filtered map must drop them.
         let raw = env(&[
             ("MOBEE_HOME", "/tmp/x"),
-            ("MOBEE_HEARTBEAT_INTERVAL_SECS", "9"),
-            ("MOBEE_RELAY_URL", "wss://kept"),
+            ("MAXPLAYER_HEARTBEAT_INTERVAL_SECS", "9"),
+            ("MAXPLAYER_RELAY_URL", "wss://kept"),
         ]);
         let kept: HashMap<String, String> = raw
             .into_iter()
-            .filter(|(key, _)| key.starts_with("MOBEE_") && !RESERVED_ENV_VARS.contains(&key.as_str()))
+            .filter(|(key, _)| key.starts_with("MAXPLAYER_") && !RESERVED_ENV_VARS.contains(&key.as_str()))
             .collect();
         assert_eq!(kept.len(), 1);
-        assert!(kept.contains_key("MOBEE_RELAY_URL"));
+        assert!(kept.contains_key("MAXPLAYER_RELAY_URL"));
         // And resolution succeeds precisely because the reserved seams were dropped.
-        let resolved = apply_env_layer(&MobeeConfig::default(), kept).expect("resolve");
+        let resolved = apply_env_layer(&MaxplayerConfig::default(), kept).expect("resolve");
         assert_eq!(resolved.relay_url, "wss://kept");
     }
 
@@ -1769,7 +1769,7 @@ mod tests {
     #[test]
     fn env_only_boots_buyer_and_seller_without_a_file() {
         // File-less container: defaults alone already boot a BUYER (mint, relay, budget caps).
-        let buyer = apply_env_layer(&MobeeConfig::default(), HashMap::new()).expect("buyer");
+        let buyer = apply_env_layer(&MaxplayerConfig::default(), HashMap::new()).expect("buyer");
         assert!(!buyer.relay_url.is_empty());
         assert!(!buyer.default_mint().is_empty());
         assert!(buyer.per_job_budget_sats > 0);
@@ -1777,11 +1777,11 @@ mod tests {
 
         // A SELLER needs only the seller table's required fields via env.
         let seller = apply_env_layer(
-            &MobeeConfig::default(),
+            &MaxplayerConfig::default(),
             env(&[
-                ("MOBEE_SELLER__AGENT_COMMAND", "claude,--headless"),
-                ("MOBEE_SELLER__RATE_SATS", "3"),
-                ("MOBEE_SELLER__GIT_REMOTE", "https://relay.example/git/x/y.git"),
+                ("MAXPLAYER_SELLER__AGENT_COMMAND", "claude,--headless"),
+                ("MAXPLAYER_SELLER__RATE_SATS", "3"),
+                ("MAXPLAYER_SELLER__GIT_REMOTE", "https://relay.example/git/x/y.git"),
             ]),
         )
         .expect("seller boots from env alone");

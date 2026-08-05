@@ -47,9 +47,9 @@ RUN apt-get update \
 # Run as an unprivileged user. The key file must be 0600 and owned by this
 # user; /data (MOBEE_HOME) is created up front so a named volume inherits the
 # right ownership on first run.
-RUN useradd --system --create-home --uid 10001 --shell /usr/sbin/nologin mobee \
+RUN useradd --system --create-home --uid 10001 --shell /usr/sbin/nologin maxplayer \
     && mkdir -p /data \
-    && chown mobee:mobee /data
+    && chown maxplayer:maxplayer /data
 
 COPY --from=builder /usr/local/bin/maxplayer /usr/local/bin/maxplayer
 
@@ -58,7 +58,7 @@ COPY --from=builder /usr/local/bin/maxplayer /usr/local/bin/maxplayer
 ENV MOBEE_HOME=/data
 VOLUME ["/data"]
 
-USER mobee
+USER maxplayer
 WORKDIR /data
 
 # tini as PID 1 so SIGTERM from `docker stop` cleanly shuts the daemon.

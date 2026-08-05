@@ -863,16 +863,16 @@ mod tests {
 
     #[cfg(feature = "acp")]
     #[test]
-    #[ignore = "requires MOBEE_ACP_SMOKE=1 and MOBEE_ACP_SMOKE_CMD"]
+    #[ignore = "requires MAXPLAYER_ACP_SMOKE=1 and MAXPLAYER_ACP_SMOKE_CMD"]
     fn acp_smoke_real_agent_command_writes_terminal_log() {
-        if std::env::var("MOBEE_ACP_SMOKE").ok().as_deref() != Some("1") {
-            eprintln!("set MOBEE_ACP_SMOKE=1 to run the ACP smoke test");
+        if std::env::var("MAXPLAYER_ACP_SMOKE").ok().as_deref() != Some("1") {
+            eprintln!("set MAXPLAYER_ACP_SMOKE=1 to run the ACP smoke test");
             return;
         }
-        let command = match std::env::var("MOBEE_ACP_SMOKE_CMD") {
+        let command = match std::env::var("MAXPLAYER_ACP_SMOKE_CMD") {
             Ok(command) => command,
             Err(_) => {
-                eprintln!("set MOBEE_ACP_SMOKE_CMD to run the ACP smoke test");
+                eprintln!("set MAXPLAYER_ACP_SMOKE_CMD to run the ACP smoke test");
                 return;
             }
         };

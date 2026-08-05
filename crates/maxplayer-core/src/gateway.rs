@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::delivery::{CommitOid, DeliveryError, GitDelivery};
 
 pub const MOBEE_TAG: &str = "mobee";
-// mobee protocol version. mobee events occupy a dedicated kind block, so a parser only ever
+// maxplayer protocol version. maxplayer events occupy a dedicated kind block, so a parser only ever
 // matches mobee's own events.
 pub const PROTOCOL_VERSION: &str = "0";
 
@@ -122,7 +122,7 @@ impl OfferDraft {
         if let Some(seller_pubkey) = &self.seller_pubkey {
             tags.push(TagSpec::new(["p", seller_pubkey]));
         }
-        tags.push(mobee_tag());
+        tags.push(maxplayer_tag());
         tags.push(version_tag());
 
         EventDraft::new(JOB_OFFER_KIND, tags, "")
@@ -202,7 +202,7 @@ pub enum OfferParseError {
     InvalidDeadline(String),
     UnsupportedUnit(String),
     UnsupportedVersion(String),
-    MissingMobeeTag,
+    MissingMaxplayerTag,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,7 +210,7 @@ pub enum GitResultParseError {
     WrongKind(u16),
     MissingTag(&'static str),
     /// Namespace guard: a result event without the `["t","mobee"]` tag.
-    MissingMobeeTag,
+    MissingMaxplayerTag,
     UnsupportedDelivery(String),
     InvalidDelivery(DeliveryError),
 }
@@ -247,7 +247,7 @@ impl fmt::Display for GitResultParseError {
         match self {
             Self::WrongKind(kind) => write!(f, "expected kind {JOB_RESULT_KIND}, got {kind}"),
             Self::MissingTag(tag) => write!(f, "missing required git result tag {tag}"),
-            Self::MissingMobeeTag => write!(f, "missing t=mobee tag"),
+            Self::MissingMaxplayerTag => write!(f, "missing t=maxplayer tag"),
             Self::UnsupportedDelivery(delivery) => {
                 write!(f, "unsupported result delivery {delivery:?}")
             }
@@ -266,8 +266,8 @@ impl fmt::Display for OfferParseError {
             Self::InvalidAmount(value) => write!(f, "invalid amount tag value {value:?}"),
             Self::InvalidDeadline(value) => write!(f, "invalid deadline tag value {value:?}"),
             Self::UnsupportedUnit(unit) => write!(f, "unsupported amount unit {unit:?}"),
-            Self::UnsupportedVersion(version) => write!(f, "unsupported mobee version {version:?}"),
-            Self::MissingMobeeTag => write!(f, "missing t=mobee tag"),
+            Self::UnsupportedVersion(version) => write!(f, "unsupported maxplayer version {version:?}"),
+            Self::MissingMaxplayerTag => write!(f, "missing t=maxplayer tag"),
         }
     }
 }
@@ -279,7 +279,7 @@ pub fn parse_offer(event: &EventDraft) -> Result<ParsedOffer, OfferParseError> {
         return Err(OfferParseError::WrongKind(event.kind));
     }
     if !has_tag_value(&event.tags, "t", MOBEE_TAG) {
-        return Err(OfferParseError::MissingMobeeTag);
+        return Err(OfferParseError::MissingMaxplayerTag);
     }
     let version = first_tag_value(&event.tags, "v").ok_or(OfferParseError::MissingTag("v"))?;
     if version != PROTOCOL_VERSION {
@@ -353,7 +353,7 @@ pub fn parse_git_result_delivery(event: &EventDraft) -> Result<GitDelivery, GitR
     // Namespace guard: reject a foreign event squatting the result kind before reading any
     // delivery field.
     if !has_tag_value(&event.tags, "t", MOBEE_TAG) {
-        return Err(GitResultParseError::MissingMobeeTag);
+        return Err(GitResultParseError::MissingMaxplayerTag);
     }
     let delivery = first_tag_value(&event.tags, "delivery")
         .ok_or(GitResultParseError::MissingTag("delivery"))?;
@@ -572,7 +572,7 @@ pub fn result_draft(
     tags.push(TagSpec::new(["sig", "seller", seller_signature]));
     // exec-metadata (seller-claimed, unsigned — sig/seller does NOT cover it).
     tags.extend(exec_metadata.iter().cloned());
-    tags.push(mobee_tag());
+    tags.push(maxplayer_tag());
     tags.push(version_tag());
     EventDraft::new(JOB_RESULT_KIND, tags, content)
 }
@@ -751,7 +751,7 @@ pub fn receipt_draft(
         tags.push(TagSpec::new(["delivery_kind", delivery.kind]));
     }
     tags.extend(exec_metadata.iter().cloned());
-    tags.push(mobee_tag());
+    tags.push(maxplayer_tag());
     tags.push(version_tag());
     EventDraft::new(JOB_RECEIPT_KIND, tags, "")
 }
@@ -761,7 +761,7 @@ pub fn receipt_draft(
 /// view logic can read a single field across them.
 fn status_draft(kind: u16, status: &str, mut tags: Vec<TagSpec>) -> EventDraft {
     tags.insert(0, TagSpec::new(["status", status]));
-    tags.push(mobee_tag());
+    tags.push(maxplayer_tag());
     tags.push(version_tag());
     EventDraft::new(kind, tags, "")
 }
@@ -782,7 +782,7 @@ fn has_tag_value(tags: &[TagSpec], name: &str, value: &str) -> bool {
     })
 }
 
-fn mobee_tag() -> TagSpec {
+fn maxplayer_tag() -> TagSpec {
     TagSpec::new(["t", MOBEE_TAG])
 }
 
@@ -1081,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn claim_and_award_use_split_mobee_kinds() {
+    fn claim_and_award_use_split_maxplayer_kinds() {
         // The claim (processing) is its own claim kind, and the buyer-authored award
         // is the award kind — each distinct from the seller's feedback kind.
         assert_eq!(
@@ -1317,7 +1317,7 @@ mod tests {
         assert!(has_tag_value(&receipt.tags, "harness", "claude-agent-acp"));
         assert!(has_tag_value(&receipt.tags, "metadata_trust", "seller-claimed"));
         // t/v markers stay last.
-        assert_eq!(receipt.tags[receipt.tags.len() - 2], mobee_tag());
+        assert_eq!(receipt.tags[receipt.tags.len() - 2], maxplayer_tag());
         assert_eq!(receipt.tags[receipt.tags.len() - 1], version_tag());
     }
 

@@ -4,7 +4,7 @@
 //! HTTPS through an in-memory self-signed cert (rustls + rcgen — the seller transport
 //! allowlist refuses plain `http://`, so a faithful fixture must be `https://`). Every
 //! smart-transport request (`info/refs`, `git-upload-pack`, `git-receive-pack`) requires
-//! an `Authorization` header — mirroring mobee relay-git, which gates reads AND writes
+//! an `Authorization` header — mirroring maxplayer relay-git, which gates reads AND writes
 //! behind NIP-98 — and is answered `401` + `WWW-Authenticate` challenge otherwise, so a
 //! stock git client only moves refs/packs after its credential helper produces a
 //! credential. Every request is recorded (method, target, Authorization) so tests can

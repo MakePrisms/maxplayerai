@@ -14,7 +14,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use maxplayer_core::delivery_transport::is_relay_git_locator;
-use maxplayer_core::home::{self, MobeeHome, SellerConfig, DEFAULT_MINT_URL, DEFAULT_RELAY_URL};
+use maxplayer_core::home::{self, MaxplayerHome, SellerConfig, DEFAULT_MINT_URL, DEFAULT_RELAY_URL};
 use maxplayer_core::profile::{self, SetProfileRequest};
 
 use maxplayer_core::agent_presets;
@@ -105,7 +105,7 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
     })?;
 
     // Explicit good defaults (never prompt for these). Persist through save_config's file-only
-    // edit view so a MOBEE_* env override (which leaves the effective value non-empty) never gets
+    // edit view so a MAXPLAYER_* env override (which leaves the effective value non-empty) never gets
     // written back to config.toml.
     let needs_relay = home.config.relay_url.trim().is_empty();
     let needs_mints = home.config.accepted_mints.is_empty();
@@ -264,7 +264,7 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
 
 #[cfg(feature = "wallet")]
 fn ensure_seller_config(
-    home: &mut MobeeHome,
+    home: &mut MaxplayerHome,
     options: &SellOptions,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -514,7 +514,7 @@ fn atty_stderr() -> bool {
 /// Event-accept alone is insufficient: a global `.names/<d>` collision stores the
 /// kind-30617 but skips seed → later push 404s ("repository not found").
 #[cfg(feature = "wallet")]
-fn probe_relay_git_seeded(home: &MobeeHome, remote_url: &str) -> Result<(), String> {
+fn probe_relay_git_seeded(home: &MaxplayerHome, remote_url: &str) -> Result<(), String> {
     // In-process libgit2 ls-remote (issue #55 — no system `git`). NIP-98 is signed from the seller
     // secret in-process for the relay-git upload-pack advertisement; the secret never hits argv/env.
     let secret = home::read_secret_key_hex(home).map_err(|e| e.to_string())?;

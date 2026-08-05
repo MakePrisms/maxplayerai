@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use crate::authorize_pay::{self, AuthorizePayError, AuthorizePayOutcome};
 use crate::budget::BudgetGate;
 use crate::delivery_git::PayPathDeliveryVerifier;
-use crate::home::MobeeHome;
+use crate::home::MaxplayerHome;
 use crate::job_lifecycle::{self, JobLifecycleError};
 
 /// Inputs for [`collect_async`].
@@ -86,7 +86,7 @@ impl std::error::Error for CollectError {}
 /// composed [`authorize_pay`](crate::authorize_pay::authorize_pay_async) refuses BEFORE the budget
 /// gate — so this returns [`CollectError::Pay`] with ZERO spend and no files are materialized.
 pub async fn collect_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     gate: &mut BudgetGate,
     request: CollectRequest,
 ) -> Result<CollectOutcome, CollectError> {
@@ -142,7 +142,7 @@ pub async fn collect_async(
 
 /// Blocking wrapper over [`collect_async`] for the CLI (builds a current-thread runtime).
 pub fn collect_blocking(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     gate: &mut BudgetGate,
     request: CollectRequest,
 ) -> Result<CollectOutcome, CollectError> {
@@ -157,7 +157,7 @@ pub fn collect_blocking(
 
 /// The buyer store: the local bare repository the pay path retains verified delivery objects in.
 /// Mirrors the path [`authorize_pay`](crate::authorize_pay) opens the verifier against.
-pub fn delivery_store_path(home: &MobeeHome) -> PathBuf {
+pub fn delivery_store_path(home: &MaxplayerHome) -> PathBuf {
     home.root.join("store")
 }
 
@@ -165,7 +165,7 @@ pub fn delivery_store_path(home: &MobeeHome) -> PathBuf {
 /// — path separators / traversal are refused so a caller can never write outside `results`. `None`
 /// ⇒ `<home>/results/<job_id>`.
 pub fn results_dest(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     job_id: &str,
     out: Option<&str>,
 ) -> Result<PathBuf, String> {
@@ -596,7 +596,7 @@ mod tests {
         drop(relay);
     }
 
-    fn write_bind(home: &MobeeHome, bind: &AcceptedBind) {
+    fn write_bind(home: &MaxplayerHome, bind: &AcceptedBind) {
         let jobs = home.root.join("jobs");
         std::fs::create_dir_all(&jobs).expect("jobs dir");
         std::fs::write(

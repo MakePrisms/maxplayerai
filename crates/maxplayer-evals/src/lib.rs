@@ -1,10 +1,10 @@
-//! Deterministic Mobee eval scenarios.
+//! Deterministic Maxplayer eval scenarios.
 //!
 //! Normal `cargo test -p maxplayer-evals` runs are hermetic and never write snapshots.
 //! To intentionally refresh checked-in snapshots, run:
 //!
 //! ```text
-//! MOBEE_EVALS_BLESS=1 cargo test -p maxplayer-evals
+//! MAXPLAYER_EVALS_BLESS=1 cargo test -p maxplayer-evals
 //! ```
 
 use std::error::Error;
@@ -96,7 +96,7 @@ pub fn scenario_dir() -> PathBuf {
 }
 
 pub fn snapshot_dir() -> PathBuf {
-    std::env::var_os("MOBEE_EVALS_SNAPSHOT_DIR").map_or_else(
+    std::env::var_os("MAXPLAYER_EVALS_SNAPSHOT_DIR").map_or_else(
         || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("snapshots"),
         PathBuf::from,
     )

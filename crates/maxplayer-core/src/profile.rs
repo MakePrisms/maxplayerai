@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::home::{self, HomeError, MobeeHome, ProfileConfig};
+use crate::home::{self, HomeError, MaxplayerHome, ProfileConfig};
 
 const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 8;
 /// Cap hostile kind-0 payloads (same order as web network parser).
@@ -81,7 +81,7 @@ impl From<HomeError> for ProfileError {
 ///
 /// For callers already on a Tokio runtime (MCP dispatch). Never echoes the secret key.
 pub async fn set_profile_async(
-    home: &mut MobeeHome,
+    home: &mut MaxplayerHome,
     request: SetProfileRequest,
 ) -> Result<SetProfileOutcome, ProfileError> {
     home::reload_config(home)?;
@@ -130,7 +130,7 @@ pub async fn set_profile_async(
 /// Kind-0: fetch → merge name/about → publish; **abort on fetch failure**.
 /// NIP-89: same `d` tag every launch (parameterized replaceable — not spam).
 pub fn publish_seller_discoverability(
-    home: &mut MobeeHome,
+    home: &mut MaxplayerHome,
 ) -> Result<SellerDiscoverabilityOutcome, ProfileError> {
     crate::runtime_guard::refuse_nested_block_on("publish_seller_discoverability")
         .map_err(ProfileError::Relay)?;
@@ -143,7 +143,7 @@ pub fn publish_seller_discoverability(
 
 /// Async twin of [`publish_seller_discoverability`].
 pub async fn publish_seller_discoverability_async(
-    home: &mut MobeeHome,
+    home: &mut MaxplayerHome,
 ) -> Result<SellerDiscoverabilityOutcome, ProfileError> {
     home::reload_config(home)?;
     let seller = home.config.seller.as_ref().ok_or_else(|| {
@@ -213,7 +213,7 @@ pub async fn publish_seller_discoverability_async(
 ///
 /// Returns a map keyed by lowercase hex pubkey. Never used for payment decisions.
 pub fn resolve_display_names(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     pubkeys: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> HashMap<String, Option<String>> {
     let mut unique = HashSet::new();
@@ -246,7 +246,7 @@ fn clamp_field(raw: &str, max: usize) -> Option<String> {
     Some(cut)
 }
 
-fn buyer_keys(home: &MobeeHome) -> Result<nostr_sdk::Keys, ProfileError> {
+fn buyer_keys(home: &MaxplayerHome) -> Result<nostr_sdk::Keys, ProfileError> {
     let secret = home::read_secret_key_hex(home)?;
     nostr_sdk::Keys::parse(&secret)
         .map_err(|error| ProfileError::Home(HomeError::Key(format!("buyer key parse: {error}"))))
@@ -254,7 +254,7 @@ fn buyer_keys(home: &MobeeHome) -> Result<nostr_sdk::Keys, ProfileError> {
 
 /// Fail-closed read-merge-write for replaceable kind-0 (never blind-overwrite).
 async fn publish_metadata_merged_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     keys: &nostr_sdk::Keys,
     profile: &ProfileConfig,
 ) -> Result<String, ProfileError> {
@@ -384,7 +384,7 @@ fn nip89_handler_content(
 }
 
 async fn publish_nip89_announce_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     keys: &nostr_sdk::Keys,
     profile: &ProfileConfig,
     rate_sats: u64,
@@ -401,7 +401,7 @@ async fn publish_nip89_announce_async(
         &home.config.accepted_mints,
     );
 
-    // NIP-89 handler advertises the mobee kinds this seller handles: the OFFER it consumes and the
+    // NIP-89 handler advertises the maxplayer kinds this seller handles: the OFFER it consumes and the
     // RESULT it produces.
     let k_offer = Tag::parse(["k", &crate::gateway::JOB_OFFER_KIND.to_string()])
         .map_err(|error| ProfileError::Relay(format!("NIP-89 k tag: {error}")))?;
@@ -419,7 +419,7 @@ async fn publish_nip89_announce_async(
 ///
 /// Parameterized replaceable via `d=<repo_id>` — idempotent across launches.
 pub fn announce_seller_delivery_repo(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     remote_url: &str,
 ) -> Result<String, ProfileError> {
     crate::runtime_guard::refuse_nested_block_on("announce_seller_delivery_repo")
@@ -433,7 +433,7 @@ pub fn announce_seller_delivery_repo(
 
 /// Async twin of [`announce_seller_delivery_repo`].
 pub async fn announce_seller_delivery_repo_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     remote_url: &str,
 ) -> Result<String, ProfileError> {
     use nostr_sdk::nips::nip34::GitRepositoryAnnouncement;
@@ -480,7 +480,7 @@ pub async fn announce_seller_delivery_repo_async(
 }
 
 async fn send_signed_event(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     keys: &nostr_sdk::Keys,
     event: &nostr_sdk::Event,
     label: &str,
@@ -514,7 +514,7 @@ async fn send_signed_event(
 }
 
 fn fetch_names(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     pubkeys: &HashSet<String>,
 ) -> Result<HashMap<String, Option<String>>, ProfileError> {
     // Sync entry only — must not be called from inside an existing Tokio runtime
@@ -530,7 +530,7 @@ fn fetch_names(
 
 /// Async kind-0 name fetch for callers already on a Tokio runtime (e.g. `get_job`).
 pub async fn fetch_names_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     pubkeys: &HashSet<String>,
 ) -> Result<HashMap<String, Option<String>>, ProfileError> {
     use nostr_sdk::prelude::{Client, Filter, Kind, PublicKey};

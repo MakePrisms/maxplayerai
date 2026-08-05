@@ -25,7 +25,7 @@ pub const JOB_CLASS_CONTRIBUTION: &str = "contribution";
 pub const ACCEPTS_FORK: &str = "fork";
 
 /// Domain separator for the seller's signed-result authorship tuple. DISTINCT from the
-/// receipt-preimage domain (`mobee/v1/receipt-preimage`) so the two seller signatures can never
+/// receipt-preimage domain (`maxplayer/v1/receipt-preimage`) so the two seller signatures can never
 /// collide — the receipt cosig and the contribution cosig are independent binds at the one seam.
 pub const CONTRIBUTION_TUPLE_DOMAIN: &str = "mobee/v1/contribution-tuple";
 
@@ -113,7 +113,7 @@ impl ContributionBase {
     /// Validate: branch non-empty (no leading `-` / control bytes), `base_oid` EXACTLY 40 lowercase
     /// hex chars — a canonical git sha1 commit oid.
     ///
-    /// Strict and canonical, refusing fail-closed: mobee repos are sha1 (40-hex), so a 64-hex
+    /// Strict and canonical, refusing fail-closed: maxplayer repos are sha1 (40-hex), so a 64-hex
     /// (sha256) oid can never resolve — accepting one lets a seller claim an offer it can only fail
     /// at checkout. Uppercase is refused rather than silently normalized so the oid
     /// published on the wire is byte-identical to what the seller's `rev-parse`/verify produces.
@@ -186,7 +186,7 @@ impl ForkRef {
     }
 
     /// A per-job unique store/push ref carrying the **FULL** `job_id`. The
-    /// `mobee/<job_id[:8]>` prefix collides — a real field collision already occurred between two
+    /// `maxplayer/<job_id[:8]>` prefix collides — a real field collision already occurred between two
     /// sellers sharing a remote — so the full id + owner-scoped namespaces is the shape.
     pub fn unique_branch(job_id: &str) -> String {
         format!("mobee/contribution/{job_id}")
@@ -595,7 +595,7 @@ mod tests {
     // refuse uppercase rather than normalizing it (the wire oid must match the seller's rev-parse).
     #[test]
     fn base_oid_requires_exactly_40_lowercase_hex() {
-        // 64-hex (sha256) refused — mobee repos are sha1, so it can never resolve.
+        // 64-hex (sha256) refused — maxplayer repos are sha1, so it can never resolve.
         let err = ContributionBase::new("main", "a".repeat(64)).expect_err("64-hex must refuse");
         assert!(
             matches!(&err, ContributionError::MalformedBase(m) if m.contains("base_oid")),

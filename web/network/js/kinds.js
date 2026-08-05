@@ -60,7 +60,7 @@ export const KIND_LABELS = Object.freeze({
  * Marketplace kinds that carry `["t","mobee"]` — requested with a `#t:["mobee"]` filter.
  * The trade path plus the seller heartbeat all live in the mobee namespace.
  */
-export const MOBEE_TAGGED_KINDS = Object.freeze([
+export const MAXPLAYER_TAGGED_KINDS = Object.freeze([
   OFFER,
   CLAIM,
   RESULT,

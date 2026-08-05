@@ -1,4 +1,4 @@
-//! Shared in-process libgit2 transport for every mobee relay-git leg — seller push, seller
+//! Shared in-process libgit2 transport for every maxplayer relay-git leg — seller push, seller
 //! base-fetch, buyer verify-fetch, and ref-advertisement probes (ls-remote / boot preflight).
 //!
 //! No system `git` is used on any product path. A rustls-backed smart-HTTP

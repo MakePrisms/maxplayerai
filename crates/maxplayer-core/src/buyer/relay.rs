@@ -243,7 +243,7 @@ impl RelayHandle {
 ///
 /// Returns as soon as the relay is REGISTERED — it does not wait for the socket or the handshake.
 /// That is load-bearing, not an optimisation: the daemon binds its Unix socket after bootstrap, and
-/// `mobee`'s connect-or-spawn gives a cold daemon only `SPAWN_READY_TIMEOUT` (10s) to appear
+/// `maxplayer`'s connect-or-spawn gives a cold daemon only `SPAWN_READY_TIMEOUT` (10s) to appear
 /// (`crates/maxplayer/src/daemon.rs:21`). Waiting here for a handshake bounded at 20s would let an
 /// unreachable — or merely lazily-challenging — relay push the socket past that deadline, and every
 /// MCP call would report a daemon that failed to start while it was in fact coming up fine.
@@ -333,7 +333,7 @@ pub async fn spawn(keys: Keys, relay_url: &str) -> Result<RelayHandle, RelayBoot
 /// and no filter to rebuild on reconnect — a dynamic `#e`-list would be a subscription-lifecycle
 /// problem taken on for no benefit.
 ///
-/// The `#t=mobee` guard keeps a foreign event squatting these kinds from ever being delivered.
+/// The `#t=maxplayer` guard keeps a foreign event squatting these kinds from ever being delivered.
 async fn subscribe_job_events(client: &Client, buyer_pubkey: nostr_sdk::PublicKey) {
     let filter = Filter::new()
         .kinds([

@@ -21,7 +21,7 @@ set -euo pipefail
 
 BINARY="${1:-result/bin/maxplayer}"
 BINARY_ARM64="${2:-}"
-PKG_MAIN="npm/mobee"
+PKG_MAIN="npm/maxplayer"
 PKG_PLATFORM="npm/cli-linux-x64"
 
 die() { echo "npm-pack-local: $*" >&2; exit 1; }

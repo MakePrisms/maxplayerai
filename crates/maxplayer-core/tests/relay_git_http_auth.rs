@@ -4,12 +4,12 @@
 //! construction-level coverage: we inspected the built `git` Command, but never ran an
 //! authenticated transfer end-to-end. These tests drive the REAL contribution fork path
 //! (`init_contribution_workdir` → scrubbed `fetch-base` → checkout fork tip) against a
-//! local git-over-HTTPS fixture that, like mobee relay-git, refuses upload-pack /
+//! local git-over-HTTPS fixture that, like maxplayer relay-git, refuses upload-pack /
 //! receive-pack without an `Authorization` header (NIP-98-style: 401 + challenge).
 //!
 //! Auth is presented the same way production does it: the scrubbed fetch child gets
 //! `credential.helper=git-credential-nostr` wired by `build_scrubbed_command`; here the
-//! helper binary is a stub injected through the existing `MOBEE_GIT_CREDENTIAL_NOSTR`
+//! helper binary is a stub injected through the existing `MAXPLAYER_GIT_CREDENTIAL_NOSTR`
 //! override, so the whole 401 → credential fill → authorized retry dance is real git.
 #![cfg(unix)]
 
@@ -39,7 +39,7 @@ fn temp(label: &str) -> PathBuf {
 static ENV_INIT: Once = Once::new();
 
 /// Stage process env every test needs, exactly once:
-/// - a stub `git-credential-nostr` reachable via the `MOBEE_GIT_CREDENTIAL_NOSTR`
+/// - a stub `git-credential-nostr` reachable via the `MAXPLAYER_GIT_CREDENTIAL_NOSTR`
 ///   override that `resolve_git_credential_nostr` checks first;
 /// - `GIT_SSL_NO_VERIFY` so git accepts the fixture's self-signed cert (the scrub
 ///   keeps it — it only strips SSH/insteadOf/config vectors);
@@ -68,7 +68,7 @@ fn init_test_env() {
         // spawning any git child; racing test threads block in call_once until the env
         // is fully staged, so no reader observes a partial update.
         unsafe {
-            std::env::set_var("MOBEE_GIT_CREDENTIAL_NOSTR", &helper);
+            std::env::set_var("MAXPLAYER_GIT_CREDENTIAL_NOSTR", &helper);
             std::env::set_var("GIT_SSL_NO_VERIFY", "1");
             std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
             std::env::set_var("no_proxy", "127.0.0.1,localhost");

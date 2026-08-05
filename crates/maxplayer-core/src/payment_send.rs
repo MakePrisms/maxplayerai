@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// Buyer's NUT-18 payment reply plus the mobee routing it rides with.
+/// Buyer's NUT-18 payment reply plus the maxplayer routing it rides with.
 ///
 /// The wire form is the cashu [`PaymentRequestPayload`] (NUT-18: `id`, `memo`, `mint`, `unit`,
 /// `proofs`) — the buyer emits exactly the object that satisfies the seller-authored `creq`.

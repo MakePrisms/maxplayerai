@@ -1,4 +1,4 @@
-//! The persistent per-home **mobee buyer** (step 1 of the stateful-buyer design, #127).
+//! The persistent per-home **maxplayer buyer** (step 1 of the stateful-buyer design, #127).
 //!
 //! One daemon owns a home. It takes an exclusive OS lock on `$MOBEE_HOME/buyer.lock`
 //! (a second daemon on the same home fails closed), opens the CDK wallet and the
@@ -44,7 +44,7 @@ use tokio::sync::Mutex;
 use crate::budget::BudgetGate;
 use crate::buyer_fund::{self, FundError};
 use crate::collect::{self, CollectRequest};
-use crate::home::{self, HomeError, MobeeHome};
+use crate::home::{self, HomeError, MaxplayerHome};
 use crate::job_lifecycle::{
     self, AwardClaimRequest, ContributionSpec, GetJobRequest, JobKind, PostJobRequest, WaitFor,
 };
@@ -145,7 +145,7 @@ impl From<HomeError> for BuyerError {
 
 /// Shared, immutable-after-startup handles the connection handlers reach into.
 struct BuyerContext {
-    home: MobeeHome,
+    home: MaxplayerHome,
     store: BuyerStore,
     wallet: WalletHandle,
     signer: SignerHandle,
@@ -175,7 +175,7 @@ fn now_unix() -> i64 {
 /// the shared context, and the socket path to bind.
 ///
 /// Fails closed at the lock step if another daemon already owns this home.
-async fn bootstrap(home: MobeeHome) -> Result<(HomeLock, Arc<BuyerContext>, PathBuf), BuyerError> {
+async fn bootstrap(home: MaxplayerHome) -> Result<(HomeLock, Arc<BuyerContext>, PathBuf), BuyerError> {
     let lock = HomeLock::acquire(home.root.join(LOCK_FILE))?;
 
     let store = BuyerStore::open(home.root.join(STATE_DB_FILE))?;
@@ -229,7 +229,7 @@ fn bind_socket(path: &std::path::Path) -> Result<UnixListener, BuyerError> {
 
 /// Run the buyer until the process is terminated. Acquires the home lock (fail
 /// closed if held), binds the socket, and serves connections forever.
-pub async fn run(home: MobeeHome) -> Result<(), BuyerError> {
+pub async fn run(home: MaxplayerHome) -> Result<(), BuyerError> {
     // `_lock` is held for the whole run; dropping it releases the OS lock.
     let (_lock, context, socket_path) = bootstrap(home).await?;
     // Reconcile the reservation ledger against relay + journal truth before serving: a reservation
@@ -978,7 +978,7 @@ async fn money_snapshot(context: &BuyerContext) -> Result<(u64, u64), String> {
 }
 
 /// The buyer nostr identity, parsed from the home secret (the same source the signer actor loads).
-fn buyer_keys(home: &MobeeHome) -> Result<nostr_sdk::Keys, String> {
+fn buyer_keys(home: &MaxplayerHome) -> Result<nostr_sdk::Keys, String> {
     let secret = home::read_secret_key_hex(home).map_err(|error| error.to_string())?;
     nostr_sdk::Keys::parse(&secret).map_err(|error| format!("buyer key parse: {error}"))
 }
@@ -1423,7 +1423,7 @@ fn is_invisible_format(c: char) -> bool {
 /// per such row — linear, local, silent. If fleets ever accumulate enough settled no-metadata
 /// trades for this to matter at boot, add a terminal "nothing to heal" marker; today it is
 /// milliseconds and not worth a schema state.
-fn heal_award_attribution(store: &store::BuyerStore, home: &MobeeHome) {
+fn heal_award_attribution(store: &store::BuyerStore, home: &MaxplayerHome) {
     let jobs = match store.unattributed_settled_award_job_ids() {
         Ok(jobs) => jobs,
         Err(error) => {
@@ -1461,7 +1461,7 @@ fn heal_award_attribution(store: &store::BuyerStore, home: &MobeeHome) {
 /// the migration sentinel `''` (rows from the pre-column build, which only ever sent to its
 /// configured relay). Without the fallback that population could neither send nor probe —
 /// `add_relay("")` errors — so it would hold its funds forever.
-fn attempt_relay(attempt: &store::AwardAttempt, home: &MobeeHome) -> String {
+fn attempt_relay(attempt: &store::AwardAttempt, home: &MaxplayerHome) -> String {
     if attempt.relay_url.is_empty() {
         home.config.relay_url.clone()
     } else {
@@ -2426,7 +2426,7 @@ fn plan_reconcile(
 /// carries its [`crate::payment::PaymentKey`] (hence its `job_id`), so no attempt-id recomputation
 /// is needed. A journal that cannot be read/folded is treated as `Uncertain` (kept, never
 /// released) — reconcile must fail safe, never free funds on ambiguous evidence.
-fn scan_payment_progress(home: &MobeeHome) -> BTreeMap<String, PaymentProgress> {
+fn scan_payment_progress(home: &MaxplayerHome) -> BTreeMap<String, PaymentProgress> {
     let mut progress: BTreeMap<String, PaymentProgress> = BTreeMap::new();
     let dir = home.root.join("payment-journal");
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -3806,7 +3806,7 @@ mod tests {
             shipped.grace_secs > 3_600,
             "the grace must exceed the default job deadline so a live job is never a candidate",
         );
-        assert!(!crate::home::MobeeConfig::default().buyer_reservation_floor.enabled);
+        assert!(!crate::home::MaxplayerConfig::default().buyer_reservation_floor.enabled);
     }
 
     // Across two journals for one job, evidence that an attempt happened must not be masked by a
@@ -4315,7 +4315,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// scan_payment_progress reads `<home>/payment-journal`; the fn takes a `MobeeHome`, so drive it
+    /// scan_payment_progress reads `<home>/payment-journal`; the fn takes a `MaxplayerHome`, so drive it
     /// through a bootstrapped home rooted at `root`.
     fn scan_payment_progress_at(root: &std::path::Path) -> BTreeMap<String, PaymentProgress> {
         let home = bootstrap_home(root).expect("home");

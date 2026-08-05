@@ -50,7 +50,7 @@ set -eu
 
 REPO="MakePrisms/maxplayerai"
 # The name of the executable, which is deliberately not the crate name (`[[bin]] maxplayer` inside
-# package `mobee`). It names the asset, the directory inside the asset, the installed file, and the
+# package `maxplayer`). It names the asset, the directory inside the asset, the installed file, and the
 # first word this binary prints when asked for its version — asserted below, not assumed.
 BIN_NAME="maxplayer"
 

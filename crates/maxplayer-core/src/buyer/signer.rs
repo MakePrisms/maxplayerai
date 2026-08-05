@@ -9,7 +9,7 @@
 use nostr_sdk::Keys;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::home::{self, HomeError, MobeeHome};
+use crate::home::{self, HomeError, MaxplayerHome};
 
 enum Command {
     /// Return the buyer public key (hex). Safe to expose; not secret material.
@@ -116,7 +116,7 @@ impl SignerHandle {
 
 /// Load the buyer key from `home` and spawn the signer actor. The secret is
 /// consumed into the task and never held elsewhere.
-pub fn spawn(home: &MobeeHome) -> Result<SignerHandle, HomeError> {
+pub fn spawn(home: &MaxplayerHome) -> Result<SignerHandle, HomeError> {
     let secret = home::read_secret_key_hex(home)?;
     let keys = Keys::parse(&secret)
         .map_err(|error| HomeError::Key(format!("signer key parse: {error}")))?;

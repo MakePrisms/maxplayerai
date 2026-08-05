@@ -22,16 +22,16 @@ pub const SELLER_HEARTBEAT_D: &str = "mobee-seller";
 
 /// Env override for the heartbeat cadence (seconds). Takes precedence over `[seller_heartbeat]
 /// interval_secs`; intended for tests that cannot wait 5 minutes.
-pub const HEARTBEAT_INTERVAL_ENV: &str = "MOBEE_HEARTBEAT_INTERVAL_SECS";
+pub const HEARTBEAT_INTERVAL_ENV: &str = "MAXPLAYER_HEARTBEAT_INTERVAL_SECS";
 
 /// Env override for heartbeat enablement (`0`/`false`/`no` disable, `1`/`true`/`yes` enable).
 /// Takes precedence over `[seller_heartbeat] enabled`; intended for tests.
-pub const HEARTBEAT_ENABLED_ENV: &str = "MOBEE_HEARTBEAT_ENABLED";
+pub const HEARTBEAT_ENABLED_ENV: &str = "MAXPLAYER_HEARTBEAT_ENABLED";
 
 /// Env override for the relay-stall watchdog threshold (missed heartbeat intervals). Takes
 /// precedence over `[seller_heartbeat] stall_missed_intervals`; intended for tests that cannot
 /// wait several 5-minute intervals for the watchdog to trip.
-pub const HEARTBEAT_STALL_MISSED_INTERVALS_ENV: &str = "MOBEE_HEARTBEAT_STALL_MISSED_INTERVALS";
+pub const HEARTBEAT_STALL_MISSED_INTERVALS_ENV: &str = "MAXPLAYER_HEARTBEAT_STALL_MISSED_INTERVALS";
 
 /// A heartbeat ready to sign + publish. Build from live daemon state via [`heartbeat_for_state`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,7 +42,7 @@ pub struct HeartbeatDraft {
     pub queue_depth: u32,
     /// The seller's advertised rate (sats).
     pub rate_sats: u64,
-    /// The mobee protocol versions this seller speaks.
+    /// The maxplayer protocol versions this seller speaks.
     pub protocol_versions: Vec<String>,
     /// The agent harnesses this seller can run, in preference order. Empty ⇒ the seller states no
     /// harness and the tag is omitted entirely (an unlabelled `agent_command` seller has no honest
@@ -194,11 +194,11 @@ pub struct HeartbeatKey {
     pub d: String,
 }
 
-/// Reasons a kind-30340 event fails to parse as a mobee seller heartbeat.
+/// Reasons a kind-30340 event fails to parse as a maxplayer seller heartbeat.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HeartbeatParseError {
     WrongKind(u16),
-    MissingMobeeTag,
+    MissingMaxplayerTag,
     /// The `d` tag is absent or not `mobee-seller`.
     WrongDTag(Option<String>),
     MissingTag(&'static str),
@@ -213,7 +213,7 @@ impl std::fmt::Display for HeartbeatParseError {
             Self::WrongKind(kind) => {
                 write!(f, "expected kind {SELLER_HEARTBEAT_KIND}, got {kind}")
             }
-            Self::MissingMobeeTag => write!(f, "missing t={MOBEE_TAG} tag"),
+            Self::MissingMaxplayerTag => write!(f, "missing t={MOBEE_TAG} tag"),
             Self::WrongDTag(d) => write!(
                 f,
                 "expected d={SELLER_HEARTBEAT_D}, got {}",
@@ -232,13 +232,13 @@ impl std::fmt::Display for HeartbeatParseError {
 impl std::error::Error for HeartbeatParseError {}
 
 /// Parse a kind-30340 event into a [`ParsedHeartbeat`]. Rejects a wrong kind, a missing
-/// `t=mobee` guard, or a `d` other than `mobee-seller`.
+/// `t=maxplayer` guard, or a `d` other than `mobee-seller`.
 pub fn parse_heartbeat(event: &EventDraft) -> Result<ParsedHeartbeat, HeartbeatParseError> {
     if event.kind != SELLER_HEARTBEAT_KIND {
         return Err(HeartbeatParseError::WrongKind(event.kind));
     }
     if !has_tag_value(&event.tags, "t", MOBEE_TAG) {
-        return Err(HeartbeatParseError::MissingMobeeTag);
+        return Err(HeartbeatParseError::MissingMaxplayerTag);
     }
     let d = first_tag_value(&event.tags, "d");
     if d != Some(SELLER_HEARTBEAT_D) {
@@ -502,12 +502,12 @@ mod tests {
             Err(HeartbeatParseError::WrongKind(30341))
         );
 
-        // Drop the t=mobee guard.
+        // Drop the t=maxplayer guard.
         let mut no_mobee = HeartbeatDraft::v1(true, 0, 5).to_event_draft();
         no_mobee.tags.retain(|tag| tag.first() != Some("t"));
         assert_eq!(
             parse_heartbeat(&no_mobee),
-            Err(HeartbeatParseError::MissingMobeeTag)
+            Err(HeartbeatParseError::MissingMaxplayerTag)
         );
 
         // Wrong d.

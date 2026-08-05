@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::driver::UsageMetadata;
 use crate::gateway::TagSpec;
-use crate::home::MobeeHome;
+use crate::home::MaxplayerHome;
 use crate::seller_git::DeliveryAgentIdentity;
 
 /// A neutral agent-run / delivery-shaping failure. Distinct from any consumer's error type so no
@@ -130,7 +130,7 @@ fn launch_argv(
 }
 
 /// The per-job working directory under the home (`$MOBEE_HOME/seller-jobs/<job_id>`).
-pub fn job_workdir(home: &MobeeHome, job_id: &str) -> PathBuf {
+pub fn job_workdir(home: &MaxplayerHome, job_id: &str) -> PathBuf {
     home.root.join("seller-jobs").join(job_id)
 }
 

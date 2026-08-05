@@ -59,9 +59,9 @@ impl GitDeliveryVerifier {
             .map_err(|_| DeliveryError::GitCommandFailed("open-store"))
     }
 
-    /// Ensure the buyer store exists. mobee sellers always emit sha1 objects (they `init` without
+    /// Ensure the buyer store exists. maxplayer sellers always emit sha1 objects (they `init` without
     /// `--object-format`), so the store is sha1; a sha256 (64-hex) delivery is not reachable in the
-    /// mobee system and git2 0.19 cannot init a sha256 odb — so it fails CLOSED here rather than
+    /// maxplayer system and git2 0.19 cannot init a sha256 odb — so it fails CLOSED here rather than
     /// silently mishandling one.
     fn ensure_repository(&self, oid: &CommitOid) -> Result<(), DeliveryError> {
         if oid.as_str().len() == 64 {
@@ -453,7 +453,7 @@ mod tests {
             let store = root.join("store.git");
             fs::create_dir_all(&work).expect("create fixture");
             run(["init", "--initial-branch=main"], Some(&work));
-            run(["config", "user.name", "Mobee Test"], Some(&work));
+            run(["config", "user.name", "Maxplayer Test"], Some(&work));
             run(
                 ["config", "user.email", "mobee@example.invalid"],
                 Some(&work),
@@ -635,7 +635,7 @@ mod tests {
         index.add_path(Path::new("d.txt")).expect("add");
         index.write().expect("index write");
         let tree = repo.find_tree(index.write_tree().expect("write tree")).expect("tree");
-        let sig = Signature::now("Mobee Test", "t@t.invalid").expect("sig");
+        let sig = Signature::now("Maxplayer Test", "t@t.invalid").expect("sig");
         let oid = repo
             .commit(Some("refs/heads/main"), &sig, &sig, "one", &tree, &[])
             .expect("git2 commit");

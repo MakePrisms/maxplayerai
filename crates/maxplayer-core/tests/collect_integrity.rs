@@ -276,7 +276,7 @@ fn from_scratch_bind(
     }
 }
 
-fn write_bind(home: &maxplayer_core::home::MobeeHome, bind: &AcceptedBind) {
+fn write_bind(home: &maxplayer_core::home::MaxplayerHome, bind: &AcceptedBind) {
     let jobs = home.root.join("jobs");
     fs::create_dir_all(&jobs).expect("jobs dir");
     fs::write(

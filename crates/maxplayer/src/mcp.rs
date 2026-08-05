@@ -10,7 +10,7 @@
 use std::io::{BufRead, Write};
 use std::time::Duration;
 
-use maxplayer_core::home::{self, MobeeHome};
+use maxplayer_core::home::{self, MaxplayerHome};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -35,7 +35,7 @@ struct McpRequest {
 /// The MCP owns no money authority — the buyer daemon does. The MCP only needs the home to resolve
 /// the daemon socket (connect-or-spawn) and to run the never-echo-secret guard over daemon replies.
 struct McpState {
-    home: MobeeHome,
+    home: MaxplayerHome,
 }
 
 /// Run the MCP server on the provided stdio handles until stdin EOF.
@@ -155,7 +155,7 @@ async fn dispatch_async(state: &McpState, request: &McpRequest) -> Value {
 /// The slimmed MCP surface is the buyer TRADE LOOP only: post_job → get_job → award_claim →
 /// collect. Wallet management (setup / balance / mint / send / receive / melt / invoice / mints /
 /// reconcile), profile, stub-pay, and the lower-level accept/authorize_pay primitives moved to the
-/// `mobee` CLI. A kept tool that needs a missing prerequisite returns an actionable error naming
+/// `maxplayer` CLI. A kept tool that needs a missing prerequisite returns an actionable error naming
 /// the CLI command to run (see [`missing_prereq_hint`]).
 fn tools() -> Value {
     json!([
@@ -275,7 +275,7 @@ async fn call_tool_async(state: &McpState, params: &Value) -> Result<Value, Stri
     let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
     // The MCP is a thin client of the buyer daemon: the trade-loop tools route over the daemon
     // socket (connect-or-spawn), which owns the wallet, budget ledger, and reservation ledger — the
-    // single money authority. Everything else moved to the `mobee` CLI; a stale client calling a
+    // single money authority. Everything else moved to the `maxplayer` CLI; a stale client calling a
     // moved tool gets a pointer to the command that replaced it. `award_claim` maps to the daemon's
     // `award` RPC (manual, claim_id-named award).
     match name {
@@ -346,7 +346,7 @@ fn guard_never_echo(state: &McpState, tool: &str, body: &Value) -> Result<(), St
     Ok(())
 }
 
-/// Actionable error for a tool that moved off the MCP surface to the `mobee` CLI, or an unknown
+/// Actionable error for a tool that moved off the MCP surface to the `maxplayer` CLI, or an unknown
 /// tool. Names the exact CLI command a stale caller should run instead.
 fn moved_tool_error(name: &str) -> String {
     let cli = match name {

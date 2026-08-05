@@ -1,6 +1,6 @@
-//! Network-probe primitives for the `mobee doctor` seller self-check.
+//! Network-probe primitives for the `maxplayer doctor` seller self-check.
 //!
-//! The CLI orchestration + human output lives in the `mobee` binary crate (`mobee doctor`); the
+//! The CLI orchestration + human output lives in the `maxplayer` binary crate (`maxplayer doctor`); the
 //! network probes live here because their clients — the relay client (nostr-sdk) and the mint
 //! client (cdk) — are `maxplayer-core` dependencies the binary crate does not carry.
 //!

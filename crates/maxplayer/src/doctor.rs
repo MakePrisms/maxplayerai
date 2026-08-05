@@ -435,14 +435,14 @@ fn parse_doctor_args(args: &[String]) -> Result<Option<std::path::PathBuf>, Stri
 /// duplicated. The seller key is read once only to probe NIP-42 relay auth; it is NEVER placed in
 /// any Check detail.
 #[cfg(feature = "wallet")]
-fn build_checks(home: &maxplayer_core::home::MobeeHome) -> Vec<Box<dyn FnOnce() -> Check>> {
+fn build_checks(home: &maxplayer_core::home::MaxplayerHome) -> Vec<Box<dyn FnOnce() -> Check>> {
     let relay_url = home.config.relay_url.clone();
     let secret = maxplayer_core::home::read_secret_key_hex(home).ok();
     let key_present = maxplayer_core::home::key_file_present(home);
     // The key file of the RESOLVED home, so the key check names what it read (#216/#265).
     let key_path = home.key_path.clone();
     // The seller accept-policy mints (`accepted_mints`) — the list this seller will settle at.
-    // `extra_mints` is a BUYER wallet field (see `MobeeConfig` in home.rs) and has no place in a
+    // `extra_mints` is a BUYER wallet field (see `MaxplayerConfig` in home.rs) and has no place in a
     // seller boot gate, so it is deliberately NOT consulted here.
     let accepted_mints = home.config.accepted_mints.clone();
     let seller = home.config.seller.clone();
@@ -472,7 +472,7 @@ fn build_checks(home: &maxplayer_core::home::MobeeHome) -> Vec<Box<dyn FnOnce() 
 #[cfg(feature = "wallet")]
 fn resolve_doctor_home(
     home_override: Option<std::path::PathBuf>,
-) -> Result<maxplayer_core::home::MobeeHome, maxplayer_core::home::HomeError> {
+) -> Result<maxplayer_core::home::MaxplayerHome, maxplayer_core::home::HomeError> {
     use maxplayer_core::home;
     let root = match home_override {
         Some(root) => root,
@@ -525,7 +525,7 @@ fn run_doctor(
 // carrying `acp` also carries `wallet`, so the wallet-gated `checks` it calls are present.
 #[cfg(feature = "acp")]
 pub fn sell_readiness_gate(
-    home: &maxplayer_core::home::MobeeHome,
+    home: &maxplayer_core::home::MaxplayerHome,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<(), ()> {

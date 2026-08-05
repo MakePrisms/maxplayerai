@@ -11,7 +11,7 @@ use nostr_sdk::{Event, JsonUtil, Keys, Timestamp, UnsignedEvent};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::gateway::{self, EventDraft};
-use crate::home::{self, HomeError, MobeeHome};
+use crate::home::{self, HomeError, MaxplayerHome};
 
 /// A signed event, ready to publish.
 #[derive(Debug, Clone)]
@@ -251,7 +251,7 @@ impl SignerHandle {
 
 /// Load the seller key from `home` and spawn the signer actor. The secret is consumed into the task
 /// and never held elsewhere.
-pub fn spawn(home: &MobeeHome) -> Result<SignerHandle, HomeError> {
+pub fn spawn(home: &MaxplayerHome) -> Result<SignerHandle, HomeError> {
     let secret = home::read_secret_key_hex(home)?;
     let keys =
         Keys::parse(&secret).map_err(|error| HomeError::Key(format!("signer key parse: {error}")))?;

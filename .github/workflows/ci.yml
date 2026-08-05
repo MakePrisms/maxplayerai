@@ -43,7 +43,7 @@ jobs:
       # other test invocation in this file is -p maxplayer-core (#264). mcp_daemon.rs is gated on the
       # wallet feature, which is a default feature, so the default-feature job is the one that
       # satisfies its cfg gate.
-      - name: Test mobee (CLI crate, default features)
+      - name: Test maxplayer (CLI crate, default features)
         run: cargo test -p maxplayer --locked
       # Same gap, other crate (#264): the relay write-policy plugin's tests (the #372 config-flip
       # red-prove, #397 NIP-17 admission) are built by the workspace build but named by no test
@@ -61,7 +61,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build mobee (acp + wallet, release)
+      - name: Build maxplayer (acp + wallet, release)
         run: cargo build -p maxplayer --release --features acp,wallet --locked
       - name: Build maxplayer-core (full shipped feature combo)
         run: cargo build -p maxplayer-core --features acp,gateway,git-delivery,wallet --locked

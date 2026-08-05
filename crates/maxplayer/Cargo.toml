@@ -2,7 +2,7 @@
 # The crate keeps its name; the shipped binary does not. `[[bin]]` below is what makes that
 # separable — without it Cargo derives the executable name from the package, which is why the
 # application rename looked like it forced a crate rename. Internal crate names are deliberately
-# `mobee`: nothing publishes to crates.io, so users never see them, and renaming them would touch
+# `maxplayer`: nothing publishes to crates.io, so users never see them, and renaming them would touch
 # most of the workspace for no user-visible gain.
 name = "maxplayer"
 version.workspace = true
@@ -24,12 +24,12 @@ path = "src/main.rs"
 #
 # ★ What this does NOT do: make `cargo binstall maxplayer` work. binstall reads this metadata out of
 #   the registry entry for the crate, and `publish = false` in [workspace.package] means there is no
-#   registry entry — neither `maxplayer` nor `mobee` exists on crates.io. Until something is
+#   registry entry — neither `maxplayer` nor `maxplayer` exists on crates.io. Until something is
 #   published, the working invocation is the one that reads this manifest directly:
 #
-#     cargo binstall --git https://github.com/MakePrisms/maxplayerai mobee
+#     cargo binstall --git https://github.com/MakePrisms/maxplayerai maxplayer
 #
-#   Note `mobee`, not `maxplayer`: binstall resolves a PACKAGE, and the package keeps its name while
+#   Note `maxplayer`, not `maxplayer`: binstall resolves a PACKAGE, and the package keeps its name while
 #   `[[bin]]` above renames the executable.
 #
 # ★ Why the URL is written out instead of using `{ repo }`. That template expands to the manifest's
@@ -77,7 +77,7 @@ default = ["wallet"]
 # are sound (they can rely on the wallet-gated code being present). #360.
 acp = ["wallet", "maxplayer-core/acp"]
 wallet = ["maxplayer-core/wallet", "dep:git2", "dep:nostr-sdk"]
-# Dev-only: exposes `mobee stub-pay` (budget-gate exercise). Not on the settlement
+# Dev-only: exposes `maxplayer stub-pay` (budget-gate exercise). Not on the settlement
 # path and not part of the default user CLI surface.
 stub-pay = []
 

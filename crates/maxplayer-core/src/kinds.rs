@@ -1,4 +1,4 @@
-//! The single registry of every mobee nostr event kind.
+//! The single registry of every maxplayer nostr event kind.
 //!
 //! This module is the ONE place a kind *number* may appear. Every other site refers to a named
 //! constant from here (re-exported through [`crate::gateway`] for the trade-path kinds). The
@@ -46,7 +46,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trade_path_kinds_are_the_contiguous_mobee_block() {
+    fn trade_path_kinds_are_the_contiguous_maxplayer_block() {
         // The trade path lives in a contiguous mobee-owned block; none reuse the generic DVM range.
         assert_eq!(
             [
@@ -72,7 +72,7 @@ mod tests {
                     JOB_ACCEPT_KIND
                 ]
                 .contains(&kind),
-                "generic DVM kind {kind} must not appear in the mobee block"
+                "generic DVM kind {kind} must not appear in the maxplayer block"
             );
         }
     }

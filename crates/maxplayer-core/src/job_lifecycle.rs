@@ -1,4 +1,4 @@
-//! Buyer job lifecycle over the mobee relay (kinds offer / feedback / result).
+//! Buyer job lifecycle over the maxplayer relay (kinds offer / feedback / result).
 //!
 //! - [`post_job`] publishes a real offer-kind offer (targeted p-tag = documented default).
 //! - [`get_job`] reads claim/result state from relay events (not local invent).
@@ -24,7 +24,7 @@ use crate::gateway::{
     self, accept_draft, award_draft, parse_git_result_delivery, parse_offer, EventDraft, OfferDraft,
     TagSpec, JOB_AWARD_KIND, JOB_CLAIM_KIND, JOB_FEEDBACK_KIND, JOB_OFFER_KIND, JOB_RESULT_KIND,
 };
-use crate::home::{self, HomeError, MobeeHome};
+use crate::home::{self, HomeError, MaxplayerHome};
 #[cfg(feature = "wallet")]
 use crate::{buyer_fund, payment_wallet};
 
@@ -471,7 +471,7 @@ impl From<HomeError> for JobLifecycleError {
 
 /// Publish a offer-kind offer to the configured relay. Returns the offer event id as `job_id`.
 /// Sync entry for CLI/tests — nested call fails fast; MCP uses [`post_job_async`].
-pub fn post_job(home: &MobeeHome, request: PostJobRequest) -> Result<PostJobOutcome, JobLifecycleError> {
+pub fn post_job(home: &MaxplayerHome, request: PostJobRequest) -> Result<PostJobOutcome, JobLifecycleError> {
     crate::runtime_guard::refuse_nested_block_on("post_job")
         .map_err(JobLifecycleError::Relay)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -484,7 +484,7 @@ pub fn post_job(home: &MobeeHome, request: PostJobRequest) -> Result<PostJobOutc
 /// Async `post_job` for callers already on a Tokio runtime (MCP dispatch).
 /// Avoids nested `block_on` when publishing the offer over the relay.
 pub async fn post_job_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     request: PostJobRequest,
 ) -> Result<PostJobOutcome, JobLifecycleError> {
     if request.task.trim().is_empty() {
@@ -711,7 +711,7 @@ fn contribution_offer_from_spec(
 
 /// Read offer / claims / results from the relay. Local accept-bind is attached if present.
 /// Sync entry for CLI/tests — nested call fails fast; MCP uses [`get_job_async`].
-pub fn get_job(home: &MobeeHome, request: GetJobRequest) -> Result<JobView, JobLifecycleError> {
+pub fn get_job(home: &MaxplayerHome, request: GetJobRequest) -> Result<JobView, JobLifecycleError> {
     crate::runtime_guard::refuse_nested_block_on("get_job")
         .map_err(JobLifecycleError::Relay)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -726,7 +726,7 @@ pub fn get_job(home: &MobeeHome, request: GetJobRequest) -> Result<JobView, JobL
 /// `wait_for` is capped at [`WAIT_FOR_CAP_SECS`]. Cap-hit with condition unmet returns
 /// `pending: true` (re-poll) — never an error.
 pub async fn get_job_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     request: GetJobRequest,
 ) -> Result<JobView, JobLifecycleError> {
     let keys = buyer_keys(home)?;
@@ -796,7 +796,7 @@ const SAFETY_RECHECK: Duration = Duration::from_secs(3);
 /// The caller must have subscribed BEFORE calling: `events` is passed in already-live precisely so
 /// the subscribe cannot land after the first fetch and lose an event in the gap.
 pub async fn get_job_awaiting_events_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     request: GetJobRequest,
     mut events: tokio::sync::broadcast::Receiver<std::sync::Arc<nostr_sdk::Event>>,
 ) -> Result<JobView, JobLifecycleError> {
@@ -875,7 +875,7 @@ pub(crate) fn event_references_job(event: &nostr_sdk::Event, job_id: &str) -> bo
 /// Accept a live claim: persist the pay-bind, then publish the `accepted` ACCEPT (kind-3406).
 /// Sync entry for CLI/tests — nested call fails fast; MCP uses [`accept_claim_async`].
 pub fn accept_claim(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     request: AcceptClaimRequest,
 ) -> Result<AcceptClaimOutcome, JobLifecycleError> {
     crate::runtime_guard::refuse_nested_block_on("accept_claim")
@@ -903,7 +903,7 @@ pub fn accept_claim(
 /// and a fresh id. A failure HERE (validation or signing) is provably wire-free: nothing signed
 /// has been persisted or transmitted, so the caller may safely release and re-plan.
 pub async fn prepare_award_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     request: AwardClaimRequest,
 ) -> Result<PreparedAward, JobLifecycleError> {
     let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
@@ -1105,7 +1105,7 @@ fn classify_ok_false(message: &str) -> SendOutcome {
 
 /// Async `accept_claim` for callers already on a Tokio runtime (MCP dispatch).
 pub async fn accept_claim_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     request: AcceptClaimRequest,
 ) -> Result<AcceptClaimOutcome, JobLifecycleError> {
     let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
@@ -1313,7 +1313,7 @@ pub async fn accept_claim_async(
 /// Fail-closed with no bind written when the delivered claim cannot be resolved unambiguously
 /// (zero or multiple live delivered claims); the error names the explicit `accept_claim` primitive.
 pub async fn accept_for_collect_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     job_id: &str,
 ) -> Result<AcceptedBind, JobLifecycleError> {
     let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
@@ -1493,7 +1493,7 @@ fn resolve_accepted_contribution(
 
 /// Load the local accept-bind for a job, if any.
 pub fn load_accepted_bind(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     job_id: &str,
 ) -> Result<Option<AcceptedBind>, JobLifecycleError> {
     let path = bind_path(home, job_id);
@@ -1716,7 +1716,7 @@ pub fn fill_explicit_request_from_bind(
     }
 }
 
-fn write_accepted_bind(home: &MobeeHome, bind: &AcceptedBind) -> Result<(), JobLifecycleError> {
+fn write_accepted_bind(home: &MaxplayerHome, bind: &AcceptedBind) -> Result<(), JobLifecycleError> {
     let dir = home.root.join(JOBS_DIR);
     fs::create_dir_all(&dir).map_err(|error| JobLifecycleError::Io(error.to_string()))?;
     let path = bind_path(home, &bind.job_id);
@@ -1729,7 +1729,7 @@ fn write_accepted_bind(home: &MobeeHome, bind: &AcceptedBind) -> Result<(), JobL
         .map_err(|error| JobLifecycleError::Io(error.to_string()))
 }
 
-fn bind_path(home: &MobeeHome, job_id: &str) -> PathBuf {
+fn bind_path(home: &MaxplayerHome, job_id: &str) -> PathBuf {
     // Event ids are hex — safe as a single path segment.
     home.root.join(JOBS_DIR).join(format!("{job_id}.json"))
 }
@@ -1738,7 +1738,7 @@ fn bind_path(home: &MobeeHome, job_id: &str) -> PathBuf {
 /// (finding W). Blocks until any other accept holding this job's lock releases; the returned
 /// handle holds the `flock` until it drops. Separate lock file per job (`<job_id>.lock`) so
 /// accepts on DIFFERENT jobs never contend. Mirrors `budget.rs::acquire_lock`.
-fn acquire_job_lock(home: &MobeeHome, job_id: &str) -> Result<File, JobLifecycleError> {
+fn acquire_job_lock(home: &MaxplayerHome, job_id: &str) -> Result<File, JobLifecycleError> {
     let dir = home.root.join(JOBS_DIR);
     fs::create_dir_all(&dir).map_err(|error| JobLifecycleError::Io(error.to_string()))?;
     // Event ids are hex — safe as a single path segment.
@@ -1766,7 +1766,7 @@ pub fn job_hash_for_offer(job_id: &str, task: &str, amount_sats: u64) -> String 
     hex::encode(hasher.finalize())
 }
 
-fn buyer_keys(home: &MobeeHome) -> Result<nostr_sdk::Keys, JobLifecycleError> {
+fn buyer_keys(home: &MaxplayerHome) -> Result<nostr_sdk::Keys, JobLifecycleError> {
     let secret = home::read_secret_key_hex(home)?;
     nostr_sdk::Keys::parse(&secret)
         .map_err(|error| JobLifecycleError::Home(HomeError::Key(format!("buyer key parse: {error}"))))
@@ -1774,7 +1774,7 @@ fn buyer_keys(home: &MobeeHome) -> Result<nostr_sdk::Keys, JobLifecycleError> {
 
 #[allow(dead_code)] // guarded sync twin for non-async callers; MCP uses `_async`
 fn publish_draft(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     keys: &nostr_sdk::Keys,
     draft: &EventDraft,
 ) -> Result<String, JobLifecycleError> {
@@ -1788,7 +1788,7 @@ fn publish_draft(
 }
 
 async fn publish_draft_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     keys: &nostr_sdk::Keys,
     draft: &EventDraft,
 ) -> Result<String, JobLifecycleError> {
@@ -1967,7 +1967,7 @@ pub(crate) enum PresenceRead<T> {
 /// repair the missing row from it. Parsing happens here, against the real event, so
 /// `buyer::lifecycle` stays free of nostr types and remains unit-testable with a plain closure.
 pub(crate) async fn award_presence_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     keys: &nostr_sdk::Keys,
     job_id: &str,
     timeout: Duration,
@@ -2261,7 +2261,7 @@ fn parse_relayed_award(
 /// (already-delivered / live-claimed-by-another) without duplicating the relay read.
 
 pub(crate) async fn fetch_job_view_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     keys: &nostr_sdk::Keys,
     job_id: &str,
     timeout: Duration,
@@ -2279,8 +2279,8 @@ pub(crate) async fn fetch_job_view_async(
         .map_err(|error| JobLifecycleError::Relay(format!("add relay: {error}")))?;
     client.connect().await;
 
-    // Every fetch filter carries the `#t=mobee` namespace guard so a foreign event
-    // squatting a mobee kind is never returned.
+    // Every fetch filter carries the `#t=maxplayer` namespace guard so a foreign event
+    // squatting a maxplayer kind is never returned.
     let offer_filter = Filter::new()
         .id(offer_id)
         .kind(Kind::Custom(JOB_OFFER_KIND))
@@ -2478,7 +2478,7 @@ fn apply_display_names(view: &mut JobView, names: &std::collections::HashMap<Str
 /// Cosmetic kind-0 enrichment only — never feeds accept-bind / targeting / pay.
 /// Async so `get_job`'s existing runtime does not nest `block_on` (panic).
 async fn maybe_attach_display_names_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     view: &mut JobView,
     include_display_names: bool,
 ) {
@@ -2487,7 +2487,7 @@ async fn maybe_attach_display_names_async(
     }
 }
 
-async fn attach_display_names_async(home: &MobeeHome, view: &mut JobView) {
+async fn attach_display_names_async(home: &MaxplayerHome, view: &mut JobView) {
     let pubkeys = display_name_pubkeys(view);
     let mut unique = std::collections::HashSet::new();
     for key in pubkeys {
@@ -3461,7 +3461,7 @@ mod tests {
         };
 
         // The accept check→write critical section, guarded by the per-job lock.
-        let attempt = |home: Arc<MobeeHome>, job_id: String, result_id: String, bind: AcceptedBind| {
+        let attempt = |home: Arc<MaxplayerHome>, job_id: String, result_id: String, bind: AcceptedBind| {
             let _lock = acquire_job_lock(&home, &job_id)?;
             let existing = load_accepted_bind(&home, &job_id)?;
             assert_single_settlement(existing.as_ref(), &job_id, &result_id)?;
@@ -3961,7 +3961,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    fn temp_job_home(label: &str) -> (std::path::PathBuf, crate::home::MobeeHome) {
+    fn temp_job_home(label: &str) -> (std::path::PathBuf, crate::home::MaxplayerHome) {
         let root = std::env::temp_dir().join(format!(
             "mobee-jobs-{label}-{}-{}",
             std::process::id(),

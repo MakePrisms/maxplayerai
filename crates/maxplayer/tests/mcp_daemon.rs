@@ -2,9 +2,9 @@
 //!
 //! A fresh home with ONLY the MCP/CLI configured — zero manual daemon commands — must transparently
 //! start the buyer daemon on first use, reuse the same daemon for later sessions, and serve every
-//! money op through it (never in-process). These drive the real `mobee` binary.
+//! money op through it (never in-process). These drive the real `maxplayer` binary.
 //!
-//! Relay is pinned to a dead loopback (`MOBEE_RELAY_URL`) so a routed trade op fails fast and the
+//! Relay is pinned to a dead loopback (`MAXPLAYER_RELAY_URL`) so a routed trade op fails fast and the
 //! test stays hermetic — the point under test is the daemon boundary, not a live trade.
 #![cfg(all(unix, feature = "wallet"))]
 
@@ -22,18 +22,18 @@ fn temp_home(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("mobee-mcp-daemon-{label}-{}-{id}", std::process::id()))
 }
 
-/// A `mobee` command pinned to `home` with a dead relay (fast, network-free relay failures).
-fn mobee(home: &Path) -> Command {
+/// A `maxplayer` command pinned to `home` with a dead relay (fast, network-free relay failures).
+fn maxplayer(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_maxplayer"));
     command
         .env("MOBEE_HOME", home)
-        .env("MOBEE_RELAY_URL", "ws://127.0.0.1:1");
+        .env("MAXPLAYER_RELAY_URL", "ws://127.0.0.1:1");
     command
 }
 
-/// Run `mobee <args>` to completion; returns (exit code, stdout, stderr).
+/// Run `maxplayer <args>` to completion; returns (exit code, stdout, stderr).
 fn run(home: &Path, args: &[&str]) -> (i32, String, String) {
-    let output = mobee(home).args(args).output().expect("spawn mobee");
+    let output = maxplayer(home).args(args).output().expect("spawn mobee");
     (
         output.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -97,7 +97,7 @@ fn connect_or_spawn_starts_then_reuses_one_daemon() {
 
     // The exclusive home lock holds: a direct second `buyer serve` fails closed rather than becoming
     // a second money owner.
-    let mut second_serve = mobee(&home)
+    let mut second_serve = maxplayer(&home)
         .args(["buyer", "serve"])
         .spawn()
         .expect("spawn second buyer serve");

@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::gateway::ParsedOffer;
-use crate::home::{HomeError, MobeeHome, SellerConfig};
+use crate::home::{HomeError, MaxplayerHome, SellerConfig};
 
 const JOURNAL_FILE: &str = "seller-journal.jsonl";
 pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 600;
@@ -51,7 +51,7 @@ impl From<HomeError> for SellerError {
 }
 
 /// Require the three locked `[seller]` fields (named fail-closed).
-pub fn require_seller_config(home: &MobeeHome) -> Result<&SellerConfig, SellerError> {
+pub fn require_seller_config(home: &MaxplayerHome) -> Result<&SellerConfig, SellerError> {
     let seller = home.config.seller.as_ref().ok_or_else(|| {
         SellerError::Config("missing required [seller] section (agent_command, rate_sats, git_remote)".into())
     })?;
@@ -286,7 +286,7 @@ pub struct SellerJournal {
 }
 
 impl SellerJournal {
-    pub fn open(home: &MobeeHome) -> Result<Self, SellerError> {
+    pub fn open(home: &MaxplayerHome) -> Result<Self, SellerError> {
         let path = home.root.join(JOURNAL_FILE);
         let parent = path.parent();
         if let Some(parent) = parent {
@@ -718,7 +718,7 @@ pub fn cashu_secret_from_nostr_hex(secret_hex: &str) -> Result<cashu::SecretKey,
 mod tests {
     use super::*;
     use crate::gateway::ParsedOffer;
-    use crate::home::{self, MobeeConfig, SellerConfig};
+    use crate::home::{self, MaxplayerConfig, SellerConfig};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -813,7 +813,7 @@ agent_command = "claude --print"
 rate_sats = 1
 git_remote = "https://example.invalid/repo.git"
 "#;
-        let err = toml::from_str::<MobeeConfig>(raw).expect_err("string argv must refuse");
+        let err = toml::from_str::<MaxplayerConfig>(raw).expect_err("string argv must refuse");
         assert!(
             err.to_string().contains("argv array") || err.to_string().contains("agent_command"),
             "unexpected error: {err}"
@@ -841,7 +841,7 @@ git_remote = "https://example.invalid/repo.git"
         // Without the migration seam, deny_unknown_fields BRICKS this pre-#378 config — the exact
         // failure the fold prevents. THIS contrast is the red-prove (lead's explicit ask).
         assert!(
-            toml::from_str::<MobeeConfig>(raw).is_err(),
+            toml::from_str::<MaxplayerConfig>(raw).is_err(),
             "raw parse must brick on total_budget_sats + singular agent under deny_unknown_fields"
         );
         let seller = crate::home::parse_config_toml(raw)
@@ -872,7 +872,7 @@ rate_sats = 7
 git_remote = "https://example.invalid/repo.git"
 agents = ["claude", "codex"]
 "#;
-        let seller = toml::from_str::<MobeeConfig>(bare).expect("parse").seller.expect("seller");
+        let seller = toml::from_str::<MaxplayerConfig>(bare).expect("parse").seller.expect("seller");
         assert_eq!(seller.agents, vec!["claude".to_owned(), "codex".to_owned()]);
 
         // A pre-#378 config with `{ name, slots }` table entries migrates to bare names, in order.
@@ -909,7 +909,7 @@ agent_command = ["claude", "--print"]
 rate_sats = 7
 git_remote = "https://example.invalid/repo.git"
 "#;
-        let config: MobeeConfig = toml::from_str(raw).expect("parse");
+        let config: MaxplayerConfig = toml::from_str(raw).expect("parse");
         let seller = config.seller.expect("seller");
         assert_eq!(seller.agent_command, vec!["claude", "--print"]);
         assert_eq!(seller.rate_sats, 7);
@@ -937,10 +937,10 @@ offer_backfill_secs = {backfill}
             )
         };
         // Custom window.
-        let custom: MobeeConfig = toml::from_str(&base("300")).expect("parse custom");
+        let custom: MaxplayerConfig = toml::from_str(&base("300")).expect("parse custom");
         assert_eq!(custom.seller.expect("seller").offer_backfill_secs, 300);
         // Explicit 0 = live-only (must NOT fall back to the default).
-        let zero: MobeeConfig = toml::from_str(&base("0")).expect("parse zero");
+        let zero: MaxplayerConfig = toml::from_str(&base("0")).expect("parse zero");
         assert_eq!(
             zero.seller.expect("seller").offer_backfill_secs,
             0,

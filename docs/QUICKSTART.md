@@ -12,7 +12,7 @@ Roles index: [`README.md`](README.md). Seller path:
 git clone https://github.com/MakePrisms/maxplayerai.git
 cd maxplayerai
 cargo build -p maxplayer --release
-MOBEE_BIN="$(pwd)/target/release/maxplayer"
+MAXPLAYER_BIN="$(pwd)/target/release/maxplayer"
 ```
 
 ## 2. Choose the buyer home
@@ -25,28 +25,28 @@ on the same buyer:
 
 ```bash
 export MOBEE_HOME="$HOME/.mobee"
-"$MOBEE_BIN" wallet setup
+"$MAXPLAYER_BIN" wallet setup
 ```
 
 To use a different buyer, choose a different absolute directory:
 
 ```bash
 export MOBEE_HOME="/absolute/path/to/a-buyer-home"
-"$MOBEE_BIN" wallet setup
+"$MAXPLAYER_BIN" wallet setup
 ```
 
 The wallet and profile are managed through the CLI. For example, inspect funds with
-`"$MOBEE_BIN" wallet balance` and optionally publish a display name with
-`"$MOBEE_BIN" profile set --name "Buyer name"`.
+`"$MAXPLAYER_BIN" wallet balance` and optionally publish a display name with
+`"$MAXPLAYER_BIN" profile set --name "Buyer name"`.
 
 > **⚠ Real sats by default.** The shipped default mint is a **real** mint
 > (`https://mint.minibits.cash/Bitcoin`), and `allow_real_mints` defaults to `true`. So
-> `"$MOBEE_BIN" wallet setup` provisions the wallet on a real mint and prints a Lightning invoice
+> `"$MAXPLAYER_BIN" wallet setup` provisions the wallet on a real mint and prints a Lightning invoice
 > you fund with **real sats** — it does **not** auto-fund. Buyers spend from that wallet, bounded by
 > the per-job budget cap in `config.toml`.
 >
 > testnut is the development mint (auto-settling invoices, no real money). Opt in for local testing
-> with `"$MOBEE_BIN" wallet setup --mint https://testnut.cashudevkit.org`, or set
+> with `"$MAXPLAYER_BIN" wallet setup --mint https://testnut.cashudevkit.org`, or set
 > `allow_real_mints = false` in `config.toml` to restrict the wallet to it. It is a dev tool — real
 > sats are the default and the point.
 
@@ -57,7 +57,7 @@ server's environment. Registering `env` as part of the server command makes the 
 unambiguous even when the MCP client starts it later:
 
 ```bash
-claude mcp add maxplayer -- env MOBEE_HOME="$MOBEE_HOME" "$MOBEE_BIN" mcp
+claude mcp add maxplayer -- env MOBEE_HOME="$MOBEE_HOME" "$MAXPLAYER_BIN" mcp
 ```
 
 For another MCP client, configure the equivalent command and arguments:

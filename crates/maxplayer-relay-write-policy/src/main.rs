@@ -14,7 +14,7 @@
 //! contents, and says nothing about what day two accepts.
 //!
 //! The tag is parameterised on its VALUE on purpose. The `#t` flip to "maxplayer" is
-//! waived out of 0.1.0, so day-one events still carry `t=mobee`; a hardcoded "maxplayer"
+//! waived out of 0.1.0, so day-one events still carry `t=maxplayer`; a hardcoded "maxplayer"
 //! would reject every real event while the relay looked like a healthy quiet box. The
 //! nix module supplies the value from `services.maxplayer.relay.namespaceTag`.
 

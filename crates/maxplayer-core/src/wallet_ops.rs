@@ -1,4 +1,4 @@
-//! Flexible ecash wallet ops for `mobee wallet` / MCP mirrors, over the packaged CDK wallet at
+//! Flexible ecash wallet ops for `maxplayer wallet` / MCP mirrors, over the packaged CDK wallet at
 //! `home/.mobee/wallet`. This module owns the mint-fund path: [`begin_mint_async`] creates a mint
 //! quote and returns the bolt11 invoice up front, then [`complete_mint_async`] mints once it is
 //! paid. ([`crate::buyer_fund`] covers wallet open, seed derivation, and balance read.)
@@ -21,7 +21,7 @@ use cdk::Amount;
 use cdk_sqlite::wallet::WalletSqliteDatabase;
 
 use crate::buyer_fund::seed_from_secret_hex;
-use crate::home::{self, HomeError, MobeeHome, DEFAULT_MINT_URL};
+use crate::home::{self, HomeError, MaxplayerHome, DEFAULT_MINT_URL};
 
 #[derive(Debug)]
 pub enum WalletOpsError {
@@ -165,7 +165,7 @@ fn is_autopay_mint(mint_url: &str) -> bool {
 }
 
 /// Configured mints: default `mint_url` first, then opt-in `extra_mints` (deduped).
-pub fn configured_mints(home: &MobeeHome) -> Result<Vec<String>, WalletOpsError> {
+pub fn configured_mints(home: &MaxplayerHome) -> Result<Vec<String>, WalletOpsError> {
     let mut out = Vec::new();
     let default = normalize_mint_url(home.config.default_mint())?;
     out.push(default.clone());
@@ -178,7 +178,7 @@ pub fn configured_mints(home: &MobeeHome) -> Result<Vec<String>, WalletOpsError>
     Ok(out)
 }
 
-fn mint_is_allowed(home: &MobeeHome, mint_url: &str) -> Result<String, WalletOpsError> {
+fn mint_is_allowed(home: &MaxplayerHome, mint_url: &str) -> Result<String, WalletOpsError> {
     let normalized = normalize_mint_url(mint_url)?;
     let allowed = configured_mints(home)?;
     if allowed.iter().any(|entry| entry == &normalized) {
@@ -244,7 +244,7 @@ fn post_receive_balance(read: Result<u64, String>, before: u64, received_sats: u
     }
 }
 
-fn resolve_mint(home: &MobeeHome, mint_override: Option<&str>) -> Result<String, WalletOpsError> {
+fn resolve_mint(home: &MaxplayerHome, mint_override: Option<&str>) -> Result<String, WalletOpsError> {
     match mint_override {
         Some(url) => mint_is_allowed(home, url),
         None => normalize_mint_url(home.config.default_mint()),
@@ -253,7 +253,7 @@ fn resolve_mint(home: &MobeeHome, mint_override: Option<&str>) -> Result<String,
 
 /// Open the packaged CDK wallet for one allowed mint (shared sqlite + seed).
 pub async fn open_wallet_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     mint_url: &str,
 ) -> Result<Wallet, WalletOpsError> {
     let mint_url = mint_is_allowed(home, mint_url)?;
@@ -321,7 +321,7 @@ pub(crate) async fn poll_and_mint(
 }
 
 /// Balance per configured mint (default + extras).
-pub async fn balances_async(home: &MobeeHome) -> Result<Vec<MintBalance>, WalletOpsError> {
+pub async fn balances_async(home: &MaxplayerHome) -> Result<Vec<MintBalance>, WalletOpsError> {
     let default = normalize_mint_url(home.config.default_mint())?;
     let mut rows = Vec::new();
     for mint_url in configured_mints(home)? {
@@ -342,7 +342,7 @@ pub async fn balances_async(home: &MobeeHome) -> Result<Vec<MintBalance>, Wallet
 
 /// Create a mint quote and return the bolt11 **before** any poll/wait.
 pub async fn begin_mint_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     amount_sats: u64,
     mint_override: Option<&str>,
 ) -> Result<MintQuote, WalletOpsError> {
@@ -372,7 +372,7 @@ pub async fn begin_mint_async(
 
 /// Poll + mint a previously created quote. Refuses when proof total ≠ requested.
 pub async fn complete_mint_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     quote: &MintQuote,
 ) -> Result<MintOutcome, WalletOpsError> {
     let mint_url = mint_is_allowed(home, &quote.mint_url)?;
@@ -400,7 +400,7 @@ pub async fn complete_mint_async(
 /// variable-amount methods that cannot be completed from the id alone). Lets
 /// [`complete_mint_by_id_async`] recover mint/amount/invoice from the id.
 pub async fn lookup_pending_quote_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     quote_id: &str,
 ) -> Result<Option<MintQuote>, WalletOpsError> {
     let quote_id = quote_id.trim();
@@ -441,7 +441,7 @@ pub async fn lookup_pending_quote_async(
 /// mismatch is refused rather than guessed, keeping the funded total exactly
 /// what was quoted.
 pub async fn complete_mint_by_id_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     quote_id: &str,
     amount_override: Option<u64>,
     mint_override: Option<&str>,
@@ -498,7 +498,7 @@ pub async fn complete_mint_by_id_async(
 /// Other configured mints return [`MintFlow::NeedsPayment`] with bolt11 already
 /// surfaced (caller pays, then [`complete_mint_async`]).
 pub async fn mint_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     amount_sats: u64,
     mint_override: Option<&str>,
 ) -> Result<MintFlow, WalletOpsError> {
@@ -513,7 +513,7 @@ pub async fn mint_async(
 /// Create a bolt11 invoice; on testnut, mint once FakeWallet auto-pays.
 /// Non-autopay mints return [`MintFlow::NeedsPayment`] (invoice before any wait).
 pub async fn invoice_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     amount_sats: u64,
     mint_override: Option<&str>,
 ) -> Result<MintFlow, WalletOpsError> {
@@ -522,7 +522,7 @@ pub async fn invoice_async(
 
 /// Create/print an unlocked cashu token (ecash out).
 pub async fn send_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     amount_sats: u64,
     mint_override: Option<&str>,
 ) -> Result<SendOutcome, WalletOpsError> {
@@ -575,7 +575,7 @@ pub async fn send_async(
 
 /// Redeem a cashu token (ecash in). Mint must already be configured.
 pub async fn receive_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     token: &str,
 ) -> Result<ReceiveOutcome, WalletOpsError> {
     let token = token.trim();
@@ -633,7 +633,7 @@ pub async fn receive_async(
 /// `confirm` is the effect boundary; the post-confirm balance read is observational and never
 /// discards the settled outcome (finding U — see [`post_confirm_balance`]).
 pub async fn melt_async(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     bolt11: &str,
     mint_override: Option<&str>,
 ) -> Result<MeltOutcome, WalletOpsError> {
@@ -692,7 +692,7 @@ pub async fn melt_async(
 }
 
 /// List configured mints (default first).
-pub fn list_mints(home: &MobeeHome) -> Result<Vec<MintBalance>, WalletOpsError> {
+pub fn list_mints(home: &MaxplayerHome) -> Result<Vec<MintBalance>, WalletOpsError> {
     let default = normalize_mint_url(home.config.default_mint())?;
     Ok(configured_mints(home)?
         .into_iter()
@@ -705,7 +705,7 @@ pub fn list_mints(home: &MobeeHome) -> Result<Vec<MintBalance>, WalletOpsError> 
 }
 
 /// Opt-in add of an extra mint URL (does not invent balance).
-pub fn add_mint(home: &mut MobeeHome, mint_url: &str) -> Result<String, WalletOpsError> {
+pub fn add_mint(home: &mut MaxplayerHome, mint_url: &str) -> Result<String, WalletOpsError> {
     let normalized = normalize_mint_url(mint_url)?;
     let default = normalize_mint_url(home.config.default_mint())?;
     if normalized == default {
@@ -727,7 +727,7 @@ pub fn add_mint(home: &mut MobeeHome, mint_url: &str) -> Result<String, WalletOp
 }
 
 /// Remove an opt-in extra mint. Default mint is pinned and cannot be removed.
-pub fn remove_mint(home: &mut MobeeHome, mint_url: &str) -> Result<(), WalletOpsError> {
+pub fn remove_mint(home: &mut MaxplayerHome, mint_url: &str) -> Result<(), WalletOpsError> {
     let normalized = normalize_mint_url(mint_url)?;
     let default = normalize_mint_url(home.config.default_mint())?;
     if normalized == default {
@@ -750,7 +750,7 @@ pub fn remove_mint(home: &mut MobeeHome, mint_url: &str) -> Result<(), WalletOps
     Ok(())
 }
 
-pub fn balances_blocking(home: &MobeeHome) -> Result<Vec<MintBalance>, WalletOpsError> {
+pub fn balances_blocking(home: &MaxplayerHome) -> Result<Vec<MintBalance>, WalletOpsError> {
     crate::runtime_guard::refuse_nested_block_on("balances_blocking")
         .map_err(WalletOpsError::Wallet)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -761,7 +761,7 @@ pub fn balances_blocking(home: &MobeeHome) -> Result<Vec<MintBalance>, WalletOps
 }
 
 pub fn mint_blocking(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     amount_sats: u64,
     mint_override: Option<&str>,
 ) -> Result<MintFlow, WalletOpsError> {
@@ -774,7 +774,7 @@ pub fn mint_blocking(
 }
 
 pub fn complete_mint_blocking(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     quote: &MintQuote,
 ) -> Result<MintOutcome, WalletOpsError> {
     crate::runtime_guard::refuse_nested_block_on("complete_mint_blocking")
@@ -787,7 +787,7 @@ pub fn complete_mint_blocking(
 }
 
 pub fn complete_mint_by_id_blocking(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     quote_id: &str,
     amount_override: Option<u64>,
     mint_override: Option<&str>,
@@ -807,7 +807,7 @@ pub fn complete_mint_by_id_blocking(
 }
 
 pub fn send_blocking(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     amount_sats: u64,
     mint_override: Option<&str>,
 ) -> Result<SendOutcome, WalletOpsError> {
@@ -820,7 +820,7 @@ pub fn send_blocking(
 }
 
 pub fn receive_blocking(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     token: &str,
 ) -> Result<ReceiveOutcome, WalletOpsError> {
     crate::runtime_guard::refuse_nested_block_on("receive_blocking")
@@ -833,7 +833,7 @@ pub fn receive_blocking(
 }
 
 pub fn melt_blocking(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     bolt11: &str,
     mint_override: Option<&str>,
 ) -> Result<MeltOutcome, WalletOpsError> {
@@ -846,7 +846,7 @@ pub fn melt_blocking(
 }
 
 pub fn invoice_blocking(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
     amount_sats: u64,
     mint_override: Option<&str>,
 ) -> Result<MintFlow, WalletOpsError> {

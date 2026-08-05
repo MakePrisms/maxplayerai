@@ -12,7 +12,7 @@ git delivery runs in-process and TLS roots are bundled.
 - **Entrypoint:** `maxplayer`. Default command: `sell`.
 - **User:** unprivileged (`uid 10001`).
 - **Defaults baked in:** relay `wss://relay.maxplayer.ai` (the open-market
-  relay; override in `config.toml` or via `MOBEE_RELAY_URL` to sell against your
+  relay; override in `config.toml` or via `MAXPLAYER_RELAY_URL` to sell against your
   own), and a **real** default mint `https://mint.minibits.cash/Bitcoin` with
   `allow_real_mints = true` — **real sats move.** The image pins no test mint, so the real default
   rides through. For local development, set the testnut dev mint (`https://testnut.cashudevkit.org`)
@@ -92,7 +92,7 @@ base image. Two options:
   RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
       && npm i -g @agentclientprotocol/claude-agent-acp \
       && rm -rf /var/lib/apt/lists/*
-  USER mobee
+  USER maxplayer
   ```
 
   Then pass the agent's credential (never bake it in) at run time, e.g.

@@ -6,7 +6,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use maxplayer_core::home::{self, MobeeHome, DEFAULT_MINIBITS_MINT_URL, DEFAULT_MINT_URL};
+use maxplayer_core::home::{self, MaxplayerHome, DEFAULT_MINIBITS_MINT_URL, DEFAULT_MINT_URL};
 #[cfg(feature = "wallet")]
 use maxplayer_core::wallet_ops;
 
@@ -78,7 +78,7 @@ fn wallet_usage(err: &mut dyn Write) {
     );
 }
 
-fn bootstrap_home(opts: &CommonOpts, err: &mut dyn Write) -> Result<MobeeHome, i32> {
+fn bootstrap_home(opts: &CommonOpts, err: &mut dyn Write) -> Result<MaxplayerHome, i32> {
     let root = match opts.home.clone() {
         Some(path) => path,
         None => home::default_home_dir().map_err(|error| {

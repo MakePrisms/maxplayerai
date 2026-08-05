@@ -8,7 +8,7 @@
 //!
 //! SCAFFOLD STATUS: boot + the drain/dispatch skeleton are wired. The offer→claim, award→execute,
 //! and gift-wrap→pay arms + the #150 relay-stall watchdog + #162 recovery-retry are ported on top of
-//! this in the following cutover steps (marked `PORT` below); `mobee sell` is NOT yet pointed here.
+//! this in the following cutover steps (marked `PORT` below); `maxplayer sell` is NOT yet pointed here.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -23,7 +23,7 @@ use crate::gateway::{
     self, claim_draft, error_draft, git_result_draft, parse_award, parse_offer, OfferParseError,
     ParsedOffer, ReasonCode,
 };
-use crate::home::{self, MobeeHome};
+use crate::home::{self, MaxplayerHome};
 use crate::job_lifecycle::{event_to_draft, job_hash_for_offer};
 use crate::kinds::{JOB_ACCEPT_KIND, JOB_AWARD_KIND, JOB_OFFER_KIND};
 use crate::receipt::{ReceiptPreimage, EXEC_METADATA_COMMITMENT_EMPTY};
@@ -419,7 +419,7 @@ const WRAP_BACKFILL_INTERVAL_SECS: u64 = 300;
 const WRAP_BACKFILL_MARGIN_SECS: i64 = 3600;
 /// Test-only override of [`WRAP_BACKFILL_INTERVAL_SECS`]. NOT a user config knob; no production path
 /// sets it (mirrors the heartbeat cadence seam).
-const WRAP_BACKFILL_INTERVAL_ENV: &str = "MOBEE_WRAP_BACKFILL_INTERVAL_SECS";
+const WRAP_BACKFILL_INTERVAL_ENV: &str = "MAXPLAYER_WRAP_BACKFILL_INTERVAL_SECS";
 /// Hard cap on one backfill fetch, so an auth-gated relay that never EOSEs cannot wedge the tick.
 const WRAP_BACKFILL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -667,7 +667,7 @@ async fn probe_relay_serves_our_reqs(
 }
 
 /// The seller's LIVE offer filters: the TARGETED (`#p == self`) filter always, plus — under
-/// `open_pool` — the un-pinned open-pool filter. BOTH carry the `#t=mobee` namespace guard, so a
+/// `open_pool` — the un-pinned open-pool filter. BOTH carry the `#t=maxplayer` namespace guard, so a
 /// foreign event squatting the offer kind is never even delivered.
 ///
 /// The two ride ONE subscription (a single REQ, OR-matched per NIP-01). Registered as a separate
@@ -776,7 +776,7 @@ async fn clear_subscription_registrations(
 fn offer_parse_refusal(error: &OfferParseError) -> String {
     match error {
         OfferParseError::UnsupportedVersion(version) => {
-            format!("unsupported mobee protocol version {version:?}")
+            format!("unsupported maxplayer protocol version {version:?}")
         }
         other => format!("unparseable ({other})"),
     }
@@ -921,7 +921,7 @@ fn classify_offer(
 /// SOME failing DEGRADES loudly and serves with the remainder, advertising only those, because a
 /// two-harness seller that loses one is still a working one-harness seller. A node with no `agents`
 /// list at all resolves to its single `agent_command` and prints nothing new.
-fn boot_agent_registry(home: &MobeeHome) -> Result<AgentRegistry, NodeError> {
+fn boot_agent_registry(home: &MaxplayerHome) -> Result<AgentRegistry, NodeError> {
     let Some(seller) = home.config.seller.as_ref() else {
         // No `[seller]` section: nothing serves offers, and the run loop already no-ops. An empty
         // registry keeps that path unchanged rather than turning it into a boot failure.
@@ -1131,7 +1131,7 @@ pub struct HarnessProbeVerdict {
 /// rather than a restoration, so a seat that cannot deliver never advertises at all (#357). Inputs
 /// are derived from `home` the same way `start_due_harness_probes` derives them for the restore probe.
 pub async fn probe_configured_harnesses(
-    home: &MobeeHome,
+    home: &MaxplayerHome,
 ) -> Result<Vec<HarnessProbeVerdict>, NodeError> {
     let registry = boot_agent_registry(home)?;
     let sandbox = SandboxPolicy::from_config(home.config.sandbox.as_ref());
@@ -1177,7 +1177,7 @@ pub fn proven_serving_indices(verdicts: &[HarnessProbeVerdict]) -> Vec<usize> {
 /// The gate is the `is_empty` block below; reverting it — publishing unconditionally — reproduces the
 /// #357 bug (advertise, then fail every job).
 pub async fn boot_advertising_only_proven(
-    mut home: MobeeHome,
+    mut home: MaxplayerHome,
     verdicts: Vec<HarnessProbeVerdict>,
 ) -> Result<SellerNodeRunner, NodeError> {
     if proven_serving_indices(&verdicts).is_empty() {
@@ -1246,7 +1246,7 @@ impl SellerNodeRunner {
     /// exposed by an accessor, logged, or serialized. The client holds it because mobee-relay
     /// authenticates the seller via NIP-42 (signing the challenge) before it will deliver the
     /// p-gated kind-1059 payment wraps.
-    pub async fn boot(home: MobeeHome) -> Result<Self, NodeError> {
+    pub async fn boot(home: MaxplayerHome) -> Result<Self, NodeError> {
         let relay_url = home.config.relay_url.clone();
 
         // Read the seller secret ONCE, here, to build the authenticated client (single construction
@@ -4137,7 +4137,7 @@ mod tests {
         let skew_reason = offer_parse_refusal(&skew);
         let broken_reason = offer_parse_refusal(&broken);
         assert!(
-            skew_reason.contains("unsupported mobee protocol version") && skew_reason.contains("99"),
+            skew_reason.contains("unsupported maxplayer protocol version") && skew_reason.contains("99"),
             "the version-skew refusal must say so and name the version, got {skew_reason:?}"
         );
         assert!(
@@ -4151,7 +4151,7 @@ mod tests {
     }
 
     // TOOTH (#171 layer 2 / #172) — the offer REQ carries the un-pinned open-pool filter IFF the
-    // seller opted in, and BOTH filters carry the `#t=mobee` namespace guard. The node subscribed
+    // seller opted in, and BOTH filters carry the `#t=maxplayer` namespace guard. The node subscribed
     // targeted-only unconditionally, so a `claim_open_pool = true` seller ran a claim gate over
     // offers its subscription could never deliver. Bite: drop the `claim_open_pool` branch and the
     // two-filter assertions go red; drop the hashtag and the guard assertions go red.
@@ -4196,7 +4196,7 @@ mod tests {
             assert_eq!(
                 filter.generic_tags.get(&hashtag),
                 Some(&[crate::gateway::MOBEE_TAG.to_owned()].into_iter().collect()),
-                "offer filter {index} must carry the #t=mobee namespace guard"
+                "offer filter {index} must carry the #t=maxplayer namespace guard"
             );
         }
 
@@ -4842,7 +4842,7 @@ mod tests {
     // configured concurrency without that showing up in `available()`.
     //
     // It is NOT a payment defect. Double payment is blocked further down the path (reservation PK, a
-    // single job-keyed watcher, outbox dedup); that path was verified by the mobee lead, not here, and
+    // single job-keyed watcher, outbox dedup); that path was verified by the maxplayer lead, not here, and
     // this comment should not be read as this test having checked it. The costs are operator compute,
     // slot accounting, and a second push that can move the branch tip off the journaled commit — which
     // the buyer then refuses on tip-match, i.e. it fails toward NOT paying a seller who did the work.
