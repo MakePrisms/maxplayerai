@@ -246,7 +246,7 @@ mod tests {
         // indistinguishable from the relay's logs.
         let line = msg(3400, serde_json::json!([["t", "maxplayer"]]));
         assert_eq!(decide(&line, "maxplayer").action, "accept");
-        assert_eq!(decide(&line, "maxplayer").action, "reject");
+        assert_eq!(decide(&line, "other-namespace").action, "reject");
     }
 
     #[test]
