@@ -1919,6 +1919,49 @@ impl SellerNodeRunner {
                             // A newly authenticated session earns a fresh retry budget: the budget
                             // exists to bound retries WITHIN a session, not to spend one forever.
                             restricted_retry_used.clear();
+
+                            // #429 FIX. A completed NIP-42 auth is the only reliable signal that this
+                            // socket can carry our `#p`-gated REQs again — so RE-ISSUE the long-lived
+                            // subscriptions here, on EVERY completed auth, re-armed per-expiry (no
+                            // once-per-process latch).
+                            //
+                            // WHY it is needed: the relay refuses an unauthenticated `#p`-self REQ with
+                            // `auth-required:` (retryable, NOT `restricted:` — so the #189 belt above
+                            // never even fires for the money leg) and closes the auth-scoped subs when
+                            // auth lapses on a LIVE socket. nostr-sdk's only live-socket repair is the
+                            // post-auth `resubscribe()` (`relay/inner.rs:941`), gated by
+                            // `should_resubscribe` to re-send only subs already marked `closed==true`;
+                            // it races the CLOSED that sets that flag and, field-observed, LOSES — the
+                            // 1059/awards/offers legs stay registered-but-deaf with no reconnect and no
+                            // restart. Re-issuing here does not depend on that race, on the sub's
+                            // closed flag, or on a reconnect: `subscribe_with_id` re-sends the REQ
+                            // unconditionally (`pool/mod.rs:603`), AUTHENTICATED, so the relay accepts
+                            // it and the leg is durable — robust to whichever SDK path is broken.
+                            //
+                            // No loop: the re-sends go out on an already-authenticated socket, so the
+                            // relay serves them (no fresh challenge). A harmless idempotent re-send at
+                            // boot is accepted rather than guarded — the loop rarely even sees the boot
+                            // auth (the notification stream is taken after `boot()` completes), and a
+                            // duplicate REQ is answered the same as the first. The overlap cursor lets
+                            // events published while a leg was deaf backfill on the re-send.
+                            let overlap = nostr_sdk::Timestamp::from(
+                                last_liveness_seen_unix
+                                    .saturating_sub(STALL_OVERLAP_MARGIN_SECS as i64)
+                                    .max(0) as u64,
+                            );
+                            match self.subscribe_all(Some(overlap)).await {
+                                Ok(()) => eprintln!(
+                                    "seller node RELAY-AUTH RESUBSCRIBE: re-issued offers+awards+\
+                                     kind-1059 on a completed NIP-42 auth (since={} overlap), so a \
+                                     relay that re-challenged auth on this live socket does not leave \
+                                     the money leg silently deaf",
+                                    overlap.as_secs()
+                                ),
+                                Err(error) => eprintln!(
+                                    "seller node RELAY-AUTH RESUBSCRIBE failed ({error}); the next \
+                                     completed auth or the wrap backfill retries"
+                                ),
+                            }
                         }
                         Ok(RelayNotification::AuthenticationFailed) => nip42_authed = false,
                         // A socket that went away takes its NIP-42 state with it — whatever comes
@@ -5669,6 +5712,189 @@ mod tests {
                     "the node must keep probing after an unknown-id CLOSED"
                 );
 
+            })
+            .await;
+        loop_handle.abort();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Budget for one challenge-roll to re-authenticate the live socket and for the fix to re-issue
+    /// the long-lived legs on that completed auth. Generous; the REVERT path never re-issues, so it
+    /// spends the whole budget then trips — a slow but unambiguous red.
+    const RECHALLENGE_WAIT: Duration = Duration::from_secs(30);
+
+    /// The long-lived subscriptions the daemon must re-issue on a completed auth: the offer, award,
+    /// and kind-1059 legs (what [`subscribe_all`] carries). The liveness probe is transient — it is
+    /// re-issued every heartbeat and self-heals — so it is not in this set.
+    const LONG_LIVED_SUBS: [&str; 3] = [OFFER_SUB_ID, AWARD_SUB_ID, WRAP_SUB_ID];
+
+    /// How many REQs for `id` the relay served (`EOSE`) on an AUTHENTICATED session — the count that
+    /// must grow after each challenge-roll for the leg to be genuinely restored (not merely re-sent
+    /// onto a stale generation and refused).
+    fn served_authed(reqs: &[ReqRecord], id: &str) -> usize {
+        reqs.iter()
+            .filter(|r| r.subscription_id == id && r.authenticated && r.verdict == Verdict::Eose)
+            .count()
+    }
+
+    /// TOOTH #429 — a live-socket NIP-42 RE-CHALLENGE must not leave the money leg deaf: the daemon
+    /// re-issues the long-lived subscriptions on every COMPLETED auth, re-armed per challenge-roll.
+    ///
+    /// FIELD MECHANISM (deployed relay + nostr-sdk 0.44.1, three independent source reads): the relay
+    /// refuses an unauthenticated `#p`-self REQ with `auth-required:` — retryable, and NEVER
+    /// `restricted:`, so the #189 belt cannot even fire for the money leg — and closes the auth-scoped
+    /// subs when auth lapses on a LIVE socket. nostr-sdk's only live-socket repair is a one-shot
+    /// post-auth `resubscribe()` (`relay/inner.rs:941`) gated on `closed==true`; it races the CLOSED
+    /// that sets that flag and, field-observed, loses — offers/awards/kind-1059 stay
+    /// registered-but-deaf, no reconnect and no restart, until the next completed auth (which the
+    /// periodic backfill triggers incidentally). Every missed kind-1059 is an unredeemed payment.
+    ///
+    /// WHY THIS TOOTH MODELS THE ROLL WITHOUT THE `auth-required:` CLOSE FRAME. The faithful frame
+    /// makes the red-prove VACUOUS against a REAL nostr-sdk: an `auth-required:` CLOSE marks the sub
+    /// `closed==true` (MarkAsClosed — kept in the registry), and the re-challenge's post-auth
+    /// `resubscribe()` then re-sends it and the relay serves it, so the SDK SELF-HEALS and a
+    /// fix-removed run still passes (empirically confirmed). The field failure is the resubscribe
+    /// RACING that CLOSE and losing (it fires while `closed==false`, then the CLOSE lands with no
+    /// further resubscribe) — inherently non-deterministic, and a race-based test would be a flake in
+    /// a module we are actively de-flaking. So this tooth WITHHOLDS the CLOSE and lets the STALE
+    /// generation alone deafen the leg: with the sub `closed==false`, the SDK's `closed==true`-gated
+    /// resubscribe correctly SKIPS it, so the ONLY thing that re-serves it is the daemon's
+    /// unconditional re-issue-on-auth. The induction differs from the field (closed==false-skip vs
+    /// closed==true race-loss) but the OUTCOME under test is identical — the SDK does not restore on
+    /// the re-auth, only the daemon does — and `subscribe_all` re-sends unconditionally
+    /// (`pool/mod.rs:603`) regardless of closed-state, so the fix behaves identically either way. That
+    /// the fix ALSO restores the real `closed==true` state is confirmed separately by
+    /// [`resubscribe_on_auth_restores_an_auth_required_closed_leg`].
+    ///
+    /// [`PGateRelay::roll_challenge`] with an EMPTY close-set: bump the relay's auth generation and
+    /// re-issue an `AUTH` challenge so the client re-authenticates IN PLACE (no reconnect). The boot
+    /// subs are now on the stale generation; only a REQ re-issued after the socket catches up serves
+    /// on the authenticated (current-generation) session. Test double for the observed contract, not a
+    /// claim about relay internals — the deployed relay has no generation concept (see [`decide`]).
+    ///
+    /// Two consecutive rolls prove the re-issue is re-armed per challenge-roll, not once-per-process.
+    /// WITH the fix, both cycles restore every long-lived leg SERVED on an AUTHENTICATED session.
+    ///
+    /// RED ON REVERT: delete the resubscribe-on-auth block from the `Authenticated` arm. The socket
+    /// still re-authenticates, but nothing re-issues the stale legs, so no fresh served+authed REQ
+    /// ever appears after the roll and the cycle-1 wait times out — the leg stays deaf on the stale
+    /// generation exactly as the field's leg stayed deaf on its closed one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn long_lived_subs_resubscribe_on_auth_after_a_challenge_roll() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("rechallenge");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, false));
+        // The heartbeat/watchdog is deliberately OFF so no stall-recovery reconnect can re-serve the
+        // legs on its own and mask the fix — matching the field, where the leg went deaf with NO
+        // reconnect. The resubscribe-on-auth fix lives in the `Authenticated` arm, not the heartbeat,
+        // so it fires regardless; OFF leaves it the ONLY restorer, which is what makes the revert red.
+        home.config.seller_heartbeat.enabled = false;
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        // `run()` is NOT `Send` under the `acp` feature (the runner holds an `AcpDriver` with a
+        // `!Sync` std mpsc `Receiver`), so keep the loop on this thread with a `LocalSet`, exactly as
+        // the sibling loop teeth do.
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        local
+            .run_until(async {
+                // Boot: every long-lived leg is served on an authenticated session — the baseline a
+                // challenge-roll knocks down and every completed auth must restore.
+                for id in LONG_LIVED_SUBS {
+                    assert!(
+                        fixture
+                            .wait_until(FIXTURE_WAIT, |reqs| served_authed(reqs, id) >= 1)
+                            .await,
+                        "harness check: {id} must boot SERVED on an AUTHENTICATED session"
+                    );
+                }
+
+                for cycle in 1..=2 {
+                    let snapshot = fixture.reqs().await;
+                    let before: Vec<usize> = LONG_LIVED_SUBS
+                        .iter()
+                        .map(|id| served_authed(&snapshot, id))
+                        .collect();
+
+                    // The live-socket re-challenge, WITHOUT the `auth-required:` CLOSE (see the tooth
+                    // doc for why): the generation rolls and the client re-authenticates in place,
+                    // leaving the boot legs on the now-stale generation.
+                    fixture.roll_challenge(&[]).await;
+
+                    // Every long-lived leg must be RE-ISSUED and SERVED on the re-authenticated
+                    // session — a fresh served+authed REQ beyond the pre-roll count. WITHOUT the fix
+                    // nothing re-issues them, so this times out on cycle 1 (the leg stays deaf).
+                    for (idx, id) in LONG_LIVED_SUBS.iter().enumerate() {
+                        let target = before[idx];
+                        assert!(
+                            fixture
+                                .wait_until(RECHALLENGE_WAIT, |reqs| served_authed(reqs, id)
+                                    > target)
+                                .await,
+                            "cycle {cycle}: {id} was not re-issued+served on the re-authenticated \
+                             session after a challenge roll — the completed-auth resubscribe did not \
+                             restore it"
+                        );
+                    }
+                }
+            })
+            .await;
+        loop_handle.abort();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// CONFIRMATION (not a red-prove) — the resubscribe-on-auth fix operates correctly against the
+    /// REAL `closed==true` field state, restoring an `auth-required:`-CLOSED long-lived leg on the
+    /// re-auth. Kept as SEPARATE evidence that the fix runs on the frame the field actually showed
+    /// (re-issuing offers+awards+kind-1059 on the completed auth, no loop, no error), so the no-CLOSE
+    /// red-prove above is not the only thing tying the fix to the field.
+    ///
+    /// This deliberately CANNOT be the non-vacuous prover: against a real nostr-sdk a `closed==true`
+    /// sub is ALSO re-sent by the SDK's own post-auth `resubscribe()`, so removing the fix does NOT
+    /// turn this red (the SDK self-heals it) — which is precisely why the deterministic red-prove
+    /// withholds the CLOSE. Its job here is fidelity to the observed frame, not regression-guarding;
+    /// [`long_lived_subs_resubscribe_on_auth_after_a_challenge_roll`] does the guarding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resubscribe_on_auth_restores_an_auth_required_closed_leg() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("authrequiredclose");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, false));
+        home.config.seller_heartbeat.enabled = false;
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        local
+            .run_until(async {
+                for id in LONG_LIVED_SUBS {
+                    assert!(
+                        fixture
+                            .wait_until(FIXTURE_WAIT, |reqs| served_authed(reqs, id) >= 1)
+                            .await,
+                        "harness check: {id} must boot SERVED on an AUTHENTICATED session"
+                    );
+                }
+                let snapshot = fixture.reqs().await;
+                let before: Vec<usize> = LONG_LIVED_SUBS
+                    .iter()
+                    .map(|id| served_authed(&snapshot, id))
+                    .collect();
+
+                // The field's ACTUAL frame: each long-lived leg CLOSED `auth-required:` on the live
+                // socket (marked `closed==true`), then an in-place re-auth.
+                fixture.roll_challenge(&LONG_LIVED_SUBS).await;
+
+                for (idx, id) in LONG_LIVED_SUBS.iter().enumerate() {
+                    let target = before[idx];
+                    assert!(
+                        fixture
+                            .wait_until(RECHALLENGE_WAIT, |reqs| served_authed(reqs, id) > target)
+                            .await,
+                        "{id} was not restored SERVED+AUTHED after an auth-required close + re-auth"
+                    );
+                }
             })
             .await;
         loop_handle.abort();

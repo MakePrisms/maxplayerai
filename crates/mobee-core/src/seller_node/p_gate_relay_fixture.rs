@@ -79,6 +79,11 @@ struct Controls {
     /// Writer for the most recently accepted socket, so a test can push an UNSOLICITED `CLOSED` —
     /// which is what the deployed relay does, and what neither a REQ nor a policy hook can model.
     live: Mutex<Option<Arc<Mutex<Writer>>>>,
+    /// NIP-42 auth GENERATION (#429). Bumped by [`PGateRelay::roll_challenge`] to model a live-socket
+    /// auth re-challenge: a socket authenticated under an OLDER generation is now behind the current
+    /// epoch, so its `#p`-pinned REQs read STALE (closed `auth-required:`) until it answers the new
+    /// challenge and catches up — which is the in-place re-auth the fix re-issues its subs on.
+    auth_generation: std::sync::atomic::AtomicU64,
 }
 
 /// A running fixture relay. Dropping it stops accepting new connections.
@@ -152,6 +157,38 @@ impl PGateRelay {
         let live = self.controls.live.lock().await.clone();
         if let Some(writer) = live {
             let _ = send(&writer, json!(["CLOSED", subscription_id, reason])).await;
+        }
+    }
+
+    /// Model a NIP-42 auth RE-CHALLENGE on a LIVE socket (#429): bump the relay's auth generation (so
+    /// every open socket's last auth is now behind the current epoch), OPTIONALLY push an unsolicited
+    /// `auth-required: not authenticated` CLOSED for each id in `close_subs` — the frame the field
+    /// showed, with the socket STAYING UP and no reconnect — then re-issue an `AUTH` challenge so the
+    /// client re-authenticates IN PLACE. The client catching up (answering the challenge) is the
+    /// incidental completed-auth the fix keys its resubscribe off.
+    ///
+    /// `close_subs` is EMPTY for the deterministic red-prove and the money legs for the confirmation
+    /// tooth — see [`long_lived_subs_resubscribe_on_auth_after_a_challenge_roll`] for why a faithful
+    /// CLOSE makes the red-prove vacuous (nostr-sdk's own post-auth `resubscribe()` re-sends a
+    /// `closed==true` sub on the re-auth and self-heals it), so the non-vacuous prover withholds the
+    /// CLOSE and lets the STALE generation alone deafen the leg.
+    pub(super) async fn roll_challenge(&self, close_subs: &[&str]) {
+        let generation = self
+            .controls
+            .auth_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let live = self.controls.live.lock().await.clone();
+        if let Some(writer) = live {
+            for id in close_subs {
+                let _ = send(
+                    &writer,
+                    json!(["CLOSED", id, "auth-required: not authenticated"]),
+                )
+                .await;
+            }
+            let _ =
+                send(&writer, json!(["AUTH", format!("mobee-rechallenge-{generation}")])).await;
         }
     }
 
@@ -231,18 +268,27 @@ async fn serve_connection(
     let writer = Arc::new(Mutex::new(writer));
     *controls.live.lock().await = Some(Arc::clone(&writer));
 
-    // The challenge goes out on its own task so the delay never blocks reading: the REQs we are here
-    // to observe arrive DURING that window.
-    let challenge = "mobee-recoveryfix-challenge";
+    // The auth GENERATION this socket is currently authenticated under (#429). A `roll_challenge`
+    // bumps the relay's generation and re-challenges auth on the SAME socket (no reconnect); until
+    // the client answers the new challenge this value stays behind, and a `#p`-pinned REQ arriving
+    // meanwhile reads STALE. It is advanced on every completed AUTH below — that live-socket re-auth
+    // is exactly what the fix keys its resubscribe off.
+    let mut authed_gen = controls
+        .auth_generation
+        .load(std::sync::atomic::Ordering::SeqCst);
+
+    // The boot challenge goes out on its own task so the delay never blocks reading: the REQs we are
+    // here to observe arrive DURING that window.
+    let boot_challenge = "mobee-recoveryfix-challenge";
     tokio::spawn({
         let writer = Arc::clone(&writer);
         async move {
             tokio::time::sleep(auth_delay).await;
-            let _ = send(&writer, json!(["AUTH", challenge])).await;
+            let _ = send(&writer, json!(["AUTH", boot_challenge])).await;
         }
     });
 
-    // Per-session NIP-42 state. `None` until the client answers the challenge.
+    // Per-session NIP-42 state. `None` until the client answers a challenge.
     let mut authed_pubkey: Option<String> = None;
 
     while let Some(message) = reader.next().await {
@@ -265,6 +311,12 @@ async fn serve_connection(
                         .get("pubkey")
                         .and_then(Value::as_str)
                         .map(str::to_string);
+                    // A completed auth binds this socket to the CURRENT generation — a live-socket
+                    // re-auth (the client answering a re-challenge without reconnecting) catches the
+                    // socket up, which is the exact moment the fix re-issues the subs.
+                    authed_gen = controls
+                        .auth_generation
+                        .load(std::sync::atomic::Ordering::SeqCst);
                 }
                 let id = event.get("id").and_then(Value::as_str).unwrap_or_default();
                 send(&writer, json!(["OK", id, authed_pubkey.is_some(), ""])).await?;
@@ -297,17 +349,30 @@ async fn serve_connection(
                     })
                     .collect();
 
+                // A `roll_challenge` bumped the relay's generation past this socket's last completed
+                // auth (#429): the socket authenticated, but under a now-superseded generation, so its
+                // `#p`-pinned REQs no longer count as authenticated until it answers the re-challenge.
+                let stale = authed_pubkey.is_some()
+                    && authed_gen
+                        < controls
+                            .auth_generation
+                            .load(std::sync::atomic::Ordering::SeqCst);
+
                 let verdict = decide(
                     &subscription_id,
                     &pinned,
                     authed_pubkey.as_deref(),
+                    stale,
                     &controls,
                 )
                 .await;
 
                 transcript.lock().await.push(ReqRecord {
                     subscription_id: subscription_id.clone(),
-                    authenticated: authed_pubkey.is_some(),
+                    // A REQ arriving under a stale generation is served neither authed nor at all —
+                    // the record shows it UNAUTHENTICATED, which is how the test tells a leg re-issued
+                    // on the caught-up (post-re-auth) socket from one that was never re-sent.
+                    authenticated: authed_pubkey.is_some() && !stale,
                     p_pinned: pinned.iter().any(Option::is_some),
                     filter_count: filters.len(),
                     has_unpinned_filter: pinned.iter().any(Option::is_none),
@@ -340,6 +405,7 @@ async fn decide(
     subscription_id: &str,
     pinned: &[Option<&str>],
     authed_pubkey: Option<&str>,
+    stale: bool,
     controls: &Controls,
 ) -> Verdict {
     let has_unpinned = pinned.iter().any(Option::is_none);
@@ -352,6 +418,20 @@ async fn decide(
         return Verdict::Closed(entry.reason);
     }
     drop(forced);
+
+    // A `#p`-pinned REQ arriving under a STALE (re-challenged) generation is closed
+    // `auth-required: not authenticated` — the OBSERVED wire contract on a live re-auth socket (field
+    // log: all four subs closed EXACTLY this, never `restricted:`). This is a test double for the
+    // relay's behaviour, NOT a claim about relay internals: mac's read of the deployed relay source
+    // says it has NO generation concept, so `stale` here only stands in for "this socket's auth is
+    // behind the current epoch". nostr-sdk treats `auth-required:` as retryable (MarkAsClosed — the
+    // sub stays in the registry, `closed==true`), so the leg is repaired only by re-issuing on the
+    // next completed AUTH. Distinct from the pre-auth race below, where an UNAUTHENTICATED session
+    // (never authed) still gets the permanent-class `restricted:` (#189, unchanged).
+    let p_gated = pinned.iter().any(Option::is_some);
+    if stale && p_gated {
+        return Verdict::Closed("auth-required: not authenticated".to_string());
+    }
 
     for value in pinned.iter().flatten() {
         if authed_pubkey != Some(*value) {
