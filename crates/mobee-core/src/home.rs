@@ -147,8 +147,10 @@ pub fn default_buzz_heartbeat_secs() -> u64 {
     30
 }
 
-/// Default relay-git base (delivery). Live on mobee-relay (`/git/<owner>/<repo>.git`).
-pub const DEFAULT_RELAY_GIT_BASE: &str = "https://mobee-relay.orveth.dev/git";
+/// Default relay-git base (delivery), on the launch relay (`/git/<owner>/<repo>.git`) — the same
+/// host the default `relay_url` announces to, so the kind-30617 announce seeds the exact git base
+/// the seed probe then checks (#394: splitting announce-host from git-host bricked fresh sellers).
+pub const DEFAULT_RELAY_GIT_BASE: &str = "https://relay.maxplayer.ai/git";
 /// Shared leaf name — NOT used as default (relay name registry is global).
 pub const DEFAULT_RELAY_GIT_REPO: &str = "mobee-seller";
 
@@ -1612,6 +1614,20 @@ mod tests {
         // the old relay URL.
         assert_eq!(default_relay_url(), "wss://relay.maxplayer.ai");
         assert_eq!(DEFAULT_RELAY_URL, "wss://relay.maxplayer.ai");
+    }
+
+    #[test]
+    fn shipped_default_git_base_is_on_the_launch_relay() {
+        // Revert-guard for the #390 repoint, and a coherence pin for #394: the default git base
+        // must live on the SAME host the default relay_url announces to — the kind-30617 announce
+        // seeds git on whatever relay ingests it, and the seed probe checks DEFAULT_RELAY_GIT_BASE.
+        // Splitting the two hosts bricks every fresh seller at the seed probe.
+        assert_eq!(DEFAULT_RELAY_GIT_BASE, "https://relay.maxplayer.ai/git");
+        let relay_host = DEFAULT_RELAY_URL.trim_start_matches("wss://");
+        assert!(
+            DEFAULT_RELAY_GIT_BASE.contains(relay_host),
+            "git base ({DEFAULT_RELAY_GIT_BASE}) must be on the default relay's host ({relay_host})"
+        );
     }
 
     #[test]
