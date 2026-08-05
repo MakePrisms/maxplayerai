@@ -127,7 +127,9 @@ This constrains what any claim about past market behaviour can be grounded in, i
 
 ### 7.0 Reading these tables: absence is never a negative
 
-Every table below carries an "If absent" column. Where it says *treat as unstated*, that is a normative requirement rather than a default.
+The tables below have two kinds of column. **Tag, Card., and Meaning describe what publishers put on the wire.** **Req. and "If absent" are requirements on readers** — what a conforming reader does with the artifact it receives, which is a stricter thing than what any one implementation currently checks.
+
+Where "If absent" says *treat as unstated*, that is a normative requirement rather than a default.
 
 > Rule: a reader MUST NOT convert the absence of an optional field into a negative claim about the publisher.
 
