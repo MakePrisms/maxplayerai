@@ -322,7 +322,7 @@ Only start selling once the probe cannot see `~/.mobee`.
 namespace on the marketplace relay:
 
 ```text
-https://mobee-relay.orveth.dev/git/<seller-pubkey>/m<seller-pubkey-short>.git
+https://relay.maxplayer.ai/git/<seller-pubkey>/m<seller-pubkey-short>.git
 ```
 
 On start it (1) publishes a **NIP-34** repo announcement (kind-30617) *before* any push — the relay
@@ -431,7 +431,7 @@ Startup status (stderr) looks like:
 
 ```text
 maxplayer sell home=… key_present=true mint=https://testnut.cashudevkit.org relay=wss://relay.maxplayer.ai
-git_remote defaulting to relay-git https://mobee-relay.orveth.dev/git/<pubkey>/m<pubkey-short>.git
+git_remote defaulting to relay-git https://relay.maxplayer.ai/git/<pubkey>/m<pubkey-short>.git
 wrote [seller] to …/config.toml
 relay-git NIP-34 announce ok id=… remote=…
 relay-git seed probe ok (info/refs reachable)
