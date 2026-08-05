@@ -13,10 +13,16 @@
 #
 # Writes <outdir>/<name>-<version>-<platform>.tar.gz and prints its path.
 #
-# `name` defaults to `maxplayer` and names both the archive and the executable inside it. It is an
-# argument rather than a constant because the release matrix ships more than one binary from this
-# script — the racer (buyer surface) and the runner (seller surface) are separate artifacts that
-# differ only in feature set, so the caller is what knows which one it is holding.
+# `name` defaults to `maxplayer` and names the ARCHIVE — the tarball and the directory inside it. It
+# is an argument rather than a constant because the release matrix ships more than one artifact from
+# this script: the racer (buyer surface) and the seller artifact differ only in feature set, so the
+# caller is what knows which one it is holding.
+#
+# The executable inside is named after the binary being packaged, never after the archive. A binary
+# must answer to the name it is invoked by — `verify-release-version.sh` holds every artifact to
+# that — and `maxplayer` reports `maxplayer <version>` whichever feature set it was built with. An
+# archive-derived name would ship the seller artifact as a command that disagrees with its own
+# `version` output.
 
 set -euo pipefail
 
@@ -46,6 +52,8 @@ esac
 mkdir -p "$OUTDIR"
 OUTDIR="$(cd "$OUTDIR" && pwd)"
 
+BIN="$(basename "$BINARY")"
+
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 ROOT="$STAGE/$NAME-$VERSION-$PLATFORM"
@@ -53,8 +61,8 @@ mkdir -p "$ROOT"
 
 # `cp -L` because a nix build output is a symlink into the store: archiving the link would produce a
 # tarball containing a dangling path instead of an executable.
-cp -L "$BINARY" "$ROOT/$NAME"
-chmod 755 "$ROOT/$NAME"
+cp -L "$BINARY" "$ROOT/$BIN"
+chmod 755 "$ROOT/$BIN"
 cp LICENSE-MIT LICENSE-APACHE "$ROOT/"
 
 TARBALL="$OUTDIR/$NAME-$VERSION-$PLATFORM.tar.gz"
@@ -89,10 +97,10 @@ TAR="${TAR:-tar}"
 # The listing is read into a variable first: under `set -o pipefail`, `tar … | grep -q` FAILS on a
 # successful match, because grep exits at the first hit and tar then dies of SIGPIPE.
 LISTING="$("$TAR" -tzf "$TARBALL")"
-for entry in "$NAME" LICENSE-MIT LICENSE-APACHE; do
+for entry in "$BIN" LICENSE-MIT LICENSE-APACHE; do
     grep -qx "$NAME-$VERSION-$PLATFORM/$entry" <<<"$LISTING" \
         || die "$TARBALL is missing $entry"
 done
 
-echo "ok: $(basename "$TARBALL") carries $NAME, LICENSE-MIT, LICENSE-APACHE"
+echo "ok: $(basename "$TARBALL") carries $BIN, LICENSE-MIT, LICENSE-APACHE"
 echo "$TARBALL"

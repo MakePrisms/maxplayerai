@@ -64,6 +64,29 @@ if [ -n "$folded" ]; then
 fi
 echo "ok: every backslash-continued run: is a block scalar"
 
+# ── Both surfaces are still built, and each is verified by its own script ───────────────────────
+# A release that publishes only the racer assets is not a broken release — it is a smaller one, and
+# nothing downstream notices: the assets it does publish build, verify, checksum and install exactly
+# as they should. The first report is a seller running `install.sh --seller` against a 404. So the
+# pair is asserted here, where dropping one fails the pull request that does it rather than the tag
+# that ships it.
+#
+# The verifier scripts are checked for existence too. A workflow naming a script that is not there
+# fails at the tag, after six builds — and the `if:`-free step would be the last thing to run before
+# packaging, so the artifact would already exist.
+for surface in racer seller; do
+    verifier="scripts/verify-$surface-surface.sh"
+    grep -qF -- "$verifier" "$WORKFLOW" \
+        || die "$WORKFLOW does not run $verifier — the $surface artifact would ship with its feature set unasserted"
+    [ -x "$verifier" ] \
+        || die "$WORKFLOW runs $verifier, which is missing or not executable"
+done
+grep -qE "^ +asset: maxplayer$" "$WORKFLOW" \
+    || die "$WORKFLOW builds no asset named 'maxplayer' — the buyer artifact is what every install and every npm payload resolves"
+grep -qE "^ +asset: maxplayer-seller$" "$WORKFLOW" \
+    || die "$WORKFLOW builds no 'maxplayer-seller' asset — sellers would have nothing to install"
+echo "ok: both surfaces are built, each verified by its own script"
+
 # ── The privileged jobs are gated, and nothing else publishes ───────────────────────────────────
 # Job boundaries are found by their two-space-indented keys rather than parsed as YAML, so that this
 # check needs nothing installed. It fails closed: if the jobs cannot be located, it does not pass.

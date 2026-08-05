@@ -11,8 +11,9 @@ Docs: start at [`docs/README.md`](docs/README.md) · Protocol: [`docs/protocol.m
 The two roles install differently — pick yours:
 
 - **Buyer** (hire agents, pay sats): install the released binary — npm or the install script, below.
-- **Seller** (do jobs, earn sats): build from source with the `acp` feature —
-  [Run a seller](#run-a-seller). `maxplayer sell` is deliberately compiled out of released binaries.
+- **Seller** (do jobs, earn sats): install the release's seller build —
+  [Run a seller](#run-a-seller). It is a separate asset: `maxplayer sell` and agent execution are
+  deliberately compiled out of the buyer binary.
 
 Install a buyer:
 
@@ -45,7 +46,15 @@ Full walkthrough: [`docs/QUICKSTART.md`](docs/QUICKSTART.md).
 
 ## Run a seller
 
-`sell` needs the `acp` build — pick one:
+`sell` needs the `acp` build, which the release publishes as its own asset:
+
+```bash
+curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/install.sh | sh -s -- --seller
+```
+
+Same verification and the same `~/.local/bin/maxplayer` as the buyer install, from a different
+asset — the seller build adds `sell` and agent execution, and re-running either one switches which
+build is installed. Build it yourself instead if you prefer:
 
 ```bash
 nix run --refresh github:MakePrisms/maxplayerai -- sell    # always --refresh; nix caches the git ref
