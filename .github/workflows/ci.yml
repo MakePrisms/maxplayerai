@@ -28,7 +28,7 @@ jobs:
       - name: Verify the release version check agrees with the built binary
         run: |
           VERSION="$(cargo metadata --no-deps --format-version 1 \
-            | node -e 'const m=JSON.parse(require("fs").readFileSync(0,"utf8"));const p=m.packages.find(p=>p.name==="mobee");if(!p){process.stderr.write("no mobee package in cargo metadata\n");process.exit(1)}process.stdout.write(p.version)')"
+            | node -e 'const m=JSON.parse(require("fs").readFileSync(0,"utf8"));const p=m.packages.find(p=>p.name==="maxplayer");if(!p){process.stderr.write("no maxplayer package in cargo metadata\n");process.exit(1)}process.stdout.write(p.version)')"
           ./scripts/verify-release-version.sh "$VERSION" target/debug/maxplayer
       # One half of a pair — this build has `acp` off, and the acp job below runs the other verifier
       # on a build that has it on. Both surface verifiers otherwise run only on a tag, which leaves
@@ -36,23 +36,23 @@ jobs:
       # that has never run is not a guard.
       - name: Verify the racer surface (default features)
         run: ./scripts/verify-racer-surface.sh target/debug/maxplayer
-      - name: Test mobee-core (default features)
-        run: cargo test -p mobee-core --locked
+      - name: Test maxplayer-core (default features)
+        run: cargo test -p maxplayer-core --locked
       # The CLI crate's tests (cli unit tests, cli_e2e.rs, and the #126/#127/#131 daemon self-spawn
       # acceptance in mcp_daemon.rs, which drives the real built binary) run nowhere else: every
-      # other test invocation in this file is -p mobee-core (#264). mcp_daemon.rs is gated on the
+      # other test invocation in this file is -p maxplayer-core (#264). mcp_daemon.rs is gated on the
       # wallet feature, which is a default feature, so the default-feature job is the one that
       # satisfies its cfg gate.
       - name: Test mobee (CLI crate, default features)
-        run: cargo test -p mobee --locked
+        run: cargo test -p maxplayer --locked
       # Same gap, other crate (#264): the relay write-policy plugin's tests (the #372 config-flip
       # red-prove, #397 NIP-17 admission) are built by the workspace build but named by no test
       # invocation. The crate has no feature gates, so it runs here too.
-      - name: Test mobee-relay-write-policy
-        run: cargo test -p mobee-relay-write-policy --locked
+      - name: Test maxplayer-relay-write-policy
+        run: cargo test -p maxplayer-relay-write-policy --locked
 
   # The acp feature gates the seller-execute path and is off by default, so it rots silently unless
-  # CI compiles it explicitly (issue #108). Build BOTH crates with acp on — mobee-core with the full
+  # CI compiles it explicitly (issue #108). Build BOTH crates with acp on — maxplayer-core with the full
   # shipped feature combo — then run the acp-gated tests.
   build-acp:
     name: Build & test (acp)
@@ -62,14 +62,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build mobee (acp + wallet, release)
-        run: cargo build -p mobee --release --features acp,wallet --locked
-      - name: Build mobee-core (full shipped feature combo)
-        run: cargo build -p mobee-core --features acp,gateway,git-delivery,wallet --locked
+        run: cargo build -p maxplayer --release --features acp,wallet --locked
+      - name: Build maxplayer-core (full shipped feature combo)
+        run: cargo build -p maxplayer-core --features acp,gateway,git-delivery,wallet --locked
       # The acp-gated tests (the ACP driver units + the #223 seller-concurrency regression:
       # N jobs must OVERLAP on one LocalSet thread and the loop must stay live) only exist under
       # the acp feature — the default-feature job above compiles them out, so run them here.
-      - name: Test mobee-core (acp)
-        run: cargo test -p mobee-core --features acp --locked
+      - name: Test maxplayer-core (acp)
+        run: cargo test -p maxplayer-core --features acp --locked
       # Paired with the racer check in the default-feature job: the two scripts must reach opposite
       # verdicts on the two builds, which is what shows each one moves with the feature rather than
       # with something incidental to the binary it happens to be handed.
@@ -103,8 +103,8 @@ jobs:
       # panics on drop under debug). Interim: release-only until that transport-lifecycle bug is
       # fixed (#152); the money assertions here (tip-match refusal, zero-burn, no
       # journal/materialization) hold in release.
-      - name: Test mobee-core (money-path suite)
-        run: cargo test -p mobee-core --release --no-default-features --features gateway,git-delivery,wallet --locked
+      - name: Test maxplayer-core (money-path suite)
+        run: cargo test -p maxplayer-core --release --no-default-features --features gateway,git-delivery,wallet --locked
 
   # The release workflow triggers only on a tag, so no pull request ever exercises it. What CI can
   # check is that the gates keeping it from publishing are still in place — otherwise the property

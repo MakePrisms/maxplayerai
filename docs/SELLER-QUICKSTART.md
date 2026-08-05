@@ -62,7 +62,7 @@ git clone https://github.com/MakePrisms/maxplayerai.git
 cd maxplayerai
 
 # Seller execute needs the `acp` feature (flake packages already enable it).
-nix develop -c bash -lc 'cargo build -p mobee --release --features acp'
+nix develop -c bash -lc 'cargo build -p maxplayer --release --features acp'
 MOBEE_BIN="$(pwd)/target/release/maxplayer"
 "$MOBEE_BIN" sell --bogus   # must print sell Usage (see above)
 ```

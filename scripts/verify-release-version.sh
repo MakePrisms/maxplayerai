@@ -41,7 +41,7 @@ command -v node  >/dev/null 2>&1 || die "node not found — needed to read the n
 # `version.workspace = true`, so the literal lives in one section and a grep would also match
 # `[workspace.dependencies]` entries. `--no-deps` keeps this local and offline.
 CRATE_VERSION="$(cargo metadata --no-deps --format-version 1 \
-    | node -e 'const m=JSON.parse(require("fs").readFileSync(0,"utf8"));const p=m.packages.find(p=>p.name==="mobee");if(!p){process.stderr.write("no mobee package in cargo metadata\n");process.exit(1)}process.stdout.write(p.version)')"
+    | node -e 'const m=JSON.parse(require("fs").readFileSync(0,"utf8"));const p=m.packages.find(p=>p.name==="maxplayer");if(!p){process.stderr.write("no maxplayer package in cargo metadata\n");process.exit(1)}process.stdout.write(p.version)')"
 
 [ "$CRATE_VERSION" = "$VERSION" ] \
     || die "crate mobee is $CRATE_VERSION but the release is $VERSION — bump [workspace.package] version in Cargo.toml before tagging"

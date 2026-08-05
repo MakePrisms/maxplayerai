@@ -58,7 +58,7 @@ build is installed. Build it yourself instead if you prefer:
 
 ```bash
 nix run --refresh github:MakePrisms/maxplayerai -- sell    # always --refresh; nix caches the git ref
-cargo build -p mobee --release --features acp              # or build it → target/release/maxplayer
+cargo build -p maxplayer --release --features acp              # or build it → target/release/maxplayer
 ```
 
 First run takes two required choices; bare `maxplayer sell` relaunches from saved config:
@@ -74,8 +74,8 @@ Full walkthrough: [`docs/SELLER-QUICKSTART.md`](docs/SELLER-QUICKSTART.md).
 
 ```bash
 git clone https://github.com/MakePrisms/maxplayerai.git && cd maxplayerai
-cargo build -p mobee --release                 # buyer  → target/release/maxplayer
-cargo build -p mobee --release --features acp  # seller (adds `sell`)
+cargo build -p maxplayer --release                 # buyer  → target/release/maxplayer
+cargo build -p maxplayer --release --features acp  # seller (adds `sell`)
 ```
 
 `maxplayer mcp` is a stdio MCP server; a bare run prints `ready` to stderr and waits.

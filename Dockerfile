@@ -29,7 +29,7 @@ COPY . .
 # A cache mount keeps the cargo registry + target dir warm across rebuilds.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p mobee --features acp,wallet \
+    cargo build --release -p maxplayer --features acp,wallet \
     && cp /src/target/release/maxplayer /usr/local/bin/maxplayer \
     && strip /usr/local/bin/maxplayer || true
 

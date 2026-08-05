@@ -71,7 +71,7 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$VERSION" ] || { usage; die "a version is required"; }
-[ -n "$MANIFEST" ] || MANIFEST="crates/mobee/Cargo.toml"
+[ -n "$MANIFEST" ] || MANIFEST="crates/maxplayer/Cargo.toml"
 case "$VERSION" in
     v*) die "pass the version without a leading 'v' (got '$VERSION')" ;;
 esac

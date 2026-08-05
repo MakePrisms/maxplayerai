@@ -53,7 +53,7 @@ This is the finding that reframes the rest, and it is not a matter of flipping a
 
 **★ The release binary we build today cannot run on a non-nix box.** Not because of glibc
 versioning — because the ELF interpreter is a nix store path. From a real
-`cargo build -p mobee --release --features acp,wallet` artifact:
+`cargo build -p maxplayer --release --features acp,wallet` artifact:
 
 ```
 linux-vdso.so.1
@@ -167,7 +167,7 @@ buyer-static = pkgs.pkgsStatic.rustPlatform.buildRustPackage (
 ```
 
 `mobeeArgs` holds what both builds share — `src = self`, `cargoLock.lockFile = ./Cargo.lock`
-(hermetic vendoring, no network at build time), `cargoBuildFlags = [ "-p" "mobee" ]`, `doCheck =
+(hermetic vendoring, no network at build time), `cargoBuildFlags = [ "-p" "maxplayer" ]`, `doCheck =
 false`. Guarded by `lib.optionalAttrs stdenv.hostPlatform.isLinux`, because static linking is a
 Linux-only property (see the matrix below).
 
@@ -293,7 +293,7 @@ will hold a ~38M binary per platform sub-package (materially smaller compressed)
 
 **Read this section before assuming what "npx" means here.** This repo *banned* npx in the other
 direction: post-R4 the seller deliberately removed the npx auto-launch fallback for ACP adapters,
-and a test enforces it (`crates/mobee-core/src/agent_presets.rs`, asserting `must not resolve to
+and a test enforces it (`crates/maxplayer-core/src/agent_presets.rs`, asserting `must not resolve to
 an npx fallback`). A missing adapter must fail with an install hint rather than silently reach for
 `npx`. **That stays true and is not in scope here.**
 
@@ -326,7 +326,7 @@ npx -y mobee@<version> version          # → prints <version>, rc=0
 npx -y mobee@<version> --this-is-not-a-flag; echo "rc=$?"   # → argv forwarded, non-zero rc preserved
 npm install --ignore-scripts -g mobee@<version> && mobee version   # → still works (no postinstall dependence)
 # The ban this track must not undo:
-cargo test -p mobee-core builtin_presets_resolve_to_binary_or_install_hint
+cargo test -p maxplayer-core builtin_presets_resolve_to_binary_or_install_hint
 ```
 
 ### Track C — `install.sh` *(belongs on [#125](https://github.com/MakePrisms/maxplayerai/issues/125))*
@@ -366,7 +366,7 @@ curl -fsSL <url> | sh && curl -fsSL <url> | sh && mobee version   # → rc=0, on
   (`Dockerfile`, `docker-compose.yml`, `docs/DOCKER.md`); publishing images is a separate call.
 - **Shipping the seller's harness.** The ACP adapter is the seller's own binary by design. Nothing
   here changes that, and no installer should pretend to supply it.
-- **`mobee-desktop`.** Deliberately outside `default-members` because it pulls egui's native deps;
+- **`maxplayer-desktop`.** Deliberately outside `default-members` because it pulls egui's native deps;
   it is not part of a CLI release.
 
 ## 5. Open decisions — for gudnuf, not for us

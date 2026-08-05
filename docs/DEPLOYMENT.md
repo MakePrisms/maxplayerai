@@ -67,7 +67,7 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
   seller), no clone. Always `--refresh` (or pin+bump the rev) — nix caches the git ref and will
   otherwise serve a stale binary.
 - `devShells.default` — the workspace build/dev shell.
-- `packages.relay-write-policy` — the strfry write-policy plugin (crate `mobee-relay-write-policy`),
+- `packages.relay-write-policy` — the strfry write-policy plugin (crate `maxplayer-relay-write-policy`),
   consumed by the relay module below.
 - `packages.buyer-static` / `packages.buyer-static-aarch64` — statically-linked (musl) buyer builds.
 - `nixosModules.relay` + `nixosConfigurations.relay` — the launch relay as a deployable NixOS box

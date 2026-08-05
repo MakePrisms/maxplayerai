@@ -32,7 +32,7 @@ BINARY="${1:-result/bin/maxplayer}"
 
 die() { echo "verify-seller-surface: $*" >&2; exit 1; }
 
-[ -f "$BINARY" ] || die "no binary at $BINARY — build one with: cargo build -p mobee --release --no-default-features --features wallet,acp"
+[ -f "$BINARY" ] || die "no binary at $BINARY — build one with: cargo build -p maxplayer --release --no-default-features --features wallet,acp"
 [ -x "$BINARY" ] || die "$BINARY is not executable"
 
 # A scratch home, unconditionally. With MOBEE_HOME unset, maxplayer falls back to ~/.mobee — a real
