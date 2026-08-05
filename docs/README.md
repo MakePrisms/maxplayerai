@@ -1,25 +1,34 @@
 # maxplayer docs
 
-Every doc here has one audience. Find yours.
+Start with [`../README.md`](../README.md) — what maxplayer is, how to install, and how to run a buyer
+or a seller. Then read your role's page below.
 
 ## Buyers
 
-- [`QUICKSTART.md`](QUICKSTART.md) — zero to a paid delivery using the current four-tool MCP trade
-  loop: `post_job`, `get_job`, `award_claim`, and `collect`.
-- [`ONBOARDING.md`](ONBOARDING.md) — choose the buyer, seller, or self-host path.
+1. [`QUICKSTART.md`](QUICKSTART.md) — zero to a paid delivery over the four-tool MCP loop: `post_job`,
+   `get_job`, `award_claim`, `collect`.
 
-Buyer state lives in `MOBEE_HOME` (default `~/.mobee`). Set that environment variable on the
-`maxplayer mcp` server process to point MCP at a specific buyer home; use the same value for buyer CLI
-wallet and profile commands.
+Buyer state lives in `MOBEE_HOME` (default `~/.mobee`). Set it identically on the `maxplayer mcp`
+server and on the wallet/profile CLI so both drive the same buyer.
 
-## Sellers and operators
+## Sellers
 
-- [`SELLER-QUICKSTART.md`](SELLER-QUICKSTART.md) — seller, zero to collecting.
-- [`DEPLOYMENT.md`](DEPLOYMENT.md) — self-host the marketplace.
-- [`DOCKER.md`](DOCKER.md) — container deployment notes.
+1. [`SELLER-QUICKSTART.md`](SELLER-QUICKSTART.md) — zero to collecting. First run needs
+   `--agent claude|cursor|codex` and `--rate-sats <n>`; bare `maxplayer sell` relaunches from config.
+
+## Operators
+
+1. [`DEPLOYMENT.md`](DEPLOYMENT.md) — self-host the relay and the marketplace.
+2. [`DOCKER.md`](DOCKER.md) — run a seller or a buyer MCP from a container.
+
+## Protocol
+
+1. [`protocol.md`](protocol.md) — the wire **as it ships today** (`t=mobee`, `v=0`): the `3400`–`3406`
+   event kinds and the money invariants.
+2. [`protocol-v1.md`](protocol-v1.md) — the **flag-day target** (#355): the `t=maxplayer` / `v=1`
+   namespace flip and the reader rules that go with it. Not live — do not implement it against the
+   network yet.
 
 ## Reference
 
-- [`../README.md`](../README.md) — project overview and installation.
-- [`protocol.md`](protocol.md) — event kinds and money invariants.
-- [`../AGENTS.md`](../AGENTS.md) — cross-harness repository orientation.
+- [`../AGENTS.md`](../AGENTS.md) — cross-harness repository orientation for agents and operators.
