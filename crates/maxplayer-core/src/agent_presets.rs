@@ -124,6 +124,41 @@ fn resolve_codex() -> Result<Vec<String>, String> {
     }
 }
 
+/// What a built-in preset needs BEYOND its ACP adapter binary: the underlying agent CLI, installed
+/// and authenticated (#488).
+///
+/// Resolving the adapter proves only that a binary exists. Every built-in adapter then drives a
+/// separate agent CLI that carries its own credentials, so a seat can pass every resolution check
+/// and still fail its first probe turn with an auth error. Returns `None` for custom `[agents]`
+/// presets — their prerequisites are the operator's to know, and inventing one would be worse than
+/// saying nothing.
+///
+/// This is operator guidance, NOT a check: nothing here reads the credential. The pre-advertise
+/// probe remains the only thing that proves an authenticated turn is possible.
+pub fn preset_prerequisite(name: &str) -> Option<&'static str> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "claude" => Some(
+            "the `claude` CLI (npm i -g @anthropic-ai/claude-code), signed in — run `claude` once \
+             and complete `/login`, or set ANTHROPIC_API_KEY in the daemon's environment",
+        ),
+        "cursor" => Some(
+            "the Cursor agent CLI itself — `cursor-agent` is both the adapter and the agent, so it \
+             needs no extra shim, but it must be signed in (`cursor-agent login`)",
+        ),
+        "codex" => Some(
+            "the `codex` CLI (npm i -g @openai/codex), signed in — run `codex login`, or set \
+             OPENAI_API_KEY in the daemon's environment",
+        ),
+        _ => None,
+    }
+}
+
+/// The sentence that follows any [`preset_prerequisite`]: what happens if the prerequisite is not
+/// met. Kept next to the prerequisites so the two never drift out of agreement.
+pub const PREREQUISITE_ENFORCEMENT: &str =
+    "the seat refuses to advertise until a probe turn actually succeeds, so an unauthenticated \
+     CLI fails at boot, not silently mid-job";
+
 fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -151,6 +186,41 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// #488: the gap was a seat passing every resolution check and then failing its probe on
+    /// `Authentication required`. Enumerating over `BUILTIN_PRESETS` (not a hand-listed three)
+    /// means a preset added later cannot ship without saying how it is authenticated.
+    #[test]
+    fn every_builtin_preset_states_an_auth_prerequisite() {
+        for name in BUILTIN_PRESETS {
+            let prerequisite = preset_prerequisite(name)
+                .unwrap_or_else(|| panic!("built-in preset {name} has no prerequisite line"));
+            // Naming an install alone is what the docs already did and is exactly what let the
+            // auth failure through — each line must name a way to authenticate.
+            let names_auth = prerequisite.contains("login")
+                || prerequisite.contains("signed in")
+                || prerequisite.contains("API_KEY");
+            assert!(
+                names_auth,
+                "prerequisite for {name} names no auth step: {prerequisite}"
+            );
+        }
+    }
+
+    /// Case and surrounding space are normalized exactly as `resolve_agent_preset` does, so the
+    /// label a caller resolved always finds its own prerequisite.
+    #[test]
+    fn prerequisite_lookup_normalizes_like_the_resolver() {
+        assert_eq!(preset_prerequisite("  CoDeX "), preset_prerequisite("codex"));
+        assert!(preset_prerequisite("codex").is_some());
+    }
+
+    /// A custom `[agents]` entry gets no invented prerequisite — saying nothing beats guessing.
+    #[test]
+    fn custom_and_unknown_presets_have_no_prerequisite() {
+        assert!(preset_prerequisite("my-own-agent").is_none());
+        assert!(preset_prerequisite("").is_none());
     }
 
     #[test]
