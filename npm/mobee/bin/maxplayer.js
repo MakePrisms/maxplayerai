@@ -13,6 +13,10 @@ const os = require("node:os");
 const PLATFORM_PACKAGES = {
   "linux-x64": "@maxplayerai/linux-x64",
   "linux-arm64": "@maxplayerai/linux-arm64",
+  // Apple Silicon only. An Intel mac reports darwin-x64, finds no entry, and gets the "not
+  // published yet" refusal below — the same answer install.sh gives it, for the same reason: the
+  // release matrix builds no x86_64 darwin artifact.
+  "darwin-arm64": "@maxplayerai/darwin-arm64",
 };
 
 const key = `${process.platform}-${process.arch}`;

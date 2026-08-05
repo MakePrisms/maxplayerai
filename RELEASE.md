@@ -6,8 +6,8 @@ npm. Both come out of `.github/workflows/release.yml`, which runs on a pushed `v
 ## Before the first release
 
 One setup step, done once **per package**, and it is the only thing standing between a tag and a
-publish. On npmjs.com, for each of `maxplayer`, `@maxplayerai/linux-x64` and
-`@maxplayerai/linux-arm64`:
+publish. On npmjs.com, for each of `maxplayer`, `@maxplayerai/linux-x64`, `@maxplayerai/linux-arm64`
+and `@maxplayerai/darwin-arm64`:
 
 - Settings → **Trusted publishing** → add a GitHub Actions publisher: organization `MakePrisms`,
   repository `maxplayerai`, workflow `release.yml`.
@@ -21,10 +21,14 @@ Releases as normal, and `npm publish` fails loudly for that package. There is no
 unconfigured package fails the job rather than producing a release that looks published.
 
 The launcher publishes as the unscoped package `maxplayer`; the per-platform payloads publish under
-the `@maxplayerai/linux-x64` and `@maxplayerai/linux-arm64` packages, in the npm organization
-`maxplayerai`. All three need their own trusted publisher entry — the setting is per package, not
-per account or per org. The GitHub side of that entry is the same for all three, and is unaffected
-by the npm scope: organization `MakePrisms`, repository `maxplayerai`.
+the `@maxplayerai/linux-x64`, `@maxplayerai/linux-arm64` and `@maxplayerai/darwin-arm64` packages, in
+the npm organization `maxplayerai`. All four need their own trusted publisher entry — the setting is
+per package, not per account or per org. The GitHub side of that entry is the same for all four, and
+is unaffected by the npm scope: organization `MakePrisms`, repository `maxplayerai`.
+
+⚠ `@maxplayerai/darwin-arm64` is new (#446) and has no entry yet. It must be added before the tag
+that first publishes it. Nothing in this repo can check that for you: the setting lives on npmjs.com
+and needs an org admin.
 
 `--access public`, which the publish job already passes on every publish, is what the scoped payload
 packages need on a first publish — a scoped package defaults to restricted, which on a free account
@@ -152,21 +156,25 @@ git cat-file -e "$TAG":.github/workflows/release.yml && echo present || echo abs
 |---|---|---|
 | linux-x64 | `ubuntu-latest` | archive + `@maxplayerai/linux-x64` |
 | linux-arm64 | `ubuntu-24.04-arm` | archive + `@maxplayerai/linux-arm64` |
-| darwin-arm64 | `macos-14` | archive only |
-
-darwin-arm64 has no npm payload package yet, so macOS users download the archive; `npx maxplayer` tells
-them so rather than failing obscurely. Adding it means a `npm/cli-darwin-arm64` package and its entry
-in the launcher's platform map — at which point the publish job's platform list has to name it too,
-and the workflow fails at release time if it does not. That failure is the point: a payload package
-present in the tree but missing from the registry breaks every install on that platform, because the
-launcher pins it by exact version.
+| darwin-arm64 | `macos-14` | archive + `@maxplayerai/darwin-arm64` |
 
 **darwin-x64 and Windows are out of scope.**
 
 Adding a platform means: a matrix entry in `release.yml`, a package under `npm/`, an entry in
-`PLATFORM_PACKAGES` in `npm/mobee/bin/maxplayer.js`, an `optionalDependencies` pin, and the platform in
-`RELEASE_PLATFORMS`. Two of those five are asserted rather than trusted — the pin by
-`verify-release-version.sh`, and the platform list by the publish job.
+`PLATFORM_PACKAGES` in `npm/mobee/bin/maxplayer.js`, an `optionalDependencies` pin, the platform in
+`RELEASE_PLATFORMS`, and a trusted-publisher entry for the new package on npmjs.com. Three of those
+six are asserted rather than trusted — the pin by `verify-release-version.sh`, and both directions of
+the platform list by the publish job: a payload package in the tree that is not published, and a
+platform the release BUILDS with no payload behind it. The second is the one darwin needed. It was a
+first-class release artifact while `npm i maxplayer` answered `no binary for darwin-arm64` on every
+mac (#446), because the build matrix and the npm platform list were independent lists and nothing
+compared them.
+
+The trusted-publisher entry is the step no check can make: it lives on npmjs.com, needs an org admin,
+and must exist BEFORE the tag. Without it the publish job fails on that package — loudly, which is
+correct — but only after the packages ahead of it in the loop have published, and npm does not allow
+republishing a version. Recovering from that means cutting the next patch version, not re-running the
+job.
 
 ## Notes on the build
 
