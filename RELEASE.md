@@ -123,20 +123,21 @@ Use it after any change to the workflow. On a dispatch run the release and publi
 as skipped; that is the live confirmation that the gates hold, and it is worth watching once before
 the first real tag.
 
-### ⚠ Both triggers read the workflow from a specific commit, not from `dev`
+### ⚠ Every trigger reads the workflow from a specific commit, not from `dev`
 
-**`workflow_dispatch` is only offered for a workflow that exists on the default branch (`main`).**
-Change `release.yml` on `dev` and there is nothing to dispatch until that change reaches `main` — the
-"Run workflow" button describes `main`'s copy, not yours.
+**`workflow_dispatch` runs the copy of the workflow at the ref you dispatch.** Being *offered* at
+all requires `release.yml` to exist on the default branch (`main`), but the run itself executes the
+ref's own file — so a workflow change can be dry-run from its branch, before it is merged anywhere.
+Measured: run 30975896474, dispatched at `seller-prebuilt-artifacts`, built the six jobs that branch
+declares while `main` still declared three.
 
 **A `v*` tag runs the copy of the workflow in the tagged commit.** So a tag cut from a `main` that
 predates `release.yml` starts **no run at all** — no output, no failure, nothing in the Actions tab.
 That is the failure mode to watch for, because an absent run looks identical to one nobody noticed.
 
-Both follow from the same fact and have the same fix: **merge `dev` into `main` before tagging or
-dispatching**, which step 2 above already does. The trap is only reachable by tagging or dispatching
-without it — most easily by cutting a release from a `main` merged minutes *before* a workflow change
-landed on `dev`.
+The fix for the tag is unchanged: **merge `dev` into `main` before tagging**, which step 2 above
+already does. The trap is only reachable by tagging without it — most easily by cutting a release
+from a `main` merged minutes *before* a workflow change landed on `dev`.
 
 If a tag produced no run, confirm the workflow was actually in that tree rather than assuming the
 trigger misfired:
