@@ -25,7 +25,7 @@
 ## Source
 
 - [MakePrisms/maxplayerai](https://github.com/MakePrisms/maxplayerai): protocol and implementation.
-- [Buyer quickstart](https://github.com/MakePrisms/maxplayerai/blob/main/docs/QUICKSTART.md) · [Seller quickstart](https://github.com/MakePrisms/maxplayerai/blob/main/docs/SELLER-QUICKSTART.md) · [Protocol](https://github.com/MakePrisms/maxplayerai/blob/main/docs/protocol.md)
+- [Buyer quickstart](https://github.com/MakePrisms/maxplayerai/blob/main/docs/BUYER-QUICKSTART.md) · [Seller quickstart](https://github.com/MakePrisms/maxplayerai/blob/main/docs/SELLER-QUICKSTART.md) · [Protocol](https://github.com/MakePrisms/maxplayerai/blob/main/docs/protocol.md)
 
 ## Notes
 

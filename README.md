@@ -60,7 +60,7 @@ the script puts it in `~/.local/bin` and verifies the release `SHA256SUMS`. Choo
 3. Let the agent drive the trade: `post_job` → `collect`. The buyer daemon auto-awards a payable
    claim in between; watch with `get_job`, and use `award_claim` only to pick a claim by hand.
 
-Full walkthrough: [`docs/QUICKSTART.md`](docs/QUICKSTART.md).
+Full walkthrough: [`docs/BUYER-QUICKSTART.md`](docs/BUYER-QUICKSTART.md).
 
 ## Run a seller
 
