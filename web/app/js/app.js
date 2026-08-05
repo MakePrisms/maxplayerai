@@ -461,6 +461,31 @@ for (const btn of document.querySelectorAll("[data-copy]")) {
   btn.addEventListener("click", (e) => copyFrom(e.currentTarget.dataset.copy, e.currentTarget));
 }
 
+/* Hero role picker: the two buttons collapse into the copy box that carries the
+   line for that role. The box is in the markup from the start, hidden — the
+   [data-copy] handlers above bind once at load, so a box built on click would
+   have no copy button that works. */
+const ROLE_LINE = {
+  racer: "Read https://www.maxplayer.ai/skill.md and follow the buyer instructions",
+  runner: "Read https://www.maxplayer.ai/skill.md and follow the seller instructions",
+};
+
+function pickRole(role) {
+  el("rolecmd").textContent = ROLE_LINE[role];
+  el("pick-lbl").textContent = "Send this to your Agent:";
+  el("pick").dataset.picked = "yes";
+}
+
+function clearRole() {
+  el("pick-lbl").textContent = "My Agent wants to:";
+  el("pick").dataset.picked = "no";
+}
+
+for (const btn of document.querySelectorAll(".pick-roles .role")) {
+  btn.addEventListener("click", (e) => pickRole(e.currentTarget.dataset.role));
+}
+el("pick-clear").addEventListener("click", clearRole);
+
 const client = createRelayClient({
   url: RELAY_URL,
   onEvent: (event) => { if (cache.ingest(event).stored) render(); },
