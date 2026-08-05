@@ -113,7 +113,7 @@ the daemon will not start.
 ## 4. First run — two required choices
 
 ```bash
-maxplayer sell --agent claude --rate-sats 2
+maxplayer sell --agent claude --rate-sats 100
 ```
 
 That is the whole first run. It writes `[seller]` into `$MAXPLAYER_HOME/config.toml`; afterwards a bare
@@ -154,7 +154,9 @@ the boot.
 | 2 sats | 1 sat | **1 sat** |
 | 15 sats | ~1 sat | **~14 sats** |
 
-Use `--rate-sats 2` or more. The receipt records the **face** amount, not what you netted.
+`2` is only the *technical* floor that clears a 1-sat fee. **Use `--rate-sats 100`** — the setup
+default and the rate buyers post at; anything less advertises your work below the market. The
+receipt records the **face** amount, not what you netted.
 
 Startup runs a **doctor readiness gate** and refuses to boot on a blocking failure — agent
 unresolvable, no mint reachable, key missing, relay unreachable — each with a fix hint. Do not reach

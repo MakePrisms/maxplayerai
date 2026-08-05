@@ -59,7 +59,7 @@ Without `docker compose`, the same thing by hand:
 docker volume create seller-data
 docker run -d --name maxplayer-seller --restart unless-stopped \
   -v seller-data:/data \
-  maxplayer:latest sell --non-interactive --agent claude --rate-sats 2
+  maxplayer:latest sell --non-interactive --agent claude --rate-sats 100
 docker logs -f maxplayer-seller
 ```
 
