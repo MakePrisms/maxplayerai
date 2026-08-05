@@ -122,7 +122,7 @@ a { color: var(--blue); }
   margin: 12px 0 0; color: var(--neon);
   font-size: clamp(13px, 1.6vw, 17px); letter-spacing: 0.34em; text-transform: uppercase;
 }
-/* two entry points, labelled — a visitor should know which line is theirs.
+/* the entry point: pick a role, get the line to hand your agent.
    Built to read as a terminal: dark well, prompt glyph, hard-separated zones. */
 .runs { display: inline-flex; flex-direction: column; gap: 10px; margin: 26px 0 0; max-width: 100%; }
 .run {
@@ -157,6 +157,34 @@ a { color: var(--blue); }
    button holds its width to stop the command box twitching on click. */
 .run button.ok, .run button.ok:hover { background: var(--neon); color: #0a0d02; font-size: 14px; }
 .run button { min-width: 74px; }
+/* The prompt glyph belongs on a shell command. This box holds a sentence for an
+   agent, and a leading "$" would invite someone to paste it into a terminal. */
+.run.prose code::before { content: none; }
+
+.pick-lbl {
+  margin: 0; color: var(--muted);
+  font-size: 11px; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase;
+  text-align: left;
+}
+.pick-roles { display: flex; gap: 10px; flex-wrap: wrap; }
+/* `display` on .run and .pick-roles outranks the UA rule for [hidden]. */
+.run[hidden], .pick-roles[hidden] { display: none; }
+/* Same well as .run — a role button is one half of the box it turns into. */
+.pick-roles .role {
+  flex: 1 1 0; min-width: 150px;
+  background: #070404; border: 1px solid var(--line); border-radius: 9px;
+  color: var(--ink); cursor: pointer; padding: 14px 18px;
+  font-size: 11.5px; font-weight: 700;
+  letter-spacing: 0.16em; text-transform: uppercase;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.pick-roles .role:hover { background: var(--neon); border-color: var(--neon); color: #0a0d02; }
+.pick-again {
+  align-self: flex-start; border: 0; background: none; padding: 0;
+  color: var(--faint); cursor: pointer;
+  font-family: var(--sans); font-size: 11px; letter-spacing: 0.1em;
+}
+.pick-again:hover { color: var(--ink); }
 /* balance: the browser evens the line lengths instead of filling line 1 and
    leaving a stub on line 2. max-width keeps it to two lines to balance. */
 /* margin-inline auto, not just max-width: the hero centers its TEXT, but a
@@ -278,7 +306,6 @@ a { color: var(--blue); }
 .steps .n { font-size: 11px; font-weight: 700; letter-spacing: 0.14em; color: var(--neon); }
 .steps h3 { margin: 10px 0 8px; font-size: 15px; font-weight: 700; letter-spacing: 0.02em; color: var(--ink); }
 .steps p { margin: 0; font-family: var(--sans); font-size: 13.5px; line-height: 1.6; color: var(--muted); }
-.pitch .run { margin-top: 30px; }
 @media (max-width: 1000px) { .steps { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 560px) { .steps { grid-template-columns: 1fr; } }
 
@@ -389,7 +416,8 @@ a { color: var(--blue); }
 /* ================= MAXPLAYER racing layer ================= */
 /* Display type: Chakra Petch semibold italic — the lean IS the speed.
    Body prose: Saira (via --sans, already applied to ledes/steps). Data stays mono. */
-h1, h2, h3, .brand span, .eyebrow, .steps .n, .run .lbl, .windows button, .tag, .statgrid dd, .nav-links a {
+h1, h2, h3, .brand span, .eyebrow, .steps .n, .run .lbl, .pick-lbl, .pick-roles .role,
+.windows button, .tag, .statgrid dd, .nav-links a {
   font-family: var(--display);
 }
 h1 { font-weight: 700; font-style: italic; }
@@ -412,6 +440,7 @@ h2, h3, .brand span, .eyebrow { font-weight: 600; font-style: italic; }
 /* action controls go full red */
 .run button:hover { background: var(--blue); color: #fff; }
 .run button.ok, .run button.ok:hover { background: var(--blue); color: #fff; }
+.pick-roles .role:hover { background: var(--blue); border-color: var(--blue); color: #fff; }
 .windows button[aria-pressed="true"] { background: var(--blue); color: #fff; }
 
 /* buy/sell: the livery carries through — slimmer stripe sets, same 102° lean.
