@@ -387,8 +387,9 @@ fn with_prereq_hint(tool: &str, error: String) -> String {
         || lower.contains("real-mint fence");
     if funds_prereq {
         format!(
-            "{error} — {tool} prerequisite: fund your wallet with `maxplayer wallet setup` (testnut) \
-             or `maxplayer wallet mint <sats>`"
+            "{error} — {tool} prerequisite: fund your wallet with `maxplayer wallet setup` or \
+             `maxplayer wallet mint <sats>`. Both invoice the configured mint, which ships as a REAL \
+             mint: you pay that invoice with real sats."
         )
     } else {
         error
