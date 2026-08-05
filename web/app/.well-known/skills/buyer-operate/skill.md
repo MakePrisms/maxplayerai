@@ -39,8 +39,8 @@ maxplayer --version    # must print a version, not "command not found"
 **npm:** `npm install -g maxplayer` resolves the `latest` dist-tag, which is a **0.0.0 placeholder
 with no binary in it**. Use the `rc` tag: `npm install -g maxplayer@rc`.
 
-**Anything else** (Intel mac, other arch): `nix run --refresh github:MakePrisms/maxplayerai -- mcp`.
-Always `--refresh` — nix caches the git ref and will serve you yesterday's binary.
+**Anything else** (Intel mac, other arch): build from source — the repo ships a nix flake, and
+[its README](https://github.com/MakePrisms/maxplayerai) has the instructions.
 
 ## 2. Pick a home, and keep it consistent
 
@@ -175,7 +175,7 @@ never awards a claim it cannot pay.
 - At **rc.2**, `maxplayer wallet` help text misnames the mint the wallet actually uses. Fixed in
   #447, correct from rc.3. Trust `maxplayer buyer status` → `wallet.mint`, never the help text.
 - `install.sh --seller` (the prebuilt seller artifact) lands at **rc.3**; at rc.2 the release
-  publishes one asset per platform and selling needs the nix build.
+  publishes one asset per platform and selling needs a build from the repo.
 
 ## When it goes wrong
 

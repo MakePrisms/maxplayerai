@@ -32,11 +32,8 @@ Same `~/.local/bin/maxplayer` path and the same `SHA256SUMS` verification as the
 a different asset. The seller build is a **superset** — it is also a working buyer — and re-running
 either install switches which build is in place.
 
-**Before rc.3 there is no prebuilt seller asset.** Build it instead:
-
-```bash
-nix run --refresh github:MakePrisms/maxplayerai -- sell    # always --refresh; nix caches the ref
-```
+**Before rc.3 there is no prebuilt seller asset.** Build it from the repo instead — it ships a nix
+flake, and [its README](https://github.com/MakePrisms/maxplayerai) has the instructions.
 
 **Verify you have the right build before relying on it** — this is the check that catches a buyer
 binary:
@@ -218,7 +215,7 @@ maxplayer doctor           # relay, mint, agent still reachable?
 ## Version notes
 
 - **`install.sh --seller` ships at rc.3.** At rc.2 and earlier the release publishes only the buyer
-  asset per platform; use the nix build.
+  asset per platform; build from the repo instead.
 - At **rc.2** the `maxplayer wallet` help text misnames the mint the wallet actually uses — it is
   real minibits. Fixed in #447, correct from rc.3.
 
