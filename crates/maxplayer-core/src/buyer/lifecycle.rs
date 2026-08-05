@@ -710,7 +710,7 @@ where
         Some(prior) => {
             let observed = prior.max(attempt.send_count.saturating_sub(1));
             if observed != prior {
-                eprintln!(
+                crate::opline!(
                     "buyer: award {} for {job_id} was transmitted concurrently (licensed after \
                      {prior} starts, {} recorded now); this verdict judges one copy only and \
                      cannot be terminal",
@@ -731,7 +731,7 @@ where
             // failed record leaves a confirmed attempt without its row — the boot heal writes it
             // from the attempt. Both converge without an operator; say what happened either way.
             if let Err(error) = store.mark_attempt_confirmed(job_id, now_unix) {
-                eprintln!(
+                crate::opline!(
                     "buyer: award for {job_id} acked but confirming the attempt failed ({error}); \
                      the next award call re-confirms it from the recorded award"
                 );
@@ -744,7 +744,7 @@ where
                 attempt.amount_sats,
                 now_unix,
             ) {
-                eprintln!(
+                crate::opline!(
                     "buyer: award for {job_id} confirmed ({}) but recording it failed ({error}); \
                      the boot heal will write the awards row from the pinned attempt",
                     attempt.award_event_id
