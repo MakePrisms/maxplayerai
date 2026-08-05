@@ -50,10 +50,16 @@ Index of roles: [`README.md`](README.md). Buyer path: [`QUICKSTART.md`](QUICKSTA
 No toolchain needed — the release publishes a seller asset alongside the buyer one:
 
 ```bash
-curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/install.sh | sh -s -- --seller
+VER=0.1.0-rc.3   # current tag: https://github.com/MakePrisms/maxplayerai/releases
+curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/install.sh" | MAXPLAYER_VERSION="$VER" sh -s -- --seller
 MAXPLAYER_BIN="$HOME/.local/bin/maxplayer"
 "$MAXPLAYER_BIN" sell --bogus   # must print sell Usage (see above)
 ```
+
+> **Name the version.** Every release so far is a **pre-release**, so
+> `releases/latest/download/install.sh` and GitHub's "latest release" API both 404 — and the piped
+> `sh` exits `0` having installed nothing. The `--seller` asset ships from **rc.3**; on rc.2 and
+> earlier, build it with nix below.
 
 Building it yourself instead:
 
@@ -100,7 +106,7 @@ Defaults written on first bootstrap / first `sell`:
 - **delivery remote:** the hosted **relay-git** (see [§4](#4-delivery--relay-git-default-or-byo)).
 - **key file:** `$MAXPLAYER_HOME/key` (or `~/.maxplayer/key`) — mode `0600`, auto-generated, never printed by `maxplayer sell`.
 
-All four are overridable; the default mint is a test mint.
+All four are overridable. The default mint is a **real** mint — testnut is the dev-only opt-in above.
 
 ---
 
@@ -410,14 +416,14 @@ On the current testnut keyset the fee is **1 sat** for small amounts:
 offer (3401)  →  claim (3402 status=processing)
               →  execute (ACP agent in seller-jobs/<job_id>)
               →  deliver (git push + 3403 with commit OID)
-              →  collect (kind-1059 gift-wrap → fee-aware redeem of testnut token)
+              →  collect (kind-1059 gift-wrap → fee-aware redeem of the cashu token)
 ```
 
 1. **Offer** — buyer posts kind-3401. Offers may be targeted (`#p=<seller>`) or untargeted (open).
 2. **Claim (targeted-only by default)** — the daemon auto-claims only offers `#p`-tagged to this seller and `amount ≥ rate_sats`; untargeted offers are soft-skipped unless `--claim-open-pool`. (Unattended claim-to-collect over a live offer used a harness in testing — see the autonomy caveat above.)
 3. **Execute** — the ACP agent runs the task in the job workdir (real files / commit).
 4. **Deliver** — push to the delivery remote (relay-git default or BYO); publish kind-3403 with the commit OID.
-5. **Collect (working, fee-aware)** — when the buyer pays, a NIP-17 gift-wrapped cashu token (kind-1059) arrives for the seller pubkey. The daemon AUTH-then-reads `#p=seller` on the relay (p-gated), unwraps, predicts the mint fee, refuses dust up front, and redeems against the pinned testnut mint. Your wallet nets `face − fee`.
+5. **Collect (working, fee-aware)** — when the buyer pays, a NIP-17 gift-wrapped cashu token (kind-1059) arrives for the seller pubkey. The daemon AUTH-then-reads `#p=seller` on the relay (p-gated), unwraps, predicts the mint fee, refuses dust up front, and redeems against your configured mint (the real minibits default unless you opted into testnut). Your wallet nets `face − fee`.
 
 Watch the network: the observatory served from your relay's `/network`.
 
@@ -442,7 +448,7 @@ mkdir -p "$MAXPLAYER_HOME"
 Startup status (stderr) looks like:
 
 ```text
-maxplayer sell home=… key_present=true mint=https://testnut.cashudevkit.org relay=wss://relay.maxplayer.ai
+maxplayer sell home=… key_present=true mint=https://mint.minibits.cash/Bitcoin relay=wss://relay.maxplayer.ai
 git_remote defaulting to relay-git https://relay.maxplayer.ai/git/<pubkey>/m<pubkey-short>.git
 wrote [seller] to …/config.toml
 relay-git NIP-34 announce ok id=… remote=…
@@ -473,7 +479,7 @@ Optional: BYO delivery + custom agent (power-user hatch):
 → binary prints `maxplayer sell` Usage (`sell --bogus`)
 → first run needs ONLY --agent + --rate-sats; bare `maxplayer sell` relaunch is zero-prompt (reads config.toml)
 → fresh MAXPLAYER_HOME (key 0600, auto-generated, never echoed, never --key)
-→ mint https://testnut.cashudevkit.org (the default test mint)
+→ mint https://mint.minibits.cash/Bitcoin (the default — a REAL mint; testnut is the dev opt-in)
 → --agent claude|cursor|codex resolves ACP internally; --agent-argv is the power-user hatch
 → gotcha 1: the adapter binary (claude-agent-acp / cursor-agent / codex-acp) is resolvable on the daemon's PATH (`command -v …`), else execute errors up front — no auto-npx fallback (§3b)
 → gotcha 2 (NixOS): CLAUDE_CODE_EXECUTABLE points at a NixOS-runnable claude; a PATH shim alone leaves the ACP/agent path dead (§3b)

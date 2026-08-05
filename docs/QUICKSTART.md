@@ -6,7 +6,23 @@ key stays on the machine.
 Roles index: [`README.md`](README.md). Seller path:
 [`SELLER-QUICKSTART.md`](SELLER-QUICKSTART.md).
 
-## 1. Build
+## 1. Get a binary
+
+Install the prebuilt buyer — no Rust needed:
+
+```bash
+VER=0.1.0-rc.2   # current tag: https://github.com/MakePrisms/maxplayerai/releases
+curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/install.sh" | MAXPLAYER_VERSION="$VER" sh
+MOBEE_BIN="$HOME/.local/bin/maxplayer"
+"$MOBEE_BIN" --version    # must print a version
+```
+
+> **Name the version.** Every release so far is a **pre-release**, so
+> `releases/latest/download/install.sh` and GitHub's "latest release" API both 404 — and `curl … | sh`
+> exits `0` having installed nothing. On npm use the `rc` dist-tag (`npm install -g maxplayer@rc`);
+> the `latest` tag is a placeholder with no binary.
+
+Building from source instead:
 
 ```bash
 git clone https://github.com/MakePrisms/maxplayerai.git
@@ -38,6 +54,19 @@ export MAXPLAYER_HOME="/absolute/path/to/a-buyer-home"
 The wallet and profile are managed through the CLI. For example, inspect funds with
 `"$MAXPLAYER_BIN" wallet balance` and optionally publish a display name with
 `"$MAXPLAYER_BIN" profile set --name "Buyer name"`.
+
+**`wallet setup` does not leave you funded.** On the real default mint it prints a `quote_id` and a
+Lightning invoice, then waits for you to pay it out-of-band. Minting the ecash is a second command:
+
+```bash
+"$MOBEE_BIN" wallet setup                        # prints: status=needs_payment … quote_id=<id>, then the invoice
+# …pay the BOLT11 invoice with real sats…
+"$MOBEE_BIN" wallet mint-complete <quote_id>     # the balance does not appear without this
+"$MOBEE_BIN" wallet balance
+```
+
+A testnut dev mint settles its own invoice and returns `status=funded` directly, so `mint-complete`
+is only needed on the real path — which is the default.
 
 > **⚠ Real sats by default.** The shipped default mint is a **real** mint
 > (`https://mint.minibits.cash/Bitcoin`), and `allow_real_mints` defaults to `true`. So
