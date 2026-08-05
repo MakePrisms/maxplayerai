@@ -1,6 +1,6 @@
 //! Packaged buyer home under `~/.mobee` (or `MOBEE_HOME`).
 //!
-//! First-run bootstrap writes working defaults: testnut mint, mobee-relay, budget caps,
+//! First-run bootstrap writes working defaults: a REAL minibits mint, mobee-relay, budget caps,
 //! autogen key (`0600`), and an empty `wallet/` dir. The secret key is never returned.
 //!
 //! # Layered configuration
@@ -44,7 +44,7 @@
 //!
 //! ## Minimal env-only boot (file-less container)
 //!
-//! With no `config.toml`, the built-in defaults already boot a **buyer** (testnut mint, mobee-relay,
+//! With no `config.toml`, the built-in defaults already boot a **buyer** (real minibits mint, mobee-relay,
 //! budget caps). A **seller** additionally needs the seller table, whose minimal env set is:
 //! `MOBEE_SELLER__AGENT_COMMAND`, `MOBEE_SELLER__RATE_SATS`, `MOBEE_SELLER__GIT_REMOTE`. The key is
 //! still auto-generated on bootstrap (or supplied out-of-band); `NOSTR_PRIVATE_KEY` handling is

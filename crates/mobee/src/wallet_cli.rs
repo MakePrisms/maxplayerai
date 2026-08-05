@@ -6,7 +6,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use mobee_core::home::{self, MobeeHome};
+use mobee_core::home::{self, MobeeHome, DEFAULT_MINIBITS_MINT_URL, DEFAULT_MINT_URL};
 #[cfg(feature = "wallet")]
 use mobee_core::wallet_ops;
 
@@ -21,7 +21,8 @@ struct CommonOpts {
     amount: Option<u64>,
 }
 
-/// Default testnut fund amount for `maxplayer wallet setup` (mirrors the old setup_wallet MCP tool).
+/// Default amount `maxplayer wallet setup` asks the mint for (mirrors the old setup_wallet MCP tool).
+/// On the shipped default mint that is an invoice for 21 REAL sats, not a gift.
 const SETUP_FUND_SATS: u64 = 21;
 
 /// Entry from `cli::run` for `maxplayer wallet ...`.
@@ -49,7 +50,7 @@ fn wallet_usage(err: &mut dyn Write) {
     let _ = writeln!(
         err,
         "Usage:\n\
-         \x20 maxplayer wallet setup [<amount>] [--mint <url>] [--home <path>]   # bootstrap ~/.mobee + fund (default testnut, 21 sat)\n\
+         \x20 maxplayer wallet setup [<amount>] [--mint <url>] [--home <path>]   # bootstrap ~/.mobee, then invoice <amount> (default 21) from the mint\n\
          \x20 maxplayer wallet balance [--mint <url>] [--home <path>]\n\
          \x20 maxplayer wallet mint <amount> [--mint <url>] [--home <path>]\n\
          \x20 maxplayer wallet mint-complete <quote_id> [--amount <sats>] [--mint <url>] [--home <path>]\n\
@@ -62,9 +63,17 @@ fn wallet_usage(err: &mut dyn Write) {
          \x20 maxplayer wallet mints remove <url> [--home <path>]\n\
          \x20 maxplayer wallet reconcile [--home <path>]   # retire eligible incomplete send sagas (no receipt/credit)\n\
          \x20 maxplayer wallet complete-locked --job-id <id> --result-id <id> --delivery-integrity-hash <hex> --job-hash <hex> --seller-pubkey <hex> --amount <sats> --seller-signature <hex> [--creq-hash <hex>] [--accepted-mint <url> ...] [--realized-mint <url>] [--home <path>]\n\
-         \x20\x20\x20# operator: complete ONE payment wedged at Locked by proof-gated REUSE of the already-minted token (never re-mints; STOPS + alarms if the token reads spent)\n\
-         \n\
-         Default mint is testnut (pinned). Extra mints are opt-in via `mints add`.\n\
+         \x20\x20\x20# operator: complete ONE payment wedged at Locked by proof-gated REUSE of the already-minted token (never re-mints; STOPS + alarms if the token reads spent)\n"
+    );
+    // The mint line names the constant the code actually ships rather than restating it. A literal
+    // here is what let this text go on saying "testnut" for a release whose default had moved to a
+    // real mint (#378, #447) — a reader believed they were on play money while funding with sats.
+    let _ = writeln!(
+        err,
+        "Default mint is {DEFAULT_MINIBITS_MINT_URL} — a REAL mint. `setup` and `mint` print a \
+         Lightning invoice you pay with REAL sats; nothing is auto-funded.\n\
+         Play money is a dev-only opt-in: --mint {DEFAULT_MINT_URL} (its invoices settle \
+         themselves). Extra mints are opt-in via `mints add`.\n\
          Exit codes: 0 success, 1 usage error, 2 runtime error"
     );
 }
@@ -285,10 +294,11 @@ fn cmd_setup(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             SUCCESS
         }
         Ok(wallet_ops::MintFlow::NeedsPayment(quote)) => {
-            // Non-testnut mint: emit the bolt11 to pay, then complete with mint-complete.
+            // The ordinary path on the shipped default: a real mint invoices, and the sats are the
+            // user's. Only a dev test mint settles its own invoice and lands in `Funded` above.
             let _ = writeln!(
                 err,
-                "status=needs_payment amount_sats={} mint={} quote_id={} (pay the invoice, then `maxplayer wallet mint-complete {}`)",
+                "status=needs_payment amount_sats={} mint={} quote_id={} (pay the invoice below with real sats, then `maxplayer wallet mint-complete {}`)",
                 quote.amount_sats, quote.mint_url, quote.quote_id, quote.quote_id
             );
             let _ = writeln!(out, "{}", quote.invoice);
@@ -638,8 +648,8 @@ fn cmd_mint(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             // Bolt11 before any poll — payer must fund, then complete_mint.
             let _ = writeln!(
                 err,
-                "status=needs_payment amount_sats={} mint={} quote_id={} (testnut auto-pays; extras require external pay + complete)",
-                quote.amount_sats, quote.mint_url, quote.quote_id
+                "status=needs_payment amount_sats={} mint={} quote_id={} (pay the invoice below with real sats, then `maxplayer wallet mint-complete {}`)",
+                quote.amount_sats, quote.mint_url, quote.quote_id, quote.quote_id
             );
             let _ = writeln!(out, "{}", quote.invoice);
             SUCCESS
@@ -947,6 +957,31 @@ fn cmd_mints(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #447: the help text told users the default mint was testnut for the whole of the release
+    // whose default had already moved to a real minibits mint (#378). Nothing failed — a string is
+    // not checked by anything — so the only report was a user who had funded with real sats
+    // believing they were on play money. This binds the wording to the constant the code ships.
+    #[test]
+    fn wallet_usage_names_the_shipped_default_mint_and_never_calls_it_testnut() {
+        let mut err = Vec::new();
+        wallet_usage(&mut err);
+        let text = String::from_utf8(err).expect("utf8");
+
+        assert!(
+            text.contains(DEFAULT_MINIBITS_MINT_URL),
+            "help must name the mint a fresh config actually uses:\n{text}"
+        );
+        // testnut may only appear as the dev opt-in, never as what you get by default.
+        assert!(
+            !text.contains("Default mint is testnut") && !text.contains("default testnut"),
+            "help still presents testnut as the default:\n{text}"
+        );
+        assert!(
+            text.contains("REAL"),
+            "help must say plainly that the default mint moves real sats:\n{text}"
+        );
+    }
 
     #[test]
     fn parse_common_accepts_amount_flag_alongside_positional() {
