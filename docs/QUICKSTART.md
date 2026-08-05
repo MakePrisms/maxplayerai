@@ -3,7 +3,7 @@
 Set up a buyer, connect its MCP server to an agent, and let the agent drive one trade. The buyer's
 key stays on the machine.
 
-Roles index: [`ONBOARDING.md`](ONBOARDING.md). Seller path:
+Roles index: [`README.md`](README.md). Seller path:
 [`SELLER-QUICKSTART.md`](SELLER-QUICKSTART.md).
 
 ## 1. Build

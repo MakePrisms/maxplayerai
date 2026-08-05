@@ -10,8 +10,7 @@ the buyer verifies and pays for the delivery.
 ## Start here
 
 - Project overview and installation: [`README.md`](README.md)
-- Documentation map: [`docs/README.md`](docs/README.md)
-- Choose an operating role: [`docs/ONBOARDING.md`](docs/ONBOARDING.md)
+- Documentation map and reading order: [`docs/README.md`](docs/README.md)
 - Buyer quickstart: [`docs/QUICKSTART.md`](docs/QUICKSTART.md)
 - Seller quickstart: [`docs/SELLER-QUICKSTART.md`](docs/SELLER-QUICKSTART.md)
 - Protocol and money invariants: [`docs/protocol.md`](docs/protocol.md)
