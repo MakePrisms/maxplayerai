@@ -372,7 +372,7 @@ function emptyUsage() {
 
 function isPlausibleOffer(ev) {
   const tags = ev.tags || [];
-  const hasMaxplayer = tags.some((t) => t[0] === "t" && t[1] === "mobee");
+  const hasMobee = tags.some((t) => t[0] === "t" && t[1] === "mobee");
   const hasAmount = tags.some((t) => t[0] === "amount" && t[1]);
-  return hasMaxplayer || hasAmount;
+  return hasMobee || hasAmount;
 }

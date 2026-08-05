@@ -1,5 +1,5 @@
 import { HISTORY_LIMIT, RELAY_URL } from "../config.js";
-import { MOBEE_TAG, MAXPLAYER_TAGGED_KINDS, PROFILE, UNTAGGED_KINDS } from "./kinds.js";
+import { MOBEE_TAG, MOBEE_TAGGED_KINDS, PROFILE, UNTAGGED_KINDS } from "./kinds.js";
 
 /**
  * Single-owner NIP-01 websocket client.
@@ -107,7 +107,7 @@ export function createRelayClient(hooks) {
     // foreign event squatting a trade kind is filtered at the relay; the handler announce
     // carries no t-tag, so it rides an unscoped filter.
     /** @type {Record<string, unknown>} */
-    const tagged = { kinds: [...MAXPLAYER_TAGGED_KINDS], "#t": [MOBEE_TAG] };
+    const tagged = { kinds: [...MOBEE_TAGGED_KINDS], "#t": [MOBEE_TAG] };
     /** @type {Record<string, unknown>} */
     const untagged = { kinds: [...UNTAGGED_KINDS] };
     if (sinceCursor != null) {
