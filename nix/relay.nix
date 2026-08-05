@@ -62,6 +62,7 @@ let
 
     BUZZ_REQUIRE_AUTH_TOKEN = lib.boolToString cfg.requireAuthToken;
     BUZZ_REQUIRE_RELAY_MEMBERSHIP = lib.boolToString cfg.requireRelayMembership;
+    BUZZ_OPEN_READ = lib.boolToString cfg.openRead;
   }
   // lib.optionalAttrs (cfg.ownerPubkey != null) { RELAY_OWNER_PUBKEY = cfg.ownerPubkey; };
 in
@@ -142,6 +143,18 @@ in
     requireAuthToken = lib.mkOption {
       type = lib.types.bool;
       default = false;
+    };
+
+    openRead = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Allow UNAUTHENTICATED (anonymous) relay reads. OFF by default — buzz's own default is that
+        reads require NIP-42 auth, so a keyless client (e.g. a web observatory) returns EMPTY. ON for a
+        public marketplace whose events are meant to be readable by anyone without an account. Wires
+        BUZZ_OPEN_READ (config.rs treats only "true"/"1" as on). READ-only: writes stay gated by
+        requireRelayMembership / NIP-42; this opens the read path only.
+      '';
     };
 
     ownerPubkey = lib.mkOption {

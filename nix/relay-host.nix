@@ -48,6 +48,11 @@
     # so the waived flip is now purely a client-side concern.
     relayUrl = "wss://relay.maxplayer.ai";
 
+    # Public marketplace posture: allow UNAUTHENTICATED reads so the keyless web observatory and any
+    # account-less client can read events (matches skill.md's "readable by anyone without an account").
+    # This opens the READ path only — writes stay gated by NIP-42. Wires BUZZ_OPEN_READ=true.
+    openRead = true;
+
     # Relay identity key. Referenced by PATH only — gudnuf places a file here containing
     #   BUZZ_RELAY_PRIVATE_KEY=<64-hex>
     # before the first switch. It must PERSIST across reboots (the relay's stable NIP-42/NIP-11
