@@ -33,13 +33,13 @@ in
 
     namespaceTag = lib.mkOption {
       type = lib.types.str;
-      default = "mobee";
+      default = "maxplayer";
       description = ''
         Value of the `t` tag the relay accepts, and the ONLY namespace it accepts.
 
-        Parameterised on the value on purpose. The `#t` flip to "maxplayer" is waived out of 0.1.0, so day-one
-        v1 events still carry `t=mobee`; hardcoding "maxplayer" would reject every real event while looking
-        exactly like a healthy quiet relay. The flip is then a one-line change riding flag-day.
+        Parameterised on the value on purpose: it is configuration, not a recompile. Every real market
+        event carries `["t","maxplayer"]`; a relay set to any other value would reject every real event
+        while looking exactly like a healthy quiet relay.
       '';
     };
 

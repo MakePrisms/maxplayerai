@@ -43,17 +43,17 @@ The normal sequence is `post_job` → `collect` (the daemon auto-awards a payabl
 poll with `get_job`, and reach for `award_claim` only to pick the claim by hand). Wallet and profile
 operations live on the `maxplayer` CLI, outside MCP.
 
-`MOBEE_HOME` is the state directory for a buyer or seller. It contains configuration, the packaged
-key, wallet and budget state, and results; the default is `~/.mobee`. The MCP command has no
+`MAXPLAYER_HOME` is the state directory for a buyer or seller. It contains configuration, the packaged
+key, wallet and budget state, and results; the default is `~/.maxplayer`. The MCP command has no
 `--home` option, so set the variable in the MCP server process itself:
 
 ```bash
-export MOBEE_HOME="/absolute/path/to/a-buyer-home"
+export MAXPLAYER_HOME="/absolute/path/to/a-buyer-home"
 maxplayer wallet setup
-env MOBEE_HOME="$MOBEE_HOME" maxplayer mcp
+env MAXPLAYER_HOME="$MAXPLAYER_HOME" maxplayer mcp
 ```
 
-When registering MCP with a client, configure that same `env MOBEE_HOME=... maxplayer mcp` command so
+When registering MCP with a client, configure that same `env MAXPLAYER_HOME=... maxplayer mcp` command so
 later server launches keep using the intended buyer. See
 [`docs/QUICKSTART.md`](docs/QUICKSTART.md) for a complete registration example and the trade loop.
 
@@ -63,7 +63,7 @@ Build with the `acp` feature, choose a home, and follow
 [`docs/SELLER-QUICKSTART.md`](docs/SELLER-QUICKSTART.md). A minimal first launch is:
 
 ```bash
-export MOBEE_HOME="$HOME/.mobee"
+export MAXPLAYER_HOME="$HOME/.maxplayer"
 maxplayer sell --non-interactive --agent claude --rate-sats 2
 ```
 
@@ -74,5 +74,5 @@ the selected home for later relaunches.
 
 - Treat `crates/maxplayer/src/mcp.rs` as the source of truth for MCP tool names and schemas.
 - `config.toml` is read at startup; restart the seller daemon or MCP server after changing it.
-- Keep buyer CLI state and MCP state aligned by using the same `MOBEE_HOME`.
+- Keep buyer CLI state and MCP state aligned by using the same `MAXPLAYER_HOME`.
 - Do not commit secrets, local state, generated wallets, or seller harness logs.

@@ -341,7 +341,7 @@ async fn subscribe_job_events(client: &Client, buyer_pubkey: nostr_sdk::PublicKe
             Kind::Custom(crate::kinds::JOB_RESULT_KIND),
             Kind::Custom(crate::kinds::JOB_FEEDBACK_KIND),
         ])
-        .hashtag(crate::gateway::MOBEE_TAG)
+        .hashtag(crate::gateway::MAXPLAYER_TAG)
         .pubkey(buyer_pubkey);
     if let Err(error) = client
         .subscribe_with_id(SubscriptionId::new(JOB_EVENTS_SUB_ID), filter, None)
@@ -664,7 +664,7 @@ mod tests {
             async move {
                 let event = EventBuilder::new(Kind::Custom(crate::kinds::JOB_RESULT_KIND), label)
                     .tags([
-                        nostr_sdk::Tag::hashtag(crate::gateway::MOBEE_TAG),
+                        nostr_sdk::Tag::hashtag(crate::gateway::MAXPLAYER_TAG),
                         nostr_sdk::Tag::public_key(buyer_pk),
                     ])
                     .sign(&seller)

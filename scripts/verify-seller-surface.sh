@@ -35,12 +35,12 @@ die() { echo "verify-seller-surface: $*" >&2; exit 1; }
 [ -f "$BINARY" ] || die "no binary at $BINARY — build one with: cargo build -p maxplayer --release --no-default-features --features wallet,acp"
 [ -x "$BINARY" ] || die "$BINARY is not executable"
 
-# A scratch home, unconditionally. With MOBEE_HOME unset, maxplayer falls back to ~/.mobee — a real
+# A scratch home, unconditionally. With MAXPLAYER_HOME unset, maxplayer falls back to ~/.maxplayer — a real
 # wallet home on a developer machine — and `wallet balance` below would read it. The value is forced
 # rather than checked so a caller's home can never leak in.
-MOBEE_HOME="$(mktemp -d)"
-export MOBEE_HOME
-trap 'rm -rf "$MOBEE_HOME"' EXIT
+MAXPLAYER_HOME="$(mktemp -d)"
+export MAXPLAYER_HOME
+trap 'rm -rf "$MAXPLAYER_HOME"' EXIT
 
 # The two messages the acp probe has to distinguish. Both builds exit non-zero on it, so the exit
 # code carries nothing; anything other than these is treated as inconclusive, so that a reworded

@@ -11,7 +11,7 @@
 
 use super::*;
 use crate::home::{self, BuzzConfig};
-use crate::seller_node::buzz::{event_has_marker, BuzzError, MOBEE_MARKER_TAG, MOBEE_MARKER_VALUE, PRESENCE_KIND};
+use crate::seller_node::buzz::{event_has_marker, BuzzError, MAXPLAYER_MARKER_TAG, MAXPLAYER_MARKER_VALUE, PRESENCE_KIND};
 use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{
     Client, EventBuilder, Filter, Keys, Kind, Metadata, PublicKey, RelayPoolNotification, Tag,
@@ -177,7 +177,7 @@ async fn own_marked_kind0_is_replaced() {
     let keys = Keys::parse(&secret).expect("keys");
     let seeder = connect_client(&relay_url).await;
     // Seed a kind-0 WITH our marker (a prior run's persona).
-    let marker = Tag::parse([MOBEE_MARKER_TAG, MOBEE_MARKER_VALUE]).expect("marker tag");
+    let marker = Tag::parse([MAXPLAYER_MARKER_TAG, MAXPLAYER_MARKER_VALUE]).expect("marker tag");
     let ours = EventBuilder::metadata(&Metadata::new().name("Rocky").about("old card"))
         .tag(marker)
         .sign_with_keys(&keys)

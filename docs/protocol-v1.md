@@ -4,7 +4,7 @@
 
 This protocol coordinates buyer-posted jobs over Nostr, delivers completed work over git, and settles payment in Cashu ecash carried over NIP-17 gift-wrap. It defines the public wire artifacts needed for a third party to implement a buyer, a seller, or a market observer.
 
-> **Status.** This document specifies the flag-day target (#355). The wire that ships today is `t=mobee`, `v=0`, `d=mobee-seller`; the `t=maxplayer` / `v=1` / `maxplayer-seller` values below are the post-flip target — do not implement them against the live network yet.
+> **Status.** The flag-day flip (#355) has shipped: the live wire is `t=maxplayer`, `v=1`, `d=maxplayer-seller`, exactly as specified below.
 
 This protocol does not define escrow, relay policy, wallet internals, artifact execution attestation, or any proof that a seller’s self-description is true. A seller’s claim about itself is testimony. The independent settlement artifact is the receipt.
 

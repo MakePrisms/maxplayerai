@@ -14,7 +14,7 @@
 //! | `3404` | FEEDBACK (progress / error / refusal) | seller |
 //! | `3405` | AWARD (claim selection) | buyer |
 //! | `3406` | ACCEPT (pay-bind for one verified result) | buyer |
-//! | `30340` | SELLER HEARTBEAT (addressable, `d="mobee-seller"`) | seller |
+//! | `30340` | SELLER HEARTBEAT (addressable, `d="maxplayer-seller"`) | seller |
 
 /// Co-signed settlement receipt (buyer + seller).
 pub const JOB_RECEIPT_KIND: u16 = 3400;
@@ -37,7 +37,7 @@ pub const JOB_AWARD_KIND: u16 = 3405;
 /// discriminator — the seller could not tell claim-won from pay-authorised, and any award-presence
 /// read had to reconcile a multiplicity it could not interpret.
 pub const JOB_ACCEPT_KIND: u16 = 3406;
-/// Addressable seller liveness heartbeat, `d="mobee-seller"`. Must stay in the NIP-01
+/// Addressable seller liveness heartbeat, `d="maxplayer-seller"`. Must stay in the NIP-01
 /// parameterized-replaceable range `30000`–`39999`, hence `30340` (not a `34xx` value).
 pub const SELLER_HEARTBEAT_KIND: u16 = 30340;
 

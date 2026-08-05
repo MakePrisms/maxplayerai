@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::delivery::{CommitOid, DeliveryError, GitDelivery};
 
-pub const MOBEE_TAG: &str = "mobee";
+pub const MAXPLAYER_TAG: &str = "maxplayer";
 // maxplayer protocol version. maxplayer events occupy a dedicated kind block, so a parser only ever
 // matches maxplayer's own events.
-pub const PROTOCOL_VERSION: &str = "0";
+pub const PROTOCOL_VERSION: &str = "1";
 
 // All kind NUMBERS live in `crate::kinds` (the one registry); re-exported here so the historical
 // `gateway::JOB_*_KIND` paths keep resolving.
@@ -209,7 +209,7 @@ pub enum OfferParseError {
 pub enum GitResultParseError {
     WrongKind(u16),
     MissingTag(&'static str),
-    /// Namespace guard: a result event without the `["t","mobee"]` tag.
+    /// Namespace guard: a result event without the `["t","maxplayer"]` tag.
     MissingMaxplayerTag,
     UnsupportedDelivery(String),
     InvalidDelivery(DeliveryError),
@@ -278,7 +278,7 @@ pub fn parse_offer(event: &EventDraft) -> Result<ParsedOffer, OfferParseError> {
     if event.kind != JOB_OFFER_KIND {
         return Err(OfferParseError::WrongKind(event.kind));
     }
-    if !has_tag_value(&event.tags, "t", MOBEE_TAG) {
+    if !has_tag_value(&event.tags, "t", MAXPLAYER_TAG) {
         return Err(OfferParseError::MissingMaxplayerTag);
     }
     let version = first_tag_value(&event.tags, "v").ok_or(OfferParseError::MissingTag("v"))?;
@@ -352,7 +352,7 @@ pub fn parse_git_result_delivery(event: &EventDraft) -> Result<GitDelivery, GitR
     }
     // Namespace guard: reject a foreign event squatting the result kind before reading any
     // delivery field.
-    if !has_tag_value(&event.tags, "t", MOBEE_TAG) {
+    if !has_tag_value(&event.tags, "t", MAXPLAYER_TAG) {
         return Err(GitResultParseError::MissingMaxplayerTag);
     }
     let delivery = first_tag_value(&event.tags, "delivery")
@@ -783,7 +783,7 @@ fn has_tag_value(tags: &[TagSpec], name: &str, value: &str) -> bool {
 }
 
 fn maxplayer_tag() -> TagSpec {
-    TagSpec::new(["t", MOBEE_TAG])
+    TagSpec::new(["t", MAXPLAYER_TAG])
 }
 
 fn version_tag() -> TagSpec {
@@ -1004,7 +1004,7 @@ mod tests {
                 TagSpec::new(["amount", "7", "sat"]),
                 TagSpec::new(["param", "deadline", "1800000000"]),
                 TagSpec::new(["p", SELLER]),
-                TagSpec::new(["t", MOBEE_TAG]),
+                TagSpec::new(["t", MAXPLAYER_TAG]),
                 TagSpec::new(["v", PROTOCOL_VERSION]),
             ]
         );
@@ -1053,6 +1053,38 @@ mod tests {
         );
     }
 
+    // Wire-cutover red-leg (rename PR B): a v1 offer round-trips, and the pre-flip wire is rejected
+    // BOTH ways — t=mobee as out-of-namespace, v=0 as an unsupported version. This is the partition
+    // the flag day accepts: rc.2 seats still speaking t=mobee / v=0 are invisible to a v1 parser.
+    #[test]
+    fn legacy_mobee_v0_offer_is_rejected_under_v1() {
+        let ok = OfferDraft::new("summarize", "application/json", 3, 1_800_000_001, SELLER)
+            .to_event_draft();
+        assert!(parse_offer(&ok).is_ok(), "a v1 offer (t=maxplayer, v=1) must round-trip");
+
+        let mut legacy_tag = ok.clone();
+        for tag in legacy_tag.tags.iter_mut() {
+            if tag.first() == Some("t") {
+                tag.0 = vec!["t".to_owned(), "mobee".to_owned()];
+            }
+        }
+        assert!(
+            matches!(parse_offer(&legacy_tag), Err(OfferParseError::MissingMaxplayerTag)),
+            "a legacy t=mobee offer must be rejected as outside the maxplayer namespace"
+        );
+
+        let mut legacy_ver = ok.clone();
+        for tag in legacy_ver.tags.iter_mut() {
+            if tag.first() == Some("v") {
+                tag.0 = vec!["v".to_owned(), "0".to_owned()];
+            }
+        }
+        assert!(
+            matches!(parse_offer(&legacy_ver), Err(OfferParseError::UnsupportedVersion(v)) if v == "0"),
+            "a legacy v=0 offer must be rejected as an unsupported version"
+        );
+    }
+
     #[test]
     fn targeting_helpers_fail_closed_for_targeted_offers() {
         let targeted = parse_offer(
@@ -1094,7 +1126,7 @@ mod tests {
                     TagSpec::new(["p", BUYER]),
                     TagSpec::new(["p", SELLER]),
                     TagSpec::new(["creq", "creqAtest"]),
-                    TagSpec::new(["t", MOBEE_TAG]),
+                    TagSpec::new(["t", MAXPLAYER_TAG]),
                     TagSpec::new(["v", PROTOCOL_VERSION]),
                 ],
                 ""
@@ -1111,7 +1143,7 @@ mod tests {
                     TagSpec::new(["e", "claim"]),
                     TagSpec::new(["p", BUYER]),
                     TagSpec::new(["p", SELLER]),
-                    TagSpec::new(["t", MOBEE_TAG]),
+                    TagSpec::new(["t", MAXPLAYER_TAG]),
                     TagSpec::new(["v", PROTOCOL_VERSION]),
                 ],
                 ""
@@ -1332,7 +1364,7 @@ mod tests {
             "offer",
             BUYER,
             "https://example.invalid/repo.git",
-            "mobee/job",
+            "maxplayer/job",
             &"a".repeat(40),
             7,
             "hash",
@@ -1363,16 +1395,16 @@ mod tests {
             vec![
                 TagSpec::new(["delivery", "git"]),
                 TagSpec::new(["repo", "https://example.invalid/repo.git"]),
-                TagSpec::new(["branch", "mobee/job"]),
+                TagSpec::new(["branch", "maxplayer/job"]),
                 TagSpec::new(["commit", &"a".repeat(40)]),
-                TagSpec::new(["t", MOBEE_TAG]),
+                TagSpec::new(["t", MAXPLAYER_TAG]),
             ],
             "",
         );
 
         let delivery = parse_git_result_delivery(&result).expect("parse git delivery");
         assert_eq!(delivery.repo(), "https://example.invalid/repo.git");
-        assert_eq!(delivery.branch(), "mobee/job");
+        assert_eq!(delivery.branch(), "maxplayer/job");
         assert_eq!(delivery.commit_oid().as_str(), "a".repeat(40));
     }
 
@@ -1385,7 +1417,7 @@ mod tests {
                 TagSpec::new(["repo", "repo"]),
                 TagSpec::new(["branch", "work"]),
                 TagSpec::new(["commit", "abc123"]),
-                TagSpec::new(["t", MOBEE_TAG]),
+                TagSpec::new(["t", MAXPLAYER_TAG]),
             ],
             "",
         );
@@ -1405,7 +1437,7 @@ mod tests {
             vec![
                 TagSpec::new(["delivery", "git"]),
                 TagSpec::new(["repo", "https://example.invalid/offered.git"]),
-                TagSpec::new(["branch", "mobee/job"]),
+                TagSpec::new(["branch", "maxplayer/job"]),
             ],
             "",
         );
@@ -1414,9 +1446,9 @@ mod tests {
             vec![
                 TagSpec::new(["delivery", "git"]),
                 TagSpec::new(["repo", "https://attacker.invalid/other.git"]),
-                TagSpec::new(["branch", "mobee/job"]),
+                TagSpec::new(["branch", "maxplayer/job"]),
                 TagSpec::new(["commit", &"a".repeat(40)]),
-                TagSpec::new(["t", MOBEE_TAG]),
+                TagSpec::new(["t", MAXPLAYER_TAG]),
             ],
             "",
         );

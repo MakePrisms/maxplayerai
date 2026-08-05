@@ -116,7 +116,7 @@ mod tests {
     fn temp_home(label: &str) -> std::path::PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!(
-            "mobee-seller-wactor-{label}-{}-{id}",
+            "maxplayer-seller-wactor-{label}-{}-{id}",
             std::process::id()
         ))
     }

@@ -64,9 +64,9 @@ pub use super::signer::{
 /// Marker tag stamped on every kind-0 this node publishes, so a later boot can tell ITS OWN
 /// persona (safe to replace) from a FOREIGN kind-0 on the same key (must not be clobbered). A
 /// buzz client renders kind-0 by its metadata content and ignores this tag.
-pub const MOBEE_MARKER_TAG: &str = "maxplayer_persona";
+pub const MAXPLAYER_MARKER_TAG: &str = "maxplayer_persona";
 /// The marker tag's value.
-pub const MOBEE_MARKER_VALUE: &str = "seller";
+pub const MAXPLAYER_MARKER_VALUE: &str = "seller";
 
 /// How long to wait for the relay's stored kind-0 before the clobber check (bounded; the relay
 /// terminates the fetch on EOSE, so this is an upper bound, not a fixed wait).
@@ -126,8 +126,8 @@ pub fn clobber_decision(existing_marker: Option<bool>) -> ClobberDecision {
 pub fn event_has_marker(event: &Event) -> bool {
     event.tags.iter().any(|tag| {
         let parts = tag.as_slice();
-        parts.first().map(String::as_str) == Some(MOBEE_MARKER_TAG)
-            && parts.get(1).map(String::as_str) == Some(MOBEE_MARKER_VALUE)
+        parts.first().map(String::as_str) == Some(MAXPLAYER_MARKER_TAG)
+            && parts.get(1).map(String::as_str) == Some(MAXPLAYER_MARKER_VALUE)
     })
 }
 
@@ -184,7 +184,7 @@ impl NodeNostrSigner {
 
 impl NostrSigner for NodeNostrSigner {
     fn backend(&self) -> SignerBackend<'_> {
-        SignerBackend::Custom(std::borrow::Cow::Borrowed("mobee-seller-node-signer-actor"))
+        SignerBackend::Custom(std::borrow::Cow::Borrowed("maxplayer-seller-node-signer-actor"))
     }
 
     fn get_public_key(&self) -> BoxedFuture<'_, Result<PublicKey, SignerError>> {
@@ -373,7 +373,7 @@ async fn build_kind0(
     seller_rate_sats: Option<u64>,
 ) -> Result<Event, BuzzError> {
     let metadata = persona_metadata(cfg, seller_rate_sats);
-    let marker = Tag::parse([MOBEE_MARKER_TAG, MOBEE_MARKER_VALUE])
+    let marker = Tag::parse([MAXPLAYER_MARKER_TAG, MAXPLAYER_MARKER_VALUE])
         .map_err(|error| BuzzError::Config(format!("marker tag: {error}")))?;
     let unsigned = EventBuilder::metadata(&metadata).tag(marker).build(pubkey);
     sign_via_adapter(adapter, unsigned).await

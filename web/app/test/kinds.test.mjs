@@ -16,7 +16,7 @@ const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const RENUMBERABLE = [3400, 3401, 3402, 3403, 3404, 3405, 30340, 31990];
 
 /**
- * Retired DVM kinds from mobee's earlier protocol. The app is a clean cut from
+ * Retired DVM kinds from maxplayer's earlier protocol. The app is a clean cut from
  * that era and does not read it, so a stray digit is always a bug — including
  * in js/kinds.js itself.
  */
@@ -70,14 +70,14 @@ test("no retired kind appears anywhere in the app source", () => {
 });
 
 test("gift-wrap is never requested", () => {
-  const requested = new Set([...kinds.MOBEE_TAGGED_KINDS, ...kinds.UNTAGGED_KINDS]);
+  const requested = new Set([...kinds.MAXPLAYER_TAGGED_KINDS, ...kinds.UNTAGGED_KINDS]);
   assert.equal(requested.has(1059), false, "gift-wrapped payment traffic stays dark");
 });
 
 test("every trade stage maps to a kind the client actually requests", () => {
   for (const kind of Object.keys(kinds.TRADE_STAGES)) {
     assert.ok(
-      kinds.MOBEE_TAGGED_KINDS.includes(Number(kind)),
+      kinds.MAXPLAYER_TAGGED_KINDS.includes(Number(kind)),
       `kind ${kind} is staged but never fetched`,
     );
   }

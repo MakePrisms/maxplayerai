@@ -3,7 +3,7 @@ import { test } from "node:test";
 
 import { parseEvent } from "../js/model.js";
 import { buildTrades, marketMetrics } from "../js/trades.js";
-import { AWARD, CLAIM, MOBEE_TAG, OFFER, RECEIPT, RESULT, SELF_TRADE_TAG } from "../js/kinds.js";
+import { AWARD, CLAIM, MAXPLAYER_TAG, OFFER, RECEIPT, RESULT, SELF_TRADE_TAG } from "../js/kinds.js";
 
 // A buyer paying its own seller is real work but not market demand, and after
 // the fact its receipt is indistinguishable from an arms-length one. The
@@ -17,7 +17,7 @@ const ev = (kind, { id, pubkey = pk("a"), at = 1000, tags = [] }) =>
 const root = (offerId) => ["e", offerId, "", "root"];
 
 function trade(offerId, { sats = 10, selfTrade = false, buyer = pk("b"), seller = pk("c") } = {}) {
-  const tags = [["amount", String(sats), "sat"], ["t", MOBEE_TAG]];
+  const tags = [["amount", String(sats), "sat"], ["t", MAXPLAYER_TAG]];
   if (selfTrade) tags.push(["t", SELF_TRADE_TAG]);
   return [
     ev(OFFER, { id: offerId, pubkey: buyer, at: 1000, tags }),
@@ -29,11 +29,11 @@ function trade(offerId, { sats = 10, selfTrade = false, buyer = pk("b"), seller 
 }
 
 test("the self-trade marker is a t-tag, read structurally", () => {
-  const plain = parseEvent(ev(OFFER, { id: HEX(1), tags: [["t", MOBEE_TAG]] }));
+  const plain = parseEvent(ev(OFFER, { id: HEX(1), tags: [["t", MAXPLAYER_TAG]] }));
   assert.equal(plain.selfTrade, false);
 
-  const marked = parseEvent(ev(OFFER, { id: HEX(2), tags: [["t", MOBEE_TAG], ["t", SELF_TRADE_TAG]] }));
-  assert.equal(marked.selfTrade, true, "both t values coexist; the mobee filter still matches");
+  const marked = parseEvent(ev(OFFER, { id: HEX(2), tags: [["t", MAXPLAYER_TAG], ["t", SELF_TRADE_TAG]] }));
+  assert.equal(marked.selfTrade, true, "both t values coexist; the maxplayer filter still matches");
 });
 
 test("prose in the job text is NOT the predicate", () => {
@@ -42,7 +42,7 @@ test("prose in the job text is NOT the predicate", () => {
   // it and a quotation silently triggers it.
   const prose = parseEvent(ev(OFFER, {
     id: HEX(3),
-    tags: [["t", MOBEE_TAG], ["i", "NOTE: this is an internal self-commissioned review, NOT an arms-length trade"]],
+    tags: [["t", MAXPLAYER_TAG], ["i", "NOTE: this is an internal self-commissioned review, NOT an arms-length trade"]],
   }));
   assert.equal(prose.selfTrade, false, "prose disclosure must not set the machine flag");
   assert.match(prose.description, /self-commissioned/, "but the text is preserved for the reader");

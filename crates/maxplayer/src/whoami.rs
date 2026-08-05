@@ -1,7 +1,7 @@
 //! `maxplayer whoami` — print THIS seat's PUBLIC identity and nothing else.
 //!
 //! Prints three lines: the hex nostr public key, its npub (bech32), and the resolved home
-//! directory (honoring `--home` / `MOBEE_HOME` exactly as the other commands do, via
+//! directory (honoring `--home` / `MAXPLAYER_HOME` exactly as the other commands do, via
 //! [`home::default_home_dir`]).
 //!
 //! # Security

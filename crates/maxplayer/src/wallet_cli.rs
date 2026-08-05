@@ -50,7 +50,7 @@ fn wallet_usage(err: &mut dyn Write) {
     let _ = writeln!(
         err,
         "Usage:\n\
-         \x20 maxplayer wallet setup [<amount>] [--mint <url>] [--home <path>]   # bootstrap ~/.mobee, then invoice <amount> (default 21) from the mint\n\
+         \x20 maxplayer wallet setup [<amount>] [--mint <url>] [--home <path>]   # bootstrap ~/.maxplayer, then invoice <amount> (default 21) from the mint\n\
          \x20 maxplayer wallet balance [--mint <url>] [--home <path>]\n\
          \x20 maxplayer wallet mint <amount> [--mint <url>] [--home <path>]\n\
          \x20 maxplayer wallet mint-complete <quote_id> [--amount <sats>] [--mint <url>] [--home <path>]\n\
@@ -275,7 +275,7 @@ fn cmd_setup(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             return USAGE_ERROR;
         }
     };
-    // Bootstrap ~/.mobee (config + autogen key + wallet dir), then fund. `home::bootstrap` never
+    // Bootstrap ~/.maxplayer (config + autogen key + wallet dir), then fund. `home::bootstrap` never
     // prints the secret key.
     let home = match bootstrap_home(&opts, err) {
         Ok(home) => home,

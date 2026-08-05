@@ -129,7 +129,7 @@ fn launch_argv(
     Ok((program, argv.collect()))
 }
 
-/// The per-job working directory under the home (`$MOBEE_HOME/seller-jobs/<job_id>`).
+/// The per-job working directory under the home (`$MAXPLAYER_HOME/seller-jobs/<job_id>`).
 pub fn job_workdir(home: &MaxplayerHome, job_id: &str) -> PathBuf {
     home.root.join("seller-jobs").join(job_id)
 }
@@ -495,7 +495,7 @@ mod tests {
     fn seller_delivery_kind_derives_fork_from_typed_delivery() {
         let kind = seller_delivery_kind(
             "https://relay.example/git/job.git",
-            "mobee/abcd1234",
+            "maxplayer/abcd1234",
             &"a".repeat(40),
         )
         .expect("commit delivery types");

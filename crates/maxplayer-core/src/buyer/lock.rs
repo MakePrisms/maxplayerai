@@ -1,7 +1,7 @@
 //! Exclusive per-home process lock.
 //!
 //! The buyer holds an OS advisory lock (`flock(LOCK_EX | LOCK_NB)`) on
-//! `$MOBEE_HOME/buyer.lock` for its whole lifetime. This is the money-safety
+//! `$MAXPLAYER_HOME/buyer.lock` for its whole lifetime. This is the money-safety
 //! keystone of the buyer: it guarantees a single owner of the wallet, identity,
 //! and state DB per home. A second daemon on the same home fails closed here —
 //! before it ever opens `cdk-wallet.sqlite` — so two processes can never select

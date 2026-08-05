@@ -254,7 +254,7 @@ function openParticipant(role, pubkey, events) {
       // Only the structured fields — a seller's free-text `about` is often stale
       // against its own numbers, and printing both publishes a contradiction.
       //
-      // The advertised MINT is deliberately NOT shown. mobee #209: the mint in
+      // The advertised MINT is deliberately NOT shown. maxplayer #209: the mint in
       // the announce is hardcoded "testnut" on stock builds and never reads
       // config, so sellers settling in real bitcoin advertise a test mint. A
       // reader seeing "testnut" would conclude no real money is involved, which

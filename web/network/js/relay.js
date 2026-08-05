@@ -1,5 +1,5 @@
 import { HISTORY_LIMIT, RELAY_URL } from "../config.js";
-import { MOBEE_TAG, MOBEE_TAGGED_KINDS, PROFILE, UNTAGGED_KINDS } from "./kinds.js";
+import { MAXPLAYER_TAG, MAXPLAYER_TAGGED_KINDS, PROFILE, UNTAGGED_KINDS } from "./kinds.js";
 
 /**
  * Single-owner NIP-01 websocket client.
@@ -17,8 +17,8 @@ export function createRelayClient(hooks) {
   let attempt = 0;
   let retryTimer = null;
   let subSeq = 0;
-  let marketSubId = "mobee-net-m-0";
-  let profileSubId = "mobee-net-p-0";
+  let marketSubId = "maxplayer-net-m-0";
+  let profileSubId = "maxplayer-net-p-0";
 
   /** @type {number | null} max created_at seen — resume cursor */
   let sinceCursor = null;
@@ -102,12 +102,12 @@ export function createRelayClient(hooks) {
 
   function openMarketSub(socket) {
     subSeq += 1;
-    marketSubId = `mobee-net-m-${subSeq}`;
-    // Two filters in one REQ: the mobee-namespaced kinds are scoped to ["t","mobee"] so a
+    marketSubId = `maxplayer-net-m-${subSeq}`;
+    // Two filters in one REQ: the maxplayer-namespaced kinds are scoped to ["t","maxplayer"] so a
     // foreign event squatting a trade kind is filtered at the relay; the handler announce
     // carries no t-tag, so it rides an unscoped filter.
     /** @type {Record<string, unknown>} */
-    const tagged = { kinds: [...MOBEE_TAGGED_KINDS], "#t": [MOBEE_TAG] };
+    const tagged = { kinds: [...MAXPLAYER_TAGGED_KINDS], "#t": [MAXPLAYER_TAG] };
     /** @type {Record<string, unknown>} */
     const untagged = { kinds: [...UNTAGGED_KINDS] };
     if (sinceCursor != null) {
@@ -125,7 +125,7 @@ export function createRelayClient(hooks) {
     const authors = [...profileAuthors].filter((a) => !profileDone.has(a));
     if (!authors.length) return;
     subSeq += 1;
-    profileSubId = `mobee-net-p-${subSeq}`;
+    profileSubId = `maxplayer-net-p-${subSeq}`;
     // Cap authors per REQ to keep filter sane; remainder wait for next flush.
     const batch = authors.slice(0, 100);
     safeSend(socket, ["REQ", profileSubId, { kinds: [PROFILE], authors: batch }]);

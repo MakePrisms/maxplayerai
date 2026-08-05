@@ -1,6 +1,6 @@
 //! The signer actor — the node's single owner of the seller Nostr identity.
 //!
-//! The seller key is read from `$MOBEE_HOME/key` once at startup and lives only inside this task.
+//! The seller key is read from `$MAXPLAYER_HOME/key` once at startup and lives only inside this task.
 //! Every published event is signed here, through the queue, so there is exactly one signing
 //! principal per home and the secret never leaves the actor — no agent process, no client, ever
 //! sees it. The outbox publisher hands drafts to [`SignerHandle::sign`]; the fixed authored-at
@@ -379,7 +379,7 @@ mod tests {
     fn temp_home(label: &str) -> std::path::PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!(
-            "mobee-seller-signer-{label}-{}-{id}",
+            "maxplayer-seller-signer-{label}-{}-{id}",
             std::process::id()
         ))
     }
@@ -588,17 +588,17 @@ mod tests {
     }
 
     // A signed event carries the protocol tags a live buyer requires (`parse_offer` rejects an event
-    // without `["v","0"]` / `["t","mobee"]`). Proves the outbox→signer path emits wire-valid events.
+    // without `["v","1"]` / `["t","maxplayer"]`). Proves the outbox→signer path emits wire-valid events.
     #[tokio::test(flavor = "current_thread")]
     async fn signed_event_carries_the_protocol_tags() {
-        use crate::gateway::{MOBEE_TAG, PROTOCOL_VERSION};
+        use crate::gateway::{MAXPLAYER_TAG, PROTOCOL_VERSION};
         let root = temp_home("wire-valid");
         let _ = std::fs::remove_dir_all(&root);
         let home = bootstrap(&root).expect("bootstrap");
         let signer = spawn(&home).expect("spawn");
 
         let signed = signer.sign(claim_draft(), 1000).await.expect("actor").expect("sign");
-        // The claim_draft carries `["v","0"]` + `["t","mobee"]`; they must survive into the signed
+        // The claim_draft carries `["v","1"]` + `["t","maxplayer"]`; they must survive into the signed
         // event's tags array (rendered in its JSON).
         let value: serde_json::Value = serde_json::from_str(&signed.json).expect("event json");
         let tags = value["tags"].as_array().expect("tags array");
@@ -609,8 +609,8 @@ mod tests {
                     == Some((name, val))
             })
         };
-        assert!(has("v", PROTOCOL_VERSION), "signed event must carry [\"v\",\"0\"]: {}", signed.json);
-        assert!(has("t", MOBEE_TAG), "signed event must carry [\"t\",\"mobee\"]: {}", signed.json);
+        assert!(has("v", PROTOCOL_VERSION), "signed event must carry [\"v\",\"1\"]: {}", signed.json);
+        assert!(has("t", MAXPLAYER_TAG), "signed event must carry [\"t\",\"maxplayer\"]: {}", signed.json);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

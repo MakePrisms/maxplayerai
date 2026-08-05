@@ -99,7 +99,7 @@ maxplayer sell --agent <claude|cursor|codex> --rate-sats <n> --git-remote <https
 `--git-remote <https-url>` points delivery at a git host you control (e.g. an HTTPS repo
 URL). It skips the relay-git announce/seed path entirely, so the 404 cannot occur. There
 is **no `--relay` flag**; the market relay is set only via `relay_url` in
-`~/.mobee/config.toml` or `MAXPLAYER_RELAY_URL`.
+`~/.maxplayer/config.toml` or `MAXPLAYER_RELAY_URL`.
 
 **Dead end → report it:** if you must use relay-git and cannot use `--git-remote`, this is
 tracked as the v0.1 tag-blocker — file/comment on **MakePrisms/maxplayerai** with the full
@@ -194,7 +194,7 @@ restart** stays at `state = 'claimed'` **forever**: the release sweep is in-memo
 start-up reconcile deliberately does not touch claimed rows. Enough of these accumulate and
 permanently wedge claiming.
 
-**Check:** the seat's claims table in `$MOBEE_HOME/seller.sqlite` — rows with
+**Check:** the seat's claims table in `$MAXPLAYER_HOME/seller.sqlite` — rows with
 `state = 'claimed'` whose offer deadline is long past. (Same-process, those release on
 their own after ~300s; it is the across-restart orphans that pile up.)
 

@@ -3833,7 +3833,7 @@ mod tests {
     fn git_delivery_for_key(key: &PaymentKey) -> GitDelivery {
         GitDelivery::new(
             "https://example.invalid/repo.git",
-            "mobee/job",
+            "maxplayer/job",
             CommitOid::parse(key.delivery_integrity_hash.as_str()).unwrap(),
         )
         .unwrap()

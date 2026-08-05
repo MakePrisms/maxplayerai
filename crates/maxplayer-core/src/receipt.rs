@@ -9,7 +9,7 @@ pub fn result_content_hash_hex(content: &str) -> String {
 
 /// Domain separator for the co-signed receipt preimage (distinct from the receipt H-tuple
 /// domain above so the two hashes can never collide).
-pub const RECEIPT_PREIMAGE_DOMAIN: &str = "mobee/v1/receipt-preimage";
+pub const RECEIPT_PREIMAGE_DOMAIN: &str = "maxplayer/v1/receipt-preimage";
 
 /// Marker committed in [`ReceiptPreimage::exec_metadata_commitment`] when no
 /// exec-metadata is folded into the co-signature (the default today — see the type doc).

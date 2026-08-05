@@ -45,7 +45,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Run as an unprivileged user. The key file must be 0600 and owned by this
-# user; /data (MOBEE_HOME) is created up front so a named volume inherits the
+# user; /data (MAXPLAYER_HOME) is created up front so a named volume inherits the
 # right ownership on first run.
 RUN useradd --system --create-home --uid 10001 --shell /usr/sbin/nologin maxplayer \
     && mkdir -p /data \
@@ -55,7 +55,7 @@ COPY --from=builder /usr/local/bin/maxplayer /usr/local/bin/maxplayer
 
 # Seller home lives on a mounted volume so the key, wallet, config, and journal
 # survive image upgrades. See docs/DOCKER.md for the upgrade path.
-ENV MOBEE_HOME=/data
+ENV MAXPLAYER_HOME=/data
 VOLUME ["/data"]
 
 USER maxplayer

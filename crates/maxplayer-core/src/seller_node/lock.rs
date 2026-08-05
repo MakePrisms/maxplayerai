@@ -1,7 +1,7 @@
 //! Exclusive per-home process lock for the seller node.
 //!
 //! The node holds an OS advisory lock (`flock(LOCK_EX | LOCK_NB)`) on
-//! `$MOBEE_HOME/seller.lock` for its whole lifetime. This is the money-safety keystone: it
+//! `$MAXPLAYER_HOME/seller.lock` for its whole lifetime. This is the money-safety keystone: it
 //! guarantees a single owner of the receiving wallet, the seller identity, and the lifecycle DB
 //! per home. A second node on the same home fails closed here — before it ever opens the wallet —
 //! so two processes can never sign or redeem proofs concurrently.
@@ -99,7 +99,7 @@ mod tests {
     fn temp_lock(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!(
-            "mobee-seller-lock-{label}-{}-{id}.lock",
+            "maxplayer-seller-lock-{label}-{}-{id}.lock",
             std::process::id()
         ))
     }

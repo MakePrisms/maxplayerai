@@ -31,12 +31,12 @@ die() { echo "verify-racer-surface: $*" >&2; exit 1; }
 [ -f "$BINARY" ] || die "no binary at $BINARY — build one with: nix build .#buyer-static"
 [ -x "$BINARY" ] || die "$BINARY is not executable"
 
-# A scratch home, unconditionally. With MOBEE_HOME unset, maxplayer falls back to ~/.mobee — a real
+# A scratch home, unconditionally. With MAXPLAYER_HOME unset, maxplayer falls back to ~/.maxplayer — a real
 # wallet home on a developer machine — and `wallet balance` below would read it. The value is forced
 # rather than checked so a caller's home can never leak in.
-MOBEE_HOME="$(mktemp -d)"
-export MOBEE_HOME
-trap 'rm -rf "$MOBEE_HOME"' EXIT
+MAXPLAYER_HOME="$(mktemp -d)"
+export MAXPLAYER_HOME
+trap 'rm -rf "$MAXPLAYER_HOME"' EXIT
 
 # Both builds exit non-zero on the probe below, so the exit code cannot tell them apart — only the
 # message can. These are the two it has to distinguish, and anything else is treated as inconclusive

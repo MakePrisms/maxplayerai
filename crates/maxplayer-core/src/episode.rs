@@ -219,7 +219,7 @@ impl Episode {
     }
 }
 
-/// Append-only episode log: a sibling of `seller-journal.jsonl` under `MOBEE_HOME`.
+/// Append-only episode log: a sibling of `seller-journal.jsonl` under `MAXPLAYER_HOME`.
 ///
 /// Read-tolerant: [`entries`](Self::entries) SKIPS a line it cannot parse (a forward-compat or
 /// partially-written line must never wedge a reader — episodes are diagnostic, not fail-closed
@@ -229,13 +229,13 @@ pub struct EpisodeLog {
 }
 
 impl EpisodeLog {
-    /// Path of the episode file for a given `MOBEE_HOME` root.
+    /// Path of the episode file for a given `MAXPLAYER_HOME` root.
     pub fn path_for(home_root: &Path) -> PathBuf {
         home_root.join(EPISODES_FILE)
     }
 
     /// Open (creating the file lazily on first append). The parent dir must already exist —
-    /// it is `MOBEE_HOME`, always bootstrapped before a seller runs.
+    /// it is `MAXPLAYER_HOME`, always bootstrapped before a seller runs.
     pub fn open(home_root: &Path) -> Self {
         Self {
             path: Self::path_for(home_root),

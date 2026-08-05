@@ -13,10 +13,10 @@
 //! *enforces* rather than a state it *hopes* holds: born-empty is only about day-one
 //! contents, and says nothing about what day two accepts.
 //!
-//! The tag is parameterised on its VALUE on purpose. The `#t` flip to "maxplayer" is
-//! waived out of 0.1.0, so day-one events still carry `t=maxplayer`; a hardcoded "maxplayer"
-//! would reject every real event while the relay looked like a healthy quiet box. The
-//! nix module supplies the value from `services.maxplayer.relay.namespaceTag`.
+//! The tag is parameterised on its VALUE on purpose: the nix module supplies it from
+//! `services.maxplayer.relay.namespaceTag`, so the relay's namespace is configuration rather
+//! than a recompile. A hardcoded value would silently reject every event outside it while the
+//! relay looked like a healthy quiet box.
 
 use std::io::{self, BufRead, Write};
 
@@ -30,7 +30,7 @@ use serde_json::Value;
 /// which the predicate is uniform. It is here because a relay that required the `t` tag
 /// on *every* event would reject kind-0 and kind-31990, which is exactly how a seat
 /// pubkey is resolved — the relay would serve normally and look healthy while making its
-/// own participants undiscoverable. See project_mobee_relay_write_policy_spec_20260803.
+/// own participants undiscoverable.
 const DISCOVERY_KINDS: &[u64] = &[0, 31990, 30617];
 
 /// NIP-17 private-DM kinds, admitted by KIND rather than by namespace tag. A NIP-59 gift wrap
@@ -214,27 +214,27 @@ mod tests {
 
     #[test]
     fn accepts_in_namespace() {
-        let v = decide(&msg(3400, serde_json::json!([["t", "mobee"]])), "mobee");
+        let v = decide(&msg(3400, serde_json::json!([["t", "maxplayer"]])), "maxplayer");
         assert_eq!(v.action, "accept");
         assert_eq!(v.id, "abc");
     }
 
     #[test]
     fn rejects_foreign_namespace() {
-        let v = decide(&msg(1, serde_json::json!([["t", "other"]])), "mobee");
+        let v = decide(&msg(1, serde_json::json!([["t", "other"]])), "maxplayer");
         assert_eq!(v.action, "reject");
     }
 
     #[test]
     fn rejects_untagged_non_discovery() {
-        let v = decide(&msg(1, serde_json::json!([])), "mobee");
+        let v = decide(&msg(1, serde_json::json!([])), "maxplayer");
         assert_eq!(v.action, "reject");
     }
 
     #[test]
     fn discovery_kinds_bypass_the_tag() {
         for kind in [0u64, 31990, 30617] {
-            let v = decide(&msg(kind, serde_json::json!([])), "mobee");
+            let v = decide(&msg(kind, serde_json::json!([])), "maxplayer");
             assert_eq!(v.action, "accept", "kind {kind} should be allowlisted");
         }
     }
@@ -244,48 +244,48 @@ mod tests {
         // The discriminator: the SAME event, two configured tags, opposite verdicts. A
         // policy that accepted everything and one that is not running are otherwise
         // indistinguishable from the relay's logs.
-        let line = msg(3400, serde_json::json!([["t", "mobee"]]));
-        assert_eq!(decide(&line, "mobee").action, "accept");
-        assert_eq!(decide(&line, "maxplayer").action, "reject");
+        let line = msg(3400, serde_json::json!([["t", "maxplayer"]]));
+        assert_eq!(decide(&line, "maxplayer").action, "accept");
+        assert_eq!(decide(&line, "other-namespace").action, "reject");
     }
 
     #[test]
     fn tag_with_trailing_elements_still_matches() {
-        let v = decide(&msg(3400, serde_json::json!([["t", "mobee", "wss://relay"]])), "mobee");
+        let v = decide(&msg(3400, serde_json::json!([["t", "maxplayer", "wss://relay"]])), "maxplayer");
         assert_eq!(v.action, "accept");
     }
 
     #[test]
     fn accepts_nip17_gift_wrap_addressed() {
         // RED-PROVE: the payment that failed pre-fix now passes. A real NIP-59 gift wrap carries
-        // only a recipient `p` tag (never `["t","mobee"]`), so it must be admitted by kind.
-        let v = decide(&msg(1059, serde_json::json!([["p", "deadbeef"]])), "mobee");
+        // only a recipient `p` tag (never `["t","maxplayer"]`), so it must be admitted by kind.
+        let v = decide(&msg(1059, serde_json::json!([["p", "deadbeef"]])), "maxplayer");
         assert_eq!(v.action, "accept");
     }
 
     #[test]
     fn control_untagged_non_dm_kind_still_rejected() {
         // The other half of the red-prove: widening for NIP-17 must NOT open a non-DM kind.
-        let v = decide(&msg(1, serde_json::json!([])), "mobee");
+        let v = decide(&msg(1, serde_json::json!([])), "maxplayer");
         assert_eq!(v.action, "reject");
     }
 
     #[test]
     fn rejects_gift_wrap_without_recipient() {
-        let v = decide(&msg(1059, serde_json::json!([])), "mobee");
+        let v = decide(&msg(1059, serde_json::json!([])), "maxplayer");
         assert_eq!(v.action, "reject");
     }
 
     #[test]
     fn rejects_oversized_nip17_event() {
         let big = "x".repeat(MAX_NIP17_CONTENT_BYTES + 1);
-        let v = decide(&msg_with_content(1059, serde_json::json!([["p", "deadbeef"]]), &big), "mobee");
+        let v = decide(&msg_with_content(1059, serde_json::json!([["p", "deadbeef"]]), &big), "maxplayer");
         assert_eq!(v.action, "reject");
     }
 
     #[test]
     fn accepts_dm_relay_list() {
-        let v = decide(&msg(10050, serde_json::json!([])), "mobee");
+        let v = decide(&msg(10050, serde_json::json!([])), "maxplayer");
         assert_eq!(v.action, "accept");
     }
 }

@@ -1,6 +1,6 @@
 //! The signer actor — the buyer's single owner of the Nostr identity.
 //!
-//! The buyer key is read from `$MOBEE_HOME/key` once at startup and lives only
+//! The buyer key is read from `$MAXPLAYER_HOME/key` once at startup and lives only
 //! inside this task. Marketplace-event signing (awards, receipts) routes through
 //! the queue in later phases so there is one signing principal per home and the
 //! secret never leaves the actor. Step 1 exposes the public key; the secret is

@@ -25,7 +25,7 @@ npx -y maxplayer version
 npx -y maxplayer mcp
 ```
 
-`MOBEE_HOME` selects the wallet/config home. **Unset, it defaults to `~/.mobee`** — worth knowing
+`MAXPLAYER_HOME` selects the wallet/config home. **Unset, it defaults to `~/.maxplayer`** — worth knowing
 before pointing this at anything you care about.
 
 ## What is actually installed

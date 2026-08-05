@@ -166,11 +166,11 @@ head -c 4 "$(readlink -f "$LINK")" | grep -q $'\x7fELF' \
 echo "ok: 'maxplayer' resolves to the JS launcher"
 
 # ── Prove it launches ───────────────────────────────────────────────────────────────────────────
-# A scratch home, always: this OVERRIDES whatever MOBEE_HOME the caller had. With MOBEE_HOME unset
-# maxplayer falls back to ~/.mobee — a real wallet home on a developer machine — and inheriting a
+# A scratch home, always: this OVERRIDES whatever MAXPLAYER_HOME the caller had. With MAXPLAYER_HOME unset
+# maxplayer falls back to ~/.maxplayer — a real wallet home on a developer machine — and inheriting a
 # caller's home would be just as wrong, so the value is forced rather than checked.
-export MOBEE_HOME="$WORK/home"
-mkdir -p "$MOBEE_HOME"
+export MAXPLAYER_HOME="$WORK/home"
+mkdir -p "$MAXPLAYER_HOME"
 
 VERSION_OUT="$( cd "$PROJECT" && npx --no-install maxplayer version )" \
     || die "npx maxplayer version failed"

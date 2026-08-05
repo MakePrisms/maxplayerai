@@ -1,10 +1,10 @@
 //! The persistent per-home **maxplayer buyer** (step 1 of the stateful-buyer design, #127).
 //!
-//! One daemon owns a home. It takes an exclusive OS lock on `$MOBEE_HOME/buyer.lock`
+//! One daemon owns a home. It takes an exclusive OS lock on `$MAXPLAYER_HOME/buyer.lock`
 //! (a second daemon on the same home fails closed), opens the CDK wallet and the
 //! Nostr identity behind serialized in-process actors, opens the durable state DB
-//! `$MOBEE_HOME/buyer.sqlite`, and serves a small JSON-RPC surface over the
-//! user-only Unix socket `$MOBEE_HOME/buyer.sock`. Every other process is a thin,
+//! `$MAXPLAYER_HOME/buyer.sqlite`, and serves a small JSON-RPC surface over the
+//! user-only Unix socket `$MAXPLAYER_HOME/buyer.sock`. Every other process is a thin,
 //! stateless [`client`] over that socket.
 //!
 //! This module is deliberately the *shell*: the boundary that makes financial
@@ -2948,7 +2948,7 @@ mod tests {
         client.connect().await;
         let junk = EventBuilder::new(Kind::Custom(3403), "")
             .tag(Tag::parse(vec!["e".to_owned(), job.clone()]).expect("e tag"))
-            .tag(Tag::parse(vec!["t".to_owned(), crate::gateway::MOBEE_TAG.to_owned()]).expect("t tag"))
+            .tag(Tag::parse(vec!["t".to_owned(), crate::gateway::MAXPLAYER_TAG.to_owned()]).expect("t tag"))
             .sign_with_keys(&griefer)
             .expect("sign junk");
         client.send_event(&junk).await.expect("relay stores the junk result");
@@ -3131,7 +3131,7 @@ mod tests {
         client.connect().await;
         let delivered = EventBuilder::new(Kind::Custom(3403), "")
             .tag(Tag::parse(vec!["e".to_owned(), job.clone()]).expect("e tag"))
-            .tag(Tag::parse(vec!["t".to_owned(), crate::gateway::MOBEE_TAG.to_owned()]).expect("t tag"))
+            .tag(Tag::parse(vec!["t".to_owned(), crate::gateway::MAXPLAYER_TAG.to_owned()]).expect("t tag"))
             .sign_with_keys(&seller)
             .expect("sign delivery");
         client.send_event(&delivered).await.expect("relay stores the seller's result");

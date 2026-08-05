@@ -60,7 +60,7 @@ hits easily.
 **Fix:** raise the funds or the cap so `available ≥ the job amount`, then re-post the
 job (a parked award is not retried against the same stale state):
 - fund the wallet: `maxplayer wallet setup`, or check `maxplayer wallet balance`
-- lower the job price, or raise your budget cap in `~/.mobee/config.toml`
+- lower the job price, or raise your budget cap in `~/.maxplayer/config.toml`
 
 ### Cause B — no claim was payable from a mint your wallet can reach
 
@@ -90,7 +90,7 @@ sweep was observed.
 
 **Check:** `pending_award_attempts` in `maxplayer buyer status` shows in-flight awards
 still holding a reservation. For the durable rows, the `reservations` table in
-`~/.mobee/buyer.sqlite` shows any row stuck at `state = "reserved"` with
+`~/.maxplayer/buyer.sqlite` shows any row stuck at `state = "reserved"` with
 `created_at == updated_at` (never transitioned).
 
 **Read it:** this costs **budget headroom, not ecash** — your Cashu proofs do not move
@@ -98,7 +98,7 @@ until payment is actually collected, so the sats are still spendable. It is a sl
 of *available budget*, not a loss of money.
 
 **Fix / workaround:** there is no first-class release yet. To recover the headroom now,
-raise your budget cap in `~/.mobee/config.toml`. Do **not** hand-edit the wallet.
+raise your budget cap in `~/.maxplayer/config.toml`. Do **not** hand-edit the wallet.
 
 **Dead end → report it:** file on **MakePrisms/maxplayerai**, paste the stuck
 `reservations` row (`job_id`, `amount_sats`, `state`, `created_at`, `updated_at`) and
@@ -151,7 +151,7 @@ around it.
   are moving **real sats**. Start small.
 - `wallet.mint` = `https://testnut.cashudevkit.org` → test mint, play money.
 
-**Fix:** to force test-only, set `allow_real_mints = false` in `~/.mobee/config.toml`
+**Fix:** to force test-only, set `allow_real_mints = false` in `~/.maxplayer/config.toml`
 (this pins you to the testnut dev mint); for free test funding run
 `maxplayer wallet setup --mint https://testnut.cashudevkit.org`. To spend real sats
 deliberately, leave the default and keep amounts small.
@@ -194,7 +194,7 @@ yourself to test-only mints.
 **Check:**
 - your side: `maxplayer buyer status` → `wallet.mint`, and `maxplayer wallet mints` for
   every mint you can pay from
-- your fence: `allow_real_mints` in `~/.mobee/config.toml` (default `true`)
+- your fence: `allow_real_mints` in `~/.maxplayer/config.toml` (default `true`)
 
 **Read it:**
 - `allow_real_mints = true` (default) → hops to real mints are permitted, so a mismatch
@@ -217,7 +217,7 @@ trade is a test.
 **Fix:**
 - to pay a real-mint seller, keep `allow_real_mints = true` — and know you are moving
   real sats
-- add a mint the seller accepts to `extra_mints` in `~/.mobee/config.toml`
+- add a mint the seller accepts to `extra_mints` in `~/.maxplayer/config.toml`
 - or trade with a seller on a mint you already hold
 
 **Dead end → report it:** if a mismatch fails even with `allow_real_mints = true` (a hop

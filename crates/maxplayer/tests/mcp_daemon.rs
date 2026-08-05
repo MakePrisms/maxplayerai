@@ -26,7 +26,7 @@ fn temp_home(label: &str) -> PathBuf {
 fn maxplayer(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_maxplayer"));
     command
-        .env("MOBEE_HOME", home)
+        .env("MAXPLAYER_HOME", home)
         .env("MAXPLAYER_RELAY_URL", "ws://127.0.0.1:1");
     command
 }

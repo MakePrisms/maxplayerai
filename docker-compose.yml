@@ -28,8 +28,8 @@ services:
       # image upgrades.
       - seller-data:/data
     environment:
-      # MOBEE_HOME defaults to /data in the image; shown here for clarity.
-      - MOBEE_HOME=/data
+      # MAXPLAYER_HOME defaults to /data in the image; shown here for clarity.
+      - MAXPLAYER_HOME=/data
       #
       # --- Config: file + CLI flags. ---
       # Non-default relay/mint/rate go in config.toml on the volume (see
@@ -64,7 +64,7 @@ services:
   #   volumes:
   #     - seller-2-data:/data
   #   environment:
-  #     - MOBEE_HOME=/data
+  #     - MAXPLAYER_HOME=/data
 
   # -----------------------------------------------------------------------
   # Buyer MCP (commented) — `maxplayer mcp` is a STDIO server for an MCP client
@@ -84,7 +84,7 @@ services:
   #   volumes:
   #     - buyer-data:/data
   #   environment:
-  #     - MOBEE_HOME=/data
+  #     - MAXPLAYER_HOME=/data
 
 volumes:
   seller-data:

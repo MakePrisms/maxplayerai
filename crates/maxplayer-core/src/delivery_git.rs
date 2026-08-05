@@ -99,7 +99,7 @@ impl GitDeliveryVerifier {
         // ambient runtime, on a dedicated OS thread.
         git_transport::off_runtime(|| {
             let repo = self.open_store()?;
-            let fetched_ref = format!("refs/mobee/deliveries/{}", delivery.commit_oid().as_str());
+            let fetched_ref = format!("refs/maxplayer/deliveries/{}", delivery.commit_oid().as_str());
             let refspec = format!("+refs/heads/{}:{fetched_ref}", delivery.branch());
             // short_timeout=true: a hung fetch must not own the MCP stdio loop past the client
             // timeout, and must fail CLOSED before authorize_pay burns budget (verify-before-pay).
@@ -139,7 +139,7 @@ impl GitDeliveryVerifier {
         // Same #152 constraint as `fetch`: run the git2 base fetch off any ambient async runtime.
         git_transport::off_runtime(|| {
             let repo = self.open_store()?;
-            let fetched_ref = format!("refs/mobee/bases/{}", base_oid.as_str());
+            let fetched_ref = format!("refs/maxplayer/bases/{}", base_oid.as_str());
             let refspec = format!("+refs/heads/{base_branch}:{fetched_ref}");
             git_transport::fetch_refspecs(&repo, base_clone_url, &[&refspec], self.read_auth(), true)
                 .map_err(|_| DeliveryError::GitCommandFailed("fetch-base"))?;
@@ -246,7 +246,7 @@ impl GitDeliveryVerifier {
         base_oid: &CommitOid,
         policy: &crate::contribution::ContentPolicy,
     ) -> Result<VerifiedContribution, DeliveryError> {
-        // 1. fetch fork tip into the store + tip-match (retains the object under refs/mobee/deliveries/…).
+        // 1. fetch fork tip into the store + tip-match (retains the object under refs/maxplayer/deliveries/…).
         let verified = self.verify(fork)?;
         // 2. base-from-pin into the same buyer store (fail-closed if absent from the pinned target).
         self.fetch_base(base_clone_url, base_branch, base_oid)?;
@@ -338,7 +338,7 @@ impl PayPathDeliveryVerifier {
 
     /// The buyer-controlled store ref a fork tip is retained under (retention).
     pub fn store_ref_for(commit_oid: &str) -> String {
-        format!("refs/mobee/deliveries/{commit_oid}")
+        format!("refs/maxplayer/deliveries/{commit_oid}")
     }
 
     /// Contribution buyer verify-path — the ONE state machine, ALL pre-pay, ALL against
@@ -383,7 +383,7 @@ impl PayPathDeliveryVerifier {
         let store = self.repository();
         let store_url = store.to_string_lossy().into_owned();
         let local_ref = Self::store_ref_for(commit_oid.as_str());
-        let merge_ref = format!("refs/mobee/merge/{}", commit_oid.as_str());
+        let merge_ref = format!("refs/maxplayer/merge/{}", commit_oid.as_str());
         let fetch_spec = format!("+{local_ref}:{merge_ref}");
 
         let target = Repository::open(target_workdir)
@@ -805,7 +805,7 @@ mod contribution_tests {
         v.verify(&fork_delivery(&fx)).expect("fetch fork tip");
         ok(["init", "--bare", fx.store.join("dummy").to_str().unwrap_or("dummy")], &fx.root);
         // fetch the orphan commit into the store directly
-        let spec = format!("+refs/heads/main:refs/mobee/bases/{}", orphan_oid.as_str());
+        let spec = format!("+refs/heads/main:refs/maxplayer/bases/{}", orphan_oid.as_str());
         ok(["-C", fx.store.to_str().unwrap(), "fetch", orphan_work.to_str().unwrap(), &spec], &fx.root);
         assert!(matches!(
             v.assert_descendant(&orphan_oid, &fx.fork_tip),
@@ -825,7 +825,7 @@ mod contribution_tests {
         let sib_oid = oid(&sib, "HEAD");
         let mut v = GitDeliveryVerifier::new(&fx.store);
         v.verify(&fork_delivery(&fx)).expect("fetch fork tip");
-        let spec = format!("+refs/heads/sib:refs/mobee/x/{}", sib_oid.as_str());
+        let spec = format!("+refs/heads/sib:refs/maxplayer/x/{}", sib_oid.as_str());
         ok(["-C", fx.store.to_str().unwrap(), "fetch", sib.to_str().unwrap(), &spec], &fx.root);
         // The sibling is NOT an ancestor of the fork tip ⇒ swapped-base refuse.
         assert!(matches!(

@@ -1,7 +1,7 @@
 //! Seller heartbeat — addressable kind-30340 liveness + capacity signal.
 //!
 //! A running seller republishes an **addressable** (NIP-01 parameterized-replaceable) event,
-//! `d="mobee-seller"`, on a ~5-minute cadence. It advertises whether the seller is `accepting`
+//! `d="maxplayer-seller"`, on a ~5-minute cadence. It advertises whether the seller is `accepting`
 //! new work, its `queue_depth`, its `rate`, and the `protocol_versions` it speaks (feeding
 //! `min_protocol_version` eligibility). This is diagnostic/discovery context only — it never
 //! feeds the pay gate, journal, or receipt bind.
@@ -12,13 +12,13 @@
 
 use serde::Serialize;
 
-use crate::gateway::{EventDraft, MOBEE_TAG, PROTOCOL_VERSION, TagSpec};
+use crate::gateway::{EventDraft, MAXPLAYER_TAG, PROTOCOL_VERSION, TagSpec};
 use crate::seller_agents::AGENT_TAG;
 
 pub use crate::kinds::SELLER_HEARTBEAT_KIND;
 
 /// The addressable `d` identifier for the seller heartbeat.
-pub const SELLER_HEARTBEAT_D: &str = "mobee-seller";
+pub const SELLER_HEARTBEAT_D: &str = "maxplayer-seller";
 
 /// Env override for the heartbeat cadence (seconds). Takes precedence over `[seller_heartbeat]
 /// interval_secs`; intended for tests that cannot wait 5 minutes.
@@ -93,7 +93,7 @@ impl HeartbeatDraft {
 
         let mut tags = vec![
             TagSpec::new(["d", SELLER_HEARTBEAT_D]),
-            TagSpec::new(["t", MOBEE_TAG]),
+            TagSpec::new(["t", MAXPLAYER_TAG]),
             TagSpec::new(["accepting", accepting]),
             TagSpec::new(["queue_depth", &queue_depth]),
             TagSpec::new(["rate", &rate]),
@@ -199,7 +199,7 @@ pub struct HeartbeatKey {
 pub enum HeartbeatParseError {
     WrongKind(u16),
     MissingMaxplayerTag,
-    /// The `d` tag is absent or not `mobee-seller`.
+    /// The `d` tag is absent or not `maxplayer-seller`.
     WrongDTag(Option<String>),
     MissingTag(&'static str),
     InvalidAccepting(String),
@@ -213,7 +213,7 @@ impl std::fmt::Display for HeartbeatParseError {
             Self::WrongKind(kind) => {
                 write!(f, "expected kind {SELLER_HEARTBEAT_KIND}, got {kind}")
             }
-            Self::MissingMaxplayerTag => write!(f, "missing t={MOBEE_TAG} tag"),
+            Self::MissingMaxplayerTag => write!(f, "missing t={MAXPLAYER_TAG} tag"),
             Self::WrongDTag(d) => write!(
                 f,
                 "expected d={SELLER_HEARTBEAT_D}, got {}",
@@ -232,12 +232,12 @@ impl std::fmt::Display for HeartbeatParseError {
 impl std::error::Error for HeartbeatParseError {}
 
 /// Parse a kind-30340 event into a [`ParsedHeartbeat`]. Rejects a wrong kind, a missing
-/// `t=maxplayer` guard, or a `d` other than `mobee-seller`.
+/// `t=maxplayer` guard, or a `d` other than `maxplayer-seller`.
 pub fn parse_heartbeat(event: &EventDraft) -> Result<ParsedHeartbeat, HeartbeatParseError> {
     if event.kind != SELLER_HEARTBEAT_KIND {
         return Err(HeartbeatParseError::WrongKind(event.kind));
     }
-    if !has_tag_value(&event.tags, "t", MOBEE_TAG) {
+    if !has_tag_value(&event.tags, "t", MAXPLAYER_TAG) {
         return Err(HeartbeatParseError::MissingMaxplayerTag);
     }
     let d = first_tag_value(&event.tags, "d");
@@ -361,7 +361,7 @@ mod tests {
         let draft = HeartbeatDraft::v1(true, 0, 7).to_event_draft();
         assert_eq!(draft.kind, SELLER_HEARTBEAT_KIND);
         assert_eq!(first_tag_value(&draft.tags, "d"), Some(SELLER_HEARTBEAT_D));
-        assert_eq!(first_tag_value(&draft.tags, "t"), Some(MOBEE_TAG));
+        assert_eq!(first_tag_value(&draft.tags, "t"), Some(MAXPLAYER_TAG));
         assert_eq!(first_tag_value(&draft.tags, "accepting"), Some("y"));
         assert_eq!(first_tag_value(&draft.tags, "queue_depth"), Some("0"));
         assert_eq!(first_tag_value(&draft.tags, "rate"), Some("7"));
@@ -514,13 +514,13 @@ mod tests {
         let mut wrong_d = HeartbeatDraft::v1(true, 0, 5).to_event_draft();
         for tag in wrong_d.tags.iter_mut() {
             if tag.first() == Some("d") {
-                tag.0[1] = "not-mobee-seller".to_owned();
+                tag.0[1] = "not-maxplayer-seller".to_owned();
             }
         }
         assert_eq!(
             parse_heartbeat(&wrong_d),
             Err(HeartbeatParseError::WrongDTag(Some(
-                "not-mobee-seller".to_owned()
+                "not-maxplayer-seller".to_owned()
             )))
         );
     }

@@ -274,11 +274,11 @@ impl HomeState {
 }
 
 fn fallback_home_dir() -> PathBuf {
-    env::var_os("MOBEE_HOME")
+    env::var_os("MAXPLAYER_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".mobee")))
-        .unwrap_or_else(|| PathBuf::from(".mobee"))
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".maxplayer")))
+        .unwrap_or_else(|| PathBuf::from(".maxplayer"))
 }
 
 #[derive(Default)]
@@ -539,12 +539,12 @@ fn run_wallet_balance(home: &Path) -> MoneyResult {
 }
 
 fn doctor_command(home: &Path) -> Command {
-    // `maxplayer doctor` ignores argv and resolves its own home via `MOBEE_HOME`
+    // `maxplayer doctor` ignores argv and resolves its own home via `MAXPLAYER_HOME`
     // (maxplayer_core::home::default_home_dir). Pin it to the desktop's resolved
     // home so the probe reports on the same home the Home tab displays.
     let mut command = maxplayer_command();
     command.arg("doctor");
-    command.env("MOBEE_HOME", home);
+    command.env("MAXPLAYER_HOME", home);
     command
 }
 
@@ -871,13 +871,13 @@ mod tests {
         let rendered = format_command(&command);
         assert!(rendered.ends_with("doctor"), "rendered: {rendered}");
 
-        // doctor ignores argv --home; the home is pinned through MOBEE_HOME instead.
+        // doctor ignores argv --home; the home is pinned through MAXPLAYER_HOME instead.
         assert!(!rendered.contains("--home"));
         let maxplayer_home = command
             .get_envs()
-            .find(|(key, _)| *key == std::ffi::OsStr::new("MOBEE_HOME"))
+            .find(|(key, _)| *key == std::ffi::OsStr::new("MAXPLAYER_HOME"))
             .and_then(|(_, value)| value)
-            .expect("MOBEE_HOME env set");
+            .expect("MAXPLAYER_HOME env set");
         assert_eq!(maxplayer_home, home.as_os_str());
     }
 

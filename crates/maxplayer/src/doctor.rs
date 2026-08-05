@@ -137,7 +137,7 @@ mod checks {
     // Blocking (issue #107): a seller can neither sign offers nor NIP-98-authenticate delivery
     // pushes without its key, so `maxplayer sell` refuses to boot when this FAILs. `present` is
     // `home::key_file_present` for the RESOLVED home, and `key_path` is that home's key file — the
-    // detail names the file actually inspected rather than a hardcoded `~/.mobee/key`, so a
+    // detail names the file actually inspected rather than a hardcoded `~/.maxplayer/key`, so a
     // multi-home / `--home` run never reports about a home it did not read (issues #216, #265). The
     // key material itself is never read here and never appears in any Check detail.
     pub(super) fn check_seller_key(key_path: &Path, present: bool) -> Check {
@@ -158,7 +158,7 @@ mod checks {
             return Check::warn(
                 RELAY_CHECK,
                 format!("{relay_url}: seller key unreadable — cannot test NIP-42 auth"),
-                "ensure ~/.mobee/key exists and is readable (mode 0600)",
+                "ensure ~/.maxplayer/key exists and is readable (mode 0600)",
             );
         };
         let outcome = match build_runtime() {
@@ -403,7 +403,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 
 /// Parse `maxplayer doctor`'s argv (everything after the `doctor` subcommand). The only accepted
 /// argument is `--home <dir>`; anything else is refused so the operator is told to use `--home` or
-/// `MOBEE_HOME` rather than being silently answered about the default home (issue #216). Mirrors the
+/// `MAXPLAYER_HOME` rather than being silently answered about the default home (issue #216). Mirrors the
 /// `--home` parse in `sell.rs`.
 #[cfg(feature = "wallet")]
 fn parse_doctor_args(args: &[String]) -> Result<Option<std::path::PathBuf>, String> {
@@ -421,7 +421,7 @@ fn parse_doctor_args(args: &[String]) -> Result<Option<std::path::PathBuf>, Stri
             other => {
                 return Err(format!(
                     "unknown doctor option: {other} (doctor accepts only `--home <dir>`; \
-                     the home may also be set via MOBEE_HOME)"
+                     the home may also be set via MAXPLAYER_HOME)"
                 ));
             }
         }
@@ -466,7 +466,7 @@ fn build_checks(home: &maxplayer_core::home::MaxplayerHome) -> Vec<Box<dyn FnOnc
 }
 
 /// Resolve which home `maxplayer doctor` inspects and bootstrap it: the `--home <dir>` override when
-/// given, else the default resolution (`MOBEE_HOME`, then `~/.mobee`). Threading the override here
+/// given, else the default resolution (`MAXPLAYER_HOME`, then `~/.maxplayer`). Threading the override here
 /// is the fix for issue #216 — before it, `doctor` always bootstrapped the default home and
 /// reported on a seat nobody asked about. No network I/O: `bootstrap` only touches the filesystem.
 #[cfg(feature = "wallet")]
@@ -631,7 +631,7 @@ mod tests {
     }
 
     // Issue #216 / #265: the key check names the RESOLVED home's key file, never a hardcoded
-    // `~/.mobee/key`, so a `--home`/multi-home run cannot report about a home it did not read.
+    // `~/.maxplayer/key`, so a `--home`/multi-home run cannot report about a home it did not read.
     #[cfg(feature = "wallet")]
     #[test]
     fn seller_key_check_names_the_resolved_home_not_hardcoded_default() {
@@ -643,8 +643,8 @@ mod tests {
             "key check must name the home it inspected: {detail}"
         );
         assert!(
-            !detail.contains("~/.mobee"),
-            "key check must not hardcode ~/.mobee: {detail}"
+            !detail.contains("~/.maxplayer"),
+            "key check must not hardcode ~/.maxplayer: {detail}"
         );
     }
 
