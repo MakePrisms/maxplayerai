@@ -131,10 +131,39 @@ pub fn event_has_marker(event: &Event) -> bool {
     })
 }
 
+/// Shorten a mint URL to the host a rate card can carry. Derived from the URL rather than invented,
+/// so the advertised label cannot name a mint the seat does not accept. A value that does not parse
+/// as a URL is passed through: an operator's explicit `[buzz] mint` may be any label they like.
+fn mint_label(mint: &str) -> String {
+    let rest = mint
+        .strip_prefix("https://")
+        .or_else(|| mint.strip_prefix("http://"))
+        .unwrap_or(mint);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    if host.is_empty() {
+        mint.to_owned()
+    } else {
+        host.to_owned()
+    }
+}
+
 /// Assemble the human-readable rate card shown in the persona's kind-0 `about`. Pure over its
 /// inputs so the wording is unit-testable. `seller_rate_sats` is the `[seller]` rate used when the
-/// `[buzz]` section does not set its own.
-pub fn rate_card_about(cfg: &BuzzConfig, seller_rate_sats: Option<u64>) -> String {
+/// `[buzz]` section does not set its own, and `accepted_mints` is what the seat will actually settle
+/// in — the fallback for the advertised mint when `[buzz] mint` names none.
+///
+/// ★ The mint clause is read by BUYERS choosing a seller, who have no config of their own to check
+///   it against. It used to default to the literal `"testnut"` while a fresh seat's `accepted_mints`
+///   was a REAL minibits mint (#378), so a seat that never set `[buzz] mint` advertised play money
+///   and settled in real sats (#453). Nothing else in the system carries that claim, so nothing else
+///   could contradict it. Now the label comes from what the seat accepts, and when that is unknown
+///   the clause is OMITTED — saying nothing about the mint is the only honest answer available, and
+///   it is not the same as saying "testnut".
+pub fn rate_card_about(
+    cfg: &BuzzConfig,
+    seller_rate_sats: Option<u64>,
+    accepted_mints: &[String],
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(about) = cfg.about.as_deref() {
         let trimmed = about.trim();
@@ -148,18 +177,31 @@ pub fn rate_card_about(cfg: &BuzzConfig, seller_rate_sats: Option<u64>) -> Strin
     if !cfg.capabilities.is_empty() {
         parts.push(format!("does: {}", cfg.capabilities.join(", ")));
     }
-    let mint = cfg.mint.as_deref().unwrap_or("testnut");
-    parts.push(format!("pays via {mint}"));
+    // An explicit `[buzz] mint` is the operator's own words and stays authoritative. Otherwise the
+    // seat's accepted mints answer, every one of them: advertising only the first would be a
+    // partial truth on a multi-mint seat, and this clause exists to be relied on.
+    match cfg.mint.as_deref() {
+        Some(mint) => parts.push(format!("pays via {}", mint_label(mint))),
+        None if !accepted_mints.is_empty() => {
+            let labels: Vec<String> = accepted_mints.iter().map(|m| mint_label(m)).collect();
+            parts.push(format!("pays via {}", labels.join(", ")));
+        }
+        None => {}
+    }
     parts.push("hire me on maxplayer".to_owned());
     parts.join(" · ")
 }
 
 /// Build the persona metadata (kind-0 content) for the config. `name` is the display handle; the
 /// rate card is the `about`.
-fn persona_metadata(cfg: &BuzzConfig, seller_rate_sats: Option<u64>) -> Metadata {
+fn persona_metadata(
+    cfg: &BuzzConfig,
+    seller_rate_sats: Option<u64>,
+    accepted_mints: &[String],
+) -> Metadata {
     Metadata::new()
         .name(cfg.name.clone())
-        .about(rate_card_about(cfg, seller_rate_sats))
+        .about(rate_card_about(cfg, seller_rate_sats, accepted_mints))
 }
 
 /// A nostr-sdk signer that delegates every operation to the seller node's [`signer`](super::signer)
@@ -285,6 +327,7 @@ pub async fn start(
     signer: SignerHandle,
     cfg: &BuzzConfig,
     seller_rate_sats: Option<u64>,
+    accepted_mints: &[String],
 ) -> Result<BuzzHandle, BuzzError> {
     let adapter = NodeNostrSigner::new(signer)?;
     let pubkey = adapter.pubkey;
@@ -329,7 +372,7 @@ pub async fn start(
     }
 
     // Publish the persona kind-0 (signed via the allowlisted adapter → actor).
-    let kind0 = build_kind0(&publish_signer, pubkey, cfg, seller_rate_sats).await?;
+    let kind0 = build_kind0(&publish_signer, pubkey, cfg, seller_rate_sats, accepted_mints).await?;
     let kind0_event_id = kind0.id.to_hex();
     send_event(&client, &kind0).await?;
 
@@ -371,8 +414,9 @@ async fn build_kind0(
     pubkey: PublicKey,
     cfg: &BuzzConfig,
     seller_rate_sats: Option<u64>,
+    accepted_mints: &[String],
 ) -> Result<Event, BuzzError> {
-    let metadata = persona_metadata(cfg, seller_rate_sats);
+    let metadata = persona_metadata(cfg, seller_rate_sats, accepted_mints);
     let marker = Tag::parse([MAXPLAYER_MARKER_TAG, MAXPLAYER_MARKER_VALUE])
         .map_err(|error| BuzzError::Config(format!("marker tag: {error}")))?;
     let unsigned = EventBuilder::metadata(&metadata).tag(marker).build(pubkey);
@@ -459,7 +503,7 @@ fn spawn_presence_heartbeat(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::home::BuzzConfig;
+    use crate::home::{BuzzConfig, DEFAULT_MINIBITS_MINT_URL, DEFAULT_MINT_URL};
 
     fn cfg() -> BuzzConfig {
         BuzzConfig {
@@ -480,20 +524,24 @@ mod tests {
         assert_eq!(clobber_decision(Some(false)), ClobberDecision::ForeignRefuse);
     }
 
+    fn accepted(mints: &[&str]) -> Vec<String> {
+        mints.iter().map(|m| (*m).to_owned()).collect()
+    }
+
     #[test]
     fn rate_card_carries_rate_caps_and_mint() {
-        let about = rate_card_about(&cfg(), None);
+        let about = rate_card_about(&cfg(), None, &accepted(&[DEFAULT_MINIBITS_MINT_URL]));
         assert!(about.contains("Rust reviewer"), "about: {about}");
         assert!(about.contains("50 sat/job"), "about: {about}");
         assert!(about.contains("code, test"), "about: {about}");
-        assert!(about.contains("testnut"), "about: {about}");
+        assert!(about.contains("pays via mint.minibits.cash"), "about: {about}");
     }
 
     #[test]
     fn rate_card_falls_back_to_seller_rate() {
         let mut c = cfg();
         c.rate_sats = None;
-        let about = rate_card_about(&c, Some(7));
+        let about = rate_card_about(&c, Some(7), &[]);
         assert!(about.contains("7 sat/job"), "about: {about}");
     }
 
@@ -501,8 +549,74 @@ mod tests {
     fn rate_card_honours_explicit_mint() {
         let mut c = cfg();
         c.mint = Some("https://real.mint".to_owned());
-        let about = rate_card_about(&c, None);
-        assert!(about.contains("https://real.mint"), "about: {about}");
+        let about = rate_card_about(&c, None, &accepted(&[DEFAULT_MINT_URL]));
+        assert!(about.contains("real.mint"), "about: {about}");
+        assert!(
+            !about.contains("testnut"),
+            "an explicit [buzz] mint must win over the accepted list: {about}"
+        );
+    }
+
+    // #453. The shipped default `accepted_mints` is a REAL minibits mint, and this clause used to
+    // read `unwrap_or("testnut")` — so a seat that never set `[buzz] mint` told every buyer it was
+    // on play money while settling in real sats. The buyer has no config of their own to check it
+    // against, which is what made the advert the whole of their evidence.
+    #[test]
+    fn rate_card_default_advertises_the_mint_the_seat_accepts() {
+        let mut c = cfg();
+        c.mint = None;
+        let about = rate_card_about(&c, None, &accepted(&[DEFAULT_MINIBITS_MINT_URL]));
+        assert!(about.contains("pays via mint.minibits.cash"), "about: {about}");
+        assert!(
+            !about.contains("testnut"),
+            "a seat accepting a real mint must never advertise testnut: {about}"
+        );
+    }
+
+    // The verdict has to MOVE with what the seat accepts, or the test above would pass on a
+    // function that had simply swapped one hardcoded label for another.
+    #[test]
+    fn rate_card_default_advertises_a_dev_mint_when_that_is_what_the_seat_accepts() {
+        let mut c = cfg();
+        c.mint = None;
+        let about = rate_card_about(&c, None, &accepted(&[DEFAULT_MINT_URL]));
+        assert!(about.contains("pays via testnut.cashudevkit.org"), "about: {about}");
+        assert!(!about.contains("minibits"), "about: {about}");
+    }
+
+    #[test]
+    fn rate_card_names_every_accepted_mint() {
+        let mut c = cfg();
+        c.mint = None;
+        let about = rate_card_about(
+            &c,
+            None,
+            &accepted(&[DEFAULT_MINIBITS_MINT_URL, "https://second.example/Bitcoin"]),
+        );
+        assert!(
+            about.contains("pays via mint.minibits.cash, second.example"),
+            "a multi-mint seat must not advertise only its first: {about}"
+        );
+    }
+
+    // Nothing known ⇒ no claim. Silence is the only honest answer, and it is not the same as the
+    // false one this bug was made of.
+    #[test]
+    fn rate_card_omits_the_mint_clause_when_the_seat_accepts_nothing() {
+        let mut c = cfg();
+        c.mint = None;
+        let about = rate_card_about(&c, None, &[]);
+        assert!(!about.contains("pays via"), "about: {about}");
+        assert!(about.contains("hire me on maxplayer"), "the rest of the card survives: {about}");
+    }
+
+    #[test]
+    fn mint_label_reduces_a_url_to_its_host() {
+        assert_eq!(mint_label("https://mint.minibits.cash/Bitcoin"), "mint.minibits.cash");
+        assert_eq!(mint_label("http://localhost:3338/"), "localhost:3338");
+        assert_eq!(mint_label("https://testnut.cashudevkit.org"), "testnut.cashudevkit.org");
+        // Not a URL: an operator's own label passes through untouched.
+        assert_eq!(mint_label("my dev mint"), "my dev mint");
     }
 
     #[test]

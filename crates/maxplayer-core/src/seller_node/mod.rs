@@ -218,7 +218,10 @@ impl SellerNode {
             return Ok(None);
         };
         let seller_rate_sats = self.home.config.seller.as_ref().map(|seller| seller.rate_sats);
-        let handle = buzz::start(self.signer.clone(), cfg, seller_rate_sats).await?;
+        // What this seat will actually settle in, so the rate card's mint clause describes the seat
+        // rather than a default someone wrote into a format string (#453).
+        let accepted_mints = self.home.config.accepted_mints.clone();
+        let handle = buzz::start(self.signer.clone(), cfg, seller_rate_sats, &accepted_mints).await?;
         Ok(Some(handle))
     }
 

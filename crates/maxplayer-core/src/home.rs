@@ -146,7 +146,9 @@ pub struct BuzzConfig {
     /// Human-readable capability tags shown in the rate card (e.g. `["code", "test"]`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
-    /// Mint label shown in the rate card. `None` ⇒ `"testnut"` (the default dev mint).
+    /// Mint label shown in the rate card, for an operator who wants their own wording. `None` ⇒ the
+    /// seat's `accepted_mints` answer, which is what it will really settle in; with neither, the
+    /// rate card omits the mint clause rather than guessing (#453).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mint: Option<String>,
     /// Presence heartbeat cadence (seconds). Default **30** (the deployed relay expires presence

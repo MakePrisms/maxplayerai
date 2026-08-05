@@ -117,6 +117,19 @@ async fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut cond: F) -> bool 
 async fn boot_publishes_kind0_rate_card() {
     let (relay, relay_url) = start_relay().await;
     let home = buzz_home(&unique_root("kind0"), &relay_url);
+    // Read out of the home rather than restated: the assertion below is that the ADVERT agrees with
+    // what this seat accepts, and a literal here would be a second claim that could drift from the
+    // config independently — which is the shape of #453 itself.
+    let accepted_mint_host = home
+        .config
+        .accepted_mints
+        .first()
+        .expect("a bootstrapped home accepts a mint")
+        .replace("https://", "")
+        .split('/')
+        .next()
+        .expect("host")
+        .to_owned();
     let node = SellerNode::open(home).await.expect("open node");
     let seller_pk = PublicKey::parse(node.seller_pubkey()).expect("seller pubkey");
 
@@ -132,7 +145,10 @@ async fn boot_publishes_kind0_rate_card() {
     let about = fetch_kind0_about(&observer, seller_pk).await.expect("kind-0 present");
     assert!(about.contains("50 sat/job"), "rate missing from about: {about}");
     assert!(about.contains("code, test"), "capabilities missing: {about}");
-    assert!(about.contains("testnut"), "mint missing: {about}");
+    assert!(
+        about.contains(&format!("pays via {accepted_mint_host}")),
+        "the advertised mint must be one this seat accepts ({accepted_mint_host}): {about}"
+    );
     assert!(about.contains("Rust reviewer"), "blurb missing: {about}");
 
     handle.shutdown().await;
