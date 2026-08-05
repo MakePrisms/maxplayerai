@@ -203,6 +203,18 @@ in
           role — no static credentials on the box.
         '';
       };
+      alertCommand = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = ''
+          Command the OnFailure alert unit runs when a backup RUN FAILS, so a failed backup PAGES
+          instead of failing silently (a silently-failing backup is a durability-layer lie). Runs with
+          `$DESTINATION` in the environment. The default ("") still emits a loud emerg-priority journal
+          line on every failure; set this to a real out-of-band pager — e.g. an `aws sns publish` to an
+          ops topic, or a webhook curl — via the instance role (its transport IAM, like sns:Publish, is
+          granted on the box; no static creds).
+        '';
+      };
       schedule = lib.mkOption {
         type = lib.types.str;
         default = "daily";
@@ -338,6 +350,7 @@ in
     # cache of those S3 objects, not a source of truth, so they are deliberately not dumped.)
     systemd.services.buzz-relay-backup = {
       description = "maxplayer relay backup — Postgres event log to ${cfg.backup.destination}";
+      onFailure = [ "buzz-relay-backup-alert.service" ];
       serviceConfig = {
         Type = "oneshot";
         User = cfg.user;
@@ -366,7 +379,42 @@ in
         DUMP="$RUNTIME_DIRECTORY/buzz-$STAMP.sql.gz"
         PGHOST=/run/postgresql pg_dump ${lib.escapeShellArg cfg.database} | gzip > "$DUMP"
         echo "pg dump ok: $(wc -c < "$DUMP") bytes"
-        FILE="$DUMP" KEY="pg/buzz-$STAMP.sql.gz" ${cfg.backup.uploadCommand}
+        # $FILE/$KEY set + exported on their OWN lines BEFORE the upload. A `FILE=.. KEY=.. cmd` prefix
+        # does NOT bind them for that same command's own arg expansion, so under `set -u` the upload
+        # aborted "unbound variable" every run — a backup that silently never ran. uploadCommand's
+        # contract is $FILE/$KEY/$DESTINATION in the environment (DESTINATION is exported above).
+        FILE="$DUMP"
+        KEY="pg/buzz-$STAMP.sql.gz"
+        export FILE KEY
+        ${cfg.backup.uploadCommand}
+      '';
+    };
+
+    # A backup that fails silently is a durability-layer lie — tonight's failed at 00:00 and nothing
+    # noticed. OnFailure on buzz-relay-backup fires this the instant a run fails (shell error, or a
+    # non-zero upload such as an S3 AccessDenied), so the failure PAGES. The guaranteed floor is a loud
+    # emerg journal line even with no external pager wired; backup.alertCommand adds real out-of-band paging.
+    systemd.services.buzz-relay-backup-alert = {
+      description = "ALERT — maxplayer relay backup FAILED (off-box durability at risk)";
+      serviceConfig = {
+        Type = "oneshot";
+        User = cfg.user;
+        Group = cfg.group;
+      }
+      // lib.optionalAttrs (cfg.backup.environmentFile != null) {
+        EnvironmentFile = cfg.backup.environmentFile;
+      };
+      environment = {
+        DESTINATION = cfg.backup.destination;
+      };
+      path = [ pkgs.coreutils ];
+      script = ''
+        set -uo pipefail
+        msg="maxplayer relay NIGHTLY BACKUP FAILED at $(date -u +%Y%m%dT%H%M%SZ) on $(uname -n) — no Postgres event-log object written to ${cfg.backup.destination}. Off-box durable state is now STALE; investigate: journalctl -u buzz-relay-backup.service"
+        # Floor: an emerg-priority journal line, unmissable even with no external pager wired.
+        printf '%s\n' "$msg" | ${pkgs.systemd}/bin/systemd-cat -t buzz-relay-backup-alert -p emerg || printf '%s\n' "$msg" >&2
+        # Real out-of-band pager (host-supplied via backup.alertCommand; empty default = journal-only).
+        ${cfg.backup.alertCommand}
       '';
     };
 
