@@ -26,9 +26,44 @@ the npm organization `maxplayerai`. All four need their own trusted publisher en
 per package, not per account or per org. The GitHub side of that entry is the same for all four, and
 is unaffected by the npm scope: organization `MakePrisms`, repository `maxplayerai`.
 
-⚠ `@maxplayerai/darwin-arm64` is new (#446) and has no entry yet. It must be added before the tag
-that first publishes it. Nothing in this repo can check that for you: the setting lives on npmjs.com
-and needs an org admin.
+⚠ `@maxplayerai/darwin-arm64` is new (#446) and needs its entry before the tag that first publishes
+it. The setting lives on npmjs.com and needs an org admin — but whether it is really there is a
+question this repo CAN answer, by publishing something worthless through the same path. See below.
+
+### Proving an entry exists, before the tag
+
+`npm publish` fails only after the packages ahead of it in the release loop have already published,
+and npm does not allow republishing a version — so a missing entry discovered at tag time costs a
+version, not a re-run. "I think I added it" is not worth that. Run the probe instead:
+
+**Actions → Release → Run workflow**, set **npm_probe_package** to the package under test and
+**npm_probe_version** to a fresh `0.0.<n>`. The `npm-probe` job publishes a placeholder — no binary,
+no launcher, `probe` dist-tag, content generated in the job — through the same OIDC exchange the
+release uses. Green means that package's trusted-publisher entry exists and admits this workflow.
+
+Three things about it are load-bearing:
+
+- **It runs from `release.yml`, not a workflow of its own.** npm scopes a trusted publisher to a
+  workflow FILENAME, so a probe in `npm-oidc-probe.yml` would test a publisher entry for
+  `npm-oidc-probe.yml` — a credential no release uses. A green run there would look like proof and
+  be worth nothing.
+- **A green run covers ONE package.** The entry is per package. Probing the darwin payload says
+  nothing about the launcher or the linux payloads — those are proven by something else, not by this
+  run: `maxplayer`, `@maxplayerai/linux-x64` and `@maxplayerai/linux-arm64` published through this
+  same workflow file, tokenless, in the rc.1 and rc.2 releases. Production runs are the strongest
+  evidence an entry exists. `@maxplayerai/darwin-arm64` is the only one with no such run behind it,
+  which is why it is the one to probe.
+- **Bump the version every run.** npm never allows reusing a version, probe or not.
+
+A red has three causes that look identical — npm answers a trusted-publishing mismatch with a 404 or
+ENEEDAUTH, which reads like a registry problem. The job prints them at the point of failure: the
+version already exists; no entry for the package at all; or an entry that exists but names a
+different workflow file (npm matches org, repo and FILENAME exactly, case-sensitively). The last two
+are the same red and a different repair.
+
+Leaving `npm_probe_package` blank is an ordinary dry run and publishes nothing. Every fence on that
+job — dispatch-only, an explicitly named package, `0.0.<n>` only, payload packages only, the `probe`
+dist-tag, and no checkout — is asserted by `verify-release-workflow.sh`, each one red-proven.
 
 `--access public`, which the publish job already passes on every publish, is what the scoped payload
 packages need on a first publish — a scoped package defaults to restricted, which on a free account
@@ -39,7 +74,7 @@ fails outright.
 1. **Bump the version.** `[workspace.package].version` in `Cargo.toml`, the workspace crate
    entries in `Cargo.lock` (refreshed by any `cargo` invocation — e.g. `cargo build` — since the
    release build passes `--locked` and fails on a stale lockfile), and `version` in every
-   `npm/*/package.json`, and the `optionalDependencies` pins in `npm/mobee/package.json`. All of
+   `npm/*/package.json`, and the `optionalDependencies` pins in `npm/maxplayer/package.json`. All of
    them must read the same string, and it must match the tag with the `v` dropped — the build
    asserts this and stops if anything disagrees.
 2. Open a PR to `dev` with the bump and let it merge. **Then cut `dev` into `main` as a pull request —
@@ -161,7 +196,7 @@ git cat-file -e "$TAG":.github/workflows/release.yml && echo present || echo abs
 **darwin-x64 and Windows are out of scope.**
 
 Adding a platform means: a matrix entry in `release.yml`, a package under `npm/`, an entry in
-`PLATFORM_PACKAGES` in `npm/mobee/bin/maxplayer.js`, an `optionalDependencies` pin, the platform in
+`PLATFORM_PACKAGES` in `npm/maxplayer/bin/maxplayer.js`, an `optionalDependencies` pin, the platform in
 `RELEASE_PLATFORMS`, and a trusted-publisher entry for the new package on npmjs.com. Three of those
 six are asserted rather than trusted — the pin by `verify-release-version.sh`, and both directions of
 the platform list by the publish job: a payload package in the tree that is not published, and a

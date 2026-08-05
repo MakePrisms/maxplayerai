@@ -1,5 +1,5 @@
 {
-  description = "Mobee";
+  description = "Maxplayer";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
 
@@ -20,9 +20,9 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
 
-          # Args common to every `mobee` build.
-          mobeeArgs = {
-            pname = "mobee";
+          # Args common to every `maxplayer` build.
+          maxplayerArgs = {
+            pname = "maxplayer";
             version = "0.1.0";
             src = self;
 
@@ -30,10 +30,10 @@
             # Cargo.lock. No network access is needed at build time.
             cargoLock.lockFile = ./Cargo.lock;
 
-            # Workspace repo: build/install only the `mobee` package, whose binary is `maxplayer`.
+            # Workspace repo: build/install only the `maxplayer` package (its binary is also `maxplayer`).
             cargoBuildFlags = [
               "-p"
-              "mobee"
+              "maxplayer"
             ];
 
             # The flake's job is packaging the runnable binary, not running
@@ -55,7 +55,7 @@
           buyerStatic =
             staticPkgs:
             staticPkgs.rustPlatform.buildRustPackage (
-              mobeeArgs
+              maxplayerArgs
               // {
                 nativeBuildInputs = [ staticPkgs.pkg-config ];
               }
@@ -63,7 +63,7 @@
         in
         {
           default = pkgs.rustPlatform.buildRustPackage (
-            mobeeArgs
+            maxplayerArgs
             // {
               # Enable the `acp` feature (off by default) so the acp-gated
               # `run` subcommand is compiled in. Default features (wallet)
@@ -74,23 +74,23 @@
             }
           );
 
-          # The strfry write-policy plugin (crate `mobee-relay-write-policy`, binary
-          # `mobee-write-policy`). A separate derivation, not a `mobeeArgs` variant: it builds only
+          # The strfry write-policy plugin (crate `maxplayer-relay-write-policy`, binary
+          # `maxplayer-write-policy`). A separate derivation, not a `maxplayerArgs` variant: it builds only
           # this one workspace crate — serde/serde_json, no C deps — so it needs neither the `acp`
           # feature nor pkg-config, and must not pull in the egui/sqlite/libgit2 members. Deps still
           # vendor from the one workspace `Cargo.lock`; `-p` keeps the compile to this crate.
           # `lib.getExe` in `nixosModules.relay` resolves `meta.mainProgram`.
           relay-write-policy = pkgs.rustPlatform.buildRustPackage {
-            pname = "mobee-relay-write-policy";
+            pname = "maxplayer-relay-write-policy";
             version = "0.1.0";
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
             cargoBuildFlags = [
               "-p"
-              "mobee-relay-write-policy"
+              "maxplayer-relay-write-policy"
             ];
             doCheck = false;
-            meta.mainProgram = "mobee-write-policy";
+            meta.mainProgram = "maxplayer-write-policy";
           };
         }
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {

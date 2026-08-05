@@ -21,7 +21,7 @@ set -euo pipefail
 
 BINARY="${1:-result/bin/maxplayer}"
 BINARY_ARM64="${2:-}"
-PKG_MAIN="npm/mobee"
+PKG_MAIN="npm/maxplayer"
 PKG_PLATFORM="npm/cli-linux-x64"
 
 die() { echo "npm-pack-local: $*" >&2; exit 1; }
@@ -70,7 +70,7 @@ mkdir -p "$STAGE" "$DIST" "$PROJECT"
 # ── Stage and pack ──────────────────────────────────────────────────────────────────────────────
 # The binary is copied in at pack time and is deliberately NOT committed: it is ~38MB of build
 # output, and it belongs to a release, not to the source tree.
-cp -R "$PKG_MAIN"     "$STAGE/mobee"
+cp -R "$PKG_MAIN"     "$STAGE/maxplayer"
 cp -R "$PKG_PLATFORM" "$STAGE/cli-linux-x64"
 
 # Every published package carries both licence texts. Apache-2.0 section 4(a) requires a copy of the
@@ -80,13 +80,13 @@ stage_licenses() {
     cp LICENSE-MIT LICENSE-APACHE "$1/" \
         || die "could not stage the licence files into $1"
 }
-stage_licenses "$STAGE/mobee"
+stage_licenses "$STAGE/maxplayer"
 stage_licenses "$STAGE/cli-linux-x64"
 mkdir -p "$STAGE/cli-linux-x64/bin"
 cp -L "$BINARY" "$STAGE/cli-linux-x64/bin/maxplayer"
 chmod 755 "$STAGE/cli-linux-x64/bin/maxplayer"
 
-( cd "$STAGE/mobee"          && npm pack --silent --pack-destination "$DIST" >/dev/null )
+( cd "$STAGE/maxplayer"          && npm pack --silent --pack-destination "$DIST" >/dev/null )
 ( cd "$STAGE/cli-linux-x64"  && npm pack --silent --pack-destination "$DIST" >/dev/null )
 
 TGZ_MAIN="$(find "$DIST" -name 'maxplayer-*.tgz' | head -1)"
@@ -166,11 +166,11 @@ head -c 4 "$(readlink -f "$LINK")" | grep -q $'\x7fELF' \
 echo "ok: 'maxplayer' resolves to the JS launcher"
 
 # ── Prove it launches ───────────────────────────────────────────────────────────────────────────
-# A scratch home, always: this OVERRIDES whatever MOBEE_HOME the caller had. With MOBEE_HOME unset
-# maxplayer falls back to ~/.mobee — a real wallet home on a developer machine — and inheriting a
+# A scratch home, always: this OVERRIDES whatever MAXPLAYER_HOME the caller had. With MAXPLAYER_HOME unset
+# maxplayer falls back to ~/.maxplayer — a real wallet home on a developer machine — and inheriting a
 # caller's home would be just as wrong, so the value is forced rather than checked.
-export MOBEE_HOME="$WORK/home"
-mkdir -p "$MOBEE_HOME"
+export MAXPLAYER_HOME="$WORK/home"
+mkdir -p "$MAXPLAYER_HOME"
 
 VERSION_OUT="$( cd "$PROJECT" && npx --no-install maxplayer version )" \
     || die "npx maxplayer version failed"

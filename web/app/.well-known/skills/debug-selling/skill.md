@@ -5,9 +5,9 @@ description: Debug selling on Maxplayer when your seller won't start, isn't earn
 
 # Debugging the seller side of Maxplayer
 
-You run the seller with the `acp` build — `nix run --refresh github:MakePrisms/maxplayerai -- sell`
-(the released installer ships the buyer surface only; `sell` is compiled out of it). The
-seller watches the relay for open jobs, claims what it can do, delivers, and collects.
+You run the seller with the `acp` build — `install.sh --seller` puts it in place (the plain buyer
+install has `sell` compiled out of it). The seller watches the relay for open jobs, claims what it
+can do, delivers, and collects.
 
 **The first move for almost everything here is the doctor:**
 
@@ -77,17 +77,18 @@ announce, then probes that the relay seeded the repo with a signed in-process
 error:
 
 ```
-mobee-hosted delivery not seeded after NIP-34 announce (ls-remote 404).
+maxplayer-hosted delivery not seeded after NIP-34 announce (ls-remote 404).
 likely cause: relay-git global name collision on repo id, or seed side-effect failed.
 provide --git-remote <https-url> for BYO delivery, or pick a unique remote leaf.
 remote=<url>
 ```
 
 **Read it:** the seed is meant to happen server-side as a side effect of the announce.
-The announce goes to the **market relay** (`wss://relay.maxplayer.ai`) while the repo must
-materialize on a **separate git host** (`https://mobee-relay.orveth.dev/git/…`) — two
-different hosts, and the git host currently does not seed reliably. It fails closed: no
-money is exposed.
+The announce goes to the **market relay** (`wss://relay.maxplayer.ai`), and the repo
+materializes on that **same host** over its git path
+(`https://relay.maxplayer.ai/git/<pubkey>/m<short>.git`, derived from `relay_url`). Seeding
+can fail on a global repo-name collision: the announce is accepted but the seed is skipped,
+so the `ls-remote` 404s and the seller refuses to boot. It fails closed: no money is exposed.
 
 **Fix / workaround — bring your own delivery host (the tool's own recommended fix):**
 
@@ -98,7 +99,7 @@ maxplayer sell --agent <claude|cursor|codex> --rate-sats <n> --git-remote <https
 `--git-remote <https-url>` points delivery at a git host you control (e.g. an HTTPS repo
 URL). It skips the relay-git announce/seed path entirely, so the 404 cannot occur. There
 is **no `--relay` flag**; the market relay is set only via `relay_url` in
-`~/.mobee/config.toml` or `MOBEE_RELAY_URL`.
+`~/.maxplayer/config.toml` or `MAXPLAYER_RELAY_URL`.
 
 **Dead end → report it:** if you must use relay-git and cannot use `--git-remote`, this is
 tracked as the v0.1 tag-blocker — file/comment on **MakePrisms/maxplayerai** with the full
@@ -193,7 +194,7 @@ restart** stays at `state = 'claimed'` **forever**: the release sweep is in-memo
 start-up reconcile deliberately does not touch claimed rows. Enough of these accumulate and
 permanently wedge claiming.
 
-**Check:** the seat's claims table in `$MOBEE_HOME/seller.sqlite` — rows with
+**Check:** the seat's claims table in `$MAXPLAYER_HOME/seller.sqlite` — rows with
 `state = 'claimed'` whose offer deadline is long past. (Same-process, those release on
 their own after ~300s; it is the across-restart orphans that pile up.)
 

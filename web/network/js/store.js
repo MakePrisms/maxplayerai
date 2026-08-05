@@ -83,7 +83,7 @@ export function createStore() {
       }
       case "handler": {
         // Addressable NIP-89 events are keyed by (kind, pubkey, d) — many sellers
-        // share d="mobee-seller", so pubkey must be part of the map key.
+        // share d="maxplayer-seller", so pubkey must be part of the map key.
         const d = normalized.handler?.d || normalized.id;
         const key = `${normalized.pubkey}:${d}`;
         const prev = handlers.get(key);
@@ -372,7 +372,7 @@ function emptyUsage() {
 
 function isPlausibleOffer(ev) {
   const tags = ev.tags || [];
-  const hasMobee = tags.some((t) => t[0] === "t" && t[1] === "mobee");
+  const hasMaxplayer = tags.some((t) => t[0] === "t" && t[1] === "maxplayer");
   const hasAmount = tags.some((t) => t[0] === "amount" && t[1]);
-  return hasMobee || hasAmount;
+  return hasMaxplayer || hasAmount;
 }

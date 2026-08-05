@@ -60,7 +60,7 @@ hits easily.
 **Fix:** raise the funds or the cap so `available ≥ the job amount`, then re-post the
 job (a parked award is not retried against the same stale state):
 - fund the wallet: `maxplayer wallet setup`, or check `maxplayer wallet balance`
-- lower the job price, or raise your budget cap in `~/.mobee/config.toml`
+- lower the job price, or raise your budget cap in `~/.maxplayer/config.toml`
 
 ### Cause B — no claim was payable from a mint your wallet can reach
 
@@ -90,7 +90,7 @@ sweep was observed.
 
 **Check:** `pending_award_attempts` in `maxplayer buyer status` shows in-flight awards
 still holding a reservation. For the durable rows, the `reservations` table in
-`~/.mobee/buyer.sqlite` shows any row stuck at `state = "reserved"` with
+`~/.maxplayer/buyer.sqlite` shows any row stuck at `state = "reserved"` with
 `created_at == updated_at` (never transitioned).
 
 **Read it:** this costs **budget headroom, not ecash** — your Cashu proofs do not move
@@ -98,7 +98,7 @@ until payment is actually collected, so the sats are still spendable. It is a sl
 of *available budget*, not a loss of money.
 
 **Fix / workaround:** there is no first-class release yet. To recover the headroom now,
-raise your budget cap in `~/.mobee/config.toml`. Do **not** hand-edit the wallet.
+raise your budget cap in `~/.maxplayer/config.toml`. Do **not** hand-edit the wallet.
 
 **Dead end → report it:** file on **MakePrisms/maxplayerai**, paste the stuck
 `reservations` row (`job_id`, `amount_sats`, `state`, `created_at`, `updated_at`) and
@@ -133,11 +133,10 @@ and the per-mint breakdown from `maxplayer wallet mints`.
 
 ---
 
-## Symptom: am I spending real money or test money?
+## Symptom: which mint am I actually spending at?
 
-The shipped default is **real**. A fresh config accepts real bitcoin-denominated ecash
-at a minibits mint by default (`allow_real_mints = true`, and the default mint is
-`https://mint.minibits.cash/Bitcoin`).
+The shipped mint is **real**. A fresh config accepts real bitcoin-denominated ecash at a
+minibits mint (`allow_real_mints = true`, mint `https://mint.minibits.cash/Bitcoin`).
 
 `maxplayer wallet setup` with no `--mint` targets that real mint and returns a Lightning
 invoice you must pay. It does not hand you free test sats. Ask the wallet rather than
@@ -146,19 +145,15 @@ around it.
 
 **Check:** `maxplayer buyer status` → `wallet.mint`, or `maxplayer wallet mints`.
 
-**Read it:**
-- `wallet.mint` = `https://mint.minibits.cash/Bitcoin` (or any non-testnut host) → you
-  are moving **real sats**. Start small.
-- `wallet.mint` = `https://testnut.cashudevkit.org` → test mint, play money.
+**Read it:** `wallet.mint` = `https://mint.minibits.cash/Bitcoin` → you are moving **real
+sats**. Start small. Any other value is a mint you set yourself; know what it settles in
+before you spend from it.
 
-**Fix:** to force test-only, set `allow_real_mints = false` in `~/.mobee/config.toml`
-(this pins you to the testnut dev mint); for free test funding run
-`maxplayer wallet setup --mint https://testnut.cashudevkit.org`. To spend real sats
-deliberately, leave the default and keep amounts small.
+**Fix:** leave the shipped mint in place and keep amounts small.
 
 **Dead end → report it:** if any string names a mint that disagrees with `wallet.mint`,
 that is a bug worth filing — note the exact string and where you saw it on
-**MakePrisms/maxplayerai**. The help text said "testnut" for a release whose default was
+**MakePrisms/maxplayerai**. The help text misnamed the mint for a release whose wallet was
 already real (#447), and a user paying a real invoice was the only thing that caught it.
 
 ---
@@ -194,14 +189,14 @@ yourself to test-only mints.
 **Check:**
 - your side: `maxplayer buyer status` → `wallet.mint`, and `maxplayer wallet mints` for
   every mint you can pay from
-- your fence: `allow_real_mints` in `~/.mobee/config.toml` (default `true`)
+- your fence: `allow_real_mints` in `~/.maxplayer/config.toml` (default `true`)
 
 **Read it:**
 - `allow_real_mints = true` (default) → hops to real mints are permitted, so a mismatch
   usually still settles. If it fails, the hop's target mint was likely unreachable.
-- `allow_real_mints = false` → you are pinned to the testnut dev mint, and a seller who
-  accepts only a real mint **cannot be paid**. Auto-award skips the claim; a manual pay
-  fails closed with a message like:
+- `allow_real_mints = false` → you are pinned to the built-in dev allow-list, and a
+  seller who accepts only a real mint **cannot be paid**. Auto-award skips the claim; a
+  manual pay fails closed with a message like:
 
 ```
 real-mint fence: buyer mint <url> is not in the creq mint list [...] and no accepted mint
@@ -211,13 +206,13 @@ set allow_real_mints=true to pay at a real mint
 
 **A real trap when judging the counterparty:** a seller's *advertised* mint is
 self-reported and currently unreliable (a known bug hardcodes it in the announce, so it
-can show "testnut" for a real-minibits seller). Do not infer from the advert whether a
-trade is a test.
+can name a mint the seller does not settle on). Do not infer a seller's mint from the
+advert.
 
 **Fix:**
 - to pay a real-mint seller, keep `allow_real_mints = true` — and know you are moving
   real sats
-- add a mint the seller accepts to `extra_mints` in `~/.mobee/config.toml`
+- add a mint the seller accepts to `extra_mints` in `~/.maxplayer/config.toml`
 - or trade with a seller on a mint you already hold
 
 **Dead end → report it:** if a mismatch fails even with `allow_real_mints = true` (a hop

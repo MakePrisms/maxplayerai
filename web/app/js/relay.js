@@ -1,5 +1,5 @@
 /**
- * Relay client — reads mobee's market from the relay and keeps reading.
+ * Relay client — reads maxplayer's market from the relay and keeps reading.
  *
  * Read-only by construction: it never signs, never holds a key, and never
  * requests gift-wrap. It walks history back to exhaustion, then stays
@@ -7,7 +7,7 @@
  *
  * The socket is injectable so the whole lifecycle is testable without a network.
  */
-import { MOBEE_TAG, MOBEE_TAGGED_KINDS, UNTAGGED_KINDS } from "./kinds.js";
+import { MAXPLAYER_TAG, MAXPLAYER_TAGGED_KINDS, UNTAGGED_KINDS } from "./kinds.js";
 
 /** Events per history page. The relay caps a REQ; we page under that cap. */
 export const PAGE_SIZE = 500;
@@ -31,7 +31,7 @@ export const POLL_MS = 3000;
  */
 export function historyStreams() {
   return [
-    { name: "tagged", filter: { kinds: [...MOBEE_TAGGED_KINDS], limit: PAGE_SIZE, "#t": [MOBEE_TAG] } },
+    { name: "tagged", filter: { kinds: [...MAXPLAYER_TAGGED_KINDS], limit: PAGE_SIZE, "#t": [MAXPLAYER_TAG] } },
     { name: "untagged", filter: { kinds: [...UNTAGGED_KINDS], limit: PAGE_SIZE } },
   ];
 }
@@ -43,7 +43,7 @@ export function historyFilter(stream, until) {
 }
 
 export function liveFilters(since) {
-  const tagged = { kinds: [...MOBEE_TAGGED_KINDS], "#t": [MOBEE_TAG], since };
+  const tagged = { kinds: [...MAXPLAYER_TAGGED_KINDS], "#t": [MAXPLAYER_TAG], since };
   const untagged = { kinds: [...UNTAGGED_KINDS], since };
   return [tagged, untagged];
 }

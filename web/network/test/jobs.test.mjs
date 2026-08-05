@@ -73,7 +73,7 @@ test("OPEN and WORKING stages derive correctly", () => {
     pubkey: "a".repeat(64),
     kind: OFFER,
     created_at: 1784576000,
-    tags: [["i", "an open task"], ["amount", "7", "sat"], ["param", "deadline", String(future)], ["t", "mobee"], ["v", "2"]],
+    tags: [["i", "an open task"], ["amount", "7", "sat"], ["param", "deadline", String(future)], ["t", "maxplayer"], ["v", "2"]],
     content: "",
   });
   const workOffer = synth({
@@ -81,7 +81,7 @@ test("OPEN and WORKING stages derive correctly", () => {
     pubkey: "c".repeat(64),
     kind: OFFER,
     created_at: 1784576000,
-    tags: [["i", "a working task"], ["amount", "9", "sat"], ["param", "deadline", String(future)], ["t", "mobee"], ["v", "2"]],
+    tags: [["i", "a working task"], ["amount", "9", "sat"], ["param", "deadline", String(future)], ["t", "maxplayer"], ["v", "2"]],
     content: "",
   });
   const award = synth({
@@ -89,7 +89,7 @@ test("OPEN and WORKING stages derive correctly", () => {
     pubkey: "c".repeat(64), // buyer awards the claim
     kind: AWARD,
     created_at: 1784576100,
-    tags: [["status", "accepted"], ["e", "b".repeat(64), "", "root"], ["e", "aa".repeat(32)], ["p", "e".repeat(64)], ["t", "mobee"], ["v", "2"]],
+    tags: [["status", "accepted"], ["e", "b".repeat(64), "", "root"], ["e", "aa".repeat(32)], ["p", "e".repeat(64)], ["t", "maxplayer"], ["v", "2"]],
     content: "",
   });
   const jobs = aggregateJobs([openOffer, workOffer, award], new Map(), 1784576200);
@@ -151,7 +151,7 @@ test("pulse: open offers count matches OPEN-status jobs", () => {
     pubkey: "a".repeat(64),
     kind: OFFER,
     created_at: 1784576000,
-    tags: [["i", "task"], ["amount", "3", "sat"], ["param", "deadline", String(future)], ["t", "mobee"], ["v", "2"]],
+    tags: [["i", "task"], ["amount", "3", "sat"], ["param", "deadline", String(future)], ["t", "maxplayer"], ["v", "2"]],
     content: "",
   });
   const events = [...market, openOffer];

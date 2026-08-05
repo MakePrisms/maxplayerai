@@ -1,0 +1,470 @@
+//! The persistent per-home **maxplayer seller node**.
+//!
+//! One node owns a home. It takes an exclusive OS lock on `$MAXPLAYER_HOME/seller.lock` (a second node
+//! on the same home fails closed), opens the receiving CDK wallet and the seller Nostr identity
+//! behind serialized in-process actors, and opens the durable lifecycle DB `$MAXPLAYER_HOME/seller.sqlite`
+//! — the source of truth for offers, claims, awards, jobs, deliveries, receipts, and the nostr event
+//! outbox. A single relay ingester ([`ingester`]) writes marketplace events into the store; an async
+//! publisher ([`outbox`]) drains published events to the relay with crash-idempotent retries; a
+//! deterministic roster ([`roster`]) routes each awarded job to one agent under the single seller
+//! identity.
+//!
+//! Concurrency safety does not depend on running one job at a time: the queue behind each actor —
+//! not SQLite locking — is the in-process concurrency boundary, mirroring the home lock across
+//! processes. Even with several execution slots active (`[seller] slots`), no two operations ever
+//! race the wallet, the signer, or the store — the actors serialize them regardless of how many
+//! jobs run at once.
+//!
+//! Money-safe boundary: agents produce files; the node signs, commits, publishes, and receives
+//! payment. No agent process ever holds the seller key (owned by the [`signer`] actor) or the
+//! receiving wallet (owned by the [`wallet_actor`]). This mirrors the buyer daemon's shape; a shared
+//! node core is deferred until both consumers exist (issue #131).
+
+pub mod buzz;
+pub mod ingester;
+pub mod lock;
+pub mod outbox;
+#[cfg(test)]
+mod p_gate_relay_fixture;
+pub mod publisher;
+pub mod run;
+pub mod signer;
+pub mod store;
+pub mod wallet_actor;
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::buyer_fund::{self, FundError};
+use crate::home::{HomeError, MaxplayerHome};
+use lock::{HomeLock, LockError};
+use signer::SignerHandle;
+use store::{HealthSnapshot, SellerStore, StoreError};
+use wallet_actor::WalletHandle;
+
+/// Lock file leaf under the home.
+pub const LOCK_FILE: &str = "seller.lock";
+/// State DB leaf under the home.
+pub const STATE_DB_FILE: &str = "seller.sqlite";
+
+/// Node startup / run failure.
+#[derive(Debug)]
+pub enum NodeError {
+    Lock(LockError),
+    Store(StoreError),
+    Wallet(FundError),
+    Identity(HomeError),
+    /// A live relay-surface failure (connect, NIP-42 auth, subscribe) raised by the run loop.
+    Relay(String),
+    /// The configured agent harnesses could not be resolved into a registry the node can serve
+    /// with — boot refuses rather than advertise work it cannot run.
+    Agents(crate::seller_agents::RegistryError),
+    /// Every configured harness LAUNCHES but none produced a pre-advertise self-probe artifact, so
+    /// there is nothing honest to advertise. Boot refuses rather than list work it cannot deliver:
+    /// under award-is-payment a buyer commits the sats at award, so advertising a dead capability
+    /// makes the buyer pay for our outage (#357).
+    NoProvenHarness(String),
+}
+
+impl std::fmt::Display for NodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lock(error) => write!(formatter, "{error}"),
+            Self::Store(error) => write!(formatter, "{error}"),
+            Self::Wallet(error) => write!(formatter, "seller node wallet error: {error}"),
+            Self::Identity(error) => write!(formatter, "seller node identity error: {error}"),
+            Self::Relay(message) => write!(formatter, "seller node relay error: {message}"),
+            Self::Agents(error) => write!(formatter, "seller node agent config error: {error}"),
+            Self::NoProvenHarness(message) => {
+                write!(formatter, "seller node prove-before-advertise: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NodeError {}
+
+impl From<LockError> for NodeError {
+    fn from(value: LockError) -> Self {
+        Self::Lock(value)
+    }
+}
+impl From<StoreError> for NodeError {
+    fn from(value: StoreError) -> Self {
+        Self::Store(value)
+    }
+}
+impl From<FundError> for NodeError {
+    fn from(value: FundError) -> Self {
+        Self::Wallet(value)
+    }
+}
+impl From<HomeError> for NodeError {
+    fn from(value: HomeError) -> Self {
+        Self::Identity(value)
+    }
+}
+
+/// What reconcile-on-start recovered from the durable store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// Non-terminal jobs (awarded/executing/delivered) that resume from sqlite after a restart.
+    pub resumed_jobs: Vec<(String, store::JobState)>,
+    /// Outbox rows whose retry window had elapsed and were marked expired on start.
+    pub expired_outbox: usize,
+    /// Outbox rows still pending publication after start (the publisher will drain these).
+    pub pending_outbox: usize,
+}
+
+/// A status view of the running node (never includes the secret key).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusSnapshot {
+    pub pubkey: String,
+    pub started_at_unix: i64,
+    pub wallet_balance_sats: Option<u64>,
+    pub health: HealthSnapshot,
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The persistent seller node: exclusive lock + durable store + serialized wallet/identity actors.
+pub struct SellerNode {
+    home: MaxplayerHome,
+    store: SellerStore,
+    wallet: WalletHandle,
+    signer: SignerHandle,
+    started_at_unix: i64,
+    // Held for the node's lifetime; dropping it releases the OS lock.
+    _lock: HomeLock,
+}
+
+impl SellerNode {
+    /// Bring up the node's owned resources: take the exclusive lock, open the state DB and record
+    /// the start, then open the receiving wallet and seller identity behind their serialized actors.
+    ///
+    /// Fails closed at the lock step if another node already owns this home.
+    pub async fn open(home: MaxplayerHome) -> Result<Self, NodeError> {
+        let lock = HomeLock::acquire(home.root.join(LOCK_FILE))?;
+
+        let store = SellerStore::open(home.root.join(STATE_DB_FILE))?;
+        let started_at_unix = now_unix();
+        store.record_start(started_at_unix)?;
+
+        // The node is the ONLY opener of the receiving CDK wallet — this is what the exclusive home
+        // lock protects. Opening touches the local sqlite store only (no network).
+        let wallet = buyer_fund::open_wallet_async(&home).await?;
+        let wallet = wallet_actor::spawn(wallet);
+
+        let signer = signer::spawn(&home)?;
+
+        Ok(Self {
+            home,
+            store,
+            wallet,
+            signer,
+            started_at_unix,
+            _lock: lock,
+        })
+    }
+
+    /// The seller public key (hex).
+    pub fn seller_pubkey(&self) -> &str {
+        self.signer.public_key_hex()
+    }
+
+    /// The durable lifecycle store.
+    pub fn store(&self) -> &SellerStore {
+        &self.store
+    }
+
+    /// The serialized signer actor (owns the seller key). Crate-internal: the run loop and the buzz
+    /// persona reach it (publisher sharing, receipts / push-auth / heartbeats / wrap decode, and the
+    /// persona's raw-sign path — which is DEFAULT-DENY inside the actor to
+    /// [`signer::UNSIGNED_SIGN_ALLOWLIST`], so a holder of the handle cannot sign a trade-path
+    /// event through it). The seller key never leaves the actor.
+    pub(crate) fn signer(&self) -> &SignerHandle {
+        &self.signer
+    }
+
+    /// The home this node owns.
+    pub fn home(&self) -> &MaxplayerHome {
+        &self.home
+    }
+
+    /// Recover durable state after a (re)start: expire any outbox rows past their retry window, then
+    /// report the non-terminal jobs that resume and the outbox rows still pending. State comes
+    /// entirely from sqlite, so a crash mid-lifecycle resumes exactly where it left off.
+    pub fn reconcile_on_start(&self, now_unix: i64) -> Result<ReconcileReport, NodeError> {
+        let expired_outbox = self.store.expire_outbox(now_unix)?;
+        let resumed_jobs = self.store.resumable_jobs()?;
+        let pending_outbox = self.store.pending_outbox(now_unix)?.len();
+        Ok(ReconcileReport {
+            resumed_jobs,
+            expired_outbox,
+            pending_outbox,
+        })
+    }
+
+    /// Bring up the node's buzz persona if `[buzz]` is configured, returning a live
+    /// [`buzz::BuzzHandle`] (connected relay + presence heartbeat) to hold for the node's lifetime.
+    /// With no `[buzz]` section this is inert — `Ok(None)`, no connection, no publish. The persona
+    /// is signed by the node's existing signer actor (one identity; the key never leaves it).
+    pub async fn start_buzz(&self) -> Result<Option<buzz::BuzzHandle>, buzz::BuzzError> {
+        let Some(cfg) = self.home.config.buzz.as_ref() else {
+            return Ok(None);
+        };
+        let seller_rate_sats = self.home.config.seller.as_ref().map(|seller| seller.rate_sats);
+        // What this seat will actually settle in, so the rate card's mint clause describes the seat
+        // rather than a default someone wrote into a format string (#453).
+        let accepted_mints = self.home.config.accepted_mints.clone();
+        let handle = buzz::start(self.signer.clone(), cfg, seller_rate_sats, &accepted_mints).await?;
+        Ok(Some(handle))
+    }
+
+    /// A status snapshot proving the boundary end to end — the store answered, and the wallet actor
+    /// answered through its queue. The secret key is never included.
+    pub async fn status_snapshot(&self) -> Result<StatusSnapshot, NodeError> {
+        let health = self.store.health()?;
+        let wallet_balance_sats = match self.wallet.balance().await {
+            Ok(Ok(balance)) => Some(balance),
+            _ => None,
+        };
+        Ok(StatusSnapshot {
+            pubkey: self.signer.public_key_hex().to_owned(),
+            started_at_unix: self.started_at_unix,
+            wallet_balance_sats,
+            health,
+        })
+    }
+}
+
+#[cfg(test)]
+mod buzz_relay_it;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::home::bootstrap as bootstrap_home;
+    use crate::seller_node::outbox::{drain_once, EventPublisher};
+    use crate::seller_node::store::{JobState, OutboxItem};
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_home(label: &str) -> std::path::PathBuf {
+        let id = NEXT.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "maxplayer-seller-node-{label}-{}-{id}",
+            std::process::id()
+        ))
+    }
+
+    fn claim_draft() -> crate::gateway::EventDraft {
+        crate::gateway::claim_draft(&"e".repeat(64), &"b".repeat(64), &"s".repeat(64), "creqA", &[])
+    }
+
+    struct FakePublisher {
+        calls: RefCell<Vec<String>>,
+    }
+
+    impl EventPublisher for FakePublisher {
+        async fn publish(&self, item: &OutboxItem) -> Result<String, String> {
+            self.calls.borrow_mut().push(item.dedup_key.clone());
+            Ok(format!("evt-{}", item.dedup_key))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_snapshot_never_leaks_the_secret() {
+        let root = temp_home("status");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap_home(&root).expect("home");
+        let secret = crate::home::read_secret_key_hex(&home).expect("secret");
+
+        let node = SellerNode::open(home).await.expect("open node");
+        let snapshot = node.status_snapshot().await.expect("status");
+        assert_eq!(snapshot.pubkey.len(), 64);
+        assert_eq!(snapshot.wallet_balance_sats, Some(0));
+        assert_eq!(snapshot.health.schema_version, store::SCHEMA_VERSION);
+        assert_ne!(snapshot.pubkey, secret);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn second_node_on_same_home_fails_closed() {
+        let root = temp_home("exclusive");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap_home(&root).expect("home");
+
+        let _first = SellerNode::open(home.clone()).await.expect("first node");
+        let second = SellerNode::open(home).await;
+        assert!(
+            matches!(second, Err(NodeError::Lock(LockError::Held { .. }))),
+            "a second node must fail closed on the home lock"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // TOOTH 1 (charter) — RESTART SURVIVAL. Drive a job mid-lifecycle, publish its claim, then
+    // "crash" (drop the node, releasing the lock). Restart on the SAME home and prove state
+    // reconciles from sqlite: the job resumes as `executing`, and re-enqueuing + re-draining the
+    // already-published claim publishes NOTHING new (outbox dedup) — no duplicate claim on the wire.
+    //
+    // Red-on-revert: if reconcile did not read jobs from sqlite, `resumed_jobs` would be empty and
+    // the resume assertion fails; if the outbox `dedup_key` did not dedupe, the re-enqueue would add
+    // a second pending row and the second drain would call the publisher again, failing the
+    // "exactly one publish across the restart" assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_resumes_job_state_and_never_double_publishes() {
+        let root = temp_home("restart");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap_home(&root).expect("home");
+
+        let job = "j".repeat(64);
+        let offer = "o".repeat(64);
+        let award = "w".repeat(64);
+        let buyer = "b".repeat(64);
+        let publisher = FakePublisher { calls: RefCell::new(vec![]) };
+
+        // ---- Pre-crash: park a claim (enqueue), publish it, take the award, start executing.
+        {
+            let node = SellerNode::open(home.clone()).await.expect("open");
+            let store = node.store();
+            store
+                .claim_and_enqueue(&job, &offer, "creqA", &claim_draft(), 1000, 9_999, 1)
+                .expect("claim");
+            let confirmed = drain_once(store, &publisher, 2).await.expect("drain");
+            assert_eq!(confirmed.confirmed, 1, "the claim was published pre-crash");
+            store.record_award(&award, &job, &buyer, 3).expect("award");
+            store.mark_executing(&job, 4).expect("executing");
+            // node drops here — the process "crashed" mid-execution; the DB persists.
+        }
+        assert_eq!(publisher.calls.borrow().len(), 1, "exactly one publish so far");
+
+        // ---- Restart on the same home: state must come back from sqlite.
+        let node = SellerNode::open(home).await.expect("reopen");
+        let report = node.reconcile_on_start(5).expect("reconcile");
+        assert_eq!(
+            report.resumed_jobs,
+            vec![(job.clone(), JobState::Executing)],
+            "the executing job resumes from durable state"
+        );
+        assert_eq!(report.pending_outbox, 0, "the claim was already confirmed, nothing pending");
+
+        // Re-enqueuing the same claim is a dedup no-op; a fresh drain publishes nothing new.
+        let replay = node
+            .store()
+            .claim_and_enqueue(&job, &offer, "creqA", &claim_draft(), 1000, 9_999, 6)
+            .expect("replay claim");
+        assert_eq!(replay, store::Claimed::Idempotent);
+        let after = drain_once(node.store(), &publisher, 7).await.expect("drain2");
+        assert_eq!(after.confirmed, 0);
+        assert_eq!(
+            publisher.calls.borrow().len(),
+            1,
+            "no duplicate publish across the restart — outbox dedup held"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // TOOTH 3 (#143) — ACROSS-RESTART AWARD RE-BIND. The #141 drop class: a claim parked BEFORE a
+    // restart must re-bind when its award (kind-3405) arrives AFTER the restart. Distinct from
+    // TOOTH 1, which takes the award pre-crash and resumes an already-awarded job. Here the award is
+    // delivered ONLY to the reopened node, so re-binding can succeed only by reading the parked
+    // claim from the durable claims table — no in-memory claim handle survives the drop.
+    //
+    // Red-on-revert / bite: the pre-crash node (store, connection, every in-memory handle) is
+    // dropped entirely and a FRESH SellerNode is opened on the same home. If the parked claim were
+    // memory-only, the reopened store would hold no claim row, `record_award` would return
+    // `Awarded::NoClaim` and create no job — the `Awarded::New` and `job_state == Awarded`
+    // assertions would fail. (Confirmed by pointing the reopened node at an empty home: the award
+    // then returns `NoClaim` and this test goes red.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_then_award_rebinds_the_parked_claim() {
+        let root = temp_home("restart-award");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap_home(&root).expect("home");
+
+        let job = "j".repeat(64);
+        let offer = "o".repeat(64);
+        let award = "w".repeat(64);
+        let buyer = "b".repeat(64);
+        let publisher = FakePublisher { calls: RefCell::new(vec![]) };
+
+        // ---- Pre-crash: park the claim and publish it. NO award yet — the claim is only parked.
+        {
+            let node = SellerNode::open(home.clone()).await.expect("open");
+            let store = node.store();
+            assert_eq!(
+                store
+                    .claim_and_enqueue(&job, &offer, "creqA", &claim_draft(), 1000, 9_999, 1)
+                    .expect("claim"),
+                store::Claimed::New
+            );
+            let confirmed = drain_once(store, &publisher, 2).await.expect("drain");
+            assert_eq!(confirmed.confirmed, 1, "the claim was published pre-crash");
+            // node drops here — hard restart; the award has NOT arrived. The DB persists the claim.
+        }
+        assert_eq!(publisher.calls.borrow().len(), 1, "exactly one claim published pre-crash");
+
+        // ---- Restart on the SAME home: the parked claim must come back from sqlite.
+        let node = SellerNode::open(home).await.expect("reopen");
+
+        // Reconcile in the restart window must NOT release the parked claim: it is still open, and
+        // with no award yet there is no job to resume.
+        let report = node.reconcile_on_start(3).expect("reconcile");
+        assert!(report.resumed_jobs.is_empty(), "no job yet — the award has not arrived");
+        assert_eq!(
+            node.store().health().expect("health").open_claims,
+            1,
+            "reconcile_on_start must not release the parked claim"
+        );
+
+        // ---- Award arrives AFTER the restart. It re-binds the durable parked claim: a job is born.
+        assert_eq!(
+            node.store().record_award(&award, &job, &buyer, 4).expect("award"),
+            store::Awarded::New,
+            "award re-binds the claim read from the durable table — a fresh Awarded::New job"
+        );
+        assert_eq!(
+            node.store().job_state(&job).expect("state"),
+            Some(JobState::Awarded),
+            "the re-bound claim produced an Awarded job row"
+        );
+        assert_eq!(
+            node.store().health().expect("health").open_claims,
+            0,
+            "the claim moved claimed -> awarded (not released)"
+        );
+
+        // REBIND-OK proceeds: the awarded job is now picked up on a subsequent reconcile.
+        let after_award = node.reconcile_on_start(5).expect("reconcile2");
+        assert_eq!(
+            after_award.resumed_jobs,
+            vec![(job.clone(), JobState::Awarded)],
+            "the re-bound job resumes from durable state"
+        );
+
+        // No duplicate claim on the wire: re-enqueue is a dedup no-op and a fresh drain publishes
+        // nothing new — journal dedup held across the restart.
+        assert_eq!(
+            node.store()
+                .claim_and_enqueue(&job, &offer, "creqA", &claim_draft(), 1000, 9_999, 6)
+                .expect("replay claim"),
+            store::Claimed::Idempotent
+        );
+        let after = drain_once(node.store(), &publisher, 7).await.expect("drain2");
+        assert_eq!(after.confirmed, 0, "nothing new to publish");
+        assert_eq!(
+            publisher.calls.borrow().len(),
+            1,
+            "no duplicate claim published across the restart — journal dedup held"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

@@ -1,0 +1,100 @@
+{
+  "log_payloads": [
+    {
+      "type": "driver.ready",
+      "data": {
+        "runtime_id": "mock"
+      }
+    },
+    {
+      "type": "job.execution_changed",
+      "data": {
+        "job_id": "job-1",
+        "status": "queued"
+      }
+    },
+    {
+      "type": "job.execution_changed",
+      "data": {
+        "job_id": "job-1",
+        "status": "running"
+      }
+    },
+    {
+      "type": "agent.message",
+      "data": {
+        "job_id": "job-1",
+        "text": "working"
+      }
+    },
+    {
+      "type": "job.execution_changed",
+      "data": {
+        "job_id": "job-1",
+        "status": "completed"
+      }
+    },
+    {
+      "type": "artifact.produced",
+      "data": {
+        "artifact_id": "out/result.txt"
+      }
+    }
+  ],
+  "updates": [
+    {
+      "type": "agent_message",
+      "data": [
+        {
+          "type": "text",
+          "data": {
+            "text": "working"
+          }
+        }
+      ]
+    },
+    {
+      "type": "plan",
+      "data": {
+        "entries": [
+          "inspect",
+          "edit",
+          "verify"
+        ]
+      }
+    },
+    {
+      "type": "tool_call",
+      "data": {
+        "id": "call-1",
+        "name": "shell",
+        "input": {
+          "cmd": "cargo test"
+        }
+      }
+    },
+    {
+      "type": "tool_result",
+      "data": {
+        "id": "call-1",
+        "output": {
+          "status": "ok"
+        }
+      }
+    },
+    {
+      "type": "ext",
+      "data": {
+        "method": "maxplayer.note",
+        "params": {
+          "text": "ready"
+        }
+      }
+    },
+    {
+      "type": "turn_ended",
+      "data": "completed"
+    }
+  ],
+  "permissions": []
+}

@@ -67,7 +67,7 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
   seller), no clone. Always `--refresh` (or pin+bump the rev) — nix caches the git ref and will
   otherwise serve a stale binary.
 - `devShells.default` — the workspace build/dev shell.
-- `packages.relay-write-policy` — the strfry write-policy plugin (crate `mobee-relay-write-policy`),
+- `packages.relay-write-policy` — the strfry write-policy plugin (crate `maxplayer-relay-write-policy`),
   consumed by the relay module below.
 - `packages.buyer-static` / `packages.buyer-static-aarch64` — statically-linked (musl) buyer builds.
 - `nixosModules.relay` + `nixosConfigurations.relay` — the launch relay as a deployable NixOS box
@@ -80,8 +80,10 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
   `.github/workflows/release.yml` builds one artifact per platform — `linux-x64` and `linux-arm64`
   statically linked against musl, `darwin-arm64` linked against the base macOS libraries (macOS cannot
   link libSystem statically, so the check there is that it pulls in no Homebrew or `/usr/local`
-  dylib) — and attaches them with a `SHA256SUMS`. `install.sh` (attached to every release, hence
-  `releases/latest/download/install.sh`) resolves, verifies and installs one. Intel macs are not
+  dylib) — and attaches them with a `SHA256SUMS`. `install.sh` is attached to every release and
+  resolves, verifies and installs one. ★ While every release is a **pre-release**,
+  `releases/latest/download/…` and the "latest release" API both 404, so the install must name a
+  version (`MAXPLAYER_VERSION=x.y.z` and a tagged asset URL). Intel macs are not
   covered: the matrix builds `aarch64-apple-darwin` only. ★ These artifacts are
   built `--no-default-features --features wallet` — the **buyer surface only**. `maxplayer sell` is
   compiled out, so this path cannot deploy a seller; that still needs `packages.default` or a
@@ -108,7 +110,7 @@ component plus the client binary, so each service builds from the same source an
 - **relay-operator** — deploys the backend bundle with `docker compose up`.
 - **seller** — `maxplayer sell`, run two ways by taste: `nix run --refresh … -- sell`
   (quick) or the Docker image. Same binary, same config contract.
-- **buyer** — `curl -fsSL …/releases/latest/download/install.sh | sh`, then `maxplayer mcp` wired into
+- **buyer** — `curl -fsSL …/releases/download/v$VER/install.sh | MAXPLAYER_VERSION=$VER sh`, then `maxplayer mcp` wired into
   their agent (Claude etc.). Zero clone, no nix; linux x86_64/aarch64 and macOS Apple Silicon.
   `nix run --refresh … -- mcp` stays supported and is the answer on any platform the release does not
   cover — an Intel mac, or a linux architecture outside those two.

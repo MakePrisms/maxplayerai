@@ -1,0 +1,1428 @@
+//! The seller node's durable lifecycle state: `$MAXPLAYER_HOME/seller.sqlite`.
+//!
+//! Opened only by the node (single-owner, guaranteed by the home lock). This SQLite database — in
+//! WAL mode, `synchronous=FULL`, foreign keys on — is the **source of truth** for the seller's
+//! trade lifecycle: the offers it has seen, the claims it has parked, the awards it has been
+//! selected for, the jobs it is running, its deliveries and its collected receipts. Alongside them
+//! sits the **nostr event outbox**: every event the node publishes is written to the DB and
+//! enqueued in the SAME transaction as the state change that produced it, then handed to an async
+//! publisher that retries until the relay confirms it or it expires. A crash between "state
+//! changed" and "event sent" therefore never loses the obligation to publish, and never publishes
+//! twice — the outbox `dedup_key` makes re-enqueue a no-op and the stored `created_at` makes the
+//! signed event's id deterministic, so a re-publish is relay-idempotent.
+//!
+//! Every transition here is idempotent: replaying an award, a delivery, or a receipt lands the same
+//! state and never double-credits. `rusqlite`'s [`Connection`] is `Send` but not `Sync`, so the
+//! store keeps it behind a mutex and callers reach it from the async runtime via `spawn_blocking`.
+
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+
+use crate::gateway::EventDraft;
+
+/// Current on-disk schema version.
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// A cloneable handle to the node-owned SQLite state.
+#[derive(Clone)]
+pub struct SellerStore {
+    conn: Arc<Mutex<Connection>>,
+}
+
+/// Store open / query failure.
+#[derive(Debug)]
+pub struct StoreError(pub String);
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "seller store error: {}", self.0)
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+impl From<rusqlite::Error> for StoreError {
+    fn from(value: rusqlite::Error) -> Self {
+        Self(value.to_string())
+    }
+}
+
+/// An offer the relay ingester has seen and the node may claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Offer {
+    pub offer_id: String,
+    pub buyer_pubkey: String,
+    pub amount_sats: u64,
+    pub unit: String,
+    pub task: String,
+    pub deadline_unix: i64,
+    pub targeted: bool,
+    /// The harness the offer asked for (`["param", "agent", …]`), canonicalised; `None` ⇒ no
+    /// preference. Journaled with the other offer facts because execution can be a RESTART away
+    /// from the claim: a resumed job reads its requested harness from here, so it dispatches to
+    /// the harness the buyer asked for and not to whichever one happens to be preferred now.
+    pub requested_agent: Option<String>,
+}
+
+/// The lifecycle state of a job (execution side of a claim that was awarded).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobState {
+    Awarded,
+    Executing,
+    Delivered,
+    Paid,
+    Failed,
+}
+
+impl JobState {
+    /// Every variant, so a predicate over states can be checked against all of them rather than
+    /// against the one that motivated it.
+    pub const ALL: [Self; 5] = [
+        Self::Awarded,
+        Self::Executing,
+        Self::Delivered,
+        Self::Paid,
+        Self::Failed,
+    ];
+
+    fn parse(raw: &str) -> Option<Self> {
+        Some(match raw {
+            "awarded" => Self::Awarded,
+            "executing" => Self::Executing,
+            "delivered" => Self::Delivered,
+            "paid" => Self::Paid,
+            "failed" => Self::Failed,
+            _ => return None,
+        })
+    }
+
+    /// The stored spelling — the same literal the write statements use.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Awarded => "awarded",
+            Self::Executing => "executing",
+            Self::Delivered => "delivered",
+            Self::Paid => "paid",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Whether a job in this state is occupying execution capacity **right now**.
+    ///
+    /// This is the single definition of "in flight". [`SellerStore::jobs_in_flight`] builds its SQL
+    /// from it and `should_resume_execution` answers with it, so the `queue_depth` on the wire and
+    /// the set a restart re-drives cannot drift apart.
+    ///
+    /// `Delivered` is deliberately excluded: execution has finished and the job is awaiting payment,
+    /// so it holds no slot — which is also why `resumable_jobs` selects it but resume does not
+    /// execute it.
+    pub fn occupies_execution_slot(self) -> bool {
+        matches!(self, Self::Awarded | Self::Executing)
+    }
+}
+
+/// Outcome of parking a claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claimed {
+    /// A fresh claim row + a fresh outbox enqueue landed.
+    New,
+    /// The claim already existed — an idempotent replay, nothing re-enqueued.
+    Idempotent,
+}
+
+/// Outcome of recording an award.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Awarded {
+    /// First time this award id was seen: the claim moved to `awarded` and a job row was created.
+    New,
+    /// This award id was already recorded — a duplicate, ignored (no second job).
+    Duplicate,
+    /// The award names a claim this node never parked — recorded, but no job created.
+    NoClaim,
+}
+
+/// Outcome of recording a collected receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Collected {
+    /// First time this receipt id was seen: the job moved to `paid`.
+    New,
+    /// This receipt id was already recorded — deduped, not credited a second time.
+    Duplicate,
+}
+
+/// A pending outbox row the publisher must send. `draft` is the FULL event to sign — kind, content,
+/// and every protocol/routing tag (`["v","1"]`, `["t","maxplayer"]`, the `e`/`p` tags) — so what the
+/// publisher signs is wire-valid by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxItem {
+    pub id: i64,
+    pub dedup_key: String,
+    pub draft: EventDraft,
+    /// The fixed authored-at second: signing with this makes the event id deterministic, so a
+    /// re-publish after a crash is idempotent at the relay.
+    pub created_at_unix: i64,
+    pub attempts: i64,
+    pub expires_at_unix: i64,
+}
+
+/// A point-in-time view of the store for `status` / reconcile reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthSnapshot {
+    pub schema_version: i64,
+    pub started_at_unix: i64,
+    pub offers: i64,
+    pub open_claims: i64,
+    pub jobs: i64,
+    pub pending_outbox: i64,
+}
+
+impl SellerStore {
+    /// Open (creating if absent) the state DB at `path` with WAL + crash-safe pragmas and ensure
+    /// the schema is present.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let conn = Connection::open(path.as_ref())?;
+        // WAL for concurrent reads alongside the single writer; FULL sync + FK enforcement because
+        // this DB holds money-adjacent lifecycle state. A bounded busy timeout avoids an immediate
+        // SQLITE_BUSY under contention.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        conn.pragma_update(None, "foreign_keys", true)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Self::init_schema(&conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    fn init_schema(conn: &Connection) -> Result<(), StoreError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS seller_meta (
+                 key   TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );
+             -- Offers the ingester has seen. One row per offer event id.
+             CREATE TABLE IF NOT EXISTS offers (
+                 offer_id        TEXT PRIMARY KEY,
+                 buyer_pubkey    TEXT NOT NULL,
+                 amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
+                 unit            TEXT NOT NULL,
+                 task            TEXT NOT NULL,
+                 deadline_unix   INTEGER NOT NULL,
+                 targeted        INTEGER NOT NULL,
+                 created_at_unix INTEGER NOT NULL,
+                 -- The harness the offer requested. NULL ⇒ no preference, which is also what an
+                 -- offer recorded before this column existed reads as.
+                 requested_agent TEXT
+             );
+             -- Claims the node parked. `state` is the claim's own lifecycle; `awarded` marks the
+             -- one the buyer selected, `released` the ones it stepped back from.
+             CREATE TABLE IF NOT EXISTS claims (
+                 job_id          TEXT PRIMARY KEY,
+                 offer_id        TEXT NOT NULL,
+                 state           TEXT NOT NULL CHECK (state IN ('claimed','awarded','released')),
+                 -- The seller creq (NUT-18 payment request) authored from the offer terms at CLAIM
+                 -- time (audit N-4). It is the single source of truth for the trade's payment terms:
+                 -- the delivery cosignature signs ITS hash (never a rebuild from live config, so a
+                 -- config change between claim and delivery cannot break the buyer/seller cosig), and
+                 -- the restart redeem-guard settles against the mints IT lists (Fix Q — original terms,
+                 -- not current config).
+                 creq            TEXT NOT NULL,
+                 created_at_unix INTEGER NOT NULL,
+                 updated_at_unix INTEGER NOT NULL
+             );
+             -- Awards received. `award_id` (the award event id) is UNIQUE so a re-seen award is
+             -- deduped and never creates a second job.
+             CREATE TABLE IF NOT EXISTS awards (
+                 award_id        TEXT PRIMARY KEY,
+                 job_id          TEXT NOT NULL,
+                 buyer_pubkey    TEXT NOT NULL,
+                 created_at_unix INTEGER NOT NULL
+             );
+             -- Jobs the node is executing (one per awarded claim). `agent_name` is the harness that
+             -- actually ran it — the journal row naming which agent did the job, and the evidence
+             -- that a harness-requesting job was served by the harness it asked for.
+             CREATE TABLE IF NOT EXISTS jobs (
+                 job_id          TEXT PRIMARY KEY,
+                 offer_id        TEXT NOT NULL,
+                 agent_name      TEXT,
+                 state           TEXT NOT NULL
+                     CHECK (state IN ('awarded','executing','delivered','paid','failed')),
+                 created_at_unix INTEGER NOT NULL,
+                 updated_at_unix INTEGER NOT NULL
+             );
+             -- One delivery per job (the seller-authored snapshot the daemon published).
+             CREATE TABLE IF NOT EXISTS deliveries (
+                 job_id          TEXT PRIMARY KEY,
+                 result_ref      TEXT NOT NULL,
+                 delivered_at_unix INTEGER NOT NULL
+             );
+             -- Collected receipts. `receipt_id` is UNIQUE — the dedup that stops a replayed
+             -- payment from crediting the same job twice.
+             CREATE TABLE IF NOT EXISTS receipts (
+                 receipt_id      TEXT PRIMARY KEY,
+                 job_id          TEXT NOT NULL,
+                 amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
+                 received_at_unix INTEGER NOT NULL
+             );
+             -- Intent-to-receive breadcrumbs, written BEFORE the mint swap (payment ordering,
+             -- invariant 3). A breadcrumb records ONLY that a swap was attempted for a token — it is
+             -- NEVER proof the swap landed (the mint reporting already-spent + a COMPLETED receipt is
+             -- the only proof of our own prior collection). `token_hash` is SHA-256 of the token
+             -- string; no proof/secret material is stored.
+             CREATE TABLE IF NOT EXISTS pending_receive (
+                 job_id          TEXT NOT NULL,
+                 token_hash      TEXT NOT NULL,
+                 buyer_pubkey    TEXT NOT NULL,
+                 mint            TEXT NOT NULL,
+                 amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
+                 created_at_unix INTEGER NOT NULL,
+                 PRIMARY KEY (job_id, token_hash)
+             );
+             -- The nostr event outbox. `dedup_key` (UNIQUE) makes an enqueue idempotent; `draft_json`
+             -- is the full serialized EventDraft (kind + content + all protocol/routing tags) so the
+             -- publisher signs a wire-valid event. The publisher drains `pending` rows, signs with
+             -- the fixed `created_at_unix` (so the event id is deterministic and re-publish is
+             -- relay-idempotent), and marks each `confirmed` or `expired`.
+             CREATE TABLE IF NOT EXISTS nostr_event_outbox (
+                 id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                 dedup_key          TEXT NOT NULL UNIQUE,
+                 draft_json         TEXT NOT NULL,
+                 created_at_unix    INTEGER NOT NULL,
+                 state              TEXT NOT NULL CHECK (state IN ('pending','confirmed','expired')),
+                 attempts           INTEGER NOT NULL DEFAULT 0,
+                 expires_at_unix    INTEGER NOT NULL,
+                 published_event_id TEXT,
+                 updated_at_unix    INTEGER NOT NULL
+             );",
+        )?;
+        Self::migrate(conn)?;
+        conn.execute(
+            "INSERT INTO seller_meta (key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value
+             WHERE CAST(seller_meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
+            [SCHEMA_VERSION.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Bring a store created by an older binary up to [`SCHEMA_VERSION`]. `CREATE TABLE IF NOT
+    /// EXISTS` never alters a table that already exists, so a column added to the schema above
+    /// reaches existing stores only through here.
+    ///
+    /// Every step is ADDITIVE and idempotent — a nullable column whose absence reads the same as
+    /// its default. Nothing here rewrites or drops a row: this store holds live trade state.
+    fn migrate(conn: &Connection) -> Result<(), StoreError> {
+        if !Self::column_exists(conn, "offers", "requested_agent")? {
+            conn.execute_batch("ALTER TABLE offers ADD COLUMN requested_agent TEXT;")?;
+        }
+        Ok(())
+    }
+
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+        let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            if row.get::<_, String>(1)? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Record (idempotently overwrite) the node's most recent start time.
+    pub fn record_start(&self, now_unix: i64) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO seller_meta (key, value) VALUES ('started_at_unix', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [now_unix.to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StoreError> {
+        self.conn
+            .lock()
+            .map_err(|_| StoreError("state DB mutex poisoned".into()))
+    }
+
+    // ---- Offer ingest ---------------------------------------------------------------------------
+
+    /// Record a seen offer. Idempotent: a re-seen offer id is a no-op. Returns whether a new row
+    /// landed.
+    pub fn record_offer(&self, offer: &Offer, now_unix: i64) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO offers
+                 (offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted, created_at_unix,
+                  requested_agent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                offer.offer_id,
+                offer.buyer_pubkey,
+                offer.amount_sats as i64,
+                offer.unit,
+                offer.task,
+                offer.deadline_unix,
+                offer.targeted as i64,
+                now_unix,
+                offer.requested_agent,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// The `(buyer_pubkey, amount_sats, unit)` of a recorded offer, if any. The award arm reads the
+    /// buyer to authorize an award (the award author MUST be the offer's buyer), and the pay path
+    /// reads amount/unit as the redeem terms. `None` when the node never recorded this offer.
+    pub fn offer_facts(&self, offer_id: &str) -> Result<Option<(String, u64, String)>, StoreError> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT buyer_pubkey, amount_sats, unit FROM offers WHERE offer_id = ?1",
+                [offer_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// The full recorded [`Offer`], if any. The execute arm needs the task (agent prompt + delivery
+    /// message) and the absolute deadline (the unified job timeout) on top of the buyer/amount/unit
+    /// that [`Self::offer_facts`] returns. `None` when the node never recorded this offer.
+    pub fn offer_row(&self, offer_id: &str) -> Result<Option<Offer>, StoreError> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted,
+                        requested_agent
+                 FROM offers WHERE offer_id = ?1",
+                [offer_id],
+                |row| {
+                    Ok(Offer {
+                        offer_id: row.get(0)?,
+                        buyer_pubkey: row.get(1)?,
+                        amount_sats: row.get::<_, i64>(2)? as u64,
+                        unit: row.get(3)?,
+                        task: row.get(4)?,
+                        deadline_unix: row.get(5)?,
+                        targeted: row.get::<_, i64>(6)? != 0,
+                        requested_agent: row.get(7)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    // ---- Claim (state change + outbox enqueue in one transaction) -------------------------------
+
+    /// Park a claim and enqueue its claim event in ONE transaction: either both the claim row and
+    /// the outbox row land, or neither does. Idempotent — a replay for a `job_id` that already has
+    /// a claim row changes nothing and re-enqueues nothing.
+    ///
+    /// `draft` is the full claim nostr event to publish (kind + content + protocol/routing tags);
+    /// `created_at_unix` is its fixed authored-at second; `expires_at_unix` bounds how long the
+    /// publisher retries before giving up. `creq` is the seller creq (NUT-18 payment request)
+    /// authored from the offer terms at claim time (audit N-4) — journaled here so the delivery
+    /// cosignature signs its stored hash and the restart redeem-guard settles against its stored
+    /// mints, never a rebuild from live config.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_and_enqueue(
+        &self,
+        job_id: &str,
+        offer_id: &str,
+        creq: &str,
+        draft: &EventDraft,
+        created_at_unix: i64,
+        expires_at_unix: i64,
+        now_unix: i64,
+    ) -> Result<Claimed, StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if claim_state(&tx, job_id)?.is_some() {
+            tx.commit()?;
+            return Ok(Claimed::Idempotent);
+        }
+        tx.execute(
+            "INSERT INTO claims (job_id, offer_id, state, creq, created_at_unix, updated_at_unix)
+             VALUES (?1, ?2, 'claimed', ?3, ?4, ?4)",
+            params![job_id, offer_id, creq, now_unix],
+        )?;
+        enqueue_event(
+            &tx,
+            &format!("claim:{job_id}"),
+            draft,
+            created_at_unix,
+            expires_at_unix,
+            now_unix,
+        )?;
+        tx.commit()?;
+        Ok(Claimed::New)
+    }
+
+    /// Release a parked claim (offer expired, another seller won, capacity reached). Idempotent:
+    /// only a still-`claimed` row is released; `awarded`/`released`/absent are no-ops.
+    pub fn release_claim(&self, job_id: &str, now_unix: i64) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE claims SET state = 'released', updated_at_unix = ?2
+             WHERE job_id = ?1 AND state = 'claimed'",
+            params![job_id, now_unix],
+        )?;
+        Ok(())
+    }
+
+    // ---- Award ----------------------------------------------------------------------------------
+
+    /// Record an award for `job_id`. The `award_id` (award event id) is deduped: the first sighting
+    /// moves the claim to `awarded` and creates the job row; a re-seen award id is a
+    /// [`Awarded::Duplicate`] no-op (never a second job). An award naming a claim this node never
+    /// parked is recorded but creates no job ([`Awarded::NoClaim`]).
+    pub fn record_award(
+        &self,
+        award_id: &str,
+        job_id: &str,
+        buyer_pubkey: &str,
+        now_unix: i64,
+    ) -> Result<Awarded, StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO awards (award_id, job_id, buyer_pubkey, created_at_unix)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![award_id, job_id, buyer_pubkey, now_unix],
+        )?;
+        if inserted == 0 {
+            tx.commit()?;
+            return Ok(Awarded::Duplicate);
+        }
+
+        let claim = claim_state(&tx, job_id)?;
+        let offer_id = match &claim {
+            Some((_, offer_id)) => offer_id.clone(),
+            None => {
+                // Award for a claim we do not hold — record the award, create no job.
+                tx.commit()?;
+                return Ok(Awarded::NoClaim);
+            }
+        };
+        tx.execute(
+            "UPDATE claims SET state = 'awarded', updated_at_unix = ?2 WHERE job_id = ?1",
+            params![job_id, now_unix],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO jobs (job_id, offer_id, agent_name, state, created_at_unix, updated_at_unix)
+             VALUES (?1, ?2, NULL, 'awarded', ?3, ?3)",
+            params![job_id, offer_id, now_unix],
+        )?;
+        tx.commit()?;
+        Ok(Awarded::New)
+    }
+
+    // ---- Job execution --------------------------------------------------------------------------
+
+    /// Record which harness ran a job. Idempotent (last write wins).
+    pub fn assign_agent(&self, job_id: &str, agent_name: &str) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE jobs SET agent_name = ?2 WHERE job_id = ?1",
+            params![job_id, agent_name],
+        )?;
+        Ok(())
+    }
+
+    /// Move a job to `executing`. Idempotent: only an `awarded` job advances; a job already
+    /// executing/delivered/paid is left as-is.
+    pub fn mark_executing(&self, job_id: &str, now_unix: i64) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE jobs SET state = 'executing', updated_at_unix = ?2
+             WHERE job_id = ?1 AND state = 'awarded'",
+            params![job_id, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Record a delivery and enqueue its result event in ONE transaction. Idempotent — a replay for
+    /// a job that already has a delivery row changes nothing and re-enqueues nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deliver_and_enqueue(
+        &self,
+        job_id: &str,
+        result_ref: &str,
+        draft: &EventDraft,
+        created_at_unix: i64,
+        expires_at_unix: i64,
+        now_unix: i64,
+    ) -> Result<bool, StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM deliveries WHERE job_id = ?1",
+                [job_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if exists {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO deliveries (job_id, result_ref, delivered_at_unix) VALUES (?1, ?2, ?3)",
+            params![job_id, result_ref, now_unix],
+        )?;
+        tx.execute(
+            "UPDATE jobs SET state = 'delivered', updated_at_unix = ?2 WHERE job_id = ?1",
+            params![job_id, now_unix],
+        )?;
+        enqueue_event(
+            &tx,
+            &format!("result:{job_id}"),
+            draft,
+            created_at_unix,
+            expires_at_unix,
+            now_unix,
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Mark a job failed. Idempotent (last write wins) but never overwrites a terminal `paid`.
+    pub fn fail_job(&self, job_id: &str, now_unix: i64) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE jobs SET state = 'failed', updated_at_unix = ?2
+             WHERE job_id = ?1 AND state != 'paid'",
+            params![job_id, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Record a collected receipt and mark the job paid. The `receipt_id` is deduped: the first
+    /// sighting credits the job (`New`); a replay is a [`Collected::Duplicate`] no-op that never
+    /// marks paid a second time. This is the money-safe boundary — a job is only ever `paid` once,
+    /// keyed on the unique receipt id.
+    pub fn collect_receipt(
+        &self,
+        receipt_id: &str,
+        job_id: &str,
+        amount_sats: u64,
+        now_unix: i64,
+    ) -> Result<Collected, StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO receipts (receipt_id, job_id, amount_sats, received_at_unix)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![receipt_id, job_id, amount_sats as i64, now_unix],
+        )?;
+        if inserted == 0 {
+            tx.commit()?;
+            return Ok(Collected::Duplicate);
+        }
+        tx.execute(
+            "UPDATE jobs SET state = 'paid', updated_at_unix = ?2 WHERE job_id = ?1",
+            params![job_id, now_unix],
+        )?;
+        tx.commit()?;
+        Ok(Collected::New)
+    }
+
+    /// Write the durable intent-to-receive breadcrumb BEFORE a mint swap (payment ordering, invariant
+    /// 3). Idempotent on `(job_id, token_hash)` — a replay is a no-op. A breadcrumb NEVER proves the
+    /// swap landed; it exists so a crash between swap and receipt is diagnosable and the re-see is
+    /// classified by the COMPLETED-receipt read, not by the breadcrumb.
+    pub fn append_pending_receive(
+        &self,
+        job_id: &str,
+        token_hash: &str,
+        buyer_pubkey: &str,
+        mint: &str,
+        amount_sats: u64,
+        now_unix: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO pending_receive
+                 (job_id, token_hash, buyer_pubkey, mint, amount_sats, created_at_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![job_id, token_hash, buyer_pubkey, mint, amount_sats as i64, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a COMPLETED receipt exists for `job_id`. This is the ONLY positive proof of our own
+    /// prior collection (finding S): on an already-spent re-see, `true` ⇒ idempotent no-op, `false` ⇒
+    /// refuse (never forge a receipt from a breadcrumb), and a read error fails CLOSED at the caller.
+    /// The most recent collected receipt's timestamp, or `None` when nothing has ever been
+    /// collected. One half of the wrap-backfill cursor.
+    pub fn last_receipt_unix(&self) -> Result<Option<i64>, StoreError> {
+        let conn = self.lock()?;
+        let latest = conn.query_row(
+            "SELECT MAX(received_at_unix) FROM receipts",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        Ok(latest)
+    }
+
+    /// Delivery timestamp of the OLDEST job that has been delivered but never paid, or `None` when
+    /// every delivery has settled. The clamp that stops the wrap-backfill cursor from stepping over
+    /// an older job's still-uncollected payment.
+    pub fn oldest_unsettled_delivery_unix(&self) -> Result<Option<i64>, StoreError> {
+        let conn = self.lock()?;
+        let oldest = conn.query_row(
+            "SELECT MIN(d.delivered_at_unix) FROM deliveries d
+             WHERE NOT EXISTS (SELECT 1 FROM receipts r WHERE r.job_id = d.job_id)",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        Ok(oldest)
+    }
+
+    pub fn has_receipt(&self, job_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let found = conn
+            .query_row(
+                "SELECT 1 FROM receipts WHERE job_id = ?1 LIMIT 1",
+                [job_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(found)
+    }
+
+    // ---- Outbox ---------------------------------------------------------------------------------
+
+    /// Every still-`pending` outbox row that has not yet expired (`expires_at_unix > now`),
+    /// oldest first — the batch the publisher must send.
+    pub fn pending_outbox(&self, now_unix: i64) -> Result<Vec<OutboxItem>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, dedup_key, draft_json, created_at_unix, attempts, expires_at_unix
+             FROM nostr_event_outbox
+             WHERE state = 'pending' AND expires_at_unix > ?1
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map([now_unix], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        let mut items = Vec::new();
+        for row in rows {
+            let (id, dedup_key, draft_json, created_at_unix, attempts, expires_at_unix) = row?;
+            let draft: EventDraft = serde_json::from_str(&draft_json)
+                .map_err(|error| StoreError(format!("outbox draft decode: {error}")))?;
+            items.push(OutboxItem {
+                id,
+                dedup_key,
+                draft,
+                created_at_unix,
+                attempts,
+                expires_at_unix,
+            });
+        }
+        Ok(items)
+    }
+
+    /// Mark an outbox row confirmed by the relay, recording the published event id.
+    pub fn mark_confirmed(
+        &self,
+        id: i64,
+        published_event_id: &str,
+        now_unix: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE nostr_event_outbox
+             SET state = 'confirmed', published_event_id = ?2, attempts = attempts + 1,
+                 updated_at_unix = ?3
+             WHERE id = ?1",
+            params![id, published_event_id, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Bump the attempt counter after a failed publish (the row stays `pending` to retry).
+    pub fn record_attempt(&self, id: i64, now_unix: i64) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE nostr_event_outbox SET attempts = attempts + 1, updated_at_unix = ?2
+             WHERE id = ?1",
+            params![id, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Mark an outbox row expired (retry window elapsed) so the publisher stops sending it.
+    pub fn expire_outbox(&self, now_unix: i64) -> Result<usize, StoreError> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE nostr_event_outbox SET state = 'expired', updated_at_unix = ?1
+             WHERE state = 'pending' AND expires_at_unix <= ?1",
+            [now_unix],
+        )?;
+        Ok(changed)
+    }
+
+    /// The `(state, attempts, published_event_id)` of an outbox row by dedup key. Inspection/tests.
+    pub fn outbox_row(
+        &self,
+        dedup_key: &str,
+    ) -> Result<Option<(String, i64, Option<String>)>, StoreError> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT state, attempts, published_event_id FROM nostr_event_outbox
+                 WHERE dedup_key = ?1",
+                [dedup_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    // ---- Reconcile / inspection -----------------------------------------------------------------
+
+    /// The jobs that must resume after a restart: everything not yet terminal (`awarded`,
+    /// `executing`, `delivered`), oldest first. `paid`/`failed` are done and excluded.
+    pub fn resumable_jobs(&self) -> Result<Vec<(String, JobState)>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT job_id, state FROM jobs
+             WHERE state IN ('awarded','executing','delivered')
+             ORDER BY created_at_unix, job_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            let (job_id, state) = row?;
+            let state = JobState::parse(&state)
+                .ok_or_else(|| StoreError(format!("unknown job state {state:?}")))?;
+            jobs.push((job_id, state));
+        }
+        Ok(jobs)
+    }
+
+    /// The state of a single job, if any. Inspection/tests.
+    pub fn job_state(&self, job_id: &str) -> Result<Option<JobState>, StoreError> {
+        let conn = self.lock()?;
+        let raw: Option<String> = conn
+            .query_row("SELECT state FROM jobs WHERE job_id = ?1", [job_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        match raw {
+            None => Ok(None),
+            Some(state) => JobState::parse(&state)
+                .map(Some)
+                .ok_or_else(|| StoreError(format!("unknown job state {state:?}"))),
+        }
+    }
+
+    /// The unix second the award for `job_id` was recorded, if any. This is a durable, restart-STABLE
+    /// value (written once at `record_award`), so the execute path uses it as the delivery commit's
+    /// authored-at — a re-created delivery after a restart is then byte-identical (invariant 2). `None`
+    /// when the job was never awarded.
+    pub fn job_award_time(&self, job_id: &str) -> Result<Option<i64>, StoreError> {
+        let conn = self.lock()?;
+        let ts: Option<i64> = conn
+            .query_row(
+                "SELECT created_at_unix FROM awards WHERE job_id = ?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(ts)
+    }
+
+    /// The creq journaled for a job at claim time (audit N-4). The delivery path signs its hash into
+    /// the receipt preimage and the restart redeem-guard reads its mints, so a config change between
+    /// claim and delivery can never alter the cosigned terms or the settlement mint set. `None` when
+    /// the node never parked a claim for this job.
+    pub fn job_creq(&self, job_id: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.lock()?;
+        let creq: Option<String> = conn
+            .query_row("SELECT creq FROM claims WHERE job_id = ?1", [job_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(creq)
+    }
+
+    /// The assigned agent for a job, if any. Inspection/tests.
+    pub fn job_agent(&self, job_id: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.lock()?;
+        let agent: Option<Option<String>> = conn
+            .query_row(
+                "SELECT agent_name FROM jobs WHERE job_id = ?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(agent.flatten())
+    }
+
+    /// Read the current health view for `status`.
+    /// How many jobs are occupying execution capacity right now.
+    ///
+    /// ⚠ **Not [`HealthSnapshot::jobs`]**, which is `COUNT(*)` over every job row ever written and is
+    /// never pruned. Reading that as "in flight" is what made a seat publish `accepting=n`
+    /// permanently from its first job onward (#313): the count's healthy baseline grew with use, so
+    /// the seat that had delivered the most looked the busiest and stopped being selectable.
+    ///
+    /// The state list comes from [`JobState::occupies_execution_slot`] rather than being written out
+    /// here, so this count and the resume predicate have one definition between them.
+    pub fn jobs_in_flight(&self) -> Result<u32, StoreError> {
+        let conn = self.lock()?;
+        let occupying: Vec<String> = JobState::ALL
+            .iter()
+            .filter(|state| state.occupies_execution_slot())
+            .map(|state| format!("'{}'", state.as_str()))
+            .collect();
+        // Every element is a compile-time constant from JobState, so there is no untrusted input in
+        // this string; a bound-parameter list cannot be spliced into `IN (...)` without building it.
+        let total = count(
+            &conn,
+            &format!(
+                "SELECT COUNT(*) FROM jobs WHERE state IN ({})",
+                occupying.join(",")
+            ),
+        )?;
+        Ok(u32::try_from(total).unwrap_or(u32::MAX))
+    }
+
+    pub fn health(&self) -> Result<HealthSnapshot, StoreError> {
+        let conn = self.lock()?;
+        let schema_version = read_meta_i64(&conn, "schema_version")?.unwrap_or(0);
+        let started_at_unix = read_meta_i64(&conn, "started_at_unix")?.unwrap_or(0);
+        let offers = count(&conn, "SELECT COUNT(*) FROM offers")?;
+        let open_claims = count(&conn, "SELECT COUNT(*) FROM claims WHERE state = 'claimed'")?;
+        let jobs = count(&conn, "SELECT COUNT(*) FROM jobs")?;
+        let pending_outbox = count(
+            &conn,
+            "SELECT COUNT(*) FROM nostr_event_outbox WHERE state = 'pending'",
+        )?;
+        Ok(HealthSnapshot {
+            schema_version,
+            started_at_unix,
+            offers,
+            open_claims,
+            jobs,
+            pending_outbox,
+        })
+    }
+}
+
+/// Enqueue an event into the outbox within a live transaction. Idempotent on `dedup_key`: a second
+/// enqueue with the same key is a no-op (`INSERT OR IGNORE`), which is what makes the transitions
+/// that call this safe to replay.
+fn enqueue_event(
+    tx: &rusqlite::Transaction<'_>,
+    dedup_key: &str,
+    draft: &EventDraft,
+    created_at_unix: i64,
+    expires_at_unix: i64,
+    now_unix: i64,
+) -> Result<(), StoreError> {
+    let draft_json = serde_json::to_string(draft)
+        .map_err(|error| StoreError(format!("outbox draft encode: {error}")))?;
+    tx.execute(
+        "INSERT OR IGNORE INTO nostr_event_outbox
+             (dedup_key, draft_json, created_at_unix, state, attempts, expires_at_unix, updated_at_unix)
+         VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?5)",
+        params![dedup_key, draft_json, created_at_unix, expires_at_unix, now_unix],
+    )?;
+    Ok(())
+}
+
+/// Read a claim's `(state, offer_id)` from any connection-like handle (a transaction derefs to
+/// one). `None` when no claim row exists.
+fn claim_state(
+    conn: &Connection,
+    job_id: &str,
+) -> Result<Option<(String, String)>, StoreError> {
+    let row = conn
+        .query_row(
+            "SELECT state, offer_id FROM claims WHERE job_id = ?1",
+            [job_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    Ok(row)
+}
+
+fn count(conn: &Connection, sql: &str) -> Result<i64, StoreError> {
+    Ok(conn.query_row(sql, [], |row| row.get::<_, i64>(0))?)
+}
+
+fn read_meta_i64(conn: &Connection, key: &str) -> Result<Option<i64>, StoreError> {
+    let value: Option<String> = conn
+        .query_row("SELECT value FROM seller_meta WHERE key = ?1", [key], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?;
+    match value {
+        Some(text) => text
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|error| StoreError(format!("seller_meta.{key} not an integer: {error}"))),
+        None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gateway::TagSpec;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_db(label: &str) -> std::path::PathBuf {
+        let id = NEXT.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "maxplayer-seller-store-{label}-{}-{id}.sqlite",
+            std::process::id()
+        ))
+    }
+
+    fn fresh_store(label: &str) -> (SellerStore, std::path::PathBuf) {
+        let path = temp_db(label);
+        let _ = std::fs::remove_file(&path);
+        let store = SellerStore::open(&path).expect("open");
+        (store, path)
+    }
+
+    /// Put a job row in an exact state. Direct SQL on purpose: driving five states through the
+    /// public transition path would make the state-coverage test below a test of the transitions
+    /// instead of a test of the predicate.
+    fn insert_job(store: &SellerStore, job_id: &str, state: JobState) {
+        let conn = store.lock().expect("lock");
+        conn.execute(
+            "INSERT INTO jobs (job_id, offer_id, agent_name, state, created_at_unix, updated_at_unix)
+             VALUES (?1, ?2, NULL, ?3, 1, 1)",
+            params![job_id, format!("offer-{job_id}"), state.as_str()],
+        )
+        .expect("insert job");
+    }
+
+    /// The stored spellings, written out by hand.
+    ///
+    /// Deliberately NOT derived from `as_str` — the point is to disagree with it if it drifts. These
+    /// same five literals also live in the `jobs.state` CHECK constraint and in `JobState::parse`, so
+    /// a silent rename in one place would otherwise surface as a runtime CHECK violation or an
+    /// "unknown job state" error rather than a failing test.
+    #[test]
+    fn job_state_spellings_are_the_literals_the_schema_stores() {
+        assert_eq!(JobState::Awarded.as_str(), "awarded");
+        assert_eq!(JobState::Executing.as_str(), "executing");
+        assert_eq!(JobState::Delivered.as_str(), "delivered");
+        assert_eq!(JobState::Paid.as_str(), "paid");
+        assert_eq!(JobState::Failed.as_str(), "failed");
+        for state in JobState::ALL {
+            assert_eq!(
+                JobState::parse(state.as_str()),
+                Some(state),
+                "{state:?} must round-trip through its stored spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn only_awarded_and_executing_occupy_an_execution_slot() {
+        assert!(JobState::Awarded.occupies_execution_slot());
+        assert!(JobState::Executing.occupies_execution_slot());
+        // Delivered has finished executing and is awaiting payment — it holds no slot.
+        assert!(!JobState::Delivered.occupies_execution_slot());
+        assert!(!JobState::Paid.occupies_execution_slot());
+        assert!(!JobState::Failed.occupies_execution_slot());
+    }
+
+    /// Enumerated over EVERY variant rather than the two that motivated the change, so adding a state
+    /// without deciding whether it occupies a slot fails here instead of on the wire.
+    #[test]
+    fn jobs_in_flight_counts_exactly_the_occupying_states() {
+        for state in JobState::ALL {
+            let (store, path) = fresh_store(&format!("inflight-{}", state.as_str()));
+            insert_job(&store, "job-1", state);
+            let expected = u32::from(state.occupies_execution_slot());
+            assert_eq!(
+                store.jobs_in_flight().expect("count"),
+                expected,
+                "a single {state:?} job must count as {expected} in flight"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// ★ THE #313 REGRESSION, and it must start from a NON-EMPTY store.
+    ///
+    /// The old predicate was `health().jobs > 0` — `COUNT(*)` over every row ever written — so a seat
+    /// that had finished work advertised `accepting=n` forever. A fixture starting from an empty
+    /// store cannot tell the fix from the bug: both report zero. The discriminator is terminal rows
+    /// PRESENT, and this test asserts the two counts DISAGREE, which is the whole defect.
+    #[test]
+    fn a_store_holding_only_terminal_jobs_reports_none_in_flight() {
+        let (store, path) = fresh_store("terminal-only");
+        insert_job(&store, "job-paid-1", JobState::Paid);
+        insert_job(&store, "job-paid-2", JobState::Paid);
+        insert_job(&store, "job-failed", JobState::Failed);
+        insert_job(&store, "job-delivered", JobState::Delivered);
+
+        assert_eq!(
+            store.jobs_in_flight().expect("count"),
+            0,
+            "a seat whose jobs are all finished is FREE and must advertise accepting=y"
+        );
+        assert_eq!(
+            store.health().expect("health").jobs,
+            4,
+            "health().jobs stays the lifetime total — that is its job, which is why it must not be \
+             read as in-flight"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn jobs_in_flight_is_a_count_not_a_flag() {
+        let (store, path) = fresh_store("inflight-depth");
+        insert_job(&store, "job-a", JobState::Awarded);
+        insert_job(&store, "job-b", JobState::Executing);
+        insert_job(&store, "job-c", JobState::Awarded);
+        insert_job(&store, "job-done", JobState::Paid);
+        assert_eq!(
+            store.jobs_in_flight().expect("count"),
+            3,
+            "three occupying jobs must report 3 — a 0/1 answer is the #313 shape"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn sample_offer(id: &str) -> Offer {
+        Offer {
+            offer_id: id.to_owned(),
+            buyer_pubkey: "b".repeat(64),
+            amount_sats: 100,
+            unit: "sat".to_owned(),
+            task: "do the thing".to_owned(),
+            deadline_unix: 10_000,
+            targeted: true,
+            requested_agent: None,
+        }
+    }
+
+    /// A wire-valid draft carrying the protocol tags every maxplayer event needs.
+    fn wire_draft(kind: u16) -> EventDraft {
+        use crate::gateway::{MAXPLAYER_TAG, PROTOCOL_VERSION};
+        EventDraft::new(
+            kind,
+            vec![
+                TagSpec::new(["t", MAXPLAYER_TAG]),
+                TagSpec::new(["v", PROTOCOL_VERSION]),
+            ],
+            "content",
+        )
+    }
+
+    fn claim() -> EventDraft {
+        wire_draft(crate::gateway::JOB_CLAIM_KIND)
+    }
+
+    fn result() -> EventDraft {
+        wire_draft(crate::gateway::JOB_RESULT_KIND)
+    }
+
+    #[test]
+    fn open_is_wal_and_carries_schema_and_start() {
+        let (store, path) = fresh_store("wal");
+        store.record_start(1234).expect("record start");
+        let health = store.health().expect("health");
+        assert_eq!(health.schema_version, SCHEMA_VERSION);
+        assert_eq!(health.started_at_unix, 1234);
+        assert_eq!(health.jobs, 0);
+
+        let conn = Connection::open(&path).expect("reopen");
+        let mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("journal_mode");
+        assert_eq!(mode.to_lowercase(), "wal");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // TOOTH — the harness an offer requested is journaled with its other facts and READS BACK
+    // across a reopen. Execution can be a restart away from the claim, so a request that lived only
+    // in memory would let a resumed job run on whatever harness the node prefers now.
+    #[test]
+    fn requested_agent_survives_a_reopen() {
+        let path = temp_db("requested-agent");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = SellerStore::open(&path).expect("open");
+            let mut offer = sample_offer("o1");
+            offer.requested_agent = Some("codex".to_owned());
+            store.record_offer(&offer, 1).expect("record");
+            // An offer with no preference stays None — absence is a value here, not a default.
+            store.record_offer(&sample_offer("o2"), 1).expect("record");
+        }
+        let store = SellerStore::open(&path).expect("reopen");
+        assert_eq!(
+            store.offer_row("o1").expect("row").expect("o1").requested_agent.as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            store.offer_row("o2").expect("row").expect("o2").requested_agent,
+            None
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // TOOTH — a store written by a binary from before this column opens, MIGRATES, and reads its
+    // existing rows as "no preference". `CREATE TABLE IF NOT EXISTS` silently skips an existing
+    // table, so without the ALTER an upgraded node would fail every offer read on a live store.
+    #[test]
+    fn a_store_from_before_the_column_migrates_and_reads_no_preference() {
+        let path = temp_db("pre-agent-schema");
+        let _ = std::fs::remove_file(&path);
+        // The offers table exactly as the previous schema had it, holding a live row.
+        {
+            let conn = Connection::open(&path).expect("create old store");
+            conn.execute_batch(
+                "CREATE TABLE offers (
+                     offer_id        TEXT PRIMARY KEY,
+                     buyer_pubkey    TEXT NOT NULL,
+                     amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
+                     unit            TEXT NOT NULL,
+                     task            TEXT NOT NULL,
+                     deadline_unix   INTEGER NOT NULL,
+                     targeted        INTEGER NOT NULL,
+                     created_at_unix INTEGER NOT NULL
+                 );
+                 INSERT INTO offers VALUES ('old', 'buyer', 21, 'sat', 'task', 10000, 1, 1);",
+            )
+            .expect("old schema");
+        }
+
+        let store = SellerStore::open(&path).expect("open migrates");
+        let row = store.offer_row("old").expect("read").expect("the pre-existing row survives");
+        assert_eq!(row.amount_sats, 21, "the row is migrated, not replaced");
+        assert_eq!(row.requested_agent, None, "an offer from before the column asked for no harness");
+        // Migration is idempotent: opening again neither errors nor double-adds.
+        drop(store);
+        let store = SellerStore::open(&path).expect("second open");
+        assert_eq!(store.health().expect("health").schema_version, SCHEMA_VERSION);
+        assert!(store.offer_row("old").expect("read").is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn record_offer_is_idempotent() {
+        let (store, path) = fresh_store("offer");
+        let offer = sample_offer(&"a".repeat(64));
+        assert!(store.record_offer(&offer, 1).expect("first"));
+        assert!(!store.record_offer(&offer, 2).expect("second"), "re-seen offer is a no-op");
+        assert_eq!(store.health().expect("h").offers, 1);
+        // offer_facts serves the award-auth (buyer) and pay (amount/unit) reads.
+        assert_eq!(
+            store.offer_facts(&offer.offer_id).expect("facts"),
+            Some((offer.buyer_pubkey.clone(), offer.amount_sats, offer.unit.clone()))
+        );
+        assert_eq!(store.offer_facts(&"z".repeat(64)).expect("absent"), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // TOOTH 2 (charter) — RED ON REVERT for the outbox. `claim_and_enqueue` must write the claim
+    // row AND the outbox row atomically. This asserts the outbox MUTATION LANDED (a pending row
+    // carrying the full wire-valid draft — right kind AND the `["v","1"]` + `["t","maxplayer"]` protocol
+    // tags a live buyer requires), not merely that no error was returned. Deleting the
+    // `enqueue_event` call in `claim_and_enqueue` leaves the claim row but no outbox row, so the
+    // length / kind / tag assertions fail — the revert turns this test red.
+    #[test]
+    fn tooth_outbox_write_lands_atomically_with_the_claim() {
+        use crate::gateway::{JOB_CLAIM_KIND, MAXPLAYER_TAG, PROTOCOL_VERSION};
+        let (store, path) = fresh_store("outbox-redonrevert");
+        let job = "j".repeat(64);
+        let offer = "o".repeat(64);
+        assert_eq!(
+            store
+                .claim_and_enqueue(&job, &offer, "creqA", &claim(), 500, 999, 1)
+                .expect("claim"),
+            Claimed::New
+        );
+
+        // The outbox row LANDED — pending, the claim kind, and the protocol tags, not yet published.
+        let pending = store.pending_outbox(2).expect("pending");
+        assert_eq!(pending.len(), 1, "exactly one pending outbox row must exist");
+        let item = &pending[0];
+        assert_eq!(item.dedup_key, format!("claim:{job}"));
+        assert_eq!(item.draft.kind, JOB_CLAIM_KIND);
+        assert_eq!(item.created_at_unix, 500);
+        assert_eq!(item.attempts, 0);
+        // The enqueued draft is wire-valid: it carries the version + namespace tags parse_offer/
+        // the buyer require, so a signed event from it is not rejected on the wire.
+        assert!(has_tag(&item.draft, "v", PROTOCOL_VERSION), "draft must carry [\"v\",\"1\"]");
+        assert!(has_tag(&item.draft, "t", MAXPLAYER_TAG), "draft must carry [\"t\",\"maxplayer\"]");
+
+        let row = store.outbox_row(&format!("claim:{job}")).expect("row").expect("exists");
+        assert_eq!(row.0, "pending");
+        assert!(row.2.is_none(), "not yet published");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn has_tag(draft: &EventDraft, name: &str, value: &str) -> bool {
+        draft
+            .tags
+            .iter()
+            .any(|tag| tag.first() == Some(name) && tag.value() == Some(value))
+    }
+
+    #[test]
+    fn claim_and_enqueue_is_idempotent_no_double_enqueue() {
+        let (store, path) = fresh_store("claim-idem");
+        let job = "j".repeat(64);
+        let offer = "o".repeat(64);
+        assert_eq!(
+            store.claim_and_enqueue(&job, &offer, "creqA", &claim(), 1, 999, 1).expect("first"),
+            Claimed::New
+        );
+        // A replay carrying a DIFFERENT creq is a no-op: neither the outbox nor the journaled
+        // claim-time creq is overwritten. The first creq — the one that was on the wire — stands.
+        assert_eq!(
+            store.claim_and_enqueue(&job, &offer, "creqB", &claim(), 1, 999, 2).expect("replay"),
+            Claimed::Idempotent
+        );
+        assert_eq!(store.pending_outbox(3).expect("pending").len(), 1, "no second enqueue");
+        assert_eq!(
+            store.job_creq(&job).expect("creq").as_deref(),
+            Some("creqA"),
+            "the claim-time creq is immutable across replays"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn award_dedup_creates_one_job_and_ignores_replays() {
+        let (store, path) = fresh_store("award");
+        let job = "j".repeat(64);
+        let offer = "o".repeat(64);
+        let award = "w".repeat(64);
+        let buyer = "b".repeat(64);
+        store.claim_and_enqueue(&job, &offer, "creqA", &claim(), 1, 999, 1).expect("claim");
+
+        assert_eq!(
+            store.record_award(&award, &job, &buyer, 2).expect("award"),
+            Awarded::New
+        );
+        assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Awarded));
+        // The award time is the durable, restart-stable delivery author-date (invariant 2 source).
+        assert_eq!(store.job_award_time(&job).expect("award time"), Some(2));
+        assert_eq!(store.job_award_time(&"z".repeat(64)).expect("absent"), None);
+
+        // A re-seen award id is a dedup no-op — no second job, state unchanged.
+        assert_eq!(
+            store.record_award(&award, &job, &buyer, 3).expect("replay"),
+            Awarded::Duplicate
+        );
+        assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Awarded));
+
+        // An award for an unknown claim is recorded but creates no job.
+        let orphan_job = "k".repeat(64);
+        let orphan_award = "x".repeat(64);
+        assert_eq!(
+            store.record_award(&orphan_award, &orphan_job, &buyer, 4).expect("orphan"),
+            Awarded::NoClaim
+        );
+        assert_eq!(store.job_state(&orphan_job).expect("state"), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deliver_is_idempotent_and_enqueues_result_once() {
+        let (store, path) = fresh_store("deliver");
+        let job = "j".repeat(64);
+        let offer = "o".repeat(64);
+        let buyer = "b".repeat(64);
+        store.claim_and_enqueue(&job, &offer, "creqA", &claim(), 1, 999, 1).expect("claim");
+        store.record_award(&"w".repeat(64), &job, &buyer, 2).expect("award");
+        store.mark_executing(&job, 3).expect("exec");
+
+        assert!(store
+            .deliver_and_enqueue(&job, "ref-1", &result(), 4, 999, 5)
+            .expect("deliver"));
+        assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Delivered));
+        // Replay: no second delivery, no second result enqueue.
+        assert!(!store
+            .deliver_and_enqueue(&job, "ref-1", &result(), 4, 999, 6)
+            .expect("replay"));
+        assert_eq!(
+            store.outbox_row(&format!("result:{job}")).expect("row").expect("exists").0,
+            "pending"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Money-safe dedup: a replayed receipt never marks a job paid twice.
+    #[test]
+    fn collect_receipt_dedups_and_pays_once() {
+        let (store, path) = fresh_store("collect");
+        let job = "j".repeat(64);
+        let offer = "o".repeat(64);
+        let receipt = "r".repeat(64);
+        store.claim_and_enqueue(&job, &offer, "creqA", &claim(), 1, 999, 1).expect("claim");
+        store.record_award(&"w".repeat(64), &job, &"b".repeat(64), 2).expect("award");
+
+        assert_eq!(
+            store.collect_receipt(&receipt, &job, 100, 3).expect("collect"),
+            Collected::New
+        );
+        assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Paid));
+        assert_eq!(
+            store.collect_receipt(&receipt, &job, 100, 4).expect("replay"),
+            Collected::Duplicate,
+            "a replayed receipt must not credit twice"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn expire_outbox_stops_the_publisher_from_sending() {
+        let (store, path) = fresh_store("expire");
+        let job = "j".repeat(64);
+        store.claim_and_enqueue(&job, &"o".repeat(64), "creqA", &claim(), 1, 100, 1).expect("claim");
+        // now=200 is past expires_at=100.
+        assert_eq!(store.expire_outbox(200).expect("expire"), 1);
+        assert!(store.pending_outbox(200).expect("pending").is_empty());
+        assert_eq!(
+            store.outbox_row(&format!("claim:{job}")).expect("row").expect("exists").0,
+            "expired"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+}

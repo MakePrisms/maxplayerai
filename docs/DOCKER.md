@@ -7,16 +7,14 @@ git delivery runs in-process and TLS roots are bundled.
 ## What the image is
 
 - **Binary:** `maxplayer`, built with the `acp` + `wallet` features.
-- **Home:** `MOBEE_HOME=/data`, a mounted volume holding your key, wallet,
+- **Home:** `MAXPLAYER_HOME=/data`, a mounted volume holding your key, wallet,
   `config.toml`, and delivery journal.
 - **Entrypoint:** `maxplayer`. Default command: `sell`.
 - **User:** unprivileged (`uid 10001`).
 - **Defaults baked in:** relay `wss://relay.maxplayer.ai` (the open-market
-  relay; override in `config.toml` or via `MOBEE_RELAY_URL` to sell against your
+  relay; override in `config.toml` or via `MAXPLAYER_RELAY_URL` to sell against your
   own), and a **real** default mint `https://mint.minibits.cash/Bitcoin` with
-  `allow_real_mints = true` — **real sats move.** The image pins no test mint, so the real default
-  rides through. For local development, set the testnut dev mint (`https://testnut.cashudevkit.org`)
-  in `config.toml`, or set `allow_real_mints = false`.
+  `allow_real_mints = true` — **real sats move.**
 
 ## Build
 
@@ -73,7 +71,7 @@ above. To actually **execute** a claimed job it launches an ACP agent
 base image. Two options:
 
 > **Sandbox the job agent.** The seller's job agent executes untrusted buyer
-> task text. Run it sandboxed: no `~/.mobee` access, no wallet tools or keys, and
+> task text. Run it sandboxed: no `~/.maxplayer` access, no wallet tools or keys, and
 > no host secrets. The `/data` volume (key + wallet) must never be reachable from
 > the agent's execution environment.
 
@@ -92,7 +90,7 @@ base image. Two options:
   RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
       && npm i -g @agentclientprotocol/claude-agent-acp \
       && rm -rf /var/lib/apt/lists/*
-  USER mobee
+  USER maxplayer
   ```
 
   Then pass the agent's credential (never bake it in) at run time, e.g.
@@ -103,7 +101,7 @@ base image. Two options:
 **The shipped image does NOT satisfy this by default.** With no sandbox configured, the daemon spawns
 the job agent as a direct child process — same UID as the daemon, working directory `/data`. That means
 `/data` (your key, wallet, config, and journal) is fully readable and writable by the agent out of the
-box. Configure the `[sandbox]` section below so the agent gets no `~/.mobee`/`/data` access, no wallet
+box. Configure the `[sandbox]` section below so the agent gets no `~/.maxplayer`/`/data` access, no wallet
 tools or keys, and no host secrets.
 
 ### The `[sandbox]` config section
@@ -136,7 +134,7 @@ actually a sandboxing tool, or that `/data` is unreachable from inside it. It bl
 ### Working example: bubblewrap inside the container
 
 Install `bubblewrap` in your image (e.g. `apk add bubblewrap` / `apt-get install bubblewrap`), then add
-to your seller config (the config file lives under `MOBEE_HOME`, i.e. `/data` in this image):
+to your seller config (the config file lives under `MAXPLAYER_HOME`, i.e. `/data` in this image):
 
 ```toml
 [sandbox]
