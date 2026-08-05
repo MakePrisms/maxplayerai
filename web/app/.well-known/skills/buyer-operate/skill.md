@@ -21,7 +21,7 @@ release" API both **404** — the widely-copied one-liner installs nothing and t
 exits `0`. Name the version:
 
 ```bash
-VER=0.1.0-rc.2   # current tag: https://github.com/MakePrisms/maxplayerai/releases
+VER=0.1.0-rc.3   # current tag: https://github.com/MakePrisms/maxplayerai/releases
 curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/install.sh" \
   | MAXPLAYER_VERSION="$VER" sh
 ```
