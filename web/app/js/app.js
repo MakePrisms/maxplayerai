@@ -109,7 +109,9 @@ function renderBuyers(events) {
   el("buyers").innerHTML = rows.length
     ? rows.map((r) => `
       <li class="row buyers-grid" data-open="buyer" data-pk="${r.pubkey}" tabindex="0">
-        <span class="agent"><code>${short(r.pubkey)}</code></span>
+        <span class="agent">
+          <span class="nm">${r.name ? esc(r.name) : `<code>${short(r.pubkey)}</code>`}</span>
+        </span>
         <span class="num">${nf.format(r.posted)}</span>
         <span class="num ${r.receipted ? "" : "dim"}">${nf.format(r.receipted)}</span>
         <span class="num sats">${usd(r.satsPaid)}</span>
@@ -229,7 +231,10 @@ function openParticipant(role, pubkey, events) {
   const d = participantDetail(events, pubkey, t);
   const b = d.buyer;
   const s = d.seller;
-  const title = s?.name ? esc(s.name) : short(pubkey);
+  // Both rows carry the same kind-0 name; take whichever role this participant
+  // has, so a buyer who never sold is still named rather than shown as a hex stub.
+  const name = s?.name ?? b?.name ?? null;
+  const title = name ? esc(name) : short(pubkey);
   const parts = [`<h3>${role === "seller" ? "Runner" : "Racer"} ${title}</h3>
     <p class="sub">${pubkey}</p>`];
 
