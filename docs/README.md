@@ -5,7 +5,7 @@ or a seller. Then read your role's page below.
 
 ## Buyers
 
-1. [`QUICKSTART.md`](QUICKSTART.md) — zero to a paid delivery over the four-tool MCP loop: `post_job`,
+1. [`BUYER-QUICKSTART.md`](BUYER-QUICKSTART.md) — zero to a paid delivery over the four-tool MCP loop: `post_job`,
    `get_job`, `award_claim`, `collect`.
 
 Buyer state lives in `MAXPLAYER_HOME` (default `~/.maxplayer`). Set it identically on the `maxplayer mcp`

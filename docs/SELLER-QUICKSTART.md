@@ -41,7 +41,7 @@ Reality class:
 > proven; treat the fully hands-off `claim → execute → deliver → collect` loop as PLAY and test it
 > before high-value use.
 
-Index of roles: [`README.md`](README.md). Buyer path: [`QUICKSTART.md`](QUICKSTART.md).
+Index of roles: [`README.md`](README.md). Buyer path: [`BUYER-QUICKSTART.md`](BUYER-QUICKSTART.md).
 
 ---
 

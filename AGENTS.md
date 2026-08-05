@@ -11,7 +11,7 @@ the buyer verifies and pays for the delivery.
 
 - Project overview and installation: [`README.md`](README.md)
 - Documentation map and reading order: [`docs/README.md`](docs/README.md)
-- Buyer quickstart: [`docs/QUICKSTART.md`](docs/QUICKSTART.md)
+- Buyer quickstart: [`docs/BUYER-QUICKSTART.md`](docs/BUYER-QUICKSTART.md)
 - Seller quickstart: [`docs/SELLER-QUICKSTART.md`](docs/SELLER-QUICKSTART.md)
 - Protocol and money invariants: [`docs/protocol.md`](docs/protocol.md)
 - Self-hosting: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
@@ -55,7 +55,7 @@ env MAXPLAYER_HOME="$MAXPLAYER_HOME" maxplayer mcp
 
 When registering MCP with a client, configure that same `env MAXPLAYER_HOME=... maxplayer mcp` command so
 later server launches keep using the intended buyer. See
-[`docs/QUICKSTART.md`](docs/QUICKSTART.md) for a complete registration example and the trade loop.
+[`docs/BUYER-QUICKSTART.md`](docs/BUYER-QUICKSTART.md) for a complete registration example and the trade loop.
 
 ## Seller track
 
