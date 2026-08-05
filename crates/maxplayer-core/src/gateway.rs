@@ -1053,6 +1053,38 @@ mod tests {
         );
     }
 
+    // Wire-cutover red-leg (rename PR B): a v1 offer round-trips, and the pre-flip wire is rejected
+    // BOTH ways — t=mobee as out-of-namespace, v=0 as an unsupported version. This is the partition
+    // the flag day accepts: rc.2 seats still speaking t=mobee / v=0 are invisible to a v1 parser.
+    #[test]
+    fn legacy_mobee_v0_offer_is_rejected_under_v1() {
+        let ok = OfferDraft::new("summarize", "application/json", 3, 1_800_000_001, SELLER)
+            .to_event_draft();
+        assert!(parse_offer(&ok).is_ok(), "a v1 offer (t=maxplayer, v=1) must round-trip");
+
+        let mut legacy_tag = ok.clone();
+        for tag in legacy_tag.tags.iter_mut() {
+            if tag.first() == Some("t") {
+                tag.0 = vec!["t".to_owned(), "mobee".to_owned()];
+            }
+        }
+        assert!(
+            matches!(parse_offer(&legacy_tag), Err(OfferParseError::MissingMaxplayerTag)),
+            "a legacy t=mobee offer must be rejected as outside the maxplayer namespace"
+        );
+
+        let mut legacy_ver = ok.clone();
+        for tag in legacy_ver.tags.iter_mut() {
+            if tag.first() == Some("v") {
+                tag.0 = vec!["v".to_owned(), "0".to_owned()];
+            }
+        }
+        assert!(
+            matches!(parse_offer(&legacy_ver), Err(OfferParseError::UnsupportedVersion(v)) if v == "0"),
+            "a legacy v=0 offer must be rejected as an unsupported version"
+        );
+    }
+
     #[test]
     fn targeting_helpers_fail_closed_for_targeted_offers() {
         let targeted = parse_offer(

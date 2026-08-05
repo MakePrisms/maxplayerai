@@ -1490,7 +1490,7 @@ mod tests {
 
     // Frozen AttemptId of `key()` with no creq. Guards the None-creq regression path.
     const KEY_ATTEMPT_ID: &str =
-        "99e8e7b4c53c7af9f2329e16a9625133e9f788d3ffe1257f0a5a121c549de3cd";
+        "8f58e28cd361fef026af7305b15d12dc9607649ccc841d4ca4c06bb664f57c21";
 
     #[test]
     fn content_hash_field_name_refuses_to_deserialize() {
