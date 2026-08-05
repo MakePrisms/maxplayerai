@@ -150,7 +150,7 @@ mod tests {
 
     fn temp_home(label: &str) -> std::path::PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("mobee-buyer-signer-{label}-{}-{id}", std::process::id()))
+        std::env::temp_dir().join(format!("maxplayer-buyer-signer-{label}-{}-{id}", std::process::id()))
     }
 
     // TOOTH (#173) — a signer round-trip is BOUNDED, so an actor that never answers cannot park the

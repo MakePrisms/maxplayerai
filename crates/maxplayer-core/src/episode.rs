@@ -306,7 +306,7 @@ mod tests {
     fn temp_root(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         let root = std::env::temp_dir().join(format!(
-            "mobee-episode-{label}-{}-{id}",
+            "maxplayer-episode-{label}-{}-{id}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&root);

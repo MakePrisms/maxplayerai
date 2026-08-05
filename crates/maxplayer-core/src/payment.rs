@@ -2340,7 +2340,7 @@ mod tests {
     #[test]
     fn fs_journal_rejects_torn_tail() {
         let path = std::env::temp_dir().join(format!(
-            "mobee-payment-journal-{}-{}.jsonl",
+            "maxplayer-payment-journal-{}-{}.jsonl",
             std::process::id(),
             key().attempt_id().as_str()
         ));
@@ -2376,7 +2376,7 @@ mod tests {
     #[test]
     fn fs_journal_rejects_complete_json_without_newline() {
         let path = std::env::temp_dir().join(format!(
-            "mobee-payment-journal-complete-tail-{}-{}.jsonl",
+            "maxplayer-payment-journal-complete-tail-{}-{}.jsonl",
             std::process::id(),
             key().attempt_id().as_str()
         ));
@@ -2407,7 +2407,7 @@ mod tests {
     #[test]
     fn fs_journal_rejects_foreign_payment_key_record() {
         let path = std::env::temp_dir().join(format!(
-            "mobee-payment-journal-foreign-key-{}-{}.jsonl",
+            "maxplayer-payment-journal-foreign-key-{}-{}.jsonl",
             std::process::id(),
             key().attempt_id().as_str()
         ));
@@ -2447,7 +2447,7 @@ mod tests {
 
         // Control: a genuinely-absent journal (no file) still replays as the legitimate empty case.
         let empty_path = std::env::temp_dir().join(format!(
-            "mobee-payment-journal-absent-{}-{}.jsonl",
+            "maxplayer-payment-journal-absent-{}-{}.jsonl",
             std::process::id(),
             key().attempt_id().as_str()
         ));
@@ -2465,7 +2465,7 @@ mod tests {
     #[test]
     fn fs_journal_syncs_parent_before_the_first_effect() {
         let directory = std::env::temp_dir().join(format!(
-            "mobee-payment-journal-dir-{}-{}",
+            "maxplayer-payment-journal-dir-{}-{}",
             std::process::id(),
             key().attempt_id().as_str()
         ));
@@ -2769,12 +2769,12 @@ mod tests {
             seller_pubkey: seller_keys().public_key().to_hex(),
             target: crate::contribution::TargetRepoPin::new(
                 "aa".repeat(32),
-                "https://mobee-relay.orveth.dev/git/owner/repo.git",
+                "https://relay.maxplayer.test/git/owner/repo.git",
             )
             .unwrap(),
             base_oid: "77".repeat(20),
             fork: crate::contribution::ForkRef::new(
-                "https://mobee-relay.orveth.dev/git/seller/fork.git",
+                "https://relay.maxplayer.test/git/seller/fork.git",
                 "mobee/contribution/job",
             )
             .unwrap(),

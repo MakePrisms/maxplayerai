@@ -947,7 +947,7 @@ mod tests {
     fn test_path(name: &str) -> PathBuf {
         let id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!(
-            "mobee-cli-{name}-{}-{id}.jsonl",
+            "maxplayer-cli-{name}-{}-{id}.jsonl",
             std::process::id()
         ))
     }
@@ -955,6 +955,6 @@ mod tests {
     #[cfg(feature = "wallet")]
     fn test_home(name: &str) -> PathBuf {
         let id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("mobee-cli-home-{name}-{}-{id}", std::process::id()))
+        std::env::temp_dir().join(format!("maxplayer-cli-home-{name}-{}-{id}", std::process::id()))
     }
 }

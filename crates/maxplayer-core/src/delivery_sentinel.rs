@@ -41,7 +41,7 @@ pub const SENTINEL_FILE: &str = "MOBEE_EXECUTION_SENTINEL";
 /// `mobee-probe`/`mobee-selfprobe` prefixes on purpose: those mean a throwaway pre-advertise
 /// capability probe; THIS means a per-job, buyer-verified delivery proof. A grep for either must land
 /// on one meaning.
-pub const SENTINEL_MARKER: &str = "mobee-execution-sentinel/v1";
+pub const SENTINEL_MARKER: &str = "maxplayer-execution-sentinel/v1";
 
 /// Delivery mode recorded in the manifest — the parentage the node snapshotted under (§18.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

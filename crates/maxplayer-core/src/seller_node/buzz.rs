@@ -150,7 +150,7 @@ pub fn rate_card_about(cfg: &BuzzConfig, seller_rate_sats: Option<u64>) -> Strin
     }
     let mint = cfg.mint.as_deref().unwrap_or("testnut");
     parts.push(format!("pays via {mint}"));
-    parts.push("hire me on mobee".to_owned());
+    parts.push("hire me on maxplayer".to_owned());
     parts.join(" · ")
 }
 
@@ -530,7 +530,7 @@ mod tests {
         use nostr_sdk::prelude::{EventBuilder, Kind};
 
         let root = std::env::temp_dir().join(format!(
-            "mobee-buzz-allowlist-{}-{}",
+            "maxplayer-buzz-allowlist-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

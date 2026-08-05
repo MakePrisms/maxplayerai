@@ -347,7 +347,7 @@ fn default_seller_about(agent: Option<&str>, rate_sats: u64, accepted_mints: &[S
         .first()
         .map(String::as_str)
         .unwrap_or("no-mint");
-    format!("mobee seller · {agent_label} · {rate_sats} sat/job · {mint_label}")
+    format!("maxplayer seller · {agent_label} · {rate_sats} sat/job · {mint_label}")
 }
 
 /// Build NIP-89 kind-31990 content from profile + seller knobs + accepted mints.
@@ -464,7 +464,7 @@ pub async fn announce_seller_delivery_repo_async(
     let announcement = GitRepositoryAnnouncement {
         id: repo_id,
         name: Some(name),
-        description: Some("mobee seller delivery".into()),
+        description: Some("maxplayer seller delivery".into()),
         web: Vec::new(),
         clone: vec![clone],
         relays: Vec::new(),
@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn announce_delivery_repo_refuses_bad_locators_without_leaking_url() {
         let root = std::env::temp_dir().join(format!(
-            "mobee-announce-allowlist-{}-{}",
+            "maxplayer-announce-allowlist-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -670,7 +670,7 @@ mod tests {
     #[test]
     fn resolve_display_names_skips_invalid_hex_without_relay() {
         let root = std::env::temp_dir().join(format!(
-            "mobee-profile-resolve-{}-{}",
+            "maxplayer-profile-resolve-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -687,7 +687,7 @@ mod tests {
     #[test]
     fn set_profile_writes_config_without_inventing_on_bootstrap() {
         let root = std::env::temp_dir().join(format!(
-            "mobee-profile-set-{}-{}",
+            "maxplayer-profile-set-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -717,7 +717,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_names_sync_refuses_inside_runtime() {
         let root = std::env::temp_dir().join(format!(
-            "mobee-fetch-names-nested-{}-{}",
+            "maxplayer-fetch-names-nested-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -746,7 +746,7 @@ mod tests {
     #[test]
     fn nip89_announce_mint_matches_config_not_testnut() {
         let root = std::env::temp_dir().join(format!(
-            "mobee-nip89-mint-{}-{}",
+            "maxplayer-nip89-mint-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -762,7 +762,7 @@ mod tests {
             config.allow_real_mints = true;
             config.profile = Some(ProfileConfig {
                 name: Some("frogger".into()),
-                about: Some("mobee seller · grok-4.5 · 100 sat/job · minibits".into()),
+                about: Some("maxplayer seller · grok-4.5 · 100 sat/job · minibits".into()),
             });
         })
         .expect("save");

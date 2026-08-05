@@ -68,10 +68,10 @@ const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const RELAY_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Stable id for the liveness REQ, so a relay `CLOSED` names it.
-const LIVENESS_PROBE_SUB_ID: &str = "mobee-buyer-liveness";
+const LIVENESS_PROBE_SUB_ID: &str = "maxplayer-buyer-liveness";
 
 /// Stable id for the buyer's job-event REQ, so a relay `CLOSED` names which subscription died.
-const JOB_EVENTS_SUB_ID: &str = "mobee-buyer-jobs";
+const JOB_EVENTS_SUB_ID: &str = "maxplayer-buyer-jobs";
 
 /// Depth of the fan-out channel carrying job events to waiters. A waiter that falls behind sees
 /// `Lagged`, which is a re-check signal and NOT an error — see [`RelayHandle::subscribe_events`].
@@ -541,7 +541,7 @@ mod tests {
     //
     // The fixture is `RelayBuilderNip42Mode::Both`, which refuses an EVENT from an unauthenticated
     // session with `MachineReadablePrefix::AuthRequired` (nostr-relay-builder local/inner.rs:420-438)
-    // — the exact wire condition mobee-relay produces. A fixture that served writes unauthenticated
+    // — the exact wire condition maxplayer-relay produces. A fixture that served writes unauthenticated
     // would make this whole test decorative.
     //
     // BITE: set `automatic_authentication(false)` in `spawn`, or bump to an SDK whose `send_event`
@@ -570,7 +570,7 @@ mod tests {
             .await
             .expect("buyer relay spawn");
 
-        let note = EventBuilder::text_note("mobee buyer write-path contract")
+        let note = EventBuilder::text_note("maxplayer buyer write-path contract")
             .sign(&buyer)
             .await
             .expect("sign");
@@ -594,7 +594,7 @@ mod tests {
             .expect("add relay");
         drifted.connect().await;
         drifted.wait_for_connection(CONNECT_WAIT).await;
-        let drifted_note = EventBuilder::text_note("mobee buyer write-path drift arm")
+        let drifted_note = EventBuilder::text_note("maxplayer buyer write-path drift arm")
             .sign(&buyer)
             .await
             .expect("sign");

@@ -117,7 +117,7 @@ mod tests {
 
     fn temp_home(label: &str) -> std::path::PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("mobee-buyer-wactor-{label}-{}-{id}", std::process::id()))
+        std::env::temp_dir().join(format!("maxplayer-buyer-wactor-{label}-{}-{id}", std::process::id()))
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

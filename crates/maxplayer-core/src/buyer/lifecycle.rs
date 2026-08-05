@@ -1085,7 +1085,7 @@ mod tests {
     fn temp_db(label: &str) -> std::path::PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!(
-            "mobee-buyer-lifecycle-{label}-{}-{id}.sqlite",
+            "maxplayer-buyer-lifecycle-{label}-{}-{id}.sqlite",
             std::process::id()
         ))
     }
@@ -2468,7 +2468,7 @@ mod tests {
     #[test]
     fn crash_between_pay_and_flip_never_overstates_available_and_reconcile_converges() {
         let root = std::env::temp_dir().join(format!(
-            "mobee-buyer-lifecycle-crash-{}-{}",
+            "maxplayer-buyer-lifecycle-crash-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::SeqCst)
         ));
@@ -2605,7 +2605,7 @@ mod tests {
     /// rolling total ceiling; the wallet balance is the sole shared limit).
     fn conc_home(label: &str, cap: u64) -> (crate::home::MaxplayerHome, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!(
-            "mobee-buyer-lifecycle-conc-{label}-{}-{}",
+            "maxplayer-buyer-lifecycle-conc-{label}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::SeqCst)
         ));

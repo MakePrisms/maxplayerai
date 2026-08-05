@@ -55,7 +55,7 @@ EXPOSURE_CAP_SATS="${EXPOSURE_CAP_SATS:-50}"
 SOURCE_MINT="${SOURCE_MINT:-}"         # the mint the buyer holds sats at
 TARGET_MINT="${TARGET_MINT:-}"         # the mint the seller accepts — MUST differ from SOURCE_MINT
 
-MOBEE="${MOBEE:-/srv/forge/workspaces/.crossmint-target/release/maxplayer}"
+MAXPLAYER="${MAXPLAYER:-/srv/forge/workspaces/.crossmint-target/release/maxplayer}"
 RUN_DIR="${RUN_DIR:-/tmp/crossmint-smoke-run}"
 
 # The marker that makes a directory a legitimate target. Bootstrap WRITES into MOBEE_HOME, and an
@@ -187,13 +187,13 @@ unset or wrong MOBEE_HOME resolves to ~/.mobee, which holds a real key and walle
 maxplayer_at() { # <home> <args...>
     local home="$1"; shift
     assert_throwaway "$home"
-    MOBEE_HOME="$home" "$MOBEE" "$@" --home "$home"
+    MOBEE_HOME="$home" "$MAXPLAYER" "$@" --home "$home"
 }
 # Same, for the non-wallet commands that take no --home flag and read MOBEE_HOME from the env.
 maxplayer_env() { # <home> <args...>
     local home="$1"; shift
     assert_throwaway "$home"
-    MOBEE_HOME="$home" "$MOBEE" "$@"
+    MOBEE_HOME="$home" "$MAXPLAYER" "$@"
 }
 
 # ── Authorization ───────────────────────────────────────────────────────────────────────────────
@@ -344,7 +344,7 @@ ${TARGET_MINT} failed for quote ${quote_id}. The money left the source and is no
 target. It is RECOVERABLE and no sats are lost — re-run exactly:
 
   MOBEE_HOME=${home} MAXPLAYER_ALLOW_REAL_MINTS=true MAXPLAYER_ACCEPTED_MINTS=${SOURCE_MINT} \\
-  MAXPLAYER_EXTRA_MINTS=${TARGET_MINT} ${MOBEE} wallet mint-complete ${quote_id} \\
+  MAXPLAYER_EXTRA_MINTS=${TARGET_MINT} ${MAXPLAYER} wallet mint-complete ${quote_id} \\
   --amount ${PROBE_SATS} --mint ${TARGET_MINT} --home ${home}
 
 Copy the quote id from THIS line, not from any earlier output. Report before retrying."
@@ -461,7 +461,7 @@ main() {
         *) die "usage: $0 --self-test | --dry-run | --fund | --fund-complete <quote_id> | --stage-a | --stage-b" ;;
     esac
 
-    [ -x "$MOBEE" ] || die "no maxplayer binary at $MOBEE (set MOBEE=...)"
+    [ -x "$MAXPLAYER" ] || die "no maxplayer binary at $MAXPLAYER (set MAXPLAYER=...)"
     self_test   # parsers are proven before anything else runs, on every mode
 
     mkdir -p "$RUN_DIR"

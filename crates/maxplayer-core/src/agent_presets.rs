@@ -224,7 +224,7 @@ mod tests {
     fn detect_excludes_custom_preset_with_unresolvable_argv0() {
         let table = custom(&[(
             "ghost",
-            &["mobee-test-binary-that-definitely-does-not-exist-4c1f"],
+            &["maxplayer-test-binary-that-definitely-does-not-exist-4c1f"],
         )]);
         let detected = detect_available_agents(&table);
         assert!(!detected.contains(&"ghost".to_owned()), "{detected:?}");

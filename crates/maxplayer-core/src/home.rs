@@ -1,6 +1,6 @@
 //! Packaged buyer home under `~/.mobee` (or `MOBEE_HOME`).
 //!
-//! First-run bootstrap writes working defaults: a REAL minibits mint, mobee-relay, budget caps,
+//! First-run bootstrap writes working defaults: a REAL minibits mint, maxplayer-relay, budget caps,
 //! autogen key (`0600`), and an empty `wallet/` dir. The secret key is never returned.
 //!
 //! # Layered configuration
@@ -44,7 +44,7 @@
 //!
 //! ## Minimal env-only boot (file-less container)
 //!
-//! With no `config.toml`, the built-in defaults already boot a **buyer** (real minibits mint, mobee-relay,
+//! With no `config.toml`, the built-in defaults already boot a **buyer** (real minibits mint, maxplayer-relay,
 //! budget caps). A **seller** additionally needs the seller table, whose minimal env set is:
 //! `MAXPLAYER_SELLER__AGENT_COMMAND`, `MAXPLAYER_SELLER__RATE_SATS`, `MAXPLAYER_SELLER__GIT_REMOTE`. The key is
 //! still auto-generated on bootstrap (or supplied out-of-band); `NOSTR_PRIVATE_KEY` handling is
@@ -337,7 +337,7 @@ pub fn default_announce_timeout_ms() -> u64 {
 /// Seller **brain/episode telemetry** config (`[telemetry]` section). Wires every captured
 /// [`Episode`](crate::episode::Episode) — the per-job reasoning + economics record already written
 /// to `episodes.jsonl` — to a live stream so an operator can watch what is going on inside a
-/// mobee's brain: a pluggable sink command (one JSON event on stdin, same exec/timeout contract as
+/// maxplayer's brain: a pluggable sink command (one JSON event on stdin, same exec/timeout contract as
 /// [`SellerAnnounceConfig`]) and/or an append-only JSONL mirror file. See [`crate::telemetry`].
 ///
 /// **Feature ON by default** (`enabled = true`): the channel is armed. It only produces output
@@ -1338,7 +1338,7 @@ mod tests {
     fn temp_home(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!(
-            "mobee-home-{label}-{}-{id}",
+            "maxplayer-home-{label}-{}-{id}",
             std::process::id()
         ))
     }

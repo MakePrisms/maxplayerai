@@ -2,7 +2,7 @@
 //!
 //! This module is the ONE place a kind *number* may appear. Every other site refers to a named
 //! constant from here (re-exported through [`crate::gateway`] for the trade-path kinds). The
-//! trade kinds form a contiguous mobee-owned block — `3400`–`3406` — plus the addressable
+//! trade kinds form a contiguous maxplayer-owned block — `3400`–`3406` — plus the addressable
 //! seller heartbeat `30340`.
 //!
 //! | Kind | Object | Author |
@@ -47,7 +47,7 @@ mod tests {
 
     #[test]
     fn trade_path_kinds_are_the_contiguous_maxplayer_block() {
-        // The trade path lives in a contiguous mobee-owned block; none reuse the generic DVM range.
+        // The trade path lives in a contiguous maxplayer-owned block; none reuse the generic DVM range.
         assert_eq!(
             [
                 JOB_RECEIPT_KIND,

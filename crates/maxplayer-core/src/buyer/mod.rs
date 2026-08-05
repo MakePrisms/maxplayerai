@@ -2623,7 +2623,7 @@ mod tests {
 
     fn temp_home(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("mobee-buyer-mod-{label}-{}-{id}", std::process::id()))
+        std::env::temp_dir().join(format!("maxplayer-buyer-mod-{label}-{}-{id}", std::process::id()))
     }
 
     // #322: the manual award RPC's write-once gate. A named claim contradicting the pinned one

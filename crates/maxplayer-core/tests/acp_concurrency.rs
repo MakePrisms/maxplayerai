@@ -101,7 +101,7 @@ async fn run_stub_job(
 // the thread for the whole prompt turn, execution is strictly serial AND the ticker starves.
 #[test]
 fn two_jobs_execute_concurrently_and_the_loop_keeps_ticking_on_one_thread() {
-    let dir = std::env::temp_dir().join(format!("mobee-acp-concurrency-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("maxplayer-acp-concurrency-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create test dir");
     let script = write_stub_agent(&dir);
 

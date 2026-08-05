@@ -2,7 +2,7 @@
 //! piped to a pluggable external command (`[seller_announce] command`).
 //!
 //! This is the daemon-native, first-class sibling of the log-tailing sidecar
-//! (`scripts/mobee-buzz-sidecar.sh`): instead of grepping stderr, the daemon emits a typed,
+//! (`scripts/maxplayer-buzz-sidecar.sh`): instead of grepping stderr, the daemon emits a typed,
 //! schema-versioned JSON event and spawns the operator's sink command with that JSON on stdin.
 //! Buzz is the first-class target (`sinks/buzz-announce.sh`), but the contract is generic — any
 //! command that reads one JSON event from stdin works (Discord/Slack webhooks ship too).
@@ -295,7 +295,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        path.push(format!("mobee-announce-test-{name}-{nanos}"));
+        path.push(format!("maxplayer-announce-test-{name}-{nanos}"));
         path
     }
 

@@ -38,7 +38,7 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 
 fn temp(label: &str) -> PathBuf {
     let id = NEXT.fetch_add(1, Ordering::SeqCst);
-    std::env::temp_dir().join(format!("mobee-collect-itest-{label}-{}-{id}", std::process::id()))
+    std::env::temp_dir().join(format!("maxplayer-collect-itest-{label}-{}-{id}", std::process::id()))
 }
 
 static ENV_INIT: Once = Once::new();

@@ -549,7 +549,7 @@ pub fn sell_readiness_gate(
     let failures: Vec<&Check> = results.iter().filter(|c| c.status == Status::Fail).collect();
     let _ = writeln!(
         err,
-        "\nmobee sell REFUSING to start: {} blocking readiness check(s) failed —",
+        "\nmaxplayer sell REFUSING to start: {} blocking readiness check(s) failed —",
         failures.len()
     );
     for failure in &failures {
@@ -682,7 +682,7 @@ mod tests {
     fn doctor_honors_home_override_and_inspects_that_home() {
         use std::path::PathBuf;
         let tmp: PathBuf = std::env::temp_dir().join(format!(
-            "mobee-doctor-home-216-{}-{}",
+            "maxplayer-doctor-home-216-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -759,7 +759,7 @@ mod tests {
         use maxplayer_core::home::SandboxConfig;
 
         let tmp = std::env::temp_dir().join(format!(
-            "mobee-doctor-sandbox-357-{}-{}",
+            "maxplayer-doctor-sandbox-357-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -806,7 +806,7 @@ mod tests {
         presets.insert(
             "myabsent".to_owned(),
             AgentPresetConfig {
-                argv: vec!["mobee-doctor-absent-adapter-x7q".to_owned()],
+                argv: vec!["maxplayer-doctor-absent-adapter-x7q".to_owned()],
             },
         );
 

@@ -52,7 +52,7 @@ fn serve(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(2)
-        .thread_name("mobee-buyer")
+        .thread_name("maxplayer-buyer")
         .build()
     {
         Ok(runtime) => runtime,

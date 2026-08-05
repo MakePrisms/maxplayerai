@@ -379,7 +379,7 @@ mod tests {
         let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "mobee-driver-{name}-{}-{test_id}.jsonl",
+            "maxplayer-driver-{name}-{}-{test_id}.jsonl",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);

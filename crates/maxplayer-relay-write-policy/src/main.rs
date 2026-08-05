@@ -79,7 +79,7 @@ fn main() {
             // reject every real event — indistinguishable in the relay's logs from a
             // correctly-running strict relay. Refuse to run instead, so preflight/strfry
             // surface a spawn failure rather than a silent deny-all.
-            eprintln!("mobee-write-policy: MAXPLAYER_RELAY_TAG is unset or empty — refusing to run");
+            eprintln!("maxplayer-write-policy: MAXPLAYER_RELAY_TAG is unset or empty — refusing to run");
             std::process::exit(1);
         }
     };
@@ -87,7 +87,7 @@ fn main() {
     // One line at startup so the relay's journal shows the plugin came up and with which
     // namespace — the difference an operator needs between "policy rejected it" and
     // "the plugin never ran".
-    eprintln!("mobee-write-policy: online, namespace tag = {namespace_tag:?}");
+    eprintln!("maxplayer-write-policy: online, namespace tag = {namespace_tag:?}");
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -97,7 +97,7 @@ fn main() {
         let line = match line {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("mobee-write-policy: stdin read error: {e}");
+                eprintln!("maxplayer-write-policy: stdin read error: {e}");
                 break;
             }
         };
@@ -130,7 +130,7 @@ fn decide(line: &str, namespace_tag: &str) -> Verdict {
             // strfry validates id + signature before consulting the plugin, so a
             // malformed line here is a protocol fault, not a hostile event. We have no
             // id to echo; reject with an empty id and let strfry log the mismatch.
-            eprintln!("mobee-write-policy: unparseable input: {e}");
+            eprintln!("maxplayer-write-policy: unparseable input: {e}");
             return Verdict::reject(String::new(), "unparseable event json");
         }
     };

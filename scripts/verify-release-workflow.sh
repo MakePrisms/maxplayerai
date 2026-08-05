@@ -45,7 +45,7 @@ echo "ok: no credential literal in the workflow"
 # shell as `\ ` — an escaped space, which joins onto the following word instead of continuing the
 # line. The next argument silently gains a leading space. Nothing about the YAML looks wrong and the
 # step runs; it just receives a path that cannot exist. That cost a full three-platform dry-run
-# (30476367671), where the argument arrived as ` target/x86_64-unknown-linux-musl/release/mobee`.
+# (30476367671), where the argument arrived as ` target/x86_64-unknown-linux-musl/release/maxplayer`.
 # Every such command belongs in a `run: |` block.
 #
 # ★ actionlint is silent on this shape — it reports zero findings on the exact file that failed — so

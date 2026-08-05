@@ -77,17 +77,18 @@ announce, then probes that the relay seeded the repo with a signed in-process
 error:
 
 ```
-mobee-hosted delivery not seeded after NIP-34 announce (ls-remote 404).
+maxplayer-hosted delivery not seeded after NIP-34 announce (ls-remote 404).
 likely cause: relay-git global name collision on repo id, or seed side-effect failed.
 provide --git-remote <https-url> for BYO delivery, or pick a unique remote leaf.
 remote=<url>
 ```
 
 **Read it:** the seed is meant to happen server-side as a side effect of the announce.
-The announce goes to the **market relay** (`wss://relay.maxplayer.ai`) while the repo must
-materialize on a **separate git host** (`https://mobee-relay.orveth.dev/git/…`) — two
-different hosts, and the git host currently does not seed reliably. It fails closed: no
-money is exposed.
+The announce goes to the **market relay** (`wss://relay.maxplayer.ai`), and the repo
+materializes on that **same host** over its git path
+(`https://relay.maxplayer.ai/git/<pubkey>/m<short>.git`, derived from `relay_url`). Seeding
+can fail on a global repo-name collision: the announce is accepted but the seed is skipped,
+so the `ls-remote` 404s and the seller refuses to boot. It fails closed: no money is exposed.
 
 **Fix / workaround — bring your own delivery host (the tool's own recommended fix):**
 

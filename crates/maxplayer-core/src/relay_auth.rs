@@ -1,6 +1,6 @@
 //! Shared NIP-42 relay-auth handshake, neutral to any single consumer.
 //!
-//! mobee-relay requires NIP-42 AUTH for the p-gated kind-1059 subscribe AND for all writes, and the
+//! maxplayer-relay requires NIP-42 AUTH for the p-gated kind-1059 subscribe AND for all writes, and the
 //! handshake shape is identical on the seller receive path and the buyer receipt-publish path. This
 //! module owns the one `wait_for_nip42_auth` both use, so neither depends on the other's error type
 //! or lifecycle. Callers map the outcome to their own gate: the seller degrades on `NoChallenge`,
@@ -37,10 +37,10 @@ impl std::error::Error for RelayAuthError {}
 /// Caller must subscribe `relay.notifications()` **before** `connect` so the `Authenticated` event
 /// cannot be missed.
 ///
-/// mobee-relay p-gates kind-1059: unauthenticated `REQ kinds:[1059] #p:self` is `CLOSED` with
+/// maxplayer-relay p-gates kind-1059: unauthenticated `REQ kinds:[1059] #p:self` is `CLOSED` with
 /// `restricted:` (not `auth-required:`). nostr-sdk 0.44 treats `restricted:` as `Remove` — the sub
 /// is dropped, so a post-auth `resubscribe()` never restores it. Auth **before** the 1059 subscribe
-/// is therefore load-bearing for seller receive, and mobee-relay challenges on connect so
+/// is therefore load-bearing for seller receive, and maxplayer-relay challenges on connect so
 /// `Authenticated` arrives in milliseconds.
 ///
 /// A window with NO challenge is reported as `NoChallenge` rather than a fatal error: a relay that

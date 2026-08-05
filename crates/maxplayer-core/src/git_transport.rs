@@ -166,7 +166,7 @@ fn with_context<T>(header: Option<String>, short: bool, body: impl FnOnce() -> T
 /// Build the NIP-98 (`kind:27235`) `Authorization` header for `remote_url`.
 ///
 /// Signs `u = <remote_url>` (the repo-root the relay verifies after stripping `/info/refs` or the
-/// service suffix) with method `POST`. mobee-relay is method-agnostic on git routes and does not
+/// service suffix) with method `POST`. maxplayer-relay is method-agnostic on git routes and does not
 /// dedup the event id, so this ONE header is valid for both the info/refs GET advertisement and the
 /// service POST — the same token-reuse the git-credential-nostr helper relied on, delivered directly
 /// instead of via git's credential protocol. The secret never appears in the returned string.
@@ -329,7 +329,7 @@ pub fn list_remote(
     let repo = Repository::open_from_env()
         .or_else(|_| {
             let tmp = std::env::temp_dir().join(format!(
-                "mobee-lsremote-{}-{}",
+                "maxplayer-lsremote-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

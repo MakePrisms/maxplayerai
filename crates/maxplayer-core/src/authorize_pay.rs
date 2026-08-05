@@ -1007,7 +1007,7 @@ fn build_and_publish_receipt(
 /// A digest-derived `created_at` (windowed into 2023-11 .. ~2027) would reproduce the SAME
 /// event id on a recovery republish — relay-native idempotency (a relay stores an event once,
 /// by id) — but that timestamp almost never falls inside a real relay's accept window
-/// (mobee-relay ≈ ±30 min of server time), so the receipt is rejected and the payment holds at
+/// (maxplayer-relay ≈ ±30 min of server time), so the receipt is rejected and the payment holds at
 /// `Sent` forever. A fresh wall-clock timestamp satisfies the relay window, so the receipt
 /// publishes.
 ///
@@ -1035,7 +1035,7 @@ fn receipt_created_at(_digest: &[u8; 32]) -> Timestamp {
 /// Runs on a fresh OS thread with its own current-thread runtime: publishing is async and
 /// the caller may already hold a Tokio runtime (a nested `block_on` would panic).
 ///
-/// mobee-relay requires NIP-42 AUTH for ALL writes, so this path completes + WAITS FOR the
+/// maxplayer-relay requires NIP-42 AUTH for ALL writes, so this path completes + WAITS FOR the
 /// auth handshake before `send_event_to` (via the shared `wait_for_nip42_auth`); the
 /// payment WRAP path already authenticates, as does this receipt path. On auth
 /// timeout/failure the send is NOT reached and an empty `relay_success` is returned (never a
@@ -1406,7 +1406,7 @@ mod tests {
     #[test]
     fn authorize_pay_refuses_empty_buyer_hash_without_burn() {
         let root = std::env::temp_dir().join(format!(
-            "mobee-authorize-pay-d2-empty-{}-{}",
+            "maxplayer-authorize-pay-d2-empty-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1478,7 +1478,7 @@ mod tests {
     #[test]
     fn authorize_pay_refuses_an_inadmissible_hop_with_zero_spend_and_no_pairing() {
         let root = std::env::temp_dir().join(format!(
-            "mobee-authorize-pay-hop-fence-{}-{}",
+            "maxplayer-authorize-pay-hop-fence-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1533,7 +1533,7 @@ mod tests {
     #[test]
     fn authorize_pay_refuses_buyer_hash_mismatch_vs_advertised_commit() {
         let root = std::env::temp_dir().join(format!(
-            "mobee-authorize-pay-d2-{}-{}",
+            "maxplayer-authorize-pay-d2-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1576,7 +1576,7 @@ mod tests {
     #[test]
     fn authorize_pay_refuses_contribution_class_without_binds() {
         let root = std::env::temp_dir().join(format!(
-            "mobee-authorize-pay-jobclass-{}-{}",
+            "maxplayer-authorize-pay-jobclass-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1616,7 +1616,7 @@ mod tests {
     #[test]
     fn authorize_pay_refuses_ext_locator_via_pay_path_verifier() {
         let root = std::env::temp_dir().join(format!(
-            "mobee-authorize-pay-ext-{}-{}",
+            "maxplayer-authorize-pay-ext-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1841,7 +1841,7 @@ mod tests {
     #[test]
     fn authorize_pay_refuses_forged_seller_signature_with_zero_spend() {
         let root = std::env::temp_dir().join(format!(
-            "mobee-authorize-pay-forged-{}-{}",
+            "maxplayer-authorize-pay-forged-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1898,7 +1898,7 @@ mod tests {
     #[test]
     fn cosig_refusal_diagnostic_carries_every_field_and_no_secret() {
         let root = std::env::temp_dir().join(format!(
-            "mobee-authorize-pay-diag-{}-{}",
+            "maxplayer-authorize-pay-diag-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1970,7 +1970,7 @@ mod tests {
     #[test]
     fn authorize_pay_refuses_tampered_preimage_field_with_zero_spend() {
         let root = std::env::temp_dir().join(format!(
-            "mobee-authorize-pay-tamper-{}-{}",
+            "maxplayer-authorize-pay-tamper-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

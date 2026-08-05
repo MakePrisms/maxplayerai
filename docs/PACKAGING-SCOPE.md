@@ -129,10 +129,10 @@ A tag produces per-platform binaries and checksums on a GitHub release.
 ```acceptance
 # Every artifact runs on a machine with no nix and no rust toolchain.
 # Re-run per published asset, on a clean container of the target platform:
-docker run --rm -v "$PWD:/w" -w /w alpine:3 ./mobee-x86_64-unknown-linux-musl version
+docker run --rm -v "$PWD:/w" -w /w alpine:3 ./maxplayer-x86_64-unknown-linux-musl version
 #   → prints a version, rc=0
 # The interpreter check that today's build fails:
-ldd ./mobee-x86_64-unknown-linux-musl 2>&1 | grep -qi 'not a dynamic executable' \
+ldd ./maxplayer-x86_64-unknown-linux-musl 2>&1 | grep -qi 'not a dynamic executable' \
   || { echo "FAIL: not static"; exit 1; }
 # Checksums match what was published:
 sha256sum -c SHA256SUMS
@@ -162,11 +162,11 @@ derivation with `buildFeatures = [ "acp" ]`. One shape, two feature sets.
 
 ```nix
 buyer-static = pkgs.pkgsStatic.rustPlatform.buildRustPackage (
-  mobeeArgs // { nativeBuildInputs = [ pkgs.pkgsStatic.pkg-config ]; }
+  maxplayerArgs // { nativeBuildInputs = [ pkgs.pkgsStatic.pkg-config ]; }
 );
 ```
 
-`mobeeArgs` holds what both builds share — `src = self`, `cargoLock.lockFile = ./Cargo.lock`
+`maxplayerArgs` holds what both builds share — `src = self`, `cargoLock.lockFile = ./Cargo.lock`
 (hermetic vendoring, no network at build time), `cargoBuildFlags = [ "-p" "maxplayer" ]`, `doCheck =
 false`. Guarded by `lib.optionalAttrs stdenv.hostPlatform.isLinux`, because static linking is a
 Linux-only property (see the matrix below).
@@ -212,7 +212,7 @@ any pkgsStatic build is safe, which is not what was measured.
 One regular file per platform plus one checksum line — nothing else:
 
 ```
-mobee-x86_64-unknown-linux-musl          # static ELF, no interpreter, no DT_NEEDED
+maxplayer-x86_64-unknown-linux-musl          # static ELF, no interpreter, no DT_NEEDED
 SHA256SUMS                                # one line per artifact
 ```
 
@@ -263,8 +263,8 @@ Not a projection. Built 2026-07-28 against the pinned nixpkgs, `nix build .#buye
 size            39,816,976 bytes (38M), already stripped by the fixup phase
 ldd             statically linked
 /nix/store refs 0 occurrences in the binary
-alpine:3 (musl, no /nix)             maxplayer version → "mobee 0.1.0"  rc=0
-debian:bookworm-slim (glibc, no /nix) maxplayer version → "mobee 0.1.0"  rc=0
+alpine:3 (musl, no /nix)             maxplayer version → "maxplayer 0.1.0"  rc=0
+debian:bookworm-slim (glibc, no /nix) maxplayer version → "maxplayer 0.1.0"  rc=0
 bogus subcommand                                                     rc=1   (control)
 sha256 de0b96258aa4dc83c6b72ba3a3e604de8bd91175d70dbfb0c957414a01b4f1bf
 ```
@@ -314,7 +314,7 @@ wirable the way every other MCP server is wired.
 { "mcpServers": { "mobee": { "command": "npx", "args": ["-y", "mobee", "mcp"] } } }
 ```
 
-Names are free as of 2026-07-28: `maxplayer`, `mobee-cli`, and the `@maxplayer` scope all return 404 from
+Names are free as of 2026-07-28: `maxplayer`, `maxplayer-cli`, and the `@maxplayer` scope all return 404 from
 the npm registry. Claiming the name is cheap and worth doing before someone else does, independent
 of when the work lands.
 
@@ -373,7 +373,7 @@ curl -fsSL <url> | sh && curl -fsSL <url> | sh && maxplayer version   # → rc=0
 
 1. **Does the 7/23 downgrade get revisited at all?** The ruling stands until he says otherwise.
    What has changed since is a fact worth putting in front of him rather than an argument:
-   there is now a public orderbook at `/mobeemarket` with `.well-known/skills/` and an
+   there is now a public orderbook at `https://www.maxplayer.ai` with `.well-known/skills/` and an
    `npx skills add` payoff. "Whole team is on nix" was true of the team; a stranger arriving from a
    public marketplace is the non-nix buyer #125 was originally about, and that stranger did not
    exist on 7/23.

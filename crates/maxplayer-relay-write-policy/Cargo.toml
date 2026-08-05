@@ -8,7 +8,7 @@ publish = false
 # strfry spawns this binary and speaks JSONL over stdin/stdout. `lib.getExe` on the
 # packaged derivation resolves this name via meta.mainProgram, so the two must agree.
 [[bin]]
-name = "mobee-write-policy"
+name = "maxplayer-write-policy"
 path = "src/main.rs"
 
 [dependencies]

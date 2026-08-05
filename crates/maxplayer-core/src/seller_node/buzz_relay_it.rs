@@ -25,7 +25,7 @@ static IT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn unique_root(label: &str) -> std::path::PathBuf {
     let n = IT_SEQ.fetch_add(1, Ordering::SeqCst);
-    std::env::temp_dir().join(format!("mobee-buzz-it-{label}-{}-{n}", std::process::id()))
+    std::env::temp_dir().join(format!("maxplayer-buzz-it-{label}-{}-{n}", std::process::id()))
 }
 
 async fn start_relay() -> (LocalRelay, String) {
@@ -150,7 +150,7 @@ async fn foreign_kind0_refuses_clobber() {
     let secret = home::read_secret_key_hex(&home).expect("secret");
     let keys = Keys::parse(&secret).expect("keys");
     let seeder = connect_client(&relay_url).await;
-    let foreign = EventBuilder::metadata(&Metadata::new().name("someone-else").about("not mobee"))
+    let foreign = EventBuilder::metadata(&Metadata::new().name("someone-else").about("not maxplayer"))
         .sign_with_keys(&keys)
         .expect("sign foreign kind-0");
     seeder.send_event(&foreign).await.expect("seed foreign kind-0");
@@ -302,7 +302,7 @@ async fn presence_heartbeats_flow_then_stop_on_shutdown() {
 //   cargo test -p maxplayer-core --no-default-features --features gateway,git-delivery,wallet --release \
 //     -- --ignored --nocapture live_buzz_presence_against_deployed_relay
 //
-// Deployed presence (relay source, keeper:mobee-buzz): a kind-20001 `"online"` from the AUTHED
+// Deployed presence (relay source, keeper:maxplayer-buzz): a kind-20001 `"online"` from the AUTHED
 // connection registers presence keyed on the authed pubkey; the relay ignores tags and expires it
 // on a ~60s TTL. The canonical operator snapshot is the HTTP `POST /query` (NIP-98) which
 // synthesizes a RELAY-SIGNED online event — a WS `REQ` for a kind-20001 hits the DB (ephemerals are

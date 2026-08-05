@@ -503,10 +503,10 @@ mod tests {
         );
 
         // Drop the t=maxplayer guard.
-        let mut no_mobee = HeartbeatDraft::v1(true, 0, 5).to_event_draft();
-        no_mobee.tags.retain(|tag| tag.first() != Some("t"));
+        let mut no_maxplayer = HeartbeatDraft::v1(true, 0, 5).to_event_draft();
+        no_maxplayer.tags.retain(|tag| tag.first() != Some("t"));
         assert_eq!(
-            parse_heartbeat(&no_mobee),
+            parse_heartbeat(&no_maxplayer),
             Err(HeartbeatParseError::MissingMaxplayerTag)
         );
 

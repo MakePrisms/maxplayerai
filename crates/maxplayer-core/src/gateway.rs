@@ -6,7 +6,7 @@ use crate::delivery::{CommitOid, DeliveryError, GitDelivery};
 
 pub const MOBEE_TAG: &str = "mobee";
 // maxplayer protocol version. maxplayer events occupy a dedicated kind block, so a parser only ever
-// matches mobee's own events.
+// matches maxplayer's own events.
 pub const PROTOCOL_VERSION: &str = "0";
 
 // All kind NUMBERS live in `crate::kinds` (the one registry); re-exported here so the historical

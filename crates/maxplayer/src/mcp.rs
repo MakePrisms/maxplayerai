@@ -62,7 +62,7 @@ pub fn run(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(2)
-        .thread_name("mobee-mcp")
+        .thread_name("maxplayer-mcp")
         .build()
     {
         Ok(runtime) => runtime,
@@ -486,7 +486,7 @@ mod tests {
     fn temp_home(label: &str) -> std::path::PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!(
-            "mobee-mcp-{label}-{}-{id}",
+            "maxplayer-mcp-{label}-{}-{id}",
             std::process::id()
         ))
     }

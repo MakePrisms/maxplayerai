@@ -19,7 +19,7 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 
 fn temp_home(label: &str) -> PathBuf {
     let id = NEXT.fetch_add(1, Ordering::SeqCst);
-    std::env::temp_dir().join(format!("mobee-mcp-daemon-{label}-{}-{id}", std::process::id()))
+    std::env::temp_dir().join(format!("maxplayer-mcp-daemon-{label}-{}-{id}", std::process::id()))
 }
 
 /// A `maxplayer` command pinned to `home` with a dead relay (fast, network-free relay failures).
@@ -33,7 +33,7 @@ fn maxplayer(home: &Path) -> Command {
 
 /// Run `maxplayer <args>` to completion; returns (exit code, stdout, stderr).
 fn run(home: &Path, args: &[&str]) -> (i32, String, String) {
-    let output = maxplayer(home).args(args).output().expect("spawn mobee");
+    let output = maxplayer(home).args(args).output().expect("spawn maxplayer");
     (
         output.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&output.stdout).into_owned(),

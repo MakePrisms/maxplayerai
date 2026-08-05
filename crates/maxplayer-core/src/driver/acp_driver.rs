@@ -665,7 +665,7 @@ mod tests {
         );
 
         let session = serde_json::to_value(SessionConfig {
-            cwd: "/tmp/mobee".into(),
+            cwd: "/tmp/maxplayer".into(),
             mcp_servers: Vec::new(),
             env: Vec::new(),
         })
@@ -673,7 +673,7 @@ mod tests {
         assert_eq!(
             session,
             json!({
-                "cwd": "/tmp/mobee",
+                "cwd": "/tmp/maxplayer",
                 "mcpServers": [],
                 "env": []
             })

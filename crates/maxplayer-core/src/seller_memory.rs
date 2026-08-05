@@ -294,7 +294,7 @@ mod tests {
     fn temp_dir(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!(
-            "mobee-mem-{label}-{}-{id}",
+            "maxplayer-mem-{label}-{}-{id}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);

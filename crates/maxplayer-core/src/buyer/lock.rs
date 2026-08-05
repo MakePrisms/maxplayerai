@@ -98,7 +98,7 @@ mod tests {
 
     fn temp_lock(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("mobee-buyer-lock-{label}-{}-{id}.lock", std::process::id()))
+        std::env::temp_dir().join(format!("maxplayer-buyer-lock-{label}-{}-{id}.lock", std::process::id()))
     }
 
     #[test]

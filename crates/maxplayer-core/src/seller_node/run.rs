@@ -466,11 +466,11 @@ const OFFER_BACKFILL_LIMIT: usize = 500;
 /// Stable per-role subscription ids. Named rather than generated so a relay `CLOSED` says WHICH
 /// subscription died — with anonymous ids a closed subscription is indistinguishable in the log,
 /// which is how a node could go silently deaf on one leg while heartbeating happily on another.
-const OFFER_SUB_ID: &str = "mobee-offers";
-const AWARD_SUB_ID: &str = "mobee-awards";
-const WRAP_SUB_ID: &str = "mobee-wraps";
+const OFFER_SUB_ID: &str = "maxplayer-offers";
+const AWARD_SUB_ID: &str = "maxplayer-awards";
+const WRAP_SUB_ID: &str = "maxplayer-wraps";
 /// The liveness probe's subscription (see [`probe_relay_serves_our_reqs`]).
-const LIVENESS_PROBE_SUB_ID: &str = "mobee-liveness-probe";
+const LIVENESS_PROBE_SUB_ID: &str = "maxplayer-liveness-probe";
 
 /// How long the liveness probe waits for its `EOSE`. A `limit(0)` REQ is answered in milliseconds by
 /// a healthy relay, so this is generous — it bounds the tick, and a single slow answer is not a stall
@@ -526,7 +526,7 @@ fn unknown_close_diagnostic(
 /// This is the precondition for reading a `restricted:` CLOSED as the #189 pre-auth race instead of a
 /// gate violation, and the CLOSED-prefix taxonomy stays load-bearing everywhere else: `restricted:`
 /// remains permanent-class, and the SDK's `Remove` classification is not softened. The carve-out is
-/// sound because mobee-relay's p-gate has exactly two ways to refuse a `#p` filter — the `#p` names
+/// sound because maxplayer-relay's p-gate has exactly two ways to refuse a `#p` filter — the `#p` names
 /// somebody else, or the connection had no authenticated pubkey to compare it against. We author
 /// these filters from `self.seller_pubkey`, so the first is impossible by construction for the ids
 /// below; only the second remains, and the second is retryable once auth exists. A subscription
@@ -1243,7 +1243,7 @@ impl SellerNodeRunner {
     ///
     /// Custody rule: the seller key lives in exactly two places — the signer actor (opened by
     /// [`SellerNode::open`]) and THIS authenticated relay client, constructed once below. It is never
-    /// exposed by an accessor, logged, or serialized. The client holds it because mobee-relay
+    /// exposed by an accessor, logged, or serialized. The client holds it because maxplayer-relay
     /// authenticates the seller via NIP-42 (signing the challenge) before it will deliver the
     /// p-gated kind-1059 payment wraps.
     pub async fn boot(home: MaxplayerHome) -> Result<Self, NodeError> {
@@ -2192,7 +2192,7 @@ impl SellerNodeRunner {
     /// CLEARING BEFORE THE RECONNECT IS THE WHOLE OF #189. `RelayInner::post_connection` re-sends every
     /// registered `REQ` as its first act on socket-up (`relay/inner.rs:748-752`), before that
     /// connection has any NIP-42 state at all; auth only happens later, in the ingester
-    /// (`inner.rs:936`). mobee-relay evaluates its p-gate against the empty authed pubkey of that
+    /// (`inner.rs:936`). maxplayer-relay evaluates its p-gate against the empty authed pubkey of that
     /// unauthenticated session and answers `restricted:` — the PERMANENT prefix — where the truth is
     /// the retryable `auth-required:`. nostr-sdk takes `restricted:` at its word and DELETES the
     /// subscription (`inner.rs:1028` → `remove_subscription`), so the post-auth `resubscribe()` at
@@ -3893,7 +3893,7 @@ mod tests {
         assert_ne!(a.sentinel, other_harness.sentinel, "and it is per-harness");
 
         // The readback accepts exactly what the mint produced — one definition, both ends.
-        let dir = std::env::temp_dir().join(format!("mobee-sn-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("maxplayer-sn-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         std::fs::write(dir.join("probe.txt"), &a.sentinel).expect("write");
         assert!(probe_sentinel_present(&dir, &a.sentinel));
@@ -3927,7 +3927,7 @@ mod tests {
         // ② And the readback refuses a path echo even when the path DOES carry the sentinel — the
         // belt to ①'s braces, so a future caller reintroducing the leak cannot revive a dead harness.
         let leaky = std::env::temp_dir()
-            .join(format!("mobee-leak-{}-{}", std::process::id(), probe.sentinel));
+            .join(format!("maxplayer-leak-{}-{}", std::process::id(), probe.sentinel));
         std::fs::create_dir_all(&leaky).expect("leaky dir");
         std::fs::write(
             leaky.join("trace.log"),
@@ -4962,7 +4962,7 @@ mod tests {
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("mobee-run-{label}-{}-{id}", std::process::id()))
+        std::env::temp_dir().join(format!("maxplayer-run-{label}-{}-{id}", std::process::id()))
     }
 
     // A store with a full offer → claim(creq) → award already journaled, so the execute-body readers
@@ -5082,7 +5082,7 @@ mod tests {
                 &identity,
                 None,
                 branch,
-                "mobee delivery: build a widget",
+                "maxplayer delivery: build a widget",
                 author_date,
                 &"c".repeat(64),
             )
@@ -5312,7 +5312,7 @@ mod tests {
     //
     // These drive the REAL paths against [`p_gate_relay_fixture`], which answers a `#p`-gated REQ
     // from an unauthenticated session with the permanent-class `restricted:` prefix exactly as
-    // mobee-relay does. The nostr-relay-builder fixture used above cannot express this: it says
+    // maxplayer-relay does. The nostr-relay-builder fixture used above cannot express this: it says
     // `auth-required:`, which nostr-sdk keeps and restores by itself, so every ordering would pass.
 
     use crate::seller_node::p_gate_relay_fixture::{PGateRelay, ReqRecord, Verdict};
@@ -5324,7 +5324,7 @@ mod tests {
     /// on the exclusive home lock.
     fn throwaway_root(label: &str) -> std::path::PathBuf {
         let root =
-            std::env::temp_dir().join(format!("mobee-recoveryfix-{label}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("maxplayer-recoveryfix-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         root
     }

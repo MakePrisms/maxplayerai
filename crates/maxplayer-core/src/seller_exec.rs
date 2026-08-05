@@ -213,10 +213,10 @@ pub fn delivery_message(task: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     if summary.is_empty() {
-        return "mobee delivery".to_owned();
+        return "maxplayer delivery".to_owned();
     }
     let capped: String = summary.chars().take(72).collect();
-    format!("mobee delivery: {capped}")
+    format!("maxplayer delivery: {capped}")
 }
 
 /// Delivery discriminator for the seller's commit/fork delivery, derived from the SAME typed
@@ -786,20 +786,20 @@ mod tests {
     fn delivery_message_summarizes_the_task() {
         assert_eq!(
             delivery_message("Fix the parser\n\nmore detail"),
-            "mobee delivery: Fix the parser"
+            "maxplayer delivery: Fix the parser"
         );
         // Leading blank lines skipped; whitespace collapsed.
         assert_eq!(
             delivery_message("\n\n   add   retry   logic  "),
-            "mobee delivery: add retry logic"
+            "maxplayer delivery: add retry logic"
         );
         // Empty task falls back to a fixed label.
-        assert_eq!(delivery_message("   \n  "), "mobee delivery");
+        assert_eq!(delivery_message("   \n  "), "maxplayer delivery");
         // Long first line is capped.
         let long = "x".repeat(200);
         let msg = delivery_message(&long);
-        assert!(msg.starts_with("mobee delivery: "));
-        assert_eq!(msg.len(), "mobee delivery: ".len() + 72);
+        assert!(msg.starts_with("maxplayer delivery: "));
+        assert_eq!(msg.len(), "maxplayer delivery: ".len() + 72);
     }
 
     #[cfg(not(feature = "acp"))]

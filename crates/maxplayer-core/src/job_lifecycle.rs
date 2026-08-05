@@ -2763,7 +2763,7 @@ mod tests {
         }
 
         let root = std::env::temp_dir().join(format!(
-            "mobee-jobs-empty-sig-{}-{}",
+            "maxplayer-jobs-empty-sig-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3095,7 +3095,7 @@ mod tests {
         // A buyer home whose LIVE config default is B (the buyer flipped it after accept) — the value
         // the pre-fix wallet-open used. The frozen mint A must win over this.
         let root = std::env::temp_dir().join(format!(
-            "mobee-cc-walletopen-{}-{}",
+            "maxplayer-cc-walletopen-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3215,7 +3215,7 @@ mod tests {
     #[test]
     fn accept_bind_round_trips_on_disk() {
         let root = std::env::temp_dir().join(format!(
-            "mobee-jobs-bind-{}-{}",
+            "maxplayer-jobs-bind-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3361,7 +3361,7 @@ mod tests {
     #[test]
     fn accept_bind_write_is_atomic_no_temp_leftover_and_durable_overwrite() {
         let root = std::env::temp_dir().join(format!(
-            "mobee-jobs-bind-atomic-{}-{}",
+            "maxplayer-jobs-bind-atomic-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3428,7 +3428,7 @@ mod tests {
     fn concurrent_accepts_for_different_results_bind_exactly_one() {
         use std::sync::{Arc, Barrier};
         let root = std::env::temp_dir().join(format!(
-            "mobee-jobs-bind-race-{}-{}",
+            "maxplayer-jobs-bind-race-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3518,7 +3518,7 @@ mod tests {
     #[test]
     fn accept_bind_pending_then_finalize_durability() {
         let root = std::env::temp_dir().join(format!(
-            "mobee-jobs-bind-pending-{}-{}",
+            "maxplayer-jobs-bind-pending-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3932,7 +3932,7 @@ mod tests {
     #[test]
     fn post_job_refuses_missing_seller_without_untargeted() {
         let root = std::env::temp_dir().join(format!(
-            "mobee-jobs-post-{}-{}",
+            "maxplayer-jobs-post-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3963,7 +3963,7 @@ mod tests {
 
     fn temp_job_home(label: &str) -> (std::path::PathBuf, crate::home::MaxplayerHome) {
         let root = std::env::temp_dir().join(format!(
-            "mobee-jobs-{label}-{}-{}",
+            "maxplayer-jobs-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4384,7 +4384,7 @@ mod tests {
     #[test]
     fn accept_contribution_records_offer_authority_and_store_ref() {
         let owner = "aa".repeat(32);
-        let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
+        let url = "https://relay.maxplayer.test/git/owner/repo.git";
         let base_oid = "77".repeat(20);
         let offer = offer_view_contribution(&owner, url, "main", &base_oid);
         let result = result_view_contribution(&owner, url, "main", &base_oid, "sigbytes");
@@ -4403,7 +4403,7 @@ mod tests {
 
     #[test]
     fn accept_contribution_refuses_echo_target_mismatch() {
-        let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
+        let url = "https://relay.maxplayer.test/git/owner/repo.git";
         let base_oid = "77".repeat(20);
         let offer = offer_view_contribution(&"aa".repeat(32), url, "main", &base_oid);
         // Result echoes a DIFFERENT target owner — equality-check refuses.
@@ -4416,7 +4416,7 @@ mod tests {
     #[test]
     fn accept_contribution_refuses_echo_base_mismatch() {
         let owner = "aa".repeat(32);
-        let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
+        let url = "https://relay.maxplayer.test/git/owner/repo.git";
         let offer = offer_view_contribution(&owner, url, "main", &"77".repeat(20));
         // Result echoes a DIFFERENT base_oid.
         let result = result_view_contribution(&owner, url, "main", &"88".repeat(20), "s");
@@ -4439,7 +4439,7 @@ mod tests {
     #[test]
     fn accept_contribution_requires_a_contribution_result() {
         let owner = "aa".repeat(32);
-        let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
+        let url = "https://relay.maxplayer.test/git/owner/repo.git";
         let offer = offer_view_contribution(&owner, url, "main", &"77".repeat(20));
         // A from-scratch result (no contribution echo) against a contribution offer ⇒ refuse.
         let result = result_view(&"cc".repeat(32), &"dd".repeat(32));
@@ -4466,7 +4466,7 @@ mod tests {
             result_id: "cc".repeat(32),
             seller_pubkey: "dd".repeat(32),
             commit_oid: "ee".repeat(20),
-            repo: "https://mobee-relay.orveth.dev/git/seller/fork.git".into(),
+            repo: "https://relay.maxplayer.test/git/seller/fork.git".into(),
             branch: "mobee/contribution/x".into(),
             job_hash: "ff".repeat(32),
             amount_sats: 1,
@@ -4480,7 +4480,7 @@ mod tests {
             model_used: None,
             contribution: Some(AcceptedContribution {
                 target_owner_pubkey: "aa".repeat(32),
-                target_clone_url: "https://mobee-relay.orveth.dev/git/owner/repo.git".into(),
+                target_clone_url: "https://relay.maxplayer.test/git/owner/repo.git".into(),
                 base_branch: "main".into(),
                 base_oid: "77".repeat(20),
                 tuple_signature: "cafe".into(),
@@ -4504,7 +4504,7 @@ mod tests {
         let offer = crate::contribution::ContributionOffer {
             target: crate::contribution::TargetRepoPin::new(
                 "aa".repeat(32),
-                "https://mobee-relay.orveth.dev/git/owner/repo.git",
+                "https://relay.maxplayer.test/git/owner/repo.git",
             )
             .unwrap(),
             base: crate::contribution::ContributionBase::new("main", "77".repeat(20)).unwrap(),
@@ -4567,7 +4567,7 @@ mod tests {
         // parse_contribution_offer yields exactly {owner,url,branch,oid} -> emitted tags ARE the
         // canonical constructor output (no drift) -> the accept-path binds to the OFFER's values.
         let owner = "aa".repeat(32);
-        let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
+        let url = "https://relay.maxplayer.test/git/owner/repo.git";
         let base_oid = "77".repeat(20);
         let request = contribution_post_request(&owner, url, "main", &base_oid, None);
 
@@ -4662,7 +4662,7 @@ mod tests {
     #[test]
     fn post_job_contribution_bad_fields_refuse() {
         let owner = "aa".repeat(32);
-        let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
+        let url = "https://relay.maxplayer.test/git/owner/repo.git";
         let oid = "77".repeat(20);
         // bad owner (not 64-hex)
         assert!(

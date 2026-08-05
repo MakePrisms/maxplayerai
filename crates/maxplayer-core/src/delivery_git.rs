@@ -415,7 +415,7 @@ impl PayPathDeliveryVerifier {
         let mut head = target
             .head()
             .map_err(|_| DeliveryError::MergeFailed("ff-only"))?;
-        head.set_target(merged, "mobee ff-only merge of retained delivery")
+        head.set_target(merged, "maxplayer ff-only merge of retained delivery")
             .map_err(|_| DeliveryError::MergeFailed("ff-only"))?;
         Ok(())
     }
@@ -447,7 +447,7 @@ mod tests {
         fn new() -> Self {
             let id = NEXT_REPO.fetch_add(1, Ordering::Relaxed);
             let root =
-                std::env::temp_dir().join(format!("mobee-delivery-{}-{id}", std::process::id()));
+                std::env::temp_dir().join(format!("maxplayer-delivery-{}-{id}", std::process::id()));
             let work = root.join("work");
             let remote = root.join("remote.git");
             let store = root.join("store.git");
@@ -455,7 +455,7 @@ mod tests {
             run(["init", "--initial-branch=main"], Some(&work));
             run(["config", "user.name", "Maxplayer Test"], Some(&work));
             run(
-                ["config", "user.email", "mobee@example.invalid"],
+                ["config", "user.email", "maxplayer@example.invalid"],
                 Some(&work),
             );
             fs::write(work.join("delivery.txt"), "one\n").expect("write delivery");
@@ -625,7 +625,7 @@ mod tests {
     fn verify_delivery_without_system_git() {
         use git2::{Repository, Signature};
         let id = NEXT_REPO.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!("mobee-nogit-{}-{id}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("maxplayer-nogit-{}-{id}", std::process::id()));
         let src = root.join("src");
         let store = root.join("store.git");
         fs::create_dir_all(&src).expect("mkdir src");
@@ -723,7 +723,7 @@ mod contribution_tests {
 
     fn scenario(depth: usize, change_path: &str) -> Fx {
         let id = SEQ.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!("mobee-contrib-{}-{id}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("maxplayer-contrib-{}-{id}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let target_work = root.join("target_work");
         let target_git = root.join("target.git");
@@ -871,7 +871,7 @@ mod contribution_tests {
     fn content_gate_refuses_empty_diff() {
         // A fork whose tip has the SAME tree as base (an empty commit) ⇒ empty diff.
         let id = SEQ.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!("mobee-contrib-empty-{}-{id}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("maxplayer-contrib-empty-{}-{id}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let tw = root.join("tw");
         let tg = root.join("t.git");

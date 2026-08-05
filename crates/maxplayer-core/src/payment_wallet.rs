@@ -1637,7 +1637,7 @@ impl<R> CdkPaymentEffects<R> {
             .map_err(wallet_error)?;
         let (commands, mut requests) = tokio::sync::mpsc::channel(1);
         let worker = thread::Builder::new()
-            .name("mobee-payment-wallet".into())
+            .name("maxplayer-payment-wallet".into())
             .spawn(move || {
                 runtime.block_on(async move {
                     while let Some(command) = requests.recv().await {

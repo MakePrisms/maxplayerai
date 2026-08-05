@@ -198,7 +198,7 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
             Err(error) => {
                 let _ = writeln!(
                     err,
-                    "mobee-hosted delivery announce failed: {error}\n\
+                    "maxplayer-hosted delivery announce failed: {error}\n\
                      provide --git-remote <https-url> to use BYO delivery, or retry when relay-git is reachable"
                 );
                 return Err(RUNTIME_ERROR);
@@ -526,14 +526,14 @@ fn probe_relay_git_seeded(home: &MaxplayerHome, remote_url: &str) -> Result<(), 
             let message = error.to_string().to_lowercase();
             if message.contains("repository not found") || message.contains("404") {
                 Err(format!(
-                    "mobee-hosted delivery not seeded after NIP-34 announce (ls-remote 404).\n\
+                    "maxplayer-hosted delivery not seeded after NIP-34 announce (ls-remote 404).\n\
                      likely cause: relay-git global name collision on repo id, or seed side-effect failed.\n\
                      provide --git-remote <https-url> for BYO delivery, or pick a unique remote leaf.\n\
                      remote={remote_url}"
                 ))
             } else {
                 Err(format!(
-                    "mobee-hosted delivery seed probe failed (in-process ls-remote): {error}.\n\
+                    "maxplayer-hosted delivery seed probe failed (in-process ls-remote): {error}.\n\
                      provide --git-remote <https-url> for BYO delivery.\n\
                      remote={remote_url}"
                 ))
@@ -776,7 +776,7 @@ mod tests {
                 "--non-interactive".into(),
                 "--home".into(),
                 std::env::temp_dir()
-                    .join(format!("mobee-sell-miss-{}", std::process::id()))
+                    .join(format!("maxplayer-sell-miss-{}", std::process::id()))
                     .to_string_lossy()
                     .into_owned(),
             ],
@@ -807,7 +807,7 @@ mod tests {
         // to the pre-fix `else if let Some(label) { vec![label] }` reloads ["claude"] and reddens both
         // asserts below.
         let root = std::env::temp_dir().join(format!(
-            "mobee-369-multi-{}-{}",
+            "maxplayer-369-multi-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -858,7 +858,7 @@ mod tests {
         // #369-class: a steady-state relaunch must NOT clobber contribution_enabled=false back to
         // true, and must keep a single-harness wire label in `agents`.
         let root = std::env::temp_dir().join(format!(
-            "mobee-369-contrib-{}-{}",
+            "maxplayer-369-contrib-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -910,7 +910,7 @@ mod tests {
     #[test]
     fn sell_writeback_preserves_operator_slots_and_claim_timeout() {
         let root = std::env::temp_dir().join(format!(
-            "mobee-369-slots-{}-{}",
+            "maxplayer-369-slots-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

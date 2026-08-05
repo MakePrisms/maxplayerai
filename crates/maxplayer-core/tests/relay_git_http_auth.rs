@@ -31,7 +31,7 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 fn temp(label: &str) -> PathBuf {
     let id = NEXT.fetch_add(1, Ordering::SeqCst);
     std::env::temp_dir().join(format!(
-        "mobee-relay-git-auth-{label}-{}-{id}",
+        "maxplayer-relay-git-auth-{label}-{}-{id}",
         std::process::id()
     ))
 }

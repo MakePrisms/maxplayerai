@@ -196,7 +196,7 @@ fn handle_connection(
         return respond(
             &mut tls,
             "401 Unauthorized",
-            &["WWW-Authenticate: Basic realm=\"mobee-relay-git-fixture\""],
+            &["WWW-Authenticate: Basic realm=\"maxplayer-relay-git-fixture\""],
             "text/plain",
             b"authorization required\n",
         );

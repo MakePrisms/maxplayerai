@@ -21,7 +21,7 @@
           pkgs = nixpkgs.legacyPackages.${system};
 
           # Args common to every `maxplayer` build.
-          mobeeArgs = {
+          maxplayerArgs = {
             pname = "maxplayer";
             version = "0.1.0";
             src = self;
@@ -55,7 +55,7 @@
           buyerStatic =
             staticPkgs:
             staticPkgs.rustPlatform.buildRustPackage (
-              mobeeArgs
+              maxplayerArgs
               // {
                 nativeBuildInputs = [ staticPkgs.pkg-config ];
               }
@@ -63,7 +63,7 @@
         in
         {
           default = pkgs.rustPlatform.buildRustPackage (
-            mobeeArgs
+            maxplayerArgs
             // {
               # Enable the `acp` feature (off by default) so the acp-gated
               # `run` subcommand is compiled in. Default features (wallet)
@@ -75,7 +75,7 @@
           );
 
           # The strfry write-policy plugin (crate `maxplayer-relay-write-policy`, binary
-          # `mobee-write-policy`). A separate derivation, not a `mobeeArgs` variant: it builds only
+          # `maxplayer-write-policy`). A separate derivation, not a `maxplayerArgs` variant: it builds only
           # this one workspace crate — serde/serde_json, no C deps — so it needs neither the `acp`
           # feature nor pkg-config, and must not pull in the egui/sqlite/libgit2 members. Deps still
           # vendor from the one workspace `Cargo.lock`; `-p` keeps the compile to this crate.
@@ -90,7 +90,7 @@
               "maxplayer-relay-write-policy"
             ];
             doCheck = false;
-            meta.mainProgram = "mobee-write-policy";
+            meta.mainProgram = "maxplayer-write-policy";
           };
         }
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {

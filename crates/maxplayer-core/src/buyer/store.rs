@@ -1284,7 +1284,7 @@ mod tests {
 
     fn temp_db(label: &str) -> std::path::PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("mobee-buyer-store-{label}-{}-{id}.sqlite", std::process::id()))
+        std::env::temp_dir().join(format!("maxplayer-buyer-store-{label}-{}-{id}.sqlite", std::process::id()))
     }
 
     #[test]

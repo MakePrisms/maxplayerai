@@ -846,7 +846,7 @@ mod tests {
     #[test]
     fn seller_start_command_uses_maxplayer_sell_without_secret_args() {
         let request = StartSellerRequest {
-            home: PathBuf::from("/tmp/mobee-home"),
+            home: PathBuf::from("/tmp/maxplayer-home"),
             preset: AgentPreset::Codex,
             display_name: "Desk Seller".to_owned(),
             rate_sats: 7,
@@ -856,7 +856,7 @@ mod tests {
         let rendered = format_command(&command);
 
         assert!(rendered.contains("sell --non-interactive --agent codex --rate-sats 7"));
-        assert!(rendered.contains("--home /tmp/mobee-home"));
+        assert!(rendered.contains("--home /tmp/maxplayer-home"));
         assert!(rendered.contains("--name Desk Seller"));
         assert!(!rendered.contains("--key"));
         assert!(!rendered.contains("--secret-key"));
@@ -865,7 +865,7 @@ mod tests {
 
     #[test]
     fn doctor_command_is_bound_to_home_via_env() {
-        let home = PathBuf::from("/tmp/mobee-home");
+        let home = PathBuf::from("/tmp/maxplayer-home");
         let command = doctor_command(&home);
 
         let rendered = format_command(&command);

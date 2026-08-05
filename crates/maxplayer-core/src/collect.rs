@@ -263,7 +263,7 @@ mod tests {
 
     fn temp_root(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("mobee-collect-{label}-{}-{id}", std::process::id()))
+        std::env::temp_dir().join(format!("maxplayer-collect-{label}-{}-{id}", std::process::id()))
     }
 
     /// Build a buyer store (bare repo) holding a delivered commit (README.md + src/lib.rs) under its

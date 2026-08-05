@@ -566,7 +566,7 @@ mod tests {
     use super::*;
 
     fn pin() -> TargetRepoPin {
-        TargetRepoPin::new("aa".repeat(32), "https://mobee-relay.orveth.dev/git/owner/repo.git")
+        TargetRepoPin::new("aa".repeat(32), "https://relay.maxplayer.test/git/owner/repo.git")
             .expect("pin")
     }
 

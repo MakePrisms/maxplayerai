@@ -81,7 +81,7 @@ impl From<TransportError> for SellerGitError {
 }
 
 /// The deterministic identity every delivery commit carries: `mobee-seller-<pubkey16>` /
-/// `<pubkey16>@seller.mobee.invalid`. The daemon authors the snapshot commit under this identity,
+/// `<pubkey16>@seller.maxplayer.invalid`. The daemon authors the snapshot commit under this identity,
 /// so the delivered commit is provably the seat's — the seller's signature over the result and
 /// receipt is the binding attribution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,7 +99,7 @@ impl DeliveryAgentIdentity {
             .to_ascii_lowercase();
         Self {
             name: format!("mobee-seller-{short}"),
-            email: format!("{short}@seller.mobee.invalid"),
+            email: format!("{short}@seller.maxplayer.invalid"),
         }
     }
 
@@ -389,7 +389,7 @@ pub fn snapshot_delivery_at(
     // the agent left HEAD in. Force-update the ref directly (`Repository::branch` refuses to move
     // the checked-out branch, which is the common case).
     let refname = format!("refs/heads/{branch}");
-    repo.reference(&refname, commit, true, "mobee delivery snapshot")
+    repo.reference(&refname, commit, true, "maxplayer delivery snapshot")
         .map_err(|_| SellerGitError::CommandFailed("snapshot-branch"))?;
     repo.set_head(&refname)
         .map_err(|_| SellerGitError::CommandFailed("snapshot-set-head"))?;
@@ -482,7 +482,7 @@ pub fn push_branch_with_header(
 /// relay-git repo, write-scoped auth failure — at daemon boot instead of at job-delivery time.
 ///
 /// git2 has no `push --dry-run`; `connect(Push) + list` is the faithful equivalent (it performs
-/// exactly the receive-pack advertisement mobee-relay NIP-98 auth-gates, then stops). Allowlisted
+/// exactly the receive-pack advertisement maxplayer-relay NIP-98 auth-gates, then stops). Allowlisted
 /// (https + relay-git; `ext::`/file/ssh refused).
 pub fn preflight_push_probe(
     remote_url: &str,
@@ -698,7 +698,7 @@ mod tests {
 
     #[test]
     fn preflight_push_probe_fails_closed_on_unreachable_https_remote() {
-        let err = preflight_push_probe("https://mobee-preflight.invalid/git/owner/repo.git", None)
+        let err = preflight_push_probe("https://maxplayer-preflight.invalid/git/owner/repo.git", None)
             .expect_err("unreachable remote must fail closed");
         assert!(
             matches!(
@@ -824,7 +824,7 @@ mod snapshot_tests {
     fn workdir(label: &str) -> PathBuf {
         let id = SEQ.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir()
-            .join(format!("mobee-snapshot-{label}-{}-{id}", std::process::id()));
+            .join(format!("maxplayer-snapshot-{label}-{}-{id}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("mkdir workdir");
         dir
@@ -919,7 +919,7 @@ mod snapshot_tests {
         write(&dir, "src/feature.rs", "agent work, never committed\n");
         let id = identity();
 
-        let oid = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "mobee delivery: task")
+        let oid = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "maxplayer delivery: task")
             .expect("snapshot");
 
         let c = commit(&dir, &oid);

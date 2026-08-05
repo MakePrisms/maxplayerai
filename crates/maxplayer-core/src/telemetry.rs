@@ -1,6 +1,6 @@
 //! Seller **brain/episode telemetry** stream: every [`Episode`](crate::episode::Episode) captured
 //! to `episodes.jsonl` (the on-disk source of truth) is ALSO emitted, live, as one JSON telemetry
-//! event so an operator can watch what is going on inside a mobee's brain as it happens.
+//! event so an operator can watch what is going on inside a maxplayer's brain as it happens.
 //!
 //! Two independent, best-effort delivery paths, both driven by [`emit`]:
 //!   * a pluggable **sink command** (`[telemetry] command`) spawned with the event JSON on stdin —
@@ -143,7 +143,7 @@ mod tests {
     fn temp_root(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         let root = std::env::temp_dir().join(format!(
-            "mobee-telemetry-{label}-{}-{id}",
+            "maxplayer-telemetry-{label}-{}-{id}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&root);

@@ -522,7 +522,7 @@ where
 {
     let label = label.to_owned();
     std::thread::Builder::new()
-        .name("mobee-crossmint-hop".into())
+        .name("maxplayer-crossmint-hop".into())
         .spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1189,7 +1189,7 @@ mod tests {
     /// A fresh journal directory for one test, named so concurrent test binaries cannot collide.
     fn scratch_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "mobee-crossmint-journal-{}-{label}",
+            "maxplayer-crossmint-journal-{}-{label}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);

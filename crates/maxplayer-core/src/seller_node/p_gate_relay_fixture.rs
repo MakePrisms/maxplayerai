@@ -1,4 +1,4 @@
-//! An in-process relay that reproduces mobee-relay's `#p`-gate wire behaviour, and records what the
+//! An in-process relay that reproduces maxplayer-relay's `#p`-gate wire behaviour, and records what the
 //! client actually sent.
 //!
 //! The `nostr-relay-builder` fixture used elsewhere in this crate cannot express the failure in #189.
@@ -188,7 +188,7 @@ impl PGateRelay {
                 .await;
             }
             let _ =
-                send(&writer, json!(["AUTH", format!("mobee-rechallenge-{generation}")])).await;
+                send(&writer, json!(["AUTH", format!("maxplayer-rechallenge-{generation}")])).await;
         }
     }
 
@@ -279,7 +279,7 @@ async fn serve_connection(
 
     // The boot challenge goes out on its own task so the delay never blocks reading: the REQs we are
     // here to observe arrive DURING that window.
-    let boot_challenge = "mobee-recoveryfix-challenge";
+    let boot_challenge = "maxplayer-recoveryfix-challenge";
     tokio::spawn({
         let writer = Arc::clone(&writer);
         async move {
@@ -397,7 +397,7 @@ async fn serve_connection(
 /// The deployed relay's rule, and the whole reason this fixture exists.
 ///
 /// A `#p`-pinned filter is refused with the PERMANENT-class `restricted:` prefix unless the session
-/// is authenticated as that very pubkey. mobee-relay reaches this verdict by evaluating its p-gate
+/// is authenticated as that very pubkey. maxplayer-relay reaches this verdict by evaluating its p-gate
 /// against an empty authed pubkey on an unauthenticated connection (`req.rs:208`), which is why the
 /// pre-auth race and a genuine wrong-`#p` request are indistinguishable on the wire — the exact
 /// ambiguity the client-side fix has to resolve without softening the taxonomy.

@@ -448,7 +448,7 @@ mod tests {
     fn test_path(name: &str) -> std::path::PathBuf {
         let id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!(
-            "mobee-engine-{name}-{}-{id}.jsonl",
+            "maxplayer-engine-{name}-{}-{id}.jsonl",
             std::process::id()
         ))
     }

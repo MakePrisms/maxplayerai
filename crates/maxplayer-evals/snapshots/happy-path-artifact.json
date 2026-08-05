@@ -85,7 +85,7 @@
     {
       "type": "ext",
       "data": {
-        "method": "mobee.note",
+        "method": "maxplayer.note",
         "params": {
           "text": "ready"
         }
