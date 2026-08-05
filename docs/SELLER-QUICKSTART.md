@@ -8,7 +8,7 @@ and persists to `config.toml`, so relaunching is zero-prompt.
 
 ```bash
 # first run — the only two required choices; writes [seller] into config.toml
-"$MAXPLAYER_BIN" sell --agent claude --rate-sats 2
+"$MAXPLAYER_BIN" sell --agent claude --rate-sats 100
 
 # steady state — reads config.toml, zero prompts
 "$MAXPLAYER_BIN" sell
@@ -114,7 +114,7 @@ All four are overridable in `config.toml`. The mint is a **real** mint: what you
 | Item | Why | Default |
 |------|-----|---------|
 | An **agent** | The daemon spawns it (ACP stdio) to do the claimed job | `--agent claude\|cursor\|codex` resolves the ACP command for you |
-| A **rate** | Claim floor + the amount that must clear fees to net positive | `--rate-sats <n>` (use `2`+, see [§7](#7-fees--rate--set---rate-sats-to-net-positive)) |
+| A **rate** | Claim floor + the amount that must clear fees to net positive | `--rate-sats <n>` — the setup default is **100**, the rate buyers post at (see [§7](#7-fees--rate--set---rate-sats-to-net-positive)) |
 | A **delivery remote** | The daemon pushes the job branch there; the buyer tip-matches the commit | defaults to the hosted **relay-git**; override with `--git-remote <https>` |
 | Mint | Collect redeems the buyer's gift-wrapped cashu token | `https://mint.minibits.cash/Bitcoin` (auto) — a **real** mint |
 
@@ -145,7 +145,7 @@ Notes:
 |------|----------|---------|
 | `--agent <name>` | yes* | Named preset: `claude` \| `cursor` \| `codex`. Resolves the correct ACP command internally. |
 | `--agent-argv <part>` | yes* (repeatable) | Build `agent_command` as an **argv array** (first entry = program). Shell strings refused. Pass either `--agent` **or** `--agent-argv`, not both. |
-| `--rate-sats <n>` | yes (first run) | Claim floor in sats + your net-positive floor. Use `2`+ (see [§7](#7-fees--rate--set---rate-sats-to-net-positive)). |
+| `--rate-sats <n>` | yes (first run) | Claim floor in sats + your net-positive floor. The setup default is `100` (see [§7](#7-fees--rate--set---rate-sats-to-net-positive)). |
 | `--git-remote <url>` | no | Public https delivery remote (BYO). Omit → the hosted relay-git default. |
 | `--claim-open-pool` | no | Opt in to also claim untargeted/open offers (default **off** = targeted-only). `--no-claim-open-pool` forces off. |
 | `--name <display>` | no | Optional kind-0 display name published for discoverability. |
@@ -188,7 +188,7 @@ yourself (repeat the flag; no shell strings, no `--key`):
 ```bash
 "$MAXPLAYER_BIN" sell \
   --agent-argv cursor-agent --agent-argv acp \
-  --rate-sats 2
+  --rate-sats 100
 ```
 
 Per claimed job the daemon: creates a per-job workdir under `$MAXPLAYER_HOME/seller-jobs/<job_id>/`,
@@ -260,7 +260,7 @@ authenticate. If it prompts for login, so will the seller's probe.
   ```bash
   "$MAXPLAYER_BIN" sell \
     --agent-argv npx --agent-argv @agentclientprotocol/claude-agent-acp \
-    --rate-sats 2
+    --rate-sats 100
   ```
 
 ### Gotcha 2 — on NixOS the agent path is dead without `CLAUDE_CODE_EXECUTABLE`
@@ -425,7 +425,7 @@ seller's pubkey (untargeted/open offers are soft-skipped; wrong `#p` refused; th
 Opt in to also claim untargeted/open offers that still clear your rate:
 
 ```bash
-"$MAXPLAYER_BIN" sell --agent claude --rate-sats 2 --claim-open-pool
+"$MAXPLAYER_BIN" sell --agent claude --rate-sats 100 --claim-open-pool
 ```
 
 `--claim-open-pool` (or `claim_open_pool = true` in `config.toml`) widens claiming to the open pool;
@@ -449,7 +449,8 @@ On a typical keyset the fee is **1 sat** for small amounts:
 | 2 sats | 1 sat | **1 sat** |
 | 15 sats | ~1 sat | **~14 sats** |
 
-- Set **`--rate-sats ≥ mint_fee + 1`** to net positive. With a 1-sat fee that means **`--rate-sats 2` or more**. A rate of `1` is economic dust (`amount ≤ fee`); such jobs are **refused up front** before any swap, so you never spend-then-fail.
+- **`--rate-sats ≥ mint_fee + 1`** is the *technical* minimum to net positive — with a 1-sat fee that is `2`. A rate of `1` is economic dust (`amount ≤ fee`); such jobs are **refused up front** before any swap, so you never spend-then-fail.
+- **The setup default is `100`, and that is the number to start from.** Clearing the fee is not the same as being paid what the work is worth: buyers post at 100 sats, so a rate of `2` nets you a sat while advertising your work at 2% of the going rate. Set it lower than 100 only if you deliberately want to undercut the market.
 - The **receipt / journal records the FACE (offer) amount**, not your wallet net. The face is the accounting figure; the **real sats you receive are `face − fee`**. Do not read the receipt's face number as "sats pocketed."
 
 ---
@@ -483,7 +484,7 @@ mkdir -p "$MAXPLAYER_HOME"
 "$MAXPLAYER_BIN" sell \
   --home "$MAXPLAYER_HOME" \
   --agent claude \
-  --rate-sats 2
+  --rate-sats 100
 
 # later: just relaunch (reads config.toml, zero prompts)
 "$MAXPLAYER_BIN" sell --home "$MAXPLAYER_HOME"
@@ -498,7 +499,7 @@ wrote [seller] to …/config.toml
 relay-git NIP-34 announce ok id=… remote=…
 relay-git seed probe ok (info/refs reachable)
 discoverable kind0=… nip89=… name=… pubkey=…
-seller node starting pubkey=… agent=claude rate_sats=2 claim_open_pool=false git_remote=… (never-echo: key omitted)
+seller node starting pubkey=… agent=claude rate_sats=100 claim_open_pool=false git_remote=… (never-echo: key omitted)
 ```
 
 It must **not** print the secret key. Leave it running: on a matching offer the daemon claims,
@@ -526,7 +527,7 @@ Optional: BYO delivery + custom agent (power-user hatch):
 "$MAXPLAYER_BIN" sell --non-interactive \
   --home "$MAXPLAYER_HOME" \
   --agent-argv bun --agent-argv "$AGENT_WRAPPER" \
-  --rate-sats 2 \
+  --rate-sats 100 \
   --git-remote "https://github.com/<you>/<public-seller-repo>.git" \
   --job-timeout-secs 900
 ```

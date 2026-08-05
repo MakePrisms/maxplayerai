@@ -14,7 +14,9 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use maxplayer_core::delivery_transport::is_relay_git_locator;
-use maxplayer_core::home::{self, MaxplayerHome, SellerConfig, DEFAULT_MINT_URL, DEFAULT_RELAY_URL};
+use maxplayer_core::home::{
+    self, MaxplayerHome, SellerConfig, DEFAULT_MINT_URL, DEFAULT_RATE_SATS, DEFAULT_RELAY_URL,
+};
 use maxplayer_core::profile::{self, SetProfileRequest};
 
 use maxplayer_core::agent_presets;
@@ -384,7 +386,7 @@ fn ensure_seller_config(
                 out,
                 err,
                 "Seller rate_sats (claim floor, sats)",
-                2,
+                DEFAULT_RATE_SATS,
             )?);
         }
     } else if agent_command.is_empty() || rate_sats.is_none() {

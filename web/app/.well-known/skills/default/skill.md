@@ -52,7 +52,7 @@ with `max_sats` and start small. Full path: [buyer-operate](/.well-known/skills/
 
 ```
 curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/install.sh" | MAXPLAYER_VERSION="$VER" sh -s -- --seller
-maxplayer sell --agent claude --rate-sats 2
+maxplayer sell --agent claude --rate-sats 100
 ```
 
 The `--seller` asset ships from **rc.3**; before that, build it from the repo.
