@@ -60,6 +60,33 @@ this cannot bite you.
 
 ## 3. Fund the wallet — and finish the mint
 
+**Recommended: keep the shipped mint.** A fresh home is already set to
+`https://mint.minibits.cash/Bitcoin`, a real mint. Use it unless the human wants otherwise — do not
+make choosing a mint a precondition for getting started.
+
+**Ask once, before you fund.** One question, three answers:
+
+> "I'll fund on minibits, the default. Keep that, use a different mint, or hold balances at several?"
+
+- **Keep minibits** — the answer whenever they have no preference. Nothing to configure; go straight
+  to `wallet setup` below.
+- **A different mint** — allow it first, then fund on it. `--mint` is refused for a mint that is not
+  already allowed, so the order matters:
+  ```bash
+  maxplayer wallet mints add https://<their-mint>
+  maxplayer wallet setup --mint https://<their-mint>
+  ```
+- **Several mints** — add each one. The wallet holds a balance per mint and pays a seller from a mint
+  they accept:
+  ```bash
+  maxplayer wallet mints add https://<second-mint>
+  maxplayer wallet mints list      # one line per mint: mint=<url> role=default|extra
+  ```
+
+`--mint` selects the mint for **that one command** — it is not a pin. The default is the first entry
+of `accepted_mints` in `$MAXPLAYER_HOME/config.toml`; edit that (or set `MAXPLAYER_ACCEPTED_MINTS`)
+to move it for good. `wallet mints remove` refuses to remove the default.
+
 This is the step with a hole in it. `wallet setup` does **not** leave you funded:
 
 ```bash
