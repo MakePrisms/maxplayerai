@@ -2642,6 +2642,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mobee-relay-write-policy"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

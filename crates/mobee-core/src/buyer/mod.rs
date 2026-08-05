@@ -726,7 +726,7 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
             );
         }
     }
-    let (balance, total_cap, spent) = match money_snapshot(context).await {
+    let (balance, _spent) = match money_snapshot(context).await {
         Ok(snapshot) => snapshot,
         Err(error) => return Response::err(id, CODE_INTERNAL, error),
     };
@@ -743,8 +743,6 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
         &params.job_id,
         award_amount,
         balance,
-        total_cap,
-        spent,
         now_unix(),
         move || async move {
             job_lifecycle::award_presence_async(&probe_home, &probe_keys, &probe_job, RELAY_TIMEOUT)
@@ -952,7 +950,6 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
                     "attempt_id": outcome.pay.attempt_id,
                     "amount_sats": outcome.pay.amount_sats,
                     "spent_total_sats": outcome.pay.spent_total_sats,
-                    "remaining_sats": outcome.pay.remaining_sats,
                 },
                 "commit_oid": outcome.commit_oid,
                 "path": outcome.path,
@@ -967,16 +964,17 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
     }
 }
 
-/// Honest reserve snapshot: the live wallet balance (through the actor), the budget cap, and the
-/// budget spent total (fresh fold). Never a sentinel or a stale cached value.
-async fn money_snapshot(context: &BuyerContext) -> Result<(u64, u64, u64), String> {
+/// Honest reserve snapshot: the live wallet balance (through the actor) and the budget spent total
+/// (fresh fold, shown in status). Never a sentinel or a stale cached value. Issue #378 removed the
+/// total cap, so the wallet balance is the sole reservation ceiling.
+async fn money_snapshot(context: &BuyerContext) -> Result<(u64, u64), String> {
     let balance = context
         .wallet
         .balance()
         .await
         .map_err(|error| error.to_string())??;
     let gate = BudgetGate::from_home(&context.home).map_err(|error| error.to_string())?;
-    Ok((balance, gate.total_cap(), gate.spent()))
+    Ok((balance, gate.spent()))
 }
 
 /// The buyer nostr identity, parsed from the home secret (the same source the signer actor loads).
@@ -1151,7 +1149,7 @@ async fn finalize_auto_award(
             ));
         }
     }
-    let (balance, total_cap, spent) = money_snapshot(context).await?;
+    let (balance, _spent) = money_snapshot(context).await?;
     let home = context.home.clone();
     let job = job_id.to_owned();
     let publish_claim = claim_id.clone();
@@ -1175,8 +1173,6 @@ async fn finalize_auto_award(
         job_id,
         offer_amount,
         balance,
-        total_cap,
-        spent,
         now_unix(),
         move || async move {
             job_lifecycle::award_presence_async(&probe_home, &probe_keys, &probe_job, RELAY_TIMEOUT)
@@ -1607,7 +1603,7 @@ async fn resolve_attempt_via_chokepoint(
     licensed_prior_sends: Option<u64>,
 ) -> Result<AwardOutcome, AwardError> {
     let _guard = context.money_lock.lock().await;
-    let (balance, total_cap, spent) = match money_snapshot(context).await {
+    let (balance, _spent) = match money_snapshot(context).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
             return Err(AwardError::Presence(StoreError(format!(
@@ -1623,8 +1619,6 @@ async fn resolve_attempt_via_chokepoint(
         job_id,
         amount_sats,
         balance,
-        total_cap,
-        spent,
         now_unix(),
         move || async move {
             job_lifecycle::award_presence_async(&probe_home, &probe_keys, &probe_job, RELAY_TIMEOUT)
@@ -1999,9 +1993,9 @@ async fn resolve_award_attempts(context: &BuyerContext) {
         // instead of releasing at once (round-4 review).
         let licensed_prior = {
             let _guard = context.money_lock.lock().await;
-            // The snapshot is read INSIDE the guard: the two-ceiling check below must not decide
-            // on balance/spent numbers a concurrent settle's melt has already invalidated — the
-            // same invariant every other reserve site in this file holds to.
+            // The snapshot is read INSIDE the guard: the wallet-ceiling check below must not decide
+            // on a balance a concurrent settle's melt has already invalidated — the same invariant
+            // every other reserve site in this file holds to.
             let snapshot = money_snapshot(context).await;
             match context.store.award_attempt(&job_id) {
                 // The deadline is re-checked HERE, under the guard, for the same reason the two
@@ -2018,13 +2012,11 @@ async fn resolve_award_attempts(context: &BuyerContext) {
                 }
                 Ok(Some(current)) if current.state == store::AttemptState::Pending => {
                     match &snapshot {
-                        Ok((balance, total_cap, spent)) => {
+                        Ok((balance, _spent)) => {
                             match context.store.reserve(
                                 &job_id,
                                 attempt.amount_sats,
                                 *balance,
-                                *total_cap,
-                                *spent,
                                 now_unix(),
                             ) {
                                 Ok(_)
@@ -2709,7 +2701,7 @@ mod tests {
         let store =
             store::BuyerStore::open(root.join("buyer.sqlite")).expect("open store");
         let job = "a".repeat(64);
-        store.reserve(&job, 40, 100, u64::MAX, 0, 1).expect("reserve");
+        store.reserve(&job, 40, 100, 1).expect("reserve");
         store
             .begin_award_attempt(&attempt_fixture(&job, "ws://relay.test"), 1)
             .expect("pin");
@@ -2737,7 +2729,7 @@ mod tests {
         // the park would be a silent no-op and the assertion below could not see it).
         let pending_job = "b".repeat(64);
         store.put_pending_award(&pending_job, 40, None, None, 4).expect("intent");
-        store.reserve(&pending_job, 40, 100, u64::MAX, 0, 4).expect("reserve");
+        store.reserve(&pending_job, 40, 100, 4).expect("reserve");
         store
             .begin_award_attempt(&attempt_fixture(&pending_job, "ws://relay.test"), 4)
             .expect("pin");
@@ -2774,7 +2766,7 @@ mod tests {
         // an ack or a presence-verified repair, so a pending attempt WITH its row (the
         // confirm-write-failed crash) must never be refused, however absent the probes read.
         let recorded_job = "d".repeat(64);
-        store.reserve(&recorded_job, 40, 100, u64::MAX, 0, 7).expect("reserve");
+        store.reserve(&recorded_job, 40, 100, 7).expect("reserve");
         store
             .begin_award_attempt(&attempt_fixture(&recorded_job, "ws://relay.test"), 7)
             .expect("pin");
@@ -2832,7 +2824,7 @@ mod tests {
 
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
         let job = "a".repeat(64);
-        context.store.reserve(&job, 4, 1_000, u64::MAX, 0, now_unix()).expect("reserve");
+        context.store.reserve(&job, 4, 1_000, now_unix()).expect("reserve");
         let mut pinned = attempt_fixture(&job, &context.home.config.relay_url);
         pinned.amount_sats = 4;
         context.store.begin_award_attempt(&pinned, now_unix()).expect("pin");
@@ -2890,7 +2882,7 @@ mod tests {
 
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
         let job = "a".repeat(64);
-        context.store.reserve(&job, 4, 1_000, u64::MAX, 0, now_unix()).expect("reserve");
+        context.store.reserve(&job, 4, 1_000, now_unix()).expect("reserve");
         let mut pinned = attempt_fixture(&job, &context.home.config.relay_url);
         pinned.amount_sats = 4;
         // Past the offer deadline AND the 7-day pay window: the probe (confirmed absent against
@@ -2943,7 +2935,7 @@ mod tests {
 
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
         let job = "a".repeat(64);
-        context.store.reserve(&job, 4, 1_000, u64::MAX, 0, now_unix()).expect("reserve");
+        context.store.reserve(&job, 4, 1_000, now_unix()).expect("reserve");
         let mut pinned = attempt_fixture(&job, &context.home.config.relay_url);
         pinned.amount_sats = 4;
         pinned.offer_deadline_unix = now_unix() - 9 * 24 * 3_600; // past deadline AND pay window
@@ -3000,7 +2992,7 @@ mod tests {
 
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
         let job = "a".repeat(64);
-        context.store.reserve(&job, 4, 1_000, u64::MAX, 0, now_unix()).expect("reserve");
+        context.store.reserve(&job, 4, 1_000, now_unix()).expect("reserve");
         let mut pinned = attempt_fixture(&job, &context.home.config.relay_url);
         pinned.amount_sats = 4;
         // REAL signed bytes, not the fixture's placeholder: with unparseable JSON the send would
@@ -3071,7 +3063,7 @@ mod tests {
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
         let job = "a".repeat(64);
         context.store.put_pending_award(&job, 4, None, None, now_unix()).expect("intent");
-        context.store.reserve(&job, 4, 1_000, u64::MAX, 0, now_unix()).expect("reserve");
+        context.store.reserve(&job, 4, 1_000, now_unix()).expect("reserve");
         // The attempt's amount DISAGREES with the held reservation, so the repair's re-reserve is
         // refused (AmountMismatch) — the award is public and its row cannot be written.
         let mut pinned = attempt_fixture(&job, &context.home.config.relay_url);
@@ -3124,7 +3116,7 @@ mod tests {
 
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
         let job = "a".repeat(64);
-        context.store.reserve(&job, 4, 1_000, u64::MAX, 0, now_unix()).expect("reserve");
+        context.store.reserve(&job, 4, 1_000, now_unix()).expect("reserve");
         let mut pinned = attempt_fixture(&job, &context.home.config.relay_url);
         pinned.amount_sats = 4;
         pinned.offer_deadline_unix = now_unix() - 9 * 24 * 3_600; // past deadline AND pay window
@@ -3197,7 +3189,7 @@ mod tests {
 
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
         let job = "a".repeat(64);
-        context.store.reserve(&job, 4, 1_000, u64::MAX, 0, now_unix()).expect("reserve");
+        context.store.reserve(&job, 4, 1_000, now_unix()).expect("reserve");
         let keys = buyer_keys(&context.home).expect("keys");
         // Real signed bytes: with the fixture placeholder the send would bail locally on parse,
         // making the no-transmit assertion vacuous.
@@ -3238,7 +3230,7 @@ mod tests {
         // bounce is a `continue`, not a `return`. Nothing else in the suite notices if one
         // diverted job aborts the whole pass (round-9 review).
         let control = "c".repeat(64);
-        context.store.reserve(&control, 4, 1_000, u64::MAX, 0, now_unix()).expect("reserve");
+        context.store.reserve(&control, 4, 1_000, now_unix()).expect("reserve");
         let control_event = EventBuilder::new(Kind::Custom(3405), "control")
             .sign_with_keys(&keys)
             .expect("sign control");
@@ -3355,7 +3347,7 @@ mod tests {
 
         // (a) HEAL: confirmed attempt, no awards row, reservation held.
         let heal_job = "a".repeat(64);
-        context.store.reserve(&heal_job, 4, 1_000, u64::MAX, 0, now).expect("reserve");
+        context.store.reserve(&heal_job, 4, 1_000, now).expect("reserve");
         let mut heal = attempt_fixture(&heal_job, &relay_url);
         heal.amount_sats = 4;
         context.store.begin_award_attempt(&heal, now).expect("pin");
@@ -3363,7 +3355,7 @@ mod tests {
 
         // (b) FINISH: refused attempt whose release crashed — funds still reserved.
         let finish_job = "b".repeat(64);
-        context.store.reserve(&finish_job, 4, 1_000, u64::MAX, 0, now).expect("reserve");
+        context.store.reserve(&finish_job, 4, 1_000, now).expect("reserve");
         let mut finish = attempt_fixture(&finish_job, &relay_url);
         finish.amount_sats = 4;
         context.store.begin_award_attempt(&finish, now).expect("pin");
@@ -3375,7 +3367,7 @@ mod tests {
             .sign_with_keys(&keys)
             .expect("sign");
         let resolve_job = "c".repeat(64);
-        context.store.reserve(&resolve_job, 4, 1_000, u64::MAX, 0, now).expect("reserve");
+        context.store.reserve(&resolve_job, 4, 1_000, now).expect("reserve");
         let resolve = store::AwardAttempt {
             job_id: resolve_job.clone(),
             claim_id: "c".repeat(64),
@@ -3395,7 +3387,7 @@ mod tests {
         // (d) HOLD: pending, deadline passed but inside the 7-day pay window — the sweep must
         // neither transmit (late award) nor release (window still open).
         let hold_job = "d".repeat(64);
-        context.store.reserve(&hold_job, 4, 1_000, u64::MAX, 0, now).expect("reserve");
+        context.store.reserve(&hold_job, 4, 1_000, now).expect("reserve");
         let mut hold = attempt_fixture(&hold_job, &relay_url);
         hold.amount_sats = 4;
         hold.offer_deadline_unix = now - 100;
@@ -3483,7 +3475,7 @@ mod tests {
 
         // A settled award whose attribution never landed: reserved → awarded → spent, NULL/NULL.
         let job = "a".repeat(64);
-        store.reserve(&job, 5, 100, u64::MAX, 0, 1).expect("reserve");
+        store.reserve(&job, 5, 100, 1).expect("reserve");
         store
             .record_award(&job, &"1".repeat(64), &"2".repeat(64), &"3".repeat(64), 5, 1)
             .expect("award");
@@ -3562,7 +3554,7 @@ mod tests {
         let job = "a".repeat(64);
         context
             .store
-            .reserve(&job, 4, 1_000, u64::MAX, 0, now_unix())
+            .reserve(&job, 4, 1_000, now_unix())
             .expect("reserve");
 
         // Confirm the premise: with no bind, no payment journal and no live claim, this job WOULD be
@@ -4093,7 +4085,7 @@ mod tests {
         // Seed exactly what the award path writes: the reservation, then the published-award row.
         context
             .store
-            .reserve(&job_id, amount, 1_000, u64::MAX, 0, now_unix())
+            .reserve(&job_id, amount, 1_000, now_unix())
             .expect("reserve");
         context
             .store

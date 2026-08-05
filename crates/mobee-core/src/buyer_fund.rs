@@ -131,7 +131,7 @@ pub async fn wallet_balance_sats(home: &MobeeHome) -> Result<u64, FundError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::home::{bootstrap, MobeeConfig, DEFAULT_MINT_URL};
+    use crate::home::{bootstrap, MobeeConfig};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -226,7 +226,12 @@ mod tests {
     }
 
     #[test]
-    fn default_config_is_testnut() {
-        assert_eq!(MobeeConfig::default().default_mint(), DEFAULT_MINT_URL);
+    fn default_config_mint_is_the_shipped_minibits_default() {
+        // Issue #378 flipped the shipped default mint from testnut to a REAL minibits mint (paired
+        // with allow_real_mints = true). A fresh config's default mint is that minibits mint.
+        assert_eq!(
+            MobeeConfig::default().default_mint(),
+            crate::home::DEFAULT_MINIBITS_MINT_URL
+        );
     }
 }

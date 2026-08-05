@@ -7,9 +7,12 @@
 const { spawnSync } = require("node:child_process");
 const os = require("node:os");
 
+// Scoped under @maxplayerai so the payload names cannot collide with anything unscoped. The value
+// is the package name exactly as `require.resolve` needs it — a scope is part of the specifier, so
+// these are joined with the in-package path below rather than assembled from the platform key.
 const PLATFORM_PACKAGES = {
-  "linux-x64": "maxplayer-linux-x64",
-  "linux-arm64": "maxplayer-linux-arm64",
+  "linux-x64": "@maxplayerai/linux-x64",
+  "linux-arm64": "@maxplayerai/linux-arm64",
 };
 
 const key = `${process.platform}-${process.arch}`;

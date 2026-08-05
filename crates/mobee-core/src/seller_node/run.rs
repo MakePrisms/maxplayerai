@@ -21,7 +21,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::gateway::{
     self, claim_draft, error_draft, git_result_draft, parse_award, parse_offer, OfferParseError,
-    ParsedOffer,
+    ParsedOffer, ReasonCode,
 };
 use crate::home::{self, MobeeHome};
 use crate::job_lifecycle::{event_to_draft, job_hash_for_offer};
@@ -57,6 +57,14 @@ const RESULT_PUBLISH_WINDOW_SECS: i64 = 86_400;
 /// error detail — the operator log carries the specifics) but enough that the buyer learns the job
 /// failed instead of waiting on a delivery that will never come.
 const EXEC_FAILURE_FEEDBACK: &str = "seller could not complete the job (execution failed before delivery)";
+/// Buyer-facing reason when execution succeeded but the delivery (snapshot/push/publish) failed —
+/// a display-only mirror of the `delivery_failed` reason_code (§10; the tag governs).
+const DELIVERY_FAILURE_FEEDBACK: &str =
+    "seller executed the job but delivery failed before it reached you";
+/// Buyer-facing reason when the node observed no genuine execution (the quota-dead case §19 catches),
+/// so it refused to deliver without a sentinel — a display-only mirror of the `no_sentinel` reason_code.
+const NO_SENTINEL_FEEDBACK: &str =
+    "seller refused delivery: no execution was observed, so no execution sentinel was produced";
 
 // TODO(multi-slot): this default is a placeholder pending real award-latency measurement — how long
 // a live buyer actually takes between our claim and its award. It is deliberately far below
@@ -1105,6 +1113,103 @@ fn probe_sentinel_present(workdir: &std::path::Path, sentinel: &str) -> bool {
     })
 }
 
+/// One configured harness's pre-advertise probe verdict: which registry index it is, its name (for
+/// logs), and whether it PROVED it can deliver. `Err` carries the operator reason and the `Fault` to
+/// record against the roster — the same `(reason, Fault)` a real job's failure produces, so a dead
+/// harness narrows the roster identically whether the fault is found here or at runtime.
+pub struct HarnessProbeVerdict {
+    pub index: usize,
+    pub name: Option<String>,
+    pub result: Result<(), (String, Fault)>,
+}
+
+/// Probe EVERY configured harness once, before anything goes on the wire.
+///
+/// Local compute only — no sats, no mint, no award (`run_harness_probe` runs the harness in a
+/// throwaway workdir to write a sentinel and decides on the artifact). It is ours to run and ours to
+/// pay for, exactly like the restore-timer self-probe — but here it gates the FIRST advertisement
+/// rather than a restoration, so a seat that cannot deliver never advertises at all (#357). Inputs
+/// are derived from `home` the same way `start_due_harness_probes` derives them for the restore probe.
+pub async fn probe_configured_harnesses(
+    home: &MobeeHome,
+) -> Result<Vec<HarnessProbeVerdict>, NodeError> {
+    let registry = boot_agent_registry(home)?;
+    let sandbox = SandboxPolicy::from_config(home.config.sandbox.as_ref());
+    let identity = DeliveryAgentIdentity::for_seller(&home::public_key_hex(home)?);
+    let mut verdicts = Vec::with_capacity(registry.entries().len());
+    for (index, entry) in registry.entries().iter().enumerate() {
+        let probe = mint_probe_identity(index, now_unix() as u64);
+        let workdir = job_workdir(home, &probe.dir_label);
+        let result =
+            run_harness_probe(&entry.argv, &sandbox, &identity, &workdir, &probe.sentinel).await;
+        let _ = std::fs::remove_dir_all(&workdir);
+        verdicts.push(HarnessProbeVerdict {
+            index,
+            name: entry.name.clone(),
+            result,
+        });
+    }
+    Ok(verdicts)
+}
+
+/// The pure decision the pre-advertise gate turns on: the registry indices that PROVED they can
+/// serve. No I/O, so the healthy direction is testable by injecting outcomes — no agent spawn.
+pub fn proven_serving_indices(verdicts: &[HarnessProbeVerdict]) -> Vec<usize> {
+    verdicts
+        .iter()
+        .filter(|verdict| verdict.result.is_ok())
+        .map(|verdict| verdict.index)
+        .collect()
+}
+
+/// Prove-before-advertise: publish discoverability and boot serving ONLY the harnesses that proved
+/// they can deliver.
+///
+/// `verdicts` is the outcome of [`probe_configured_harnesses`], taken as a parameter so a caller can
+/// inject a passing result without spawning an agent. Two outcomes:
+///
+/// - **None proved out** → publish NOTHING (0×kind-31990) and refuse to boot (0×kind-30340). Fail
+///   loud, non-zero: a seat that cannot deliver any harness must not advertise, and lingering while
+///   advertising nothing only hides the fault from the operator.
+/// - **Some proved out** → publish discoverability as before, boot, then pre-narrow the live roster
+///   to the provers so the kind-30340 heartbeat (which reads the roster) is honest for free.
+///
+/// The gate is the `is_empty` block below; reverting it — publishing unconditionally — reproduces the
+/// #357 bug (advertise, then fail every job).
+pub async fn boot_advertising_only_proven(
+    mut home: MobeeHome,
+    verdicts: Vec<HarnessProbeVerdict>,
+) -> Result<SellerNodeRunner, NodeError> {
+    if proven_serving_indices(&verdicts).is_empty() {
+        for verdict in &verdicts {
+            if let Err((reason, _)) = &verdict.result {
+                let label = verdict.name.as_deref().unwrap_or("<unlabelled>");
+                eprintln!("seller node pre-advertise probe FAILED {label}: {reason}");
+            }
+        }
+        return Err(NodeError::NoProvenHarness(format!(
+            "none of {} configured harness(es) produced a probe artifact; refusing to advertise \
+             (fix the harness/launcher, then restart)",
+            verdicts.len()
+        )));
+    }
+
+    let disco = crate::profile::publish_seller_discoverability_async(&mut home)
+        .await
+        .map_err(|error| NodeError::Relay(format!("discoverability publish failed: {error}")))?;
+    eprintln!(
+        "seller node discoverable kind0={} nip89={} name={} pubkey={}",
+        disco.kind0_event_id,
+        disco.nip89_event_id,
+        disco.name.as_deref().unwrap_or(""),
+        disco.pubkey
+    );
+
+    let runner = SellerNodeRunner::boot(home).await?;
+    runner.narrow_roster_to(&verdicts);
+    Ok(runner)
+}
+
 /// How long boot waits for the relay connection and the NIP-42 challenge.
 const CONNECT_WAIT: Duration = Duration::from_secs(20);
 /// Cadence of the outbox drain / housekeeping tick.
@@ -1814,6 +1919,49 @@ impl SellerNodeRunner {
                             // A newly authenticated session earns a fresh retry budget: the budget
                             // exists to bound retries WITHIN a session, not to spend one forever.
                             restricted_retry_used.clear();
+
+                            // #429 FIX. A completed NIP-42 auth is the only reliable signal that this
+                            // socket can carry our `#p`-gated REQs again — so RE-ISSUE the long-lived
+                            // subscriptions here, on EVERY completed auth, re-armed per-expiry (no
+                            // once-per-process latch).
+                            //
+                            // WHY it is needed: the relay refuses an unauthenticated `#p`-self REQ with
+                            // `auth-required:` (retryable, NOT `restricted:` — so the #189 belt above
+                            // never even fires for the money leg) and closes the auth-scoped subs when
+                            // auth lapses on a LIVE socket. nostr-sdk's only live-socket repair is the
+                            // post-auth `resubscribe()` (`relay/inner.rs:941`), gated by
+                            // `should_resubscribe` to re-send only subs already marked `closed==true`;
+                            // it races the CLOSED that sets that flag and, field-observed, LOSES — the
+                            // 1059/awards/offers legs stay registered-but-deaf with no reconnect and no
+                            // restart. Re-issuing here does not depend on that race, on the sub's
+                            // closed flag, or on a reconnect: `subscribe_with_id` re-sends the REQ
+                            // unconditionally (`pool/mod.rs:603`), AUTHENTICATED, so the relay accepts
+                            // it and the leg is durable — robust to whichever SDK path is broken.
+                            //
+                            // No loop: the re-sends go out on an already-authenticated socket, so the
+                            // relay serves them (no fresh challenge). A harmless idempotent re-send at
+                            // boot is accepted rather than guarded — the loop rarely even sees the boot
+                            // auth (the notification stream is taken after `boot()` completes), and a
+                            // duplicate REQ is answered the same as the first. The overlap cursor lets
+                            // events published while a leg was deaf backfill on the re-send.
+                            let overlap = nostr_sdk::Timestamp::from(
+                                last_liveness_seen_unix
+                                    .saturating_sub(STALL_OVERLAP_MARGIN_SECS as i64)
+                                    .max(0) as u64,
+                            );
+                            match self.subscribe_all(Some(overlap)).await {
+                                Ok(()) => eprintln!(
+                                    "seller node RELAY-AUTH RESUBSCRIBE: re-issued offers+awards+\
+                                     kind-1059 on a completed NIP-42 auth (since={} overlap), so a \
+                                     relay that re-challenged auth on this live socket does not leave \
+                                     the money leg silently deaf",
+                                    overlap.as_secs()
+                                ),
+                                Err(error) => eprintln!(
+                                    "seller node RELAY-AUTH RESUBSCRIBE failed ({error}); the next \
+                                     completed auth or the wrap backfill retries"
+                                ),
+                            }
                         }
                         Ok(RelayNotification::AuthenticationFailed) => nip42_authed = false,
                         // A socket that went away takes its NIP-42 state with it — whatever comes
@@ -1839,15 +1987,28 @@ impl SellerNodeRunner {
     /// deliver — so the buyer learns the reason instead of getting silence. Best-effort: signed
     /// through the signer actor and sent on the shared client; a failure is logged, never wedges the
     /// loop. Used for both the targeted under-rate refusal and an execution failure.
-    async fn publish_buyer_feedback(&self, offer_id: &str, buyer_pubkey: &str, reason: &str) {
-        let draft = error_draft(offer_id, buyer_pubkey, &self.seller_pubkey.to_hex(), reason);
+    async fn publish_buyer_feedback(
+        &self,
+        offer_id: &str,
+        buyer_pubkey: &str,
+        reason_code: ReasonCode,
+        reason: &str,
+    ) {
+        let draft = error_draft(
+            offer_id,
+            buyer_pubkey,
+            &self.seller_pubkey.to_hex(),
+            reason_code,
+            reason,
+        );
         match self.node.signer().sign(draft, now_unix()).await {
             Ok(Ok(signed)) => {
                 use nostr_sdk::JsonUtil as _;
                 match nostr_sdk::Event::from_json(&signed.json) {
                     Ok(feedback) => match self.client.send_event_to([&self.relay_url], &feedback).await {
                         Ok(_) => eprintln!(
-                            "seller node buyer feedback surfaced: offer={offer_id} reason={reason}"
+                            "seller node buyer feedback surfaced: offer={offer_id} reason_code={} reason={reason}",
+                            reason_code.as_str()
                         ),
                         Err(error) => eprintln!(
                             "seller node WARN: buyer feedback publish failed offer={offer_id} ({error})"
@@ -1867,10 +2028,16 @@ impl SellerNodeRunner {
         }
     }
 
-    /// The targeted under-rate refusal feedback (see [`should_publish_under_rate_feedback`]).
+    /// The targeted under-rate refusal feedback (see [`should_publish_under_rate_feedback`]) — a price
+    /// decline, so it carries the `below_rate` reason_code (§10 `refusal` class, does not score).
     async fn publish_under_rate_feedback(&self, event: &nostr_sdk::Event, reason: &str) {
-        self.publish_buyer_feedback(&event.id.to_hex(), &event.pubkey.to_hex(), reason)
-            .await;
+        self.publish_buyer_feedback(
+            &event.id.to_hex(),
+            &event.pubkey.to_hex(),
+            ReasonCode::BelowRate,
+            reason,
+        )
+        .await;
     }
 
     /// Re-ask the relay for stored payment gift-wraps and ingest whatever comes back.
@@ -2491,6 +2658,26 @@ impl SellerNodeRunner {
         }
     }
 
+    /// Pre-narrow the live roster to the harnesses that PROVED they can deliver: every FAILED
+    /// pre-advertise probe faults its index with the fault it produced, exactly as the restore-timer
+    /// verdict does — so the kind-30340 heartbeat, which reads the roster, advertises only provers
+    /// from the very first tick (#357). Provers are left untouched (boot already starts them serving).
+    fn narrow_roster_to(&self, verdicts: &[HarnessProbeVerdict]) {
+        for verdict in verdicts {
+            if let Err((reason, fault)) = &verdict.result {
+                let state = self.agents.fault(verdict.index, fault.clone(), Instant::now());
+                let label = self
+                    .agents
+                    .label(verdict.index)
+                    .unwrap_or_else(|| "<unlabelled>".to_owned());
+                eprintln!(
+                    "seller node pre-advertise DROPPED {label}: {reason} — {}",
+                    state.reason()
+                );
+            }
+        }
+    }
+
     /// Take a harness out of service after a failure attributed to IT, and say so in one line naming
     /// both the drop and what would fix it.
     ///
@@ -2578,7 +2765,7 @@ impl SellerNodeRunner {
             Ok(Some(creq)) => creq,
             _ => {
                 eprintln!("seller node execute fail job_id={job_id}: stored creq missing");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK).await;
                 return;
             }
         };
@@ -2601,7 +2788,7 @@ impl SellerNodeRunner {
                  this node (never substituted)",
                 requested_agent.as_deref().unwrap_or("<any>")
             );
-            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK).await;
             return;
         };
         let agent_command = selected.agent.argv.clone();
@@ -2635,7 +2822,7 @@ impl SellerNodeRunner {
         .await
         {
             eprintln!("seller node execute fail job_id={job_id}: workdir init failed ({error})");
-            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK).await;
             return;
         }
 
@@ -2662,15 +2849,21 @@ impl SellerNodeRunner {
             Err(error) => {
                 eprintln!("seller node execute fail job_id={job_id}: agent run failed ({error})");
                 self.drop_harness(harness, harness_fault_for(&error));
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK).await;
                 return;
             }
         };
 
         // Snapshot the agent's final workdir tree into ONE delivery commit at the stored author date.
-        // An empty / no-op tree is refused with a precise reason (nothing to deliver).
+        // §19: the snapshot writes the execution sentinel into the delivered tree, seeded from this
+        // job's job_hash (replay-resistant; the buyer holds the same value on its accept-bind). When
+        // the node observed no genuine execution — the quota-dead case, an empty / base-identical tree
+        // — the snapshot refuses `NoExecutionObserved` and writes no sentinel, which is mapped here to
+        // the `no_sentinel` refusal so the buyer learns delivery was refused for want of a sentinel
+        // (distinct from a crash). The gate, not an unconditional write, is the check.
         let branch = format!("mobee/{}", &job_id[..8.min(job_id.len())]);
         let message = delivery_message(&offer.task);
+        let job_hash = job_hash_for_offer(job_id, &offer.task, offer.amount_sats);
         if let Err(error) = seller_git::snapshot_delivery_at_off_runtime(
             workdir.clone(),
             identity.clone(),
@@ -2678,15 +2871,30 @@ impl SellerNodeRunner {
             branch.clone(),
             message,
             author_date,
+            job_hash,
         )
         .await
         {
-            eprintln!("seller node execute fail job_id={job_id}: delivery snapshot refused ({error})");
             // Harness-attributable: the agent returned success having left nothing to deliver. This
             // is the site that fires on a quota-dead harness — its turn "completes", so the agent-run
             // arm above sees no error at all — which is why the trigger cannot live at one site.
             self.drop_harness(harness, Some(Fault::Unproven));
-            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+            let (reason_code, feedback) = match error {
+                seller_git::SellerGitError::NoExecutionObserved(_) => {
+                    eprintln!(
+                        "seller node execute fail job_id={job_id}: delivery refused no_sentinel — {error}"
+                    );
+                    (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
+                }
+                _ => {
+                    eprintln!(
+                        "seller node execute fail job_id={job_id}: delivery snapshot failed ({error})"
+                    );
+                    (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
+                }
+            };
+            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, reason_code, feedback)
+                .await;
             return;
         }
 
@@ -2699,12 +2907,12 @@ impl SellerNodeRunner {
                 Ok(Ok(header)) => Some(header),
                 Ok(Err(error)) => {
                     eprintln!("seller node execute fail job_id={job_id}: push auth sign failed ({error})");
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                     return;
                 }
                 Err(error) => {
                     eprintln!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                     return;
                 }
             }
@@ -2722,7 +2930,7 @@ impl SellerNodeRunner {
             Ok(oid) => oid,
             Err(error) => {
                 eprintln!("seller node execute fail job_id={job_id}: git push failed ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                 return;
             }
         };
@@ -2733,7 +2941,7 @@ impl SellerNodeRunner {
             Ok(kind) => kind,
             Err(error) => {
                 eprintln!("seller node execute fail job_id={job_id}: delivery kind typing failed ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                 return;
             }
         };
@@ -2751,12 +2959,12 @@ impl SellerNodeRunner {
             Ok(Ok(sig)) => sig,
             Ok(Err(error)) => {
                 eprintln!("seller node execute fail job_id={job_id}: receipt sign refused ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                 return;
             }
             Err(error) => {
                 eprintln!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                 return;
             }
         };
@@ -2814,7 +3022,7 @@ impl SellerNodeRunner {
             ),
             Err(error) => {
                 eprintln!("seller node execute fail job_id={job_id}: deliver journal failed ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, EXEC_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                 return;
             }
         }
@@ -3051,12 +3259,21 @@ impl SellerNodeRunner {
         }
     }
 
-    /// Fail the job AND tell the buyer why (a feedback-kind `status=error`), so an execution failure
-    /// is not silent on the wire (the buyer waits on a delivery that will never come otherwise). Used
-    /// at the post-offer execute fail points where the offer buyer is known.
-    async fn fail_job_with_feedback(&self, job_id: &str, buyer_pubkey: &str, reason: &str) {
+    /// Fail the job AND tell the buyer why (a feedback-kind carrying the §10 `reason_code` tag), so a
+    /// failure is not silent on the wire (the buyer waits on a delivery that will never come
+    /// otherwise). Used at the post-offer execute fail points where the offer buyer is known; the
+    /// caller passes the reason_code that names WHICH failure this is (execution vs delivery vs
+    /// no_sentinel), so the buyer can class it without parsing the human-readable reason.
+    async fn fail_job_with_feedback(
+        &self,
+        job_id: &str,
+        buyer_pubkey: &str,
+        reason_code: ReasonCode,
+        reason: &str,
+    ) {
         self.fail_job(job_id).await;
-        self.publish_buyer_feedback(job_id, buyer_pubkey, reason).await;
+        self.publish_buyer_feedback(job_id, buyer_pubkey, reason_code, reason)
+            .await;
     }
 
     /// One outbox drain pass over the shared authenticated client. Log-and-continue: a publish
@@ -3420,7 +3637,6 @@ mod tests {
             rate_sats,
             git_remote: "https://example.invalid/repo.git".to_owned(),
             job_timeout_secs: None,
-            agent: Some("claude".to_owned()),
             agents: Vec::new(),
             claim_open_pool,
             offer_backfill_secs: 0,
@@ -4681,11 +4897,18 @@ mod tests {
     }
 
     // TOOTH (buyer-facing feedback) — an execution failure produces a buyer-addressed feedback-kind
-    // `status=error` carrying the (path-free) reason, so the buyer learns the job failed instead of
-    // waiting on a delivery that never comes (the silence the live smoke's first attempt exposed).
+    // `status=error` carrying the (path-free) reason AND the §10 `reason_code=execution_failed` tag,
+    // so the buyer learns the job failed and can CLASS it without parsing prose (the silence the live
+    // smoke's first attempt exposed).
     #[test]
     fn execution_failure_feedback_is_a_buyer_addressed_error() {
-        let draft = error_draft("offer1", "buyerpk", &"s".repeat(64), EXEC_FAILURE_FEEDBACK);
+        let draft = error_draft(
+            "offer1",
+            "buyerpk",
+            &"s".repeat(64),
+            ReasonCode::ExecutionFailed,
+            EXEC_FAILURE_FEEDBACK,
+        );
         assert_eq!(draft.kind, crate::kinds::JOB_FEEDBACK_KIND);
         assert_eq!(draft.content, EXEC_FAILURE_FEEDBACK);
         let has = |name: &str, val: &str| {
@@ -4694,9 +4917,40 @@ mod tests {
                     && tag.0.get(1).map(String::as_str) == Some(val)
             })
         };
-        assert!(has("status", "error"), "feedback carries status=error");
+        assert!(has("status", "error"), "an execution failure is the error class");
+        assert!(has("reason_code", "execution_failed"), "carries the authoritative §10 code");
         assert!(has("p", "buyerpk"), "addressed to the buyer");
         assert!(has("e", "offer1"), "references the offer");
+    }
+
+    // TOOTH (#374 §10) — every emitting site rides the authoritative `reason_code` tag; a reader keys
+    // on it, not on parsing content. The coarse `status` stays `error` for now (the buyer claim-list
+    // view keys on it — re-classing refusals to `status=refusal` is a deliberate view change left as a
+    // follow-up, not smuggled in here). Bite: drop the reason_code tag from `error_draft` and the code
+    // assertions go red.
+    #[test]
+    fn feedback_rides_the_authoritative_reason_code_tag() {
+        let tag = |code: ReasonCode, name: &str| {
+            let draft = error_draft("offer1", "buyerpk", &"s".repeat(64), code, "why");
+            draft
+                .tags
+                .iter()
+                .find(|t| t.0.first().map(String::as_str) == Some(name))
+                .and_then(|t| t.0.get(1).cloned())
+        };
+        assert_eq!(tag(ReasonCode::BelowRate, "reason_code").as_deref(), Some("below_rate"));
+        assert_eq!(tag(ReasonCode::NoSentinel, "reason_code").as_deref(), Some("no_sentinel"));
+        assert_eq!(
+            tag(ReasonCode::DeliveryFailed, "reason_code").as_deref(),
+            Some("delivery_failed")
+        );
+        assert_eq!(
+            tag(ReasonCode::ExecutionFailed, "reason_code").as_deref(),
+            Some("execution_failed")
+        );
+        // Coarse status is unchanged (historical `error`) for every code — the tag is the discriminator.
+        assert_eq!(tag(ReasonCode::BelowRate, "status").as_deref(), Some("error"));
+        assert_eq!(tag(ReasonCode::NoSentinel, "status").as_deref(), Some("error"));
     }
 
     // ── Execute-body delivery contract (invariants 2 & 8), no network ────────────────────────────
@@ -4821,9 +5075,18 @@ mod tests {
             let _ = std::fs::remove_dir_all(&wd);
             seller_git::init_empty_delivery_workdir(&wd, &identity).expect("init workdir");
             std::fs::write(wd.join("deliverable.txt"), b"the widget\n").expect("write file");
-            let commit =
-                seller_git::snapshot_delivery_at(&wd, &identity, None, branch, "mobee delivery: build a widget", author_date)
-                    .expect("snapshot");
+            // Same job hash on both passes: the sentinel is seeded from it, so a deterministic
+            // manifest is part of what keeps the re-created delivery oid identical across a resume.
+            let commit = seller_git::snapshot_delivery_at(
+                &wd,
+                &identity,
+                None,
+                branch,
+                "mobee delivery: build a widget",
+                author_date,
+                &"c".repeat(64),
+            )
+            .expect("snapshot");
             let _ = std::fs::remove_dir_all(&wd);
             commit
         };
@@ -5455,6 +5718,189 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Budget for one challenge-roll to re-authenticate the live socket and for the fix to re-issue
+    /// the long-lived legs on that completed auth. Generous; the REVERT path never re-issues, so it
+    /// spends the whole budget then trips — a slow but unambiguous red.
+    const RECHALLENGE_WAIT: Duration = Duration::from_secs(30);
+
+    /// The long-lived subscriptions the daemon must re-issue on a completed auth: the offer, award,
+    /// and kind-1059 legs (what [`subscribe_all`] carries). The liveness probe is transient — it is
+    /// re-issued every heartbeat and self-heals — so it is not in this set.
+    const LONG_LIVED_SUBS: [&str; 3] = [OFFER_SUB_ID, AWARD_SUB_ID, WRAP_SUB_ID];
+
+    /// How many REQs for `id` the relay served (`EOSE`) on an AUTHENTICATED session — the count that
+    /// must grow after each challenge-roll for the leg to be genuinely restored (not merely re-sent
+    /// onto a stale generation and refused).
+    fn served_authed(reqs: &[ReqRecord], id: &str) -> usize {
+        reqs.iter()
+            .filter(|r| r.subscription_id == id && r.authenticated && r.verdict == Verdict::Eose)
+            .count()
+    }
+
+    /// TOOTH #429 — a live-socket NIP-42 RE-CHALLENGE must not leave the money leg deaf: the daemon
+    /// re-issues the long-lived subscriptions on every COMPLETED auth, re-armed per challenge-roll.
+    ///
+    /// FIELD MECHANISM (deployed relay + nostr-sdk 0.44.1, three independent source reads): the relay
+    /// refuses an unauthenticated `#p`-self REQ with `auth-required:` — retryable, and NEVER
+    /// `restricted:`, so the #189 belt cannot even fire for the money leg — and closes the auth-scoped
+    /// subs when auth lapses on a LIVE socket. nostr-sdk's only live-socket repair is a one-shot
+    /// post-auth `resubscribe()` (`relay/inner.rs:941`) gated on `closed==true`; it races the CLOSED
+    /// that sets that flag and, field-observed, loses — offers/awards/kind-1059 stay
+    /// registered-but-deaf, no reconnect and no restart, until the next completed auth (which the
+    /// periodic backfill triggers incidentally). Every missed kind-1059 is an unredeemed payment.
+    ///
+    /// WHY THIS TOOTH MODELS THE ROLL WITHOUT THE `auth-required:` CLOSE FRAME. The faithful frame
+    /// makes the red-prove VACUOUS against a REAL nostr-sdk: an `auth-required:` CLOSE marks the sub
+    /// `closed==true` (MarkAsClosed — kept in the registry), and the re-challenge's post-auth
+    /// `resubscribe()` then re-sends it and the relay serves it, so the SDK SELF-HEALS and a
+    /// fix-removed run still passes (empirically confirmed). The field failure is the resubscribe
+    /// RACING that CLOSE and losing (it fires while `closed==false`, then the CLOSE lands with no
+    /// further resubscribe) — inherently non-deterministic, and a race-based test would be a flake in
+    /// a module we are actively de-flaking. So this tooth WITHHOLDS the CLOSE and lets the STALE
+    /// generation alone deafen the leg: with the sub `closed==false`, the SDK's `closed==true`-gated
+    /// resubscribe correctly SKIPS it, so the ONLY thing that re-serves it is the daemon's
+    /// unconditional re-issue-on-auth. The induction differs from the field (closed==false-skip vs
+    /// closed==true race-loss) but the OUTCOME under test is identical — the SDK does not restore on
+    /// the re-auth, only the daemon does — and `subscribe_all` re-sends unconditionally
+    /// (`pool/mod.rs:603`) regardless of closed-state, so the fix behaves identically either way. That
+    /// the fix ALSO restores the real `closed==true` state is confirmed separately by
+    /// [`resubscribe_on_auth_restores_an_auth_required_closed_leg`].
+    ///
+    /// [`PGateRelay::roll_challenge`] with an EMPTY close-set: bump the relay's auth generation and
+    /// re-issue an `AUTH` challenge so the client re-authenticates IN PLACE (no reconnect). The boot
+    /// subs are now on the stale generation; only a REQ re-issued after the socket catches up serves
+    /// on the authenticated (current-generation) session. Test double for the observed contract, not a
+    /// claim about relay internals — the deployed relay has no generation concept (see [`decide`]).
+    ///
+    /// Two consecutive rolls prove the re-issue is re-armed per challenge-roll, not once-per-process.
+    /// WITH the fix, both cycles restore every long-lived leg SERVED on an AUTHENTICATED session.
+    ///
+    /// RED ON REVERT: delete the resubscribe-on-auth block from the `Authenticated` arm. The socket
+    /// still re-authenticates, but nothing re-issues the stale legs, so no fresh served+authed REQ
+    /// ever appears after the roll and the cycle-1 wait times out — the leg stays deaf on the stale
+    /// generation exactly as the field's leg stayed deaf on its closed one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn long_lived_subs_resubscribe_on_auth_after_a_challenge_roll() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("rechallenge");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, false));
+        // The heartbeat/watchdog is deliberately OFF so no stall-recovery reconnect can re-serve the
+        // legs on its own and mask the fix — matching the field, where the leg went deaf with NO
+        // reconnect. The resubscribe-on-auth fix lives in the `Authenticated` arm, not the heartbeat,
+        // so it fires regardless; OFF leaves it the ONLY restorer, which is what makes the revert red.
+        home.config.seller_heartbeat.enabled = false;
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        // `run()` is NOT `Send` under the `acp` feature (the runner holds an `AcpDriver` with a
+        // `!Sync` std mpsc `Receiver`), so keep the loop on this thread with a `LocalSet`, exactly as
+        // the sibling loop teeth do.
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        local
+            .run_until(async {
+                // Boot: every long-lived leg is served on an authenticated session — the baseline a
+                // challenge-roll knocks down and every completed auth must restore.
+                for id in LONG_LIVED_SUBS {
+                    assert!(
+                        fixture
+                            .wait_until(FIXTURE_WAIT, |reqs| served_authed(reqs, id) >= 1)
+                            .await,
+                        "harness check: {id} must boot SERVED on an AUTHENTICATED session"
+                    );
+                }
+
+                for cycle in 1..=2 {
+                    let snapshot = fixture.reqs().await;
+                    let before: Vec<usize> = LONG_LIVED_SUBS
+                        .iter()
+                        .map(|id| served_authed(&snapshot, id))
+                        .collect();
+
+                    // The live-socket re-challenge, WITHOUT the `auth-required:` CLOSE (see the tooth
+                    // doc for why): the generation rolls and the client re-authenticates in place,
+                    // leaving the boot legs on the now-stale generation.
+                    fixture.roll_challenge(&[]).await;
+
+                    // Every long-lived leg must be RE-ISSUED and SERVED on the re-authenticated
+                    // session — a fresh served+authed REQ beyond the pre-roll count. WITHOUT the fix
+                    // nothing re-issues them, so this times out on cycle 1 (the leg stays deaf).
+                    for (idx, id) in LONG_LIVED_SUBS.iter().enumerate() {
+                        let target = before[idx];
+                        assert!(
+                            fixture
+                                .wait_until(RECHALLENGE_WAIT, |reqs| served_authed(reqs, id)
+                                    > target)
+                                .await,
+                            "cycle {cycle}: {id} was not re-issued+served on the re-authenticated \
+                             session after a challenge roll — the completed-auth resubscribe did not \
+                             restore it"
+                        );
+                    }
+                }
+            })
+            .await;
+        loop_handle.abort();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// CONFIRMATION (not a red-prove) — the resubscribe-on-auth fix operates correctly against the
+    /// REAL `closed==true` field state, restoring an `auth-required:`-CLOSED long-lived leg on the
+    /// re-auth. Kept as SEPARATE evidence that the fix runs on the frame the field actually showed
+    /// (re-issuing offers+awards+kind-1059 on the completed auth, no loop, no error), so the no-CLOSE
+    /// red-prove above is not the only thing tying the fix to the field.
+    ///
+    /// This deliberately CANNOT be the non-vacuous prover: against a real nostr-sdk a `closed==true`
+    /// sub is ALSO re-sent by the SDK's own post-auth `resubscribe()`, so removing the fix does NOT
+    /// turn this red (the SDK self-heals it) — which is precisely why the deterministic red-prove
+    /// withholds the CLOSE. Its job here is fidelity to the observed frame, not regression-guarding;
+    /// [`long_lived_subs_resubscribe_on_auth_after_a_challenge_roll`] does the guarding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resubscribe_on_auth_restores_an_auth_required_closed_leg() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("authrequiredclose");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, false));
+        home.config.seller_heartbeat.enabled = false;
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        local
+            .run_until(async {
+                for id in LONG_LIVED_SUBS {
+                    assert!(
+                        fixture
+                            .wait_until(FIXTURE_WAIT, |reqs| served_authed(reqs, id) >= 1)
+                            .await,
+                        "harness check: {id} must boot SERVED on an AUTHENTICATED session"
+                    );
+                }
+                let snapshot = fixture.reqs().await;
+                let before: Vec<usize> = LONG_LIVED_SUBS
+                    .iter()
+                    .map(|id| served_authed(&snapshot, id))
+                    .collect();
+
+                // The field's ACTUAL frame: each long-lived leg CLOSED `auth-required:` on the live
+                // socket (marked `closed==true`), then an in-place re-auth.
+                fixture.roll_challenge(&LONG_LIVED_SUBS).await;
+
+                for (idx, id) in LONG_LIVED_SUBS.iter().enumerate() {
+                    let target = before[idx];
+                    assert!(
+                        fixture
+                            .wait_until(RECHALLENGE_WAIT, |reqs| served_authed(reqs, id) > target)
+                            .await,
+                        "{id} was not restored SERVED+AUTHED after an auth-required close + re-auth"
+                    );
+                }
+            })
+            .await;
+        loop_handle.abort();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The unknown-id line is field-facing: the relay owner reads it to separate our own transient
     /// `fetch_events` REQ from a relay-side auth-TTL sweep, so both ages have to actually be in it.
     #[test]
@@ -5720,5 +6166,109 @@ mod tests {
 
         assert_eq!(state.on_tick(), RearmStep::Wait, "cooling down");
         assert_eq!(state.on_tick(), RearmStep::Attempt, "then attempting again");
+    }
+
+    // ---- #357 prove-before-advertise -----------------------------------------------------------
+    //
+    // These drive `boot_advertising_only_proven` against the fixture relay and assert what reached
+    // the wire BY KIND (kind-31990 handler ad, kind-30340 heartbeat). Safe: the bogus case fails at
+    // spawn with ENOENT (no process created), and the healthy case injects a passing verdict so no
+    // agent is ever spawned.
+
+    /// A seat whose every configured harness FAILS its pre-advertise probe must publish nothing: no
+    /// kind-31990 handler ad and no kind-30340 heartbeat. The `[sandbox]` launcher is unresolvable, so
+    /// the probe's spawn fails ENOENT before any agent runs.
+    ///
+    /// RED ON REVERT: delete the `is_empty` gate block in `boot_advertising_only_proven` (publish
+    /// unconditionally) and the relay sees ≥1 kind-31990 — the #357 bug, advertise-then-fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_seat_whose_harness_fails_its_probe_advertises_nothing() {
+        use crate::home::SandboxConfig;
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("noprobe");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        // Persist seller + fixture relay + the bogus launcher. The launcher resolves to nothing, so
+        // every probe spawn fails ENOENT (no child — `AcpDriver::spawn` is a synchronous
+        // `std::process::Command::spawn` that errors first). Persisting the FIXTURE relay is
+        // load-bearing for the red-prove: reverting the gate makes the disco publish run, and the
+        // `reload_config` inside it must read the fixture url, never a real relay.
+        crate::home::save_config(&mut home, |config| {
+            config.seller = Some(seller_cfg(1, false));
+            config.relay_url = fixture.url();
+            config.sandbox = Some(SandboxConfig {
+                launcher: vec!["definitely-not-a-real-binary-xyz".to_owned()],
+            });
+        })
+        .expect("persist config");
+
+        let verdicts = probe_configured_harnesses(&home)
+            .await
+            .expect("probe returns verdicts");
+        assert!(
+            verdicts.iter().all(|verdict| verdict.result.is_err()),
+            "harness check: a bogus launcher must fail every probe"
+        );
+
+        let outcome = boot_advertising_only_proven(home, verdicts).await;
+
+        // The load-bearing property: a seat whose harness failed its probe put NOTHING on the wire.
+        assert_eq!(
+            fixture.event_kind_count(31990).await,
+            0,
+            "a dead seat must NOT publish the kind-31990 handler ad"
+        );
+        assert_eq!(
+            fixture.event_kind_count(30340).await,
+            0,
+            "a dead seat must NOT publish a kind-30340 heartbeat"
+        );
+        // …and it refused to boot rather than lingering while advertising nothing (fail loud).
+        match outcome {
+            Err(NodeError::NoProvenHarness(_)) => {}
+            Err(other) => panic!("expected NoProvenHarness, got: {other}"),
+            Ok(_) => panic!("no prover must refuse to boot"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A seat with a PROVEN harness advertises as before: discoverability (kind-31990) is published
+    /// and the live roster serves. The passing verdict is INJECTED — no agent is spawned — which is
+    /// exactly why the orchestrator takes probe outcomes as a parameter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_seat_with_a_proven_harness_still_advertises_and_serves() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("proven");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        // The discoverability publish reloads config from disk, so the seller + fixture relay must be
+        // PERSISTED, not merely set in memory.
+        crate::home::save_config(&mut home, |config| {
+            config.seller = Some(seller_cfg(1, false));
+            config.relay_url = fixture.url();
+        })
+        .expect("persist config");
+
+        // Index 0 — the single `claude` preset — proved out. Injected: no agent spawn.
+        let verdicts = vec![HarnessProbeVerdict {
+            index: 0,
+            name: Some("claude".to_owned()),
+            result: Ok(()),
+        }];
+
+        let runner = boot_advertising_only_proven(home, verdicts)
+            .await
+            .expect("a proven seat must boot");
+
+        assert!(
+            fixture.event_kind_count(31990).await >= 1,
+            "a proven seat MUST publish the kind-31990 handler ad"
+        );
+        assert!(
+            runner.agents.advertisement().serving,
+            "the live roster must serve the proven harness"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

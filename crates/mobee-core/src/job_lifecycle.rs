@@ -4647,8 +4647,8 @@ mod tests {
         assert_eq!(draft, expected, "from-scratch draft must be byte-identical");
         assert!(!crate::contribution::is_contribution_tags(&draft.tags));
         // The budget guard fires ONLY over-cap and does NOT touch tag emission — a normal
-        // within-cap post (amount 3 <= default cap 21) passes the guard, so emitted tags for a
-        // normal post are unchanged (byte-identical, asserted above).
+        // within-cap post (amount 3, well within the default cap) passes the guard, so emitted
+        // tags for a normal post are unchanged (byte-identical, asserted above).
         assert!(
             assert_amount_within_budget_cap(3, crate::home::DEFAULT_PER_JOB_BUDGET_SATS).is_ok(),
             "a within-cap post must pass the budget guard"
@@ -4728,6 +4728,15 @@ mod tests {
         assert!(assert_amount_within_budget_cap(21, 21).is_ok(), "at-cap must pass");
         // under-cap ⇒ passes, unchanged.
         assert!(assert_amount_within_budget_cap(20, 21).is_ok(), "under-cap must pass");
+        // The shipped default per-job cap (30_000, #378) binds too: one over refuses.
+        assert!(
+            assert_amount_within_budget_cap(
+                crate::home::DEFAULT_PER_JOB_BUDGET_SATS + 1,
+                crate::home::DEFAULT_PER_JOB_BUDGET_SATS,
+            )
+            .is_err(),
+            "one over the shipped default per-job cap must refuse"
+        );
     }
 
     #[test]

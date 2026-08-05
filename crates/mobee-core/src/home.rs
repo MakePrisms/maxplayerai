@@ -26,7 +26,6 @@
 //! | `relay_url` | `MOBEE_RELAY_URL` |
 //! | `accepted_mints` (list) | `MOBEE_ACCEPTED_MINTS=a,b` |
 //! | `per_job_budget_sats` | `MOBEE_PER_JOB_BUDGET_SATS` |
-//! | `total_budget_sats` | `MOBEE_TOTAL_BUDGET_SATS` |
 //! | `extra_mints` (list) | `MOBEE_EXTRA_MINTS=a,b` |
 //! | `allow_real_mints` | `MOBEE_ALLOW_REAL_MINTS` |
 //! | `profile.name` | `MOBEE_PROFILE__NAME` |
@@ -58,17 +57,19 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Open-market demo relay.
-pub const DEFAULT_RELAY_URL: &str = "wss://mobee-relay.orveth.dev";
-/// Standing CDK test mint — its bolt11 invoices auto-settle, so the default moves no real money.
-/// The specific host may change; the load-bearing rule is the class: the default is a test/dev mint.
+/// Open-market relay — the maxplayer launch relay.
+pub const DEFAULT_RELAY_URL: &str = "wss://relay.maxplayer.ai";
+/// Standing CDK test mint — its bolt11 invoices auto-settle, so it moves no real money. Kept as the
+/// testnut/dev allow-list anchor: `mint_allowed` admits exactly this when `allow_real_mints` is false.
 pub const DEFAULT_MINT_URL: &str = "https://testnut.cashudevkit.org";
+/// Shipped default seller mint (issue #378): a REAL minibits mint. Fresh configs accept real sats here
+/// by default — paired with `allow_real_mints = true`, without which the fence would refuse this mint.
+pub const DEFAULT_MINIBITS_MINT_URL: &str = "https://mint.minibits.cash/Bitcoin";
 /// Dead testnut host — bootstrap migrates config.toml away from this.
 pub const DEAD_TESTNUT_MINT_HOST: &str = "testnut.cashu.space";
-/// Conservative per-job spend cap (sats) until config is tuned.
-pub const DEFAULT_PER_JOB_BUDGET_SATS: u64 = 21;
-/// Conservative rolling/session total spend cap (sats).
-pub const DEFAULT_TOTAL_BUDGET_SATS: u64 = 100;
+/// Empty-market per-job spend fallback (sats): the cap applied when no market-rate signal exists.
+/// Market-rate derivation is a follow-up (#378); until then every fresh config ships this cap.
+pub const DEFAULT_PER_JOB_BUDGET_SATS: u64 = 30_000;
 
 const CONFIG_FILE: &str = "config.toml";
 const KEY_FILE: &str = "key";
@@ -146,8 +147,10 @@ pub fn default_buzz_heartbeat_secs() -> u64 {
     30
 }
 
-/// Default relay-git base (delivery). Live on mobee-relay (`/git/<owner>/<repo>.git`).
-pub const DEFAULT_RELAY_GIT_BASE: &str = "https://mobee-relay.orveth.dev/git";
+/// Default relay-git base (delivery), on the launch relay (`/git/<owner>/<repo>.git`) — the same
+/// host the default `relay_url` announces to, so the kind-30617 announce seeds the exact git base
+/// the seed probe then checks (#394: splitting announce-host from git-host bricked fresh sellers).
+pub const DEFAULT_RELAY_GIT_BASE: &str = "https://relay.maxplayer.ai/git";
 /// Shared leaf name — NOT used as default (relay name registry is global).
 pub const DEFAULT_RELAY_GIT_REPO: &str = "mobee-seller";
 
@@ -165,21 +168,18 @@ pub struct SellerConfig {
     /// Job deadline override (seconds). Default: offer `deadline_unix`, else ~600s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_timeout_secs: Option<u64>,
-    /// Optional preset label (`claude` | `cursor` | `codex`) for rediscovery / status. With an
-    /// `agents` list configured this names the harness the list's first entry resolved to; on its
-    /// own it labels the single `agent_command`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent: Option<String>,
     /// The harnesses this node enables, in preference order — the multi-harness registry
-    /// ([`crate::seller_agents`]). Each entry is a preset name (bare, or a `{ name, slots }`
-    /// table). Empty ⇒ the node serves with the single `agent_command` alone.
+    /// ([`crate::seller_agents`]). Each entry is a preset name (`claude` | `cursor` | `codex`, or a
+    /// custom `[agents.<name>]`). Empty ⇒ the node serves with the single `agent_command` alone. The
+    /// first entry doubles as the seller's advertised harness label (rediscovery / status / NIP-89).
     ///
-    /// The node advertises this list on its heartbeat and claims, and dispatches a job to the
-    /// harness its offer requested. How many awarded jobs run at once is governed by the
-    /// homogeneous [`SellerConfig::slots`] (every slot runs whichever harness the job asked for),
-    /// not by per-entry pool counts.
+    /// The node advertises this list on its heartbeat and claims, and dispatches a job to the harness
+    /// its offer requested. How many awarded jobs run at once is governed by the homogeneous
+    /// [`SellerConfig::slots`] (every slot runs whichever harness the job asked for). Issue #378
+    /// removed the singular `agent` label field and the per-entry `{ name, slots }` table: this is a
+    /// plain list of harness names, and the top-level `slots` is the only concurrency knob.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub agents: Vec<AgentSlotConfig>,
+    pub agents: Vec<String>,
     /// Opt-in to claim untargeted/open offers. Default **false** (targeted-only).
     #[serde(default)]
     pub claim_open_pool: bool,
@@ -203,13 +203,13 @@ pub struct SellerConfig {
     #[serde(default = "default_contribution_enabled")]
     pub contribution_enabled: bool,
     /// Homogeneous execution slots: the maximum number of awarded jobs this node runs
-    /// concurrently. Default **1** — serial execution, today's behavior exactly. A slot is
-    /// RESERVED when the node claims an offer and released on the job's terminal outcome
-    /// (delivery/failure), when the buyer awards another seller, or when a parked claim lapses
-    /// unawarded. Reserve-at-claim is what makes a fully loaded node invisible to the market: with
-    /// no free slot it simply does not claim. Every slot is identical and runs the seller's
-    /// configured harness — there is no per-slot harness typing (that is the per-agent
-    /// `AgentSlotConfig.slots`, which stays refused above 1).
+    /// concurrently. Default **3** (issue #378). A slot is RESERVED when the node claims an offer
+    /// and released on the job's terminal outcome (delivery/failure), when the buyer awards another
+    /// seller, or when a parked claim lapses unawarded. Reserve-at-claim is what makes a fully loaded
+    /// node invisible to the market: with no free slot it simply does not claim. Every slot is
+    /// identical and runs whichever harness the job asked for — there is no per-slot harness typing
+    /// (issue #378 removed the per-entry `{ name, slots }` pool; this homogeneous count is the only
+    /// concurrency knob).
     #[serde(default = "default_slots")]
     pub slots: usize,
     /// How long (seconds) a parked, unawarded claim may hold its reserved execution slot before the
@@ -583,11 +583,11 @@ pub fn default_contribution_enabled() -> bool {
     true
 }
 
-/// serde default for [`SellerConfig::slots`]: 1. A `[seller]` block written before this field
-/// existed parses to a single execution slot — serial execution, byte-identical to the pre-
-/// multi-slot behavior.
+/// serde default for [`SellerConfig::slots`]: 3 (issue #378). A `[seller]` block that does not set
+/// `slots` runs three concurrent execution slots. (Per-entry `AgentSlotConfig.slots` was removed as
+/// dead weight; this homogeneous top-level count is the only concurrency knob.)
 pub fn default_slots() -> usize {
-    1
+    3
 }
 
 /// serde default for [`SellerConfig::offer_backfill_secs`]: 1200s (20 min). A `[seller]` block
@@ -679,110 +679,6 @@ pub struct AgentPresetConfig {
     pub argv: Vec<String>,
 }
 
-/// One enabled harness in `[seller] agents` — a preset name plus the size of its pool.
-///
-/// Written either as a bare name or as a table, in the same list:
-///
-/// ```toml
-/// agents = ["claude", { name = "codex", slots = 1 }]
-/// ```
-///
-/// The bare form is the whole config today. The table form is why pool counts can arrive later
-/// without reshaping anything an operator already wrote — a `slots` value only ever gets added to
-/// an entry. `slots` above 1 is refused at boot while execution is serial (see
-/// [`crate::seller_agents::RegistryError::ParallelismUnsupported`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentSlotConfig {
-    /// Preset name from the `[agents]` table or the built-ins (`claude|cursor|codex`).
-    pub name: String,
-    /// Concurrent jobs this harness may run. Always 1 today.
-    pub slots: u32,
-}
-
-impl AgentSlotConfig {
-    /// A single-slot entry — the bare-name form.
-    pub fn named(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            slots: default_agent_slots(),
-        }
-    }
-}
-
-/// Serde default for [`AgentSlotConfig::slots`].
-fn default_agent_slots() -> u32 {
-    1
-}
-
-impl Serialize for AgentSlotConfig {
-    /// Round-trips to the form it was written in: a single-slot entry serializes as the bare name,
-    /// so a config the CLI writes stays `agents = ["claude", "codex"]`.
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if self.slots == default_agent_slots() {
-            return serializer.serialize_str(&self.name);
-        }
-        use serde::ser::SerializeStruct;
-        let mut table = serializer.serialize_struct("AgentSlotConfig", 2)?;
-        table.serialize_field("name", &self.name)?;
-        table.serialize_field("slots", &self.slots)?;
-        table.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for AgentSlotConfig {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use serde::de::{self, MapAccess, Visitor};
-        use std::fmt;
-
-        struct SlotVisitor;
-
-        impl<'de> Visitor<'de> for SlotVisitor {
-            type Value = AgentSlotConfig;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("an agent preset name, or a { name, slots } table")
-            }
-
-            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                if value.trim().is_empty() {
-                    return Err(E::custom("agent name must be non-empty"));
-                }
-                Ok(AgentSlotConfig::named(value))
-            }
-
-            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
-                self.visit_str(&value)
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                let mut name: Option<String> = None;
-                let mut slots: Option<u32> = None;
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "name" => name = Some(map.next_value()?),
-                        "slots" => slots = Some(map.next_value()?),
-                        other => {
-                            return Err(de::Error::custom(format!(
-                                "unknown agent entry field {other:?} (want name, slots)"
-                            )));
-                        }
-                    }
-                }
-                let name = name.ok_or_else(|| de::Error::missing_field("name"))?;
-                if name.trim().is_empty() {
-                    return Err(de::Error::custom("agent name must be non-empty"));
-                }
-                Ok(AgentSlotConfig {
-                    name,
-                    slots: slots.unwrap_or_else(default_agent_slots),
-                })
-            }
-        }
-
-        deserializer.deserialize_any(SlotVisitor)
-    }
-}
-
 /// Buyer-facing packaged config (`~/.mobee/config.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -799,25 +695,25 @@ pub struct MobeeConfig {
     /// fields with separate meanings and are never merged or repurposed for one another.
     #[serde(default = "default_accepted_mints")]
     pub accepted_mints: Vec<String>,
-    /// Per-job spend cap (sats). Absent ⇒ the built-in [`DEFAULT_PER_JOB_BUDGET_SATS`].
+    /// Per-job spend cap (sats) — the standing spend bound on the money path. Absent ⇒ the built-in
+    /// [`DEFAULT_PER_JOB_BUDGET_SATS`]. Issue #378 removed the rolling/total cap: the durable
+    /// `spent.jsonl` ledger still records every spend (audit + retry-idempotency), but this per-job cap
+    /// is the only gate — every posted and paid job is bounded by this one number.
     #[serde(default = "default_per_job_budget_sats")]
     pub per_job_budget_sats: u64,
-    /// Rolling/session spend cap (sats). Absent ⇒ the built-in [`DEFAULT_TOTAL_BUDGET_SATS`].
-    #[serde(default = "default_total_budget_sats")]
-    pub total_budget_sats: u64,
     /// Opt-in additional mints for the BUYER wallet (`mobee wallet mints add`). The buyer's
     /// default mint stays the first `accepted_mints` entry ([`MobeeConfig::default_mint`]);
     /// never invents spendable credit by itself.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_mints: Vec<String>,
-    /// REAL-MONEY SWITCH (issue #49). When `false` (default — the safety posture) the seller
-    /// `accepted_mints` boot fence and the buyer pay-path mint resolution admit ONLY the
-    /// testnut/dev allow-list ([`DEFAULT_MINT_URL`]); a real mint is refused fail-closed. When
-    /// `true` (deliberate operator opt-in) any well-formed `https://` mint URL
-    /// is admitted — this is the switch that lets real sats move. It flips ONLY the allow-list
-    /// check; every other money gate (creq membership, redeem guard token==payload mint, dust
-    /// guard, budget caps, co-signatures) is unchanged.
-    #[serde(default)]
+    /// REAL-MONEY SWITCH (issue #49). When `true` (issue #378 made this the DEFAULT, because the
+    /// shipped `accepted_mints` default is a real minibits mint) the seller `accepted_mints` boot fence
+    /// and the buyer pay-path mint resolution admit any well-formed `https://` mint URL — real sats
+    /// move. When `false` (explicit opt-OUT) only the testnut/dev allow-list ([`DEFAULT_MINT_URL`]) is
+    /// admitted; a real mint is refused fail-closed. It flips ONLY the allow-list check; every other
+    /// money gate (creq membership, redeem guard token==payload mint, dust guard, per-job budget cap,
+    /// co-signatures) is unchanged — the per-job cap is the standing spend bound on the real path.
+    #[serde(default = "default_allow_real_mints")]
     pub allow_real_mints: bool,
     /// Optional `[profile] name / about`. Skipped when absent so fresh homes stay unnamed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -878,10 +774,12 @@ pub struct ContributionPolicyConfig {
     pub max_diff_bytes: Option<u64>,
 }
 
-/// Serde/default seed for [`MobeeConfig::accepted_mints`]: exactly the current testnut
-/// default, so an operator who configures nothing behaves identically to today.
+/// Serde/default seed for [`MobeeConfig::accepted_mints`] (issue #378): a single REAL minibits mint.
+/// A fresh config accepts real sats here by default — which is why [`MobeeConfig::default`] also flips
+/// `allow_real_mints` true, without which `mint_allowed` would refuse this very default. Mint VARIETY
+/// (multiple real mints) lives in the market-mode loop, not the shipped default pool.
 fn default_accepted_mints() -> Vec<String> {
-    vec![DEFAULT_MINT_URL.to_owned()]
+    vec![DEFAULT_MINIBITS_MINT_URL.to_owned()]
 }
 
 /// Serde default for [`MobeeConfig::relay_url`] — the built-in [`DEFAULT_RELAY_URL`].
@@ -894,9 +792,11 @@ fn default_per_job_budget_sats() -> u64 {
     DEFAULT_PER_JOB_BUDGET_SATS
 }
 
-/// Serde default for [`MobeeConfig::total_budget_sats`] — [`DEFAULT_TOTAL_BUDGET_SATS`].
-fn default_total_budget_sats() -> u64 {
-    DEFAULT_TOTAL_BUDGET_SATS
+/// Serde default for [`MobeeConfig::allow_real_mints`] — `true` (issue #378). The shipped
+/// `accepted_mints` default is a real mint, so the fence must admit it; `false` here would make the
+/// default config refuse its own default mint. Set `allow_real_mints = false` to force testnut-only.
+fn default_allow_real_mints() -> bool {
+    true
 }
 
 /// The single real-mint fence predicate (issue #49), shared by the seller `accepted_mints` boot
@@ -936,9 +836,8 @@ impl Default for MobeeConfig {
             relay_url: DEFAULT_RELAY_URL.to_owned(),
             accepted_mints: default_accepted_mints(),
             per_job_budget_sats: DEFAULT_PER_JOB_BUDGET_SATS,
-            total_budget_sats: DEFAULT_TOTAL_BUDGET_SATS,
             extra_mints: Vec::new(),
-            allow_real_mints: false,
+            allow_real_mints: true,
             profile: None,
             seller: None,
             buzz: None,
@@ -1002,7 +901,8 @@ pub fn bootstrap(root: impl AsRef<Path>) -> Result<MobeeHome, HomeError> {
         config
     } else {
         let config = MobeeConfig::default();
-        write_config(&config_path, &config)?;
+        // First run: write config.toml WITH short per-field doc comments (issue #376).
+        write_config_documented(&config_path, &config)?;
         config
     };
 
@@ -1060,6 +960,55 @@ fn fold_legacy_mint_url(table: &mut toml::Table) {
     }
 }
 
+/// Issue #378 removed three config surfaces; fold a pre-#378 `config.toml` forward so it still parses
+/// under `deny_unknown_fields` instead of bricking on the now-unknown keys (same read-time migration
+/// seam as [`fold_legacy_mint_url`], applied before the typed parse). Each step is idempotent on an
+/// already-migrated file:
+///
+/// - top-level `total_budget_sats` is dropped — the rolling cap is gone; the per-job cap and the
+///   `spent.jsonl` ledger stay;
+/// - `[seller].agent = "x"` folds into `[seller].agents = ["x"]` unless a non-empty `agents` list is
+///   already present (never drops a configured harness label), then the key is removed;
+/// - each `[seller].agents` entry written as a `{ name, slots }` table collapses to its bare `name`
+///   (the per-entry `slots` knob was dead weight — refused above 1 — so nothing is lost).
+fn fold_removed_config_fields(table: &mut toml::Table) {
+    table.remove("total_budget_sats");
+
+    let Some(seller) = table.get_mut("seller").and_then(toml::Value::as_table_mut) else {
+        return;
+    };
+
+    // Singular `agent` label → a single-entry `agents` list, unless a real list is already present
+    // (the list wins, mirroring `fold_legacy_mint_url`). The legacy key is always removed.
+    let legacy_agent = seller.remove("agent");
+    let agents_present = seller
+        .get("agents")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|list| !list.is_empty());
+    if !agents_present {
+        if let Some(label) = legacy_agent.as_ref().and_then(toml::Value::as_str) {
+            seller.insert(
+                "agents".to_owned(),
+                toml::Value::Array(vec![toml::Value::String(label.to_owned())]),
+            );
+        }
+    }
+
+    // `{ name, slots }` table entries → bare name strings.
+    if let Some(agents) = seller.get_mut("agents").and_then(toml::Value::as_array_mut) {
+        for entry in agents.iter_mut() {
+            let name = entry
+                .as_table()
+                .and_then(|table| table.get("name"))
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned);
+            if let Some(name) = name {
+                *entry = toml::Value::String(name);
+            }
+        }
+    }
+}
+
 /// Hex-encode the secp256k1 x-only/public view is deferred; this returns the *public* key
 /// only when a caller supplies a derived pubkey. For bootstrap status we expose whether a
 /// key file exists — use [`read_secret_key_hex`] only inside trusted surfaces that never log it.
@@ -1097,12 +1046,14 @@ fn load_config(path: &Path) -> Result<MobeeConfig, HomeError> {
     parse_config_toml(&raw)
 }
 
-/// Parse a `config.toml` document into the file-layer [`MobeeConfig`]. Fold legacy `mint_url`, then
-/// typed-parse under `deny_unknown_fields` so any other unknown key (at any depth) refuses.
-fn parse_config_toml(raw: &str) -> Result<MobeeConfig, HomeError> {
+/// Parse a `config.toml` document into the file-layer [`MobeeConfig`]. Fold legacy `mint_url` and the
+/// issue #378 removed fields, then typed-parse under `deny_unknown_fields` so any other unknown key
+/// (at any depth) refuses. `pub(crate)` so sibling modules' tests can exercise the read-time migration.
+pub(crate) fn parse_config_toml(raw: &str) -> Result<MobeeConfig, HomeError> {
     let mut table: toml::Table =
         toml::from_str(raw).map_err(|error| HomeError::Config(format!("config.toml: {error}")))?;
     fold_legacy_mint_url(&mut table);
+    fold_removed_config_fields(&mut table);
     table
         .try_into()
         .map_err(|error| HomeError::Config(format!("config.toml: {error}")))
@@ -1185,6 +1136,73 @@ fn write_config(path: &Path, config: &MobeeConfig) -> Result<(), HomeError> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     crate::durable::write_atomic(dir, path, raw.as_bytes())
         .map_err(|error| HomeError::Io(error.to_string()))
+}
+
+/// First-run variant of [`write_config`] (issue #376): the same crash-atomic write, but the serialized
+/// body is annotated with short per-field doc comments describing the money-relevant defaults. The
+/// comments are TOML comments (ignored on parse), so the file still round-trips byte-for-byte through
+/// [`parse_config_toml`]. Only bootstrap's fresh-config branch uses this; later `save_config` rewrites
+/// are bare, so an operator's edited value is never re-annotated with a default they changed.
+fn write_config_documented(path: &Path, config: &MobeeConfig) -> Result<(), HomeError> {
+    let raw = documented_config_toml(config)?;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    crate::durable::write_atomic(dir, path, raw.as_bytes())
+        .map_err(|error| HomeError::Io(error.to_string()))
+}
+
+/// Render `config` as TOML with a header block and short `#` doc comments above the money-relevant
+/// default keys (issue #376). The body is the ordinary `toml::to_string_pretty` output, so the result
+/// parses back to an equal config; the comments are onboarding for the operator who first opens the
+/// file — most importantly, that the shipped defaults move REAL sats.
+fn documented_config_toml(config: &MobeeConfig) -> Result<String, HomeError> {
+    // Doc lines injected above the first serialized line whose key matches. Keyed by field name, so
+    // order-independent; a key not present in the (skip-defaulted) output is simply not annotated.
+    const FIELD_DOCS: &[(&str, &[&str])] = &[
+        ("relay_url", &["Open-market relay this node publishes offers to and reads from."]),
+        (
+            "accepted_mints",
+            &[
+                "Mints this seller accepts; the first is also the buyer wallet's default mint.",
+                "⚠ THE SHIPPED DEFAULT IS A REAL MINT (minibits) — a fresh node moves REAL sats.",
+                "For testnut/dev only, set a test mint here AND allow_real_mints = false below.",
+            ],
+        ),
+        (
+            "per_job_budget_sats",
+            &[
+                "Per-job spend cap (sats): the standing bound on every job posted or paid. There is",
+                "no total cap — the spent.jsonl ledger records every spend for audit. Raise with care.",
+            ],
+        ),
+        (
+            "allow_real_mints",
+            &[
+                "Real-money switch — TRUE by default so the fence admits the real default mint above.",
+                "Set false to force testnut/dev-only (any real mint is then refused fail-closed).",
+            ],
+        ),
+    ];
+
+    let body =
+        toml::to_string_pretty(config).map_err(|error| HomeError::Config(error.to_string()))?;
+    let mut out = String::new();
+    out.push_str("# maxplayer config.toml — written on first run.\n");
+    out.push_str("# Edit freely. Comments are NOT preserved when the app rewrites this file\n");
+    out.push_str("# (e.g. `maxplayer sell` setup or a wallet change).\n");
+    out.push_str("# ⚠ This node's DEFAULTS accept and pay REAL sats — see accepted_mints.\n\n");
+    for line in body.lines() {
+        let key = line.split('=').next().unwrap_or("").trim();
+        if let Some((_, docs)) = FIELD_DOCS.iter().find(|(name, _)| *name == key) {
+            for doc in *docs {
+                out.push_str("# ");
+                out.push_str(doc);
+                out.push('\n');
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 /// Persist an explicit config change to `config.toml`, keeping `MOBEE_*` overrides runtime-only.
@@ -1451,15 +1469,48 @@ mod tests {
 
     #[test]
     fn accepted_mints_default() {
-        // A config that names no mint at all yields accepted_mints == [DEFAULT_MINT_URL].
+        // Issue #378: a config that names no mint yields the shipped default — a single REAL minibits
+        // mint (paired with allow_real_mints = true; see `default_allow_real_mints`).
         let config: MobeeConfig = toml::from_str(
-            "relay_url = 'r'\nper_job_budget_sats = 1\ntotal_budget_sats = 2\n",
+            "relay_url = 'r'\nper_job_budget_sats = 1\n",
         )
         .expect("parse mint-less config");
-        assert_eq!(config.accepted_mints, vec![DEFAULT_MINT_URL.to_owned()]);
+        assert_eq!(config.accepted_mints, vec![DEFAULT_MINIBITS_MINT_URL.to_owned()]);
         assert_eq!(
             MobeeConfig::default().accepted_mints,
-            vec![DEFAULT_MINT_URL.to_owned()]
+            vec![DEFAULT_MINIBITS_MINT_URL.to_owned()]
+        );
+    }
+
+    #[test]
+    fn documented_config_round_trips_and_warns_of_real_money() {
+        // #376: the first-run config.toml carries `#` comments; they must not break parse, and the
+        // file must round-trip to the exact default it serialized (comments are TOML comments).
+        let rendered = documented_config_toml(&MobeeConfig::default()).expect("render documented");
+        let reparsed = parse_config_toml(&rendered).expect("documented config must parse");
+        assert_eq!(
+            toml::to_string_pretty(&reparsed).expect("ser"),
+            toml::to_string_pretty(&MobeeConfig::default()).expect("ser"),
+            "documented first-run config must round-trip to the default"
+        );
+        assert!(rendered.contains("REAL sats"), "must warn the shipped defaults move real sats");
+        assert!(rendered.contains("minibits"), "must name the real default mint");
+        assert!(rendered.contains("Per-job spend cap"), "must document the per-job cap");
+    }
+
+    #[test]
+    fn shipped_defaults_are_real_money_and_the_fence_admits_them() {
+        // #378 flipped fresh nodes real-money-capable. The whole default posture in one place; the
+        // load-bearing part is that mint_allowed ADMITS the shipped default mint (it would REFUSE it
+        // if allow_real_mints had stayed false, or if the mint reverted to testnut).
+        let d = MobeeConfig::default();
+        assert_eq!(d.accepted_mints, vec![DEFAULT_MINIBITS_MINT_URL.to_owned()]);
+        assert!(d.allow_real_mints, "fresh nodes are real-money-capable by default");
+        assert_eq!(d.per_job_budget_sats, 30_000);
+        assert_eq!(default_slots(), 3, "seller default concurrency");
+        assert!(
+            mint_allowed(d.default_mint(), d.allow_real_mints),
+            "the fence must admit the shipped default mint (breaks if either default reverts)"
         );
     }
 
@@ -1556,6 +1607,30 @@ mod tests {
     }
 
     #[test]
+    fn shipped_default_relay_is_the_maxplayer_launch_relay() {
+        // Revert-guard for the #375 flip: a fresh config (relay_url absent from the file) must
+        // resolve to the maxplayer launch relay, not the previous default. Pins the VALUE so a bad
+        // rebase onto the neighbouring DEFAULT_* const block reddens instead of silently restoring
+        // the old relay URL.
+        assert_eq!(default_relay_url(), "wss://relay.maxplayer.ai");
+        assert_eq!(DEFAULT_RELAY_URL, "wss://relay.maxplayer.ai");
+    }
+
+    #[test]
+    fn shipped_default_git_base_is_on_the_launch_relay() {
+        // Revert-guard for the #390 repoint, and a coherence pin for #394: the default git base
+        // must live on the SAME host the default relay_url announces to — the kind-30617 announce
+        // seeds git on whatever relay ingests it, and the seed probe checks DEFAULT_RELAY_GIT_BASE.
+        // Splitting the two hosts bricks every fresh seller at the seed probe.
+        assert_eq!(DEFAULT_RELAY_GIT_BASE, "https://relay.maxplayer.ai/git");
+        let relay_host = DEFAULT_RELAY_URL.trim_start_matches("wss://");
+        assert!(
+            DEFAULT_RELAY_GIT_BASE.contains(relay_host),
+            "git base ({DEFAULT_RELAY_GIT_BASE}) must be on the default relay's host ({relay_host})"
+        );
+    }
+
+    #[test]
     fn save_persists_explicitly_chosen_field() {
         // The guarantee is only that UNCHOSEN env values do not leak. A value the caller
         // explicitly saves is persisted even when an env var also covers that field.
@@ -1602,7 +1677,7 @@ mod tests {
         .expect("file layer");
         // Sanity: defaults<file already merged by the file parse.
         assert_eq!(file.relay_url, "wss://from-file"); // file over default
-        assert_eq!(file.total_budget_sats, DEFAULT_TOTAL_BUDGET_SATS); // default stands
+        assert!(file.allow_real_mints); // default stands (file did not set it)
 
         let resolved = apply_env_layer(
             &file,
@@ -1620,7 +1695,7 @@ mod tests {
             resolved.accepted_mints,
             vec!["https://env-a".to_owned(), "https://env-b".to_owned()]
         ); // env list over file list
-        assert_eq!(resolved.total_budget_sats, DEFAULT_TOTAL_BUDGET_SATS); // untouched default survives
+        assert!(resolved.allow_real_mints); // untouched default survives
     }
 
     #[test]

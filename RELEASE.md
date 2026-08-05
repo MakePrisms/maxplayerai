@@ -5,22 +5,36 @@ npm. Both come out of `.github/workflows/release.yml`, which runs on a pushed `v
 
 ## Before the first release
 
-One setup step, done once, and it is the only thing standing between a tag and a publish:
+One setup step, done once **per package**, and it is the only thing standing between a tag and a
+publish. On npmjs.com, for each of `maxplayer`, `@maxplayerai/linux-x64` and
+`@maxplayerai/linux-arm64`:
 
-- Add an npm **automation** token as the repository secret `NPM_TOKEN`
-  (Settings → Secrets and variables → Actions).
+- Settings → **Trusted publishing** → add a GitHub Actions publisher: organization `MakePrisms`,
+  repository `maxplayerai`, workflow `release.yml`.
 
-Until that secret exists the workflow builds, verifies and creates GitHub Releases as normal, and the
-publish job stops on its first step. That is deliberate: the token lives in repository secrets and
-never in the tree.
+There is no repository secret to add. The workflow authenticates by trusted publishing (OIDC): the
+`publish` job mints a short-lived GitHub identity token and npm exchanges it for publish rights, so
+no long-lived credential exists to expire, leak, or be rotated.
+
+Until a package's trusted publisher is configured the workflow builds, verifies and creates GitHub
+Releases as normal, and `npm publish` fails loudly for that package. There is no silent skip — an
+unconfigured package fails the job rather than producing a release that looks published.
 
 The launcher publishes as the unscoped package `maxplayer`; the per-platform payloads publish under
-the `maxplayer-linux-x64` and `maxplayer-linux-arm64` packages. Both need to be writable by the token's account; `--access public` (passed by the job) is required for scoped first-publishes and a
-first publish needs `--access public`, which the publish job already passes.
+the `@maxplayerai/linux-x64` and `@maxplayerai/linux-arm64` packages, in the npm organization
+`maxplayerai`. All three need their own trusted publisher entry — the setting is per package, not
+per account or per org. The GitHub side of that entry is the same for all three, and is unaffected
+by the npm scope: organization `MakePrisms`, repository `maxplayerai`.
+
+`--access public`, which the publish job already passes on every publish, is what the scoped payload
+packages need on a first publish — a scoped package defaults to restricted, which on a free account
+fails outright.
 
 ## Cutting one
 
-1. **Bump the version.** `[workspace.package].version` in `Cargo.toml`, and `version` in every
+1. **Bump the version.** `[workspace.package].version` in `Cargo.toml`, the workspace crate
+   entries in `Cargo.lock` (refreshed by any `cargo` invocation — e.g. `cargo build` — since the
+   release build passes `--locked` and fails on a stale lockfile), and `version` in every
    `npm/*/package.json`, and the `optionalDependencies` pins in `npm/mobee/package.json`. All of
    them must read the same string, and it must match the tag with the `v` dropped — the build
    asserts this and stops if anything disagrees.
@@ -132,8 +146,8 @@ git cat-file -e "$TAG":.github/workflows/release.yml && echo present || echo abs
 
 | platform | runner | shipped as |
 |---|---|---|
-| linux-x64 | `ubuntu-latest` | archive + `maxplayer-linux-x64` |
-| linux-arm64 | `ubuntu-24.04-arm` | archive + `maxplayer-linux-arm64` |
+| linux-x64 | `ubuntu-latest` | archive + `@maxplayerai/linux-x64` |
+| linux-arm64 | `ubuntu-24.04-arm` | archive + `@maxplayerai/linux-arm64` |
 | darwin-arm64 | `macos-14` | archive only |
 
 darwin-arm64 has no npm payload package yet, so macOS users download the archive; `npx maxplayer` tells

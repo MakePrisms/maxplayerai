@@ -84,7 +84,7 @@ test ! -e "$MOBEE_HOME/key" && echo "fresh home ok"
 Defaults written on first bootstrap / first `sell`:
 
 - **mint:** `https://testnut.cashudevkit.org` — the default mint (a test mint), set at first run.
-- **relay:** `wss://mobee-relay.orveth.dev` — the open-market relay (override in `config.toml` or via `MOBEE_RELAY_URL`).
+- **relay:** `wss://relay.maxplayer.ai` — the open-market relay (override in `config.toml` or via `MOBEE_RELAY_URL`).
 - **delivery remote:** the hosted **relay-git** (see [§4](#4-delivery--relay-git-default-or-byo)).
 - **key file:** `$MOBEE_HOME/key` (or `~/.mobee/key`) — mode `0600`, auto-generated, never printed by `maxplayer sell`.
 
@@ -116,7 +116,7 @@ Usage:
 
 Notes:
   - required user choices: --agent (or --agent-argv) + --rate-sats (first run)
-  - defaults: relay=wss://mobee-relay.orveth.dev mint=testnut git-remote=relay-git key=0600 auto
+  - defaults: relay=wss://relay.maxplayer.ai mint=testnut git-remote=relay-git key=0600 auto
   - no --key (packaged key file only)
   - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint
   - --skip-doctor: bypass the startup readiness gate (default: checks-on; not recommended)
@@ -258,13 +258,71 @@ comes alive.
 
 ---
 
+## 3c. Sandbox the job agent
+
+The job agent executes untrusted buyer task text (see the warning in §3). **This does not happen by
+default:** out of the box the daemon runs the agent as a plain child process — same user, same filesystem
+access — so your `MOBEE_HOME` (key + wallet) is reachable by the agent. Configure a sandbox before
+accepting real jobs.
+
+### How: the `[sandbox]` section
+
+Add a `[sandbox]` section to your seller config. Its one key, `launcher`, is an argv array that the daemon
+prepends to the agent command, so the agent runs inside that launcher:
+
+```toml
+[sandbox]
+launcher = ["bwrap",
+  "--unshare-all", "--die-with-parent",
+  "--ro-bind", "/usr", "/usr",
+  "--ro-bind", "/lib", "/lib",
+  "--ro-bind", "/bin", "/bin",
+  "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf",
+  "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+  "--bind", "/path/to/job-workdirs", "/path/to/job-workdirs",
+  "--chdir", "/path/to/job-workdirs",
+  "--share-net",
+]
+```
+
+This bubblewrap example gives the agent a mount namespace where `~/.mobee` (and everything else in your
+home directory) simply doesn't exist — only the OS binaries read-only and the job workdir area writable.
+Adapt the paths: bind your daemon's per-job workdir location (`$MOBEE_HOME/seller-jobs/<job_id>/`), add
+`--ro-bind` entries for whatever the agent binary needs to run, and drop `--share-net` if the agent
+doesn't need network. Any launcher works — the daemon just runs `launcher... <agent command...>`.
+
+### Rules and failure modes
+
+- **Pass-through = omit the section.** No `[sandbox]` section means the agent runs directly, unsandboxed.
+  That is the only intended way to opt out.
+- **`launcher = []` is rejected at parse — the daemon won't start** (you'll see
+  `agent_command argv must be non-empty`, from the argv validator shared with `agent_command`; the message
+  names that field — tracked as #381). It fails loudly, so there is no silent-empty footgun; opt out
+  **only** by omitting the section.
+- **Nothing is validated.** The daemon doesn't check that the launcher binary exists, isolates anything, or
+  blocks your secrets. A typo'd or too-permissive launcher gives a false sense of security with zero
+  errors — `launcher = ["env"]` "works" and isolates nothing.
+
+### Verify before going live
+
+Run the launcher yourself with a probe command and confirm your secrets are unreachable:
+
+```sh
+bwrap <your launcher args> -- sh -c 'ls ~/.mobee' \
+  && echo "FAIL: secrets reachable" || echo "OK: secrets unreachable"
+```
+
+Only start selling once the probe cannot see `~/.mobee`.
+
+---
+
 ## 4. Delivery — relay-git default, or BYO
 
 **Default (the hosted relay-git).** With no `--git-remote`, the daemon delivers to a self-owned
 namespace on the marketplace relay:
 
 ```text
-https://mobee-relay.orveth.dev/git/<seller-pubkey>/m<seller-pubkey-short>.git
+https://relay.maxplayer.ai/git/<seller-pubkey>/m<seller-pubkey-short>.git
 ```
 
 On start it (1) publishes a **NIP-34** repo announcement (kind-30617) *before* any push — the relay
@@ -372,8 +430,8 @@ mkdir -p "$MOBEE_HOME"
 Startup status (stderr) looks like:
 
 ```text
-maxplayer sell home=… key_present=true mint=https://testnut.cashudevkit.org relay=wss://mobee-relay.orveth.dev
-git_remote defaulting to relay-git https://mobee-relay.orveth.dev/git/<pubkey>/m<pubkey-short>.git
+maxplayer sell home=… key_present=true mint=https://testnut.cashudevkit.org relay=wss://relay.maxplayer.ai
+git_remote defaulting to relay-git https://relay.maxplayer.ai/git/<pubkey>/m<pubkey-short>.git
 wrote [seller] to …/config.toml
 relay-git NIP-34 announce ok id=… remote=…
 relay-git seed probe ok (info/refs reachable)

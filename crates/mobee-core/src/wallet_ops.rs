@@ -37,7 +37,7 @@ impl std::fmt::Display for WalletOpsError {
             Self::Home(error) => write!(formatter, "{error}"),
             Self::MintNotAllowed { mint_url } => write!(
                 formatter,
-                "mint {mint_url} is not configured; add it with `mobee wallet mints add` (default stays {DEFAULT_MINT_URL})"
+                "mint {mint_url} is not configured; add it with `maxplayer wallet mints add` (default stays {DEFAULT_MINT_URL})"
             ),
             Self::MintPinnedDefault => write!(
                 formatter,
@@ -920,7 +920,8 @@ mod tests {
         let root = temp_home("mints");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap(&root).expect("bootstrap");
-        assert_eq!(home.config.default_mint(), DEFAULT_MINT_URL);
+        // Issue #378: the shipped default mint is the real minibits mint (not testnut).
+        assert_eq!(home.config.default_mint(), crate::home::DEFAULT_MINIBITS_MINT_URL);
         let listed = list_mints(&home).expect("list");
         assert_eq!(listed.len(), 1);
         assert!(listed[0].is_default);
@@ -929,7 +930,7 @@ mod tests {
         assert_eq!(added, "https://example.mint.test");
         assert_eq!(list_mints(&home).expect("list2").len(), 2);
 
-        let err = remove_mint(&mut home, DEFAULT_MINT_URL).expect_err("pin");
+        let err = remove_mint(&mut home, crate::home::DEFAULT_MINIBITS_MINT_URL).expect_err("pin");
         assert!(matches!(err, WalletOpsError::MintPinnedDefault));
 
         remove_mint(&mut home, "https://example.mint.test").expect("remove");

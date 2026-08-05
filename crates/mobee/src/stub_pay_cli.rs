@@ -66,11 +66,9 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         Ok(stub) => {
             let _ = writeln!(
                 out,
-                "{stub} amount_sats={amount} spent_total_sats={} remaining_sats={} per_job_cap_sats={} total_cap_sats={}",
+                "{stub} amount_sats={amount} spent_total_sats={} per_job_cap_sats={}",
                 gate.spent(),
-                gate.remaining(),
-                gate.per_job_cap(),
-                gate.total_cap()
+                gate.per_job_cap()
             );
             SUCCESS
         }

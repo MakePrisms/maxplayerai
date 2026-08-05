@@ -403,9 +403,12 @@ pub fn parse_bound_git_delivery(
 /// the invoice. Build `creq` with [`creq::build_seller_creq`]; buyers read it back with
 /// [`creq::parse_creq`].
 ///
+/// The offer `e` tag is marked `root`, so an observer holding only public tags can join the claim
+/// to its offer without guessing at `e`-tag position.
+///
 /// `agents` advertises the harnesses this seller can run (preference order) as
 /// `["mobee_agent", …]`, so the buyer's award filter can hold the claim to the harness its job
-/// asked for. Empty ⇒ the tag is omitted and the claim is byte-identical to a pre-registry claim.
+/// asked for. Empty ⇒ the tag is omitted rather than sent empty.
 pub fn claim_draft(
     offer_id: &str,
     buyer_pubkey: &str,
@@ -414,7 +417,7 @@ pub fn claim_draft(
     agents: &[String],
 ) -> EventDraft {
     let mut tags = vec![
-        TagSpec::new(["e", offer_id]),
+        TagSpec::new(["e", offer_id, "", "root"]),
         TagSpec::new(["p", buyer_pubkey]),
         TagSpec::new(["p", seller_pubkey]),
         TagSpec::new(["creq", creq]),
@@ -605,23 +608,75 @@ pub fn git_result_draft(
     )
 }
 
-/// Kind-feedback FEEDBACK draft (`status=error`; timeout / push-fail / refuse paths).
+/// The protocol-v1 §10 feedback reason-code vocabulary. A `FEEDBACK` carries the code as an
+/// authoritative `["reason_code", <code>]` tag; `content` stays human-readable and is explanatory
+/// only. A reader MUST treat the tag as authoritative for the class and MUST NOT parse `content` to
+/// determine it; an unrecognised code falls back to the coarse class named by `status` (the code is a
+/// newer peer, not a broken one), so the vocabulary is extensible.
 ///
-/// `content` carries a machine-readable reason when one is available (e.g. rate-gate
-/// refusal); empty string preserves the historical empty-content callers.
+/// The set is deliberately COMPLETE, not just the code that prompted its introduction (`no_sentinel`):
+/// per §10, a vocabulary added only at the site that happened to prompt it reproduces the original
+/// class-ambiguity defect with a tag sitting on top of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReasonCode {
+    /// Offer amount is below the seller's rate floor — a price decline, not a work error.
+    BelowRate,
+    /// Offer speaks a protocol major this seat does not — a version reject, distinct from malformed.
+    UnsupportedVersion,
+    /// The trade's mint set does not intersect the seat's accepted mints.
+    MintIncompatible,
+    /// The seat is at capacity and declines to take the work.
+    AtCapacity,
+    /// The work execution failed (the agent could not produce the deliverable).
+    ExecutionFailed,
+    /// Execution succeeded but the delivery (snapshot/push/publish) failed.
+    DeliveryFailed,
+    /// The delivery carried no execution sentinel — a refusal that DOES count against the seller (§19).
+    NoSentinel,
+}
+
+impl ReasonCode {
+    /// The stable `reason_code` tag value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BelowRate => "below_rate",
+            Self::UnsupportedVersion => "unsupported_version",
+            Self::MintIncompatible => "mint_incompatible",
+            Self::AtCapacity => "at_capacity",
+            Self::ExecutionFailed => "execution_failed",
+            Self::DeliveryFailed => "delivery_failed",
+            Self::NoSentinel => "no_sentinel",
+        }
+    }
+}
+
+/// Kind-feedback FEEDBACK draft carrying the §10 `reason_code` tag — the authoritative class
+/// discriminator a reader keys on. The `status` tag stays `error` (as every emitting site here
+/// always has): the coarse status is a fallback for readers that do not know a code, and the buyer's
+/// claim-list view keys on it, so re-classing it (a `below_rate`/`no_sentinel` refusal is `refusal`
+/// per §10's table) is a deliberate view change left as a follow-up, not smuggled in here.
+///
+/// The offer `e` tag is marked `root`, so a failure is attributable to its job from public tags
+/// alone — a refusal that cannot be joined to an offer is invisible in a seller's reliability
+/// record, which is the half of reputation that only failures carry.
+///
+/// `content` carries the human-readable reason (a display-only mirror of the code); empty preserves the
+/// historical empty-content callers.
 pub fn error_draft(
     offer_id: &str,
     buyer_pubkey: &str,
     seller_pubkey: &str,
+    reason_code: ReasonCode,
     content: impl Into<String>,
 ) -> EventDraft {
     let mut draft = status_draft(
         JOB_FEEDBACK_KIND,
         "error",
         vec![
-            TagSpec::new(["e", offer_id]),
+            TagSpec::new(["e", offer_id, "", "root"]),
             TagSpec::new(["p", buyer_pubkey]),
             TagSpec::new(["p", seller_pubkey]),
+            TagSpec::new(["reason_code", reason_code.as_str()]),
         ],
     );
     draft.content = content.into();
@@ -1035,7 +1090,7 @@ mod tests {
                 JOB_CLAIM_KIND,
                 vec![
                     TagSpec::new(["status", "processing"]),
-                    TagSpec::new(["e", "offer"]),
+                    TagSpec::new(["e", "offer", "", "root"]),
                     TagSpec::new(["p", BUYER]),
                     TagSpec::new(["p", SELLER]),
                     TagSpec::new(["creq", "creqAtest"]),
@@ -1075,6 +1130,100 @@ mod tests {
         assert_eq!(
             parse_award(&claim_draft("offer", BUYER, SELLER, "creqAtest", &[])),
             None
+        );
+    }
+
+    #[test]
+    fn every_lifecycle_draft_roots_its_offer_e_tag() {
+        // Every lifecycle stage after the offer carries exactly one `root`-marked `e` tag naming the
+        // offer, so an observer holding nothing but public tags can join any stage to its job. The
+        // stage this exists for is FEEDBACK: a refusal that cannot be joined to an offer is missing
+        // from the seller's reliability record, and award-without-delivery is the signal that record
+        // is for.
+        //
+        // Written over the set rather than once per builder so the shared property is asserted in
+        // one place. ⚠ It does NOT catch a builder added later — nothing here enumerates the
+        // builders; the crate exposes the kinds as seven separate constants and no list to check a
+        // new one against. A new lifecycle builder needs a row added by hand.
+        const OFFER: &str = "offer";
+        let lifecycle = [
+            ("claim", claim_draft(OFFER, BUYER, SELLER, "creqAtest", &[])),
+            ("award", award_draft(OFFER, "claim", BUYER, SELLER)),
+            ("accept", accept_draft(OFFER, "claim", BUYER, SELLER)),
+            (
+                "result",
+                result_draft(
+                    OFFER,
+                    BUYER,
+                    "text/plain",
+                    7,
+                    "hash",
+                    "seller-sig",
+                    "done",
+                    None,
+                    &[],
+                ),
+            ),
+            ("feedback", error_draft(OFFER, BUYER, SELLER, ReasonCode::ExecutionFailed, "refused")),
+            (
+                "receipt",
+                receipt_draft(
+                    OFFER,
+                    "result",
+                    BUYER,
+                    SELLER,
+                    TESTNUT_MINT_URL,
+                    7,
+                    "hash",
+                    "seller-sig",
+                    "buyer-sig",
+                    None,
+                    None,
+                    &[],
+                ),
+            ),
+        ];
+
+        for (stage, draft) in &lifecycle {
+            let rooted: Vec<&TagSpec> = draft
+                .tags
+                .iter()
+                .filter(|tag| {
+                    tag.first() == Some("e") && tag.0.get(3).map(String::as_str) == Some("root")
+                })
+                .collect();
+            // Exactly one, not at-least-one: a second root marker would make the job root ambiguous
+            // to a reader that takes the first match, which is the failure the marker removes.
+            assert_eq!(
+                rooted.len(),
+                1,
+                "{stage}: expected exactly one root-marked e tag, found {}",
+                rooted.len()
+            );
+            assert_eq!(
+                rooted[0].value(),
+                Some(OFFER),
+                "{stage}: the root marker must name the offer, not another event in the chain"
+            );
+        }
+
+        // The stages covered are the trade block minus the offer itself. Asserted against the kind
+        // constants so a renumbering cannot leave a stage silently uncovered.
+        let covered: Vec<u16> = lifecycle.iter().map(|(_, draft)| draft.kind).collect();
+        assert_eq!(
+            covered,
+            vec![
+                JOB_CLAIM_KIND,
+                JOB_AWARD_KIND,
+                JOB_ACCEPT_KIND,
+                JOB_RESULT_KIND,
+                JOB_FEEDBACK_KIND,
+                JOB_RECEIPT_KIND,
+            ]
+        );
+        assert!(
+            !covered.contains(&JOB_OFFER_KIND),
+            "the offer is the root; it does not tag one"
         );
     }
 

@@ -156,6 +156,9 @@ JSON
 
 # `npx maxplayer` must reach the LAUNCHER. The platform package deliberately names its own bin
 # `maxplayer-linux-x64` so it cannot win the `maxplayer` name and silently bypass the launcher.
+# That bin name intentionally does NOT track the package name: the package is `@maxplayerai/linux-x64`,
+# and npm's default bin name for it would be the scope-stripped `linux-x64` — far too generic for a
+# command installed into a shared `.bin`, so the key stays spelled out.
 LINK="$PROJECT/node_modules/.bin/maxplayer"
 [ -e "$LINK" ] || die "npm did not link a 'maxplayer' bin"
 head -c 4 "$(readlink -f "$LINK")" | grep -q $'\x7fELF' \

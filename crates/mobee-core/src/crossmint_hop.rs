@@ -1233,9 +1233,9 @@ mod tests {
             world: Rc::clone(&world),
         };
 
-        // Per-job and total caps both sit one sat under what the hop would cost.
+        // The per-job cap sits one sat under what the hop would cost.
         let under = pairing.planned_cost.saturating_sub(1);
-        let mut gate = BudgetGate::new(under, under);
+        let mut gate = BudgetGate::new(under);
         let refusal = gate
             .authorize_then_attempt(&pairing.attempt_id, pairing.planned_cost, || {
                 run_hop(&store, &mut effects, &pairing)
@@ -1256,7 +1256,7 @@ mod tests {
 
         // The same hop at a cap that covers it does melt — so the refusal above came from the cap
         // and not from something else refusing first.
-        let mut gate = BudgetGate::new(pairing.planned_cost, pairing.planned_cost);
+        let mut gate = BudgetGate::new(pairing.planned_cost);
         gate.authorize_then_attempt(&pairing.attempt_id, pairing.planned_cost, || {
             run_hop(&store, &mut effects, &pairing)
         })
@@ -1282,7 +1282,7 @@ mod tests {
             world: Rc::clone(&world),
         };
 
-        let mut gate = BudgetGate::new(pairing.delivered_sats, pairing.delivered_sats);
+        let mut gate = BudgetGate::new(pairing.delivered_sats);
         let refusal = gate
             .authorize_then_attempt(&pairing.attempt_id, pairing.planned_cost, || {
                 run_hop(&store, &mut effects, &pairing)

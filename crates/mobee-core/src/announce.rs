@@ -385,26 +385,50 @@ mod tests {
         // A tiny capturing sink (`tee -a <file>`) receives the JSON on stdin. Dispatch three
         // distinct lifecycle events and prove each lands as exactly one well-formed JSON line
         // with the right event label + fields.
+        //
+        // #403: the events are dispatched SERIALLY — each is waited for before the next is sent —
+        // so only one detached `tee -a` ever writes the shared file at a time. The prior version
+        // fired all three concurrently and the tees raced on the append, going non-deterministically
+        // red under full-suite parallelism. Production is unaffected: `dispatch` spawns one fresh
+        // sink process per event and `run_sink` hands it a single complete line, and real lifecycle
+        // events are time-spaced — so serializing here matches the accumulating-log shape without
+        // the test-only concurrency.
         let out = unique_tmp("capture");
         let command = vec!["tee".to_owned(), "-a".to_owned(), out.display().to_string()];
         let timeout = Duration::from_secs(5);
-        dispatch(&command, timeout, &AnnounceEvent::claimed(1, "sk", "j1", "b1", 5, 100));
-        dispatch(&command, timeout, &AnnounceEvent::delivered(2, "sk", "j1", "r1", "oid", 5));
-        dispatch(&command, timeout, &AnnounceEvent::refused(3, "sk", "j2", "RateGate", "too cheap", Some(1)));
+        let lifecycle = [
+            AnnounceEvent::claimed(1, "sk", "j1", "b1", 5, 100),
+            AnnounceEvent::delivered(2, "sk", "j1", "r1", "oid", 5),
+            AnnounceEvent::refused(3, "sk", "j2", "RateGate", "too cheap", Some(1)),
+        ];
 
-        // Wait (bounded) for all three detached sinks to land their line.
-        let deadline = Instant::now() + Duration::from_secs(5);
         let mut lines: Vec<String> = Vec::new();
-        while Instant::now() < deadline {
-            if let Ok(body) = std::fs::read_to_string(&out) {
-                lines = body.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
-                if lines.len() == 3 {
-                    break;
+        for (index, event) in lifecycle.iter().enumerate() {
+            let expected = index + 1;
+            dispatch(&command, timeout, event);
+            // Wait (bounded) for THIS event's line to land before dispatching the next, so the
+            // appends never overlap. Only count a body that ends in a newline, so a read that
+            // catches a `tee` mid-write is never miscounted.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Ok(body) = std::fs::read_to_string(&out) {
+                    if body.ends_with('\n') {
+                        lines =
+                            body.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
+                        if lines.len() >= expected {
+                            break;
+                        }
+                    }
                 }
+                assert!(
+                    Instant::now() < deadline,
+                    "event #{expected} did not land within the bound; got {lines:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
             }
-            std::thread::sleep(Duration::from_millis(20));
         }
         let _ = std::fs::remove_file(&out);
+
         assert_eq!(lines.len(), 3, "expected exactly 3 captured events, got {lines:?}");
         let mut events: Vec<String> = lines
             .iter()

@@ -37,8 +37,18 @@ export MOBEE_HOME="/absolute/path/to/a-buyer-home"
 
 The wallet and profile are managed through the CLI. For example, inspect funds with
 `"$MOBEE_BIN" wallet balance` and optionally publish a display name with
-`"$MOBEE_BIN" profile set --name "Buyer name"`. The default testnut mint automatically funds the
-initial test wallet; buyers spend from it, subject to the budget caps in `config.toml`.
+`"$MOBEE_BIN" profile set --name "Buyer name"`.
+
+> **⚠ Real sats by default.** The shipped default mint is a **real** mint
+> (`https://mint.minibits.cash/Bitcoin`), and `allow_real_mints` defaults to `true`. So
+> `"$MOBEE_BIN" wallet setup` provisions the wallet on a real mint and prints a Lightning invoice
+> you fund with **real sats** — it does **not** auto-fund. Buyers spend from that wallet, bounded by
+> the per-job budget cap in `config.toml`.
+>
+> testnut is the development mint (auto-settling invoices, no real money). Opt in for local testing
+> with `"$MOBEE_BIN" wallet setup --mint https://testnut.cashudevkit.org`, or set
+> `allow_real_mints = false` in `config.toml` to restrict the wallet to it. It is a dev tool — real
+> sats are the default and the point.
 
 ## 3. Add the MCP to your agent
 

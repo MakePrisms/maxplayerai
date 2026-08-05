@@ -5,6 +5,7 @@
 //! no [`PaymentService::advance`] from this surface.
 
 use std::fmt;
+use std::path::Path;
 use std::str::FromStr;
 
 use cashu::{Amount, CurrencyUnit, PublicKey as CashuPublicKey};
@@ -116,7 +117,44 @@ pub struct AuthorizePayOutcome {
     /// differ and the gap is the hop's cost rather than anything the seller was paid.
     pub charged_sats: u64,
     pub spent_total_sats: u64,
-    pub remaining_sats: u64,
+}
+
+/// Inputs for the operator completion path ([`complete_recovered_locked_async`]).
+///
+/// Mirrors the IDENTITY inputs of [`AuthorizePayRequest`] so the SAME attempt id (and journal file)
+/// is targeted, and adds only `seller_signature` — the seller cosig the completion still needs to
+/// publish the receipt. It carries NO new spend authority: the token was minted and the budget
+/// charged at the original award; completion REUSES that token and re-checks the same attempt id
+/// against the gate (never a second charge). There is deliberately no `repo`/`branch`/`commit_oid`
+/// or contribution binds — completion re-checks proof state and re-sends the existing token; it does
+/// not re-verify delivery (that gated the ORIGINAL spend, which already happened).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompleteLockedRequest {
+    pub job_id: String,
+    pub result_id: String,
+    pub delivery_integrity_hash: String,
+    pub job_hash: String,
+    pub seller_pubkey: String,
+    pub amount_sats: u64,
+    /// Seller schnorr signature (hex) over the receipt preimage — read from the accepted result's
+    /// `sig/seller` tag, exactly as the pay path reads it. Required: the buyer cannot co-sign a
+    /// valid receipt without it, so completion would stall at the receipt leg.
+    pub seller_signature: String,
+    pub creq_hash: Option<String>,
+    pub accepted_mints: Vec<String>,
+    pub realized_mint: Option<String>,
+}
+
+/// Successful operator-completion outcome. `state` is the folded payment state after the run —
+/// `Closed` on a full completion, or an earlier state if a later leg (e.g. the receipt publish) is
+/// left to a subsequent run. `spent_total_sats` is UNCHANGED from before the call when the attempt
+/// was already charged (the common case), because completion never re-charges.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompleteLockedOutcome {
+    pub state: PaymentState,
+    pub attempt_id: String,
+    pub amount_sats: u64,
+    pub spent_total_sats: u64,
 }
 
 #[derive(Debug)]
@@ -135,6 +173,10 @@ pub enum AuthorizePayError {
     /// Pre-pay seller co-signature refusal, carrying the buyer's computed preimage fields + digest
     /// (public trade data, no secrets) so the divergent field self-identifies (diagnostic).
     CosigRefused(String),
+    /// Pre-pay execution-sentinel refusal (§19): the independently-fetched delivery tree carries no
+    /// job-bound execution sentinel — missing, invalid, or replayed from another job. A refusal, not a
+    /// crash: ZERO spend, no journal, and a durable local sentinel-refusal record for §17 reputation.
+    NoSentinel(String),
 }
 
 impl fmt::Display for AuthorizePayError {
@@ -150,6 +192,7 @@ impl fmt::Display for AuthorizePayError {
             Self::CosigRefused(message) => write!(formatter, "authorize_pay payment: {message}"),
             Self::Home(message) => write!(formatter, "authorize_pay home: {message}"),
             Self::Effects(message) => write!(formatter, "authorize_pay effects: {message}"),
+            Self::NoSentinel(message) => write!(formatter, "authorize_pay no_sentinel: {message}"),
         }
     }
 }
@@ -240,52 +283,31 @@ pub async fn authorize_pay_async(
         ));
     }
 
-    let job_id = JobId::new(request.job_id.clone())
-        .map_err(|error| AuthorizePayError::Input(error.to_string()))?;
-    let result_id = ResultId::new(request.result_id.clone())
-        .map_err(|error| AuthorizePayError::Input(error.to_string()))?;
-    let delivery_integrity_hash = DeliveryIntegrityHash::from_hex(request.delivery_integrity_hash)
-        .map_err(|error| AuthorizePayError::Input(error.to_string()))?;
-    let job_hash = JobHash::from_hex(request.job_hash)
-        .map_err(|error| AuthorizePayError::Input(error.to_string()))?;
-    let seller_nostr = NostrPublicKey::parse(&request.seller_pubkey)
-        .map_err(|error| AuthorizePayError::Input(format!("seller_pubkey: {error}")))?;
-    let seller_p2pk = cashu_compressed_from_nostr(&seller_nostr)?;
-    // Choose the realized mint the buyer pays at from the seller's `creq` `m` list. The SELECTION is
-    // the mint FROZEN into the accept-bind at accept (`request.realized_mint`), not the live config
-    // default — so a config-default change between attempts cannot shift the mint and mint a second
-    // attempt id (double-pay). `resolve_realized_mint` still enforces accepted-set membership + the
-    // real-mint fence over that frozen selection. A legacy bind (no sealed mint) falls back to the
-    // live config default (pre-seal behavior).
-    let buyer_selected_mint = request
-        .realized_mint
-        .as_deref()
-        .unwrap_or_else(|| home.config.default_mint());
-    // A buyer funded only at mints the seller does not accept still has a way through: melt at a
-    // funded mint to pay a mint quote raised at one the seller does accept, and pay from there. The
-    // plan decides which of those two shapes this payment is; the realized mint is where the ecash
-    // the seller receives ends up, so for a hop it is the TARGET, and the terms, the attempt id and
-    // the receipt all bind that one mint exactly as they do on the direct path.
-    let plan = crate::crossmint::plan_payment(
-        buyer_selected_mint,
-        &request.accepted_mints,
-        home.config.allow_real_mints,
-    )?;
-    let terms = PaymentTerms::new(
-        plan.realized_mint().clone(),
-        Amount::from(request.amount_sats),
-        CurrencyUnit::Sat,
+    // Buyer-controlled job hash (from the accept-bind, never a seller echo) kept for the §19 sentinel
+    // check below, which asserts the delivered tree carries THIS job's hash — so a replayed sentinel
+    // from another job fails the match. `derive_payment` only borrows `request.job_hash`, so it stays
+    // available here.
+    let expected_job_hash = request.job_hash.clone();
+    // Single derivation of the stable payment terms + key (⇒ attempt id) from the trade identity,
+    // shared byte-for-byte with `complete_recovered_locked_async` so a completion re-derives the
+    // EXACT same attempt id and journal file (a drift here would double-pay). See `derive_payment`.
+    let DerivedPayment {
+        terms,
+        key,
         seller_nostr,
-        seller_p2pk,
-    );
-    let key = PaymentKey::new(
-        job_id,
-        result_id,
-        delivery_integrity_hash,
-        job_hash,
-        &terms,
+        plan,
+    } = derive_payment(
+        home,
+        &request.job_id,
+        &request.result_id,
+        &request.delivery_integrity_hash,
+        &request.job_hash,
+        &request.seller_pubkey,
+        request.amount_sats,
+        &request.accepted_mints,
+        request.realized_mint.as_deref(),
         request.creq_hash.clone(),
-    );
+    )?;
     let attempt_id = key.attempt_id();
 
     let commit_oid = CommitOid::parse(request.commit_oid)?;
@@ -399,6 +421,47 @@ pub async fn authorize_pay_async(
     crate::payment::verify_pay_path_delivery(&mut verifier, &delivery, &key)
         .map_err(AuthorizePayError::Payment)?;
 
+    // THE §19 EXECUTION-SENTINEL TOOTH (from-scratch money path). The delivery the buyer just fetched
+    // + tip-matched into its OWN store MUST carry this job's execution sentinel inside the delivered
+    // tree — evidence the buyer independently reads, never the seller's testimony. Runs BEFORE the
+    // budget gate / wallet / journal below, so a missing / invalid / replayed sentinel refuses with
+    // ZERO spend and no journal, and durably records the refusal for §17 (the JOURNAL is the artifact,
+    // never the silence — an absent record is never read as a refusal, §7.0). Contribution deliveries
+    // are gated by verify_contribution's content path and are not served by the node yet; their
+    // buyer-side sentinel check is a later slice.
+    if request.job_class == JobClass::FromScratch {
+        let commit_hex = delivery.commit_oid().as_str();
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(commit_hex);
+        // The verifier owns the store path it just fetched the delivery into (`store` was moved into
+        // it); read the tree back from that same store.
+        match delivery_tree_carries_sentinel(
+            verifier.repository(),
+            &store_ref,
+            commit_hex,
+            &expected_job_hash,
+            &request.job_id,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                journal_sentinel_refusal(home, &request.job_id, commit_hex, "missing_or_replayed");
+                return Err(AuthorizePayError::NoSentinel(format!(
+                    "delivery {commit_hex} carries no execution sentinel bound to job {} (§19); \
+                     refusing no_sentinel with zero spend",
+                    request.job_id
+                )));
+            }
+            Err(reason) => {
+                // A store-read failure is a positive failure to VERIFY, not silence: fail closed
+                // (refuse, zero spend) rather than pay a tree we could not read. Journalled with a
+                // distinct class so §17 does not misattribute a buyer-side read fault to the seller.
+                journal_sentinel_refusal(home, &request.job_id, commit_hex, "verify_error");
+                return Err(AuthorizePayError::NoSentinel(format!(
+                    "delivery {commit_hex} sentinel could not be verified ({reason}); fail-closed, zero spend"
+                )));
+            }
+        }
+    }
+
     let amount = request.amount_sats;
     // Cross-mint hop planning. Pre-budget and pre-spend: raising quotes moves no money, so a hop
     // that cannot be priced refuses having spent nothing. Delivery is PINNED here — the quote at the
@@ -427,11 +490,13 @@ pub async fn authorize_pay_async(
 
     let wallet = buyer_fund::open_wallet_at_mint_async(home, &wallet_open_mint_url(home, &terms))
         .await?;
-    // Dust guard (live keyset N=1 floor, fail-closed). lock_or_reconcile re-checks
-    // against CDK input-count send_fee after prepare_send.
-    crate::payment_wallet::require_fee_safe_amount(&wallet, terms.amount)
-        .await
-        .map_err(AuthorizePayError::Wallet)?;
+    // Wallet HTTP must run ONLY on the wallet worker, never on this caller runtime. A pre-spawn dust
+    // check here ran on the current-thread runtime `collect_blocking` builds (collect.rs), priming a
+    // reqwest pooled connection whose IO driver task lived on the caller; the worker then blocked that
+    // same runtime on the effects bridge `recv`, so the pooled connection its `prepare_send` needed
+    // could never be driven — both parked forever (MakePrisms/maxplayerai#387). The N=1 dust guard is
+    // instead run as a WORKER preflight just below (pre-reserve, so a dead mint burns zero budget) and
+    // re-checked inside lock_or_reconcile (payment_wallet.rs).
     let payment_send = NostrPaymentSend::new(home.config.relay_url.clone(), keys);
     let mut effects = CdkPaymentEffects::spawn(
         wallet,
@@ -448,6 +513,15 @@ pub async fn authorize_pay_async(
         },
     )
     .map_err(|error| AuthorizePayError::Effects(error.to_string()))?;
+
+    // Pre-reserve dust/liveness guard, run on the WORKER runtime (see above). A dead/hung mint refuses
+    // HERE — before the budget gate below — so it burns ZERO spend, exactly as the removed pre-spawn
+    // check did, but with wallet HTTP on the worker (no cross-runtime deadlock). Bounded by
+    // MINT_TOUCH_TIMEOUT (inside the check) + the bridge recv ceiling. lock_or_reconcile re-checks the
+    // real input-count fee after prepare_send; this only refuses the dead-mint / N=1-dust cases early.
+    effects
+        .preflight_fee(terms.amount)
+        .map_err(|error| AuthorizePayError::Effects(error.to_string()))?;
 
     // Payment journal — created only AFTER the pre-pay seam passed (a pre-pay refusal leaves no
     // journal on disk, preserving the zero-spend / no-record invariant).
@@ -484,7 +558,189 @@ pub async fn authorize_pay_async(
         amount_sats: amount,
         charged_sats: charged,
         spent_total_sats: gate.spent(),
-        remaining_sats: gate.remaining(),
+    })
+}
+
+/// Whether the delivered tree retained in the buyer store carries THIS job's execution sentinel
+/// (§19). Opens the buyer store (the bare repo the pay path fetched the delivery into), resolves the
+/// delivery commit's tree, reads the sentinel manifest at its well-known path, and matches it through
+/// the SHARED [`crate::delivery_sentinel::content_carries_sentinel`] — one definition with the seller
+/// writer, so a format drift at either end fails the match rather than passing silently. `subtract_path`
+/// (the `job_id`, the seller's workdir label the buyer already knows) is removed before matching so a
+/// token reachable only through a path echo cannot count. `Ok(false)` = read fine, no job-bound
+/// sentinel present (missing or replayed); `Err` = the tree could not be read (the caller fails closed).
+fn delivery_tree_carries_sentinel(
+    store: &Path,
+    store_ref: &str,
+    commit_hex: &str,
+    expected_job_hash: &str,
+    subtract_path: &str,
+) -> Result<bool, String> {
+    let repo = git2::Repository::open_bare(store)
+        .map_err(|error| format!("open buyer store {}: {error}", store.display()))?;
+    let commit = repo
+        .revparse_single(store_ref)
+        .or_else(|_| repo.revparse_single(commit_hex))
+        .map_err(|error| {
+            format!("delivery {commit_hex} not found in buyer store (ref {store_ref}): {error}")
+        })?
+        .peel_to_commit()
+        .map_err(|error| error.to_string())?;
+    let tree = commit.tree().map_err(|error| error.to_string())?;
+
+    // The node writes the manifest at a fixed, well-known path (both ends share the const). An absent
+    // entry is a delivery with no sentinel — present, but not a read failure — so it is Ok(false), a
+    // refusal, never an Err.
+    let entry = match tree.get_path(Path::new(crate::delivery_sentinel::SENTINEL_FILE)) {
+        Ok(entry) => entry,
+        Err(_) => return Ok(false),
+    };
+    let object = entry
+        .to_object(&repo)
+        .map_err(|error| format!("read sentinel object: {error}"))?;
+    let blob = object
+        .as_blob()
+        .ok_or_else(|| "sentinel path is not a blob".to_string())?;
+    // A non-UTF-8 sentinel cannot be a genuine manifest (it is text); treat it as not-present rather
+    // than a hard read error — the delivery simply lacks a usable sentinel.
+    let Ok(text) = std::str::from_utf8(blob.content()) else {
+        return Ok(false);
+    };
+    Ok(crate::delivery_sentinel::content_carries_sentinel(
+        text,
+        expected_job_hash,
+        subtract_path,
+    ))
+}
+
+/// Durably record a pre-pay execution-sentinel refusal as a LOCAL artifact for §17 reputation to
+/// consume later. The record's PRESENCE is the refusal — never the silence (§7.0: an absent record is
+/// not a refusal). `class` distinguishes a genuine missing/replayed sentinel (a seller-attributable
+/// `no_sentinel`) from a buyer-side verify error, so reputation does not misattribute the latter to
+/// the seller. Best-effort: a journal write that itself fails is logged, never converted into a spend
+/// — the refusal already stands on the returned error.
+fn journal_sentinel_refusal(home: &MobeeHome, job_id: &str, commit_oid: &str, class: &str) {
+    let dir = home.root.join("sentinel-refusals");
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        eprintln!("authorize_pay: sentinel-refusal journal dir failed (continuing): {error}");
+        return;
+    }
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let record = serde_json::json!({
+        "job_id": job_id,
+        "commit_oid": commit_oid,
+        "reason_code": crate::gateway::ReasonCode::NoSentinel.as_str(),
+        "class": class,
+        "at": at,
+    });
+    let path = dir.join(format!("{job_id}-{commit_oid}.json"));
+    if let Err(error) = std::fs::write(&path, format!("{record}\n")) {
+        eprintln!("authorize_pay: sentinel-refusal journal write failed (continuing): {error}");
+    }
+}
+
+/// Operator-invoked completion of ONE payment wedged at a recovered `Locked` — the state the AUTO
+/// pay path fails closed on as [`PaymentError::AmbiguousSendRefused`].
+///
+/// Re-derives the SAME terms/key/attempt id as the original pay (via the shared [`derive_payment`]),
+/// opens the SAME `<attempt_id>.jsonl` journal, and drives
+/// [`PaymentService::complete_recovered_locked`] — which proof-gates the already-minted P2PK-locked
+/// token at the mint (LIVE, never cached) and, only if every proof is Unspent, REUSES that token
+/// through the same settlement legs. It NEVER re-mints and NEVER re-verifies delivery (that gated
+/// the original spend, which already happened).
+///
+/// Budget (constraint #4): routed THROUGH [`BudgetGate::authorize_then_attempt`] keyed by the same
+/// attempt id, which the original award already counted, so the reserve is a no-op — no bypass, no
+/// double charge. The `amount_sats` passed is only ever charged if the id is somehow uncounted (a
+/// fail-closed safety net; a genuinely-`Locked` attempt is always already counted).
+///
+/// NEVER wired into boot or the settle watcher — the only caller is the explicit
+/// `maxplayer wallet complete-locked` CLI subcommand.
+pub async fn complete_recovered_locked_async(
+    home: &MobeeHome,
+    gate: &mut BudgetGate,
+    request: CompleteLockedRequest,
+) -> Result<CompleteLockedOutcome, AuthorizePayError> {
+    if request.seller_signature.trim().is_empty() {
+        return Err(AuthorizePayError::Input(
+            "seller_signature is required to co-sign the receipt on completion".into(),
+        ));
+    }
+
+    let DerivedPayment {
+        terms,
+        key,
+        seller_nostr,
+        plan: _,
+    } = derive_payment(
+        home,
+        &request.job_id,
+        &request.result_id,
+        &request.delivery_integrity_hash,
+        &request.job_hash,
+        &request.seller_pubkey,
+        request.amount_sats,
+        &request.accepted_mints,
+        request.realized_mint.as_deref(),
+        request.creq_hash.clone(),
+    )?;
+    let attempt_id = key.attempt_id();
+
+    let secret_hex = home::read_secret_key_hex(home)
+        .map_err(|error| AuthorizePayError::Home(error.to_string()))?;
+    let keys = Keys::parse(&secret_hex)
+        .map_err(|error| AuthorizePayError::Home(format!("buyer key parse: {error}")))?;
+    let authority = ReceiptAuthority {
+        // External anchors: buyer == this buyer's own key, seller == the accepted-claim seller.
+        buyer: keys.public_key(),
+        seller: seller_nostr,
+    };
+    // Receipt-publish inputs captured before `keys` moves into the payment sender.
+    let buyer_receipt_keys = keys.clone();
+    let receipt_relay = home.config.relay_url.clone();
+    let seller_hex = seller_nostr.to_hex();
+    let seller_signature = request.seller_signature.clone();
+    // Live delivery is fork-only ([`DeliveryKind::Fork`]); the receipt preimage the seller signed at
+    // delivery used that kind, so completion reconstructs byte-identical bytes.
+    let delivery_kind = DeliveryKind::Fork;
+
+    let wallet = buyer_fund::open_wallet_at_mint_async(home, &wallet_open_mint_url(home, &terms))
+        .await?;
+    let payment_send = NostrPaymentSend::new(home.config.relay_url.clone(), keys);
+    let mut effects = CdkPaymentEffects::spawn(
+        wallet,
+        payment_send,
+        move |key: &PaymentKey, _payment: &crate::payment_send::PaymentSent| {
+            build_and_publish_receipt(
+                &buyer_receipt_keys,
+                &receipt_relay,
+                &seller_hex,
+                &seller_signature,
+                delivery_kind,
+                key,
+            )
+        },
+    )
+    .map_err(|error| AuthorizePayError::Effects(error.to_string()))?;
+
+    // Same journal file the pay path writes — completion advances THIS attempt's wedge, never a new one.
+    let journal_dir = home.root.join("payment-journal");
+    let journal = FsPaymentJournal::new(journal_dir.join(format!("{}.jsonl", attempt_id.as_str())));
+
+    // Route through the gate (no bypass) keyed by the already-counted attempt id (no double charge).
+    // The completion runs under the same cross-process spend lock + ledger discipline as the pay path.
+    let state = gate.authorize_then_attempt(attempt_id.as_str(), request.amount_sats, || {
+        PaymentService::new(&journal).complete_recovered_locked(&key, &terms, &authority, &mut effects)
+    })??;
+
+    Ok(CompleteLockedOutcome {
+        state,
+        attempt_id: attempt_id.as_str().to_owned(),
+        amount_sats: request.amount_sats,
+        spent_total_sats: gate.spent(),
     })
 }
 
@@ -559,6 +815,83 @@ fn cosig_refusal_diagnostic(preimage: &ReceiptPreimage) -> String {
 fn cashu_compressed_from_nostr(key: &NostrPublicKey) -> Result<CashuPublicKey, AuthorizePayError> {
     CashuPublicKey::from_str(&format!("02{}", key.to_hex())).map_err(|error| {
         AuthorizePayError::Input(format!("cashu pubkey from nostr key: {error}"))
+    })
+}
+
+/// The stable payment terms + key (⇒ attempt id) derived from a trade's identity inputs, plus the
+/// pay plan. Returned by [`derive_payment`], the SINGLE derivation shared by the pay path and the
+/// operator completion path.
+struct DerivedPayment {
+    terms: PaymentTerms,
+    key: PaymentKey,
+    /// The seller's nostr key (Copy) — reused for the receipt authority + receipt co-sign so callers
+    /// do not re-parse it.
+    seller_nostr: NostrPublicKey,
+    plan: crate::crossmint::PayPlan,
+}
+
+/// Derive the stable [`PaymentTerms`] + [`PaymentKey`] (and thus the attempt id) from a trade's
+/// identity inputs. This is the ONE derivation both [`authorize_pay_async`] and
+/// [`complete_recovered_locked_async`] call, so both compute the IDENTICAL attempt id for the same
+/// job — a re-derivation drift would target a different journal file and could double-pay. Pure
+/// beyond reading the home config's default mint + real-mint policy.
+///
+/// The realized mint is chosen from the seller's `creq` `m` list via the SELECTION frozen into the
+/// accept-bind (`realized_mint`), not the live config default — so a config-default change between
+/// attempts cannot shift the mint and mint a second attempt id. `plan_payment` still enforces
+/// accepted-set membership + the real-mint fence over that selection (and plans a cross-mint hop
+/// when the buyer holds nothing at an accepted mint); a legacy bind (no sealed mint) falls back to
+/// the live default.
+#[allow(clippy::too_many_arguments)]
+fn derive_payment(
+    home: &MobeeHome,
+    job_id: &str,
+    result_id: &str,
+    delivery_integrity_hash: &str,
+    job_hash: &str,
+    seller_pubkey: &str,
+    amount_sats: u64,
+    accepted_mints: &[String],
+    realized_mint: Option<&str>,
+    creq_hash: Option<String>,
+) -> Result<DerivedPayment, AuthorizePayError> {
+    let job_id =
+        JobId::new(job_id.to_owned()).map_err(|error| AuthorizePayError::Input(error.to_string()))?;
+    let result_id = ResultId::new(result_id.to_owned())
+        .map_err(|error| AuthorizePayError::Input(error.to_string()))?;
+    let delivery_integrity_hash = DeliveryIntegrityHash::from_hex(delivery_integrity_hash)
+        .map_err(|error| AuthorizePayError::Input(error.to_string()))?;
+    let job_hash =
+        JobHash::from_hex(job_hash).map_err(|error| AuthorizePayError::Input(error.to_string()))?;
+    let seller_nostr = NostrPublicKey::parse(seller_pubkey)
+        .map_err(|error| AuthorizePayError::Input(format!("seller_pubkey: {error}")))?;
+    let seller_p2pk = cashu_compressed_from_nostr(&seller_nostr)?;
+    let buyer_selected_mint = realized_mint.unwrap_or_else(|| home.config.default_mint());
+    let plan = crate::crossmint::plan_payment(
+        buyer_selected_mint,
+        accepted_mints,
+        home.config.allow_real_mints,
+    )?;
+    let terms = PaymentTerms::new(
+        plan.realized_mint().clone(),
+        Amount::from(amount_sats),
+        CurrencyUnit::Sat,
+        seller_nostr,
+        seller_p2pk,
+    );
+    let key = PaymentKey::new(
+        job_id,
+        result_id,
+        delivery_integrity_hash,
+        job_hash,
+        &terms,
+        creq_hash,
+    );
+    Ok(DerivedPayment {
+        terms,
+        key,
+        seller_nostr,
+        plan,
     })
 }
 
@@ -896,10 +1229,10 @@ mod tests {
         );
     }
 
-    // Real-mint switch: a buyer configured at a real mint X is REFUSED by the fence when
-    // `allow_real_mints` is false (default safety posture)...
+    // Real-mint switch: a buyer configured at a real mint X is REFUSED by the fence when the
+    // operator sets `allow_real_mints = false` (opt-out; since #378 the default is true)...
     #[test]
-    fn pay_plan_real_mint_refused_by_default() {
+    fn pay_plan_real_mint_refused_when_flag_false() {
         let error =
             crate::crossmint::plan_payment(REAL_MINT, &[REAL_MINT.to_string()], false).unwrap_err();
         assert!(matches!(error, AuthorizePayError::Input(_)));
@@ -939,6 +1272,135 @@ mod tests {
             .build()
             .expect("current-thread runtime")
             .block_on(authorize_pay_async(home, gate, request))
+    }
+
+    // ── #374 §19 buyer-side execution-sentinel gate (the from-scratch money decision) ──────────
+    //
+    // The buyer's pre-pay decision turns on `delivery_tree_carries_sentinel`, reading the delivered
+    // tree the pay path retained into the buyer store. These drive it directly against a seeded store
+    // (the same store `verify_pay_path_delivery` populates), so the artifact predicate is proven
+    // without a live mint / network fetch. On `Ok(false)` the from-scratch arm of `authorize_pay_async`
+    // returns `NoSentinel` BEFORE the budget gate — the identical pre-spend return that
+    // `collect_forged_cosig_blocks_pay_and_materialize_zero_spend` proves burns zero spend and leaves
+    // no journal. The full-path spent==0 red-prove (through `collect_async`) is integration-level
+    // (needs the git_http delivery fixture) — see `tests/collect_integrity.rs`.
+
+    fn temp_dir_374(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "mobee-sentinel-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// Seed a buyer store (bare repo) with a delivered commit (README + optionally the sentinel
+    /// manifest at its well-known path) retained under its store ref — mirrors what the pay path
+    /// retains post-verify. Returns the delivery commit hex.
+    fn seed_store_delivery(store: &Path, sentinel: Option<&str>) -> String {
+        let repo = git2::Repository::init_bare(store).expect("init store");
+        let readme = repo.blob(b"# delivered\n").expect("blob readme");
+        let mut top = repo.treebuilder(None).expect("tree");
+        top.insert("README.md", readme, 0o100644).expect("insert readme");
+        if let Some(content) = sentinel {
+            let blob = repo.blob(content.as_bytes()).expect("blob sentinel");
+            top.insert(crate::delivery_sentinel::SENTINEL_FILE, blob, 0o100644)
+                .expect("insert sentinel");
+        }
+        let tree_oid = top.write().expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let sig = git2::Signature::now("t", "t@e").expect("sig");
+        let commit_oid = repo
+            .commit(None, &sig, &sig, "delivery", &tree, &[])
+            .expect("commit");
+        let commit_hex = commit_oid.to_string();
+        repo.reference(
+            &PayPathDeliveryVerifier::store_ref_for(&commit_hex),
+            commit_oid,
+            true,
+            "retain",
+        )
+        .expect("retain ref");
+        commit_hex
+    }
+
+    // Positive control — a delivery carrying THIS job's sentinel is accepted, so the red refusals
+    // below are meaningful (the predicate reaches its healthy state).
+    #[test]
+    fn buyer_accepts_a_delivery_carrying_this_jobs_sentinel() {
+        let root = temp_dir_374("ok");
+        let store = root.join("store");
+        let job_hash = "1a".repeat(32);
+        let manifest = crate::delivery_sentinel::render_manifest(
+            &job_hash,
+            crate::delivery_sentinel::DeliveryMode::FromScratch,
+            1,
+            12,
+        );
+        let commit = seed_store_delivery(&store, Some(&manifest));
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit);
+        let job_id = "9c".repeat(32);
+        assert_eq!(
+            delivery_tree_carries_sentinel(&store, &store_ref, &commit, &job_hash, &job_id),
+            Ok(true),
+            "a delivery carrying THIS job's sentinel is accepted (positive control)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // RED-PROVE (missing) — a sentinel-less delivery (old seller build, or a quota-dead run the seller
+    // did not catch) refuses. This is the `Ok(false)` that drives `NoSentinel` + zero spend in the
+    // from-scratch arm. Revert `delivery_tree_carries_sentinel` to a blanket `Ok(true)` and the buyer
+    // pays a sentinel-less delivery — this assertion goes red.
+    #[test]
+    fn buyer_refuses_a_delivery_with_no_sentinel() {
+        let root = temp_dir_374("missing");
+        let store = root.join("store");
+        let commit = seed_store_delivery(&store, None);
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit);
+        let job_hash = "1a".repeat(32);
+        let job_id = "9c".repeat(32);
+        assert_eq!(
+            delivery_tree_carries_sentinel(&store, &store_ref, &commit, &job_hash, &job_id),
+            Ok(false),
+            "a delivery with no sentinel must refuse (drives NoSentinel + zero spend)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // RED-PROVE (replay) — a delivery carrying a VALID sentinel minted for a DIFFERENT job must still
+    // refuse: presence is not enough, the job binding must match. Proves job-binding, not mere
+    // presence — a blanket-`Ok(true)` revert also fails this.
+    #[test]
+    fn buyer_refuses_a_replayed_sentinel_from_a_different_job() {
+        let root = temp_dir_374("replay");
+        let store = root.join("store");
+        let other_job = "bb".repeat(32);
+        let this_job = "1a".repeat(32);
+        let manifest = crate::delivery_sentinel::render_manifest(
+            &other_job,
+            crate::delivery_sentinel::DeliveryMode::FromScratch,
+            1,
+            12,
+        );
+        let commit = seed_store_delivery(&store, Some(&manifest));
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit);
+        let job_id = "9c".repeat(32);
+        assert_eq!(
+            delivery_tree_carries_sentinel(&store, &store_ref, &commit, &this_job, &job_id),
+            Ok(false),
+            "a sentinel bound to another job is a replay and must refuse (job-binding, not presence)"
+        );
+        // The SAME tree validates for the job it WAS minted for — the refusal above is binding, not a
+        // broken read.
+        assert_eq!(
+            delivery_tree_carries_sentinel(&store, &store_ref, &commit, &other_job, &job_id),
+            Ok(true),
+            "and it validates for its own job (the refusal is binding, not a read failure)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1024,10 +1486,13 @@ mod tests {
                 .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let home = home::bootstrap(&root).expect("home");
+        let mut home = home::bootstrap(&root).expect("home");
+        // Issue #378 made allow_real_mints default TRUE; force the fenced posture this test needs so
+        // the seller's real mint stays inadmissible and the hop has nowhere to land.
+        home.config.allow_real_mints = false;
         assert!(
             !home.config.allow_real_mints,
-            "the default posture is what makes this refuse"
+            "fenced posture (allow_real_mints = false) is what makes this refuse"
         );
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let request = AuthorizePayRequest {

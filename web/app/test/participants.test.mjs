@@ -5,7 +5,7 @@ import {
   DEFAULT_WINDOW, LIVE_WITHIN_SECONDS, WINDOWS,
   buyerBoard, participantDetail, sellerBoard, withinWindow, windowSeconds,
 } from "../js/participants.js";
-import { AWARD, CLAIM, FEEDBACK, HANDLER, HEARTBEAT, OFFER, RECEIPT, RESULT } from "../js/kinds.js";
+import { AWARD, CLAIM, FEEDBACK, HANDLER, HEARTBEAT, OFFER, PROFILE, RECEIPT, RESULT } from "../js/kinds.js";
 
 
 /** Fixtures use readable labels; the wire uses 32 bytes of hex. Map one to the other. */
@@ -146,6 +146,21 @@ test("a capability advert attaches to its seller", () => {
   ];
   const [row] = sellerBoard(events, NOW);
   assert.deepEqual(row.capabilities, ["code review"]);
+});
+
+test("the seat name resolves from kind-0, not the 31990 handler (#275)", () => {
+  const s = pk("e");
+  const events = [
+    ...trade("o1", { seller: s }),
+    ev(PROFILE, { id: "p1", pubkey: s, at: NOW - 100, content: '{"name":"frogger"}' }),
+    // A 31990 handler processed AFTER kind-0, carrying a STALE name, must NOT override it —
+    // kind-0 metadata is the single publisher (§6.1 / #275). Handler is last in the array on
+    // purpose: with the old `r.name = p.name || r.name` handler read still present this row
+    // would read "STALE", so this red-proves the removal, not just the kind-0 fall-through.
+    ev(HANDLER, { id: "h1", pubkey: s, at: NOW - 50, tags: [["d", "code"]], content: '{"name":"STALE"}' }),
+  ];
+  const [row] = sellerBoard(events, NOW);
+  assert.equal(row.name, "frogger", "kind-0 name is authoritative; the 31990 name is ignored for display");
 });
 
 test("a participant detail gathers both roles and their trades", () => {
