@@ -100,11 +100,14 @@ Release a pre-release and publishes under the `rc` dist-tag, leaving `latest` wh
 
 ## What the tag does
 
-- Builds the racer binary `maxplayer` for each platform on a runner of that architecture.
-- Verifies each artifact: the version matches the tag, the feature set is the racer surface
-  (`wallet` in, `acp` out), and on Linux that it runs inside alpine and debian with no toolchain
-  present.
-- Attaches `maxplayer-<version>-<platform>.tar.gz` plus `SHA256SUMS` to a GitHub Release.
+- Builds `maxplayer` for each platform on a runner of that architecture, at both surfaces: the racer
+  (`wallet`) and the seller (`wallet,acp`).
+- Verifies each artifact: the version matches the tag, the feature set is the surface it is being
+  published as — `acp` out for the racer, `acp` and `sell` in for the seller — and on Linux that it
+  runs inside alpine and debian with no toolchain present.
+- Attaches `maxplayer-<version>-<platform>.tar.gz` and `maxplayer-seller-<version>-<platform>.tar.gz`
+  plus `SHA256SUMS` to a GitHub Release. Every one of the six is required by name before the release
+  is created: a count cannot tell a complete release from one missing a whole surface.
 - Publishes the npm packages: every payload package first, then the `maxplayer` launcher.
 
 The publish order matters. The launcher pins its payload by exact version, so publishing it first
@@ -120,20 +123,21 @@ Use it after any change to the workflow. On a dispatch run the release and publi
 as skipped; that is the live confirmation that the gates hold, and it is worth watching once before
 the first real tag.
 
-### ⚠ Both triggers read the workflow from a specific commit, not from `dev`
+### ⚠ Every trigger reads the workflow from a specific commit, not from `dev`
 
-**`workflow_dispatch` is only offered for a workflow that exists on the default branch (`main`).**
-Change `release.yml` on `dev` and there is nothing to dispatch until that change reaches `main` — the
-"Run workflow" button describes `main`'s copy, not yours.
+**`workflow_dispatch` runs the copy of the workflow at the ref you dispatch.** Being *offered* at
+all requires `release.yml` to exist on the default branch (`main`), but the run itself executes the
+ref's own file — so a workflow change can be dry-run from its branch, before it is merged anywhere.
+Measured: run 30975896474, dispatched at `seller-prebuilt-artifacts`, built the six jobs that branch
+declares while `main` still declared three.
 
 **A `v*` tag runs the copy of the workflow in the tagged commit.** So a tag cut from a `main` that
 predates `release.yml` starts **no run at all** — no output, no failure, nothing in the Actions tab.
 That is the failure mode to watch for, because an absent run looks identical to one nobody noticed.
 
-Both follow from the same fact and have the same fix: **merge `dev` into `main` before tagging or
-dispatching**, which step 2 above already does. The trap is only reachable by tagging or dispatching
-without it — most easily by cutting a release from a `main` merged minutes *before* a workflow change
-landed on `dev`.
+The fix for the tag is unchanged: **merge `dev` into `main` before tagging**, which step 2 above
+already does. The trap is only reachable by tagging without it — most easily by cutting a release
+from a `main` merged minutes *before* a workflow change landed on `dev`.
 
 If a tag produced no run, confirm the workflow was actually in that tree rather than assuming the
 trigger misfired:

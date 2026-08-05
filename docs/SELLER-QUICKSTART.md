@@ -45,7 +45,17 @@ Index of roles: [`README.md`](README.md). Buyer path: [`QUICKSTART.md`](QUICKSTA
 
 ---
 
-## 0. Clone + toolchain
+## 0. Get a seller binary
+
+No toolchain needed — the release publishes a seller asset alongside the buyer one:
+
+```bash
+curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/install.sh | sh -s -- --seller
+MOBEE_BIN="$HOME/.local/bin/maxplayer"
+"$MOBEE_BIN" sell --bogus   # must print sell Usage (see above)
+```
+
+Building it yourself instead:
 
 ```bash
 git clone https://github.com/MakePrisms/maxplayerai.git
