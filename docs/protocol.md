@@ -292,7 +292,7 @@ The echoed exec metadata is **not** covered by the co-signatures.
 >
 > Readers MUST NOT infer claim eligibility from either tag. Both are advertisements, for display and ranking. Claim eligibility is a seller-internal capacity decision, and the protocol deliberately does not expose it: a seat at capacity does not publish a "busy" flag, it simply does not claim, so a full seat is **absent** from the market rather than visibly present and declining.
 >
-> The authoritative signal that a seat will take a job is that it claims one. The authoritative signal that it will not is a `FEEDBACK` refusal carrying `at_capacity` (see 10). A reader that waits on `accepting` instead is waiting on a field no implementation is required to consult.
+> The authoritative signal that a seat will take a job is that it claims one. The signal that it will not is the **absence** of a claim by the offer deadline: a seat that declines to bid publishes nothing at all. A reader that waits on `accepting` instead is waiting on a field no implementation is required to consult.
 
 Both tags are seller-asserted (see 17), and both ride a replaceable event, so a past value of either is unciteable after the fact (see 6.4). Their observed values across the fleet at any moment are a statement about the publishing implementations in the fleet, not about this protocol — which is the rule in 7.0 applied to a value rather than an absence.
 
@@ -343,6 +343,8 @@ After a successful pay the buyer publishes the co-signed `RECEIPT`, binding the 
 
 A non-winning claimant releases its claim without executing. A claim whose offer deadline passes with no award releases the same way. Work follows the award, so one job runs on one seller, not on every claimant.
 
+**A release is a local state transition and publishes no event.** The seller drops its reserved execution slot and releases the durable claim; nothing goes on the wire. A buyer MUST NOT wait for a release event, and a market observer MUST infer a release from the award naming a different claim, never from a published artifact.
+
 ## 9. Offer-Root Requirement
 
 Every lifecycle event after `OFFER` carries one `e` tag marked `root` whose value is the offer id:
@@ -362,7 +364,9 @@ A refusal carries the root marker for the same reason: a failure that cannot be 
 
 ## 10. Error And Reject Semantics
 
-All seller-side refusals, releases, progress notes, and failures publish `FEEDBACK`. Silent drops are forbidden.
+A seller that declines a job, or fails one it was awarded, publishes `FEEDBACK` rather than going quiet. A buyer learns the reason instead of getting silence.
+
+Two things publish `FEEDBACK`: a price decline before any claim (`below_rate`), and a failure after award (`execution_failed`, `delivery_failed`, `no_sentinel`). **Releasing a claim publishes nothing** — see 8.
 
 Wire rule:
 
@@ -384,6 +388,8 @@ Wire rule:
 | `no_sentinel` | The delivery carried no execution sentinel (19) | yes |
 
 The vocabulary is deliberately complete rather than covering only the code that prompted it. A vocabulary added at the sites that happened to prompt it, and not at the others, reproduces the original class-ambiguity defect with a `reason_code` tag sitting on top of it.
+
+Four codes have publishers: `below_rate` on a price decline, and `execution_failed` / `delivery_failed` / `no_sentinel` on a failure after award. `unsupported_version`, `mint_incompatible`, and `at_capacity` name real refusals that a seat currently takes by declining to claim, which puts nothing on the wire (see 7.8.1). A reader MUST handle all seven: the set is what a conforming reader accepts, not a promise about which ones a given seat emits — that is 7.0 applied to the vocabulary.
 
 The third column is normative for scoring, not for transport — see 17. Work failures count against a seller; declines do not. A price decline is not a work error: the buyer's correct reaction differs — raise the price or pick another seller, versus investigate a failure — and reputation cannot be scored fairly while the two share a surface. For the same reason an unsupported protocol major is its own code and is never collapsed into "unparseable".
 
