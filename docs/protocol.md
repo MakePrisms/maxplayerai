@@ -179,9 +179,26 @@ A worked instance, because the distinction has already cost a refused payment. A
 
 The offer does not name a mint: the seller authors the accepted mint(s) in its claim `creq`.
 
-The offer does not bind delivery either. Delivery coordinates are seller-chosen and appear on the `RESULT` (7.4), never on the offer.
+The offer does not name the delivery remote. Where the seller pushes is seller-chosen and appears on the `RESULT` (7.4); the offer never carries the `delivery` / `repo` / `branch` triple.
 
 A requested harness is exact-or-nothing. `any` and blank canonicalise to no request, so "no preference" has exactly one representation on the wire.
+
+#### 7.1.1 Contribution offers
+
+An offer that asks the seller to build on an existing tree carries an additive group. Absent the group, the job is greenfield and the delivery is a root commit (18.1).
+
+| Tag | Card. | Req. | Meaning | If absent |
+|---|---|---:|---|---|
+| `["job-class","contribution"]` | 1 | yes | Marks the group present | treat the job as greenfield |
+| `["target-repo", owner_pubkey, clone_url]` | 1 | yes | The repo being contributed to | reject |
+| `["base", branch, oid]` | 1 | yes | The pinned base commit the delivery parents on | reject |
+| `["accepts", "fork", ...]` | 1 | yes | Delivery forms the buyer will take; MUST include `fork` | reject |
+
+**The target repo is pinned by owner pubkey AND clone URL, never by a bare name.** The relay's name registry is global across owners, so a bare name is spoofable; the owner segment scopes the fetch, and a different owner is a different repo.
+
+**Parsing is fail-closed.** `job-class=contribution` with a missing or malformed pin, base, or `accepts` is a refusal. A malformed contribution offer is never quietly downgraded to a greenfield run — that would silently discard the buyer's base and pay for a tree built on nothing.
+
+The `base` oid is what 18.1 calls the buyer-pinned base: the delivery is exactly one commit parented on it.
 
 ### 7.2 Claim `3402`
 
@@ -243,6 +260,20 @@ The `root`-marked `e` is the offer; the other `e` is the claim. A seller matches
 The exec-metadata block (`harness` through `cost`) is opportunistic — only fields the seller can source are emitted, and `metadata_trust=seller-claimed` is present whenever any of them is. Absent stays absent: a dimension the driver never surfaced is omitted rather than zero-filled, because a fabricated `0` is worse than a rendered dash. `usage_transport` is `acp-native` for the codex adapter and `side-channel` otherwise.
 
 `tokens` qualifiers are `total`, `input`, `output`, `reasoning`, `cache_read`, and `cache_write`. `total` is `input + output + reasoning`; the cache dimensions are evidence and are never summed into `total`.
+
+#### 7.4.1 Contribution results
+
+A result answering a contribution offer (7.1.1) echoes the offer's `job-class`, `target-repo`, `base`, and `accepts` group unchanged, and adds one tag:
+
+| Tag | Card. | Req. | Meaning | If absent |
+|---|---|---:|---|---|
+| `["sig","seller-contribution",hex]` | 1 | yes | Schnorr signature over the authorship tuple | reject |
+
+**The seller's fork rides the ordinary `repo` / `branch` / `commit` tags** (7.4) — there is no separate fork tag. Those three are the fork locator and its tip, which is what the buyer fetches and merges.
+
+The signature covers the authorship tuple `{job_id, seller_pubkey, target_repo, base_oid, fork_ref, commit_oid}` and is labelled distinctly from the `["sig","seller",…]` pre-pay signature so both ride one result without ambiguity. It is domain-separated under `mobee/v1/contribution-tuple` (14) and verified at the pre-pay seam; any parse or verification failure is a zero-spend refusal.
+
+**The echo is equality-checked, never trusted.** The buyer compares the echoed group against its own signed offer rather than reading the seller's copy as authority — a seller that alters the base or target in its echo is refused, not obeyed.
 
 ### 7.5 Accept `3406`
 
