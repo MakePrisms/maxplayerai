@@ -377,7 +377,7 @@ fn ensure_seller_config(
                 })?;
             agent_command = argv;
             agent_label = Some(label.clone());
-            let _ = writeln!(err, "agent preset={label} argv0={}", agent_command[0]);
+            report_agent_preset(err, &label, &agent_command[0], &custom_agents);
         }
         if rate_sats.is_none() {
             rate_sats = Some(prompt_u64(
@@ -505,7 +505,7 @@ fn resolve_agent(
                 let _ = writeln!(err, "{message}");
                 USAGE_ERROR
             })?;
-        let _ = writeln!(err, "agent preset={label} argv0={}", argv[0]);
+        report_agent_preset(err, &label, &argv[0], custom_agents);
         return Ok((Some(label), argv));
     }
     if let Some(seller) = existing {
@@ -549,6 +549,31 @@ fn probe_relay_git_seeded(home: &MaxplayerHome, remote_url: &str) -> Result<(), 
                 ))
             }
         }
+    }
+}
+
+/// Report a resolved preset, and — for a built-in — the underlying agent CLI it still needs (#488).
+///
+/// Both preset paths (the guided wizard and the `--agent` flag) report through here, so a seller
+/// learns the prerequisite whichever way they picked the preset. Before this, the only thing that
+/// ever mentioned the underlying CLI was the probe's `-32000 Authentication required` failure,
+/// which arrives after every readiness check has already printed PASS.
+/// A `[agents]` entry may override a built-in NAME while launching something else entirely, and
+/// that config wins in `resolve_agent_preset`. Its prerequisites are then the operator's, not the
+/// built-in's — so an overridden name reports no prerequisite rather than a confidently wrong one.
+fn report_agent_preset(
+    err: &mut dyn Write,
+    label: &str,
+    argv0: &str,
+    custom_agents: &std::collections::BTreeMap<String, home::AgentPresetConfig>,
+) {
+    let _ = writeln!(err, "agent preset={label} argv0={argv0}");
+    if custom_agents.contains_key(label) {
+        return;
+    }
+    if let Some(prerequisite) = agent_presets::preset_prerequisite(label) {
+        let _ = writeln!(err, "  {label} also requires {prerequisite}");
+        let _ = writeln!(err, "  {}", agent_presets::PREREQUISITE_ENFORCEMENT);
     }
 }
 
@@ -697,6 +722,98 @@ fn sell_usage(err: &mut dyn Write) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #488: picking a preset must surface the underlying CLI's auth requirement, so the seller
+    /// reads it while choosing rather than discovering it via the probe's -32000 minutes later.
+    #[test]
+    fn reporting_a_builtin_preset_names_its_auth_prerequisite() {
+        let mut err = Vec::new();
+        let no_custom = std::collections::BTreeMap::new();
+        report_agent_preset(&mut err, "codex", "/usr/local/bin/codex-acp", &no_custom);
+        let printed = String::from_utf8(err).expect("utf8");
+
+        // The pre-existing line is preserved — this adds to the report, it does not replace it.
+        assert!(printed.contains("agent preset=codex argv0=/usr/local/bin/codex-acp"));
+        // The load-bearing addition: the CLI behind the adapter, and how to authenticate it.
+        assert!(printed.contains("codex login"), "no auth step named: {printed}");
+        assert!(
+            printed.contains("refuses to advertise"),
+            "consequence not stated: {printed}"
+        );
+    }
+
+    /// A custom `[agents]` preset has no prerequisite we could know, so the report stays exactly
+    /// as it was — no invented advice, and no blank bullet.
+    #[test]
+    fn reporting_a_custom_preset_adds_no_prerequisite() {
+        let mut err = Vec::new();
+        let no_custom = std::collections::BTreeMap::new();
+        report_agent_preset(&mut err, "my-own-agent", "/opt/mine", &no_custom);
+        let printed = String::from_utf8(err).expect("utf8");
+
+        assert!(printed.contains("agent preset=my-own-agent argv0=/opt/mine"));
+        assert_eq!(
+            printed.lines().count(),
+            1,
+            "expected only the preset line: {printed}"
+        );
+    }
+
+    /// A `[agents]` entry that OVERRIDES a built-in name launches the operator's argv, not the
+    /// built-in's CLI — so the built-in's login instructions would be confidently wrong. The name
+    /// alone must not be enough to earn a prerequisite line.
+    #[test]
+    fn an_overridden_builtin_name_reports_no_prerequisite() {
+        let mut custom = std::collections::BTreeMap::new();
+        custom.insert(
+            "codex".to_owned(),
+            home::AgentPresetConfig {
+                argv: vec!["/opt/not-codex".to_owned()],
+            },
+        );
+
+        let mut err = Vec::new();
+        report_agent_preset(&mut err, "codex", "/opt/not-codex", &custom);
+        let printed = String::from_utf8(err).expect("utf8");
+
+        assert!(printed.contains("agent preset=codex argv0=/opt/not-codex"));
+        assert!(
+            !printed.contains("codex login"),
+            "invented an auth step for someone else's argv: {printed}"
+        );
+        assert_eq!(printed.lines().count(), 1, "expected only the preset line: {printed}");
+    }
+
+    /// The wiring, not just the helper: the real `--agent` flag path must report through
+    /// `report_agent_preset`. A custom entry pointed at a file that exists resolves on any machine,
+    /// so this never depends on an adapter being installed and never passes vacuously.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn the_agent_flag_path_reports_through_the_shared_reporter() {
+        let argv0 = std::env::current_exe().expect("test binary path is a file that exists");
+        let argv0 = argv0.to_string_lossy().into_owned();
+        let mut custom = std::collections::BTreeMap::new();
+        custom.insert(
+            "mine".to_owned(),
+            home::AgentPresetConfig {
+                argv: vec![argv0.clone()],
+            },
+        );
+
+        let options = SellOptions::parse(&["--agent".into(), "mine".into()]).expect("parse");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let (label, resolved) =
+            resolve_agent(&options, None, &custom, &mut out, &mut err).expect("resolves");
+
+        assert_eq!(label.as_deref(), Some("mine"));
+        assert_eq!(resolved, vec![argv0.clone()]);
+        let printed = String::from_utf8(err).expect("utf8");
+        assert!(
+            printed.contains(&format!("agent preset=mine argv0={argv0}")),
+            "flag path did not report the preset: {printed}"
+        );
+    }
 
     #[test]
     fn refuses_key_argv() {

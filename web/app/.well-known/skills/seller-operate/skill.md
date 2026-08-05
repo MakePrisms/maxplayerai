@@ -45,20 +45,30 @@ maxplayer sell --bogus
 It must print the `maxplayer sell` Usage block. If it prints the *top-level* usage instead, `sell`
 is not in this binary. Read the output, not the exit code: **both cases exit `1`.**
 
-## 2. Install the agent adapter your preset needs
+## 2. Install the agent adapter your preset needs — **and authenticate the CLI behind it**
 
 `--agent claude|cursor|codex` resolves to a fixed ACP adapter command and spawns it. **There is no
 `npx` fallback** — if the adapter is not on the daemon's `PATH`, `sell` errors up front.
 
-| `--agent` | Binary that must be on `PATH` | Install |
-|-----------|-------------------------------|---------|
-| `claude`  | `claude-agent-acp` | `npm i -g @agentclientprotocol/claude-agent-acp` |
-| `cursor`  | `cursor-agent` (or `agent`) | install Cursor's agent CLI |
-| `codex`   | `codex-acp` | `npm i -g @agentclientprotocol/codex-acp` |
+The adapter is a shim. The credentials live in the agent CLI it drives, so installing the adapter
+alone gets you a seat that resolves everything and can still do no work:
+
+| `--agent` | Binary that must be on `PATH` | Install adapter | Underlying CLI — install **and** authenticate |
+|-----------|-------------------------------|---------|---------|
+| `claude`  | `claude-agent-acp` | `npm i -g @agentclientprotocol/claude-agent-acp` | `claude` (`npm i -g @anthropic-ai/claude-code`) — run `claude` once, complete `/login`, or set `ANTHROPIC_API_KEY` |
+| `cursor`  | `cursor-agent` (or `agent`) | install Cursor's agent CLI | none extra — `cursor-agent` **is** the CLI, but sign it in: `cursor-agent login` |
+| `codex`   | `codex-acp` | `npm i -g @agentclientprotocol/codex-acp` | `codex` (`npm i -g @openai/codex`) — `codex login`, or set `OPENAI_API_KEY` |
 
 ```bash
 command -v claude-agent-acp    # must print an absolute path
 ```
+
+**Resolvable is not authorized.** `command -v` finds a binary; it reads no credential, and neither
+does any readiness check — they can all print `PASS` on a seat with no login. An unauthenticated CLI
+fails at the **pre-advertise probe** with `{"code":-32000,"message":"Authentication required"}`, and
+the seat then refuses to advertise. That is the gate doing its job: it proves a real turn is
+possible before selling anything. Authenticate first and you never see it. Env-var credentials must
+be in the **daemon's** environment, not just your shell.
 
 Put it on the **daemon's** `PATH`, not just your login shell — systemd units, Docker entrypoints and
 cron start with a minimal `PATH`.

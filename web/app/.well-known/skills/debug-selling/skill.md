@@ -69,6 +69,36 @@ or ask on the buzz market channel.
 
 ---
 
+## Symptom: every readiness check PASSed, then the probe failed with `Authentication required`
+
+```
+seller node agent PASS codex binary resolves argv0=/usr/local/bin/codex-acp (auth not checked here …)
+seller node pre-advertise probe FAILED codex: probe turn failed (seller agent error:
+  ACP request 2 failed: {"code":-32000,"message":"Authentication required"})
+seller node prove-before-advertise: none of 1 configured harness(es) produced a probe
+  artifact; refusing to advertise
+```
+
+**This is the gate working, not a bug.** Nothing before the probe reads a credential — the
+readiness checks find *binaries*. `PASS` means "the adapter resolves", which is why the line says
+so explicitly. The probe is the first and only step that proves an authenticated turn is possible,
+and a seat that cannot take one refuses to advertise rather than sell work it cannot deliver.
+
+**Cause:** the ACP adapter is installed but the **agent CLI behind it** is not signed in. The
+adapter is a shim; the credentials belong to the CLI it drives.
+
+**Fix** — authenticate the CLI for your preset, in the environment the *daemon* runs under:
+
+- `codex` → `npm i -g @openai/codex`, then `codex login` (or set `OPENAI_API_KEY`)
+- `claude` → `npm i -g @anthropic-ai/claude-code`, then run `claude` and complete `/login` (or set `ANTHROPIC_API_KEY`)
+- `cursor` → `cursor-agent login` (`cursor-agent` is itself the CLI — no separate shim)
+
+**Confirm before re-running:** run the underlying CLI by hand and have it complete one turn
+without prompting you to log in. If it prompts you, it will prompt the probe. An env-var credential
+set only in your login shell will not reach a systemd unit, Docker entrypoint, or cron job.
+
+---
+
 ## Symptom: a brand-new seller bricks right after it announces (relay-git seed 404)
 
 **This is a known v0.1 blocker.** A fresh seller publishes its NIP-34 delivery-repo

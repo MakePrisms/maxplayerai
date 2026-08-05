@@ -174,10 +174,13 @@ agent and rate (rate default `2`) and then writes `[seller]`.
 > per-job workdir it needs to produce the deliverable.
 
 ```bash
---agent claude   # requires claude-agent-acp on PATH (npm i -g @agentclientprotocol/claude-agent-acp)
---agent cursor   # requires cursor-agent (or agent) on PATH, appends `acp`
---agent codex    # requires codex-acp on PATH (npm i -g @agentclientprotocol/codex-acp)
+--agent claude   # adapter: claude-agent-acp on PATH  + a signed-in `claude` CLI behind it
+--agent cursor   # adapter: cursor-agent (or agent) on PATH, appends `acp` + signed in
+--agent codex    # adapter: codex-acp on PATH          + a signed-in `codex` CLI behind it
 ```
+
+Each preset needs **two** things: the adapter binary on `PATH`, and the agent CLI behind it
+authenticated. Gotcha 1 in §3b has the install and login command for each.
 
 `--agent-argv` remains the **power-user escape hatch** for any other agent — build the argv array
 yourself (repeat the flag; no shell strings, no `--key`):
@@ -212,21 +215,37 @@ stdio agent. **There is no auto-`npx` fallback:** if that adapter binary is not 
 daemon's `PATH`, `maxplayer sell` errors up front with an install hint and does **no** work — it does
 not silently reach for `npx`.
 
-Each preset needs a specific binary on `PATH`:
+Each preset needs a specific binary on `PATH` — **and, except for `cursor`, an underlying agent CLI
+that is installed *and signed in*.** The adapter is a shim; the credentials belong to the CLI behind
+it. Installing only the adapter is the most common way a fresh seat fails (see the warning below).
 
-| `--agent` | Adapter binary that must be on `PATH` | Install |
-|-----------|----------------------------------------|---------|
-| `claude`  | `claude-agent-acp`                     | `npm i -g @agentclientprotocol/claude-agent-acp` |
-| `cursor`  | `cursor-agent` (or `agent`), `acp` appended | install Cursor's agent CLI |
-| `codex`   | `codex-acp`                            | `npm i -g @agentclientprotocol/codex-acp` |
+| `--agent` | Adapter binary that must be on `PATH` | Install adapter | Underlying CLI — install **and** authenticate |
+|-----------|----------------------------------------|---------|---------|
+| `claude`  | `claude-agent-acp`                     | `npm i -g @agentclientprotocol/claude-agent-acp` | `claude` (`npm i -g @anthropic-ai/claude-code`) — run `claude` once and complete `/login`, or set `ANTHROPIC_API_KEY` |
+| `cursor`  | `cursor-agent` (or `agent`), `acp` appended | install Cursor's agent CLI | none extra — `cursor-agent` **is** the CLI, but it must be signed in: `cursor-agent login` |
+| `codex`   | `codex-acp`                            | `npm i -g @agentclientprotocol/codex-acp` | `codex` (`npm i -g @openai/codex`) — `codex login`, or set `OPENAI_API_KEY` |
+
+> **Resolvable is not authorized.** Every readiness check can print `PASS` on a seat that cannot do
+> a single job: those checks find the *binary*, and none of them reads a credential. An adapter with
+> no signed-in CLI behind it fails at the **pre-advertise probe** instead, with
+> `{"code":-32000,"message":"Authentication required"}`. That refusal is working as designed — the
+> seat proves it can take a turn before it advertises, so it never sells work it cannot do. Set the
+> auth up front and you never meet it.
+
+The env-var forms (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) must be in the **daemon's** environment,
+not just your login shell — the same `PATH` caveat below applies to credentials.
 
 **Verify** (the daemon's own lookup — must print an absolute path):
 
 ```bash
-command -v claude-agent-acp    # claude preset
+command -v claude-agent-acp    # claude preset — then also: command -v claude
 command -v cursor-agent        # cursor preset (or: command -v agent)
-command -v codex-acp           # codex preset
+command -v codex-acp           # codex preset  — then also: command -v codex
 ```
+
+These prove resolution only. **Nothing you can `command -v` proves you are logged in** — for that,
+run the underlying CLI once by hand and confirm it completes a turn without asking you to
+authenticate. If it prompts for login, so will the seller's probe.
 
 **Fix** — pick one:
 
