@@ -66,7 +66,9 @@ impl HeartbeatDraft {
         }
     }
 
-    /// Convenience constructor: the heartbeat wire carries protocol version `1`.
+    /// Convenience constructor: advertise exactly the one major this build speaks,
+    /// [`PROTOCOL_VERSION`] — currently `"0"`, so the wire tag is `["protocol_versions","0"]`.
+    /// The name is historical and does not track the value.
     pub fn v1(accepting: bool, queue_depth: u32, rate_sats: u64) -> Self {
         Self::new(
             accepting,

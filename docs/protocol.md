@@ -27,13 +27,15 @@ The public events are:
 
 ## 3. Versioning
 
-Every maxplayer-owned event carries exactly one `["v","0"]` tag. `v` is a major version encoded as a decimal string. There is no minor version on the wire: this document is v0.1, the wire major is `0`.
+Every trade-path event — kinds `3400` through `3406` — carries exactly one `["v","0"]` tag. `v` is a major version encoded as a decimal string. There is no minor version on the wire: this document is v0.1, the wire major is `0`.
+
+The heartbeat `30340` is the exception. It carries **no `v` tag**, because it does not state the version of itself; it states the set of versions its publisher speaks, in `protocol_versions` (7.8). The two answer different questions, which is why they are different tags on different kinds.
 
 Additive changes ship as new tags or new optional fields on already-understood artifacts. A change that cannot be expressed that way is a new major.
 
 ### Rule A: event `v`
 
-For a maxplayer-owned event:
+For a trade-path event:
 
 - `v` absent: reject the event.
 - `v == "0"`: accept the event and ignore tags the reader does not recognize.
@@ -41,9 +43,21 @@ For a maxplayer-owned event:
 
 Rule A answers: "can I act on this artifact?" An unknown major means the reader might act wrongly on a money path, so reject is required. A version reject is a distinct outcome from a malformed-event reject — see the `unsupported_version` reason code in 10.
 
-### Capability advertisement
+### Rule B: heartbeat `protocol_versions`
 
-A reader learns what a seat can do from the seat's own publications: kind `31990` for capability facts, kind `30340` for liveness. Neither carries a version list; a peer's spoken major is observed from the `v` tag on the events it publishes.
+For the kind-`30340` heartbeat:
+
+- `protocol_versions` absent: reject the heartbeat.
+- The tag carries every major the publisher speaks, one per extra tag position: `["protocol_versions", "0", …]`. A seat on this protocol publishes `["protocol_versions","0"]`.
+- Entries naming a major the reader does not speak are options the reader cannot use. A reader MUST ignore them rather than treat the heartbeat as malformed.
+
+Rule B answers a different question from Rule A: not "can I act on this artifact?" but "what can this peer do?"
+
+### Deliberate asymmetry
+
+Rule A **rejects** an event of an unknown major. Rule B **ignores** unknown entries inside a heartbeat's version list. This is deliberate and MUST NOT be unified. Acting on an artifact you have misread is a money-path error, so reject is required; an unusable option in a capability list is not an error at all.
+
+A seat whose list shares no major with the reader is unusable, not faulty. Selecting among shared majors is reader policy — nothing in the shipped code consumes the parsed list to pick one, because there is only one major to pick.
 
 ## 4. Event Kinds
 
@@ -127,9 +141,22 @@ This constrains what any claim about past market behaviour can be grounded in, i
 
 ### 7.0 Reading these tables: absence is never a negative
 
-The tables below have two kinds of column. **Tag, Card., and Meaning describe what publishers put on the wire.** **Req. and "If absent" are requirements on readers** — what a conforming reader does with the artifact it receives, which is a stricter thing than what any one implementation currently checks.
+The tables below have two kinds of column. **Tag, Card., and Meaning describe what publishers put on the wire.** **Req. and "If absent" bind readers** — what a conforming reader does with the artifact it receives.
 
 Where "If absent" says *treat as unstated*, that is a normative requirement rather than a default.
+
+#### What the shipped reader validates
+
+A conforming reader enforces every row. The shipped reader has four validating entry points, and they do not all reach the same depth — an implementer replacing one should know which guarantees it is inheriting and which it is providing:
+
+| Entry point | Enforces |
+|---|---|
+| Offer | kind, `t`, `v` present and equal to `0`, `amount` with unit `sat`, `deadline` |
+| Heartbeat | kind, `t`, `d`, `accepting`, `queue_depth`, `rate`, `protocol_versions` |
+| Git result delivery | kind, `t`, `delivery=git`, `repo`, `branch`, `commit` (parsed as an oid) — **not `v`** |
+| Award / accept | kind and the two `e` tags — **neither `t` nor `v` nor `p` nor `status`** |
+
+The award and accept readers are narrow by construction: each gates on its own kind first, and the kind is the discriminator that matters for those two events (12). A reader that needs the namespace and version guarantees on a selection or a pay-bind checks them itself.
 
 > Rule: a reader MUST NOT convert the absence of an optional field into a negative claim about the publisher.
 
@@ -280,7 +307,10 @@ The echoed exec metadata is **not** covered by the co-signatures.
 | `["accepting","y"` or `"n"]` | 1 | yes | Seller-asserted intent to take work — see 7.8.1 | reject |
 | `["queue_depth", n]` | 1 | yes | Jobs in a named non-terminal state — see 7.8.1 | reject |
 | `["rate", sats]` | 1 | yes | Advertised rate | reject |
+| `["protocol_versions", "0", ...]` | 1 | yes | Majors the publisher speaks — see 3 | reject |
 | `["mobee_agent", ...]` | 0..1 | no | Advertised harness roster | treat as unstated |
+
+The heartbeat carries no `v` tag (3). `protocol_versions` is a multi-value tag: every spoken major occupies its own extra position after the tag name.
 
 #### 7.8.1 What the availability tags do not mean
 
