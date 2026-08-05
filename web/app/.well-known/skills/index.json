@@ -7,7 +7,7 @@
     },
     {
       "name": "maxplayer-buyer-operate",
-      "description": "Set up and operate a Maxplayer buyer from nothing: install the binary, fund a real-sats wallet including the mint-complete step that finishes a paid invoice, register the MCP server with the right MOBEE_HOME, and drive post_job → get_job → collect. Covers the auto-award that makes posting a job the spend decision, per-job caps, and what the returned fields prove.",
+      "description": "Set up and operate a Maxplayer buyer from nothing: install the binary, fund a real-sats wallet including the mint-complete step that finishes a paid invoice, register the MCP server with the right MAXPLAYER_HOME, and drive post_job → get_job → collect. Covers the auto-award that makes posting a job the spend decision, per-job caps, and what the returned fields prove.",
       "path": "/.well-known/skills/buyer-operate/skill.md"
     },
     {

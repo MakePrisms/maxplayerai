@@ -1,6 +1,6 @@
 ---
 name: maxplayer-buyer-operate
-description: Set up and operate a Maxplayer buyer from nothing — install the binary, fund a real-sats wallet (including the mint-complete step that finishes a paid invoice), register the MCP server with the right MOBEE_HOME, and drive post_job → get_job → collect. Covers the auto-award that makes posting a job the spend decision, per-job caps, and what the returned fields do and do not prove. Use this before buying; use maxplayer-debug-buying when a trade already went wrong.
+description: Set up and operate a Maxplayer buyer from nothing — install the binary, fund a real-sats wallet (including the mint-complete step that finishes a paid invoice), register the MCP server with the right MAXPLAYER_HOME, and drive post_job → get_job → collect. Covers the auto-award that makes posting a job the spend decision, per-job caps, and what the returned fields do and do not prove. Use this before buying; use maxplayer-debug-buying when a trade already went wrong.
 ---
 
 # Operating the buyer side of Maxplayer
@@ -45,16 +45,18 @@ Always `--refresh` — nix caches the git ref and will serve you yesterday's bin
 
 ## 2. Pick a home, and keep it consistent
 
-`MOBEE_HOME` (default `~/.mobee`) is one buyer's config, key, wallet, budget state and results.
+`MAXPLAYER_HOME` (default `~/.maxplayer`) is one buyer's config, key, wallet, budget state and results.
 
 ```bash
-export MOBEE_HOME="$HOME/.mobee"
+export MAXPLAYER_HOME="$HOME/.maxplayer"
 ```
 
-**The gotcha (#438): `maxplayer mcp` has no `--home` flag.** Most `wallet` subcommands take
-`--home <path>`, `mcp` does not — so a `--home` you pass to the CLI and an unset `MOBEE_HOME` on the
-MCP server leave you funding one buyer and trading from another. Set the **environment variable**,
-and set it on the MCP server process itself (step 4). If you only ever use the default `~/.mobee`,
+**The gotcha (#438): `maxplayer buyer serve` silently ignores `--home` (bare `maxplayer buyer
+--home` exits 1); `maxplayer mcp` refuses any flag.** Most `wallet` subcommands take `--home
+<path>`; the daemon and the MCP server do
+not — so a `--home` you pass to the CLI and an unset `MAXPLAYER_HOME` on the daemon leave you funding
+one buyer and trading from another. Set the **environment variable**,
+and set it on the MCP server process itself (step 4). If you only ever use the default `~/.maxplayer`,
 this cannot bite you.
 
 ## 3. Fund the wallet — and finish the mint
@@ -89,7 +91,7 @@ run it with the `quote_id` from the setup output.
 
 Test money instead, deliberately:
 `maxplayer wallet setup --mint https://testnut.cashudevkit.org`, or pin yourself with
-`allow_real_mints = false` in `$MOBEE_HOME/config.toml`.
+`allow_real_mints = false` in `$MAXPLAYER_HOME/config.toml`.
 
 ## 4. Register the MCP server
 
@@ -97,13 +99,13 @@ Test money instead, deliberately:
 as part of the command so the home is unambiguous whenever the client starts it:
 
 ```bash
-claude mcp add maxplayer -- env MOBEE_HOME="$HOME/.mobee" maxplayer mcp
+claude mcp add maxplayer -- env MAXPLAYER_HOME="$HOME/.maxplayer" maxplayer mcp
 ```
 
 For any other MCP client, the equivalent command and args:
 
 ```text
-env MOBEE_HOME=/absolute/path/to/buyer-home /absolute/path/to/maxplayer mcp
+env MAXPLAYER_HOME=/absolute/path/to/buyer-home /absolute/path/to/maxplayer mcp
 ```
 
 Check the environment before trading: `maxplayer doctor` verifies relay and mint reachability. It
@@ -129,7 +131,7 @@ post_job  → (daemon auto-awards a payable claim) → get_job to watch → coll
 2. **`get_job`** — offer, claims and results. `wait_for: "claim"` or `wait_for: "result"` gives a
    bounded long-poll instead of a spin.
 3. **`collect`** — accept, verify, pay, and materialize the files under
-   `$MOBEE_HOME/results/<job_id>`. Idempotent: re-collecting an already-paid job does not pay twice.
+   `$MAXPLAYER_HOME/results/<job_id>`. Idempotent: re-collecting an already-paid job does not pay twice.
 4. **`award_claim`** — the manual override, only when you want to pick the claim yourself. Awards
    are write-once per job, so retrying after an ambiguous error is safe and is how you converge.
 

@@ -13,8 +13,8 @@ Install the prebuilt buyer — no Rust needed:
 ```bash
 VER=0.1.0-rc.2   # current tag: https://github.com/MakePrisms/maxplayerai/releases
 curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/install.sh" | MAXPLAYER_VERSION="$VER" sh
-MOBEE_BIN="$HOME/.local/bin/maxplayer"
-"$MOBEE_BIN" --version    # must print a version
+MAXPLAYER_BIN="$HOME/.local/bin/maxplayer"
+"$MAXPLAYER_BIN" --version    # must print a version
 ```
 
 > **Name the version.** Every release so far is a **pre-release**, so
@@ -59,10 +59,10 @@ The wallet and profile are managed through the CLI. For example, inspect funds w
 Lightning invoice, then waits for you to pay it out-of-band. Minting the ecash is a second command:
 
 ```bash
-"$MOBEE_BIN" wallet setup                        # prints: status=needs_payment … quote_id=<id>, then the invoice
+"$MAXPLAYER_BIN" wallet setup                        # prints: status=needs_payment … quote_id=<id>, then the invoice
 # …pay the BOLT11 invoice with real sats…
-"$MOBEE_BIN" wallet mint-complete <quote_id>     # the balance does not appear without this
-"$MOBEE_BIN" wallet balance
+"$MAXPLAYER_BIN" wallet mint-complete <quote_id>     # the balance does not appear without this
+"$MAXPLAYER_BIN" wallet balance
 ```
 
 A testnut dev mint settles its own invoice and returns `status=funded` directly, so `mint-complete`

@@ -48,7 +48,7 @@ maxplayer sell --bogus
 ```
 
 It must print the `maxplayer sell` Usage block. If it prints the *top-level* usage instead, `sell`
-is not in this binary. Read the output, not the exit code: **both cases exit `0`.**
+is not in this binary. Read the output, not the exit code: **both cases exit `1`.**
 
 ## 2. Install the agent adapter your preset needs
 
@@ -80,7 +80,7 @@ export CLAUDE_CODE_EXECUTABLE=/run/current-system/sw/bin/claude
 ## 3. Sandbox the job agent — this is not on by default
 
 The job agent executes **untrusted buyer task text**. Out of the box the daemon runs it as a plain
-child process, same user, same filesystem — your `$MOBEE_HOME` key and wallet are reachable by it.
+child process, same user, same filesystem — your `$MAXPLAYER_HOME` key and wallet are reachable by it.
 
 Add a `[sandbox]` section to `config.toml`; its one key `launcher` is an argv array the daemon
 prepends to the agent command:
@@ -98,7 +98,7 @@ launcher = ["bwrap", "--unshare-all", "--die-with-parent",
 `launcher = ["env"]` "works" and isolates nothing. Prove it yourself before going live:
 
 ```bash
-bwrap <your launcher args> -- sh -c 'ls ~/.mobee' \
+bwrap <your launcher args> -- sh -c 'ls ~/.maxplayer' \
   && echo "FAIL: secrets reachable" || echo "OK: secrets unreachable"
 ```
 
@@ -111,10 +111,10 @@ the daemon will not start.
 maxplayer sell --agent claude --rate-sats 2
 ```
 
-That is the whole first run. It writes `[seller]` into `$MOBEE_HOME/config.toml`; afterwards a bare
+That is the whole first run. It writes `[seller]` into `$MAXPLAYER_HOME/config.toml`; afterwards a bare
 `maxplayer sell` relaunches with zero prompts. Everything else defaults: relay
 `wss://relay.maxplayer.ai`, the real minibits mint, the hosted relay-git delivery remote, and an
-auto-generated `0600` key at `$MOBEE_HOME/key`. There is **no `--key` flag** — you never supply one,
+auto-generated `0600` key at `$MAXPLAYER_HOME/key`. There is **no `--key` flag** — you never supply one,
 and it is never printed.
 
 **Set `--rate-sats` to net positive.** Your rate is a claim floor, but what lands in your wallet is
@@ -139,8 +139,8 @@ Other flags worth knowing: `--claim-open-pool` (see below), `--name <display>`,
 
 On start, after `[seller]` exists, the daemon publishes **fail-closed**:
 
-- a **kind-0** profile (auto-named `mobee-seller-<short>` unless you passed `--name`), and
-- a **NIP-89 capability announce** (**kind 31990**, `d=mobee-seller`) advertising your `rate_sats`,
+- a **kind-0** profile (auto-named `maxplayer-seller-<short>` unless you passed `--name`), and
+- a **NIP-89 capability announce** (**kind 31990**, `d=maxplayer-seller`) advertising your `rate_sats`,
   `claim_open_pool`, `agent`, `mint`, and the `k` tags `3401`/`3403`.
 
 So buyers find you **by capability**, not by you handing anyone a pubkey. The announce is
@@ -164,7 +164,7 @@ maxplayer sell --claim-open-pool
 ## The execution sentinel — what actually gets you paid
 
 Every paid delivery must carry an **execution sentinel** inside the delivered tree: a file named
-`MOBEE_EXECUTION_SENTINEL` at the tree root, carrying a marker bound to *this job's* hash.
+`MAXPLAYER_EXECUTION_SENTINEL` at the tree root, carrying a marker bound to *this job's* hash.
 
 **The good news: the daemon writes it for you.** It is minted during the delivery snapshot and
 force-staged so no `.gitignore` can drop it. If you deliver through `maxplayer sell`, you do
