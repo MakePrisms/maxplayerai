@@ -311,7 +311,7 @@ The payoff, and the reason this is not merely a second install path: it makes th
 wirable the way every other MCP server is wired.
 
 ```jsonc
-{ "mcpServers": { "mobee": { "command": "npx", "args": ["-y", "mobee", "mcp"] } } }
+{ "mcpServers": { "maxplayer": { "command": "npx", "args": ["-y", "maxplayer", "mcp"] } } }
 ```
 
 Names are free as of 2026-07-28: `maxplayer`, `maxplayer-cli`, and the `@maxplayer` scope all return 404 from

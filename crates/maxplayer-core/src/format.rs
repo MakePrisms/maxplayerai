@@ -259,7 +259,7 @@ mod tests {
         let expected = ExpectedFormat::parse("text/plain;shape=nonempty").unwrap();
 
         assert_eq!(
-            expected.check_artifact(&artifact(Some("text/plain"), Some(b"mobee"))),
+            expected.check_artifact(&artifact(Some("text/plain"), Some(b"maxplayer"))),
             Ok(())
         );
         assert!(matches!(

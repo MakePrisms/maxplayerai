@@ -494,12 +494,12 @@ mod tests {
 
     #[test]
     fn usage_and_version() {
-        let (code, out, err) = run_captured(["mobee"]);
+        let (code, out, err) = run_captured(["maxplayer"]);
         assert_eq!(code, 1);
         assert!(out.is_empty());
         assert!(err.contains("Usage:"));
 
-        let (code, out, err) = run_captured(["mobee", "unknown"]);
+        let (code, out, err) = run_captured(["maxplayer", "unknown"]);
         assert_eq!(code, 1);
         assert!(out.is_empty());
         assert!(err.contains("Usage:"));
@@ -575,7 +575,7 @@ mod tests {
         })
         .expect("append queued");
 
-        let (code, out, err) = run_captured(["mobee", "log", "replay", path.to_str().unwrap()]);
+        let (code, out, err) = run_captured(["maxplayer", "log", "replay", path.to_str().unwrap()]);
         assert_eq!(code, 0);
         assert!(err.is_empty());
         let envelopes = parse_lines::<Envelope>(&out);
@@ -618,7 +618,7 @@ mod tests {
             .write_all(b"{not json}\n")
             .expect("write corrupt tail");
 
-        let (code, out, err) = run_captured(["mobee", "log", "replay", path.to_str().unwrap()]);
+        let (code, out, err) = run_captured(["maxplayer", "log", "replay", path.to_str().unwrap()]);
         assert_eq!(code, 2);
         assert!(err.contains("failed to decode event envelope"));
         let envelopes = parse_lines::<Envelope>(&out);
@@ -657,7 +657,7 @@ mod tests {
         );
 
         let (code, out, err) = run_captured([
-            "mobee",
+            "maxplayer",
             "mock",
             "run",
             "--script",
@@ -730,7 +730,7 @@ mod tests {
         );
 
         let (code, out, err) = run_captured([
-            "mobee",
+            "maxplayer",
             "mock",
             "run",
             "--script",
@@ -764,7 +764,7 @@ mod tests {
         );
 
         let (code, _out, err) = run_captured([
-            "mobee",
+            "maxplayer",
             "mock",
             "run",
             "--script",
@@ -881,7 +881,7 @@ mod tests {
         let mut err = Vec::new();
         let code = run(
             [
-                "mobee".to_owned(),
+                "maxplayer".to_owned(),
                 "run".to_owned(),
                 "--agent-command".to_owned(),
                 command,

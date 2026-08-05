@@ -831,7 +831,7 @@ mod tests {
         );
 
         // Red leg / positive control: the same resolver pointed at the retired
-        // `maxplayer` name resolves to `maxplayer` — a binary nothing has installed
+        // `mobee` name resolves to `mobee` — a binary nothing has installed
         // since #262. If this differed from the assertion above the test would
         // be a no-op guard; instead it proves the name is what makes it pass.
         let retired = resolve_cli_command("mobee", Some(no_sibling));
