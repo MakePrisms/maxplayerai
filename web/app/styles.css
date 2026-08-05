@@ -164,12 +164,29 @@ a { color: var(--blue); }
    agent, and a leading "$" would invite someone to paste it into a terminal. */
 .run.prose code::before { content: none; }
 
-/* One row height for every control here, so flipping between the two states
-   cannot change the block's height. */
-/* full width rather than the inline-flex .runs default: shrink-to-fit would size
-   the block to whichever state is showing, so the picker itself would jump
-   sideways on the flip even once the heading above it is pinned. */
-.pick { --pick-h: 46px; margin-top: 40px; display: flex; width: 100%; }
+/* One row height and ONE width for everything here, so neither state can change
+   the block's size and both rows share their outer edges.
+
+   --pick-w is not a free choice: the copy box has to hold the longer of the two
+   instruction lines (73 characters) without scrolling. Measured in the shipped
+   font, that line is 460px at --pick-fs, and the box spends a further 164px on
+   code padding, the copy button, the X and the gap between them — so the width
+   below is that sum plus a little slack for font fallback. Retune the two
+   together if either the lines or the chrome change.
+
+   A narrower block than .hero-in is safe: .hero-in stays its own fixed width, so
+   the heading is still decoupled from anything the picker does.
+
+   Block-level, not the inline-flex .runs default: shrink-to-fit would size the
+   block to whichever state is showing, so the picker itself would jump sideways
+   on the flip even once the heading above it is pinned. */
+.pick {
+  --pick-h: 46px;
+  --pick-w: 640px;
+  --pick-fs: 10.5px;
+  display: flex; width: min(100%, var(--pick-w));
+  margin: 40px auto 0; gap: 18px;
+}
 .pick-lbl {
   margin: 0; color: var(--muted);
   font-size: 11px; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase;
@@ -185,7 +202,7 @@ a { color: var(--blue); }
 .pick[data-picked="no"] .pick-picked,
 .pick[data-picked="yes"] .pick-roles { visibility: hidden; }
 
-.pick-roles { display: flex; gap: 16px; flex-wrap: wrap; }
+.pick-roles { display: flex; gap: 24px; flex-wrap: wrap; }
 /* Same well as .run — a role button is one half of the box it turns into. */
 .pick-roles .role {
   flex: 1 1 0; min-width: 150px; height: var(--pick-h);
@@ -199,8 +216,10 @@ a { color: var(--blue); }
 
 .pick-picked { display: flex; align-items: stretch; gap: 10px; min-width: 0; }
 .pick-picked .run { flex: 1; height: var(--pick-h); }
-/* the row height comes from --pick-h now; vertical padding would fight it */
-.pick-picked .run code { padding-top: 0; padding-bottom: 0; }
+/* the row height comes from --pick-h now; vertical padding would fight it.
+   The type is a step down from the shell boxes so the whole line fits the
+   tightened width — see the --pick-w note above. */
+.pick-picked .run code { padding-top: 0; padding-bottom: 0; font-size: var(--pick-fs); }
 .pick-clear {
   flex: none; width: var(--pick-h); height: var(--pick-h);
   background: #070404; border: 1px solid var(--line); border-radius: 9px;
