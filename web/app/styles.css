@@ -112,7 +112,10 @@ a { color: var(--blue); }
       var(--neon) 81.8% 82.4%,
       var(--bg) 82.4% 100%);
 }
-.hero-in { max-width: 760px; min-width: 0; }
+/* width, not just max-width: as a flex item this box would otherwise be
+   shrink-to-fit, so the picker below changing content width would resize it and
+   drag the heading sideways. Fixed width decouples the heading from the picker. */
+.hero-in { width: 100%; max-width: 760px; min-width: 0; }
 .hero h1 {
   margin: 0; font-size: clamp(40px, 8.5vw, 86px); font-weight: 700;
   letter-spacing: 0.12em; line-height: 1.02; color: var(--ink);
@@ -161,30 +164,50 @@ a { color: var(--blue); }
    agent, and a leading "$" would invite someone to paste it into a terminal. */
 .run.prose code::before { content: none; }
 
+/* One row height for every control here, so flipping between the two states
+   cannot change the block's height. */
+/* full width rather than the inline-flex .runs default: shrink-to-fit would size
+   the block to whichever state is showing, so the picker itself would jump
+   sideways on the flip even once the heading above it is pinned. */
+.pick { --pick-h: 46px; margin-top: 40px; display: flex; width: 100%; }
 .pick-lbl {
   margin: 0; color: var(--muted);
   font-size: 11px; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase;
-  text-align: left;
+  text-align: center;
 }
-.pick-roles { display: flex; gap: 10px; flex-wrap: wrap; }
-/* `display` on .run and .pick-roles outranks the UA rule for [hidden]. */
-.run[hidden], .pick-roles[hidden] { display: none; }
+/* Both states occupy the SAME grid cell: the cell is sized to the larger of
+   them and keeps that size in both, so the hero heading never shifts on click.
+   They swap by visibility — `hidden` would drop one out of layout and give the
+   cell back its old collapsing behaviour. visibility also takes the inert state
+   out of the tab order and the accessibility tree, which display:none did. */
+.pick-swap { display: grid; }
+.pick-swap > * { grid-area: 1 / 1; }
+.pick[data-picked="no"] .pick-picked,
+.pick[data-picked="yes"] .pick-roles { visibility: hidden; }
+
+.pick-roles { display: flex; gap: 16px; flex-wrap: wrap; }
 /* Same well as .run — a role button is one half of the box it turns into. */
 .pick-roles .role {
-  flex: 1 1 0; min-width: 150px;
+  flex: 1 1 0; min-width: 150px; height: var(--pick-h);
   background: #070404; border: 1px solid var(--line); border-radius: 9px;
-  color: var(--ink); cursor: pointer; padding: 14px 18px;
+  color: var(--ink); cursor: pointer; padding: 0 18px;
   font-size: 11.5px; font-weight: 700;
   letter-spacing: 0.16em; text-transform: uppercase;
   transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
 }
 .pick-roles .role:hover { background: var(--neon); border-color: var(--neon); color: #0a0d02; }
-.pick-again {
-  align-self: flex-start; border: 0; background: none; padding: 0;
-  color: var(--faint); cursor: pointer;
-  font-family: var(--sans); font-size: 11px; letter-spacing: 0.1em;
+
+.pick-picked { display: flex; align-items: stretch; gap: 10px; min-width: 0; }
+.pick-picked .run { flex: 1; height: var(--pick-h); }
+/* the row height comes from --pick-h now; vertical padding would fight it */
+.pick-picked .run code { padding-top: 0; padding-bottom: 0; }
+.pick-clear {
+  flex: none; width: var(--pick-h); height: var(--pick-h);
+  background: #070404; border: 1px solid var(--line); border-radius: 9px;
+  color: var(--muted); cursor: pointer; font-size: 18px; line-height: 1;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
 }
-.pick-again:hover { color: var(--ink); }
+.pick-clear:hover { background: var(--neon); border-color: var(--neon); color: #0a0d02; }
 /* balance: the browser evens the line lengths instead of filling line 1 and
    leaving a stub on line 2. max-width keeps it to two lines to balance. */
 /* margin-inline auto, not just max-width: the hero centers its TEXT, but a
@@ -440,7 +463,8 @@ h2, h3, .brand span, .eyebrow { font-weight: 600; font-style: italic; }
 /* action controls go full red */
 .run button:hover { background: var(--blue); color: #fff; }
 .run button.ok, .run button.ok:hover { background: var(--blue); color: #fff; }
-.pick-roles .role:hover { background: var(--blue); border-color: var(--blue); color: #fff; }
+.pick-roles .role:hover,
+.pick-clear:hover { background: var(--blue); border-color: var(--blue); color: #fff; }
 .windows button[aria-pressed="true"] { background: var(--blue); color: #fff; }
 
 /* buy/sell: the livery carries through — slimmer stripe sets, same 102° lean.

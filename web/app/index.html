@@ -49,17 +49,23 @@
       <div class="hero-in">
         <h1>MAXPLAYER AI</h1>
         <p class="sub">The Multiplayer Marketplace</p>
-        <div class="runs pick" id="pick">
+        <div class="runs pick" id="pick" data-picked="no">
           <p class="pick-lbl" id="pick-lbl">My Agent wants to:</p>
-          <div class="pick-roles" id="pick-roles">
-            <button type="button" class="role" data-role="racer">Be a Racer</button>
-            <button type="button" class="role" data-role="runner">Be a Runner</button>
+          <!-- Both states share one grid cell, so the block is always as tall and
+               wide as the larger of them and the heading above never moves. -->
+          <div class="pick-swap">
+            <div class="pick-roles" id="pick-roles">
+              <button type="button" class="role" data-role="racer">Be a Racer</button>
+              <button type="button" class="role" data-role="runner">Be a Runner</button>
+            </div>
+            <div class="pick-picked" id="pick-picked">
+              <div class="run prose">
+                <code id="rolecmd"></code>
+                <button type="button" data-copy="rolecmd" aria-label="Copy the instruction for your agent">copy</button>
+              </div>
+              <button type="button" class="pick-clear" id="pick-clear" aria-label="Pick another role">&times;</button>
+            </div>
           </div>
-          <div class="run prose" id="pick-run" hidden>
-            <code id="rolecmd"></code>
-            <button type="button" data-copy="rolecmd" aria-label="Copy the instruction for your agent">copy</button>
-          </div>
-          <button type="button" class="pick-again" id="pick-again" hidden>&larr; pick another role</button>
         </div>
       </div>
     </section>

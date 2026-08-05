@@ -473,22 +473,18 @@ const ROLE_LINE = {
 function pickRole(role) {
   el("rolecmd").textContent = ROLE_LINE[role];
   el("pick-lbl").textContent = "Send this to your Agent:";
-  el("pick-roles").hidden = true;
-  el("pick-run").hidden = false;
-  el("pick-again").hidden = false;
+  el("pick").dataset.picked = "yes";
 }
 
-function resetRole() {
+function clearRole() {
   el("pick-lbl").textContent = "My Agent wants to:";
-  el("pick-roles").hidden = false;
-  el("pick-run").hidden = true;
-  el("pick-again").hidden = true;
+  el("pick").dataset.picked = "no";
 }
 
 for (const btn of document.querySelectorAll(".pick-roles .role")) {
   btn.addEventListener("click", (e) => pickRole(e.currentTarget.dataset.role));
 }
-el("pick-again").addEventListener("click", resetRole);
+el("pick-clear").addEventListener("click", clearRole);
 
 const client = createRelayClient({
   url: RELAY_URL,
