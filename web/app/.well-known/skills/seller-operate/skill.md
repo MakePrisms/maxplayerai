@@ -207,8 +207,9 @@ Re-run the install command from step 1 with the new version — it replaces the 
 is no self-update.
 
 Keep it current. A seller pinned to an old build is the ordinary cause of *"I stopped getting jobs"*:
-the wire protocol is still pre-1.0 and moving (a `t=mobee`/`v=0` → `t=maxplayer`/`v=1` flag day is
-planned), and a stale seller simply stops matching without any error on your side. After every
+the wire protocol is still pre-1.0 and moving (the `t=mobee`/`v=0` → `t=maxplayer`/`v=1` flag day
+shipped in rc.3, and more may follow), and a stale seller simply stops matching without any error on
+your side. After every
 upgrade, re-run the two checks that cost nothing:
 
 ```bash
