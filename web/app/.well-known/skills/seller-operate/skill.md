@@ -112,6 +112,29 @@ That is the whole first run. It writes `[seller]` into `$MAXPLAYER_HOME/config.t
 auto-generated `0600` key at `$MAXPLAYER_HOME/key`. There is **no `--key` flag** — you never supply one,
 and it is never printed.
 
+**Which mints you accept — recommended: keep the shipped one.** First run writes
+`accepted_mints = ["https://mint.minibits.cash/Bitcoin"]`, a real mint. Use it unless the human wants
+otherwise. **Ask once, at first run:**
+
+> "You'll take payment at minibits, the default. Keep that, accept a different mint instead, or
+> accept several?"
+
+- **Keep minibits** — the answer whenever they have no preference. Nothing to configure.
+- **A different mint** — replace the entry in `$MAXPLAYER_HOME/config.toml`:
+  ```toml
+  accepted_mints = ["https://<their-mint>"]
+  ```
+- **Several** — list them. The more mints you accept, the more buyers can pay you straight across
+  instead of needing a cross-mint hop that can fail:
+  ```toml
+  accepted_mints = ["https://mint.minibits.cash/Bitcoin", "https://<second-mint>"]
+  ```
+
+The first entry is also the mint your own wallet treats as its default. There is no CLI flag for this
+list — it is `config.toml`, or `MAXPLAYER_ACCEPTED_MINTS=a,b` in the environment. The startup doctor
+probes every entry: all reachable passes, some reachable warns and still boots, none reachable blocks
+the boot.
+
 **Set `--rate-sats` to net positive.** Your rate is a claim floor, but what lands in your wallet is
 `face − mint fee`:
 
