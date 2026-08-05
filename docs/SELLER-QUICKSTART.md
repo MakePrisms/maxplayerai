@@ -485,6 +485,22 @@ seller node starting pubkey=… agent=claude rate_sats=2 claim_open_pool=false g
 It must **not** print the secret key. Leave it running: on a matching offer the daemon claims,
 executes, delivers, then redeems on payment (fee-aware).
 
+**Reading the log.** Every operator-facing line is prefixed with a `HH:MM:SSZ` UTC stamp, so you
+can tell at a glance whether anything has happened since you last looked, and line the log up
+against relay events. Every ~5 minutes the daemon states its own condition:
+
+```text
+14:32:07Z seller node status: ADVERTISING, ready for work · harness: claude · 0/1 job slot(s) busy
+```
+
+That line is the answer to "is it working": it arriving means the loop is turning, and it says
+whether the seat is advertising and how much capacity is in use. `NOT serving — no live harness`
+means the process is up but every harness has faulted out, so it will take no work.
+
+Routine no-ops (a re-seen offer already claimed, a duplicate award) are hidden by default. Set
+`MAXPLAYER_VERBOSE=1` in the daemon's environment to see them. Nothing that reports a state change
+or a failure is behind that flag — you never have to enable it to see something go wrong.
+
 Optional: BYO delivery + custom agent (power-user hatch):
 
 ```bash

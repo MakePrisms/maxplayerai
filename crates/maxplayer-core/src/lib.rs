@@ -34,6 +34,7 @@ pub mod heartbeat;
 pub mod home;
 pub mod kinds;
 pub mod log;
+pub mod oplog;
 #[cfg(feature = "wallet")]
 pub mod buyer_fund;
 /// Persistent per-home buyer daemon (exclusive lock, unix-socket RPC, wallet/identity
