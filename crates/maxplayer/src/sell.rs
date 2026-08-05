@@ -58,6 +58,11 @@ struct SellOptions {
     /// Bypass the startup doctor readiness gate (issue #107). Default is checks-ON; this is a
     /// documented escape hatch for operators who knowingly want to boot without passing checks.
     skip_doctor: bool,
+    /// Serve the open pool with no working sandbox, deliberately (#451). Narrower than
+    /// `--skip-doctor`, and that is the point: this waives ONE finding and leaves every other check
+    /// blocking, so an operator who accepts the code-execution exposure does not also switch off the
+    /// relay, mint and key gates to get past it.
+    unsafe_no_sandbox: bool,
 }
 
 /// Entry from `cli::run` for `maxplayer sell ...`.
@@ -149,7 +154,12 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
         );
         None
     } else {
-        Some(crate::doctor::sell_readiness_gate(&home, out, err))
+        Some(crate::doctor::sell_readiness_gate(
+            &home,
+            options.unsafe_no_sandbox,
+            out,
+            err,
+        ))
     };
     readiness_decision(gate)?;
 
@@ -588,6 +598,7 @@ impl SellOptions {
             match args[index].as_str() {
                 "--non-interactive" => options.non_interactive = true,
                 "--skip-doctor" => options.skip_doctor = true,
+                "--unsafe-no-sandbox" => options.unsafe_no_sandbox = true,
                 "--claim-open-pool" => options.claim_open_pool = Some(true),
                 "--no-claim-open-pool" => options.claim_open_pool = Some(false),
                 "--key" | "--secret-key" | "--private-key" => {
@@ -679,7 +690,7 @@ impl SellOptions {
 fn sell_usage(err: &mut dyn Write) {
     let _ = writeln!(
         err,
-        "Usage:\n  maxplayer sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>] [--skip-doctor]\n  maxplayer sell   # zero-prompt relaunch from config.toml\n  maxplayer sell --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash (a REAL mint — jobs settle in real sats) git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint\n  - --skip-doctor: bypass the startup readiness gate (default: checks-on; not recommended)\n  - open-pool claiming is OFF by default; pass --claim-open-pool to opt in\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)"
+        "Usage:\n  maxplayer sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>] [--skip-doctor]\n  maxplayer sell   # zero-prompt relaunch from config.toml\n  maxplayer sell --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash (a REAL mint — jobs settle in real sats) git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint\n  - --skip-doctor: bypass the startup readiness gate (default: checks-on; not recommended)\n  - --unsafe-no-sandbox: serve the OPEN POOL with no working sandbox — this box then runs code written by strangers with no containment (waives only that one check)\n  - open-pool claiming is OFF by default; pass --claim-open-pool to opt in\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)"
     );
 }
 

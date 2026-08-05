@@ -101,6 +101,8 @@ mod checks {
     use maxplayer_core::home::DEFAULT_MINIBITS_MINT_URL;
     use maxplayer_core::home::{AgentPresetConfig, SandboxConfig, SellerConfig, TelemetryConfig};
     use maxplayer_core::seller_exec::SandboxPolicy;
+
+    use crate::sandbox_probe::Containment;
     use maxplayer_core::seller_git;
 
     use super::Check;
@@ -116,6 +118,9 @@ mod checks {
     const AGENT_CHECK: &str = "agent preset";
     const TELEMETRY_CHECK: &str = "telemetry";
     const SANDBOX_CHECK: &str = "sandbox launcher";
+    /// Named apart from SANDBOX_CHECK on purpose: one says the launcher exists, the other says it
+    /// confines, and a reader scanning the output must be able to tell which one passed.
+    const CONTAINMENT_CHECK: &str = "sandbox containment";
 
     // Informational only: the seller signs NIP-98 in-process (libgit2 transport), so the
     // external `git-credential-nostr` helper is not required for delivery push / base fetch.
@@ -348,6 +353,61 @@ mod checks {
         }
     }
 
+    /// Containment, for a seat that serves the OPEN POOL — which means executing code posted by
+    /// strangers. `check_sandbox_launcher` above answers "does the launcher resolve", a property
+    /// one layer out from this one: bubblewrap resolves on Ubuntu 24.04 and then fails at spawn on
+    /// the AppArmor unprivileged-userns restriction, so a resolvable launcher confined nothing on a
+    /// live seat (#451). This runs it and reads what it did.
+    ///
+    /// A targeted-only seat gets the same probe reported as a WARN: it runs work from
+    /// counterparties it chose, which is a different exposure from serving the open market.
+    pub(super) fn check_sandbox_containment(
+        sandbox: Option<SandboxConfig>,
+        home_root: std::path::PathBuf,
+        claims_open_pool: bool,
+        unsafe_override: bool,
+    ) -> Check {
+        let policy = SandboxPolicy::from_config(sandbox.as_ref());
+        let containment = crate::sandbox_probe::probe_containment(&policy, &home_root);
+
+        if !claims_open_pool {
+            return match containment {
+                Containment::Contained => Check::pass(
+                    CONTAINMENT_CHECK,
+                    "launcher confines: a file outside the workdir was refused, the workdir was writable",
+                ),
+                other => Check::warn(
+                    CONTAINMENT_CHECK,
+                    format!("targeted-only seat, so advisory — {}", other.detail()),
+                    "this seat only runs work from counterparties it accepts; configure a working [sandbox] launcher before serving the open pool",
+                ),
+            };
+        }
+
+        if unsafe_override {
+            return Check::warn(
+                CONTAINMENT_CHECK,
+                match containment {
+                    Containment::Contained => "--unsafe-no-sandbox passed, though the launcher does confine".to_owned(),
+                    ref other => format!("--unsafe-no-sandbox passed: SERVING THE OPEN POOL UNCONTAINED — {}", other.detail()),
+                },
+                "remove --unsafe-no-sandbox and configure a [sandbox] launcher that passes the probe",
+            );
+        }
+
+        match crate::sandbox_probe::open_pool_admission(true, &containment, false) {
+            Ok(()) => Check::pass(
+                CONTAINMENT_CHECK,
+                "launcher confines: a file outside the workdir was refused, the workdir was writable",
+            ),
+            Err(detail) => Check::fail(
+                CONTAINMENT_CHECK,
+                format!("this seat claims OPEN-POOL jobs — arbitrary code from strangers — and {detail}"),
+                "configure a [sandbox] launcher that passes `maxplayer sandbox-probe`, or drop open-pool claiming (--no-claim-open-pool), or accept the exposure deliberately with --unsafe-no-sandbox",
+            ),
+        }
+    }
+
     fn build_runtime() -> Result<tokio::runtime::Runtime, String> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -435,7 +495,10 @@ fn parse_doctor_args(args: &[String]) -> Result<Option<std::path::PathBuf>, Stri
 /// duplicated. The seller key is read once only to probe NIP-42 relay auth; it is NEVER placed in
 /// any Check detail.
 #[cfg(feature = "wallet")]
-fn build_checks(home: &maxplayer_core::home::MaxplayerHome) -> Vec<Box<dyn FnOnce() -> Check>> {
+fn build_checks(
+    home: &maxplayer_core::home::MaxplayerHome,
+    unsafe_no_sandbox: bool,
+) -> Vec<Box<dyn FnOnce() -> Check>> {
     let relay_url = home.config.relay_url.clone();
     let secret = maxplayer_core::home::read_secret_key_hex(home).ok();
     let key_present = maxplayer_core::home::key_file_present(home);
@@ -449,6 +512,17 @@ fn build_checks(home: &maxplayer_core::home::MaxplayerHome) -> Vec<Box<dyn FnOnc
     let custom_agents = home.config.agents.clone();
     let telemetry = home.config.telemetry.clone();
     let sandbox = home.config.sandbox.clone();
+    let sandbox_for_launcher = sandbox.clone();
+    // The probe runs in the seat's OWN home, because that is where a launcher's config points.
+    let home_root = home.root.clone();
+    // Open-pool claiming is the exposure the containment gate is about: it is what makes this box
+    // run code from a counterparty nobody chose. Off by default (#357), so an unconfigured seat is
+    // targeted-only and stays advisory.
+    let claims_open_pool = home
+        .config
+        .seller
+        .as_ref()
+        .is_some_and(|seller| seller.claim_open_pool);
 
     let mut checks: Vec<Box<dyn FnOnce() -> Check>> = vec![
         Box::new(checks::check_credential_helper),
@@ -461,7 +535,12 @@ fn build_checks(home: &maxplayer_core::home::MaxplayerHome) -> Vec<Box<dyn FnOnc
     checks.push(Box::new(move || checks::check_telemetry(telemetry)));
     // The seller boot gate blocks on this (issue #357): a launcher that cannot spawn would let the
     // node advertise and then fail every job. Bypassable, like every check, via --skip-doctor.
-    checks.push(Box::new(move || checks::check_sandbox_launcher(sandbox)));
+    checks.push(Box::new(move || checks::check_sandbox_launcher(sandbox_for_launcher)));
+    // Blocking for an open-pool seat (#451). Placed after the resolve check so that a launcher which
+    // is not there reports as the missing file it is, rather than as a containment failure.
+    checks.push(Box::new(move || {
+        checks::check_sandbox_containment(sandbox, home_root, claims_open_pool, unsafe_no_sandbox)
+    }));
     checks
 }
 
@@ -497,7 +576,9 @@ fn run_doctor(
 
     let _ = writeln!(out, "maxplayer doctor — seller environment self-check (home={})", home.root.display());
 
-    let results = run_checks(build_checks(&home));
+    // `doctor` reports; it never boots a seller, so there is nothing here for an unsafe override to
+    // waive. The containment check is read at its own severity.
+    let results = run_checks(build_checks(&home, false));
     for result in &results {
         let _ = writeln!(out, "{}", result.render());
     }
@@ -526,6 +607,7 @@ fn run_doctor(
 #[cfg(feature = "acp")]
 pub fn sell_readiness_gate(
     home: &maxplayer_core::home::MaxplayerHome,
+    unsafe_no_sandbox: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<(), ()> {
@@ -533,7 +615,7 @@ pub fn sell_readiness_gate(
         out,
         "maxplayer sell — startup readiness checks (auto-doctor; pass --skip-doctor to bypass)"
     );
-    let results = run_checks(build_checks(home));
+    let results = run_checks(build_checks(home, unsafe_no_sandbox));
     for result in &results {
         let _ = writeln!(out, "{}", result.render());
     }
@@ -773,7 +855,7 @@ mod tests {
         home.config.relay_url = "not-a-relay-url".into();
         home.config.accepted_mints = Vec::new();
 
-        let results = run_checks(build_checks(&home));
+        let results = run_checks(build_checks(&home, false));
         assert!(
             results
                 .iter()
