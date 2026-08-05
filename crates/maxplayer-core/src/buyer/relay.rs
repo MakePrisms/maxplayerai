@@ -347,7 +347,7 @@ async fn subscribe_job_events(client: &Client, buyer_pubkey: nostr_sdk::PublicKe
         .subscribe_with_id(SubscriptionId::new(JOB_EVENTS_SUB_ID), filter, None)
         .await
     {
-        eprintln!(
+        crate::opline!(
             "buyer relay: job-event subscription could not be opened ({error}); waiters fall back \
              to their safety re-check until a reconnect restores it"
         );
@@ -375,7 +375,7 @@ async fn forward_job_events(client: &Client, events: broadcast::Sender<Arc<Event
                 // A CLOSED while the socket is up is the silent-deafness case: connected, and
                 // serving nothing. Name it — a waiter's safety re-check will carry the load until
                 // a reconnect re-subscribes, but an operator needs to see why waits got slow.
-                eprintln!(
+                crate::opline!(
                     "buyer relay: the relay CLOSED our job-event subscription ({message}); waits \
                      degrade to the safety re-check until a reconnect re-subscribes"
                 );
@@ -394,7 +394,7 @@ async fn forward_job_events(client: &Client, events: broadcast::Sender<Arc<Event
             // We fell behind the relay. We cannot know what we missed, so say so: every waiter's
             // safety re-check is what recovers the state we dropped.
             Err(broadcast::error::RecvError::Lagged(missed)) => {
-                eprintln!(
+                crate::opline!(
                     "buyer relay: fell behind the relay notification stream, {missed} dropped; \
                      waiters recover via their safety re-check"
                 );
@@ -426,17 +426,17 @@ async fn connect_and_authenticate(
 fn report_auth_wait(phase: &str, outcome: Result<AuthWait, relay_auth::RelayAuthError>) {
     match outcome {
         Ok(AuthWait::Authenticated) => {
-            eprintln!("buyer relay [{phase}]: NIP-42 authenticated");
+            crate::opline!("buyer relay [{phase}]: NIP-42 authenticated");
         }
         Ok(AuthWait::NoChallenge) => {
-            eprintln!(
+            crate::opline!(
                 "buyer relay [{phase}] DEGRADED: no NIP-42 challenge within {CONNECT_WAIT:?}; \
                  proceeding unauthenticated. An auth-gated write will be refused once with \
                  `auth-required:` and resent by the SDK after the challenge lands."
             );
         }
         Err(error) => {
-            eprintln!(
+            crate::opline!(
                 "buyer relay [{phase}] DEGRADED: NIP-42 did not complete ({error}); writes may be \
                  refused until a reconnect re-authenticates"
             );
@@ -501,7 +501,7 @@ pub(crate) async fn probe_relay_serves_our_reqs(
         .author(buyer_pubkey)
         .limit(0);
     if let Err(error) = client.subscribe_with_id(probe_id, probe, None).await {
-        eprintln!("buyer relay liveness probe: REQ could not be sent ({error})");
+        crate::opline!("buyer relay liveness probe: REQ could not be sent ({error})");
         return false;
     }
     tokio::time::timeout(timeout, async {

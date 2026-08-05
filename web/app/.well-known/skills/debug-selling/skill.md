@@ -139,44 +139,49 @@ tracked as the v0.1 tag-blocker — file/comment on **MakePrisms/maxplayerai** w
 
 ## Symptom: I can't tell if my seller is alive — my health check shows nothing
 
-A healthy seller does **not** print an obvious "online/healthy/watching" banner, and the
-kind-30340 heartbeat logs **only when it fails** — so a health-grep for words like
-`online`, `healthy`, `watching`, or `heartbeat published` matches **nothing on a perfectly
-healthy daemon** and you cannot tell healthy from dead. (If you followed older docs, their
-health greps are wrong for exactly this reason.)
-
-**Check — grep the seller's stderr for the lines it actually emits:**
-- **Startup, once** — proves it authenticated and entered the loop:
+**There is now a status line that answers this directly.** Every ~5 minutes a healthy seller
+prints its own state, timestamped:
 
 ```
-seller node live: pubkey=<hex> relay=<url>
+14:32:07Z seller node status: ADVERTISING, ready for work · harness: claude · 0/1 job slot(s) busy
 ```
 
-- **Ongoing liveness, every ~5 minutes** — this is the load-bearing signal that a healthy
-  idle node is still running:
+Read it as: it is alive (the line just arrived), it is advertising, and it has capacity. If it
+says `NOT serving — no live harness`, the seat is up but every harness has faulted out — it will
+take no work until one recovers.
+
+Every operator-facing line carries a `HH:MM:SSZ` UTC stamp, so "has anything happened since I
+last looked" is answerable by reading the last timestamp, and any line can be lined up against
+relay events.
+
+**On older builds** (before this line existed) a healthy seller printed no "online/healthy"
+banner at all, and the kind-30340 heartbeat logged **only when it failed** — so grepping for
+`online`, `healthy`, `watching`, or `heartbeat published` matched **nothing on a perfectly healthy
+daemon**. If you are on such a build, the load-bearing liveness signal is instead the periodic
+line below, which still prints on current builds:
 
 ```
 seller node wrap backfill (periodic): fetching stored kind-1059(s) since ts=<n>
 ```
 
-- **Boot relay auth, once** — useful but only proves it authed at startup, not that it is
-  still alive:
+**Startup, once** — proves it authenticated and entered the loop:
 
 ```
-seller node relay authenticated (NIP-42)
+seller node live: pubkey=<hex> relay=<url>
 ```
 
-**Read it:** to confirm your seller is *still* alive, look for the `wrap backfill
-(periodic): fetching` line repeating every ~5 minutes. A single `seller node live:` at
-startup proves it booted; the periodic line proves it is still turning. The **absence** of
-heartbeat-failure lines is normal and healthy.
+**Fix:** point your health check / supervisor grep at `seller node status:` (or, on older
+builds, the `wrap backfill (periodic): fetching` line). Do not grep for `online` /
+`heartbeat published` — no such success line exists. The **absence** of heartbeat-failure lines
+is normal and healthy.
 
-**Fix:** point your health check / supervisor grep at those exact strings. Do not grep for
-`online` / `heartbeat published` — no such success line exists.
+**Quieter or noisier:** routine no-ops (a re-seen offer already claimed, a duplicate award) are
+hidden by default and print only with `MAXPLAYER_VERBOSE=1` in the daemon's environment. Nothing
+that reports a state change or a failure is behind that flag.
 
-**Dead end → report it:** if you see `seller node live:` but the periodic `wrap backfill`
-line never repeats, the loop may be wedged — file on **MakePrisms/maxplayerai** with the
-last few stderr lines and the gap in timestamps.
+**Dead end → report it:** if you see `seller node live:` but the periodic `seller node status:`
+line never repeats, the loop may be wedged — file on **MakePrisms/maxplayerai** with the last few
+stderr lines and the gap in timestamps.
 
 ---
 
