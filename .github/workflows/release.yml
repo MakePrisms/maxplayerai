@@ -48,7 +48,7 @@ jobs:
             # A dry run has no tag. Take the version from the tree so the cross-checks in
             # verify-release-version.sh still compare the crate, the manifests and the pins against
             # each other.
-            version="$(node -p "require('./npm/mobee/package.json').version")"
+            version="$(node -p "require('./npm/maxplayer/package.json').version")"
           fi
           [ -n "$version" ] || { echo "could not resolve a version" >&2; exit 1; }
 
@@ -151,7 +151,7 @@ jobs:
           CC_aarch64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: |
-          cargo build -p mobee --release --locked \
+          cargo build -p maxplayer --release --locked \
             --no-default-features --features ${{ matrix.features }} \
             --target ${{ matrix.target }}
 
@@ -419,5 +419,5 @@ jobs:
             ( cd "npm/cli-$platform" && npm publish "${publish_args[@]}" )
           done
 
-          cp LICENSE-MIT LICENSE-APACHE npm/mobee/
-          ( cd npm/mobee && npm publish "${publish_args[@]}" )
+          cp LICENSE-MIT LICENSE-APACHE npm/maxplayer/
+          ( cd npm/maxplayer && npm publish "${publish_args[@]}" )

@@ -39,7 +39,7 @@ fails outright.
 1. **Bump the version.** `[workspace.package].version` in `Cargo.toml`, the workspace crate
    entries in `Cargo.lock` (refreshed by any `cargo` invocation — e.g. `cargo build` — since the
    release build passes `--locked` and fails on a stale lockfile), and `version` in every
-   `npm/*/package.json`, and the `optionalDependencies` pins in `npm/mobee/package.json`. All of
+   `npm/*/package.json`, and the `optionalDependencies` pins in `npm/maxplayer/package.json`. All of
    them must read the same string, and it must match the tag with the `v` dropped — the build
    asserts this and stops if anything disagrees.
 2. Open a PR to `dev` with the bump and let it merge. **Then cut `dev` into `main` as a pull request —
@@ -161,7 +161,7 @@ git cat-file -e "$TAG":.github/workflows/release.yml && echo present || echo abs
 **darwin-x64 and Windows are out of scope.**
 
 Adding a platform means: a matrix entry in `release.yml`, a package under `npm/`, an entry in
-`PLATFORM_PACKAGES` in `npm/mobee/bin/maxplayer.js`, an `optionalDependencies` pin, the platform in
+`PLATFORM_PACKAGES` in `npm/maxplayer/bin/maxplayer.js`, an `optionalDependencies` pin, the platform in
 `RELEASE_PLATFORMS`, and a trusted-publisher entry for the new package on npmjs.com. Three of those
 six are asserted rather than trusted — the pin by `verify-release-version.sh`, and both directions of
 the platform list by the publish job: a payload package in the tree that is not published, and a

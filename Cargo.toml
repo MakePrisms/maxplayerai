@@ -1,34 +1,34 @@
 [workspace]
 members = [
-    "crates/mobee-core",
-    "crates/mobee-desktop",
-    "crates/mobee-evals",
-    "crates/mobee",
-    "crates/mobee-relay-write-policy",
+    "crates/maxplayer-core",
+    "crates/maxplayer-desktop",
+    "crates/maxplayer-evals",
+    "crates/maxplayer",
+    "crates/maxplayer-relay-write-policy",
 ]
-# mobee-desktop pulls egui's native deps (wayland/x11/fontconfig); keep it out of
-# default builds so headless boxes and CI don't inherit them. Build with -p mobee-desktop.
+# maxplayer-desktop pulls egui's native deps (wayland/x11/fontconfig); keep it out of
+# default builds so headless boxes and CI don't inherit them. Build with -p maxplayer-desktop.
 default-members = [
-    "crates/mobee-core",
-    "crates/mobee-evals",
-    "crates/mobee",
-    "crates/mobee-relay-write-policy",
+    "crates/maxplayer-core",
+    "crates/maxplayer-evals",
+    "crates/maxplayer",
+    "crates/maxplayer-relay-write-policy",
 ]
 resolver = "3"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-description = "Mobee"
-repository = "https://buzzrelay.orveth.dev/git/79284e2b167317bc455f2daccfb38c38d4836b7b2bd0d73650b0cff46660263a/mobee.git"
+description = "Maxplayer"
+repository = "https://github.com/MakePrisms/maxplayerai"
 license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.dependencies]
-mobee-core = { path = "crates/mobee-core" }
+maxplayer-core = { path = "crates/maxplayer-core" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
-# Layered config resolution (defaults -> file -> MOBEE_* env). default-features off drops the
+# Layered config resolution (defaults -> file -> MAXPLAYER_* env). default-features off drops the
 # bundled format parsers (toml/yaml/json/…): the file layer is parsed by the `toml` crate we
 # already carry, and only the serde (`Config::try_from`) and `Environment` sources are used.
 config = { version = "0.15.25", default-features = false }
@@ -50,7 +50,7 @@ strip = true
 # diagnosing the #173 park required rebuilding the binary before any capture could be read at all.
 # Same optimisation level as release so behaviour and timing are representative:
 #
-#   cargo build -p mobee --profile release-debug --features acp,wallet
+#   cargo build -p maxplayer --profile release-debug --features acp,wallet
 [profile.release-debug]
 inherits = "release"
 debug = true

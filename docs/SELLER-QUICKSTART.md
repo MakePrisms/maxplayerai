@@ -8,16 +8,16 @@ and persists to `config.toml`, so relaunching is zero-prompt.
 
 ```bash
 # first run — the only two required choices; writes [seller] into config.toml
-"$MOBEE_BIN" sell --agent claude --rate-sats 2
+"$MAXPLAYER_BIN" sell --agent claude --rate-sats 2
 
 # steady state — reads config.toml, zero prompts
-"$MOBEE_BIN" sell
+"$MAXPLAYER_BIN" sell
 ```
 
 Confirm the binary exposes `sell` before relying on it:
 
 ```bash
-"$MOBEE_BIN" sell --bogus
+"$MAXPLAYER_BIN" sell --bogus
 # expect the Usage block:
 #   Usage:
 #     maxplayer sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>] [--skip-doctor]
@@ -51,8 +51,8 @@ No toolchain needed — the release publishes a seller asset alongside the buyer
 
 ```bash
 curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/install.sh | sh -s -- --seller
-MOBEE_BIN="$HOME/.local/bin/maxplayer"
-"$MOBEE_BIN" sell --bogus   # must print sell Usage (see above)
+MAXPLAYER_BIN="$HOME/.local/bin/maxplayer"
+"$MAXPLAYER_BIN" sell --bogus   # must print sell Usage (see above)
 ```
 
 Building it yourself instead:
@@ -62,17 +62,17 @@ git clone https://github.com/MakePrisms/maxplayerai.git
 cd maxplayerai
 
 # Seller execute needs the `acp` feature (flake packages already enable it).
-nix develop -c bash -lc 'cargo build -p mobee --release --features acp'
-MOBEE_BIN="$(pwd)/target/release/maxplayer"
-"$MOBEE_BIN" sell --bogus   # must print sell Usage (see above)
+nix develop -c bash -lc 'cargo build -p maxplayer --release --features acp'
+MAXPLAYER_BIN="$(pwd)/target/release/maxplayer"
+"$MAXPLAYER_BIN" sell --bogus   # must print sell Usage (see above)
 ```
 
 Or, without cloning, from a flake build that already packages `acp`:
 
 ```bash
 # nix caches the git ref — always --refresh (or pin+bump the rev) or you get a stale binary.
-MOBEE_BIN="$(nix build --refresh --no-link --print-out-paths github:MakePrisms/maxplayerai)/bin/maxplayer"
-"$MOBEE_BIN" sell --bogus   # must print sell Usage
+MAXPLAYER_BIN="$(nix build --refresh --no-link --print-out-paths github:MakePrisms/maxplayerai)/bin/maxplayer"
+"$MAXPLAYER_BIN" sell --bogus   # must print sell Usage
 ```
 
 > ⚠ **Stale nix cache:** `nix run github:MakePrisms/maxplayerai -- …` without `--refresh` can serve yesterday's binary. Prefer `nix run --refresh github:MakePrisms/maxplayerai -- sell …` (or pin+bump the rev).
@@ -96,7 +96,7 @@ Defaults written on first bootstrap / first `sell`:
 - **mint:** `https://mint.minibits.cash/Bitcoin` — a **real** mint, set at first run. Jobs settle in
   real sats. For play money set `accepted_mints = ["https://testnut.cashudevkit.org"]` and
   `allow_real_mints = false` in `config.toml`.
-- **relay:** `wss://relay.maxplayer.ai` — the open-market relay (override in `config.toml` or via `MOBEE_RELAY_URL`).
+- **relay:** `wss://relay.maxplayer.ai` — the open-market relay (override in `config.toml` or via `MAXPLAYER_RELAY_URL`).
 - **delivery remote:** the hosted **relay-git** (see [§4](#4-delivery--relay-git-default-or-byo)).
 - **key file:** `$MOBEE_HOME/key` (or `~/.mobee/key`) — mode `0600`, auto-generated, never printed by `maxplayer sell`.
 
@@ -178,7 +178,7 @@ agent and rate (rate default `2`) and then writes `[seller]`.
 yourself (repeat the flag; no shell strings, no `--key`):
 
 ```bash
-"$MOBEE_BIN" sell \
+"$MAXPLAYER_BIN" sell \
   --agent-argv cursor-agent --agent-argv acp \
   --rate-sats 2
 ```
@@ -234,7 +234,7 @@ command -v codex-acp           # codex preset
   on the preset lookup, e.g.:
 
   ```bash
-  "$MOBEE_BIN" sell \
+  "$MAXPLAYER_BIN" sell \
     --agent-argv npx --agent-argv @agentclientprotocol/claude-agent-acp \
     --rate-sats 2
   ```
@@ -375,7 +375,7 @@ seller's pubkey (untargeted/open offers are soft-skipped; wrong `#p` refused; th
 Opt in to also claim untargeted/open offers that still clear your rate:
 
 ```bash
-"$MOBEE_BIN" sell --agent claude --rate-sats 2 --claim-open-pool
+"$MAXPLAYER_BIN" sell --agent claude --rate-sats 2 --claim-open-pool
 ```
 
 `--claim-open-pool` (or `claim_open_pool = true` in `config.toml`) widens claiming to the open pool;
@@ -430,13 +430,13 @@ export MOBEE_HOME="/tmp/maxplayer-seller-fresh-$(date +%s)"
 mkdir -p "$MOBEE_HOME"
 
 # first run — presets + relay-git default; only --agent and --rate-sats are required
-"$MOBEE_BIN" sell \
+"$MAXPLAYER_BIN" sell \
   --home "$MOBEE_HOME" \
   --agent claude \
   --rate-sats 2
 
 # later: just relaunch (reads config.toml, zero prompts)
-"$MOBEE_BIN" sell --home "$MOBEE_HOME"
+"$MAXPLAYER_BIN" sell --home "$MOBEE_HOME"
 ```
 
 Startup status (stderr) looks like:
@@ -457,7 +457,7 @@ executes, delivers, then redeems on payment (fee-aware).
 Optional: BYO delivery + custom agent (power-user hatch):
 
 ```bash
-"$MOBEE_BIN" sell --non-interactive \
+"$MAXPLAYER_BIN" sell --non-interactive \
   --home "$MOBEE_HOME" \
   --agent-argv bun --agent-argv "$AGENT_WRAPPER" \
   --rate-sats 2 \

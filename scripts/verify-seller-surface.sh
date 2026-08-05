@@ -32,7 +32,7 @@ BINARY="${1:-result/bin/maxplayer}"
 
 die() { echo "verify-seller-surface: $*" >&2; exit 1; }
 
-[ -f "$BINARY" ] || die "no binary at $BINARY — build one with: cargo build -p mobee --release --no-default-features --features wallet,acp"
+[ -f "$BINARY" ] || die "no binary at $BINARY — build one with: cargo build -p maxplayer --release --no-default-features --features wallet,acp"
 [ -x "$BINARY" ] || die "$BINARY is not executable"
 
 # A scratch home, unconditionally. With MOBEE_HOME unset, maxplayer falls back to ~/.mobee — a real
@@ -54,7 +54,7 @@ ACP_PRESENT='spawn ACP agent'
 # is ever executed. Naming a real command instead would make the probe depend on that command
 # existing on the builder, which is not true across platforms (`/bin/true` is absent on NixOS).
 set +e
-acp_out="$("$BINARY" run --agent-command /nonexistent/mobee-acp-probe --task probe --log /dev/null 2>&1)"
+acp_out="$("$BINARY" run --agent-command /nonexistent/maxplayer-acp-probe --task probe --log /dev/null 2>&1)"
 acp_rc=$?
 set -e
 

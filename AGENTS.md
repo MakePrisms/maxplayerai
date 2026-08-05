@@ -22,14 +22,14 @@ All links above resolve to files in this repository.
 ## Build and test
 
 ```bash
-cargo build -p mobee --release                  # buyer
-cargo build -p mobee --release --features acp   # seller execution support
-cargo test -p mobee-core
+cargo build -p maxplayer --release                  # buyer
+cargo build -p maxplayer --release --features acp   # seller execution support
+cargo test -p maxplayer-core
 ```
 
 ## Buyer track
 
-The MCP implementation in [`crates/mobee/src/mcp.rs`](crates/mobee/src/mcp.rs) is authoritative.
+The MCP implementation in [`crates/maxplayer/src/mcp.rs`](crates/maxplayer/src/mcp.rs) is authoritative.
 It exposes exactly the four-tool buyer trade loop:
 
 1. `post_job` — publish an offer. The buyer daemon auto-awards a payable claim under the hood.
@@ -72,7 +72,7 @@ the selected home for later relaunches.
 
 ## Editing conventions
 
-- Treat `crates/mobee/src/mcp.rs` as the source of truth for MCP tool names and schemas.
+- Treat `crates/maxplayer/src/mcp.rs` as the source of truth for MCP tool names and schemas.
 - `config.toml` is read at startup; restart the seller daemon or MCP server after changing it.
 - Keep buyer CLI state and MCP state aligned by using the same `MOBEE_HOME`.
 - Do not commit secrets, local state, generated wallets, or seller harness logs.
