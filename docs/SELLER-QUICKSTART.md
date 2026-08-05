@@ -221,9 +221,17 @@ it. Installing only the adapter is the most common way a fresh seat fails (see t
 
 | `--agent` | Adapter binary that must be on `PATH` | Install adapter | Underlying CLI — install **and** authenticate |
 |-----------|----------------------------------------|---------|---------|
-| `claude`  | `claude-agent-acp`                     | `npm i -g @agentclientprotocol/claude-agent-acp` | `claude` (`npm i -g @anthropic-ai/claude-code`) — run `claude` once and complete `/login`, or set `ANTHROPIC_API_KEY` |
-| `cursor`  | `cursor-agent` (or `agent`), `acp` appended | install Cursor's agent CLI | none extra — `cursor-agent` **is** the CLI, but it must be signed in: `cursor-agent login` |
-| `codex`   | `codex-acp`                            | `npm i -g @agentclientprotocol/codex-acp` | `codex` (`npm i -g @openai/codex`) — `codex login`, or set `OPENAI_API_KEY` |
+| `claude`  | `claude-agent-acp`                     | `npm i -g @agentclientprotocol/claude-agent-acp` | `claude` — `curl -fsSL https://claude.ai/install.sh \| bash`, or `npm i -g @anthropic-ai/claude-code` (**Node 22+**). Auth: run `claude` and complete `/login`, or `claude auth login`, or `ANTHROPIC_API_KEY` (read the warning below), or `claude setup-token` |
+| `cursor`  | `cursor-agent` (or `agent`), `acp` appended | `curl https://cursor.com/install -fsS \| bash` | none extra — `cursor-agent` **is** the CLI. Auth: `cursor-agent login`, or set `CURSOR_API_KEY` |
+| `codex`   | `codex-acp`                            | `npm i -g @agentclientprotocol/codex-acp` | `codex` — `npm i -g @openai/codex`. Auth: `codex login`, `codex login --device-auth`, or `printenv OPENAI_API_KEY \| codex login --with-api-key`. `OPENAI_API_KEY` is also read directly |
+
+> ⚠ **Do not `npm i -g cursor-agent`.** That npm package is an unrelated third party's and installs
+> **no binary at all** — you get a silent success and a `cursor-agent` that is still missing. The
+> real install is the `curl` line above.
+
+> ⚠ **`codex login --api-key <KEY>` is deprecated and hidden**, and now exits with guidance instead
+> of authenticating. Pipe the key on stdin — `printenv OPENAI_API_KEY | codex login --with-api-key` —
+> or just export `OPENAI_API_KEY`.
 
 > **Resolvable is not authorized.** Every readiness check can print `PASS` on a seat that cannot do
 > a single job: those checks find the *binary*, and none of them reads a credential. An adapter with
@@ -232,8 +240,24 @@ it. Installing only the adapter is the most common way a fresh seat fails (see t
 > seat proves it can take a turn before it advertises, so it never sells work it cannot do. Set the
 > auth up front and you never meet it.
 
-The env-var forms (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) must be in the **daemon's** environment,
-not just your login shell — the same `PATH` caveat below applies to credentials.
+The env-var forms (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CURSOR_API_KEY`) must be in the
+**daemon's** environment, not just your login shell — the same `PATH` caveat below applies to
+credentials.
+
+**Two things that specifically bite an unattended seat**, where nobody is watching to answer a
+prompt:
+
+- **`ANTHROPIC_API_KEY` alone is not enough for a hands-off seller.** Claude Code prompts **once**
+  to approve a key found in the environment rather than using it silently. A daemon has no one to
+  approve it, so the probe fails on a box where the variable is plainly set. Either approve it once
+  interactively on that machine first, or use `/login` / `claude setup-token` so the credential is
+  already stored.
+- **`cursor-agent login` opens a browser.** On a headless seat set `NO_OPEN_BROWSER=1` and it prints
+  the URL to complete on another machine instead.
+
+*Verified 2026-08-05. Two of these are version-pinned and may drift: the `codex` flags were read at
+`main` HEAD (not a released tag), and the `cursor-agent` behaviour at build `2026.07.09`. The
+adapter packages and the `claude` auth routes are not version-sensitive in the same way.*
 
 **Verify** (the daemon's own lookup — must print an absolute path):
 
