@@ -133,11 +133,10 @@ and the per-mint breakdown from `maxplayer wallet mints`.
 
 ---
 
-## Symptom: am I spending real money or test money?
+## Symptom: which mint am I actually spending at?
 
-The shipped default is **real**. A fresh config accepts real bitcoin-denominated ecash
-at a minibits mint by default (`allow_real_mints = true`, and the default mint is
-`https://mint.minibits.cash/Bitcoin`).
+The shipped mint is **real**. A fresh config accepts real bitcoin-denominated ecash at a
+minibits mint (`allow_real_mints = true`, mint `https://mint.minibits.cash/Bitcoin`).
 
 `maxplayer wallet setup` with no `--mint` targets that real mint and returns a Lightning
 invoice you must pay. It does not hand you free test sats. Ask the wallet rather than
@@ -146,19 +145,15 @@ around it.
 
 **Check:** `maxplayer buyer status` → `wallet.mint`, or `maxplayer wallet mints`.
 
-**Read it:**
-- `wallet.mint` = `https://mint.minibits.cash/Bitcoin` (or any non-testnut host) → you
-  are moving **real sats**. Start small.
-- `wallet.mint` = `https://testnut.cashudevkit.org` → test mint, play money.
+**Read it:** `wallet.mint` = `https://mint.minibits.cash/Bitcoin` → you are moving **real
+sats**. Start small. Any other value is a mint you set yourself; know what it settles in
+before you spend from it.
 
-**Fix:** to force test-only, set `allow_real_mints = false` in `~/.maxplayer/config.toml`
-(this pins you to the testnut dev mint); for free test funding run
-`maxplayer wallet setup --mint https://testnut.cashudevkit.org`. To spend real sats
-deliberately, leave the default and keep amounts small.
+**Fix:** leave the shipped mint in place and keep amounts small.
 
 **Dead end → report it:** if any string names a mint that disagrees with `wallet.mint`,
 that is a bug worth filing — note the exact string and where you saw it on
-**MakePrisms/maxplayerai**. The help text said "testnut" for a release whose default was
+**MakePrisms/maxplayerai**. The help text misnamed the mint for a release whose wallet was
 already real (#447), and a user paying a real invoice was the only thing that caught it.
 
 ---
@@ -199,9 +194,9 @@ yourself to test-only mints.
 **Read it:**
 - `allow_real_mints = true` (default) → hops to real mints are permitted, so a mismatch
   usually still settles. If it fails, the hop's target mint was likely unreachable.
-- `allow_real_mints = false` → you are pinned to the testnut dev mint, and a seller who
-  accepts only a real mint **cannot be paid**. Auto-award skips the claim; a manual pay
-  fails closed with a message like:
+- `allow_real_mints = false` → you are pinned to the built-in dev allow-list, and a
+  seller who accepts only a real mint **cannot be paid**. Auto-award skips the claim; a
+  manual pay fails closed with a message like:
 
 ```
 real-mint fence: buyer mint <url> is not in the creq mint list [...] and no accepted mint
@@ -211,8 +206,8 @@ set allow_real_mints=true to pay at a real mint
 
 **A real trap when judging the counterparty:** a seller's *advertised* mint is
 self-reported and currently unreliable (a known bug hardcodes it in the announce, so it
-can show "testnut" for a real-minibits seller). Do not infer from the advert whether a
-trade is a test.
+can name a mint the seller does not settle on). Do not infer a seller's mint from the
+advert.
 
 **Fix:**
 - to pay a real-mint seller, keep `allow_real_mints = true` — and know you are moving

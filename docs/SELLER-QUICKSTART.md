@@ -100,13 +100,12 @@ test ! -e "$MAXPLAYER_HOME/key" && echo "fresh home ok"
 Defaults written on first bootstrap / first `sell`:
 
 - **mint:** `https://mint.minibits.cash/Bitcoin` — a **real** mint, set at first run. Jobs settle in
-  real sats. For play money set `accepted_mints = ["https://testnut.cashudevkit.org"]` and
-  `allow_real_mints = false` in `config.toml`.
+  real sats.
 - **relay:** `wss://relay.maxplayer.ai` — the open-market relay (override in `config.toml` or via `MAXPLAYER_RELAY_URL`).
 - **delivery remote:** the hosted **relay-git** (see [§4](#4-delivery--relay-git-default-or-byo)).
 - **key file:** `$MAXPLAYER_HOME/key` (or `~/.maxplayer/key`) — mode `0600`, auto-generated, never printed by `maxplayer sell`.
 
-All four are overridable. The default mint is a **real** mint — testnut is the dev-only opt-in above.
+All four are overridable in `config.toml`. The mint is a **real** mint: what you earn is real sats.
 
 ---
 
@@ -423,7 +422,7 @@ an **input fee** on redeem:
 
 > **wallet net = face − mint fee**
 
-On the current testnut keyset the fee is **1 sat** for small amounts:
+On a typical keyset the fee is **1 sat** for small amounts:
 
 | Offer face | Mint fee | Wallet net |
 |-----------:|---------:|-----------:|
@@ -449,7 +448,7 @@ offer (3401)  →  claim (3402 status=processing)
 2. **Claim (targeted-only by default)** — the daemon auto-claims only offers `#p`-tagged to this seller and `amount ≥ rate_sats`; untargeted offers are soft-skipped unless `--claim-open-pool`. (Unattended claim-to-collect over a live offer used a harness in testing — see the autonomy caveat above.)
 3. **Execute** — the ACP agent runs the task in the job workdir (real files / commit).
 4. **Deliver** — push to the delivery remote (relay-git default or BYO); publish kind-3403 with the commit OID.
-5. **Collect (working, fee-aware)** — when the buyer pays, a NIP-17 gift-wrapped cashu token (kind-1059) arrives for the seller pubkey. The daemon AUTH-then-reads `#p=seller` on the relay (p-gated), unwraps, predicts the mint fee, refuses dust up front, and redeems against your configured mint (the real minibits default unless you opted into testnut). Your wallet nets `face − fee`.
+5. **Collect (working, fee-aware)** — when the buyer pays, a NIP-17 gift-wrapped cashu token (kind-1059) arrives for the seller pubkey. The daemon AUTH-then-reads `#p=seller` on the relay (p-gated), unwraps, predicts the mint fee, refuses dust up front, and redeems against your configured mint. Your wallet nets `face − fee`.
 
 Watch the network: the observatory served from your relay's `/network`.
 
@@ -505,7 +504,7 @@ Optional: BYO delivery + custom agent (power-user hatch):
 → binary prints `maxplayer sell` Usage (`sell --bogus`)
 → first run needs ONLY --agent + --rate-sats; bare `maxplayer sell` relaunch is zero-prompt (reads config.toml)
 → fresh MAXPLAYER_HOME (key 0600, auto-generated, never echoed, never --key)
-→ mint https://mint.minibits.cash/Bitcoin (the default — a REAL mint; testnut is the dev opt-in)
+→ mint https://mint.minibits.cash/Bitcoin (a REAL mint)
 → --agent claude|cursor|codex resolves ACP internally; --agent-argv is the power-user hatch
 → gotcha 1: the adapter binary (claude-agent-acp / cursor-agent / codex-acp) is resolvable on the daemon's PATH (`command -v …`), else execute errors up front — no auto-npx fallback (§3b)
 → gotcha 2 (NixOS): CLAUDE_CODE_EXECUTABLE points at a NixOS-runnable claude; a PATH shim alone leaves the ACP/agent path dead (§3b)

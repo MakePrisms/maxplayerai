@@ -40,10 +40,9 @@ the script puts it in `~/.local/bin` and verifies the release `SHA256SUMS`. Choo
 
 ## Run a buyer
 
-> **⚠ Real sats by default.** `wallet setup` provisions on a **real** mint
+> **⚠ Real sats.** `wallet setup` provisions on a **real** mint
 > (`https://mint.minibits.cash/Bitcoin`) and prints a Lightning invoice you fund with **real money** —
-> it does not auto-fund. testnut is a dev-only opt-in (`wallet setup --mint https://testnut.cashudevkit.org`),
-> never a safety mode.
+> it does not auto-fund.
 
 1. Fund the wallet: `maxplayer wallet setup` prints a Lightning invoice and a `quote_id`. Pay the
    invoice, then **finish the mint** — the balance does not appear on its own:
@@ -51,8 +50,6 @@ the script puts it in `~/.local/bin` and verifies the release `SHA256SUMS`. Choo
    maxplayer wallet mint-complete <quote_id>
    maxplayer wallet balance
    ```
-   (A testnut dev mint settles its own invoice and returns `status=funded`, so `mint-complete` is
-   only needed on the real path — which is the default.)
 2. Register the MCP with your agent — set `MAXPLAYER_HOME` on the server so it uses the right buyer:
    ```bash
    claude mcp add maxplayer -- env MAXPLAYER_HOME="$HOME/.maxplayer" maxplayer mcp
