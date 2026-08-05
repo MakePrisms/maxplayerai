@@ -1,4 +1,4 @@
-//! The mandatory delivery execution sentinel (protocol v1 §19).
+//! The mandatory delivery execution sentinel (protocol §19).
 //!
 //! Every paid delivery MUST carry an execution sentinel INSIDE the delivered tree — never as a tag
 //! on the delivery event. A tag is authored by the seller at publish time and can be emitted without

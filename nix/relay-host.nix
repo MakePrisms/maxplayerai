@@ -33,9 +33,8 @@
   services.maxplayer.relay = {
     enable = true;
 
-    # Keep "mobee": the #t flip to "maxplayer" is waived out of 0.1.0, so day-one events still carry
-    # t=mobee. Hardcoding "maxplayer" would reject every real event while looking like a healthy quiet relay.
-    # The flip is then a one-line change riding flag-day.
+    # The protocol namespace tag (docs/protocol.md §5). Set explicitly because any other value
+    # rejects every real event while looking like a healthy quiet relay.
     namespaceTag = "mobee";
 
     # NIP-11 identity every client reads (drafted — correct freely). `contact` is optional.

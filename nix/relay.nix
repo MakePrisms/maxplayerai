@@ -37,9 +37,9 @@ in
       description = ''
         Value of the `t` tag the relay accepts, and the ONLY namespace it accepts.
 
-        Parameterised on the value on purpose. The `#t` flip to "maxplayer" is waived out of 0.1.0, so day-one
-        v1 events still carry `t=mobee`; hardcoding "maxplayer" would reject every real event while looking
-        exactly like a healthy quiet relay. The flip is then a one-line change riding flag-day.
+        Parameterised rather than hardcoded on purpose: this must track the namespace tag in
+        `docs/protocol.md` §5, and a relay carrying any other value rejects every real event while
+        looking exactly like a healthy quiet relay.
       '';
     };
 

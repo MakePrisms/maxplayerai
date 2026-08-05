@@ -9,14 +9,14 @@
 //! Policy: accept an event iff it is inside the configured namespace — it carries a
 //! `["t", <tag>]` tag whose value equals `MAXPLAYER_RELAY_TAG` — OR it is one of the
 //! identity/discovery kinds a seat must publish to be found. Everything else is rejected.
-//! This is the mechanism that makes "born v1/maxplayer-only" a property the relay
-//! *enforces* rather than a state it *hopes* holds: born-empty is only about day-one
-//! contents, and says nothing about what day two accepts.
+//! This is the mechanism that makes single-namespace a property the relay *enforces*
+//! rather than a state it *hopes* holds: starting empty constrains only what the relay
+//! contains, and says nothing about what it accepts next.
 //!
-//! The tag is parameterised on its VALUE on purpose. The `#t` flip to "maxplayer" is
-//! waived out of 0.1.0, so day-one events still carry `t=mobee`; a hardcoded "maxplayer"
-//! would reject every real event while the relay looked like a healthy quiet box. The
-//! nix module supplies the value from `services.maxplayer.relay.namespaceTag`.
+//! The tag is parameterised on its VALUE on purpose: it must track the namespace tag in
+//! `docs/protocol.md` §5, and any other value rejects every real event while the relay
+//! looks like a healthy quiet box. The nix module supplies the value from
+//! `services.maxplayer.relay.namespaceTag`.
 
 use std::io::{self, BufRead, Write};
 
