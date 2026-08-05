@@ -320,9 +320,22 @@ in
       ];
       wants = [ "network-online.target" ];
 
-      # buzz shells out to git (receive-pack for the CAS). The schema is applied by buzz's own embedded
-      # sqlx migrator at boot (BUZZ_AUTO_MIGRATE=1), so there is no psql/pgschema apply step here.
-      path = [ pkgs.git ];
+      # buzz shells out to git (receive-pack for the CAS) AND runs the bundled pre-receive hook
+      # (crates/buzz .../buzz-relay/src/api/git/hook.rs) on EVERY push. That hook is `#!/usr/bin/env bash`
+      # and calls, by bare name: git (merge-base), coreutils (mktemp/date/sort/cat/rm/printf), sed,
+      # openssl (HMAC over the ref updates) and curl (POST to the policy endpoint). ALL must be on the
+      # unit PATH — a subprocess of buzz-relay inherits this PATH — or the hook fails closed:
+      # "pre-receive hook declined", rejecting the push AND its delivery state. bash was the pre-line-1
+      # death; openssl + curl are equally load-bearing (hook.rs's runtime_image test enforces them). The
+      # schema is applied by buzz's own embedded sqlx migrator (BUZZ_AUTO_MIGRATE=1), no pgschema step.
+      path = [
+        pkgs.git
+        pkgs.bash
+        pkgs.coreutils
+        pkgs.gnused
+        pkgs.openssl
+        pkgs.curl
+      ];
 
       environment = baseEnv;
 
