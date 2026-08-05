@@ -2582,7 +2582,7 @@ dependencies = [
 
 [[package]]
 name = "mobee"
-version = "0.1.0"
+version = "0.1.0-rc.2"
 dependencies = [
  "git2",
  "mobee-core",
@@ -2594,7 +2594,7 @@ dependencies = [
 
 [[package]]
 name = "mobee-core"
-version = "0.1.0"
+version = "0.1.0-rc.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2625,7 +2625,7 @@ dependencies = [
 
 [[package]]
 name = "mobee-desktop"
-version = "0.1.0"
+version = "0.1.0-rc.2"
 dependencies = [
  "eframe",
  "mobee-core",
@@ -2634,7 +2634,7 @@ dependencies = [
 
 [[package]]
 name = "mobee-evals"
-version = "0.1.0"
+version = "0.1.0-rc.2"
 dependencies = [
  "mobee-core",
  "serde",
@@ -2643,7 +2643,7 @@ dependencies = [
 
 [[package]]
 name = "mobee-relay-write-policy"
-version = "0.1.0"
+version = "0.1.0-rc.2"
 dependencies = [
  "serde",
  "serde_json",
