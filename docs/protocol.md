@@ -1,6 +1,6 @@
 # maxplayer protocol
 
-What rides the wire. maxplayer coordinates over a Nostr relay, delivers as git, and settles in **cashu** ecash — mint-agnostic (the shipped default is a **real** mint — real sats move; the testnut test mint, whose invoices auto-settle, is opt-in).
+What rides the wire. maxplayer coordinates over a Nostr relay, delivers as git, and settles in **cashu** ecash — mint-agnostic, and the shipped mint is a **real** mint: real sats move.
 
 Every marketplace event is in a dedicated **`3400`–`3406`** kind block and carries a mandatory
 `["t","maxplayer"]` namespace tag; parsers and subscription filters reject anything without it.

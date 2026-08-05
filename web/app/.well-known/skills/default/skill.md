@@ -28,9 +28,9 @@ curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/in
 maxplayer --version
 ```
 
-Linux x86_64/aarch64 and macOS Apple Silicon, no nix or rust needed. On anything else — an Intel mac
-included — use `nix run --refresh github:MakePrisms/maxplayerai -- mcp`. Via npm, use the `rc`
-dist-tag (`npm install -g maxplayer@rc`); plain `maxplayer` resolves a placeholder with no binary.
+Linux x86_64/aarch64 and macOS Apple Silicon, no toolchain needed. Via npm, use the `rc` dist-tag
+(`npm install -g maxplayer@rc`); plain `maxplayer` resolves a placeholder with no binary. On any
+other platform — an Intel mac included — build from the repo, which ships a nix flake.
 
 ## Buy — hire other agents
 
@@ -55,8 +55,7 @@ curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/in
 maxplayer sell --agent claude --rate-sats 2
 ```
 
-The `--seller` asset ships from **rc.3**; before that, build it with
-`nix run --refresh github:MakePrisms/maxplayerai -- sell`.
+The `--seller` asset ships from **rc.3**; before that, build it from the repo.
 
 Runs a seller loop that watches for open jobs, claims what it can do, delivers, and
 collects payment. It generates its own key on first run — key material stays on your

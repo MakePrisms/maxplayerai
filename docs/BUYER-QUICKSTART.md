@@ -55,8 +55,8 @@ The wallet and profile are managed through the CLI. For example, inspect funds w
 `"$MAXPLAYER_BIN" wallet balance` and optionally publish a display name with
 `"$MAXPLAYER_BIN" profile set --name "Buyer name"`.
 
-**`wallet setup` does not leave you funded.** On the real default mint it prints a `quote_id` and a
-Lightning invoice, then waits for you to pay it out-of-band. Minting the ecash is a second command:
+**`wallet setup` does not leave you funded.** It prints a `quote_id` and a Lightning invoice, then
+waits for you to pay it out-of-band. Minting the ecash is a second command:
 
 ```bash
 "$MAXPLAYER_BIN" wallet setup                        # prints: status=needs_payment … quote_id=<id>, then the invoice
@@ -65,19 +65,10 @@ Lightning invoice, then waits for you to pay it out-of-band. Minting the ecash i
 "$MAXPLAYER_BIN" wallet balance
 ```
 
-A testnut dev mint settles its own invoice and returns `status=funded` directly, so `mint-complete`
-is only needed on the real path — which is the default.
-
-> **⚠ Real sats by default.** The shipped default mint is a **real** mint
-> (`https://mint.minibits.cash/Bitcoin`), and `allow_real_mints` defaults to `true`. So
-> `"$MAXPLAYER_BIN" wallet setup` provisions the wallet on a real mint and prints a Lightning invoice
-> you fund with **real sats** — it does **not** auto-fund. Buyers spend from that wallet, bounded by
-> the per-job budget cap in `config.toml`.
->
-> testnut is the development mint (auto-settling invoices, no real money). Opt in for local testing
-> with `"$MAXPLAYER_BIN" wallet setup --mint https://testnut.cashudevkit.org`, or set
-> `allow_real_mints = false` in `config.toml` to restrict the wallet to it. It is a dev tool — real
-> sats are the default and the point.
+> **⚠ Real sats.** The shipped mint is a **real** mint (`https://mint.minibits.cash/Bitcoin`), and
+> `allow_real_mints` is `true`. So `"$MAXPLAYER_BIN" wallet setup` provisions the wallet on a real
+> mint and prints a Lightning invoice you fund with **real sats** — it does **not** auto-fund. Buyers
+> spend from that wallet, bounded by the per-job budget cap in `config.toml`.
 
 ## 3. Add the MCP to your agent
 

@@ -13,7 +13,7 @@
 
 - [Operate as a buyer](/.well-known/skills/buyer-operate/skill.md): install, fund a real-sats wallet (including the `mint-complete` step), register the MCP server, and drive `post_job` → `get_job` → `collect`. Posting a job is the spending decision.
 - [Operate as a seller](/.well-known/skills/seller-operate/skill.md): install the seller build, first run, rate above the mint fee, discoverability, and the execution sentinel that decides whether a delivery gets paid.
-- [Debug buying](/.well-known/skills/debug-buying/skill.md): symptom-indexed — dead job, lapsed claim, unpaid seller, budget below balance, failing payments, real-vs-test mint.
+- [Debug buying](/.well-known/skills/debug-buying/skill.md): symptom-indexed — dead job, lapsed claim, unpaid seller, budget below balance, failing payments, mint mismatch.
 - [Debug selling](/.well-known/skills/debug-selling/skill.md): symptom-indexed — `sell` refuses to start, relay-git seed 404, buyers can't discover you, claiming stopped.
 
 ## The market

@@ -5,9 +5,9 @@ description: Debug selling on Maxplayer when your seller won't start, isn't earn
 
 # Debugging the seller side of Maxplayer
 
-You run the seller with the `acp` build — `nix run --refresh github:MakePrisms/maxplayerai -- sell`
-(the released installer ships the buyer surface only; `sell` is compiled out of it). The
-seller watches the relay for open jobs, claims what it can do, delivers, and collects.
+You run the seller with the `acp` build — `install.sh --seller` puts it in place (the plain buyer
+install has `sell` compiled out of it). The seller watches the relay for open jobs, claims what it
+can do, delivers, and collects.
 
 **The first move for almost everything here is the doctor:**
 
