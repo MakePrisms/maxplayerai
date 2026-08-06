@@ -932,7 +932,22 @@ async fn settle_job(
         }
     }
 
+    // #469: this settle just converted a reservation reserved→spent, so any reconcile-on-start
+    // snapshot still listing this job under `kept` is now stale — a `status` money-read would show
+    // already-settled funds as held, exactly when trust matters. Drop the snapshot here; the next
+    // reconcile pass repopulates it from live truth. Reached only on the Ok path (a refused settle
+    // returns via `?` above and leaves the snapshot untouched).
+    invalidate_reconcile_snapshot(context).await;
+
     Ok(outcome)
+}
+
+/// Drop the reconcile-on-start snapshot (`last_reconcile`) so `status` cannot surface an entry for a
+/// reservation that has since settled (#469). Display-only and idempotent: nothing reads
+/// `last_reconcile` for a decision — reconcile decisions re-derive from the store — so clearing it
+/// removes only a stale display, never a held reservation. The next reconcile pass re-populates it.
+async fn invalidate_reconcile_snapshot(context: &BuyerContext) {
+    *context.last_reconcile.lock().await = None;
 }
 
 async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
@@ -3605,6 +3620,39 @@ mod tests {
         drop(relay);
     }
 
+    // #469: a successful settle drops the reconcile-on-start snapshot, so a `status` money-read
+    // cannot show an already-settled reservation as still-`kept`. This pins the invalidation
+    // directly; `settle_job` calls it at its one success point (right after `settle_after_pay`
+    // flips reserved→spent). A live-melt success of the full `settle_job` has no CI-safe harness
+    // (collect runs no funded wallet in-test), so the success path's CALL is covered by that single
+    // placement, and the forged-delivery watcher test pins that a REFUSED settle leaves it.
+    // Red-on-revert: no-op `invalidate_reconcile_snapshot` and this fails.
+    #[tokio::test]
+    async fn a_settle_invalidates_the_stale_reconcile_snapshot() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let root = temp_home("invalidate-reconcile");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap_home(&root).expect("bootstrap home");
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        home.config.relay_url = relay.url().await.to_string();
+        let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
+
+        let job = "a".repeat(64);
+        *context.last_reconcile.lock().await =
+            Some(ReconcileReport { kept: vec![job.clone()], ..Default::default() });
+        assert!(context.last_reconcile.lock().await.is_some(), "premise: snapshot seeded");
+
+        invalidate_reconcile_snapshot(&context).await;
+
+        assert!(
+            context.last_reconcile.lock().await.is_none(),
+            "a settle must clear the reconcile snapshot so status drops the stale `kept`"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
+    }
+
     // ★ THE #179/4b TOOTH: the reconcile reports the pass that changed NOTHING.
     //
     // A release moves the buyer's `available` — it is a money-visible decision — and the pass that
@@ -4097,6 +4145,12 @@ mod tests {
             "the seeded award must be the watcher's work set"
         );
 
+        // #469: seed a reconcile-on-start snapshot that still lists this job under `kept`. A
+        // REFUSED settle must NOT clear it — the invalidation is gated on a successful flip
+        // (asserted below), so this pins that the clear is success-only, not unconditional.
+        *context.last_reconcile.lock().await =
+            Some(ReconcileReport { kept: vec![job_id.clone()], ..Default::default() });
+
         // Drive the watcher's settle pass directly — the same call its event and tick paths make.
         settle_awarded(&context, None).await;
 
@@ -4127,6 +4181,12 @@ mod tests {
                 Some((reservations::ReservationState::Reserved, _))
             ),
             "a refused settle must leave the reservation reserved"
+        );
+        // #469: and the reconcile snapshot is untouched — the invalidation is success-gated, so a
+        // refused settle never drops it (only a completed flip does).
+        assert!(
+            context.last_reconcile.lock().await.is_some(),
+            "a refused settle must not clear the reconcile snapshot (#469 clear is success-gated)"
         );
 
         let _ = std::fs::remove_dir_all(&root);
