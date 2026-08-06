@@ -142,6 +142,51 @@ pub fn plan_payment(
     }
 }
 
+/// Choose the buyer's SOURCE mint for a payment, preferring a mint the buyer already holds a
+/// covering balance at so a pre-funded cross-mint balance is spent directly instead of hopping from
+/// the default (which would drain the default and pay a melt fee). Falls back to the configured
+/// default — today's behavior — when no held, accepted, fence-admissible mint covers the amount.
+///
+/// Deterministic preference: the FIRST entry of the seller's `accepted_mints`, in the seller's list
+/// order, that (1) passes the real-mint fence and (2) shows a balance `>= amount_sats`. Returning an
+/// accepted mint makes [`plan_payment`] plan a DIRECT payment from it (no hop); the seller's order is
+/// their stated preference and keeps the choice stable across retries.
+///
+/// Balance-awareness is ADVISORY and applied ONCE, here at accept. The result is sealed into the
+/// accept-bind and re-derived (not re-decided) at pay, so a later balance or config-default change
+/// cannot shift the sealed mint — the pays-once attempt-id invariant is unchanged. Exact coverage
+/// (including fees) is enforced at pay: if the chosen mint's balance is spent before pay, the pay
+/// refuses fail-closed at that sealed mint rather than silently re-selecting a different one.
+pub(crate) fn select_source_mint(
+    config_default: &str,
+    accepted_mints: &[String],
+    allow_real_mints: bool,
+    balances: &[crate::wallet_ops::MintBalance],
+    amount_sats: u64,
+) -> String {
+    accepted_mints
+        .iter()
+        .find(|accepted| {
+            let mint = accepted.as_str();
+            home::mint_allowed(mint, allow_real_mints) && holds_at_least(balances, mint, amount_sats)
+        })
+        .cloned()
+        .unwrap_or_else(|| config_default.to_owned())
+}
+
+/// Whether `balances` shows at least `amount_sats` at `mint`, comparing normalized mint URLs. A
+/// parse failure on either side is treated as "no match" (never a panic); the caller's fallback to
+/// the configured default keeps a malformed accepted entry from becoming a selected source.
+fn holds_at_least(balances: &[crate::wallet_ops::MintBalance], mint: &str, amount_sats: u64) -> bool {
+    let Ok(target) = MintUrl::from_str(mint) else {
+        return false;
+    };
+    balances.iter().any(|entry| {
+        entry.balance_sats >= amount_sats
+            && MintUrl::from_str(&entry.mint_url).map(|url| url == target).unwrap_or(false)
+    })
+}
+
 /// What the buyer spends to deliver `offer.amount` across a hop.
 ///
 /// Three components, all of which the buyer pays and none of which reduce what the seller receives:
@@ -450,5 +495,114 @@ mod tests {
         let plan = plan_payment("https://buyer.example", &accepted, true)
             .expect("a later admissible entry is usable");
         assert_eq!(plan.realized_mint(), &mint(DEFAULT_MINT_URL));
+    }
+
+    // ---- select_source_mint: balance-aware source selection at accept (#497 behavior B) ----
+
+    fn balance(mint_url: &str, sats: u64) -> crate::wallet_ops::MintBalance {
+        crate::wallet_ops::MintBalance {
+            mint_url: mint_url.to_owned(),
+            balance_sats: sats,
+            is_default: false,
+        }
+    }
+
+    // #497 / probe ⑤: the buyer's default (minibits) is not what the seller accepts (cuba), but the
+    // buyer holds a covering balance at cuba. The old default-seeded plan HOPS minibits->cuba (melt
+    // fee, drains the default); balance-aware selection seeds cuba and pays DIRECT from the
+    // already-held balance — no hop, no melt fee.
+    #[test]
+    fn select_prefers_a_covering_accepted_mint_so_the_prefunded_balance_pays_direct() {
+        let minibits = "https://minibits.example";
+        let cuba = "https://cuba.example";
+        let accepted = vec![cuba.to_owned()];
+        let balances = vec![balance(minibits, 5_000), balance(cuba, 5_000)];
+
+        // Control — the default seed hops to reach cuba (the ⑤ waste).
+        let control = plan_payment(minibits, &accepted, true).expect("control plans");
+        assert!(control.is_hop(), "control: the default-seeded plan hops minibits->cuba");
+
+        // Balance-aware — cuba is selected and plan_payment pays direct from it.
+        let seed = select_source_mint(minibits, &accepted, true, &balances, 100);
+        assert_eq!(seed, cuba, "the held, accepted mint is chosen as the source");
+        let plan = plan_payment(&seed, &accepted, true).expect("balance-aware plan");
+        assert!(!plan.is_hop(), "direct from the held mint — no hop, no melt fee");
+        assert_eq!(plan.realized_mint(), &mint(cuba));
+    }
+
+    // No accepted mint holds enough -> fall back to the configured default (today's behavior). A
+    // balance below the amount, or no balance row at all, does not qualify.
+    #[test]
+    fn select_falls_back_to_the_default_when_no_accepted_mint_covers() {
+        let minibits = "https://minibits.example";
+        let cuba = "https://cuba.example";
+        let accepted = vec![cuba.to_owned()];
+
+        let thin = vec![balance(cuba, 99)];
+        assert_eq!(select_source_mint(minibits, &accepted, true, &thin, 100), minibits);
+
+        let elsewhere = vec![balance(minibits, 10_000)];
+        assert_eq!(select_source_mint(minibits, &accepted, true, &elsewhere, 100), minibits);
+
+        // Legacy: an empty accepted set has nothing to prefer; the default stands.
+        assert_eq!(select_source_mint(minibits, &[], true, &elsewhere, 100), minibits);
+    }
+
+    // The real-mint fence gates SELECTION exactly as it gates plan_payment: a covered mint the fence
+    // disallows is never chosen. Off -> only the testnut default; on -> the real mint is selectable.
+    #[test]
+    fn select_skips_a_fence_disallowed_mint_even_when_it_is_covered() {
+        let real = "https://real-mint.example";
+        let accepted = vec![real.to_owned()];
+        let balances = vec![balance(real, 10_000)];
+        assert_eq!(
+            select_source_mint(DEFAULT_MINT_URL, &accepted, false, &balances, 100),
+            DEFAULT_MINT_URL,
+            "fence off: a covered real mint is not admissible, fall back to the default"
+        );
+        assert_eq!(
+            select_source_mint(DEFAULT_MINT_URL, &accepted, true, &balances, 100),
+            real,
+            "fence on: the covered real mint is now selectable"
+        );
+    }
+
+    // Two covered, admissible accepted mints -> the FIRST in the seller's order wins, matching
+    // plan_payment's deterministic first-admissible rule. Order is the only thing that moves it, so
+    // a retry cannot re-order into a different sealed mint / attempt id.
+    #[test]
+    fn select_is_deterministic_first_covering_in_seller_order() {
+        let default_mint = "https://default.example";
+        let a = "https://a.example";
+        let b = "https://b.example";
+        let balances = vec![balance(a, 5_000), balance(b, 5_000)];
+        assert_eq!(
+            select_source_mint(default_mint, &[a.to_owned(), b.to_owned()], true, &balances, 100),
+            a
+        );
+        assert_eq!(
+            select_source_mint(default_mint, &[b.to_owned(), a.to_owned()], true, &balances, 100),
+            b
+        );
+    }
+
+    // Stale-source safety: selection happens ONCE at accept. If the chosen source is later drained,
+    // the PAY path re-derives from the sealed source (plan_payment over the seal) and never
+    // re-selects to a different held mint — so a drained sealed source lands on the wallet's existing
+    // fail-closed insufficient-balance refusal, never a silent swap.
+    #[test]
+    fn a_sealed_source_is_honored_at_pay_and_never_re_selected() {
+        let minibits = "https://minibits.example";
+        let cuba = "https://cuba.example";
+        let accepted = vec![cuba.to_owned()];
+        // cuba is covered at accept and gets sealed.
+        let sealed = select_source_mint(minibits, &accepted, true, &[balance(cuba, 5_000)], 100);
+        assert_eq!(sealed, cuba);
+        // At pay, re-derivation uses ONLY the sealed mint + accepted set — no balance input — so the
+        // plan is sourced at the sealed cuba regardless of where funds now sit. A drained cuba then
+        // fails the wallet's coverage check (the existing fail-closed guard), never a re-select.
+        let pay_plan = plan_payment(&sealed, &accepted, true).expect("re-derives from the seal");
+        assert_eq!(pay_plan.source_mint(), &mint(cuba), "pay honors the sealed source");
+        assert!(!pay_plan.is_hop());
     }
 }
