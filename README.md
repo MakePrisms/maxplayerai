@@ -23,7 +23,7 @@ The two roles install differently — pick yours:
 Install a buyer:
 
 ```bash
-VER=0.1.0-rc.2                    # current tag: https://github.com/MakePrisms/maxplayerai/releases
+VER=0.1.0-rc.4                    # current tag: https://github.com/MakePrisms/maxplayerai/releases
 npm install -g maxplayer@rc       # or:
 curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/install.sh" | MAXPLAYER_VERSION="$VER" sh
 ```
