@@ -14,19 +14,6 @@ and persists to `config.toml`, so relaunching is zero-prompt.
 "$MAXPLAYER_BIN" sell
 ```
 
-Confirm the binary exposes `sell` before relying on it:
-
-```bash
-"$MAXPLAYER_BIN" sell --bogus
-# expect the Usage block:
-#   Usage:
-#     maxplayer sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>] [--skip-doctor]
-#     maxplayer sell   # zero-prompt relaunch from config.toml
-#     maxplayer sell --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch
-```
-
-If that Usage does not appear, this quickstart cannot run on your tip — stop and get a binary that includes `sell`.
-
 Reality class:
 
 | Leg | Class | What that means |
@@ -45,40 +32,35 @@ Index of roles: [`README.md`](README.md). Buyer path: [`BUYER-QUICKSTART.md`](BU
 
 ---
 
-## 0. Get a seller binary
+## 0. Get the binary
 
-No toolchain needed — the release publishes a seller asset alongside the buyer one:
+No toolchain needed:
 
 ```bash
-VER=0.1.0-rc.4   # current tag: https://github.com/MakePrisms/maxplayerai/releases
-curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/install.sh" | MAXPLAYER_VERSION="$VER" sh -s -- --seller
+VER=0.1.0-rc.7   # current tag: https://github.com/MakePrisms/maxplayerai/releases
+curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/install.sh" | MAXPLAYER_VERSION="$VER" sh
 MAXPLAYER_BIN="$HOME/.local/bin/maxplayer"
-"$MAXPLAYER_BIN" sell --bogus   # must print sell Usage (see above)
+"$MAXPLAYER_BIN" --version   # must print a version
 ```
 
 > **Name the version.** Every release so far is a **pre-release**, so
 > `releases/latest/download/install.sh` and GitHub's "latest release" API both 404 — and the piped
-> `sh` exits `0` having installed nothing. The `--seller` asset ships from **rc.3**; on rc.2 and
-> earlier, build it with nix below.
+> `sh` exits `0` having installed nothing.
 
 Building it yourself instead:
 
 ```bash
 git clone https://github.com/MakePrisms/maxplayerai.git
 cd maxplayerai
-
-# Seller execute needs the `acp` feature (flake packages already enable it).
-nix develop -c bash -lc 'cargo build -p maxplayer --release --features acp'
+nix develop -c bash -lc 'cargo build -p maxplayer --release --no-default-features --features wallet,acp'
 MAXPLAYER_BIN="$(pwd)/target/release/maxplayer"
-"$MAXPLAYER_BIN" sell --bogus   # must print sell Usage (see above)
 ```
 
-Or, without cloning, from a flake build that already packages `acp`:
+Or, without cloning, straight from the flake:
 
 ```bash
 # nix caches the git ref — always --refresh (or pin+bump the rev) or you get a stale binary.
 MAXPLAYER_BIN="$(nix build --refresh --no-link --print-out-paths github:MakePrisms/maxplayerai)/bin/maxplayer"
-"$MAXPLAYER_BIN" sell --bogus   # must print sell Usage
 ```
 
 > ⚠ **Stale nix cache:** `nix run github:MakePrisms/maxplayerai -- …` without `--refresh` can serve yesterday's binary. Prefer `nix run --refresh github:MakePrisms/maxplayerai -- sell …` (or pin+bump the rev).
@@ -145,6 +127,7 @@ Notes:
   - no --key (packaged key file only)
   - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint
   - --skip-doctor: bypass the startup readiness gate (default: checks-on; not recommended)
+  - --unsafe-no-sandbox: serve the OPEN POOL with no working sandbox — this box then runs code written by strangers with no containment (waives only that one check)
   - open-pool claiming is OFF by default; pass --claim-open-pool to opt in
   - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)
 ```
@@ -160,6 +143,7 @@ Notes:
 | `--job-timeout-secs <n>` | no | Per-job timeout (seconds). |
 | `--offer-backfill-secs <n>` | no | See OPEN-POOL offers posted up to `n` seconds before startup (default `1200`; `0` = live-only; targeted offers always backfill). |
 | `--skip-doctor` | no | Bypass the startup doctor readiness gate (checks-on by default; not recommended). |
+| `--unsafe-no-sandbox` | no | Serve the open pool with no working sandbox — this box then runs strangers' code uncontained. Waives that one check only. |
 | `--home <dir>` | no | Home root (else `MAXPLAYER_HOME` / `~/.maxplayer`). |
 
 \* Exactly one of `--agent` / `--agent-argv` is required on the **first** run. After that they are
@@ -571,7 +555,6 @@ Optional: BYO delivery + custom agent (power-user hatch):
 ## Acceptance checklist
 
 ```
-→ binary prints `maxplayer sell` Usage (`sell --bogus`)
 → first run needs ONLY --agent + --rate-sats; bare `maxplayer sell` relaunch is zero-prompt (reads config.toml)
 → fresh MAXPLAYER_HOME (key 0600, auto-generated, never echoed, never --key)
 → mint https://mint.minibits.cash/Bitcoin (a REAL mint)

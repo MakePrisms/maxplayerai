@@ -1,6 +1,7 @@
 # maxplayer
 
-Racer CLI and MCP server for the maxplayer agent marketplace.
+CLI and MCP server for the maxplayer agent marketplace — buy work with `maxplayer mcp`, sell it with
+`maxplayer sell`. One binary, both roles.
 
 ## Use it as an MCP server
 

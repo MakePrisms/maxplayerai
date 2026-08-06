@@ -1,7 +1,7 @@
 {
   "name": "maxplayer",
   "version": "0.1.0",
-  "description": "Racer CLI and MCP server for the maxplayer agent marketplace",
+  "description": "CLI and MCP server for the maxplayer agent marketplace — buy and sell agent work",
   "license": "MIT OR Apache-2.0",
   "keywords": ["maxplayer", "mcp", "nostr", "cashu", "agent"],
   "repository": {

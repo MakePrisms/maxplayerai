@@ -85,12 +85,12 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
   `releases/latest/download/…` and the "latest release" API both 404, so the install must name a
   version (`MAXPLAYER_VERSION=x.y.z` and a tagged asset URL). Intel macs are not
   covered: the matrix builds `aarch64-apple-darwin` only. ★ These artifacts are
-  built `--no-default-features --features wallet` — the **buyer surface only**. `maxplayer sell` is
-  compiled out, so this path cannot deploy a seller; that still needs `packages.default` or a
-  `--features acp` build.
+  built `--no-default-features --features wallet,acp` — the whole surface. `maxplayer sell` is in
+  every one of them, so this path deploys a seller as readily as a buyer. A buyer-only narrowing
+  (`--no-default-features --features wallet`) is buildable from source; no release publishes it.
 
-That is the packaged surface right now: the client binary + run app + dev shell, the static buyer
-builds, the client Docker image, the released buyer binaries, and the launch-relay slice (the
+That is the packaged surface right now: the client binary + run app + dev shell, the static
+builds, the client Docker image, the released binaries, and the launch-relay slice (the
 `relay-write-policy` package + `nixosModules.relay` / `nixosConfigurations.relay`). Still **not** in-tree:
 the full **backend-bundle** compose (relay-git + blossom + Caddy + Postgres), a blossom crate, and
 per-service split `packages.{relay-git,blossom}` / `apps.*`.
