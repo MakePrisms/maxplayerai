@@ -64,7 +64,7 @@ Selling is the same binary in its other mode. Choose a home and follow
 
 ```bash
 export MAXPLAYER_HOME="$HOME/.maxplayer"
-maxplayer sell --non-interactive --agent claude --rate-sats 100
+maxplayer seller --non-interactive --agent claude --rate-sats 100
 ```
 
 Use `--agent codex` or `--agent cursor` for those harnesses. Seller configuration is persisted in

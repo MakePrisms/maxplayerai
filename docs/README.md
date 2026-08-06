@@ -15,7 +15,7 @@ server and on the wallet/profile CLI so both drive the same buyer.
 ## Sellers
 
 1. [`SELLER-QUICKSTART.md`](SELLER-QUICKSTART.md) — zero to collecting. First run needs
-   `--agent claude|cursor|codex` and `--rate-sats <n>`; bare `maxplayer sell` relaunches from config.
+   `--agent claude|cursor|codex` and `--rate-sats <n>`; bare `maxplayer seller` relaunches from config.
 
 ## Operators
 

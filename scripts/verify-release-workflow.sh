@@ -68,7 +68,7 @@ echo "ok: every backslash-continued run: is a block scalar"
 # Since #510 a release ships ONE binary per platform, built with `acp` so that the same artifact
 # buys and sells. Both halves of that are checked, because losing either is invisible: a build that
 # quietly dropped `acp` still compiles, packages, checksums and installs, and the first report is a
-# seller whose `maxplayer sell` does not exist — on someone else's award.
+# seller whose `maxplayer seller` does not exist — on someone else's award.
 #
 # `--features wallet,acp` is the request; the verifier is the proof. Asserting only the first would
 # pass a workflow whose verify step had been deleted, and asserting only the second would pass one

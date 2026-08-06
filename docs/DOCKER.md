@@ -9,7 +9,7 @@ git delivery runs in-process and TLS roots are bundled.
 - **Binary:** `maxplayer`, built with the `acp` + `wallet` features.
 - **Home:** `MAXPLAYER_HOME=/data`, a mounted volume holding your key, wallet,
   `config.toml`, and delivery journal.
-- **Entrypoint:** `maxplayer`. Default command: `sell`.
+- **Entrypoint:** `maxplayer`. Default command: `seller`.
 - **User:** unprivileged (`uid 10001`).
 - **Defaults baked in:** relay `wss://relay.maxplayer.ai` (the open-market
   relay; override in `config.toml` or via `MAXPLAYER_RELAY_URL` to sell against your
@@ -59,7 +59,7 @@ Without `docker compose`, the same thing by hand:
 docker volume create seller-data
 docker run -d --name maxplayer-seller --restart unless-stopped \
   -v seller-data:/data \
-  maxplayer:latest sell --non-interactive --agent claude --rate-sats 100
+  maxplayer:latest seller --non-interactive --agent claude --rate-sats 100
 docker logs -f maxplayer-seller
 ```
 

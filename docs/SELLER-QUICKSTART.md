@@ -2,16 +2,16 @@
 
 Documented seller steps only. The key never leaves the box.
 
-`maxplayer sell` is a seller daemon with good defaults. The **only** inputs you must choose are
+`maxplayer seller` is a seller daemon with good defaults. The **only** inputs you must choose are
 **`--agent`** and **`--rate-sats`**. Everything else (relay, mint, delivery remote, key) defaults
 and persists to `config.toml`, so relaunching is zero-prompt.
 
 ```bash
 # first run — the only two required choices; writes [seller] into config.toml
-"$MAXPLAYER_BIN" sell --agent claude --rate-sats 100
+"$MAXPLAYER_BIN" seller --agent claude --rate-sats 100
 
 # steady state — reads config.toml, zero prompts
-"$MAXPLAYER_BIN" sell
+"$MAXPLAYER_BIN" seller
 ```
 
 Reality class:
@@ -63,7 +63,7 @@ Or, without cloning, straight from the flake:
 MAXPLAYER_BIN="$(nix build --refresh --no-link --print-out-paths github:MakePrisms/maxplayerai)/bin/maxplayer"
 ```
 
-> ⚠ **Stale nix cache:** `nix run github:MakePrisms/maxplayerai -- …` without `--refresh` can serve yesterday's binary. Prefer `nix run --refresh github:MakePrisms/maxplayerai -- sell …` (or pin+bump the rev).
+> ⚠ **Stale nix cache:** `nix run github:MakePrisms/maxplayerai -- …` without `--refresh` can serve yesterday's binary. Prefer `nix run --refresh github:MakePrisms/maxplayerai -- seller …` (or pin+bump the rev).
 
 ---
 
@@ -85,7 +85,7 @@ Defaults written on first bootstrap / first `sell`:
   real sats.
 - **relay:** `wss://relay.maxplayer.ai` — the open-market relay (override in `config.toml` or via `MAXPLAYER_RELAY_URL`).
 - **delivery remote:** the hosted **relay-git** (see [§4](#4-delivery--relay-git-default-or-byo)).
-- **key file:** `$MAXPLAYER_HOME/key` (or `~/.maxplayer/key`) — mode `0600`, auto-generated, never printed by `maxplayer sell`.
+- **key file:** `$MAXPLAYER_HOME/key` (or `~/.maxplayer/key`) — mode `0600`, auto-generated, never printed by `maxplayer seller`.
 
 All four are overridable in `config.toml`. The mint is a **real** mint: what you earn is real sats.
 
@@ -113,13 +113,13 @@ relay-git, and relay / mint / key are automatic.
 
 ---
 
-## 2. `maxplayer sell` flags
+## 2. `maxplayer seller` flags
 
 ```text
 Usage:
-  maxplayer sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>] [--skip-doctor]
-  maxplayer sell   # zero-prompt relaunch from config.toml
-  maxplayer sell --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch
+  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>] [--skip-doctor]
+  maxplayer seller   # zero-prompt relaunch from config.toml
+  maxplayer seller --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch
 
 Notes:
   - required user choices: --agent (or --agent-argv) + --rate-sats (first run)
@@ -147,9 +147,9 @@ Notes:
 | `--home <dir>` | no | Home root (else `MAXPLAYER_HOME` / `~/.maxplayer`). |
 
 \* Exactly one of `--agent` / `--agent-argv` is required on the **first** run. After that they are
-persisted in `config.toml`, so a bare `maxplayer sell` relaunch needs neither.
+persisted in `config.toml`, so a bare `maxplayer seller` relaunch needs neither.
 
-**Zero-prompt / non-interactive.** A bare `maxplayer sell` with an existing `[seller]` config runs
+**Zero-prompt / non-interactive.** A bare `maxplayer seller` with an existing `[seller]` config runs
 straight through (zero prompts). On a **first** run without a TTY, pass `--agent` + `--rate-sats`
 (the daemon errors and names the missing fields rather than hanging). `--non-interactive` forces
 that fail-closed naming even in a TTY. In a TTY with no config, a short wizard prompts for the
@@ -159,7 +159,7 @@ agent and rate (rate default `2`) and then writes `[seller]`.
 
 ## 3. Agents — presets first, argv as the hatch
 
-`maxplayer sell` starts your agent as an **ACP stdio agent**. You do not need to know ACP: pick a preset.
+`maxplayer seller` starts your agent as an **ACP stdio agent**. You do not need to know ACP: pick a preset.
 
 > **Sandbox the job agent.** The seller's job agent executes untrusted buyer task text. Run it
 > sandboxed: no `~/.maxplayer` access, no wallet tools or keys, and no host secrets. Give it only the
@@ -178,7 +178,7 @@ authenticated. Gotcha 1 in §3b has the install and login command for each.
 yourself (repeat the flag; no shell strings, no `--key`):
 
 ```bash
-"$MAXPLAYER_BIN" sell \
+"$MAXPLAYER_BIN" seller \
   --agent-argv cursor-agent --agent-argv acp \
   --rate-sats 100
 ```
@@ -204,7 +204,7 @@ things **first**.
 
 `--agent claude|cursor|codex` resolves to a **fixed adapter command** and spawns it as the ACP
 stdio agent. **There is no auto-`npx` fallback:** if that adapter binary is not found on the
-daemon's `PATH`, `maxplayer sell` errors up front with an install hint and does **no** work — it does
+daemon's `PATH`, `maxplayer seller` errors up front with an install hint and does **no** work — it does
 not silently reach for `npx`.
 
 Each preset needs a specific binary on `PATH` — **and, except for `cursor`, an underlying agent CLI
@@ -274,7 +274,7 @@ authenticate. If it prompts for login, so will the seller's probe.
   on the preset lookup, e.g.:
 
   ```bash
-  "$MAXPLAYER_BIN" sell \
+  "$MAXPLAYER_BIN" seller \
     --agent-argv npx --agent-argv @agentclientprotocol/claude-agent-acp \
     --rate-sats 100
   ```
@@ -304,7 +304,7 @@ export CLAUDE_CODE_EXECUTABLE=/run/current-system/sw/bin/claude
 ```
 
 Export `CLAUDE_CODE_EXECUTABLE` into the **same environment the daemon runs under** (systemd
-`Environment=`, Docker `-e` / `ENV`, or the shell that launches `maxplayer sell`) — not just an
+`Environment=`, Docker `-e` / `ENV`, or the shell that launches `maxplayer seller`) — not just an
 interactive shell. With it set, the adapter runs the working `claude` and the ACP/`execute` path
 comes alive.
 
@@ -353,14 +353,14 @@ and aborts the boot probe without them (read-only is enough — it never writes 
   `agent_command argv must be non-empty`, from the argv validator shared with `agent_command`; the message
   names that field — tracked as #381). It fails loudly, so there is no silent-empty footgun; opt out
   **only** by omitting the section.
-- **A seat serving the OPEN POOL must be contained, and this is checked at boot.** `maxplayer sell`
+- **A seat serving the OPEN POOL must be contained, and this is checked at boot.** `maxplayer seller`
   runs the launcher and reads what it did: a file beside your key must be unreadable from inside it,
   and the job workdir must be writable. Fail either leg and the seat refuses to start (#451).
   `launcher = ["env"]` resolves perfectly and confines nothing — it is refused on the second leg,
   not the first.
 - **Targeted-only seats stay advisory.** Without `claim_open_pool`, the same probe reports as a WARN:
   you run work from counterparties you accepted, rather than whatever the market posts.
-- **The escape hatch is one flag, and it is narrow on purpose.** `maxplayer sell --unsafe-no-sandbox`
+- **The escape hatch is one flag, and it is narrow on purpose.** `maxplayer seller --unsafe-no-sandbox`
   serves the open pool uncontained. It waives THIS check only — the relay, mint, key and agent gates
   stay blocking, so accepting the code-execution exposure never means switching the rest off.
 
@@ -443,7 +443,7 @@ seller's pubkey (untargeted/open offers are soft-skipped; wrong `#p` refused; th
 Opt in to also claim untargeted/open offers that still clear your rate:
 
 ```bash
-"$MAXPLAYER_BIN" sell --agent claude --rate-sats 100 --claim-open-pool
+"$MAXPLAYER_BIN" seller --agent claude --rate-sats 100 --claim-open-pool
 ```
 
 `--claim-open-pool` (or `claim_open_pool = true` in `config.toml`) widens claiming to the open pool;
@@ -499,19 +499,19 @@ export MAXPLAYER_HOME="/tmp/maxplayer-seller-fresh-$(date +%s)"
 mkdir -p "$MAXPLAYER_HOME"
 
 # first run — presets + relay-git default; only --agent and --rate-sats are required
-"$MAXPLAYER_BIN" sell \
+"$MAXPLAYER_BIN" seller \
   --home "$MAXPLAYER_HOME" \
   --agent claude \
   --rate-sats 100
 
 # later: just relaunch (reads config.toml, zero prompts)
-"$MAXPLAYER_BIN" sell --home "$MAXPLAYER_HOME"
+"$MAXPLAYER_BIN" seller --home "$MAXPLAYER_HOME"
 ```
 
 Startup status (stderr) looks like:
 
 ```text
-maxplayer sell home=… key_present=true mint=https://mint.minibits.cash/Bitcoin relay=wss://relay.maxplayer.ai
+maxplayer seller home=… key_present=true mint=https://mint.minibits.cash/Bitcoin relay=wss://relay.maxplayer.ai
 git_remote defaulting to relay-git https://relay.maxplayer.ai/git/<pubkey>/m<pubkey-short>.git
 wrote [seller] to …/config.toml
 relay-git NIP-34 announce ok id=… remote=…
@@ -542,7 +542,7 @@ or a failure is behind that flag — you never have to enable it to see somethin
 Optional: BYO delivery + custom agent (power-user hatch):
 
 ```bash
-"$MAXPLAYER_BIN" sell --non-interactive \
+"$MAXPLAYER_BIN" seller --non-interactive \
   --home "$MAXPLAYER_HOME" \
   --agent-argv bun --agent-argv "$AGENT_WRAPPER" \
   --rate-sats 100 \
@@ -555,7 +555,7 @@ Optional: BYO delivery + custom agent (power-user hatch):
 ## Acceptance checklist
 
 ```
-→ first run needs ONLY --agent + --rate-sats; bare `maxplayer sell` relaunch is zero-prompt (reads config.toml)
+→ first run needs ONLY --agent + --rate-sats; bare `maxplayer seller` relaunch is zero-prompt (reads config.toml)
 → fresh MAXPLAYER_HOME (key 0600, auto-generated, never echoed, never --key)
 → mint https://mint.minibits.cash/Bitcoin (a REAL mint)
 → --agent claude|cursor|codex resolves ACP internally; --agent-argv is the power-user hatch

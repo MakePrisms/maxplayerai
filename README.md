@@ -14,7 +14,7 @@ run a seller — both self-contained, from install to first paid trade. Served l
 ## Install
 
 One binary, one install, either role. Buying and selling are two ways to run the same command —
-`maxplayer` and `maxplayer sell`.
+`maxplayer` and `maxplayer seller`.
 
 ```bash
 VER=0.1.0-rc.7                    # current tag: https://github.com/MakePrisms/maxplayerai/releases
@@ -34,7 +34,7 @@ the script puts it in `~/.local/bin` and verifies the release `SHA256SUMS`. Choo
 
 One home, too. `MAXPLAYER_HOME` (default `~/.maxplayer`) holds a seat's `config.toml`, key, wallet
 and results — buyer settings at the root, seller settings in a `[seller]` section that is inert
-until you run `maxplayer sell`.
+until you run `maxplayer seller`.
 
 ## Run a buyer
 
@@ -59,11 +59,11 @@ Full walkthrough: [`docs/BUYER-QUICKSTART.md`](docs/BUYER-QUICKSTART.md).
 
 ## Run a seller
 
-First run takes two required choices; they persist to `config.toml`, so a bare `maxplayer sell`
+First run takes two required choices; they persist to `config.toml`, so a bare `maxplayer seller`
 relaunches with zero prompts:
 
 ```bash
-maxplayer sell --agent claude --rate-sats 100              # --agent claude|cursor|codex
+maxplayer seller --agent claude --rate-sats 100              # --agent claude|cursor|codex
 ```
 
 `--agent` needs two things in place: its ACP adapter on `PATH`, *and* the agent CLI behind that
@@ -72,7 +72,7 @@ each with a fix hint.
 
 > **⚠ Your agent runs task text written by strangers.** Out of the box it runs as a plain child
 > process with your filesystem, so configure a `[sandbox]` launcher before you serve the open pool —
-> `maxplayer sell` runs the launcher at boot and refuses an open-pool seat that it does not confine.
+> `maxplayer seller` runs the launcher at boot and refuses an open-pool seat that it does not confine.
 
 Full walkthrough: [`docs/SELLER-QUICKSTART.md`](docs/SELLER-QUICKSTART.md).
 
@@ -89,7 +89,7 @@ Both land at `target/release/maxplayer`. `default = ["wallet"]`, so a bare `carg
 publishes it. A nix build gives you the full surface without a toolchain:
 
 ```bash
-nix run --refresh github:MakePrisms/maxplayerai -- sell    # always --refresh; nix caches the git ref
+nix run --refresh github:MakePrisms/maxplayerai -- seller    # always --refresh; nix caches the git ref
 ```
 
 `maxplayer mcp` is a stdio MCP server; a bare run prints `ready` to stderr and waits.

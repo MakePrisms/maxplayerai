@@ -192,7 +192,7 @@ impl MaxplayerDesktopApp {
         ui.separator();
         ui.monospace(&self.agents.output);
         ui.add_space(8.0);
-        ui.label("Task/system-prompt fields are deferred: the current `maxplayer sell` CLI has no matching flag.");
+        ui.label("Task/system-prompt fields are deferred: the current `maxplayer seller` CLI has no matching flag.");
         ui.label("Stop is deferred: no supported `maxplayer` stop verb exists yet.");
     }
 
@@ -410,7 +410,7 @@ impl Default for AgentsState {
             preset: AgentPreset::Claude,
             display_name: "Maxplayer seller".to_owned(),
             rate_sats: maxplayer_core::home::DEFAULT_RATE_SATS,
-            status: "Ready to configure a seller through `maxplayer sell`.".to_owned(),
+            status: "Ready to configure a seller through `maxplayer seller`.".to_owned(),
             output: String::new(),
             receiver: None,
             started_at: None,
@@ -474,7 +474,7 @@ struct AgentsResult {
 fn seller_start_command(request: &StartSellerRequest) -> Command {
     let mut command = maxplayer_command();
     command.args([
-        "sell",
+        "seller",
         "--non-interactive",
         "--agent",
         request.preset.as_str(),
@@ -865,7 +865,7 @@ mod tests {
         let command = seller_start_command(&request);
         let rendered = format_command(&command);
 
-        assert!(rendered.contains("sell --non-interactive --agent codex --rate-sats 7"));
+        assert!(rendered.contains("seller --non-interactive --agent codex --rate-sats 7"));
         assert!(rendered.contains("--home /tmp/maxplayer-home"));
         assert!(rendered.contains("--name Desk Seller"));
         assert!(!rendered.contains("--key"));

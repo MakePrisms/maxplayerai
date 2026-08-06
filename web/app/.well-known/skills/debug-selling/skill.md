@@ -1,11 +1,11 @@
 ---
 name: maxplayer-debug-selling
-description: Debug selling on Maxplayer when your seller won't start, isn't earning, or looks dead. Covers `maxplayer sell` refusing to boot (the startup doctor / readiness gate), a fresh seller bricking at the relay-git seed with a 404, health-checks that show nothing on a perfectly healthy daemon (which log line actually proves liveness), a seat that buyers can't discover, and a seller that quietly stops claiming new jobs. Says exactly which command to run, which log line to grep, and where to report a dead end.
+description: Debug selling on Maxplayer when your seller won't start, isn't earning, or looks dead. Covers `maxplayer seller` refusing to boot (the startup doctor / readiness gate), a fresh seller bricking at the relay-git seed with a 404, health-checks that show nothing on a perfectly healthy daemon (which log line actually proves liveness), a seat that buyers can't discover, and a seller that quietly stops claiming new jobs. Says exactly which command to run, which log line to grep, and where to report a dead end.
 ---
 
 # Debugging the seller side of Maxplayer
 
-The seller is `maxplayer sell` — the same binary a buyer installs, run in its other mode. It watches
+The seller is `maxplayer seller` — the same binary a buyer installs, run in its other mode. It watches
 the relay for open jobs, claims what it can do, delivers, and collects.
 
 **The first move for almost everything here is the doctor:**
@@ -14,7 +14,7 @@ the relay for open jobs, claims what it can do, delivers, and collects.
 maxplayer doctor
 ```
 
-It runs the same checks `maxplayer sell` runs at startup: `seller key`, `relay
+It runs the same checks `maxplayer seller` runs at startup: `seller key`, `relay
 reachability`, `mint reachability`, `agent preset`, `sandbox launcher`, plus advisory
 `credential helper` and `telemetry`. Each prints `PASS`/`WARN`/`FAIL` and, when not PASS,
 a one-line `(fix: …)` hint. Exit is `0` unless something `FAIL`ed; a `WARN` never fails.
@@ -23,14 +23,14 @@ Every check runs even after one fails, so one run shows the whole picture. Add
 
 ---
 
-## Symptom: `maxplayer sell` refuses to start
+## Symptom: `maxplayer seller` refuses to start
 
 On startup, `sell` runs the doctor as a readiness gate and **refuses to boot if any
 blocking check FAILs** — this is by design, so a seat never advertises work it cannot do.
 You will see:
 
 ```
-maxplayer sell — startup readiness checks (auto-doctor; pass --skip-doctor to bypass)
+maxplayer seller — startup readiness checks (auto-doctor; pass --skip-doctor to bypass)
 ```
 
 followed by the check lines, and on failure:
@@ -38,7 +38,7 @@ followed by the check lines, and on failure:
 ```
 ... REFUSING to start: N blocking readiness check(s) failed —
   FAIL <check> — <detail> (fix: <hint>)
-resolve the item(s) above, then re-run `maxplayer sell`. To bypass these checks (NOT
+resolve the item(s) above, then re-run `maxplayer seller`. To bypass these checks (NOT
 recommended), pass --skip-doctor.
 ```
 
@@ -57,7 +57,7 @@ recommended), pass --skip-doctor.
 A `WARN` (e.g. one of several mints down, or `no [seller] section configured`) prints but
 does **not** block boot.
 
-**Fix:** resolve the FAILed item using its hint, then re-run `maxplayer sell`. Re-running
+**Fix:** resolve the FAILed item using its hint, then re-run `maxplayer seller`. Re-running
 `maxplayer doctor` confirms it before you retry. `--skip-doctor` bypasses the gate but is
 not recommended — a bad launcher or unresolvable agent means every awarded job dies at
 spawn and you lose the award.
@@ -133,7 +133,7 @@ so the `ls-remote` 404s and the seller refuses to boot. It fails closed: no mone
 **Fix / workaround — bring your own delivery host (the tool's own recommended fix):**
 
 ```
-maxplayer sell --agent <claude|cursor|codex> --rate-sats <n> --git-remote <https-url>
+maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> --git-remote <https-url>
 ```
 
 `--git-remote <https-url>` points delivery at a git host you control (e.g. an HTTPS repo
@@ -213,7 +213,7 @@ confusing but expected.)
 **Check:** confirm the `seller node discoverable …` line appeared at your last startup, and
 that the relay was up at that moment.
 
-**Fix:** **restart the seller** (`maxplayer sell`). Boot re-publishes kind-0 + kind-31990
+**Fix:** **restart the seller** (`maxplayer seller`). Boot re-publishes kind-0 + kind-31990
 and you are listed again. This is the correct response after any relay outage that
 happened while your seat was already running.
 
@@ -262,7 +262,7 @@ backlog full (cap 32)` line and a count of `claimed` rows past their deadline
 - grep stderr for `seller node live:` (booted) and `seller node wrap backfill (periodic):
   fetching` (still alive)
 
-There is no `maxplayer sell status` command — a seller's state lives in its stderr log and
+There is no `maxplayer seller status` command — a seller's state lives in its stderr log and
 the checks above. Every dead end exits the same way: an issue on
 **https://github.com/MakePrisms/maxplayerai** naming the exact log line you saw, or a note
 on the Maxplayer market channel (buzz). Reporting the line that was missing is what turns a

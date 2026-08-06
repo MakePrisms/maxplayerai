@@ -36,9 +36,9 @@ where
         Some("mcp") if args.len() == 2 => crate::mcp::run(out, err),
         Some("buyer") => crate::buyer::run(&args[2..], out, err),
         // Seller advertise surface — compiled in only with `acp` (#360). On a buyer-only build this
-        // falls through to `usage`, so `sell` cannot boot or publish a seat it can never deliver on.
+        // falls through to `usage`, so `seller` cannot boot or publish a seat it can never deliver on.
         #[cfg(feature = "acp")]
-        Some("sell") => crate::sell::run(&args[2..], out, err),
+        Some("seller") => crate::sell::run(&args[2..], out, err),
         Some("accept") => crate::accept_cli::run(&args[2..], out, err),
         Some("collect") => crate::collect_cli::run(&args[2..], out, err),
         Some("doctor") => crate::doctor::run(&args[2..], out, err),
@@ -288,7 +288,7 @@ fn usage(err: &mut dyn Write) -> i32 {
 fn write_usage(out: &mut dyn Write) {
     let _ = write!(
         out,
-        "Usage:\n  maxplayer [--help | --version]\n  maxplayer version\n  maxplayer mcp\n  maxplayer buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # runner environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  maxplayer whoami [--home <dir>]   # print this seat's public identity (hex pubkey, npub, resolved home)\n"
+        "Usage:\n  maxplayer [--help | --version]\n  maxplayer version\n  maxplayer mcp\n  maxplayer buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # seller environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  maxplayer whoami [--home <dir>]   # print this seat's public identity (hex pubkey, npub, resolved home)\n"
     );
     #[cfg(feature = "stub-pay")]
     let _ = write!(
@@ -301,7 +301,7 @@ fn write_usage(out: &mut dyn Write) {
     #[cfg(feature = "acp")]
     let _ = write!(
         out,
-        "  maxplayer sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool]\n  maxplayer sell   # zero-prompt relaunch from config.toml\n"
+        "  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n"
     );
     let _ = writeln!(
         out,
@@ -536,7 +536,7 @@ mod tests {
 
     // #360: the seller advertise surface is gated on `acp`. These two tests are the same assertion
     // read from opposite feature builds — the verdict must MOVE with the feature, which is what
-    // proves the gate binds `sell` rather than something incidental.
+    // proves the gate binds `seller` rather than something incidental.
     #[cfg(not(feature = "acp"))]
     #[test]
     fn sell_is_absent_from_the_buyer_surface() {
@@ -544,12 +544,12 @@ mod tests {
         let (code, out, _err) = run_captured(["maxplayer", "--help"]);
         assert_eq!(code, 0);
         assert!(
-            !out.contains("maxplayer sell"),
-            "buyer build must not list `sell` in usage:\n{out}"
+            !out.contains("maxplayer seller"),
+            "buyer build must not list `seller` in usage:\n{out}"
         );
         // Invoking it cannot boot the seller: it is a plain usage error, identical to any unknown
         // command, and never reaches the discoverability/heartbeat publish.
-        let (code, out, err) = run_captured(["maxplayer", "sell", "--agent", "claude", "--rate-sats", "100"]);
+        let (code, out, err) = run_captured(["maxplayer", "seller", "--agent", "claude", "--rate-sats", "100"]);
         assert_eq!(code, 1);
         assert!(out.is_empty());
         assert!(err.contains("Usage:"));
@@ -561,8 +561,42 @@ mod tests {
         let (code, out, _err) = run_captured(["maxplayer", "--help"]);
         assert_eq!(code, 0);
         assert!(
-            out.contains("maxplayer sell"),
-            "acp build must list `sell` in usage:\n{out}"
+            out.contains("maxplayer seller"),
+            "acp build must list `seller` in usage:\n{out}"
+        );
+    }
+
+    // #533: the top-level `--help` names `doctor` with the same "seller environment self-check"
+    // wording as doctor.rs's own header — the two surfaces must not drift apart again (this line
+    // used to read "runner environment self-check"). A label pin in the #528 style, on the base
+    // usage so it holds on every feature build.
+    #[test]
+    fn doctor_help_line_uses_seller_wording() {
+        let (code, out, _err) = run_captured(["maxplayer", "--help"]);
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("# seller environment self-check"),
+            "top-level --help must describe doctor as the seller environment self-check:\n{out}"
+        );
+        assert!(
+            !out.contains("runner environment self-check"),
+            "the retired \"runner environment self-check\" wording must not reappear:\n{out}"
+        );
+    }
+
+    // No-alias (cleancut): the RETIRED `sell` subcommand must not dispatch. There is no `sell` arm,
+    // so it falls through to a plain usage error like any unknown command, on every build. The arm is
+    // gone structurally; this makes the property red-provable — re-pointing the dispatch at `sell`
+    // (or adding a `sell` alias) fails it. Guards the blind-rename-of-the-foil hazard: the old
+    // buyer-surface test's argv was renamed to `seller`, leaving no assertion that `sell` is rejected.
+    #[test]
+    fn retired_sell_subcommand_is_rejected_no_alias() {
+        let (code, out, err) = run_captured(["maxplayer", "sell", "--agent", "claude", "--rate-sats", "100"]);
+        assert_eq!(code, 1, "`maxplayer sell` must be a usage error, never a dispatch");
+        assert!(out.is_empty(), "`maxplayer sell` must print nothing to stdout:\n{out}");
+        assert!(
+            err.contains("Usage:"),
+            "`maxplayer sell` must fall through to usage, not boot a seller:\n{err}"
         );
     }
 

@@ -8,7 +8,7 @@
 //!
 //! SCAFFOLD STATUS: boot + the drain/dispatch skeleton are wired. The offer→claim, award→execute,
 //! and gift-wrap→pay arms + the #150 relay-stall watchdog + #162 recovery-retry are ported on top of
-//! this in the following cutover steps (marked `PORT` below); `maxplayer sell` is NOT yet pointed here.
+//! this in the following cutover steps (marked `PORT` below); `maxplayer seller` is NOT yet pointed here.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

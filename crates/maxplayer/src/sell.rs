@@ -1,4 +1,4 @@
-//! `maxplayer sell` — seller daemon with good defaults.
+//! `maxplayer seller` — seller daemon with good defaults.
 //!
 //! Required user choices: `--agent` (or `--agent-argv`) and `--rate-sats` on first run.
 //! Everything else defaults (relay, mint, key 0600, relay-git delivery) and persists to
@@ -25,7 +25,7 @@ const SUCCESS: i32 = 0;
 const USAGE_ERROR: i32 = 1;
 const RUNTIME_ERROR: i32 = 2;
 
-/// Decide whether `maxplayer sell` may proceed past the startup readiness gate. `gate` is `None` when
+/// Decide whether `maxplayer seller` may proceed past the startup readiness gate. `gate` is `None` when
 /// `--skip-doctor` bypassed the checks (the gate was never run), `Some(Ok)` when every blocking
 /// check passed, and `Some(Err)` when one failed. Only a run gate that failed aborts startup —
 /// `--skip-doctor` always proceeds. Pure so the run_sell wiring is unit-tested both ways.
@@ -67,7 +67,7 @@ struct SellOptions {
     unsafe_no_sandbox: bool,
 }
 
-/// Entry from `cli::run` for `maxplayer sell ...`.
+/// Entry from `cli::run` for `maxplayer seller ...`.
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let options = match SellOptions::parse(args) {
         Ok(options) => options,
@@ -83,7 +83,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         let _ = (options, out);
         let _ = writeln!(
             err,
-            "maxplayer sell requires the wallet feature (rebuild with default features)"
+            "maxplayer seller requires the wallet feature (rebuild with default features)"
         );
         return USAGE_ERROR;
     }
@@ -134,7 +134,7 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
     // Status must never echo the secret key.
     let _ = writeln!(
         err,
-        "maxplayer sell home={} key_present={} mint={} relay={}",
+        "maxplayer seller home={} key_present={} mint={} relay={}",
         home.root.display(),
         home::key_file_present(&home),
         home.config.default_mint(),
@@ -152,7 +152,7 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
     let gate = if options.skip_doctor {
         let _ = writeln!(
             err,
-            "maxplayer sell --skip-doctor: startup readiness checks bypassed (box may be unable to sell)"
+            "maxplayer seller --skip-doctor: startup readiness checks bypassed (box may be unable to sell)"
         );
         None
     } else {
@@ -348,7 +348,7 @@ fn ensure_seller_config(
         if !missing.is_empty() {
             let _ = writeln!(
                 err,
-                "maxplayer sell missing required field(s): {}",
+                "maxplayer seller missing required field(s): {}",
                 missing.join(", ")
             );
             let available = agent_presets::detect_available_agents(&custom_agents);
@@ -393,7 +393,7 @@ fn ensure_seller_config(
         // Non-TTY first run without flags.
         let _ = writeln!(
             err,
-            "maxplayer sell: pass --agent <claude|cursor|codex> --rate-sats <n> \
+            "maxplayer seller: pass --agent <claude|cursor|codex> --rate-sats <n> \
              (or run in a TTY for the guided wizard)"
         );
         return Err(USAGE_ERROR);
@@ -724,7 +724,7 @@ impl SellOptions {
 fn sell_usage(err: &mut dyn Write) {
     let _ = writeln!(
         err,
-        "Usage:\n  maxplayer sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>] [--skip-doctor]\n  maxplayer sell   # zero-prompt relaunch from config.toml\n  maxplayer sell --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash (a REAL mint — jobs settle in real sats) git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint\n  - --skip-doctor: bypass the startup readiness gate (default: checks-on; not recommended)\n  - --unsafe-no-sandbox: serve the OPEN POOL with no working sandbox — this box then runs code written by strangers with no containment (waives only that one check)\n  - open-pool claiming is OFF by default; pass --claim-open-pool to opt in\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)"
+        "Usage:\n  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>] [--skip-doctor]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n  maxplayer seller --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash (a REAL mint — jobs settle in real sats) git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint\n  - --skip-doctor: bypass the startup readiness gate (default: checks-on; not recommended)\n  - --unsafe-no-sandbox: serve the OPEN POOL with no working sandbox — this box then runs code written by strangers with no containment (waives only that one check)\n  - open-pool claiming is OFF by default; pass --claim-open-pool to opt in\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)"
     );
 }
 
@@ -929,7 +929,7 @@ mod tests {
         assert!(!rendered.to_ascii_lowercase().contains("nsec"));
     }
 
-    // Red-prove for #369. A steady-state `maxplayer sell` relaunch (an existing `[seller]` on disk,
+    // Red-prove for #369. A steady-state `maxplayer seller` relaunch (an existing `[seller]` on disk,
     // no CLI flags) MUST carry the operator's `slots` and `claim_award_timeout_secs` through the
     // config write-back — the same way `agents` is already carried from `existing`. Pre-fix
     // `ensure_seller_config` hardcoded `slots: home::default_slots()` (=1) and
@@ -1139,7 +1139,7 @@ mod tests {
 
         // Steady-state relaunch: `SellOptions::default()` (no --agent / --rate-sats / --git-remote)
         // ⇒ `existing.is_some()` drives every field from the loaded config. This is the exact
-        // zero-prompt `maxplayer sell` write-back path.
+        // zero-prompt `maxplayer seller` write-back path.
         let options = SellOptions::default();
         let mut out = Vec::new();
         let mut err = Vec::new();

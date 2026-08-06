@@ -141,7 +141,7 @@ mod checks {
     }
 
     // Blocking (issue #107): a seller can neither sign offers nor NIP-98-authenticate delivery
-    // pushes without its key, so `maxplayer sell` refuses to boot when this FAILs. `present` is
+    // pushes without its key, so `maxplayer seller` refuses to boot when this FAILs. `present` is
     // `home::key_file_present` for the RESOLVED home, and `key_path` is that home's key file — the
     // detail names the file actually inspected rather than a hardcoded `~/.maxplayer/key`, so a
     // multi-home / `--home` run never reports about a home it did not read (issues #216, #265). The
@@ -266,7 +266,7 @@ mod checks {
             return Check::warn(
                 AGENT_CHECK,
                 "no [seller] section configured",
-                "run `maxplayer sell --agent <claude|cursor|codex> --rate-sats <n>` once to configure",
+                "run `maxplayer seller --agent <claude|cursor|codex> --rate-sats <n>` once to configure",
             );
         };
         match seller_agents::resolve(&seller, &presets) {
@@ -510,7 +510,7 @@ mod checks {
 
 /// Entry from `cli::run` for `maxplayer doctor`.
 ///
-/// Honors `--home <dir>` (mirroring `maxplayer sell`) so an operator can diagnose a specific seat,
+/// Honors `--home <dir>` (mirroring `maxplayer seller`) so an operator can diagnose a specific seat,
 /// and REFUSES any other argument rather than silently dropping it — a discarded flag produced a
 /// confident report about the wrong home, which is worse than an error (issue #216).
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
@@ -568,7 +568,7 @@ fn parse_doctor_args(args: &[String]) -> Result<Option<std::path::PathBuf>, Stri
 }
 
 /// Build the full check registry from a bootstrapped home. Shared by `maxplayer doctor` and the
-/// `maxplayer sell` boot-readiness gate (issue #107) so the two never drift and no check logic is
+/// `maxplayer seller` boot-readiness gate (issue #107) so the two never drift and no check logic is
 /// duplicated. The seller key is read once only to probe NIP-42 relay auth; it is NEVER placed in
 /// any Check detail.
 #[cfg(feature = "wallet")]
@@ -676,7 +676,7 @@ fn run_doctor(
     code
 }
 
-/// `maxplayer sell` startup readiness gate (issue #107 — auto-doctor, NOT a first-run wizard). Runs the
+/// `maxplayer seller` startup readiness gate (issue #107 — auto-doctor, NOT a first-run wizard). Runs the
 /// SAME registry as `maxplayer doctor` via [`build_checks`] and REFUSES to boot when any BLOCKING check
 /// (`Status::Fail`) fails, echoing each failure's one-line fix hint. WARN checks are advisory: they
 /// print but never block. Returns `Ok(())` when the box can sell, `Err(())` when it must not start.
@@ -698,7 +698,7 @@ pub fn sell_readiness_gate(
 ) -> Result<(), ()> {
     let _ = writeln!(
         out,
-        "maxplayer sell — startup readiness checks (auto-doctor; pass --skip-doctor to bypass)"
+        "maxplayer seller — startup readiness checks (auto-doctor; pass --skip-doctor to bypass)"
     );
     let results = run_checks(build_checks(home, unsafe_no_sandbox));
     for result in &results {
@@ -716,7 +716,7 @@ pub fn sell_readiness_gate(
     let failures: Vec<&Check> = results.iter().filter(|c| c.status == Status::Fail).collect();
     let _ = writeln!(
         err,
-        "\nmaxplayer sell REFUSING to start: {} blocking readiness check(s) failed —",
+        "\nmaxplayer seller REFUSING to start: {} blocking readiness check(s) failed —",
         failures.len()
     );
     for failure in &failures {
@@ -724,7 +724,7 @@ pub fn sell_readiness_gate(
     }
     let _ = writeln!(
         err,
-        "resolve the item(s) above, then re-run `maxplayer sell`. To bypass these checks (NOT recommended), pass --skip-doctor."
+        "resolve the item(s) above, then re-run `maxplayer seller`. To bypass these checks (NOT recommended), pass --skip-doctor."
     );
     Err(())
 }
@@ -785,7 +785,7 @@ mod tests {
         assert!(Check::warn("x", "hmm", "do this").render().contains("(fix: do this)"));
     }
 
-    // Issue #107: a missing seller key must BLOCK `maxplayer sell` (Fail, not Warn) and carry a fix hint.
+    // Issue #107: a missing seller key must BLOCK `maxplayer seller` (Fail, not Warn) and carry a fix hint.
     #[cfg(feature = "wallet")]
     #[test]
     fn seller_key_check_blocks_when_absent() {

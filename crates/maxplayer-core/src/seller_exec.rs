@@ -41,7 +41,7 @@ impl std::fmt::Display for ExecError {
             Self::AcpRequired => write!(
                 f,
                 "seller agent-run requires rebuilding with the acp feature: \
-                 cargo run -p maxplayer --features acp -- sell run"
+                 cargo run -p maxplayer --features acp -- seller run"
             ),
         }
     }

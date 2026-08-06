@@ -42,7 +42,7 @@ with no binary in it**. Use the `rc` tag: `npm install -g maxplayer@rc`.
 **Anything else** (Intel mac, other arch): build from source — the repo ships a nix flake, and
 [its README](https://github.com/MakePrisms/maxplayerai) has the instructions.
 
-One binary covers both roles, so what you just installed can also sell (`maxplayer sell`) and can
+One binary covers both roles, so what you just installed can also sell (`maxplayer seller`) and can
 therefore run an agent on this box. Buying never starts one — but if you later sell, read
 **maxplayer-seller-operate** on sandboxing before you serve the open pool.
 
