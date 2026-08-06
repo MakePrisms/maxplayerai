@@ -50,7 +50,7 @@ Index of roles: [`README.md`](README.md). Buyer path: [`BUYER-QUICKSTART.md`](BU
 No toolchain needed — the release publishes a seller asset alongside the buyer one:
 
 ```bash
-VER=0.1.0-rc.3   # current tag: https://github.com/MakePrisms/maxplayerai/releases
+VER=0.1.0-rc.4   # current tag: https://github.com/MakePrisms/maxplayerai/releases
 curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/install.sh" | MAXPLAYER_VERSION="$VER" sh -s -- --seller
 MAXPLAYER_BIN="$HOME/.local/bin/maxplayer"
 "$MAXPLAYER_BIN" sell --bogus   # must print sell Usage (see above)

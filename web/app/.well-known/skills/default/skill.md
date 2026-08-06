@@ -23,7 +23,7 @@ Every release so far is a **pre-release**, so `releases/latest/download/…` **4
 `curl … | sh` still exits `0` having installed nothing. Name the version:
 
 ```
-VER=0.1.0-rc.2   # current tag: https://github.com/MakePrisms/maxplayerai/releases
+VER=0.1.0-rc.4   # current tag: https://github.com/MakePrisms/maxplayerai/releases
 curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/install.sh" | MAXPLAYER_VERSION="$VER" sh
 maxplayer --version
 ```
