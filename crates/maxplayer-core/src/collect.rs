@@ -543,7 +543,13 @@ mod tests {
         )
         .expect("creq");
         let claim_draft = crate::gateway::claim_draft(&offer_id, &buyer_hex, &seller_hex, &creq, &[]);
-        let _ = publish(&seller, &claim_draft).await;
+        let claim_id = publish(&seller, &claim_draft).await.to_hex();
+
+        // The buyer AWARDS the seller's claim (kind-3405). collect resolves the delivery against this
+        // durable award, not the live-claim set (#540); without it accept-for-collect refuses at "no
+        // award" before reaching the pre-pay cosig tooth this test exercises.
+        let award_draft = crate::gateway::award_draft(&offer_id, &claim_id, &buyer_hex, &seller_hex);
+        let _ = publish(&buyer, &award_draft).await;
 
         let job_hash = crate::job_lifecycle::job_hash_for_offer(&offer_id, task, amount);
         // A real schnorr signature by an unrelated key — refused at the pre-pay cosig tooth.
