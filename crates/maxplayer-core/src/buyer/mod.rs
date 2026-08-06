@@ -35,7 +35,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -473,6 +473,50 @@ struct GetJobParams {
     include_display_names: bool,
 }
 
+/// The `get_job` wire response: the relay-truth [`job_lifecycle::JobView`] plus the buyer-LOCAL
+/// committed award, which the view builder cannot carry (it reads the relay and the local accept
+/// file and holds no store handle). #481: once the buyer awards, `get_job` must SHOW the
+/// commitment. A signed 3405 award is a spend already decided; telemetry that omits it reads as
+/// "nothing committed" at the exact moment that is false, and an operator can misjudge an
+/// in-flight, unstoppable award as still stoppable. `accepted` (kind-3406) is a distinct, later
+/// fact and is deliberately left unchanged — award, delivery, and accept are three separate facts.
+#[derive(Serialize)]
+struct GetJobResponse {
+    #[serde(flatten)]
+    view: job_lifecycle::JobView,
+    /// The published award for this job, present iff the buyer has committed one. Sourced from the
+    /// local award store — its mere existence IS the "award committed" fact, since the row is
+    /// written only after the 3405 is confirmed public.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    awarded: Option<AwardedView>,
+}
+
+/// Serializable projection of a committed [`store::AwardRecord`] for the `get_job` response
+/// ([`store::AwardRecord`] is not itself `Serialize`). Same field shape the `award` RPC already
+/// returns under `already_awarded`, so the two award surfaces read identically.
+#[derive(Serialize)]
+struct AwardedView {
+    job_id: String,
+    claim_id: String,
+    award_event_id: String,
+    seller_pubkey: String,
+    amount_sats: u64,
+    awarded_at_unix: i64,
+}
+
+impl From<store::AwardRecord> for AwardedView {
+    fn from(record: store::AwardRecord) -> Self {
+        Self {
+            job_id: record.job_id,
+            claim_id: record.claim_id,
+            award_event_id: record.award_event_id,
+            seller_pubkey: record.seller_pubkey,
+            amount_sats: record.amount_sats,
+            awarded_at_unix: record.awarded_at_unix,
+        }
+    }
+}
+
 async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
     let params: GetJobParams = match serde_json::from_value(params) {
         Ok(params) => params,
@@ -493,7 +537,21 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
     // already stale when it read it.
     let events = context.relay.subscribe_events();
     match job_lifecycle::get_job_awaiting_events_async(&context.home, request, events).await {
-        Ok(view) => Response::ok(id, json!(view)),
+        Ok(view) => {
+            // #481: enrich the relay-truth view with the buyer-LOCAL committed award. The view
+            // builder has no store handle, so the lookup lives here, at the RPC boundary where
+            // `context.store` is in scope. A store read error must NOT sink the whole response —
+            // the relay view is still useful — so it degrades to `None` and is logged, never
+            // surfaced as a false "no award".
+            let awarded = match context.store.award_record(&view.job_id) {
+                Ok(record) => record.map(AwardedView::from),
+                Err(error) => {
+                    crate::opline!("get_job: could not read {}'s award row: {error}", view.job_id);
+                    None
+                }
+            };
+            Response::ok(id, json!(GetJobResponse { view, awarded }))
+        }
         Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
     }
 }
@@ -932,7 +990,22 @@ async fn settle_job(
         }
     }
 
+    // #469: this settle just converted a reservation reserved→spent, so any reconcile-on-start
+    // snapshot still listing this job under `kept` is now stale — a `status` money-read would show
+    // already-settled funds as held, exactly when trust matters. Drop the snapshot here; the next
+    // reconcile pass repopulates it from live truth. Reached only on the Ok path (a refused settle
+    // returns via `?` above and leaves the snapshot untouched).
+    invalidate_reconcile_snapshot(context).await;
+
     Ok(outcome)
+}
+
+/// Drop the reconcile-on-start snapshot (`last_reconcile`) so `status` cannot surface an entry for a
+/// reservation that has since settled (#469). Display-only and idempotent: nothing reads
+/// `last_reconcile` for a decision — reconcile decisions re-derive from the store — so clearing it
+/// removes only a stale display, never a held reservation. The next reconcile pass re-populates it.
+async fn invalidate_reconcile_snapshot(context: &BuyerContext) {
+    *context.last_reconcile.lock().await = None;
 }
 
 async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
@@ -3605,6 +3678,146 @@ mod tests {
         drop(relay);
     }
 
+    // #469: a successful settle drops the reconcile-on-start snapshot, so a `status` money-read
+    // cannot show an already-settled reservation as still-`kept`. This pins the invalidation
+    // directly; `settle_job` calls it at its one success point (right after `settle_after_pay`
+    // flips reserved→spent). A live-melt success of the full `settle_job` has no CI-safe harness
+    // (collect runs no funded wallet in-test), so the success path's CALL is covered by that single
+    // placement, and the forged-delivery watcher test pins that a REFUSED settle leaves it.
+    // Red-on-revert: no-op `invalidate_reconcile_snapshot` and this fails.
+    #[tokio::test]
+    async fn a_settle_invalidates_the_stale_reconcile_snapshot() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let root = temp_home("invalidate-reconcile");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap_home(&root).expect("bootstrap home");
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        home.config.relay_url = relay.url().await.to_string();
+        let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
+
+        let job = "a".repeat(64);
+        *context.last_reconcile.lock().await =
+            Some(ReconcileReport { kept: vec![job.clone()], ..Default::default() });
+        assert!(context.last_reconcile.lock().await.is_some(), "premise: snapshot seeded");
+
+        invalidate_reconcile_snapshot(&context).await;
+
+        assert!(
+            context.last_reconcile.lock().await.is_none(),
+            "a settle must clear the reconcile snapshot so status drops the stale `kept`"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
+    }
+
+    // ★ #481: an operator reading get_job must SEE a committed award the moment the 3405 exists —
+    // BEFORE any delivery or accept — so an in-flight, unstoppable spend never reads as "nothing
+    // committed". The incident (job a719a8b5) was exactly this: `accepted` null for minutes after
+    // a signed award existed and the seller was already executing, making a committed spend look
+    // stoppable. Drives the REAL get_job handler: with no award the `awarded` field is ABSENT (a
+    // false Some would be the same bug in reverse); once the 3405 award row exists it surfaces
+    // under `awarded`, while `accepted` (kind-3406, a distinct later fact) stays null throughout.
+    // Red-on-revert: return `json!(view)` from the Ok arm (drop the enrichment) and the post-award
+    // `awarded` assertion fails.
+    #[tokio::test]
+    async fn get_job_surfaces_a_committed_award_while_accepted_stays_null() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let root = temp_home("get-job-awarded");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap_home(&root).expect("bootstrap home");
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        home.config.relay_url = relay.url().await.to_string();
+        let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
+
+        let job = "a".repeat(64);
+
+        // Pre-award: no commitment, so no `awarded`, and nothing accepted.
+        let before = get_job(&context, json!(1), json!({ "job_id": job.clone() }))
+            .await
+            .result
+            .expect("get_job (pre-award) returns a view");
+        assert_eq!(before["job_id"], json!(job.clone()), "the flattened JobView carries the job_id");
+        assert!(before.get("awarded").is_none(), "no award committed yet ⇒ no `awarded` field");
+        assert!(before["accepted"].is_null(), "and nothing is accepted yet");
+
+        // Commit an award (the 3405 record) — no delivery, no accept bind.
+        let claim = "c".repeat(64);
+        let award_event = "e".repeat(64);
+        let seller = "5".repeat(64);
+        context
+            .store
+            .record_award(&job, &claim, &award_event, &seller, 100, 7)
+            .expect("record award");
+
+        // Post-award: the commitment surfaces under `awarded` with its 3405 identity + amount,
+        // while `accepted` is STILL null — award and accept are separate facts (#481).
+        let after = get_job(&context, json!(2), json!({ "job_id": job.clone() }))
+            .await
+            .result
+            .expect("get_job (post-award) returns a view");
+        let awarded =
+            after.get("awarded").expect("a committed award now surfaces under `awarded`");
+        assert_eq!(awarded["award_event_id"], json!(award_event), "carries the 3405 event id");
+        assert_eq!(awarded["amount_sats"], json!(100), "and the committed amount");
+        assert_eq!(awarded["seller_pubkey"], json!(seller));
+        assert_eq!(awarded["claim_id"], json!(claim));
+        assert!(
+            after["accepted"].is_null(),
+            "accepted (kind-3406) is unchanged by the award — the two are separate facts"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
+    }
+
+    // ★ #481 (serialize contract, harness-free): the committed award serializes UNDER `awarded` as
+    // a peer of the flattened JobView, carrying the 3405 identity + amount; with no award the field
+    // is absent (never a false empty object). Pins the wire shape the handler relies on, free of any
+    // relay. Red-on-revert: drop `awarded` from GetJobResponse and the Some case loses the field.
+    #[test]
+    fn get_job_response_serializes_a_committed_award_beside_the_flattened_view() {
+        let view = job_lifecycle::JobView {
+            job_id: "a".repeat(64),
+            offer: None,
+            claims: vec![],
+            results: vec![],
+            live_claim_id: None,
+            accepted: None,
+            pending: false,
+            read_confirmed: true,
+        };
+        let record = store::AwardRecord {
+            job_id: "a".repeat(64),
+            claim_id: "c".repeat(64),
+            award_event_id: "e".repeat(64),
+            seller_pubkey: "5".repeat(64),
+            amount_sats: 100,
+            awarded_at_unix: 7,
+            agent_used: None,
+            model_used: None,
+        };
+
+        // A committed award: JobView fields flatten to the top level and `awarded` sits beside them.
+        let with_award = serde_json::to_value(GetJobResponse {
+            view: view.clone(),
+            awarded: Some(AwardedView::from(record)),
+        })
+        .expect("serialize");
+        assert_eq!(with_award["job_id"], json!("a".repeat(64)), "JobView is flattened, not nested");
+        assert_eq!(with_award["awarded"]["award_event_id"], json!("e".repeat(64)));
+        assert_eq!(with_award["awarded"]["amount_sats"], json!(100));
+        assert_eq!(with_award["awarded"]["seller_pubkey"], json!("5".repeat(64)));
+        assert_eq!(with_award["awarded"]["claim_id"], json!("c".repeat(64)));
+        assert!(with_award["accepted"].is_null(), "accepted is a distinct field, untouched");
+
+        // No award: `awarded` is omitted entirely (skip_serializing_if), never null/empty.
+        let no_award =
+            serde_json::to_value(GetJobResponse { view, awarded: None }).expect("serialize");
+        assert!(no_award.get("awarded").is_none(), "no commitment ⇒ `awarded` absent, not null");
+    }
+
     // ★ THE #179/4b TOOTH: the reconcile reports the pass that changed NOTHING.
     //
     // A release moves the buyer's `available` — it is a money-visible decision — and the pass that
@@ -4097,6 +4310,12 @@ mod tests {
             "the seeded award must be the watcher's work set"
         );
 
+        // #469: seed a reconcile-on-start snapshot that still lists this job under `kept`. A
+        // REFUSED settle must NOT clear it — the invalidation is gated on a successful flip
+        // (asserted below), so this pins that the clear is success-only, not unconditional.
+        *context.last_reconcile.lock().await =
+            Some(ReconcileReport { kept: vec![job_id.clone()], ..Default::default() });
+
         // Drive the watcher's settle pass directly — the same call its event and tick paths make.
         settle_awarded(&context, None).await;
 
@@ -4127,6 +4346,12 @@ mod tests {
                 Some((reservations::ReservationState::Reserved, _))
             ),
             "a refused settle must leave the reservation reserved"
+        );
+        // #469: and the reconcile snapshot is untouched — the invalidation is success-gated, so a
+        // refused settle never drops it (only a completed flip does).
+        assert!(
+            context.last_reconcile.lock().await.is_some(),
+            "a refused settle must not clear the reconcile snapshot (#469 clear is success-gated)"
         );
 
         let _ = std::fs::remove_dir_all(&root);

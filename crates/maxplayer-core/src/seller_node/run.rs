@@ -275,6 +275,10 @@ enum ClaimDecision {
 enum SkipReason {
     /// The offer's own absolute deadline already passed — dead, never resurrected.
     Lapsed,
+    /// The seller runs a populated `accept_offers_only_from` allowlist and this offer's author (the
+    /// buyer) is not on it — a hard fence (#482). Named (not silent) so the operator log records the
+    /// declined pubkey; no buyer feedback is emitted (a private seller does not advertise the fence).
+    NotAllowlisted,
     /// Rate-gate refused: untargeted without open-pool opt-in, or below the seller's rate floor.
     RateGate,
     /// The offer asked for a harness this node does not run.
@@ -291,6 +295,7 @@ impl SkipReason {
     fn reason(self) -> &'static str {
         match self {
             Self::Lapsed => "offer deadline already passed (lapsed; never resurrected)",
+            Self::NotAllowlisted => "buyer not in accept_offers_only_from allowlist",
             Self::RateGate => "rate-gate refused (untargeted without opt-in / below rate)",
             Self::AgentUnavailable => "requested agent harness not available on this node",
             Self::SlotsBusy => "all execution slots busy (node fully loaded; not claiming)",
@@ -718,6 +723,28 @@ fn offer_subscription_filters(
     filters
 }
 
+/// The award/accept subscription filter. Both buyer-authored decisions about our claims ride ONE REQ
+/// — the AWARD that selects a claim, and the ACCEPT that pay-binds a delivered result. A TARGETED
+/// seller only claims offers addressed to it, and an award for such an offer p-tags it as the sole
+/// winner, so scoping the REQ to its own pubkey suffices. An OPEN-POOL seller ALSO claims untargeted
+/// offers it can LOSE; an award p-tags ONLY the winner, so a loser scoped to its own pubkey never
+/// receives the award that should release its slot (#456) and holds that capacity until the lapse
+/// timeout fires. When open-pool we therefore drop the pubkey scope and match by kind + hashtag alone
+/// — mirroring the open-pool OFFER filter above, which is likewise unscoped. This is a VISIBILITY
+/// change only: `on_award`/`on_accept` bind ONLY offers this node recorded and claimed (offer_facts +
+/// job_creq), so a wider filter changes slot-release LATENCY, never money authorization. The filter
+/// is static for the node's lifetime — no per-claim re-subscription to drift or leak.
+fn award_filter(seller_pubkey: nostr_sdk::PublicKey, open_pool: bool) -> Filter {
+    let base = Filter::new()
+        .kinds([Kind::Custom(JOB_AWARD_KIND), Kind::Custom(JOB_ACCEPT_KIND)])
+        .hashtag(crate::gateway::MAXPLAYER_TAG);
+    if open_pool {
+        base
+    } else {
+        base.pubkey(seller_pubkey)
+    }
+}
+
 /// Drop the live socket and bring a fresh authenticated one up, returning once NIP-42 has completed
 /// on the NEW connection.
 ///
@@ -889,8 +916,8 @@ fn offer_row(job_id: &str, buyer_pubkey: &str, offer: &ParsedOffer) -> super::st
 
 /// Decide whether to claim `offer`, applying the always-on money-safety gates in the legacy order:
 /// a lapsed offer is refused BEFORE its deadline is re-derived (never resurrect a stale offer with a
-/// fresh `now + timeout`), then the targeting/rate gate, then the harness the offer asked for.
-/// Pure over (offer, config, registry, now).
+/// fresh `now + timeout`), then the buyer-allowlist fence (#482), then the targeting/rate gate, then
+/// the harness the offer asked for. Pure over (offer, config, registry, buyer, now).
 ///
 /// The harness gate is a CLAIM-time decision, not a delivery-time one: a node that cannot run the
 /// requested harness never parks a claim at all, so the buyer's offer stays visible to a seller
@@ -900,12 +927,22 @@ fn classify_offer(
     seller: &crate::home::SellerConfig,
     agents: &LiveRoster,
     seller_pubkey: &str,
+    buyer_pubkey: &str,
     now_unix: u64,
 ) -> ClaimDecision {
     // Offer-freshness (money-safety): an offer whose own absolute deadline already passed is dead,
     // refused here before `job_deadline_unix` could hand it a fresh window.
     if offer.deadline_unix <= now_unix {
         return ClaimDecision::Skip(SkipReason::Lapsed);
+    }
+    // Private-seller fence (#482): a populated `accept_offers_only_from` claims ONLY from a named
+    // buyer. Empty/absent ⇒ accept-all (unchanged). Consulted after the lapsed refusal but before
+    // the rate/harness gates, so a stranger's offer is declined outright; the caller names the
+    // declined pubkey in the skip log (this pure fn cannot, and stays silent to the buyer).
+    if !seller.accept_offers_only_from.is_empty()
+        && !seller.accept_offers_only_from.iter().any(|allowed| allowed == buyer_pubkey)
+    {
+        return ClaimDecision::Skip(SkipReason::NotAllowlisted);
     }
     if rate_gate_allows(offer, seller_pubkey, seller.rate_sats, seller.claim_open_pool).is_err() {
         return ClaimDecision::Skip(SkipReason::RateGate);
@@ -1426,10 +1463,10 @@ impl SellerNodeRunner {
             // that selects one, and the ACCEPT that pay-binds a delivered result. Sharing the REQ
             // (rather than adding a sub id) keeps them under the same CLOSED handling and the same
             // stall watchdog — a second subscription would be a second thing that can die quietly.
-            AWARD_SUB_ID => Filter::new()
-                .kinds([Kind::Custom(JOB_AWARD_KIND), Kind::Custom(JOB_ACCEPT_KIND)])
-                .hashtag(crate::gateway::MAXPLAYER_TAG)
-                .pubkey(self.seller_pubkey),
+            // Award/accept visibility (#456): an open-pool seller subscribes UNSCOPED so a losing
+            // claimant still receives the award that releases its slot (an award p-tags only the
+            // winner). See `award_filter` — on_award/on_accept still bind only offers we claimed.
+            AWARD_SUB_ID => award_filter(self.seller_pubkey, self.claim_open_pool()),
             WRAP_SUB_ID => Filter::new()
                 .kind(Kind::GiftWrap)
                 .pubkey(self.seller_pubkey),
@@ -2334,12 +2371,25 @@ impl SellerNodeRunner {
         }
 
         let seller_pubkey = self.seller_pubkey.to_hex();
+        // The buyer is the offer's author. Resolved here — ahead of the classify call — so the
+        // allowlist fence can test it and the skip log can name the declined pubkey.
+        let buyer_pubkey = event.pubkey.to_hex();
         let now = now_unix();
-        let deadline_unix = match classify_offer(&offer, &seller, &self.agents, &seller_pubkey, now as u64)
+        let deadline_unix = match classify_offer(&offer, &seller, &self.agents, &seller_pubkey, &buyer_pubkey, now as u64)
         {
             ClaimDecision::Claim { deadline_unix } => deadline_unix,
             ClaimDecision::Skip(skip) => {
-                opline!("seller node offer skip id={}: {}", event.id, skip.reason());
+                // Every skip is named, never silent. The allowlist fence additionally names the
+                // declined buyer (the other reasons are offer-intrinsic and need no identity).
+                match skip {
+                    SkipReason::NotAllowlisted => opline!(
+                        "seller node offer skip id={}: {} (buyer={})",
+                        event.id,
+                        skip.reason(),
+                        buyer_pubkey
+                    ),
+                    _ => opline!("seller node offer skip id={}: {}", event.id, skip.reason()),
+                }
                 // Buyer-visibility: a TARGETED-to-self under-rate refusal also emits a feedback-kind
                 // `status=error` so the buyer learns WHY (distinguishes rate-refusal from a crash /
                 // silence). Open-pool under-rate stays log-only (spam guard); a lapsed offer never
@@ -2369,9 +2419,9 @@ impl SellerNodeRunner {
             }
         }
 
-        // The job id IS the offer event id (as on the legacy path); the buyer is its author.
+        // The job id IS the offer event id (as on the legacy path); the buyer (its author) was
+        // resolved above for the allowlist fence.
         let job_id = event.id.to_hex();
-        let buyer_pubkey = event.pubkey.to_hex();
 
         // Journal the offer facts BEFORE claiming: the award arm reads the buyer to authorize an
         // award (author MUST be the offer's buyer), and the pay path reads amount/unit as the redeem
@@ -3672,6 +3722,7 @@ mod tests {
     use super::*;
 
     const SELLER: &str = "aa";
+    const BUYER: &str = "bb";
     const NOW: u64 = 10_000;
 
     fn seller_cfg(rate_sats: u64, claim_open_pool: bool) -> crate::home::SellerConfig {
@@ -3682,6 +3733,7 @@ mod tests {
             job_timeout_secs: None,
             agents: Vec::new(),
             claim_open_pool,
+            accept_offers_only_from: Vec::new(),
             offer_backfill_secs: 0,
             contribution_enabled: true,
             slots: 1,
@@ -3714,7 +3766,7 @@ mod tests {
     // A fresh, in-rate, targeted offer is claimed and carries the resolved deadline.
     #[test]
     fn claims_fresh_targeted_offer_at_rate() {
-        let decision = classify_offer(&offer(5, Some(SELLER), NOW + 600), &seller_cfg(2, false), &claude_only(), SELLER, NOW);
+        let decision = classify_offer(&offer(5, Some(SELLER), NOW + 600), &seller_cfg(2, false), &claude_only(), SELLER, BUYER, NOW);
         assert_eq!(decision, ClaimDecision::Claim { deadline_unix: NOW + 600 });
     }
 
@@ -3722,15 +3774,67 @@ mod tests {
     // it is never resurrected with a fresh window, even though it clears the rate floor.
     #[test]
     fn refuses_lapsed_offer_before_rate() {
-        let decision = classify_offer(&offer(100, Some(SELLER), NOW), &seller_cfg(2, false), &claude_only(), SELLER, NOW);
+        let decision = classify_offer(&offer(100, Some(SELLER), NOW), &seller_cfg(2, false), &claude_only(), SELLER, BUYER, NOW);
         assert_eq!(decision, ClaimDecision::Skip(SkipReason::Lapsed));
     }
 
     // Below the rate floor ⇒ skip (never claim work priced under the seller's floor).
     #[test]
     fn refuses_below_rate() {
-        let decision = classify_offer(&offer(1, Some(SELLER), NOW + 600), &seller_cfg(5, false), &claude_only(), SELLER, NOW);
+        let decision = classify_offer(&offer(1, Some(SELLER), NOW + 600), &seller_cfg(5, false), &claude_only(), SELLER, BUYER, NOW);
         assert_eq!(decision, ClaimDecision::Skip(SkipReason::RateGate));
+    }
+
+    // #482 FENCE (the reject leg) — a populated `accept_offers_only_from` claims ONLY from a named
+    // buyer; an UNLISTED buyer's otherwise-claimable offer is skipped with the dedicated reason. The
+    // foil is real: identical offer, identical seller, the ONLY difference is the buyer's pubkey (one
+    // on the list, one — STRANGER — deliberately not).
+    #[test]
+    fn allowlist_fences_out_an_unlisted_buyer() {
+        const ALLOWED: &str = "cafe01";
+        const STRANGER: &str = "dead02"; // ≠ ALLOWED — the real foil, never vacuous-green
+        let mut cfg = seller_cfg(2, false);
+        cfg.accept_offers_only_from = vec![ALLOWED.to_owned()];
+
+        // Listed buyer ⇒ still claims (same offer an empty allowlist would claim).
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, ALLOWED, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "a listed buyer's offer must claim"
+        );
+        // Unlisted buyer ⇒ fenced out, named reason (NOT a silent drop, NOT a rate/harness reason).
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, STRANGER, NOW),
+            ClaimDecision::Skip(SkipReason::NotAllowlisted),
+            "an unlisted buyer's offer must be fenced — only the buyer changed"
+        );
+    }
+
+    // #482 BACKCOMPAT (the accept leg) — an empty/absent allowlist is accept-all: any buyer's in-rate
+    // offer still claims, exactly as before the fence existed. Bite: fire the fence on an empty list
+    // and this claim turns into a NotAllowlisted skip.
+    #[test]
+    fn empty_allowlist_accepts_any_buyer() {
+        let cfg = seller_cfg(2, false);
+        assert!(cfg.accept_offers_only_from.is_empty(), "precondition: default allowlist is empty");
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, "anybody99", NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "with no allowlist, any buyer's in-rate offer claims"
+        );
+    }
+
+    // #482 ORDER — the fence is consulted AFTER the lapsed refusal: a dead offer from an unlisted
+    // buyer reports Lapsed (money-safety ordering preserved), not NotAllowlisted.
+    #[test]
+    fn lapsed_is_refused_before_the_allowlist_fence() {
+        let mut cfg = seller_cfg(2, false);
+        cfg.accept_offers_only_from = vec!["cafe01".to_owned()];
+        assert_eq!(
+            classify_offer(&offer(100, Some(SELLER), NOW), &cfg, &claude_only(), SELLER, "dead02", NOW),
+            ClaimDecision::Skip(SkipReason::Lapsed),
+            "a lapsed offer is refused before the allowlist is consulted"
+        );
     }
 
     // TOOTH (invariant 8 / audit N-4) — the delivery cosignature signs the hash of the STORED
@@ -3764,6 +3868,34 @@ mod tests {
         );
     }
 
+    // #456 — an open-pool seller's award/accept subscription must NOT be scoped to its own pubkey: an
+    // award p-tags only the WINNER, so a loser scoped to itself never sees the award that frees its
+    // slot and waits out the lapse timeout. The open-pool filter matches by kind + hashtag alone.
+    #[test]
+    fn award_filter_is_unscoped_for_open_pool_so_losers_see_the_award() {
+        let pk = nostr_sdk::prelude::Keys::generate().public_key();
+        let json = serde_json::to_value(award_filter(pk, true)).expect("serialize open-pool filter");
+        assert!(
+            json.get("#p").is_none(),
+            "open-pool award filter must not scope by pubkey, or a losing claimant never receives the award: {json}"
+        );
+        assert!(json.get("kinds").is_some(), "must still bound to the award/accept kinds: {json}");
+        assert!(json.get("#t").is_some(), "must still bound to the maxplayer hashtag: {json}");
+    }
+
+    // The FOIL: a targeted-only seller KEEPS the pubkey scope (it only claims offers addressed to it;
+    // an award for such an offer p-tags it as the sole winner). Without this leg the test above would
+    // still pass if the scope were dropped for everyone.
+    #[test]
+    fn award_filter_is_pubkey_scoped_for_targeted() {
+        let pk = nostr_sdk::prelude::Keys::generate().public_key();
+        let json = serde_json::to_value(award_filter(pk, false)).expect("serialize targeted filter");
+        assert!(
+            json.get("#p").is_some(),
+            "targeted award filter must keep the pubkey scope: {json}"
+        );
+    }
+
     // AWARD AUTHORIZATION (security-critical): only the offer's buyer may drive execute or release.
     #[test]
     fn award_from_non_buyer_is_ignored_even_when_claim_matches() {
@@ -3789,11 +3921,11 @@ mod tests {
     #[test]
     fn untargeted_needs_open_pool_opt_in() {
         assert_eq!(
-            classify_offer(&offer(5, None, NOW + 600), &seller_cfg(2, false), &claude_only(), SELLER, NOW),
+            classify_offer(&offer(5, None, NOW + 600), &seller_cfg(2, false), &claude_only(), SELLER, BUYER, NOW),
             ClaimDecision::Skip(SkipReason::RateGate)
         );
         assert_eq!(
-            classify_offer(&offer(5, None, NOW + 600), &seller_cfg(2, true), &claude_only(), SELLER, NOW),
+            classify_offer(&offer(5, None, NOW + 600), &seller_cfg(2, true), &claude_only(), SELLER, BUYER, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 }
         );
     }
@@ -3808,7 +3940,7 @@ mod tests {
         let mut wants_codex = offer(5, Some(SELLER), NOW + 600);
         wants_codex.requested_agent = Some("codex".to_owned());
         assert_eq!(
-            classify_offer(&wants_codex, &seller_cfg(2, false), &claude_only(), SELLER, NOW),
+            classify_offer(&wants_codex, &seller_cfg(2, false), &claude_only(), SELLER, BUYER, NOW),
             ClaimDecision::Skip(SkipReason::AgentUnavailable)
         );
 
@@ -3825,13 +3957,13 @@ mod tests {
             },
         ]));
         assert_eq!(
-            classify_offer(&wants_codex, &seller_cfg(2, false), &both, SELLER, NOW),
+            classify_offer(&wants_codex, &seller_cfg(2, false), &both, SELLER, BUYER, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 }
         );
 
         // And an offer asking for nothing is claimed by the claude-only node exactly as before.
         assert_eq!(
-            classify_offer(&offer(5, Some(SELLER), NOW + 600), &seller_cfg(2, false), &claude_only(), SELLER, NOW),
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &seller_cfg(2, false), &claude_only(), SELLER, BUYER, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 }
         );
     }
@@ -3855,7 +3987,7 @@ mod tests {
         // Precondition — the SAME offer is claimable before the drop, so the assertion below cannot
         // pass for some unrelated reason.
         assert_eq!(
-            classify_offer(&untargeted, &seller_cfg(2, false), &roster, SELLER, NOW),
+            classify_offer(&untargeted, &seller_cfg(2, false), &roster, SELLER, BUYER, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 },
             "the offer must be claimable first, or the drop below proves nothing"
         );
@@ -3863,7 +3995,7 @@ mod tests {
         roster.fault(0, Fault::Unproven, std::time::Instant::now());
 
         assert_eq!(
-            classify_offer(&untargeted, &seller_cfg(2, false), &roster, SELLER, NOW),
+            classify_offer(&untargeted, &seller_cfg(2, false), &roster, SELLER, BUYER, NOW),
             ClaimDecision::Skip(SkipReason::AgentUnavailable),
             "a node whose only harness is dropped must stop claiming"
         );
