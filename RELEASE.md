@@ -139,14 +139,14 @@ Release a pre-release and publishes under the `rc` dist-tag, leaving `latest` wh
 
 ## What the tag does
 
-- Builds `maxplayer` for each platform on a runner of that architecture, at both surfaces: the racer
-  (`wallet`) and the seller (`wallet,acp`).
-- Verifies each artifact: the version matches the tag, the feature set is the surface it is being
-  published as — `acp` out for the racer, `acp` and `sell` in for the seller — and on Linux that it
-  runs inside alpine and debian with no toolchain present.
-- Attaches `maxplayer-<version>-<platform>.tar.gz` and `maxplayer-seller-<version>-<platform>.tar.gz`
-  plus `SHA256SUMS` to a GitHub Release. Every one of the six is required by name before the release
-  is created: a count cannot tell a complete release from one missing a whole surface.
+- Builds `maxplayer` once per platform, on a runner of that architecture, with
+  `--no-default-features --features wallet,acp` — the whole surface, buying and selling.
+- Verifies each artifact: the version matches the tag, `acp` and `sell` are compiled in
+  (`scripts/verify-seller-surface.sh`), and on Linux that it runs inside alpine and debian with no
+  toolchain present.
+- Attaches the three `maxplayer-<version>-<platform>.tar.gz` plus `SHA256SUMS` to a GitHub Release.
+  Each is required by name before the release is created: a count cannot tell a complete release
+  from one missing a platform.
 - Publishes the npm packages: every payload package first, then the `maxplayer` launcher.
 
 The publish order matters. The launcher pins its payload by exact version, so publishing it first

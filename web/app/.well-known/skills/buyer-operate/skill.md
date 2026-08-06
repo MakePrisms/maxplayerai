@@ -21,7 +21,7 @@ release" API both **404** — the widely-copied one-liner installs nothing and t
 exits `0`. Name the version:
 
 ```bash
-VER=0.1.0-rc.4   # current tag: https://github.com/MakePrisms/maxplayerai/releases
+VER=0.1.0-rc.7   # current tag: https://github.com/MakePrisms/maxplayerai/releases
 curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/install.sh" \
   | MAXPLAYER_VERSION="$VER" sh
 ```
@@ -41,6 +41,10 @@ with no binary in it**. Use the `rc` tag: `npm install -g maxplayer@rc`.
 
 **Anything else** (Intel mac, other arch): build from source — the repo ships a nix flake, and
 [its README](https://github.com/MakePrisms/maxplayerai) has the instructions.
+
+One binary covers both roles, so what you just installed can also sell (`maxplayer sell`) and can
+therefore run an agent on this box. Buying never starts one — but if you later sell, read
+**maxplayer-seller-operate** on sandboxing before you serve the open pool.
 
 ## 2. Pick a home, and keep it consistent
 
@@ -196,13 +200,6 @@ never awards a claim it cannot pay.
   about real-money delivery.
 - There is **no escrow, no dispute desk and no refund path**. The public record is the whole
   enforcement mechanism.
-
-## Version notes
-
-- At **rc.2**, `maxplayer wallet` help text misnames the mint the wallet actually uses. Fixed in
-  #447, correct from rc.3. Trust `maxplayer buyer status` → `wallet.mint`, never the help text.
-- `install.sh --seller` (the prebuilt seller artifact) lands at **rc.3**; at rc.2 the release
-  publishes one asset per platform and selling needs a build from the repo.
 
 ## When it goes wrong
 

@@ -5,9 +5,8 @@ description: Debug selling on Maxplayer when your seller won't start, isn't earn
 
 # Debugging the seller side of Maxplayer
 
-You run the seller with the `acp` build — `install.sh --seller` puts it in place (the plain buyer
-install has `sell` compiled out of it). The seller watches the relay for open jobs, claims what it
-can do, delivers, and collects.
+The seller is `maxplayer sell` — the same binary a buyer installs, run in its other mode. It watches
+the relay for open jobs, claims what it can do, delivers, and collects.
 
 **The first move for almost everything here is the doctor:**
 

@@ -13,17 +13,11 @@ run a seller — both self-contained, from install to first paid trade. Served l
 
 ## Install
 
-The two roles install differently — pick yours:
-
-- **Buyer** (hire agents, pay sats): install the released binary — npm or the install script, below.
-- **Seller** (do jobs, earn sats): install the release's seller build —
-  [Run a seller](#run-a-seller). It is a separate asset: `maxplayer sell` and agent execution are
-  deliberately compiled out of the buyer binary.
-
-Install a buyer:
+One binary, one install, either role. Buying and selling are two ways to run the same command —
+`maxplayer` and `maxplayer sell`.
 
 ```bash
-VER=0.1.0-rc.4                    # current tag: https://github.com/MakePrisms/maxplayerai/releases
+VER=0.1.0-rc.7                    # current tag: https://github.com/MakePrisms/maxplayerai/releases
 npm install -g maxplayer@rc       # or:
 curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/install.sh" | MAXPLAYER_VERSION="$VER" sh
 ```
@@ -37,6 +31,10 @@ curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/in
 Both deliver the same prebuilt binary (Linux x86_64/aarch64, macOS Apple Silicon — no Rust needed);
 the script puts it in `~/.local/bin` and verifies the release `SHA256SUMS`. Choose the directory with
 `--bin-dir`, re-run to upgrade in place.
+
+One home, too. `MAXPLAYER_HOME` (default `~/.maxplayer`) holds a seat's `config.toml`, key, wallet
+and results — buyer settings at the root, seller settings in a `[seller]` section that is inert
+until you run `maxplayer sell`.
 
 ## Run a buyer
 
@@ -61,38 +59,37 @@ Full walkthrough: [`docs/BUYER-QUICKSTART.md`](docs/BUYER-QUICKSTART.md).
 
 ## Run a seller
 
-`sell` needs the `acp` build, which the release publishes as its own asset:
-
-```bash
-curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/install.sh" | MAXPLAYER_VERSION="$VER" sh -s -- --seller
-maxplayer sell --bogus    # must print the `sell` Usage block — both builds exit 0, so read the output
-```
-
-Same verification and the same `~/.local/bin/maxplayer` as the buyer install, from a different
-asset — the seller build adds `sell` and agent execution, and re-running either one switches which
-build is installed. The `--seller` asset ships from **rc.3**; before that, use the nix build below.
-Build it yourself instead if you prefer:
-
-```bash
-nix run --refresh github:MakePrisms/maxplayerai -- sell    # always --refresh; nix caches the git ref
-cargo build -p maxplayer --release --features acp              # or build it → target/release/maxplayer
-```
-
-First run takes two required choices; bare `maxplayer sell` relaunches from saved config:
+First run takes two required choices; they persist to `config.toml`, so a bare `maxplayer sell`
+relaunches with zero prompts:
 
 ```bash
 maxplayer sell --agent claude --rate-sats 100              # --agent claude|cursor|codex
 ```
 
-Startup runs a doctor readiness gate and refuses to boot on a blocking failure, each with a fix hint.
+`--agent` needs two things in place: its ACP adapter on `PATH`, *and* the agent CLI behind that
+adapter signed in. Startup runs a doctor readiness gate and refuses to boot on a blocking failure,
+each with a fix hint.
+
+> **⚠ Your agent runs task text written by strangers.** Out of the box it runs as a plain child
+> process with your filesystem, so configure a `[sandbox]` launcher before you serve the open pool —
+> `maxplayer sell` runs the launcher at boot and refuses an open-pool seat that it does not confine.
+
 Full walkthrough: [`docs/SELLER-QUICKSTART.md`](docs/SELLER-QUICKSTART.md).
 
 ## Build from source
 
 ```bash
 git clone https://github.com/MakePrisms/maxplayerai.git && cd maxplayerai
-cargo build -p maxplayer --release                 # buyer  → target/release/maxplayer
-cargo build -p maxplayer --release --features acp  # seller (adds `sell`)
+cargo build -p maxplayer --release --no-default-features --features wallet,acp   # what releases ship
+cargo build -p maxplayer --release --no-default-features --features wallet       # buyer only: no `sell`, no agent execution
+```
+
+Both land at `target/release/maxplayer`. `default = ["wallet"]`, so a bare `cargo build -p maxplayer
+--release` is the buyer-only build. The buyer-only narrowing exists for source builds; no release
+publishes it. A nix build gives you the full surface without a toolchain:
+
+```bash
+nix run --refresh github:MakePrisms/maxplayerai -- sell    # always --refresh; nix caches the git ref
 ```
 
 `maxplayer mcp` is a stdio MCP server; a bare run prints `ready` to stderr and waits.
@@ -107,8 +104,8 @@ cargo build -p maxplayer --release --features acp  # seller (adds `sell`)
 ## Key custody
 
 Your key lives at `~/.maxplayer/key` (`0600`) and never leaves the box. There is no `--key` flag — never
-print, log, commit, or pass a secret on a command line. `MAXPLAYER_HOME` (default `~/.maxplayer`) selects a
-buyer or seller home; set it identically on the CLI and on the MCP server process.
+print, log, commit, or pass a secret on a command line. `MAXPLAYER_HOME` (default `~/.maxplayer`) selects
+which seat you are operating; set it identically on the CLI and on the MCP server process.
 
 ## License
 

@@ -1,7 +1,8 @@
 # maxplayer docs
 
 Start with [`../README.md`](../README.md) — what maxplayer is, how to install, and how to run a buyer
-or a seller. Then read your role's page below.
+or a seller. One binary covers both roles, so the install is the same either way; the pages below
+differ only in what you do after it. Then read your role's page.
 
 ## Buyers
 
@@ -26,7 +27,7 @@ server and on the wallet/profile CLI so both drive the same buyer.
 1. [`protocol.md`](protocol.md) — the wire **as it ships today** (`t=maxplayer`, `v=1`): the `3400`–`3406`
    event kinds and the money invariants.
 2. [`protocol-v1.md`](protocol-v1.md) — the full **v1 wire spec** (#355): the `t=maxplayer` / `v=1`
-   namespace and the reader rules that go with it. Live as of rc.3.
+   namespace and the reader rules that go with it.
 
 ## Reference
 

@@ -22,8 +22,8 @@ All links above resolve to files in this repository.
 ## Build and test
 
 ```bash
-cargo build -p maxplayer --release                  # buyer
-cargo build -p maxplayer --release --features acp   # seller execution support
+cargo build -p maxplayer --release --no-default-features --features wallet,acp   # what releases ship
+cargo build -p maxplayer --release --no-default-features --features wallet       # buyer only, source-only
 cargo test -p maxplayer-core
 ```
 
@@ -59,7 +59,7 @@ later server launches keep using the intended buyer. See
 
 ## Seller track
 
-Build with the `acp` feature, choose a home, and follow
+Selling is the same binary in its other mode. Choose a home and follow
 [`docs/SELLER-QUICKSTART.md`](docs/SELLER-QUICKSTART.md). A minimal first launch is:
 
 ```bash

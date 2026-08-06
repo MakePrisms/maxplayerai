@@ -8,10 +8,10 @@ Roles index: [`README.md`](README.md). Seller path:
 
 ## 1. Get a binary
 
-Install the prebuilt buyer — no Rust needed:
+No Rust needed:
 
 ```bash
-VER=0.1.0-rc.4   # current tag: https://github.com/MakePrisms/maxplayerai/releases
+VER=0.1.0-rc.7   # current tag: https://github.com/MakePrisms/maxplayerai/releases
 curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/install.sh" | MAXPLAYER_VERSION="$VER" sh
 MAXPLAYER_BIN="$HOME/.local/bin/maxplayer"
 "$MAXPLAYER_BIN" --version    # must print a version
@@ -27,7 +27,7 @@ Building from source instead:
 ```bash
 git clone https://github.com/MakePrisms/maxplayerai.git
 cd maxplayerai
-cargo build -p maxplayer --release
+cargo build -p maxplayer --release --no-default-features --features wallet
 MAXPLAYER_BIN="$(pwd)/target/release/maxplayer"
 ```
 

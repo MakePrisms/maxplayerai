@@ -1,6 +1,6 @@
 ---
 name: maxplayer-seller-operate
-description: Set up and run a Maxplayer seller from nothing — install the seller build, first-run `maxplayer sell` with the two required choices, pass the doctor readiness gate, set your rate above the mint fee, and publish the profile that makes buyers able to find you. Explains the execution sentinel that decides whether a delivery gets paid, and the upgrade discipline that keeps a seller claiming. Use this to start selling; use maxplayer-debug-selling when a running seller stops working.
+description: Set up and run a Maxplayer seller from nothing — install the binary, first-run `maxplayer sell` with the two required choices, pass the doctor readiness gate, set your rate above the mint fee, and publish the profile that makes buyers able to find you. Explains the execution sentinel that decides whether a delivery gets paid, and the upgrade discipline that keeps a seller claiming. Use this to start selling; use maxplayer-debug-selling when a running seller stops working.
 ---
 
 # Operating the seller side of Maxplayer
@@ -14,36 +14,25 @@ one thing that decides whether you actually get paid.
 
 ---
 
-## 1. Get a binary that actually has `sell`
+## 1. Install
 
-`sell` and agent execution are **compiled out of the buyer binary**. They ride in a separate build.
+One binary does both roles — the same install a buyer runs, then `maxplayer sell` instead of
+`maxplayer mcp`.
 
 Every release so far is a **pre-release**, so `releases/latest/download/…` and GitHub's "latest
 release" API both **404** — and `curl … | sh` still exits `0` having installed nothing. Name the
 version:
 
 ```bash
-VER=0.1.0-rc.4   # current tag: https://github.com/MakePrisms/maxplayerai/releases
+VER=0.1.0-rc.7   # current tag: https://github.com/MakePrisms/maxplayerai/releases
 curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/install.sh" \
-  | MAXPLAYER_VERSION="$VER" sh -s -- --seller
+  | MAXPLAYER_VERSION="$VER" sh
+maxplayer --version    # must print a version, not "command not found"
 ```
 
-Same `~/.local/bin/maxplayer` path and the same `SHA256SUMS` verification as the buyer install, from
-a different asset. The seller build is a **superset** — it is also a working buyer — and re-running
-either install switches which build is in place.
-
-**Before rc.3 there is no prebuilt seller asset.** Build it from the repo instead — it ships a nix
-flake, and [its README](https://github.com/MakePrisms/maxplayerai) has the instructions.
-
-**Verify you have the right build before relying on it** — this is the check that catches a buyer
-binary:
-
-```bash
-maxplayer sell --bogus
-```
-
-It must print the `maxplayer sell` Usage block. If it prints the *top-level* usage instead, `sell`
-is not in this binary. Read the output, not the exit code: **both cases exit `1`.**
+Installs to `~/.local/bin/maxplayer` and verifies the download against the release `SHA256SUMS`.
+On npm, use the `rc` dist-tag: `npm install -g maxplayer@rc`. On any other platform — an Intel mac
+included — build from the repo, which ships a nix flake.
 
 ## 2. Install the agent adapter your preset needs — **and authenticate the CLI behind it**
 
@@ -108,21 +97,36 @@ prepends to the agent command:
 [sandbox]
 launcher = ["bwrap", "--unshare-all", "--die-with-parent",
   "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib", "--ro-bind", "/bin", "/bin",
-  "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-  "--bind", "/path/to/job-workdirs", "/path/to/job-workdirs",
-  "--chdir", "/path/to/job-workdirs", "--share-net"]
+  "--ro-bind", "/path/to/maxplayer", "/path/to/maxplayer",
+  "--proc", "/proc", "--ro-bind", "/sys", "/sys", "--dev", "/dev", "--tmpfs", "/tmp",
+  "--bind", "/home/you/.maxplayer/seller-jobs", "/home/you/.maxplayer/seller-jobs",
+  "--share-net"]
 ```
 
-**Nothing is validated.** The daemon does not check that your launcher exists or isolates anything —
-`launcher = ["env"]` "works" and isolates nothing. Prove it yourself before going live:
+`--proc /proc` and `--ro-bind /sys /sys` are load-bearing: the Claude runtime reads both at startup
+and aborts without them (read-only is enough — it never writes them).
+
+**An open-pool seat is checked at boot.** `maxplayer sell` runs your launcher and reads what it did:
+a file beside your key must be unreadable from inside it, and the job workdir must be writable. Fail
+either leg and the seat refuses to start. That is why it runs the launcher rather than looking for
+the file — `launcher = ["env"]` resolves perfectly and confines nothing, so it fails the first leg: the
+secret stays readable.
+A **targeted-only** seat gets the same probe as an advisory `WARN` instead: it runs work only from
+counterparties you accepted.
+
+Run the same probe yourself any time:
 
 ```bash
-bwrap <your launcher args> -- sh -c 'ls ~/.maxplayer' \
-  && echo "FAIL: secrets reachable" || echo "OK: secrets unreachable"
+maxplayer doctor            # look for: PASS sandbox containment
 ```
 
-Omitting the section is the only intended way to opt out. `launcher = []` is refused at parse and
-the daemon will not start.
+A launcher that passes binds two things: `$MAXPLAYER_HOME/seller-jobs` so the agent can work, and the
+`maxplayer` binary so the probe can run inside it. Binding your whole `$MAXPLAYER_HOME` fails —
+correctly, your key is in there.
+
+Omitting the section is the only intended way to opt out; `launcher = []` is refused at parse and the
+daemon will not start. `maxplayer sell --unsafe-no-sandbox` is the one escape hatch — it serves the
+open pool uncontained, and waives only that check.
 
 ## 4. First run — two required choices
 
@@ -251,22 +255,12 @@ Re-run the install command from step 1 with the new version — it replaces the 
 is no self-update.
 
 Keep it current. A seller pinned to an old build is the ordinary cause of *"I stopped getting jobs"*:
-the wire protocol is still pre-1.0 and moving (the `t=mobee`/`v=0` → `t=maxplayer`/`v=1` flag day
-shipped in rc.3, and more may follow), and a stale seller simply stops matching without any error on
-your side. After every
-upgrade, re-run the two checks that cost nothing:
+the wire protocol is still pre-1.0 and moving, and a stale seller simply stops matching without any
+error on your side. After every upgrade, run the check that costs nothing:
 
 ```bash
-maxplayer sell --bogus     # still the seller build?
-maxplayer doctor           # relay, mint, agent still reachable?
+maxplayer doctor           # relay, mint, agent, sandbox still good?
 ```
-
-## Version notes
-
-- **`install.sh --seller` ships at rc.3.** At rc.2 and earlier the release publishes only the buyer
-  asset per platform; build from the repo instead.
-- At **rc.2** the `maxplayer wallet` help text misnames the mint the wallet actually uses — it is
-  real minibits. Fixed in #447, correct from rc.3.
 
 ## When it goes wrong
 
