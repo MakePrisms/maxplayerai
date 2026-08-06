@@ -55,9 +55,23 @@ alone gets you a seat that resolves everything and can still do no work:
 
 | `--agent` | Binary that must be on `PATH` | Install adapter | Underlying CLI — install **and** authenticate |
 |-----------|-------------------------------|---------|---------|
-| `claude`  | `claude-agent-acp` | `npm i -g @agentclientprotocol/claude-agent-acp` | `claude` (`npm i -g @anthropic-ai/claude-code`) — run `claude` once, complete `/login`, or set `ANTHROPIC_API_KEY` |
-| `cursor`  | `cursor-agent` (or `agent`) | install Cursor's agent CLI | none extra — `cursor-agent` **is** the CLI, but sign it in: `cursor-agent login` |
-| `codex`   | `codex-acp` | `npm i -g @agentclientprotocol/codex-acp` | `codex` (`npm i -g @openai/codex`) — `codex login`, or set `OPENAI_API_KEY` |
+| `claude`  | `claude-agent-acp` | `npm i -g @agentclientprotocol/claude-agent-acp` | `claude` — `curl -fsSL https://claude.ai/install.sh \| bash`, or `npm i -g @anthropic-ai/claude-code` (**Node 22+**). Auth: `claude` then `/login`, or `claude auth login`, or `claude setup-token`, or `ANTHROPIC_API_KEY` (see warning) |
+| `cursor`  | `cursor-agent` (or `agent`) | `curl https://cursor.com/install -fsS \| bash` | none extra — `cursor-agent` **is** the CLI. Auth: `cursor-agent login`, or set `CURSOR_API_KEY` |
+| `codex`   | `codex-acp` | `npm i -g @agentclientprotocol/codex-acp` | `codex` — `npm i -g @openai/codex`. Auth: `codex login`, `codex login --device-auth`, or `printenv OPENAI_API_KEY \| codex login --with-api-key`; `OPENAI_API_KEY` is read directly too |
+
+⚠ **Do not `npm i -g cursor-agent`** — that package is an unrelated third party's and installs **no
+binary**, so you get a silent success and a still-missing `cursor-agent`. Use the `curl` line above.
+
+⚠ **`codex login --api-key <KEY>` is deprecated and hidden**; it now exits with guidance instead of
+authenticating. Pipe the key on stdin with `--with-api-key`, or export `OPENAI_API_KEY`.
+
+⚠ **For an unattended seat:** `ANTHROPIC_API_KEY` alone is not enough — Claude Code prompts **once**
+to approve an environment key rather than using it silently, and a daemon has nobody to approve it.
+Complete `/login` or `claude setup-token` on that machine instead. And `cursor-agent login` opens a
+browser: on a headless box set `NO_OPEN_BROWSER=1` to print the URL instead.
+
+*Verified 2026-08-05; `codex` flags read at `main` HEAD, `cursor-agent` behaviour at build
+`2026.07.09` — both may drift.*
 
 ```bash
 command -v claude-agent-acp    # must print an absolute path

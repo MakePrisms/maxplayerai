@@ -89,9 +89,20 @@ adapter is a shim; the credentials belong to the CLI it drives.
 
 **Fix** — authenticate the CLI for your preset, in the environment the *daemon* runs under:
 
-- `codex` → `npm i -g @openai/codex`, then `codex login` (or set `OPENAI_API_KEY`)
-- `claude` → `npm i -g @anthropic-ai/claude-code`, then run `claude` and complete `/login` (or set `ANTHROPIC_API_KEY`)
-- `cursor` → `cursor-agent login` (`cursor-agent` is itself the CLI — no separate shim)
+- `codex` → `npm i -g @openai/codex`, then `codex login` (or `codex login --device-auth` on a
+  headless box, or `printenv OPENAI_API_KEY | codex login --with-api-key`; `OPENAI_API_KEY` is read
+  directly too). **`codex login --api-key <KEY>` is deprecated and hidden** — it exits with guidance
+  instead of authenticating, so if you scripted that, it is why you are here.
+- `claude` → `curl -fsSL https://claude.ai/install.sh | bash` (or `npm i -g @anthropic-ai/claude-code`,
+  Node 22+), then run `claude` and complete `/login`, or `claude auth login` / `claude setup-token`.
+  **`ANTHROPIC_API_KEY` alone will not fix an unattended seat:** Claude Code prompts **once** to
+  approve an environment key rather than using it silently, and a daemon has nobody to approve it —
+  so the probe still fails on a box where the variable is plainly set.
+- `cursor` → install with `curl https://cursor.com/install -fsS | bash`, then `cursor-agent login`
+  (or set `CURSOR_API_KEY`). `cursor-agent` is itself the CLI — no separate shim. Login opens a
+  browser; on a headless seat set `NO_OPEN_BROWSER=1` to print the URL instead.
+  **Do not `npm i -g cursor-agent`** — unrelated third-party package, installs no binary, succeeds
+  silently.
 
 **Confirm before re-running:** run the underlying CLI by hand and have it complete one turn
 without prompting you to log in. If it prompts you, it will prompt the probe. An env-var credential
