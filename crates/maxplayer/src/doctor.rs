@@ -121,6 +121,7 @@ mod checks {
     /// Named apart from SANDBOX_CHECK on purpose: one says the launcher exists, the other says it
     /// confines, and a reader scanning the output must be able to tell which one passed.
     const CONTAINMENT_CHECK: &str = "sandbox containment";
+    const HOME_PERMS_CHECK: &str = "home permissions";
 
     // Informational only: the seller signs NIP-98 in-process (libgit2 transport), so the
     // external `git-credential-nostr` helper is not required for delivery push / base fetch.
@@ -426,6 +427,64 @@ mod checks {
         }
     }
 
+    /// The home and wallet CONTAINERS must be owner-only on disk. On a shared host, seller state — the
+    /// key, mint proofs, config, job workdirs — IS the wallet, so a group/world-accessible dir lets any
+    /// local user read money-bearing material (#473). `home::bootstrap` now chmods both `0700` at
+    /// creation, so this check is the VERIFICATION half of that pairing: it catches a dir that drifted
+    /// open AFTER bootstrap (an external chmod, a restored backup, a pre-#473 seat that never
+    /// re-bootstrapped) rather than trusting the enforcement to be the only guard.
+    ///
+    /// Access-exposure is orthogonal to transaction value — testnut vs real changes nothing about who
+    /// can read the key — so this never consults the mint. A too-open dir is a WARN for a targeted-only
+    /// seat (single-user boxes are common, and there the exposure is nil) and a FAIL for an open-pool
+    /// seat, whose higher exposure warrants the stricter posture. A no-op PASS where there is no POSIX
+    /// mode to read (non-unix): the `too_open` list simply stays empty.
+    pub(super) fn check_home_permissions(
+        home_root: std::path::PathBuf,
+        wallet_dir: std::path::PathBuf,
+        claims_open_pool: bool,
+    ) -> Check {
+        let mut too_open: Vec<String> = Vec::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for dir in [&home_root, &wallet_dir] {
+                let metadata = match std::fs::metadata(dir) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        return Check::warn(
+                            HOME_PERMS_CHECK,
+                            format!("could not read {} permissions: {error}", dir.display()),
+                            "check the seat home exists and is readable",
+                        );
+                    }
+                };
+                let mode = metadata.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    too_open.push(format!("{} ({mode:#o})", dir.display()));
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (&home_root, &wallet_dir);
+        }
+
+        if too_open.is_empty() {
+            return Check::pass(HOME_PERMS_CHECK, "home and wallet are owner-only (0700)");
+        }
+        let detail = format!(
+            "group/world-accessible: {} — another local user on this host can read this seat's key and wallet",
+            too_open.join(", ")
+        );
+        let hint = "chmod 0700 the seat home and wallet/ (maxplayer re-tightens them on the next boot); on a shared host also set UMask=0077 on the service unit so harness state the binary does not own is owner-only too";
+        if claims_open_pool {
+            Check::fail(HOME_PERMS_CHECK, detail, hint)
+        } else {
+            Check::warn(HOME_PERMS_CHECK, detail, hint)
+        }
+    }
+
     fn build_runtime() -> Result<tokio::runtime::Runtime, String> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -541,6 +600,9 @@ fn build_checks(
         .seller
         .as_ref()
         .is_some_and(|seller| seller.claim_open_pool);
+    // Home/wallet perms are verified against the SAME resolved home the rest of the gate inspects.
+    let perms_home_root = home.root.clone();
+    let perms_wallet_dir = home.wallet_dir.clone();
 
     let mut checks: Vec<Box<dyn FnOnce() -> Check>> = vec![
         Box::new(checks::check_credential_helper),
@@ -558,6 +620,11 @@ fn build_checks(
     // is not there reports as the missing file it is, rather than as a containment failure.
     checks.push(Box::new(move || {
         checks::check_sandbox_containment(sandbox, home_root, claims_open_pool, unsafe_no_sandbox)
+    }));
+    // Verifies the owner-only invariant `home::bootstrap` enforces at creation hasn't drifted (#473):
+    // WARN for a targeted seat, FAIL for an open-pool one.
+    checks.push(Box::new(move || {
+        checks::check_home_permissions(perms_home_root, perms_wallet_dir, claims_open_pool)
     }));
     checks
 }
@@ -1061,5 +1128,42 @@ mod tests {
             !readiness_ok(&[Check::pass("a", "ok"), Check::fail("b", "bad", "fix")]),
             "any Fail ⇒ the seller must be refused"
         );
+    }
+
+    // #473: the perms leg VERIFIES the owner-only invariant bootstrap enforces — PASS when owner-only,
+    // WARN for a targeted seat that drifted open, FAIL for an open-pool one. Pure over two real dirs,
+    // so no agent or network. Access-exposure is orthogonal to the mint (testnut vs real is irrelevant).
+    #[cfg(all(unix, feature = "wallet"))]
+    #[test]
+    fn home_permissions_warns_targeted_and_fails_open_pool_on_a_loose_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("mp-perms-{}", std::process::id()));
+        let home = base.join("home");
+        let wallet = home.join("wallet");
+        std::fs::create_dir_all(&wallet).expect("mk dirs");
+
+        // Owner-only ⇒ PASS, whatever the seat type.
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&wallet, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            checks::check_home_permissions(home.clone(), wallet.clone(), false).status,
+            Status::Pass,
+            "owner-only home and wallet must pass"
+        );
+
+        // Loosen the home to world-readable: targeted ⇒ WARN, open-pool ⇒ FAIL.
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            checks::check_home_permissions(home.clone(), wallet.clone(), false).status,
+            Status::Warn,
+            "a group/world-accessible home is a WARN for a targeted seat"
+        );
+        assert_eq!(
+            checks::check_home_permissions(home.clone(), wallet.clone(), true).status,
+            Status::Fail,
+            "…and a FAIL for an open-pool seat"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
