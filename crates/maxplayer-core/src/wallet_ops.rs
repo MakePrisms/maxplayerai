@@ -26,7 +26,13 @@ use crate::home::{self, HomeError, MaxplayerHome, DEFAULT_MINT_URL};
 #[derive(Debug)]
 pub enum WalletOpsError {
     Home(HomeError),
+    /// The mint is not in this home's configured set (`accepted_mints`/`extra_mints`) — a
+    /// MEMBERSHIP miss, cleared by `maxplayer wallet mints add`.
     MintNotAllowed { mint_url: String },
+    /// The mint IS configured but is a real mint refused by the real-mint fence (issue #49):
+    /// `allow_real_mints` is off. A POLICY block — `mints add` cannot clear it, so it must NOT
+    /// borrow [`Self::MintNotAllowed`]'s remedy; the control is `MAXPLAYER_ALLOW_REAL_MINTS` (#465).
+    RealMintDisallowed { mint_url: String },
     MintPinnedDefault,
     Wallet(String),
 }
@@ -38,6 +44,12 @@ impl std::fmt::Display for WalletOpsError {
             Self::MintNotAllowed { mint_url } => write!(
                 formatter,
                 "mint {mint_url} is not configured; add it with `maxplayer wallet mints add` (default stays {DEFAULT_MINT_URL})"
+            ),
+            Self::RealMintDisallowed { mint_url } => write!(
+                formatter,
+                "mint {mint_url} not allowed: allow_real_mints is off (only {DEFAULT_MINT_URL} is permitted). \
+                 Set MAXPLAYER_ALLOW_REAL_MINTS=true (or allow_real_mints in config.toml) to opt in, \
+                 or use --mint {DEFAULT_MINT_URL} for dev/play-money"
             ),
             Self::MintPinnedDefault => write!(
                 formatter,
@@ -534,7 +546,7 @@ pub async fn send_async(
     // deliberate action OUTSIDE the job-pay budget gate (BudgetGate is deliberately not wired in
     // here — owner decision pending), but they must still honor `allow_real_mints`.
     if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
-        return Err(WalletOpsError::MintNotAllowed { mint_url });
+        return Err(WalletOpsError::RealMintDisallowed { mint_url });
     }
     let wallet = open_wallet_async(home, &mint_url).await?;
     let before = wallet
@@ -594,7 +606,7 @@ pub async fn receive_async(
     // send/melt enforce. Without it a real mint left in the configured list would redeem while
     // `allow_real_mints == false`.
     if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
-        return Err(WalletOpsError::MintNotAllowed { mint_url });
+        return Err(WalletOpsError::RealMintDisallowed { mint_url });
     }
     let wallet = open_wallet_async(home, &mint_url).await?;
     let before = wallet
@@ -646,7 +658,7 @@ pub async fn melt_async(
     // deliberate action OUTSIDE the job-pay budget gate (BudgetGate is deliberately not wired in
     // here — owner decision pending), but they must still honor `allow_real_mints`.
     if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
-        return Err(WalletOpsError::MintNotAllowed { mint_url });
+        return Err(WalletOpsError::RealMintDisallowed { mint_url });
     }
     let wallet = open_wallet_async(home, &mint_url).await?;
     let quote = wallet
@@ -954,7 +966,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let home = bootstrap(&root).expect("bootstrap");
         let err = mint_blocking(&home, 1, Some("https://evil.example")).expect_err("deny");
-        assert!(matches!(err, WalletOpsError::MintNotAllowed { .. }));
+        assert!(matches!(&err, WalletOpsError::MintNotAllowed { .. }));
+        // #465: a genuine membership miss KEEPS the `mints add` remedy — the distinction the fix draws.
+        assert!(err.to_string().contains("mints add"), "membership miss keeps the `mints add` remedy: {err}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -993,8 +1007,19 @@ mod tests {
             .await
             .expect_err("real mint must refuse under allow_real_mints=false");
         assert!(
-            matches!(&err, WalletOpsError::MintNotAllowed { mint_url } if mint_url.contains("real-mint.example")),
-            "expected MintNotAllowed, got {err:?}"
+            matches!(&err, WalletOpsError::RealMintDisallowed { mint_url } if mint_url.contains("real-mint.example")),
+            "expected RealMintDisallowed (policy fence, not a membership miss), got {err:?}"
+        );
+        // #465: the policy refusal must name the ACTUAL control and never the membership remedy —
+        // `mints add` cannot clear an allow_real_mints=false fence.
+        let message = err.to_string();
+        assert!(
+            message.contains("MAXPLAYER_ALLOW_REAL_MINTS"),
+            "policy refusal must name the real control (MAXPLAYER_ALLOW_REAL_MINTS), got: {message}"
+        );
+        assert!(
+            !message.contains("mints add"),
+            "policy refusal must NOT borrow the membership `mints add` remedy, got: {message}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
