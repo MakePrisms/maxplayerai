@@ -723,6 +723,28 @@ fn offer_subscription_filters(
     filters
 }
 
+/// The award/accept subscription filter. Both buyer-authored decisions about our claims ride ONE REQ
+/// — the AWARD that selects a claim, and the ACCEPT that pay-binds a delivered result. A TARGETED
+/// seller only claims offers addressed to it, and an award for such an offer p-tags it as the sole
+/// winner, so scoping the REQ to its own pubkey suffices. An OPEN-POOL seller ALSO claims untargeted
+/// offers it can LOSE; an award p-tags ONLY the winner, so a loser scoped to its own pubkey never
+/// receives the award that should release its slot (#456) and holds that capacity until the lapse
+/// timeout fires. When open-pool we therefore drop the pubkey scope and match by kind + hashtag alone
+/// — mirroring the open-pool OFFER filter above, which is likewise unscoped. This is a VISIBILITY
+/// change only: `on_award`/`on_accept` bind ONLY offers this node recorded and claimed (offer_facts +
+/// job_creq), so a wider filter changes slot-release LATENCY, never money authorization. The filter
+/// is static for the node's lifetime — no per-claim re-subscription to drift or leak.
+fn award_filter(seller_pubkey: nostr_sdk::PublicKey, open_pool: bool) -> Filter {
+    let base = Filter::new()
+        .kinds([Kind::Custom(JOB_AWARD_KIND), Kind::Custom(JOB_ACCEPT_KIND)])
+        .hashtag(crate::gateway::MAXPLAYER_TAG);
+    if open_pool {
+        base
+    } else {
+        base.pubkey(seller_pubkey)
+    }
+}
+
 /// Drop the live socket and bring a fresh authenticated one up, returning once NIP-42 has completed
 /// on the NEW connection.
 ///
@@ -1441,10 +1463,10 @@ impl SellerNodeRunner {
             // that selects one, and the ACCEPT that pay-binds a delivered result. Sharing the REQ
             // (rather than adding a sub id) keeps them under the same CLOSED handling and the same
             // stall watchdog — a second subscription would be a second thing that can die quietly.
-            AWARD_SUB_ID => Filter::new()
-                .kinds([Kind::Custom(JOB_AWARD_KIND), Kind::Custom(JOB_ACCEPT_KIND)])
-                .hashtag(crate::gateway::MAXPLAYER_TAG)
-                .pubkey(self.seller_pubkey),
+            // Award/accept visibility (#456): an open-pool seller subscribes UNSCOPED so a losing
+            // claimant still receives the award that releases its slot (an award p-tags only the
+            // winner). See `award_filter` — on_award/on_accept still bind only offers we claimed.
+            AWARD_SUB_ID => award_filter(self.seller_pubkey, self.claim_open_pool()),
             WRAP_SUB_ID => Filter::new()
                 .kind(Kind::GiftWrap)
                 .pubkey(self.seller_pubkey),
@@ -3843,6 +3865,34 @@ mod tests {
             gateway::creq_hash_hex(&drifted_creq),
             signed_hash,
             "a config-drifted creq hashes differently; delivery must sign the STORED creq's hash"
+        );
+    }
+
+    // #456 — an open-pool seller's award/accept subscription must NOT be scoped to its own pubkey: an
+    // award p-tags only the WINNER, so a loser scoped to itself never sees the award that frees its
+    // slot and waits out the lapse timeout. The open-pool filter matches by kind + hashtag alone.
+    #[test]
+    fn award_filter_is_unscoped_for_open_pool_so_losers_see_the_award() {
+        let pk = nostr_sdk::prelude::Keys::generate().public_key();
+        let json = serde_json::to_value(award_filter(pk, true)).expect("serialize open-pool filter");
+        assert!(
+            json.get("#p").is_none(),
+            "open-pool award filter must not scope by pubkey, or a losing claimant never receives the award: {json}"
+        );
+        assert!(json.get("kinds").is_some(), "must still bound to the award/accept kinds: {json}");
+        assert!(json.get("#t").is_some(), "must still bound to the maxplayer hashtag: {json}");
+    }
+
+    // The FOIL: a targeted-only seller KEEPS the pubkey scope (it only claims offers addressed to it;
+    // an award for such an offer p-tags it as the sole winner). Without this leg the test above would
+    // still pass if the scope were dropped for everyone.
+    #[test]
+    fn award_filter_is_pubkey_scoped_for_targeted() {
+        let pk = nostr_sdk::prelude::Keys::generate().public_key();
+        let json = serde_json::to_value(award_filter(pk, false)).expect("serialize targeted filter");
+        assert!(
+            json.get("#p").is_some(),
+            "targeted award filter must keep the pubkey scope: {json}"
         );
     }
 
