@@ -533,6 +533,25 @@ fn parse_offer_and_claim_tags(event: &EventDraft) -> Option<ParsedAward> {
     })
 }
 
+/// The settled offer id a co-signed kind-3400 receipt names, or `None` when the event is not a
+/// receipt or carries no `root`-marked `e` tag. A receipt roots its offer exactly as every other
+/// lifecycle stage does (`["e", offer_id, "", "root"]`, see [`receipt_draft`]); the other `e` is the
+/// result, not a claim, so only the root id is returned. Pure over the draft so the seller's
+/// terminal-eligibility gate is unit-testable, and gated on the kind so a caller that means "which
+/// offer did this receipt settle?" can never be satisfied by a non-receipt event.
+pub fn settled_offer_id(event: &EventDraft) -> Option<String> {
+    if event.kind != JOB_RECEIPT_KIND {
+        return None;
+    }
+    event
+        .tags
+        .iter()
+        .filter(|tag| tag.first() == Some("e"))
+        .find(|tag| tag.0.get(3).map(String::as_str) == Some("root"))
+        .and_then(|tag| tag.value())
+        .map(str::to_owned)
+}
+
 /// Optional git delivery tags on a result-kind result (`delivery=git` + repo/branch/commit).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitResultTags<'a> {
@@ -1351,6 +1370,24 @@ mod tests {
         // t/v markers stay last.
         assert_eq!(receipt.tags[receipt.tags.len() - 2], maxplayer_tag());
         assert_eq!(receipt.tags[receipt.tags.len() - 1], version_tag());
+    }
+
+    #[test]
+    fn settled_offer_id_reads_the_root_offer_of_a_receipt_only() {
+        // A co-signed receipt names its settled offer as the `root`-marked `e` tag.
+        let receipt = receipt_draft(
+            "the-offer", "result", BUYER, SELLER, TESTNUT_MINT_URL, 7, "hash", "seller-sig",
+            "buyer-sig", None, None, &[],
+        );
+        assert_eq!(settled_offer_id(&receipt).as_deref(), Some("the-offer"));
+        // The kind gate is load-bearing: a result carries an identical root `e` for the SAME offer,
+        // but it is not a settlement signal, so "which offer did this receipt settle?" must return
+        // None for it — never conflate a delivery with a settlement.
+        let result = git_result_draft(
+            "the-offer", BUYER, "https://example.invalid/repo.git", "maxplayer/job",
+            &"a".repeat(40), 7, "hash", "seller-sig", "commit", &[],
+        );
+        assert_eq!(settled_offer_id(&result), None);
     }
 
     #[test]

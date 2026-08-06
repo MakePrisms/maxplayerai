@@ -30,7 +30,7 @@ use crate::gateway::{
 };
 use crate::home::{self, MaxplayerHome};
 use crate::job_lifecycle::{event_to_draft, job_hash_for_offer};
-use crate::kinds::{JOB_ACCEPT_KIND, JOB_AWARD_KIND, JOB_OFFER_KIND};
+use crate::kinds::{JOB_ACCEPT_KIND, JOB_AWARD_KIND, JOB_OFFER_KIND, JOB_RECEIPT_KIND};
 use crate::receipt::{ReceiptPreimage, EXEC_METADATA_COMMITMENT_EMPTY};
 use crate::relay_auth::{self, AuthWait};
 use crate::seller::rate_gate_allows;
@@ -288,6 +288,11 @@ enum SkipReason {
     /// [`SellerNodeRunner::on_offer`], never by the pure [`classify_offer`], because it depends on
     /// live slot state.
     SlotsBusy,
+    /// #541: the offer is already SETTLED — a co-signed kind-3400 receipt authored by the offer's own
+    /// buyer has been seen for it (a settlement by any seller is terminal, never claimable). Emitted
+    /// by [`SellerNodeRunner::claim_offer`], never by the pure [`classify_offer`], because it depends
+    /// on the live relay-derived terminal cache — the same reason `SlotsBusy` lives here, not there.
+    Settled,
 }
 
 impl SkipReason {
@@ -299,7 +304,118 @@ impl SkipReason {
             Self::RateGate => "rate-gate refused (untargeted without opt-in / below rate)",
             Self::AgentUnavailable => "requested agent harness not available on this node",
             Self::SlotsBusy => "all execution slots busy (node fully loaded; not claiming)",
+            Self::Settled => "offer already settled (co-signed receipt seen; terminal, never claimed)",
         }
+    }
+}
+
+/// Upper bound on distinct settled offer ids the terminal cache tracks (#541). FIFO by first-seen: a
+/// settled offer is terminal forever, but the set cannot grow without limit, so the oldest ids age
+/// out. Eviction is FAIL-OPEN — an aged-out offer becomes claimable again, bounded by its own
+/// deadline (and, if genuinely re-awarded, a fresh receipt).
+const TERMINAL_OFFERS_CAP: usize = 4096;
+/// Upper bound on receipt-author pubkeys cached per offer (#541). A co-signed receipt is buyer-signed
+/// (authorize_pay.rs `sign_with_keys(buyer_keys)`), so the honest set is size one; the cap tolerates a
+/// few and DROPS-NEWEST on overflow, so once the real buyer's author is recorded a later forged
+/// receipt can never displace it.
+const TERMINAL_AUTHORS_PER_OFFER: usize = 4;
+
+/// Offers known to be SETTLED — a co-signed kind-3400 receipt has been seen for them — keyed by offer
+/// id to the receipt-author pubkeys observed. Relay-derived, populated by
+/// [`SellerNodeRunner::on_receipt`] off the live 3400 subscription plus its boot/reconnect backfill.
+///
+/// The gate ([`SellerNodeRunner::claim_offer`]) skips an offer ONLY when a receipt authored by the
+/// offer's OWN buyer is present ([`Self::settled_by`]). Deliberately NOT the local
+/// `store.has_receipt`, which knows only settlements THIS node collected — an offer another seat won
+/// and settled is absent there, so a local check would be vacuous. And buyer-bound: a receipt is
+/// buyer-signed and its outer event signature is client-verified, so a forged receipt (author != the
+/// offer's buyer) is stored but never matches at claim time, where the offer's real buyer is known.
+///
+/// Bounded twice so it can neither grow without limit nor be displaced by a flood:
+/// - authors-per-offer caps at [`TERMINAL_AUTHORS_PER_OFFER`], DROP-NEWEST, so an established
+///   real-buyer entry can never be evicted by later (forged) receipts;
+/// - the offer map caps at [`TERMINAL_OFFERS_CAP`], FIFO by first-seen.
+///
+/// FAIL-OPEN throughout: an unknown / evicted / flood-displaced offer stays claimable. The worst a
+/// forger or a flood achieves is the PRE-#541 behaviour — a wasted slot until the claim lapses —
+/// never a spend and never worse than today.
+struct TerminalOffers {
+    inner: std::sync::Mutex<TerminalOffersInner>,
+}
+
+struct TerminalOffersInner {
+    /// offer id → the receipt-author pubkeys seen for it (a bounded, drop-newest set).
+    by_offer: std::collections::HashMap<String, Vec<String>>,
+    /// offer ids in first-seen order, for FIFO eviction of the whole map.
+    order: std::collections::VecDeque<String>,
+    offers_cap: usize,
+    authors_cap: usize,
+}
+
+impl TerminalOffersInner {
+    fn new(offers_cap: usize, authors_cap: usize) -> Self {
+        Self {
+            by_offer: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            offers_cap: offers_cap.max(1),
+            authors_cap: authors_cap.max(1),
+        }
+    }
+
+    /// Record `author` as having published a settlement receipt for `offer_id`. Idempotent per
+    /// (offer, author). DROP-NEWEST once an offer holds `authors_cap` distinct authors (so an
+    /// established real-buyer entry is never displaced); FIFO-evict the oldest offer when a NEW offer
+    /// would exceed `offers_cap`.
+    fn record(&mut self, offer_id: &str, author: &str) {
+        if let Some(authors) = self.by_offer.get_mut(offer_id) {
+            if authors.len() < self.authors_cap && !authors.iter().any(|a| a == author) {
+                authors.push(author.to_owned());
+            }
+            return;
+        }
+        if self.order.len() >= self.offers_cap {
+            if let Some(evicted) = self.order.pop_front() {
+                self.by_offer.remove(&evicted);
+            }
+        }
+        self.by_offer.insert(offer_id.to_owned(), vec![author.to_owned()]);
+        self.order.push_back(offer_id.to_owned());
+    }
+
+    /// Whether a receipt authored by `buyer` (the offer's own buyer) has been seen for `offer_id`.
+    /// The buyer-binding is the whole of the anti-grief property: a forged receipt authored by any
+    /// other key is present in the set but never satisfies this test.
+    fn settled_by(&self, offer_id: &str, buyer: &str) -> bool {
+        self.by_offer
+            .get(offer_id)
+            .is_some_and(|authors| authors.iter().any(|a| a == buyer))
+    }
+
+    #[cfg(test)]
+    fn offer_count(&self) -> usize {
+        self.by_offer.len()
+    }
+}
+
+impl TerminalOffers {
+    fn new(offers_cap: usize, authors_cap: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(TerminalOffersInner::new(offers_cap, authors_cap)),
+        }
+    }
+
+    fn record(&self, offer_id: &str, author: &str) {
+        self.inner
+            .lock()
+            .expect("terminal offers mutex poisoned")
+            .record(offer_id, author);
+    }
+
+    fn settled_by(&self, offer_id: &str, buyer: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("terminal offers mutex poisoned")
+            .settled_by(offer_id, buyer)
     }
 }
 
@@ -479,6 +595,12 @@ const OFFER_BACKFILL_LIMIT: usize = 500;
 const OFFER_SUB_ID: &str = "maxplayer-offers";
 const AWARD_SUB_ID: &str = "maxplayer-awards";
 const WRAP_SUB_ID: &str = "maxplayer-wraps";
+/// #541: co-signed settlement receipts (kind-3400). An open-pool seller subscribes to these to learn
+/// which offers are already SETTLED (by ANY seller) so it never claims a terminal offer that
+/// re-appears via backfill or redelivery. Registered only when open-pool — a targeted seller's own
+/// settlements are covered by local claim idempotency, and a targeted-to-it offer can only ever be
+/// settled by it.
+const RECEIPT_SUB_ID: &str = "maxplayer-receipts";
 /// The liveness probe's subscription (see [`probe_relay_serves_our_reqs`]).
 const LIVENESS_PROBE_SUB_ID: &str = "maxplayer-liveness-probe";
 
@@ -493,6 +615,7 @@ fn subscription_label(id: &str) -> &'static str {
         OFFER_SUB_ID => "offers",
         AWARD_SUB_ID => "awards",
         WRAP_SUB_ID => "payment gift-wraps (kind-1059)",
+        RECEIPT_SUB_ID => "settlement receipts (kind-3400)",
         LIVENESS_PROBE_SUB_ID => "liveness probe",
         _ => "unknown (not one of ours)",
     }
@@ -504,7 +627,7 @@ fn subscription_label(id: &str) -> &'static str {
 fn is_our_subscription(id: &str) -> bool {
     matches!(
         id,
-        OFFER_SUB_ID | AWARD_SUB_ID | WRAP_SUB_ID | LIVENESS_PROBE_SUB_ID
+        OFFER_SUB_ID | AWARD_SUB_ID | WRAP_SUB_ID | RECEIPT_SUB_ID | LIVENESS_PROBE_SUB_ID
     )
 }
 
@@ -1425,6 +1548,11 @@ pub struct SellerNodeRunner {
     /// (`claim_and_enqueue` dedups an already-claimed offer), so re-delivering every stored offer
     /// safely re-claims only the ones still open.
     capacity_skip_pending: std::sync::atomic::AtomicBool,
+    /// #541: relay-derived set of SETTLED offer ids (a co-signed kind-3400 receipt has been seen).
+    /// Read before any claim to skip a terminal offer that re-appears via backfill or redelivery.
+    /// Populated by [`Self::on_receipt`] from the live receipt subscription and its boot/reconnect
+    /// backfill. Stays empty when the seller is not open-pool (the receipt sub is registered only then).
+    terminal_offers: TerminalOffers,
 }
 
 impl SellerNodeRunner {
@@ -1538,6 +1666,7 @@ impl SellerNodeRunner {
             agents,
             slots,
             capacity_skip_pending: std::sync::atomic::AtomicBool::new(false),
+            terminal_offers: TerminalOffers::new(TERMINAL_OFFERS_CAP, TERMINAL_AUTHORS_PER_OFFER),
         })
     }
 
@@ -1576,6 +1705,46 @@ impl SellerNodeRunner {
             )
             .await
             .map_err(|error| NodeError::Relay(format!("subscribe offers: {error}")))?;
+        Ok(())
+    }
+
+    /// #541: subscribe (or re-subscribe) the settlement-receipt REQ — one kind-3400 + hashtag filter,
+    /// bounded like the open-pool offer filter so it is never a firehose. At boot (`since` None) it
+    /// backfills the `offer_backfill_secs` window — the window offers themselves re-appear from, so
+    /// exactly the receipts needed to gate them — capped at [`OFFER_BACKFILL_LIMIT`]; a `0` window is
+    /// live-only. On a post-stall resubscribe it carries the overlap cursor. Only ever registered for
+    /// an open-pool seller (see [`Self::subscribe_all`]).
+    async fn subscribe_receipts(
+        &self,
+        since: Option<nostr_sdk::Timestamp>,
+    ) -> Result<(), NodeError> {
+        let base = Filter::new()
+            .kind(Kind::Custom(JOB_RECEIPT_KIND))
+            .hashtag(crate::gateway::MAXPLAYER_TAG);
+        let filter = match since {
+            Some(cursor) => base.since(cursor),
+            None => {
+                let backfill_secs = self
+                    .node
+                    .home()
+                    .config
+                    .seller
+                    .as_ref()
+                    .map(|seller| seller.offer_backfill_secs)
+                    .unwrap_or(0);
+                let now = now_unix().max(0) as u64;
+                if backfill_secs > 0 {
+                    base.since(nostr_sdk::Timestamp::from(now.saturating_sub(backfill_secs)))
+                        .limit(OFFER_BACKFILL_LIMIT)
+                } else {
+                    base.since(nostr_sdk::Timestamp::from(now))
+                }
+            }
+        };
+        self.client
+            .subscribe_with_id(nostr_sdk::SubscriptionId::new(RECEIPT_SUB_ID), filter, None)
+            .await
+            .map_err(|error| NodeError::Relay(format!("subscribe receipts: {error}")))?;
         Ok(())
     }
 
@@ -1687,6 +1856,14 @@ impl SellerNodeRunner {
         for id in [OFFER_SUB_ID, AWARD_SUB_ID, WRAP_SUB_ID] {
             self.subscribe_one(id, since).await?;
         }
+        // #541: the settlement-receipt sub feeds the terminal-offer gate, and the gate only matters for
+        // offers we can LOSE — the open pool. A targeted seller is covered by local claim idempotency
+        // (its own settlements are in its store) and cannot lose a targeted-to-it offer to another
+        // seat, so it never carries the sub. Registered here so boot AND the watchdog's reconnect keep
+        // the same set.
+        if self.claim_open_pool() {
+            self.subscribe_one(RECEIPT_SUB_ID, since).await?;
+        }
         Ok(())
     }
 
@@ -1701,6 +1878,12 @@ impl SellerNodeRunner {
         // partial form, and it carries two filters rather than one.
         if id == OFFER_SUB_ID {
             return self.subscribe_offers(since, self.claim_open_pool()).await;
+        }
+        // #541: receipts have their own entry point too — one kind+hashtag filter bounded by the same
+        // backfill window as offers, so a cold cache re-fills from the relay's stored receipts on
+        // boot/reconnect (the relay-verify-on-restart) rather than a firehose of every receipt ever.
+        if id == RECEIPT_SUB_ID {
+            return self.subscribe_receipts(since).await;
         }
         let base = match id {
             // One subscription carries both buyer-authored decisions about our claims: the AWARD
@@ -2023,6 +2206,7 @@ impl SellerNodeRunner {
                                 k if k.as_u16() == JOB_OFFER_KIND => self.on_offer(&event).await,
                                 k if k.as_u16() == JOB_AWARD_KIND => self.on_award(&event).await,
                                 k if k.as_u16() == JOB_ACCEPT_KIND => self.on_accept(&event).await,
+                                k if k.as_u16() == JOB_RECEIPT_KIND => self.on_receipt(&event).await,
                                 Kind::GiftWrap => self.on_gift_wrap(&event).await,
                                 _ => {}
                             }
@@ -2655,6 +2839,23 @@ impl SellerNodeRunner {
             .await;
     }
 
+    /// #541: a co-signed kind-3400 settlement receipt marks its offer terminal. Cache
+    /// `(offer_id → receipt author)` so the claim path skips an offer already settled by another seat
+    /// (see [`Self::claim_offer`] and [`TerminalOffers`]). The author is the event's own pubkey,
+    /// already signature-verified by the client, so no crypto runs here; the buyer-binding that makes
+    /// a forged receipt inert is applied at claim time, where the offer's real buyer is known. A
+    /// receipt with no root offer tag is ignored — fail-open, the offer stays claimable.
+    async fn on_receipt(&self, event: &nostr_sdk::Event) {
+        let draft = event_to_draft(event);
+        let Some(offer_id) = crate::gateway::settled_offer_id(&draft) else {
+            opline_verbose!("seller node receipt id={}: no root offer e-tag; ignoring", event.id);
+            return;
+        };
+        let author = event.pubkey.to_hex();
+        self.terminal_offers.record(&offer_id, &author);
+        opline_verbose!("seller node receipt: offer {offer_id} settled by author={author} (terminal)");
+    }
+
     /// The claim tail: capacity back-pressure → journal the offer facts → build the creq/claim →
     /// reserve a slot → park the claim. Shared by [`Self::on_offer`] (a wire offer just classified
     /// `Claim`) and [`Self::reconsider_capacity_skips`] (a RECORDED offer re-driven from the store
@@ -2670,6 +2871,17 @@ impl SellerNodeRunner {
         deadline_unix: u64,
         now: i64,
     ) {
+        // #541: refuse a SETTLED offer before any work. A co-signed kind-3400 receipt authored by
+        // THIS offer's buyer means the offer was awarded + settled (to us or another seat) and is
+        // terminal — claiming it would park a slot on finished work and mask real availability. The
+        // buyer-binding is load-bearing: a forged receipt (author != buyer) sits in the cache but never
+        // matches here, so the worst a forger or a flood achieves is the pre-#541 wasted slot, never a
+        // spend. FAIL-OPEN: an unknown / cold / evicted offer is not skipped. Consulted only on the
+        // event loop, before record_offer / try_reserve, so nothing is reserved for a terminal offer.
+        if self.terminal_offers.settled_by(job_id, buyer_pubkey) {
+            opline!("seller node offer skip id={job_id}: {}", SkipReason::Settled.reason());
+            return;
+        }
         // Capacity back-pressure: never hold unbounded parked claims.
         match self.node.store().health() {
             Ok(health) if health.open_claims >= AWAITING_AWARD_CAP => {
@@ -4186,6 +4398,96 @@ mod tests {
         assert_eq!(match_award("claim1", None, "buyer", "buyer"), AwardMatch::Ignore);
     }
 
+    // ---- #541 terminal-offer cache (relay-derived settlement gate) --------------------------------
+
+    #[test]
+    fn terminal_offers_buyer_binds_the_settlement() {
+        // The gate skips ONLY on a receipt authored by the offer's OWN buyer. A settlement recorded
+        // for buyer B makes the offer terminal for B; a forged receipt authored by anyone else is
+        // stored but never satisfies the buyer-bound test — the whole of the anti-grief property.
+        let mut t = TerminalOffersInner::new(16, 4);
+        t.record("offerX", "buyerB");
+        assert!(t.settled_by("offerX", "buyerB"), "the offer's own buyer settled it ⇒ terminal");
+        assert!(
+            !t.settled_by("offerX", "forgerF"),
+            "a receipt author who is not the offer's buyer never matches"
+        );
+        assert!(
+            !t.settled_by("otherOffer", "buyerB"),
+            "an unrelated offer is not terminal (fail-open on the unknown)"
+        );
+
+        // A forger publishing alone cannot make the offer terminal for its real buyer.
+        let mut g = TerminalOffersInner::new(16, 4);
+        g.record("offerY", "forgerF");
+        assert!(
+            !g.settled_by("offerY", "buyerB"),
+            "a forger-only receipt does NOT suppress the real buyer's offer"
+        );
+    }
+
+    #[test]
+    fn terminal_offers_drop_newest_protects_an_established_buyer() {
+        // Once the real buyer's author is recorded, a flood of later (forged) authors can NEVER
+        // displace it: the per-offer author set is DROP-NEWEST at its cap.
+        let mut sticky = TerminalOffersInner::new(16, 2); // authors_cap = 2
+        sticky.record("offerX", "buyerB");
+        sticky.record("offerX", "f1"); // fills the 2-cap
+        sticky.record("offerX", "f2"); // over cap ⇒ dropped (newest)
+        sticky.record("offerX", "f3"); // over cap ⇒ dropped
+        assert!(
+            sticky.settled_by("offerX", "buyerB"),
+            "an established real-buyer entry is never evicted by a later flood"
+        );
+
+        // The documented residual, asserted as REAL behaviour (never a silent claim of safety): a
+        // flood that fills the cap with fakes BEFORE the buyer's receipt blocks the buyer entry, so
+        // the offer degrades to PRE-#541 (claimable, wasted slot until lapse) — never a spend.
+        let mut flooded = TerminalOffersInner::new(16, 2);
+        flooded.record("offerZ", "f1");
+        flooded.record("offerZ", "f2"); // cap full with fakes
+        flooded.record("offerZ", "buyerB"); // over cap ⇒ dropped-newest ⇒ buyer blocked
+        assert!(
+            !flooded.settled_by("offerZ", "buyerB"),
+            "first-flood degrades that offer to pre-fix (fail-open), by design"
+        );
+    }
+
+    #[test]
+    fn terminal_offers_fifo_bounds_the_offer_map() {
+        // The offer map is FIFO-bounded: a new offer past the cap evicts the OLDEST, so memory is
+        // bounded and an aged-out offer fails open — claimable again.
+        let mut t = TerminalOffersInner::new(2, 4); // offers_cap = 2
+        t.record("o1", "b1");
+        t.record("o2", "b2");
+        assert_eq!(t.offer_count(), 2);
+        t.record("o3", "b3"); // evicts o1 (oldest first-seen)
+        assert_eq!(t.offer_count(), 2, "the map never exceeds its cap");
+        assert!(!t.settled_by("o1", "b1"), "the oldest offer aged out ⇒ claimable again (fail-open)");
+        assert!(
+            t.settled_by("o2", "b2") && t.settled_by("o3", "b3"),
+            "the two newest offers stay terminal"
+        );
+    }
+
+    #[test]
+    fn terminal_offers_record_is_idempotent() {
+        // A replayed receipt (same offer + same author) is a no-op: the offer is tracked once, not
+        // once per redelivery, and the replay does not consume the per-offer author cap.
+        let mut t = TerminalOffersInner::new(4, 2);
+        t.record("offerX", "buyerB");
+        t.record("offerX", "buyerB");
+        t.record("offerX", "buyerB");
+        assert_eq!(t.offer_count(), 1, "the offer is tracked once, not once per redelivery");
+        assert!(t.settled_by("offerX", "buyerB"));
+        // The idempotent replays did not consume the cap: a second DISTINCT author still fits.
+        t.record("offerX", "buyerB-2nd-device");
+        assert!(
+            t.settled_by("offerX", "buyerB-2nd-device"),
+            "a distinct author still fits under the cap after idempotent replays"
+        );
+    }
+
     // Untargeted offers are refused unless open-pool is opted in; with it, they claim.
     #[test]
     fn untargeted_needs_open_pool_opt_in() {
@@ -5162,6 +5464,220 @@ mod tests {
             }
         }
         done(runner)
+    }
+
+    /// #541 — a settled offer another seat won is never claimed, and the fail-open control still claims
+    /// an unsettled one. The receipt is BUYER-authored (a co-signed kind-3400) for an offer awarded to
+    /// ANOTHER seller, so THIS node never locally collected it: `store.has_receipt` is false and a
+    /// vacuous local gate would claim. The relay-derived, buyer-bound cache must make it terminal.
+    ///
+    /// RED ON REVERT: drop the `terminal_offers.settled_by` guard at the top of `claim_offer` and the
+    /// settled offer is recorded and reserves the slot, failing the first assertion block.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_settled_offer_won_by_another_seat_is_not_claimed() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        // A 1-slot OPEN-POOL seller — the pool that claims an untargeted offer it can lose.
+        let (runner, root) =
+            boot_capacity_skip_seller("settled-not-claimed", &relay_url, true, 0, Some(0)).await;
+
+        let buyer = Keys::generate();
+        let deadline_unix = now_unix() as u64 + 3_600;
+
+        // An untargeted offer the open-pool seller WOULD otherwise claim (over the floor, future
+        // deadline, default harness) — so a skip can ONLY be the settlement gate, never a stray refusal.
+        let offer_draft =
+            crate::gateway::OfferDraft::untargeted("settled job", "", 100, deadline_unix)
+                .to_event_draft();
+        let offer_event = crate::gateway::nostr::event_builder(&offer_draft)
+            .expect("offer builder")
+            .sign_with_keys(&buyer)
+            .expect("sign offer");
+        let settled_id = offer_event.id.to_hex();
+
+        // The BUYER publishes the co-signed kind-3400 settling it; the award went to ANOTHER seller
+        // (the seller p-tag), so this node never collected the receipt.
+        let other_seller = Keys::generate().public_key().to_hex();
+        let receipt = crate::gateway::receipt_draft(
+            &settled_id,
+            "result-id",
+            &buyer.public_key().to_hex(),
+            &other_seller,
+            "https://mint.invalid",
+            100,
+            "job-hash",
+            "seller-sig",
+            "buyer-sig",
+            None,
+            None,
+            &[],
+        );
+        let receipt_event = crate::gateway::nostr::event_builder(&receipt)
+            .expect("receipt builder")
+            .sign_with_keys(&buyer) // the 3400 is BUYER-authored (authorize_pay.rs)
+            .expect("sign receipt");
+
+        // A second, UNSETTLED untargeted offer — the fail-open control that must still be claimed.
+        let fresh_draft =
+            crate::gateway::OfferDraft::untargeted("fresh job", "", 100, deadline_unix)
+                .to_event_draft();
+        let fresh_event = crate::gateway::nostr::event_builder(&fresh_draft)
+            .expect("fresh offer builder")
+            .sign_with_keys(&buyer)
+            .expect("sign fresh offer");
+        let fresh_id = fresh_event.id.to_hex();
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Precondition: this node has NOT locally collected the receipt (another seat won it),
+                // so a `store.has_receipt` gate would be vacuous — the whole point of relay-deriving.
+                assert!(
+                    !runner.node.store().has_receipt(&settled_id).expect("has_receipt read"),
+                    "precondition: the settlement was collected by another seat, not us"
+                );
+
+                // The co-signed receipt arrives and marks the offer terminal.
+                runner.on_receipt(&receipt_event).await;
+                // The settled offer re-appears (backfill / redelivery) — it must NOT be claimed.
+                runner.on_offer(&offer_event).await;
+                assert!(
+                    runner.node.store().offer_facts(&settled_id).expect("offer_facts").is_none(),
+                    "a settled offer must not be recorded"
+                );
+                assert!(
+                    runner.node.store().claim_row_state(&settled_id).expect("claim row").is_none(),
+                    "a settled offer must park no claim"
+                );
+                assert_eq!(runner.slots.available(), 1, "no slot is reserved for a settled offer");
+
+                // Fail-open control: an UNSETTLED offer is still claimed — proving the seller is willing
+                // and able, so the skip above was the settlement gate, not a blanket refusal.
+                runner.on_offer(&fresh_event).await;
+                assert!(
+                    runner.node.store().offer_facts(&fresh_id).expect("fresh offer_facts").is_some(),
+                    "an unsettled offer is still claimed (fail-open on the unknown)"
+                );
+                assert_eq!(runner.slots.available(), 0, "the unsettled claim takes the slot");
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Feed JOB_RECEIPT events off the seller's live notification stream into `on_receipt` — exactly
+    /// what the run loop's select arm does — until `done` holds or the deadline passes. Mirrors
+    /// [`pump_offers_until`]; the receipt path is `&self` (no execution spawn), so no `Arc` is needed.
+    async fn pump_receipts_until(
+        runner: &SellerNodeRunner,
+        notifications: &mut tokio::sync::broadcast::Receiver<RelayPoolNotification>,
+        deadline: std::time::Instant,
+        mut done: impl FnMut(&SellerNodeRunner) -> bool,
+    ) -> bool {
+        while !done(runner) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            if let Ok(Ok(RelayPoolNotification::Event { event, .. })) = tokio::time::timeout(
+                remaining.min(Duration::from_millis(150)),
+                notifications.recv(),
+            )
+            .await
+            {
+                if event.kind.as_u16() == JOB_RECEIPT_KIND {
+                    runner.on_receipt(&event).await;
+                }
+            }
+        }
+        done(runner)
+    }
+
+    /// #541 — the settlement-receipt SUB actually feeds the terminal cache, and a fresh boot rebuilds
+    /// it from the relay's STORED receipts (the relay-verify-on-restart). This exercises the one novel,
+    /// silent-failure-prone bit: the boot backfill WINDOW. A receipt published BEFORE the seller boots
+    /// must be re-fetched by the sub. RED ON REVERT: break the boot `since` in `subscribe_receipts`
+    /// (e.g. `since(now)` live-only) and the past receipt never backfills, so the cache stays empty and
+    /// the `settled_by` wait times out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_receipt_sub_backfills_the_terminal_cache_on_boot() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+
+        // A buyer publishes an offer and its co-signed settlement receipt to the relay BEFORE any
+        // seller boots — the "already settled when we arrive" case.
+        let buyer = Keys::generate();
+        let publisher = Client::new(buyer.clone());
+        publisher.add_relay(&relay_url).await.expect("add relay");
+        publisher.connect().await;
+        publisher.wait_for_connection(Duration::from_secs(5)).await;
+        let buyer_hex = buyer.public_key().to_hex();
+        let deadline_unix = now_unix() as u64 + 3_600;
+
+        let offer_draft =
+            crate::gateway::OfferDraft::untargeted("settled-by-relay", "", 100, deadline_unix)
+                .to_event_draft();
+        let offer_event = crate::gateway::nostr::event_builder(&offer_draft)
+            .expect("offer builder")
+            .sign_with_keys(&buyer)
+            .expect("sign offer");
+        let settled_id = offer_event.id.to_hex();
+
+        let other_seller = Keys::generate().public_key().to_hex();
+        let receipt = crate::gateway::receipt_draft(
+            &settled_id,
+            "result-id",
+            &buyer_hex,
+            &other_seller,
+            "https://mint.invalid",
+            100,
+            "job-hash",
+            "seller-sig",
+            "buyer-sig",
+            None,
+            None,
+            &[],
+        );
+        let receipt_event = crate::gateway::nostr::event_builder(&receipt)
+            .expect("receipt builder")
+            .sign_with_keys(&buyer)
+            .expect("sign receipt");
+        publisher.send_event(&receipt_event).await.expect("publish receipt to relay");
+
+        // Boot an open-pool seller WITH a backfill window; its receipt sub must re-fetch the stored
+        // 3400 into the terminal cache.
+        let (runner, root) =
+            boot_capacity_skip_seller("receipt-backfill", &relay_url, true, 3_600, Some(0)).await;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut notifications = runner.client.notifications();
+                runner.subscribe_receipts(None).await.expect("subscribe receipts");
+                assert!(
+                    pump_receipts_until(
+                        &runner,
+                        &mut notifications,
+                        std::time::Instant::now() + Duration::from_secs(5),
+                        |r| r.terminal_offers.settled_by(&settled_id, &buyer_hex),
+                    )
+                    .await,
+                    "the receipt sub must backfill the past 3400 into the terminal cache"
+                );
+                // With the cache rebuilt from the relay, the settled offer is not claimed.
+                runner.on_offer(&offer_event).await;
+                assert!(
+                    runner.node.store().offer_facts(&settled_id).expect("offer_facts").is_none(),
+                    "a relay-learned settled offer must not be claimed"
+                );
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+        publisher.disconnect().await;
     }
 
     /// The full capacity-skip → lapse → reconsider → backfill → re-claim drive, shared by the targeted
