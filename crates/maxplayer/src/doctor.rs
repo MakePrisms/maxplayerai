@@ -246,8 +246,17 @@ mod checks {
     /// the authority (#201): it refuses to advertise work it cannot run, and `--skip-doctor` can
     /// bypass this gate entirely, so the boot-side resolve is the only guaranteed check on a real
     /// launch. Because this lives in [`super::build_checks`], `maxplayer doctor` and the
-    /// `sell_readiness_gate` share it, so a green doctor means "this seat boots with these
-    /// harnesses" by construction.
+    /// `sell_readiness_gate` share it.
+    ///
+    /// This is a RESOLUTION check, not an executability one, and the PASS says so out loud (#470). A
+    /// harness that resolves can still fail to run: the rc.3 Bolty seat resolved its `claude` preset,
+    /// passed doctor 8/8, then aborted the REAL prove-before-advertise probe because its runtime could
+    /// not read /proc and /sys under the Landlock launcher. Resolvable ≠ executable — the same
+    /// adjacency as #252's resolvable ≠ authorized — so executability is proven ONLY at the
+    /// pre-advertise self-probe at boot (#357), never here, and the PASS detail is labelled so a green
+    /// doctor cannot be read as a green probe. (Giving doctor a real exec leg was the alternative;
+    /// rejected because `sell` runs this gate AND then the advertise probe, so it would double-probe at
+    /// boot and stand up a second probe authority to keep in sync with the fail-closed gate forever.)
     pub(super) fn check_agent_registry(
         seller: Option<SellerConfig>,
         presets: BTreeMap<String, AgentPresetConfig>,
@@ -264,7 +273,16 @@ mod checks {
             // so it is an advisory WARN carrying the same loud degrade line boot would print — never
             // a boot-blocking FAIL, because boot does not refuse it.
             Ok(resolved) => match resolved.degrade_line() {
-                None => Check::pass(AGENT_CHECK, describe_registry(&resolved.registry)),
+                None => Check::pass(
+                    AGENT_CHECK,
+                    format!(
+                        "{} — RESOLUTION ONLY: this proves the registry resolves the way boot does, \
+                         NOT that any harness can deliver; executability is proven at the \
+                         pre-advertise self-probe at boot, never here (a resolvable harness can still \
+                         fail to run — #470/#252)",
+                        describe_registry(&resolved.registry)
+                    ),
+                ),
                 Some(degrade) => Check::warn(
                     AGENT_CHECK,
                     degrade,
@@ -916,6 +934,53 @@ mod tests {
             check.status,
             Status::Pass,
             "doctor must converge on boot's registry verdict, not a PATH-based preset probe: {}",
+            check.render()
+        );
+    }
+
+    // #470: doctor's agent leg is RESOLUTION-only, and its PASS must SAY so — a resolvable registry is
+    // not a probe-verified one (rc.3 Bolty seat: doctor 8/8 PASS, then the real probe aborted under
+    // Landlock). The loud label is the fix (Option B): executability is proven at the pre-advertise
+    // probe, not here. Drop the disclaimer and a green doctor reads as a green probe again — this pins
+    // it, so a future edit that silently restores the masquerade goes red.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn doctor_agent_pass_is_labelled_resolution_only_not_probe_verified() {
+        use maxplayer_core::home::SellerConfig;
+        use std::collections::BTreeMap;
+
+        // An existing file as an absolute agent_command resolves ⇒ a PASS with no degrade.
+        let existing = std::env::current_exe().expect("current exe exists");
+        let seller = SellerConfig {
+            agent_command: vec![existing.to_string_lossy().into_owned()],
+            rate_sats: 5,
+            git_remote: "https://example.invalid/repo".into(),
+            job_timeout_secs: None,
+            agents: Vec::new(),
+            claim_open_pool: false,
+            accept_offers_only_from: Vec::new(),
+            offer_backfill_secs: 0,
+            contribution_enabled: true,
+            slots: 1,
+            claim_award_timeout_secs: None,
+        };
+
+        let check = checks::check_agent_registry(Some(seller), BTreeMap::new());
+        assert_eq!(
+            check.status,
+            Status::Pass,
+            "a resolvable registry passes: {}",
+            check.render()
+        );
+        let detail = check.detail.to_lowercase();
+        assert!(
+            detail.contains("resolution only"),
+            "the agent PASS must announce it is resolution-only, not probe-verified: {}",
+            check.render()
+        );
+        assert!(
+            detail.contains("pre-advertise") && detail.contains("self-probe"),
+            "the agent PASS must point at the pre-advertise self-probe as the executability authority: {}",
             check.render()
         );
     }
