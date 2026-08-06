@@ -153,9 +153,13 @@ case "$out" in
     *)
         fail "maxplayer sell fell through to the generic usage, which is what a build WITHOUT the seller surface does — the installed artifact is not the one-binary build (#510). Output: $out" ;;
 esac
-# It must have refused in the parser, not booted and failed later.
+# It must have refused in the parser, not booted and failed later. These are the same four needles
+# `verify-seller-surface.sh` uses, and they are specific on purpose: `sell`'s usage text names
+# `git-remote=relay-git` among its defaults, so a bare `relay-git` needle matches the very output a
+# CORRECT refusal produces. Measured — it fired on the real binary.
 case "$out" in
-    *"discoverable kind0="* | *"discoverability publish"* | *"relay-git"*)
+    *"discoverable kind0="* | *"discoverability publish"* | \
+    *"relay-git seed probe"* | *"relay-git NIP-34 announce"*)
         fail "the sell probe reached the discoverability/boot path — it must publish nothing. Output: $out" ;;
 esac
 
