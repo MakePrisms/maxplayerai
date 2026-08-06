@@ -865,7 +865,13 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
                 "reserved_for": params.job_id,
             }),
         ),
-        Err(AwardError::Reserve(refused)) => Response::err(id, CODE_REFUSED, refused.to_string()),
+        Err(AwardError::Reserve(refused)) => {
+            // #539: the operator console records the affordability refusal, not only the RPC caller —
+            // a script-driven award otherwise fails with nothing in the daemon log. `refused` names
+            // the numbers (need vs available).
+            crate::opline!("buyer: cannot afford to award job {} — {refused}", params.job_id);
+            Response::err(id, CODE_REFUSED, refused.to_string())
+        }
         // Presence refusals are REFUSED, not INTERNAL: nothing broke, the daemon declined to
         // publish a second award. The message names the operator action. A relay REFUSAL of the
         // pinned event is the same class — the daemon is reporting a terminal verdict, not a
@@ -1032,7 +1038,13 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
                 "model_used": outcome.model_used,
             }),
         ),
-        Err(error @ SettleJobError::Pay(_)) => Response::err(id, CODE_REFUSED, error.to_string()),
+        Err(error @ SettleJobError::Pay(_)) => {
+            // #539: surface the settle failure on the operator console — the collect RPC path, unlike
+            // the delivery watcher, otherwise tells only the RPC caller. `error` carries the shortfall
+            // detail (a cross-mint hop names need/held/mint).
+            crate::opline!("buyer: could not settle {}: {error}", params.job_id);
+            Response::err(id, CODE_REFUSED, error.to_string())
+        }
         Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
     }
 }
@@ -1280,6 +1292,11 @@ async fn finalize_auto_award(
             Ok(())
         }
         Err(AwardError::Reserve(refused)) => {
+            // #539: the auto-award reservation refusal is the buyer's "cannot afford this award"
+            // decision. Without this line the daemon silently declines and looks idle — the parked
+            // reason is only visible later via `status`. `refused` names need vs available; the
+            // reservation is against aggregate available balance, so no single source mint applies.
+            crate::opline!("buyer: cannot afford to award job {job_id} — {refused}");
             let _ = context.store.mark_award_parked(
                 job_id,
                 &format!("reservation refused: {refused}"),
