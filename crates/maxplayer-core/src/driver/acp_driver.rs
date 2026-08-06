@@ -51,6 +51,11 @@ pub struct AcpDriver {
     /// ACP-native usage captured from the most recent `session/prompt` result.
     /// `None` when the harness surfaced nothing (absent-stays-absent).
     last_usage: Option<UsageMetadata>,
+    /// The harness-resolved model id (`models.currentModelId`) captured from the `session/new`
+    /// response — the only ACP surface that carries it (the prompt result does not; see
+    /// [`super::acp::parse_acp_usage`]). Folded into [`Self::usage`] so a run's exec-metadata carries
+    /// the resolved model (#455). `None` when the harness reported no model.
+    session_model: Option<String>,
 }
 
 impl AcpDriver {
@@ -70,6 +75,7 @@ impl AcpDriver {
             update_tx: None,
             next_request_id: AtomicU64::new(1),
             last_usage: None,
+            session_model: None,
         }
     }
 
@@ -242,6 +248,10 @@ impl Driver for AcpDriver {
             })?,
         )?;
         let result = self.wait_response(id).await?;
+        // Capture the harness-resolved model (`models.currentModelId`) before the response is reduced
+        // to a session id — this is the only ACP surface that carries it (#455). Absent-stays-absent:
+        // a harness that reports no model leaves this `None`, and nothing downstream fabricates one.
+        self.session_model = session_model_from_result(&result);
         session_id_from_result(&result)
     }
 
@@ -288,7 +298,7 @@ impl Driver for AcpDriver {
     }
 
     fn usage(&self) -> Option<UsageMetadata> {
-        self.last_usage.clone()
+        merge_session_model(self.last_usage.clone(), self.session_model.as_deref())
     }
 
     async fn shutdown(&mut self) -> Result<(), DriverError> {
@@ -504,6 +514,42 @@ fn session_id_from_result(result: &Value) -> Result<SessionId, DriverError> {
         })
 }
 
+/// The harness-resolved model id from a `session/new` result: ACP `models.currentModelId`
+/// (camelCase on the wire). This is the resolved identity INCLUDING the harness's reasoning-effort
+/// suffix, e.g. `gpt-5.6-terra[medium]`. `None` when the response carries no model block — the field
+/// is optional, so absence stays absence and is never fabricated.
+fn session_model_from_result(result: &Value) -> Option<String> {
+    result
+        .get("models")?
+        .get("currentModelId")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Fold the `session/new` model into a run's captured usage. The `session/prompt` result never
+/// carries a model (see [`super::acp::parse_acp_usage`]), so the resolved model is OR-filled from the
+/// session-start capture — but only when the prompt usage did not itself surface one (a real wire
+/// model always wins). When there is no token usage at all yet a model IS known, the model alone is
+/// surfaced: a known model with unknown token counts is honest, not empty.
+fn merge_session_model(
+    last_usage: Option<UsageMetadata>,
+    session_model: Option<&str>,
+) -> Option<UsageMetadata> {
+    match (last_usage, session_model) {
+        (Some(mut usage), model) => {
+            if usage.model.is_none() {
+                usage.model = model.map(str::to_owned);
+            }
+            Some(usage)
+        }
+        (None, Some(model)) => Some(UsageMetadata {
+            model: Some(model.to_owned()),
+            ..UsageMetadata::default()
+        }),
+        (None, None) => None,
+    }
+}
+
 fn is_permission_method(method: &str) -> bool {
     method.contains("permission")
 }
@@ -649,6 +695,94 @@ mod tests {
 
     use super::*;
     use crate::driver::{ContentBlock, ExtMethod, PermissionOutcome};
+
+    #[test]
+    fn session_model_read_from_the_new_session_response() {
+        // Ground-truthed against a captured codex-acp `session/new` result: the resolved model is
+        // `models.currentModelId`, carrying the reasoning-effort suffix (e.g. `[medium]`).
+        let result = json!({
+            "sessionId": "019f61bd-89be-7230-b67b-717871387cea",
+            "models": {
+                "currentModelId": "gpt-5.6-terra[medium]",
+                "availableModels": [
+                    {"modelId": "gpt-5.6-terra[medium]", "name": "GPT-5.6-Terra (medium)"}
+                ]
+            }
+        });
+        assert_eq!(
+            session_model_from_result(&result).as_deref(),
+            Some("gpt-5.6-terra[medium]")
+        );
+    }
+
+    #[test]
+    fn session_model_absent_stays_absent() {
+        // No model block, or a block without `currentModelId` → None (opportunistic, never fabricated).
+        assert_eq!(session_model_from_result(&json!({"sessionId": "abc"})), None);
+        assert_eq!(
+            session_model_from_result(
+                &json!({"sessionId": "abc", "models": {"availableModels": []}})
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn merge_session_model_or_fills_only_a_missing_model() {
+        // Prompt usage carries tokens but never a model (parse_acp_usage); the session-start model
+        // fills it and the tokens are preserved — the #455 fix at the driver's usage seam.
+        let prompt = UsageMetadata {
+            input_tokens: Some(3162),
+            output_tokens: Some(10),
+            ..UsageMetadata::default()
+        };
+        let merged =
+            merge_session_model(Some(prompt), Some("gpt-5.6-terra[medium]")).expect("some");
+        assert_eq!(merged.model.as_deref(), Some("gpt-5.6-terra[medium]"));
+        assert_eq!(merged.input_tokens, Some(3162));
+        assert_eq!(merged.output_tokens, Some(10));
+
+        // A model already present on the usage is never clobbered by the session model.
+        let wired = UsageMetadata {
+            model: Some("wire-model".into()),
+            ..UsageMetadata::default()
+        };
+        assert_eq!(
+            merge_session_model(Some(wired), Some("gpt-5.6-terra[medium]"))
+                .expect("some")
+                .model
+                .as_deref(),
+            Some("wire-model")
+        );
+
+        // No token usage at all but a known model → surface the model alone (not empty/None).
+        let model_only = merge_session_model(None, Some("gpt-5.6-terra[medium]")).expect("some");
+        assert_eq!(model_only.model.as_deref(), Some("gpt-5.6-terra[medium]"));
+        assert!(model_only.input_tokens.is_none());
+
+        // Nothing known stays None.
+        assert!(merge_session_model(None, None).is_none());
+    }
+
+    #[test]
+    fn driver_usage_surfaces_the_captured_session_model() {
+        // Pins the wiring (not just the pure helper): the trait `usage()` folds the captured
+        // session model into the run usage, so a regression that stops merging is caught here.
+        use crate::driver::Driver;
+        let mut driver = AcpDriver::new(
+            AgentCommand::new("codex".into(), Vec::new()),
+            PermissionOutcome::Allow,
+            Duration::from_secs(1),
+        );
+        driver.session_model = Some("gpt-5.6-terra[medium]".into());
+        driver.last_usage = Some(UsageMetadata {
+            input_tokens: Some(3162),
+            ..UsageMetadata::default()
+        });
+        let usage = driver.usage().expect("usage present");
+        assert_eq!(usage.model.as_deref(), Some("gpt-5.6-terra[medium]"));
+        assert_eq!(usage.input_tokens, Some(3162));
+    }
 
     #[test]
     fn request_side_wire_uses_real_acp_camel_case() {
