@@ -31,9 +31,10 @@ jobs:
             | node -e 'const m=JSON.parse(require("fs").readFileSync(0,"utf8"));const p=m.packages.find(p=>p.name==="maxplayer");if(!p){process.stderr.write("no maxplayer package in cargo metadata\n");process.exit(1)}process.stdout.write(p.version)')"
           ./scripts/verify-release-version.sh "$VERSION" target/debug/maxplayer
       # One half of a pair — this build has `acp` off, and the acp job below runs the other verifier
-      # on a build that has it on. Both surface verifiers otherwise run only on a tag, which leaves
-      # them unexecuted on every pull request that changes what they check, and a surface verifier
-      # that has never run is not a guard.
+      # on a build that has it on. Since #510 this is the ONLY place the racer verifier runs: a
+      # release ships one binary with `acp` in, so nothing else exercises the buyer-only feature set.
+      # It stays because that feature set is still supported from source and must keep compiling and
+      # keep being acp-free, and because a surface verifier that has never run is not a guard.
       - name: Verify the racer surface (default features)
         run: ./scripts/verify-racer-surface.sh target/debug/maxplayer
       - name: Test maxplayer-core (default features)
