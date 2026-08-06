@@ -131,18 +131,40 @@ got="$(maxplayer --version)" || fail "maxplayer --version exited non-zero"
 [ "$got" = "maxplayer $VERSION" ] || fail "maxplayer --version printed '$got'"
 ok "maxplayer --version -> $got (rc=0)"
 
-# ── Leg 2 — the racer surface is the racer surface ───────────────────────────────────────────────
-# `sell` is compiled out of the released (buyer) artifact, so it must NOT succeed. This is also the
-# negative control on leg 1: without it, a binary that exits 0 on everything would have passed.
-echo "leg 2: the seller subcommand is absent from the released artifact"
-if out="$(maxplayer sell 2>&1)"; then
-    fail "maxplayer sell exited 0 — the released artifact is not the buyer-only build it should be. Output: $out"
+# ── Leg 2 — the installed artifact carries the whole surface ────────────────────────────────────
+# Since #510 one binary ships and it can sell, so `sell` must be COMPILED IN. This leg used to
+# assert the opposite — it is the acceptance test for the change, and it is version-sensitive:
+# pointed at rc.4 or earlier it fails correctly, because that release published a buyer-only asset
+# under this name.
+#
+# `sell` must not be invoked with valid arguments: it publishes kind-0 and NIP-89 discoverability
+# and starts a heartbeat before it can fail, which would advertise a seat that exists for the length
+# of a container. So it is handed an option its own parser rejects — a message that exists only in
+# the module compiled in under `acp`, where a build without it falls through to the generic
+# top-level usage. Both exit 1, so the message is the whole of the signal.
+echo "leg 2: the released artifact carries the seller surface"
+if out="$(maxplayer sell --not-a-sell-option 2>&1)"; then
+    fail "maxplayer sell --not-a-sell-option exited 0 — its parser must reject an unknown option. Output: $out"
 fi
-out="$(maxplayer sell 2>&1 || true)"
+out="$(maxplayer sell --not-a-sell-option 2>&1 || true)"
 case "$out" in
-    *[Uu]sage* | *nknown* | *nrecognized* | *not*available* ) ok "maxplayer sell refuses (non-zero) -> $(printf '%s' "$out" | head -n 1)" ;;
-    *) fail "maxplayer sell exited non-zero but said nothing recognisable: $out" ;;
+    *"unknown sell option"*)
+        ok "maxplayer sell reaches its own parser -> $(printf '%s' "$out" | head -n 1)" ;;
+    *)
+        fail "maxplayer sell fell through to the generic usage, which is what a build WITHOUT the seller surface does — the installed artifact is not the one-binary build (#510). Output: $out" ;;
 esac
+# It must have refused in the parser, not booted and failed later.
+case "$out" in
+    *"discoverable kind0="* | *"discoverability publish"* | *"relay-git"*)
+        fail "the sell probe reached the discoverability/boot path — it must publish nothing. Output: $out" ;;
+esac
+
+# Negative control on leg 1 and on the case above: a binary that answered everything the same way
+# would have satisfied both. An unknown subcommand must still be refused.
+if maxplayer not-a-subcommand >/dev/null 2>&1; then
+    fail "maxplayer not-a-subcommand exited 0, so the exit codes above carry no information"
+fi
+ok "control: an unknown subcommand is refused"
 
 # ── Leg 3 — idempotency ─────────────────────────────────────────────────────────────────────────
 echo "leg 3: re-running upgrades in place"
@@ -402,6 +424,43 @@ cat "$INSTALLER" | sh -s -- --version "$VERSION" --bin-dir "$BIN_PIPED" >/legs/p
 got="$("$BIN_PIPED/maxplayer" version)" || fail "the piped install produced a binary that will not run"
 [ "$got" = "maxplayer $VERSION" ] || fail "the piped install produced '$got'"
 ok "cat install.sh | sh -s -- --version $VERSION --bin-dir ... -> $got"
+
+# ── Leg 15 — `--seller` is a no-op, not a refusal and not a different download ──────────────────
+# The flag selected a separately named asset up to rc.4 and #510 removed that asset. Every seller's
+# install line still carries it, so all three of these have to hold at once: the run SUCCEEDS (a
+# refusal would break those lines), it says so on stderr (silence would leave people believing they
+# installed something else), and it installs the SAME binary — which is the half a
+# "does it still exit 0" check would miss.
+echo "leg 15: --seller is accepted, warns, and installs the one binary"
+BIN_SELLER="$(leg_dir sellerflag)"
+MAXPLAYER_VERSION="$VERSION" MAXPLAYER_BIN_DIR="$BIN_SELLER" sh "$INSTALLER" --seller \
+    >/legs/sellerflag.out 2>/legs/sellerflag.err \
+    || fail "install.sh --seller exited non-zero. stdout: $(cat /legs/sellerflag.out) stderr: $(cat /legs/sellerflag.err)"
+grep -q 'deprecated' /legs/sellerflag.err \
+    || fail "--seller installed but printed no deprecation notice to stderr: $(cat /legs/sellerflag.err)"
+# The retired asset name must never appear: it would mean a URL was constructed for an asset no
+# release publishes, which is a 404 waiting for the next person who is offline-cached past it.
+if grep -q 'maxplayer-seller-' /legs/sellerflag.out /legs/sellerflag.err; then
+    fail "--seller still constructed a maxplayer-seller-* asset name: $(cat /legs/sellerflag.out /legs/sellerflag.err)"
+fi
+got="$("$BIN_SELLER/maxplayer" version)" || fail "--seller installed a binary that will not run"
+[ "$got" = "maxplayer $VERSION" ] || fail "--seller installed something that reports '$got'"
+# Same bytes as the plain install, which is the actual claim "no-op" makes.
+cmp -s "$BIN1/maxplayer" "$BIN_SELLER/maxplayer" \
+    || fail "--seller installed a DIFFERENT binary than the plain install — the flag is not a no-op"
+ok "--seller -> rc=0, warned on stderr, byte-identical to the plain install ($got)"
+
+# Control: the notice is not printed unconditionally. Without this, leg 15's grep would pass on an
+# installer that warns about a flag nobody passed.
+echo "leg 15b: control — a run without --seller prints no deprecation notice"
+BIN_NOSELLER="$(leg_dir noseller)"
+MAXPLAYER_VERSION="$VERSION" MAXPLAYER_BIN_DIR="$BIN_NOSELLER" sh "$INSTALLER" \
+    >/legs/noseller.out 2>/legs/noseller.err \
+    || fail "the control install exited non-zero: $(cat /legs/noseller.err)"
+if grep -q 'deprecated' /legs/noseller.err; then
+    fail "a run without --seller printed the deprecation notice, so leg 15's grep proves nothing: $(cat /legs/noseller.err)"
+fi
+ok "control: no --seller, no notice"
 
 echo "PASS"
 DRIVER

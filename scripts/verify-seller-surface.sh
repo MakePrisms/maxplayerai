@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 #
-# Capability gate for a shipped SELLER artifact — asserts WHICH features were compiled in.
+# Capability gate for the SHIPPED artifact — asserts WHICH features were compiled in.
 #
-# The mirror of `verify-racer-surface.sh`, and it exists for the same reason that one does:
-# `maxplayer version` succeeds identically in every feature combination, so nothing else in the
-# release pipeline can tell one build from another. A seller artifact built without `acp` compiles
-# clean, packages clean, installs clean, and hands the seller a binary that cannot run a job or
-# advertise a seat — the failure arrives at the first award, on someone else's sats.
+# Since #510 this runs against the one binary a release publishes: `wallet,acp`, able to buy and to
+# sell. It exists because `maxplayer version` succeeds identically in every feature combination, so
+# nothing else in the release pipeline can tell one build from another. A shipped binary built
+# without `acp` compiles clean, packages clean, installs clean, and hands a seller a binary that
+# cannot run a job or advertise a seat — the failure arrives at the first award, on someone else's
+# sats.
+#
+# Its mirror, `verify-racer-surface.sh`, asserts the opposite shape. Nothing ships from that path any
+# more; it runs in `ci.yml` against a default-feature build, so the buyer-only feature set — still
+# supported from source — keeps compiling and keeps being acp-free.
 #
 #   * `wallet` must be IN, or the seller cannot hold ecash or be paid.
 #   * `acp` must be IN. That feature compiles the agent-execution path (`run`) and, with it, the

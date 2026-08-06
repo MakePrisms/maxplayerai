@@ -13,16 +13,15 @@
 #
 # Writes <outdir>/<name>-<version>-<platform>.tar.gz and prints its path.
 #
-# `name` defaults to `maxplayer` and names the ARCHIVE — the tarball and the directory inside it. It
-# is an argument rather than a constant because the release matrix ships more than one artifact from
-# this script: the racer (buyer surface) and the seller artifact differ only in feature set, so the
-# caller is what knows which one it is holding.
+# `name` defaults to `maxplayer` and names the ARCHIVE — the tarball and the directory inside it.
+# The release passes nothing and takes that default: since #510 there is one shipped asset stem, and
+# naming it at the call site would only add a second place for it to drift. The argument stays for
+# local and experimental packaging, where an archive built beside a real one needs a name of its own.
 #
 # The executable inside is named after the binary being packaged, never after the archive. A binary
 # must answer to the name it is invoked by — `verify-release-version.sh` holds every artifact to
 # that — and `maxplayer` reports `maxplayer <version>` whichever feature set it was built with. An
-# archive-derived name would ship the seller artifact as a command that disagrees with its own
-# `version` output.
+# archive-derived name would ship a command that disagrees with its own `version` output.
 
 set -euo pipefail
 
@@ -32,7 +31,8 @@ VERSION="${3:-}"
 OUTDIR="${4:-}"
 # `${5-...}` and not `${5:-...}`: the colon form would also substitute the default for an argument
 # that was passed but EMPTY, which is how an unset caller-side variable arrives. Defaulting there
-# would quietly produce a racer-named archive for a caller that believed it had named something else.
+# would quietly produce a `maxplayer`-named archive for a caller that believed it had named
+# something else.
 # Omitted means default; empty means the caller is broken, and the check below says so.
 NAME="${5-maxplayer}"
 
