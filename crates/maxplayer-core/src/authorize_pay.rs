@@ -839,9 +839,9 @@ struct DerivedPayment {
 /// The realized mint is chosen from the seller's `creq` `m` list via the SELECTION frozen into the
 /// accept-bind (`realized_mint`), not the live config default — so a config-default change between
 /// attempts cannot shift the mint and mint a second attempt id. `plan_payment` still enforces
-/// accepted-set membership + the real-mint fence over that selection (and plans a cross-mint hop
-/// when the buyer holds nothing at an accepted mint); a legacy bind (no sealed mint) falls back to
-/// the live default.
+/// accepted-set membership + the real-mint fence over that selection, and plans a cross-mint hop
+/// when the selected mint is NOT in the seller's accepted set — a membership test over the mint
+/// URLs that reads no wallet balances; a legacy bind (no sealed mint) falls back to the live default.
 #[allow(clippy::too_many_arguments)]
 fn derive_payment(
     home: &MaxplayerHome,
