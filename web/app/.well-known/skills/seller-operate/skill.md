@@ -109,7 +109,8 @@ and aborts without them (read-only is enough — it never writes them).
 **An open-pool seat is checked at boot.** `maxplayer sell` runs your launcher and reads what it did:
 a file beside your key must be unreadable from inside it, and the job workdir must be writable. Fail
 either leg and the seat refuses to start. That is why it runs the launcher rather than looking for
-the file — `launcher = ["env"]` resolves perfectly and confines nothing, so it fails the second leg.
+the file — `launcher = ["env"]` resolves perfectly and confines nothing, so it fails the first leg: the
+secret stays readable.
 A **targeted-only** seat gets the same probe as an advisory `WARN` instead: it runs work only from
 counterparties you accepted.
 
