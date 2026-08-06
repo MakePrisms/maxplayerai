@@ -1324,14 +1324,17 @@ pub async fn accept_claim_async(
 /// Resolve + accept the delivered claim for a one-call collect on `job_id`, returning the recorded
 /// pay-bind. This is the accept step [`collect`](crate::collect) runs ITSELF when no accept-bind
 /// exists yet, so a buyer with an awarded job and a delivered result can collect once (no separate
-/// accept_claim call). It fetches relay truth, selects the live claim whose seller delivered a git
-/// result, and runs the SAME [`accept_claim_async`] path — publishing the buyer accept and recording
+/// accept_claim call). It fetches relay truth, resolves the buyer's own durable AWARD (kind-3405)
+/// and accepts THAT awarded claim's delivery — against the award, never the live-claim set, so later
+/// claim churn cannot strand it (#540) — and runs the SAME [`accept_claim_async`] path, publishing
+/// the buyer accept and recording
 /// the co-signed pay-bind (seller / result / commit / repo / branch / job-hash / creq_hash, all
 /// accept-time money gates: single-settlement, creq verify, realized-mint freeze). It adds NO money
 /// authority — it only moves WHERE the bind is created.
 ///
-/// Fail-closed with no bind written when the delivered claim cannot be resolved unambiguously
-/// (zero or multiple live delivered claims); the error names the explicit `accept_claim` primitive.
+/// Fail-closed with no bind written when the award cannot be resolved (absent, unverified, or
+/// unrepairable on the relay) or the awarded delivery is missing or past its pay window; each error
+/// names the remedy (`accept_claim`, or wait for delivery).
 pub async fn accept_for_collect_async(
     home: &MaxplayerHome,
     job_id: &str,
@@ -1339,7 +1342,32 @@ pub async fn accept_for_collect_async(
     let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
     let keys = buyer_keys(home)?;
     let view = fetch_job_view_async(home, &keys, job_id, timeout, now_unix()).await?;
-    let claim_id = select_deliverable_claim(&view)?;
+    // Resolve the winner from the buyer's DURABLE AWARD (its own kind-3405), never the live-claim
+    // set: the award is the payment decision, and later claim churn — a newer, non-awarded claim
+    // becoming the single `live_claim_id` — must not strand a delivered, still-payable awarded claim
+    // (#540). A relay-truth read (restart-safe, no local ledger); its Unverified / Absent /
+    // Unrepairable cases each refuse fail-closed rather than guess a claim.
+    let award = match award_presence_async(home, &keys, job_id, timeout).await? {
+        PresenceRead::Present(AwardPresence::Repairable(award)) => award,
+        PresenceRead::Present(AwardPresence::Unrepairable { detail, .. }) => {
+            return Err(JobLifecycleError::Input(format!(
+                "collect: the award for job {job_id} is not a single unambiguous claim ({detail}); \
+                 resolve it with accept_claim before collecting"
+            )));
+        }
+        PresenceRead::ConfirmedAbsent => {
+            return Err(JobLifecycleError::NotFound(format!(
+                "collect: no award on the relay for job {job_id} — award a seller and wait for \
+                 delivery before collecting"
+            )));
+        }
+        PresenceRead::Unverified => {
+            return Err(JobLifecycleError::Relay(format!(
+                "collect: could not confirm the award for job {job_id} (relay unverified) — retry"
+            )));
+        }
+    };
+    let claim_id = select_deliverable_claim(&view, &award)?;
     // Reuse accept_claim_async unchanged: it re-fetches relay truth and re-runs every accept-time
     // gate (targeting, single-settlement, job-hash echo, creq verify, realized-mint freeze) before
     // writing the bind. The extra fetch is the price of not duplicating the money machinery.
@@ -1355,36 +1383,53 @@ pub async fn accept_for_collect_async(
     Ok(outcome.bind)
 }
 
-/// Select the live claim to auto-accept for a one-call collect: the live claim whose seller has
-/// delivered a git result (a result the seller authored carrying a `commit_oid`). Relay truth only
-/// — never invents a claim. Exactly one such claim is required: zero refuses (nothing delivered to
-/// collect yet), more than one refuses as ambiguous (the buyer must pick one with `accept_claim`,
-/// then collect). Both refusals name the remedy and never write a bind.
-fn select_deliverable_claim(view: &JobView) -> Result<String, JobLifecycleError> {
-    let delivered: Vec<&ClaimView> = view
+/// Select the claim to auto-accept for a one-call collect: the AWARDED claim (the buyer's own
+/// kind-3405 established the winner — the payment decision), verifying its seller has delivered a
+/// git result. Resolves against the durable AWARD passed in, NOT the exclusive live claim (#540):
+/// once an award exists, later claim churn — a newer, non-awarded claim becoming the single
+/// `live_claim_id` — is status-only and must never overturn it, so a delivered, still-payable
+/// awarded claim stays collectable through that churn.
+///
+/// The pay WINDOW is retained: the awarded claim must be payable — `processing` or
+/// [`CLAIM_STATUS_DELIVERED`], the SAME per-claim predicate [`derive_claim_liveness`] admits a live
+/// claim by — so a [`CLAIM_STATUS_EXPIRED`] award (past its pay window) still never pays. Only the
+/// EXCLUSIVE "is THE live claim" test is dropped. Relay truth only; never invents a claim.
+/// Fail-closed and named on every refusal (award not on the relay, past the pay window, not yet
+/// delivered), writing no bind.
+fn select_deliverable_claim(
+    view: &JobView,
+    award: &RelayedAward,
+) -> Result<String, JobLifecycleError> {
+    let awarded = view
         .claims
         .iter()
-        .filter(|claim| {
-            claim.live
-                && view.results.iter().any(|result| {
-                    result.seller_pubkey == claim.seller_pubkey && result.commit_oid.is_some()
-                })
-        })
-        .collect();
-    match delivered.as_slice() {
-        [claim] => Ok(claim.claim_id.clone()),
-        [] => Err(JobLifecycleError::NotFound(format!(
-            "collect: no live claim with a delivered git result for job {} — award a seller and wait \
-             for delivery (get_job wait_for=result) before collecting",
-            view.job_id
-        ))),
-        _ => Err(JobLifecycleError::Input(format!(
-            "collect: {} live claims have delivered results for job {}; the delivered claim is \
-             ambiguous — accept one explicitly with accept_claim, then collect",
-            delivered.len(),
-            view.job_id
-        ))),
+        .find(|claim| claim.claim_id == award.claim_id)
+        .ok_or_else(|| {
+            JobLifecycleError::NotFound(format!(
+                "collect: the awarded claim {} for job {} is not on the relay yet — cannot collect \
+                 (retry once the claim is readable)",
+                award.claim_id, view.job_id
+            ))
+        })?;
+    if awarded.status != "processing" && awarded.status != CLAIM_STATUS_DELIVERED {
+        return Err(JobLifecycleError::NotFound(format!(
+            "collect: the awarded claim {} for job {} is {} (past its pay window) — the awarded \
+             delivery is no longer collectable",
+            award.claim_id, view.job_id, awarded.status
+        )));
     }
+    let delivered = view
+        .results
+        .iter()
+        .any(|result| result.seller_pubkey == awarded.seller_pubkey && result.commit_oid.is_some());
+    if !delivered {
+        return Err(JobLifecycleError::NotFound(format!(
+            "collect: the awarded seller for job {} has not delivered a git result yet — wait for \
+             delivery (get_job wait_for=result) before collecting",
+            view.job_id
+        )));
+    }
+    Ok(award.claim_id.clone())
 }
 
 /// Accept-time contribution resolution. Authority is the buyer's SIGNED OFFER:
@@ -3714,19 +3759,6 @@ mod tests {
 
     const SELLER_HEX: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
-    fn live_claim(claim_id: &str, seller_pubkey: &str) -> ClaimView {
-        ClaimView {
-            claim_id: claim_id.to_owned(),
-            created_at: 100,
-            seller_pubkey: seller_pubkey.to_owned(),
-            display_name: None,
-            status: "processing".to_owned(),
-            live: true,
-            creq: None,
-            agents: Vec::new(),
-        }
-    }
-
     fn job_view_for(claims: Vec<ClaimView>, results: Vec<ResultView>) -> JobView {
         JobView {
             job_id: "ab".repeat(32),
@@ -3740,67 +3772,143 @@ mod tests {
         }
     }
 
-    // collect's auto-accept selector: exactly one live claim whose seller delivered a git result.
-    #[test]
-    fn select_deliverable_claim_picks_the_single_live_delivered_claim() {
-        let seller = "aa".repeat(32);
-        let view = job_view_for(
-            vec![live_claim("claim-1", &seller)],
-            vec![result_view("result-1", &seller)],
-        );
-        assert_eq!(
-            select_deliverable_claim(&view).expect("one delivered claim"),
-            "claim-1"
-        );
+    // ── #540: collect resolves the DURABLE AWARD, not the exclusive live claim ────────────────
+    // A claim with a chosen status + live flag; `award_for` is the buyer's parsed kind-3405 naming
+    // the winning claim + its seller. These drive the resolver purely, no relay.
+    fn claim_with(claim_id: &str, seller: &str, status: &str, live: bool) -> ClaimView {
+        ClaimView {
+            claim_id: claim_id.to_owned(),
+            created_at: 100,
+            seller_pubkey: seller.to_owned(),
+            display_name: None,
+            status: status.to_owned(),
+            live,
+            creq: None,
+            agents: Vec::new(),
+        }
+    }
+    fn award_for(claim_id: &str, seller: &str) -> RelayedAward {
+        RelayedAward {
+            award_event_id: "aw".repeat(32),
+            claim_id: claim_id.to_owned(),
+            seller_pubkey: seller.to_owned(),
+        }
     }
 
-    // A live claim whose seller delivered NOTHING ⇒ NotFound (nothing to collect yet).
+    // #540 REGRESSION (leg 1): the awarded claim A was DELIVERED, then a newer non-awarded claim B
+    // became the single live one. collect must resolve A from the durable award — not the live set.
+    // Red-on-revert: the old live-gate resolver filtered `live && delivered` (A not live, B not
+    // delivered) → empty → refused, stranding a valid awarded delivery.
     #[test]
-    fn select_deliverable_claim_refuses_when_nothing_delivered() {
-        let seller = "aa".repeat(32);
-        let view = job_view_for(vec![live_claim("claim-1", &seller)], Vec::new());
-        let err = select_deliverable_claim(&view).expect_err("no delivery must refuse");
-        assert!(matches!(err, JobLifecycleError::NotFound(_)), "unexpected: {err}");
-        assert!(
-            err.to_string().contains("no live claim with a delivered git result"),
-            "message: {err}"
-        );
-    }
-
-    // A delivered result whose claim is NOT live (expired/replaced) ⇒ not collectable.
-    #[test]
-    fn select_deliverable_claim_ignores_non_live_claims() {
-        let seller = "aa".repeat(32);
-        let mut claim = live_claim("claim-1", &seller);
-        claim.live = false;
-        let view = job_view_for(vec![claim], vec![result_view("result-1", &seller)]);
-        assert!(
-            matches!(
-                select_deliverable_claim(&view).expect_err("non-live must refuse"),
-                JobLifecycleError::NotFound(_)
-            ),
-            "a non-live claim must not be auto-selected"
-        );
-    }
-
-    // Two live claims with deliveries ⇒ ambiguous refusal (buyer must accept_claim explicitly).
-    #[test]
-    fn select_deliverable_claim_refuses_ambiguous_multiple_delivered() {
+    fn select_resolves_the_awarded_claim_even_when_a_newer_claim_is_live() {
         let seller_a = "aa".repeat(32);
         let seller_b = "bb".repeat(32);
         let view = job_view_for(
             vec![
-                live_claim("claim-a", &seller_a),
-                live_claim("claim-b", &seller_b),
+                claim_with("claim-b", &seller_b, "processing", true),
+                claim_with("claim-a", &seller_a, CLAIM_STATUS_DELIVERED, false),
+            ],
+            vec![result_view("result-a", &seller_a)],
+        );
+        assert_eq!(
+            select_deliverable_claim(&view, &award_for("claim-a", &seller_a))
+                .expect("the awarded claim resolves despite B being live"),
+            "claim-a"
+        );
+    }
+
+    // leg 5 (B never receives A's award): even if the live non-awarded claim B ALSO delivered, the
+    // award pins A. Red-on-revert: the old resolver returned the live+delivered claim → B.
+    #[test]
+    fn select_never_picks_a_live_non_awarded_claim_over_the_award() {
+        let seller_a = "aa".repeat(32);
+        let seller_b = "bb".repeat(32);
+        let view = job_view_for(
+            vec![
+                claim_with("claim-b", &seller_b, "processing", true),
+                claim_with("claim-a", &seller_a, CLAIM_STATUS_DELIVERED, false),
             ],
             vec![
-                result_view("result-a", &seller_a),
                 result_view("result-b", &seller_b),
+                result_view("result-a", &seller_a),
             ],
         );
-        let err = select_deliverable_claim(&view).expect_err("ambiguous must refuse");
-        assert!(matches!(err, JobLifecycleError::Input(_)), "unexpected: {err}");
-        assert!(err.to_string().contains("ambiguous"), "message: {err}");
+        assert_eq!(
+            select_deliverable_claim(&view, &award_for("claim-a", &seller_a))
+                .expect("the award pins A, never the live B"),
+            "claim-a"
+        );
+    }
+
+    // leg 2 (restart-between): resolution depends only on the durable award + per-claim payability,
+    // never on WHICH claim is transiently live. A restart re-derives liveness; vary the live flag
+    // (the thing a restart changes) and the awarded claim must resolve identically.
+    #[test]
+    fn select_resolution_is_invariant_under_live_claim_churn() {
+        let seller_a = "aa".repeat(32);
+        let seller_b = "bb".repeat(32);
+        let award = award_for("claim-a", &seller_a);
+        let before = job_view_for(
+            vec![claim_with("claim-a", &seller_a, CLAIM_STATUS_DELIVERED, true)],
+            vec![result_view("result-a", &seller_a)],
+        );
+        let after = job_view_for(
+            vec![
+                claim_with("claim-b", &seller_b, "processing", true),
+                claim_with("claim-a", &seller_a, CLAIM_STATUS_DELIVERED, false),
+            ],
+            vec![result_view("result-a", &seller_a)],
+        );
+        assert_eq!(
+            select_deliverable_claim(&before, &award).expect("before churn"),
+            select_deliverable_claim(&after, &award).expect("after churn"),
+            "the awarded claim must resolve the same regardless of which claim is live"
+        );
+    }
+
+    // leg 4 (expired-A never pays): an awarded claim past its pay window surfaces EXPIRED; collect
+    // must refuse it. Dropping the live gate must NOT re-admit an expired delivery — red-on-revert:
+    // removing the payable/status check returns the claim here.
+    #[test]
+    fn select_refuses_an_expired_award_so_it_never_pays() {
+        let seller_a = "aa".repeat(32);
+        let view = job_view_for(
+            vec![claim_with("claim-a", &seller_a, CLAIM_STATUS_EXPIRED, false)],
+            vec![result_view("result-a", &seller_a)],
+        );
+        let err = select_deliverable_claim(&view, &award_for("claim-a", &seller_a))
+            .expect_err("an expired award must refuse");
+        assert!(matches!(err, JobLifecycleError::NotFound(_)), "unexpected: {err}");
+        assert!(err.to_string().contains("pay window"), "message: {err}");
+    }
+
+    // The awarded claim is payable but its seller has published no git delivery yet ⇒ nothing to
+    // collect. Fail-closed, named. Red-on-revert: removing the delivered check returns the claim.
+    #[test]
+    fn select_refuses_when_the_awarded_seller_has_not_delivered() {
+        let seller_a = "aa".repeat(32);
+        let view = job_view_for(
+            vec![claim_with("claim-a", &seller_a, "processing", true)],
+            Vec::new(),
+        );
+        let err = select_deliverable_claim(&view, &award_for("claim-a", &seller_a))
+            .expect_err("no delivery must refuse");
+        assert!(matches!(err, JobLifecycleError::NotFound(_)), "unexpected: {err}");
+        assert!(err.to_string().contains("has not delivered"), "message: {err}");
+    }
+
+    // The award names a claim the relay view does not carry (a torn read) ⇒ refuse, never guess.
+    #[test]
+    fn select_refuses_when_the_awarded_claim_is_absent_from_the_view() {
+        let seller_a = "aa".repeat(32);
+        let seller_b = "bb".repeat(32);
+        let view = job_view_for(
+            vec![claim_with("claim-b", &seller_b, "processing", true)],
+            vec![result_view("result-a", &seller_a)],
+        );
+        let err = select_deliverable_claim(&view, &award_for("claim-a", &seller_a))
+            .expect_err("an absent awarded claim must refuse");
+        assert!(matches!(err, JobLifecycleError::NotFound(_)), "unexpected: {err}");
     }
 
     fn claim_view(claim_id: &str, created_at: u64, status: &str) -> ClaimView {

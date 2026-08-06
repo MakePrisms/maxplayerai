@@ -4277,7 +4277,12 @@ mod tests {
         )
         .expect("creq");
         let claim_draft = crate::gateway::claim_draft(&job_id, &buyer_hex, &seller_hex, &creq, &[]);
-        let _ = publish(&seller, &claim_draft).await;
+        let claim_id = publish(&seller, &claim_draft).await.to_hex();
+
+        // The buyer AWARDED this claim on the relay (kind-3405) — collect resolves the delivery
+        // against this durable award, not the live-claim set (#540).
+        let award_draft = crate::gateway::award_draft(&job_id, &claim_id, &buyer_hex, &seller_hex);
+        let award_evt = publish(&buyer, &award_draft).await.to_hex();
 
         let job_hash = job_lifecycle::job_hash_for_offer(&job_id, task, amount);
         let forged = attacker
@@ -4302,7 +4307,7 @@ mod tests {
             .expect("reserve");
         context
             .store
-            .record_award(&job_id, &"c".repeat(64), &"e".repeat(64), &seller_hex, amount, now_unix())
+            .record_award(&job_id, &claim_id, &award_evt, &seller_hex, amount, now_unix())
             .expect("record award");
         assert_eq!(
             context.store.awarded_unsettled_job_ids().expect("awarded"),
