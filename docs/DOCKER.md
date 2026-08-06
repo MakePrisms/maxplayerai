@@ -147,6 +147,7 @@ launcher = [
   "--ro-bind", "/bin", "/bin",
   "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf",
   "--proc", "/proc",
+  "--ro-bind", "/sys", "/sys",
   "--dev", "/dev",
   "--tmpfs", "/tmp",
   "--bind", "/work/jobs", "/work/jobs",
@@ -163,6 +164,12 @@ Key points about this example:
   writable. Give the agent only the per-job workdir it needs, nothing more.
 - Adjust the read-only binds (`/usr`, `/lib`, `/bin`, `/lib64` on glibc systems, etc.) to whatever your
   agent binary needs to execute. Drop `--share-net` if the agent doesn't need network access.
+- **The agent runtime needs read-only `/proc` and `/sys`.** `--proc /proc` mounts a fresh procfs and
+  `--ro-bind /sys /sys` exposes `/sys` read-only. Claude's native runtime reads both at startup and
+  **aborts the pre-advertise probe** without them — the rc.3 Bolty-seat incident, where the seat passed
+  `doctor` yet could not boot (#470). Read-only is enough; the agent never needs to **write** either, so
+  do not grant write access to satisfy this. Omit them and a seat that passes `doctor` still fails the
+  real probe at boot.
 - Because `WORKDIR` in the image is `/data`, use `--chdir` so the agent does not start (and fail) in a
   directory that doesn't exist inside the sandbox.
 - `bwrap` needs user namespaces; depending on your container runtime you may need to run the container
@@ -181,8 +188,16 @@ bwrap <your args from launcher> -- sh -c 'ls /data' \
   && echo "FAIL: /data reachable" || echo "OK: /data unreachable"
 ```
 
-Do the same for any other secret paths on the host. Only put the seller into service once this probe
-fails to see `/data`.
+Then confirm the runtime's read-only paths ARE present — an over-restricted launcher fails the
+pre-advertise probe just as surely as a leaky one leaks (this is the rc.3 failure mode, #470):
+
+```sh
+bwrap <your args from launcher> -- sh -c 'test -r /proc/self/status && test -d /sys' \
+  && echo "OK: /proc and /sys readable" || echo "FAIL: agent runtime needs read-only /proc and /sys"
+```
+
+Do the same for any other secret paths on the host. Only put the seller into service once the first
+probe fails to see `/data` and the second confirms `/proc` and `/sys`.
 
 ## Bring your own key
 

@@ -945,6 +945,9 @@ fn default_home_under(home_base: &Path) -> Result<PathBuf, HomeError> {
 pub fn bootstrap(root: impl AsRef<Path>) -> Result<MaxplayerHome, HomeError> {
     let root = root.as_ref().to_path_buf();
     fs::create_dir_all(&root).map_err(|error| HomeError::Io(error.to_string()))?;
+    // Owner-only BEFORE anything money-bearing is written inside: config, key, and wallet all land
+    // under this dir, and a 0700 container fences them whatever the operator's umask was (#473).
+    ensure_dir_owner_only(&root)?;
 
     let config_path = root.join(CONFIG_FILE);
     let key_path = root.join(KEY_FILE);
@@ -964,6 +967,9 @@ pub fn bootstrap(root: impl AsRef<Path>) -> Result<MaxplayerHome, HomeError> {
     };
 
     fs::create_dir_all(&wallet_dir).map_err(|error| HomeError::Io(error.to_string()))?;
+    // wallet/ holds mint proofs — spendable ecash — so it is fenced owner-only in its own right, not
+    // only by the home dir above (defense in depth if the home dir is later loosened).
+    ensure_dir_owner_only(&wallet_dir)?;
 
     let key_created = if key_path.exists() {
         validate_existing_key(&key_path)?;
@@ -1390,6 +1396,50 @@ fn ensure_key_permissions(path: &Path) -> Result<(), HomeError> {
     Ok(())
 }
 
+/// A home/wallet directory must be owner-only (`0700`), so seller state — which on a shared host IS
+/// the wallet (key, mint proofs, config, job workdirs) — cannot be read by another local user (#473).
+///
+/// Owner-only is made a property of the PRODUCT here rather than of the operator's `umask`: the rc.3
+/// exposure was a seat whose state defaulted broader than owner-only until a systemd `UMask=0077`
+/// happened to tighten it, so every operator who did not replicate that unit was exposed. A `0700`
+/// container dir fences everything inside it (traversal is denied), so this is the load-bearing bind.
+///
+/// Mirrors [`ensure_key_permissions`]: idempotent (a dir already owner-only is untouched), it re-chmods
+/// an existing too-open dir — the real upgrade case, a seat created by an older binary under a `0022`
+/// umask is `0755` — and REFUSES rather than leaving money-bearing state group/world-accessible, the
+/// same fail-closed posture the key file already takes. A no-op on non-unix (no POSIX mode to enforce).
+fn ensure_dir_owner_only(path: &Path) -> Result<(), HomeError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::metadata(path).map_err(|error| HomeError::Io(error.to_string()))?;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 == 0 {
+            return Ok(());
+        }
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).map_err(|error| {
+            HomeError::Io(format!(
+                "home directory {} permissions too open ({mode:#o}); re-chmod 0700 failed: {error}",
+                path.display()
+            ))
+        })?;
+        let after = fs::metadata(path)
+            .map_err(|error| HomeError::Io(error.to_string()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if after & 0o077 != 0 {
+            return Err(HomeError::Io(format!(
+                "home directory {} permissions too open ({mode:#o}); refused to leave open (still {after:#o})",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_secret_hex(secret: &str) -> Result<(), HomeError> {
     if secret.len() != 64 {
         return Err(HomeError::Key(format!(
@@ -1526,6 +1576,55 @@ mod tests {
         assert!(!second.key_created);
         assert_eq!(read_secret_key_hex(&second).expect("secret again"), secret);
         assert_eq!(second.config, first.config);
+    }
+
+    // #473: the home and wallet CONTAINERS must be owner-only, so seller state (key, mint proofs,
+    // config) is not readable by another local user on a shared host. Property of the product, not the
+    // operator's umask.
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_makes_home_and_wallet_dirs_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_home("owner-only");
+        let _ = fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        for dir in [&home.root, &home.wallet_dir] {
+            let mode = fs::metadata(dir)
+                .expect("dir metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "{} must be owner-only (no group/world bits), got {mode:#o}",
+                dir.display()
+            );
+        }
+    }
+
+    // The load-bearing (umask-independent) case: a seat created by an OLDER binary under a 0022 umask
+    // is 0755, and re-bootstrapping must RE-CHMOD it owner-only rather than leaving the drift. Revert
+    // `ensure_dir_owner_only` and this goes red regardless of the test host's umask.
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_tightens_an_existing_too_open_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_home("tighten");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mk root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).expect("loosen to 0755");
+        let home = bootstrap(&root).expect("bootstrap tightens");
+        let mode = fs::metadata(&home.root)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "an existing too-open home must be tightened to 0700, got {mode:#o}"
+        );
     }
 
     #[test]

@@ -1046,15 +1046,17 @@ struct ProbeIdentity {
 ///
 /// Both are then PASSED to the prompt, the workdir name and the readback, so no second literal exists
 /// anywhere that could drift out of step. The sentinel carries sub-second entropy the label does not,
-/// so it is neither equal to nor derivable from anything the harness can read off its own path.
-fn mint_probe_identity(harness: usize, now_unix: u64) -> ProbeIdentity {
+/// so it is neither equal to nor derivable from anything the harness can read off its own path. The
+/// `attempt` index distinguishes the retries of one harness's probe (#472), so two turns that fall in
+/// the same second never share a workdir and no attempt can inherit an earlier one's artifact.
+fn mint_probe_identity(harness: usize, attempt: usize, now_unix: u64) -> ProbeIdentity {
     let entropy = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.subsec_nanos())
         .unwrap_or(0);
     ProbeIdentity {
-        dir_label: format!("{PROBE_DIR_PREFIX}-{harness}-{now_unix}"),
-        sentinel: format!("{PROBE_SENTINEL_PREFIX}-{harness}-{now_unix}-{entropy:09}"),
+        dir_label: format!("{PROBE_DIR_PREFIX}-{harness}-{attempt}-{now_unix}"),
+        sentinel: format!("{PROBE_SENTINEL_PREFIX}-{harness}-{attempt}-{now_unix}-{entropy:09}"),
     }
 }
 
@@ -1067,7 +1069,94 @@ fn harness_probe_prompt(sentinel: &str) -> String {
     )
 }
 
-/// Run ONE self-probe turn and decide it on the ARTIFACT.
+/// How many self-probe turns the FLAKY shape gets before the pre-advertise gate gives up on a harness.
+///
+/// Only the "completed the turn but produced no artifact" shape is retried, and only up to this many
+/// turns total (#472). A model that flakes on one turn often delivers on the next, so grounding a seat
+/// on a single empty turn would drop a working harness; but one that never produces the sentinel across
+/// three turns is not flaky, it is broken. A launcher/exec failure is NEVER counted here — it is
+/// structural (a permission or containment barrier does not clear by re-asking) and stops on the first
+/// attempt. See [`probe_step`].
+const HARNESS_PROBE_MAX_ATTEMPTS: usize = 3;
+
+/// One self-probe turn's outcome, keeping WHICH shape of failure occurred — the one bit a single
+/// `Result` throws away, and the bit the prove-before-advertise diagnostic needs (#472). The two
+/// failure shapes have OPPOSITE remedies:
+///
+/// - [`Self::CompletedNoArtifact`] — the launcher ran the turn, the turn completed, the model just did
+///   not do the task. Flaky; the remedy is to retry (or swap the model). RETRIED.
+/// - [`Self::Unrunnable`] — the turn never ran (a typed launcher/exec [`ExecError`], or our own workdir
+///   could not be created). The remedy is to fix the launcher/containment, not the model. NOT retried:
+///   re-asking a launcher that refused only delays a fail-closed boot.
+///
+/// Collapsing the two — as a lone turn did — sends the operator hunting containment for a flaky model,
+/// or the reverse. Naming them apart is the whole point of the diagnostic.
+enum ProbeAttempt {
+    /// The harness produced the sentinel artifact: a proven turn.
+    Proven,
+    /// The ACP turn completed but left no artifact carrying the sentinel — a flaky model/harness.
+    CompletedNoArtifact,
+    /// A failure retrying cannot fix. Carries the operator reason (which NAMES the launcher/containment
+    /// remedy) and the fault to record.
+    Unrunnable { reason: String, fault: Fault },
+}
+
+/// What the retry loop does after one attempt: try again, or stop with a verdict. Pure — the decision
+/// is a function of (attempt index, cap, this turn's shape) and nothing else — so the whole retry
+/// policy is unit-tested without spawning an agent. See [`probe_step`].
+enum ProbeStep {
+    /// The flaky shape, with turns still left: probe again.
+    Retry,
+    /// Stop: this is the verdict the gate records (an `Err` is fail-closed).
+    Done(Result<(), (String, Fault)>),
+}
+
+/// The refusal reason for the FLAKY shape once every retry still produced no artifact.
+///
+/// Names the remedy that fits THIS shape and says which one it is NOT: the launcher ran every turn, so
+/// an operator must not go hunting containment for a fault that is upstream in the model.
+fn flaky_harness_reason(attempts: usize) -> String {
+    format!(
+        "completed {attempts} self-probe turn(s) but never produced the sentinel artifact — the \
+         launcher ran the turn each time, so this is a FLAKY harness/model, not a containment fault \
+         (remedy: retry later, or switch to a more reliable model/harness)"
+    )
+}
+
+/// The refusal reason for the UNRUNNABLE launcher/exec shape.
+///
+/// The opposite remedy to [`flaky_harness_reason`]: the turn never executed, so the fault is the
+/// launcher or its containment, never the model — retrying it would only defer a fail-closed boot.
+fn launcher_unrunnable_reason(error: &ExecError) -> String {
+    format!(
+        "the launcher could not run a probe turn ({error}) — the harness never executed, so this is a \
+         containment/permission/launcher fault, not a flaky model (remedy: fix the launcher/sandbox \
+         config, then restart)"
+    )
+}
+
+/// The retry policy, as a pure decision over one attempt's shape (#472).
+///
+/// - `Proven` → `Done(Ok)`.
+/// - `Unrunnable` → `Done(Err)`, always, whatever the attempt index: a launcher that refused does not
+///   start working because we asked again.
+/// - `CompletedNoArtifact` → `Retry` while turns remain, else `Done(Err(flaky))`. This is the ONLY
+///   shape that retries, and only up to `max_attempts`.
+fn probe_step(attempt: usize, max_attempts: usize, outcome: ProbeAttempt) -> ProbeStep {
+    match outcome {
+        ProbeAttempt::Proven => ProbeStep::Done(Ok(())),
+        ProbeAttempt::Unrunnable { reason, fault } => ProbeStep::Done(Err((reason, fault))),
+        ProbeAttempt::CompletedNoArtifact => {
+            if attempt + 1 < max_attempts {
+                ProbeStep::Retry
+            } else {
+                ProbeStep::Done(Err((flaky_harness_reason(max_attempts), Fault::Unproven)))
+            }
+        }
+    }
+}
+
+/// Run ONE self-probe turn and decide it on the ARTIFACT, reporting WHICH shape occurred.
 ///
 /// A positive control, not a liveness check, and the distinction is the entire reason this exists. A
 /// harness whose account is exhausted ends its turn `completed`, exits 0, and returns a perfectly
@@ -1078,27 +1167,28 @@ fn harness_probe_prompt(sentinel: &str) -> String {
 /// The probe runs under the same sandbox policy as a real job. Probing an unsandboxed path while jobs
 /// run sandboxed would verify a path no paid job ever takes.
 ///
-/// An `Err` carries both an operator-facing reason and the fault to record. Failures that ARE typed
-/// go through [`harness_fault_for`], the same classifier a real job's failure uses, so a probe against
-/// an `acp`-less binary marks the harness INCAPABLE and stops being probed at all rather than
-/// re-asking a settled question every few hours.
-async fn run_harness_probe(
+/// The two failure shapes are returned APART (see [`ProbeAttempt`]) so the caller can retry the flaky
+/// one and fail the structural one fast. Typed launcher/exec failures go through [`harness_fault_for`],
+/// the same classifier a real job's failure uses, so a probe against an `acp`-less binary marks the
+/// harness INCAPABLE and stops being probed at all rather than re-asking a settled question.
+async fn run_harness_probe_once(
     argv: &[String],
     sandbox: &SandboxPolicy,
     identity: &DeliveryAgentIdentity,
     workdir: &std::path::Path,
     sentinel: &str,
-) -> Result<(), (String, Fault)> {
-    seller_git::init_empty_delivery_workdir_off_runtime(workdir.to_path_buf(), identity.clone())
-        .await
-        .map_err(|error| {
-            // Our own filesystem, not the harness: record nothing against it, but the probe still
-            // did not answer, so re-arm the window rather than restoring on a non-answer.
-            (
-                format!("probe workdir init failed ({error})"),
-                Fault::Unproven,
-            )
-        })?;
+) -> ProbeAttempt {
+    if let Err(error) =
+        seller_git::init_empty_delivery_workdir_off_runtime(workdir.to_path_buf(), identity.clone())
+            .await
+    {
+        // Our own filesystem, not the harness: record nothing against its capability, and do NOT
+        // retry — re-minting a workdir cannot fix a filesystem that just refused one.
+        return ProbeAttempt::Unrunnable {
+            reason: format!("probe workdir init failed ({error}) — our filesystem, not the harness"),
+            fault: Fault::Unproven,
+        };
+    }
 
     if let Err(error) = run_agent_job(
         argv,
@@ -1110,22 +1200,40 @@ async fn run_harness_probe(
     )
     .await
     {
+        // The turn never ran: a launcher/exec fault. Structural — do not retry.
         let fault = harness_fault_for(&error).unwrap_or(Fault::Unproven);
-        return Err((format!("probe turn failed ({error})"), fault));
+        return ProbeAttempt::Unrunnable {
+            reason: launcher_unrunnable_reason(&error),
+            fault,
+        };
     }
 
     // The turn "succeeded" — now ask the only question that separates a working harness from an
     // exhausted one: is the sentinel actually here?
     if probe_sentinel_present(workdir, sentinel) {
-        Ok(())
+        ProbeAttempt::Proven
     } else {
-        Err((
-            format!(
-                "probe turn reported success but produced no artifact carrying {sentinel} — a completed \
-                 turn is not delivered work"
-            ),
-            Fault::Unproven,
-        ))
+        ProbeAttempt::CompletedNoArtifact
+    }
+}
+
+/// One-shot probe verdict, no retry: run a single turn and collapse its shape to pass/fail.
+///
+/// The pre-advertise gate uses [`run_harness_probe_once`] directly so it can tell the two failure
+/// shapes apart and retry the flaky one (#472). The restore-timer path has not adopted the retry, so it
+/// keeps the single-turn collapse here — the same verdict it recorded before, now carrying the shape's
+/// sharper reason string.
+async fn run_harness_probe(
+    argv: &[String],
+    sandbox: &SandboxPolicy,
+    identity: &DeliveryAgentIdentity,
+    workdir: &std::path::Path,
+    sentinel: &str,
+) -> Result<(), (String, Fault)> {
+    match run_harness_probe_once(argv, sandbox, identity, workdir, sentinel).await {
+        ProbeAttempt::Proven => Ok(()),
+        ProbeAttempt::Unrunnable { reason, fault } => Err((reason, fault)),
+        ProbeAttempt::CompletedNoArtifact => Err((flaky_harness_reason(1), Fault::Unproven)),
     }
 }
 
@@ -1165,13 +1273,49 @@ pub struct HarnessProbeVerdict {
     pub result: Result<(), (String, Fault)>,
 }
 
-/// Probe EVERY configured harness once, before anything goes on the wire.
+/// Probe ONE configured harness under the retry policy (#472), returning the verdict the gate records.
 ///
-/// Local compute only — no sats, no mint, no award (`run_harness_probe` runs the harness in a
+/// Each attempt gets a FRESH identity and workdir, so a retry must be earned by THIS turn — no stale
+/// artifact or replayed transcript can satisfy a later attempt. Only the flaky `CompletedNoArtifact`
+/// shape loops; [`probe_step`] returns `Done` immediately for a proven or unrunnable turn, so a bogus
+/// launcher costs exactly one spawn, not three.
+async fn probe_one_harness(
+    index: usize,
+    argv: &[String],
+    label: &str,
+    sandbox: &SandboxPolicy,
+    identity: &DeliveryAgentIdentity,
+    home: &MaxplayerHome,
+) -> Result<(), (String, Fault)> {
+    for attempt in 0..HARNESS_PROBE_MAX_ATTEMPTS {
+        let probe = mint_probe_identity(index, attempt, now_unix() as u64);
+        let workdir = job_workdir(home, &probe.dir_label);
+        let outcome =
+            run_harness_probe_once(argv, sandbox, identity, &workdir, &probe.sentinel).await;
+        let _ = std::fs::remove_dir_all(&workdir);
+        match probe_step(attempt, HARNESS_PROBE_MAX_ATTEMPTS, outcome) {
+            ProbeStep::Done(result) => return result,
+            ProbeStep::Retry => opline!(
+                "seller node harness probe {label}: turn {} completed with NO artifact — flaky-model \
+                 shape, retrying",
+                attempt + 1
+            ),
+        }
+    }
+    // Unreachable: probe_step returns Done on the final attempt. Kept as a fail-closed verdict so a
+    // future change to the policy cannot fall through to a panic on a money path.
+    Err((flaky_harness_reason(HARNESS_PROBE_MAX_ATTEMPTS), Fault::Unproven))
+}
+
+/// Probe EVERY configured harness before anything goes on the wire.
+///
+/// Local compute only — no sats, no mint, no award ([`probe_one_harness`] runs the harness in a
 /// throwaway workdir to write a sentinel and decides on the artifact). It is ours to run and ours to
 /// pay for, exactly like the restore-timer self-probe — but here it gates the FIRST advertisement
-/// rather than a restoration, so a seat that cannot deliver never advertises at all (#357). Inputs
-/// are derived from `home` the same way `start_due_harness_probes` derives them for the restore probe.
+/// rather than a restoration, so a seat that cannot deliver never advertises at all (#357). Each
+/// harness is probed under the retry policy, so a merely FLAKY model is not mistaken for a broken one
+/// and grounded before it advertises (#472). Inputs are derived from `home` the same way
+/// `start_due_harness_probes` derives them for the restore probe.
 pub async fn probe_configured_harnesses(
     home: &MaxplayerHome,
 ) -> Result<Vec<HarnessProbeVerdict>, NodeError> {
@@ -1180,11 +1324,8 @@ pub async fn probe_configured_harnesses(
     let identity = DeliveryAgentIdentity::for_seller(&home::public_key_hex(home)?);
     let mut verdicts = Vec::with_capacity(registry.entries().len());
     for (index, entry) in registry.entries().iter().enumerate() {
-        let probe = mint_probe_identity(index, now_unix() as u64);
-        let workdir = job_workdir(home, &probe.dir_label);
-        let result =
-            run_harness_probe(&entry.argv, &sandbox, &identity, &workdir, &probe.sentinel).await;
-        let _ = std::fs::remove_dir_all(&workdir);
+        let label = entry.name.clone().unwrap_or_else(|| "<unlabelled>".to_owned());
+        let result = probe_one_harness(index, &entry.argv, &label, &sandbox, &identity, home).await;
         verdicts.push(HarnessProbeVerdict {
             index,
             name: entry.name.clone(),
@@ -2848,7 +2989,8 @@ impl SellerNodeRunner {
             // Minted per probe, so neither a stale workdir nor a replayed transcript can satisfy one:
             // the artifact has to be produced by THIS turn. The workdir is named after the NON-SECRET
             // label — never the sentinel, which the harness must not be able to read off its own cwd.
-            let probe = mint_probe_identity(harness, now_unix() as u64);
+            // Attempt 0: the restore path runs a single turn (it has not adopted the retry).
+            let probe = mint_probe_identity(harness, 0, now_unix() as u64);
             let workdir = job_workdir(self.node.home(), &probe.dir_label);
             let sentinel = probe.sentinel;
             tokio::task::spawn_local(async move {
@@ -4148,7 +4290,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("probe dir");
         // Minted through the SAME function the probe path uses, so this test cannot pass against a
         // sentinel shape the node would never actually produce.
-        let sentinel = mint_probe_identity(0, 1_785_400_000).sentinel;
+        let sentinel = mint_probe_identity(0, 0, 1_785_400_000).sentinel;
 
         // Nothing written at all — a turn that completed having done nothing.
         assert!(
@@ -4183,9 +4325,10 @@ mod tests {
     // silently — which is why the assertion runs through the shared function.
     #[test]
     fn a_probe_sentinel_is_minted_from_one_definition_and_is_not_ecash() {
-        let a = mint_probe_identity(0, 1_785_400_000);
-        let b = mint_probe_identity(0, 1_785_400_001);
-        let other_harness = mint_probe_identity(1, 1_785_400_000);
+        let a = mint_probe_identity(0, 0, 1_785_400_000);
+        let b = mint_probe_identity(0, 0, 1_785_400_001);
+        let other_harness = mint_probe_identity(1, 0, 1_785_400_000);
+        let other_attempt = mint_probe_identity(0, 1, 1_785_400_000);
 
         assert!(a.sentinel.starts_with(PROBE_SENTINEL_PREFIX), "{}", a.sentinel);
         assert_ne!(
@@ -4193,6 +4336,16 @@ mod tests {
             "a sentinel is per-probe, so a replay cannot satisfy a later one"
         );
         assert_ne!(a.sentinel, other_harness.sentinel, "and it is per-harness");
+        // Per-attempt too (#472): a retry gets its own sentinel AND its own workdir, so no attempt can
+        // inherit an earlier one's artifact even inside the same second.
+        assert_ne!(
+            a.sentinel, other_attempt.sentinel,
+            "a retry's sentinel must differ from the first attempt's"
+        );
+        assert_ne!(
+            a.dir_label, other_attempt.dir_label,
+            "a retry must not reuse an earlier attempt's workdir"
+        );
 
         // The readback accepts exactly what the mint produced — one definition, both ends.
         let dir = std::env::temp_dir().join(format!("maxplayer-sn-test-{}", std::process::id()));
@@ -4216,7 +4369,7 @@ mod tests {
     // passes a probe the harness did no work for.
     #[test]
     fn a_harness_cannot_pass_its_probe_by_echoing_its_own_workdir_path() {
-        let probe = mint_probe_identity(3, 1_785_400_000);
+        let probe = mint_probe_identity(3, 0, 1_785_400_000);
 
         // ① The mint keeps them disjoint: no workdir named after the label can contain the sentinel.
         assert!(
@@ -4898,23 +5051,25 @@ mod tests {
     // published-and-confirmed claim id (`match_award` returns `Release` only for `Some(our_claim)`),
     // i.e. the outbox publisher running — a heavier harness left as a separate lane.
 
-    /// A 1-slot seller wired to `relay_url`, its parked-claim lapse set to fire on the next sweep so a
-    /// slot frees on demand. `offer_backfill_secs` bounds only the open-pool re-delivery; the targeted
-    /// re-subscribe is unbounded regardless.
+    /// A 1-slot seller wired to `relay_url`. `claim_award_timeout_secs` sets the parked-claim lapse:
+    /// `Some(0)` ⇒ a parked claim counts as lapsed on the very next sweep regardless of wall-clock, so
+    /// a test frees the slot on demand (the #450 capacity-skip drive); a LARGE value makes the lapse
+    /// unreachable in-test, pinning the AWARD-visibility path as the ONLY thing that can free the slot
+    /// (the loser-release pin, which must NOT ride the lapse). `offer_backfill_secs` bounds only the
+    /// open-pool re-delivery; the targeted re-subscribe is unbounded regardless.
     async fn boot_capacity_skip_seller(
         label: &str,
         relay_url: &str,
         claim_open_pool: bool,
         offer_backfill_secs: u64,
+        claim_award_timeout_secs: Option<u64>,
     ) -> (SellerNodeRunner, std::path::PathBuf) {
         let root = temp_dir(label);
         let _ = std::fs::remove_dir_all(&root);
         let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
         home.config.relay_url = relay_url.to_string();
         let mut seller = seller_cfg(1, claim_open_pool);
-        // 0 ⇒ a parked claim counts as lapsed on the very next sweep regardless of wall-clock, so the
-        // test frees the slot on demand — no sleep, no award/execute cycle.
-        seller.claim_award_timeout_secs = Some(0);
+        seller.claim_award_timeout_secs = claim_award_timeout_secs;
         seller.offer_backfill_secs = offer_backfill_secs;
         home.config.seller = Some(seller);
         let runner = SellerNodeRunner::boot(home)
@@ -4980,6 +5135,35 @@ mod tests {
         done(runner)
     }
 
+    /// Feed JOB_AWARD events off the seller's live notification stream into `on_award` — exactly what
+    /// the run loop's select arm does — until `done` holds or the deadline passes. Mirrors
+    /// [`pump_offers_until`]; takes an `Arc` runner because `on_award` binds `self: &Arc<Self>` (its
+    /// execute branch spawns the job onto the LocalSet). Returns whether `done` held.
+    async fn pump_awards_until(
+        runner: &Arc<SellerNodeRunner>,
+        notifications: &mut tokio::sync::broadcast::Receiver<RelayPoolNotification>,
+        deadline: std::time::Instant,
+        mut done: impl FnMut(&SellerNodeRunner) -> bool,
+    ) -> bool {
+        while !done(runner) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            if let Ok(Ok(RelayPoolNotification::Event { event, .. })) = tokio::time::timeout(
+                remaining.min(Duration::from_millis(150)),
+                notifications.recv(),
+            )
+            .await
+            {
+                if event.kind.as_u16() == JOB_AWARD_KIND {
+                    runner.on_award(&event).await;
+                }
+            }
+        }
+        done(runner)
+    }
+
     /// The full capacity-skip → lapse → reconsider → backfill → re-claim drive, shared by the targeted
     /// and open-pool cases. `open_pool` shapes both the seller's subscription and whether the offers
     /// are targeted; the mechanism under test is identical either way.
@@ -4991,7 +5175,7 @@ mod tests {
         let relay_url = relay.url().await.to_string();
 
         let (runner, root) =
-            boot_capacity_skip_seller(label, &relay_url, open_pool, backfill_secs).await;
+            boot_capacity_skip_seller(label, &relay_url, open_pool, backfill_secs, Some(0)).await;
         let seller_hex = runner.seller_pubkey();
         let to_seller = if open_pool { None } else { Some(seller_hex.clone()) };
 
@@ -5130,6 +5314,190 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconsider_backfills_a_capacity_skipped_open_pool_offer_when_a_slot_frees() {
         drive_capacity_skip_backfill("cap-skip-open-pool", true, 0).await;
+    }
+
+    /// #456 / #514 END-TO-END PIN — a losing open-pool claimant frees its reserved slot the MOMENT it
+    /// sees the award, over the wire, with no lapse involved.
+    ///
+    /// #450's tests reach slot-release only through the LAPSE sweep (`claim_award_timeout_secs = 0`),
+    /// so they can never exercise the award-visibility release #514 shipped. This drives the real
+    /// path: TWO one-slot open-pool sellers both claim ONE untargeted offer (each reserving its single
+    /// slot), the buyer awards seller A's claim, and seller B — the loser — receives that award
+    /// because its open-pool award REQ is UNSCOPED (`award_filter`, #514) and releases its slot + marks
+    /// its claim `released` SYNCHRONOUSLY, i.e. without waiting out the 120s claim-award timeout. The
+    /// lapse is pinned unreachable here (`claim_award_timeout_secs = Some(3600)`, and no sweep is ever
+    /// called), so the AWARD is the ONLY thing that can free B's slot.
+    ///
+    /// `publish_award` parameterises the non-vacuity foil: with it FALSE the identical harness runs
+    /// minus the award and B's slot must STAY reserved (the committed test passes TRUE). Two red-proofs
+    /// are recorded on the PR: (a) re-scoping `award_filter` to the pubkey for open-pool ⇒ the loser
+    /// never receives the award ⇒ this fails; (b) `publish_award = false` ⇒ nothing frees the slot
+    /// in-window ⇒ this fails. Both prove the release is caused by the AWARD arriving — not by a slot
+    /// that was never reserved, nor a claim row that defaulted to `released`.
+    async fn drive_loser_release_on_award(publish_award: bool) {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+
+        // Two DISTINCT-key one-slot open-pool sellers (distinct labels ⇒ distinct homes ⇒ distinct
+        // keys). The large lapse timeout pins the AWARD path as the only slot-release path in-test.
+        let (winner, winner_root) =
+            boot_capacity_skip_seller("loser-release-winner", &relay_url, true, 0, Some(3600)).await;
+        let (loser_runner, loser_root) =
+            boot_capacity_skip_seller("loser-release-loser", &relay_url, true, 0, Some(3600)).await;
+        // `on_award` binds `self: &Arc<Self>`, so the loser is driven through an Arc.
+        let loser = Arc::new(loser_runner);
+        let winner_hex = winner.seller_pubkey();
+
+        // A separate buyer/publisher: a node is never delivered its OWN events, so the offer AND the
+        // award come from a third key — and that key IS the offer's buyer, the sole authorized awarder
+        // (`on_award` checks the award author == the recorded offer buyer).
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let publisher = Client::new(buyer.clone());
+        publisher.add_relay(&relay_url).await.expect("publisher add relay");
+        publisher.connect().await;
+        publisher.wait_for_connection(Duration::from_secs(5)).await;
+
+        let mut winner_notifs = winner.client.notifications();
+        let mut loser_notifs = loser.client.notifications();
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                winner
+                    .subscribe_offers(None, true)
+                    .await
+                    .expect("winner offer subscription");
+                // The loser needs BOTH the offer REQ (to claim) and the award REQ (to see the award).
+                loser
+                    .subscribe_all(None)
+                    .await
+                    .expect("loser offer + award subscriptions");
+
+                let deadline_unix = now_unix() as u64 + 3_600;
+                let job_id = post_offer(
+                    &publisher,
+                    &buyer,
+                    "loser-release open-pool offer",
+                    None,
+                    100,
+                    deadline_unix,
+                )
+                .await;
+
+                // Both sellers record + claim the one untargeted offer, each reserving its lone slot.
+                assert!(
+                    pump_offers_until(
+                        &winner,
+                        &mut winner_notifs,
+                        std::time::Instant::now() + Duration::from_secs(5),
+                        |r| r.node.store().claim_row_state(&job_id).ok().flatten().is_some(),
+                    )
+                    .await,
+                    "the winner must claim the open-pool offer"
+                );
+                assert!(
+                    pump_offers_until(
+                        &loser,
+                        &mut loser_notifs,
+                        std::time::Instant::now() + Duration::from_secs(5),
+                        |r| r.node.store().claim_row_state(&job_id).ok().flatten().is_some(),
+                    )
+                    .await,
+                    "the loser must claim the open-pool offer"
+                );
+                assert_eq!(winner.slots.available(), 0, "the winner's single slot is reserved");
+                assert_eq!(loser.slots.available(), 0, "the loser's single slot is reserved");
+
+                // Publish both claims so each has a real id on the wire; the award names the winner's.
+                winner.drain().await;
+                loser.drain().await;
+                let winner_claim_id = match winner.node.store().outbox_row(&format!("claim:{job_id}"))
+                {
+                    Ok(Some((_, _, Some(published)))) => published,
+                    other => panic!("winner claim must be published with an id; got {other:?}"),
+                };
+                let loser_claim_id = match loser.node.store().outbox_row(&format!("claim:{job_id}")) {
+                    Ok(Some((_, _, Some(published)))) => published,
+                    other => panic!("loser claim must be published with an id; got {other:?}"),
+                };
+                assert_ne!(
+                    winner_claim_id, loser_claim_id,
+                    "two distinct sellers publish two distinct claim events"
+                );
+
+                // The buyer AWARDS the winner's claim: e-tags offer-root + winner-claim, p-tags buyer +
+                // winner, signed by the buyer (the offer's author). The award p-tags ONLY the winner —
+                // the loser sees it solely because its open-pool award REQ is unscoped (#514).
+                if publish_award {
+                    let award = crate::gateway::award_draft(
+                        &job_id,
+                        &winner_claim_id,
+                        &buyer_hex,
+                        &winner_hex,
+                    );
+                    let event = crate::gateway::nostr::event_builder(&award)
+                        .expect("award event builder")
+                        .sign_with_keys(&buyer)
+                        .expect("sign award as the buyer");
+                    publisher.send_event(&event).await.expect("post award to relay");
+                }
+
+                // Drive the LOSER's award ingestion off its own notification stream. With the fix the
+                // loser receives the award naming another claim → `match_award` → `Release` → slot +
+                // durable claim released, SYNCHRONOUSLY (no 120s lapse; none is even reachable here).
+                let released = pump_awards_until(
+                    &loser,
+                    &mut loser_notifs,
+                    std::time::Instant::now() + Duration::from_secs(5),
+                    |r| {
+                        r.slots.available() == 1
+                            && r.node
+                                .store()
+                                .claim_row_state(&job_id)
+                                .ok()
+                                .flatten()
+                                .as_deref()
+                                == Some("released")
+                    },
+                )
+                .await;
+
+                assert!(
+                    released,
+                    "the losing open-pool claimant must free its slot on the AWARD, promptly and \
+                     without a lapse (available={}, claim_state={:?})",
+                    loser.slots.available(),
+                    loser.node.store().claim_row_state(&job_id)
+                );
+                // The slot is back AND the claim row is `released` — never `awarded`. `release_claim`
+                // only moves `claimed`→`released`; the execute path (`record_award`) would have moved
+                // it to `awarded`. So `released` positively proves the loser took the Release branch
+                // and NEVER executed — a free slot alone could not (a failed execute frees one too).
+                assert_eq!(loser.slots.available(), 1, "the loser's reserved slot is released");
+                assert_eq!(
+                    loser.node.store().claim_row_state(&job_id).expect("loser claim row"),
+                    Some("released".to_string()),
+                    "the loser's claim row is `released` (Release path), never `awarded` (execute)"
+                );
+            })
+            .await;
+
+        winner.client.disconnect().await;
+        loser.client.disconnect().await;
+        publisher.disconnect().await;
+        let _ = std::fs::remove_dir_all(&winner_root);
+        let _ = std::fs::remove_dir_all(&loser_root);
+    }
+
+    /// #456 / #514 — the committed GREEN pin: award published, `award_filter` intact. The two RED
+    /// foils (award-filter re-scoped; award withheld) are RUN and recorded on the PR, not in CI.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_losing_open_pool_claimant_releases_its_slot_when_it_sees_the_award() {
+        drive_loser_release_on_award(true).await;
     }
 
     // TOOTH (wrap backfill) — the cursor keeps an OLDER delivered-but-unpaid job's payment window in
@@ -6822,5 +7190,146 @@ mod tests {
 
         runner.client.disconnect().await;
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- #472: prove-before-advertise probe diagnostic — two failure shapes, retry only the flaky
+    // one. The policy is pure (`probe_step`), so it is proven here with scripted outcomes and no agent
+    // spawn — the same seam that lets `boot_advertising_only_proven` take verdicts as a parameter.
+
+    #[test]
+    fn probe_step_retries_the_flaky_shape_up_to_the_cap_then_fails_closed() {
+        // Completed-but-empty turns retry while turns remain...
+        assert!(matches!(
+            probe_step(0, 3, ProbeAttempt::CompletedNoArtifact),
+            ProbeStep::Retry
+        ));
+        assert!(matches!(
+            probe_step(1, 3, ProbeAttempt::CompletedNoArtifact),
+            ProbeStep::Retry
+        ));
+        // ...and the FINAL empty turn fails closed with the flaky remedy, never another retry.
+        let ProbeStep::Done(Err((reason, fault))) =
+            probe_step(2, 3, ProbeAttempt::CompletedNoArtifact)
+        else {
+            panic!("the last flaky attempt must be Done(Err), not a retry");
+        };
+        assert_eq!(fault, Fault::Unproven);
+        assert!(
+            reason.contains("FLAKY")
+                && reason.contains("retry later")
+                && reason.contains("more reliable model"),
+            "the flaky verdict must name the retry/replace-model remedy: {reason}"
+        );
+        assert!(
+            !reason.contains("fix the launcher"),
+            "the flaky verdict must NOT prescribe the launcher fix: {reason}"
+        );
+    }
+
+    #[test]
+    fn probe_step_never_retries_the_unrunnable_shape() {
+        // A launcher/exec failure is structural: Done on EVERY attempt index, turns remaining or not.
+        for attempt in 0..3 {
+            let outcome = ProbeAttempt::Unrunnable {
+                reason: launcher_unrunnable_reason(&ExecError::Agent("spawn refused".to_owned())),
+                fault: Fault::Unproven,
+            };
+            let ProbeStep::Done(Err((reason, _))) = probe_step(attempt, 3, outcome) else {
+                panic!("an unrunnable turn must never retry (attempt {attempt})");
+            };
+            assert!(
+                reason.contains("fix the launcher") && reason.contains("containment"),
+                "the unrunnable verdict must name the launcher/containment remedy: {reason}"
+            );
+            assert!(
+                !reason.contains("retry later") && !reason.contains("more reliable model"),
+                "the unrunnable verdict must NOT prescribe a model retry: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_step_stops_on_a_proven_turn() {
+        // A proven turn ends the loop immediately — the gate's healthy direction is unchanged.
+        assert!(matches!(
+            probe_step(0, 3, ProbeAttempt::Proven),
+            ProbeStep::Done(Ok(()))
+        ));
+    }
+
+    #[test]
+    fn the_two_probe_remedies_point_opposite_ways() {
+        let flaky = flaky_harness_reason(3);
+        let launcher = launcher_unrunnable_reason(&ExecError::Agent("boom".to_owned()));
+        // Flaky ⇒ retry / replace the model; launcher ⇒ fix containment. Neither borrows the other's
+        // remedy — the whole point of splitting the shapes is that an operator is pointed the right way.
+        assert!(flaky.contains("retry later") && flaky.contains("more reliable model"));
+        assert!(!flaky.contains("fix the launcher"));
+        assert!(launcher.contains("fix the launcher") && launcher.contains("containment"));
+        assert!(!launcher.contains("retry later") && !launcher.contains("more reliable model"));
+    }
+
+    #[test]
+    fn a_flaky_harness_that_recovers_on_a_later_turn_is_proven() {
+        // Drive the exact loop `probe_one_harness` drives, over a scripted [flaky, flaky, proven]
+        // sequence: the first two retry, the third proves — so the harness ends PROVEN, not grounded.
+        // This is the money-relevant direction: a merely flaky model still gets to advertise.
+        let script = [
+            ProbeAttempt::CompletedNoArtifact,
+            ProbeAttempt::CompletedNoArtifact,
+            ProbeAttempt::Proven,
+        ];
+        let mut verdict = None;
+        for (attempt, outcome) in script.into_iter().enumerate() {
+            match probe_step(attempt, 3, outcome) {
+                ProbeStep::Done(result) => {
+                    verdict = Some(result);
+                    break;
+                }
+                ProbeStep::Retry => continue,
+            }
+        }
+        assert!(
+            matches!(verdict, Some(Ok(()))),
+            "a harness that delivers on its third turn must be proven, not grounded: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn an_unrunnable_turn_stops_the_loop_even_after_a_flaky_retry() {
+        // [flaky, unrunnable, proven]: the flaky retries, the unrunnable STOPS at attempt 1 — the
+        // third element is never consumed, so a launcher fault surfacing on a retry still fails fast,
+        // and the RECORDED fault is the launcher's, not the flaky Unproven.
+        let script = [
+            ProbeAttempt::CompletedNoArtifact,
+            ProbeAttempt::Unrunnable {
+                reason: launcher_unrunnable_reason(&ExecError::AcpRequired),
+                fault: Fault::Incapable(MissingCapability::AcpFeature),
+            },
+            ProbeAttempt::Proven,
+        ];
+        let mut consumed = 0;
+        let mut verdict = None;
+        for (attempt, outcome) in script.into_iter().enumerate() {
+            consumed += 1;
+            match probe_step(attempt, 3, outcome) {
+                ProbeStep::Done(result) => {
+                    verdict = Some(result);
+                    break;
+                }
+                ProbeStep::Retry => continue,
+            }
+        }
+        assert_eq!(
+            consumed, 2,
+            "the loop must stop at the unrunnable turn, not run the third"
+        );
+        assert!(
+            matches!(
+                verdict,
+                Some(Err((_, Fault::Incapable(MissingCapability::AcpFeature))))
+            ),
+            "the unrunnable fault must be the recorded verdict: {verdict:?}"
+        );
     }
 }

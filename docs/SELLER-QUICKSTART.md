@@ -107,6 +107,14 @@ Defaults written on first bootstrap / first `sell`:
 
 All four are overridable in `config.toml`. The mint is a **real** mint: what you earn is real sats.
 
+**Owner-only on disk (shared hosts).** `bootstrap` chmods `$MAXPLAYER_HOME` and `wallet/` to `0700` at
+creation — on a shared host, seller state (key, mint proofs, config, job workdirs) IS the wallet, so a
+group/world-readable home lets any local user read money-bearing material (#473). This is a property of
+the binary, not of your `umask`, and `maxplayer doctor` has a **home permissions** leg that flags a home
+that has since drifted open (WARN for a targeted seat, FAIL for an open-pool one). The one thing the
+binary cannot own is state a **harness** writes outside the seat home (e.g. a Cursor config under `~`):
+run the daemon under a service unit with **`UMask=0077`** so that residue is owner-only too.
+
 ---
 
 ## 1. What you need before earning
@@ -338,7 +346,7 @@ launcher = ["bwrap",
   "--ro-bind", "/lib", "/lib",
   "--ro-bind", "/bin", "/bin",
   "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf",
-  "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+  "--proc", "/proc", "--ro-bind", "/sys", "/sys", "--dev", "/dev", "--tmpfs", "/tmp",
   "--bind", "/path/to/job-workdirs", "/path/to/job-workdirs",
   "--chdir", "/path/to/job-workdirs",
   "--share-net",
@@ -349,7 +357,9 @@ This bubblewrap example gives the agent a mount namespace where `~/.maxplayer` (
 home directory) simply doesn't exist — only the OS binaries read-only and the job workdir area writable.
 Adapt the paths: bind your daemon's per-job workdir location (`$MAXPLAYER_HOME/seller-jobs/<job_id>/`), add
 `--ro-bind` entries for whatever the agent binary needs to run, and drop `--share-net` if the agent
-doesn't need network. Any launcher works — the daemon just runs `launcher... <agent command...>`.
+doesn't need network. Any launcher works — the daemon just runs `launcher... <agent command...>`. The
+`--proc /proc` and `--ro-bind /sys /sys` binds are load-bearing: the Claude runtime reads both at startup
+and aborts the boot probe without them (read-only is enough — it never writes them; #470).
 
 ### Rules and failure modes
 
@@ -390,7 +400,7 @@ launcher = ["bwrap",
   "--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin", "--ro-bind", "/lib", "/lib",
   "--ro-bind", "/path/to/maxplayer", "/path/to/maxplayer",
   "--bind", "/home/you/.maxplayer/seller-jobs", "/home/you/.maxplayer/seller-jobs",
-  "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+  "--proc", "/proc", "--ro-bind", "/sys", "/sys", "--dev", "/dev", "--tmpfs", "/tmp",
   "--share-net",
 ]
 ```
