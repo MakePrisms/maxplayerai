@@ -1225,8 +1225,28 @@ pub async fn accept_claim_async(
     // would re-plan at pay time as a direct payment from a mint the buyer holds nothing at; the
     // target is re-derived there from this seal plus the accepted set frozen alongside it, so it
     // stays deterministic without being stored twice.
+    // Prefer sourcing from a mint the buyer already holds a covering balance at (spends a
+    // pre-funded cross-mint balance directly instead of hopping from the default and paying a melt
+    // fee); fall back to the configured default. Balances are a local sqlite read (no network). The
+    // CHOICE is sealed below and re-derived at pay, so it stays deterministic — a later balance or
+    // config-default change can never shift a sealed mint (the pays-once attempt-id invariant).
+    let source_seed = match crate::wallet_ops::balances_async(home).await {
+        Ok(balances) => crate::crossmint::select_source_mint(
+            home.config.default_mint(),
+            &accepted_mints,
+            home.config.allow_real_mints,
+            &balances,
+            offer.amount_sats,
+        ),
+        // Best-effort: a balance-read failure falls back to today's behavior (the default mint)
+        // rather than blocking an otherwise-plannable payment. Logged, never silent.
+        Err(error) => {
+            crate::opline!("accept: mint balance read failed ({error}); sourcing from the default mint");
+            home.config.default_mint().to_string()
+        }
+    };
     let realized_mint = crate::crossmint::plan_payment(
-        home.config.default_mint(),
+        &source_seed,
         &accepted_mints,
         home.config.allow_real_mints,
     )

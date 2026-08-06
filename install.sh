@@ -11,19 +11,23 @@
 # Options (flags and environment are equivalent; the flag wins):
 #   --version <x.y.z>   MAXPLAYER_VERSION   install this exact version instead of the latest release
 #   --bin-dir <dir>     MAXPLAYER_BIN_DIR   install here instead of ~/.local/bin
-#   --seller            MAXPLAYER_SELLER=1  install the seller artifact instead of the buyer one
+#   --seller            MAXPLAYER_SELLER=1  accepted and ignored; see below
 #
-# ── The two artifacts ───────────────────────────────────────────────────────────────────────────
-# A release publishes two builds of the same binary, and this installs ONE of them. The buyer
-# artifact is the default and carries no agent-execution path: `maxplayer run` and `maxplayer sell`
-# are compiled out of it, so nothing a buyer installs can spawn an agent. `--seller` selects the
-# build with `acp` compiled in, which is what a seller needs to claim a job, execute it and
-# advertise a seat.
+# ── One artifact ────────────────────────────────────────────────────────────────────────────────
+# A release publishes ONE build per platform and this installs it. It carries the whole surface:
+# buying, and — through `maxplayer sell` — advertising a seat, claiming a job and executing it. Buyer
+# and seller are runtime modes of one command, not two downloads (#510).
 #
-# Both install as `maxplayer`, at the same path, and one replaces the other — the seller surface is
-# a superset, so a seller's binary is also a working buyer. Which one is installed is a property of
-# the ASSET, never of a runtime flag: the artifact handed to someone who asked for the buyer cannot
-# be talked into executing an agent.
+# `--seller` selected a second, separately named asset up to rc.4. That asset no longer exists, so
+# the flag is accepted and ignored rather than refused: a seller's install line, and any script
+# carrying it, keeps working and now installs a binary that can do strictly more than the one it
+# asked for. It prints a deprecation notice to stderr and will be removed.
+#
+# ★ What this means for the execution surface: every install now carries the agent-execution path,
+#   where the buyer-only asset compiled it out. That surface is the sandbox track's (#490, #499) to
+#   hold — packaging no longer stands in for it. A buyer-only binary is still buildable from source
+#   (`cargo build -p maxplayer --no-default-features --features wallet`); it is simply not a thing
+#   this installer can fetch, because no release publishes one.
 #
 # Through a pipe, flags need `sh -s --`:
 #   curl -fsSL <url> | sh -s -- --version 0.1.0 --bin-dir /usr/local/bin
@@ -266,9 +270,9 @@ dir_on_path() {
 
 usage() {
     say "usage: install.sh [--version <x.y.z>] [--bin-dir <dir>] [--seller]"
-    say '  --seller         install the seller build, which adds sell and agent execution'
+    say '  --seller         deprecated no-op: one binary ships and it can already sell'
     say "  through a pipe:  curl -fsSL <url> | sh -s -- --version 0.1.0"
-    say "  environment:     MAXPLAYER_VERSION, MAXPLAYER_BIN_DIR, MAXPLAYER_SELLER=1"
+    say "  environment:     MAXPLAYER_VERSION, MAXPLAYER_BIN_DIR"
 }
 
 main() {
@@ -277,8 +281,9 @@ main() {
     DOWNLOADER=""
     HASHER=""
     bin_dir="${MAXPLAYER_BIN_DIR:-}"
-    # Any non-empty value selects the seller artifact, so `MAXPLAYER_SELLER=1` and
-    # `MAXPLAYER_SELLER=yes` mean the same thing rather than one of them silently meaning "buyer".
+    # Retired selector, kept only so that a run carrying it is not refused. Any non-empty value
+    # counts, matching what it used to accept — the point is that no existing invocation changes
+    # meaning, and none of them can change what is installed either.
     seller="${MAXPLAYER_SELLER:-}"
 
     while [ $# -gt 0 ]; do
@@ -293,6 +298,14 @@ main() {
         esac
         shift
     done
+
+    # Said once, here, before anything can fail for an unrelated reason — a deprecation notice that
+    # only prints on the happy path is one the people still passing the flag are least likely to see.
+    # stderr, not stdout: this is not part of the install's report, and the script is routinely run
+    # through a pipe whose stdout somebody is reading.
+    if [ -n "$seller" ]; then
+        warn "--seller (MAXPLAYER_SELLER) is deprecated and does nothing: one binary ships and it can already sell — run 'maxplayer sell'"
+    fi
 
     # A leading `v` is what a user copies out of a tag name, and `v0.1.0` would build an asset name
     # no release has. Accept it and normalise rather than 404 later on something avoidable.
@@ -314,26 +327,14 @@ main() {
     command -v tar >/dev/null 2>&1 || die "tar not found — needed to unpack the release asset"
     command -v awk >/dev/null 2>&1 || die "awk not found — needed to read the release's SHA256SUMS"
 
-    # The asset carrying the surface that was asked for. The seller artifact is published under its
-    # own name, so the choice is made HERE and shows up in the download URL — the buyer asset cannot
-    # be turned into a seller one, and a release missing the seller assets fails loudly at the
-    # download rather than installing a buyer binary to someone who asked for a seller.
-    if [ -n "$seller" ]; then
-        asset_stem="$BIN_NAME-seller"
-        surface="seller"
-    else
-        asset_stem="$BIN_NAME"
-        surface="buyer"
-    fi
-
     if [ -n "$VERSION" ]; then
-        say "installing $BIN_NAME $VERSION ($surface) for $PLATFORM"
+        say "installing $BIN_NAME $VERSION for $PLATFORM"
     else
         resolve_latest_version
-        say "latest release is $VERSION; installing the $surface build for $PLATFORM"
+        say "latest release is $VERSION; installing it for $PLATFORM"
     fi
 
-    asset="$asset_stem-$VERSION-$PLATFORM.tar.gz"
+    asset="$BIN_NAME-$VERSION-$PLATFORM.tar.gz"
     base="https://github.com/$REPO/releases/download/v$VERSION"
 
     tmp="$(mktemp -d "$(tmpl dl)")" || die "cannot create a temporary directory"
@@ -343,7 +344,7 @@ main() {
     trap 'rm -rf "$tmp"; [ -z "$staged" ] || rm -f "$staged"' EXIT HUP INT TERM
 
     fetch "$base/$asset" "$tmp/$asset" \
-        || die "could not download $base/$asset — check that release v$VERSION exists and publishes a $PLATFORM $surface asset"
+        || die "could not download $base/$asset — check that release v$VERSION exists and publishes a $PLATFORM asset"
     fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" \
         || die "could not download $base/SHA256SUMS — refusing to install an unverified download"
 
@@ -351,13 +352,13 @@ main() {
 
     tar -xzf "$tmp/$asset" -C "$tmp" || die "could not unpack $asset"
 
-    # The directory inside the archive is named after the ASSET, the executable inside it after the
-    # binary — a seller tarball holds `maxplayer-seller-<version>-<platform>/maxplayer`. The two
-    # differ on purpose: the archive says which build it is, and the binary answers to the name it
-    # is invoked by, which is what the version check below compares against.
-    unpacked="$tmp/$asset_stem-$VERSION-$PLATFORM/$BIN_NAME"
+    # The archive holds a versioned directory whose name matches the tarball's, with the executable
+    # inside it named after the binary. Both are derived from the same two values the download URL
+    # was built from, so an archive whose layout does not match is caught here rather than producing
+    # a confusing "not found" from a path nobody printed.
+    unpacked="$tmp/$BIN_NAME-$VERSION-$PLATFORM/$BIN_NAME"
     [ -f "$unpacked" ] \
-        || die "$asset does not contain $asset_stem-$VERSION-$PLATFORM/$BIN_NAME — this is not the asset layout this installer expects"
+        || die "$asset does not contain $BIN_NAME-$VERSION-$PLATFORM/$BIN_NAME — this is not the asset layout this installer expects"
     chmod 755 "$unpacked"
 
     # ── Prove it before installing it ───────────────────────────────────────────────────────────

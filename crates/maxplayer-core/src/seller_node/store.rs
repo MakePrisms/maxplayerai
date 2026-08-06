@@ -481,6 +481,57 @@ impl SellerStore {
         Ok(())
     }
 
+    /// Offers recorded but never claimed and still fresh (`deadline_unix > now`): the capacity-skip
+    /// set. `on_offer` records an offer BEFORE it reserves a slot, so an offer skipped for `SlotsBusy`
+    /// leaves a row here with no claim. `reconsider_capacity_skips` re-drives these once a slot frees
+    /// (#450) — a relay re-subscribe cannot, because the pool suppresses a re-delivery of an
+    /// already-seen event. An offer that WAS claimed (even one whose claim later lapsed to `released`)
+    /// has a claim row and is excluded: a lapsed-unawarded offer is not re-claimed.
+    pub fn offers_awaiting_claim(&self, now_unix: i64) -> Result<Vec<Offer>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted,
+                    requested_agent
+             FROM offers
+             WHERE deadline_unix > ?1
+               AND offer_id NOT IN (SELECT job_id FROM claims)",
+        )?;
+        let rows = stmt.query_map([now_unix], |row| {
+            Ok(Offer {
+                offer_id: row.get(0)?,
+                buyer_pubkey: row.get(1)?,
+                amount_sats: row.get::<_, i64>(2)? as u64,
+                unit: row.get(3)?,
+                task: row.get(4)?,
+                deadline_unix: row.get(5)?,
+                targeted: row.get::<_, i64>(6)? != 0,
+                requested_agent: row.get(7)?,
+            })
+        })?;
+        let mut offers = Vec::new();
+        for row in rows {
+            offers.push(row?);
+        }
+        Ok(offers)
+    }
+
+    /// The claim row's state for `job_id` (`claimed` / `awarded` / `released`), or `None` if this
+    /// node never parked a claim for it. Test-only: the #450 capacity-skip regression asserts that a
+    /// lapsed claim's row survives as `released` (so a re-delivered offer dedups on it rather than
+    /// being re-claimed) while the freed slot lets the previously capacity-skipped offer claim.
+    #[cfg(test)]
+    pub fn claim_row_state(&self, job_id: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.lock()?;
+        let state = conn
+            .query_row(
+                "SELECT state FROM claims WHERE job_id = ?1",
+                [job_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(state)
+    }
+
     // ---- Award ----------------------------------------------------------------------------------
 
     /// Record an award for `job_id`. The `award_id` (award event id) is deduped: the first sighting
