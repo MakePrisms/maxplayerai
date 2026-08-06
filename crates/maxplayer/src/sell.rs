@@ -458,6 +458,13 @@ fn ensure_seller_config(
         job_timeout_secs,
         agents,
         claim_open_pool,
+        // Buyer allowlist (#482): carried from an existing config so a relaunch never clobbers an
+        // operator's private-seller fence back to accept-all (#369-class); a fresh config defaults
+        // empty (accept-all). Operators edit it via `[seller] accept_offers_only_from`.
+        accept_offers_only_from: existing
+            .as_ref()
+            .map(|s| s.accept_offers_only_from.clone())
+            .unwrap_or_default(),
         offer_backfill_secs,
         // Contribution (freelance-PR fork) support: carried from an existing config so a relaunch
         // never clobbers an operator's `contribution_enabled = false` back to true (#369-class); a
@@ -954,6 +961,7 @@ mod tests {
                 job_timeout_secs: None,
                 agents: vec!["claude".to_owned(), "codex".to_owned()],
                 claim_open_pool: false,
+                accept_offers_only_from: Vec::new(),
                 offer_backfill_secs: home::default_offer_backfill_secs(),
                 contribution_enabled: true,
                 slots: 3,
@@ -1005,6 +1013,7 @@ mod tests {
                 job_timeout_secs: None,
                 agents: vec!["claude".to_owned()],
                 claim_open_pool: false,
+                accept_offers_only_from: Vec::new(),
                 offer_backfill_secs: home::default_offer_backfill_secs(),
                 contribution_enabled: false,
                 slots: 3,
@@ -1038,6 +1047,58 @@ mod tests {
     }
 
     #[test]
+    fn sell_writeback_preserves_operator_accept_offers_only_from() {
+        // #482 / #369-class: a steady-state relaunch must NOT clobber an operator's buyer allowlist
+        // back to accept-all — a private seller must stay private across a bare `sell` relaunch. Seed
+        // a populated allowlist, relaunch, and assert it survives the write-back.
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-482-allowlist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = home::bootstrap(&root).expect("bootstrap temp home");
+        home::save_config(&mut home, |config| {
+            config.seller = Some(SellerConfig {
+                agent_command: vec!["claude".to_owned()],
+                rate_sats: 5,
+                git_remote: "https://example.invalid/seller.git".to_owned(),
+                job_timeout_secs: None,
+                agents: vec!["claude".to_owned()],
+                claim_open_pool: false,
+                accept_offers_only_from: vec!["buyer-abc".to_owned(), "buyer-def".to_owned()],
+                offer_backfill_secs: home::default_offer_backfill_secs(),
+                contribution_enabled: true,
+                slots: 3,
+                claim_award_timeout_secs: None,
+            });
+        })
+        .expect("seed [seller] with a populated allowlist");
+
+        let options = SellOptions::default();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        ensure_seller_config(&mut home, &options, &mut out, &mut err).unwrap_or_else(|code| {
+            panic!(
+                "ensure_seller_config failed code={code} err={}",
+                String::from_utf8_lossy(&err)
+            )
+        });
+
+        let reloaded = home::bootstrap(&root).expect("reload persisted config");
+        let seller = reloaded.config.seller.expect("[seller] persisted");
+        assert_eq!(
+            seller.accept_offers_only_from,
+            vec!["buyer-abc".to_owned(), "buyer-def".to_owned()],
+            "operator accept_offers_only_from must survive relaunch (a relaunch must never open a private seller)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn sell_writeback_preserves_operator_slots_and_claim_timeout() {
         let root = std::env::temp_dir().join(format!(
             "maxplayer-369-slots-{}-{}",
@@ -1060,6 +1121,7 @@ mod tests {
                 job_timeout_secs: None,
                 agents: Vec::new(),
                 claim_open_pool: false,
+                accept_offers_only_from: Vec::new(),
                 offer_backfill_secs: home::default_offer_backfill_secs(),
                 contribution_enabled: true,
                 slots: 2,
