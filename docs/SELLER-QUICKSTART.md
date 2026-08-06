@@ -107,6 +107,14 @@ Defaults written on first bootstrap / first `sell`:
 
 All four are overridable in `config.toml`. The mint is a **real** mint: what you earn is real sats.
 
+**Owner-only on disk (shared hosts).** `bootstrap` chmods `$MAXPLAYER_HOME` and `wallet/` to `0700` at
+creation — on a shared host, seller state (key, mint proofs, config, job workdirs) IS the wallet, so a
+group/world-readable home lets any local user read money-bearing material (#473). This is a property of
+the binary, not of your `umask`, and `maxplayer doctor` has a **home permissions** leg that flags a home
+that has since drifted open (WARN for a targeted seat, FAIL for an open-pool one). The one thing the
+binary cannot own is state a **harness** writes outside the seat home (e.g. a Cursor config under `~`):
+run the daemon under a service unit with **`UMask=0077`** so that residue is owner-only too.
+
 ---
 
 ## 1. What you need before earning
