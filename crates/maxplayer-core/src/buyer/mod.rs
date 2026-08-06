@@ -867,9 +867,8 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
         ),
         Err(AwardError::Reserve(refused)) => {
             // #539: the operator console records the affordability refusal, not only the RPC caller —
-            // a script-driven award otherwise fails with nothing in the daemon log. `refused` names
-            // the numbers (need vs available).
-            crate::opline!("buyer: cannot afford to award job {} — {refused}", params.job_id);
+            // a script-driven award otherwise fails with nothing in the daemon log.
+            crate::opline!("{}", cannot_afford_award_line(&params.job_id, &refused));
             Response::err(id, CODE_REFUSED, refused.to_string())
         }
         // Presence refusals are REFUSED, not INTERNAL: nothing broke, the daemon declined to
@@ -1014,6 +1013,21 @@ async fn invalidate_reconcile_snapshot(context: &BuyerContext) {
     *context.last_reconcile.lock().await = None;
 }
 
+/// #539: compose the operator-console line for a spend the buyer cannot afford — an award reservation
+/// refused, or a settle that failed at the pay step. The typed refusals already carry the shortfall
+/// numbers on their `Display` (`ReserveRefused` names need vs available; the cross-mint `HopError`
+/// names need/held/mint), so these funnel that detail onto the operator surface through ONE formatter
+/// each. Routing the handler and its test through the same formatter makes a dropped or transposed
+/// number red-provable — a money-debugging diagnostic that names the wrong numbers is worse than
+/// silence, and the raw `opline!` stderr boundary can only be eyeballed.
+fn cannot_afford_award_line(job_id: &str, refused: &impl std::fmt::Display) -> String {
+    format!("buyer: cannot afford to award job {job_id} — {refused}")
+}
+
+fn could_not_settle_line(job_id: &str, error: &impl std::fmt::Display) -> String {
+    format!("buyer: could not settle {job_id}: {error}")
+}
+
 async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
     let params: CollectParams = match serde_json::from_value(params) {
         Ok(params) => params,
@@ -1042,7 +1056,7 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
             // #539: surface the settle failure on the operator console — the collect RPC path, unlike
             // the delivery watcher, otherwise tells only the RPC caller. `error` carries the shortfall
             // detail (a cross-mint hop names need/held/mint).
-            crate::opline!("buyer: could not settle {}: {error}", params.job_id);
+            crate::opline!("{}", could_not_settle_line(&params.job_id, &error));
             Response::err(id, CODE_REFUSED, error.to_string())
         }
         Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
@@ -1296,7 +1310,7 @@ async fn finalize_auto_award(
             // decision. Without this line the daemon silently declines and looks idle — the parked
             // reason is only visible later via `status`. `refused` names need vs available; the
             // reservation is against aggregate available balance, so no single source mint applies.
-            crate::opline!("buyer: cannot afford to award job {job_id} — {refused}");
+            crate::opline!("{}", cannot_afford_award_line(job_id, &refused));
             let _ = context.store.mark_award_parked(
                 job_id,
                 &format!("reservation refused: {refused}"),
@@ -2714,6 +2728,42 @@ mod tests {
     fn temp_home(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!("maxplayer-buyer-mod-{label}-{}-{id}", std::process::id()))
+    }
+
+    /// #539: the operator-console diagnostics for an unaffordable award and a failed settle must
+    /// carry the shortfall NUMBERS in their roles, not merely announce that something was refused — a
+    /// money-debugging line that names no numbers (or transposes them) is the misdirection this issue
+    /// exists to kill. Asserting the composed line through the SAME formatter the handlers emit makes
+    /// a dropped or swapped field red-provable, which the raw `opline!` stderr boundary cannot be.
+    #[test]
+    fn spend_refusal_lines_carry_the_shortfall_numbers_in_role() {
+        use crate::crossmint_hop::HopError;
+        use reservations::{Ceiling, ReserveRefused};
+
+        // Award reservation refusal → need vs available, un-transposed.
+        let refused = ReserveRefused::InsufficientAvailable {
+            requested: 150,
+            available: 42,
+            bound: Ceiling::Wallet,
+        };
+        let line = cannot_afford_award_line("job-abc", &refused);
+        assert!(line.contains("job-abc"), "names the job: {line}");
+        assert!(
+            line.contains("150 sat exceeds available 42"),
+            "carries need (150) and available (42) without swapping them: {line}"
+        );
+
+        // Cross-mint settle shortfall → need, held, AND the mint that is short.
+        let hop = HopError::InsufficientSource {
+            mint: "https://mint.example/Bitcoin".to_owned(),
+            balance: 42,
+            planned_cost: 150,
+        };
+        let line = could_not_settle_line("job-xyz", &hop);
+        assert!(line.contains("job-xyz"), "names the job: {line}");
+        assert!(line.contains("holds 42 sats"), "carries what the buyer holds: {line}");
+        assert!(line.contains("costs 150 sats"), "carries the hop cost (need): {line}");
+        assert!(line.contains("mint.example"), "names the mint that is short: {line}");
     }
 
     // #322: the manual award RPC's write-once gate. A named claim contradicting the pinned one
