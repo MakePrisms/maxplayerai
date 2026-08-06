@@ -1024,6 +1024,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // #500: a funding op must persist ONLY its own change, never the in-memory, env-widened real-mint
+    // fence. `save_config` writes the FILE-only view (re-reads config.toml, edits that), so an
+    // `allow_real_mints = true` that exists only because MAXPLAYER_ALLOW_REAL_MINTS opened it in-process
+    // can never leak to disk. The write-back class was fixed by #84 (fix/save-config-env-promotion);
+    // this pins the FENCE field on the FUNDING path — which the scalar-only, direct-save
+    // `save_does_not_persist_env_override_values` (home.rs) did not cover.
+    #[test]
+    fn funding_op_never_writes_back_the_env_widened_real_mint_fence() {
+        let root = temp_home("500-funding-no-gate-writeback");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+
+        // Durable fence CLOSED on disk — the operator's explicit opt-out.
+        home::save_config(&mut home, |config| config.allow_real_mints = false)
+            .expect("seed the fence closed on disk");
+
+        // Simulate the daemon launcher's MAXPLAYER_ALLOW_REAL_MINTS=true: the env overlay opens the
+        // fence IN-MEMORY only (`home.config`), while config.toml on disk stays false.
+        home.config.allow_real_mints = true;
+
+        // A funding op (adds an extra mint) — persists through `save_config`.
+        let added = add_mint(&mut home, "https://real-mint.example/").expect("add an extra mint");
+
+        let raw = std::fs::read_to_string(root.join("config.toml")).expect("read config.toml");
+        let on_disk = home::parse_config_toml(&raw).expect("parse config.toml");
+        // The durable fence is untouched: the env-widened in-memory value did NOT leak to disk...
+        assert!(
+            !on_disk.allow_real_mints,
+            "a funding op must not write the env-widened real-mint fence back to disk (#500); config.toml = {raw}"
+        );
+        // ...while the funding op's OWN change DID persist.
+        assert!(
+            on_disk.extra_mints.iter().any(|entry| entry == &added),
+            "the funding op's own change (the added mint) must persist to disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // Finding U: `confirm` is the effect boundary, so a post-confirm balance-read FAILURE must never
     // discard the confirmed token/outcome — `post_confirm_balance` returns a best-effort estimate and
     // never errors, so the caller always returns the token. A stale/equal balance also still returns.
