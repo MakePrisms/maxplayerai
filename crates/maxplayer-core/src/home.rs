@@ -203,6 +203,14 @@ pub struct SellerConfig {
     /// Opt-in to claim untargeted/open offers. Default **false** (targeted-only).
     #[serde(default)]
     pub claim_open_pool: bool,
+    /// Allowlist of buyer pubkeys (64-hex) whose offers this seller will claim. **Empty/absent =
+    /// accept-all** — every buyer is eligible, subject to the usual targeting/rate/harness gates
+    /// (the pre-#482 behavior; existing sellers are unaffected). **Populated = a hard fence**: an
+    /// offer whose author (the buyer) is not on the list is skipped with a named `NotAllowlisted`
+    /// skip reason and NO buyer feedback — a private seller does not advertise why it declined a
+    /// stranger. Consulted right after the lapsed-offer refusal, before the rate/harness gates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accept_offers_only_from: Vec<String>,
     /// Backfill window (seconds) for the seller's UNTARGETED (open-pool) offer-kind offer
     /// filter. On (re)subscribe the open-pool filter requests stored offers dated at/after
     /// `now - this`, so a daemon started AFTER an open-pool offer was posted still SEES it

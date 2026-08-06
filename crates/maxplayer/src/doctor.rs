@@ -899,6 +899,7 @@ mod tests {
             job_timeout_secs: None,
             agents: Vec::new(), // empty ⇒ boot uses fallback_registry (agent_command VERBATIM)
             claim_open_pool: false,
+            accept_offers_only_from: Vec::new(),
             offer_backfill_secs: 0,
             contribution_enabled: true,
             slots: 1,
@@ -939,6 +940,7 @@ mod tests {
             job_timeout_secs: None,
             agents: vec!["ghostxyz-not-a-preset".to_owned()],
             claim_open_pool: false,
+            accept_offers_only_from: Vec::new(),
             offer_backfill_secs: 0,
             contribution_enabled: true,
             slots: 1,
