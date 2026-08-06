@@ -1046,15 +1046,17 @@ struct ProbeIdentity {
 ///
 /// Both are then PASSED to the prompt, the workdir name and the readback, so no second literal exists
 /// anywhere that could drift out of step. The sentinel carries sub-second entropy the label does not,
-/// so it is neither equal to nor derivable from anything the harness can read off its own path.
-fn mint_probe_identity(harness: usize, now_unix: u64) -> ProbeIdentity {
+/// so it is neither equal to nor derivable from anything the harness can read off its own path. The
+/// `attempt` index distinguishes the retries of one harness's probe (#472), so two turns that fall in
+/// the same second never share a workdir and no attempt can inherit an earlier one's artifact.
+fn mint_probe_identity(harness: usize, attempt: usize, now_unix: u64) -> ProbeIdentity {
     let entropy = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.subsec_nanos())
         .unwrap_or(0);
     ProbeIdentity {
-        dir_label: format!("{PROBE_DIR_PREFIX}-{harness}-{now_unix}"),
-        sentinel: format!("{PROBE_SENTINEL_PREFIX}-{harness}-{now_unix}-{entropy:09}"),
+        dir_label: format!("{PROBE_DIR_PREFIX}-{harness}-{attempt}-{now_unix}"),
+        sentinel: format!("{PROBE_SENTINEL_PREFIX}-{harness}-{attempt}-{now_unix}-{entropy:09}"),
     }
 }
 
@@ -1067,7 +1069,94 @@ fn harness_probe_prompt(sentinel: &str) -> String {
     )
 }
 
-/// Run ONE self-probe turn and decide it on the ARTIFACT.
+/// How many self-probe turns the FLAKY shape gets before the pre-advertise gate gives up on a harness.
+///
+/// Only the "completed the turn but produced no artifact" shape is retried, and only up to this many
+/// turns total (#472). A model that flakes on one turn often delivers on the next, so grounding a seat
+/// on a single empty turn would drop a working harness; but one that never produces the sentinel across
+/// three turns is not flaky, it is broken. A launcher/exec failure is NEVER counted here — it is
+/// structural (a permission or containment barrier does not clear by re-asking) and stops on the first
+/// attempt. See [`probe_step`].
+const HARNESS_PROBE_MAX_ATTEMPTS: usize = 3;
+
+/// One self-probe turn's outcome, keeping WHICH shape of failure occurred — the one bit a single
+/// `Result` throws away, and the bit the prove-before-advertise diagnostic needs (#472). The two
+/// failure shapes have OPPOSITE remedies:
+///
+/// - [`Self::CompletedNoArtifact`] — the launcher ran the turn, the turn completed, the model just did
+///   not do the task. Flaky; the remedy is to retry (or swap the model). RETRIED.
+/// - [`Self::Unrunnable`] — the turn never ran (a typed launcher/exec [`ExecError`], or our own workdir
+///   could not be created). The remedy is to fix the launcher/containment, not the model. NOT retried:
+///   re-asking a launcher that refused only delays a fail-closed boot.
+///
+/// Collapsing the two — as a lone turn did — sends the operator hunting containment for a flaky model,
+/// or the reverse. Naming them apart is the whole point of the diagnostic.
+enum ProbeAttempt {
+    /// The harness produced the sentinel artifact: a proven turn.
+    Proven,
+    /// The ACP turn completed but left no artifact carrying the sentinel — a flaky model/harness.
+    CompletedNoArtifact,
+    /// A failure retrying cannot fix. Carries the operator reason (which NAMES the launcher/containment
+    /// remedy) and the fault to record.
+    Unrunnable { reason: String, fault: Fault },
+}
+
+/// What the retry loop does after one attempt: try again, or stop with a verdict. Pure — the decision
+/// is a function of (attempt index, cap, this turn's shape) and nothing else — so the whole retry
+/// policy is unit-tested without spawning an agent. See [`probe_step`].
+enum ProbeStep {
+    /// The flaky shape, with turns still left: probe again.
+    Retry,
+    /// Stop: this is the verdict the gate records (an `Err` is fail-closed).
+    Done(Result<(), (String, Fault)>),
+}
+
+/// The refusal reason for the FLAKY shape once every retry still produced no artifact.
+///
+/// Names the remedy that fits THIS shape and says which one it is NOT: the launcher ran every turn, so
+/// an operator must not go hunting containment for a fault that is upstream in the model.
+fn flaky_harness_reason(attempts: usize) -> String {
+    format!(
+        "completed {attempts} self-probe turn(s) but never produced the sentinel artifact — the \
+         launcher ran the turn each time, so this is a FLAKY harness/model, not a containment fault \
+         (remedy: retry later, or switch to a more reliable model/harness)"
+    )
+}
+
+/// The refusal reason for the UNRUNNABLE launcher/exec shape.
+///
+/// The opposite remedy to [`flaky_harness_reason`]: the turn never executed, so the fault is the
+/// launcher or its containment, never the model — retrying it would only defer a fail-closed boot.
+fn launcher_unrunnable_reason(error: &ExecError) -> String {
+    format!(
+        "the launcher could not run a probe turn ({error}) — the harness never executed, so this is a \
+         containment/permission/launcher fault, not a flaky model (remedy: fix the launcher/sandbox \
+         config, then restart)"
+    )
+}
+
+/// The retry policy, as a pure decision over one attempt's shape (#472).
+///
+/// - `Proven` → `Done(Ok)`.
+/// - `Unrunnable` → `Done(Err)`, always, whatever the attempt index: a launcher that refused does not
+///   start working because we asked again.
+/// - `CompletedNoArtifact` → `Retry` while turns remain, else `Done(Err(flaky))`. This is the ONLY
+///   shape that retries, and only up to `max_attempts`.
+fn probe_step(attempt: usize, max_attempts: usize, outcome: ProbeAttempt) -> ProbeStep {
+    match outcome {
+        ProbeAttempt::Proven => ProbeStep::Done(Ok(())),
+        ProbeAttempt::Unrunnable { reason, fault } => ProbeStep::Done(Err((reason, fault))),
+        ProbeAttempt::CompletedNoArtifact => {
+            if attempt + 1 < max_attempts {
+                ProbeStep::Retry
+            } else {
+                ProbeStep::Done(Err((flaky_harness_reason(max_attempts), Fault::Unproven)))
+            }
+        }
+    }
+}
+
+/// Run ONE self-probe turn and decide it on the ARTIFACT, reporting WHICH shape occurred.
 ///
 /// A positive control, not a liveness check, and the distinction is the entire reason this exists. A
 /// harness whose account is exhausted ends its turn `completed`, exits 0, and returns a perfectly
@@ -1078,27 +1167,28 @@ fn harness_probe_prompt(sentinel: &str) -> String {
 /// The probe runs under the same sandbox policy as a real job. Probing an unsandboxed path while jobs
 /// run sandboxed would verify a path no paid job ever takes.
 ///
-/// An `Err` carries both an operator-facing reason and the fault to record. Failures that ARE typed
-/// go through [`harness_fault_for`], the same classifier a real job's failure uses, so a probe against
-/// an `acp`-less binary marks the harness INCAPABLE and stops being probed at all rather than
-/// re-asking a settled question every few hours.
-async fn run_harness_probe(
+/// The two failure shapes are returned APART (see [`ProbeAttempt`]) so the caller can retry the flaky
+/// one and fail the structural one fast. Typed launcher/exec failures go through [`harness_fault_for`],
+/// the same classifier a real job's failure uses, so a probe against an `acp`-less binary marks the
+/// harness INCAPABLE and stops being probed at all rather than re-asking a settled question.
+async fn run_harness_probe_once(
     argv: &[String],
     sandbox: &SandboxPolicy,
     identity: &DeliveryAgentIdentity,
     workdir: &std::path::Path,
     sentinel: &str,
-) -> Result<(), (String, Fault)> {
-    seller_git::init_empty_delivery_workdir_off_runtime(workdir.to_path_buf(), identity.clone())
-        .await
-        .map_err(|error| {
-            // Our own filesystem, not the harness: record nothing against it, but the probe still
-            // did not answer, so re-arm the window rather than restoring on a non-answer.
-            (
-                format!("probe workdir init failed ({error})"),
-                Fault::Unproven,
-            )
-        })?;
+) -> ProbeAttempt {
+    if let Err(error) =
+        seller_git::init_empty_delivery_workdir_off_runtime(workdir.to_path_buf(), identity.clone())
+            .await
+    {
+        // Our own filesystem, not the harness: record nothing against its capability, and do NOT
+        // retry — re-minting a workdir cannot fix a filesystem that just refused one.
+        return ProbeAttempt::Unrunnable {
+            reason: format!("probe workdir init failed ({error}) — our filesystem, not the harness"),
+            fault: Fault::Unproven,
+        };
+    }
 
     if let Err(error) = run_agent_job(
         argv,
@@ -1110,22 +1200,40 @@ async fn run_harness_probe(
     )
     .await
     {
+        // The turn never ran: a launcher/exec fault. Structural — do not retry.
         let fault = harness_fault_for(&error).unwrap_or(Fault::Unproven);
-        return Err((format!("probe turn failed ({error})"), fault));
+        return ProbeAttempt::Unrunnable {
+            reason: launcher_unrunnable_reason(&error),
+            fault,
+        };
     }
 
     // The turn "succeeded" — now ask the only question that separates a working harness from an
     // exhausted one: is the sentinel actually here?
     if probe_sentinel_present(workdir, sentinel) {
-        Ok(())
+        ProbeAttempt::Proven
     } else {
-        Err((
-            format!(
-                "probe turn reported success but produced no artifact carrying {sentinel} — a completed \
-                 turn is not delivered work"
-            ),
-            Fault::Unproven,
-        ))
+        ProbeAttempt::CompletedNoArtifact
+    }
+}
+
+/// One-shot probe verdict, no retry: run a single turn and collapse its shape to pass/fail.
+///
+/// The pre-advertise gate uses [`run_harness_probe_once`] directly so it can tell the two failure
+/// shapes apart and retry the flaky one (#472). The restore-timer path has not adopted the retry, so it
+/// keeps the single-turn collapse here — the same verdict it recorded before, now carrying the shape's
+/// sharper reason string.
+async fn run_harness_probe(
+    argv: &[String],
+    sandbox: &SandboxPolicy,
+    identity: &DeliveryAgentIdentity,
+    workdir: &std::path::Path,
+    sentinel: &str,
+) -> Result<(), (String, Fault)> {
+    match run_harness_probe_once(argv, sandbox, identity, workdir, sentinel).await {
+        ProbeAttempt::Proven => Ok(()),
+        ProbeAttempt::Unrunnable { reason, fault } => Err((reason, fault)),
+        ProbeAttempt::CompletedNoArtifact => Err((flaky_harness_reason(1), Fault::Unproven)),
     }
 }
 
@@ -1165,13 +1273,49 @@ pub struct HarnessProbeVerdict {
     pub result: Result<(), (String, Fault)>,
 }
 
-/// Probe EVERY configured harness once, before anything goes on the wire.
+/// Probe ONE configured harness under the retry policy (#472), returning the verdict the gate records.
 ///
-/// Local compute only — no sats, no mint, no award (`run_harness_probe` runs the harness in a
+/// Each attempt gets a FRESH identity and workdir, so a retry must be earned by THIS turn — no stale
+/// artifact or replayed transcript can satisfy a later attempt. Only the flaky `CompletedNoArtifact`
+/// shape loops; [`probe_step`] returns `Done` immediately for a proven or unrunnable turn, so a bogus
+/// launcher costs exactly one spawn, not three.
+async fn probe_one_harness(
+    index: usize,
+    argv: &[String],
+    label: &str,
+    sandbox: &SandboxPolicy,
+    identity: &DeliveryAgentIdentity,
+    home: &MaxplayerHome,
+) -> Result<(), (String, Fault)> {
+    for attempt in 0..HARNESS_PROBE_MAX_ATTEMPTS {
+        let probe = mint_probe_identity(index, attempt, now_unix() as u64);
+        let workdir = job_workdir(home, &probe.dir_label);
+        let outcome =
+            run_harness_probe_once(argv, sandbox, identity, &workdir, &probe.sentinel).await;
+        let _ = std::fs::remove_dir_all(&workdir);
+        match probe_step(attempt, HARNESS_PROBE_MAX_ATTEMPTS, outcome) {
+            ProbeStep::Done(result) => return result,
+            ProbeStep::Retry => opline!(
+                "seller node harness probe {label}: turn {} completed with NO artifact — flaky-model \
+                 shape, retrying",
+                attempt + 1
+            ),
+        }
+    }
+    // Unreachable: probe_step returns Done on the final attempt. Kept as a fail-closed verdict so a
+    // future change to the policy cannot fall through to a panic on a money path.
+    Err((flaky_harness_reason(HARNESS_PROBE_MAX_ATTEMPTS), Fault::Unproven))
+}
+
+/// Probe EVERY configured harness before anything goes on the wire.
+///
+/// Local compute only — no sats, no mint, no award ([`probe_one_harness`] runs the harness in a
 /// throwaway workdir to write a sentinel and decides on the artifact). It is ours to run and ours to
 /// pay for, exactly like the restore-timer self-probe — but here it gates the FIRST advertisement
-/// rather than a restoration, so a seat that cannot deliver never advertises at all (#357). Inputs
-/// are derived from `home` the same way `start_due_harness_probes` derives them for the restore probe.
+/// rather than a restoration, so a seat that cannot deliver never advertises at all (#357). Each
+/// harness is probed under the retry policy, so a merely FLAKY model is not mistaken for a broken one
+/// and grounded before it advertises (#472). Inputs are derived from `home` the same way
+/// `start_due_harness_probes` derives them for the restore probe.
 pub async fn probe_configured_harnesses(
     home: &MaxplayerHome,
 ) -> Result<Vec<HarnessProbeVerdict>, NodeError> {
@@ -1180,11 +1324,8 @@ pub async fn probe_configured_harnesses(
     let identity = DeliveryAgentIdentity::for_seller(&home::public_key_hex(home)?);
     let mut verdicts = Vec::with_capacity(registry.entries().len());
     for (index, entry) in registry.entries().iter().enumerate() {
-        let probe = mint_probe_identity(index, now_unix() as u64);
-        let workdir = job_workdir(home, &probe.dir_label);
-        let result =
-            run_harness_probe(&entry.argv, &sandbox, &identity, &workdir, &probe.sentinel).await;
-        let _ = std::fs::remove_dir_all(&workdir);
+        let label = entry.name.clone().unwrap_or_else(|| "<unlabelled>".to_owned());
+        let result = probe_one_harness(index, &entry.argv, &label, &sandbox, &identity, home).await;
         verdicts.push(HarnessProbeVerdict {
             index,
             name: entry.name.clone(),
@@ -2848,7 +2989,8 @@ impl SellerNodeRunner {
             // Minted per probe, so neither a stale workdir nor a replayed transcript can satisfy one:
             // the artifact has to be produced by THIS turn. The workdir is named after the NON-SECRET
             // label — never the sentinel, which the harness must not be able to read off its own cwd.
-            let probe = mint_probe_identity(harness, now_unix() as u64);
+            // Attempt 0: the restore path runs a single turn (it has not adopted the retry).
+            let probe = mint_probe_identity(harness, 0, now_unix() as u64);
             let workdir = job_workdir(self.node.home(), &probe.dir_label);
             let sentinel = probe.sentinel;
             tokio::task::spawn_local(async move {
@@ -4148,7 +4290,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("probe dir");
         // Minted through the SAME function the probe path uses, so this test cannot pass against a
         // sentinel shape the node would never actually produce.
-        let sentinel = mint_probe_identity(0, 1_785_400_000).sentinel;
+        let sentinel = mint_probe_identity(0, 0, 1_785_400_000).sentinel;
 
         // Nothing written at all — a turn that completed having done nothing.
         assert!(
@@ -4183,9 +4325,10 @@ mod tests {
     // silently — which is why the assertion runs through the shared function.
     #[test]
     fn a_probe_sentinel_is_minted_from_one_definition_and_is_not_ecash() {
-        let a = mint_probe_identity(0, 1_785_400_000);
-        let b = mint_probe_identity(0, 1_785_400_001);
-        let other_harness = mint_probe_identity(1, 1_785_400_000);
+        let a = mint_probe_identity(0, 0, 1_785_400_000);
+        let b = mint_probe_identity(0, 0, 1_785_400_001);
+        let other_harness = mint_probe_identity(1, 0, 1_785_400_000);
+        let other_attempt = mint_probe_identity(0, 1, 1_785_400_000);
 
         assert!(a.sentinel.starts_with(PROBE_SENTINEL_PREFIX), "{}", a.sentinel);
         assert_ne!(
@@ -4193,6 +4336,16 @@ mod tests {
             "a sentinel is per-probe, so a replay cannot satisfy a later one"
         );
         assert_ne!(a.sentinel, other_harness.sentinel, "and it is per-harness");
+        // Per-attempt too (#472): a retry gets its own sentinel AND its own workdir, so no attempt can
+        // inherit an earlier one's artifact even inside the same second.
+        assert_ne!(
+            a.sentinel, other_attempt.sentinel,
+            "a retry's sentinel must differ from the first attempt's"
+        );
+        assert_ne!(
+            a.dir_label, other_attempt.dir_label,
+            "a retry must not reuse an earlier attempt's workdir"
+        );
 
         // The readback accepts exactly what the mint produced — one definition, both ends.
         let dir = std::env::temp_dir().join(format!("maxplayer-sn-test-{}", std::process::id()));
@@ -4216,7 +4369,7 @@ mod tests {
     // passes a probe the harness did no work for.
     #[test]
     fn a_harness_cannot_pass_its_probe_by_echoing_its_own_workdir_path() {
-        let probe = mint_probe_identity(3, 1_785_400_000);
+        let probe = mint_probe_identity(3, 0, 1_785_400_000);
 
         // ① The mint keeps them disjoint: no workdir named after the label can contain the sentinel.
         assert!(
@@ -6822,5 +6975,146 @@ mod tests {
 
         runner.client.disconnect().await;
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- #472: prove-before-advertise probe diagnostic — two failure shapes, retry only the flaky
+    // one. The policy is pure (`probe_step`), so it is proven here with scripted outcomes and no agent
+    // spawn — the same seam that lets `boot_advertising_only_proven` take verdicts as a parameter.
+
+    #[test]
+    fn probe_step_retries_the_flaky_shape_up_to_the_cap_then_fails_closed() {
+        // Completed-but-empty turns retry while turns remain...
+        assert!(matches!(
+            probe_step(0, 3, ProbeAttempt::CompletedNoArtifact),
+            ProbeStep::Retry
+        ));
+        assert!(matches!(
+            probe_step(1, 3, ProbeAttempt::CompletedNoArtifact),
+            ProbeStep::Retry
+        ));
+        // ...and the FINAL empty turn fails closed with the flaky remedy, never another retry.
+        let ProbeStep::Done(Err((reason, fault))) =
+            probe_step(2, 3, ProbeAttempt::CompletedNoArtifact)
+        else {
+            panic!("the last flaky attempt must be Done(Err), not a retry");
+        };
+        assert_eq!(fault, Fault::Unproven);
+        assert!(
+            reason.contains("FLAKY")
+                && reason.contains("retry later")
+                && reason.contains("more reliable model"),
+            "the flaky verdict must name the retry/replace-model remedy: {reason}"
+        );
+        assert!(
+            !reason.contains("fix the launcher"),
+            "the flaky verdict must NOT prescribe the launcher fix: {reason}"
+        );
+    }
+
+    #[test]
+    fn probe_step_never_retries_the_unrunnable_shape() {
+        // A launcher/exec failure is structural: Done on EVERY attempt index, turns remaining or not.
+        for attempt in 0..3 {
+            let outcome = ProbeAttempt::Unrunnable {
+                reason: launcher_unrunnable_reason(&ExecError::Agent("spawn refused".to_owned())),
+                fault: Fault::Unproven,
+            };
+            let ProbeStep::Done(Err((reason, _))) = probe_step(attempt, 3, outcome) else {
+                panic!("an unrunnable turn must never retry (attempt {attempt})");
+            };
+            assert!(
+                reason.contains("fix the launcher") && reason.contains("containment"),
+                "the unrunnable verdict must name the launcher/containment remedy: {reason}"
+            );
+            assert!(
+                !reason.contains("retry later") && !reason.contains("more reliable model"),
+                "the unrunnable verdict must NOT prescribe a model retry: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_step_stops_on_a_proven_turn() {
+        // A proven turn ends the loop immediately — the gate's healthy direction is unchanged.
+        assert!(matches!(
+            probe_step(0, 3, ProbeAttempt::Proven),
+            ProbeStep::Done(Ok(()))
+        ));
+    }
+
+    #[test]
+    fn the_two_probe_remedies_point_opposite_ways() {
+        let flaky = flaky_harness_reason(3);
+        let launcher = launcher_unrunnable_reason(&ExecError::Agent("boom".to_owned()));
+        // Flaky ⇒ retry / replace the model; launcher ⇒ fix containment. Neither borrows the other's
+        // remedy — the whole point of splitting the shapes is that an operator is pointed the right way.
+        assert!(flaky.contains("retry later") && flaky.contains("more reliable model"));
+        assert!(!flaky.contains("fix the launcher"));
+        assert!(launcher.contains("fix the launcher") && launcher.contains("containment"));
+        assert!(!launcher.contains("retry later") && !launcher.contains("more reliable model"));
+    }
+
+    #[test]
+    fn a_flaky_harness_that_recovers_on_a_later_turn_is_proven() {
+        // Drive the exact loop `probe_one_harness` drives, over a scripted [flaky, flaky, proven]
+        // sequence: the first two retry, the third proves — so the harness ends PROVEN, not grounded.
+        // This is the money-relevant direction: a merely flaky model still gets to advertise.
+        let script = [
+            ProbeAttempt::CompletedNoArtifact,
+            ProbeAttempt::CompletedNoArtifact,
+            ProbeAttempt::Proven,
+        ];
+        let mut verdict = None;
+        for (attempt, outcome) in script.into_iter().enumerate() {
+            match probe_step(attempt, 3, outcome) {
+                ProbeStep::Done(result) => {
+                    verdict = Some(result);
+                    break;
+                }
+                ProbeStep::Retry => continue,
+            }
+        }
+        assert!(
+            matches!(verdict, Some(Ok(()))),
+            "a harness that delivers on its third turn must be proven, not grounded: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn an_unrunnable_turn_stops_the_loop_even_after_a_flaky_retry() {
+        // [flaky, unrunnable, proven]: the flaky retries, the unrunnable STOPS at attempt 1 — the
+        // third element is never consumed, so a launcher fault surfacing on a retry still fails fast,
+        // and the RECORDED fault is the launcher's, not the flaky Unproven.
+        let script = [
+            ProbeAttempt::CompletedNoArtifact,
+            ProbeAttempt::Unrunnable {
+                reason: launcher_unrunnable_reason(&ExecError::AcpRequired),
+                fault: Fault::Incapable(MissingCapability::AcpFeature),
+            },
+            ProbeAttempt::Proven,
+        ];
+        let mut consumed = 0;
+        let mut verdict = None;
+        for (attempt, outcome) in script.into_iter().enumerate() {
+            consumed += 1;
+            match probe_step(attempt, 3, outcome) {
+                ProbeStep::Done(result) => {
+                    verdict = Some(result);
+                    break;
+                }
+                ProbeStep::Retry => continue,
+            }
+        }
+        assert_eq!(
+            consumed, 2,
+            "the loop must stop at the unrunnable turn, not run the third"
+        );
+        assert!(
+            matches!(
+                verdict,
+                Some(Err((_, Fault::Incapable(MissingCapability::AcpFeature))))
+            ),
+            "the unrunnable fault must be the recorded verdict: {verdict:?}"
+        );
     }
 }
