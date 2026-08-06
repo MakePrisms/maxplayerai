@@ -14,6 +14,13 @@
 //! 3. **environment** — `MAXPLAYER_*` variables. Every field is reachable: uppercase the field path,
 //!    prefix `MAXPLAYER_`, join nested fields with `__` (double underscore). Comma-separated for lists.
 //!
+//! The **entire `MAXPLAYER_` prefix is reserved** for this config: every `MAXPLAYER_*` variable must map
+//! to a [`MaxplayerConfig`] field or be a known operational seam ([`RESERVED_ENV_VARS`], e.g.
+//! `MAXPLAYER_HOME`). An unrecognized `MAXPLAYER_*` variable is refused fail-closed — never silently
+//! ignored — so do not repurpose the prefix for unrelated environment variables. A single `_` where a
+//! nested `__` was meant (`MAXPLAYER_SANDBOX_RO_PATHS` vs `MAXPLAYER_SANDBOX__RO_PATHS`) reads as an
+//! unknown top-level field and refuses; the refusal names the offending variable and this rule.
+//!
 //! The typed struct is the single in-process representation — only its *construction* is layered
 //! (the one seam is [`bootstrap`] / [`reload_config`], both routed through the env overlay). Every
 //! layer fails closed: an unknown or malformed key refuses with the offending key named, never a
@@ -1154,6 +1161,10 @@ fn config_env_from_process() -> HashMap<String, String> {
 /// `MAXPLAYER_*` map ([`config_env_from_process`] in production; tests inject one). A malformed value
 /// (wrong type) or an unknown `MAXPLAYER_<FIELD>` refuses fail-closed, naming the offending key.
 fn apply_env_layer(base: &MaxplayerConfig, env: HashMap<String, String>) -> Result<MaxplayerConfig, HomeError> {
+    // The `config` crate lowercases and strips the prefix, so its `deny_unknown_fields` refusal names
+    // the derived FIELD (e.g. `sandbox_ro_paths`), not the `MAXPLAYER_*` variable the operator set.
+    // Keep the caller's keys so [`reserved_namespace_hint`] can re-point the refusal at that variable.
+    let env_keys: Vec<String> = env.keys().cloned().collect();
     let mut environment = config::Environment::with_prefix("MAXPLAYER")
         .prefix_separator("_")
         .separator("__")
@@ -1174,7 +1185,57 @@ fn apply_env_layer(base: &MaxplayerConfig, env: HashMap<String, String>) -> Resu
         .build()
         .map_err(|error| HomeError::Config(format!("MAXPLAYER_* environment layer: {error}")))?
         .try_deserialize::<MaxplayerConfig>()
-        .map_err(|error| HomeError::Config(format!("MAXPLAYER_* environment layer: {error}")))
+        .map_err(|error| {
+            HomeError::Config(reserved_namespace_hint(
+                format!("MAXPLAYER_* environment layer: {error}"),
+                &env_keys,
+            ))
+        })
+}
+
+/// Turn a `config`-crate `deny_unknown_fields` refusal into one that names the `MAXPLAYER_*` variable
+/// the operator actually set (not just the derived field) and states the reserved-namespace rule.
+///
+/// The crate reports the derived field name (lowercased leaf, e.g. `sandbox_ro_paths` for
+/// `MAXPLAYER_SANDBOX_RO_PATHS`, or `bogus` under key `seller` for `MAXPLAYER_SELLER__BOGUS`). We match
+/// that leaf back to `env_keys` — the exact variables handed in — so the message points at what the
+/// operator typed. Only unknown-field refusals are enriched; malformed-value errors (which already name
+/// their key) pass through untouched.
+fn reserved_namespace_hint(message: String, env_keys: &[String]) -> String {
+    let Some(leaf) = message
+        .split("unknown field `")
+        .nth(1)
+        .and_then(|rest| rest.split('`').next())
+    else {
+        return message;
+    };
+    // The offending variable(s): a MAXPLAYER_* key whose derived leaf (last `__`-segment, lowercased)
+    // is the field the crate rejected. Usually exactly one; if none/ambiguous, keep the teaching text
+    // without naming a specific variable rather than guess.
+    let offenders: Vec<&str> = env_keys
+        .iter()
+        .filter(|key| {
+            key.strip_prefix("MAXPLAYER_")
+                .map(|suffix| suffix.to_ascii_lowercase())
+                .and_then(|lowered| lowered.rsplit("__").next().map(str::to_owned))
+                .as_deref()
+                == Some(leaf)
+        })
+        .map(String::as_str)
+        .collect();
+    let named = match offenders.as_slice() {
+        [one] => format!(" — from environment variable {one}"),
+        [] => String::new(),
+        many => format!(" — from one of these variables: {}", many.join(", ")),
+    };
+    format!(
+        "{message}{named}. The whole MAXPLAYER_ prefix is reserved for maxplayer config: every \
+         MAXPLAYER_* variable must map to a config field — nested fields join with a double \
+         underscore, e.g. MAXPLAYER_SELLER__RATE_SATS — or be a known operational seam, e.g. \
+         MAXPLAYER_HOME. An unrecognized MAXPLAYER_* variable is refused fail-closed, never ignored. \
+         Fix the spelling (a single '_' where a nested '__' was meant reads as an unknown top-level \
+         field) or unset the variable."
+    )
 }
 
 fn write_config(path: &Path, config: &MaxplayerConfig) -> Result<(), HomeError> {
@@ -1821,13 +1882,87 @@ mod tests {
 
     #[test]
     fn env_layer_refuses_unknown_variable() {
-        // A MAXPLAYER_-prefixed var that is neither a field nor a reserved seam fails closed.
-        let error = apply_env_layer(
+        // A MAXPLAYER_-prefixed var that is neither a field nor a reserved seam fails closed, and the
+        // refusal names the VARIABLE the operator set (not just the derived field) plus the rule.
+        let message = apply_env_layer(
             &MaxplayerConfig::default(),
             env(&[("MAXPLAYER_NO_SUCH_FIELD", "x")]),
         )
-        .expect_err("unknown env must refuse");
-        assert!(error.to_string().contains("environment"));
+        .expect_err("unknown env must refuse")
+        .to_string();
+        assert!(message.contains("environment"), "names the layer: {message}");
+        assert!(
+            message.contains("MAXPLAYER_NO_SUCH_FIELD"),
+            "names the actual variable, not just the derived field: {message}"
+        );
+        assert!(
+            message.contains("reserved"),
+            "states the reserved-namespace rule: {message}"
+        );
+        assert!(
+            message.contains("MAXPLAYER_SELLER__RATE_SATS"),
+            "shows the `__` nesting form: {message}"
+        );
+    }
+
+    #[test]
+    fn env_layer_refusal_names_the_single_underscore_footgun() {
+        // The issue's case: an operator means the nested `sandbox.ro_paths` but writes a single `_`, so
+        // the crate reads an unknown top-level field `sandbox_ro_paths`. The refusal must name THEIR
+        // variable and the `_` vs `__` fix — not leave them staring at a derived field they never typed.
+        let message = apply_env_layer(
+            &MaxplayerConfig::default(),
+            env(&[("MAXPLAYER_SANDBOX_RO_PATHS", "/x")]),
+        )
+        .expect_err("single-underscore nesting must refuse")
+        .to_string();
+        assert!(
+            message.contains("MAXPLAYER_SANDBOX_RO_PATHS"),
+            "names the operator's variable: {message}"
+        );
+        assert!(
+            message.contains("double underscore") && message.contains("single '_'"),
+            "explains the `_` vs `__` nesting fix: {message}"
+        );
+    }
+
+    #[test]
+    fn env_layer_refusal_names_a_nested_variable() {
+        // A genuinely nested unknown (`seller.bogus`) resolves back to its full `__` variable, not the
+        // bare leaf `bogus` the crate reports "for key `seller`".
+        let message = apply_env_layer(
+            &MaxplayerConfig::default(),
+            env(&[("MAXPLAYER_SELLER__BOGUS", "x")]),
+        )
+        .expect_err("unknown nested env must refuse")
+        .to_string();
+        assert!(
+            message.contains("MAXPLAYER_SELLER__BOGUS"),
+            "names the full nested variable: {message}"
+        );
+    }
+
+    #[test]
+    fn env_layer_refusal_names_only_the_offender_beside_valid_vars() {
+        // With a valid variable set alongside the unknown one, only the unknown is named — the leaf
+        // match must not misattribute the refusal to a well-formed neighbour.
+        let message = apply_env_layer(
+            &MaxplayerConfig::default(),
+            env(&[
+                ("MAXPLAYER_RELAY_URL", "wss://valid"),
+                ("MAXPLAYER_SANDBOX_RO_PATHS", "/x"),
+            ]),
+        )
+        .expect_err("unknown env beside a valid one must still refuse")
+        .to_string();
+        assert!(
+            message.contains("MAXPLAYER_SANDBOX_RO_PATHS"),
+            "names the offender: {message}"
+        );
+        assert!(
+            !message.contains("variable MAXPLAYER_RELAY_URL"),
+            "must not blame the valid neighbour: {message}"
+        );
     }
 
     #[test]
