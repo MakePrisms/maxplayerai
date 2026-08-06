@@ -65,11 +65,19 @@ export const MAXPLAYER_TAGGED_KINDS = Object.freeze([
 ]);
 
 /**
- * Kinds requested WITHOUT a t-tag filter. The NIP-89 handler announce is a
- * standard advert carrying no maxplayer tag, so a `#t` filter would hide it.
+ * Kinds requested WITHOUT a t-tag filter. Both are Nostr standards that carry no
+ * maxplayer tag of their own, so a `#t` filter would hide them: the NIP-89
+ * handler announce is a plain advert, and NIP-01 profile metadata is plain
+ * metadata.
+ *
+ * PROFILE belongs here because it is the SINGLE publisher of a seat's display
+ * name (§6.1 / #275). It was parsed, cached and read by the seller board while
+ * appearing on no requested-kinds list at all, so the name had a reader and no
+ * source and every card fell back to the short pubkey (#449).
+ *
  * Gift-wrap stays dark either way and is never requested or decoded.
  */
-export const UNTAGGED_KINDS = Object.freeze([HANDLER]);
+export const UNTAGGED_KINDS = Object.freeze([HANDLER, PROFILE]);
 
 /**
  * Kinds whose newest event per (author, kind, d) supersedes the rest.

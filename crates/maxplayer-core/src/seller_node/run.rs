@@ -14,6 +14,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+// Every operator-facing line in this file goes through these: `opline!` stamps and prints,
+// `opline_verbose!` does the same only under MAXPLAYER_VERBOSE. Neither is `eprintln!` — an
+// unstamped line here would be the one line an operator cannot place in time (#489).
+use crate::{opline, opline_verbose};
+
 use nostr_sdk::prelude::{
     Client, Filter, Keys, Kind, RelayOptions, RelayPoolNotification, RelayUrl,
 };
@@ -241,7 +246,7 @@ where
         tokio::task::spawn_local(async move {
             let slot = slots.acquire_for_resume().await;
             if slot.is_none() {
-                eprintln!(
+                opline!(
                     "seller node resume job_id={job_id}: slot gate closed; resuming WITHOUT a permit \
                      (capacity may be exceeded — dropping awarded work is the worse outcome)"
                 );
@@ -500,7 +505,7 @@ fn is_our_subscription(id: &str) -> bool {
 
 /// The diagnostic for a `CLOSED` naming a subscription id we never registered.
 ///
-/// A function rather than an inline `eprintln!` because this line is field-facing: the relay owner
+/// A function rather than an inline `opline!` because this line is field-facing: the relay owner
 /// reads it to tell two hypotheses apart, and neither is visible from the server side. Our periodic
 /// wrap backfill calls `fetch_events`, which GENERATES its subscription id (`pool/mod.rs:815`) and
 /// runs on exactly the cadence these closes appear on — so a small `last_backfill` age implicates our
@@ -646,7 +651,7 @@ async fn probe_relay_serves_our_reqs(
         .identifier(crate::heartbeat::SELLER_HEARTBEAT_D)
         .limit(0);
     if let Err(error) = client.subscribe_with_id(probe_id, probe, None).await {
-        eprintln!("seller node liveness probe: REQ could not be sent ({error})");
+        opline!("seller node liveness probe: REQ could not be sent ({error})");
         return false;
     }
     tokio::time::timeout(timeout, async {
@@ -758,7 +763,7 @@ async fn clear_subscription_registrations(
     }
     let leftover = relay.subscriptions().await.len();
     if leftover > 0 {
-        eprintln!(
+        opline!(
             "seller node WARN: {leftover} subscription registration(s) survived the pre-reconnect \
              clear; they will be re-sent before NIP-42 completes"
         );
@@ -930,12 +935,12 @@ fn boot_agent_registry(home: &MaxplayerHome) -> Result<AgentRegistry, NodeError>
     let resolved =
         crate::seller_agents::resolve(seller, &home.config.agents).map_err(NodeError::Agents)?;
     for verdict in &resolved.verdicts {
-        eprintln!("seller node agent {}", verdict.line());
+        opline!("seller node agent {}", verdict.line());
     }
     if let Some(degraded) = resolved.degrade_line() {
-        eprintln!("{degraded}");
+        opline!("{degraded}");
     } else if !resolved.registry.advertised().is_empty() {
-        eprintln!(
+        opline!(
             "seller node agents ready: {:?} (execution concurrency set by [seller] slots)",
             resolved.registry.advertised()
         );
@@ -1184,7 +1189,7 @@ pub async fn boot_advertising_only_proven(
         for verdict in &verdicts {
             if let Err((reason, _)) = &verdict.result {
                 let label = verdict.name.as_deref().unwrap_or("<unlabelled>");
-                eprintln!("seller node pre-advertise probe FAILED {label}: {reason}");
+                opline!("seller node pre-advertise probe FAILED {label}: {reason}");
             }
         }
         return Err(NodeError::NoProvenHarness(format!(
@@ -1197,7 +1202,7 @@ pub async fn boot_advertising_only_proven(
     let disco = crate::profile::publish_seller_discoverability_async(&mut home)
         .await
         .map_err(|error| NodeError::Relay(format!("discoverability publish failed: {error}")))?;
-    eprintln!(
+    opline!(
         "seller node discoverable kind0={} nip89={} name={} pubkey={}",
         disco.kind0_event_id,
         disco.nip89_event_id,
@@ -1267,13 +1272,13 @@ impl SellerNodeRunner {
         // Reconcile durable state before serving anything live: expire stale outbox rows, report the
         // non-terminal jobs that resume. Reconcile must NOT release parked claims (invariant 5).
         match node.reconcile_on_start(now_unix()) {
-            Ok(report) => eprintln!(
+            Ok(report) => opline!(
                 "seller node reconcile: resumed_jobs={} expired_outbox={} pending_outbox={}",
                 report.resumed_jobs.len(),
                 report.expired_outbox,
                 report.pending_outbox
             ),
-            Err(error) => eprintln!("seller node reconcile failed on startup (continuing): {error}"),
+            Err(error) => opline!("seller node reconcile failed on startup (continuing): {error}"),
         }
 
         let seller_pubkey = keys.public_key();
@@ -1303,11 +1308,11 @@ impl SellerNodeRunner {
         let boot_auth =
             match relay_auth::wait_for_nip42_auth(&mut relay_notifications, CONNECT_WAIT).await {
                 Ok(AuthWait::Authenticated) => {
-                    eprintln!("seller node relay authenticated (NIP-42)");
+                    opline!("seller node relay authenticated (NIP-42)");
                     AuthWait::Authenticated
                 }
                 Ok(AuthWait::NoChallenge) => {
-                    eprintln!(
+                    opline!(
                         "seller node WARN: no NIP-42 challenge within {CONNECT_WAIT:?}; proceeding \
                      (auto-auth stays ON — a challenge on the REQ still authenticates). p-gated \
                      kind-1059 receive may be degraded until auth completes."
@@ -1333,7 +1338,7 @@ impl SellerNodeRunner {
             capacity,
             Duration::from_secs(lapse_secs.unwrap_or(DEFAULT_CLAIM_AWARD_TIMEOUT_SECS)),
         ));
-        eprintln!(
+        opline!(
             "seller node execution slots: {} (claim-lapse timeout {}s)",
             capacity.max(1),
             lapse_secs.unwrap_or(DEFAULT_CLAIM_AWARD_TIMEOUT_SECS)
@@ -1498,19 +1503,19 @@ impl SellerNodeRunner {
 
         let mut notifications = self.client.notifications();
         self.subscribe_all(None).await?;
-        eprintln!(
+        opline!(
             "seller node live: pubkey={} relay={}",
             self.seller_pubkey.to_hex(),
             self.relay_url
         );
         if heartbeat_enabled {
-            eprintln!(
+            opline!(
                 "seller node heartbeat+watchdog enabled: kind-30340 every {heartbeat_interval_secs}s; \
                  reconnect if the relay stops serving our REQs for {stall_threshold}s \
                  ({stall_missed_intervals} missed intervals)"
             );
         }
-        eprintln!(
+        opline!(
             "seller node wrap backfill enabled: re-fetching stored kind-1059(s) every {}s (recovers a \
              silently-deaf payment subscription without a restart; its log line is the periodic \
              liveness signal)",
@@ -1529,7 +1534,7 @@ impl SellerNodeRunner {
                 let mut resumable = Vec::new();
                 for (job_id, state) in jobs {
                     if should_resume_execution(state) {
-                        eprintln!(
+                        opline!(
                             "seller node resume: re-driving execution for job_id={job_id} (state={state:?})"
                         );
                         resumable.push(job_id);
@@ -1540,7 +1545,7 @@ impl SellerNodeRunner {
                     // runs them in waves, and an operator seeing only the count cannot tell whether
                     // that is happening. While the backlog drains the node also stops claiming new
                     // offers (no free permit ⇒ `SlotsBusy`), which is the intended back-pressure.
-                    eprintln!(
+                    opline!(
                         "seller node resume: {} job(s) to re-drive, bounded to {} execution slot(s)",
                         resumable.len(),
                         self.slots.capacity
@@ -1554,7 +1559,7 @@ impl SellerNodeRunner {
                 });
             }
             Err(error) => {
-                eprintln!("seller node resume: resumable_jobs read failed (continuing): {error}")
+                opline!("seller node resume: resumable_jobs read failed (continuing): {error}")
             }
         }
 
@@ -1627,7 +1632,7 @@ impl SellerNodeRunner {
                                 .max(0) as u64,
                         );
                         match self.subscribe_offers(Some(overlap), true).await {
-                            Ok(()) => eprintln!(
+                            Ok(()) => opline!(
                                 "seller node RELAY-CLOSED RE-ARM: retrying the open-pool half of \
                                  the offer subscription (attempt after {} rejection(s), since={} \
                                  overlap); the relay's EOSE confirms it",
@@ -1636,7 +1641,7 @@ impl SellerNodeRunner {
                             ),
                             Err(error) => {
                                 state.reject();
-                                eprintln!(
+                                opline!(
                                     "seller node RELAY-CLOSED RE-ARM failed to send ({error}); next \
                                      attempt in {} backfill tick(s)",
                                     state.cooldown_ticks
@@ -1659,12 +1664,12 @@ impl SellerNodeRunner {
                     {
                         if stalled_since_recovery {
                             if manual_recovery_succeeded {
-                                eprintln!(
+                                opline!(
                                     "seller node subscription RESTORED via MANUAL recovery (relay \
                                      is serving our REQs again)"
                                 );
                             } else {
-                                eprintln!(
+                                opline!(
                                     "seller node subscription RESTORED via SDK BACKGROUND reconnect \
                                      — no manual recovery had succeeded (relay is serving our REQs \
                                      again)"
@@ -1686,14 +1691,14 @@ impl SellerNodeRunner {
                                 .max(0) as u64,
                         );
                         if stalled {
-                            eprintln!(
+                            opline!(
                                 "seller node RELAY-STALL detected: relay has not served our REQs in \
                                  {stall_elapsed}s (threshold {stall_threshold}s); reconnecting + \
                                  resubscribing with since={} overlap",
                                 overlap_since.as_secs()
                             );
                         } else {
-                            eprintln!(
+                            opline!(
                                 "seller node RELAY-RECOVERY triggered: {}; reconnecting + \
                                  resubscribing with since={} overlap",
                                 forced.unwrap_or_default(),
@@ -1711,7 +1716,7 @@ impl SellerNodeRunner {
                                 // The full set was re-subscribed, so the open-pool half is back.
                                 open_pool = None;
                                 manual_recovery_succeeded = true;
-                                eprintln!(
+                                opline!(
                                     "seller node RELAY-STALL recovery SUCCEEDED (attempts={attempts}, \
                                      outage={outage}s): reconnected + resubscribed \
                                      (offers+awards+1059, since={} overlap)",
@@ -1720,7 +1725,7 @@ impl SellerNodeRunner {
                             }
                             Err(error) => {
                                 // Leave the clocks untouched so the next heartbeat tick retries.
-                                eprintln!(
+                                opline!(
                                     "seller node RELAY-STALL recovery FAILED (will retry next heartbeat tick): {error}"
                                 );
                             }
@@ -1742,7 +1747,7 @@ impl SellerNodeRunner {
                             self.drain().await;
                         }
                         Ok(RelayPoolNotification::Shutdown) => {
-                            eprintln!("seller node: relay pool shutdown; loop ending");
+                            opline!("seller node: relay pool shutdown; loop ending");
                             break;
                         }
                         // A relay `CLOSED` kills ONE subscription while the socket stays up, so the
@@ -1755,7 +1760,7 @@ impl SellerNodeRunner {
                         }) => {
                             let id = subscription_id.to_string();
                             let label = subscription_label(&id);
-                            eprintln!(
+                            opline!(
                                 "seller node RELAY-CLOSED: relay closed the {label} subscription \
                                  (id={id}): {reason}"
                             );
@@ -1774,7 +1779,7 @@ impl SellerNodeRunner {
                             // re-challenge sweep closing auth-scoped subs from the pre-expiry
                             // generation.
                             if !is_our_subscription(&id) {
-                                eprintln!(
+                                opline!(
                                     "{}",
                                     unknown_close_diagnostic(
                                         &id,
@@ -1810,7 +1815,7 @@ impl SellerNodeRunner {
                                             open_pool = Some(OpenPoolDegrade::new());
                                             (0, 0)
                                         });
-                                        eprintln!(
+                                        opline!(
                                             "seller node RELAY-CLOSED DEGRADE: offer subscription \
                                              re-armed TARGETED-ONLY (open-pool half dropped after \
                                              {rejections} consecutive refusal(s); the open-pool half \
@@ -1820,7 +1825,7 @@ impl SellerNodeRunner {
                                         );
                                     }
                                     Err(error) => {
-                                        eprintln!(
+                                        opline!(
                                             "seller node RELAY-CLOSED degrade failed ({error}); \
                                              forcing full recovery on the next heartbeat tick"
                                         );
@@ -1859,7 +1864,7 @@ impl SellerNodeRunner {
                                 );
                                 match self.subscribe_one(&id, Some(overlap)).await {
                                     Ok(()) => {
-                                        eprintln!(
+                                        opline!(
                                             "seller node RELAY-CLOSED RETRY: the {label} \
                                              subscription pins #p to our OWN pubkey and this session \
                                              authenticated {}s ago, so `restricted:` here is the \
@@ -1870,7 +1875,7 @@ impl SellerNodeRunner {
                                         );
                                         continue;
                                     }
-                                    Err(error) => eprintln!(
+                                    Err(error) => opline!(
                                         "seller node RELAY-CLOSED retry failed ({error}); forcing \
                                          full recovery on the next heartbeat tick"
                                     ),
@@ -1892,7 +1897,7 @@ impl SellerNodeRunner {
                         }) if eose_id.to_string() == OFFER_SUB_ID => {
                             if open_pool.is_some_and(|state| state.attempt_pending) {
                                 open_pool = None;
-                                eprintln!(
+                                opline!(
                                     "seller node RELAY-CLOSED RE-ARMED: the open-pool half of the \
                                      offer subscription is live again (the relay served the grouped \
                                      REQ); no reconnect was required"
@@ -1902,7 +1907,7 @@ impl SellerNodeRunner {
                         Ok(_) => {}
                         Err(error) => {
                             // A broadcast lag is recoverable — never go permanently deaf.
-                            eprintln!("seller node WARN: notification stream {error}; continuing");
+                            opline!("seller node WARN: notification stream {error}; continuing");
                             continue;
                         }
                     }
@@ -1950,14 +1955,14 @@ impl SellerNodeRunner {
                                     .max(0) as u64,
                             );
                             match self.subscribe_all(Some(overlap)).await {
-                                Ok(()) => eprintln!(
+                                Ok(()) => opline!(
                                     "seller node RELAY-AUTH RESUBSCRIBE: re-issued offers+awards+\
                                      kind-1059 on a completed NIP-42 auth (since={} overlap), so a \
                                      relay that re-challenged auth on this live socket does not leave \
                                      the money leg silently deaf",
                                     overlap.as_secs()
                                 ),
-                                Err(error) => eprintln!(
+                                Err(error) => opline!(
                                     "seller node RELAY-AUTH RESUBSCRIBE failed ({error}); the next \
                                      completed auth or the wrap backfill retries"
                                 ),
@@ -2006,24 +2011,24 @@ impl SellerNodeRunner {
                 use nostr_sdk::JsonUtil as _;
                 match nostr_sdk::Event::from_json(&signed.json) {
                     Ok(feedback) => match self.client.send_event_to([&self.relay_url], &feedback).await {
-                        Ok(_) => eprintln!(
+                        Ok(_) => opline!(
                             "seller node buyer feedback surfaced: offer={offer_id} reason_code={} reason={reason}",
                             reason_code.as_str()
                         ),
-                        Err(error) => eprintln!(
+                        Err(error) => opline!(
                             "seller node WARN: buyer feedback publish failed offer={offer_id} ({error})"
                         ),
                     },
                     Err(error) => {
-                        eprintln!("seller node buyer feedback encode failed (continuing): {error}")
+                        opline!("seller node buyer feedback encode failed (continuing): {error}")
                     }
                 }
             }
             Ok(Err(error)) => {
-                eprintln!("seller node buyer feedback sign failed (continuing): {error}")
+                opline!("seller node buyer feedback sign failed (continuing): {error}")
             }
             Err(error) => {
-                eprintln!("seller node signer actor gone at buyer feedback (continuing): {error}")
+                opline!("seller node signer actor gone at buyer feedback (continuing): {error}")
             }
         }
     }
@@ -2038,6 +2043,36 @@ impl SellerNodeRunner {
             reason,
         )
         .await;
+    }
+
+    /// The "is it working" line (#489): one periodic line that answers the operator's question
+    /// directly, instead of leaving them to infer health from an internal `kind-1059` fetch line.
+    ///
+    /// A healthy idle seat is otherwise almost silent, so the honest answer had to be stated rather
+    /// than implied by absence of errors. Rides the wrap-backfill tick because that timer already
+    /// exists at the cadence an operator wants, and is emitted BEFORE the fetch so it still appears
+    /// on a cycle whose cursor read aborts.
+    ///
+    /// `serving` is the authority on whether the seat can take work — NOT whether `names` is empty,
+    /// which is also true for an unlabelled `--agent-argv` hatch that is serving perfectly well.
+    /// Both come from ONE `advertisement()` snapshot, as that method requires.
+    fn report_status(&self) {
+        let roster = self.agents.advertisement();
+        let busy = self.slots.capacity.saturating_sub(self.slots.available());
+        let harnesses = if roster.names.is_empty() {
+            "unnamed (argv hatch)".to_owned()
+        } else {
+            roster.names.join(", ")
+        };
+        opline!(
+            "seller node status: {} · harness: {harnesses} · {busy}/{} job slot(s) busy",
+            if roster.serving {
+                "ADVERTISING, ready for work"
+            } else {
+                "NOT serving — no live harness"
+            },
+            self.slots.capacity
+        );
     }
 
     /// Re-ask the relay for stored payment gift-wraps and ingest whatever comes back.
@@ -2056,20 +2091,21 @@ impl SellerNodeRunner {
     /// external supervision has — a parked process satisfies pid-presence, so absence of failures is
     /// not evidence of health. Do not make it conditional to reduce noise.
     async fn run_wrap_backfill(&self) {
+        self.report_status();
         let since = match resolve_backfill_since(
             self.node.store().last_receipt_unix(),
             self.node.store().oldest_unsettled_delivery_unix(),
         ) {
             Ok(since) => since,
             Err(error) => {
-                eprintln!(
+                opline!(
                     "seller node wrap backfill: ABORT — cursor read failed (retrying next cycle, \
                      NOT defaulting to since=0): {error}"
                 );
                 return;
             }
         };
-        eprintln!("seller node wrap backfill (periodic): fetching stored kind-1059(s) since ts={since}");
+        opline!("seller node wrap backfill (periodic): fetching stored kind-1059(s) since ts={since}");
         let filter = Filter::new()
             .kind(Kind::GiftWrap)
             .pubkey(self.seller_pubkey)
@@ -2082,7 +2118,7 @@ impl SellerNodeRunner {
         .await
         {
             Ok(Ok(events)) => {
-                eprintln!(
+                opline!(
                     "seller node wrap backfill (periodic): {} stored kind-1059(s) returned since ts={since}",
                     events.len()
                 );
@@ -2091,11 +2127,11 @@ impl SellerNodeRunner {
                 }
                 self.drain().await;
             }
-            Ok(Err(error)) => eprintln!(
+            Ok(Err(error)) => opline!(
                 "seller node WARN: wrap backfill fetch failed (continuing; live 1059 subscription \
                  active): {error}"
             ),
-            Err(_) => eprintln!(
+            Err(_) => opline!(
                 "seller node WARN: wrap backfill fetch timed out after {}s (continuing; live 1059 \
                  subscription active)",
                 WRAP_BACKFILL_FETCH_TIMEOUT.as_secs()
@@ -2117,7 +2153,7 @@ impl SellerNodeRunner {
             Err(error) => {
                 // Fail toward AVAILABLE, as this path always has, but say so: a silent read failure
                 // that parked the seat would be the same invisible-refusal shape as #313 itself.
-                eprintln!(
+                opline!(
                     "seller node heartbeat: in-flight count unavailable ({error}); \
                      advertising as free this tick"
                 );
@@ -2140,17 +2176,17 @@ impl SellerNodeRunner {
                 match nostr_sdk::Event::from_json(&signed.json) {
                     Ok(event) => {
                         if let Err(error) = self.client.send_event_to([&self.relay_url], &event).await {
-                            eprintln!("seller node heartbeat publish failed (continuing): {error}");
+                            opline!("seller node heartbeat publish failed (continuing): {error}");
                         }
                     }
                     Err(error) => {
-                        eprintln!("seller node heartbeat encode failed (continuing): {error}")
+                        opline!("seller node heartbeat encode failed (continuing): {error}")
                     }
                 }
             }
-            Ok(Err(error)) => eprintln!("seller node heartbeat sign failed (continuing): {error}"),
+            Ok(Err(error)) => opline!("seller node heartbeat sign failed (continuing): {error}"),
             Err(error) => {
-                eprintln!("seller node signer actor gone at heartbeat (continuing): {error}")
+                opline!("seller node signer actor gone at heartbeat (continuing): {error}")
             }
         }
     }
@@ -2173,7 +2209,7 @@ impl SellerNodeRunner {
                 Ok(()) => return Ok(attempt),
                 Err(error) if attempt < RECOVERY_MAX_ATTEMPTS => {
                     let backoff = recovery_backoff(attempt);
-                    eprintln!(
+                    opline!(
                         "seller node RELAY-STALL recovery attempt {attempt} failed ({error}); \
                          retrying in {}s",
                         backoff.as_secs()
@@ -2213,7 +2249,7 @@ impl SellerNodeRunner {
                 // the REQ itself still authenticates — but a p-gated resubscribe issued before that
                 // completes is exactly the condition above, so say so rather than report a clean
                 // recovery.
-                eprintln!(
+                opline!(
                     "seller node WARN: recovery saw no NIP-42 challenge within {CONNECT_WAIT:?}; \
                      resubscribing anyway (auto-auth stays ON). p-gated kind-1059 receive may be \
                      degraded until auth completes."
@@ -2227,7 +2263,7 @@ impl SellerNodeRunner {
                 // still knows about. Re-registering makes a failed attempt no worse than not having
                 // tried; the next heartbeat tick retries the whole recovery.
                 if let Err(restore) = self.subscribe_all(Some(overlap_since)).await {
-                    eprintln!(
+                    opline!(
                         "seller node WARN: subscriptions could not be restored after a failed \
                          recovery ({restore}); the next heartbeat tick retries"
                     );
@@ -2252,12 +2288,12 @@ impl SellerNodeRunner {
     fn sweep_lapsed_claims(&self) {
         for job_id in self.slots.sweep_lapsed(Instant::now()) {
             match self.node.store().release_claim(&job_id, now_unix()) {
-                Ok(()) => eprintln!(
+                Ok(()) => opline!(
                     "seller node slot reclaimed job_id={job_id}: parked claim lapsed unawarded ({} slot(s) free)",
                     self.slots.available()
                 ),
                 Err(error) => {
-                    eprintln!("seller node slot reclaim job_id={job_id}: release_claim failed ({error})")
+                    opline!("seller node slot reclaim job_id={job_id}: release_claim failed ({error})")
                 }
             }
         }
@@ -2265,14 +2301,14 @@ impl SellerNodeRunner {
 
     async fn on_offer(&self, event: &nostr_sdk::Event) {
         let Some(seller) = self.node.home().config.seller.clone() else {
-            eprintln!("seller node offer skipped: no [seller] config");
+            opline!("seller node offer skipped: no [seller] config");
             return;
         };
         let draft = event_to_draft(event);
         let offer = match parse_offer(&draft) {
             Ok(offer) => offer,
             Err(error) => {
-                eprintln!(
+                opline!(
                     "seller node offer skip id={}: {}",
                     event.id,
                     offer_parse_refusal(&error)
@@ -2285,14 +2321,14 @@ impl SellerNodeRunner {
         match crate::contribution::parse_contribution_offer(&draft.tags) {
             Ok(None) => {}
             Ok(Some(_)) => {
-                eprintln!(
+                opline!(
                     "seller node offer skip id={}: contribution offers not served by the node yet",
                     event.id
                 );
                 return;
             }
             Err(error) => {
-                eprintln!("seller node offer skip id={}: malformed contribution ({error})", event.id);
+                opline!("seller node offer skip id={}: malformed contribution ({error})", event.id);
                 return;
             }
         }
@@ -2303,7 +2339,7 @@ impl SellerNodeRunner {
         {
             ClaimDecision::Claim { deadline_unix } => deadline_unix,
             ClaimDecision::Skip(skip) => {
-                eprintln!("seller node offer skip id={}: {}", event.id, skip.reason());
+                opline!("seller node offer skip id={}: {}", event.id, skip.reason());
                 // Buyer-visibility: a TARGETED-to-self under-rate refusal also emits a feedback-kind
                 // `status=error` so the buyer learns WHY (distinguishes rate-refusal from a crash /
                 // silence). Open-pool under-rate stays log-only (spam guard); a lapsed offer never
@@ -2320,7 +2356,7 @@ impl SellerNodeRunner {
         // Capacity back-pressure: never hold unbounded parked claims.
         match self.node.store().health() {
             Ok(health) if health.open_claims >= AWAITING_AWARD_CAP => {
-                eprintln!(
+                opline!(
                     "seller node offer skip id={}: awaiting-award backlog full (cap {AWAITING_AWARD_CAP})",
                     event.id
                 );
@@ -2328,7 +2364,7 @@ impl SellerNodeRunner {
             }
             Ok(_) => {}
             Err(error) => {
-                eprintln!("seller node offer skip id={}: store health read failed ({error})", event.id);
+                opline!("seller node offer skip id={}: store health read failed ({error})", event.id);
                 return;
             }
         }
@@ -2345,7 +2381,7 @@ impl SellerNodeRunner {
             .store()
             .record_offer(&offer_row(&job_id, &buyer_pubkey, &offer), now)
         {
-            eprintln!("seller node offer skip id={job_id}: record offer failed ({error})");
+            opline!("seller node offer skip id={job_id}: record offer failed ({error})");
             return;
         }
 
@@ -2358,7 +2394,7 @@ impl SellerNodeRunner {
         ) {
             Ok(creq) => creq,
             Err(error) => {
-                eprintln!("seller node offer skip id={job_id}: creq build failed ({error})");
+                opline!("seller node offer skip id={job_id}: creq build failed ({error})");
                 return;
             }
         };
@@ -2376,7 +2412,7 @@ impl SellerNodeRunner {
         // never concurrently with itself, so two offers can never both take the last slot.
         let reserved = self.slots.try_reserve(&job_id);
         if reserved == Reserve::Full {
-            eprintln!("seller node offer skip id={job_id}: {}", SkipReason::SlotsBusy.reason());
+            opline!("seller node offer skip id={job_id}: {}", SkipReason::SlotsBusy.reason());
             return;
         }
         // Release a FRESH reservation if the claim does not actually become a new parked claim (dedup
@@ -2396,7 +2432,7 @@ impl SellerNodeRunner {
             now,
         ) {
             Ok(super::store::Claimed::New) => {
-                eprintln!(
+                opline!(
                     "seller node claimed job_id={job_id} buyer={buyer_pubkey} amount={} deadline={deadline_unix} slot-reserved (awaiting award; {} slot(s) free)",
                     offer.amount,
                     self.slots.available()
@@ -2404,11 +2440,14 @@ impl SellerNodeRunner {
                 // The caller drains after dispatch, publishing the just-enqueued claim.
             }
             Ok(super::store::Claimed::Idempotent) => {
-                eprintln!("seller node offer id={job_id}: already claimed (dedup no-op)");
+                // Verbose-only (#489): a re-seen offer we already claimed is nothing happening.
+                // It reports no state change and prompts no operator decision, and relays redeliver
+                // often enough that it crowds out lines that do.
+                opline_verbose!("seller node offer id={job_id}: already claimed (dedup no-op)");
                 release_on_no_claim(self);
             }
             Err(error) => {
-                eprintln!("seller node claim failed job_id={job_id}: {error}");
+                opline!("seller node claim failed job_id={job_id}: {error}");
                 release_on_no_claim(self);
             }
         }
@@ -2446,16 +2485,16 @@ impl SellerNodeRunner {
         let buyer = match self.node.store().offer_facts(&job_id) {
             Ok(Some((buyer, _, _))) => buyer,
             Ok(None) => {
-                eprintln!("seller node accept ignore job_id={job_id}: no offer of ours recorded");
+                opline!("seller node accept ignore job_id={job_id}: no offer of ours recorded");
                 return;
             }
             Err(error) => {
-                eprintln!("seller node accept ignore job_id={job_id}: offer read failed ({error})");
+                opline!("seller node accept ignore job_id={job_id}: offer read failed ({error})");
                 return;
             }
         };
         if event.pubkey.to_hex() != buyer {
-            eprintln!(
+            opline!(
                 "seller node accept ignore job_id={job_id}: author is not the offer's buyer"
             );
             return;
@@ -2463,11 +2502,11 @@ impl SellerNodeRunner {
         match self.node.store().job_creq(&job_id) {
             Ok(Some(_)) => {}
             Ok(None) => {
-                eprintln!("seller node accept ignore job_id={job_id}: no claim of ours");
+                opline!("seller node accept ignore job_id={job_id}: no claim of ours");
                 return;
             }
             Err(error) => {
-                eprintln!("seller node accept ignore job_id={job_id}: claim read failed ({error})");
+                opline!("seller node accept ignore job_id={job_id}: claim read failed ({error})");
                 return;
             }
         }
@@ -2476,7 +2515,7 @@ impl SellerNodeRunner {
             // The overwhelmingly common case: the AWARD already bound this job. The ACCEPT is
             // information, not instruction — record nothing, run nothing.
             Ok(Some(_)) => {
-                eprintln!(
+                opline!(
                     "seller node accept job_id={job_id} buyer={buyer}: pay-bind observed (already awarded — no action)"
                 );
             }
@@ -2489,16 +2528,16 @@ impl SellerNodeRunner {
                     &buyer,
                     now_unix(),
                 ) {
-                    Ok(outcome) => eprintln!(
+                    Ok(outcome) => opline!(
                         "seller node accept job_id={job_id} buyer={buyer}: bound from ACCEPT with no prior award ({outcome:?}) — NOT executing"
                     ),
-                    Err(error) => eprintln!(
+                    Err(error) => opline!(
                         "seller node accept job_id={job_id}: bind from accept failed ({error})"
                     ),
                 }
             }
             Err(error) => {
-                eprintln!("seller node accept ignore job_id={job_id}: award read failed ({error})")
+                opline!("seller node accept ignore job_id={job_id}: award read failed ({error})")
             }
         }
     }
@@ -2517,11 +2556,11 @@ impl SellerNodeRunner {
         let buyer = match self.node.store().offer_facts(&job_id) {
             Ok(Some((buyer, _, _))) => buyer,
             Ok(None) => {
-                eprintln!("seller node award ignore job_id={job_id}: no offer of ours recorded");
+                opline!("seller node award ignore job_id={job_id}: no offer of ours recorded");
                 return;
             }
             Err(error) => {
-                eprintln!("seller node award ignore job_id={job_id}: offer read failed ({error})");
+                opline!("seller node award ignore job_id={job_id}: offer read failed ({error})");
                 return;
             }
         };
@@ -2529,11 +2568,11 @@ impl SellerNodeRunner {
         match self.node.store().job_creq(&job_id) {
             Ok(Some(_)) => {}
             Ok(None) => {
-                eprintln!("seller node award ignore job_id={job_id}: no claim of ours");
+                opline!("seller node award ignore job_id={job_id}: no claim of ours");
                 return;
             }
             Err(error) => {
-                eprintln!("seller node award ignore job_id={job_id}: claim read failed ({error})");
+                opline!("seller node award ignore job_id={job_id}: claim read failed ({error})");
                 return;
             }
         }
@@ -2571,7 +2610,7 @@ impl SellerNodeRunner {
                             }
                             Ok(None) | Err(_) => "unknown".to_owned(),
                         };
-                        eprintln!(
+                        opline!(
                             "seller node awarded job_id={job_id} buyer={buyer} requested_agent={requested_agent} — executing (spawned; {} slot(s) free)",
                             self.slots.available()
                         );
@@ -2582,27 +2621,31 @@ impl SellerNodeRunner {
                         });
                     }
                     Ok(super::store::Awarded::Duplicate) => {
-                        eprintln!("seller node award dedup job_id={job_id} (already recorded)")
+                        // Verbose-only (#489): the award was already recorded — a redelivery, not
+                        // an event. The FIRST award still logs; only the duplicate is quiet.
+                        opline_verbose!(
+                            "seller node award dedup job_id={job_id} (already recorded)"
+                        )
                     }
                     Ok(super::store::Awarded::NoClaim) => {
-                        eprintln!("seller node award job_id={job_id}: no claim to bind");
+                        opline!("seller node award job_id={job_id}: no claim to bind");
                         // No claim to bind ⇒ any slot we reserved for it is orphaned; return it.
                         self.slots.release(&job_id);
                     }
-                    Err(error) => eprintln!("seller node award record failed job_id={job_id}: {error}"),
+                    Err(error) => opline!("seller node award record failed job_id={job_id}: {error}"),
                 }
             }
             AwardMatch::Release => {
                 // The buyer picked another seller: release the durable claim AND its reserved slot.
                 self.slots.release(&job_id);
                 match self.node.store().release_claim(&job_id, now_unix()) {
-                    Ok(()) => eprintln!(
+                    Ok(()) => opline!(
                         "seller node released claim job_id={job_id}: buyer picked another seller's claim"
                     ),
-                    Err(error) => eprintln!("seller node release failed job_id={job_id}: {error}"),
+                    Err(error) => opline!("seller node release failed job_id={job_id}: {error}"),
                 }
             }
-            AwardMatch::Ignore => eprintln!(
+            AwardMatch::Ignore => opline!(
                 "seller node award ignore job_id={job_id}: author not the offer buyer, or our claim not yet published"
             ),
         }
@@ -2638,7 +2681,7 @@ impl SellerNodeRunner {
                 match run_harness_probe(&argv, &sandbox, &identity, &workdir, &sentinel).await {
                     Ok(()) => {
                         roster.restore(harness);
-                        eprintln!(
+                        opline!(
                             "seller node harness RESTORED {label}: self-probe delivered its sentinel — \
                              now advertising {:?} of {} resolved",
                             roster.advertised(),
@@ -2647,7 +2690,7 @@ impl SellerNodeRunner {
                     }
                     Err((reason, fault)) => {
                         let state = roster.fault(harness, fault, Instant::now());
-                        eprintln!(
+                        opline!(
                             "seller node harness probe FAILED {label}: {reason} — {}",
                             state.reason()
                         );
@@ -2670,7 +2713,7 @@ impl SellerNodeRunner {
                     .agents
                     .label(verdict.index)
                     .unwrap_or_else(|| "<unlabelled>".to_owned());
-                eprintln!(
+                opline!(
                     "seller node pre-advertise DROPPED {label}: {reason} — {}",
                     state.reason()
                 );
@@ -2692,7 +2735,7 @@ impl SellerNodeRunner {
         let label = self.agents.label(harness).unwrap_or_else(|| "<unlabelled>".to_owned());
         // The denominator belongs in the line: "1 harness dropped" means nothing without how many
         // this node had, and a roster that has reached 0 is a node that has gone quiet on the market.
-        eprintln!(
+        opline!(
             "seller node harness DROPPED {label}: {} — now advertising {:?} of {} resolved",
             state.reason(),
             self.agents.advertised(),
@@ -2725,23 +2768,23 @@ impl SellerNodeRunner {
         match self.node.store().job_state(job_id) {
             Ok(Some(state)) if should_resume_execution(state) => {}
             Ok(Some(state)) => {
-                eprintln!(
+                opline!(
                     "seller node execute skip job_id={job_id}: job already {state:?} (idempotent — not re-run)"
                 );
                 return;
             }
             Ok(None) => {
-                eprintln!("seller node execute skip job_id={job_id}: no job row (idempotent)");
+                opline!("seller node execute skip job_id={job_id}: no job row (idempotent)");
                 return;
             }
             Err(error) => {
-                eprintln!("seller node execute job_id={job_id}: job_state read failed ({error}); not executing");
+                opline!("seller node execute job_id={job_id}: job_state read failed ({error}); not executing");
                 return;
             }
         }
 
         let Some(seller) = self.node.home().config.seller.clone() else {
-            eprintln!("seller node execute skip job_id={job_id}: no [seller] config");
+            opline!("seller node execute skip job_id={job_id}: no [seller] config");
             self.fail_job(job_id).await;
             return;
         };
@@ -2749,12 +2792,12 @@ impl SellerNodeRunner {
         let offer = match self.node.store().offer_row(job_id) {
             Ok(Some(offer)) => offer,
             Ok(None) => {
-                eprintln!("seller node execute fail job_id={job_id}: offer facts missing");
+                opline!("seller node execute fail job_id={job_id}: offer facts missing");
                 self.fail_job(job_id).await;
                 return;
             }
             Err(error) => {
-                eprintln!("seller node execute fail job_id={job_id}: offer read failed ({error})");
+                opline!("seller node execute fail job_id={job_id}: offer read failed ({error})");
                 self.fail_job(job_id).await;
                 return;
             }
@@ -2764,7 +2807,7 @@ impl SellerNodeRunner {
         let stored_creq = match self.node.store().job_creq(job_id) {
             Ok(Some(creq)) => creq,
             _ => {
-                eprintln!("seller node execute fail job_id={job_id}: stored creq missing");
+                opline!("seller node execute fail job_id={job_id}: stored creq missing");
                 self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK).await;
                 return;
             }
@@ -2783,7 +2826,7 @@ impl SellerNodeRunner {
         // one outcome the registry exists to prevent.
         let requested_agent = offer.requested_agent.clone();
         let Some(selected) = self.agents.dispatch(requested_agent.as_deref()) else {
-            eprintln!(
+            opline!(
                 "seller node execute fail job_id={job_id}: requested agent {:?} is not available on \
                  this node (never substituted)",
                 requested_agent.as_deref().unwrap_or("<any>")
@@ -2802,14 +2845,14 @@ impl SellerNodeRunner {
         if let Some(label) = agent_label.as_deref()
             && let Err(error) = self.node.store().assign_agent(job_id, label)
         {
-            eprintln!(
+            opline!(
                 "seller node execute job_id={job_id}: agent journal write failed (continuing): {error}"
             );
         }
 
         // Move awarded -> executing (idempotent). A failed mark is logged, never fatal.
         if let Err(error) = self.node.store().mark_executing(job_id, now_unix()) {
-            eprintln!("seller node execute job_id={job_id}: mark_executing failed (continuing): {error}");
+            opline!("seller node execute job_id={job_id}: mark_executing failed (continuing): {error}");
         }
 
         let seller_pubkey = self.seller_pubkey.to_hex();
@@ -2821,7 +2864,7 @@ impl SellerNodeRunner {
         )
         .await
         {
-            eprintln!("seller node execute fail job_id={job_id}: workdir init failed ({error})");
+            opline!("seller node execute fail job_id={job_id}: workdir init failed ({error})");
             self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK).await;
             return;
         }
@@ -2847,7 +2890,7 @@ impl SellerNodeRunner {
         let usage = match run_result {
             Ok(usage) => usage,
             Err(error) => {
-                eprintln!("seller node execute fail job_id={job_id}: agent run failed ({error})");
+                opline!("seller node execute fail job_id={job_id}: agent run failed ({error})");
                 self.drop_harness(harness, harness_fault_for(&error));
                 self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK).await;
                 return;
@@ -2881,13 +2924,13 @@ impl SellerNodeRunner {
             self.drop_harness(harness, Some(Fault::Unproven));
             let (reason_code, feedback) = match error {
                 seller_git::SellerGitError::NoExecutionObserved(_) => {
-                    eprintln!(
+                    opline!(
                         "seller node execute fail job_id={job_id}: delivery refused no_sentinel — {error}"
                     );
                     (ReasonCode::NoSentinel, NO_SENTINEL_FEEDBACK)
                 }
                 _ => {
-                    eprintln!(
+                    opline!(
                         "seller node execute fail job_id={job_id}: delivery snapshot failed ({error})"
                     );
                     (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
@@ -2906,12 +2949,12 @@ impl SellerNodeRunner {
             match self.node.signer().http_auth_header(seller.git_remote.clone()).await {
                 Ok(Ok(header)) => Some(header),
                 Ok(Err(error)) => {
-                    eprintln!("seller node execute fail job_id={job_id}: push auth sign failed ({error})");
+                    opline!("seller node execute fail job_id={job_id}: push auth sign failed ({error})");
                     self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                     return;
                 }
                 Err(error) => {
-                    eprintln!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
+                    opline!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
                     self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                     return;
                 }
@@ -2929,7 +2972,7 @@ impl SellerNodeRunner {
         {
             Ok(oid) => oid,
             Err(error) => {
-                eprintln!("seller node execute fail job_id={job_id}: git push failed ({error})");
+                opline!("seller node execute fail job_id={job_id}: git push failed ({error})");
                 self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                 return;
             }
@@ -2940,7 +2983,7 @@ impl SellerNodeRunner {
         let delivery_kind = match seller_delivery_kind(&seller.git_remote, &branch, &commit) {
             Ok(kind) => kind,
             Err(error) => {
-                eprintln!("seller node execute fail job_id={job_id}: delivery kind typing failed ({error})");
+                opline!("seller node execute fail job_id={job_id}: delivery kind typing failed ({error})");
                 self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                 return;
             }
@@ -2958,12 +3001,12 @@ impl SellerNodeRunner {
         let seller_sig = match self.node.signer().sign_receipt_hash(preimage.digest_hex()).await {
             Ok(Ok(sig)) => sig,
             Ok(Err(error)) => {
-                eprintln!("seller node execute fail job_id={job_id}: receipt sign refused ({error})");
+                opline!("seller node execute fail job_id={job_id}: receipt sign refused ({error})");
                 self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                 return;
             }
             Err(error) => {
-                eprintln!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
+                opline!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
                 self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                 return;
             }
@@ -3013,15 +3056,15 @@ impl SellerNodeRunner {
                     .find(|tag| tag.first() == Some("harness"))
                     .and_then(|tag| tag.value())
                     .unwrap_or("unknown");
-                eprintln!(
+                opline!(
                     "seller node delivered job_id={job_id} commit={commit} agent={harness_id} result enqueued"
                 )
             }
-            Ok(false) => eprintln!(
+            Ok(false) => opline!(
                 "seller node execute job_id={job_id}: delivery already journaled (dedup no-op)"
             ),
             Err(error) => {
-                eprintln!("seller node execute fail job_id={job_id}: deliver journal failed ({error})");
+                opline!("seller node execute fail job_id={job_id}: deliver journal failed ({error})");
                 self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                 return;
             }
@@ -3039,26 +3082,26 @@ impl SellerNodeRunner {
     async fn on_gift_wrap(&self, event: &nostr_sdk::Event) {
         let event_id = event.id.to_hex();
         // Log EVERY wrap seen — silence must mean "no wraps", never "lost money".
-        eprintln!("seller node wrap seen event={event_id}");
+        opline!("seller node wrap seen event={event_id}");
 
         let received = match self.node.signer().unwrap_payment_wrap(event.clone()).await {
             Ok(Ok(Some(received))) => received,
             Ok(Ok(None)) => {
-                eprintln!("seller node wrap event={event_id}: not a decodable own-payment wrap (skipped)");
+                opline!("seller node wrap event={event_id}: not a decodable own-payment wrap (skipped)");
                 return;
             }
             Ok(Err(error)) => {
-                eprintln!("seller node wrap event={event_id}: decode failed ({error})");
+                opline!("seller node wrap event={event_id}: decode failed ({error})");
                 return;
             }
             Err(error) => {
-                eprintln!("seller node wrap event={event_id}: signer actor gone ({error})");
+                opline!("seller node wrap event={event_id}: signer actor gone ({error})");
                 return;
             }
         };
         let job_id = received.payload.job_id().to_owned();
         if job_id.is_empty() {
-            eprintln!("seller node wrap event={event_id}: payment carries no job id (skipped)");
+            opline!("seller node wrap event={event_id}: payment carries no job id (skipped)");
             return;
         }
 
@@ -3066,12 +3109,12 @@ impl SellerNodeRunner {
         // read error (never read an unreadable journal as "not paid ⇒ safe to redeem again").
         match self.node.store().has_receipt(&job_id) {
             Ok(true) => {
-                eprintln!("seller node wrap event={event_id}: job {job_id} already receipted, skipping");
+                opline!("seller node wrap event={event_id}: job {job_id} already receipted, skipping");
                 return;
             }
             Ok(false) => {}
             Err(error) => {
-                eprintln!("seller node wrap event={event_id}: has_receipt read failed for {job_id} (fail-closed, skipping): {error}");
+                opline!("seller node wrap event={event_id}: has_receipt read failed for {job_id} (fail-closed, skipping): {error}");
                 return;
             }
         }
@@ -3081,11 +3124,11 @@ impl SellerNodeRunner {
         let offer = match self.node.store().offer_row(&job_id) {
             Ok(Some(offer)) => offer,
             Ok(None) => {
-                eprintln!("seller node wrap event={event_id}: no offer recorded for job {job_id} (skipped)");
+                opline!("seller node wrap event={event_id}: no offer recorded for job {job_id} (skipped)");
                 return;
             }
             Err(error) => {
-                eprintln!("seller node wrap event={event_id}: offer read failed for {job_id} ({error})");
+                opline!("seller node wrap event={event_id}: offer read failed for {job_id} ({error})");
                 return;
             }
         };
@@ -3093,7 +3136,7 @@ impl SellerNodeRunner {
         // Seal-sender guard: the authenticated buyer MUST be the bound offer buyer.
         let buyer = received.buyer_pubkey.to_hex();
         if !seal_sender_is_bound_buyer(&buyer, &offer.buyer_pubkey) {
-            eprintln!(
+            opline!(
                 "seller node wrap event={event_id}: payment sender {buyer} is not the bound offer buyer {} for job {job_id} — refused",
                 offer.buyer_pubkey
             );
@@ -3106,14 +3149,14 @@ impl SellerNodeRunner {
         let stored_creq = match self.node.store().job_creq(&job_id) {
             Ok(Some(creq)) => creq,
             _ => {
-                eprintln!("seller node wrap event={event_id}: no stored creq for job {job_id} (skipped)");
+                opline!("seller node wrap event={event_id}: no stored creq for job {job_id} (skipped)");
                 return;
             }
         };
         let request = match crate::gateway::creq::parse_creq(&stored_creq) {
             Ok(request) => request,
             Err(error) => {
-                eprintln!("seller node wrap event={event_id}: stored creq unparseable for job {job_id} ({error})");
+                opline!("seller node wrap event={event_id}: stored creq unparseable for job {job_id} ({error})");
                 return;
             }
         };
@@ -3121,14 +3164,14 @@ impl SellerNodeRunner {
         let mint_str = payload_mint.to_string();
         // Redeem guard: the realized mint MUST be one the STORED creq advertised.
         if !request.mints.contains(&payload_mint) {
-            eprintln!(
+            opline!(
                 "seller node wrap event={event_id}: realized mint {mint_str} outside the stored creq's accepted mints for job {job_id} — refused"
             );
             return;
         }
         // Real-mint fence: a real mint can never settle unless the operator opted in.
         if !crate::home::mint_allowed(&mint_str, self.node.home().config.allow_real_mints) {
-            eprintln!(
+            opline!(
                 "seller node wrap event={event_id}: mint {mint_str} not allowed (allow_real_mints={}) for job {job_id} — refused",
                 self.node.home().config.allow_real_mints
             );
@@ -3155,7 +3198,7 @@ impl SellerNodeRunner {
         let terms = match policy.terms_for_offer(payload_mint.clone(), &parsed_offer, &seller_pubkey) {
             Ok(terms) => terms,
             Err(error) => {
-                eprintln!("seller node wrap event={event_id}: payment terms refused for job {job_id} ({error})");
+                opline!("seller node wrap event={event_id}: payment terms refused for job {job_id} ({error})");
                 return;
             }
         };
@@ -3165,18 +3208,18 @@ impl SellerNodeRunner {
         let cashu_key = match self.node.signer().cashu_p2pk_secret().await {
             Ok(Ok(key)) => key,
             Ok(Err(error)) => {
-                eprintln!("seller node wrap event={event_id}: cashu key derive failed for job {job_id} ({error})");
+                opline!("seller node wrap event={event_id}: cashu key derive failed for job {job_id} ({error})");
                 return;
             }
             Err(error) => {
-                eprintln!("seller node wrap event={event_id}: signer actor gone ({error})");
+                opline!("seller node wrap event={event_id}: signer actor gone ({error})");
                 return;
             }
         };
         let wallet = match crate::buyer_fund::open_wallet_at_mint_async(self.node.home(), &mint_str).await {
             Ok(wallet) => wallet,
             Err(error) => {
-                eprintln!("seller node wrap event={event_id}: open wallet at {mint_str} failed for job {job_id} ({error})");
+                opline!("seller node wrap event={event_id}: open wallet at {mint_str} failed for job {job_id} ({error})");
                 return;
             }
         };
@@ -3197,7 +3240,7 @@ impl SellerNodeRunner {
                 .store()
                 .append_pending_receive(&job_id, &token_hash, &buyer, &mint_str, expected, now_unix())
         {
-            eprintln!("seller node wrap event={event_id}: breadcrumb write failed for job {job_id} ({error}) — refusing to receive");
+            opline!("seller node wrap event={event_id}: breadcrumb write failed for job {job_id} ({error}) — refusing to receive");
             return;
         }
 
@@ -3213,15 +3256,15 @@ impl SellerNodeRunner {
         }) {
             RedeemDecision::Finalize(amount) => amount,
             RedeemDecision::IdempotentNoOp => {
-                eprintln!("seller node wrap event={event_id}: idempotent no-op (already spent AND a completed receipt exists) for job {job_id}");
+                opline!("seller node wrap event={event_id}: idempotent no-op (already spent AND a completed receipt exists) for job {job_id}");
                 return;
             }
             RedeemDecision::Refuse(reason) => {
-                eprintln!("seller node wrap event={event_id}: receive refused for job {job_id} ({reason}) — buffered for reconcile");
+                opline!("seller node wrap event={event_id}: receive refused for job {job_id} ({reason}) — buffered for reconcile");
                 return;
             }
         };
-        eprintln!(
+        opline!(
             "seller node collect ok: job_id={job_id} amount_received={amount_received} expected={expected} mint={mint_str}"
         );
 
@@ -3238,15 +3281,15 @@ impl SellerNodeRunner {
                 // publishes that; the seller never sees its id on this path), so name it for what it
                 // is rather than inviting an operator to grep the relay for a 3400 that will not
                 // match.
-                eprintln!(
+                opline!(
                     "seller node paid job_id={job_id} amount={amount_received} payment_wrap={event_id}"
                 )
             }
-            Ok(super::store::Collected::Duplicate) => eprintln!(
+            Ok(super::store::Collected::Duplicate) => opline!(
                 "seller node wrap event={event_id}: receipt already collected for job {job_id} (dedup no-op)"
             ),
             Err(error) => {
-                eprintln!("seller node wrap event={event_id}: receipt write failed for job {job_id} ({error})")
+                opline!("seller node wrap event={event_id}: receipt write failed for job {job_id} ({error})")
             }
         }
     }
@@ -3255,7 +3298,7 @@ impl SellerNodeRunner {
     /// the loop keeps serving).
     async fn fail_job(&self, job_id: &str) {
         if let Err(error) = self.node.store().fail_job(job_id, now_unix()) {
-            eprintln!("seller node job_id={job_id}: fail_job write error (continuing): {error}");
+            opline!("seller node job_id={job_id}: fail_job write error (continuing): {error}");
         }
     }
 
@@ -3281,12 +3324,12 @@ impl SellerNodeRunner {
     async fn drain(&self) {
         let now = now_unix();
         match drain_once(self.node.store(), &self.publisher, now).await {
-            Ok(report) if report.confirmed > 0 || report.failed > 0 => eprintln!(
+            Ok(report) if report.confirmed > 0 || report.failed > 0 => opline!(
                 "seller node outbox drain: confirmed={} failed={} expired={}",
                 report.confirmed, report.failed, report.expired
             ),
             Ok(_) => {}
-            Err(error) => eprintln!("seller node outbox drain error (continuing): {error}"),
+            Err(error) => opline!("seller node outbox drain error (continuing): {error}"),
         }
     }
 }

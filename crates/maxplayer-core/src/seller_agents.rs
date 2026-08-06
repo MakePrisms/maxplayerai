@@ -63,11 +63,17 @@ pub struct AgentVerdict {
 }
 
 impl AgentVerdict {
-    /// `PASS <name> argv0=<bin>` / `FAIL <name>: <reason>` — one line per listed preset.
+    /// `PASS <name> binary resolves argv0=<bin> (…)` / `FAIL <name>: <reason>` — one line per
+    /// listed preset.
+    ///
+    /// The PASS wording names only what this check had access to: the adapter binary was found.
+    /// It says nothing about whether the underlying agent CLI is authenticated — a resolvable
+    /// adapter with no credentials still fails the pre-advertise probe (#488, the #252 class).
+    /// Naming the limit here keeps a PASS from reading as "this seat can do work".
     pub fn line(&self) -> String {
         match &self.outcome {
             Ok(argv) => format!(
-                "PASS {} argv0={}",
+                "PASS {} binary resolves argv0={} (auth not checked here — proven at the pre-advertise probe)",
                 self.name,
                 argv.first().map(String::as_str).unwrap_or("")
             ),

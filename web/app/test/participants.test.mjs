@@ -163,6 +163,61 @@ test("the seat name resolves from kind-0, not the 31990 handler (#275)", () => {
   assert.equal(row.name, "frogger", "kind-0 name is authoritative; the 31990 name is ignored for display");
 });
 
+/**
+ * REGRESSION: a kind-0 ENRICHES a participant, it never creates one.
+ *
+ * When kind-0 first began arriving, the seller board's PROFILE arm called the
+ * same row-creating getter as the heartbeat and advert arms, so every profile
+ * on the relay became a runner: 13 of 24 rows were strangers with no claim, no
+ * delivery, no advert and no heartbeat — including a pubkey whose only activity
+ * was buying.
+ */
+test("REGRESSION: a kind-0 alone never creates a seller row", () => {
+  const stranger = pk("9");
+  const events = [
+    ...trade("o1", { seller: pk("c") }),
+    ev(PROFILE, { id: "pstranger", pubkey: stranger, at: NOW - 100, content: '{"name":"bob"}' }),
+  ];
+  const board = sellerBoard(events, NOW);
+  assert.equal(board.some((r) => r.pubkey === stranger), false,
+    "publishing profile metadata is not selling");
+  assert.equal(board.length, 1, "only the seat that actually delivered holds a row");
+});
+
+test("REGRESSION: a buyer's kind-0 never creates a seller row", () => {
+  const buyer = pk("d");
+  const events = [
+    ...trade("o1", { buyer, seller: pk("c") }),
+    ev(PROFILE, { id: "pbuyer", pubkey: buyer, at: NOW - 100, content: '{"name":"sage"}' }),
+  ];
+  assert.equal(sellerBoard(events, NOW).some((r) => r.pubkey === buyer), false,
+    "buying is not selling, whoever owns the profile");
+  const [row] = buyerBoard(events, NOW);
+  assert.equal(row.pubkey, buyer);
+  assert.equal(row.name, "sage", "the buyer is named from its own kind-0");
+});
+
+/**
+ * Relay order is not ours to choose, so naming must not depend on it.
+ *
+ * The case that discriminates is a seat earning its row from a HEARTBEAT or an
+ * advert — evidence read in the same pass as kind-0, not in the trades pass
+ * that runs before it. Most live seats are exactly this: heartbeating, adverts
+ * up, nothing delivered yet. Enriching in-loop with a plain row lookup passes
+ * when the profile happens to arrive second and drops the name when it arrives
+ * first, which is why the names are applied after every row-creating pass.
+ */
+test("REGRESSION: a heartbeat-only seat is named whichever order kind-0 arrives in", () => {
+  const s = pk("e");
+  const profile = ev(PROFILE, { id: "pe", pubkey: s, at: NOW - 100, content: '{"name":"cherry"}' });
+  const beat = ev(HEARTBEAT, { id: "hb", pubkey: s, at: NOW - 30, tags: [["d", "seller"]] });
+
+  const rowFrom = (events) => sellerBoard(events, NOW).find((r) => r.pubkey === s);
+  assert.equal(rowFrom([profile, beat])?.name, "cherry", "kind-0 before the heartbeat");
+  assert.equal(rowFrom([beat, profile])?.name, "cherry", "kind-0 after the heartbeat");
+  assert.equal(rowFrom([profile, beat])?.delivered, 0, "still a seat with no deliveries");
+});
+
 test("a participant detail gathers both roles and their trades", () => {
   const who = pk("5");
   const events = [

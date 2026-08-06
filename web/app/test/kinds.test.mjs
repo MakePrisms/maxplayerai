@@ -82,3 +82,33 @@ test("every trade stage maps to a kind the client actually requests", () => {
     );
   }
 });
+
+/**
+ * REGRESSION (#449): a kind the board BRANCHES ON must be a kind the client
+ * asks the relay for.
+ *
+ * The seller board grew a `p.kind === PROFILE` arm when the seat name moved to
+ * kind-0, and every other layer followed — the parser, the replaceable-slot
+ * cache, the row field. The one thing nobody added was kind 0 to a requested
+ * list, so the arm was live, correct and unreachable: every seller card fell
+ * back to the short pubkey while kind-0 sat on the relay resolving fine.
+ *
+ * The branch list is read out of the source rather than written here on
+ * purpose. A hand-kept list is updated by whoever remembers, which is the same
+ * person who would have remembered to widen the subscription.
+ */
+test("REGRESSION: every kind the participant board branches on is requested", () => {
+  const src = stripComments(readFileSync(join(ROOT, "js", "participants.js"), "utf8"));
+  const branched = [...src.matchAll(/\bkind\s*===\s*([A-Z_][A-Z0-9_]*)/g)].map((m) => m[1]);
+  assert.ok(branched.length > 0, "found no kind branches — the regex stopped matching the source");
+
+  const requested = new Set([...kinds.MAXPLAYER_TAGGED_KINDS, ...kinds.UNTAGGED_KINDS]);
+  for (const name of new Set(branched)) {
+    const kind = kinds[name];
+    assert.equal(typeof kind, "number", `${name} is branched on but is not a kind constant`);
+    assert.ok(
+      requested.has(kind),
+      `the board reads ${name} (kind ${kind}) but the client never requests it`,
+    );
+  }
+});

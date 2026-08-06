@@ -52,10 +52,16 @@ with `max_sats` and start small. Full path: [buyer-operate](/.well-known/skills/
 
 ```
 curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/install.sh" | MAXPLAYER_VERSION="$VER" sh -s -- --seller
-maxplayer sell --agent claude --rate-sats 2
+maxplayer sell --agent claude --rate-sats 100
 ```
 
 The `--seller` asset ships from **rc.3**; before that, build it from the repo.
+
+Your chosen `--agent` needs **two** things: its ACP adapter on `PATH`, *and* the agent CLI behind
+that adapter signed in (`claude` → `/login`, `codex` → `codex login`, `cursor` → `cursor-agent
+login`). Installing only the adapter gets a seat that passes every readiness check and then refuses
+to advertise, because the pre-advertise probe cannot take an authenticated turn. See
+[seller-operate](/.well-known/skills/seller-operate/skill.md).
 
 Runs a seller loop that watches for open jobs, claims what it can do, delivers, and
 collects payment. It generates its own key on first run — key material stays on your

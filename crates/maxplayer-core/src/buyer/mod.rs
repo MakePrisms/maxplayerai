@@ -266,7 +266,7 @@ pub async fn run(home: MaxplayerHome) -> Result<(), BuyerError> {
                 spawn_auto_award(context.clone(), intent.job_id, intent.max_sats);
             }
         }
-        Err(error) => eprintln!("buyer: could not list pending auto-awards to re-arm: {error}"),
+        Err(error) => crate::opline!("buyer: could not list pending auto-awards to re-arm: {error}"),
     }
     // Start watching for delivered results. Its own first action is a sweep of awarded-unsettled
     // jobs, which is what collects a delivery that landed while this daemon was down.
@@ -447,7 +447,7 @@ async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Resp
                 model.as_deref(),
                 now_unix(),
             ) {
-                eprintln!(
+                crate::opline!(
                     "buyer: could not record auto-award intent for {}: {error}",
                     outcome.job_id
                 );
@@ -921,14 +921,14 @@ async fn settle_job(
         // re-drops a real report.
         Ok(store::AttributeAward::NoAwardRow) => {
             if outcome.agent_used.is_some() || outcome.model_used.is_some() {
-                eprintln!(
+                crate::opline!(
                     "buyer: settled {job_id} has no awards row to attribute (externally accepted \
                      or unrecorded award) — seller-reported attribution dropped"
                 );
             }
         }
         Err(error) => {
-            eprintln!("buyer: award attribution write failed for {job_id} (continuing): {error}")
+            crate::opline!("buyer: award attribution write failed for {job_id} (continuing): {error}")
         }
     }
 
@@ -989,7 +989,7 @@ fn buyer_keys(home: &MaxplayerHome) -> Result<nostr_sdk::Keys, String> {
 fn spawn_auto_award(context: Arc<BuyerContext>, job_id: String, max_sats: u64) {
     tokio::spawn(async move {
         if let Err(error) = drive_auto_award(&context, &job_id, max_sats).await {
-            eprintln!("buyer: auto-award for {job_id} did not complete ({error}); left pending for re-arm");
+            crate::opline!("buyer: auto-award for {job_id} did not complete ({error}); left pending for re-arm");
         }
     });
 }
@@ -1338,7 +1338,7 @@ async fn watch_loop<S, Fut>(
                     // response is to widen to a full sweep.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => WatchWake::Sweep,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        eprintln!(
+                        crate::opline!(
                             "buyer: delivery watcher lost the relay subscription; falling back to \
                              periodic sweeps every {}s (deliveries still settle, just later)",
                             interval.as_secs()
@@ -1427,7 +1427,7 @@ fn heal_award_attribution(store: &store::BuyerStore, home: &MaxplayerHome) {
     let jobs = match store.unattributed_settled_award_job_ids() {
         Ok(jobs) => jobs,
         Err(error) => {
-            eprintln!("buyer: attribution heal could not enumerate settled awards ({error}); skipping");
+            crate::opline!("buyer: attribution heal could not enumerate settled awards ({error}); skipping");
             return;
         }
     };
@@ -1437,7 +1437,7 @@ fn heal_award_attribution(store: &store::BuyerStore, home: &MaxplayerHome) {
             // Settled with no local bind (pre-bind legacy state) — nothing to heal from.
             Ok(None) => continue,
             Err(error) => {
-                eprintln!("buyer: attribution heal could not read bind for {job_id} ({error}); skipping");
+                crate::opline!("buyer: attribution heal could not read bind for {job_id} ({error}); skipping");
                 continue;
             }
         };
@@ -1445,13 +1445,13 @@ fn heal_award_attribution(store: &store::BuyerStore, home: &MaxplayerHome) {
             continue;
         }
         match store.attribute_award(&job_id, bind.agent_used.as_deref(), bind.model_used.as_deref()) {
-            Ok(store::AttributeAward::Written) => eprintln!(
+            Ok(store::AttributeAward::Written) => crate::opline!(
                 "buyer: healed award attribution for settled {job_id} (agent={})",
                 log_safe_agent(bind.agent_used.as_deref())
             ),
             Ok(_) => {}
             Err(error) => {
-                eprintln!("buyer: attribution heal write failed for {job_id} (continuing): {error}")
+                crate::opline!("buyer: attribution heal write failed for {job_id} (continuing): {error}")
             }
         }
     }
@@ -1537,7 +1537,7 @@ async fn settle_intent_from_attempt(
                 Err(error @ AwardError::PublishedButUnrecorded { .. }) => {
                     let _ = context.store.mark_award_parked(job_id, &error.to_string(), now_unix());
                 }
-                Err(error) => eprintln!(
+                Err(error) => crate::opline!(
                     "buyer: confirmed attempt for {job_id} could not be healed ({error}); the \
                      sweep retries"
                 ),
@@ -1690,7 +1690,7 @@ async fn resolve_expired_attempt(
                         .flatten()
                         .map(|after| after.state);
                     if state == Some(store::AttemptState::Refused) {
-                        eprintln!(
+                        crate::opline!(
                             "buyer: ⚠ award {} for {job_id} IS on the relay, but a concurrent \
                              resolver terminalized the attempt as refused (probes diverged); \
                              the refusal is one-way and this cannot self-heal — if the seller \
@@ -1703,7 +1703,7 @@ async fn resolve_expired_attempt(
                     // proceed to the heal exactly as if our mark had won.
                 }
                 Err(error) => {
-                    eprintln!(
+                    crate::opline!(
                         "buyer: award attempt for {job_id} could not be confirmed ({error}); \
                          will retry next pass"
                     );
@@ -1715,13 +1715,13 @@ async fn resolve_expired_attempt(
             {
                 Ok(_) => {
                     let _ = context.store.mark_award_awarded(job_id, now_unix());
-                    eprintln!(
+                    crate::opline!(
                         "buyer: pending award attempt for {job_id} resolved — award {} is on the \
                          relay (found by probe)",
                         attempt.award_event_id
                     );
                 }
-                Err(error) => eprintln!(
+                Err(error) => crate::opline!(
                     "buyer: award {} for {job_id} is on the relay but the row/funds heal failed \
                      ({error}); will retry next pass",
                     attempt.award_event_id
@@ -1730,7 +1730,7 @@ async fn resolve_expired_attempt(
         }
         Ok(job_lifecycle::PresenceRead::ConfirmedAbsent) => {
             if !past_pay_window(now_unix(), attempt.offer_deadline_unix) {
-                eprintln!(
+                crate::opline!(
                     "buyer: pending award attempt for {job_id} confirmed absent but inside the \
                      pay window; holding"
                 );
@@ -1757,7 +1757,7 @@ async fn resolve_expired_attempt(
             {
                 Ok(job_lifecycle::PresenceRead::ConfirmedAbsent) => {}
                 Ok(job_lifecycle::PresenceRead::Present(())) => {
-                    eprintln!(
+                    crate::opline!(
                         "buyer: award attempt for {job_id} probes absent past its pay window, \
                          but the job HAS deliveries — holding (the award likely aged out of the \
                          probe; settle via `collect {job_id}`)"
@@ -1765,7 +1765,7 @@ async fn resolve_expired_attempt(
                     return;
                 }
                 Ok(job_lifecycle::PresenceRead::Unverified) | Err(_) => {
-                    eprintln!(
+                    crate::opline!(
                         "buyer: award attempt for {job_id} probes absent past its pay window, \
                          but the delivery check did not answer; holding until it does"
                     );
@@ -1780,16 +1780,16 @@ async fn resolve_expired_attempt(
             let _guard = context.money_lock.lock().await;
             match terminalize_absent_attempt(&context.store, job_id, detail, now_unix()) {
                 Ok(true) => {
-                    eprintln!("buyer: pending award attempt for {job_id} refused: {detail}");
+                    crate::opline!("buyer: pending award attempt for {job_id} refused: {detail}");
                 }
                 Ok(false) => {
-                    eprintln!(
+                    crate::opline!(
                         "buyer: award attempt for {job_id} was resolved concurrently; leaving \
                          the other resolver's verdict in place"
                     );
                 }
                 Err(error) => {
-                    eprintln!(
+                    crate::opline!(
                         "buyer: award attempt for {job_id} could not be terminalized ({error}); \
                          will retry next pass"
                     );
@@ -1797,13 +1797,13 @@ async fn resolve_expired_attempt(
             }
         }
         Ok(job_lifecycle::PresenceRead::Unverified) => {
-            eprintln!(
+            crate::opline!(
                 "buyer: pending award attempt for {job_id} unresolved (relay did not confirm \
                  presence or absence); will retry next pass"
             );
         }
         Err(error) => {
-            eprintln!("buyer: pending award attempt for {job_id} probe failed: {error}");
+            crate::opline!("buyer: pending award attempt for {job_id} probe failed: {error}");
         }
     }
 }
@@ -1836,7 +1836,7 @@ async fn resolve_award_attempts(context: &BuyerContext) {
     let keys = match buyer_keys(&context.home) {
         Ok(keys) => keys,
         Err(error) => {
-            eprintln!("buyer: award attempt sweep skipped (no keys): {error}");
+            crate::opline!("buyer: award attempt sweep skipped (no keys): {error}");
             return;
         }
     };
@@ -1859,7 +1859,7 @@ async fn resolve_award_attempts(context: &BuyerContext) {
                         // earlier failed-repair park, and this attempt now leaves the work set,
                         // so nothing later would correct the intent (round-3 review).
                         let _ = context.store.mark_award_awarded(&attempt.job_id, now_unix());
-                        eprintln!(
+                        crate::opline!(
                             "buyer: healed awards row for {} from its confirmed attempt ({})",
                             attempt.job_id, attempt.award_event_id
                         );
@@ -1880,20 +1880,20 @@ async fn resolve_award_attempts(context: &BuyerContext) {
                             &error.to_string(),
                             now_unix(),
                         );
-                        eprintln!(
+                        crate::opline!(
                             "buyer: award for {} is public but unrepairable ({error}); parked for \
                              an operator — the sweep keeps retrying the heal",
                             attempt.job_id
                         );
                     }
-                    Err(error) => eprintln!(
+                    Err(error) => crate::opline!(
                         "buyer: healing awards row for {} failed ({error}); will retry next pass",
                         attempt.job_id
                     ),
                 }
             }
         }
-        Err(error) => eprintln!("buyer: could not enumerate confirmed attempts to heal: {error}"),
+        Err(error) => crate::opline!("buyer: could not enumerate confirmed attempts to heal: {error}"),
     }
 
     // Finish refusals a crash left half-done (refused attempt, funds still reserved): the
@@ -1922,12 +1922,12 @@ async fn resolve_award_attempts(context: &BuyerContext) {
                             .clone()
                             .unwrap_or_else(|| "the relay refused the award event".to_owned());
                         let _ = context.store.mark_award_parked(&attempt.job_id, &detail, now_unix());
-                        eprintln!(
+                        crate::opline!(
                             "buyer: finished the crashed refusal for {} — funds released",
                             attempt.job_id
                         );
                     }
-                    Err(error) => eprintln!(
+                    Err(error) => crate::opline!(
                         "buyer: finishing the crashed refusal for {} failed ({error}); will \
                          retry next pass",
                         attempt.job_id
@@ -1935,13 +1935,13 @@ async fn resolve_award_attempts(context: &BuyerContext) {
                 }
             }
         }
-        Err(error) => eprintln!("buyer: could not enumerate crashed refusals: {error}"),
+        Err(error) => crate::opline!("buyer: could not enumerate crashed refusals: {error}"),
     }
 
     let pending = match context.store.pending_award_attempts() {
         Ok(pending) => pending,
         Err(error) => {
-            eprintln!("buyer: could not enumerate pending award attempts: {error}");
+            crate::opline!("buyer: could not enumerate pending award attempts: {error}");
             return;
         }
     };
@@ -1966,7 +1966,7 @@ async fn resolve_award_attempts(context: &BuyerContext) {
                 )
                 .await;
                 let _ = context.store.mark_award_awarded(&job_id, now_unix());
-                eprintln!(
+                crate::opline!(
                     "buyer: pending award attempt for {job_id} re-confirmed from its recorded \
                      award"
                 );
@@ -1974,7 +1974,7 @@ async fn resolve_award_attempts(context: &BuyerContext) {
             }
             Ok(None) => {}
             Err(error) => {
-                eprintln!("buyer: attempt sweep could not read {job_id}'s award row: {error}");
+                crate::opline!("buyer: attempt sweep could not read {job_id}'s award row: {error}");
                 continue;
             }
         }
@@ -2004,7 +2004,7 @@ async fn resolve_award_attempts(context: &BuyerContext) {
                 // deadline that crossed in that window must send NOTHING; the expired path
                 // (probe only) owns the attempt from then on.
                 Ok(Some(current)) if resume_crossed_deadline(&current, now_unix()) => {
-                    eprintln!(
+                    crate::opline!(
                         "buyer: award attempt for {job_id} crossed its offer deadline while \
                          awaiting the money lock; not transmitting — it resolves by probe"
                     );
@@ -2024,7 +2024,7 @@ async fn resolve_award_attempts(context: &BuyerContext) {
                                     match context.store.record_attempt_send(&job_id, now_unix()) {
                                         Ok(prior) => Some(prior),
                                         Err(error) => {
-                                            eprintln!(
+                                            crate::opline!(
                                                 "buyer: attempt sweep for {job_id} could not \
                                                  license a send: {error}"
                                             );
@@ -2033,7 +2033,7 @@ async fn resolve_award_attempts(context: &BuyerContext) {
                                     }
                                 }
                                 Err(refused) => {
-                                    eprintln!(
+                                    crate::opline!(
                                         "buyer: attempt sweep cannot fund {job_id}'s re-send \
                                          ({refused}); holding until funds return"
                                     );
@@ -2042,7 +2042,7 @@ async fn resolve_award_attempts(context: &BuyerContext) {
                             }
                         }
                         Err(error) => {
-                            eprintln!(
+                            crate::opline!(
                                 "buyer: attempt sweep for {job_id} has no money snapshot \
                                  ({error}); holding"
                             );
@@ -2052,7 +2052,7 @@ async fn resolve_award_attempts(context: &BuyerContext) {
                 }
                 Ok(_) => None, // resolved while we gathered — nothing to send
                 Err(error) => {
-                    eprintln!("buyer: attempt sweep could not re-read {job_id}: {error}");
+                    crate::opline!("buyer: attempt sweep could not re-read {job_id}: {error}");
                     None
                 }
             }
@@ -2079,14 +2079,14 @@ async fn resolve_award_attempts(context: &BuyerContext) {
         match result {
             Ok(AwardOutcome::Published(outcome)) => {
                 let _ = context.store.mark_award_awarded(&job_id, now_unix());
-                eprintln!(
+                crate::opline!(
                     "buyer: pending award attempt for {job_id} resolved — award {} is on the relay",
                     outcome.award_event_id
                 );
             }
             Ok(AwardOutcome::AlreadyAwarded(record)) => {
                 let _ = context.store.mark_award_awarded(&job_id, now_unix());
-                eprintln!(
+                crate::opline!(
                     "buyer: pending award attempt for {job_id} resolved — award {} was already \
                      recorded",
                     record.award_event_id
@@ -2095,16 +2095,16 @@ async fn resolve_award_attempts(context: &BuyerContext) {
             Err(error @ AwardError::Refused { .. }) => {
                 // Terminal: surfaced on the intent row (no-op for manual-path attempts) AND logged.
                 let _ = context.store.mark_award_parked(&job_id, &error.to_string(), now_unix());
-                eprintln!("buyer: pending award attempt for {job_id} refused: {error}");
+                crate::opline!("buyer: pending award attempt for {job_id} refused: {error}");
             }
             Err(error @ AwardError::Unresolved { .. }) => {
-                eprintln!(
+                crate::opline!(
                     "buyer: pending award attempt for {job_id} still unresolved ({error}); will \
                      retry next pass"
                 );
             }
             Err(error) => {
-                eprintln!("buyer: pending award attempt for {job_id} not resolved: {error}");
+                crate::opline!("buyer: pending award attempt for {job_id} not resolved: {error}");
             }
         }
     }
@@ -2118,7 +2118,7 @@ async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Ev
     let jobs = match context.store.awarded_unsettled_job_ids() {
         Ok(jobs) => jobs,
         Err(error) => {
-            eprintln!("buyer: delivery watcher could not read awarded jobs ({error}); will retry");
+            crate::opline!("buyer: delivery watcher could not read awarded jobs ({error}); will retry");
             return;
         }
     };
@@ -2133,7 +2133,7 @@ async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Ev
             // "unreported" is honest absence, never a guess at what was requested. Rendered
             // through `log_safe_agent`: this is the one place seller-authored free text reaches
             // the operator's terminal, so control bytes must not survive into the log line.
-            Ok(outcome) => eprintln!(
+            Ok(outcome) => crate::opline!(
                 "buyer: delivery watcher settled {job_id} — paid {} sat for commit {} ({} file(s); agent={})",
                 outcome.pay.amount_sats,
                 outcome.commit_oid,
@@ -2146,7 +2146,7 @@ async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Ev
             Err(SettleJobError::Pay(collect::CollectError::Lifecycle(
                 job_lifecycle::JobLifecycleError::NotFound(_),
             ))) => {}
-            Err(error) => eprintln!("buyer: delivery watcher could not settle {job_id}: {error}"),
+            Err(error) => crate::opline!("buyer: delivery watcher could not settle {job_id}: {error}"),
         }
     }
 }
@@ -2252,7 +2252,7 @@ async fn run_reconcile_pass(context: &Arc<BuyerContext>) {
         // An unreachable relay must never be fatal: every job it could not verify was treated as
         // still-payable, so the ledger is conservative until the next pass.
         Err(error) => {
-            eprintln!("buyer: reconcile pass did not complete ({error}); serving with the ledger as-is")
+            crate::opline!("buyer: reconcile pass did not complete ({error}); serving with the ledger as-is")
         }
     }
 }
@@ -2265,7 +2265,7 @@ async fn run_reconcile_pass(context: &Arc<BuyerContext>) {
 async fn run_hop_sweep(context: &Arc<BuyerContext>) {
     match crate::crossmint_hop::sweep_hops(&context.home).await {
         Ok(swept) if swept.is_empty() => {
-            eprintln!("buyer: cross-mint hop sweep found no hop in flight")
+            crate::opline!("buyer: cross-mint hop sweep found no hop in flight")
         }
         Ok(swept) => {
             let recovered = swept
@@ -2277,7 +2277,7 @@ async fn run_hop_sweep(context: &Arc<BuyerContext>) {
                 })
                 .count();
             let failed = swept.iter().filter(|hop| hop.result.is_err()).count();
-            eprintln!(
+            crate::opline!(
                 "buyer: cross-mint hop sweep resumed {} hop(s): {recovered} stranded and recovered, \
                  {failed} still unfinished",
                 swept.len()
@@ -2285,7 +2285,7 @@ async fn run_hop_sweep(context: &Arc<BuyerContext>) {
         }
         // A journal we cannot read is not a reason to refuse to serve, but it IS a reason to say so:
         // an unreadable journal means any hop it holds is invisible until someone looks.
-        Err(error) => eprintln!(
+        Err(error) => crate::opline!(
             "buyer: cross-mint hop sweep could not read its journal ({error}); a hop left in flight \
              by a prior run would not have been noticed"
         ),
@@ -2302,7 +2302,7 @@ async fn run_hop_sweep(context: &Arc<BuyerContext>) {
 /// The examined count is in the line deliberately: it is also the number of per-job relay fetches
 /// this pass made, so #180's amplification is visible while it grows instead of when it bites.
 fn report_reconcile(report: &ReconcileReport) {
-    eprintln!("{}", reconcile_line(report));
+    crate::opline!("{}", reconcile_line(report));
 }
 
 /// Build the reconcile report line. Split from the printing so the wording — including the

@@ -81,7 +81,7 @@ cargo build -p maxplayer --release --features acp              # or build it →
 First run takes two required choices; bare `maxplayer sell` relaunches from saved config:
 
 ```bash
-maxplayer sell --agent claude --rate-sats 2                # --agent claude|cursor|codex
+maxplayer sell --agent claude --rate-sats 100              # --agent claude|cursor|codex
 ```
 
 Startup runs a doctor readiness gate and refuses to boot on a blocking failure, each with a fix hint.

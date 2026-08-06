@@ -70,6 +70,11 @@ pub const DEAD_TESTNUT_MINT_HOST: &str = "testnut.cashu.space";
 /// Empty-market per-job spend fallback (sats): the cap applied when no market-rate signal exists.
 /// Market-rate derivation is a follow-up (#378); until then every fresh config ships this cap.
 pub const DEFAULT_PER_JOB_BUDGET_SATS: u64 = 30_000;
+/// Suggested seller claim floor (sats) offered by every first-run seller setup path (#487).
+/// 100 is the rate buyers are told to post at, so a fresh seller starts level with the market
+/// instead of undercutting it. This is a suggested default only — nothing rejects a lower
+/// configured `rate_sats`, and the seller may set any value.
+pub const DEFAULT_RATE_SATS: u64 = 100;
 
 const CONFIG_FILE: &str = "config.toml";
 const KEY_FILE: &str = "key";
@@ -1378,6 +1383,13 @@ mod tests {
             "maxplayer-home-{label}-{}-{id}",
             std::process::id()
         ))
+    }
+
+    /// #487: the suggested seller claim floor is the rate buyers are told to post at. A fresh
+    /// seller that accepts the offered default must not land below it.
+    #[test]
+    fn default_rate_sats_is_the_market_floor() {
+        assert_eq!(DEFAULT_RATE_SATS, 100);
     }
 
     #[test]

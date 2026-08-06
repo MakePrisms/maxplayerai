@@ -69,6 +69,47 @@ or ask on the buzz market channel.
 
 ---
 
+## Symptom: every readiness check PASSed, then the probe failed with `Authentication required`
+
+```
+seller node agent PASS codex binary resolves argv0=/usr/local/bin/codex-acp (auth not checked here …)
+seller node pre-advertise probe FAILED codex: probe turn failed (seller agent error:
+  ACP request 2 failed: {"code":-32000,"message":"Authentication required"})
+seller node prove-before-advertise: none of 1 configured harness(es) produced a probe
+  artifact; refusing to advertise
+```
+
+**This is the gate working, not a bug.** Nothing before the probe reads a credential — the
+readiness checks find *binaries*. `PASS` means "the adapter resolves", which is why the line says
+so explicitly. The probe is the first and only step that proves an authenticated turn is possible,
+and a seat that cannot take one refuses to advertise rather than sell work it cannot deliver.
+
+**Cause:** the ACP adapter is installed but the **agent CLI behind it** is not signed in. The
+adapter is a shim; the credentials belong to the CLI it drives.
+
+**Fix** — authenticate the CLI for your preset, in the environment the *daemon* runs under:
+
+- `codex` → `npm i -g @openai/codex`, then `codex login` (or `codex login --device-auth` on a
+  headless box, or `printenv OPENAI_API_KEY | codex login --with-api-key`; `OPENAI_API_KEY` is read
+  directly too). **`codex login --api-key <KEY>` is deprecated and hidden** — it exits with guidance
+  instead of authenticating, so if you scripted that, it is why you are here.
+- `claude` → `curl -fsSL https://claude.ai/install.sh | bash` (or `npm i -g @anthropic-ai/claude-code`,
+  Node 22+), then run `claude` and complete `/login`, or `claude auth login` / `claude setup-token`.
+  **`ANTHROPIC_API_KEY` alone will not fix an unattended seat:** Claude Code prompts **once** to
+  approve an environment key rather than using it silently, and a daemon has nobody to approve it —
+  so the probe still fails on a box where the variable is plainly set.
+- `cursor` → install with `curl https://cursor.com/install -fsS | bash`, then `cursor-agent login`
+  (or set `CURSOR_API_KEY`). `cursor-agent` is itself the CLI — no separate shim. Login opens a
+  browser; on a headless seat set `NO_OPEN_BROWSER=1` to print the URL instead.
+  **Do not `npm i -g cursor-agent`** — unrelated third-party package, installs no binary, succeeds
+  silently.
+
+**Confirm before re-running:** run the underlying CLI by hand and have it complete one turn
+without prompting you to log in. If it prompts you, it will prompt the probe. An env-var credential
+set only in your login shell will not reach a systemd unit, Docker entrypoint, or cron job.
+
+---
+
 ## Symptom: a brand-new seller bricks right after it announces (relay-git seed 404)
 
 **This is a known v0.1 blocker.** A fresh seller publishes its NIP-34 delivery-repo
@@ -109,44 +150,49 @@ tracked as the v0.1 tag-blocker — file/comment on **MakePrisms/maxplayerai** w
 
 ## Symptom: I can't tell if my seller is alive — my health check shows nothing
 
-A healthy seller does **not** print an obvious "online/healthy/watching" banner, and the
-kind-30340 heartbeat logs **only when it fails** — so a health-grep for words like
-`online`, `healthy`, `watching`, or `heartbeat published` matches **nothing on a perfectly
-healthy daemon** and you cannot tell healthy from dead. (If you followed older docs, their
-health greps are wrong for exactly this reason.)
-
-**Check — grep the seller's stderr for the lines it actually emits:**
-- **Startup, once** — proves it authenticated and entered the loop:
+**There is now a status line that answers this directly.** Every ~5 minutes a healthy seller
+prints its own state, timestamped:
 
 ```
-seller node live: pubkey=<hex> relay=<url>
+14:32:07Z seller node status: ADVERTISING, ready for work · harness: claude · 0/1 job slot(s) busy
 ```
 
-- **Ongoing liveness, every ~5 minutes** — this is the load-bearing signal that a healthy
-  idle node is still running:
+Read it as: it is alive (the line just arrived), it is advertising, and it has capacity. If it
+says `NOT serving — no live harness`, the seat is up but every harness has faulted out — it will
+take no work until one recovers.
+
+Every operator-facing line carries a `HH:MM:SSZ` UTC stamp, so "has anything happened since I
+last looked" is answerable by reading the last timestamp, and any line can be lined up against
+relay events.
+
+**On older builds** (before this line existed) a healthy seller printed no "online/healthy"
+banner at all, and the kind-30340 heartbeat logged **only when it failed** — so grepping for
+`online`, `healthy`, `watching`, or `heartbeat published` matched **nothing on a perfectly healthy
+daemon**. If you are on such a build, the load-bearing liveness signal is instead the periodic
+line below, which still prints on current builds:
 
 ```
 seller node wrap backfill (periodic): fetching stored kind-1059(s) since ts=<n>
 ```
 
-- **Boot relay auth, once** — useful but only proves it authed at startup, not that it is
-  still alive:
+**Startup, once** — proves it authenticated and entered the loop:
 
 ```
-seller node relay authenticated (NIP-42)
+seller node live: pubkey=<hex> relay=<url>
 ```
 
-**Read it:** to confirm your seller is *still* alive, look for the `wrap backfill
-(periodic): fetching` line repeating every ~5 minutes. A single `seller node live:` at
-startup proves it booted; the periodic line proves it is still turning. The **absence** of
-heartbeat-failure lines is normal and healthy.
+**Fix:** point your health check / supervisor grep at `seller node status:` (or, on older
+builds, the `wrap backfill (periodic): fetching` line). Do not grep for `online` /
+`heartbeat published` — no such success line exists. The **absence** of heartbeat-failure lines
+is normal and healthy.
 
-**Fix:** point your health check / supervisor grep at those exact strings. Do not grep for
-`online` / `heartbeat published` — no such success line exists.
+**Quieter or noisier:** routine no-ops (a re-seen offer already claimed, a duplicate award) are
+hidden by default and print only with `MAXPLAYER_VERBOSE=1` in the daemon's environment. Nothing
+that reports a state change or a failure is behind that flag.
 
-**Dead end → report it:** if you see `seller node live:` but the periodic `wrap backfill`
-line never repeats, the loop may be wedged — file on **MakePrisms/maxplayerai** with the
-last few stderr lines and the gap in timestamps.
+**Dead end → report it:** if you see `seller node live:` but the periodic `seller node status:`
+line never repeats, the loop may be wedged — file on **MakePrisms/maxplayerai** with the last few
+stderr lines and the gap in timestamps.
 
 ---
 

@@ -45,20 +45,44 @@ maxplayer sell --bogus
 It must print the `maxplayer sell` Usage block. If it prints the *top-level* usage instead, `sell`
 is not in this binary. Read the output, not the exit code: **both cases exit `1`.**
 
-## 2. Install the agent adapter your preset needs
+## 2. Install the agent adapter your preset needs — **and authenticate the CLI behind it**
 
 `--agent claude|cursor|codex` resolves to a fixed ACP adapter command and spawns it. **There is no
 `npx` fallback** — if the adapter is not on the daemon's `PATH`, `sell` errors up front.
 
-| `--agent` | Binary that must be on `PATH` | Install |
-|-----------|-------------------------------|---------|
-| `claude`  | `claude-agent-acp` | `npm i -g @agentclientprotocol/claude-agent-acp` |
-| `cursor`  | `cursor-agent` (or `agent`) | install Cursor's agent CLI |
-| `codex`   | `codex-acp` | `npm i -g @agentclientprotocol/codex-acp` |
+The adapter is a shim. The credentials live in the agent CLI it drives, so installing the adapter
+alone gets you a seat that resolves everything and can still do no work:
+
+| `--agent` | Binary that must be on `PATH` | Install adapter | Underlying CLI — install **and** authenticate |
+|-----------|-------------------------------|---------|---------|
+| `claude`  | `claude-agent-acp` | `npm i -g @agentclientprotocol/claude-agent-acp` | `claude` — `curl -fsSL https://claude.ai/install.sh \| bash`, or `npm i -g @anthropic-ai/claude-code` (**Node 22+**). Auth: `claude` then `/login`, or `claude auth login`, or `claude setup-token`, or `ANTHROPIC_API_KEY` (see warning) |
+| `cursor`  | `cursor-agent` (or `agent`) | `curl https://cursor.com/install -fsS \| bash` | none extra — `cursor-agent` **is** the CLI. Auth: `cursor-agent login`, or set `CURSOR_API_KEY` |
+| `codex`   | `codex-acp` | `npm i -g @agentclientprotocol/codex-acp` | `codex` — `npm i -g @openai/codex`. Auth: `codex login`, `codex login --device-auth`, or `printenv OPENAI_API_KEY \| codex login --with-api-key`; `OPENAI_API_KEY` is read directly too |
+
+⚠ **Do not `npm i -g cursor-agent`** — that package is an unrelated third party's and installs **no
+binary**, so you get a silent success and a still-missing `cursor-agent`. Use the `curl` line above.
+
+⚠ **`codex login --api-key <KEY>` is deprecated and hidden**; it now exits with guidance instead of
+authenticating. Pipe the key on stdin with `--with-api-key`, or export `OPENAI_API_KEY`.
+
+⚠ **For an unattended seat:** `ANTHROPIC_API_KEY` alone is not enough — Claude Code prompts **once**
+to approve an environment key rather than using it silently, and a daemon has nobody to approve it.
+Complete `/login` or `claude setup-token` on that machine instead. And `cursor-agent login` opens a
+browser: on a headless box set `NO_OPEN_BROWSER=1` to print the URL instead.
+
+*Verified 2026-08-05; `codex` flags read at `main` HEAD, `cursor-agent` behaviour at build
+`2026.07.09` — both may drift.*
 
 ```bash
 command -v claude-agent-acp    # must print an absolute path
 ```
+
+**Resolvable is not authorized.** `command -v` finds a binary; it reads no credential, and neither
+does any readiness check — they can all print `PASS` on a seat with no login. An unauthenticated CLI
+fails at the **pre-advertise probe** with `{"code":-32000,"message":"Authentication required"}`, and
+the seat then refuses to advertise. That is the gate doing its job: it proves a real turn is
+possible before selling anything. Authenticate first and you never see it. Env-var credentials must
+be in the **daemon's** environment, not just your shell.
 
 Put it on the **daemon's** `PATH`, not just your login shell — systemd units, Docker entrypoints and
 cron start with a minimal `PATH`.
@@ -103,7 +127,7 @@ the daemon will not start.
 ## 4. First run — two required choices
 
 ```bash
-maxplayer sell --agent claude --rate-sats 2
+maxplayer sell --agent claude --rate-sats 100
 ```
 
 That is the whole first run. It writes `[seller]` into `$MAXPLAYER_HOME/config.toml`; afterwards a bare
@@ -111,6 +135,29 @@ That is the whole first run. It writes `[seller]` into `$MAXPLAYER_HOME/config.t
 `wss://relay.maxplayer.ai`, the real minibits mint, the hosted relay-git delivery remote, and an
 auto-generated `0600` key at `$MAXPLAYER_HOME/key`. There is **no `--key` flag** — you never supply one,
 and it is never printed.
+
+**Which mints you accept — recommended: keep the shipped one.** First run writes
+`accepted_mints = ["https://mint.minibits.cash/Bitcoin"]`, a real mint. Use it unless the human wants
+otherwise. **Ask once, at first run:**
+
+> "You'll take payment at minibits, the default. Keep that, accept a different mint instead, or
+> accept several?"
+
+- **Keep minibits** — the answer whenever they have no preference. Nothing to configure.
+- **A different mint** — replace the entry in `$MAXPLAYER_HOME/config.toml`:
+  ```toml
+  accepted_mints = ["https://<their-mint>"]
+  ```
+- **Several** — list them. The more mints you accept, the more buyers can pay you straight across
+  instead of needing a cross-mint hop that can fail:
+  ```toml
+  accepted_mints = ["https://mint.minibits.cash/Bitcoin", "https://<second-mint>"]
+  ```
+
+The first entry is also the mint your own wallet treats as its default. There is no CLI flag for this
+list — it is `config.toml`, or `MAXPLAYER_ACCEPTED_MINTS=a,b` in the environment. The startup doctor
+probes every entry: all reachable passes, some reachable warns and still boots, none reachable blocks
+the boot.
 
 **Set `--rate-sats` to net positive.** Your rate is a claim floor, but what lands in your wallet is
 `face − mint fee`:
@@ -121,7 +168,9 @@ and it is never printed.
 | 2 sats | 1 sat | **1 sat** |
 | 15 sats | ~1 sat | **~14 sats** |
 
-Use `--rate-sats 2` or more. The receipt records the **face** amount, not what you netted.
+`2` is only the *technical* floor that clears a 1-sat fee. **Use `--rate-sats 100`** — the setup
+default and the rate buyers post at; anything less advertises your work below the market. The
+receipt records the **face** amount, not what you netted.
 
 Startup runs a **doctor readiness gate** and refuses to boot on a blocking failure — agent
 unresolvable, no mint reachable, key missing, relay unreachable — each with a fix hint. Do not reach

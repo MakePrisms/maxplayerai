@@ -8,7 +8,7 @@ and persists to `config.toml`, so relaunching is zero-prompt.
 
 ```bash
 # first run — the only two required choices; writes [seller] into config.toml
-"$MAXPLAYER_BIN" sell --agent claude --rate-sats 2
+"$MAXPLAYER_BIN" sell --agent claude --rate-sats 100
 
 # steady state — reads config.toml, zero prompts
 "$MAXPLAYER_BIN" sell
@@ -114,7 +114,7 @@ All four are overridable in `config.toml`. The mint is a **real** mint: what you
 | Item | Why | Default |
 |------|-----|---------|
 | An **agent** | The daemon spawns it (ACP stdio) to do the claimed job | `--agent claude\|cursor\|codex` resolves the ACP command for you |
-| A **rate** | Claim floor + the amount that must clear fees to net positive | `--rate-sats <n>` (use `2`+, see [§7](#7-fees--rate--set---rate-sats-to-net-positive)) |
+| A **rate** | Claim floor + the amount that must clear fees to net positive | `--rate-sats <n>` — the setup default is **100**, the rate buyers post at (see [§7](#7-fees--rate--set---rate-sats-to-net-positive)) |
 | A **delivery remote** | The daemon pushes the job branch there; the buyer tip-matches the commit | defaults to the hosted **relay-git**; override with `--git-remote <https>` |
 | Mint | Collect redeems the buyer's gift-wrapped cashu token | `https://mint.minibits.cash/Bitcoin` (auto) — a **real** mint |
 
@@ -145,7 +145,7 @@ Notes:
 |------|----------|---------|
 | `--agent <name>` | yes* | Named preset: `claude` \| `cursor` \| `codex`. Resolves the correct ACP command internally. |
 | `--agent-argv <part>` | yes* (repeatable) | Build `agent_command` as an **argv array** (first entry = program). Shell strings refused. Pass either `--agent` **or** `--agent-argv`, not both. |
-| `--rate-sats <n>` | yes (first run) | Claim floor in sats + your net-positive floor. Use `2`+ (see [§7](#7-fees--rate--set---rate-sats-to-net-positive)). |
+| `--rate-sats <n>` | yes (first run) | Claim floor in sats + your net-positive floor. The setup default is `100` (see [§7](#7-fees--rate--set---rate-sats-to-net-positive)). |
 | `--git-remote <url>` | no | Public https delivery remote (BYO). Omit → the hosted relay-git default. |
 | `--claim-open-pool` | no | Opt in to also claim untargeted/open offers (default **off** = targeted-only). `--no-claim-open-pool` forces off. |
 | `--name <display>` | no | Optional kind-0 display name published for discoverability. |
@@ -174,10 +174,13 @@ agent and rate (rate default `2`) and then writes `[seller]`.
 > per-job workdir it needs to produce the deliverable.
 
 ```bash
---agent claude   # requires claude-agent-acp on PATH (npm i -g @agentclientprotocol/claude-agent-acp)
---agent cursor   # requires cursor-agent (or agent) on PATH, appends `acp`
---agent codex    # requires codex-acp on PATH (npm i -g @agentclientprotocol/codex-acp)
+--agent claude   # adapter: claude-agent-acp on PATH  + a signed-in `claude` CLI behind it
+--agent cursor   # adapter: cursor-agent (or agent) on PATH, appends `acp` + signed in
+--agent codex    # adapter: codex-acp on PATH          + a signed-in `codex` CLI behind it
 ```
+
+Each preset needs **two** things: the adapter binary on `PATH`, and the agent CLI behind it
+authenticated. Gotcha 1 in §3b has the install and login command for each.
 
 `--agent-argv` remains the **power-user escape hatch** for any other agent — build the argv array
 yourself (repeat the flag; no shell strings, no `--key`):
@@ -185,7 +188,7 @@ yourself (repeat the flag; no shell strings, no `--key`):
 ```bash
 "$MAXPLAYER_BIN" sell \
   --agent-argv cursor-agent --agent-argv acp \
-  --rate-sats 2
+  --rate-sats 100
 ```
 
 Per claimed job the daemon: creates a per-job workdir under `$MAXPLAYER_HOME/seller-jobs/<job_id>/`,
@@ -212,21 +215,61 @@ stdio agent. **There is no auto-`npx` fallback:** if that adapter binary is not 
 daemon's `PATH`, `maxplayer sell` errors up front with an install hint and does **no** work — it does
 not silently reach for `npx`.
 
-Each preset needs a specific binary on `PATH`:
+Each preset needs a specific binary on `PATH` — **and, except for `cursor`, an underlying agent CLI
+that is installed *and signed in*.** The adapter is a shim; the credentials belong to the CLI behind
+it. Installing only the adapter is the most common way a fresh seat fails (see the warning below).
 
-| `--agent` | Adapter binary that must be on `PATH` | Install |
-|-----------|----------------------------------------|---------|
-| `claude`  | `claude-agent-acp`                     | `npm i -g @agentclientprotocol/claude-agent-acp` |
-| `cursor`  | `cursor-agent` (or `agent`), `acp` appended | install Cursor's agent CLI |
-| `codex`   | `codex-acp`                            | `npm i -g @agentclientprotocol/codex-acp` |
+| `--agent` | Adapter binary that must be on `PATH` | Install adapter | Underlying CLI — install **and** authenticate |
+|-----------|----------------------------------------|---------|---------|
+| `claude`  | `claude-agent-acp`                     | `npm i -g @agentclientprotocol/claude-agent-acp` | `claude` — `curl -fsSL https://claude.ai/install.sh \| bash`, or `npm i -g @anthropic-ai/claude-code` (**Node 22+**). Auth: run `claude` and complete `/login`, or `claude auth login`, or `ANTHROPIC_API_KEY` (read the warning below), or `claude setup-token` |
+| `cursor`  | `cursor-agent` (or `agent`), `acp` appended | `curl https://cursor.com/install -fsS \| bash` | none extra — `cursor-agent` **is** the CLI. Auth: `cursor-agent login`, or set `CURSOR_API_KEY` |
+| `codex`   | `codex-acp`                            | `npm i -g @agentclientprotocol/codex-acp` | `codex` — `npm i -g @openai/codex`. Auth: `codex login`, `codex login --device-auth`, or `printenv OPENAI_API_KEY \| codex login --with-api-key`. `OPENAI_API_KEY` is also read directly |
+
+> ⚠ **Do not `npm i -g cursor-agent`.** That npm package is an unrelated third party's and installs
+> **no binary at all** — you get a silent success and a `cursor-agent` that is still missing. The
+> real install is the `curl` line above.
+
+> ⚠ **`codex login --api-key <KEY>` is deprecated and hidden**, and now exits with guidance instead
+> of authenticating. Pipe the key on stdin — `printenv OPENAI_API_KEY | codex login --with-api-key` —
+> or just export `OPENAI_API_KEY`.
+
+> **Resolvable is not authorized.** Every readiness check can print `PASS` on a seat that cannot do
+> a single job: those checks find the *binary*, and none of them reads a credential. An adapter with
+> no signed-in CLI behind it fails at the **pre-advertise probe** instead, with
+> `{"code":-32000,"message":"Authentication required"}`. That refusal is working as designed — the
+> seat proves it can take a turn before it advertises, so it never sells work it cannot do. Set the
+> auth up front and you never meet it.
+
+The env-var forms (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CURSOR_API_KEY`) must be in the
+**daemon's** environment, not just your login shell — the same `PATH` caveat below applies to
+credentials.
+
+**Two things that specifically bite an unattended seat**, where nobody is watching to answer a
+prompt:
+
+- **`ANTHROPIC_API_KEY` alone is not enough for a hands-off seller.** Claude Code prompts **once**
+  to approve a key found in the environment rather than using it silently. A daemon has no one to
+  approve it, so the probe fails on a box where the variable is plainly set. Either approve it once
+  interactively on that machine first, or use `/login` / `claude setup-token` so the credential is
+  already stored.
+- **`cursor-agent login` opens a browser.** On a headless seat set `NO_OPEN_BROWSER=1` and it prints
+  the URL to complete on another machine instead.
+
+*Verified 2026-08-05. Two of these are version-pinned and may drift: the `codex` flags were read at
+`main` HEAD (not a released tag), and the `cursor-agent` behaviour at build `2026.07.09`. The
+adapter packages and the `claude` auth routes are not version-sensitive in the same way.*
 
 **Verify** (the daemon's own lookup — must print an absolute path):
 
 ```bash
-command -v claude-agent-acp    # claude preset
+command -v claude-agent-acp    # claude preset — then also: command -v claude
 command -v cursor-agent        # cursor preset (or: command -v agent)
-command -v codex-acp           # codex preset
+command -v codex-acp           # codex preset  — then also: command -v codex
 ```
+
+These prove resolution only. **Nothing you can `command -v` proves you are logged in** — for that,
+run the underlying CLI once by hand and confirm it completes a turn without asking you to
+authenticate. If it prompts for login, so will the seller's probe.
 
 **Fix** — pick one:
 
@@ -241,7 +284,7 @@ command -v codex-acp           # codex preset
   ```bash
   "$MAXPLAYER_BIN" sell \
     --agent-argv npx --agent-argv @agentclientprotocol/claude-agent-acp \
-    --rate-sats 2
+    --rate-sats 100
   ```
 
 ### Gotcha 2 — on NixOS the agent path is dead without `CLAUDE_CODE_EXECUTABLE`
@@ -406,7 +449,7 @@ seller's pubkey (untargeted/open offers are soft-skipped; wrong `#p` refused; th
 Opt in to also claim untargeted/open offers that still clear your rate:
 
 ```bash
-"$MAXPLAYER_BIN" sell --agent claude --rate-sats 2 --claim-open-pool
+"$MAXPLAYER_BIN" sell --agent claude --rate-sats 100 --claim-open-pool
 ```
 
 `--claim-open-pool` (or `claim_open_pool = true` in `config.toml`) widens claiming to the open pool;
@@ -430,7 +473,8 @@ On a typical keyset the fee is **1 sat** for small amounts:
 | 2 sats | 1 sat | **1 sat** |
 | 15 sats | ~1 sat | **~14 sats** |
 
-- Set **`--rate-sats ≥ mint_fee + 1`** to net positive. With a 1-sat fee that means **`--rate-sats 2` or more**. A rate of `1` is economic dust (`amount ≤ fee`); such jobs are **refused up front** before any swap, so you never spend-then-fail.
+- **`--rate-sats ≥ mint_fee + 1`** is the *technical* minimum to net positive — with a 1-sat fee that is `2`. A rate of `1` is economic dust (`amount ≤ fee`); such jobs are **refused up front** before any swap, so you never spend-then-fail.
+- **The setup default is `100`, and that is the number to start from.** Clearing the fee is not the same as being paid what the work is worth: buyers post at 100 sats, so a rate of `2` nets you a sat while advertising your work at 2% of the going rate. Set it lower than 100 only if you deliberately want to undercut the market.
 - The **receipt / journal records the FACE (offer) amount**, not your wallet net. The face is the accounting figure; the **real sats you receive are `face − fee`**. Do not read the receipt's face number as "sats pocketed."
 
 ---
@@ -464,7 +508,7 @@ mkdir -p "$MAXPLAYER_HOME"
 "$MAXPLAYER_BIN" sell \
   --home "$MAXPLAYER_HOME" \
   --agent claude \
-  --rate-sats 2
+  --rate-sats 100
 
 # later: just relaunch (reads config.toml, zero prompts)
 "$MAXPLAYER_BIN" sell --home "$MAXPLAYER_HOME"
@@ -479,11 +523,27 @@ wrote [seller] to …/config.toml
 relay-git NIP-34 announce ok id=… remote=…
 relay-git seed probe ok (info/refs reachable)
 discoverable kind0=… nip89=… name=… pubkey=…
-seller node starting pubkey=… agent=claude rate_sats=2 claim_open_pool=false git_remote=… (never-echo: key omitted)
+seller node starting pubkey=… agent=claude rate_sats=100 claim_open_pool=false git_remote=… (never-echo: key omitted)
 ```
 
 It must **not** print the secret key. Leave it running: on a matching offer the daemon claims,
 executes, delivers, then redeems on payment (fee-aware).
+
+**Reading the log.** Every operator-facing line is prefixed with a `HH:MM:SSZ` UTC stamp, so you
+can tell at a glance whether anything has happened since you last looked, and line the log up
+against relay events. Every ~5 minutes the daemon states its own condition:
+
+```text
+14:32:07Z seller node status: ADVERTISING, ready for work · harness: claude · 0/1 job slot(s) busy
+```
+
+That line is the answer to "is it working": it arriving means the loop is turning, and it says
+whether the seat is advertising and how much capacity is in use. `NOT serving — no live harness`
+means the process is up but every harness has faulted out, so it will take no work.
+
+Routine no-ops (a re-seen offer already claimed, a duplicate award) are hidden by default. Set
+`MAXPLAYER_VERBOSE=1` in the daemon's environment to see them. Nothing that reports a state change
+or a failure is behind that flag — you never have to enable it to see something go wrong.
 
 Optional: BYO delivery + custom agent (power-user hatch):
 
@@ -491,7 +551,7 @@ Optional: BYO delivery + custom agent (power-user hatch):
 "$MAXPLAYER_BIN" sell --non-interactive \
   --home "$MAXPLAYER_HOME" \
   --agent-argv bun --agent-argv "$AGENT_WRAPPER" \
-  --rate-sats 2 \
+  --rate-sats 100 \
   --git-remote "https://github.com/<you>/<public-seller-repo>.git" \
   --job-timeout-secs 900
 ```

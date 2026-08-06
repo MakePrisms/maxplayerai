@@ -409,7 +409,7 @@ impl Default for AgentsState {
         Self {
             preset: AgentPreset::Claude,
             display_name: "Maxplayer seller".to_owned(),
-            rate_sats: 2,
+            rate_sats: maxplayer_core::home::DEFAULT_RATE_SATS,
             status: "Ready to configure a seller through `maxplayer sell`.".to_owned(),
             output: String::new(),
             receiver: None,
@@ -841,6 +841,16 @@ mod tests {
             retired.get_program(),
             "shipped and retired binary names must differ"
         );
+    }
+
+    /// #487: the desktop's pre-filled rate is a first-run seller default like the `sell` wizard's,
+    /// so it must be the same number. Asserting the literal too keeps this from passing if the
+    /// shared constant is ever moved off the market floor.
+    #[test]
+    fn default_seller_rate_is_the_shared_market_floor() {
+        let prefilled = AgentsState::default().rate_sats;
+        assert_eq!(prefilled, maxplayer_core::home::DEFAULT_RATE_SATS);
+        assert_eq!(prefilled, 100);
     }
 
     #[test]
