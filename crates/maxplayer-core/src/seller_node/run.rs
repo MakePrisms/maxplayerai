@@ -1278,6 +1278,12 @@ pub struct SellerNodeRunner {
     /// Homogeneous execution-slot admission (reserve-at-claim). Behind an `Arc` so it is shared with
     /// the off-loop execution tasks; see [`SlotGate`].
     slots: Arc<SlotGate>,
+    /// #450: armed when an offer is skipped because every slot is busy (`SlotsBusy`). The drain tick
+    /// consumes it once a slot frees to re-run the offer backfill, so a capacity-skipped offer is
+    /// reconsidered without waiting for a restart. A flag, not a queue: `on_offer` is idempotent
+    /// (`claim_and_enqueue` dedups an already-claimed offer), so re-delivering every stored offer
+    /// safely re-claims only the ones still open.
+    capacity_skip_pending: std::sync::atomic::AtomicBool,
 }
 
 impl SellerNodeRunner {
@@ -1390,6 +1396,7 @@ impl SellerNodeRunner {
             boot_auth,
             agents,
             slots,
+            capacity_skip_pending: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1429,6 +1436,102 @@ impl SellerNodeRunner {
             .await
             .map_err(|error| NodeError::Relay(format!("subscribe offers: {error}")))?;
         Ok(())
+    }
+
+    /// #450: reconsider offers we skipped for capacity once a slot frees. An offer skipped because
+    /// every slot was busy (`SlotsBusy`) is recorded but parks no claim, and was previously only
+    /// revisited by a RESTART's offer backfill. When a slot later frees, re-drive those recorded
+    /// offers straight from the store — NOT by re-subscribing the relay: nostr-relay-pool emits an
+    /// event notification only the FIRST time it sees an id (an already-seen replay is swallowed by
+    /// its per-connection seen-cache), so a re-subscribe re-REQs but never re-fires `on_offer`. Only
+    /// a restart's fresh connection would, which is exactly the gap this closes.
+    ///
+    /// Each candidate is re-classified at re-drive time — freshness/expiry, the buyer allowlist, the
+    /// rate gate, and the requested harness can all have changed in the seconds since the skip — and
+    /// only those still `Claim` are re-driven through [`Self::claim_offer`]. Idempotency there
+    /// (`claim_and_enqueue` dedups) is the double-claim guard. The pending flag is consumed only when
+    /// a slot is actually free, and re-armed if more recorded offers remain than freed slots.
+    async fn reconsider_capacity_skips(&self) {
+        if self.slots.available() == 0
+            || !self
+                .capacity_skip_pending
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let Some(seller) = self.node.home().config.seller.clone() else {
+            return;
+        };
+        let now = now_unix();
+        let pending = match self.node.store().offers_awaiting_claim(now) {
+            Ok(offers) => offers,
+            Err(error) => {
+                opline!("seller node capacity-skip reconsider: store read failed ({error}); re-arming for the next tick");
+                self.capacity_skip_pending
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        };
+        if pending.is_empty() {
+            return;
+        }
+        let seller_pubkey = self.seller_pubkey.to_hex();
+        let mut reclaimed = 0usize;
+        for row in pending {
+            if self.slots.available() == 0 {
+                // More recorded-unclaimed offers than freed slots: re-arm so the next freed slot
+                // revisits the remainder rather than dropping them on the floor.
+                self.capacity_skip_pending
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                break;
+            }
+            // Reconstruct the parsed offer from the stored row. Only offers that already passed the
+            // targeting gate are ever recorded (`rate_gate_allows` refuses a foreign `p`-tag BEFORE
+            // `record_offer`), so `targeted ⇒ p-tag == self` and the reconstruction is exact.
+            let offer = ParsedOffer {
+                task: row.task.clone(),
+                output: String::new(),
+                amount: row.amount_sats,
+                unit: row.unit.clone(),
+                deadline_unix: row.deadline_unix as u64,
+                seller_pubkey: row.targeted.then(|| seller_pubkey.clone()),
+                requested_agent: row.requested_agent.clone(),
+            };
+            match classify_offer(
+                &offer,
+                &seller,
+                &self.agents,
+                &seller_pubkey,
+                &row.buyer_pubkey,
+                now as u64,
+            ) {
+                ClaimDecision::Claim { deadline_unix } => {
+                    self.claim_offer(
+                        &row.offer_id,
+                        &row.buyer_pubkey,
+                        &offer,
+                        &seller_pubkey,
+                        deadline_unix,
+                        now,
+                    )
+                    .await;
+                    reclaimed += 1;
+                }
+                ClaimDecision::Skip(skip) => {
+                    opline_verbose!(
+                        "seller node capacity-skip reconsider: offer id={} no longer claimable ({})",
+                        row.offer_id,
+                        skip.reason()
+                    );
+                }
+            }
+        }
+        if reclaimed > 0 {
+            opline!(
+                "seller node reconsidered capacity-skipped offers: re-drove {reclaimed} recorded offer(s) after a slot freed ({} slot(s) free)",
+                self.slots.available()
+            );
+        }
     }
 
     /// Subscribe the marketplace filters: offers, awards, and payment gift-wraps. `since` is
@@ -1645,6 +1748,7 @@ impl SellerNodeRunner {
             tokio::select! {
                 _ = drain_tick.tick() => {
                     self.sweep_lapsed_claims();
+                    self.reconsider_capacity_skips().await;
                     self.start_due_harness_probes();
                     self.drain().await;
                     continue;
@@ -2403,44 +2507,62 @@ impl SellerNodeRunner {
             }
         };
 
+        // The job id IS the offer event id (as on the legacy path); the buyer (its author) was
+        // resolved above for the allowlist fence.
+        let job_id = event.id.to_hex();
+        self.claim_offer(&job_id, &buyer_pubkey, &offer, &seller_pubkey, deadline_unix, now)
+            .await;
+    }
+
+    /// The claim tail: capacity back-pressure → journal the offer facts → build the creq/claim →
+    /// reserve a slot → park the claim. Shared by [`Self::on_offer`] (a wire offer just classified
+    /// `Claim`) and [`Self::reconsider_capacity_skips`] (a RECORDED offer re-driven from the store
+    /// once a slot frees). Idempotent via `claim_and_enqueue`: an offer we already claimed is a
+    /// `Claimed::Idempotent` no-op and its fresh reservation is released, so re-driving a recorded
+    /// offer can never double-claim — the same property the restart backfill relies on.
+    async fn claim_offer(
+        &self,
+        job_id: &str,
+        buyer_pubkey: &str,
+        offer: &ParsedOffer,
+        seller_pubkey: &str,
+        deadline_unix: u64,
+        now: i64,
+    ) {
         // Capacity back-pressure: never hold unbounded parked claims.
         match self.node.store().health() {
             Ok(health) if health.open_claims >= AWAITING_AWARD_CAP => {
                 opline!(
-                    "seller node offer skip id={}: awaiting-award backlog full (cap {AWAITING_AWARD_CAP})",
-                    event.id
+                    "seller node offer skip id={job_id}: awaiting-award backlog full (cap {AWAITING_AWARD_CAP})"
                 );
                 return;
             }
             Ok(_) => {}
             Err(error) => {
-                opline!("seller node offer skip id={}: store health read failed ({error})", event.id);
+                opline!("seller node offer skip id={job_id}: store health read failed ({error})");
                 return;
             }
         }
 
-        // The job id IS the offer event id (as on the legacy path); the buyer (its author) was
-        // resolved above for the allowlist fence.
-        let job_id = event.id.to_hex();
-
         // Journal the offer facts BEFORE claiming: the award arm reads the buyer to authorize an
         // award (author MUST be the offer's buyer), and the pay path reads amount/unit as the redeem
-        // terms. Idempotent — a re-seen offer is a no-op.
+        // terms. Idempotent — a re-seen offer is a no-op (so a reconsider re-drive never re-writes an
+        // already-recorded offer).
         if let Err(error) = self
             .node
             .store()
-            .record_offer(&offer_row(&job_id, &buyer_pubkey, &offer), now)
+            .record_offer(&offer_row(job_id, buyer_pubkey, offer), now)
         {
             opline!("seller node offer skip id={job_id}: record offer failed ({error})");
             return;
         }
 
         let creq = match gateway::creq::build_seller_creq(
-            &job_id,
+            job_id,
             offer.amount,
             &offer.unit,
             &self.node.home().config.accepted_mints,
-            &seller_pubkey,
+            seller_pubkey,
         ) {
             Ok(creq) => creq,
             Err(error) => {
@@ -2451,30 +2573,35 @@ impl SellerNodeRunner {
         // The claim advertises what this node can run, so the buyer's award filter can hold it to
         // the harness its job asked for.
         let claim = claim_draft(
-            &job_id,
-            &buyer_pubkey,
-            &seller_pubkey,
+            job_id,
+            buyer_pubkey,
+            seller_pubkey,
             &creq,
             &self.agents.advertised(),
         );
         // Reserve-at-claim: a fully loaded node has no free slot and simply does not claim, which is
         // how it stays invisible to the market. The gate is consulted only here on the event loop,
         // never concurrently with itself, so two offers can never both take the last slot.
-        let reserved = self.slots.try_reserve(&job_id);
+        let reserved = self.slots.try_reserve(job_id);
         if reserved == Reserve::Full {
             opline!("seller node offer skip id={job_id}: {}", SkipReason::SlotsBusy.reason());
+            // #450: remember the capacity skip so a freed slot re-drives the recorded offer straight
+            // from the store (see reconsider_capacity_skips) — the offer is recorded but unclaimed
+            // until then, and was previously only revisited by a restart.
+            self.capacity_skip_pending
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             return;
         }
         // Release a FRESH reservation if the claim does not actually become a new parked claim (dedup
         // no-op or journal error). An already-parked job id keeps its existing slot untouched.
         let release_on_no_claim = |runner: &Self| {
             if reserved == Reserve::Reserved {
-                runner.slots.release(&job_id);
+                runner.slots.release(job_id);
             }
         };
         match self.node.store().claim_and_enqueue(
-            &job_id,
-            &job_id,
+            job_id,
+            job_id,
             &creq,
             &claim,
             now,
@@ -4753,6 +4880,256 @@ mod tests {
              seat emits"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── #450: capacity-skip backfill — a whole-path LocalRelay proof ─────────────────────────────
+    //
+    // The unit tests above pin the pieces (a SlotsBusy skip arms the flag; the classify gate order;
+    // the filter shapes). These drive the WHOLE path end to end against a real in-process relay: a
+    // 1-slot seller claims one offer, capacity-skips a second, and — once the parked claim lapses and
+    // frees the slot — the drain tick's `sweep_lapsed_claims` + `reconsider_capacity_skips` pair
+    // (run.rs loop arm) re-runs the offer backfill, the relay re-delivers the stored offers, and the
+    // previously skipped offer is claimed WITHOUT a restart. The re-delivered lapsed offer must NOT
+    // be re-claimed — its `released` claim row dedups it — the money-safety property the fix leans on.
+    //
+    // The slot is freed by a claim LAPSE (`claim_award_timeout_secs = 0` ⇒ the next sweep reclaims
+    // it), needing no award/execute cycle, so the whole drive is deterministic with no wall-clock
+    // waits. Freeing via a losing award (which would also exercise #456's loser-release) needs a
+    // published-and-confirmed claim id (`match_award` returns `Release` only for `Some(our_claim)`),
+    // i.e. the outbox publisher running — a heavier harness left as a separate lane.
+
+    /// A 1-slot seller wired to `relay_url`, its parked-claim lapse set to fire on the next sweep so a
+    /// slot frees on demand. `offer_backfill_secs` bounds only the open-pool re-delivery; the targeted
+    /// re-subscribe is unbounded regardless.
+    async fn boot_capacity_skip_seller(
+        label: &str,
+        relay_url: &str,
+        claim_open_pool: bool,
+        offer_backfill_secs: u64,
+    ) -> (SellerNodeRunner, std::path::PathBuf) {
+        let root = temp_dir(label);
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = relay_url.to_string();
+        let mut seller = seller_cfg(1, claim_open_pool);
+        // 0 ⇒ a parked claim counts as lapsed on the very next sweep regardless of wall-clock, so the
+        // test frees the slot on demand — no sleep, no award/execute cycle.
+        seller.claim_award_timeout_secs = Some(0);
+        seller.offer_backfill_secs = offer_backfill_secs;
+        home.config.seller = Some(seller);
+        let runner = SellerNodeRunner::boot(home)
+            .await
+            .expect("boot the capacity-skip seller against the fixture relay");
+        (runner, root)
+    }
+
+    /// Post one offer as `buyer` (targeted to `to_seller` when `Some`, open-pool otherwise) and return
+    /// its event id — which is the `job_id` the node keys the recorded offer and claim on.
+    async fn post_offer(
+        publisher: &Client,
+        buyer: &Keys,
+        task: &str,
+        to_seller: Option<&str>,
+        amount_sats: u64,
+        deadline_unix: u64,
+    ) -> String {
+        // `task` MUST differ between the two offers: a nostr event id is the hash of its content, so
+        // two byte-identical offers from one buyer in the same second collapse to ONE event id — the
+        // relay would dedup them and the "second offer" would never exist to be capacity-skipped.
+        let draft = match to_seller {
+            Some(seller_hex) => {
+                crate::gateway::OfferDraft::new(task, "", amount_sats, deadline_unix, seller_hex)
+            }
+            None => crate::gateway::OfferDraft::untargeted(task, "", amount_sats, deadline_unix),
+        }
+        .to_event_draft();
+        let event = crate::gateway::nostr::event_builder(&draft)
+            .expect("offer event builder")
+            .sign_with_keys(buyer)
+            .expect("sign offer");
+        let id = event.id.to_hex();
+        publisher.send_event(&event).await.expect("post offer to relay");
+        id
+    }
+
+    /// Feed JOB_OFFER events off the seller's live notification stream into `on_offer` — exactly what
+    /// the run loop's select arm does — until `done` holds or the deadline passes. Returns whether
+    /// `done` held.
+    async fn pump_offers_until(
+        runner: &SellerNodeRunner,
+        notifications: &mut tokio::sync::broadcast::Receiver<RelayPoolNotification>,
+        deadline: std::time::Instant,
+        mut done: impl FnMut(&SellerNodeRunner) -> bool,
+    ) -> bool {
+        while !done(runner) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            if let Ok(Ok(RelayPoolNotification::Event { event, .. })) = tokio::time::timeout(
+                remaining.min(Duration::from_millis(150)),
+                notifications.recv(),
+            )
+            .await
+            {
+                if event.kind.as_u16() == JOB_OFFER_KIND {
+                    runner.on_offer(&event).await;
+                }
+            }
+        }
+        done(runner)
+    }
+
+    /// The full capacity-skip → lapse → reconsider → backfill → re-claim drive, shared by the targeted
+    /// and open-pool cases. `open_pool` shapes both the seller's subscription and whether the offers
+    /// are targeted; the mechanism under test is identical either way.
+    async fn drive_capacity_skip_backfill(label: &str, open_pool: bool, backfill_secs: u64) {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+
+        let (runner, root) =
+            boot_capacity_skip_seller(label, &relay_url, open_pool, backfill_secs).await;
+        let seller_hex = runner.seller_pubkey();
+        let to_seller = if open_pool { None } else { Some(seller_hex.clone()) };
+
+        // A separate publisher: a node cannot be delivered its OWN events, so offers must come from a
+        // different key.
+        let buyer = Keys::generate();
+        let publisher = Client::new(buyer.clone());
+        publisher.add_relay(&relay_url).await.expect("publisher add relay");
+        publisher.connect().await;
+        publisher.wait_for_connection(Duration::from_secs(5)).await;
+
+        let mut notifications = runner.client.notifications();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                runner
+                    .subscribe_offers(None, open_pool)
+                    .await
+                    .expect("establish the offer subscription");
+
+                let deadline_unix = now_unix() as u64 + 3_600;
+                let target = to_seller.as_deref();
+                let id_a =
+                    post_offer(&publisher, &buyer, "capacity-skip offer A", target, 100, deadline_unix)
+                        .await;
+                let id_b =
+                    post_offer(&publisher, &buyer, "capacity-skip offer B", target, 100, deadline_unix)
+                        .await;
+
+                // ROUND 1 — a 1-slot seller claims one offer and capacity-skips the other.
+                assert!(
+                    pump_offers_until(
+                        &runner,
+                        &mut notifications,
+                        std::time::Instant::now() + Duration::from_secs(5),
+                        |r| r.node.store().offer_facts(&id_a).ok().flatten().is_some()
+                            && r.node.store().offer_facts(&id_b).ok().flatten().is_some(),
+                    )
+                    .await,
+                    "both offers must reach on_offer"
+                );
+
+                let claimed_a =
+                    runner.node.store().claim_row_state(&id_a).expect("claim a").is_some();
+                let claimed_b =
+                    runner.node.store().claim_row_state(&id_b).expect("claim b").is_some();
+                assert!(
+                    claimed_a ^ claimed_b,
+                    "a 1-slot seller must claim exactly one of the two offers (a={claimed_a} b={claimed_b})"
+                );
+                assert_eq!(runner.slots.available(), 0, "the single slot is full after the claim");
+                assert!(
+                    runner
+                        .capacity_skip_pending
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "the SlotsBusy skip must arm the reconsider flag"
+                );
+                let (claimed_id, skipped_id) = if claimed_a {
+                    (id_a.clone(), id_b.clone())
+                } else {
+                    (id_b.clone(), id_a.clone())
+                };
+
+                // Reconsidering while the slot is still full is a no-op that PRESERVES the pending flag
+                // — else the skip is forgotten and never revisited.
+                runner.reconsider_capacity_skips().await;
+                assert_eq!(runner.slots.available(), 0, "reconsider must not free a slot on its own");
+                assert!(
+                    runner
+                        .capacity_skip_pending
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "reconsider while full must keep the skip pending"
+                );
+
+                // Free the slot exactly as the drain tick does: the parked claim lapses and its row
+                // moves to `released` — still present, so a re-delivery dedups instead of re-claiming.
+                runner.sweep_lapsed_claims();
+                assert_eq!(runner.slots.available(), 1, "the lapsed claim frees the slot");
+                assert_eq!(
+                    runner.node.store().claim_row_state(&claimed_id).expect("released row"),
+                    Some("released".to_string()),
+                    "the lapsed claim's row must remain, as `released`"
+                );
+
+                // THE FIX — reconsider re-drives the recorded capacity-skipped offer STRAIGHT FROM
+                // THE STORE (no relay round-trip, so no dependence on a re-delivery the pool's
+                // seen-cache would swallow). The claim is synchronous: it has landed by the time the
+                // await returns, so no notification pump is involved here.
+                runner.reconsider_capacity_skips().await;
+                assert!(
+                    !runner
+                        .capacity_skip_pending
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "a reconsider that fires clears the pending flag"
+                );
+                assert_eq!(
+                    runner
+                        .node
+                        .store()
+                        .claim_row_state(&skipped_id)
+                        .expect("skipped claim state")
+                        .as_deref(),
+                    Some("claimed"),
+                    "the capacity-skipped offer must be claimed once a slot frees — no restart, no relay round-trip"
+                );
+                assert_eq!(
+                    runner.slots.available(),
+                    0,
+                    "claiming the re-driven offer refills the slot"
+                );
+                assert_eq!(
+                    runner.node.store().claim_row_state(&claimed_id).expect("still released"),
+                    Some("released".to_string()),
+                    "the lapsed offer is NOT re-claimed (it has a released row; only never-claimed offers are re-driven)"
+                );
+            })
+            .await;
+
+        runner.client.disconnect().await;
+        publisher.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #450 — the targeted case. A targeted seller's re-subscribe is unbounded, so the backfill window
+    /// is immaterial; a capacity-skipped offer is revisited the moment a slot frees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconsider_backfills_a_capacity_skipped_targeted_offer_when_a_slot_frees() {
+        drive_capacity_skip_backfill("cap-skip-targeted", false, 0).await;
+    }
+
+    /// #450 + #519 — the OPEN-POOL case, run LIVE-ONLY (`offer_backfill_secs = 0`). The re-drive
+    /// reads the store, not the relay, so it has NO backfill dependence: an open-pool capacity-skip is
+    /// revisited even on a seller that keeps nothing for stored open-pool re-delivery — the exact case
+    /// a relay re-subscribe could never reach (its untargeted replay is `since(now).limit(0)`), and
+    /// what closes #519 in full.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconsider_backfills_a_capacity_skipped_open_pool_offer_when_a_slot_frees() {
+        drive_capacity_skip_backfill("cap-skip-open-pool", true, 0).await;
     }
 
     // TOOTH (wrap backfill) — the cursor keeps an OLDER delivered-but-unpaid job's payment window in
