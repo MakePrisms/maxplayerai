@@ -5051,23 +5051,25 @@ mod tests {
     // published-and-confirmed claim id (`match_award` returns `Release` only for `Some(our_claim)`),
     // i.e. the outbox publisher running — a heavier harness left as a separate lane.
 
-    /// A 1-slot seller wired to `relay_url`, its parked-claim lapse set to fire on the next sweep so a
-    /// slot frees on demand. `offer_backfill_secs` bounds only the open-pool re-delivery; the targeted
-    /// re-subscribe is unbounded regardless.
+    /// A 1-slot seller wired to `relay_url`. `claim_award_timeout_secs` sets the parked-claim lapse:
+    /// `Some(0)` ⇒ a parked claim counts as lapsed on the very next sweep regardless of wall-clock, so
+    /// a test frees the slot on demand (the #450 capacity-skip drive); a LARGE value makes the lapse
+    /// unreachable in-test, pinning the AWARD-visibility path as the ONLY thing that can free the slot
+    /// (the loser-release pin, which must NOT ride the lapse). `offer_backfill_secs` bounds only the
+    /// open-pool re-delivery; the targeted re-subscribe is unbounded regardless.
     async fn boot_capacity_skip_seller(
         label: &str,
         relay_url: &str,
         claim_open_pool: bool,
         offer_backfill_secs: u64,
+        claim_award_timeout_secs: Option<u64>,
     ) -> (SellerNodeRunner, std::path::PathBuf) {
         let root = temp_dir(label);
         let _ = std::fs::remove_dir_all(&root);
         let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
         home.config.relay_url = relay_url.to_string();
         let mut seller = seller_cfg(1, claim_open_pool);
-        // 0 ⇒ a parked claim counts as lapsed on the very next sweep regardless of wall-clock, so the
-        // test frees the slot on demand — no sleep, no award/execute cycle.
-        seller.claim_award_timeout_secs = Some(0);
+        seller.claim_award_timeout_secs = claim_award_timeout_secs;
         seller.offer_backfill_secs = offer_backfill_secs;
         home.config.seller = Some(seller);
         let runner = SellerNodeRunner::boot(home)
@@ -5133,6 +5135,35 @@ mod tests {
         done(runner)
     }
 
+    /// Feed JOB_AWARD events off the seller's live notification stream into `on_award` — exactly what
+    /// the run loop's select arm does — until `done` holds or the deadline passes. Mirrors
+    /// [`pump_offers_until`]; takes an `Arc` runner because `on_award` binds `self: &Arc<Self>` (its
+    /// execute branch spawns the job onto the LocalSet). Returns whether `done` held.
+    async fn pump_awards_until(
+        runner: &Arc<SellerNodeRunner>,
+        notifications: &mut tokio::sync::broadcast::Receiver<RelayPoolNotification>,
+        deadline: std::time::Instant,
+        mut done: impl FnMut(&SellerNodeRunner) -> bool,
+    ) -> bool {
+        while !done(runner) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            if let Ok(Ok(RelayPoolNotification::Event { event, .. })) = tokio::time::timeout(
+                remaining.min(Duration::from_millis(150)),
+                notifications.recv(),
+            )
+            .await
+            {
+                if event.kind.as_u16() == JOB_AWARD_KIND {
+                    runner.on_award(&event).await;
+                }
+            }
+        }
+        done(runner)
+    }
+
     /// The full capacity-skip → lapse → reconsider → backfill → re-claim drive, shared by the targeted
     /// and open-pool cases. `open_pool` shapes both the seller's subscription and whether the offers
     /// are targeted; the mechanism under test is identical either way.
@@ -5144,7 +5175,7 @@ mod tests {
         let relay_url = relay.url().await.to_string();
 
         let (runner, root) =
-            boot_capacity_skip_seller(label, &relay_url, open_pool, backfill_secs).await;
+            boot_capacity_skip_seller(label, &relay_url, open_pool, backfill_secs, Some(0)).await;
         let seller_hex = runner.seller_pubkey();
         let to_seller = if open_pool { None } else { Some(seller_hex.clone()) };
 
@@ -5283,6 +5314,190 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconsider_backfills_a_capacity_skipped_open_pool_offer_when_a_slot_frees() {
         drive_capacity_skip_backfill("cap-skip-open-pool", true, 0).await;
+    }
+
+    /// #456 / #514 END-TO-END PIN — a losing open-pool claimant frees its reserved slot the MOMENT it
+    /// sees the award, over the wire, with no lapse involved.
+    ///
+    /// #450's tests reach slot-release only through the LAPSE sweep (`claim_award_timeout_secs = 0`),
+    /// so they can never exercise the award-visibility release #514 shipped. This drives the real
+    /// path: TWO one-slot open-pool sellers both claim ONE untargeted offer (each reserving its single
+    /// slot), the buyer awards seller A's claim, and seller B — the loser — receives that award
+    /// because its open-pool award REQ is UNSCOPED (`award_filter`, #514) and releases its slot + marks
+    /// its claim `released` SYNCHRONOUSLY, i.e. without waiting out the 120s claim-award timeout. The
+    /// lapse is pinned unreachable here (`claim_award_timeout_secs = Some(3600)`, and no sweep is ever
+    /// called), so the AWARD is the ONLY thing that can free B's slot.
+    ///
+    /// `publish_award` parameterises the non-vacuity foil: with it FALSE the identical harness runs
+    /// minus the award and B's slot must STAY reserved (the committed test passes TRUE). Two red-proofs
+    /// are recorded on the PR: (a) re-scoping `award_filter` to the pubkey for open-pool ⇒ the loser
+    /// never receives the award ⇒ this fails; (b) `publish_award = false` ⇒ nothing frees the slot
+    /// in-window ⇒ this fails. Both prove the release is caused by the AWARD arriving — not by a slot
+    /// that was never reserved, nor a claim row that defaulted to `released`.
+    async fn drive_loser_release_on_award(publish_award: bool) {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+
+        // Two DISTINCT-key one-slot open-pool sellers (distinct labels ⇒ distinct homes ⇒ distinct
+        // keys). The large lapse timeout pins the AWARD path as the only slot-release path in-test.
+        let (winner, winner_root) =
+            boot_capacity_skip_seller("loser-release-winner", &relay_url, true, 0, Some(3600)).await;
+        let (loser_runner, loser_root) =
+            boot_capacity_skip_seller("loser-release-loser", &relay_url, true, 0, Some(3600)).await;
+        // `on_award` binds `self: &Arc<Self>`, so the loser is driven through an Arc.
+        let loser = Arc::new(loser_runner);
+        let winner_hex = winner.seller_pubkey();
+
+        // A separate buyer/publisher: a node is never delivered its OWN events, so the offer AND the
+        // award come from a third key — and that key IS the offer's buyer, the sole authorized awarder
+        // (`on_award` checks the award author == the recorded offer buyer).
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let publisher = Client::new(buyer.clone());
+        publisher.add_relay(&relay_url).await.expect("publisher add relay");
+        publisher.connect().await;
+        publisher.wait_for_connection(Duration::from_secs(5)).await;
+
+        let mut winner_notifs = winner.client.notifications();
+        let mut loser_notifs = loser.client.notifications();
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                winner
+                    .subscribe_offers(None, true)
+                    .await
+                    .expect("winner offer subscription");
+                // The loser needs BOTH the offer REQ (to claim) and the award REQ (to see the award).
+                loser
+                    .subscribe_all(None)
+                    .await
+                    .expect("loser offer + award subscriptions");
+
+                let deadline_unix = now_unix() as u64 + 3_600;
+                let job_id = post_offer(
+                    &publisher,
+                    &buyer,
+                    "loser-release open-pool offer",
+                    None,
+                    100,
+                    deadline_unix,
+                )
+                .await;
+
+                // Both sellers record + claim the one untargeted offer, each reserving its lone slot.
+                assert!(
+                    pump_offers_until(
+                        &winner,
+                        &mut winner_notifs,
+                        std::time::Instant::now() + Duration::from_secs(5),
+                        |r| r.node.store().claim_row_state(&job_id).ok().flatten().is_some(),
+                    )
+                    .await,
+                    "the winner must claim the open-pool offer"
+                );
+                assert!(
+                    pump_offers_until(
+                        &loser,
+                        &mut loser_notifs,
+                        std::time::Instant::now() + Duration::from_secs(5),
+                        |r| r.node.store().claim_row_state(&job_id).ok().flatten().is_some(),
+                    )
+                    .await,
+                    "the loser must claim the open-pool offer"
+                );
+                assert_eq!(winner.slots.available(), 0, "the winner's single slot is reserved");
+                assert_eq!(loser.slots.available(), 0, "the loser's single slot is reserved");
+
+                // Publish both claims so each has a real id on the wire; the award names the winner's.
+                winner.drain().await;
+                loser.drain().await;
+                let winner_claim_id = match winner.node.store().outbox_row(&format!("claim:{job_id}"))
+                {
+                    Ok(Some((_, _, Some(published)))) => published,
+                    other => panic!("winner claim must be published with an id; got {other:?}"),
+                };
+                let loser_claim_id = match loser.node.store().outbox_row(&format!("claim:{job_id}")) {
+                    Ok(Some((_, _, Some(published)))) => published,
+                    other => panic!("loser claim must be published with an id; got {other:?}"),
+                };
+                assert_ne!(
+                    winner_claim_id, loser_claim_id,
+                    "two distinct sellers publish two distinct claim events"
+                );
+
+                // The buyer AWARDS the winner's claim: e-tags offer-root + winner-claim, p-tags buyer +
+                // winner, signed by the buyer (the offer's author). The award p-tags ONLY the winner —
+                // the loser sees it solely because its open-pool award REQ is unscoped (#514).
+                if publish_award {
+                    let award = crate::gateway::award_draft(
+                        &job_id,
+                        &winner_claim_id,
+                        &buyer_hex,
+                        &winner_hex,
+                    );
+                    let event = crate::gateway::nostr::event_builder(&award)
+                        .expect("award event builder")
+                        .sign_with_keys(&buyer)
+                        .expect("sign award as the buyer");
+                    publisher.send_event(&event).await.expect("post award to relay");
+                }
+
+                // Drive the LOSER's award ingestion off its own notification stream. With the fix the
+                // loser receives the award naming another claim → `match_award` → `Release` → slot +
+                // durable claim released, SYNCHRONOUSLY (no 120s lapse; none is even reachable here).
+                let released = pump_awards_until(
+                    &loser,
+                    &mut loser_notifs,
+                    std::time::Instant::now() + Duration::from_secs(5),
+                    |r| {
+                        r.slots.available() == 1
+                            && r.node
+                                .store()
+                                .claim_row_state(&job_id)
+                                .ok()
+                                .flatten()
+                                .as_deref()
+                                == Some("released")
+                    },
+                )
+                .await;
+
+                assert!(
+                    released,
+                    "the losing open-pool claimant must free its slot on the AWARD, promptly and \
+                     without a lapse (available={}, claim_state={:?})",
+                    loser.slots.available(),
+                    loser.node.store().claim_row_state(&job_id)
+                );
+                // The slot is back AND the claim row is `released` — never `awarded`. `release_claim`
+                // only moves `claimed`→`released`; the execute path (`record_award`) would have moved
+                // it to `awarded`. So `released` positively proves the loser took the Release branch
+                // and NEVER executed — a free slot alone could not (a failed execute frees one too).
+                assert_eq!(loser.slots.available(), 1, "the loser's reserved slot is released");
+                assert_eq!(
+                    loser.node.store().claim_row_state(&job_id).expect("loser claim row"),
+                    Some("released".to_string()),
+                    "the loser's claim row is `released` (Release path), never `awarded` (execute)"
+                );
+            })
+            .await;
+
+        winner.client.disconnect().await;
+        loser.client.disconnect().await;
+        publisher.disconnect().await;
+        let _ = std::fs::remove_dir_all(&winner_root);
+        let _ = std::fs::remove_dir_all(&loser_root);
+    }
+
+    /// #456 / #514 — the committed GREEN pin: award published, `award_filter` intact. The two RED
+    /// foils (award-filter re-scoped; award withheld) are RUN and recorded on the PR, not in CI.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_losing_open_pool_claimant_releases_its_slot_when_it_sees_the_award() {
+        drive_loser_release_on_award(true).await;
     }
 
     // TOOTH (wrap backfill) — the cursor keeps an OLDER delivered-but-unpaid job's payment window in
