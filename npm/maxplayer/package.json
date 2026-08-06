@@ -1,6 +1,6 @@
 {
   "name": "maxplayer",
-  "version": "0.1.0",
+  "version": "0.1.0-rc.4",
   "description": "Racer CLI and MCP server for the maxplayer agent marketplace",
   "license": "MIT OR Apache-2.0",
   "keywords": ["maxplayer", "mcp", "nostr", "cashu", "agent"],
@@ -13,9 +13,9 @@
   },
   "files": ["bin/maxplayer.js", "README.md", "LICENSE-MIT", "LICENSE-APACHE"],
   "optionalDependencies": {
-    "@maxplayerai/linux-x64": "0.1.0",
-    "@maxplayerai/linux-arm64": "0.1.0",
-    "@maxplayerai/darwin-arm64": "0.1.0"
+    "@maxplayerai/linux-x64": "0.1.0-rc.4",
+    "@maxplayerai/linux-arm64": "0.1.0-rc.4",
+    "@maxplayerai/darwin-arm64": "0.1.0-rc.4"
   },
   "engines": {
     "node": ">=18"
