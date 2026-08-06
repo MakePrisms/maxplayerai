@@ -64,28 +64,41 @@ if [ -n "$folded" ]; then
 fi
 echo "ok: every backslash-continued run: is a block scalar"
 
-# ── Both surfaces are still built, and each is verified by its own script ───────────────────────
-# A release that publishes only the racer assets is not a broken release — it is a smaller one, and
-# nothing downstream notices: the assets it does publish build, verify, checksum and install exactly
-# as they should. The first report is a seller running `install.sh --seller` against a 404. So the
-# pair is asserted here, where dropping one fails the pull request that does it rather than the tag
-# that ships it.
+# ── The one shipped artifact carries the whole surface, and it is asserted ──────────────────────
+# Since #510 a release ships ONE binary per platform, built with `acp` so that the same artifact
+# buys and sells. Both halves of that are checked, because losing either is invisible: a build that
+# quietly dropped `acp` still compiles, packages, checksums and installs, and the first report is a
+# seller whose `maxplayer sell` does not exist — on someone else's award.
 #
-# The verifier scripts are checked for existence too. A workflow naming a script that is not there
-# fails at the tag, after six builds — and the `if:`-free step would be the last thing to run before
-# packaging, so the artifact would already exist.
-for surface in racer seller; do
-    verifier="scripts/verify-$surface-surface.sh"
-    grep -qF -- "$verifier" "$WORKFLOW" \
-        || die "$WORKFLOW does not run $verifier — the $surface artifact would ship with its feature set unasserted"
-    [ -x "$verifier" ] \
-        || die "$WORKFLOW runs $verifier, which is missing or not executable"
-done
-grep -qE "^ +asset: maxplayer$" "$WORKFLOW" \
-    || die "$WORKFLOW builds no asset named 'maxplayer' — the buyer artifact is what every install and every npm payload resolves"
-grep -qE "^ +asset: maxplayer-seller$" "$WORKFLOW" \
-    || die "$WORKFLOW builds no 'maxplayer-seller' asset — sellers would have nothing to install"
-echo "ok: both surfaces are built, each verified by its own script"
+# `--features wallet,acp` is the request; the verifier is the proof. Asserting only the first would
+# pass a workflow whose verify step had been deleted, and asserting only the second would pass one
+# that verifies a different build than it packages.
+grep -qF -- '--features wallet,acp' "$WORKFLOW" \
+    || die "$WORKFLOW does not build with 'wallet,acp' — the shipped binary would not carry the seller surface"
+
+# The verifier script is checked for existence too. A workflow naming a script that is not there
+# fails at the tag, after every build — and the `if:`-free step would be the last thing to run
+# before packaging, so the artifact would already exist.
+verifier="scripts/verify-seller-surface.sh"
+grep -qF -- "$verifier" "$WORKFLOW" \
+    || die "$WORKFLOW does not run $verifier — the shipped artifact would go out with its feature set unasserted"
+[ -x "$verifier" ] \
+    || die "$WORKFLOW runs $verifier, which is missing or not executable"
+
+# The release completeness gate names the asset stem. It is what stops a release publishing with a
+# platform missing, and a stem that drifted from `maxplayer` would break every install URL and every
+# npm payload extraction at once.
+grep -qF -- 'maxplayer-$VERSION-$platform.tar.gz' "$WORKFLOW" \
+    || die "$WORKFLOW's completeness gate does not name maxplayer-\$VERSION-\$platform.tar.gz — the asset stem every install and npm payload resolves"
+
+# The retired second asset, asserted GONE rather than assumed. `install.sh` no longer constructs a
+# `maxplayer-seller-*` name, so a workflow that started building one again would publish assets
+# nothing installs — and the reverse mistake, a workflow still naming it while nothing builds it,
+# is how the completeness gate above would fail every release.
+if grep -q 'maxplayer-seller' "$WORKFLOW"; then
+    die "$WORKFLOW still names a 'maxplayer-seller' asset — #510 collapsed the release to one binary named maxplayer"
+fi
+echo "ok: one artifact, built with wallet,acp and verified by $verifier"
 
 # ── The privileged jobs are gated, and nothing else publishes ───────────────────────────────────
 # Job boundaries are found by their two-space-indented keys rather than parsed as YAML, so that this

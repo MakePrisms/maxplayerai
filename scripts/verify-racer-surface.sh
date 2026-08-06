@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 #
-# Capability gate for a shipped racer artifact — asserts WHICH features were compiled in.
+# Capability gate for a BUYER-ONLY (racer) build — asserts WHICH features were compiled in.
+#
+# ★ Since #510 no release ships this build. One binary is published, carrying the full surface, and
+#   `verify-seller-surface.sh` is what gates it. This script keeps the buyer-only FEATURE SET
+#   honest: `ci.yml` builds with default features and runs this, so `--no-default-features --features
+#   wallet` stays a real, acp-free build for anyone compiling from source. A release that started
+#   running this again would be shipping a binary that cannot sell.
 #
 # `verify-static-artifact.sh` proves the artifact runs anywhere; it cannot tell which build it is,
 # because `maxplayer version` succeeds identically in every feature combination. This script answers the
