@@ -339,44 +339,58 @@ fn refuse_silent_play_money(explicit_mint: Option<&str>, default_mint: &str) -> 
     ))
 }
 
-/// Summary line for a `wallet setup` that FUNDED (the testnut auto-pay path). Carries the money_type
-/// label (derived from the mint) alongside the URL so play money is never implicit (#506).
+/// A loud marker for play (testnut dev) money, empty for every ordinary mint. The testnut dev mint
+/// self-mints fake sats; surfacing that keeps a dev home from mistaking play money for real funds.
+/// Ordinary mints carry no class label — a mint is a mint, identified by its URL (#577). Returns a
+/// leading-space field so callers append it directly; empty means the field is simply absent.
+#[cfg(feature = "wallet")]
+fn play_money_marker(mint_url: &str) -> &'static str {
+    match wallet_ops::MoneyType::of_mint(mint_url) {
+        wallet_ops::MoneyType::Play => " play_money=true",
+        wallet_ops::MoneyType::Real => "",
+    }
+}
+
+/// Summary line for a `wallet setup` that FUNDED. Only the testnut dev mint auto-pays its own invoice,
+/// so this row is play money in practice and carries the play-money marker; an ordinary mint would
+/// carry none (#577).
 #[cfg(feature = "wallet")]
 fn setup_funded_summary(home_root: &std::path::Path, outcome: &wallet_ops::MintOutcome) -> String {
     format!(
-        "status=funded home={} funded_sats={} balance_sats={} mint={} money_type={}",
+        "status=funded home={} funded_sats={} balance_sats={} mint={}{}",
         home_root.display(),
         outcome.funded_sats,
         outcome.balance_sats,
         outcome.mint_url,
-        wallet_ops::MoneyType::of_mint(&outcome.mint_url).label(),
+        play_money_marker(&outcome.mint_url),
     )
 }
 
-/// Summary line for a `wallet setup` that returned an invoice to pay (the real-mint path). Carries
-/// the money_type label alongside the URL so REAL vs PLAY is explicit, not inferred (#506).
+/// Summary line for a `wallet setup` that returned an invoice to pay (the ordinary path: the mint
+/// invoices and the sats are the user's). A play-money marker appears only for a dev play mint;
+/// ordinary mints carry no class label (#577).
 #[cfg(feature = "wallet")]
 fn setup_needs_payment_summary(quote: &wallet_ops::MintQuote) -> String {
     format!(
-        "status=needs_payment amount_sats={} mint={} money_type={} quote_id={} (pay the invoice below with real sats, then `maxplayer wallet mint-complete {}`)",
+        "status=needs_payment amount_sats={} mint={}{} quote_id={} (pay the invoice below, then `maxplayer wallet mint-complete {}`)",
         quote.amount_sats,
         quote.mint_url,
-        wallet_ops::MoneyType::of_mint(&quote.mint_url).label(),
+        play_money_marker(&quote.mint_url),
         quote.quote_id,
         quote.quote_id,
     )
 }
 
-/// One `wallet balance` row: mint URL, role, money_type (REAL/PLAY derived from the mint), balance.
-/// money_type makes the money class explicit alongside the URL, never a URL to recognize (#506).
+/// One `wallet balance` row: mint URL, role, balance. A play-money marker trails the row only for a
+/// dev play mint; ordinary mints carry no class label — the URL is the mint's identity (#577).
 #[cfg(feature = "wallet")]
 fn balance_row_line(row: &wallet_ops::MintBalance) -> String {
     format!(
-        "mint={} role={} money_type={} balance_sats={}",
+        "mint={} role={} balance_sats={}{}",
         row.mint_url,
         if row.is_default { "default" } else { "extra" },
-        wallet_ops::MoneyType::of_mint(&row.mint_url).label(),
         row.balance_sats,
+        play_money_marker(&row.mint_url),
     )
 }
 
@@ -384,10 +398,10 @@ fn balance_row_line(row: &wallet_ops::MintBalance) -> String {
 #[cfg(feature = "wallet")]
 fn mints_list_row_line(row: &wallet_ops::MintBalance) -> String {
     format!(
-        "mint={} role={} money_type={}",
+        "mint={} role={}{}",
         row.mint_url,
         if row.is_default { "default" } else { "extra" },
-        wallet_ops::MoneyType::of_mint(&row.mint_url).label(),
+        play_money_marker(&row.mint_url),
     )
 }
 
@@ -728,7 +742,7 @@ fn cmd_mint(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             // Bolt11 before any poll — payer must fund, then complete_mint.
             let _ = writeln!(
                 err,
-                "status=needs_payment amount_sats={} mint={} quote_id={} (pay the invoice below with real sats, then `maxplayer wallet mint-complete {}`)",
+                "status=needs_payment amount_sats={} mint={} quote_id={} (pay the invoice below, then `maxplayer wallet mint-complete {}`)",
                 quote.amount_sats, quote.mint_url, quote.quote_id, quote.quote_id
             );
             let _ = writeln!(out, "{}", quote.invoice);
@@ -1266,14 +1280,16 @@ mod tests {
         );
     }
 
-    // money_type LOUD (#506): both `wallet setup` arms label the money class REAL/PLAY, derived from
-    // the mint and alongside (not replacing) the URL. Pure formatters so both a minibits-resolving
-    // (REAL) and a testnut-resolving (PLAY) setup are asserted without a live mint.
+    // #577: a play-money marker appears ONLY on a testnut (play) row; an ordinary/real row carries no
+    // money-class label at all. Pure formatters so both a testnut-resolving (play) and a
+    // minibits-resolving (real) setup are asserted without a live mint. The `!contains("money_type")`
+    // / `!contains("REAL")` / `!contains("real sats")` asserts are the red-on-revert for gudnuf's
+    // ruling: re-adding the class fork or the "real sats" qualifier reds them.
     #[cfg(feature = "wallet")]
     #[test]
-    fn setup_summaries_label_money_type_from_the_mint() {
+    fn setup_summaries_mark_play_money_only() {
         use maxplayer_core::wallet_ops::{MintOutcome, MintQuote};
-        // Funded via testnut auto-pay => PLAY, alongside the mint URL.
+        // Funded via testnut auto-pay => play money => marker present, alongside the mint URL.
         let play = setup_funded_summary(
             std::path::Path::new("/tmp/h"),
             &MintOutcome {
@@ -1284,9 +1300,9 @@ mod tests {
                 balance_sats: 21,
             },
         );
-        assert!(play.contains("money_type=PLAY"), "{play}");
+        assert!(play.contains("play_money=true"), "{play}");
         assert!(play.contains(&format!("mint={DEFAULT_MINT_URL}")), "{play}");
-        // Derived from the mint, not hardcoded to the arm: a real mint in the Funded arm reads REAL.
+        // A real mint in the Funded arm carries NO class label — no marker, no money_type, no "REAL".
         let real_funded = setup_funded_summary(
             std::path::Path::new("/tmp/h"),
             &MintOutcome {
@@ -1297,26 +1313,31 @@ mod tests {
                 balance_sats: 21,
             },
         );
-        assert!(real_funded.contains("money_type=REAL"), "{real_funded}");
-        // NeedsPayment is the real-mint invoice path => REAL.
+        assert!(!real_funded.contains("play_money"), "{real_funded}");
+        assert!(!real_funded.contains("money_type"), "{real_funded}");
+        assert!(!real_funded.contains("REAL"), "{real_funded}");
+        // NeedsPayment is the ordinary invoice path: no class label, and no "real sats" qualifier.
         let real = setup_needs_payment_summary(&MintQuote {
             mint_url: DEFAULT_MINIBITS_MINT_URL.to_owned(),
             invoice: "lnbc-invoice".to_owned(),
             quote_id: "q".to_owned(),
             amount_sats: 21,
         });
-        assert!(real.contains("money_type=REAL"), "{real}");
+        assert!(!real.contains("play_money"), "{real}");
+        assert!(!real.contains("money_type"), "{real}");
+        assert!(!real.contains("real sats"), "{real}");
         assert!(
             real.contains(&format!("mint={DEFAULT_MINIBITS_MINT_URL}")),
             "{real}"
         );
     }
 
-    // money_type LOUD (#506): `wallet balance` and `wallet mints list` rows both carry the label,
-    // derived per-row from the mint. Pure row formatters, asserted for a PLAY (testnut) and a REAL row.
+    // #577: `wallet balance` and `wallet mints list` rows mark play money ONLY on a testnut (play)
+    // row; an ordinary/real row carries no money-class label. Pure row formatters, asserted for a
+    // play (testnut) and a real row. The absence asserts red-on-revert if the class fork returns.
     #[cfg(feature = "wallet")]
     #[test]
-    fn wallet_rows_label_money_type() {
+    fn wallet_rows_mark_play_money_only() {
         use maxplayer_core::wallet_ops::MintBalance;
         let testnut_default = MintBalance {
             mint_url: DEFAULT_MINT_URL.to_owned(),
@@ -1331,25 +1352,37 @@ mod tests {
         let balance = balance_row_line(&testnut_default);
         assert!(
             balance.contains("role=default")
-                && balance.contains("money_type=PLAY")
+                && balance.contains("play_money=true")
                 && balance.contains("balance_sats=5"),
             "{balance}"
         );
-        assert!(balance_row_line(&real_extra).contains("money_type=REAL"));
+        let real_balance = balance_row_line(&real_extra);
+        assert!(
+            !real_balance.contains("play_money")
+                && !real_balance.contains("money_type")
+                && !real_balance.contains("REAL"),
+            "{real_balance}"
+        );
         let listed = mints_list_row_line(&testnut_default);
         assert!(
-            listed.contains("role=default") && listed.contains("money_type=PLAY"),
+            listed.contains("role=default") && listed.contains("play_money=true"),
             "{listed}"
         );
-        assert!(mints_list_row_line(&real_extra).contains("money_type=REAL"));
+        let real_listed = mints_list_row_line(&real_extra);
+        assert!(
+            !real_listed.contains("play_money")
+                && !real_listed.contains("money_type")
+                && !real_listed.contains("REAL"),
+            "{real_listed}"
+        );
     }
 
     // End-to-end, offline (mints list never opens a wallet): a testnut-default home with a real extra
-    // mint labels the default row PLAY and the extra row REAL — money type is per-row and appears in
-    // real command output, not only the pure formatter.
+    // mint marks the default (play) row and leaves the real extra row unmarked — the play marker is
+    // per-row and appears in real command output, not only the pure formatter.
     #[cfg(feature = "wallet")]
     #[test]
-    fn mints_list_command_labels_money_type_per_row() {
+    fn mints_list_command_marks_play_money_per_row() {
         let home = ux_test_home("mints-list-labels");
         let _ = std::fs::remove_dir_all(&home);
         seed_testnut_default_home(&home);
@@ -1386,7 +1419,7 @@ mod tests {
             .expect("a default row");
         assert!(
             default_row.contains(&format!("mint={DEFAULT_MINT_URL}"))
-                && default_row.contains("money_type=PLAY"),
+                && default_row.contains("play_money=true"),
             "default row:\n{default_row}\nfull:\n{out}"
         );
         let extra_row = out
@@ -1394,7 +1427,9 @@ mod tests {
             .find(|line| line.contains("role=extra"))
             .expect("an extra row");
         assert!(
-            extra_row.contains("money_type=REAL"),
+            !extra_row.contains("play_money")
+                && !extra_row.contains("money_type")
+                && !extra_row.contains("REAL"),
             "extra row:\n{extra_row}\nfull:\n{out}"
         );
         let _ = std::fs::remove_dir_all(&home);

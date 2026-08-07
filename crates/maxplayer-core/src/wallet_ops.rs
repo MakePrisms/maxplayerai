@@ -183,9 +183,10 @@ fn is_autopay_mint(mint_url: &str) -> bool {
 }
 
 /// Money class a mint moves, derived purely from the mint URL. The pinned testnut host
-/// ([`DEFAULT_MINT_URL`]) FakeWallet-auto-pays its own invoices — PLAY money — while every other
-/// mint invoices for REAL sats. Surfaced as a first-class label in `wallet setup`/`balance`/`mints
-/// list` (#506) so money type is never left implicit in a URL the reader must recognize.
+/// ([`DEFAULT_MINT_URL`]) FakeWallet-auto-pays its own invoices — play money — while every other
+/// mint invoices for real sats. Internal: it gates the #445 fail-closed refusal of silently
+/// auto-funding play money and drives a play-money marker on dev rows. Ordinary mints carry no
+/// money-class label in user output — a mint is a mint, identified by its URL (#577).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MoneyType {
     /// A real mint — its invoices move real sats.
@@ -202,14 +203,6 @@ impl MoneyType {
             Self::Play
         } else {
             Self::Real
-        }
-    }
-
-    /// Short uppercase label for operational output (`REAL`/`PLAY`).
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Real => "REAL",
-            Self::Play => "PLAY",
         }
     }
 }
@@ -1225,13 +1218,12 @@ mod tests {
         assert!(matches!(err, WalletOpsError::Wallet(_)));
     }
 
-    // #506 money_type: the label is derived PURELY from the mint — the testnut play mint is PLAY,
-    // every other mint (including the shipped minibits default) is REAL. Red-on-revert for the rule
-    // that makes money type a first-class label rather than a URL the reader must recognize.
+    // #506/#577 money class: `of_mint` classifies PURELY from the mint URL — the testnut play mint is
+    // Play, every other mint (including the shipped minibits default) is Real. The classification is
+    // internal: it gates the #445 refusal and the play-money marker, never a surfaced money-class label.
     #[test]
-    fn money_type_labels_testnut_play_and_others_real() {
+    fn of_mint_classifies_testnut_play_and_others_real() {
         assert_eq!(MoneyType::of_mint(DEFAULT_MINT_URL), MoneyType::Play);
-        assert_eq!(MoneyType::of_mint(DEFAULT_MINT_URL).label(), "PLAY");
         // Trailing slash / surrounding whitespace still classify as the testnut mint (normalized).
         assert_eq!(
             MoneyType::of_mint(" https://testnut.cashudevkit.org/ "),
@@ -1242,14 +1234,10 @@ mod tests {
             MoneyType::Real
         );
         assert_eq!(
-            MoneyType::of_mint(crate::home::DEFAULT_MINIBITS_MINT_URL).label(),
-            "REAL"
-        );
-        assert_eq!(
             MoneyType::of_mint("https://real-mint.example"),
             MoneyType::Real
         );
-        // Fail-safe: an unparseable URL is never labeled play money.
+        // Fail-safe: an unparseable URL is never classified play money.
         assert_eq!(MoneyType::of_mint("not a url"), MoneyType::Real);
     }
 
