@@ -600,6 +600,33 @@ mod tests {
         );
     }
 
+    // #549: `maxplayer seller --help` must print the seller usage to stdout and exit 0. The parser's
+    // catch-all had no `--help` arm, so `--help` was reported as an unknown option (empty stdout,
+    // exit 1). acp-gated because the `seller` dispatch only exists on the seller build (`mod sell`).
+    #[cfg(feature = "acp")]
+    #[test]
+    fn seller_help_prints_usage_and_succeeds() {
+        let (code, out, err) = run_captured(["maxplayer", "seller", "--help"]);
+        assert_eq!(
+            code, 0,
+            "`maxplayer seller --help` must succeed:\nstdout={out}\nstderr={err}"
+        );
+        assert!(
+            out.contains("Usage:") && out.contains("maxplayer seller"),
+            "`seller --help` must print the seller usage to stdout:\n{out}"
+        );
+        // Rename-completeness: no surface may name the retired `sell` command to the user, only
+        // `seller`. A token-level check so `seller` itself does not trip it.
+        let names_retired_sell = |text: &str| {
+            text.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|token| token == "sell")
+        };
+        assert!(
+            !names_retired_sell(&out) && !names_retired_sell(&err),
+            "seller --help must not name the retired `sell` (only `seller`):\nstdout={out}\nstderr={err}"
+        );
+    }
+
     #[test]
     fn replay_renders_log_envelopes_in_order() {
         let path = test_path("replay-renders");

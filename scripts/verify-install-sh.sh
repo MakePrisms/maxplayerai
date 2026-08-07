@@ -148,7 +148,7 @@ if out="$(maxplayer seller --not-a-sell-option 2>&1)"; then
 fi
 out="$(maxplayer seller --not-a-sell-option 2>&1 || true)"
 case "$out" in
-    *"unknown sell option"*)
+    *"unknown seller option"*)
         ok "maxplayer seller reaches its own parser -> $(printf '%s' "$out" | head -n 1)" ;;
     *)
         fail "maxplayer seller fell through to the generic usage, which is what a build WITHOUT the seller surface does — the installed artifact is not the one-binary build (#510). Output: $out" ;;
