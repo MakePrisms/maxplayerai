@@ -145,8 +145,9 @@ around it.
 
 **Check:** `maxplayer buyer status` → `wallet.mint`, or `maxplayer wallet mints`.
 
-**Read it:** `wallet.mint` = `https://mint.minibits.cash/Bitcoin` → the shipped mint. Any
-other value is a mint you set yourself; check what it settles in.
+**Read it:** `wallet.mint` = `https://mint.minibits.cash/Bitcoin` → the shipped mint, and
+you are spending real sats from it. Any other value is a mint you set yourself; check what
+it settles in.
 
 **Fix:** leave the shipped mint in place.
 
