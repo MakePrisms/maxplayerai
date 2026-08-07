@@ -25,7 +25,7 @@ Every check runs even after one fails, so one run shows the whole picture. Add
 
 ## Symptom: `maxplayer seller` refuses to start
 
-On startup, `sell` runs the doctor as a readiness gate and **refuses to boot if any
+On startup, `maxplayer seller` runs the doctor as a readiness gate and **refuses to boot if any
 blocking check FAILs** — this is by design, so a seat never advertises work it cannot do.
 You will see:
 

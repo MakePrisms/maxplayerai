@@ -76,7 +76,7 @@ Full walkthrough: [`docs/SELLER-QUICKSTART.md`](docs/SELLER-QUICKSTART.md).
 ```bash
 git clone https://github.com/MakePrisms/maxplayerai.git && cd maxplayerai
 cargo build -p maxplayer --release --no-default-features --features wallet,acp   # what releases ship
-cargo build -p maxplayer --release --no-default-features --features wallet       # buyer only: no `sell`, no agent execution
+cargo build -p maxplayer --release --no-default-features --features wallet       # buyer only: no `maxplayer seller`, no agent execution
 ```
 
 Both land at `target/release/maxplayer`. `default = ["wallet"]`, so a bare `cargo build -p maxplayer
