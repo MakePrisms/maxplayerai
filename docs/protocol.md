@@ -1,6 +1,6 @@
 # maxplayer protocol
 
-What rides the wire. maxplayer coordinates over a Nostr relay, delivers as git, and settles in **cashu** ecash. The protocol is mint-agnostic: a seller names the mints it accepts in its claim, and the buyer pays at one of them.
+What rides the wire. maxplayer coordinates over a Nostr relay, delivers as git, and settles in **cashu** ecash — mint-agnostic.
 
 Every marketplace event is in a dedicated **`3400`–`3406`** kind block and carries a mandatory
 `["t","maxplayer"]` namespace tag and a `["v","1"]` protocol version; parsers and subscription
