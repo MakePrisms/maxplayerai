@@ -729,6 +729,13 @@ fn cmd_mint(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         Ok(home) => home,
         Err(code) => return code,
     };
+    // #445 (Option 1, fail-closed): `wallet mint` tops up via the same auto-funding mint_blocking
+    // path as `setup`, so a SILENT testnut auto-fund is refused identically — a money act is affirmed
+    // with `--mint`, never defaulted from invisible home state. Same predicate, same placement.
+    if let Some(reason) = refuse_silent_play_money(opts.mint.as_deref(), home.config.default_mint()) {
+        let _ = writeln!(err, "{reason}");
+        return RUNTIME_ERROR;
+    }
     match wallet_ops::mint_blocking(&home, amount, opts.mint.as_deref()) {
         Ok(wallet_ops::MintFlow::Funded(outcome)) => {
             let _ = writeln!(
@@ -939,6 +946,13 @@ fn cmd_invoice(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32
         Ok(home) => home,
         Err(code) => return code,
     };
+    // #445 (Option 1, fail-closed): `wallet invoice` auto-funds via invoice_blocking (the testnut
+    // dev mint self-settles), so a SILENT testnut auto-fund is refused identically to `setup`/`mint` —
+    // the money-type decision is forced open with `--mint`, never defaulted. Same predicate, same placement.
+    if let Some(reason) = refuse_silent_play_money(opts.mint.as_deref(), home.config.default_mint()) {
+        let _ = writeln!(err, "{reason}");
+        return RUNTIME_ERROR;
+    }
     match wallet_ops::invoice_blocking(&home, amount, opts.mint.as_deref()) {
         Ok(wallet_ops::MintFlow::Funded(outcome)) => {
             let _ = writeln!(
@@ -1255,6 +1269,102 @@ mod tests {
             err.contains("mints add"),
             "refusal must offer the real-money remedy:\n{err}"
         );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // #445 (extension): `wallet mint <sats>` tops up via the same auto-funding mint_blocking path as
+    // `setup`. On a testnut-default home with NO explicit `--mint` it must REFUSE the silent play-money
+    // auto-fund, reached before any mint round-trip (offline). RED-ON-REVERT: drop the guard and it
+    // proceeds to mint_blocking (auto-funds testnut / networks) instead of this empty-stdout refusal.
+    // The explicit `--mint` arm shows the guard does NOT over-block: it passes through to the mint
+    // layer (which then fails for a DIFFERENT reason — an unconfigured mint — never the play refusal).
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn mint_refuses_silent_play_money_without_explicit_mint() {
+        let home = ux_test_home("mint-refuse-silent-play");
+        let _ = std::fs::remove_dir_all(&home);
+        seed_testnut_default_home(&home);
+        let home_str = home.to_string_lossy().into_owned();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(
+            &["mint".into(), "100".into(), "--home".into(), home_str.clone()],
+            &mut out,
+            &mut err,
+        );
+        let out = String::from_utf8(out).expect("utf8");
+        let err = String::from_utf8(err).expect("utf8");
+        assert_eq!(code, RUNTIME_ERROR, "must refuse, not fund:\nstdout={out}\nstderr={err}");
+        assert!(out.is_empty(), "nothing funded => empty stdout:\n{out}");
+        assert!(err.contains("PLAY money"), "refusal must name play money:\n{err}");
+        assert!(err.contains(DEFAULT_MINT_URL), "refusal must name the testnut mint:\n{err}");
+        assert!(err.contains("mints add"), "refusal must offer the other-mint remedy:\n{err}");
+
+        // Allowed path: an explicit `--mint` affirms the choice, so the guard passes through.
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let _ = run(
+            &[
+                "mint".into(),
+                "100".into(),
+                "--mint".into(),
+                "https://real-mint.example/".into(),
+                "--home".into(),
+                home_str,
+            ],
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).expect("utf8");
+        assert!(!err.contains("PLAY money"), "explicit --mint must pass the guard:\n{err}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // #445 (extension): `wallet invoice <sats>` auto-funds via invoice_blocking (the testnut dev mint
+    // self-settles), so the same silent play-money refusal applies. RED-ON-REVERT: drop the guard and
+    // it proceeds to invoice_blocking instead of this empty-stdout refusal. The explicit `--mint` arm
+    // shows pass-through (fails later on the unconfigured mint, never the play refusal).
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn invoice_refuses_silent_play_money_without_explicit_mint() {
+        let home = ux_test_home("invoice-refuse-silent-play");
+        let _ = std::fs::remove_dir_all(&home);
+        seed_testnut_default_home(&home);
+        let home_str = home.to_string_lossy().into_owned();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(
+            &["invoice".into(), "100".into(), "--home".into(), home_str.clone()],
+            &mut out,
+            &mut err,
+        );
+        let out = String::from_utf8(out).expect("utf8");
+        let err = String::from_utf8(err).expect("utf8");
+        assert_eq!(code, RUNTIME_ERROR, "must refuse, not fund:\nstdout={out}\nstderr={err}");
+        assert!(out.is_empty(), "nothing funded => empty stdout:\n{out}");
+        assert!(err.contains("PLAY money"), "refusal must name play money:\n{err}");
+        assert!(err.contains(DEFAULT_MINT_URL), "refusal must name the testnut mint:\n{err}");
+        assert!(err.contains("mints add"), "refusal must offer the other-mint remedy:\n{err}");
+
+        // Allowed path: explicit `--mint` passes the guard (then fails on the unconfigured mint).
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let _ = run(
+            &[
+                "invoice".into(),
+                "100".into(),
+                "--mint".into(),
+                "https://real-mint.example/".into(),
+                "--home".into(),
+                home_str,
+            ],
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).expect("utf8");
+        assert!(!err.contains("PLAY money"), "explicit --mint must pass the guard:\n{err}");
         let _ = std::fs::remove_dir_all(&home);
     }
 
