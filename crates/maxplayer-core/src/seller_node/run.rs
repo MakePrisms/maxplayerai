@@ -1198,12 +1198,32 @@ mod resume_action_tests {
 }
 
 /// #562: the ceiling on how long a single delivery push may hold [`SellerNodeRunner::delivery_push_lock`].
-/// The push's network leg is ALREADY bounded by the transport client's own timeout (~120s); this sits
-/// ABOVE that so the real transport error surfaces first (and is logged — the LEG-1 conflict detail),
-/// and this only fires for a pathological NON-network hang, guaranteeing the lock is released so later
-/// deliveries are never starved. Generous by design: a legit push finishes in seconds, so this never
-/// false-strands a slow-but-live push (which would be the very strand bug #562 is about).
+/// The push's network leg is ALREADY bounded by the transport client's own per-leg request timeout
+/// (`git_transport::DEFAULT_HTTP_LEG_TIMEOUT`, 120s); this sits ABOVE that so the real transport error
+/// surfaces first (and is logged — the LEG-1 conflict detail), and this only fires for a pathological
+/// NON-network hang, guaranteeing the lock is released so later deliveries are never starved. Generous
+/// by design: a legit push finishes in seconds, so this never false-strands a slow-but-live push
+/// (which would be the very strand bug #562 is about). The `whole-op > per-leg` ordering that keeps
+/// this safe is no longer prose-only: the `const _` assert below binds the two clocks at COMPILE time.
 const DELIVERY_PUSH_TIMEOUT: Duration = Duration::from_secs(150);
+
+/// #563: make the two-clock ordering a COMPILE-TIME invariant instead of the cross-file prose above.
+/// git2 has no whole-operation timeout, so `DELIVERY_PUSH_TIMEOUT` is the ONLY whole-op bound on the
+/// delivery push; the push's single-leg cap is `git_transport::DEFAULT_HTTP_LEG_TIMEOUT` — the DEFAULT
+/// long client, since the push runs with `short = false`, NOT the buyer money-path short client. If
+/// that per-leg cap were ever raised to reach or exceed this whole-op bound, a single slow-but-LIVE
+/// push leg could trip the `TimedOut` arm above — false-stranding a maybe-accepted delivery and
+/// masking the real `Push(error)` (#562). This assert turns such a drift into a BUILD failure rather
+/// than a silent live failure. `Duration::as_secs()` is const-stable and `assert!` runs in const
+/// context, so this needs no `static_assertions` dependency (stays cleancut).
+const _: () = assert!(
+    DELIVERY_PUSH_TIMEOUT.as_secs() > crate::git_transport::DEFAULT_HTTP_LEG_TIMEOUT.as_secs(),
+    "seller two-clock invariant (#563/#562): DELIVERY_PUSH_TIMEOUT (the delivery-push whole-operation \
+     bound) must be strictly GREATER THAN git_transport::DEFAULT_HTTP_LEG_TIMEOUT (the per-HTTP-leg \
+     request cap of the DEFAULT transport client the seller push uses); git2 has no whole-op timeout, \
+     so if the per-leg cap reaches or exceeds the whole-op bound a single slow-but-live push leg trips \
+     the whole-op TimedOut arm and false-strands a maybe-accepted delivery while masking the real Push error"
+);
 
 /// #562 delivery-push failure: distinguishes the transport/push error (which carries the reason for
 /// the operator log — the LEG-1 detail) from the bounded-timeout firing, so both route to the SINGLE

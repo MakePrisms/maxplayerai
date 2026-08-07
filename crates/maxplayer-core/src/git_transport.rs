@@ -80,6 +80,18 @@ static REGISTER: Once = Once::new();
 /// fetch is at most two legs, so the worst-case wall time is ~2× this — still bounded, still no pay.
 const BUYER_FETCH_LEG_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Per-HTTP-leg request timeout for the DEFAULT (long) client [`client_default`] — the seller
+/// delivery push and base-fetch, where a legitimately large pack can make a single leg run long.
+/// git2 has no whole-operation timeout, so on the push path this per-leg cap is the ONLY bound the
+/// transport imposes on one leg (the info/refs advertisement or the receive-pack POST). The seller
+/// delivery path's whole-operation ceiling (`DELIVERY_PUSH_TIMEOUT` = 150s in `seller_node::run`)
+/// MUST stay strictly above this: a `const _` assert there binds the two clocks at COMPILE time
+/// (#563), so raising this toward/past the whole-op bound fails the BUILD rather than silently
+/// letting one slow-but-live push leg trip the whole-op `TimedOut` arm — which would false-strand a
+/// maybe-accepted delivery and mask the real `Push` error (#562). This is the LONG client; the buyer
+/// money-path fetch uses the short [`BUYER_FETCH_LEG_TIMEOUT`] instead.
+pub(crate) const DEFAULT_HTTP_LEG_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Whether to skip TLS certificate verification. Honors `GIT_SSL_NO_VERIFY` — the SAME env var
 /// system `git` obeys — so nothing changes for real deployments (the var is never set; TLS is
 /// verified against the bundled webpki roots), and self-signed test fixtures work exactly as they
@@ -116,7 +128,7 @@ fn client_default() -> &'static reqwest::blocking::Client {
     CLIENT.get_or_init(|| {
         reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(120))
+            .timeout(DEFAULT_HTTP_LEG_TIMEOUT)
             .danger_accept_invalid_certs(accept_invalid_certs())
             .build()
             .expect("build reqwest blocking client")
