@@ -28,6 +28,10 @@ pub mod relay;
 pub mod reservations;
 pub mod signer;
 pub mod store;
+
+/// #574 platform-contract test that the client drops signature-invalid events at relay ingest.
+#[cfg(test)]
+mod ingest_sig_it;
 pub mod wallet_actor;
 
 use std::collections::BTreeMap;
