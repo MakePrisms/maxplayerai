@@ -388,8 +388,8 @@ fn with_prereq_hint(tool: &str, error: String) -> String {
     if funds_prereq {
         format!(
             "{error} — {tool} prerequisite: fund your wallet with `maxplayer wallet setup` or \
-             `maxplayer wallet mint <sats>`. Both invoice the configured mint, which ships as a REAL \
-             mint: you pay that invoice with real sats."
+             `maxplayer wallet mint <sats>`. Both invoice the configured mint; you pay that invoice \
+             to fund the wallet."
         )
     } else {
         error
@@ -573,6 +573,12 @@ mod tests {
         );
         assert!(mapped.contains("maxplayer wallet setup"), "message: {mapped}");
         assert!(mapped.contains("collect prerequisite"), "message: {mapped}");
+        // #595 (mints-are-mints): the hint must not fork mint classes or say "real".
+        // RED-ON-REVERT: re-adding "a REAL mint" / "real sats" reds this.
+        assert!(
+            !mapped.contains("REAL") && !mapped.to_lowercase().contains("real sats"),
+            "prereq hint must not fork mint classes / say 'real': {mapped}"
+        );
 
         let untouched = with_prereq_hint("post_job", "task must be non-empty".to_owned());
         assert_eq!(untouched, "task must be non-empty");

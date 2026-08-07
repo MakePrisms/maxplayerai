@@ -22,7 +22,7 @@ struct CommonOpts {
 }
 
 /// Default amount `maxplayer wallet setup` asks the mint for (mirrors the old setup_wallet MCP tool).
-/// On the shipped default mint that is an invoice for 21 REAL sats, not a gift.
+/// On the shipped default mint that is an invoice for 21 sats, not a gift.
 const SETUP_FUND_SATS: u64 = 21;
 
 /// Entry from `cli::run` for `maxplayer wallet ...`.
@@ -72,15 +72,14 @@ fn wallet_usage(err: &mut dyn Write) {
          \x20 maxplayer wallet complete-locked --job-id <id> --result-id <id> --delivery-integrity-hash <hex> --job-hash <hex> --seller-pubkey <hex> --amount <sats> --seller-signature <hex> [--creq-hash <hex>] [--accepted-mint <url> ...] [--realized-mint <url>] [--home <path>]\n\
          \x20\x20\x20# operator: complete ONE payment wedged at Locked by proof-gated REUSE of the already-minted token (never re-mints; STOPS + alarms if the token reads spent)\n"
     );
-    // The mint line names the constant the code actually ships rather than restating it. A literal
-    // here is what let this text go on saying "testnut" for a release whose default had moved to a
-    // real mint (#378, #447) — a reader believed they were on play money while funding with sats.
+    // The mint line interpolates the shipped default constant rather than restating it, so this help
+    // can never drift from the mint the code actually ships — a hardcoded name once let it keep
+    // naming "testnut" after the default had already moved (#378, #447).
     let _ = writeln!(
         err,
-        "Default mint is {DEFAULT_MINIBITS_MINT_URL} — a REAL mint. `setup` and `mint` print a \
-         Lightning invoice you pay with REAL sats; nothing is auto-funded.\n\
-         Play money is a dev-only opt-in: --mint {DEFAULT_MINT_URL} (its invoices settle \
-         themselves). Extra mints are opt-in via `mints add`.\n\
+        "Default mint is {DEFAULT_MINIBITS_MINT_URL}. `setup` and `mint` print a Lightning invoice \
+         you pay to fund the wallet; nothing is auto-funded. Use `--mint <url>` to fund from a \
+         different mint, or `mints add <url>` to configure one.\n\
          Exit codes: 0 success, 1 usage error, 2 runtime error"
     );
 }
@@ -1065,10 +1064,10 @@ fn cmd_mints(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 mod tests {
     use super::*;
 
-    // #447: the help text told users the default mint was testnut for the whole of the release
-    // whose default had already moved to a real minibits mint (#378). Nothing failed — a string is
-    // not checked by anything — so the only report was a user who had funded with real sats
-    // believing they were on play money. This binds the wording to the constant the code ships.
+    // #447 + #595: the help once named testnut as the default for a whole release whose default had
+    // already moved (#378) — a string nothing checks. This binds the wording to the shipped constant
+    // AND, per gudnuf's mints-are-mints ruling, forbids forking mint classes or saying "real" in the
+    // copy. RED-ON-REVERT: re-adding "REAL"/"real sats" (or naming testnut as the default) reds this.
     #[test]
     fn wallet_usage_names_the_shipped_default_mint_and_never_calls_it_testnut() {
         let mut err = Vec::new();
@@ -1079,14 +1078,14 @@ mod tests {
             text.contains(DEFAULT_MINIBITS_MINT_URL),
             "help must name the mint a fresh config actually uses:\n{text}"
         );
-        // testnut may only appear as the dev opt-in, never as what you get by default.
         assert!(
             !text.contains("Default mint is testnut") && !text.contains("default testnut"),
             "help still presents testnut as the default:\n{text}"
         );
+        // #595 (mints-are-mints): a mint is a mint — the help must not fork classes or say "real".
         assert!(
-            text.contains("REAL"),
-            "help must say plainly that the default mint moves real sats:\n{text}"
+            !text.contains("REAL") && !text.contains("real sats") && !text.contains("real money"),
+            "help must not fork mint classes or say 'real':\n{text}"
         );
     }
 

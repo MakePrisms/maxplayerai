@@ -340,7 +340,7 @@ mod checks {
                 MINT_CHECK,
                 "no accepted mints configured — the seller cannot settle anywhere",
                 format!(
-                    "set [accepted_mints] in config.toml (it defaults to {DEFAULT_MINIBITS_MINT_URL}, a REAL mint)"
+                    "set [accepted_mints] in config.toml (it defaults to {DEFAULT_MINIBITS_MINT_URL})"
                 ),
             );
         }
@@ -1250,7 +1250,15 @@ mod tests {
         let all_down = checks::fold_mint_reachability(&[down("https://a"), down("https://b")]);
         assert_eq!(all_down.status, Status::Fail, "no reachable mint must block boot");
         // No accepted mints configured ⇒ Fail.
-        assert_eq!(checks::fold_mint_reachability(&[]).status, Status::Fail);
+        let none = checks::fold_mint_reachability(&[]);
+        assert_eq!(none.status, Status::Fail);
+        // #595 (mints-are-mints): the remedy hint names the default mint but must not fork classes
+        // or say "real". RED-ON-REVERT: re-adding ", a REAL mint" reds this.
+        let hint = none.render();
+        assert!(
+            !hint.contains("REAL") && !hint.to_lowercase().contains("real mint"),
+            "mint remedy hint must not fork mint classes / say 'real': {hint}"
+        );
     }
 
     // The boot gate refuses (readiness_ok == false) iff some check FAILed; WARN alone still boots.
