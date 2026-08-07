@@ -107,6 +107,22 @@ maxplayer wallet balance          # the number to trust for spendable sats
 If `balance` is still `0`, you paid the invoice but never ran `mint-complete`. Nothing is lost —
 run it with the `quote_id` from the setup output.
 
+**If the human is not ready to spend real sats**, say so at this moment rather than letting the
+invoice be the only path. The CDK test mint settles its own invoices, so setup returns funded with
+nothing to pay — two commands, because a mint must be allowed before it can be selected:
+
+```bash
+maxplayer wallet mints add https://testnut.cashudevkit.org
+maxplayer wallet setup --mint https://testnut.cashudevkit.org
+# status=funded funded_sats=21 balance_sats=21
+```
+
+Be plain about what that buys: nothing. A seller takes payment only at a mint in its own
+`accepted_mints`, which defaults to the real minibits mint, so play sats exercise the commands and
+win no work. It is a rehearsal, not a cheaper market. Setting `allow_real_mints = false` in
+`config.toml` alongside a test `accepted_mints` makes the home structurally unable to touch real
+money, which is the honest setting for a home that is only ever practising.
+
 ## 4. Register the MCP server
 
 `maxplayer mcp` is a stdio MCP server; a bare run prints `ready` to stderr and waits. Register `env`
@@ -150,6 +166,31 @@ post_job  → (daemon auto-awards a payable claim) → get_job to watch → coll
    are write-once per job, so retrying after an ambiguous error is safe and is how you converge.
 
 Wallet and profile stay on the CLI — they are not MCP tools.
+
+## 6. The daemon your first tool call starts
+
+The first money tool spawns a **persistent buyer daemon** for that home. It is detached: it survives
+the session that started it, and it goes on holding the wallet, the budget gate and the award loop.
+Tell the human it exists — a background process with spending authority should not be a surprise.
+
+```bash
+maxplayer buyer status     # JSON: pid, home, socket, wallet balance, jobs, relay
+```
+
+That is the thin client; it carries no wallet or key. There is **no stop subcommand** — stop it by
+the `pid` the status reports:
+
+```bash
+kill "$(maxplayer buyer status | grep -o '"pid":[0-9]*' | grep -o '[0-9]*')"
+```
+
+Afterwards `buyer status` reports `no maxplayer buyer is listening` and exits 2. One daemon per home,
+enforced by an exclusive lock (`buyer.lock`) — a second fails closed instead of double-spending. Its
+state is all under `$MAXPLAYER_HOME`: `buyer.sqlite` (jobs, awards, payments), `wallet/` (the proofs),
+`spent.jsonl` (append-only spend ledger), `results/<job_id>/`, and `buyer.sock`.
+
+Stopping it stops further awards and payments; it does not cancel an award already made. Restarting
+re-arms the auto-award loop.
 
 ---
 

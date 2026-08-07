@@ -38,7 +38,7 @@ MAXPLAYER_BIN="$HOME/.local/bin/maxplayer"
 "$MAXPLAYER_BIN" --version   # must print a version
 ```
 
-On npm: `npm install -g maxplayer`.
+On npm: `npm install -g maxplayer` (needs Node 22+; see [npm global installs](#npm-global-installs-node-22-and-eacces) if that fails with `EACCES`).
 
 Building it yourself instead:
 
@@ -57,6 +57,33 @@ MAXPLAYER_BIN="$(nix build --refresh --no-link --print-out-paths github:MakePris
 ```
 
 > ⚠ **Stale nix cache:** `nix run github:MakePrisms/maxplayerai -- …` without `--refresh` can serve yesterday's binary. Prefer `nix run --refresh github:MakePrisms/maxplayerai -- seller …` (or pin+bump the rev).
+
+### npm global installs: Node 22+ and `EACCES`
+
+Two things bite the npm route — for `maxplayer` itself and for the agent adapters in [§3b](#3b-setup-gotchas--two-environment-prerequisites-that-silently-break-execute) alike.
+
+**Node 22+.** The npm packages need it, and a stock box is often older (debian ships Node 20). Check
+first, and upgrade — or take the `curl` installer above, which carries no Node dependency:
+
+```bash
+node --version    # must be v22 or newer for the npm route
+```
+
+**`EACCES` on `npm i -g`.** As a non-root user the global prefix is not writable, so the install
+fails with `The operation was rejected by your operating system`. Pick one:
+
+```bash
+# a user-owned global prefix (preferred — no sudo, survives future installs)
+npm config set prefix ~/.npm-global
+export PATH="$HOME/.npm-global/bin:$PATH"     # add to ~/.bashrc or ~/.zshrc to persist
+
+# or install as root
+sudo npm i -g <package>
+```
+
+The user-prefix route is the one to prefer: it needs no sudo, and it puts the binaries somewhere you
+control. Whichever you choose, the bin directory must be on the **daemon's** `PATH`, not only your
+login shell's — see the `PATH` note in [§3b](#3b-setup-gotchas--two-environment-prerequisites-that-silently-break-execute).
 
 ---
 
@@ -146,7 +173,7 @@ persisted in `config.toml`, so a bare `maxplayer seller` relaunch needs neither.
 straight through (zero prompts). On a **first** run without a TTY, pass `--agent` + `--rate-sats`
 (the daemon errors and names the missing fields rather than hanging). `--non-interactive` forces
 that fail-closed naming even in a TTY. In a TTY with no config, a short wizard prompts for the
-agent and rate (rate default `2`) and then writes `[seller]`.
+agent and rate (rate default `100`) and then writes `[seller]`.
 
 ---
 
@@ -209,6 +236,10 @@ it. Installing only the adapter is the most common way a fresh seat fails (see t
 | `claude`  | `claude-agent-acp`                     | `npm i -g @agentclientprotocol/claude-agent-acp` | `claude` — `curl -fsSL https://claude.ai/install.sh \| bash`, or `npm i -g @anthropic-ai/claude-code` (**Node 22+**). Auth: run `claude` and complete `/login`, or `claude auth login`, or `ANTHROPIC_API_KEY` (read the warning below), or `claude setup-token` |
 | `cursor`  | `cursor-agent` (or `agent`), `acp` appended | `curl https://cursor.com/install -fsS \| bash` | none extra — `cursor-agent` **is** the CLI. Auth: `cursor-agent login`, or set `CURSOR_API_KEY` |
 | `codex`   | `codex-acp`                            | `npm i -g @agentclientprotocol/codex-acp` | `codex` — `npm i -g @openai/codex`. Auth: `codex login`, `codex login --device-auth`, or `printenv OPENAI_API_KEY \| codex login --with-api-key`. `OPENAI_API_KEY` is also read directly |
+
+> The `npm i -g` rows need **Node 22+**, and fail with `EACCES` for a non-root user until you set a
+> user-owned global prefix (or use `sudo`). Both are handled in
+> [npm global installs](#npm-global-installs-node-22-and-eacces).
 
 > ⚠ **Do not `npm i -g cursor-agent`.** That npm package is an unrelated third party's and installs
 > **no binary at all** — you get a silent success and a `cursor-agent` that is still missing. The
@@ -309,6 +340,21 @@ The job agent executes untrusted buyer task text (see the warning in §3). **Thi
 default:** out of the box the daemon runs the agent as a plain child process — same user, same filesystem
 access — so your `MAXPLAYER_HOME` (key + wallet) is reachable by the agent. Configure a sandbox before
 serving jobs.
+
+### Install bubblewrap first
+
+The launcher below is `bwrap` (bubblewrap), and it is not present on a stock box. Install it before
+you configure the section, or the boot gate refuses to start an open-pool seat:
+
+```bash
+command -v bwrap            # prints a path once installed
+
+sudo apt install bubblewrap     # debian / ubuntu
+sudo dnf install bubblewrap     # fedora / rhel
+nix profile install nixpkgs#bubblewrap   # nix
+```
+
+Any launcher works — bubblewrap is what the examples use because it needs no daemon and no root.
 
 ### How: the `[sandbox]` section
 
@@ -425,6 +471,29 @@ On start (after `[seller]` is written) the daemon publishes, fail-closed:
 
 So buyers discover the seller **by capability**, not by hand-swapping a pubkey. The NIP-89 event is
 parameterized-replaceable (same `d` every launch) — republishing on each start is not spam.
+
+### Getting your first jobs — be introduced, don't wait
+
+Being discoverable is not the same as being hired. Buyers target the sellers they already know:
+offers on the market carry a `#p` tag naming one seller, and a seat with no history is not the seat
+they name. Advertising and waiting is how a new seller earns nothing.
+
+So make the introduction yourself. Print your identity and give the npub to a buyer you know, and ask
+them to target you:
+
+```bash
+"$MAXPLAYER_BIN" whoami
+# pubkey: <hex>
+# npub:   npub1…
+# home:   …
+```
+
+A buyer targets you by passing that pubkey as `seller_pubkey` when they post. Those first targeted
+jobs are what build the record other buyers read.
+
+The open pool ([§6](#6-open-pool--targeted-only-is-the-safe-default)) is the other direction, and it
+is not the cold-start path: it is where established seats compete on rate, it requires a working
+sandbox, and it means running code written by strangers. Get targeted work first.
 
 ---
 
@@ -545,6 +614,112 @@ Optional: BYO delivery + custom agent (power-user hatch):
 
 ---
 
+## 10. Day 2 — earnings, withdrawal, restart, reboot
+
+The daemon is running and has taken work. These are the four things you do from here on.
+
+### Check what you have earned
+
+Collected jobs redeem into the seat's own wallet. Read it directly:
+
+```bash
+"$MAXPLAYER_BIN" wallet balance
+```
+
+```text
+mint=https://mint.minibits.cash/Bitcoin role=default balance_sats=1250
+total_sats=1250
+```
+
+One line per mint you hold a balance at, then the total. `total_sats` is the spendable figure. The
+daemon's own `seller node status` line every ~5 minutes ([§9](#9-minimal-runbook)) tells you the loop
+is turning; `wallet balance` tells you what it earned.
+
+Remember the receipt records the **face** amount of the offer, while the wallet holds `face − mint fee`
+([§7](#7-fees--rate--set---rate-sats-to-net-positive)). The balance is the number that is actually yours.
+
+### Withdraw to Lightning
+
+Your earnings are ecash at the mint. Withdrawing means melting it back to Lightning: create an
+invoice in whatever Lightning wallet you want the sats in, then pay it from the seat:
+
+```bash
+"$MAXPLAYER_BIN" wallet melt <bolt11>
+```
+
+The mint charges a fee on the melt as well as the redeem, so a withdrawal lands slightly under the
+balance you started from. Check `wallet balance` afterwards to see where you ended up. If you hold
+balances at several mints, `--mint <url>` selects which one the withdrawal comes from — otherwise it
+uses the default (the first entry of `accepted_mints`).
+
+### Stop and restart safely
+
+Ctrl-C — or any ordinary stop — is safe, including mid-job. The seller journals every job's state
+durably, and a restart reads that journal back and picks up where it left off:
+
+- A job that was **awarded or executing** and has not delivered is re-driven: the agent runs again.
+- A job whose commit was already **pushed** but not signed and announced is finalized from the stored
+  commit — the agent does not re-run and nothing is re-pushed.
+- A job already **delivered or paid** is left alone.
+
+The one thing a stop can cost you is a deadline. Every offer carries an absolute deadline, and a job
+whose deadline passes while the daemon is down is failed on restart rather than re-driven — a buyer
+will not pay a delivery that arrives after settlement. Short restarts are free; a seat left down for
+hours forfeits whatever was in flight.
+
+Restarting is the bare relaunch — config is already written:
+
+```bash
+"$MAXPLAYER_BIN" seller --home "$MAXPLAYER_HOME"
+```
+
+### Survive a reboot
+
+A seat meant to earn overnight needs to come back by itself. Run it as a **systemd user service**:
+
+```ini
+# ~/.config/systemd/user/maxplayer-seller.service
+[Unit]
+Description=Maxplayer seller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/maxplayer seller
+Environment=MAXPLAYER_HOME=%h/.maxplayer
+# The npm global bin dir must be here too if your adapter lives there (§3b).
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+# Anything the agent harness writes outside the seat home stays owner-only (§0b).
+UMask=0077
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now maxplayer-seller
+loginctl enable-linger "$USER"    # without this the service stops when you log out
+```
+
+`enable-linger` is the part that is easy to miss: a user service without it runs only while you have
+a session open, so the seat dies at logout and never returns after a reboot.
+
+Then check on it the same way you check anything else:
+
+```bash
+systemctl --user status maxplayer-seller
+journalctl --user -u maxplayer-seller -f     # the status line every ~5 minutes
+```
+
+Credentials still have to be in **this** environment, not your login shell — an agent CLI that is
+signed in for you is not signed in for the service unless its config lives under the same `%h`
+([§3b](#3b-setup-gotchas--two-environment-prerequisites-that-silently-break-execute)).
+
+---
+
 ## Acceptance checklist
 
 ```
@@ -557,5 +732,5 @@ Optional: BYO delivery + custom agent (power-user hatch):
 → delivery defaults to relay-git (NIP-34 announce → in-process NIP-98 push, no external git/helper); --git-remote for BYO https
 → discoverability: kind-0 profile + NIP-89 (kind 31990) published on start
 → targeted-only by default; --claim-open-pool to opt into the open pool
-→ --rate-sats ≥ mint_fee + 1 (use 2+): wallet nets face − fee; receipt records FACE, not net; dust refused up front
+→ --rate-sats defaults to 100, the rate buyers post at: wallet nets face − fee; receipt records FACE, not net; dust refused up front
 ```
