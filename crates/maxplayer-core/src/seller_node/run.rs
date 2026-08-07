@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use crate::{opline, opline_verbose};
 
 use nostr_sdk::prelude::{
-    Client, Filter, Keys, Kind, RelayOptions, RelayPoolNotification, RelayUrl,
+    Client, EventId, Filter, Keys, Kind, RelayOptions, RelayPoolNotification, RelayUrl,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -30,7 +30,9 @@ use crate::gateway::{
 };
 use crate::home::{self, MaxplayerHome};
 use crate::job_lifecycle::{event_to_draft, job_hash_for_offer};
-use crate::kinds::{JOB_ACCEPT_KIND, JOB_AWARD_KIND, JOB_OFFER_KIND, JOB_RECEIPT_KIND};
+use crate::kinds::{
+    JOB_ACCEPT_KIND, JOB_AWARD_KIND, JOB_OFFER_KIND, JOB_RECEIPT_KIND, JOB_RESULT_KIND,
+};
 use crate::receipt::{ReceiptPreimage, EXEC_METADATA_COMMITMENT_EMPTY};
 use crate::relay_auth::{self, AuthWait};
 use crate::seller::rate_gate_allows;
@@ -602,6 +604,13 @@ const OFFER_BACKFILL_WINDOW_SECS: u64 = 3600;
 /// tick. Mirrors [`WRAP_BACKFILL_FETCH_TIMEOUT`].
 const OFFER_BACKFILL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Hard bound on the #563 resume-refine settled-elsewhere relay-derive. It runs in the resume/boot
+/// path, so a hung relay must never stall boot: the fetch is wrapped in this timeout, and a timeout
+/// is treated EXACTLY as absence (⇒ RunAgent, the safe branch here). Kept short — the derive fires
+/// only for the narrow live-deadline residual, and a settlement event either returns fast or not at
+/// all; over-waiting only delays re-driving a genuine award.
+const SETTLED_ELSEWHERE_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The `since` cursor for a periodic offer backfill: a bounded lookback from `now`, never shorter than
 /// [`OFFER_BACKFILL_WINDOW_SECS`] and widened to the seller's configured `offer_backfill_secs` when
 /// that is larger, so the periodic recovery window is never narrower than the boot backfill's. Unlike
@@ -1051,7 +1060,11 @@ fn should_resume_execution(state: super::store::JobState) -> bool {
 /// re-signed into a fresh result after its deadline (which would emit a delivery past settlement —
 /// the replay the wire regression forbids); only a slot-occupying, live-deadline row with NO delivery
 /// evidence re-runs the agent (or finalizes a pushed commit). A missing/unreadable deadline degrades
-/// to "live" — never fail a genuine award on an absent fact.
+/// to "live" — never fail a genuine award on an absent fact. `settled_elsewhere` (#563) is a
+/// relay-DERIVED terminal fact — our own already-published result, or a buyer settlement for the offer
+/// (settled with us or another seat) — supplied by the caller's bounded resume-refine; it joins the
+/// delivery/receipt terminal class (skipped FIRST), so a row settled elsewhere is never re-driven even
+/// with a live deadline.
 #[derive(Debug, PartialEq, Eq)]
 enum ResumeAction {
     /// Genuinely mid-flight (never delivered): re-drive the agent. THE FOIL — a real award, never
@@ -1074,6 +1087,7 @@ fn resume_action(
     state: super::store::JobState,
     has_delivery: bool,
     has_receipt: bool,
+    settled_elsewhere: bool,
     pushed_commit: Option<String>,
     deadline_unix: Option<i64>,
     now_unix: i64,
@@ -1082,9 +1096,13 @@ fn resume_action(
     if !state.occupies_execution_slot() {
         return ResumeAction::SkipTerminal;
     }
-    // A delivery row or a collected receipt is durable proof the result already exists — skip even if
-    // the `state` column lagged behind `deliver_and_enqueue`'s atomic advance.
-    if has_delivery || has_receipt {
+    // A delivery row, a collected receipt, or a relay-derived "settled elsewhere" marker (#563) is
+    // durable proof the result already exists (ours) or the offer is terminal (a buyer settled — with
+    // us or another seat) — skip even if the `state` column lagged behind `deliver_and_enqueue`'s
+    // atomic advance. The SAME terminal class as delivery/receipt, so it precedes BOTH the
+    // deadline-lapse and the pushed-commit branches: settled means the result exists / the buyer has
+    // left, regardless of the deadline.
+    if has_delivery || has_receipt || settled_elsewhere {
         return ResumeAction::SkipTerminal;
     }
     // #4 LAPSED — the DURABLE primary (#552): an offer whose own absolute deadline has passed is dead
@@ -1123,11 +1141,40 @@ mod resume_action_tests {
         // THE FOIL (red-provable in BOTH directions): awarded/executing, NO delivery evidence, LIVE
         // deadline ⇒ resume + run. Over-skip here (e.g. a wrong lapse comparison) and a real award
         // stalls — a lost award, worse than a replay — and this goes red.
-        assert_eq!(resume_action(JobState::Awarded, false, false, None, LIVE, NOW), ResumeAction::RunAgent);
-        assert_eq!(resume_action(JobState::Executing, false, false, None, LIVE, NOW), ResumeAction::RunAgent);
+        assert_eq!(resume_action(JobState::Awarded, false, false, false, None, LIVE, NOW), ResumeAction::RunAgent);
+        assert_eq!(resume_action(JobState::Executing, false, false, false, None, LIVE, NOW), ResumeAction::RunAgent);
         // An absent/unreadable deadline degrades to "live": never skip a genuine award on a missing
         // fact.
-        assert_eq!(resume_action(JobState::Awarded, false, false, None, None, NOW), ResumeAction::RunAgent);
+        assert_eq!(resume_action(JobState::Awarded, false, false, false, None, None, NOW), ResumeAction::RunAgent);
+    }
+
+    #[test]
+    fn settled_elsewhere_skips_the_live_residual_in_both_directions() {
+        // #563 — the belt, red-provable in BOTH directions. The residual `resume_action` would
+        // otherwise RunAgent: slot-occupying, no delivery/receipt, no pushed commit, LIVE deadline. A
+        // relay-DERIVED settled_elsewhere=true reclassifies it terminal (the result already exists, or
+        // the buyer settled — with us or another seat), so it SKIPS instead of re-driving. false leaves
+        // THE FOIL untouched: a genuine live award still runs (over-skipping strands a real award —
+        // worse than a bounded replay).
+        for state in [JobState::Awarded, JobState::Executing] {
+            assert_eq!(
+                resume_action(state, false, false, true, None, LIVE, NOW),
+                ResumeAction::SkipTerminal,
+                "settled_elsewhere ⇒ skip the live residual (the result exists / the buyer left)"
+            );
+            assert_eq!(
+                resume_action(state, false, false, false, None, LIVE, NOW),
+                ResumeAction::RunAgent,
+                "NOT settled ⇒ the FOIL still runs (absence never strands a real award)"
+            );
+        }
+        // settled_elsewhere is terminal-class: it wins over a live deadline AND a pushed commit,
+        // exactly like has_delivery/has_receipt — it is evaluated BEFORE the lapse and pushed branches.
+        assert_eq!(
+            resume_action(JobState::Awarded, false, false, true, Some("abc".into()), LIVE, NOW),
+            ResumeAction::SkipTerminal,
+            "settled_elsewhere precedes the pushed-commit finalize branch"
+        );
     }
 
     #[test]
@@ -1138,11 +1185,11 @@ mod resume_action_tests {
         // a 3403 after the deadline). Boundary `deadline == now` counts as lapsed.
         for pushed in [None, Some("abc".to_string())] {
             assert_eq!(
-                resume_action(JobState::Awarded, false, false, pushed.clone(), LAPSED, NOW),
+                resume_action(JobState::Awarded, false, false, false, pushed.clone(), LAPSED, NOW),
                 ResumeAction::SkipLapsed
             );
             assert_eq!(
-                resume_action(JobState::Executing, false, false, pushed.clone(), AT_NOW, NOW),
+                resume_action(JobState::Executing, false, false, false, pushed.clone(), AT_NOW, NOW),
                 ResumeAction::SkipLapsed
             );
         }
@@ -1153,11 +1200,11 @@ mod resume_action_tests {
         // Deadline still LIVE + pushed commit + no delivery/receipt ⇒ finalize from the stored commit
         // (no agent re-run, no re-push).
         assert_eq!(
-            resume_action(JobState::Executing, false, false, Some("abc".into()), LIVE, NOW),
+            resume_action(JobState::Executing, false, false, false, Some("abc".into()), LIVE, NOW),
             ResumeAction::FinalizeFromPushed("abc".into())
         );
         assert_eq!(
-            resume_action(JobState::Awarded, false, false, Some("abc".into()), LIVE, NOW),
+            resume_action(JobState::Awarded, false, false, false, Some("abc".into()), LIVE, NOW),
             ResumeAction::FinalizeFromPushed("abc".into())
         );
     }
@@ -1167,13 +1214,13 @@ mod resume_action_tests {
         // Delivery/receipt evidence wins over everything else, including a pushed marker and even a
         // lapsed deadline (a delivered row is never reclassified as lapsed).
         for state in [JobState::Awarded, JobState::Executing] {
-            assert_eq!(resume_action(state, true, false, None, LIVE, NOW), ResumeAction::SkipTerminal);
-            assert_eq!(resume_action(state, false, true, None, LIVE, NOW), ResumeAction::SkipTerminal);
+            assert_eq!(resume_action(state, true, false, false, None, LIVE, NOW), ResumeAction::SkipTerminal);
+            assert_eq!(resume_action(state, false, true, false, None, LIVE, NOW), ResumeAction::SkipTerminal);
             assert_eq!(
-                resume_action(state, true, false, Some("c".into()), LIVE, NOW),
+                resume_action(state, true, false, false, Some("c".into()), LIVE, NOW),
                 ResumeAction::SkipTerminal
             );
-            assert_eq!(resume_action(state, true, false, None, LAPSED, NOW), ResumeAction::SkipTerminal);
+            assert_eq!(resume_action(state, true, false, false, None, LAPSED, NOW), ResumeAction::SkipTerminal);
         }
     }
 
@@ -1182,13 +1229,15 @@ mod resume_action_tests {
         for state in [JobState::Delivered, JobState::Paid, JobState::Failed] {
             for hd in [false, true] {
                 for hr in [false, true] {
-                    for pc in [None, Some("c".to_string())] {
-                        for dl in [LIVE, LAPSED, None] {
-                            assert_eq!(
-                                resume_action(state, hd, hr, pc.clone(), dl, NOW),
-                                ResumeAction::SkipTerminal,
-                                "terminal {state:?} must never re-run (hd={hd} hr={hr} pc={pc:?} dl={dl:?})"
-                            );
+                    for se in [false, true] {
+                        for pc in [None, Some("c".to_string())] {
+                            for dl in [LIVE, LAPSED, None] {
+                                assert_eq!(
+                                    resume_action(state, hd, hr, se, pc.clone(), dl, NOW),
+                                    ResumeAction::SkipTerminal,
+                                    "terminal {state:?} must never re-run (hd={hd} hr={hr} se={se} pc={pc:?} dl={dl:?})"
+                                );
+                            }
                         }
                     }
                 }
@@ -2383,10 +2432,13 @@ impl SellerNodeRunner {
                     );
                 }
                 // Resume off the loop, each holding a real permit so a restart honors `slots`.
+                // `resume = true` arms the #563 relay-derive belt: these are exactly the stale rows a
+                // restart re-reads, the only place a job could have been settled elsewhere or delivered
+                // by a pre-#552 binary.
                 let runner = Arc::clone(&self);
                 spawn_bounded_resumes(Arc::clone(&self.slots), resumable, move |job_id, slot| {
                     let runner = Arc::clone(&runner);
-                    async move { runner.execute_job(&job_id, slot).await }
+                    async move { runner.execute_job(&job_id, slot, true).await }
                 });
             }
             Err(error) => {
@@ -3596,8 +3648,10 @@ impl SellerNodeRunner {
                         );
                         let runner = Arc::clone(self);
                         let job = job_id.clone();
+                        // `resume = false`: a FRESH award, never a stale restart re-drive — the #563
+                        // belt does not query the relay (nothing is settled the instant we are awarded).
                         tokio::task::spawn_local(async move {
-                            runner.execute_job(&job, slot).await;
+                            runner.execute_job(&job, slot, false).await;
                         });
                     }
                     Ok(super::store::Awarded::Duplicate) => {
@@ -3724,6 +3778,101 @@ impl SellerNodeRunner {
         );
     }
 
+    /// #563 — the bounded relay-derive belt: does the relay hold POSITIVE evidence that this job's
+    /// result already exists, or that the buyer has SETTLED it (with us or another seat)? Returns
+    /// `true` only on the positive presence of a settlement event actually returned by the relay:
+    ///   - our own already-published RESULT (kind-3403 authored by THIS seller), or
+    ///   - a buyer RECEIPT (kind-3400 authored by the offer's buyer) — the co-signed settlement, which
+    ///     is terminal whether it settled with us or another seat (mirrors the #541 terminal-offer gate).
+    ///
+    /// The AWARD (3405) and ACCEPT (3406) kinds are deliberately NOT positive evidence here: in this
+    /// residual we HOLD an awarded row, so an award/accept rooting this offer is almost always OUR OWN
+    /// selection (or the #143 re-bind) — matching it would strand the very award we are resuming (THE
+    /// FOIL). Only our own result or a buyer receipt is unambiguous "already produced / already settled".
+    ///
+    /// ABSENCE is NEVER a skip: a timeout, a fetch error, an unparseable id, or a relay-deaf empty
+    /// return (#560) all yield `false` ⇒ RunAgent. Relay deafness MANUFACTURES absence, so absence must
+    /// never drive a skip — over-skipping a live award STRANDS it, the one outcome worse than a bounded
+    /// replay (the receipt gate still holds the money line against double-pay; the lapse check bounds
+    /// wasted compute). This is the money-adjacent inversion of fail-closed: RunAgent is the safe branch.
+    ///
+    /// The read uses `fetch_events` (like the #560 offer/wrap backfills): a TRANSIENT REQ under a
+    /// pool-GENERATED sub id, returning events off the call itself and BYPASSING nostr-relay-pool's
+    /// per-connection seen-cache (a plain re-subscribe would be swallowed for already-seen ids). The
+    /// job is matched by an EXACT `#e` tag == the offer event id (never a substring — the #562 hazard
+    /// of a numeric token matching inside a 64-hex id), plus the `#t=maxplayer` namespace guard.
+    ///
+    /// arm-after-the-event: the durable marker is written ONLY once the settlement event is in hand,
+    /// never on the way INTO the query, so a crash mid-derive leaves the row re-checkable next restart.
+    /// A marker-persist failure does NOT change THIS run's decision (still skip) — it just re-derives
+    /// next restart, which is still correct.
+    async fn settled_elsewhere_on_relay(
+        &self,
+        job_id: &str,
+        buyer_pubkey: Option<&str>,
+        now: i64,
+    ) -> bool {
+        let offer_id = match EventId::from_hex(job_id) {
+            Ok(id) => id,
+            Err(error) => {
+                opline!(
+                    "seller node execute job_id={job_id}: settled-elsewhere derive skipped (offer id not hex: {error}); running agent"
+                );
+                return false;
+            }
+        };
+        // kind-3403 (our result) OR kind-3400 (buyer receipt), rooted at THIS offer, maxplayer namespace.
+        let filter = Filter::new()
+            .kinds([Kind::Custom(JOB_RESULT_KIND), Kind::Custom(JOB_RECEIPT_KIND)])
+            .event(offer_id)
+            .hashtag(crate::gateway::MAXPLAYER_TAG);
+        let events = match tokio::time::timeout(
+            SETTLED_ELSEWHERE_FETCH_TIMEOUT,
+            self.client
+                .fetch_events(filter, SETTLED_ELSEWHERE_FETCH_TIMEOUT / 2),
+        )
+        .await
+        {
+            Ok(Ok(events)) => events,
+            Ok(Err(error)) => {
+                opline!(
+                    "seller node execute job_id={job_id}: settled-elsewhere derive fetch failed ({error}); running agent (absence never strands a live award)"
+                );
+                return false;
+            }
+            Err(_) => {
+                opline!(
+                    "seller node execute job_id={job_id}: settled-elsewhere derive timed out after {}s; running agent (absence never strands a live award)",
+                    SETTLED_ELSEWHERE_FETCH_TIMEOUT.as_secs()
+                );
+                return false;
+            }
+        };
+        // POSITIVE presence only. Our result is authored by THIS seller; a buyer receipt is authored by
+        // the offer's buyer (the #541 buyer-binding — a forged receipt with a foreign author never
+        // counts). Absence of BOTH ⇒ false ⇒ RunAgent.
+        let settled = events.iter().any(|event| {
+            let kind = event.kind.as_u16();
+            (kind == JOB_RESULT_KIND && event.pubkey == self.seller_pubkey)
+                || (kind == JOB_RECEIPT_KIND
+                    && buyer_pubkey.is_some_and(|buyer| event.pubkey.to_hex() == buyer))
+        });
+        if settled {
+            // arm-after-the-event: the settlement event is in hand — persist the durable marker so a
+            // later restart short-circuits without re-querying. A persist failure does not change THIS
+            // run's skip (it re-derives next restart), so it is logged, not propagated.
+            if let Err(error) = self.node.store().mark_settled_elsewhere(job_id, now) {
+                opline!(
+                    "seller node execute job_id={job_id}: settled-elsewhere marker persist failed ({error}); skipping this run anyway (re-derives next restart)"
+                );
+            }
+            opline!(
+                "seller node execute skip job_id={job_id}: settled elsewhere (relay-derived: our result or a buyer receipt present) — NOT re-running the agent (#563)"
+            );
+        }
+        settled
+    }
+
     /// Execute an awarded job end to end: run the agent in a fresh empty-base workdir, snapshot its
     /// output into ONE delivery commit dated at the STORED award time (so a re-created commit after a
     /// restart keeps the same oid — invariant 2), push it under the seller's NIP-98 auth, then bind
@@ -3731,7 +3880,12 @@ impl SellerNodeRunner {
     /// into a co-signature the seller signs through its actor, and journal + enqueue the result event
     /// in one transaction. Every failure path fails the job with a named reason and publishes nothing
     /// partial; the delivery journal is idempotent, so a resumed job never double-publishes.
-    async fn execute_job(&self, job_id: &str, _slot: Option<OwnedSemaphorePermit>) {
+    ///
+    /// `resume` marks the BOOT/restart re-drive path (vs a fresh award off `on_award`). It gates the
+    /// #563 relay-derive belt: only a resumed row can be stale enough to have been settled elsewhere or
+    /// delivered by a pre-#552 binary, so a fresh award NEVER queries the relay (nothing is settled the
+    /// instant we are awarded, and the hot award path must not wait on a relay round-trip).
+    async fn execute_job(&self, job_id: &str, _slot: Option<OwnedSemaphorePermit>, resume: bool) {
         // `_slot` is the reserved execution permit, moved in and held for the whole call. It is
         // released the instant this function returns — on delivery, on any `fail_job*` path, on an
         // early idempotency return, or on a panic (unwind drops it). This RAII pairing is the single
@@ -3796,7 +3950,40 @@ impl SellerNodeRunner {
             }
         };
         let deadline_unix = offer.as_ref().map(|offer| offer.deadline_unix);
-        match resume_action(state, has_delivery, has_receipt, pushed, deadline_unix, now_unix()) {
+        // #563 — the relay-derive belt. `resume_action` returns RunAgent for a slot-occupying row with
+        // no delivery/receipt, no pushed commit, and a live deadline — right for a genuine mid-flight
+        // award (THE FOIL), but WRONG for a row actually settled ELSEWHERE (a buyer settled with
+        // another seat) or delivered by a pre-#552 binary (before the pushed_commit marker existed).
+        // Only on a RESUME (`resume`), and only for that exact residual, refine the decision from the
+        // relay. A durable marker from a PRIOR derive short-circuits without re-querying; a fresh award
+        // (`resume == false`) never queries — nothing is settled the instant we are awarded, and the
+        // hot award path must not wait on a relay round-trip. `now` is captured ONCE so this liveness
+        // gate and `resume_action`'s lapse check read the same clock.
+        let now = now_unix();
+        let settled_marked = match self.node.store().has_settled_elsewhere(job_id) {
+            Ok(v) => v,
+            Err(error) => {
+                opline!("seller node execute job_id={job_id}: has_settled_elsewhere read failed ({error}); assuming not settled");
+                false
+            }
+        };
+        let deadline_live = deadline_unix.is_none_or(|deadline| deadline > now);
+        let is_live_residual = state.occupies_execution_slot()
+            && !has_delivery
+            && !has_receipt
+            && pushed.is_none()
+            && deadline_live;
+        let settled_elsewhere = if settled_marked {
+            // A prior resume already relay-derived this settled — trust the durable marker, never re-query.
+            true
+        } else if resume && is_live_residual {
+            self.settled_elsewhere_on_relay(job_id, offer.as_ref().map(|offer| offer.buyer_pubkey.as_str()), now)
+                .await
+        } else {
+            // A fresh award, or any row that already skips/finalizes/fails on local markers: no derive.
+            false
+        };
+        match resume_action(state, has_delivery, has_receipt, settled_elsewhere, pushed, deadline_unix, now) {
             ResumeAction::RunAgent => {}
             ResumeAction::FinalizeFromPushed(commit) => {
                 opline!(
@@ -6800,6 +6987,290 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // ── #563: the relay-derive belt — a live-deadline residual settled ELSEWHERE ─────────────────
+    //
+    // `resume_action` RunAgents a slot-occupying row with no delivery/receipt, no pushed commit, and a
+    // live deadline. Right for a genuine mid-flight award (THE FOIL), WRONG for a row already settled
+    // elsewhere (a buyer receipt) or delivered by a pre-#552 binary (our own result on the relay). The
+    // belt refines it: SKIP only on the POSITIVE presence of a settlement event the relay actually
+    // returned; ABSENCE (incl. relay-deafness, #560) always runs the agent. The two positive tests
+    // exercise BOTH spine arms (our result; a buyer receipt with another seat); the foil is the spine's
+    // proof that absence never strands.
+
+    /// Boot a 1-slot seller AND return its seller Keys, so a test can publish an event AUTHORED BY the
+    /// seller (its own kind-3403 result) that `fetch_events` reads back past the per-connection
+    /// seen-cache. Mirrors [`boot_capacity_skip_seller`]; kept separate so the common helper stays
+    /// keyless. `offer_backfill_secs = 0` — the belt depends on no configured backfill window.
+    async fn boot_seller_with_keys(
+        label: &str,
+        relay_url: &str,
+    ) -> (SellerNodeRunner, Keys, std::path::PathBuf) {
+        let root = temp_dir(label);
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = relay_url.to_string();
+        let mut seller = seller_cfg(1, false);
+        seller.claim_award_timeout_secs = Some(0);
+        seller.offer_backfill_secs = 0;
+        home.config.seller = Some(seller);
+        let secret = crate::home::read_secret_key_hex(&home).expect("read seller secret");
+        let keys = Keys::parse(&secret).expect("parse seller keys");
+        let runner = SellerNodeRunner::boot(home)
+            .await
+            .expect("boot the settled-elsewhere seller against the fixture relay");
+        (runner, keys, root)
+    }
+
+    /// Seed the store with the exact residual `resume_action` RunAgents: a recorded offer (live
+    /// deadline) + a parked claim + an award ⇒ a jobs row in `awarded`, no delivery/receipt/pushed, no
+    /// settled marker. The row #563's belt refines.
+    fn seed_residual_awarded_job(
+        runner: &SellerNodeRunner,
+        job_id: &str,
+        buyer_hex: &str,
+        deadline_unix: i64,
+        now: i64,
+    ) {
+        let store = runner.node.store();
+        store
+            .record_offer(
+                &crate::seller_node::store::Offer {
+                    offer_id: job_id.to_owned(),
+                    buyer_pubkey: buyer_hex.to_owned(),
+                    amount_sats: 100,
+                    unit: "sat".to_owned(),
+                    task: "residual".to_owned(),
+                    deadline_unix,
+                    targeted: true,
+                    requested_agent: None,
+                },
+                now,
+            )
+            .expect("record offer");
+        let draft = claim_draft(job_id, buyer_hex, &"s".repeat(64), "creq", &[]);
+        store
+            .claim_and_enqueue(job_id, job_id, "creq", &draft, now, now + 3_600, now)
+            .expect("claim");
+        store
+            .record_award(&"a".repeat(64), job_id, buyer_hex, now)
+            .expect("award");
+    }
+
+    /// Compose the resume decision exactly as `execute_job` does on resume: read every durable marker
+    /// (incl. the #563 settled-elsewhere marker) and feed them to `resume_action`.
+    fn compose_resume_action(runner: &SellerNodeRunner, job_id: &str, now: i64) -> ResumeAction {
+        let store = runner.node.store();
+        let state = store.job_state(job_id).expect("job_state").expect("job row present");
+        let has_delivery = store.has_delivery(job_id).expect("has_delivery");
+        let has_receipt = store.has_receipt(job_id).expect("has_receipt");
+        let settled = store.has_settled_elsewhere(job_id).expect("has_settled_elsewhere");
+        let pushed = store.pushed_commit(job_id).expect("pushed_commit");
+        let deadline = store.offer_row(job_id).expect("offer_row").map(|o| o.deadline_unix);
+        resume_action(state, has_delivery, has_receipt, settled, pushed, deadline, now)
+    }
+
+    // POSITIVE (spine arm 1) — OUR OWN result is on the relay (delivered by a pre-#552 binary, so no
+    // local delivery marker). The belt fetches it, marks the row settled-elsewhere, and the resume
+    // composes to SkipTerminal instead of re-emitting a duplicate result inside the live window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn belt_skips_a_live_residual_when_our_result_is_on_the_relay() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+
+        let (runner, seller_keys, root) = boot_seller_with_keys("belt-our-result", &relay_url).await;
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        // A valid 64-hex offer id (== job_id); the published result roots THIS id, so `#e` matches.
+        let job_id = "1".repeat(64);
+
+        // A separate publisher SENDS the pre-signed result; the AUTHOR is the seller (signed with its
+        // keys), which is what the belt's result-branch author-check requires.
+        let publisher = Client::new(Keys::generate());
+        publisher.add_relay(&relay_url).await.expect("add relay");
+        publisher.connect().await;
+        publisher.wait_for_connection(Duration::from_secs(5)).await;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let now = now_unix();
+                let deadline = now + 3_600; // LIVE
+                seed_residual_awarded_job(&runner, &job_id, &buyer_hex, deadline, now);
+                assert!(
+                    !runner.node.store().has_settled_elsewhere(&job_id).expect("pre"),
+                    "unmarked before the derive"
+                );
+                assert_eq!(
+                    compose_resume_action(&runner, &job_id, now),
+                    ResumeAction::RunAgent,
+                    "PRECONDITION: with no relay evidence this residual would RunAgent (non-vacuous)"
+                );
+
+                let result = crate::gateway::result_draft(
+                    &job_id, &buyer_hex, "output-ref", 100, "job-hash", "seller-sig", "", None, &[],
+                );
+                let result_event = crate::gateway::nostr::event_builder(&result)
+                    .expect("result builder")
+                    .sign_with_keys(&seller_keys) // AUTHORED BY THE SELLER (our own result)
+                    .expect("sign result");
+                publisher.send_event(&result_event).await.expect("publish our result");
+
+                let settled = runner
+                    .settled_elsewhere_on_relay(&job_id, Some(&buyer_hex), now)
+                    .await;
+                assert!(settled, "our own result on the relay ⇒ settled-elsewhere POSITIVE");
+                assert!(
+                    runner.node.store().has_settled_elsewhere(&job_id).expect("post"),
+                    "the marker is armed AFTER the positive read (arm-after-the-event)"
+                );
+                assert_eq!(
+                    compose_resume_action(&runner, &job_id, now),
+                    ResumeAction::SkipTerminal,
+                    "the belt reclassifies the live residual as terminal — no re-run, no duplicate 3403"
+                );
+            })
+            .await;
+
+        runner.client.disconnect().await;
+        publisher.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // POSITIVE (spine arm 2) — a buyer RECEIPT for the offer, co-signed with ANOTHER seat. The offer is
+    // terminal (settled elsewhere) even though we hold an awarded row and never delivered; the belt
+    // skips rather than burning compute on finished work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn belt_skips_a_live_residual_when_a_buyer_receipt_settled_elsewhere() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+
+        let (runner, root) = boot_capacity_skip_seller("belt-buyer-receipt", &relay_url, true, 0, Some(0)).await;
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let job_id = "2".repeat(64);
+
+        let publisher = Client::new(buyer.clone());
+        publisher.add_relay(&relay_url).await.expect("add relay");
+        publisher.connect().await;
+        publisher.wait_for_connection(Duration::from_secs(5)).await;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let now = now_unix();
+                let deadline = now + 3_600; // LIVE
+                seed_residual_awarded_job(&runner, &job_id, &buyer_hex, deadline, now);
+
+                // A co-signed 3400 receipt settling THIS offer with ANOTHER seat, authored by the buyer
+                // (the #541 buyer-binding — a forged receipt with a foreign author would never count).
+                let other_seller = Keys::generate().public_key().to_hex();
+                let receipt = crate::gateway::receipt_draft(
+                    &job_id, "result-id", &buyer_hex, &other_seller, "https://mint.invalid", 100,
+                    "job-hash", "seller-sig", "buyer-sig", None, None, &[],
+                );
+                let receipt_event = crate::gateway::nostr::event_builder(&receipt)
+                    .expect("receipt builder")
+                    .sign_with_keys(&buyer)
+                    .expect("sign receipt");
+                publisher.send_event(&receipt_event).await.expect("publish buyer receipt");
+
+                let settled = runner
+                    .settled_elsewhere_on_relay(&job_id, Some(&buyer_hex), now)
+                    .await;
+                assert!(settled, "a buyer receipt for the offer ⇒ settled-elsewhere POSITIVE (another seat)");
+                assert!(
+                    runner.node.store().has_settled_elsewhere(&job_id).expect("post"),
+                    "marker armed after the positive read"
+                );
+                assert_eq!(
+                    compose_resume_action(&runner, &job_id, now),
+                    ResumeAction::SkipTerminal,
+                    "settled elsewhere ⇒ terminal, never re-driven"
+                );
+            })
+            .await;
+
+        runner.client.disconnect().await;
+        publisher.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // THE FOIL (the spine's proof) — the SAME live residual, but the relay holds NO settlement for THIS
+    // job (a decoy receipt for a DIFFERENT offer proves the relay answers AND that the `#e` match is
+    // EXACT — the #562 hazard). Absence — a relay-deaf empty return manufactures it (#560) — must NEVER
+    // strand a real award: the derive returns false, no marker is written, and the resume runs the
+    // agent. RunAgent is the SAFE branch here (the receipt gate holds the money line; the lapse check
+    // bounds wasted compute).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn belt_runs_the_agent_when_the_relay_holds_no_settlement_the_foil() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+
+        let (runner, root) = boot_capacity_skip_seller("belt-foil", &relay_url, true, 0, Some(0)).await;
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let job_id = "3".repeat(64);
+
+        let publisher = Client::new(buyer.clone());
+        publisher.add_relay(&relay_url).await.expect("add relay");
+        publisher.connect().await;
+        publisher.wait_for_connection(Duration::from_secs(5)).await;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let now = now_unix();
+                let deadline = now + 3_600; // LIVE
+                seed_residual_awarded_job(&runner, &job_id, &buyer_hex, deadline, now);
+
+                // A DECOY receipt for a DIFFERENT offer id: the relay IS live and answering, but nothing
+                // settles OUR job. An exact `#e` match must exclude it (a substring/prefix match would
+                // not — the #562 hazard).
+                let decoy_offer = "9".repeat(64);
+                let other_seller = Keys::generate().public_key().to_hex();
+                let decoy = crate::gateway::receipt_draft(
+                    &decoy_offer, "result-id", &buyer_hex, &other_seller, "https://mint.invalid", 100,
+                    "job-hash", "seller-sig", "buyer-sig", None, None, &[],
+                );
+                let decoy_event = crate::gateway::nostr::event_builder(&decoy)
+                    .expect("decoy builder")
+                    .sign_with_keys(&buyer)
+                    .expect("sign decoy");
+                publisher.send_event(&decoy_event).await.expect("publish decoy receipt");
+
+                let settled = runner
+                    .settled_elsewhere_on_relay(&job_id, Some(&buyer_hex), now)
+                    .await;
+                assert!(
+                    !settled,
+                    "no settlement for THIS job ⇒ ABSENCE, never a skip (the FOIL must not strand)"
+                );
+                assert!(
+                    !runner.node.store().has_settled_elsewhere(&job_id).expect("no mark"),
+                    "absence never pre-marks — the row stays re-checkable"
+                );
+                assert_eq!(
+                    compose_resume_action(&runner, &job_id, now),
+                    ResumeAction::RunAgent,
+                    "absence ⇒ RunAgent (over-skipping a live award strands it — worse than a bounded replay)"
+                );
+            })
+            .await;
+
+        runner.client.disconnect().await;
+        publisher.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // TOOTH (wrap backfill) — the cursor keeps an OLDER delivered-but-unpaid job's payment window in
     // range, and a read failure ABORTS rather than silently becoming a full-history rescan.
     //
@@ -7287,6 +7758,7 @@ mod tests {
         let pushed_live = "3".repeat(64); // awarded, live, pushed       → FinalizeFromPushed
         let pushed_lapsed = "4".repeat(64); // awarded, LAPSED, pushed   → SkipLapsed (lapse BEFORE finalize)
         let delivered = "5".repeat(64); // delivered                     → SkipTerminal
+        let settled_live = "6".repeat(64); // awarded, live, settled_elsewhere marker → SkipTerminal (#563)
 
         let root = temp_dir("resume-restart");
         let _ = std::fs::remove_dir_all(&root);
@@ -7330,20 +7802,28 @@ mod tests {
             store
                 .deliver_and_enqueue(&delivered, &"c".repeat(40), &ddraft, 4, 4 + RESULT_PUBLISH_WINDOW_SECS, 4)
                 .expect("deliver");
+            // #563: a live-deadline row a PRIOR resume relay-derived as settled elsewhere. The durable
+            // marker must survive the restart and short-circuit the next resume to SkipTerminal WITHOUT
+            // re-querying the relay (exactly what execute_job's `settled_marked` branch does at boot).
+            seed(&settled_live, live, &format!("{}6", "w".repeat(63)));
+            store.mark_settled_elsewhere(&settled_live, 3).expect("mark settled elsewhere");
             // store drops here — the sqlite home persists on disk.
         }
 
         // ---- Restart: reopen the SAME home. Every marker must come back from durable storage.
         let store = SellerStore::open(&db).expect("reopen");
 
-        // Compose exactly as execute_job does on resume: read the durable markers, then decide.
+        // Compose exactly as execute_job does on resume: read the durable markers, then decide. The
+        // settled_elsewhere marker is read from the store like the others (its relay-derive already
+        // ran on a PRIOR resume); a set marker short-circuits without any relay round-trip.
         let action = |job: &str| {
             let state = store.job_state(job).expect("job_state").expect("job row present");
             let has_delivery = store.has_delivery(job).expect("has_delivery");
             let has_receipt = store.has_receipt(job).expect("has_receipt");
+            let settled_elsewhere = store.has_settled_elsewhere(job).expect("has_settled_elsewhere");
             let pushed = store.pushed_commit(job).expect("pushed_commit");
             let deadline = store.offer_row(job).expect("offer_row").map(|o| o.deadline_unix);
-            resume_action(state, has_delivery, has_receipt, pushed, deadline, now)
+            resume_action(state, has_delivery, has_receipt, settled_elsewhere, pushed, deadline, now)
         };
 
         assert_eq!(
@@ -7371,6 +7851,12 @@ mod tests {
             ResumeAction::SkipTerminal,
             "delivered stays terminal across the restart"
         );
+        assert_eq!(
+            action(&settled_live),
+            ResumeAction::SkipTerminal,
+            "#563: a live-deadline row marked settled_elsewhere stays terminal across the restart \
+             (durable marker short-circuits — never re-driven, never re-queried)"
+        );
 
         // The coarse pre-filter (what the resume loop iterates) admits every slot-occupier and the
         // delivered row (jobs.state IN awarded/executing/delivered); resume_action is the refinement.
@@ -7380,7 +7866,7 @@ mod tests {
             .into_iter()
             .map(|(job, _state)| job)
             .collect();
-        for job in [&mid_flight, &lapsed_bare, &pushed_live, &pushed_lapsed, &delivered] {
+        for job in [&mid_flight, &lapsed_bare, &pushed_live, &pushed_lapsed, &delivered, &settled_live] {
             assert!(resumable.contains(job), "resumable set must contain {job}");
         }
 

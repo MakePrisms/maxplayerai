@@ -23,7 +23,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::gateway::EventDraft;
 
 /// Current on-disk schema version.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// A cloneable handle to the node-owned SQLite state.
 #[derive(Clone)]
@@ -255,7 +255,16 @@ impl SellerStore {
                  -- the receipt sign+enqueue (#552). On a still-`awarded`/`executing` row it means the
                  -- delivery was pushed but the enqueue was interrupted: resume FINALIZES from this
                  -- commit (re-sign + enqueue) instead of re-running the agent. NULL ⇒ never pushed.
-                 pushed_commit   TEXT
+                 pushed_commit   TEXT,
+                 -- #563: a RELAY-DERIVED settled-elsewhere marker. Set only when a resume refine
+                 -- fetched POSITIVE settlement evidence for this offer from the relay: our own
+                 -- already-published result, or a buyer receipt (settled with us or another seat),
+                 -- for the live-deadline residual resume_action would otherwise re-drive. Written
+                 -- AFTER that evidence is in hand (arm-after-the-event), never speculatively, so a
+                 -- crash mid-derive leaves the row re-checkable. Provenance-honest: relay-derived,
+                 -- DISTINCT from a local deliveries row. NULL means not derived-settled; a unix ts
+                 -- means when we derived it.
+                 settled_elsewhere_at_unix INTEGER
              );
              -- One delivery per job (the seller-authored snapshot the daemon published).
              CREATE TABLE IF NOT EXISTS deliveries (
@@ -328,6 +337,12 @@ impl SellerStore {
         // narrow live-deadline residual (pushed pre-marker, or settled elsewhere) is a tracked follow-up.
         if !Self::column_exists(conn, "jobs", "pushed_commit")? {
             conn.execute_batch("ALTER TABLE jobs ADD COLUMN pushed_commit TEXT;")?;
+        }
+        // #563: the relay-derived "settled elsewhere" marker. A store from a pre-#563 binary reads
+        // NULL (not derived-settled) for its rows and is armed going forward at resume time. Additive
+        // + idempotent, exactly like the columns above.
+        if !Self::column_exists(conn, "jobs", "settled_elsewhere_at_unix")? {
+            conn.execute_batch("ALTER TABLE jobs ADD COLUMN settled_elsewhere_at_unix INTEGER;")?;
         }
         Ok(())
     }
@@ -813,6 +828,38 @@ impl SellerStore {
             .optional()?
             .flatten();
         Ok(commit)
+    }
+
+    /// #563 — mark a job RELAY-DERIVED as settled elsewhere: a resume refine fetched POSITIVE
+    /// settlement evidence for its offer from the relay (our own already-published result, or a buyer
+    /// receipt — settled with us or another seat). Written ONLY after that evidence is in hand
+    /// (arm-after-the-event), never speculatively on the way into the query, so a crash between issuing
+    /// the derive and getting evidence leaves the row re-checkable next restart. Idempotent — last
+    /// write wins; does NOT change `state`. Provenance-honest: relay-DERIVED, distinct from a local
+    /// `deliveries` row (which only [`Self::deliver_and_enqueue`] writes).
+    pub fn mark_settled_elsewhere(&self, job_id: &str, now_unix: i64) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE jobs SET settled_elsewhere_at_unix = ?2, updated_at_unix = ?2 WHERE job_id = ?1",
+            params![job_id, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Whether `job_id` was relay-derived as settled elsewhere (see [`Self::mark_settled_elsewhere`]).
+    /// A resume refine consults this FIRST and short-circuits — a durable marker means it need never
+    /// re-query the relay.
+    pub fn has_settled_elsewhere(&self, job_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let found = conn
+            .query_row(
+                "SELECT 1 FROM jobs WHERE job_id = ?1 AND settled_elsewhere_at_unix IS NOT NULL",
+                [job_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(found)
     }
 
     // ---- Outbox ---------------------------------------------------------------------------------
@@ -1349,6 +1396,70 @@ mod tests {
         let store = SellerStore::open(&path).expect("second open");
         assert_eq!(store.health().expect("health").schema_version, SCHEMA_VERSION);
         assert!(store.offer_row("old").expect("read").is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // #563 — the relay-derived settled-elsewhere marker round-trips over a real row and DEFAULTS false.
+    // A false default is load-bearing: absence of the marker must read as "not derived-settled" so the
+    // resume refine still queries the relay (never a silent skip on a missing fact).
+    #[test]
+    fn settled_elsewhere_marker_round_trips_and_defaults_false() {
+        let (store, path) = fresh_store("settled-elsewhere");
+        insert_job(&store, "job-se", JobState::Awarded);
+        assert!(
+            !store.has_settled_elsewhere("job-se").expect("read unmarked"),
+            "an un-derived job is not settled-elsewhere (default false ⇒ the refine still checks)"
+        );
+        store.mark_settled_elsewhere("job-se", 1_234).expect("mark");
+        assert!(
+            store.has_settled_elsewhere("job-se").expect("read marked"),
+            "after the relay-derived marker the job reads settled-elsewhere"
+        );
+        // Idempotent: a later derive re-writes the ts, stays true, never errors.
+        store.mark_settled_elsewhere("job-se", 5_678).expect("re-mark");
+        assert!(store.has_settled_elsewhere("job-se").expect("read"), "idempotent — last write wins");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // TOOTH — a store written by a pre-#563 binary (a #552-era jobs table WITH pushed_commit but
+    // WITHOUT settled_elsewhere_at_unix) opens, MIGRATES additively, and reads its existing rows as
+    // "not settled-elsewhere". Without the ALTER an upgraded node would fail every has_settled_elsewhere
+    // read on a live store.
+    #[test]
+    fn a_store_from_before_the_settled_elsewhere_column_migrates_and_reads_false() {
+        let path = temp_db("pre-settled-elsewhere-schema");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("create old store");
+            conn.execute_batch(
+                "CREATE TABLE jobs (
+                     job_id          TEXT PRIMARY KEY,
+                     offer_id        TEXT NOT NULL,
+                     agent_name      TEXT,
+                     state           TEXT NOT NULL
+                         CHECK (state IN ('awarded','executing','delivered','paid','failed')),
+                     created_at_unix INTEGER NOT NULL,
+                     updated_at_unix INTEGER NOT NULL,
+                     pushed_commit   TEXT
+                 );
+                 INSERT INTO jobs (job_id, offer_id, state, created_at_unix, updated_at_unix)
+                 VALUES ('old-job', 'old-offer', 'awarded', 1, 1);",
+            )
+            .expect("old schema");
+        }
+
+        let store = SellerStore::open(&path).expect("open migrates");
+        assert!(
+            !store.has_settled_elsewhere("old-job").expect("read"),
+            "a row from before the column is not derived-settled (the refine must still check the relay)"
+        );
+        // The migrated column is writable: the refine can arm it going forward on the live store.
+        store.mark_settled_elsewhere("old-job", 2).expect("mark on migrated store");
+        assert!(store.has_settled_elsewhere("old-job").expect("read"), "marker persists post-migration");
+        // Idempotent: opening again neither errors nor double-adds.
+        drop(store);
+        let store = SellerStore::open(&path).expect("second open");
+        assert_eq!(store.health().expect("health").schema_version, SCHEMA_VERSION);
         let _ = std::fs::remove_file(&path);
     }
 
