@@ -1549,6 +1549,53 @@ fn launcher_unrunnable_reason(error: &ExecError) -> String {
     )
 }
 
+/// Whether an [`ExecError`] is an AUTHENTICATION failure rather than a containment/launcher one (#555).
+///
+/// The agent CLI surfaces "not signed in" as an ACP JSON-RPC error whose text reaches us inside
+/// [`ExecError::Agent`] — e.g. `ACP request 3 failed: {"code":-32000,"message":"Authentication
+/// required"}`. It shares the [`ProbeAttempt::Unrunnable`] shape with a launcher fault (the turn
+/// never ran), but the remedies are OPPOSITE: this one is fixed by signing in, never by editing a
+/// sandbox/launcher config.
+///
+/// Keyed on the ACP auth MESSAGE ("authentication required", case-insensitive), NOT on the `-32000`
+/// code: `-32000` is the generic JSON-RPC server-error code, so a bare match on it would
+/// false-positive on any other agent error that happens to carry it.
+fn is_auth_class(error: &ExecError) -> bool {
+    matches!(
+        error,
+        ExecError::Agent(message)
+            if message.to_ascii_lowercase().contains("authentication required")
+    )
+}
+
+/// The refusal reason for the AUTHENTICATION-failure Unrunnable shape (#555).
+///
+/// Like [`launcher_unrunnable_reason`] the turn never ran, so this is not a flaky model — but the
+/// fault is a signed-OUT agent CLI, not the sandbox/launcher, so the remedy is to sign in. Pointing
+/// an operator with a login problem at a containment config sends them to the one subsystem that was
+/// never at fault.
+fn auth_unrunnable_reason(error: &ExecError) -> String {
+    format!(
+        "this is an AUTHENTICATION failure ({error}), not a containment/launcher fault — sign in to \
+         the agent CLI on this machine (e.g. run `claude`, then `/login`), then restart"
+    )
+}
+
+/// The refusal reason for an Unrunnable probe turn, ROUTED by the error's class (#555).
+///
+/// An authentication failure and a containment failure are both [`ProbeAttempt::Unrunnable`] — the
+/// turn never ran — but their remedies are opposite (see [`auth_unrunnable_reason`] vs
+/// [`launcher_unrunnable_reason`]). Routing here keeps an operator with a login problem from being
+/// sent to edit a launcher/sandbox config that was never at fault. The shape and retry policy are
+/// unchanged; only the remedy STRING branches.
+fn unrunnable_reason(error: &ExecError) -> String {
+    if is_auth_class(error) {
+        auth_unrunnable_reason(error)
+    } else {
+        launcher_unrunnable_reason(error)
+    }
+}
+
 /// The retry policy, as a pure decision over one attempt's shape (#472).
 ///
 /// - `Proven` → `Done(Ok)`.
@@ -1614,10 +1661,12 @@ async fn run_harness_probe_once(
     )
     .await
     {
-        // The turn never ran: a launcher/exec fault. Structural — do not retry.
+        // The turn never ran: structural, so do not retry. The remedy STRING is routed by class —
+        // an auth failure needs a sign-in, not a containment fix (#555) — but the shape and fault
+        // are unchanged either way.
         let fault = harness_fault_for(&error).unwrap_or(Fault::Unproven);
         return ProbeAttempt::Unrunnable {
-            reason: launcher_unrunnable_reason(&error),
+            reason: unrunnable_reason(&error),
             fault,
         };
     }
@@ -8642,6 +8691,61 @@ mod tests {
                 "the unrunnable verdict must NOT prescribe a model retry: {reason}"
             );
         }
+    }
+
+    #[test]
+    fn is_auth_class_matches_only_the_acp_auth_message() {
+        // TRUE for the ACP "Authentication required" JSON-RPC error carried inside Agent(msg)...
+        assert!(is_auth_class(&ExecError::Agent(
+            "ACP request 3 failed: {\"code\":-32000,\"message\":\"Authentication required\"}"
+                .to_owned()
+        )));
+        // ...case-insensitively — the agent may render the message in any case.
+        assert!(is_auth_class(&ExecError::Agent(
+            "acp request 1 failed: authentication REQUIRED".to_owned()
+        )));
+        // FALSE for a non-auth agent error, and specifically for a bare `-32000` carrying some other
+        // message: that code is the generic JSON-RPC server-error, not proof of an auth fault.
+        assert!(!is_auth_class(&ExecError::Agent(
+            "ACP request 2 failed: {\"code\":-32000,\"message\":\"internal error\"}".to_owned()
+        )));
+        assert!(!is_auth_class(&ExecError::Agent("spawn refused".to_owned())));
+        // FALSE for every non-Agent shape — the auth signal only ever arrives as Agent text.
+        assert!(!is_auth_class(&ExecError::AcpRequired));
+        assert!(!is_auth_class(&ExecError::Config("GOOSE_PROVIDER unset".to_owned())));
+        assert!(!is_auth_class(&ExecError::Policy("un-typeable oid".to_owned())));
+    }
+
+    #[test]
+    fn an_auth_class_unrunnable_turn_gets_a_sign_in_remedy_not_a_sandbox_one() {
+        // The exact shape run_agent_job returns when the agent CLI is not logged in: the ACP auth
+        // JSON-RPC error, carried inside Agent(msg). It lands in the Unrunnable shape (the turn
+        // never ran), but its remedy must point at SIGNING IN, never at the launcher/sandbox that
+        // was not at fault (#555).
+        let auth_error = ExecError::Agent(
+            "ACP request 3 failed: {\"code\":-32000,\"message\":\"Authentication required\"}"
+                .to_owned(),
+        );
+        let reason = unrunnable_reason(&auth_error);
+        // (a) it must prescribe signing in / `/login`...
+        assert!(
+            reason.contains("/login") && reason.to_ascii_lowercase().contains("sign in"),
+            "an auth-class probe failure must prescribe signing in: {reason}"
+        );
+        // (b) ...and must NOT send the operator to the containment config that was never at fault.
+        assert!(
+            !reason.contains("sandbox") && !reason.contains("launcher config"),
+            "an auth-class remedy must not point at the sandbox/launcher config: {reason}"
+        );
+        // Red-prove the branch: the OLD path (launcher_unrunnable_reason, the shape's remedy before
+        // the #555 split) DOES send the operator to the launcher/sandbox config for this SAME auth
+        // error. So this test passes only because `unrunnable_reason` routes on the class — revert
+        // that routing and both asserts above go red.
+        let old = launcher_unrunnable_reason(&auth_error);
+        assert!(
+            old.contains("launcher/sandbox") && !old.contains("/login"),
+            "the pre-#555 path must still yield the sandbox/launcher remedy (red-prove anchor): {old}"
+        );
     }
 
     #[test]
