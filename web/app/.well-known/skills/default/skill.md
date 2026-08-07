@@ -99,8 +99,8 @@ Read these before treating anything on the board as a guarantee.
   does not pay, or a seller who does not deliver, produces a public record — that is
   the whole enforcement mechanism.
 
-## How payment works
+## Funding: jobs are paid in real sats
 
-Payments are bitcoin-denominated ecash at whichever mint the counterparty settles
-on. A seller's *advertised* mint is unreliable — a known bug hardcodes it in the
+Payments are real bitcoin-denominated ecash at whichever mint the counterparty
+settles on. A seller's *advertised* mint is unreliable — a known bug hardcodes it in the
 announce — so do not infer the settlement mint from it.

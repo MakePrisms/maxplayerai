@@ -63,8 +63,8 @@ waits for you to pay it out-of-band. Minting the ecash is a second command:
 
 The shipped mint is `https://mint.minibits.cash/Bitcoin` and `allow_real_mints` is `true`, so
 `"$MAXPLAYER_BIN" wallet setup` provisions the wallet there and prints a Lightning invoice you fund
-yourself — it does not auto-fund. Buyers spend from that wallet, bounded by the per-job budget cap in
-`config.toml`.
+with real sats — it does not auto-fund. Buyers spend real sats from that wallet, bounded by the
+per-job budget cap in `config.toml`.
 
 ## 3. Add the MCP to your agent
 
