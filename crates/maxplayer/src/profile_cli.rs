@@ -55,6 +55,12 @@ fn usage(err: &mut dyn Write) {
 
 /// Entry from `cli::run` for `maxplayer profile ...`.
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    // #570: a sole `--help` (`profile --help` or `profile set --help`) prints usage to STDOUT and
+    // exits 0 before any parse, home bootstrap, or relay publish.
+    if crate::cli::is_help_request(args) {
+        usage(out);
+        return SUCCESS;
+    }
     match args.first().map(String::as_str) {
         Some("set") => cmd_set(&args[1..], out, err),
         _ => {

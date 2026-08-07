@@ -15,6 +15,13 @@ const USAGE_ERROR: i32 = 1;
 const RUNTIME_ERROR: i32 = 2;
 
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    // #570: a sole `--help` — `buyer --help`, `buyer serve --help`, or `buyer status --help` —
+    // prints usage to STDOUT and exits 0 BEFORE any dispatch. In particular `buyer status --help`
+    // must NOT reach `status()` and open the daemon socket: a help request never touches the network.
+    if crate::cli::is_help_request(args) {
+        write_usage(out);
+        return SUCCESS;
+    }
     match args.first().map(String::as_str) {
         None | Some("serve") => serve(out, err),
         Some("status") => status(out, err),
@@ -22,11 +29,17 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     }
 }
 
-fn usage(err: &mut dyn Write) -> i32 {
+/// Help that was asked for goes to stdout and succeeds; the same text on stderr means the
+/// invocation was wrong. Only the destination and exit code differ, so both render here.
+fn write_usage(out: &mut dyn Write) {
     let _ = writeln!(
-        err,
+        out,
         "Usage:\n  maxplayer buyer          # run the persistent per-home daemon (exclusive lock)\n  maxplayer buyer serve    # alias for `maxplayer buyer`\n  maxplayer buyer status   # thin client: query the running daemon over its socket"
     );
+}
+
+fn usage(err: &mut dyn Write) -> i32 {
+    write_usage(err);
     USAGE_ERROR
 }
 

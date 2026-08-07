@@ -68,6 +68,12 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     use maxplayer_core::home;
     use maxplayer_core::job_lifecycle::{self, AcceptClaimRequest};
 
+    // #570: a sole `--help` prints usage to STDOUT and exits 0 before any parse or home bootstrap.
+    if crate::cli::is_help_request(args) {
+        usage(out);
+        return SUCCESS;
+    }
+
     let opts = match parse(args) {
         Ok(opts) => opts,
         Err(message) => {
@@ -124,7 +130,12 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 }
 
 #[cfg(not(feature = "wallet"))]
-pub fn run(args: &[String], _out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    // #570: `--help` succeeds to STDOUT even on a buyer-only build (help is feature-independent).
+    if crate::cli::is_help_request(args) {
+        usage(out);
+        return SUCCESS;
+    }
     if parse(args).is_err() {
         usage(err);
         return USAGE_ERROR;

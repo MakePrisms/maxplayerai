@@ -637,12 +637,28 @@ mod checks {
     }
 }
 
+/// Help that was asked for goes to stdout and succeeds. Feature-independent: `doctor --help` works
+/// on every build, before any home bootstrap or check runs.
+fn write_usage(out: &mut dyn Write) {
+    let _ = writeln!(
+        out,
+        "Usage:\n  maxplayer doctor [--home <dir>]   # seller environment self-check (credential helper, seller key, relay, mint, agent, sandbox, home permissions)\n\nExit codes: 0 all checks passed, 1 a blocking check FAILed"
+    );
+}
+
 /// Entry from `cli::run` for `maxplayer doctor`.
 ///
 /// Honors `--home <dir>` (mirroring `maxplayer seller`) so an operator can diagnose a specific seat,
 /// and REFUSES any other argument rather than silently dropping it — a discarded flag produced a
 /// confident report about the wrong home, which is worse than an error (issue #216).
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    // #570: a sole `--help` prints usage to STDOUT and exits 0 on every build, before any home
+    // bootstrap or check runs.
+    if crate::cli::is_help_request(args) {
+        write_usage(out);
+        return SUCCESS;
+    }
+
     #[cfg(not(feature = "wallet"))]
     {
         let _ = out;
