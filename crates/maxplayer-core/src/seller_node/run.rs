@@ -24,6 +24,7 @@ use nostr_sdk::prelude::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::contribution::{contribution_serve_gate, ContributionServeGate};
 use crate::gateway::{
     self, claim_draft, error_draft, git_result_draft, parse_award, parse_offer, OfferParseError,
     ParsedOffer, ReasonCode,
@@ -3404,18 +3405,24 @@ impl SellerNodeRunner {
                 return;
             }
         };
-        // Contribution offers are a later slice: refuse (never run a contribution as from-scratch),
-        // matching the legacy fail-closed posture. A malformed contribution is likewise refused.
-        match crate::contribution::parse_contribution_offer(&draft.tags) {
-            Ok(None) => {}
-            Ok(Some(_)) => {
+        // Contribution offers are gated by the operator's `[seller] contribution_enabled` flag
+        // (default on): served when enabled, refused when the operator turns them off, and a
+        // malformed contribution is refused either way (never run as from-scratch). A served
+        // contribution still runs in an empty workdir until #591 clones the target at base_oid —
+        // making the flag load-bearing here is the whole of #590.
+        match contribution_serve_gate(&draft.tags, seller.contribution_enabled) {
+            ContributionServeGate::NotContribution => {}
+            ContributionServeGate::Serve => {
+                opline!("seller node serving contribution offer id={}", event.id);
+            }
+            ContributionServeGate::RefuseDisabled => {
                 opline!(
-                    "seller node offer skip id={}: contribution offers not served by the node yet",
+                    "seller node offer skip id={}: contribution offers disabled (contribution_enabled=false)",
                     event.id
                 );
                 return;
             }
-            Err(error) => {
+            ContributionServeGate::Malformed(error) => {
                 opline!("seller node offer skip id={}: malformed contribution ({error})", event.id);
                 return;
             }
