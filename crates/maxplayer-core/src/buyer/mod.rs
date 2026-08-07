@@ -185,7 +185,9 @@ async fn bootstrap(home: MaxplayerHome) -> Result<(HomeLock, Arc<BuyerContext>, 
     // The daemon is the ONLY opener of the CDK wallet — this is what the exclusive
     // home lock protects. Opening touches the local sqlite store only (no network).
     let wallet = buyer_fund::open_wallet_async(&home).await?;
-    let wallet = wallet_actor::spawn(wallet);
+    // Hand the actor a home clone so it can enumerate per-mint balances for `status` (#496) without a
+    // second wallet opener; the daemon's exclusive home lock still guards across processes.
+    let wallet = wallet_actor::spawn(wallet, home.clone());
 
     let signer = signer::spawn(&home)?;
 
@@ -2614,9 +2616,36 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
         Err(error) => return Response::err(id, CODE_INTERNAL, format!("state DB task failed: {error}")),
     };
 
+    // Report EVERY configured mint's balance, not just the default (#496): a wallet funded across
+    // `extra_mints` otherwise hides every non-default balance from the live daemon, forcing a
+    // disruptive daemon-down CLI read to cross-foot a multi-mint wallet. The top-level `mint` +
+    // `balance_sats` (the default mint) stay for back-compat; `total_sats` + the per-mint `mints`
+    // list are added. Read through the wallet actor's single slot, so it never races a spend.
     let mint = context.home.config.default_mint().to_owned();
-    let wallet = match context.wallet.balance().await {
-        Ok(Ok(balance_sats)) => json!({ "mint": mint, "balance_sats": balance_sats }),
+    let wallet = match context.wallet.balances().await {
+        Ok(Ok(rows)) => {
+            let total_sats: u64 = rows.iter().map(|row| row.balance_sats).sum();
+            let default_balance = rows
+                .iter()
+                .find(|row| row.is_default)
+                .map_or(0, |row| row.balance_sats);
+            let mints: Vec<Value> = rows
+                .iter()
+                .map(|row| {
+                    json!({
+                        "mint": row.mint_url,
+                        "role": if row.is_default { "default" } else { "extra" },
+                        "balance_sats": row.balance_sats,
+                    })
+                })
+                .collect();
+            json!({
+                "mint": mint,
+                "balance_sats": default_balance,
+                "total_sats": total_sats,
+                "mints": mints,
+            })
+        }
         Ok(Err(error)) => json!({ "mint": mint, "error": error }),
         Err(error) => json!({ "mint": mint, "error": error.to_string() }),
     };
@@ -4451,6 +4480,17 @@ mod tests {
         let result = response.result.expect("status result");
         assert_eq!(result["ok"], json!(true));
         assert_eq!(result["wallet"]["balance_sats"], json!(0));
+        // #496: status reports the full configured-mint breakdown, not just the default balance. A
+        // fresh home has exactly one configured mint (the default) at 0, so `total_sats` is 0 and the
+        // per-mint list carries that one default row. Reverting the per-mint reporting drops these.
+        assert_eq!(result["wallet"]["total_sats"], json!(0));
+        let mints = result["wallet"]["mints"]
+            .as_array()
+            .expect("#496: status.wallet.mints is a per-mint array");
+        assert_eq!(mints.len(), 1, "fresh home has one configured mint (the default)");
+        assert_eq!(mints[0]["role"], json!("default"));
+        assert_eq!(mints[0]["balance_sats"], json!(0));
+        assert!(mints[0]["mint"].as_str().is_some(), "each per-mint row names its mint");
         assert_eq!(result["store"]["schema_version"], json!(store::SCHEMA_VERSION));
         let pubkey = result["pubkey"].as_str().expect("pubkey string");
         assert_eq!(pubkey.len(), 64);

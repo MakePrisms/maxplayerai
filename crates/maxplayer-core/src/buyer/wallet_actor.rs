@@ -14,12 +14,22 @@
 use cdk::wallet::Wallet;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::home::MaxplayerHome;
+use crate::wallet_ops::{balances_async, MintBalance};
+
 /// Commands accepted by the wallet actor. Extended in later phases with the
 /// proof-changing operations (prepare-send, melt, …).
 enum Command {
-    /// Read the total spendable balance (sats) at the wallet's bound mint.
+    /// Read the total spendable balance (sats) at the wallet's bound (default) mint.
     Balance {
         reply: oneshot::Sender<Result<u64, String>>,
+    },
+    /// Read the per-mint balances across ALL configured mints (default + `extra_mints`), so the
+    /// daemon can report every mint's balance without a daemon-down CLI read (#496). Serviced in the
+    /// same single slot as `Balance` — the actor queue, not SQLite locking, is the concurrency
+    /// boundary — so it never overlaps a proof-changing op on the wallet.
+    Balances {
+        reply: oneshot::Sender<Result<Vec<MintBalance>, String>>,
     },
     /// Test-only serialization probe: reports the max concurrent in-flight count
     /// observed by the actor. A single-task actor always observes 1; a regression
@@ -49,11 +59,22 @@ impl std::fmt::Display for WalletActorGone {
 impl std::error::Error for WalletActorGone {}
 
 impl WalletHandle {
-    /// Total spendable balance (sats). Serialized behind the actor queue.
+    /// Total spendable balance (sats) at the default mint. Serialized behind the actor queue.
     pub async fn balance(&self) -> Result<Result<u64, String>, WalletActorGone> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Command::Balance { reply })
+            .await
+            .map_err(|_| WalletActorGone)?;
+        rx.await.map_err(|_| WalletActorGone)
+    }
+
+    /// Per-mint balances across all configured mints (default + `extra_mints`). Serialized behind the
+    /// actor queue exactly like [`balance`](Self::balance), so it never overlaps a proof-changing op.
+    pub async fn balances(&self) -> Result<Result<Vec<MintBalance>, String>, WalletActorGone> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::Balances { reply })
             .await
             .map_err(|_| WalletActorGone)?;
         rx.await.map_err(|_| WalletActorGone)
@@ -71,8 +92,10 @@ impl WalletHandle {
 }
 
 /// Spawn the actor, moving `wallet` into the owning task. The returned handle is
-/// the only way to reach the wallet.
-pub fn spawn(wallet: Wallet) -> WalletHandle {
+/// the only way to reach the wallet. `home` is moved in too so the actor can enumerate the
+/// configured mints for the per-mint balance read (#496) inside its single serialized slot — no
+/// second wallet opener, and never concurrent with a proof-changing op.
+pub fn spawn(wallet: Wallet, home: MaxplayerHome) -> WalletHandle {
     // A small bounded queue: callers await a slot, which naturally applies
     // backpressure rather than growing an unbounded backlog.
     let (tx, mut rx) = mpsc::channel::<Command>(64);
@@ -87,6 +110,13 @@ pub fn spawn(wallet: Wallet) -> WalletHandle {
                         .await
                         .map(|amount| amount.to_u64())
                         .map_err(|error| error.to_string());
+                    let _ = reply.send(result);
+                }
+                Command::Balances { reply } => {
+                    // Enumerate per-mint balances from the configured-mint set. Runs in this single
+                    // slot, so the actor's own default-mint wallet is idle and no proof-changing op
+                    // is in flight — the actor queue is the concurrency boundary (#496).
+                    let result = balances_async(&home).await.map_err(|error| error.to_string());
                     let _ = reply.send(result);
                 }
                 #[cfg(test)]
@@ -130,7 +160,7 @@ mod tests {
         let wallet = buyer_fund::open_wallet_async(&home)
             .await
             .expect("open wallet");
-        let handle = spawn(wallet);
+        let handle = spawn(wallet, home);
 
         // Fire many probes concurrently; each reports the peak in-flight count it
         // saw. A single-task actor must never let two run at once.
@@ -148,6 +178,13 @@ mod tests {
         // And a real read returns a value (0 on a fresh home) through the queue.
         let balance = handle.balance().await.expect("actor alive").expect("balance");
         assert_eq!(balance, 0);
+
+        // The per-mint read (#496) returns the single configured mint (the default) at 0 on a fresh
+        // home, through the same serialized slot.
+        let rows = handle.balances().await.expect("actor alive").expect("balances");
+        assert_eq!(rows.len(), 1, "fresh home has one configured mint (the default)");
+        assert!(rows[0].is_default, "the sole configured mint is the default");
+        assert_eq!(rows[0].balance_sats, 0);
 
         let _ = std::fs::remove_dir_all(&root);
     }
