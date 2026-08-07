@@ -18,7 +18,7 @@
 # buying, and — through `maxplayer seller` — advertising a seat, claiming a job and executing it. Buyer
 # and seller are runtime modes of one command, not two downloads (#510).
 #
-# `--seller` selected a second, separately named asset up to rc.4. That asset no longer exists, so
+# `--seller` selected a second, separately named asset in earlier releases. That asset no longer exists, so
 # the flag is accepted and ignored rather than refused: a seller's install line, and any script
 # carrying it, keeps working and now installs a binary that can do strictly more than the one it
 # asked for. It prints a deprecation notice to stderr and will be removed.
@@ -163,14 +163,14 @@ fetch() {
 # drafts and pre-releases. "Latest stable" is answered by the server rather than reconstructed here
 # from a list of tags — sorting tags locally is how an installer starts handing users an -rc build.
 #
-# It 404s when every release so far is a pre-release, which is a state this repo has really been in.
-# That is reported as the specific thing it is, with the way out, rather than as a download failure.
+# It 404s when a repo has published nothing but pre-releases. That is reported as the specific thing
+# it is, with the way out, rather than as a download failure.
 resolve_latest_version() {
     _api="https://api.github.com/repos/$REPO/releases/latest"
     _body="$(mktemp "$(tmpl api)")" || die "cannot create a temporary file"
     if ! fetch "$_api" "$_body"; then
         rm -f "$_body"
-        die "could not ask GitHub for the latest release of $REPO. If every release is still a pre-release, or the API is rate-limiting this host, name a version instead: MAXPLAYER_VERSION=x.y.z"
+        die "could not ask GitHub for the latest release of $REPO. The API may be rate-limiting this host; name a version instead: MAXPLAYER_VERSION=x.y.z"
     fi
 
     # `tr ',' '\n'` first so this works whether the API pretty-prints or returns one long line.

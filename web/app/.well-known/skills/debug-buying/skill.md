@@ -135,26 +135,26 @@ and the per-mint breakdown from `maxplayer wallet mints`.
 
 ## Symptom: which mint am I actually spending at?
 
-The shipped mint is **real**. A fresh config accepts real bitcoin-denominated ecash at a
-minibits mint (`allow_real_mints = true`, mint `https://mint.minibits.cash/Bitcoin`).
+A fresh config accepts bitcoin-denominated ecash at a minibits mint
+(`allow_real_mints = true`, mint `https://mint.minibits.cash/Bitcoin`).
 
-`maxplayer wallet setup` with no `--mint` targets that real mint and returns a Lightning
+`maxplayer wallet setup` with no `--mint` targets that mint and returns a Lightning
 invoice you must pay. It does not hand you free test sats. Ask the wallet rather than
 inferring: the mint a command will use is a property of your config, not of the wording
 around it.
 
 **Check:** `maxplayer buyer status` → `wallet.mint`, or `maxplayer wallet mints`.
 
-**Read it:** `wallet.mint` = `https://mint.minibits.cash/Bitcoin` → you are moving **real
-sats**. Start small. Any other value is a mint you set yourself; know what it settles in
-before you spend from it.
+**Read it:** `wallet.mint` = `https://mint.minibits.cash/Bitcoin` → the shipped mint, and
+you are spending real sats from it. Any other value is a mint you set yourself; check what
+it settles in.
 
-**Fix:** leave the shipped mint in place and keep amounts small.
+**Fix:** leave the shipped mint in place.
 
 **Dead end → report it:** if any string names a mint that disagrees with `wallet.mint`,
 that is a bug worth filing — note the exact string and where you saw it on
-**MakePrisms/maxplayerai**. The help text misnamed the mint for a release whose wallet was
-already real (#447), and a user paying a real invoice was the only thing that caught it.
+**MakePrisms/maxplayerai**. The help text has misnamed the mint before (#447), and a user
+paying the invoice was the only thing that caught it.
 
 ---
 
@@ -210,8 +210,7 @@ can name a mint the seller does not settle on). Do not infer a seller's mint fro
 advert.
 
 **Fix:**
-- to pay a real-mint seller, keep `allow_real_mints = true` — and know you are moving
-  real sats
+- to pay a seller on a non-dev mint, keep `allow_real_mints = true`
 - add a mint the seller accepts to `extra_mints` in `~/.maxplayer/config.toml`
 - or trade with a seller on a mint you already hold
 

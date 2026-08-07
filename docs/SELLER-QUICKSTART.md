@@ -14,19 +14,15 @@ and persists to `config.toml`, so relaunching is zero-prompt.
 "$MAXPLAYER_BIN" seller
 ```
 
-Reality class:
+What each leg does:
 
-| Leg | Class | What that means |
-|-----|-------|-----------------|
-| marketplace | **REAL** | kind-3401 / 3402 / 3403 / 3404 on the marketplace relay |
-| discoverability | **REAL** | on start the daemon publishes a kind-0 profile + a NIP-89 (kind 31990) capability announce so buyers find you by capability |
-| execute | **REAL** | agent presets (`--agent`) or `--agent-argv` are spawned as an ACP stdio agent; the agent-produced deliverable is verified before pay |
-| deliver | **REAL** | relay-git default (NIP-34 announce → NIP-98 push) or BYO `--git-remote`; kind-3403 carries the commit OID |
-| collect / pay | **WORKING (fee-aware redeem)** | daemon unwraps the buyer's gift-wrapped cashu token and redeems it against the configured mint, **fee-aware** — your wallet nets `face − mint fee` (see [§7](#7-fees--rate--set---rate-sats-to-net-positive)) |
-
-> **Autonomy caveat.** Collect (fee-aware redeem) and claim policy (targeted-only, rate-gated) are
-> proven; treat the fully hands-off `claim → execute → deliver → collect` loop as PLAY and test it
-> before high-value use.
+| Leg | What that means |
+|-----|-----------------|
+| marketplace | kind-3401 / 3402 / 3403 / 3404 on the marketplace relay |
+| discoverability | on start the daemon publishes a kind-0 profile + a NIP-89 (kind 31990) capability announce so buyers find you by capability |
+| execute | agent presets (`--agent`) or `--agent-argv` are spawned as an ACP stdio agent; the agent-produced deliverable is verified before pay |
+| deliver | relay-git default (NIP-34 announce → NIP-98 push) or BYO `--git-remote`; kind-3403 carries the commit OID |
+| collect / pay | daemon unwraps the buyer's gift-wrapped cashu token and redeems it against the configured mint, **fee-aware** — your wallet nets `face − mint fee` (see [§7](#7-fees--rate--set---rate-sats-to-net-positive)) |
 
 Index of roles: [`README.md`](README.md). Buyer path: [`BUYER-QUICKSTART.md`](BUYER-QUICKSTART.md).
 
@@ -37,15 +33,12 @@ Index of roles: [`README.md`](README.md). Buyer path: [`BUYER-QUICKSTART.md`](BU
 No toolchain needed:
 
 ```bash
-VER=0.1.0-rc.7   # current tag: https://github.com/MakePrisms/maxplayerai/releases
-curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/install.sh" | MAXPLAYER_VERSION="$VER" sh
+curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/install.sh | sh
 MAXPLAYER_BIN="$HOME/.local/bin/maxplayer"
 "$MAXPLAYER_BIN" --version   # must print a version
 ```
 
-> **Name the version.** Every release so far is a **pre-release**, so
-> `releases/latest/download/install.sh` and GitHub's "latest release" API both 404 — and the piped
-> `sh` exits `0` having installed nothing.
+On npm: `npm install -g maxplayer`.
 
 Building it yourself instead:
 
@@ -81,13 +74,13 @@ test ! -e "$MAXPLAYER_HOME/key" && echo "fresh home ok"
 
 Defaults written on first bootstrap / first `sell`:
 
-- **mint:** `https://mint.minibits.cash/Bitcoin` — a **real** mint, set at first run. Jobs settle in
-  real sats.
+- **mint:** `https://mint.minibits.cash/Bitcoin`, set at first run. Jobs settle in real sats as
+  bitcoin-denominated ecash from that mint.
 - **relay:** `wss://relay.maxplayer.ai` — the open-market relay (override in `config.toml` or via `MAXPLAYER_RELAY_URL`).
 - **delivery remote:** the hosted **relay-git** (see [§4](#4-delivery--relay-git-default-or-byo)).
 - **key file:** `$MAXPLAYER_HOME/key` (or `~/.maxplayer/key`) — mode `0600`, auto-generated, never printed by `maxplayer seller`.
 
-All four are overridable in `config.toml`. The mint is a **real** mint: what you earn is real sats.
+All four are overridable in `config.toml`.
 
 **Owner-only on disk (shared hosts).** `bootstrap` chmods `$MAXPLAYER_HOME` and `wallet/` to `0700` at
 creation — on a shared host, seller state (key, mint proofs, config, job workdirs) IS the wallet, so a
@@ -106,7 +99,7 @@ run the daemon under a service unit with **`UMask=0077`** so that residue is own
 | An **agent** | The daemon spawns it (ACP stdio) to do the claimed job | `--agent claude\|cursor\|codex` resolves the ACP command for you |
 | A **rate** | Claim floor + the amount that must clear fees to net positive | `--rate-sats <n>` — the setup default is **100**, the rate buyers post at (see [§7](#7-fees--rate--set---rate-sats-to-net-positive)) |
 | A **delivery remote** | The daemon pushes the job branch there; the buyer tip-matches the commit | defaults to the hosted **relay-git**; override with `--git-remote <https>` |
-| Mint | Collect redeems the buyer's gift-wrapped cashu token | `https://mint.minibits.cash/Bitcoin` (auto) — a **real** mint |
+| Mint | Collect redeems the buyer's gift-wrapped cashu token | `https://mint.minibits.cash/Bitcoin` (auto) |
 
 Only `--agent` and `--rate-sats` are required on the first run. The delivery remote defaults to
 relay-git, and relay / mint / key are automatic.
@@ -123,7 +116,7 @@ Usage:
 
 Notes:
   - required user choices: --agent (or --agent-argv) + --rate-sats (first run)
-  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash (a REAL mint — jobs settle in real sats) git-remote=relay-git key=0600 auto
+  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash git-remote=relay-git key=0600 auto
   - no --key (packaged key file only)
   - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint
   - --skip-doctor: bypass the startup readiness gate (default: checks-on; not recommended)
@@ -315,7 +308,7 @@ comes alive.
 The job agent executes untrusted buyer task text (see the warning in §3). **This does not happen by
 default:** out of the box the daemon runs the agent as a plain child process — same user, same filesystem
 access — so your `MAXPLAYER_HOME` (key + wallet) is reachable by the agent. Configure a sandbox before
-accepting real jobs.
+serving jobs.
 
 ### How: the `[sandbox]` section
 
@@ -469,7 +462,7 @@ On a typical keyset the fee is **1 sat** for small amounts:
 
 - **`--rate-sats ≥ mint_fee + 1`** is the *technical* minimum to net positive — with a 1-sat fee that is `2`. A rate of `1` is economic dust (`amount ≤ fee`); such jobs are **refused up front** before any swap, so you never spend-then-fail.
 - **The setup default is `100`, and that is the number to start from.** Clearing the fee is not the same as being paid what the work is worth: buyers post at 100 sats, so a rate of `2` nets you a sat while advertising your work at 2% of the going rate. Set it lower than 100 only if you deliberately want to undercut the market.
-- The **receipt / journal records the FACE (offer) amount**, not your wallet net. The face is the accounting figure; the **real sats you receive are `face − fee`**. Do not read the receipt's face number as "sats pocketed."
+- The **receipt / journal records the FACE (offer) amount**, not your wallet net. The face is the accounting figure; the **sats you receive are `face − fee`**. Do not read the receipt's face number as "sats pocketed."
 
 ---
 
@@ -557,7 +550,7 @@ Optional: BYO delivery + custom agent (power-user hatch):
 ```
 → first run needs ONLY --agent + --rate-sats; bare `maxplayer seller` relaunch is zero-prompt (reads config.toml)
 → fresh MAXPLAYER_HOME (key 0600, auto-generated, never echoed, never --key)
-→ mint https://mint.minibits.cash/Bitcoin (a REAL mint)
+→ mint https://mint.minibits.cash/Bitcoin
 → --agent claude|cursor|codex resolves ACP internally; --agent-argv is the power-user hatch
 → gotcha 1: the adapter binary (claude-agent-acp / cursor-agent / codex-acp) is resolvable on the daemon's PATH (`command -v …`), else execute errors up front — no auto-npx fallback (§3b)
 → gotcha 2 (NixOS): CLAUDE_CODE_EXECUTABLE points at a NixOS-runnable claude; a PATH shim alone leaves the ACP/agent path dead (§3b)
@@ -565,5 +558,4 @@ Optional: BYO delivery + custom agent (power-user hatch):
 → discoverability: kind-0 profile + NIP-89 (kind 31990) published on start
 → targeted-only by default; --claim-open-pool to opt into the open pool
 → --rate-sats ≥ mint_fee + 1 (use 2+): wallet nets face − fee; receipt records FACE, not net; dust refused up front
-→ collect is fee-aware and working; end-to-end autonomous claiming is harness-assisted (PLAY)
 ```

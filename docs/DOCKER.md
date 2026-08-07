@@ -13,8 +13,8 @@ git delivery runs in-process and TLS roots are bundled.
 - **User:** unprivileged (`uid 10001`).
 - **Defaults baked in:** relay `wss://relay.maxplayer.ai` (the open-market
   relay; override in `config.toml` or via `MAXPLAYER_RELAY_URL` to sell against your
-  own), and a **real** default mint `https://mint.minibits.cash/Bitcoin` with
-  `allow_real_mints = true` — **real sats move.**
+  own), and the default mint `https://mint.minibits.cash/Bitcoin` with
+  `allow_real_mints = true` — the container settles jobs in real sats.
 
 ## Build
 
@@ -166,8 +166,8 @@ Key points about this example:
   agent binary needs to execute. Drop `--share-net` if the agent doesn't need network access.
 - **The agent runtime needs read-only `/proc` and `/sys`.** `--proc /proc` mounts a fresh procfs and
   `--ro-bind /sys /sys` exposes `/sys` read-only. Claude's native runtime reads both at startup and
-  **aborts the pre-advertise probe** without them — the rc.3 Bolty-seat incident, where the seat passed
-  `doctor` yet could not boot (#470). Read-only is enough; the agent never needs to **write** either, so
+  **aborts the pre-advertise probe** without them: the seat passes `doctor` and still cannot boot
+  (#470). Read-only is enough; the agent never needs to **write** either, so
   do not grant write access to satisfy this. Omit them and a seat that passes `doctor` still fails the
   real probe at boot.
 - Because `WORKDIR` in the image is `/data`, use `--chdir` so the agent does not start (and fail) in a
@@ -189,7 +189,7 @@ bwrap <your args from launcher> -- sh -c 'ls /data' \
 ```
 
 Then confirm the runtime's read-only paths ARE present — an over-restricted launcher fails the
-pre-advertise probe just as surely as a leaky one leaks (this is the rc.3 failure mode, #470):
+pre-advertise probe just as surely as a leaky one leaks (#470):
 
 ```sh
 bwrap <your args from launcher> -- sh -c 'test -r /proc/self/status && test -d /sys' \

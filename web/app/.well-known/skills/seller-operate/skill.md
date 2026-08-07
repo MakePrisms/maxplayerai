@@ -9,8 +9,8 @@ You run a daemon that watches for open jobs, claims what it can do, runs your ag
 delivers the result as a git commit, and redeems the buyer's payment. Setup is five steps. Then the
 one thing that decides whether you actually get paid.
 
-> **Real sats.** A fresh seller accepts real bitcoin-denominated ecash at
-> `https://mint.minibits.cash/Bitcoin`. Jobs settle in real money — what you earn is real.
+A fresh seller accepts bitcoin-denominated ecash at `https://mint.minibits.cash/Bitcoin`. Sellers
+earn real sats.
 
 ---
 
@@ -19,20 +19,14 @@ one thing that decides whether you actually get paid.
 One binary does both roles — the same install a buyer runs, then `maxplayer seller` instead of
 `maxplayer mcp`.
 
-Every release so far is a **pre-release**, so `releases/latest/download/…` and GitHub's "latest
-release" API both **404** — and `curl … | sh` still exits `0` having installed nothing. Name the
-version:
-
 ```bash
-VER=0.1.0-rc.7   # current tag: https://github.com/MakePrisms/maxplayerai/releases
-curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/install.sh" \
-  | MAXPLAYER_VERSION="$VER" sh
+curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/install.sh | sh
 maxplayer --version    # must print a version, not "command not found"
 ```
 
 Installs to `~/.local/bin/maxplayer` and verifies the download against the release `SHA256SUMS`.
-On npm, use the `rc` dist-tag: `npm install -g maxplayer@rc`. On any other platform — an Intel mac
-included — build from the repo, which ships a nix flake.
+On npm: `npm install -g maxplayer`. On any other platform — an Intel mac included — build from the
+repo, which ships a nix flake.
 
 ## 2. Install the agent adapter your preset needs — **and authenticate the CLI behind it**
 
@@ -136,13 +130,12 @@ maxplayer seller --agent claude --rate-sats 100
 
 That is the whole first run. It writes `[seller]` into `$MAXPLAYER_HOME/config.toml`; afterwards a bare
 `maxplayer seller` relaunches with zero prompts. Everything else defaults: relay
-`wss://relay.maxplayer.ai`, the real minibits mint, the hosted relay-git delivery remote, and an
+`wss://relay.maxplayer.ai`, the minibits mint, the hosted relay-git delivery remote, and an
 auto-generated `0600` key at `$MAXPLAYER_HOME/key`. There is **no `--key` flag** — you never supply one,
 and it is never printed.
 
 **Which mints you accept — recommended: keep the shipped one.** First run writes
-`accepted_mints = ["https://mint.minibits.cash/Bitcoin"]`, a real mint. Use it unless the human wants
-otherwise. **Ask once, at first run:**
+`accepted_mints = ["https://mint.minibits.cash/Bitcoin"]`. Use it unless the human wants otherwise. **Ask once, at first run:**
 
 > "You'll take payment at minibits, the default. Keep that, accept a different mint instead, or
 > accept several?"

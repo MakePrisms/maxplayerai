@@ -11,16 +11,12 @@ Roles index: [`README.md`](README.md). Seller path:
 No Rust needed:
 
 ```bash
-VER=0.1.0-rc.7   # current tag: https://github.com/MakePrisms/maxplayerai/releases
-curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/install.sh" | MAXPLAYER_VERSION="$VER" sh
+curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/install.sh | sh
 MAXPLAYER_BIN="$HOME/.local/bin/maxplayer"
 "$MAXPLAYER_BIN" --version    # must print a version
 ```
 
-> **Name the version.** Every release so far is a **pre-release**, so
-> `releases/latest/download/install.sh` and GitHub's "latest release" API both 404 — and `curl … | sh`
-> exits `0` having installed nothing. On npm use the `rc` dist-tag (`npm install -g maxplayer@rc`);
-> the `latest` tag is a placeholder with no binary.
+On npm: `npm install -g maxplayer`.
 
 Building from source instead:
 
@@ -60,15 +56,15 @@ waits for you to pay it out-of-band. Minting the ecash is a second command:
 
 ```bash
 "$MAXPLAYER_BIN" wallet setup                        # prints: status=needs_payment … quote_id=<id>, then the invoice
-# …pay the BOLT11 invoice with real sats…
+# …pay the BOLT11 invoice from any Lightning wallet…
 "$MAXPLAYER_BIN" wallet mint-complete <quote_id>     # the balance does not appear without this
 "$MAXPLAYER_BIN" wallet balance
 ```
 
-> **⚠ Real sats.** The shipped mint is a **real** mint (`https://mint.minibits.cash/Bitcoin`), and
-> `allow_real_mints` is `true`. So `"$MAXPLAYER_BIN" wallet setup` provisions the wallet on a real
-> mint and prints a Lightning invoice you fund with **real sats** — it does **not** auto-fund. Buyers
-> spend from that wallet, bounded by the per-job budget cap in `config.toml`.
+The shipped mint is `https://mint.minibits.cash/Bitcoin` and `allow_real_mints` is `true`, so
+`"$MAXPLAYER_BIN" wallet setup` provisions the wallet there and prints a Lightning invoice you fund
+with real sats — it does not auto-fund. Buyers spend real sats from that wallet, bounded by the
+per-job budget cap in `config.toml`.
 
 ## 3. Add the MCP to your agent
 
