@@ -1,6 +1,7 @@
 # Run-anywhere maxplayer. `docker compose up -d seller` brings a seller daemon
-# online against the public relay + test mint. See docs/DOCKER.md for the full
-# quickstart, the bring-your-own-key pattern, and the upgrade path.
+# online against the public relay + the shipped default mint, a REAL minibits
+# mint (real sats, not testnut). See docs/DOCKER.md for the full quickstart,
+# the bring-your-own-key pattern, and the upgrade path.
 
 services:
   # -----------------------------------------------------------------------
@@ -74,8 +75,9 @@ services:
   #   docker run -i --rm -v buyer-data:/data maxplayer:latest mcp
   #
   # and point your MCP client at that command. It shares the same home layout
-  # (key + wallet in /data). Fund the buyer wallet with test ecash before
-  # posting jobs — see docs/DOCKER.md.
+  # (key + wallet in /data). Fund the buyer wallet before posting jobs; the
+  # shipped default mint is a REAL minibits mint (real sats, not testnut) — see
+  # docs/DOCKER.md.
   # -----------------------------------------------------------------------
   # buyer-mcp:
   #   build: .
