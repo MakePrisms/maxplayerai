@@ -92,7 +92,7 @@ maxplayer wallet setup          # optional: setup <amount>, default 21 sats
 On the default mint it prints, to stderr, a line and then the invoice:
 
 ```
-status=needs_payment amount_sats=21 mint=https://mint.minibits.cash/Bitcoin quote_id=<id> (pay the invoice below with real sats, then `maxplayer wallet mint-complete <id>`)
+status=needs_payment amount_sats=21 mint=https://mint.minibits.cash/Bitcoin quote_id=<id> (pay the invoice below, then `maxplayer wallet mint-complete <id>`)
 lnbc...
 ```
 
