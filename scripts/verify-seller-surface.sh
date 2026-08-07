@@ -89,7 +89,7 @@ fi
 # The usage text is a static string; this is the arm. An option `sell` does not have reaches
 # `sell::run`'s own parser, which names it — a message that exists only in the module compiled in
 # under `acp`. The racer artifact falls through to the generic top-level usage instead, which never
-# mentions a sell option, so the verdict moves with the feature rather than with the exit code
+# mentions a seller option, so the verdict moves with the feature rather than with the exit code
 # (both builds exit 1 here).
 set +e
 sell_out="$("$BINARY" seller --not-a-sell-option 2>&1)"
@@ -98,7 +98,7 @@ set -e
 if [ "$sell_rc" -ne 1 ]; then
     die "\`maxplayer seller --not-a-sell-option\` exited $sell_rc, not the usage-error 1 its parser returns:"$'\n'"$sell_out"
 fi
-if ! grep -q 'unknown sell option' <<<"$sell_out"; then
+if ! grep -q 'unknown seller option' <<<"$sell_out"; then
     die "\`maxplayer seller\` did not reach its own option parser — it fell through to the generic usage, which is what a build without the seller surface does:"$'\n'"$sell_out"
 fi
 # The probe must have REFUSED, not booted. `sell` publishes before it can fail, so a probe that got

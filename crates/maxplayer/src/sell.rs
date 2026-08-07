@@ -69,6 +69,15 @@ struct SellOptions {
 
 /// Entry from `cli::run` for `maxplayer seller ...`.
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    // Help that was asked for goes to stdout and succeeds (mirrors `cli::write_usage`): `--help`
+    // must print the seller usage, not reach the parser's catch-all and be reported as an unknown
+    // option (empty stdout, exit 1 — the pre-existing regression the rename never carried). Sole
+    // `--help` only, like top-level `cli::run`'s `args.len() == 2`: a looser scan would swallow a
+    // `--help` passed as an `--agent-argv` value to the agent.
+    if matches!(args, [flag] if flag == "--help") {
+        sell_usage(out);
+        return SUCCESS;
+    }
     let options = match SellOptions::parse(args) {
         Ok(options) => options,
         Err(message) => {
@@ -713,7 +722,7 @@ impl SellOptions {
                             .ok_or_else(|| "missing value for --home".to_owned())?,
                     ));
                 }
-                other => return Err(format!("unknown sell option: {other}")),
+                other => return Err(format!("unknown seller option: {other}")),
             }
             index += 1;
         }
@@ -721,9 +730,9 @@ impl SellOptions {
     }
 }
 
-fn sell_usage(err: &mut dyn Write) {
+fn sell_usage(w: &mut dyn Write) {
     let _ = writeln!(
-        err,
+        w,
         "Usage:\n  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>] [--skip-doctor]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n  maxplayer seller --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash (a REAL mint — jobs settle in real sats) git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint\n  - --skip-doctor: bypass the startup readiness gate (default: checks-on; not recommended)\n  - --unsafe-no-sandbox: serve the OPEN POOL with no working sandbox — this box then runs code written by strangers with no containment (waives only that one check)\n  - open-pool claiming is OFF by default; pass --claim-open-pool to opt in\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)"
     );
 }
