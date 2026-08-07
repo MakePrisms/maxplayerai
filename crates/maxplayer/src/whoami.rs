@@ -17,13 +17,17 @@ use std::io::Write;
 use std::path::PathBuf;
 
 const USAGE_ERROR: i32 = 1;
-#[cfg(feature = "wallet")]
 const SUCCESS: i32 = 0;
 #[cfg(feature = "wallet")]
 const RUNTIME_ERROR: i32 = 2;
 
 /// Entry point for `maxplayer whoami [--home <dir>]`.
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    // #570: a sole `--help` prints usage to STDOUT and exits 0 before any parse or home bootstrap.
+    if crate::cli::is_help_request(args) {
+        write_usage(out);
+        return SUCCESS;
+    }
     let home_override = match parse_home(args) {
         Ok(value) => value,
         Err(()) => return usage(err),
@@ -113,10 +117,14 @@ fn npub_from_pubkey_hex(pubkey_hex: &str) -> Result<String, String> {
         .map_err(|error| format!("npub encode: {error}"))
 }
 
-fn usage(err: &mut dyn Write) -> i32 {
+fn write_usage(out: &mut dyn Write) {
     let _ = writeln!(
-        err,
+        out,
         "Usage:\n  maxplayer whoami [--home <dir>]   # print this seat's PUBLIC identity: hex pubkey, npub, resolved home"
     );
+}
+
+fn usage(err: &mut dyn Write) -> i32 {
+    write_usage(err);
     USAGE_ERROR
 }

@@ -92,12 +92,26 @@ impl Containment {
 
 // ── The payload ─────────────────────────────────────────────────────────────────────────────────
 
+/// Help that was asked for goes to stdout and succeeds (issue #570). Distinct from the missing-args
+/// `usage:` line the payload prints to stderr on a bad invocation.
+fn write_usage(out: &mut dyn Write) {
+    let _ = writeln!(
+        out,
+        "Usage:\n  maxplayer sandbox-probe --canary <path> --workdir <dir>\n\nInternal: run INSIDE the configured launcher by the seller boot gate to report what the launcher permits (canary read / workdir write). Exit codes: 0 ran, 1 usage error."
+    );
+}
+
 /// `maxplayer sandbox-probe --canary <path> --workdir <dir>`, run INSIDE the launcher by the gate.
 ///
 /// Reports and exits 0 whenever it ran, including when both legs were refused: "the sandbox blocked
 /// me" is the answer the gate is asking for, not an error. A non-zero exit here means the arguments
 /// were unusable, which the gate reads as inconclusive rather than as containment.
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    // #570: a sole `--help` prints usage to STDOUT and exits 0, before the payload parses its flags.
+    if crate::cli::is_help_request(args) {
+        write_usage(out);
+        return SUCCESS;
+    }
     let mut canary: Option<PathBuf> = None;
     let mut workdir: Option<PathBuf> = None;
     let mut index = 0;

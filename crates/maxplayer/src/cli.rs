@@ -33,6 +33,14 @@ where
             write_usage(out);
             SUCCESS
         }
+        // #570: the inline debug/replay surfaces (mcp, log, mock, run) carry no usage of their own —
+        // they are documented in the top-level usage — so a sole `--help` on any of them prints THAT
+        // to stdout and exits 0, before dispatch. The module subcommands (buyer, wallet, …) answer
+        // `--help` from their own usage at the top of each `run`, so they are handled there, not here.
+        Some("mcp" | "log" | "mock" | "run") if is_help_request(&args[2..]) => {
+            write_usage(out);
+            SUCCESS
+        }
         Some("mcp") if args.len() == 2 => crate::mcp::run(out, err),
         Some("buyer") => crate::buyer::run(&args[2..], out, err),
         // Seller advertise surface — compiled in only with `acp` (#360). On a buyer-only build this
@@ -56,6 +64,24 @@ where
         Some("mock") => run_mock(&args[2..], out, err),
         Some("run") => run_agent(&args[2..], out, err),
         _ => usage(err),
+    }
+}
+
+/// A sole `--help` request at a subcommand level. True when `--help` is the final token and every
+/// token before it is a subcommand SELECTOR (a non-flag word such as `status` or `mints`), so it
+/// matches `--help`, `<sub> --help`, and `<sub> <subsub> --help` at any nesting depth. This is a
+/// sole-help check, never a loose scan: a `--help` that follows a FLAG (e.g. an `--agent-argv
+/// --help` value, or `--rate-sats 100 --help`) is NOT a help request and reaches the parser
+/// unchanged — the property the #549 seller arm was careful to keep.
+///
+/// Each subcommand calls this at the TOP of its `run`/handler; when true it prints its usage to
+/// STDOUT and returns success BEFORE parsing options or taking any side effect — no daemon socket,
+/// no relay, no wallet, no home bootstrap (issue #570). #549 fixed only `seller`; this is the
+/// general form that closes the class across every subcommand.
+pub(crate) fn is_help_request(args: &[String]) -> bool {
+    match args.split_last() {
+        Some((last, rest)) if last == "--help" => rest.iter().all(|token| !token.starts_with('-')),
+        _ => false,
     }
 }
 
@@ -532,6 +558,129 @@ mod tests {
         assert_eq!(code, 1);
         assert!(out.is_empty());
         assert!(err.contains("Usage:"));
+    }
+
+    // ---- #570: `--help` on every subcommand exits 0 with usage on stdout and no side effects ----
+
+    /// Drive `cli::run` with an arbitrary-length argv tail (unlike the fixed-size `run_captured`).
+    fn help_captured(tail: &[&str]) -> (i32, String, String) {
+        let mut argv = vec!["maxplayer"];
+        argv.extend_from_slice(tail);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(argv, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8(out).expect("stdout utf8"),
+            String::from_utf8(err).expect("stderr utf8"),
+        )
+    }
+
+    // The sole-help predicate every subcommand relies on: `--help` as the final token, preceded only
+    // by non-flag subcommand selectors — never a `--help` that is itself a FLAG VALUE (the property
+    // the #549 seller arm guarded for `--agent-argv --help`).
+    #[test]
+    fn is_help_request_matches_sole_help_at_any_depth_only() {
+        let s = |xs: &[&str]| xs.iter().map(|x| (*x).to_owned()).collect::<Vec<String>>();
+        assert!(is_help_request(&s(&["--help"])));
+        assert!(is_help_request(&s(&["status", "--help"])));
+        assert!(is_help_request(&s(&["mints", "add", "--help"])));
+        // A `--help` that follows a flag is that flag's VALUE, not a help request.
+        assert!(!is_help_request(&s(&["--agent-argv", "--help"])));
+        assert!(!is_help_request(&s(&["--rate-sats", "100", "--help"])));
+        // `--help` must be the final and only flag token.
+        assert!(!is_help_request(&s(&["--help", "extra"])));
+        assert!(!is_help_request(&s(&[])));
+        assert!(!is_help_request(&s(&["status"])));
+    }
+
+    // The shape #570 is about: a sole `--help` on ANY registered subcommand — at every nesting depth
+    // (`buyer status`, `wallet mints add`) — prints that command's usage to STDOUT and exits 0 with
+    // nothing on stderr (no parse, no home bootstrap, no daemon socket). #549 fixed only `seller`;
+    // enumerating the whole advertised surface here means a subcommand added later WITHOUT a
+    // sole-`--help` arm fails this test rather than shipping the regression a third time. Data-driven
+    // (one assertion body, many inputs) so it is the SHAPE under test, not a few instances. The
+    // per-case marker also proves each command answered from ITS OWN usage, not a generic fallthrough.
+    #[test]
+    fn help_on_every_subcommand_prints_usage_to_stdout_and_exits_zero() {
+        // (argv tail after `maxplayer`, a string that must appear in the command's own usage)
+        #[allow(unused_mut)] // feature-gated pushes below may be compiled out on a buyer-only build
+        let mut cases: Vec<(&str, &str)> = vec![
+            ("buyer --help", "maxplayer buyer"),
+            ("buyer serve --help", "maxplayer buyer"),
+            ("buyer status --help", "maxplayer buyer"),
+            ("wallet --help", "maxplayer wallet"),
+            ("wallet setup --help", "maxplayer wallet"),
+            ("wallet balance --help", "maxplayer wallet"),
+            ("wallet mint --help", "maxplayer wallet"),
+            ("wallet mint-complete --help", "maxplayer wallet"),
+            ("wallet send --help", "maxplayer wallet"),
+            ("wallet receive --help", "maxplayer wallet"),
+            ("wallet melt --help", "maxplayer wallet"),
+            ("wallet invoice --help", "maxplayer wallet"),
+            ("wallet mints --help", "maxplayer wallet"),
+            ("wallet mints list --help", "maxplayer wallet"),
+            ("wallet mints add --help", "maxplayer wallet"),
+            ("wallet reconcile --help", "maxplayer wallet"),
+            ("doctor --help", "maxplayer doctor"),
+            ("profile --help", "maxplayer profile"),
+            ("profile set --help", "maxplayer profile"),
+            ("whoami --help", "maxplayer whoami"),
+            ("accept --help", "maxplayer accept"),
+            ("collect --help", "maxplayer collect"),
+            ("mcp --help", "maxplayer mcp"),
+            ("log --help", "maxplayer log replay"),
+            ("log replay --help", "maxplayer log replay"),
+            ("mock --help", "maxplayer mock run"),
+            ("mock run --help", "maxplayer mock run"),
+            ("run --help", "maxplayer run"),
+        ];
+        // Feature-gated surfaces are enumerated only on the builds that register them (mirroring the
+        // dispatch arms in `run`), so this tracks the surface a given build actually ships.
+        #[cfg(feature = "acp")]
+        cases.push(("seller --help", "maxplayer seller"));
+        #[cfg(feature = "wallet")]
+        cases.push(("sandbox-probe --help", "maxplayer sandbox-probe"));
+        #[cfg(feature = "stub-pay")]
+        cases.push(("stub-pay --help", "maxplayer stub-pay"));
+
+        for (line, marker) in cases {
+            let tail: Vec<&str> = line.split(' ').collect();
+            let (code, out, err) = help_captured(&tail);
+            assert_eq!(code, 0, "`maxplayer {line}` must exit 0\nstdout={out}\nstderr={err}");
+            assert!(
+                out.contains("Usage:"),
+                "`maxplayer {line}` must print usage to stdout:\nstdout={out}\nstderr={err}"
+            );
+            assert!(
+                out.contains(marker),
+                "`maxplayer {line}` must answer from its own usage (expected {marker:?}):\nstdout={out}"
+            );
+            assert!(
+                err.is_empty(),
+                "`maxplayer {line}` must have no side-effect output on stderr:\nstderr={err}"
+            );
+        }
+    }
+
+    // #570, the worst instance: `buyer status --help` must answer from usage WITHOUT opening the
+    // daemon socket — a help request never touches the network. Run with no `--home` and no daemon:
+    // the pre-fix code fell through to `status()` → `client::status(socket)`, which prints neither
+    // "Usage:" nor leaves stderr empty (it connects and dumps status JSON, or fails to connect with a
+    // socket error + non-zero exit). Exit 0 + buyer usage on stdout + empty stderr red-proves the
+    // short-circuit: revert the buyer `--help` arm and this goes red, whether or not a daemon is up.
+    #[test]
+    fn buyer_status_help_never_contacts_the_daemon() {
+        let (code, out, err) = run_captured(["maxplayer", "buyer", "status", "--help"]);
+        assert_eq!(code, 0, "buyer status --help must exit 0:\nstdout={out}\nstderr={err}");
+        assert!(
+            out.contains("Usage:") && out.contains("maxplayer buyer status"),
+            "must print buyer usage to stdout, not connect:\nstdout={out}"
+        );
+        assert!(
+            err.is_empty(),
+            "buyer status --help must not attempt a daemon connection (no socket error, no banner):\nstderr={err}"
+        );
     }
 
     // #360: the seller advertise surface is gated on `acp`. These two tests are the same assertion

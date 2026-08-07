@@ -14,6 +14,11 @@ const RUNTIME_ERROR: i32 = 2;
 
 /// Entry from `cli::run` for `maxplayer stub-pay <amount> [--home <path>]`.
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    // #570: a sole `--help` prints usage to STDOUT and exits 0 before any parse or home bootstrap.
+    if crate::cli::is_help_request(args) {
+        write_usage(out);
+        return SUCCESS;
+    }
     let mut amount: Option<u64> = None;
     let mut root: Option<PathBuf> = None;
     let mut idx = 0;
@@ -79,10 +84,14 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     }
 }
 
-fn usage(err: &mut dyn Write) -> i32 {
+fn write_usage(out: &mut dyn Write) {
     let _ = writeln!(
-        err,
+        out,
         "Usage:\n  maxplayer stub-pay <amount_sats> [--home <path>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error"
     );
+}
+
+fn usage(err: &mut dyn Write) -> i32 {
+    write_usage(err);
     USAGE_ERROR
 }

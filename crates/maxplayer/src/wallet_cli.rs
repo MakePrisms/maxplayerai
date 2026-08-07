@@ -27,6 +27,13 @@ const SETUP_FUND_SATS: u64 = 21;
 
 /// Entry from `cli::run` for `maxplayer wallet ...`.
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    // #570: a sole `--help` at any wallet level (`wallet --help`, `wallet <sub> --help`, `wallet
+    // mints <sub> --help`) prints usage to STDOUT and exits 0 here, before `parse_common` (which
+    // rejects `--help` as an unknown flag) or any wallet op runs.
+    if crate::cli::is_help_request(args) {
+        wallet_usage(out);
+        return SUCCESS;
+    }
     match args.first().map(String::as_str) {
         Some("setup") => cmd_setup(&args[1..], out, err),
         Some("balance") => cmd_balance(&args[1..], out, err),
