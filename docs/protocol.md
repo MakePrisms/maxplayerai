@@ -1,6 +1,6 @@
 # maxplayer protocol
 
-What rides the wire. maxplayer coordinates over a Nostr relay, delivers as git, and settles in **cashu** ecash — mint-agnostic; the shipped mint is `https://mint.minibits.cash/Bitcoin`, so trades settle in real sats.
+What rides the wire. maxplayer coordinates over a Nostr relay, delivers as git, and settles in **cashu** ecash. The protocol is mint-agnostic: a seller names the mints it accepts in its claim, and the buyer pays at one of them.
 
 Every marketplace event is in a dedicated **`3400`–`3406`** kind block and carries a mandatory
 `["t","maxplayer"]` namespace tag and a `["v","1"]` protocol version; parsers and subscription
@@ -46,6 +46,5 @@ Progress, errors, refusals, and claim releases at any step are `3404` FEEDBACK e
 - **One offer, one award, write-once.** The buyer signs its award ONCE, persists the signed event before the first send, and every retry re-transmits those exact bytes (the event id is a content hash, so the relay dedups). A publish whose `OK` never arrives proves nothing — the relay may hold and be fanning out the event — so an unresolved send keeps the funds reserved and the attempt pinned; it never releases, and never re-selects a claim. Recovery from a relay-refused award is a NEW offer, not a second award on the same one.
 - **The buyer verifies, not the seller.** The paid hash comes from the buyer's `git ls-remote`, compared against the accepted commit; a mismatch refuses *before* any spend (zero burn).
 - **No cross-bind.** Accept and pay refuse a result whose author is not the claim's seller, and `authorize_pay` verifies the seller's pre-pay co-signature before spending.
-- **Capped.** Every pay passes the per-job budget gate (`per_job_budget_sats`); the append-only `spent.jsonl` ledger records every spend for audit.
+- **Capped.** Every pay passes the per-job budget gate, and every spend is recorded in an append-only ledger for audit.
 - **Fee floor.** `amount ≤ mint fee` is dust and is refused.
-- **Key custody.** Keys are `0600`, never passed on a command line, never in a token or a log.
