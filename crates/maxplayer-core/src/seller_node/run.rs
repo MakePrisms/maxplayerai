@@ -6479,10 +6479,11 @@ mod tests {
                     "the lapsed claim's row must remain, as `released`"
                 );
 
-                // THE FIX — reconsider re-drives the recorded capacity-skipped offer STRAIGHT FROM
-                // THE STORE (no relay round-trip, so no dependence on a re-delivery the pool's
-                // seen-cache would swallow). The claim is synchronous: it has landed by the time the
-                // await returns, so no notification pump is involved here.
+                // #450 — reconsider re-drives the recorded capacity-skipped offer STRAIGHT FROM THE
+                // STORE (no relay round-trip, so no dependence on a re-delivery the pool's seen-cache
+                // would swallow). It is a ONE-SHOT: the first fire that finds a free slot consumes the
+                // pending flag (`swap(false)`), so it is called exactly ONCE here — never in the poll
+                // loop below.
                 runner.reconsider_capacity_skips().await;
                 assert!(
                     !runner
@@ -6490,16 +6491,30 @@ mod tests {
                         .load(std::sync::atomic::Ordering::Relaxed),
                     "a reconsider that fires clears the pending flag"
                 );
-                assert_eq!(
-                    runner
+                // The re-drive's claim is synchronous — `claim_offer` awaits nothing and
+                // `claim_and_enqueue` commits the `claimed` row before `reconsider_capacity_skips`
+                // returns — so the row is normally observable the instant the await returns. Poll it to
+                // a bounded deadline anyway (#580): under the loaded money-path suite this test shares a
+                // multi-thread runtime with ~840 others, and the bounded poll mirrors the sibling
+                // helper's `pump_*_until` shape so a scheduler beat cannot flake the read. It still
+                // FAILS if the state never reaches `claimed`, so it cannot mask a genuine non-delivery.
+                let claimed_deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    let state = runner
                         .node
                         .store()
                         .claim_row_state(&skipped_id)
-                        .expect("skipped claim state")
-                        .as_deref(),
-                    Some("claimed"),
-                    "the capacity-skipped offer must be claimed once a slot frees — no restart, no relay round-trip"
-                );
+                        .expect("skipped claim state");
+                    if state.as_deref() == Some("claimed") {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < claimed_deadline,
+                        "the capacity-skipped offer must be claimed once a slot frees — no restart, no \
+                         relay round-trip (last observed claim state: {state:?})"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
                 assert_eq!(
                     runner.slots.available(),
                     0,
