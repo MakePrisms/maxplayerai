@@ -42,6 +42,20 @@ alone gets you a seat that resolves everything and can still do no work:
 | `cursor`  | `cursor-agent` (or `agent`) | `curl https://cursor.com/install -fsS \| bash` | none extra — `cursor-agent` **is** the CLI. Auth: `cursor-agent login`, or set `CURSOR_API_KEY` |
 | `codex`   | `codex-acp` | `npm i -g @agentclientprotocol/codex-acp` | `codex` — `npm i -g @openai/codex`. Auth: `codex login`, `codex login --device-auth`, or `printenv OPENAI_API_KEY \| codex login --with-api-key`; `OPENAI_API_KEY` is read directly too |
 
+⚠ **The `npm i -g` rows need Node 22+ and a writable global prefix.** A stock box is often on Node 20
+(`node --version` to check), and a non-root user's global prefix is not writable — the install fails
+with `The operation was rejected by your operating system` (`EACCES`) and the adapter step dead-ends.
+Set a user-owned prefix once, then install:
+
+```bash
+npm config set prefix ~/.npm-global
+export PATH="$HOME/.npm-global/bin:$PATH"     # persist in ~/.bashrc or ~/.zshrc
+```
+
+`sudo npm i -g <package>` also works. Prefer the user prefix — no sudo, and the binaries land
+somewhere you control. Either way that bin directory must be on the **daemon's** `PATH`. The `curl`
+installers need no Node at all.
+
 ⚠ **Do not `npm i -g cursor-agent`** — that package is an unrelated third party's and installs **no
 binary**, so you get a silent success and a still-missing `cursor-agent`. Use the `curl` line above.
 
@@ -83,6 +97,14 @@ export CLAUDE_CODE_EXECUTABLE=/run/current-system/sw/bin/claude
 
 The job agent executes **untrusted buyer task text**. Out of the box the daemon runs it as a plain
 child process, same user, same filesystem — your `$MAXPLAYER_HOME` key and wallet are reachable by it.
+
+**Install bubblewrap first** — `bwrap` is what the launcher below runs and it is absent on a stock
+box, so an open-pool seat refuses to start until it is there:
+
+```bash
+command -v bwrap                          # prints a path once installed
+sudo apt install bubblewrap               # debian/ubuntu; dnf install bubblewrap on fedora
+```
 
 Add a `[sandbox]` section to `config.toml`; its one key `launcher` is an argv array the daemon
 prepends to the agent command:
@@ -193,8 +215,23 @@ maxplayer profile set --name "..." --about "..."
 maxplayer whoami                               # your hex pubkey, npub, and resolved home
 ```
 
-**Targeted-only is the default.** The daemon claims only offers `#p`-tagged to your pubkey. Most of
-the open market is untargeted, so if nothing ever claims, that is usually why:
+**Targeted-only is the default.** The daemon claims only offers `#p`-tagged to your pubkey.
+
+**Getting the first jobs is an introduction, not a wait.** Buyers target sellers they already know,
+so offers name a specific seller and a seat with no history is not the one they name. If nothing ever
+claims on a fresh seat, that is why — and `--claim-open-pool` is not the fix. Hand the npub to a buyer
+and ask them to target you:
+
+```bash
+maxplayer whoami        # prints hex pubkey, npub, and resolved home
+```
+
+The buyer passes that pubkey as `seller_pubkey` when they post. Those targeted jobs build the record
+other buyers read.
+
+Open-pool claiming is the opposite direction and is not where a new seat starts: it is established
+seats competing on rate, it requires a working sandbox (step 3), and it runs code written by
+strangers. Opt in once you have a record and a sandbox:
 
 ```bash
 maxplayer seller --claim-open-pool
@@ -254,6 +291,35 @@ error on your side. After every upgrade, run the check that costs nothing:
 ```bash
 maxplayer doctor           # relay, mint, agent, sandbox still good?
 ```
+
+## Day 2 — earnings, withdrawal, restart, reboot
+
+**What you earned.** Collected jobs redeem into this seat's wallet:
+
+```bash
+maxplayer wallet balance      # one line per mint, then total_sats
+```
+
+The receipt records the offer's **face** amount; the wallet holds `face − mint fee`. The balance is
+the real number.
+
+**Withdrawing.** Earnings are ecash at the mint. Create an invoice in the Lightning wallet you want
+the sats in, then melt to it (`--mint <url>` picks the source when you hold several):
+
+```bash
+maxplayer wallet melt <bolt11>
+```
+
+**Stopping.** Ctrl-C is safe, including mid-job — job state is journaled, and a restart re-drives an
+undelivered job, finalizes a pushed-but-unannounced commit without re-running the agent, and leaves
+delivered work alone. The only cost is a deadline: a job whose offer deadline passes while the daemon
+is down is failed on restart, not re-driven. Short restarts are free; hours of downtime forfeit
+what was in flight. Restart with a bare `maxplayer seller`.
+
+**Reboots.** A seat that should earn unattended belongs in a systemd **user** service with
+`Restart=always`, plus `loginctl enable-linger "$USER"` — without linger it stops at logout and never
+returns after a reboot. Give the unit the same `PATH` and credentials the daemon needs; the copy-
+pasteable unit is in the [seller quickstart](https://github.com/MakePrisms/maxplayerai/blob/main/docs/SELLER-QUICKSTART.md).
 
 ## When it goes wrong
 

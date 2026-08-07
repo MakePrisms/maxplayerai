@@ -16,7 +16,10 @@ MAXPLAYER_BIN="$HOME/.local/bin/maxplayer"
 "$MAXPLAYER_BIN" --version    # must print a version
 ```
 
-On npm: `npm install -g maxplayer`.
+On npm: `npm install -g maxplayer`. That route needs **Node 22+**, and as a non-root user it fails
+with `EACCES` until the global prefix is writable — set a user-owned one (`npm config set prefix
+~/.npm-global`, then put `~/.npm-global/bin` on `PATH`), or install under `sudo`. The `curl`
+installer above needs no Node.
 
 Building from source instead:
 
@@ -66,6 +69,22 @@ The shipped mint is `https://mint.minibits.cash/Bitcoin` and `allow_real_mints` 
 with real sats — it does not auto-fund. Buyers spend real sats from that wallet, bounded by the
 per-job budget cap in `config.toml`.
 
+**Trying it without real sats.** To exercise the flow before funding anything, use the CDK test mint:
+its invoices settle themselves, so `wallet setup` returns funded with no invoice to pay. The mint has
+to be allowed before it can be selected, so this is two commands, in this order:
+
+```bash
+"$MAXPLAYER_BIN" wallet mints add https://testnut.cashudevkit.org
+"$MAXPLAYER_BIN" wallet setup --mint https://testnut.cashudevkit.org
+# status=funded funded_sats=21 balance_sats=21 mint=https://testnut.cashudevkit.org
+```
+
+Those are play sats. A seller only takes payment at a mint in its own `accepted_mints`, which
+defaults to the real minibits mint, so a test-mint balance will not buy work from a stock seat. Use
+this to learn the commands, and fund on the real mint when you want work done. To
+make a home permanently incapable of touching real money, set `accepted_mints` to the test mint and
+`allow_real_mints = false` in `config.toml`; the mint fence then refuses every real mint.
+
 ## 3. Add the MCP to your agent
 
 `maxplayer mcp` is a stdio MCP server. Its command has no `--home` option, so set `MAXPLAYER_HOME` in the
@@ -107,3 +126,42 @@ The buyer MCP exposes exactly these four tools, as registered in
 In practice: `post_job`, then `collect` once the delivery lands — the daemon auto-awards a payable
 claim in between (use `get_job` to watch, and `award_claim` only to pick the claim by hand). Wallet
 and profile operations remain CLI commands and are not part of the MCP tool list.
+
+## 5. The buyer daemon
+
+The first money tool you call starts a **buyer daemon** for that home if one is not already running.
+You never launch it by hand, and it does not exit when your agent session ends — it holds the wallet,
+the budget gate and the award loop, so it keeps running and keeps awarding.
+
+One daemon serves one home, held by an exclusive lock: a second one on the same home fails closed
+rather than double-spending.
+
+```bash
+"$MAXPLAYER_BIN" buyer            # run it in the foreground yourself, instead of letting a tool spawn it
+"$MAXPLAYER_BIN" buyer status     # JSON snapshot: pid, home, socket, wallet balance, job count, relay
+```
+
+`buyer status` is a thin client — it holds no wallet, key or state, it just asks the running daemon.
+Its `pid` field is how you stop one:
+
+```bash
+kill "$("$MAXPLAYER_BIN" buyer status | grep -o '"pid":[0-9]*' | grep -o '[0-9]*')"
+```
+
+There is no `buyer stop` subcommand. After the process exits, `buyer status` reports `no maxplayer
+buyer is listening` and exits 2; the socket file stays on disk and the next daemon rebinds it.
+
+Everything the daemon owns lives under `$MAXPLAYER_HOME`:
+
+| Path | What it is |
+|------|------------|
+| `buyer.sock` | the unix socket `buyer status` and the MCP server talk to |
+| `buyer.lock` | the exclusive lock that keeps a second daemon from starting |
+| `buyer.sqlite` | durable job/award/payment state (plus `-wal` / `-shm`) |
+| `wallet/` | the ecash proofs — this is the money |
+| `spent.jsonl` | append-only ledger, one line per spend, for audit |
+| `results/<job_id>/` | files materialized by `collect` |
+| `key` | the buyer identity, mode `0600` |
+
+Stopping the daemon stops awards and payments; it does not cancel jobs already awarded. Restarting it
+re-arms the auto-award loop.
