@@ -28,6 +28,10 @@ pub mod relay;
 pub mod reservations;
 pub mod signer;
 pub mod store;
+
+/// #574 platform-contract test that the client drops signature-invalid events at relay ingest.
+#[cfg(test)]
+mod ingest_sig_it;
 pub mod wallet_actor;
 
 use std::collections::BTreeMap;
@@ -1404,10 +1408,11 @@ async fn drive_delivery_watch(
         match wake {
             // A result arrived: sweep, narrowed to the jobs that event references.
             WatchWake::Delivered(event) => settle_awarded(context, Some(&event)).await,
-            // A feedback arrived: release the reservation IF it is a delivery-failure report from
-            // the seller this buyer awarded that job (#562). A no-op for every other feedback.
+            // A feedback arrived: release the reservation IF it is a post-award failure report
+            // (delivery / execution / no-sentinel) from the seller this buyer awarded that job
+            // (#562, widened in #574). A no-op for every other feedback.
             WatchWake::Feedback(event) => {
-                release_on_delivery_failure_feedback(context, &event).await
+                release_on_failure_feedback(context, &event).await
             }
             WatchWake::Sweep | WatchWake::SubscriptionLost => settle_awarded(context, None).await,
         }
@@ -2297,18 +2302,19 @@ async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Ev
     }
 }
 
-/// Consume a seller's post-award FEEDBACK (kind-3404) and, when it reports a delivery FAILURE for
-/// one of this buyer's awarded-unsettled jobs, release that job's held reservation PROMPTLY —
-/// instead of leaving the funds parked until the periodic deadline reconcile ([`run_reconcile_pass`])
-/// frees them at the offer deadline (#562). The failure report is the seller's EXISTING signal; this
-/// adds no new state, no new terminal label, no shared-type change.
+/// Consume a seller's post-award FEEDBACK (kind-3404) and, when it reports a POST-AWARD FAILURE
+/// (delivery / execution / no-sentinel) for one of this buyer's awarded-unsettled jobs, release that
+/// job's held reservation PROMPTLY — instead of leaving the funds parked until the periodic deadline
+/// reconcile ([`run_reconcile_pass`]) frees them at the offer deadline (#562, widened in #574). The
+/// failure report is the seller's EXISTING signal; this adds no new state, no new terminal label, no
+/// shared-type change.
 ///
 /// The `reason_code` discriminator is read WITHOUT the money lock: a seller's ordinary progress
 /// feedback shares this buyer-keyed subscription and must never even contend the lock that serializes
-/// award/collect. Only a genuine delivery-failure report takes the lock, under which the
-/// authorization + release mirrors [`terminalize_absent_attempt`]'s money-serialized verdict.
-async fn release_on_delivery_failure_feedback(context: &BuyerContext, event: &nostr_sdk::Event) {
-    if !is_delivery_failed_error(event) {
+/// award/collect. Only a genuine failure report takes the lock, under which the authorization +
+/// release mirrors [`terminalize_absent_attempt`]'s money-serialized verdict.
+async fn release_on_failure_feedback(context: &BuyerContext, event: &nostr_sdk::Event) {
+    if !is_releasable_failure_feedback(event) {
         return; // progress / other feedback — not actionable, and not worth taking the money lock.
     }
     // A release returns funds to `available`, so serialize it with every other money decision (mirror
@@ -2317,30 +2323,39 @@ async fn release_on_delivery_failure_feedback(context: &BuyerContext, event: &no
     // store re-reads state under this lock, so a job that settled while we waited is a no-op here,
     // never a wrong release.
     let _guard = context.money_lock.lock().await;
-    match release_reservation_on_delivery_failed(&context.store, event, now_unix()) {
+    match release_reservation_on_failure_feedback(&context.store, event, now_unix()) {
         Ok(Some((job_id, amount))) => crate::opline!(
-            "buyer: delivery watcher released {job_id} on a seller-reported delivery_failed \
+            "buyer: delivery watcher released {job_id} on a seller-reported post-award failure \
              (freed {amount} sat; budget NOT spent)"
         ),
         // No awarded-unsettled job of ours, a non-awarded author (anti-griefing), or an
         // already-terminal reservation (settled/released — idempotent): a deliberate silent no-op.
         Ok(None) => {}
         Err(error) => crate::opline!(
-            "buyer: delivery watcher could not release on a delivery_failed feedback ({error}); the \
+            "buyer: delivery watcher could not release on a failure feedback ({error}); the \
              periodic reconcile will still free it at the deadline"
         ),
     }
 }
 
-/// Is this FEEDBACK an authoritative delivery-FAILURE report? The `reason_code` TAG is the
-/// authoritative class discriminator (`content` is human-readable and MUST NOT be parsed); the
-/// `status` tag must independently be `error`, as every emitting site pairs them
-/// ([`crate::gateway::error_draft`]) — requiring both keeps a malformed event inert.
+/// Is this FEEDBACK an authoritative POST-AWARD FAILURE report — the class that frees a held
+/// reservation? The `reason_code` TAG is the authoritative class discriminator (`content` is
+/// human-readable and MUST NOT be parsed); the `status` tag must independently be `error`, as every
+/// emitting site pairs them ([`crate::gateway::error_draft`]) — requiring both keeps a malformed
+/// event inert.
 ///
-/// v1 acts on `delivery_failed` ONLY. `execution_failed` and `no_sentinel`
-/// ([`crate::gateway::ReasonCode`]) are siblings on the byte-identical wire (same kind, same tags);
-/// widening this allowlist to them is a deliberate follow-up, not smuggled in here.
-fn is_delivery_failed_error(event: &nostr_sdk::Event) -> bool {
+/// The releasable set is exactly the three POST-AWARD failure codes — `delivery_failed`,
+/// `execution_failed`, and `no_sentinel` ([`crate::gateway::ReasonCode`]): each means the awarded
+/// seller will not deliver a payable result, so the buyer's held reservation should be freed (#562
+/// shipped `delivery_failed`; #574 widened to its two siblings). The siblings ride the byte-identical
+/// wire — same kind, same tags, `status=error` — so this broadens ONLY the discriminator; the author
+/// gate + idempotency + money lock downstream are reason-code-agnostic and inherited unchanged. The
+/// remaining codes (`below_rate`, `unsupported_version`, `mint_incompatible`, `at_capacity`) are
+/// PRE-award offer declines: no award — hence no reservation — exists when they are emitted, so they
+/// are deliberately NOT releasable. A future POST-AWARD failure code must be added here explicitly;
+/// an unrecognised code is inert (funds stay held until the deadline reconcile — the conservative
+/// default).
+fn is_releasable_failure_feedback(event: &nostr_sdk::Event) -> bool {
     let tag_value = |name: &str| {
         event.tags.iter().find_map(|tag| {
             let parts = tag.as_slice();
@@ -2349,12 +2364,17 @@ fn is_delivery_failed_error(event: &nostr_sdk::Event) -> bool {
                 .flatten()
         })
     };
-    tag_value("reason_code") == Some(crate::gateway::ReasonCode::DeliveryFailed.as_str())
-        && tag_value("status") == Some("error")
+    if tag_value("status") != Some("error") {
+        return false;
+    }
+    let code = tag_value("reason_code");
+    code == Some(crate::gateway::ReasonCode::DeliveryFailed.as_str())
+        || code == Some(crate::gateway::ReasonCode::ExecutionFailed.as_str())
+        || code == Some(crate::gateway::ReasonCode::NoSentinel.as_str())
 }
 
-/// The authorized core of the delivery-failure release, split out so its authorization + idempotency
-/// are testable without a relay or the money lock (the caller owns both), mirroring
+/// The authorized core of the post-award failure release, split out so its authorization +
+/// idempotency are testable without a relay or the money lock (the caller owns both), mirroring
 /// [`terminalize_absent_attempt`].
 ///
 /// Releases the reservation of the awarded-unsettled job this FEEDBACK names — but ONLY when the
@@ -2371,12 +2391,16 @@ fn is_delivery_failed_error(event: &nostr_sdk::Event) -> bool {
 /// reconcile's `Dead` arm writes, so a failure-reported release and a deadline release converge on
 /// the identical `Released` state — and inherits its idempotency: `Spent` (truly delivered) and
 /// `Released` (a duplicate relay redelivery) are both inert, so a job that delivered is never freed.
-fn release_reservation_on_delivery_failed(
+///
+/// The releasable reason-code set lives entirely in [`is_releasable_failure_feedback`]; this core is
+/// reason-code-agnostic, so #574's widening from `delivery_failed` to its siblings changed only that
+/// discriminator, never the authorization / idempotency below.
+fn release_reservation_on_failure_feedback(
     store: &store::BuyerStore,
     event: &nostr_sdk::Event,
     now_unix: i64,
 ) -> Result<Option<(String, u64)>, store::StoreError> {
-    if !is_delivery_failed_error(event) {
+    if !is_releasable_failure_feedback(event) {
         return Ok(None);
     }
     let author = event.pubkey.to_hex();
@@ -3287,19 +3311,20 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────────────────────
-    // #562: release a held reservation PROMPTLY on a seller-reported delivery_failed, instead of
-    // stranding the funds until the deadline reconcile. These exercise the authorized core
-    // (`release_reservation_on_delivery_failed`) directly — no relay, no bootstrap — exactly as the
+    // #562 + #574: release a held reservation PROMPTLY on a seller-reported POST-AWARD FAILURE
+    // (delivery_failed and its siblings execution_failed / no_sentinel), instead of stranding the
+    // funds until the deadline reconcile. These exercise the authorized core
+    // (`release_reservation_on_failure_feedback`) directly — no relay, no bootstrap — exactly as the
     // terminalize tests do: the authorization + idempotency are pure store logic, and the money lock
     // (the caller's, a mirror of `terminalize_absent_attempt`) adds nothing a single-threaded test
     // can observe.
     // ─────────────────────────────────────────────────────────────────────────────────────────
 
-    /// Build a seller-authored delivery-failure FEEDBACK (kind-3404) on the exact wire
-    /// [`crate::gateway::error_draft`] emits: `status=error`, a root-marked `e` tag naming the offer,
-    /// both `p` tags, and the authoritative `reason_code=delivery_failed`. Signed by `author` — the
-    /// gate that matters is the AUTHOR, so passing a stranger's keys forges a griefer's event.
-    fn delivery_failed_feedback(offer_id: &str, author: &nostr_sdk::Keys) -> nostr_sdk::Event {
+    /// Build a seller-authored POST-AWARD FAILURE FEEDBACK (kind-3404) carrying `reason_code`, on the
+    /// exact wire [`crate::gateway::error_draft`] emits: `status=error`, a root-marked `e` tag naming
+    /// the offer, both `p` tags, and the authoritative `reason_code`. Signed by `author` — the gate
+    /// that matters is the AUTHOR, so passing a stranger's keys forges a griefer's event.
+    fn failure_feedback(offer_id: &str, author: &nostr_sdk::Keys, reason_code: &str) -> nostr_sdk::Event {
         use nostr_sdk::prelude::{EventBuilder, Keys, Kind, Tag};
         let buyer_hex = Keys::generate().public_key().to_hex();
         // The exact wire `error_draft` emits; `Tag::parse` on these vecs is what the production
@@ -3310,11 +3335,11 @@ mod tests {
             vec!["e".to_owned(), offer_id.to_owned(), String::new(), "root".to_owned()],
             vec!["p".to_owned(), buyer_hex],
             vec!["p".to_owned(), author.public_key().to_hex()],
-            vec!["reason_code".to_owned(), "delivery_failed".to_owned()],
+            vec!["reason_code".to_owned(), reason_code.to_owned()],
         ];
         let mut builder = EventBuilder::new(
             Kind::Custom(crate::kinds::JOB_FEEDBACK_KIND),
-            "delivery failed: worker exited non-zero",
+            format!("post-award failure: {reason_code}"),
         );
         builder.allow_self_tagging = true;
         for tag in tags {
@@ -3347,7 +3372,7 @@ mod tests {
         store
     }
 
-    // Red-on-revert: make `release_reservation_on_delivery_failed` skip the `store.release` call (or
+    // Red-on-revert: make `release_reservation_on_failure_feedback` skip the `store.release` call (or
     // the watcher drop FEEDBACK) and the reservation stays `Reserved` — both assertions fail.
     #[test]
     fn a_delivery_failed_from_the_awarded_seller_releases_the_reservation() {
@@ -3356,9 +3381,9 @@ mod tests {
         let job = "a".repeat(64);
         let store = awarded_unsettled(&root, &job, &seller, 100);
 
-        let event = delivery_failed_feedback(&job, &seller);
+        let event = failure_feedback(&job, &seller, "delivery_failed");
         let outcome =
-            release_reservation_on_delivery_failed(&store, &event, now_unix()).expect("no store error");
+            release_reservation_on_failure_feedback(&store, &event, now_unix()).expect("no store error");
 
         assert_eq!(
             outcome,
@@ -3391,9 +3416,9 @@ mod tests {
 
         // A stranger — never the awarded seller — signs an otherwise-perfect delivery_failed.
         let griefer = nostr_sdk::Keys::generate();
-        let event = delivery_failed_feedback(&job, &griefer);
+        let event = failure_feedback(&job, &griefer, "delivery_failed");
         let outcome =
-            release_reservation_on_delivery_failed(&store, &event, now_unix()).expect("no store error");
+            release_reservation_on_failure_feedback(&store, &event, now_unix()).expect("no store error");
 
         assert_eq!(outcome, None, "a non-awarded author must not trigger a release (anti-griefing)");
         assert_eq!(
@@ -3416,9 +3441,9 @@ mod tests {
         let store = awarded_unsettled(&root, &job, &seller, 100);
         store.convert_to_spent(&job, 100, now_unix()).expect("settle");
 
-        let event = delivery_failed_feedback(&job, &seller);
+        let event = failure_feedback(&job, &seller, "delivery_failed");
         let outcome =
-            release_reservation_on_delivery_failed(&store, &event, now_unix()).expect("no store error");
+            release_reservation_on_failure_feedback(&store, &event, now_unix()).expect("no store error");
 
         assert_eq!(outcome, None, "an already-settled job's feedback must not release anything");
         assert_eq!(
@@ -3427,6 +3452,155 @@ mod tests {
             "the settled reservation must stay Spent — a delivered job's payment is never undone"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── #574 SIBLING WIDENING ─────────────────────────────────────────────────────────────────
+    // `execution_failed` and `no_sentinel` are POST-AWARD failure codes on the byte-identical wire as
+    // `delivery_failed` (same kind, same tags, `status=error` — see `crate::gateway::error_draft`), so
+    // each must behave EXACTLY as delivery_failed through `release_reservation_on_failure_feedback`:
+    // release from the awarded seller, refuse a non-awarded author (anti-griefing), no-op once settled.
+    // The three assertions below are the same three the delivery_failed tests above make, parametrized
+    // by reason_code so a sibling cannot silently diverge. Red-on-revert: narrow
+    // `is_releasable_failure_feedback` back to delivery_failed only → every `*_releases_the_reservation`
+    // sibling test fails at its release assertion.
+
+    /// The awarded seller's `reason_code` failure frees exactly this job's held reservation (Released,
+    /// never Spent) — the delivery_failed release property, asserted for a sibling code.
+    fn assert_awarded_failure_releases(reason_code: &str) {
+        let root = temp_home(&format!("sib-release-{reason_code}"));
+        let seller = nostr_sdk::Keys::generate();
+        let job = "a".repeat(64);
+        let store = awarded_unsettled(&root, &job, &seller, 100);
+
+        let event = failure_feedback(&job, &seller, reason_code);
+        let outcome =
+            release_reservation_on_failure_feedback(&store, &event, now_unix()).expect("no store error");
+
+        assert_eq!(
+            outcome,
+            Some((job.clone(), 100)),
+            "the awarded seller's {reason_code} must free exactly this job's held reservation"
+        );
+        assert_eq!(
+            store.reservation(&job).expect("read").map(|(state, _)| state),
+            Some(reservations::ReservationState::Released),
+            "{reason_code} must reach the SAME Released state delivery_failed and the deadline reconcile produce"
+        );
+        assert_eq!(
+            store.reserved_in_flight().expect("reserved"),
+            0,
+            "the freed funds must leave the reserved term — released, never spent"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A sibling failure from a NON-awarded author must not release — the author gate is inherited.
+    fn assert_non_awarded_sibling_does_not_release(reason_code: &str) {
+        let root = temp_home(&format!("sib-griefer-{reason_code}"));
+        let seller = nostr_sdk::Keys::generate();
+        let job = "a".repeat(64);
+        let store = awarded_unsettled(&root, &job, &seller, 100);
+
+        let griefer = nostr_sdk::Keys::generate();
+        let event = failure_feedback(&job, &griefer, reason_code);
+        let outcome =
+            release_reservation_on_failure_feedback(&store, &event, now_unix()).expect("no store error");
+
+        assert_eq!(
+            outcome, None,
+            "a non-awarded author's {reason_code} must not release (anti-griefing inherited)"
+        );
+        assert_eq!(
+            store.reservation(&job).expect("read").map(|(state, _)| state),
+            Some(reservations::ReservationState::Reserved),
+            "the reservation must stay held — the job may still be delivering"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A sibling failure for an already-SETTLED job is a strict no-op — idempotency is inherited.
+    fn assert_settled_sibling_is_no_op(reason_code: &str) {
+        let root = temp_home(&format!("sib-settled-{reason_code}"));
+        let seller = nostr_sdk::Keys::generate();
+        let job = "a".repeat(64);
+        let store = awarded_unsettled(&root, &job, &seller, 100);
+        store.convert_to_spent(&job, 100, now_unix()).expect("settle");
+
+        let event = failure_feedback(&job, &seller, reason_code);
+        let outcome =
+            release_reservation_on_failure_feedback(&store, &event, now_unix()).expect("no store error");
+
+        assert_eq!(outcome, None, "an already-settled job's {reason_code} must not release anything");
+        assert_eq!(
+            store.reservation(&job).expect("read").map(|(state, _)| state),
+            Some(reservations::ReservationState::Spent),
+            "the settled reservation must stay Spent — a delivered job's payment is never undone"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_execution_failed_from_the_awarded_seller_releases_the_reservation() {
+        assert_awarded_failure_releases("execution_failed");
+    }
+    #[test]
+    fn an_execution_failed_from_a_non_awarded_pubkey_does_not_release() {
+        assert_non_awarded_sibling_does_not_release("execution_failed");
+    }
+    #[test]
+    fn an_execution_failed_for_an_already_settled_job_is_a_no_op() {
+        assert_settled_sibling_is_no_op("execution_failed");
+    }
+
+    #[test]
+    fn a_no_sentinel_from_the_awarded_seller_releases_the_reservation() {
+        assert_awarded_failure_releases("no_sentinel");
+    }
+    #[test]
+    fn a_no_sentinel_from_a_non_awarded_pubkey_does_not_release() {
+        assert_non_awarded_sibling_does_not_release("no_sentinel");
+    }
+    #[test]
+    fn a_no_sentinel_for_an_already_settled_job_is_a_no_op() {
+        assert_settled_sibling_is_no_op("no_sentinel");
+    }
+
+    // BOUNDARY — the widening must NOT over-broaden to "any status=error feedback". The PRE-award
+    // decline codes (below_rate / unsupported_version / mint_incompatible / at_capacity) name an offer
+    // decline for which no award — hence no reservation — exists, and an unrecognised code is
+    // fail-closed. Authored by the AWARDED seller so ONLY the reason_code discriminator can refuse:
+    // none may release. Red-on-revert: widen `is_releasable_failure_feedback` to `status=error` alone
+    // (dropping the reason_code allowlist) → every assertion below fails at the release.
+    fn assert_awarded_seller_code_does_not_release(reason_code: &str) {
+        let root = temp_home(&format!("boundary-{reason_code}"));
+        let seller = nostr_sdk::Keys::generate();
+        let job = "a".repeat(64);
+        let store = awarded_unsettled(&root, &job, &seller, 100);
+
+        let event = failure_feedback(&job, &seller, reason_code);
+        let outcome =
+            release_reservation_on_failure_feedback(&store, &event, now_unix()).expect("no store error");
+
+        assert_eq!(outcome, None, "{reason_code} is not a post-award failure — it must not release");
+        assert_eq!(
+            store.reservation(&job).expect("read").map(|(state, _)| state),
+            Some(reservations::ReservationState::Reserved),
+            "the reservation must stay held — {reason_code} is not a release trigger"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_pre_award_at_capacity_decline_does_not_release() {
+        assert_awarded_seller_code_does_not_release("at_capacity");
+    }
+    #[test]
+    fn a_pre_award_below_rate_decline_does_not_release() {
+        assert_awarded_seller_code_does_not_release("below_rate");
+    }
+    #[test]
+    fn an_unknown_reason_code_is_fail_closed_and_does_not_release() {
+        assert_awarded_seller_code_does_not_release("some_future_code_we_do_not_know");
     }
 
     // WIRING TOOTH: the watcher must WAKE on FEEDBACK (3404), not only RESULT (3403) — the whole fix
@@ -3465,7 +3639,7 @@ mod tests {
         let result = EventBuilder::new(Kind::Custom(crate::kinds::JOB_RESULT_KIND), "")
             .sign_with_keys(&seller)
             .expect("sign result");
-        let feedback_event = delivery_failed_feedback(&"a".repeat(64), &seller);
+        let feedback_event = failure_feedback(&"a".repeat(64), &seller, "delivery_failed");
         let _ = sender.send(Arc::new(result));
         let _ = sender.send(Arc::new(feedback_event));
 
