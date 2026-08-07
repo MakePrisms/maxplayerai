@@ -1172,6 +1172,116 @@ mod resume_action_tests {
     }
 }
 
+/// #562: the ceiling on how long a single delivery push may hold [`SellerNodeRunner::delivery_push_lock`].
+/// The push's network leg is ALREADY bounded by the transport client's own timeout (~120s); this sits
+/// ABOVE that so the real transport error surfaces first (and is logged — the LEG-1 conflict detail),
+/// and this only fires for a pathological NON-network hang, guaranteeing the lock is released so later
+/// deliveries are never starved. Generous by design: a legit push finishes in seconds, so this never
+/// false-strands a slow-but-live push (which would be the very strand bug #562 is about).
+const DELIVERY_PUSH_TIMEOUT: Duration = Duration::from_secs(150);
+
+/// #562 delivery-push failure: distinguishes the transport/push error (which carries the reason for
+/// the operator log — the LEG-1 detail) from the bounded-timeout firing, so both route to the SINGLE
+/// `delivery_failed` handling while logging distinctly (never a new state).
+#[derive(Debug)]
+enum DeliveryPushErr {
+    /// The push itself failed; the inner error carries the transport reason (409 / auth / io).
+    Push(seller_git::SellerGitError),
+    /// The push did not settle within [`DELIVERY_PUSH_TIMEOUT`] (seconds); the lock was released.
+    TimedOut(u64),
+}
+
+/// #562: push a delivery under `lock` — serializing concurrent deliveries to this seat's ONE delivery
+/// remote (concurrent `git-receive-pack` to one repo is what the relay 409s) — and bounded by
+/// `timeout` so a hung push releases the lock rather than starving every later delivery. Pure over
+/// (lock, timeout, push) so the serialization + timeout are unit-testable WITHOUT a relay. The lock is
+/// held ONLY across the push and released the instant it settles or times out. The push oid is stable
+/// (invariant 2), so ORDERING pushes never duplicates a delivery — this is exactly-once.
+async fn serialized_bounded_push<Fut>(
+    lock: &tokio::sync::Mutex<()>,
+    timeout: Duration,
+    push: impl FnOnce() -> Fut,
+) -> Result<String, DeliveryPushErr>
+where
+    Fut: std::future::Future<Output = Result<String, seller_git::SellerGitError>>,
+{
+    let _guard = lock.lock().await;
+    match tokio::time::timeout(timeout, push()).await {
+        Ok(Ok(oid)) => Ok(oid),
+        Ok(Err(error)) => Err(DeliveryPushErr::Push(error)),
+        Err(_elapsed) => Err(DeliveryPushErr::TimedOut(timeout.as_secs())),
+    }
+    // `_guard` drops here — the lock is released the instant the push settles OR times out, never held
+    // into the sign/enqueue tail.
+}
+
+#[cfg(test)]
+mod serialized_bounded_push_tests {
+    use super::{serialized_bounded_push, DeliveryPushErr};
+    use crate::seller_git::SellerGitError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // #562 core: concurrent deliveries to ONE remote must serialize — the push closure records peak
+    // concurrency, and under the lock peak is exactly 1. Red-on-revert: drop the `_guard` in
+    // `serialized_bounded_push` and the 8 racers overlap ⇒ peak > 1 ⇒ this fails (that overlap IS the
+    // concurrent git-receive-pack the relay 409s).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_pushes_serialize_to_one_at_a_time() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for i in 0..8u32 {
+            let (lock, inflight, peak) = (lock.clone(), inflight.clone(), peak.clone());
+            handles.push(tokio::spawn(async move {
+                serialized_bounded_push(&lock, Duration::from_secs(5), || async move {
+                    let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::task::yield_now().await; // a racer would overlap here if unserialized
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    inflight.fetch_sub(1, Ordering::SeqCst);
+                    Ok::<_, SellerGitError>(format!("oid{i}"))
+                })
+                .await
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("task joined").expect("push ok");
+        }
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "delivery pushes to one remote must serialize to one at a time (#562)"
+        );
+    }
+
+    // #562 constraint (lead 37896): a hung push must NOT starve later deliveries — it times out,
+    // returns TimedOut (→ delivery_failed at the caller), and RELEASES the lock so the next delivery
+    // proceeds promptly rather than blocking behind the hung one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hung_push_times_out_and_frees_the_lock() {
+        let lock = tokio::sync::Mutex::new(());
+        let hung = serialized_bounded_push(&lock, Duration::from_millis(50), || async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok::<_, SellerGitError>("never".to_string())
+        })
+        .await;
+        assert!(matches!(hung, Err(DeliveryPushErr::TimedOut(_))), "a hung push must time out");
+        // The lock is free again: the next push acquires it and completes promptly (not starved).
+        let next = tokio::time::timeout(
+            Duration::from_secs(2),
+            serialized_bounded_push(&lock, Duration::from_secs(5), || async move {
+                Ok::<_, SellerGitError>("next-oid".to_string())
+            }),
+        )
+        .await
+        .expect("the next delivery must not be starved behind the timed-out push");
+        assert!(matches!(next, Ok(oid) if oid == "next-oid"));
+    }
+}
+
 /// The journaled offer facts for a parsed offer — the ONE place a wire offer becomes a stored row.
 ///
 /// Extracted from the claim path so this mapping is reachable by a test. Everything downstream
@@ -1704,6 +1814,12 @@ pub struct SellerNodeRunner {
     /// (`claim_and_enqueue` dedups an already-claimed offer), so re-delivering every stored offer
     /// safely re-claims only the ones still open.
     capacity_skip_pending: std::sync::atomic::AtomicBool,
+    /// #562: serializes delivery pushes to this seat's ONE `seller.git_remote`. Every awarded job
+    /// executes on its own task and pushes a per-job branch to the SAME delivery repo; concurrent
+    /// `git-receive-pack` to one repo is what the relay 409s (the multi-slot delivery hazard). Held
+    /// ONLY across the push (execution stays parallel) and bounded by [`DELIVERY_PUSH_TIMEOUT`], so a
+    /// hung push releases it rather than starving every later delivery behind the lock.
+    delivery_push_lock: tokio::sync::Mutex<()>,
     /// #541: relay-derived set of SETTLED offer ids (a co-signed kind-3400 receipt has been seen).
     /// Read before any claim to skip a terminal offer that re-appears via backfill or redelivery.
     /// Populated by [`Self::on_receipt`] from the live receipt subscription and its boot/reconnect
@@ -1822,6 +1938,7 @@ impl SellerNodeRunner {
             agents,
             slots,
             capacity_skip_pending: std::sync::atomic::AtomicBool::new(false),
+            delivery_push_lock: tokio::sync::Mutex::new(()),
             terminal_offers: TerminalOffers::new(TERMINAL_OFFERS_CAP, TERMINAL_AUTHORS_PER_OFFER),
         })
     }
@@ -3699,17 +3816,35 @@ impl SellerNodeRunner {
         } else {
             None
         };
-        let commit = match seller_git::push_branch_with_header_off_runtime(
-            workdir.clone(),
-            seller.git_remote.clone(),
-            branch.clone(),
-            push_header,
+        // #562: serialize the delivery push to this seat's ONE delivery remote, bounded so a hung
+        // push frees the lock instead of starving every later delivery. Concurrent awarded jobs push
+        // per-job branches to the same repo, and concurrent git-receive-pack to one repo is what the
+        // relay 409s (surfaced as terminal delivery_failed before this). Serializing removes the race;
+        // the push oid is stable (invariant 2), so ordering never duplicates a delivery.
+        let commit = match serialized_bounded_push(
+            &self.delivery_push_lock,
+            DELIVERY_PUSH_TIMEOUT,
+            || {
+                seller_git::push_branch_with_header_off_runtime(
+                    workdir.clone(),
+                    seller.git_remote.clone(),
+                    branch.clone(),
+                    push_header,
+                )
+            },
         )
         .await
         {
             Ok(oid) => oid,
-            Err(error) => {
+            Err(DeliveryPushErr::Push(error)) => {
                 opline!("seller node execute fail job_id={job_id}: git push failed ({error})");
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                return;
+            }
+            Err(DeliveryPushErr::TimedOut(secs)) => {
+                // Timeout lands in the SAME delivery_failed handling (lead 37896 — no new state); the
+                // lock is already released, so later deliveries are not starved behind this one.
+                opline!("seller node execute fail job_id={job_id}: git push exceeded {secs}s (delivery-push lock released; treated as delivery_failed)");
                 self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                 return;
             }
