@@ -319,14 +319,26 @@ pub struct AcceptedBind {
     /// the buyer pay path chooses the realized mint from it. Empty for a claim with no `creq`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted_mints: Vec<String>,
-    /// The realized paying mint the buyer SELECTED for this job, frozen at accept from the buyer's
-    /// then-configured default mint (validated against `accepted_mints` + the real-mint fence). The
-    /// pay path derives the realized mint from THIS on every attempt — including retries — so a
-    /// config-default change between attempts can never shift the mint and mint a second
-    /// [`crate::payment::AttemptId`] (double-pay). `None` only on a legacy bind serialized before
-    /// this field existed; the pay path then falls back to the live config default (legacy behavior).
+    /// The buyer's FUNDING (source) mint for this job — the mint whose proofs are spent — SELECTED and
+    /// frozen at accept from the buyer's then-configured default (or a pre-funded cross-mint balance),
+    /// validated against `accepted_mints` + the real-mint fence. The pay path derives the paying mint
+    /// from THIS on every attempt — including retries — so a config-default change between attempts can
+    /// never shift the mint and mint a second [`crate::payment::AttemptId`] (double-pay). On a
+    /// cross-mint hop this is the SOURCE the buyer melts, NOT the mint the seller is paid in (that is
+    /// `delivery_mint`). `None` only on a legacy bind serialized before this field existed; the pay
+    /// path then falls back to the live config default (legacy behavior). Serialized as `funding_mint`;
+    /// the `realized_mint` alias keeps binds written before the #495 rename readable — they carry the
+    /// same funding value under the old (misleading) name.
+    #[serde(default, alias = "realized_mint", skip_serializing_if = "Option::is_none")]
+    pub funding_mint: Option<String>,
+    /// The DELIVERY (realized) mint — the mint the seller is actually paid in — recorded at accept for
+    /// reporting (#495). On a direct payment this equals `funding_mint`; on a cross-mint hop it is the
+    /// hop TARGET (an entry of `accepted_mints`), which differs from the funding source. Advisory
+    /// record only: the pay path re-derives the realized mint from `funding_mint` + `accepted_mints`
+    /// and never reads this field, so it gates nothing and can never shift a spend. `None` on a legacy
+    /// bind serialized before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub realized_mint: Option<String>,
+    pub delivery_mint: Option<String>,
     /// Harness the seller claimed RAN the accepted result (its exec-metadata `["harness", …]`
     /// tag), captured at accept so settlement can attribute the payment to the worker that earned
     /// it (#261). Truth-only: this is what the seller says EXECUTED — never the buyer's requested
@@ -1103,6 +1115,16 @@ fn classify_ok_false(message: &str) -> SendOutcome {
     }
 }
 
+/// Seal the FUNDING (source) and DELIVERY (realized) mints for the accept-bind from ONE payment
+/// plan (#495). Deriving both from the same plan is what keeps them consistent: `funding` is the
+/// source the buyer melts (sealed for pay-path attempt-id stability), `delivery` is the mint the
+/// seller is realized at (recorded for reporting). Equal on a direct payment; on a cross-mint hop
+/// `funding` is the source and `delivery` is the target, so they differ — which is exactly the case
+/// the old single `realized_mint` field mis-reported (it carried the source under a delivery name).
+fn seal_bind_mints(plan: &crate::crossmint::PayPlan) -> (String, String) {
+    (plan.source_mint().to_string(), plan.realized_mint().to_string())
+}
+
 /// Async `accept_claim` for callers already on a Tokio runtime (MCP dispatch).
 pub async fn accept_claim_async(
     home: &MaxplayerHome,
@@ -1245,14 +1267,17 @@ pub async fn accept_claim_async(
             home.config.default_mint().to_string()
         }
     };
-    let realized_mint = crate::crossmint::plan_payment(
+    // Plan the payment ONCE and seal BOTH mints from that single decision (#495): the funding SOURCE
+    // the pay path spends from (frozen for attempt-id stability), and the DELIVERY mint the seller is
+    // realized at (reporting only — the pay path re-derives it and never reads the stored value). On a
+    // direct payment the two are equal; on a hop the delivery mint is the target, not the source.
+    let plan = crate::crossmint::plan_payment(
         &source_seed,
         &accepted_mints,
         home.config.allow_real_mints,
     )
-    .map_err(|error| JobLifecycleError::Input(error.to_string()))?
-    .source_mint()
-    .to_string();
+    .map_err(|error| JobLifecycleError::Input(error.to_string()))?;
+    let (funding_mint, delivery_mint) = seal_bind_mints(&plan);
 
     let buyer_pubkey = keys.public_key().to_hex();
     // ACCEPT is its own kind: this is the pay-bind, not the selection — `prepare_award_async` owns
@@ -1291,9 +1316,13 @@ pub async fn accept_claim_async(
         creq_hash: claim.creq.as_deref().map(crate::gateway::creq_hash_hex),
         // The creq's accepted-mint list (validated + parsed above, fail-closed).
         accepted_mints,
-        // The realized paying mint SELECTED for this job, frozen from the buyer's configured default
-        // above. Sealing the choice makes the pay-path attempt id stable across retries.
-        realized_mint: Some(realized_mint),
+        // The FUNDING (source) mint SELECTED for this job, frozen above. Sealing the choice makes the
+        // pay-path attempt id stable across retries. On a hop this is the source, NOT the delivery mint.
+        funding_mint: Some(funding_mint),
+        // The DELIVERY (realized) mint the seller is paid in — equals the funding mint on a direct
+        // payment, the hop target on a cross-mint hop. Recorded for reporting (#495); read by no
+        // pay-path code.
+        delivery_mint: Some(delivery_mint),
         // Attribution of the worker that produced THIS result (seller-claimed exec-metadata),
         // frozen with the bind so settlement records who earned the payment (#261).
         agent_used: result.harness.clone(),
@@ -1699,9 +1728,9 @@ pub fn authorize_request_from_bind(
         // Thread the creq's accepted-mint list so the buyer chooses the realized
         // mint. Empty ⇒ a claim with no creq (pay from the pinned default mint).
         accepted_mints: bind.accepted_mints.clone(),
-        // Thread the SEALED realized-mint selection so the pay path derives the paying mint from the
+        // Thread the SEALED funding-mint selection so the pay path derives the paying mint from the
         // bind, not the live config default — stable attempt id across retries. `None` ⇒ legacy bind.
-        realized_mint: bind.realized_mint.clone(),
+        realized_mint: bind.funding_mint.clone(),
         // Thread the contribution binds so authorize_pay runs the contribution
         // verify-path + authorship seam. `None` ⇒ from-scratch.
         contribution: bind.contribution.as_ref().map(|c| {
@@ -1758,10 +1787,10 @@ pub fn fill_explicit_request_from_bind(
     // caller-supplied value. The seller cosig does not pin the realized mint (the preimage binds
     // only creq_hash), so a caller list must never be trusted to select the paying mint.
     request.accepted_mints = bind.accepted_mints.clone();
-    // Finding CC: same seal for the realized-mint SELECTION — derived SOLELY from the sealed bind,
+    // Finding CC: same seal for the funding-mint SELECTION — derived SOLELY from the sealed bind,
     // overwriting any caller value. A caller must not be able to pick the paying mint (which would
     // shift the attempt id); the frozen selection makes retries dedup.
-    request.realized_mint = bind.realized_mint.clone();
+    request.realized_mint = bind.funding_mint.clone();
     // Same seal for the delivery locator: repo/branch identify WHERE the paid commit is fetched
     // from, so they must come from the sealed bind (which `authorize_request_from_bind` already
     // does), never caller input — a caller must not be able to redirect the fetch to a different
@@ -2745,7 +2774,8 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
-            realized_mint: None,
+            funding_mint: None,
+            delivery_mint: None,
             agent_used: None,
             model_used: None,
             contribution: None,
@@ -2783,7 +2813,8 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
-            realized_mint: None,
+            funding_mint: None,
+            delivery_mint: None,
             agent_used: None,
             model_used: None,
             contribution: None,
@@ -2870,7 +2901,8 @@ mod tests {
             seller_signature: valid_sig.clone(),
             creq_hash: None,
             accepted_mints: Vec::new(),
-            realized_mint: None,
+            funding_mint: None,
+            delivery_mint: None,
             agent_used: None,
             model_used: None,
             contribution: None,
@@ -2921,7 +2953,8 @@ mod tests {
             seller_signature: "dd".repeat(64),
             creq_hash: Some("2ad9b34cbf8c".to_string()),
             accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
-            realized_mint: None,
+            funding_mint: None,
+            delivery_mint: None,
             agent_used: None,
             model_used: None,
             contribution: None,
@@ -2978,7 +3011,8 @@ mod tests {
             seller_signature: "dd".repeat(64),
             creq_hash: Some("2ad9b34cbf8c".to_string()),
             accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
-            realized_mint: None,
+            funding_mint: None,
+            delivery_mint: None,
             agent_used: None,
             model_used: None,
             contribution: None,
@@ -3028,7 +3062,8 @@ mod tests {
             seller_signature: "dd".repeat(64),
             creq_hash: Some("2ad9b34c".repeat(8)),
             accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
-            realized_mint: None,
+            funding_mint: None,
+            delivery_mint: None,
             agent_used: None,
             model_used: None,
             contribution: None,
@@ -3088,8 +3123,10 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: Some("2ad9b34c".repeat(8)),
             accepted_mints: vec![bound_mint.clone()],
-            // The realized-mint SELECTION is sealed in the bind (finding CC).
-            realized_mint: Some(bound_mint.clone()),
+            // The funding-mint SELECTION is sealed in the bind (finding CC). Buyer funds at a mint in
+            // the accepted set ⇒ direct payment ⇒ delivery mint equals the funding mint.
+            funding_mint: Some(bound_mint.clone()),
+            delivery_mint: Some(bound_mint.clone()),
             agent_used: None,
             model_used: None,
             contribution: None,
@@ -3127,14 +3164,14 @@ mod tests {
         // attempt id).
         assert_eq!(
             explicit.realized_mint,
-            bind.realized_mint,
+            bind.funding_mint,
             "caller realized_mint must be overwritten by the sealed bind"
         );
         assert_eq!(explicit.realized_mint.as_deref(), Some(bound_mint.as_str()));
     }
 
     // Finding CC (end-to-end double-pay regression): the exact retry-stability scenario the
-    // mint-freeze closes. The accept-bind seals realized_mint = A (the buyer's then-configured
+    // mint-freeze closes. The accept-bind seals funding_mint = A (the buyer's then-configured
     // default, A in the accepted set). The buyer THEN flips its configured default to B (also
     // accepted) and RE-RUNS the pay authorization (retry). Because the pay path derives the realized
     // mint from the SEALED bind — not the live config — the retry's PaymentKey/attempt id is
@@ -3192,8 +3229,10 @@ mod tests {
             seller_signature: String::new(),
             creq_hash: Some("2ad9b34c".repeat(8)),
             accepted_mints: vec![mint_a.to_string(), mint_b.to_string()],
-            // Sealed at accept from the buyer's then-configured default (A).
-            realized_mint: Some(mint_a.to_string()),
+            // Funding sealed at accept from the buyer's then-configured default (A); A is in the
+            // accepted set ⇒ direct payment ⇒ delivery equals funding.
+            funding_mint: Some(mint_a.to_string()),
+            delivery_mint: Some(mint_a.to_string()),
             agent_used: None,
             model_used: None,
             contribution: None,
@@ -3304,7 +3343,11 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
-            realized_mint: None,
+            // Distinct funding/delivery — a cross-mint bind — so the round-trip covers BOTH fields
+            // (#495), not just their absence, and pins that the `realized_mint` alias does not clobber
+            // the funding write on the way back out.
+            funding_mint: Some("https://mint.minibits.cash/Bitcoin".into()),
+            delivery_mint: Some("https://mint.cubabitcoin.org".into()),
             // Attribution fields round-trip as written (#261) — Some values here so this test
             // covers them, not just their absence.
             agent_used: Some("claude-agent-acp".into()),
@@ -3319,9 +3362,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // Finding CC (back-compat): the `realized_mint` field is serde-defaulted, so a LEGACY bind JSON
-    // serialized before the field existed still deserializes — into `None`, the legacy pay-path
-    // fallback (live config default). Confirms the AcceptedBind change is not a wire break.
+    // Finding CC + #495 (back-compat): the funding/delivery mint fields are serde-defaulted, so a
+    // LEGACY bind JSON serialized before they existed still deserializes — into `None`, the legacy
+    // pay-path fallback (live config default). Confirms the AcceptedBind change is not a wire break.
     #[test]
     fn accept_bind_deserializes_legacy_json_without_realized_mint() {
         let legacy = r#"{
@@ -3331,16 +3374,39 @@ mod tests {
             "seller_signature":"","accepted_mints":["https://mint.example"]
         }"#;
         let bind: AcceptedBind = serde_json::from_str(legacy).expect("legacy bind deserializes");
-        assert_eq!(bind.realized_mint, None, "missing field defaults to None (legacy)");
+        assert_eq!(bind.funding_mint, None, "missing field defaults to None (legacy)");
+        assert_eq!(bind.delivery_mint, None, "missing field defaults to None (legacy)");
         assert_eq!(bind.accepted_mints, vec!["https://mint.example".to_string()]);
+
+        // #495 rename alias: a bind written BEFORE the rename carries a `realized_mint` key holding the
+        // funding selection. The `alias = "realized_mint"` must load it into `funding_mint` (same
+        // value, corrected name) — dropping the alias would silently read it as None and regress the
+        // pay path to the legacy config-default fallback for every pre-rename bind on disk.
+        let pre_rename = r#"{
+            "job_id":"aa","claim_id":"bb","result_id":"cc","seller_pubkey":"dd",
+            "commit_oid":"ee","repo":"https://example.invalid/repo.git","branch":"master",
+            "job_hash":"ff","amount_sats":5,"accept_event_id":"11","accepted_at":1,
+            "seller_signature":"","accepted_mints":["https://mint.example"],
+            "realized_mint":"https://mint.example"
+        }"#;
+        let aliased: AcceptedBind = serde_json::from_str(pre_rename).expect("pre-rename bind loads");
+        assert_eq!(
+            aliased.funding_mint.as_deref(),
+            Some("https://mint.example"),
+            "the realized_mint alias must load the sealed funding selection"
+        );
+        assert_eq!(aliased.delivery_mint, None, "pre-rename binds carry no delivery mint");
         // v5 attribution fields (#261): same back-compat contract — a legacy bind written before
         // they existed deserializes to None ("seller never reported"), never an error.
         assert_eq!(bind.agent_used, None, "legacy bind has no attribution");
         assert_eq!(bind.model_used, None, "legacy bind has no attribution");
-        // And a bind with realized_mint = None does not serialize the field (skip_serializing_if),
-        // so the on-disk shape is unchanged for legacy-equivalent binds.
+        // And a bind with None mint fields does not serialize them (skip_serializing_if), so the
+        // on-disk shape is unchanged for legacy-equivalent binds. Neither the corrected name nor the
+        // old aliased name is emitted.
         let json = serde_json::to_string(&bind).expect("serialize");
-        assert!(!json.contains("realized_mint"), "None must not emit the field: {json}");
+        assert!(!json.contains("funding_mint"), "None must not emit the field: {json}");
+        assert!(!json.contains("delivery_mint"), "None must not emit the field: {json}");
+        assert!(!json.contains("realized_mint"), "None must not emit the aliased field: {json}");
         assert!(!json.contains("agent_used"), "None must not emit the field: {json}");
         assert!(!json.contains("model_used"), "None must not emit the field: {json}");
 
@@ -3358,6 +3424,37 @@ mod tests {
         let tolerated: AcceptedBind =
             serde_json::from_str(newer).expect("unknown keys are ignored, never an error");
         assert_eq!(tolerated.job_id, "aa");
+    }
+
+    // #495 red-on-revert: on a cross-mint hop the accept-bind must record the DELIVERY (realized)
+    // mint — the mint the seller is actually paid at — distinctly from the FUNDING (source) mint the
+    // buyer melts. The single historical `realized_mint` field carried the SOURCE, so it named the
+    // wrong mint on exactly this case (and matched only by accident on same-mint jobs). `seal_bind_mints`
+    // derives BOTH from one plan; accept wires its outputs straight into `funding_mint`/`delivery_mint`.
+    // Revert the fix (delivery ← source) and the hop assertion below goes red.
+    #[test]
+    fn accept_bind_seals_delivery_mint_distinct_from_funding_on_cross_mint() {
+        let source = "https://a.example";
+        let target = "https://b.example";
+        // Buyer funded at `source`; seller accepts only `target` ⇒ no overlap ⇒ a hop.
+        let plan = crate::crossmint::plan_payment(source, &[target.to_string()], true)
+            .expect("cross-mint plan");
+        assert!(plan.is_hop(), "distinct source/target must plan a hop");
+        let (funding, delivery) = seal_bind_mints(&plan);
+        assert_eq!(funding, source, "funding is the buyer's source mint (what the pay path spends)");
+        assert_eq!(delivery, target, "delivery is the mint the seller is realized at (the hop target)");
+        assert_ne!(funding, delivery, "cross-mint: the reported delivery mint is NOT the funding mint");
+
+        // Sibling direct-payment case: the same mint on both sides ⇒ delivery equals funding (no hop),
+        // which is precisely why the mis-report was invisible on same-mint jobs.
+        let direct = crate::crossmint::plan_payment(source, &[source.to_string()], true)
+            .expect("direct plan");
+        assert!(!direct.is_hop(), "buyer mint in the accepted set is a direct payment");
+        let (funding_direct, delivery_direct) = seal_bind_mints(&direct);
+        assert_eq!(
+            funding_direct, delivery_direct,
+            "same-mint: funding equals delivery (the case that hid the defect)"
+        );
     }
 
     // Producer/consumer drift guard (#261): the attribution the buyer reads off a result is the
@@ -3451,7 +3548,8 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
-            realized_mint: None,
+            funding_mint: None,
+            delivery_mint: None,
             agent_used: None,
             model_used: None,
             contribution: None,
@@ -3519,7 +3617,8 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
-            realized_mint: None,
+            funding_mint: None,
+            delivery_mint: None,
             agent_used: None,
             model_used: None,
             contribution: None,
@@ -3608,7 +3707,8 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
-            realized_mint: None,
+            funding_mint: None,
+            delivery_mint: None,
             agent_used: None,
             model_used: None,
             contribution: None,
@@ -3652,7 +3752,8 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
-            realized_mint: None,
+            funding_mint: None,
+            delivery_mint: None,
             agent_used: None,
             model_used: None,
             contribution: None,
@@ -3692,7 +3793,8 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
-            realized_mint: None,
+            funding_mint: None,
+            delivery_mint: None,
             agent_used: None,
             model_used: None,
             contribution: None,
@@ -4603,7 +4705,8 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
-            realized_mint: None,
+            funding_mint: None,
+            delivery_mint: None,
             agent_used: None,
             model_used: None,
             contribution: Some(AcceptedContribution {

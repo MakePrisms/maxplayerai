@@ -151,7 +151,8 @@ async fn collect_refuses_pay_when_delivered_tip_differs_from_bound_oid() {
         seller_signature: String::new(),
         creq_hash: None,
         accepted_mints: Vec::new(),
-        realized_mint: None,
+        funding_mint: None,
+        delivery_mint: None,
         agent_used: None,
         model_used: None,
         contribution: None,
@@ -269,7 +270,8 @@ fn from_scratch_bind(
         seller_signature: String::new(),
         creq_hash: None,
         accepted_mints: Vec::new(),
-        realized_mint: None,
+        funding_mint: None,
+        delivery_mint: None,
         agent_used: None,
         model_used: None,
         contribution: None,
@@ -448,10 +450,10 @@ async fn collect_refuses_dead_mint_at_preflight_before_the_budget_reserve() {
 
     let job_id = "a".repeat(64);
     let mut bind = from_scratch_bind(&job_id, &pubkey_hex, &tip_oid, &repo_url, &job_hash);
-    // Seal the DEAD mint as the realized paying mint AND put it in the accepted set, so `plan_payment`
+    // Seal the DEAD mint as the funding (source) mint AND put it in the accepted set, so `plan_payment`
     // resolves a DIRECT pay at it (no cross-mint hop — that would touch other mints). The cosig is
     // computed AFTER, but the receipt preimage binds no mint, so it still passes.
-    bind.realized_mint = Some(DEAD_MINT.to_owned());
+    bind.funding_mint = Some(DEAD_MINT.to_owned());
     bind.accepted_mints = vec![DEAD_MINT.to_owned()];
     bind.seller_signature = seller_cosig(&secret_hex, &pubkey_hex, &bind);
     write_bind(&home, &bind);
