@@ -85,6 +85,15 @@ grep -qF -- "$verifier" "$WORKFLOW" \
 [ -x "$verifier" ] \
     || die "$WORKFLOW runs $verifier, which is missing or not executable"
 
+# The surface verifier — the #249 gate that holds every platform list (built, npm payloads, launcher
+# pins and resolver) to one source. Named and executable for the same reason as the seller-surface
+# one: a workflow calling a script that is not there fails at the tag, after every build.
+surface_verifier="scripts/verify-release-surface.sh"
+grep -qF -- "$surface_verifier" "$WORKFLOW" \
+    || die "$WORKFLOW does not run $surface_verifier — a matrix↔published-set drift would be seen only at publish, after the release exists (#249)"
+[ -x "$surface_verifier" ] \
+    || die "$WORKFLOW runs $surface_verifier, which is missing or not executable"
+
 # The release completeness gate names the asset stem. It is what stops a release publishing with a
 # platform missing, and a stem that drifted from `maxplayer` would break every install URL and every
 # npm payload extraction at once.
@@ -258,6 +267,32 @@ if (/NODE_AUTH_TOKEN|secrets\.NPM_TOKEN/.test(publishCode)) {
   fail("the publish job still references an npm token — authentication is trusted publishing (OIDC)");
 }
 
+// ── #249: the surface gate runs in dry runs, and gates the release ──────────────────────────────
+// The built-vs-published cross-check used to live only in the publish job — tag-gated, and reached
+// after the release was already created — so a matrix↔published-set drift passed every dry run and
+// was first seen on an un-createable release. It now lives in verify-surface, which release and
+// publish depend on. Two properties keep that true: the job must NOT be gated back onto a tag (or it
+// stops running in the dry run, which is the whole point), and the jobs that CREATE things must
+// depend on it (or a red there stops nothing).
+const surface = jobs.get("verify-surface");
+if (!surface) {
+  fail("no 'verify-surface' job — the built-vs-published cross-check would run only in publish (tag-only, after the release is created), which is #249");
+}
+const surfaceGate = surface.join("\n").match(/^ {4}if:(.*)$/m);
+if (surfaceGate && (surfaceGate[1].includes("github.ref_type == 'tag'") || surfaceGate[1].includes("github.event_name == 'push'"))) {
+  fail("job 'verify-surface' is gated on a tag/push — it must run on a workflow_dispatch dry run, or the drift it catches stays invisible until a real release");
+}
+for (const name of ["release", "publish"]) {
+  const needs = jobs.get(name).join("\n").match(/^ {4}needs:(.*)$/m);
+  if (!needs || !needs[1].includes("verify-surface")) {
+    fail(`job '${name}' does not depend on verify-surface (needs:) — a surface drift the gate catches would not stop the ${name}`);
+  }
+}
+if (!surface.join("\n").includes("verify-release-surface.sh")) {
+  fail("job 'verify-surface' does not run scripts/verify-release-surface.sh — it would gate on nothing");
+}
+
+console.log("ok: verify-surface runs in dry runs and gates release and publish (the #249 fix)");
 console.log("ok: release and publish are gated on a tag push");
 console.log("ok: 'npm publish' appears only in the publish job and the fenced npm-probe job");
 console.log("ok: npm-probe is dispatch-only, needs a named package, and can publish 0.0.<n> of a payload package only");

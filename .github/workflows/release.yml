@@ -59,11 +59,16 @@ jobs:
     outputs:
       version: ${{ steps.plan.outputs.version }}
       prerelease: ${{ steps.plan.outputs.prerelease }}
+      # The release platform set, defined once in .github/release-platforms.json and derived here so
+      # nothing downstream keeps its own copy. `matrix` drives the build (via fromJSON); `platforms`
+      # is the space-separated name list the completeness gate and RELEASE_PLATFORMS consume.
+      matrix: ${{ steps.plan.outputs.matrix }}
+      platforms: ${{ steps.plan.outputs.platforms }}
     steps:
       - uses: actions/checkout@v4
 
       - id: plan
-        name: Resolve the version being built
+        name: Resolve the version and platform set being built
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
@@ -88,6 +93,20 @@ jobs:
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
           echo "Building $version (prerelease=$prerelease)"
 
+          # The platform set has ONE source: .github/release-platforms.json. The build matrix, the
+          # release completeness gate and publish's RELEASE_PLATFORMS all read it from here rather
+          # than restating it — this is #249, where those copies drifted and a dry run could not see
+          # it. The tree-side copies npm needs statically (the payload packages, the launcher's pins)
+          # cannot read a job output, so verify-release-surface.sh holds them to this same file.
+          manifest=.github/release-platforms.json
+          [ -f "$manifest" ] || { echo "$manifest is missing — the release platform set has no source" >&2; exit 1; }
+          matrix="$(node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync("./.github/release-platforms.json","utf8"));if(!Array.isArray(p)||p.length===0){console.error("release-platforms.json is not a non-empty array");process.exit(1)}process.stdout.write(JSON.stringify({include:p}))')"
+          platforms="$(node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync("./.github/release-platforms.json","utf8"));process.stdout.write(p.map(function(e){return e.platform}).join(" "))')"
+          [ -n "$platforms" ] || { echo "$manifest lists no platforms" >&2; exit 1; }
+          echo "matrix=$matrix"       >> "$GITHUB_OUTPUT"
+          echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
+          echo "Platforms: $platforms"
+
   build:
     name: Build ${{ matrix.platform }}
     needs: plan
@@ -96,36 +115,16 @@ jobs:
       # One platform failing must not hide another's result — the point of a dry run is to learn
       # about every platform at once.
       fail-fast: false
-      matrix:
-        # ONE artifact per platform, carrying the whole surface (#510). The release used to cross
-        # this list with a `surface` dimension and ship a buyer build and a seller build under
-        # separate asset names; a user then had to pick a product before knowing which they wanted,
-        # and a platform present in one list and missing from the other shipped a release where
-        # sellers could install on x86 and not on arm. What ships now is one `maxplayer` that both
-        # buys and sells, so the choice is a runtime one (`maxplayer` vs `maxplayer seller`) rather
-        # than a download-time one.
-        #
-        # The feature split itself is NOT gone — `crates/maxplayer/Cargo.toml` still gates the seller
-        # surface behind `acp`, and a buyer-only binary is still `cargo build -p maxplayer
-        # --no-default-features --features wallet`. It is no longer a SHIPPING dimension, and CI
-        # (`ci.yml`) is what keeps both feature sets compiling.
-        platform: [linux-x64, linux-arm64, darwin-arm64]
-        include:
-          # Native runners throughout. Cross-building the aarch64 static artifact through nix
-          # compiles rustc from source, which dominates the build; a native runner per platform
-          # avoids that entirely.
-          - platform: linux-x64
-            runner: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            kind: linux-musl
-          - platform: linux-arm64
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-            kind: linux-musl
-          - platform: darwin-arm64
-            runner: macos-14
-            target: aarch64-apple-darwin
-            kind: darwin
+      # The matrix is .github/release-platforms.json, read by the plan job — the set of platforms and
+      # each one's runner/target/kind stated in exactly one place (#249, where independent copies of
+      # this list drifted). #510 made this ONE artifact per platform carrying the whole surface: a
+      # single `maxplayer` that both buys and sells, so the choice is a runtime one (`maxplayer` vs
+      # `maxplayer seller`), not a download-time one. The feature split is not gone —
+      # `crates/maxplayer/Cargo.toml` still gates the seller surface behind `acp` and ci.yml keeps the
+      # buyer-only set compiling — it is just no longer a SHIPPING dimension. Native runners
+      # throughout: cross-building the aarch64 static artifact through nix compiles rustc from source
+      # and dominates the build, which a native runner per platform avoids.
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -258,12 +257,40 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
+  verify-surface:
+    name: Verify release surface
+    # The built⊆published guard used to live only in `publish` — tag-gated, and reached only AFTER
+    # `gh release create` had already made the release. So a matrix↔published-set drift (#249) sailed
+    # through every dry run and was first seen on a release that could no longer be un-made. This job
+    # runs wherever the build runs, a dry run included, and is deliberately NOT tag-gated. `release`
+    # and `publish` both `needs:` it, so a drift here stops them before anything is created.
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: asset-*
+          merge-multiple: true
+
+      # Holds every platform list to .github/release-platforms.json: the artifacts the build
+      # produced, the npm payload packages, the launcher's pins and the launcher's runtime resolver.
+      # `platforms` (the plan job's derived list) is passed so a derivation that drifted from the file
+      # is caught here directly, not only through the build it would have mis-driven.
+      - name: Verify the built, published and launcher surfaces match the source
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          PLATFORMS: ${{ needs.plan.outputs.platforms }}
+        run: ./scripts/verify-release-surface.sh dist "$VERSION" "$PLATFORMS"
+
   release:
     name: GitHub Release
     # A tag PUSH only. Both halves are needed: a dispatch can target a tag ref, so the ref type
     # alone does not establish that a tag was pushed.
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [plan, build]
+    needs: [plan, build, verify-surface]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -279,17 +306,20 @@ jobs:
       - name: Checksum
         env:
           VERSION: ${{ needs.plan.outputs.version }}
+          PLATFORMS: ${{ needs.plan.outputs.platforms }}
         run: |
           set -euo pipefail
           cd dist
-          # Every asset the matrix builds, named — which also guards the glob below: with no assets
-          # at all, `sha256sum *.tar.gz` would write a SHA256SUMS naming a literal `*.tar.gz`.
+          # Every platform the release builds, named — from the same source the matrix is (the plan
+          # job's platforms, read from .github/release-platforms.json). This also guards the glob
+          # below: with no assets at all, `sha256sum *.tar.gz` would write a SHA256SUMS naming a
+          # literal `*.tar.gz`.
           #
           # Named rather than counted because a count cannot tell a complete release from one missing
           # a platform: two assets satisfy "some artifacts arrived", and the release would publish
           # with the third platform's install 404ing. A build job that failed, or an upload whose
           # name drifted, stops the release rather than shrinking it.
-          for platform in linux-x64 linux-arm64 darwin-arm64; do
+          for platform in $PLATFORMS; do
             asset="maxplayer-$VERSION-$platform.tar.gz"
             [ -f "$asset" ] || { echo "$asset is missing — the release would ship without it" >&2; exit 1; }
           done
@@ -342,7 +372,7 @@ jobs:
     #   a trusted publisher for the package on npmjs.com. There is no silent-skip path — an
     #   unconfigured publisher fails the job loudly, exactly as a missing token used to.
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [plan, build, release]
+    needs: [plan, build, release, verify-surface]
     runs-on: ubuntu-latest
     # `id-token: write` mints the OIDC token npm exchanges for a short-lived publish credential. It is
     # the whole of the job's write authority; `contents: read` restates the workflow default so that
@@ -378,9 +408,12 @@ jobs:
         env:
           VERSION: ${{ needs.plan.outputs.version }}
           PRERELEASE: ${{ needs.plan.outputs.prerelease }}
-          # Every platform whose payload package is published. Adding a platform package under npm/
-          # without adding it here is caught below rather than silently never shipping.
-          RELEASE_PLATFORMS: linux-x64 linux-arm64 darwin-arm64
+          # Every platform whose payload package is published — from the release platform source (the
+          # plan job reads .github/release-platforms.json), not a fourth hand-kept copy. The two
+          # guards below still cross-check it against what npm/ carries and what the build produced;
+          # verify-surface has already held all of it to the same source before this job runs, so
+          # these are defence in depth at the moment of publish rather than the only line.
+          RELEASE_PLATFORMS: ${{ needs.plan.outputs.platforms }}
         run: |
           set -euo pipefail
 
