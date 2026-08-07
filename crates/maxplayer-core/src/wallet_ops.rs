@@ -27,8 +27,10 @@ use crate::home::{self, HomeError, MaxplayerHome, DEFAULT_MINT_URL};
 pub enum WalletOpsError {
     Home(HomeError),
     /// The mint is not in this home's configured set (`accepted_mints`/`extra_mints`) — a
-    /// MEMBERSHIP miss, cleared by `maxplayer wallet mints add`.
-    MintNotAllowed { mint_url: String },
+    /// MEMBERSHIP miss, cleared by `maxplayer wallet mints add`. `default_mint` carries the home's
+    /// ACTUAL default (`config.default_mint()`) so the Display names it rather than the pinned
+    /// testnut constant — on a real-minibits home the latter is a money-relevant lie (#506).
+    MintNotAllowed { mint_url: String, default_mint: String },
     /// The mint IS configured but is a real mint refused by the real-mint fence (issue #49):
     /// `allow_real_mints` is off. A POLICY block — `mints add` cannot clear it, so it must NOT
     /// borrow [`Self::MintNotAllowed`]'s remedy; the control is `MAXPLAYER_ALLOW_REAL_MINTS` (#465).
@@ -45,9 +47,9 @@ impl std::fmt::Display for WalletOpsError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Home(error) => write!(formatter, "{error}"),
-            Self::MintNotAllowed { mint_url } => write!(
+            Self::MintNotAllowed { mint_url, default_mint } => write!(
                 formatter,
-                "mint {mint_url} is not configured; add it with `maxplayer wallet mints add` (default stays {DEFAULT_MINT_URL})"
+                "mint {mint_url} is not configured; add it with `maxplayer wallet mints add` (default stays {default_mint})"
             ),
             Self::RealMintDisallowed { mint_url } => write!(
                 formatter,
@@ -180,6 +182,38 @@ fn is_autopay_mint(mint_url: &str) -> bool {
         == Some(DEFAULT_MINT_URL)
 }
 
+/// Money class a mint moves, derived purely from the mint URL. The pinned testnut host
+/// ([`DEFAULT_MINT_URL`]) FakeWallet-auto-pays its own invoices — PLAY money — while every other
+/// mint invoices for REAL sats. Surfaced as a first-class label in `wallet setup`/`balance`/`mints
+/// list` (#506) so money type is never left implicit in a URL the reader must recognize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoneyType {
+    /// A real mint — its invoices move real sats.
+    Real,
+    /// The testnut dev/play mint — auto-pays its own invoices with fake sats.
+    Play,
+}
+
+impl MoneyType {
+    /// Classify a mint URL. A URL that does not normalize is treated as [`Self::Real`] — the
+    /// fail-safe direction, so an unrecognized mint is never mislabeled play money.
+    pub fn of_mint(mint_url: &str) -> Self {
+        if is_autopay_mint(mint_url) {
+            Self::Play
+        } else {
+            Self::Real
+        }
+    }
+
+    /// Short uppercase label for operational output (`REAL`/`PLAY`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Real => "REAL",
+            Self::Play => "PLAY",
+        }
+    }
+}
+
 /// Configured mints: default `mint_url` first, then opt-in `extra_mints` (deduped).
 pub fn configured_mints(home: &MaxplayerHome) -> Result<Vec<String>, WalletOpsError> {
     let mut out = Vec::new();
@@ -202,6 +236,7 @@ fn mint_is_allowed(home: &MaxplayerHome, mint_url: &str) -> Result<String, Walle
     } else {
         Err(WalletOpsError::MintNotAllowed {
             mint_url: normalized,
+            default_mint: home.config.default_mint().to_string(),
         })
     }
 }
@@ -755,6 +790,7 @@ pub fn remove_mint(home: &mut MaxplayerHome, mint_url: &str) -> Result<(), Walle
     if !present {
         return Err(WalletOpsError::MintNotAllowed {
             mint_url: normalized,
+            default_mint: home.config.default_mint().to_string(),
         });
     }
     let to_remove = normalized.clone();
@@ -1187,5 +1223,61 @@ mod tests {
         assert_eq!(normalized, DEFAULT_MINT_URL);
         let err = normalize_mint_url("   ").expect_err("empty");
         assert!(matches!(err, WalletOpsError::Wallet(_)));
+    }
+
+    // #506 money_type: the label is derived PURELY from the mint — the testnut play mint is PLAY,
+    // every other mint (including the shipped minibits default) is REAL. Red-on-revert for the rule
+    // that makes money type a first-class label rather than a URL the reader must recognize.
+    #[test]
+    fn money_type_labels_testnut_play_and_others_real() {
+        assert_eq!(MoneyType::of_mint(DEFAULT_MINT_URL), MoneyType::Play);
+        assert_eq!(MoneyType::of_mint(DEFAULT_MINT_URL).label(), "PLAY");
+        // Trailing slash / surrounding whitespace still classify as the testnut mint (normalized).
+        assert_eq!(
+            MoneyType::of_mint(" https://testnut.cashudevkit.org/ "),
+            MoneyType::Play
+        );
+        assert_eq!(
+            MoneyType::of_mint(crate::home::DEFAULT_MINIBITS_MINT_URL),
+            MoneyType::Real
+        );
+        assert_eq!(
+            MoneyType::of_mint(crate::home::DEFAULT_MINIBITS_MINT_URL).label(),
+            "REAL"
+        );
+        assert_eq!(
+            MoneyType::of_mint("https://real-mint.example"),
+            MoneyType::Real
+        );
+        // Fail-safe: an unparseable URL is never labeled play money.
+        assert_eq!(MoneyType::of_mint("not a url"), MoneyType::Real);
+    }
+
+    // #506-A: `MintNotAllowed` must name the home's ACTUAL default (`config.default_mint()`), never
+    // the pinned testnut constant. On the shipped real-minibits default home, "(default stays
+    // testnut)" was a money-relevant lie (`wallet mints list` correctly shows minibits as default).
+    // Red-on-revert: interpolating DEFAULT_MINT_URL again names testnut on a minibits home.
+    #[test]
+    fn mint_not_allowed_names_home_default_not_testnut_constant() {
+        let root = temp_home("506a-default-name");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        // Precondition: the fresh home's default is the real minibits mint (#378), not testnut.
+        assert_eq!(
+            home.config.default_mint(),
+            crate::home::DEFAULT_MINIBITS_MINT_URL
+        );
+        let err =
+            mint_is_allowed(&home, "https://evil.example").expect_err("unconfigured mint refused");
+        let message = err.to_string();
+        assert!(
+            message.contains(crate::home::DEFAULT_MINIBITS_MINT_URL),
+            "MintNotAllowed must name the home's real default: {message}"
+        );
+        assert!(
+            !message.contains(DEFAULT_MINT_URL),
+            "MintNotAllowed must NOT name the testnut constant as the default on a minibits home: {message}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

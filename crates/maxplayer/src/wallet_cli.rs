@@ -239,12 +239,7 @@ fn cmd_balance(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32
         }
         matched = matched.saturating_add(1);
         total = total.saturating_add(row.balance_sats);
-        let marker = if row.is_default { "default" } else { "extra" };
-        let _ = writeln!(
-            out,
-            "mint={} role={} balance_sats={}",
-            row.mint_url, marker, row.balance_sats
-        );
+        let _ = writeln!(out, "{}", balance_row_line(row));
     }
     if filter.is_some() && matched == 0 {
         let _ = writeln!(
@@ -284,30 +279,35 @@ fn cmd_setup(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     };
     // Bootstrap ~/.maxplayer (config + autogen key + wallet dir), then fund. `home::bootstrap` never
     // prints the secret key.
-    let home = match bootstrap_home(&opts, err) {
+    let mut home = match bootstrap_home(&opts, err) {
         Ok(home) => home,
         Err(code) => return code,
     };
+    // #445 (Option 1, fail-closed): never SILENTLY auto-fund play money from invisible home state.
+    // If setup resolves to the testnut play mint without the user naming it via `--mint`, refuse and
+    // force the money-type decision into the open — a money act must be affirmed, not defaulted.
+    if let Some(reason) = refuse_silent_play_money(opts.mint.as_deref(), home.config.default_mint()) {
+        let _ = writeln!(err, "{reason}");
+        return RUNTIME_ERROR;
+    }
+    // #506-C: make the advertised one-command form work on a fresh home — `wallet setup --mint <url>`
+    // auto-adds an unconfigured mint (identical to `wallet mints add <url>`) instead of exiting 2
+    // ("not configured"). Idempotent, and never changes the default (adds to extra_mints only).
+    if let Some(raw) = opts.mint.as_deref() {
+        if let Err(error) = wallet_ops::add_mint(&mut home, raw) {
+            let _ = writeln!(err, "{error}");
+            return RUNTIME_ERROR;
+        }
+    }
     match wallet_ops::mint_blocking(&home, amount, opts.mint.as_deref()) {
         Ok(wallet_ops::MintFlow::Funded(outcome)) => {
-            let _ = writeln!(
-                out,
-                "status=funded home={} funded_sats={} balance_sats={} mint={}",
-                home.root.display(),
-                outcome.funded_sats,
-                outcome.balance_sats,
-                outcome.mint_url
-            );
+            let _ = writeln!(out, "{}", setup_funded_summary(&home.root, &outcome));
             SUCCESS
         }
         Ok(wallet_ops::MintFlow::NeedsPayment(quote)) => {
             // The ordinary path on the shipped default: a real mint invoices, and the sats are the
             // user's. Only a dev test mint settles its own invoice and lands in `Funded` above.
-            let _ = writeln!(
-                err,
-                "status=needs_payment amount_sats={} mint={} quote_id={} (pay the invoice below with real sats, then `maxplayer wallet mint-complete {}`)",
-                quote.amount_sats, quote.mint_url, quote.quote_id, quote.quote_id
-            );
+            let _ = writeln!(err, "{}", setup_needs_payment_summary(&quote));
             let _ = writeln!(out, "{}", quote.invoice);
             SUCCESS
         }
@@ -316,6 +316,79 @@ fn cmd_setup(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             RUNTIME_ERROR
         }
     }
+}
+
+/// #445 (Option 1): decide whether `wallet setup` must REFUSE rather than silently auto-fund play
+/// money. Returns `Some(reason)` to refuse — exactly when the mint would resolve to the testnut play
+/// mint AND the user did not name a mint via `--mint`, so play money would be funded from invisible
+/// home state. A mint named explicitly (real OR testnut) is an affirmation and always proceeds. Pure
+/// so every branch is unit-tested without a live mint.
+#[cfg(feature = "wallet")]
+fn refuse_silent_play_money(explicit_mint: Option<&str>, default_mint: &str) -> Option<String> {
+    if explicit_mint.is_some() {
+        return None;
+    }
+    if wallet_ops::MoneyType::of_mint(default_mint) != wallet_ops::MoneyType::Play {
+        return None;
+    }
+    Some(format!(
+        "refusing to auto-fund PLAY money: this home's default mint is the testnut dev/play mint \
+         ({DEFAULT_MINT_URL}), which silently self-funds fake sats. To fund play money, affirm it \
+         explicitly with `--mint {DEFAULT_MINT_URL}`; for real money, `maxplayer wallet mints add \
+         <real-mint>` (or set a real default). Nothing was funded."
+    ))
+}
+
+/// Summary line for a `wallet setup` that FUNDED (the testnut auto-pay path). Carries the money_type
+/// label (derived from the mint) alongside the URL so play money is never implicit (#506).
+#[cfg(feature = "wallet")]
+fn setup_funded_summary(home_root: &std::path::Path, outcome: &wallet_ops::MintOutcome) -> String {
+    format!(
+        "status=funded home={} funded_sats={} balance_sats={} mint={} money_type={}",
+        home_root.display(),
+        outcome.funded_sats,
+        outcome.balance_sats,
+        outcome.mint_url,
+        wallet_ops::MoneyType::of_mint(&outcome.mint_url).label(),
+    )
+}
+
+/// Summary line for a `wallet setup` that returned an invoice to pay (the real-mint path). Carries
+/// the money_type label alongside the URL so REAL vs PLAY is explicit, not inferred (#506).
+#[cfg(feature = "wallet")]
+fn setup_needs_payment_summary(quote: &wallet_ops::MintQuote) -> String {
+    format!(
+        "status=needs_payment amount_sats={} mint={} money_type={} quote_id={} (pay the invoice below with real sats, then `maxplayer wallet mint-complete {}`)",
+        quote.amount_sats,
+        quote.mint_url,
+        wallet_ops::MoneyType::of_mint(&quote.mint_url).label(),
+        quote.quote_id,
+        quote.quote_id,
+    )
+}
+
+/// One `wallet balance` row: mint URL, role, money_type (REAL/PLAY derived from the mint), balance.
+/// money_type makes the money class explicit alongside the URL, never a URL to recognize (#506).
+#[cfg(feature = "wallet")]
+fn balance_row_line(row: &wallet_ops::MintBalance) -> String {
+    format!(
+        "mint={} role={} money_type={} balance_sats={}",
+        row.mint_url,
+        if row.is_default { "default" } else { "extra" },
+        wallet_ops::MoneyType::of_mint(&row.mint_url).label(),
+        row.balance_sats,
+    )
+}
+
+/// One `wallet mints list` row: like [`balance_row_line`] without a balance (list never reads one).
+#[cfg(feature = "wallet")]
+fn mints_list_row_line(row: &wallet_ops::MintBalance) -> String {
+    format!(
+        "mint={} role={} money_type={}",
+        row.mint_url,
+        if row.is_default { "default" } else { "extra" },
+        wallet_ops::MoneyType::of_mint(&row.mint_url).label(),
+    )
 }
 
 #[cfg(feature = "wallet")]
@@ -905,8 +978,7 @@ fn cmd_mints(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             match wallet_ops::list_mints(&home) {
                 Ok(rows) => {
                     for row in rows {
-                        let marker = if row.is_default { "default" } else { "extra" };
-                        let _ = writeln!(out, "mint={} role={}", row.mint_url, marker);
+                        let _ = writeln!(out, "{}", mints_list_row_line(&row));
                     }
                     SUCCESS
                 }
@@ -1103,5 +1175,278 @@ mod tests {
         let err_text = String::from_utf8(err).expect("utf8");
         assert!(!err_text.starts_with("ALARM"), "missing must NOT masquerade as the accounting-gap alarm");
         assert!(err_text.contains("refusing to remint"), "got: {err_text}");
+    }
+
+    // ---- #445 + #506 setup-UX fold ----
+
+    #[cfg(feature = "wallet")]
+    fn ux_test_home(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "maxplayer-setupux-{label}-{}-{id}",
+            std::process::id()
+        ))
+    }
+
+    /// Seed a home whose DEFAULT mint is the testnut PLAY mint — the "reused testnut home" of #445 —
+    /// on disk, so the CLI's own bootstrap loads it.
+    #[cfg(feature = "wallet")]
+    fn seed_testnut_default_home(root: &std::path::Path) {
+        let mut home = home::bootstrap(root).expect("bootstrap seed home");
+        home::save_config(&mut home, |config| {
+            config.accepted_mints = vec![DEFAULT_MINT_URL.to_owned()];
+        })
+        .expect("seed testnut default on disk");
+    }
+
+    // #445 (Option 1, fail-closed): `wallet setup` on a home whose default is the testnut PLAY mint,
+    // with NO explicit `--mint`, must REFUSE rather than silently auto-fund fake sats. The refusal is
+    // reached before any mint round-trip, so this holds offline. RED-ON-REVERT: without the gate the
+    // command proceeds to the mint path (auto-funding testnut / erroring on the network) — never this
+    // refusal with empty stdout.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn setup_refuses_silent_play_money_without_explicit_mint() {
+        let home = ux_test_home("refuse-silent-play");
+        let _ = std::fs::remove_dir_all(&home);
+        seed_testnut_default_home(&home);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(
+            &[
+                "setup".into(),
+                "--home".into(),
+                home.to_string_lossy().into_owned(),
+            ],
+            &mut out,
+            &mut err,
+        );
+        let out = String::from_utf8(out).expect("utf8");
+        let err = String::from_utf8(err).expect("utf8");
+
+        assert_eq!(
+            code, RUNTIME_ERROR,
+            "must refuse, not fund:\nstdout={out}\nstderr={err}"
+        );
+        assert!(out.is_empty(), "nothing funded => empty stdout:\n{out}");
+        assert!(err.contains("PLAY money"), "refusal must name play money:\n{err}");
+        assert!(
+            err.contains(DEFAULT_MINT_URL),
+            "refusal must name the testnut mint (the --mint affirmation):\n{err}"
+        );
+        assert!(
+            err.contains("mints add"),
+            "refusal must offer the real-money remedy:\n{err}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // The #445 refuse predicate, unit-tested on every branch without a live mint. The integration
+    // test above can only exercise the refuse branch offline; here the AFFIRMED-play and real-default
+    // branches are deterministic too.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn setup_money_gate_refuses_only_silent_play() {
+        // testnut default + no --mint => the silent-play surprise => refuse.
+        assert!(refuse_silent_play_money(None, DEFAULT_MINT_URL).is_some());
+        // testnut default + explicit --mint testnut => affirmed => proceed.
+        assert!(refuse_silent_play_money(Some(DEFAULT_MINT_URL), DEFAULT_MINT_URL).is_none());
+        // real minibits default + no --mint => a real invoice, never silent play => proceed.
+        assert!(refuse_silent_play_money(None, DEFAULT_MINIBITS_MINT_URL).is_none());
+        // explicit real --mint (whatever the default) => proceed.
+        assert!(
+            refuse_silent_play_money(Some("https://real-mint.example"), DEFAULT_MINT_URL).is_none()
+        );
+        // explicit --mint testnut on a real-default home => affirmed play => proceed.
+        assert!(
+            refuse_silent_play_money(Some(DEFAULT_MINT_URL), DEFAULT_MINIBITS_MINT_URL).is_none()
+        );
+    }
+
+    // money_type LOUD (#506): both `wallet setup` arms label the money class REAL/PLAY, derived from
+    // the mint and alongside (not replacing) the URL. Pure formatters so both a minibits-resolving
+    // (REAL) and a testnut-resolving (PLAY) setup are asserted without a live mint.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn setup_summaries_label_money_type_from_the_mint() {
+        use maxplayer_core::wallet_ops::{MintOutcome, MintQuote};
+        // Funded via testnut auto-pay => PLAY, alongside the mint URL.
+        let play = setup_funded_summary(
+            std::path::Path::new("/tmp/h"),
+            &MintOutcome {
+                mint_url: DEFAULT_MINT_URL.to_owned(),
+                invoice: String::new(),
+                quote_id: "q".to_owned(),
+                funded_sats: 21,
+                balance_sats: 21,
+            },
+        );
+        assert!(play.contains("money_type=PLAY"), "{play}");
+        assert!(play.contains(&format!("mint={DEFAULT_MINT_URL}")), "{play}");
+        // Derived from the mint, not hardcoded to the arm: a real mint in the Funded arm reads REAL.
+        let real_funded = setup_funded_summary(
+            std::path::Path::new("/tmp/h"),
+            &MintOutcome {
+                mint_url: DEFAULT_MINIBITS_MINT_URL.to_owned(),
+                invoice: String::new(),
+                quote_id: "q".to_owned(),
+                funded_sats: 21,
+                balance_sats: 21,
+            },
+        );
+        assert!(real_funded.contains("money_type=REAL"), "{real_funded}");
+        // NeedsPayment is the real-mint invoice path => REAL.
+        let real = setup_needs_payment_summary(&MintQuote {
+            mint_url: DEFAULT_MINIBITS_MINT_URL.to_owned(),
+            invoice: "lnbc-invoice".to_owned(),
+            quote_id: "q".to_owned(),
+            amount_sats: 21,
+        });
+        assert!(real.contains("money_type=REAL"), "{real}");
+        assert!(
+            real.contains(&format!("mint={DEFAULT_MINIBITS_MINT_URL}")),
+            "{real}"
+        );
+    }
+
+    // money_type LOUD (#506): `wallet balance` and `wallet mints list` rows both carry the label,
+    // derived per-row from the mint. Pure row formatters, asserted for a PLAY (testnut) and a REAL row.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn wallet_rows_label_money_type() {
+        use maxplayer_core::wallet_ops::MintBalance;
+        let testnut_default = MintBalance {
+            mint_url: DEFAULT_MINT_URL.to_owned(),
+            balance_sats: 5,
+            is_default: true,
+        };
+        let real_extra = MintBalance {
+            mint_url: "https://real-mint.example".to_owned(),
+            balance_sats: 0,
+            is_default: false,
+        };
+        let balance = balance_row_line(&testnut_default);
+        assert!(
+            balance.contains("role=default")
+                && balance.contains("money_type=PLAY")
+                && balance.contains("balance_sats=5"),
+            "{balance}"
+        );
+        assert!(balance_row_line(&real_extra).contains("money_type=REAL"));
+        let listed = mints_list_row_line(&testnut_default);
+        assert!(
+            listed.contains("role=default") && listed.contains("money_type=PLAY"),
+            "{listed}"
+        );
+        assert!(mints_list_row_line(&real_extra).contains("money_type=REAL"));
+    }
+
+    // End-to-end, offline (mints list never opens a wallet): a testnut-default home with a real extra
+    // mint labels the default row PLAY and the extra row REAL — money type is per-row and appears in
+    // real command output, not only the pure formatter.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn mints_list_command_labels_money_type_per_row() {
+        let home = ux_test_home("mints-list-labels");
+        let _ = std::fs::remove_dir_all(&home);
+        seed_testnut_default_home(&home);
+        let home_str = home.to_string_lossy().into_owned();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let add = run(
+            &[
+                "mints".into(),
+                "add".into(),
+                "https://real-mint.example/".into(),
+                "--home".into(),
+                home_str.clone(),
+            ],
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(add, SUCCESS, "add extra mint: {}", String::from_utf8_lossy(&err));
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(
+            &["mints".into(), "list".into(), "--home".into(), home_str],
+            &mut out,
+            &mut err,
+        );
+        let out = String::from_utf8(out).expect("utf8");
+        assert_eq!(code, SUCCESS, "stderr: {}", String::from_utf8_lossy(&err));
+
+        let default_row = out
+            .lines()
+            .find(|line| line.contains("role=default"))
+            .expect("a default row");
+        assert!(
+            default_row.contains(&format!("mint={DEFAULT_MINT_URL}"))
+                && default_row.contains("money_type=PLAY"),
+            "default row:\n{default_row}\nfull:\n{out}"
+        );
+        let extra_row = out
+            .lines()
+            .find(|line| line.contains("role=extra"))
+            .expect("an extra row");
+        assert!(
+            extra_row.contains("money_type=REAL"),
+            "extra row:\n{extra_row}\nfull:\n{out}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // #506-C: `wallet setup --mint <url>` on a fresh home must AUTO-ADD the mint (so the advertised
+    // one-command form works) instead of exiting 2 "is not configured". The add persists before any
+    // network mint round-trip, so we assert the durable side effect via `mints list` (offline) and
+    // that setup never emitted the membership error. RED-ON-REVERT: without auto-add, `mint_is_allowed`
+    // refuses BEFORE the network (offline), so `mints list` would lack the mint and setup would print
+    // "is not configured". A reserved `.example` host keeps the later network step a fast, offline NXDOMAIN.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn setup_mint_flag_auto_adds_unconfigured_mint() {
+        let home = ux_test_home("setup-auto-add");
+        let _ = std::fs::remove_dir_all(&home);
+        let home_str = home.to_string_lossy().into_owned();
+        let extra = "https://real-mint.example/";
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let _code = run(
+            &[
+                "setup".into(),
+                "--mint".into(),
+                extra.into(),
+                "--home".into(),
+                home_str.clone(),
+            ],
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).expect("utf8");
+        assert!(
+            !err.contains("is not configured"),
+            "auto-add must clear the membership refusal:\n{err}"
+        );
+
+        // The mint is now configured (durably added) — the advertised form is usable.
+        let mut out = Vec::new();
+        let mut err2 = Vec::new();
+        let code = run(
+            &["mints".into(), "list".into(), "--home".into(), home_str],
+            &mut out,
+            &mut err2,
+        );
+        let out = String::from_utf8(out).expect("utf8");
+        assert_eq!(code, SUCCESS, "stderr: {}", String::from_utf8_lossy(&err2));
+        assert!(
+            out.contains("https://real-mint.example"),
+            "setup --mint must auto-add the mint:\n{out}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
