@@ -672,7 +672,8 @@ fn unknown_close_diagnostic(
 ) -> String {
     format!(
         "seller node RELAY-CLOSED UNKNOWN-ID: id={id} was never in our registry (ours: \
-         {OFFER_SUB_ID}, {AWARD_SUB_ID}, {WRAP_SUB_ID}, {LIVENESS_PROBE_SUB_ID}); no recovery \
+         {OFFER_SUB_ID}, {AWARD_SUB_ID}, {WRAP_SUB_ID}, {RECEIPT_SUB_ID}, {LIVENESS_PROBE_SUB_ID}); \
+         no recovery \
          forced. last_backfill={last_backfill_secs}s ago, \
          last_nip42_auth={last_nip42_auth_secs}s ago, authed={authed}"
     )
