@@ -421,6 +421,104 @@ impl TerminalOffers {
     }
 }
 
+/// Upper bound on distinct offer ids remembered as having already been given the targeted under-rate
+/// buyer-feedback (#582). Sized like [`TERMINAL_OFFERS_CAP`] — a few thousand distinct under-rate
+/// offers within a single boot is already far past any real buyer's behaviour, and each entry is one
+/// 64-hex id, so the whole set stays well under a megabyte at the cap. FIFO by first-seen, FAIL-OPEN:
+/// an aged-out id can re-emit ONE more feedback if it is re-ingested, which is exactly the pre-#582
+/// duplicate this bounds — never worse.
+const FED_UNDER_RATE_OFFERS_CAP: usize = 4096;
+
+/// Offer ids that have ALREADY surfaced the targeted under-rate buyer-feedback this boot (#582), so
+/// the #560 offer-backfill re-feeding every stored offer through [`SellerNodeRunner::on_offer`] each
+/// tick does not re-emit a duplicate `BelowRate` feedback to the buyer on every pass (~12×/window in
+/// prod). A pure wire-noise dedup: it gates ONLY the buyer-feedback emit
+/// ([`SellerNodeRunner::publish_under_rate_feedback`]) and never the claim/money path, which is a
+/// different, idempotent branch of `on_offer`.
+///
+/// In-memory and bounded, mirroring [`TerminalOffers`] (the #541 precedent, also in-memory):
+/// - the set caps at [`FED_UNDER_RATE_OFFERS_CAP`], FIFO by first-seen — the OLDEST id is evicted when
+///   a new one would overflow, so a long-running seller never leaks memory. Evicting the oldest (not
+///   the newest) is deliberate: the oldest fed offer is the one most likely to have already aged past
+///   the backfill lookback, so dropping it is the least likely to cause a re-emit.
+/// - cleared on restart by construction, which the issue explicitly accepts: at most ONE re-emit per
+///   offer per boot ("suppress a repeat within the window").
+struct FedUnderRateOffers {
+    inner: std::sync::Mutex<FedUnderRateOffersInner>,
+}
+
+struct FedUnderRateOffersInner {
+    /// Offer ids already fed, for O(1) first-sight lookup.
+    seen: std::collections::HashSet<String>,
+    /// The same ids in first-seen order, for FIFO eviction of the whole set.
+    order: std::collections::VecDeque<String>,
+    cap: usize,
+}
+
+impl FedUnderRateOffersInner {
+    fn new(cap: usize) -> Self {
+        Self {
+            seen: std::collections::HashSet::new(),
+            order: std::collections::VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Whether `offer_id` has already surfaced under-rate feedback this boot.
+    fn contains(&self, offer_id: &str) -> bool {
+        self.seen.contains(offer_id)
+    }
+
+    /// Record `offer_id` as fed. Idempotent; FIFO-evicts the oldest id when at `cap`.
+    fn record(&mut self, offer_id: &str) {
+        if self.seen.contains(offer_id) {
+            return;
+        }
+        if self.order.len() >= self.cap {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        self.seen.insert(offer_id.to_owned());
+        self.order.push_back(offer_id.to_owned());
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.seen.len()
+    }
+}
+
+impl FedUnderRateOffers {
+    fn new(cap: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(FedUnderRateOffersInner::new(cap)),
+        }
+    }
+
+    fn contains(&self, offer_id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("fed under-rate offers mutex poisoned")
+            .contains(offer_id)
+    }
+
+    fn record(&self, offer_id: &str) {
+        self.inner
+            .lock()
+            .expect("fed under-rate offers mutex poisoned")
+            .record(offer_id);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("fed under-rate offers mutex poisoned")
+            .len()
+    }
+}
+
 /// The pure award-match decision over a parked claim — no I/O, so the security-critical rule is
 /// unit-testable. An award binds our claim ONLY when its author is the offer's buyer (a third party
 /// can never drive execute or release) AND it names OUR published claim id; if it names a different
@@ -1968,6 +2066,12 @@ pub struct SellerNodeRunner {
     /// Populated by [`Self::on_receipt`] from the live receipt subscription and its boot/reconnect
     /// backfill. Stays empty when the seller is not open-pool (the receipt sub is registered only then).
     terminal_offers: TerminalOffers,
+    /// #582: offer ids already given the targeted under-rate buyer-feedback this boot. First-sight
+    /// gate on the emit in [`Self::on_offer`], so the #560 offer-backfill re-ingesting a stored
+    /// under-rate offer every tick does not re-emit a duplicate `BelowRate` feedback to the buyer on
+    /// every pass. Feedback-only wire-noise dedup — never consulted on the claim/money path. See
+    /// [`FedUnderRateOffers`].
+    fed_under_rate_offers: FedUnderRateOffers,
 }
 
 impl SellerNodeRunner {
@@ -2083,6 +2187,7 @@ impl SellerNodeRunner {
             capacity_skip_pending: std::sync::atomic::AtomicBool::new(false),
             delivery_push_lock: tokio::sync::Mutex::new(()),
             terminal_offers: TerminalOffers::new(TERMINAL_OFFERS_CAP, TERMINAL_AUTHORS_PER_OFFER),
+            fed_under_rate_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
         })
     }
 
@@ -2882,13 +2987,18 @@ impl SellerNodeRunner {
     /// deliver — so the buyer learns the reason instead of getting silence. Best-effort: signed
     /// through the signer actor and sent on the shared client; a failure is logged, never wedges the
     /// loop. Used for both the targeted under-rate refusal and an execution failure.
+    ///
+    /// Returns whether the feedback reached the relay (`send_event_to` resolved `Ok`). The under-rate
+    /// dedup (#582) records an offer as fed ONLY on a `true`, so a transient publish failure is retried
+    /// by the next backfill re-ingest rather than being permanently suppressed. Callers that do not
+    /// dedup (execution/delivery failure) ignore the return.
     async fn publish_buyer_feedback(
         &self,
         offer_id: &str,
         buyer_pubkey: &str,
         reason_code: ReasonCode,
         reason: &str,
-    ) {
+    ) -> bool {
         let draft = error_draft(
             offer_id,
             buyer_pubkey,
@@ -2901,38 +3011,48 @@ impl SellerNodeRunner {
                 use nostr_sdk::JsonUtil as _;
                 match nostr_sdk::Event::from_json(&signed.json) {
                     Ok(feedback) => match self.client.send_event_to([&self.relay_url], &feedback).await {
-                        Ok(_) => opline!(
-                            "seller node buyer feedback surfaced: offer={offer_id} reason_code={} reason={reason}",
-                            reason_code.as_str()
-                        ),
-                        Err(error) => opline!(
-                            "seller node WARN: buyer feedback publish failed offer={offer_id} ({error})"
-                        ),
+                        Ok(_) => {
+                            opline!(
+                                "seller node buyer feedback surfaced: offer={offer_id} reason_code={} reason={reason}",
+                                reason_code.as_str()
+                            );
+                            true
+                        }
+                        Err(error) => {
+                            opline!(
+                                "seller node WARN: buyer feedback publish failed offer={offer_id} ({error})"
+                            );
+                            false
+                        }
                     },
                     Err(error) => {
-                        opline!("seller node buyer feedback encode failed (continuing): {error}")
+                        opline!("seller node buyer feedback encode failed (continuing): {error}");
+                        false
                     }
                 }
             }
             Ok(Err(error)) => {
-                opline!("seller node buyer feedback sign failed (continuing): {error}")
+                opline!("seller node buyer feedback sign failed (continuing): {error}");
+                false
             }
             Err(error) => {
-                opline!("seller node signer actor gone at buyer feedback (continuing): {error}")
+                opline!("seller node signer actor gone at buyer feedback (continuing): {error}");
+                false
             }
         }
     }
 
     /// The targeted under-rate refusal feedback (see [`should_publish_under_rate_feedback`]) — a price
     /// decline, so it carries the `below_rate` reason_code (§10 `refusal` class, does not score).
-    async fn publish_under_rate_feedback(&self, event: &nostr_sdk::Event, reason: &str) {
+    /// Returns whether it reached the relay, so the #582 dedup records the offer only on a real emit.
+    async fn publish_under_rate_feedback(&self, event: &nostr_sdk::Event, reason: &str) -> bool {
         self.publish_buyer_feedback(
             &event.id.to_hex(),
             &event.pubkey.to_hex(),
             ReasonCode::BelowRate,
             reason,
         )
-        .await;
+        .await
     }
 
     /// The "is it working" line (#489): one periodic line that answers the operator's question
@@ -3328,7 +3448,21 @@ impl SellerNodeRunner {
                 let targeted_to_self = offer.seller_pubkey.as_deref() == Some(seller_pubkey.as_str());
                 if should_publish_under_rate_feedback(skip, targeted_to_self, offer.amount, seller.rate_sats)
                 {
-                    self.publish_under_rate_feedback(event, skip.reason()).await;
+                    // #582: the classifier decides this skip EARNS feedback; the dedup, layered on top,
+                    // decides whether we have already SENT it for this offer. The #560 offer-backfill
+                    // re-feeds every stored offer through `on_offer` each tick (~300s) across the whole
+                    // lookback, so without this gate a targeted under-rate offer in that window re-emits
+                    // an identical `BelowRate` feedback to the buyer on every pass (~12×/window). First
+                    // sight per offer id ⇒ the buyer hears the price refusal once. RECORD ONLY AFTER a
+                    // successful emit (the `&&` short-circuits the record on a `false`), so a transient
+                    // publish failure retries on the next re-ingest (arm-after-the-event) instead of
+                    // being suppressed forever. Feedback-only: the claim/money path is untouched.
+                    let offer_id = event.id.to_hex();
+                    if !self.fed_under_rate_offers.contains(&offer_id)
+                        && self.publish_under_rate_feedback(event, skip.reason()).await
+                    {
+                        self.fed_under_rate_offers.record(&offer_id);
+                    }
                 }
                 return;
             }
@@ -7433,6 +7567,191 @@ mod tests {
         assert!(!should_publish_under_rate_feedback(SkipReason::RateGate, true, 5, 5));
         // A lapsed skip never emits under-rate feedback, even if targeted + under-rate.
         assert!(!should_publish_under_rate_feedback(SkipReason::Lapsed, true, 1, 5));
+    }
+
+    // TOOTH (#582, bounded) — the fed-offer set is FIFO-bounded so a long-running seller never leaks
+    // memory: a new offer past the cap evicts the OLDEST id (the one most likely already aged past the
+    // backfill lookback), and an evicted id fails open — it may surface ONE more feedback if re-ingested,
+    // exactly the pre-#582 duplicate this bounds, never worse.
+    #[test]
+    fn fed_under_rate_offers_fifo_bounds_the_set() {
+        let mut f = FedUnderRateOffersInner::new(2); // cap = 2
+        f.record("o1");
+        f.record("o2");
+        assert_eq!(f.len(), 2);
+        f.record("o3"); // evicts o1 (oldest first-seen)
+        assert_eq!(f.len(), 2, "the set never exceeds its cap");
+        assert!(!f.contains("o1"), "the oldest id aged out ⇒ can re-emit once (fail-open)");
+        assert!(f.contains("o2") && f.contains("o3"), "the two newest ids stay suppressed");
+    }
+
+    // TOOTH (#582, idempotent) — re-recording the same offer (the backfill re-ingesting it every tick)
+    // is a no-op: the id is tracked once, not once per pass, so the set grows only with DISTINCT
+    // under-rate offers.
+    #[test]
+    fn fed_under_rate_offers_record_is_idempotent() {
+        let mut f = FedUnderRateOffersInner::new(4);
+        f.record("offerX");
+        f.record("offerX");
+        f.record("offerX");
+        assert_eq!(f.len(), 1, "one id however many re-ingests");
+        assert!(f.contains("offerX"));
+    }
+
+    /// A targeted (non-open-pool) seller wired to `relay_url` with a controllable `rate_sats`, so a
+    /// test can post an offer BELOW the floor (`amount < rate_sats`). [`boot_capacity_skip_seller`]
+    /// pins rate_sats=1, leaving no room for an under-rate offer; this one does.
+    async fn boot_seller_with_rate(
+        label: &str,
+        relay_url: &str,
+        rate_sats: u64,
+    ) -> (SellerNodeRunner, std::path::PathBuf) {
+        let root = temp_dir(label);
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = relay_url.to_string();
+        home.config.seller = Some(seller_cfg(rate_sats, false));
+        let runner = SellerNodeRunner::boot(home)
+            .await
+            .expect("boot the under-rate seller against the fixture relay");
+        (runner, root)
+    }
+
+    /// A targeted under-rate offer (`amount` below the seller's floor) signed by `buyer`, addressed to
+    /// `seller_hex`. `task` MUST differ between offers meant to be distinct: an event id is the hash of
+    /// its content, so two byte-identical offers collapse to ONE id (the trap `post_offer` documents).
+    fn under_rate_offer(buyer: &Keys, seller_hex: &str, task: &str, amount: u64) -> nostr_sdk::Event {
+        let deadline_unix = now_unix() as u64 + 3_600;
+        let draft = crate::gateway::OfferDraft::new(task, "", amount, deadline_unix, seller_hex)
+            .to_event_draft();
+        crate::gateway::nostr::event_builder(&draft)
+            .expect("offer event builder")
+            .sign_with_keys(buyer)
+            .expect("sign offer")
+    }
+
+    /// A fresh third-party client connected to `relay_url`, used to READ the feedback the seller
+    /// publishes. Separate from the seller because a node is not re-served its own events on a live
+    /// sub; a stored fetch from another key is the clean read.
+    async fn connect_observer(relay_url: &str) -> Client {
+        let observer = Client::new(Keys::generate());
+        observer.add_relay(relay_url).await.expect("observer add relay");
+        observer.connect().await;
+        observer.wait_for_connection(Duration::from_secs(5)).await;
+        observer
+    }
+
+    /// Count the `BelowRate` feedback events (kind-3404) the seller published for `offer`. `on_offer`
+    /// awaits the publish (`send_event_to` resolves after the relay's OK), so by the time this runs the
+    /// relay holds every feedback the drive can produce and a single fetch is deterministic.
+    async fn count_under_rate_feedbacks(observer: &Client, offer: &nostr_sdk::Event) -> usize {
+        let filter = Filter::new()
+            .kind(Kind::Custom(crate::kinds::JOB_FEEDBACK_KIND))
+            .event(offer.id);
+        observer
+            .fetch_events(filter, Duration::from_secs(5))
+            .await
+            .expect("fetch under-rate feedbacks")
+            .len()
+    }
+
+    // TOOTH (#582, whole-path RED-PROVE) — the #560 offer-backfill re-feeds every stored offer through
+    // `on_offer` each tick, so a targeted under-rate offer sitting in the lookback would re-emit its
+    // `BelowRate` buyer-feedback on EVERY pass (~12×/window in prod). The first-sight dedup collapses
+    // that to ONE feedback per offer per boot. This drives the real path: a LocalRelay holds the 3404s
+    // the seller actually publishes, and the SAME offer is fed twice (a live sighting + a backfill
+    // re-ingest a tick later).
+    //
+    // RED ON REVERT: drop the `!self.fed_under_rate_offers.contains(&offer_id) &&` first-sight guard at
+    // the under-rate emit in `on_offer` and the re-ingest re-emits, so the relay holds 2 distinct
+    // feedbacks and the `== 1` assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn under_rate_feedback_emitted_once_across_backfill_re_ingest() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+
+        // Rate floor 100 sat ⇒ a 10-sat TARGETED offer is under-rate (the RateGate skip that earns
+        // buyer feedback; open-pool under-rate stays log-only).
+        let (runner, root) = boot_seller_with_rate("under-rate-dedup", &relay_url, 100).await;
+        let seller_hex = runner.seller_pubkey();
+        let buyer = Keys::generate();
+        let offer = under_rate_offer(&buyer, &seller_hex, "under-rate re-ingest", 10);
+        let observer = connect_observer(&relay_url).await;
+
+        // A live sighting emits the feedback and records the offer as fed. `contains` becoming true
+        // proves the record-AFTER-successful-emit path fired (the send returned Ok ⇒ relay stored it).
+        runner.on_offer(&offer).await;
+        assert!(
+            runner.fed_under_rate_offers.contains(&offer.id.to_hex()),
+            "a successful under-rate emit must record the offer as fed (record-after-success)"
+        );
+
+        // Advance past the 1-second created_at granularity before the re-ingest. In prod the backfill
+        // re-ingests ~300s later, so its feedback carries a LATER created_at and is a DISTINCT wire
+        // event the buyer really receives; making the two would-be events distinct here means the ONLY
+        // thing that can collapse them to one is the #582 dedup gate, never the relay's own id-dedup.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+        // The backfill re-ingesting the SAME stored offer must NOT re-emit.
+        runner.on_offer(&offer).await;
+
+        assert_eq!(
+            count_under_rate_feedbacks(&observer, &offer).await,
+            1,
+            "a re-ingested under-rate offer must surface the BelowRate feedback exactly once"
+        );
+
+        observer.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // TOOTH (#582, non-vacuity) — the dedup is per offer id, NOT a global one-shot: two DISTINCT
+    // targeted under-rate offers each still surface their OWN `BelowRate` feedback. Guards against a
+    // dedup that suppresses the second offer because ANY under-rate feedback was already sent.
+    //
+    // RED ON REVERT: swap the per-offer_id set for a single "already fed anyone" bool and the second
+    // offer is suppressed — its feedback count drops to 0 and its assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn distinct_under_rate_offers_each_get_their_own_feedback() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+
+        let (runner, root) = boot_seller_with_rate("under-rate-per-offer", &relay_url, 100).await;
+        let seller_hex = runner.seller_pubkey();
+        let buyer = Keys::generate();
+        // Distinct tasks ⇒ distinct offer ids ⇒ distinct feedback events (no created_at gap needed).
+        let offer_a = under_rate_offer(&buyer, &seller_hex, "under-rate A", 10);
+        let offer_b = under_rate_offer(&buyer, &seller_hex, "under-rate B", 20);
+        assert_ne!(offer_a.id, offer_b.id, "the two offers must be distinct events");
+        let observer = connect_observer(&relay_url).await;
+
+        runner.on_offer(&offer_a).await;
+        runner.on_offer(&offer_b).await;
+
+        assert_eq!(
+            count_under_rate_feedbacks(&observer, &offer_a).await,
+            1,
+            "offer A gets its own feedback"
+        );
+        assert_eq!(
+            count_under_rate_feedbacks(&observer, &offer_b).await,
+            1,
+            "offer B ALSO gets its own feedback — the dedup is per offer id, not a global one-shot"
+        );
+        assert_eq!(
+            runner.fed_under_rate_offers.len(),
+            2,
+            "both distinct offers are recorded as fed"
+        );
+
+        observer.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // TOOTH (idempotency, live-caught) — the execute guard keys on job_state: a job already DELIVERED
