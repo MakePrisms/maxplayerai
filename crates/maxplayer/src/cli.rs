@@ -625,6 +625,21 @@ mod tests {
             !names_retired_sell(&out) && !names_retired_sell(&err),
             "seller --help must not name the retired `sell` (only `seller`):\nstdout={out}\nstderr={err}"
         );
+
+        // Sole `--help` only (top-level `args.len() == 2` semantics): `--help` alongside other args
+        // must NOT short-circuit to help — it reaches the parser. Guards against a looser scan that
+        // would swallow a `--help` meant as an `--agent-argv` value for the agent. Boot-safe: the
+        // parser rejects `--help` as an unknown option before any relay/home/key path.
+        let (code_ns, out_ns, _err_ns) =
+            run_captured(["maxplayer", "seller", "--help", "--rate-sats", "100"]);
+        assert_ne!(
+            code_ns, 0,
+            "non-sole `--help` must not short-circuit to help-success:\nstdout={out_ns}"
+        );
+        assert!(
+            out_ns.is_empty(),
+            "non-sole `--help` must not print usage to stdout:\n{out_ns}"
+        );
     }
 
     #[test]

@@ -71,6 +71,14 @@ jobs:
       # the acp feature — the default-feature job above compiles them out, so run them here.
       - name: Test maxplayer-core (acp)
         run: cargo test -p maxplayer-core --features acp --locked
+      # The CLI crate's acp-gated tests run NOWHERE else: the default-feature job tests -p maxplayer
+      # WITHOUT acp (so `#[cfg(feature = "acp")]` tests compile out), and the acp steps here only
+      # BUILD -p maxplayer or TEST -p maxplayer-core (#264, same gap). Without this the seller-surface
+      # CLI locks are a false green — they compile but never execute (#549): the `seller --help`
+      # regression, the #542 no-alias foil, and the #533 doctor-wording pin. acp_smoke is `#[ignore]`d
+      # (env-gated real agent), so it is reported ignored here, not run.
+      - name: Test maxplayer (CLI crate, acp)
+        run: cargo test -p maxplayer --features acp,wallet --locked
       # Paired with the racer check in the default-feature job: the two scripts must reach opposite
       # verdicts on the two builds, which is what shows each one moves with the feature rather than
       # with something incidental to the binary it happens to be handed.

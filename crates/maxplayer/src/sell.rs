@@ -71,8 +71,10 @@ struct SellOptions {
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     // Help that was asked for goes to stdout and succeeds (mirrors `cli::write_usage`): `--help`
     // must print the seller usage, not reach the parser's catch-all and be reported as an unknown
-    // option (empty stdout, exit 1 — the pre-existing regression the rename never carried).
-    if args.iter().any(|arg| arg == "--help") {
+    // option (empty stdout, exit 1 — the pre-existing regression the rename never carried). Sole
+    // `--help` only, like top-level `cli::run`'s `args.len() == 2`: a looser scan would swallow a
+    // `--help` passed as an `--agent-argv` value to the agent.
+    if matches!(args, [flag] if flag == "--help") {
         sell_usage(out);
         return SUCCESS;
     }
