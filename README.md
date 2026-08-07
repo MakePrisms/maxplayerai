@@ -17,16 +17,12 @@ One binary, one install, either role. Buying and selling are two ways to run the
 `maxplayer` and `maxplayer seller`.
 
 ```bash
-VER=0.1.0-rc.7                    # current tag: https://github.com/MakePrisms/maxplayerai/releases
-npm install -g maxplayer@rc       # or:
-curl -fsSL "https://github.com/MakePrisms/maxplayerai/releases/download/v$VER/install.sh" | MAXPLAYER_VERSION="$VER" sh
+npm install -g maxplayer          # or:
+curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/install.sh | sh
 ```
 
-> **Name the version.** Every release so far is a **pre-release**, so
-> `releases/latest/download/install.sh` and GitHub's "latest release" API both 404 — and
-> `curl … | sh` exits `0` having installed nothing. On npm the same applies: the `latest` dist-tag is
-> a placeholder with no binary, so use `@rc` (and `npx -y maxplayer@rc mcp` to wire a buyer into an
-> MCP client). Confirm with `maxplayer --version` before going on.
+Both resolve the latest release. `npx -y maxplayer mcp` wires a buyer into an MCP client without
+installing. Confirm with `maxplayer --version` before going on.
 
 Both deliver the same prebuilt binary (Linux x86_64/aarch64, macOS Apple Silicon — no Rust needed);
 the script puts it in `~/.local/bin` and verifies the release `SHA256SUMS`. Choose the directory with
@@ -38,9 +34,8 @@ until you run `maxplayer seller`.
 
 ## Run a buyer
 
-> **⚠ Real sats.** `wallet setup` provisions on a **real** mint
-> (`https://mint.minibits.cash/Bitcoin`) and prints a Lightning invoice you fund with **real money** —
-> it does not auto-fund.
+`wallet setup` provisions on `https://mint.minibits.cash/Bitcoin` and prints a Lightning invoice you
+fund yourself; nothing is auto-funded.
 
 1. Fund the wallet: `maxplayer wallet setup` prints a Lightning invoice and a `quote_id`. Pay the
    invoice, then **finish the mint** — the balance does not appear on its own:

@@ -128,9 +128,9 @@ Before the first release there isn't one, so an `-rc` first release would leave 
 `npx maxplayer` with nothing to resolve. The dist-tag branch is correct in every case except the one
 that comes first.
 
-⚠ The `latest`-unset half of that has not been executed against the live registry — it is npm's
-documented behaviour and the workflow already assumes it, but nothing here has published yet. Plain
-`0.x.y` avoids depending on the answer. Should an `-rc` ever ship first, the repair is one command:
+The `latest`-unset half of that has never been executed against the live registry: `v0.1.0` was a
+plain version, so it published to `latest` directly. Plain `0.x.y` keeps it that way. Should an
+`-rc` ever ship without a stable behind it, the repair is one command:
 `npm dist-tag add maxplayer@<version> latest`.
 
 A genuine pre-release, once a stable exists, works as it always did: a semver suffix on both the tag
