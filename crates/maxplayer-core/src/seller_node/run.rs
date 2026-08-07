@@ -589,6 +589,29 @@ fn resolve_backfill_since(
 /// Upper bound on stored open-pool offers a backfilling REQ may return.
 const OFFER_BACKFILL_LIMIT: usize = 500;
 
+/// Lookback window (seconds) for the periodic offer backfill's `since` cursor (#560).
+///
+/// Bounded so a long-lived seat's targeted re-fetch does not grow to its whole history every tick.
+/// The classify-level deadline-expiry refusal (see [`offer_subscription_filters`]) discards anything
+/// stale the window still returns, so the width only trades relay bandwidth against how long a missed
+/// offer stays recoverable — sized to span several backfill intervals so a run of failed or timed-out
+/// ticks cannot open a permanent gap.
+const OFFER_BACKFILL_WINDOW_SECS: u64 = 3600;
+
+/// Hard cap on one offer-backfill fetch, so an auth-gated relay that never EOSEs cannot wedge the
+/// tick. Mirrors [`WRAP_BACKFILL_FETCH_TIMEOUT`].
+const OFFER_BACKFILL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The `since` cursor for a periodic offer backfill: a bounded lookback from `now`, never shorter than
+/// [`OFFER_BACKFILL_WINDOW_SECS`] and widened to the seller's configured `offer_backfill_secs` when
+/// that is larger, so the periodic recovery window is never narrower than the boot backfill's. Unlike
+/// the wrap cursor there is no store cursor to clamp to — offers carry their own staleness gate (the
+/// classify deadline refusal), so a wide, purely time-bounded window is safe by construction.
+fn resolve_offer_backfill_since(now: u64, offer_backfill_secs: u64) -> nostr_sdk::Timestamp {
+    let window = OFFER_BACKFILL_WINDOW_SECS.max(offer_backfill_secs);
+    nostr_sdk::Timestamp::from(now.saturating_sub(window))
+}
+
 /// Stable per-role subscription ids. Named rather than generated so a relay `CLOSED` says WHICH
 /// subscription died — with anonymous ids a closed subscription is indistinguishable in the log,
 /// which is how a node could go silently deaf on one leg while heartbeating happily on another.
@@ -635,11 +658,12 @@ fn is_our_subscription(id: &str) -> bool {
 ///
 /// A function rather than an inline `opline!` because this line is field-facing: the relay owner
 /// reads it to tell two hypotheses apart, and neither is visible from the server side. Our periodic
-/// wrap backfill calls `fetch_events`, which GENERATES its subscription id (`pool/mod.rs:815`) and
-/// runs on exactly the cadence these closes appear on — so a small `last_backfill` age implicates our
-/// own transient REQ. A `last_nip42_auth` age near the relay's NIP-42 TTL instead implicates a
-/// re-challenge sweep closing auth-scoped subscriptions from the pre-expiry generation. Being a
-/// function, its content is pinned by a test instead of drifting silently.
+/// backfills (wrap + offer, #560) call `fetch_events`, which GENERATES its subscription id
+/// (`pool/mod.rs:815`) and run on exactly the cadence these closes appear on — so a small
+/// `last_backfill` age implicates our own transient REQ. A `last_nip42_auth` age near the relay's
+/// NIP-42 TTL instead implicates a re-challenge sweep closing auth-scoped subscriptions from the
+/// pre-expiry generation. Being a function, its content is pinned by a test instead of drifting
+/// silently.
 fn unknown_close_diagnostic(
     id: &str,
     last_backfill_secs: u64,
@@ -2332,9 +2356,10 @@ impl SellerNodeRunner {
         // never become a loop.
         let mut restricted_retry_used: std::collections::HashSet<String> =
             std::collections::HashSet::new();
-        // When the last periodic wrap backfill ran. Reported alongside an unknown-id `CLOSED` so the
-        // relay owner can tell a refusal of our transient `fetch_events` REQ (which uses a generated
-        // id, and runs on exactly this cadence) from a relay-side sweep of a stale generation.
+        // When the last periodic backfill ran (wrap + offer, #560 — both fetch on this tick). Reported
+        // alongside an unknown-id `CLOSED` so the relay owner can tell a refusal of our transient
+        // `fetch_events` REQ (which uses a generated id, and runs on exactly this cadence) from a
+        // relay-side sweep of a stale generation.
         let mut last_backfill_at = tokio::time::Instant::now();
         // Which path actually restored the receive leg. Manual recovery and the SDK's background
         // reconnect were previously indistinguishable in the log — which is how a manual path that
@@ -2350,11 +2375,15 @@ impl SellerNodeRunner {
                     self.drain().await;
                     continue;
                 }
-                // Re-ask the relay for stored payment wraps, so a silently-deaf 1059 subscription
-                // recovers without a restart. Also the node's only periodic log line, and therefore
-                // the positive signal external supervision watches.
+                // Re-ask the relay for stored payment wraps AND stored offers, so a silently-deaf 1059
+                // or offer subscription recovers without a restart (#560). Also the node's only
+                // periodic log lines, and therefore the positive signal external supervision watches.
                 _ = wrap_backfill_tick.tick() => {
                     self.run_wrap_backfill().await;
+                    // #560: the offers analog, on the SAME owned cadence. It rides this tick (not the
+                    // heartbeat) for the same reason the wrap backfill does — a recovery leg must not
+                    // depend on a tick config can disable.
+                    self.run_offer_backfill().await;
                     last_backfill_at = tokio::time::Instant::now();
                     // #190: the open-pool half is re-armed on THIS tick, which is owned and
                     // unconditional. It rides the backfill rather than the heartbeat because the
@@ -2875,6 +2904,84 @@ impl SellerNodeRunner {
                  subscription active)",
                 WRAP_BACKFILL_FETCH_TIMEOUT.as_secs()
             ),
+        }
+    }
+
+    /// Re-ask the relay for stored job OFFERS and ingest whatever comes back — the offers analog of
+    /// [`Self::run_wrap_backfill`], recovering the offer leg the way that recovers the money leg.
+    ///
+    /// Same failure it repairs (#560): a registered offer subscription that has silently gone deaf —
+    /// the session still answers our REQs, so the liveness probe cannot see it — strands every new
+    /// offer until a restart. `fetch_events` issues a TRANSIENT REQ under a pool-GENERATED id and
+    /// returns the events off the call itself, so it bypasses the per-connection seen-cache that
+    /// swallows an already-seen id on the notification path (see [`Self::reconsider_capacity_skips`]);
+    /// a plain re-subscribe re-REQs but never re-fires `on_offer`, which is why recovery has to be a
+    /// fetch and not a re-subscribe.
+    ///
+    /// This RECOVERS MISSED OFFERS; it does not DETECT a registered sub's silent death. Telling a
+    /// dead leg from a merely-idle one is the subscription-map reconciler's job (#172, unimplemented).
+    /// The layering mirrors the wrap side (see [`WRAP_BACKFILL_INTERVAL_SECS`]): probe = session
+    /// liveness, backfill = leg recovery, #172 = registration integrity — none subsumes another.
+    ///
+    /// The fetch filters MATCH the live offer subscription ([`offer_subscription_filters`]) so a
+    /// backfill covers exactly what the live leg does — the `#t=maxplayer` guard and the `#p` targeting
+    /// included — bounded to [`resolve_offer_backfill_since`]. `report_status` is left to the wrap
+    /// backfill that precedes it on the shared tick, so the pair emits one status line, not two; the
+    /// "fetching" line here is still emitted UNCONDITIONALLY, as the positive signal this leg ran.
+    async fn run_offer_backfill(&self) {
+        let open_pool = self.claim_open_pool();
+        let now = now_unix().max(0) as u64;
+        let offer_backfill_secs = self
+            .node
+            .home()
+            .config
+            .seller
+            .as_ref()
+            .map(|seller| seller.offer_backfill_secs)
+            .unwrap_or(0);
+        let since = resolve_offer_backfill_since(now, offer_backfill_secs);
+        let filters = offer_subscription_filters(
+            self.seller_pubkey,
+            open_pool,
+            offer_backfill_secs,
+            Some(since),
+            nostr_sdk::Timestamp::from(now),
+        );
+        opline!(
+            "seller node offer backfill (periodic): fetching stored kind-{}(s) since ts={} ({} filter(s))",
+            JOB_OFFER_KIND,
+            since.as_secs(),
+            filters.len()
+        );
+        for filter in filters {
+            match tokio::time::timeout(
+                OFFER_BACKFILL_FETCH_TIMEOUT,
+                self.client
+                    .fetch_events(filter, OFFER_BACKFILL_FETCH_TIMEOUT / 2),
+            )
+            .await
+            {
+                Ok(Ok(events)) => {
+                    opline!(
+                        "seller node offer backfill (periodic): {} stored kind-{}(s) returned",
+                        events.len(),
+                        JOB_OFFER_KIND
+                    );
+                    for event in events {
+                        self.on_offer(&event).await;
+                    }
+                    self.drain().await;
+                }
+                Ok(Err(error)) => opline!(
+                    "seller node WARN: offer backfill fetch failed (continuing; live offer \
+                     subscription active): {error}"
+                ),
+                Err(_) => opline!(
+                    "seller node WARN: offer backfill fetch timed out after {}s (continuing; live \
+                     offer subscription active)",
+                    OFFER_BACKFILL_FETCH_TIMEOUT.as_secs()
+                ),
+            }
         }
     }
 
@@ -5790,6 +5897,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Counts REQs the relay is asked to serve for [`JOB_OFFER_KIND`], so a test can assert the offer
+    /// backfill actually reached the wire rather than inferring it from a log line — the offers analog
+    /// of [`CountWrapQueries`].
+    #[derive(Debug)]
+    struct CountOfferQueries(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl nostr_relay_builder::prelude::QueryPolicy for CountOfferQueries {
+        fn admit_query<'a>(
+            &'a self,
+            query: &'a nostr_sdk::Filter,
+            _addr: &'a std::net::SocketAddr,
+        ) -> nostr_relay_builder::prelude::BoxedFuture<
+            'a,
+            nostr_relay_builder::prelude::PolicyResult,
+        > {
+            Box::pin(async move {
+                if query
+                    .kinds
+                    .as_ref()
+                    .is_some_and(|kinds| kinds.contains(&Kind::Custom(JOB_OFFER_KIND)))
+                {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                nostr_relay_builder::prelude::PolicyResult::Accept
+            })
+        }
+    }
+
+    // TOOTH (offer backfill, UNCONDITIONALITY — #560) — the offer-backfill fetch must reach the relay
+    // even with nothing pending, the same idle case that goes quiet for wraps. Asserted at the WIRE
+    // (the fixture counts JOB_OFFER_KIND REQs), so a future "skip the fetch when idle" optimisation
+    // cannot pass by keeping the log line and dropping the fetch. The offers analog of
+    // `wrap_backfill_fetches_even_with_nothing_pending`; it drives the REAL boot path.
+    //
+    // BITE: empty `run_offer_backfill`'s body (or gate its fetch on something pending) → the delta
+    // assertion goes red.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offer_backfill_fetches_even_with_nothing_pending() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let offer_queries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let relay = LocalRelay::new(
+            RelayBuilder::default()
+                .query_policy(CountOfferQueries(std::sync::Arc::clone(&offer_queries))),
+        );
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+
+        // A real (targeted) seller seat: boot registers the live offer REQ, so only the delta across
+        // the backfill call is evidence.
+        let (runner, root) =
+            boot_capacity_skip_seller("offer-backfill-empty", &relay_url, false, 0, Some(0)).await;
+        let before = offer_queries.load(std::sync::atomic::Ordering::SeqCst);
+
+        // `on_offer` is only ever driven under a LocalSet in this suite; `run_offer_backfill` contains
+        // that path, so keep the same discipline even though nothing is pending here.
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                runner.run_offer_backfill().await;
+            })
+            .await;
+
+        assert!(
+            offer_queries.load(std::sync::atomic::Ordering::SeqCst) > before,
+            "the offer backfill must re-ask the relay for stored kind-{}(s) even with nothing pending \
+             — skipping the fetch when idle silences a periodic recovery leg and its positive signal",
+            JOB_OFFER_KIND
+        );
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ── #450: capacity-skip backfill — a whole-path LocalRelay proof ─────────────────────────────
     //
     // The unit tests above pin the pieces (a SlotsBusy skip arms the flag; the classify gate order;
@@ -6469,6 +6649,87 @@ mod tests {
         drive_loser_release_on_award(true).await;
     }
 
+    // TOOTH (offer backfill, DEAF-SUB RECOVERY — #560, the acceptance bar) — an offer a silently-deaf
+    // live subscription NEVER delivered is recovered by the periodic offer backfill, WITHOUT a restart.
+    // This is the offers analog of the wrap backfill's whole reason to exist.
+    //
+    // The deaf leg is modelled faithfully: the seat boots (its live offer REQ is registered) but the
+    // run loop is NOT driven, so NOTHING pumps the offer notification stream into `on_offer` — exactly
+    // the field's silently-deaf leg, where a posted offer never reaches `on_offer`. `run_offer_backfill`
+    // is then the SOLE path that can claim it, and it recovers because `fetch_events` returns the
+    // stored offer off the call itself, past the pool's per-connection seen-cache (a plain re-subscribe
+    // would re-REQ but the cache swallows the replay — the trap the fix exists to avoid).
+    //
+    // The BEFORE block pins the deaf premise (unclaimed with no backfill); the AFTER block is the
+    // recovery. RED ON REVERT: empty `run_offer_backfill`'s body (or delete its on_offer/drain loop)
+    // → the offer stays unclaimed and the AFTER block goes red.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offer_backfill_recovers_an_offer_the_deaf_live_sub_never_delivered() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::{Client, Keys};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+
+        // A targeted 1-slot seller. `offer_backfill_secs = 0` proves recovery does not depend on a
+        // configured backfill window — even a live-only seat's deaf leg must recover.
+        let (runner, root) =
+            boot_capacity_skip_seller("offer-backfill-deaf", &relay_url, false, 0, Some(0)).await;
+        let seller_hex = runner.seller_pubkey();
+
+        // A separate publisher: a node is never delivered its OWN events.
+        let buyer = Keys::generate();
+        let publisher = Client::new(buyer.clone());
+        publisher.add_relay(&relay_url).await.expect("publisher add relay");
+        publisher.connect().await;
+        publisher.wait_for_connection(Duration::from_secs(5)).await;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let deadline_unix = now_unix() as u64 + 3_600;
+                let job_id = post_offer(
+                    &publisher,
+                    &buyer,
+                    "deaf-sub recovery offer",
+                    Some(&seller_hex),
+                    100,
+                    deadline_unix,
+                )
+                .await;
+
+                // The deaf premise: nothing drove the live sub into `on_offer`, so the offer is
+                // unclaimed. `post_offer` awaited the relay's OK, so it IS stored and fetchable.
+                assert!(
+                    runner.node.store().offer_facts(&job_id).expect("offer_facts").is_none(),
+                    "deaf premise: with no backfill the offer is never claimed (the live sub \
+                     delivered nothing to on_offer)"
+                );
+                assert_eq!(runner.slots.available(), 1, "no slot is taken before the backfill");
+
+                // THE FIX — the periodic offer backfill re-asks the relay via `fetch_events` (past the
+                // seen-cache) and feeds the returned offer through `on_offer`, which claims it.
+                runner.run_offer_backfill().await;
+
+                assert!(
+                    runner.node.store().offer_facts(&job_id).expect("offer_facts").is_some(),
+                    "the offer backfill must recover an offer the deaf live sub never delivered"
+                );
+                assert_eq!(
+                    runner.node.store().claim_row_state(&job_id).expect("claim row").as_deref(),
+                    Some("claimed"),
+                    "the recovered offer is claimed"
+                );
+                assert_eq!(runner.slots.available(), 0, "the recovered claim takes the slot");
+            })
+            .await;
+
+        runner.client.disconnect().await;
+        publisher.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // TOOTH (wrap backfill) — the cursor keeps an OLDER delivered-but-unpaid job's payment window in
     // range, and a read failure ABORTS rather than silently becoming a full-history rescan.
     //
@@ -6509,6 +6770,41 @@ mod tests {
         assert!(
             resolve_backfill_since(Ok(Some(1)), Err(StoreError("boom".into()))).is_err(),
             "an unsettled-delivery read failure must abort too"
+        );
+    }
+
+    // TOOTH (offer backfill, CURSOR — #560) — the periodic offer-backfill `since` cursor is a bounded
+    // lookback: never shorter than the window floor, widened to the configured backfill, and clamped
+    // at the epoch so a near-epoch clock cannot underflow. Offers carry no store cursor to clamp to
+    // (unlike wraps); the classify deadline gate is their staleness backstop, so a purely time-bounded
+    // window is the whole design — this pins that it stays BOUNDED and never narrows below the floor.
+    //
+    // BITE: drop the `.max(offer_backfill_secs)` and the widen case goes red; drop `saturating_` and
+    // the near-epoch case panics on debug overflow.
+    #[test]
+    fn offer_backfill_since_is_a_bounded_lookback_widened_to_the_configured_window() {
+        // Floor: a 0 configured backfill still looks back the full window (a live-only seat's deaf leg
+        // must still recover — the window is not the config).
+        assert_eq!(
+            resolve_offer_backfill_since(100_000, 0),
+            nostr_sdk::Timestamp::from(100_000 - OFFER_BACKFILL_WINDOW_SECS)
+        );
+        // A configured backfill NARROWER than the floor does not shrink the window.
+        assert_eq!(
+            resolve_offer_backfill_since(100_000, OFFER_BACKFILL_WINDOW_SECS - 1),
+            nostr_sdk::Timestamp::from(100_000 - OFFER_BACKFILL_WINDOW_SECS)
+        );
+        // A configured backfill WIDER than the floor widens the recovery window to match, so periodic
+        // recovery is never narrower than the boot backfill the operator asked for.
+        let wide = OFFER_BACKFILL_WINDOW_SECS + 5_000;
+        assert_eq!(
+            resolve_offer_backfill_since(100_000, wide),
+            nostr_sdk::Timestamp::from(100_000 - wide)
+        );
+        // Clamp: a `now` inside the window saturates to the epoch, never underflows.
+        assert_eq!(
+            resolve_offer_backfill_since(10, 0),
+            nostr_sdk::Timestamp::from(0u64)
         );
     }
 
