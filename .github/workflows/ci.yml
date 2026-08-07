@@ -124,3 +124,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: ./scripts/verify-release-workflow.sh
+      # The tree-side platform surfaces — the npm payload packages, the launcher's pins and its
+      # runtime resolver — held to .github/release-platforms.json on every pull request.
+      # `--no-artifacts` skips only the built-artifact check (nothing is built in this job); the
+      # drift #249 is about is a tree edit, so this catches it here, before a release is ever
+      # dispatched, rather than only in the release workflow's own dry run.
+      - run: ./scripts/verify-release-surface.sh --no-artifacts
