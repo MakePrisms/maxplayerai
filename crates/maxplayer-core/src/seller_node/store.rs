@@ -23,7 +23,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::gateway::EventDraft;
 
 /// Current on-disk schema version.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// A cloneable handle to the node-owned SQLite state.
 #[derive(Clone)]
@@ -250,7 +250,12 @@ impl SellerStore {
                  state           TEXT NOT NULL
                      CHECK (state IN ('awarded','executing','delivered','paid','failed')),
                  created_at_unix INTEGER NOT NULL,
-                 updated_at_unix INTEGER NOT NULL
+                 updated_at_unix INTEGER NOT NULL,
+                 -- The delivery commit oid, journaled immediately AFTER a successful push and BEFORE
+                 -- the receipt sign+enqueue (#552). On a still-`awarded`/`executing` row it means the
+                 -- delivery was pushed but the enqueue was interrupted: resume FINALIZES from this
+                 -- commit (re-sign + enqueue) instead of re-running the agent. NULL ⇒ never pushed.
+                 pushed_commit   TEXT
              );
              -- One delivery per job (the seller-authored snapshot the daemon published).
              CREATE TABLE IF NOT EXISTS deliveries (
@@ -316,6 +321,13 @@ impl SellerStore {
     fn migrate(conn: &Connection) -> Result<(), StoreError> {
         if !Self::column_exists(conn, "offers", "requested_agent")? {
             conn.execute_batch("ALTER TABLE offers ADD COLUMN requested_agent TEXT;")?;
+        }
+        // #552: the pushed-delivery marker. A store from a pre-#552 binary reads NULL for its
+        // awarded/executing rows and is armed going forward at push time. Pre-existing stale rows are
+        // caught at resume by the deadline-lapse check (a passed deadline ⇒ fail, never re-drive); the
+        // narrow live-deadline residual (pushed pre-marker, or settled elsewhere) is a tracked follow-up.
+        if !Self::column_exists(conn, "jobs", "pushed_commit")? {
+            conn.execute_batch("ALTER TABLE jobs ADD COLUMN pushed_commit TEXT;")?;
         }
         Ok(())
     }
@@ -604,6 +616,20 @@ impl SellerStore {
         Ok(())
     }
 
+    /// Journal the pushed delivery commit for a job (#552). Called immediately AFTER a successful
+    /// push and BEFORE the receipt sign+enqueue, so a crash in that window leaves a durable marker:
+    /// on resume the job FINALIZES from this commit (re-sign + enqueue) rather than re-running the
+    /// agent. Idempotent — last write wins; does NOT change `state` (the atomic advance to
+    /// `delivered` stays with `deliver_and_enqueue`).
+    pub fn mark_pushed(&self, job_id: &str, commit: &str, now_unix: i64) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE jobs SET pushed_commit = ?2, updated_at_unix = ?3 WHERE job_id = ?1",
+            params![job_id, commit, now_unix],
+        )?;
+        Ok(())
+    }
+
     /// Record a delivery and enqueue its result event in ONE transaction. Idempotent — a replay for
     /// a job that already has a delivery row changes nothing and re-enqueues nothing.
     #[allow(clippy::too_many_arguments)]
@@ -754,6 +780,39 @@ impl SellerStore {
             .optional()?
             .is_some();
         Ok(found)
+    }
+
+    /// Whether a delivery has been journaled for `job_id` (#552). A delivery row is written only by
+    /// [`Self::deliver_and_enqueue`], atomically with the `delivered` state advance — so this is the
+    /// durable proof the result was already produced and enqueued, independent of the `state` column
+    /// (belt-and-braces against a lagged state).
+    pub fn has_delivery(&self, job_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let found = conn
+            .query_row(
+                "SELECT 1 FROM deliveries WHERE job_id = ?1 LIMIT 1",
+                [job_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(found)
+    }
+
+    /// The delivery commit oid journaled at push time for `job_id`, if any (#552). `Some` on a
+    /// still-`awarded`/`executing` row means the delivery was pushed but the enqueue was interrupted
+    /// — resume finalizes from it instead of re-running the agent. `None` ⇒ never pushed.
+    pub fn pushed_commit(&self, job_id: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.lock()?;
+        let commit: Option<String> = conn
+            .query_row(
+                "SELECT pushed_commit FROM jobs WHERE job_id = ?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(commit)
     }
 
     // ---- Outbox ---------------------------------------------------------------------------------
