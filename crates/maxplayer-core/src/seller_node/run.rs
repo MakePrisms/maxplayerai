@@ -1003,17 +1003,173 @@ fn should_publish_under_rate_feedback(
     skip == SkipReason::RateGate && targeted_to_self && amount < rate_sats
 }
 
-/// Whether a job resumed from durable state on (re)start must be re-driven to execution (charter
-/// invariant 4, fallback form): a job left `awarded` (award seen, delivery not started) or
-/// `executing` (interrupted mid-run) is re-executed, so a process that dies mid-job resumes rather
-/// than losing the award. `delivered` jobs are left for the pay path; terminal (`paid`/`failed`)
-/// never re-run. Pure so the selection is unit-testable. Re-execution is idempotent: the delivery
-/// snapshot is deterministic (stored award-date) and `deliver_and_enqueue` dedups, so a re-created
-/// delivery lands exactly once.
+/// Whether a job resumed from durable state on (re)start OCCUPIES AN EXECUTION SLOT (charter
+/// invariant 4, fallback form): `awarded` (award seen, delivery not started) or `executing`
+/// (interrupted mid-run). `delivered` jobs are left for the pay path; terminal (`paid`/`failed`)
+/// never re-run. Pure so the selection is unit-testable. This is a COARSE state-only pre-filter for
+/// the resume loop; [`resume_action`] refines it per-job over the durable delivery markers — because
+/// an `awarded`/`executing` row can ALREADY have delivered (its state lagging, or its enqueue
+/// interrupted after a push) and must NOT re-run the agent: a re-run re-executes a non-deterministic
+/// agent and re-pushes a divergent commit (#552).
 fn should_resume_execution(state: super::store::JobState) -> bool {
     // Same predicate the wire's `queue_depth` counts with, so "occupies a slot" has one definition
     // rather than one here and another in the heartbeat path.
     state.occupies_execution_slot()
+}
+
+/// The action a restart must take for a job that occupies an execution slot (#552). Pure over the
+/// job's DURABLE facts so the whole terminal-shape enumeration is unit-testable in BOTH directions:
+/// a replay (already-delivered work) must be caught, and a genuine mid-flight award must still run
+/// (over-skipping trades a replay bug for a STALL bug — a lost award). Order matters: a
+/// terminal/delivered/receipted row is skipped first; then a LAPSED offer (its absolute deadline has
+/// passed) is failed BEFORE a pushed commit is finalized, so a pushed-but-lapsed row is never
+/// re-signed into a fresh result after its deadline (which would emit a delivery past settlement —
+/// the replay the wire regression forbids); only a slot-occupying, live-deadline row with NO delivery
+/// evidence re-runs the agent (or finalizes a pushed commit). A missing/unreadable deadline degrades
+/// to "live" — never fail a genuine award on an absent fact.
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeAction {
+    /// Genuinely mid-flight (never delivered): re-drive the agent. THE FOIL — a real award, never
+    /// abandon it.
+    RunAgent,
+    /// A delivery was pushed but its sign+enqueue was interrupted (deadline still live): complete it
+    /// from the stored commit (re-sign + enqueue — deterministic + idempotent) WITHOUT re-running the
+    /// agent or re-pushing.
+    FinalizeFromPushed(String),
+    /// Already delivered / receipted, or a terminal state: nothing to do, never re-run.
+    SkipTerminal,
+    /// The offer's own absolute deadline has already passed: the award can no longer be paid (a buyer
+    /// will not honour a delivery past its deadline), so fail the job — release the slot, record it
+    /// terminal — rather than re-run or finalize. #552's DURABLE primary signal (the deadline is
+    /// journaled at claim time), the fix for stale `awarded` rows a restart would otherwise re-drive.
+    SkipLapsed,
+}
+
+fn resume_action(
+    state: super::store::JobState,
+    has_delivery: bool,
+    has_receipt: bool,
+    pushed_commit: Option<String>,
+    deadline_unix: Option<i64>,
+    now_unix: i64,
+) -> ResumeAction {
+    // Terminal (delivered/paid/failed) never re-runs.
+    if !state.occupies_execution_slot() {
+        return ResumeAction::SkipTerminal;
+    }
+    // A delivery row or a collected receipt is durable proof the result already exists — skip even if
+    // the `state` column lagged behind `deliver_and_enqueue`'s atomic advance.
+    if has_delivery || has_receipt {
+        return ResumeAction::SkipTerminal;
+    }
+    // #4 LAPSED — the DURABLE primary (#552): an offer whose own absolute deadline has passed is dead
+    // (a buyer will not pay past it), so a stale `awarded`/`executing` row a restart re-reads must be
+    // failed, not re-driven — re-running burns compute + re-pushes a divergent commit, and finalizing
+    // would re-sign a fresh result AFTER the deadline. Checked BEFORE the pushed-commit branch so a
+    // pushed-but-lapsed row fails rather than emitting a post-settlement delivery (the wire regression
+    // `count(3403 with earlier 3406) == 0`). Boundary `deadline == now` counts as lapsed, matching
+    // `classify_offer`. A `None` deadline (absent/unreadable) is treated as LIVE: never fail a genuine
+    // award on a missing fact — over-skipping is the worse (a lost award).
+    if let Some(deadline) = deadline_unix
+        && deadline <= now_unix
+    {
+        return ResumeAction::SkipLapsed;
+    }
+    // Pushed-but-not-enqueued (deadline still live): the commit is on the remote; finalize from it
+    // rather than re-running the (non-deterministic) agent, which would diverge the tree and re-push.
+    match pushed_commit {
+        Some(commit) => ResumeAction::FinalizeFromPushed(commit),
+        None => ResumeAction::RunAgent,
+    }
+}
+
+#[cfg(test)]
+mod resume_action_tests {
+    use super::{resume_action, ResumeAction};
+    use crate::seller_node::store::JobState;
+
+    const NOW: i64 = 1_000_000;
+    const LIVE: Option<i64> = Some(NOW + 3_600); // deadline still in the future
+    const LAPSED: Option<i64> = Some(NOW - 1); // deadline already passed
+    const AT_NOW: Option<i64> = Some(NOW); // boundary: deadline == now counts as lapsed
+
+    #[test]
+    fn genuine_mid_flight_runs_the_agent() {
+        // THE FOIL (red-provable in BOTH directions): awarded/executing, NO delivery evidence, LIVE
+        // deadline ⇒ resume + run. Over-skip here (e.g. a wrong lapse comparison) and a real award
+        // stalls — a lost award, worse than a replay — and this goes red.
+        assert_eq!(resume_action(JobState::Awarded, false, false, None, LIVE, NOW), ResumeAction::RunAgent);
+        assert_eq!(resume_action(JobState::Executing, false, false, None, LIVE, NOW), ResumeAction::RunAgent);
+        // An absent/unreadable deadline degrades to "live": never skip a genuine award on a missing
+        // fact.
+        assert_eq!(resume_action(JobState::Awarded, false, false, None, None, NOW), ResumeAction::RunAgent);
+    }
+
+    #[test]
+    fn lapsed_deadline_fails_the_stale_award() {
+        // #4 LAPSED — the durable primary (#552): a slot-occupying row whose offer deadline has passed
+        // can never be paid, so it is failed, never re-run/finalized. Holds with NO marker (the
+        // dominant stale-`awarded` case) AND with a pushed marker (lapse BEFORE finalize — never emit
+        // a 3403 after the deadline). Boundary `deadline == now` counts as lapsed.
+        for pushed in [None, Some("abc".to_string())] {
+            assert_eq!(
+                resume_action(JobState::Awarded, false, false, pushed.clone(), LAPSED, NOW),
+                ResumeAction::SkipLapsed
+            );
+            assert_eq!(
+                resume_action(JobState::Executing, false, false, pushed.clone(), AT_NOW, NOW),
+                ResumeAction::SkipLapsed
+            );
+        }
+    }
+
+    #[test]
+    fn pushed_but_not_enqueued_finalizes_without_rerun() {
+        // Deadline still LIVE + pushed commit + no delivery/receipt ⇒ finalize from the stored commit
+        // (no agent re-run, no re-push).
+        assert_eq!(
+            resume_action(JobState::Executing, false, false, Some("abc".into()), LIVE, NOW),
+            ResumeAction::FinalizeFromPushed("abc".into())
+        );
+        assert_eq!(
+            resume_action(JobState::Awarded, false, false, Some("abc".into()), LIVE, NOW),
+            ResumeAction::FinalizeFromPushed("abc".into())
+        );
+    }
+
+    #[test]
+    fn already_delivered_or_receipted_never_reruns() {
+        // Delivery/receipt evidence wins over everything else, including a pushed marker and even a
+        // lapsed deadline (a delivered row is never reclassified as lapsed).
+        for state in [JobState::Awarded, JobState::Executing] {
+            assert_eq!(resume_action(state, true, false, None, LIVE, NOW), ResumeAction::SkipTerminal);
+            assert_eq!(resume_action(state, false, true, None, LIVE, NOW), ResumeAction::SkipTerminal);
+            assert_eq!(
+                resume_action(state, true, false, Some("c".into()), LIVE, NOW),
+                ResumeAction::SkipTerminal
+            );
+            assert_eq!(resume_action(state, true, false, None, LAPSED, NOW), ResumeAction::SkipTerminal);
+        }
+    }
+
+    #[test]
+    fn terminal_states_never_rerun_regardless_of_markers() {
+        for state in [JobState::Delivered, JobState::Paid, JobState::Failed] {
+            for hd in [false, true] {
+                for hr in [false, true] {
+                    for pc in [None, Some("c".to_string())] {
+                        for dl in [LIVE, LAPSED, None] {
+                            assert_eq!(
+                                resume_action(state, hd, hr, pc.clone(), dl, NOW),
+                                ResumeAction::SkipTerminal,
+                                "terminal {state:?} must never re-run (hd={hd} hr={hr} pc={pc:?} dl={dl:?})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The journaled offer facts for a parsed offer — the ONE place a wire offer becomes a stored row.
@@ -3296,14 +3452,12 @@ impl SellerNodeRunner {
         // smoke) or any re-drive must NOT re-run the agent: a duplicate execute burns operator compute
         // for nothing and its push is rejected non-fast-forward. It must also never clobber a terminal
         // state (delivered/paid/failed). Delivered/paid/failed ⇒ early-return, no second execute.
-        match self.node.store().job_state(job_id) {
-            Ok(Some(state)) if should_resume_execution(state) => {}
-            Ok(Some(state)) => {
-                opline!(
-                    "seller node execute skip job_id={job_id}: job already {state:?} (idempotent — not re-run)"
-                );
-                return;
-            }
+        // #552: decide from the job's DURABLE facts whether to re-drive the agent, finalize an
+        // interrupted delivery, or skip already-delivered/terminal work. A marker READ ERROR degrades
+        // to the legacy behavior (re-drive) rather than risk STALLING a genuine mid-flight award — a
+        // wasted re-run is recoverable (the enqueue dedups), a silent skip of a real award is not.
+        let state = match self.node.store().job_state(job_id) {
+            Ok(Some(state)) => state,
             Ok(None) => {
                 opline!("seller node execute skip job_id={job_id}: no job row (idempotent)");
                 return;
@@ -3312,26 +3466,78 @@ impl SellerNodeRunner {
                 opline!("seller node execute job_id={job_id}: job_state read failed ({error}); not executing");
                 return;
             }
+        };
+        let has_delivery = match self.node.store().has_delivery(job_id) {
+            Ok(v) => v,
+            Err(error) => {
+                opline!("seller node execute job_id={job_id}: has_delivery read failed ({error}); assuming not delivered");
+                false
+            }
+        };
+        let has_receipt = match self.node.store().has_receipt(job_id) {
+            Ok(v) => v,
+            Err(error) => {
+                opline!("seller node execute job_id={job_id}: has_receipt read failed ({error}); assuming not receipted");
+                false
+            }
+        };
+        let pushed = match self.node.store().pushed_commit(job_id) {
+            Ok(v) => v,
+            Err(error) => {
+                opline!("seller node execute job_id={job_id}: pushed_commit read failed ({error}); assuming not pushed");
+                None
+            }
+        };
+        // Offer facts (task + amount + buyer + absolute deadline) were journaled at claim time. Read
+        // them BEFORE the resume decision: the absolute deadline is #552's DURABLE terminal signal — a
+        // restart must not re-drive (or finalize) a job whose offer deadline has already passed (the
+        // buyer will not pay past it). A read error or a missing row degrades the deadline to "unknown
+        // ⇒ live" so a genuine award is never skipped on an absent fact; the RunAgent path below still
+        // fails the job if the offer is truly unavailable.
+        let offer = match self.node.store().offer_row(job_id) {
+            Ok(offer) => offer,
+            Err(error) => {
+                opline!("seller node execute job_id={job_id}: offer read failed ({error}); treating deadline as live");
+                None
+            }
+        };
+        let deadline_unix = offer.as_ref().map(|offer| offer.deadline_unix);
+        match resume_action(state, has_delivery, has_receipt, pushed, deadline_unix, now_unix()) {
+            ResumeAction::RunAgent => {}
+            ResumeAction::FinalizeFromPushed(commit) => {
+                opline!(
+                    "seller node execute job_id={job_id}: delivery already pushed (commit={commit}) — finalizing from the stored commit, NOT re-running the agent (#552)"
+                );
+                self.finalize_pushed_delivery(job_id, &commit).await;
+                return;
+            }
+            ResumeAction::SkipTerminal => {
+                opline!(
+                    "seller node execute skip job_id={job_id}: job already {state:?}/delivered (idempotent — not re-run)"
+                );
+                return;
+            }
+            ResumeAction::SkipLapsed => {
+                opline!(
+                    "seller node execute skip job_id={job_id}: offer deadline already passed (lapsed) — failing the stale award, NOT re-running or finalizing (#552)"
+                );
+                self.fail_job(job_id).await;
+                return;
+            }
         }
 
+        // RunAgent: a genuinely mid-flight award with a live deadline — it now needs its seller config
+        // and full offer facts to execute.
         let Some(seller) = self.node.home().config.seller.clone() else {
             opline!("seller node execute skip job_id={job_id}: no [seller] config");
             self.fail_job(job_id).await;
             return;
         };
-        // Offer facts (task + amount + buyer + absolute deadline) were journaled at claim time.
-        let offer = match self.node.store().offer_row(job_id) {
-            Ok(Some(offer)) => offer,
-            Ok(None) => {
-                opline!("seller node execute fail job_id={job_id}: offer facts missing");
-                self.fail_job(job_id).await;
-                return;
-            }
-            Err(error) => {
-                opline!("seller node execute fail job_id={job_id}: offer read failed ({error})");
-                self.fail_job(job_id).await;
-                return;
-            }
+        // `offer` was read tolerantly above (for the deadline); its true absence fails the job here.
+        let Some(offer) = offer else {
+            opline!("seller node execute fail job_id={job_id}: offer facts missing");
+            self.fail_job(job_id).await;
+            return;
         };
         // The claim-time creq is the single source of truth for the payment terms (audit N-4): the
         // delivery cosignature signs ITS hash, never a rebuild from live config.
@@ -3509,6 +3715,13 @@ impl SellerNodeRunner {
             }
         };
 
+        // #552: arm the durable pushed-delivery marker IMMEDIATELY after the push (arm-state-after-
+        // the-event) and BEFORE the sign+enqueue — so a crash in that window is a RESUMABLE delivery
+        // (finalized from this commit) rather than a re-run that re-executes the agent and re-pushes.
+        if let Err(error) = self.node.store().mark_pushed(job_id, &commit, now_unix()) {
+            opline!("seller node execute job_id={job_id}: mark_pushed failed (continuing): {error}");
+        }
+
         // Bind the trade + delivered commit + STORED creq hash into the co-signature preimage and
         // sign it through the signer actor (the seller key never leaves the actor).
         let delivery_kind = match seller_delivery_kind(&seller.git_remote, &branch, &commit) {
@@ -3596,6 +3809,111 @@ impl SellerNodeRunner {
             ),
             Err(error) => {
                 opline!("seller node execute fail job_id={job_id}: deliver journal failed ({error})");
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                return;
+            }
+        }
+        self.drain().await;
+    }
+
+    /// Complete an interrupted delivery from its journaled pushed commit (#552), WITHOUT re-running
+    /// the agent or re-pushing. Reached only from the resume path via [`resume_action`] =
+    /// `FinalizeFromPushed`: the delivery commit is already on the remote, but the sign+enqueue was
+    /// interrupted (crash after push, before `deliver_and_enqueue`). Re-derives the SAME signed
+    /// digest — the delivery-receipt preimage is deterministic in the STORED offer facts + creq +
+    /// pushed commit, identical to what the interrupted run would have signed — signs it, and
+    /// enqueues (idempotent: `deliver_and_enqueue` dedups). Mirrors the sign+enqueue tail of
+    /// `execute_job`; keep the two in sync — both sign the SAME preimage digest, so the buyer accepts
+    /// the receipt whichever pass produced it (the schnorr signature BYTES differ per signing via
+    /// random aux_rand; BIP340 verification is over the digest, not the bytes). Exec-metadata is
+    /// degraded (no agent ran this pass) and rides only as UNSIGNED result tags — it is not in the
+    /// signed digest, so its absence cannot make the buyer reject the receipt.
+    async fn finalize_pushed_delivery(&self, job_id: &str, commit: &str) {
+        let Some(seller) = self.node.home().config.seller.clone() else {
+            opline!("seller node finalize skip job_id={job_id}: no [seller] config");
+            self.fail_job(job_id).await;
+            return;
+        };
+        let offer = match self.node.store().offer_row(job_id) {
+            Ok(Some(offer)) => offer,
+            _ => {
+                opline!("seller node finalize fail job_id={job_id}: offer facts missing");
+                self.fail_job(job_id).await;
+                return;
+            }
+        };
+        let stored_creq = match self.node.store().job_creq(job_id) {
+            Ok(Some(creq)) => creq,
+            _ => {
+                opline!("seller node finalize fail job_id={job_id}: stored creq missing");
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                return;
+            }
+        };
+        let seller_pubkey = self.seller_pubkey.to_hex();
+        let branch = format!("maxplayer/{}", &job_id[..8.min(job_id.len())]);
+        let delivery_kind = match seller_delivery_kind(&seller.git_remote, &branch, commit) {
+            Ok(kind) => kind,
+            Err(error) => {
+                opline!("seller node finalize fail job_id={job_id}: delivery kind typing failed ({error})");
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                return;
+            }
+        };
+        let preimage = delivery_receipt_preimage(
+            job_id,
+            &offer.task,
+            offer.amount_sats,
+            &offer.buyer_pubkey,
+            &seller_pubkey,
+            commit,
+            delivery_kind.as_str(),
+            &stored_creq,
+        );
+        let seller_sig = match self.node.signer().sign_receipt_hash(preimage.digest_hex()).await {
+            Ok(Ok(sig)) => sig,
+            Ok(Err(error)) => {
+                opline!("seller node finalize fail job_id={job_id}: receipt sign refused ({error})");
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                return;
+            }
+            Err(error) => {
+                opline!("seller node finalize fail job_id={job_id}: signer actor gone ({error})");
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                return;
+            }
+        };
+        // No agent ran this pass, so usage/timing are absent (opportunistic — absent stays absent).
+        let exec_metadata = seller_exec_metadata(&[], None, 0, None);
+        let draft = git_result_draft(
+            job_id,
+            &offer.buyer_pubkey,
+            &seller.git_remote,
+            &branch,
+            commit,
+            offer.amount_sats,
+            &preimage.job_hash,
+            &seller_sig,
+            format!("delivery commit {commit}"),
+            &exec_metadata,
+        );
+        let now = now_unix();
+        match self.node.store().deliver_and_enqueue(
+            job_id,
+            commit,
+            &draft,
+            now,
+            now + RESULT_PUBLISH_WINDOW_SECS,
+            now,
+        ) {
+            Ok(true) => opline!(
+                "seller node finalized interrupted delivery job_id={job_id} commit={commit} result enqueued (no agent re-run) (#552)"
+            ),
+            Ok(false) => opline!(
+                "seller node finalize job_id={job_id}: delivery already journaled (dedup no-op)"
+            ),
+            Err(error) => {
+                opline!("seller node finalize fail job_id={job_id}: deliver journal failed ({error})");
                 self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
                 return;
             }
@@ -6436,6 +6754,136 @@ mod tests {
             .record_award(&"w".repeat(64), job, buyer, award_time)
             .expect("award");
         (store, root)
+    }
+
+    // TOOTH (#552) — RESTART-SCOPED terminal-shape resume SELECTION over REAL persisted rows. The pure
+    // `resume_action` unit test drives SYNTHETIC markers; this proves the STORE getters return the
+    // right markers for rows that survived a process restart (drop + reopen on the SAME sqlite home),
+    // and that they COMPOSE to the correct action — the exact composition `execute_job` performs on
+    // resume (job_state + has_delivery + has_receipt + pushed_commit + offer deadline → resume_action).
+    //
+    // Trigger scoping (a quiet window is a SILENT false-pass, #552/37716): every row is seeded
+    // settled/lapsed/pushed BEFORE the drop and asserted AFTER the reopen, so the assertion window
+    // provably contains a restart-after-settled — it cannot decay into an always-green check.
+    //
+    // Bites (red on revert): drop the deadline-lapse check and the two lapsed rows become RunAgent —
+    // re-driving a dead award, re-running the agent and re-emitting a delivery (the #552 harm); drop
+    // the `pushed_commit` column or its migration and `pushed_live` cannot read its commit back after
+    // reopen, so the FinalizeFromPushed corner fails; break offer-row persistence and every deadline
+    // reads None (all lapsed rows would wrongly resume).
+    #[test]
+    fn restart_resume_selection_over_persisted_rows() {
+        let now = 1_000_000i64; // the reopen "now"
+        let live = now + 3_600; // deadline still in the future
+        let lapsed = now - 1; // deadline already passed
+        let buyer = "b".repeat(64);
+        let seller = "s".repeat(64);
+        let creq = "creqZ";
+
+        // One job id (== offer id, the production invariant) per terminal shape.
+        let mid_flight = "1".repeat(64); // awarded, live, no marker    → RunAgent (THE FOIL)
+        let lapsed_bare = "2".repeat(64); // awarded, LAPSED, no marker  → SkipLapsed (dominant #552 case)
+        let pushed_live = "3".repeat(64); // awarded, live, pushed       → FinalizeFromPushed
+        let pushed_lapsed = "4".repeat(64); // awarded, LAPSED, pushed   → SkipLapsed (lapse BEFORE finalize)
+        let delivered = "5".repeat(64); // delivered                     → SkipTerminal
+
+        let root = temp_dir("resume-restart");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mk root");
+        let db = root.join("seller.sqlite");
+
+        // ---- Pre-restart: seed every shape into ONE store, then DROP it (process "crash").
+        {
+            let store = SellerStore::open(&db).expect("open");
+            let seed = |job: &str, deadline: i64, award: &str| {
+                store
+                    .record_offer(
+                        &Offer {
+                            offer_id: job.to_owned(),
+                            buyer_pubkey: buyer.clone(),
+                            amount_sats: 21,
+                            unit: "sat".to_owned(),
+                            task: "t".to_owned(),
+                            deadline_unix: deadline,
+                            targeted: true,
+                            requested_agent: None,
+                        },
+                        1,
+                    )
+                    .expect("record offer");
+                // A per-job draft (distinct event id) — claim_and_enqueue dedups on `claim:{job}`.
+                let draft = claim_draft(job, &buyer, &seller, creq, &[]);
+                store
+                    .claim_and_enqueue(job, job, creq, &draft, 1, 9_999_999_999, 1)
+                    .expect("claim");
+                store.record_award(award, job, &buyer, 2).expect("award");
+            };
+            seed(&mid_flight, live, &format!("{}1", "w".repeat(63)));
+            seed(&lapsed_bare, lapsed, &format!("{}2", "w".repeat(63)));
+            seed(&pushed_live, live, &format!("{}3", "w".repeat(63)));
+            store.mark_pushed(&pushed_live, "commitL", 3).expect("mark pushed (live)");
+            seed(&pushed_lapsed, lapsed, &format!("{}4", "w".repeat(63)));
+            store.mark_pushed(&pushed_lapsed, "commitX", 3).expect("mark pushed (lapsed)");
+            seed(&delivered, live, &format!("{}5", "w".repeat(63)));
+            let ddraft = claim_draft(&delivered, &buyer, &seller, creq, &[]);
+            store
+                .deliver_and_enqueue(&delivered, &"c".repeat(40), &ddraft, 4, 4 + RESULT_PUBLISH_WINDOW_SECS, 4)
+                .expect("deliver");
+            // store drops here — the sqlite home persists on disk.
+        }
+
+        // ---- Restart: reopen the SAME home. Every marker must come back from durable storage.
+        let store = SellerStore::open(&db).expect("reopen");
+
+        // Compose exactly as execute_job does on resume: read the durable markers, then decide.
+        let action = |job: &str| {
+            let state = store.job_state(job).expect("job_state").expect("job row present");
+            let has_delivery = store.has_delivery(job).expect("has_delivery");
+            let has_receipt = store.has_receipt(job).expect("has_receipt");
+            let pushed = store.pushed_commit(job).expect("pushed_commit");
+            let deadline = store.offer_row(job).expect("offer_row").map(|o| o.deadline_unix);
+            resume_action(state, has_delivery, has_receipt, pushed, deadline, now)
+        };
+
+        assert_eq!(
+            action(&mid_flight),
+            ResumeAction::RunAgent,
+            "live + no marker ⇒ resume + run (THE FOIL — a real award must not stall)"
+        );
+        assert_eq!(
+            action(&lapsed_bare),
+            ResumeAction::SkipLapsed,
+            "lapsed stale award ⇒ fail, never re-drive (#552 durable primary)"
+        );
+        assert_eq!(
+            action(&pushed_live),
+            ResumeAction::FinalizeFromPushed("commitL".into()),
+            "live + pushed ⇒ finalize from the durable commit (it survived the restart)"
+        );
+        assert_eq!(
+            action(&pushed_lapsed),
+            ResumeAction::SkipLapsed,
+            "pushed BUT lapsed ⇒ fail — lapse BEFORE finalize (never emit a result past the deadline)"
+        );
+        assert_eq!(
+            action(&delivered),
+            ResumeAction::SkipTerminal,
+            "delivered stays terminal across the restart"
+        );
+
+        // The coarse pre-filter (what the resume loop iterates) admits every slot-occupier and the
+        // delivered row (jobs.state IN awarded/executing/delivered); resume_action is the refinement.
+        let resumable: std::collections::BTreeSet<String> = store
+            .resumable_jobs()
+            .expect("resumable")
+            .into_iter()
+            .map(|(job, _state)| job)
+            .collect();
+        for job in [&mid_flight, &lapsed_bare, &pushed_live, &pushed_lapsed, &delivered] {
+            assert!(resumable.contains(job), "resumable set must contain {job}");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // TOOTH (invariant 8 / audit N-4), NODE-level: the delivery cosignature the execute body signs
