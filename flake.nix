@@ -23,7 +23,7 @@
           # Args common to every `maxplayer` build.
           maxplayerArgs = {
             pname = "maxplayer";
-            version = "0.1.0";
+            version = "0.1.1";
             src = self;
 
             # Vendor all dependencies hermetically from the committed
@@ -82,7 +82,7 @@
           # `lib.getExe` in `nixosModules.relay` resolves `meta.mainProgram`.
           relay-write-policy = pkgs.rustPlatform.buildRustPackage {
             pname = "maxplayer-relay-write-policy";
-            version = "0.1.0";
+            version = "0.1.1";
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
             cargoBuildFlags = [
