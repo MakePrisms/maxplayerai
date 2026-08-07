@@ -157,7 +157,10 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
     // reachable, seller key missing, relay unreachable); WARNs are advisory. Runs AFTER
     // ensure_seller_config so the agent-preset check sees the just-resolved [seller], and BEFORE
     // any network mutation (NIP-34 announce / discoverability publish) so we fail fast without
-    // side effects. `--skip-doctor` bypasses the gate entirely (the checks are never run).
+    // side effects. Still fail-closed, but a purely TRANSIENT failure (relay or all mints briefly
+    // unreachable) is retried with backoff before refusing, so an unsupervised seat rides out a
+    // boot-time dependency blip instead of dying to it (issue #553); an unrecoverable failure still
+    // refuses at once. `--skip-doctor` bypasses the gate entirely (the checks are never run).
     let gate = if options.skip_doctor {
         let _ = writeln!(
             err,
