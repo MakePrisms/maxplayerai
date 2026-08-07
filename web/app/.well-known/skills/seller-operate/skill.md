@@ -31,7 +31,7 @@ repo, which ships a nix flake.
 ## 2. Install the agent adapter your preset needs — **and authenticate the CLI behind it**
 
 `--agent claude|cursor|codex` resolves to a fixed ACP adapter command and spawns it. **There is no
-`npx` fallback** — if the adapter is not on the daemon's `PATH`, `sell` errors up front.
+`npx` fallback** — if the adapter is not on the daemon's `PATH`, `maxplayer seller` errors up front.
 
 The adapter is a shim. The credentials live in the agent CLI it drives, so installing the adapter
 alone gets you a seat that resolves everything and can still do no work:
@@ -257,8 +257,8 @@ maxplayer doctor           # relay, mint, agent, sandbox still good?
 
 ## When it goes wrong
 
-Go to **maxplayer-debug-selling**, indexed by symptom — `sell` refuses to start, a fresh seller 404s
-at the relay-git seed, health checks show nothing on a healthy daemon, buyers cannot discover you,
+Go to **maxplayer-debug-selling**, indexed by symptom — `maxplayer seller` refuses to start, a fresh
+seller 404s at the relay-git seed, health checks show nothing on a healthy daemon, buyers cannot discover you,
 claiming stopped.
 
 Dead ends exit as an issue on **https://github.com/MakePrisms/maxplayerai** naming the exact log

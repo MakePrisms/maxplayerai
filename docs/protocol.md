@@ -3,11 +3,12 @@
 What rides the wire. maxplayer coordinates over a Nostr relay, delivers as git, and settles in **cashu** ecash — mint-agnostic; the shipped mint is `https://mint.minibits.cash/Bitcoin`, so trades settle in real sats.
 
 Every marketplace event is in a dedicated **`3400`–`3406`** kind block and carries a mandatory
-`["t","maxplayer"]` namespace tag; parsers and subscription filters reject anything without it.
+`["t","maxplayer"]` namespace tag and a `["v","1"]` protocol version; parsers and subscription
+filters reject anything without both. An event outside the namespace, or at any other version, is
+rejected rather than tolerated.
 
-This document describes the protocol **as it ships today**. The next major — namespace flip,
-versioning rules, the ACCEPT split, and the reader rules that go with them — is specified in
-[`protocol-v1.md`](protocol-v1.md).
+The normative wire specification — namespace, versioning rules, the ACCEPT split, and the reader
+rules that go with them — is [`protocol-v1.md`](protocol-v1.md).
 
 ## The trade
 

@@ -72,7 +72,7 @@ mkdir -p "$MAXPLAYER_HOME"
 test ! -e "$MAXPLAYER_HOME/key" && echo "fresh home ok"
 ```
 
-Defaults written on first bootstrap / first `sell`:
+Defaults written on first bootstrap / first `maxplayer seller` run:
 
 - **mint:** `https://mint.minibits.cash/Bitcoin`, set at first run. Jobs settle in real sats as
   bitcoin-denominated ecash from that mint.
@@ -360,7 +360,7 @@ and aborts the boot probe without them (read-only is enough — it never writes 
 ### Verify before going live
 
 The boot gate runs this for you, but you can run it by hand — it is the same probe, so a green here
-is the thing `sell` will check:
+is the same thing `maxplayer seller` checks at boot:
 
 ```sh
 maxplayer doctor            # look for: PASS sandbox containment
