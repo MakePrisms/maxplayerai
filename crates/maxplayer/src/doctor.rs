@@ -34,6 +34,13 @@ struct Check {
     status: Status,
     detail: String,
     hint: Option<String>,
+    /// Fault CLASS of a blocking `Fail`, distinct from `status` (which is outcome SEVERITY): `true`
+    /// when the failure is a transient dependency blip (a relay/mint briefly unreachable) that a
+    /// re-run could clear, `false` when it is an unrecoverable misconfiguration a retry cannot fix.
+    /// Read ONLY by the seller boot gate's bounded transient-retry ([`run_readiness_with_retry`]), so
+    /// it exists only in builds that carry that gate — a buyer-only (wallet, no-acp) build has none.
+    #[cfg(any(feature = "acp", test))]
+    transient: bool,
 }
 
 impl Check {
@@ -43,6 +50,10 @@ impl Check {
             status,
             detail: detail.into(),
             hint,
+            // Default fault class is unrecoverable: only the two dependency-reachability checks
+            // opt into transient via `fail_transient`, so every other blocking Fail refuses at once.
+            #[cfg(any(feature = "acp", test))]
+            transient: false,
         }
     }
 
@@ -56,6 +67,18 @@ impl Check {
 
     fn fail(name: &str, detail: impl Into<String>, hint: impl Into<String>) -> Self {
         Self::new(name, Status::Fail, detail, Some(hint.into()))
+    }
+
+    /// A blocking failure whose CAUSE is a transient dependency blip — a relay or mint briefly
+    /// unreachable at boot — rather than an unrecoverable misconfiguration. Renders identically to
+    /// [`Check::fail`]; the only difference is the `transient` marker the seller boot gate reads to
+    /// decide whether a re-run could recover (see [`run_readiness_with_retry`]). In a buyer-only
+    /// (wallet, no-acp) build there is no gate and no `transient` field, so this collapses to `fail`.
+    fn fail_transient(name: &str, detail: impl Into<String>, hint: impl Into<String>) -> Self {
+        let check = Self::fail(name, detail, hint);
+        #[cfg(any(feature = "acp", test))]
+        let check = Self { transient: true, ..check };
+        check
     }
 
     fn render(&self) -> String {
@@ -90,6 +113,106 @@ fn readiness_ok(results: &[Check]) -> bool {
     !results.iter().any(|c| c.status == Status::Fail)
 }
 
+/// Total readiness-gate evaluations before a still-failing box is refused: one initial pass plus up
+/// to `READINESS_MAX_ATTEMPTS - 1` transient re-runs. Bounded so an unrecoverable box still exits (a
+/// supervisor can then surface the fault) rather than looping forever.
+#[cfg(any(feature = "acp", test))]
+const READINESS_MAX_ATTEMPTS: u32 = 5;
+
+/// Linear backoff base: the k-th retry waits `READINESS_BACKOFF_BASE * k`. Named and linear so the
+/// wait is operator-visible and predictable rather than an opaque exponential curve.
+#[cfg(any(feature = "acp", test))]
+const READINESS_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Wait before the retry that follows a just-failed attempt `attempt` (1-based): `BASE * attempt`.
+/// Over `READINESS_MAX_ATTEMPTS = 5` that is the four inter-attempt waits 20s + 40s + 60s + 80s =
+/// 200s worst case added before a transient box is finally refused.
+#[cfg(any(feature = "acp", test))]
+fn readiness_backoff(attempt: u32) -> std::time::Duration {
+    READINESS_BACKOFF_BASE * attempt
+}
+
+/// Whether a failed gate is worth retrying: `true` only when the set has at least one blocking `Fail`
+/// AND every blocking `Fail` is `transient`. A single unrecoverable `Fail` (missing key, no mints
+/// configured, unresolvable agent/launcher, containment, home perms) ⇒ `false` ⇒ refuse immediately,
+/// because re-running cannot fix a misconfiguration and the seat would only burn the whole backoff
+/// budget before the same refusal.
+#[cfg(any(feature = "acp", test))]
+fn transient_retry_worthwhile(results: &[Check]) -> bool {
+    let mut saw_blocking_fail = false;
+    for check in results.iter().filter(|c| c.status == Status::Fail) {
+        saw_blocking_fail = true;
+        if !check.transient {
+            return false;
+        }
+    }
+    saw_blocking_fail
+}
+
+/// Drive the readiness checks with bounded transient-retry, preserving fail-closed EXACTLY: the only
+/// new behavior is that a gate whose every blocking failure is transient (a relay/mint blip) is
+/// re-run up to `max_attempts` times before the same refuse verdict its caller maps to exit 2. A
+/// single unrecoverable blocking failure refuses immediately (no retry, no sleep); exhausting the
+/// transient retries refuses identically to a single-pass gate.
+///
+/// The retry knobs are injected — `run` re-runs the checks, `backoff` maps a just-failed attempt
+/// number to a wait, `sleep` performs it — so the schedule and ceiling are unit-tested without real
+/// sleeping (tests pass a recording `sleep` and a fake clock). Returns `Ok(())` when the box may
+/// start, `Err(())` when it must not.
+#[cfg(any(feature = "acp", test))]
+fn run_readiness_with_retry(
+    mut run: impl FnMut() -> Vec<Check>,
+    max_attempts: u32,
+    backoff: impl Fn(u32) -> std::time::Duration,
+    mut sleep: impl FnMut(std::time::Duration),
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<(), ()> {
+    let mut attempt: u32 = 1;
+    loop {
+        let results = run();
+        for result in &results {
+            let _ = writeln!(out, "{}", result.render());
+        }
+        if readiness_ok(&results) {
+            let warns = results.iter().filter(|c| c.status == Status::Warn).count();
+            let _ = writeln!(
+                out,
+                "readiness OK — {} check(s), {warns} warning(s); starting seller",
+                results.len()
+            );
+            return Ok(());
+        }
+        // At least one blocking Fail. Re-run ONLY when every blocking Fail is transient and attempts
+        // remain; anything else falls through to the unchanged fail-closed refusal below.
+        if attempt < max_attempts && transient_retry_worthwhile(&results) {
+            let wait = backoff(attempt);
+            let _ = writeln!(
+                out,
+                "readiness: transient check(s) failed — retry {attempt}/{} in {}s…",
+                max_attempts - 1,
+                wait.as_secs()
+            );
+            sleep(wait);
+            attempt += 1;
+            continue;
+        }
+        let failures: Vec<&Check> = results.iter().filter(|c| c.status == Status::Fail).collect();
+        let _ = writeln!(
+            err,
+            "\nmaxplayer seller REFUSING to start: {} blocking readiness check(s) failed —",
+            failures.len()
+        );
+        for failure in &failures {
+            let _ = writeln!(err, "  {}", failure.render());
+        }
+        let _ = writeln!(
+            err,
+            "resolve the item(s) above, then re-run `maxplayer seller`. To bypass these checks (NOT recommended), pass --skip-doctor."
+        );
+        return Err(());
+    }
+}
 
 #[cfg(feature = "wallet")]
 mod checks {
@@ -179,7 +302,10 @@ mod checks {
                 RELAY_CHECK,
                 format!("{relay_url}: connected (relay issued no NIP-42 challenge)"),
             ),
-            Err(error) => Check::fail(
+            // Transient: relay reachability is a live dependency, so a boot-time blip (relay
+            // restart, momentary network loss) can clear on a re-run — the seller boot gate retries
+            // this before refusing, unlike a misconfiguration such as a missing key.
+            Err(error) => Check::fail_transient(
                 RELAY_CHECK,
                 format!("{relay_url}: {error}"),
                 "check relay_url in config.toml and network/relay availability",
@@ -227,7 +353,10 @@ mod checks {
         if down.is_empty() {
             Check::pass(MINT_CHECK, format!("all {total} accepted mint(s) reachable"))
         } else if reachable == 0 {
-            Check::fail(
+            // Transient: mints ARE configured but every one is unreachable right now — a dependency
+            // blip the boot gate retries, distinct from the no-mints-configured Fail above, which is
+            // a misconfiguration a re-run cannot fix and therefore stays a plain (unrecoverable) fail.
+            Check::fail_transient(
                 MINT_CHECK,
                 format!("no accepted mint reachable — cannot settle anywhere ({})", down.join("; ")),
                 "check the mint URLs in [accepted_mints] and network availability",
@@ -686,6 +815,16 @@ fn run_doctor(
 /// path, so the gate needs no separate severity table. The mint check is deliberately aggregate:
 /// it blocks only when EVERY accepted mint is unreachable (a single degraded mint is a `Warn`).
 /// Non-critical checks (credential helper, telemetry) report `Pass`/`Warn` and never block.
+///
+/// Fail-closed is preserved, but a boot-time dependency BLIP is no longer fatal (issue #553): when
+/// EVERY blocking failure is transient (relay unreachable, or every accepted mint unreachable) the
+/// gate re-runs the checks with linear backoff up to [`READINESS_MAX_ATTEMPTS`] before refusing, so
+/// an unsupervised seat rides out a relay/mint restart instead of dying to it. A single UNRECOVERABLE
+/// failure (missing key, no mints configured, unresolvable agent/launcher, containment, home perms)
+/// still refuses immediately — a re-run cannot fix a misconfiguration — and exhausting the transient
+/// retries refuses with the identical exit-2 verdict a single-pass gate produced. The retry loop and
+/// schedule live in [`run_readiness_with_retry`]; this wrapper only supplies the real check runner,
+/// backoff and `std::thread::sleep` (the gate runs on a plain thread, not inside a runtime).
 // Gated with the seller surface it gates (#360): `sell` is the sole caller and is `acp`-only, so on
 // a buyer-only (wallet, no-acp) build this is correctly absent rather than dead. Every shipped build
 // carrying `acp` also carries `wallet`, so the wallet-gated `checks` it calls are present.
@@ -700,33 +839,14 @@ pub fn sell_readiness_gate(
         out,
         "maxplayer seller — startup readiness checks (auto-doctor; pass --skip-doctor to bypass)"
     );
-    let results = run_checks(build_checks(home, unsafe_no_sandbox));
-    for result in &results {
-        let _ = writeln!(out, "{}", result.render());
-    }
-    if readiness_ok(&results) {
-        let warns = results.iter().filter(|c| c.status == Status::Warn).count();
-        let _ = writeln!(
-            out,
-            "readiness OK — {} check(s), {warns} warning(s); starting seller",
-            results.len()
-        );
-        return Ok(());
-    }
-    let failures: Vec<&Check> = results.iter().filter(|c| c.status == Status::Fail).collect();
-    let _ = writeln!(
+    run_readiness_with_retry(
+        || run_checks(build_checks(home, unsafe_no_sandbox)),
+        READINESS_MAX_ATTEMPTS,
+        readiness_backoff,
+        std::thread::sleep,
+        out,
         err,
-        "\nmaxplayer seller REFUSING to start: {} blocking readiness check(s) failed —",
-        failures.len()
-    );
-    for failure in &failures {
-        let _ = writeln!(err, "  {}", failure.render());
-    }
-    let _ = writeln!(
-        err,
-        "resolve the item(s) above, then re-run `maxplayer seller`. To bypass these checks (NOT recommended), pass --skip-doctor."
-    );
-    Err(())
+    )
 }
 
 #[cfg(test)]
@@ -1165,5 +1285,180 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- Issue #553: bounded transient-retry over the startup readiness gate ----
+    //
+    // These drive `run_readiness_with_retry` directly with SCRIPTED check-sets and an injected
+    // recording `sleep` (the waits are captured, never actually slept), so the schedule and ceiling
+    // are exercised in microseconds. They are plain `#[test]`s — the retry driver is feature-neutral
+    // logic — so they run in BOTH the default-feature and the `acp` CI jobs (non-inert in each).
+
+    /// Outcome of one scripted gate drive: the verdict, how many times the checks were re-run, the
+    /// waits the gate asked to sleep (recorded, NOT slept — the real `readiness_backoff` is used, so
+    /// this vector also pins the schedule), and the captured stdout/stderr.
+    struct GateDrive {
+        result: Result<(), ()>,
+        attempts: usize,
+        waits: Vec<std::time::Duration>,
+        out: String,
+        err: String,
+    }
+
+    fn drive_gate(
+        max_attempts: u32,
+        mut script: impl FnMut(usize) -> Vec<Check>,
+    ) -> GateDrive {
+        let attempts = std::cell::Cell::new(0usize);
+        let waits = std::cell::RefCell::new(Vec::new());
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let result = run_readiness_with_retry(
+            || {
+                let n = attempts.get();
+                attempts.set(n + 1);
+                script(n)
+            },
+            max_attempts,
+            readiness_backoff,
+            |wait| waits.borrow_mut().push(wait),
+            &mut out,
+            &mut err,
+        );
+        GateDrive {
+            result,
+            attempts: attempts.get(),
+            waits: waits.into_inner(),
+            out: String::from_utf8(out).unwrap(),
+            err: String::from_utf8(err).unwrap(),
+        }
+    }
+
+    // The retry PREDICATE: worthwhile only when there IS a blocking Fail and EVERY blocking Fail is
+    // transient. This is the classification the whole fix keys on (fault CLASS, not outcome severity).
+    #[test]
+    fn transient_retry_worthwhile_requires_all_blocking_fails_transient() {
+        assert!(
+            !transient_retry_worthwhile(&[Check::pass("a", "ok"), Check::warn("b", "meh", "x")]),
+            "no blocking Fail ⇒ nothing to retry"
+        );
+        assert!(
+            transient_retry_worthwhile(&[Check::fail_transient("relay reachability", "down", "x")]),
+            "a lone transient Fail is retry-worthwhile"
+        );
+        assert!(
+            !transient_retry_worthwhile(&[Check::fail("seller key", "missing", "x")]),
+            "a lone unrecoverable Fail is not"
+        );
+        assert!(
+            !transient_retry_worthwhile(&[
+                Check::fail_transient("relay reachability", "down", "x"),
+                Check::fail("seller key", "missing", "x"),
+            ]),
+            "one unrecoverable among transients ⇒ refuse, not retry"
+        );
+        assert!(
+            transient_retry_worthwhile(&[
+                Check::warn("mint reachability", "degraded", "x"),
+                Check::fail_transient("relay reachability", "down", "x"),
+            ]),
+            "a non-blocking WARN does not defeat retry"
+        );
+    }
+
+    // (1) A transient blip that clears on re-run BOOTS the seller — the recovery #553 asks for.
+    // RED-PROVE: delete the retry branch in `run_readiness_with_retry` (refuse on the first Fail) and
+    // this goes red — attempt 1's transient Fail is treated as fatal and the box never re-runs.
+    #[test]
+    fn transient_failure_then_success_boots() {
+        let run = drive_gate(READINESS_MAX_ATTEMPTS, |n| {
+            if n == 0 {
+                vec![Check::fail_transient("relay reachability", "relay down", "check relay")]
+            } else {
+                vec![Check::pass("relay reachability", "connected + NIP-42 authenticated")]
+            }
+        });
+        assert_eq!(run.result, Ok(()), "a transient blip that clears must boot; stderr: {}", run.err);
+        assert_eq!(run.attempts, 2, "exactly one retry after the blip");
+        assert_eq!(
+            run.waits,
+            vec![readiness_backoff(1)],
+            "exactly one backoff — the first-retry wait"
+        );
+        assert!(run.out.contains("retry 1/"), "operator must see the retry wait: {}", run.out);
+        assert!(run.out.contains("starting seller"), "the recovered gate boots: {}", run.out);
+    }
+
+    // (2) An unrecoverable misconfiguration refuses on the FIRST pass — no retry, no sleep — because
+    // re-running cannot conjure a missing key. RED-PROVE: make `transient_retry_worthwhile` ignore the
+    // `transient` marker (retry on any Fail) and this goes red — `attempts` climbs past 1 and the gate
+    // sleeps before the inevitable refusal.
+    #[test]
+    fn unrecoverable_failure_refuses_immediately_without_retry() {
+        let run = drive_gate(READINESS_MAX_ATTEMPTS, |_| {
+            vec![Check::fail("seller key", "key missing — seller has no signing key", "generate the key")]
+        });
+        assert_eq!(run.result, Err(()), "an unrecoverable failure must refuse");
+        assert_eq!(run.attempts, 1, "no retry on an unrecoverable failure");
+        assert!(run.waits.is_empty(), "must not sleep before refusing an unrecoverable failure");
+        assert!(
+            run.err.contains("REFUSING to start"),
+            "the fail-closed refusal message is preserved: {}",
+            run.err
+        );
+    }
+
+    // (3) A transient failure that NEVER clears exhausts the bounded retries, then refuses — the
+    // fail-closed CEILING. Pins the exact schedule (20s,40s,60s,80s = 200s) and that the box is
+    // ultimately refused, not looping forever. RED-PROVE: dropping the `attempt < max_attempts` guard
+    // (unbounded loop) hangs this test instead of returning Err.
+    #[test]
+    fn exhausted_transient_retries_still_refuse_fail_closed() {
+        use std::time::Duration;
+        let run = drive_gate(READINESS_MAX_ATTEMPTS, |_| {
+            vec![Check::fail_transient("relay reachability", "relay down", "check relay")]
+        });
+        assert_eq!(run.result, Err(()), "exhausted transient retries must still refuse");
+        assert_eq!(
+            run.attempts,
+            READINESS_MAX_ATTEMPTS as usize,
+            "every attempt is consumed before refusing"
+        );
+        assert_eq!(
+            run.waits,
+            vec![
+                readiness_backoff(1),
+                readiness_backoff(2),
+                readiness_backoff(3),
+                readiness_backoff(4),
+            ],
+            "linear backoff across the four inter-attempt waits"
+        );
+        assert_eq!(
+            run.waits.iter().sum::<Duration>(),
+            Duration::from_secs(200),
+            "documented 200s worst-case added wait over 5 attempts"
+        );
+        assert!(
+            run.err.contains("REFUSING to start"),
+            "the fail-closed refusal message is preserved: {}",
+            run.err
+        );
+    }
+
+    // (4) A mixed set — a transient Fail ALONGSIDE an unrecoverable one — refuses immediately: ANY
+    // unrecoverable blocking failure defeats retry, so a genuinely misconfigured seat never burns the
+    // backoff budget on a dependency that would not have saved it.
+    #[test]
+    fn any_unrecoverable_failure_defeats_transient_retry() {
+        let run = drive_gate(READINESS_MAX_ATTEMPTS, |_| {
+            vec![
+                Check::fail_transient("relay reachability", "relay down", "check relay"),
+                Check::fail("seller key", "key missing", "generate the key"),
+            ]
+        });
+        assert_eq!(run.result, Err(()));
+        assert_eq!(run.attempts, 1, "a single unrecoverable failure refuses at once");
+        assert!(run.waits.is_empty(), "no sleep when an unrecoverable failure is present");
     }
 }
