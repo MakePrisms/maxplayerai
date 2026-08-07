@@ -33,7 +33,11 @@ pub enum WalletOpsError {
     /// `allow_real_mints` is off. A POLICY block — `mints add` cannot clear it, so it must NOT
     /// borrow [`Self::MintNotAllowed`]'s remedy; the control is `MAXPLAYER_ALLOW_REAL_MINTS` (#465).
     RealMintDisallowed { mint_url: String },
-    MintPinnedDefault,
+    /// `remove_mint` refuses to remove the home's pinned default mint. `mint_url` carries that
+    /// actual default (`config.default_mint()`) so the message names the real pinned mint rather
+    /// than a hardcoded constant — on a real-minibits home the constant would be a false-default
+    /// lie (#579).
+    MintPinnedDefault { mint_url: String },
     Wallet(String),
 }
 
@@ -51,9 +55,9 @@ impl std::fmt::Display for WalletOpsError {
                  Set MAXPLAYER_ALLOW_REAL_MINTS=true (or allow_real_mints in config.toml) to opt in, \
                  or use --mint {DEFAULT_MINT_URL} for dev/play-money"
             ),
-            Self::MintPinnedDefault => write!(
+            Self::MintPinnedDefault { mint_url } => write!(
                 formatter,
-                "cannot remove the default mint ({DEFAULT_MINT_URL}); only extra_mints are removable"
+                "cannot remove the default mint ({mint_url}); only extra_mints are removable"
             ),
             Self::Wallet(message) => write!(formatter, "wallet error: {message}"),
         }
@@ -743,7 +747,7 @@ pub fn remove_mint(home: &mut MaxplayerHome, mint_url: &str) -> Result<(), Walle
     let normalized = normalize_mint_url(mint_url)?;
     let default = normalize_mint_url(home.config.default_mint())?;
     if normalized == default {
-        return Err(WalletOpsError::MintPinnedDefault);
+        return Err(WalletOpsError::MintPinnedDefault { mint_url: default });
     }
     let present = home.config.extra_mints.iter().any(|entry| {
         normalize_mint_url(entry).ok().as_deref() == Some(normalized.as_str())
@@ -943,10 +947,40 @@ mod tests {
         assert_eq!(list_mints(&home).expect("list2").len(), 2);
 
         let err = remove_mint(&mut home, crate::home::DEFAULT_MINIBITS_MINT_URL).expect_err("pin");
-        assert!(matches!(err, WalletOpsError::MintPinnedDefault));
+        assert!(matches!(err, WalletOpsError::MintPinnedDefault { .. }));
 
         remove_mint(&mut home, "https://example.mint.test").expect("remove");
         assert_eq!(list_mints(&home).expect("list3").len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // #579: MintPinnedDefault's message hardcoded the testnut DEFAULT_MINT_URL, so on a
+    // real-minibits-default home `wallet mints remove <minibits>` errored "cannot remove the default
+    // mint (https://testnut.cashudevkit.org)" — naming testnut as the default when the mint actually
+    // pinned is minibits (config.default_mint()). Display-only lie; the guard pins correctly. This
+    // pins the message to the ACTUAL default. Reverting the Display fix REDS this.
+    #[test]
+    fn mint_pinned_default_error_names_the_real_default_not_testnut() {
+        let root = temp_home("pinned-default-message");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        let default = normalize_mint_url(home.config.default_mint()).expect("normalize default");
+        // The shipped default is the real minibits mint, distinct from the testnut constant — so a
+        // message naming testnut here is provably wrong, not a coincidental match.
+        assert_eq!(default, crate::home::DEFAULT_MINIBITS_MINT_URL);
+        assert_ne!(default, crate::home::DEFAULT_MINT_URL);
+
+        let message = remove_mint(&mut home, crate::home::DEFAULT_MINIBITS_MINT_URL)
+            .expect_err("removing the pinned default must error")
+            .to_string();
+        assert!(
+            message.contains(&default),
+            "message must name the real pinned default ({default}): {message}"
+        );
+        assert!(
+            !message.contains(crate::home::DEFAULT_MINT_URL),
+            "message must not name the testnut constant as the default: {message}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
