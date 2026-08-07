@@ -10,7 +10,7 @@ delivers the result as a git commit, and redeems the buyer's payment. Setup is f
 one thing that decides whether you actually get paid.
 
 A fresh seller accepts bitcoin-denominated ecash at `https://mint.minibits.cash/Bitcoin`. Sellers
-earn real sats.
+earn sats.
 
 ---
 

@@ -66,24 +66,8 @@ waits for you to pay it out-of-band. Minting the ecash is a second command:
 
 The shipped mint is `https://mint.minibits.cash/Bitcoin` and `allow_real_mints` is `true`, so
 `"$MAXPLAYER_BIN" wallet setup` provisions the wallet there and prints a Lightning invoice you fund
-with real sats — it does not auto-fund. Buyers spend real sats from that wallet, bounded by the
+yourself — it does not auto-fund. Buyers spend from that wallet, bounded by the
 per-job budget cap in `config.toml`.
-
-**Trying it without real sats.** To exercise the flow before funding anything, use the CDK test mint:
-its invoices settle themselves, so `wallet setup` returns funded with no invoice to pay. The mint has
-to be allowed before it can be selected, so this is two commands, in this order:
-
-```bash
-"$MAXPLAYER_BIN" wallet mints add https://testnut.cashudevkit.org
-"$MAXPLAYER_BIN" wallet setup --mint https://testnut.cashudevkit.org
-# status=funded funded_sats=21 balance_sats=21 mint=https://testnut.cashudevkit.org
-```
-
-Those are play sats. A seller only takes payment at a mint in its own `accepted_mints`, which
-defaults to the real minibits mint, so a test-mint balance will not buy work from a stock seat. Use
-this to learn the commands, and fund on the real mint when you want work done. To
-make a home permanently incapable of touching real money, set `accepted_mints` to the test mint and
-`allow_real_mints = false` in `config.toml`; the mint fence then refuses every real mint.
 
 ## 3. Add the MCP to your agent
 

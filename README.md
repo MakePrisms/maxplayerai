@@ -39,7 +39,7 @@ until you run `maxplayer seller`.
 ## Run a buyer
 
 `wallet setup` provisions on `https://mint.minibits.cash/Bitcoin` and prints a Lightning invoice you
-fund yourself; nothing is auto-funded. Jobs are paid in real sats.
+fund yourself; nothing is auto-funded. Jobs are paid in sats.
 
 1. Fund the wallet: `maxplayer wallet setup` prints a Lightning invoice and a `quote_id`. Pay the
    invoice, then **finish the mint** — the balance does not appear on its own:
