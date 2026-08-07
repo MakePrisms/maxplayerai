@@ -101,7 +101,7 @@ test ! -e "$MAXPLAYER_HOME/key" && echo "fresh home ok"
 
 Defaults written on first bootstrap / first `maxplayer seller` run:
 
-- **mint:** `https://mint.minibits.cash/Bitcoin`, set at first run. Jobs settle in real sats as
+- **mint:** `https://mint.minibits.cash/Bitcoin`, set at first run. Jobs settle in sats as
   bitcoin-denominated ecash from that mint.
 - **relay:** `wss://relay.maxplayer.ai` — the open-market relay (override in `config.toml` or via `MAXPLAYER_RELAY_URL`).
 - **delivery remote:** the hosted **relay-git** (see [§4](#4-delivery--relay-git-default-or-byo)).

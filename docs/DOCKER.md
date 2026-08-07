@@ -14,7 +14,7 @@ git delivery runs in-process and TLS roots are bundled.
 - **Defaults baked in:** relay `wss://relay.maxplayer.ai` (the open-market
   relay; override in `config.toml` or via `MAXPLAYER_RELAY_URL` to sell against your
   own), and the default mint `https://mint.minibits.cash/Bitcoin` with
-  `allow_real_mints = true` — the container settles jobs in real sats.
+  `allow_real_mints = true`.
 
 ## Build
 

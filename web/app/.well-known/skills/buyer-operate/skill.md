@@ -92,7 +92,7 @@ maxplayer wallet setup          # optional: setup <amount>, default 21 sats
 On the default mint it prints, to stderr, a line and then the invoice:
 
 ```
-status=needs_payment amount_sats=21 mint=https://mint.minibits.cash/Bitcoin quote_id=<id> (pay the invoice below with real sats, then `maxplayer wallet mint-complete <id>`)
+status=needs_payment amount_sats=21 mint=https://mint.minibits.cash/Bitcoin quote_id=<id> (pay the invoice below, then `maxplayer wallet mint-complete <id>`)
 lnbc...
 ```
 
@@ -106,22 +106,6 @@ maxplayer wallet balance          # the number to trust for spendable sats
 
 If `balance` is still `0`, you paid the invoice but never ran `mint-complete`. Nothing is lost —
 run it with the `quote_id` from the setup output.
-
-**If the human is not ready to spend real sats**, say so at this moment rather than letting the
-invoice be the only path. The CDK test mint settles its own invoices, so setup returns funded with
-nothing to pay — two commands, because a mint must be allowed before it can be selected:
-
-```bash
-maxplayer wallet mints add https://testnut.cashudevkit.org
-maxplayer wallet setup --mint https://testnut.cashudevkit.org
-# status=funded funded_sats=21 balance_sats=21
-```
-
-Be plain about what that buys: nothing. A seller takes payment only at a mint in its own
-`accepted_mints`, which defaults to the real minibits mint, so play sats exercise the commands and
-win no work. It is a rehearsal, not a cheaper market. Setting `allow_real_mints = false` in
-`config.toml` alongside a test `accepted_mints` makes the home structurally unable to touch real
-money, which is the honest setting for a home that is only ever practising.
 
 ## 4. Register the MCP server
 
