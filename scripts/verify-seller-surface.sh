@@ -23,7 +23,7 @@
 #   paired below with one that invokes the command, because a usage string is a claim about the
 #   surface and the dispatch arm is the surface.
 #
-# ★ Nothing here may publish. `maxplayer sell` with valid arguments BOOTS: it publishes kind-0 and
+# ★ Nothing here may publish. `maxplayer seller` with valid arguments BOOTS: it publishes kind-0 and
 #   NIP-89 discoverability and starts the heartbeat, which on a builder would advertise a seat that
 #   exists for the length of a CI job. The probe below therefore hands `sell` an argument its own
 #   parser rejects, so it refuses inside `sell::run` before any relay, home or key is touched.
@@ -82,8 +82,8 @@ help_rc=$?
 set -e
 [ "$help_rc" -eq 0 ] \
     || die "\`maxplayer --help\` exited $help_rc — cannot read the surface to check for \`sell\`:"$'\n'"$help_out"
-if ! grep -q 'maxplayer sell' <<<"$help_out"; then
-    die "\`maxplayer sell\` is not listed in --help — the seller advertise surface is not compiled into this artifact (#360):"$'\n'"$help_out"
+if ! grep -q 'maxplayer seller' <<<"$help_out"; then
+    die "\`maxplayer seller\` is not listed in --help — the seller advertise surface is not compiled into this artifact (#360):"$'\n'"$help_out"
 fi
 
 # The usage text is a static string; this is the arm. An option `sell` does not have reaches
@@ -92,14 +92,14 @@ fi
 # mentions a sell option, so the verdict moves with the feature rather than with the exit code
 # (both builds exit 1 here).
 set +e
-sell_out="$("$BINARY" sell --not-a-sell-option 2>&1)"
+sell_out="$("$BINARY" seller --not-a-sell-option 2>&1)"
 sell_rc=$?
 set -e
 if [ "$sell_rc" -ne 1 ]; then
-    die "\`maxplayer sell --not-a-sell-option\` exited $sell_rc, not the usage-error 1 its parser returns:"$'\n'"$sell_out"
+    die "\`maxplayer seller --not-a-sell-option\` exited $sell_rc, not the usage-error 1 its parser returns:"$'\n'"$sell_out"
 fi
 if ! grep -q 'unknown sell option' <<<"$sell_out"; then
-    die "\`maxplayer sell\` did not reach its own option parser — it fell through to the generic usage, which is what a build without the seller surface does:"$'\n'"$sell_out"
+    die "\`maxplayer seller\` did not reach its own option parser — it fell through to the generic usage, which is what a build without the seller surface does:"$'\n'"$sell_out"
 fi
 # The probe must have REFUSED, not booted. `sell` publishes before it can fail, so a probe that got
 # past the parser would have advertised a seat from a builder — assert none of the boot path was

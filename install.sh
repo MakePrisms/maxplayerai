@@ -15,7 +15,7 @@
 #
 # ── One artifact ────────────────────────────────────────────────────────────────────────────────
 # A release publishes ONE build per platform and this installs it. It carries the whole surface:
-# buying, and — through `maxplayer sell` — advertising a seat, claiming a job and executing it. Buyer
+# buying, and — through `maxplayer seller` — advertising a seat, claiming a job and executing it. Buyer
 # and seller are runtime modes of one command, not two downloads (#510).
 #
 # `--seller` selected a second, separately named asset up to rc.4. That asset no longer exists, so
@@ -304,7 +304,7 @@ main() {
     # stderr, not stdout: this is not part of the install's report, and the script is routinely run
     # through a pipe whose stdout somebody is reading.
     if [ -n "$seller" ]; then
-        warn "--seller (MAXPLAYER_SELLER) is deprecated and does nothing: one binary ships and it can already sell — run 'maxplayer sell'"
+        warn "--seller (MAXPLAYER_SELLER) is deprecated and does nothing: one binary ships and it can already sell — run 'maxplayer seller'"
     fi
 
     # A leading `v` is what a user copies out of a tag name, and `v0.1.0` would build an asset name

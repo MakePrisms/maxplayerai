@@ -1,6 +1,6 @@
 ---
 name: maxplayer-seller-operate
-description: Set up and run a Maxplayer seller from nothing — install the binary, first-run `maxplayer sell` with the two required choices, pass the doctor readiness gate, set your rate above the mint fee, and publish the profile that makes buyers able to find you. Explains the execution sentinel that decides whether a delivery gets paid, and the upgrade discipline that keeps a seller claiming. Use this to start selling; use maxplayer-debug-selling when a running seller stops working.
+description: Set up and run a Maxplayer seller from nothing — install the binary, first-run `maxplayer seller` with the two required choices, pass the doctor readiness gate, set your rate above the mint fee, and publish the profile that makes buyers able to find you. Explains the execution sentinel that decides whether a delivery gets paid, and the upgrade discipline that keeps a seller claiming. Use this to start selling; use maxplayer-debug-selling when a running seller stops working.
 ---
 
 # Operating the seller side of Maxplayer
@@ -16,7 +16,7 @@ one thing that decides whether you actually get paid.
 
 ## 1. Install
 
-One binary does both roles — the same install a buyer runs, then `maxplayer sell` instead of
+One binary does both roles — the same install a buyer runs, then `maxplayer seller` instead of
 `maxplayer mcp`.
 
 Every release so far is a **pre-release**, so `releases/latest/download/…` and GitHub's "latest
@@ -106,7 +106,7 @@ launcher = ["bwrap", "--unshare-all", "--die-with-parent",
 `--proc /proc` and `--ro-bind /sys /sys` are load-bearing: the Claude runtime reads both at startup
 and aborts without them (read-only is enough — it never writes them).
 
-**An open-pool seat is checked at boot.** `maxplayer sell` runs your launcher and reads what it did:
+**An open-pool seat is checked at boot.** `maxplayer seller` runs your launcher and reads what it did:
 a file beside your key must be unreadable from inside it, and the job workdir must be writable. Fail
 either leg and the seat refuses to start. That is why it runs the launcher rather than looking for
 the file — `launcher = ["env"]` resolves perfectly and confines nothing, so it fails the first leg: the
@@ -125,17 +125,17 @@ A launcher that passes binds two things: `$MAXPLAYER_HOME/seller-jobs` so the ag
 correctly, your key is in there.
 
 Omitting the section is the only intended way to opt out; `launcher = []` is refused at parse and the
-daemon will not start. `maxplayer sell --unsafe-no-sandbox` is the one escape hatch — it serves the
+daemon will not start. `maxplayer seller --unsafe-no-sandbox` is the one escape hatch — it serves the
 open pool uncontained, and waives only that check.
 
 ## 4. First run — two required choices
 
 ```bash
-maxplayer sell --agent claude --rate-sats 100
+maxplayer seller --agent claude --rate-sats 100
 ```
 
 That is the whole first run. It writes `[seller]` into `$MAXPLAYER_HOME/config.toml`; afterwards a bare
-`maxplayer sell` relaunches with zero prompts. Everything else defaults: relay
+`maxplayer seller` relaunches with zero prompts. Everything else defaults: relay
 `wss://relay.maxplayer.ai`, the real minibits mint, the hosted relay-git delivery remote, and an
 auto-generated `0600` key at `$MAXPLAYER_HOME/key`. There is **no `--key` flag** — you never supply one,
 and it is never printed.
@@ -195,7 +195,7 @@ So buyers find you **by capability**, not by you handing anyone a pubkey. The an
 parameterized-replaceable — republishing every launch is not spam. To set a nicer identity:
 
 ```bash
-maxplayer sell --name "your display name"      # persisted; or
+maxplayer seller --name "your display name"      # persisted; or
 maxplayer profile set --name "..." --about "..."
 maxplayer whoami                               # your hex pubkey, npub, and resolved home
 ```
@@ -204,7 +204,7 @@ maxplayer whoami                               # your hex pubkey, npub, and reso
 the open market is untargeted, so if nothing ever claims, that is usually why:
 
 ```bash
-maxplayer sell --claim-open-pool
+maxplayer seller --claim-open-pool
 ```
 
 ---
@@ -215,7 +215,7 @@ Every paid delivery must carry an **execution sentinel** inside the delivered tr
 `MAXPLAYER_EXECUTION_SENTINEL` at the tree root, carrying a marker bound to *this job's* hash.
 
 **The good news: the daemon writes it for you.** It is minted during the delivery snapshot and
-force-staged so no `.gitignore` can drop it. If you deliver through `maxplayer sell`, you do
+force-staged so no `.gitignore` can drop it. If you deliver through `maxplayer seller`, you do
 nothing.
 
 **What you must not do is bypass that path.** A commit you push by hand, or any delivery not

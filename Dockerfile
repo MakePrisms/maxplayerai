@@ -64,8 +64,8 @@ WORKDIR /data
 # tini as PID 1 so SIGTERM from `docker stop` cleanly shuts the daemon.
 ENTRYPOINT ["/usr/bin/tini", "--", "maxplayer"]
 
-# Default to the seller daemon. `maxplayer sell` with no args relaunches zero-prompt
+# Default to the seller daemon. `maxplayer seller` with no args relaunches zero-prompt
 # from an existing config.toml; first run needs --agent + --rate-sats (see
 # docker-compose.yml / docs/DOCKER.md). Override the command for `mcp`, `doctor`,
 # `wallet`, etc.
-CMD ["sell"]
+CMD ["seller"]

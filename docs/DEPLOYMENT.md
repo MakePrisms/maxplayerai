@@ -1,7 +1,7 @@
 # maxplayer deployment & packaging
 
 > **Status (dev tip) — read this first.** `flake.nix` ships the `maxplayer` client
-> (`packages.default`, built with `--features acp`), `apps.default` (`nix run … -- mcp|sell`), and a
+> (`packages.default`, built with `--features acp`), `apps.default` (`nix run … -- mcp|seller`), and a
 > `devShells.default` — **plus a launch-relay slice**: `packages.relay-write-policy` (the strfry
 > write-policy plugin), `nixosModules.relay` + `nixosConfigurations.relay` (a deployable relay box,
 > `nixos-rebuild switch --flake .#relay`), and static buyer builds `packages.buyer-static` /
@@ -63,7 +63,7 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
 ### Today — what `flake.nix` actually exposes
 
 - `packages.default` — the `maxplayer` client binary, built with `--features acp` (buyer MCP + seller).
-- `apps.default` — `nix run --refresh github:MakePrisms/maxplayerai/<ref> -- mcp|sell` (buyer + ad-hoc
+- `apps.default` — `nix run --refresh github:MakePrisms/maxplayerai/<ref> -- mcp|seller` (buyer + ad-hoc
   seller), no clone. Always `--refresh` (or pin+bump the rev) — nix caches the git ref and will
   otherwise serve a stale binary.
 - `devShells.default` — the workspace build/dev shell.
@@ -73,7 +73,7 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
 - `nixosModules.relay` + `nixosConfigurations.relay` — the launch relay as a deployable NixOS box
   (`nixos-rebuild switch --flake .#relay`); `nix/relay.nix` runs strfry in open mode with the
   write-policy plugin. The relay component of the backend, shipping today.
-- Root `Dockerfile` + `docker-compose.yml` — a **client** container only: a `maxplayer sell` daemon
+- Root `Dockerfile` + `docker-compose.yml` — a **client** container only: a `maxplayer seller` daemon
   (the compose `seller` service) or an attached buyer `maxplayer mcp`. Standalone cargo build, not
   derived from the flake. See [`DOCKER.md`](DOCKER.md).
 - **GitHub Releases + `install.sh`** — outside the flake entirely.
@@ -85,7 +85,7 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
   `releases/latest/download/…` and the "latest release" API both 404, so the install must name a
   version (`MAXPLAYER_VERSION=x.y.z` and a tagged asset URL). Intel macs are not
   covered: the matrix builds `aarch64-apple-darwin` only. ★ These artifacts are
-  built `--no-default-features --features wallet,acp` — the whole surface. `maxplayer sell` is in
+  built `--no-default-features --features wallet,acp` — the whole surface. `maxplayer seller` is in
   every one of them, so this path deploys a seller as readily as a buyer. A buyer-only narrowing
   (`--no-default-features --features wallet`) is buildable from source; no release publishes it.
 
@@ -108,7 +108,7 @@ component plus the client binary, so each service builds from the same source an
 ## Personas
 
 - **relay-operator** — deploys the backend bundle with `docker compose up`.
-- **seller** — `maxplayer sell`, run two ways by taste: `nix run --refresh … -- sell`
+- **seller** — `maxplayer seller`, run two ways by taste: `nix run --refresh … -- seller`
   (quick) or the Docker image. Same binary, same config contract.
 - **buyer** — `curl -fsSL …/releases/download/v$VER/install.sh | MAXPLAYER_VERSION=$VER sh`, then `maxplayer mcp` wired into
   their agent (Claude etc.). Zero clone, no nix; linux x86_64/aarch64 and macOS Apple Silicon.
@@ -121,7 +121,7 @@ perms, never baked into images or the nix store.
 ## Sequencing
 
 1. **Flake foundation first**: stabilize the client flake so
-   `nix run --refresh … -- mcp|sell` works hermetically — the packaging base everything
+   `nix run --refresh … -- mcp|seller` works hermetically — the packaging base everything
    else builds on.
 2. **Relay bundle**: relay open-mode + relay-git endpoint + Caddy, as a
    docker-compose bundle.

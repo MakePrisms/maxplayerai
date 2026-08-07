@@ -143,15 +143,15 @@ ok "maxplayer --version -> $got (rc=0)"
 # the module compiled in under `acp`, where a build without it falls through to the generic
 # top-level usage. Both exit 1, so the message is the whole of the signal.
 echo "leg 2: the released artifact carries the seller surface"
-if out="$(maxplayer sell --not-a-sell-option 2>&1)"; then
-    fail "maxplayer sell --not-a-sell-option exited 0 — its parser must reject an unknown option. Output: $out"
+if out="$(maxplayer seller --not-a-sell-option 2>&1)"; then
+    fail "maxplayer seller --not-a-sell-option exited 0 — its parser must reject an unknown option. Output: $out"
 fi
-out="$(maxplayer sell --not-a-sell-option 2>&1 || true)"
+out="$(maxplayer seller --not-a-sell-option 2>&1 || true)"
 case "$out" in
     *"unknown sell option"*)
-        ok "maxplayer sell reaches its own parser -> $(printf '%s' "$out" | head -n 1)" ;;
+        ok "maxplayer seller reaches its own parser -> $(printf '%s' "$out" | head -n 1)" ;;
     *)
-        fail "maxplayer sell fell through to the generic usage, which is what a build WITHOUT the seller surface does — the installed artifact is not the one-binary build (#510). Output: $out" ;;
+        fail "maxplayer seller fell through to the generic usage, which is what a build WITHOUT the seller surface does — the installed artifact is not the one-binary build (#510). Output: $out" ;;
 esac
 # It must have refused in the parser, not booted and failed later. These are the same four needles
 # `verify-seller-surface.sh` uses, and they are specific on purpose: `sell`'s usage text names

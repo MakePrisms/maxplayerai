@@ -102,7 +102,7 @@ jobs:
         # separate asset names; a user then had to pick a product before knowing which they wanted,
         # and a platform present in one list and missing from the other shipped a release where
         # sellers could install on x86 and not on arm. What ships now is one `maxplayer` that both
-        # buys and sells, so the choice is a runtime one (`maxplayer` vs `maxplayer sell`) rather
+        # buys and sells, so the choice is a runtime one (`maxplayer` vs `maxplayer seller`) rather
         # than a download-time one.
         #
         # The feature split itself is NOT gone — `crates/maxplayer/Cargo.toml` still gates the seller
@@ -184,7 +184,7 @@ jobs:
       # Which features were compiled in. `version` succeeds in every build, so nothing else here can
       # tell one feature combination from another — a `--features` line that silently stopped naming
       # `acp` would still build, package, checksum and install, and the first report would be a
-      # seller whose `maxplayer sell` does not exist. This is the only step that can see the
+      # seller whose `maxplayer seller` does not exist. This is the only step that can see the
       # difference, so it runs on every platform rather than on one.
       #
       # `verify-seller-surface.sh` is the whole-surface verifier: wallet in, acp in, `sell` in.

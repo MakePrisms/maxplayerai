@@ -12,7 +12,7 @@
     },
     {
       "name": "maxplayer-seller-operate",
-      "description": "Set up and run a Maxplayer seller from nothing: install the binary, first-run maxplayer sell, pass the doctor readiness gate, set a rate above the mint fee, and publish the profile buyers discover you by. Explains the execution sentinel that decides whether a delivery gets paid, and the upgrade discipline that keeps a seller claiming.",
+      "description": "Set up and run a Maxplayer seller from nothing: install the binary, first-run maxplayer seller, pass the doctor readiness gate, set a rate above the mint fee, and publish the profile buyers discover you by. Explains the execution sentinel that decides whether a delivery gets paid, and the upgrade discipline that keeps a seller claiming.",
       "path": "/.well-known/skills/seller-operate/skill.md"
     },
     {
@@ -22,7 +22,7 @@
     },
     {
       "name": "maxplayer-debug-selling",
-      "description": "Debug the seller side of Maxplayer: maxplayer sell refuses to start, a fresh seller 404s at the relay-git seed, health-checks show nothing on a healthy daemon, buyers can't discover your seat, or your seller stopped claiming jobs. Says which command to run, which log line to grep, and where to report a dead end.",
+      "description": "Debug the seller side of Maxplayer: maxplayer seller refuses to start, a fresh seller 404s at the relay-git seed, health-checks show nothing on a healthy daemon, buyers can't discover your seat, or your seller stopped claiming jobs. Says which command to run, which log line to grep, and where to report a dead end.",
       "path": "/.well-known/skills/debug-selling/skill.md"
     }
   ]

@@ -753,7 +753,7 @@ pub struct MaxplayerConfig {
     /// Optional `[profile] name / about`. Skipped when absent so fresh homes stay unnamed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ProfileConfig>,
-    /// Optional `[seller]` daemon config. Absent until `maxplayer sell` setup writes it.
+    /// Optional `[seller]` daemon config. Absent until `maxplayer seller` setup writes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seller: Option<SellerConfig>,
     /// Optional `[buzz]` persona config. Absent ⇒ the buzz persona feature is inert.
@@ -1305,7 +1305,7 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
     let mut out = String::new();
     out.push_str("# maxplayer config.toml — written on first run.\n");
     out.push_str("# Edit freely. Comments are NOT preserved when the app rewrites this file\n");
-    out.push_str("# (e.g. `maxplayer sell` setup or a wallet change).\n");
+    out.push_str("# (e.g. `maxplayer seller` setup or a wallet change).\n");
     out.push_str("# ⚠ This node's DEFAULTS accept and pay REAL sats — see accepted_mints.\n\n");
     for line in body.lines() {
         let key = line.split('=').next().unwrap_or("").trim();

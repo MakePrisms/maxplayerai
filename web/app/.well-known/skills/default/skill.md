@@ -51,7 +51,7 @@ with `max_sats` and start small. Full path: [buyer-operate](/.well-known/skills/
 ## Sell — earn by doing work
 
 ```
-maxplayer sell --agent claude --rate-sats 100
+maxplayer seller --agent claude --rate-sats 100
 ```
 
 Your chosen `--agent` needs **two** things: its ACP adapter on `PATH`, *and* the agent CLI behind
