@@ -1172,6 +1172,7 @@ async fn drive_auto_award(
                     if settle_intent_from_attempt(context, &keys, job_id).await {
                         return Ok(());
                     }
+                    crate::opline!("{}", auto_award_park_line(job_id, lifecycle::PARK_REASON_OFFER_ABSENT));
                     let _ = context.store.mark_award_parked(
                         job_id,
                         lifecycle::PARK_REASON_OFFER_ABSENT,
@@ -1185,11 +1186,9 @@ async fn drive_auto_award(
                     if settle_intent_from_attempt(context, &keys, job_id).await {
                         return Ok(());
                     }
-                    let _ = context.store.mark_award_parked(
-                        job_id,
-                        &lifecycle::park_reason_unreadable(unanswered_reads),
-                        now_unix(),
-                    );
+                    let reason = lifecycle::park_reason_unreadable(unanswered_reads);
+                    crate::opline!("{}", auto_award_park_line(job_id, &reason));
+                    let _ = context.store.mark_award_parked(job_id, &reason, now_unix());
                 }
             }
             return Ok(());
@@ -1202,6 +1201,10 @@ async fn drive_auto_award(
             if settle_intent_from_attempt(context, &keys, job_id).await {
                 return Ok(());
             }
+            crate::opline!(
+                "{}",
+                auto_award_park_line(job_id, "offer deadline passed before an awardable claim appeared")
+            );
             let _ = context.store.mark_award_parked(
                 job_id,
                 "offer deadline passed before an awardable claim appeared",
@@ -1225,6 +1228,22 @@ async fn drive_auto_award(
         // live-but-unpayable claim). The deadline check above bounds the total wait.
         tokio::time::sleep(AUTO_AWARD_POLL_INTERVAL).await;
     }
+}
+
+/// Compose the operator-log line for an auto-award that PARKED (#411, merging #183). Every park in
+/// the auto-award path (`drive_auto_award`, `finalize_auto_award`) emits this through `opline!`:
+/// parking is the correct handling of an unawardable job, so it returns `Ok`, and the success path
+/// printed nothing — a job that lapsed (on budget, on a passed deadline, on an offer gone from the
+/// relay) was indistinguishable in the log from the daemon ignoring the claim. The durable reason
+/// still lives in the store and shows in the `status` RPC; this only makes the same decision audible
+/// in `journalctl`/daemon.log, where an operator who was told the daemon would award the job looks.
+///
+/// Split from the `opline!` call (not inlined) so the wording — which MUST carry the job id and the
+/// reason an operator needs to act — is directly assertable in a test without capturing stderr, per
+/// #183's empty-case rule. `PARKED` is a stable, greppable token; the reason already distinguishes
+/// the parks. Logging only: no park/award decision is changed.
+fn auto_award_park_line(job_id: &str, reason: &str) -> String {
+    format!("buyer: auto-award for {job_id} PARKED — {reason}")
 }
 
 /// Reserve-then-award a selected claim (invariant B), serialized on the money lock so the reserve
@@ -1306,11 +1325,15 @@ async fn finalize_auto_award(
             Ok(())
         }
         Err(AwardError::Reserve(refused)) => {
-            // #539: the auto-award reservation refusal is the buyer's "cannot afford this award"
-            // decision. Without this line the daemon silently declines and looks idle — the parked
-            // reason is only visible later via `status`. `refused` names need vs available; the
-            // reservation is against aggregate available balance, so no single source mint applies.
-            crate::opline!("{}", cannot_afford_award_line(job_id, &refused));
+            // #411/#539 reconcile: this arm PARKS the job — the daemon's "cannot afford this award"
+            // decision. Without a line it silently declines and looks idle; the parked reason is only
+            // visible later via `status`. It emits through `auto_award_park_line` like every other
+            // auto-award park site, so a `PARKED`-token grep finds EVERY park — including this budget
+            // park, which is #411's canonical case. `refused.to_string()` still names need vs available
+            // (the shortfall #539 requires on the console); the reservation is against aggregate
+            // available balance, so no single source mint applies. `cannot_afford_award_line` is
+            // reserved for the RPC award path, where a refusal is returned to the caller, not parked.
+            crate::opline!("{}", auto_award_park_line(job_id, &refused.to_string()));
             let _ = context.store.mark_award_parked(
                 job_id,
                 &format!("reservation refused: {refused}"),
@@ -1322,6 +1345,7 @@ async fn finalize_auto_award(
         // not appear on its own — so park it, which surfaces the refusal (with its operator action)
         // in `status` via `parked_awards` rather than retrying forever against a fixed state.
         Err(error @ AwardError::PublishedButUnrecorded { .. }) => {
+            crate::opline!("{}", auto_award_park_line(job_id, &error.to_string()));
             let _ = context
                 .store
                 .mark_award_parked(job_id, &error.to_string(), now_unix());
@@ -1339,6 +1363,7 @@ async fn finalize_auto_award(
             | AwardError::Unresolved { .. }),
         ) => Err(error.to_string()),
         Err(error) => {
+            crate::opline!("{}", auto_award_park_line(job_id, &format!("award failed: {error}")));
             let _ = context
                 .store
                 .mark_award_parked(job_id, &format!("award failed: {error}"), now_unix());
@@ -3776,6 +3801,31 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
         drop(relay);
+    }
+
+    // #411 (merging #183): an auto-award that cannot place its award PARKS — the correct handling of
+    // an unawardable job, so it returns Ok — and the success path printed nothing, leaving a job that
+    // lapsed (on budget, on a passed deadline, on an offer gone from the relay) indistinguishable in
+    // the log from the daemon ignoring the claim. Found live twice, and reproduced by an outside
+    // tester who mis-read the silence as agent behavior. Every park site now emits
+    // `auto_award_park_line` through `opline!`. Per #183's empty-case rule the line-building is split
+    // from the stderr print, so the operator-visible wording is asserted directly here (no stderr
+    // capture): it MUST carry the job id and the reason. Red-on-revert: drop either the job id or the
+    // reason from `auto_award_park_line` and this fails.
+    #[test]
+    fn an_auto_award_park_line_carries_the_job_id_and_the_reason() {
+        let job = "a".repeat(64);
+        // The #411 canonical case: a budget refusal, whose reason names the shortfall (requested vs
+        // available + the binding ceiling) — the numbers an operator needs to see WHY it parked.
+        let reason = "reservation refused: 100 sat exceeds available 40 sat \
+                      (bound by the wallet ceiling; available = wallet_balance − reserved)";
+        let line = auto_award_park_line(&job, reason);
+        assert!(line.contains(&job), "park log line must name the job id: {line}");
+        assert!(line.contains(reason), "park log line must carry the reason: {line}");
+        assert!(
+            line.to_lowercase().contains("park"),
+            "park log line must be greppable as a park (the token an operator tails for): {line}"
+        );
     }
 
     // ★ #481: an operator reading get_job must SEE a committed award the moment the 3405 exists —
