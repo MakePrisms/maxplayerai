@@ -1404,6 +1404,11 @@ async fn drive_delivery_watch(
         match wake {
             // A result arrived: sweep, narrowed to the jobs that event references.
             WatchWake::Delivered(event) => settle_awarded(context, Some(&event)).await,
+            // A feedback arrived: release the reservation IF it is a delivery-failure report from
+            // the seller this buyer awarded that job (#562). A no-op for every other feedback.
+            WatchWake::Feedback(event) => {
+                release_on_delivery_failure_feedback(context, &event).await
+            }
             WatchWake::Sweep | WatchWake::SubscriptionLost => settle_awarded(context, None).await,
         }
     })
@@ -1416,6 +1421,9 @@ async fn drive_delivery_watch(
 enum WatchWake {
     /// A delivered result arrived — sweep, narrowed to the jobs it references.
     Delivered(Arc<nostr_sdk::Event>),
+    /// A seller FEEDBACK arrived — inspect it for a delivery-failure report against one of this
+    /// buyer's awarded-unsettled jobs (#562) and promptly free that reservation.
+    Feedback(Arc<nostr_sdk::Event>),
     /// The backstop fired, or a gap means something may have been missed — sweep everything.
     Sweep,
     /// The subscription ended; the loop continues on the backstop alone.
@@ -1429,7 +1437,7 @@ enum WatchWake {
 ///
 /// 1. The backstop is a fixed-cadence `interval`, NOT a sleep re-armed inside the `select!`. A
 ///    per-iteration sleep is pushed back by every arriving event, and events the loop does not act
-///    on (the `continue` below) would reset it WITHOUT sweeping — so a steady claim/feedback stream
+///    on (the `continue` below) would reset it WITHOUT sweeping — so a steady claim stream
 ///    would starve the sweep indefinitely, defeating it in exactly the case it exists for: a result
 ///    event that was missed. `Delay` keeps a slow settle pass from bunching the next ticks.
 /// 2. A closed subscription DEGRADES, it does not stop the loop. Settling does not depend on the
@@ -1459,10 +1467,17 @@ async fn watch_loop<S, Fut>(
             Some(stream) => tokio::select! {
                 received = stream.recv() => match received {
                     Ok(event) => {
-                        if event.kind != nostr_sdk::Kind::Custom(crate::kinds::JOB_RESULT_KIND) {
+                        // The buyer-keyed subscription carries the seller's RESULT (settle it) and
+                        // FEEDBACK (a delivery-failure report may free a held reservation, #562);
+                        // every other kind is noise the loop drops so it cannot starve the sweep.
+                        if event.kind == nostr_sdk::Kind::Custom(crate::kinds::JOB_RESULT_KIND) {
+                            WatchWake::Delivered(event)
+                        } else if event.kind == nostr_sdk::Kind::Custom(crate::kinds::JOB_FEEDBACK_KIND)
+                        {
+                            WatchWake::Feedback(event)
+                        } else {
                             continue;
                         }
-                        WatchWake::Delivered(event)
                     }
                     // Lagged is NOT an error — the buffer overflowed and a result may have been
                     // missed. Treating a busy relay as a failure would strand a payment; the right
@@ -2280,6 +2295,111 @@ async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Ev
             Err(error) => crate::opline!("buyer: delivery watcher could not settle {job_id}: {error}"),
         }
     }
+}
+
+/// Consume a seller's post-award FEEDBACK (kind-3404) and, when it reports a delivery FAILURE for
+/// one of this buyer's awarded-unsettled jobs, release that job's held reservation PROMPTLY —
+/// instead of leaving the funds parked until the periodic deadline reconcile ([`run_reconcile_pass`])
+/// frees them at the offer deadline (#562). The failure report is the seller's EXISTING signal; this
+/// adds no new state, no new terminal label, no shared-type change.
+///
+/// The `reason_code` discriminator is read WITHOUT the money lock: a seller's ordinary progress
+/// feedback shares this buyer-keyed subscription and must never even contend the lock that serializes
+/// award/collect. Only a genuine delivery-failure report takes the lock, under which the
+/// authorization + release mirrors [`terminalize_absent_attempt`]'s money-serialized verdict.
+async fn release_on_delivery_failure_feedback(context: &BuyerContext, event: &nostr_sdk::Event) {
+    if !is_delivery_failed_error(event) {
+        return; // progress / other feedback — not actionable, and not worth taking the money lock.
+    }
+    // A release returns funds to `available`, so serialize it with every other money decision (mirror
+    // `reconcile_reservations` / `terminalize_absent_attempt`): it must never fall inside a concurrent
+    // collect's melt→flip window and transiently free ecash that has already left the wallet. The
+    // store re-reads state under this lock, so a job that settled while we waited is a no-op here,
+    // never a wrong release.
+    let _guard = context.money_lock.lock().await;
+    match release_reservation_on_delivery_failed(&context.store, event, now_unix()) {
+        Ok(Some((job_id, amount))) => crate::opline!(
+            "buyer: delivery watcher released {job_id} on a seller-reported delivery_failed \
+             (freed {amount} sat; budget NOT spent)"
+        ),
+        // No awarded-unsettled job of ours, a non-awarded author (anti-griefing), or an
+        // already-terminal reservation (settled/released — idempotent): a deliberate silent no-op.
+        Ok(None) => {}
+        Err(error) => crate::opline!(
+            "buyer: delivery watcher could not release on a delivery_failed feedback ({error}); the \
+             periodic reconcile will still free it at the deadline"
+        ),
+    }
+}
+
+/// Is this FEEDBACK an authoritative delivery-FAILURE report? The `reason_code` TAG is the
+/// authoritative class discriminator (`content` is human-readable and MUST NOT be parsed); the
+/// `status` tag must independently be `error`, as every emitting site pairs them
+/// ([`crate::gateway::error_draft`]) — requiring both keeps a malformed event inert.
+///
+/// v1 acts on `delivery_failed` ONLY. `execution_failed` and `no_sentinel`
+/// ([`crate::gateway::ReasonCode`]) are siblings on the byte-identical wire (same kind, same tags);
+/// widening this allowlist to them is a deliberate follow-up, not smuggled in here.
+fn is_delivery_failed_error(event: &nostr_sdk::Event) -> bool {
+    let tag_value = |name: &str| {
+        event.tags.iter().find_map(|tag| {
+            let parts = tag.as_slice();
+            (parts.first().map(String::as_str) == Some(name))
+                .then(|| parts.get(1).map(String::as_str))
+                .flatten()
+        })
+    };
+    tag_value("reason_code") == Some(crate::gateway::ReasonCode::DeliveryFailed.as_str())
+        && tag_value("status") == Some("error")
+}
+
+/// The authorized core of the delivery-failure release, split out so its authorization + idempotency
+/// are testable without a relay or the money lock (the caller owns both), mirroring
+/// [`terminalize_absent_attempt`].
+///
+/// Releases the reservation of the awarded-unsettled job this FEEDBACK names — but ONLY when the
+/// event's AUTHOR is the very seller THIS buyer awarded that job. That author gate is the
+/// anti-griefing tooth (mirror the delivery guard's pinned-seller author filter and the seller
+/// node's `event.pubkey.to_hex() != buyer` reject): a third party must not be able to strand a
+/// reservation for a job that is in fact being delivered — releasing a still-delivering job's
+/// reservation could drop a legitimate payment or let a stranger free the buyer's committed funds
+/// at will.
+///
+/// Returns `Ok(Some((job_id, freed_sats)))` ONLY on an actual release; every no-op is `Ok(None)`:
+/// a feedback naming no awarded-unsettled job of ours, one signed by anyone but the awarded seller,
+/// or a job already terminal. Reuses [`store::BuyerStore::release`] — the same primitive the deadline
+/// reconcile's `Dead` arm writes, so a failure-reported release and a deadline release converge on
+/// the identical `Released` state — and inherits its idempotency: `Spent` (truly delivered) and
+/// `Released` (a duplicate relay redelivery) are both inert, so a job that delivered is never freed.
+fn release_reservation_on_delivery_failed(
+    store: &store::BuyerStore,
+    event: &nostr_sdk::Event,
+    now_unix: i64,
+) -> Result<Option<(String, u64)>, store::StoreError> {
+    if !is_delivery_failed_error(event) {
+        return Ok(None);
+    }
+    let author = event.pubkey.to_hex();
+    // Scope is the awarded-AND-unsettled set (the JOIN in `awarded_unsettled_job_ids`), so a feedback
+    // for a job we never awarded, or one already spent/released, matches nothing here.
+    for job_id in store.awarded_unsettled_job_ids()? {
+        if !job_lifecycle::event_references_job(event, &job_id) {
+            continue;
+        }
+        // The root `e` tag names an awarded-unsettled job of ours; authorize on the awarded seller.
+        let Some(award) = store.award_record(&job_id)? else {
+            return Ok(None); // unreachable (the set JOINs `awards`), but fail closed if it raced away.
+        };
+        if author != award.seller_pubkey {
+            return Ok(None); // ANTI-GRIEFING: not the seller we awarded for this job — a strict no-op.
+        }
+        return Ok(match store.release(&job_id, now_unix)? {
+            reservations::Released::Freed { amount } => Some((job_id, amount)),
+            // Already spent (delivered) or already released (duplicate feedback): never re-release.
+            _ => None,
+        });
+    }
+    Ok(None)
 }
 
 /// Reconcile every still-`Reserved` job against relay + payment-journal truth: a job the relay no
@@ -3164,6 +3284,206 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
         drop(relay);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+    // #562: release a held reservation PROMPTLY on a seller-reported delivery_failed, instead of
+    // stranding the funds until the deadline reconcile. These exercise the authorized core
+    // (`release_reservation_on_delivery_failed`) directly — no relay, no bootstrap — exactly as the
+    // terminalize tests do: the authorization + idempotency are pure store logic, and the money lock
+    // (the caller's, a mirror of `terminalize_absent_attempt`) adds nothing a single-threaded test
+    // can observe.
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+
+    /// Build a seller-authored delivery-failure FEEDBACK (kind-3404) on the exact wire
+    /// [`crate::gateway::error_draft`] emits: `status=error`, a root-marked `e` tag naming the offer,
+    /// both `p` tags, and the authoritative `reason_code=delivery_failed`. Signed by `author` — the
+    /// gate that matters is the AUTHOR, so passing a stranger's keys forges a griefer's event.
+    fn delivery_failed_feedback(offer_id: &str, author: &nostr_sdk::Keys) -> nostr_sdk::Event {
+        use nostr_sdk::prelude::{EventBuilder, Keys, Kind, Tag};
+        let buyer_hex = Keys::generate().public_key().to_hex();
+        // The exact wire `error_draft` emits; `Tag::parse` on these vecs is what the production
+        // builder's `to_tag` does. `allow_self_tagging` mirrors `gateway::nostr::event_builder` —
+        // the seller feedback p-tags the seller, a self-tag the default builder would reject.
+        let tags = [
+            vec!["status".to_owned(), "error".to_owned()],
+            vec!["e".to_owned(), offer_id.to_owned(), String::new(), "root".to_owned()],
+            vec!["p".to_owned(), buyer_hex],
+            vec!["p".to_owned(), author.public_key().to_hex()],
+            vec!["reason_code".to_owned(), "delivery_failed".to_owned()],
+        ];
+        let mut builder = EventBuilder::new(
+            Kind::Custom(crate::kinds::JOB_FEEDBACK_KIND),
+            "delivery failed: worker exited non-zero",
+        );
+        builder.allow_self_tagging = true;
+        for tag in tags {
+            builder = builder.tag(Tag::parse(tag).expect("parse feedback tag"));
+        }
+        builder.sign_with_keys(author).expect("sign feedback")
+    }
+
+    /// Open a fresh store under `root` and seed ONE awarded-AND-unsettled job: a held reservation
+    /// plus the published-award row that pins `seller` as the awarded party.
+    fn awarded_unsettled(
+        root: &std::path::Path,
+        job: &str,
+        seller: &nostr_sdk::Keys,
+        amount: u64,
+    ) -> store::BuyerStore {
+        std::fs::create_dir_all(root).expect("temp dir");
+        let store = store::BuyerStore::open(root.join("buyer.sqlite")).expect("open store");
+        store.reserve(job, amount, 10_000, now_unix()).expect("reserve");
+        store
+            .record_award(
+                job,
+                &"c".repeat(64),
+                &"e".repeat(64),
+                &seller.public_key().to_hex(),
+                amount,
+                now_unix(),
+            )
+            .expect("record award");
+        store
+    }
+
+    // Red-on-revert: make `release_reservation_on_delivery_failed` skip the `store.release` call (or
+    // the watcher drop FEEDBACK) and the reservation stays `Reserved` — both assertions fail.
+    #[test]
+    fn a_delivery_failed_from_the_awarded_seller_releases_the_reservation() {
+        let root = temp_home("df-release");
+        let seller = nostr_sdk::Keys::generate();
+        let job = "a".repeat(64);
+        let store = awarded_unsettled(&root, &job, &seller, 100);
+
+        let event = delivery_failed_feedback(&job, &seller);
+        let outcome =
+            release_reservation_on_delivery_failed(&store, &event, now_unix()).expect("no store error");
+
+        assert_eq!(
+            outcome,
+            Some((job.clone(), 100)),
+            "the awarded seller's delivery_failed must free exactly this job's held reservation"
+        );
+        assert_eq!(
+            store.reservation(&job).expect("read").map(|(state, _)| state),
+            Some(reservations::ReservationState::Released),
+            "the reservation must reach the SAME Released state the deadline reconcile produces"
+        );
+        assert_eq!(
+            store.reserved_in_flight().expect("reserved"),
+            0,
+            "the freed funds must leave the reserved term — released, never spent"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ANTI-GRIEFING (the load-bearing security gate): a delivery_failed for a real awarded-unsettled
+    // job but signed by anyone OTHER than the awarded seller MUST NOT release — else a stranger could
+    // strand the reservation of a job that is in fact being delivered, dropping a legitimate payment.
+    // Red-on-revert: drop the `author != award.seller_pubkey` gate and this releases, failing here.
+    #[test]
+    fn a_delivery_failed_from_a_non_awarded_pubkey_does_not_release() {
+        let root = temp_home("df-griefer");
+        let seller = nostr_sdk::Keys::generate();
+        let job = "a".repeat(64);
+        let store = awarded_unsettled(&root, &job, &seller, 100);
+
+        // A stranger — never the awarded seller — signs an otherwise-perfect delivery_failed.
+        let griefer = nostr_sdk::Keys::generate();
+        let event = delivery_failed_feedback(&job, &griefer);
+        let outcome =
+            release_reservation_on_delivery_failed(&store, &event, now_unix()).expect("no store error");
+
+        assert_eq!(outcome, None, "a non-awarded author must not trigger a release (anti-griefing)");
+        assert_eq!(
+            store.reservation(&job).expect("read").map(|(state, _)| state),
+            Some(reservations::ReservationState::Reserved),
+            "the reservation must stay held — the job may still be delivering"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // IDEMPOTENCY / never-un-pay-a-delivery: a job already SETTLED (reservation `Spent`) must be a
+    // strict no-op — the delivery happened, so a late or duplicate delivery_failed must never corrupt
+    // it into `Released`. (`awarded_unsettled_job_ids` excludes spent jobs, so a settled job is never
+    // even a release candidate; and `BuyerStore::release` returns `WasSpent` if it somehow were.)
+    #[test]
+    fn a_delivery_failed_for_an_already_settled_job_is_a_no_op() {
+        let root = temp_home("df-settled");
+        let seller = nostr_sdk::Keys::generate();
+        let job = "a".repeat(64);
+        let store = awarded_unsettled(&root, &job, &seller, 100);
+        store.convert_to_spent(&job, 100, now_unix()).expect("settle");
+
+        let event = delivery_failed_feedback(&job, &seller);
+        let outcome =
+            release_reservation_on_delivery_failed(&store, &event, now_unix()).expect("no store error");
+
+        assert_eq!(outcome, None, "an already-settled job's feedback must not release anything");
+        assert_eq!(
+            store.reservation(&job).expect("read").map(|(state, _)| state),
+            Some(reservations::ReservationState::Spent),
+            "the settled reservation must stay Spent — a delivered job's payment is never undone"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // WIRING TOOTH: the watcher must WAKE on FEEDBACK (3404), not only RESULT (3403) — the whole fix
+    // is inert if a feedback event is dropped at the subscription filter before it can be considered.
+    // Red-on-revert: restore the old `if event.kind != JOB_RESULT_KIND { continue; }` and the feedback
+    // wake never fires, failing the `feedback == 1` assertion. The backstop is an hour out so ONLY the
+    // two injected events wake the loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_watcher_wakes_on_both_results_and_feedback() {
+        use nostr_sdk::prelude::{EventBuilder, Keys, Kind};
+        use std::sync::atomic::AtomicUsize;
+
+        let (sender, receiver) = tokio::sync::broadcast::channel(8);
+        let (delivered, feedback) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+
+        let (d, f) = (delivered.clone(), feedback.clone());
+        let loop_task = tokio::spawn(async move {
+            watch_loop(receiver, Duration::from_secs(3_600), move |wake| {
+                let (d, f) = (d.clone(), f.clone());
+                async move {
+                    match wake {
+                        WatchWake::Delivered(_) => {
+                            d.fetch_add(1, Ordering::SeqCst);
+                        }
+                        WatchWake::Feedback(_) => {
+                            f.fetch_add(1, Ordering::SeqCst);
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await;
+        });
+
+        let seller = Keys::generate();
+        let result = EventBuilder::new(Kind::Custom(crate::kinds::JOB_RESULT_KIND), "")
+            .sign_with_keys(&seller)
+            .expect("sign result");
+        let feedback_event = delivery_failed_feedback(&"a".repeat(64), &seller);
+        let _ = sender.send(Arc::new(result));
+        let _ = sender.send(Arc::new(feedback_event));
+
+        // Long enough for the loop to drain both; the backstop tick is an hour away, so nothing else
+        // can inflate the counts.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        loop_task.abort();
+
+        assert_eq!(
+            delivered.load(Ordering::SeqCst),
+            1,
+            "a RESULT (3403) must wake the watcher to settle"
+        );
+        assert_eq!(
+            feedback.load(Ordering::SeqCst),
+            1,
+            "a FEEDBACK (3404) must wake the watcher to consider a release (#562)"
+        );
     }
 
     // ★ #322 round 4: the deadline TOCTOU re-check is WIRED, not merely predicate-tested. The
@@ -4237,13 +4557,15 @@ mod tests {
         );
     }
 
-    /// A non-actionable event for the starvation tooth: any kind the watcher does not act on. Job
-    /// FEEDBACK is the realistic one — it shares the buyer-keyed subscription with results, so a
-    /// chatty job produces exactly this traffic.
+    /// A non-actionable event for the starvation tooth: a kind the watcher drops via `continue`.
+    /// Since #562 the watcher acts on BOTH results and FEEDBACK, so a CLAIM (a seller's bid) is now
+    /// the realistic foil — it shares the buyer-keyed subscription yet the delivery watcher ignores
+    /// it. It MUST be a dropped kind: a kind that produced a wake would drive a sweep per event, and
+    /// then even the broken per-iteration-sleep backstop this tooth guards against would look busy.
     fn non_actionable_event() -> Arc<nostr_sdk::Event> {
         use nostr_sdk::prelude::{EventBuilder, Keys};
         Arc::new(
-            EventBuilder::new(nostr_sdk::Kind::Custom(crate::kinds::JOB_FEEDBACK_KIND), "")
+            EventBuilder::new(nostr_sdk::Kind::Custom(crate::kinds::JOB_CLAIM_KIND), "")
                 .sign_with_keys(&Keys::generate())
                 .expect("sign"),
         )
