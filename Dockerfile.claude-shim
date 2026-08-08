@@ -1,0 +1,34 @@
+# syntax=docker/dockerfile:1
+#
+# Claude-seller = dev's base image + the official ACP adapter. This is the
+# "bring an agent" extension dev's docs/DOCKER.md describes, packaged as a file.
+# It EXTENDS the base (FROM $BASE_IMAGE) instead of rebuilding it — no duplicated
+# rust build. Auth: an ANTHROPIC_API_KEY supplied at runtime.
+#
+# Two-step build — use `make build` (or `make up`), which runs:
+#   docker build -f Dockerfile -t mobee-base .
+#   docker build -f Dockerfile.claude-shim --build-arg BASE_IMAGE=mobee-base -t mobee-seller-shim .
+ARG BASE_IMAGE=mobee-base
+FROM ${BASE_IMAGE}
+
+# Node + the official ACP adapter (dev's `--agent claude` preset resolves to
+# `which claude-agent-acp`). Installed as root, then drop back to the base's
+# non-root `mobee` user. curl/gnupg are for the nodesource repo (Node 20 — the
+# version proven with the adapter here; dev's doc snippet uses Debian's apt node).
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g @agentclientprotocol/claude-agent-acp \
+    && rm -rf /var/lib/apt/lists/* \
+    && which claude-agent-acp
+
+# Fresh claude config dir so no host hooks/MCP/CLAUDE.md leak into job runs.
+ENV CLAUDE_CONFIG_DIR=/data/.claude-sandbox \
+    DISABLE_AUTOUPDATER=1 \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+USER mobee
+# ENTRYPOINT (tini -- mobee), CMD (sell), WORKDIR (/data), MOBEE_HOME — all
+# inherited from the base image.

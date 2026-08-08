@@ -1,0 +1,40 @@
+# Integrated local run: dev-style packaging (unhardened) + the official
+# claude-agent-acp adapter (`--agent claude`). Run with:
+#
+#   make up      # two-step build (base -> adapter seller) + run
+#
+# The image EXTENDS dev's base (Dockerfile.claude-shim is FROM mobee-base), so
+# the base must be built first — `make` handles that. Auth: put an
+# ANTHROPIC_API_KEY in docker/seller.env (see seller.env.example). UNHARDENED by
+# design (non-root + tini + volume). Delivery uses dev's default relay-git
+# transport (no --git-remote / .netrc needed). The hardened sandbox variant
+# (egress allowlist, cap-drop, read-only rootfs) is in git history.
+name: mobee-seller-shim
+services:
+  seller:
+    build:
+      context: .
+      dockerfile: Dockerfile.claude-shim
+      args:
+        # base image built by `make base`; Dockerfile.claude-shim is FROM this.
+        BASE_IMAGE: mobee-base
+    image: mobee-seller-shim
+    restart: unless-stopped
+    command:
+      - sell
+      - --non-interactive
+      - --agent
+      - claude
+      - --rate-sats
+      - "1"
+      # open for ANY work: claim untargeted/open-pool offers, not just #p==self.
+      - --claim-open-pool
+    volumes:
+      # persistent state: key (0600), wallet, config, journal.
+      - seller-data:/data
+    env_file:
+      # ANTHROPIC_API_KEY (see seller.env.example). Gitignored.
+      - docker/seller.env
+
+volumes:
+  seller-data:

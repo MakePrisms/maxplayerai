@@ -1,0 +1,3 @@
+# Local seller config / secrets (auth credential + git remote) — never commit.
+# (*.env.example templates aren't matched by *.env, so they stay committable.)
+*.env
