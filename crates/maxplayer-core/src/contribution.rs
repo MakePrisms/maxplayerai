@@ -485,6 +485,45 @@ fn parse_target_repo(tags: &[TagSpec]) -> Result<TargetRepoPin, ContributionErro
     TargetRepoPin::new(owner, clone_url)
 }
 
+/// How the seller node's offer gate should treat an incoming offer once the operator's
+/// `[seller] contribution_enabled` flag (default on) is applied to the parse result. Pure over
+/// `(tags, contribution_enabled)` so the serve decision is unit-testable without standing up a
+/// node — the acceptance tests drive this directly.
+///
+/// This is the whole of #590: it decides *whether* a contribution offer is served, not *how*. A
+/// served contribution still runs in an empty workdir until #591 clones the target at `base_oid`;
+/// that follow-up is deliberately outside this gate.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ContributionServeGate {
+    /// Not a contribution offer (no `job-class=contribution`) — the from-scratch path, unchanged
+    /// and ungated: the flag never touches ordinary offers.
+    NotContribution,
+    /// A well-formed contribution offer an operator serves (`contribution_enabled = true`).
+    Serve,
+    /// A well-formed contribution offer refused because the operator set
+    /// `contribution_enabled = false`. This is the flag made load-bearing.
+    RefuseDisabled,
+    /// `job-class=contribution` tags that do not parse — refused fail-closed, never run as
+    /// from-scratch (mirrors [`parse_contribution_offer`]'s posture).
+    Malformed(ContributionError),
+}
+
+/// Apply the operator's `contribution_enabled` flag to a parsed offer to get the serve decision.
+/// The refusal that once fired unconditionally in the seller node now fires only when the operator
+/// has turned contributions off; an enabled node serves, an ordinary offer is untouched, and a
+/// malformed contribution is still refused.
+pub fn contribution_serve_gate(
+    tags: &[TagSpec],
+    contribution_enabled: bool,
+) -> ContributionServeGate {
+    match parse_contribution_offer(tags) {
+        Ok(None) => ContributionServeGate::NotContribution,
+        Ok(Some(_)) if contribution_enabled => ContributionServeGate::Serve,
+        Ok(Some(_)) => ContributionServeGate::RefuseDisabled,
+        Err(error) => ContributionServeGate::Malformed(error),
+    }
+}
+
 /// Parse a seller result's contribution echo. `Ok(None)` when not a contribution; `Ok(Some((echo,
 /// tuple_sig)))` for a well-formed contribution result; `Err` when `job-class=contribution` but the
 /// echo is malformed or the `sig/seller-contribution` tag is absent (fail-closed — buyer refuses).
@@ -785,5 +824,59 @@ mod tests {
             TagSpec::new([TAG_ACCEPTS, "patch"]),
         ];
         assert!(parse_contribution_offer(&tags).is_err());
+    }
+
+    /// Well-formed contribution offer used by the serve-gate tests below.
+    fn served_contribution_tags() -> Vec<TagSpec> {
+        let offer = ContributionOffer {
+            target: pin(),
+            base: ContributionBase::new("main", "a".repeat(40)).unwrap(),
+            accepts: vec![ACCEPTS_FORK.to_owned()],
+        };
+        contribution_offer_tags(&offer)
+    }
+
+    #[test]
+    fn contribution_offer_is_served_when_enabled() {
+        // A1: a well-formed contribution offer is SERVED (not refused) when the operator leaves
+        // `contribution_enabled` on. The old unconditional "not served by the node yet" refusal is
+        // gone — the flag, not the job class, decides.
+        let tags = served_contribution_tags();
+        assert_eq!(contribution_serve_gate(&tags, true), ContributionServeGate::Serve);
+    }
+
+    #[test]
+    fn contribution_offer_refused_when_disabled() {
+        // A2: the SAME well-formed offer is refused once an operator sets `contribution_enabled =
+        // false`. This is the flag made load-bearing; before #590 it was dead code on this path.
+        let tags = served_contribution_tags();
+        assert_eq!(
+            contribution_serve_gate(&tags, false),
+            ContributionServeGate::RefuseDisabled
+        );
+    }
+
+    #[test]
+    fn from_scratch_offer_is_never_gated_by_contribution_flag() {
+        // The flag governs contribution offers only: an ordinary (from-scratch) offer proceeds
+        // under either setting, so honouring it can never strand the money path.
+        let tags = vec![TagSpec::new(["output", "text"]), TagSpec::new(["t", "maxplayer"])];
+        assert_eq!(contribution_serve_gate(&tags, true), ContributionServeGate::NotContribution);
+        assert_eq!(contribution_serve_gate(&tags, false), ContributionServeGate::NotContribution);
+    }
+
+    #[test]
+    fn malformed_contribution_is_refused_under_either_flag() {
+        // A malformed contribution stays fail-closed regardless of the flag — never silently run as
+        // from-scratch (mirrors `malformed_contribution_offer_fails_closed_never_from_scratch`).
+        let tags = vec![TagSpec::new([TAG_JOB_CLASS, JOB_CLASS_CONTRIBUTION])];
+        assert!(matches!(
+            contribution_serve_gate(&tags, true),
+            ContributionServeGate::Malformed(_)
+        ));
+        assert!(matches!(
+            contribution_serve_gate(&tags, false),
+            ContributionServeGate::Malformed(_)
+        ));
     }
 }
