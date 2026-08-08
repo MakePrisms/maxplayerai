@@ -3310,6 +3310,113 @@ mod tests {
         drop(relay);
     }
 
+    // ★ #602: `fetch_job_view_async` must certify offer-ABSENCE from the OFFER read alone. The bug
+    // was `read_confirmed = offer || feedback || result || probe`, so a present CLAIM certified an
+    // empty offer read as absence and `drive_auto_award` terminally parked a retryable offer. Here a
+    // seller publishes a claim e-tagging the job while NO offer exists — the exact asymmetric shape
+    // the #291/#298 tests never exercised (they drove `plan_missing_offer` as a pure fn over a bool).
+    // The view must surface the claim AND report `read_confirmed` established by the offer's own
+    // probe+re-fetch (the relay answered our REQ), not by the claim. Red-on-revert of the PROBE:
+    // drop the probe/re-fetch and `read_confirmed` goes false on this input; the original blend is
+    // blocked structurally (the claim read runs after the decision) and by `offer_read_answered`'s
+    // signature.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_present_claim_does_not_certify_an_empty_offer_read_as_absence() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::{Client, EventBuilder, Keys, Kind, Tag};
+
+        let root = temp_home("offer-602-asymmetric");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap_home(&root).expect("bootstrap home");
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        home.config.relay_url = relay.url().await.to_string();
+        let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
+
+        // A synthetic job id: no offer with this id can exist on the relay, so the offer read is
+        // genuinely empty — while a seller's claim e-tagging it is served.
+        let job = "b".repeat(64);
+        let seller = Keys::generate();
+        let publisher = Client::new(seller.clone());
+        publisher
+            .add_relay(&context.home.config.relay_url)
+            .await
+            .expect("add relay");
+        publisher.connect().await;
+        let claim = EventBuilder::new(Kind::Custom(crate::kinds::JOB_CLAIM_KIND), "")
+            .tag(Tag::parse(vec!["e".to_owned(), job.clone()]).expect("e tag"))
+            .tag(Tag::parse(vec!["t".to_owned(), crate::gateway::MAXPLAYER_TAG.to_owned()]).expect("t tag"))
+            .tag(Tag::parse(vec!["status".to_owned(), "processing".to_owned()]).expect("status tag"))
+            .sign_with_keys(&seller)
+            .expect("sign claim");
+        publisher.send_event(&claim).await.expect("relay stores the claim");
+        publisher.disconnect().await;
+
+        let keys = buyer_keys(&context.home).expect("buyer keys");
+        let view =
+            job_lifecycle::fetch_job_view_async(&context.home, &keys, &job, RELAY_TIMEOUT, now_unix() as u64)
+                .await
+                .expect("fetch view");
+
+        assert!(view.offer.is_none(), "no offer for this job exists on the relay");
+        assert_eq!(
+            view.claims.len(),
+            1,
+            "the claim IS served — this is the asymmetric shape (#602), not an unreachable relay"
+        );
+        assert!(
+            view.read_confirmed,
+            "the relay proved it served our OFFER REQ (EOSE + re-fetch), so the empty offer read is \
+             confirmed — established by the offer's own probe, never by the present claim (#602)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
+    }
+
+    // ★ #602 companion: the fast path + the id-hardening. When the offer IS on the relay it is
+    // returned (never parked) with no probe round trip, and the view reports exactly the queried id
+    // — the `event.id == offer_id` assertion the award path already carries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_present_offer_is_returned_confirmed_and_by_exact_id() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::{Client, EventBuilder, Kind, Tag};
+
+        let root = temp_home("offer-602-present");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap_home(&root).expect("bootstrap home");
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        home.config.relay_url = relay.url().await.to_string();
+        let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
+        let keys = buyer_keys(&context.home).expect("buyer keys");
+
+        // A real offer event — its id is a genuine content hash, and that id IS the job id.
+        let offer_event = EventBuilder::new(Kind::Custom(crate::kinds::JOB_OFFER_KIND), "")
+            .tag(Tag::parse(vec!["t".to_owned(), crate::gateway::MAXPLAYER_TAG.to_owned()]).expect("t tag"))
+            .sign_with_keys(&keys)
+            .expect("sign offer");
+        let job = offer_event.id.to_hex();
+        let publisher = Client::new(keys.clone());
+        publisher
+            .add_relay(&context.home.config.relay_url)
+            .await
+            .expect("add relay");
+        publisher.connect().await;
+        publisher.send_event(&offer_event).await.expect("relay stores the offer");
+        publisher.disconnect().await;
+
+        let view =
+            job_lifecycle::fetch_job_view_async(&context.home, &keys, &job, RELAY_TIMEOUT, now_unix() as u64)
+                .await
+                .expect("fetch view");
+
+        let offer = view.offer.expect("the published offer is returned, not parked");
+        assert_eq!(offer.event_id, job, "the returned offer is exactly the one queried, by id");
+        assert!(view.read_confirmed, "an offer in hand is itself the answer");
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
+    }
+
     // ─────────────────────────────────────────────────────────────────────────────────────────
     // #562 + #574: release a held reservation PROMPTLY on a seller-reported POST-AWARD FAILURE
     // (delivery_failed and its siblings execution_failed / no_sentinel), instead of stranding the
