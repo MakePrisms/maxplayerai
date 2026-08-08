@@ -736,13 +736,32 @@ impl SellOptions {
 fn sell_usage(w: &mut dyn Write) {
     let _ = writeln!(
         w,
-        "Usage:\n  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>] [--skip-doctor]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n  maxplayer seller --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash (a REAL mint — jobs settle in real sats) git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint\n  - --skip-doctor: bypass the startup readiness gate (default: checks-on; not recommended)\n  - --unsafe-no-sandbox: serve the OPEN POOL with no working sandbox — this box then runs code written by strangers with no containment (waives only that one check)\n  - open-pool claiming is OFF by default; pass --claim-open-pool to opt in\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)"
+        "Usage:\n  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>] [--skip-doctor]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n  maxplayer seller --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint\n  - --skip-doctor: bypass the startup readiness gate (default: checks-on; not recommended)\n  - --unsafe-no-sandbox: serve the OPEN POOL with no working sandbox — this box then runs code written by strangers with no containment (waives only that one check)\n  - open-pool claiming is OFF by default; pass --claim-open-pool to opt in\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)"
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #595 (mints-are-mints): the seller `--help` names the shipped default mint but must not fork
+    // mint classes or say "real" — a REAL label on the normal path is a constant column (zero
+    // information; testnut never appears in normal use). This also binds the string to a test: the
+    // #447/#595 root bug was a money string nothing checked, which let the copy drift from the mint
+    // the code ships (this help had already drifted from its SELLER-QUICKSTART.md mirror).
+    // RED-ON-REVERT: re-adding "(a REAL mint — jobs settle in real sats)" reds this.
+    #[test]
+    fn sell_usage_does_not_fork_mint_classes_or_say_real() {
+        let mut buf = Vec::new();
+        sell_usage(&mut buf);
+        let help = String::from_utf8_lossy(&buf);
+        assert!(
+            !help.contains("REAL")
+                && !help.to_lowercase().contains("real sats")
+                && !help.to_lowercase().contains("real mint"),
+            "seller --help must not fork mint classes or say 'real':\n{help}"
+        );
+    }
 
     /// #488: picking a preset must surface the underlying CLI's auth requirement, so the seller
     /// reads it while choosing rather than discovering it via the probe's -32000 minutes later.
