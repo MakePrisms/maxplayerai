@@ -23,7 +23,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::gateway::EventDraft;
 
 /// Current on-disk schema version.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// A cloneable handle to the node-owned SQLite state.
 #[derive(Clone)]
@@ -64,6 +64,17 @@ pub struct Offer {
     /// from the claim: a resumed job reads its requested harness from here, so it dispatches to
     /// the harness the buyer asked for and not to whichever one happens to be preferred now.
     pub requested_agent: Option<String>,
+}
+
+/// #591: the target + base a SERVED contribution job clones into its delivery workdir. The buyer's
+/// pin is owner-scoped, so `owner_pubkey` records the target's identity; `clone_url` + `base_branch`
+/// + `base_oid` are what the clone fetches and checks out. Absent ⇒ a from-scratch job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContributionPin {
+    pub owner_pubkey: String,
+    pub clone_url: String,
+    pub base_branch: String,
+    pub base_oid: String,
 }
 
 /// The lifecycle state of a job (execution side of a claim that was awarded).
@@ -309,6 +320,18 @@ impl SellerStore {
                  expires_at_unix    INTEGER NOT NULL,
                  published_event_id TEXT,
                  updated_at_unix    INTEGER NOT NULL
+             );
+             -- #591: the pinned target + base a SERVED contribution job clones into its delivery
+             -- workdir. One row per contribution job, written at claim time (the only place the offer
+             -- tags are in scope). ABSENT ⇒ a from-scratch job — the empty-workdir default. A store
+             -- from a pre-#591 binary simply has no rows here, so the fallback is unchanged.
+             CREATE TABLE IF NOT EXISTS contribution_pins (
+                 job_id          TEXT PRIMARY KEY,
+                 owner_pubkey    TEXT NOT NULL,
+                 clone_url       TEXT NOT NULL,
+                 base_branch     TEXT NOT NULL,
+                 base_oid        TEXT NOT NULL,
+                 created_at_unix INTEGER NOT NULL
              );",
         )?;
         Self::migrate(conn)?;
@@ -443,6 +466,57 @@ impl SellerStore {
                         deadline_unix: row.get(5)?,
                         targeted: row.get::<_, i64>(6)? != 0,
                         requested_agent: row.get(7)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// #591: persist the pin a served contribution job clones at execute time, keyed by job_id (the
+    /// offer event id). INSERT OR IGNORE — idempotent with the offer/claim re-ingest, so a re-driven
+    /// offer never double-writes. `claim_offer` writes this BEFORE `record_offer` so a crash can never
+    /// leave an offer recorded (hence claimable/awardable/executable) without its pin — the only crash
+    /// window strands a harmless orphan pin (no offer ⇒ no claim ⇒ no execute).
+    pub fn record_contribution_pin(
+        &self,
+        job_id: &str,
+        pin: &ContributionPin,
+        now_unix: i64,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO contribution_pins
+                 (job_id, owner_pubkey, clone_url, base_branch, base_oid, created_at_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                job_id,
+                pin.owner_pubkey,
+                pin.clone_url,
+                pin.base_branch,
+                pin.base_oid,
+                now_unix,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// The pin for a job if it was recorded as a contribution; `None` ⇒ a from-scratch job (execute
+    /// provisions an empty workdir). Read at execute time on BOTH the fresh-award and restart paths —
+    /// the store is the only source of the served contribution's base there.
+    pub fn contribution_pin(&self, job_id: &str) -> Result<Option<ContributionPin>, StoreError> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT owner_pubkey, clone_url, base_branch, base_oid
+                 FROM contribution_pins WHERE job_id = ?1",
+                [job_id],
+                |row| {
+                    Ok(ContributionPin {
+                        owner_pubkey: row.get(0)?,
+                        clone_url: row.get(1)?,
+                        base_branch: row.get(2)?,
+                        base_oid: row.get(3)?,
                     })
                 },
             )
@@ -1418,6 +1492,89 @@ mod tests {
         // Idempotent: a later derive re-writes the ts, stays true, never errors.
         store.mark_settled_elsewhere("job-se", 5_678).expect("re-mark");
         assert!(store.has_settled_elsewhere("job-se").expect("read"), "idempotent — last write wins");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // #591 — the contribution pin round-trips and is ABSENT for a from-scratch job (the empty-workdir
+    // default execute_job falls back to). INSERT OR IGNORE makes a re-ingest of the same offer a
+    // no-op, never a second write — the property the crash-safe pin-before-offer ordering relies on.
+    #[test]
+    fn contribution_pin_round_trips_and_absent_for_from_scratch() {
+        let (store, path) = fresh_store("contribution-pin");
+        assert_eq!(
+            store.contribution_pin("scratch").expect("read"),
+            None,
+            "a from-scratch job has no pin"
+        );
+        let pin = ContributionPin {
+            owner_pubkey: "b".repeat(64),
+            clone_url: "https://relay.maxplayer.ai/git/owner/repo.git".to_owned(),
+            base_branch: "main".to_owned(),
+            base_oid: "a".repeat(40),
+        };
+        assert!(
+            store.record_contribution_pin("job-c", &pin, 7).expect("record"),
+            "the first write inserts"
+        );
+        assert_eq!(
+            store.contribution_pin("job-c").expect("read"),
+            Some(pin.clone()),
+            "the pin reads back"
+        );
+        assert!(
+            !store.record_contribution_pin("job-c", &pin, 8).expect("re-record"),
+            "INSERT OR IGNORE ⇒ a re-ingest is idempotent"
+        );
+        assert_eq!(
+            store.contribution_pin("job-c").expect("read"),
+            Some(pin),
+            "unchanged after the re-ingest"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // #591 — a v4 store (no contribution_pins) opens CLEAN under v5: the additive CREATE TABLE IF NOT
+    // EXISTS adds the new table, the version bumps, and the pre-existing money-path row is UNTOUCHED
+    // (no ALTER/DROP crosses claims/wallet tables). The store then persists a pin.
+    #[test]
+    fn a_v4_store_opens_clean_under_v5_and_gains_contribution_pins() {
+        let path = temp_db("pre-contribution-pins");
+        let _ = std::fs::remove_file(&path);
+        // A v4 store: version 4 + a live money-path claims row, WITHOUT contribution_pins.
+        {
+            let conn = Connection::open(&path).expect("create v4 store");
+            conn.execute_batch(
+                "CREATE TABLE seller_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO seller_meta VALUES ('schema_version', '4');
+                 CREATE TABLE claims (
+                     job_id TEXT PRIMARY KEY, offer_id TEXT NOT NULL, state TEXT NOT NULL,
+                     creq TEXT NOT NULL, created_at_unix INTEGER NOT NULL, updated_at_unix INTEGER NOT NULL
+                 );
+                 INSERT INTO claims VALUES ('live-job', 'live-job', 'awarded', 'live-creq', 1, 1);",
+            )
+            .expect("v4 schema");
+        }
+        let store = SellerStore::open(&path).expect("a v4 store opens clean under v5");
+        assert_eq!(
+            store.health().expect("health").schema_version,
+            SCHEMA_VERSION,
+            "the version bumped to v5"
+        );
+        let pin = ContributionPin {
+            owner_pubkey: "b".repeat(64),
+            clone_url: "https://x/git/o/r.git".to_owned(),
+            base_branch: "main".to_owned(),
+            base_oid: "a".repeat(40),
+        };
+        assert!(store.record_contribution_pin("live-job", &pin, 2).expect("record"));
+        assert_eq!(store.contribution_pin("live-job").expect("read"), Some(pin));
+        drop(store);
+        // The pre-existing money-path row was NOT touched by the v5 migration.
+        let conn = Connection::open(&path).expect("reopen raw");
+        let creq: String = conn
+            .query_row("SELECT creq FROM claims WHERE job_id = 'live-job'", [], |row| row.get(0))
+            .expect("the v4 claims row survives the v5 migration");
+        assert_eq!(creq, "live-creq");
         let _ = std::fs::remove_file(&path);
     }
 

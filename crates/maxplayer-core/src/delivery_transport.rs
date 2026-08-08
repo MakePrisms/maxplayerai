@@ -205,6 +205,12 @@ mod tests {
             assert_allowed_repo_locator("http://example.invalid/repo.git"),
             Err(TransportRefuse::ForbiddenScheme("http".into()))
         );
+        // #591 — the git:// protocol is not on the https-only allowlist either (a contribution's
+        // clone_url is buyer-controlled, so an allowlist, not a denylist, is what keeps it safe).
+        assert!(
+            assert_allowed_repo_locator("git://example.invalid/repo.git").is_err(),
+            "git:// is not an allowed contribution base locator"
+        );
     }
 
     #[test]
