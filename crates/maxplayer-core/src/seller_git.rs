@@ -10,10 +10,12 @@
 //! The previous implementation shelled out to `git` and had to defend against ambient config: empty
 //! `GIT_CONFIG_GLOBAL`/`XDG_CONFIG_HOME`, `GIT_CONFIG_NOSYSTEM`, `protocol.*.allow=never`, scrubbed
 //! `GIT_SSH*`/`insteadOf`. In-process git2 needs NONE of that:
-//! - **`insteadOf` immunity is structural:** every remote is [`Repository::remote_anonymous`], which
-//!   uses the literal URL and applies NO `url.*.insteadOf` config rewrite — an agent-planted
-//!   `.git/config` (or poisoned `$HOME/.gitconfig`) can never redirect an allowlisted `https` push
-//!   onto `ssh`/`file`/`ext`.
+//! - **`insteadOf` / ambient-config immunity:** the transport layer ([`crate::git_transport`])
+//!   empties libgit2's global/XDG/system config search path at first use, so no ambient git config is
+//!   consulted on any leg. `url.*.insteadOf` is applied by libgit2 at CONNECT time and
+//!   [`Repository::remote_anonymous`] does NOT prevent it — only clearing the search path does — so an
+//!   agent-planted `.git/config` (or poisoned `$HOME`/XDG/system config) can never redirect an
+//!   allowlisted `https` push onto `ssh`/`file`/`ext`.
 //! - **Transport allowlist:** every entry asserts [`assert_allowed_repo_locator`] and only `https`
 //!   is registered as a subtransport — `ext:`/`file:`/`ssh:` are refused before any remote exists.
 //! - **Key hygiene:** the seller secret signs the NIP-98 event in-process only — never on argv,
