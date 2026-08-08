@@ -3417,6 +3417,171 @@ mod tests {
         drop(relay);
     }
 
+    // ★ #602 ACCEPTANCE-BAR REGRESSION. A relay `QueryPolicy` that REFUSES exactly the by-id OFFER
+    // read (`.id(offer_id).kind(3401)`) with a `CLOSED`, while serving every other REQ — the claim
+    // read, the liveness probe (`kind 3401` but `limit(0)`, no ids), all of it. This stages the
+    // literal #602 asymmetry — the offer read FAILS (never an EOSE) while the relay is otherwise
+    // fully alive and the claim is served — as a DETERMINISTIC, NON-BLOCKING, FILTER-SCOPED starve.
+    // A sleep-based starve would serialize `LocalRelay` admission and stall the claim too (a
+    // different situation that would lie green); a `Reject` blocks nothing and touches only the
+    // offer filter. `admit_query` receives the REQ's filter, so the scoping is exact.
+    #[derive(Debug)]
+    struct RefuseOfferReads;
+
+    impl nostr_relay_builder::prelude::QueryPolicy for RefuseOfferReads {
+        fn admit_query<'a>(
+            &'a self,
+            query: &'a nostr_sdk::Filter,
+            _addr: &'a std::net::SocketAddr,
+        ) -> nostr_relay_builder::prelude::BoxedFuture<
+            'a,
+            nostr_relay_builder::prelude::PolicyResult,
+        > {
+            Box::pin(async move {
+                // The offer read is the ONLY by-id request for the offer kind; the claim/feedback/
+                // result reads carry `#e` not `.id`, and the probe carries no ids. Scoping to
+                // `ids.is_some()` refuses the offer read alone and leaves the relay provably alive.
+                let refuses_offer_read = query.ids.is_some()
+                    && query.kinds.as_ref().is_some_and(|kinds| {
+                        kinds.contains(&nostr_sdk::Kind::Custom(crate::kinds::JOB_OFFER_KIND))
+                    });
+                if refuses_offer_read {
+                    nostr_relay_builder::prelude::PolicyResult::Reject(
+                        "offer read starved (#602 regression)".to_owned(),
+                    )
+                } else {
+                    nostr_relay_builder::prelude::PolicyResult::Accept
+                }
+            })
+        }
+    }
+
+    // ★ #602 (unit): a REFUSED offer read is UNKNOWN, never absence — even with a live claim. The
+    // #603 tests above assert `read_confirmed == true` (offer present / genuinely-empty-with-probe);
+    // neither stages the bug — an offer read that FAILS (relay CLOSED the REQ, no EOSE) WHILE a
+    // claim is served. Post-#603 the offer read goes single-relay `ExitOnEOSE`, so the refusal
+    // surfaces as `Err` and `fetch_job_view_async` returns `Err` (the caller then retries, never
+    // parks). Under the pre-#603 blend the pool swallowed the CLOSED to `Ok(empty)` and the served
+    // claim drove `read_confirmed = true` → `Ok(view)` with the offer absent-certified. So this
+    // REDS on the blend (returns `Ok`, `is_err()` fails). The served-claim assertion first proves
+    // the starve is NON-CONFOUNDED (the relay is alive) so the `Err` is the offer read's alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_offer_read_is_not_certified_as_absence_even_with_a_live_claim() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::{Client, EventBuilder, EventId, Filter, Keys, Kind, Tag};
+
+        let root = temp_home("offer-602-refused");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap_home(&root).expect("bootstrap home");
+        let relay = LocalRelay::new(RelayBuilder::default().query_policy(RefuseOfferReads));
+        relay.run().await.expect("relay run");
+        home.config.relay_url = relay.url().await.to_string();
+        let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
+
+        // A synthetic job id: no offer with this id exists, and the relay refuses the by-id offer
+        // REQ regardless — but the seller's claim e-tagging it IS served (only the offer read is
+        // starved).
+        let job = "b".repeat(64);
+        let seller = Keys::generate();
+        let publisher = Client::new(seller.clone());
+        publisher.add_relay(&context.home.config.relay_url).await.expect("add relay");
+        publisher.connect().await;
+        let claim = EventBuilder::new(Kind::Custom(crate::kinds::JOB_CLAIM_KIND), "")
+            .tag(Tag::parse(vec!["e".to_owned(), job.clone()]).expect("e tag"))
+            .tag(Tag::parse(vec!["t".to_owned(), crate::gateway::MAXPLAYER_TAG.to_owned()]).expect("t tag"))
+            .tag(Tag::parse(vec!["status".to_owned(), "processing".to_owned()]).expect("status tag"))
+            .sign_with_keys(&seller)
+            .expect("sign claim");
+        publisher.send_event(&claim).await.expect("relay stores the claim");
+
+        // NON-CONFOUND: the claim read is genuinely served under this policy — the starve is
+        // filter-scoped to the offer REQ, not a relay outage that would stall everything and lie.
+        let served = publisher
+            .fetch_events(
+                Filter::new()
+                    .kind(Kind::Custom(crate::kinds::JOB_CLAIM_KIND))
+                    .hashtag(crate::gateway::MAXPLAYER_TAG)
+                    .event(EventId::from_hex(&job).expect("job id")),
+                RELAY_TIMEOUT,
+            )
+            .await
+            .expect("claim read is served");
+        assert_eq!(served.len(), 1, "the claim IS served — a NON-confounded, filter-scoped starve (relay alive)");
+        publisher.disconnect().await;
+
+        // THE OFFER READ IS REFUSED ⇒ the view read is UNKNOWN, not absence. Post-#603 the
+        // single-relay `ExitOnEOSE` offer read surfaces the CLOSED as `Err`. Under the pre-#603
+        // blend this returned `Ok(view)` with `read_confirmed == true`, certifying false absence.
+        let keys = buyer_keys(&context.home).expect("buyer keys");
+        let view =
+            job_lifecycle::fetch_job_view_async(&context.home, &keys, &job, RELAY_TIMEOUT, now_unix() as u64)
+                .await;
+        assert!(
+            view.is_err(),
+            "a REFUSED offer read (relay CLOSED the REQ, no EOSE) is UNKNOWN, never absence — a \
+             served claim must NOT turn it into Ok(read_confirmed=true) (#602). got: {view:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
+    }
+
+    // ★ #602 (e2e — THE acceptance test): under a starved offer read + a live claim, the auto-award
+    // driver must NEVER terminally park the retryable intent as offer-absent. This is the literal
+    // #602 field harm — a ~302s re-claim loop — driven end-to-end through `drive_auto_award` /
+    // `parked_awards()`. Post-#603 the refused offer read is `Err` → treated as UNKNOWN → the intent
+    // is left retry-eligible (not parked). REDS on the pre-#603 BLEND: the served claim certifies
+    // the empty offer read as absence → `ParkOfferAbsent` → `parked_awards()` non-empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_starved_offer_with_a_live_claim_never_parks_the_retryable_intent() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::{Client, EventBuilder, Keys, Kind, Tag};
+
+        let root = temp_home("offer-602-no-park");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap_home(&root).expect("bootstrap home");
+        let relay = LocalRelay::new(RelayBuilder::default().query_policy(RefuseOfferReads));
+        relay.run().await.expect("relay run");
+        home.config.relay_url = relay.url().await.to_string();
+        let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
+
+        // A retryable intent: a pending award + a live reservation, and deliberately NO pinned
+        // attempt — so the attempt-outranks-offer guard (`settle_intent_from_attempt`) cannot mask
+        // the park, and the park path is genuinely reachable as it is in the field. The pending
+        // intent row makes a park VISIBLE; without it `mark_award_parked` is a silent no-op.
+        let job = "b".repeat(64);
+        context.store.put_pending_award(&job, 40, None, None, now_unix()).expect("intent");
+        context.store.reserve(&job, 40, 1_000, now_unix()).expect("reserve");
+
+        // The seller's claim e-tagging the job IS served — only the by-id offer REQ is refused.
+        let seller = Keys::generate();
+        let publisher = Client::new(seller.clone());
+        publisher.add_relay(&context.home.config.relay_url).await.expect("add relay");
+        publisher.connect().await;
+        let claim = EventBuilder::new(Kind::Custom(crate::kinds::JOB_CLAIM_KIND), "")
+            .tag(Tag::parse(vec!["e".to_owned(), job.clone()]).expect("e tag"))
+            .tag(Tag::parse(vec!["t".to_owned(), crate::gateway::MAXPLAYER_TAG.to_owned()]).expect("t tag"))
+            .tag(Tag::parse(vec!["status".to_owned(), "processing".to_owned()]).expect("status tag"))
+            .sign_with_keys(&seller)
+            .expect("sign claim");
+        publisher.send_event(&claim).await.expect("relay stores the claim");
+        publisher.disconnect().await;
+
+        // Drive the real auto-award path once. Post-#603 the refused offer read errors out of
+        // `fetch_job_view_async` → out of `drive_auto_award` (never reaching a park). We ignore the
+        // returned `Err` on purpose: the ASSERTION is on the durable effect — the intent stays
+        // unparked. Under the blend this same call parks it.
+        let _ = drive_auto_award(&context, &job, 40).await;
+
+        let parked = context.store.parked_awards().expect("parked");
+        assert!(
+            !parked.iter().any(|(parked_job, _)| parked_job == &job),
+            "a starved offer read + a live claim must NEVER terminally park a retryable intent as \
+             offer-absent (#602) — the offer read FAILED, it was not answered-empty. parked: {parked:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
+    }
+
     // ─────────────────────────────────────────────────────────────────────────────────────────
     // #562 + #574: release a held reservation PROMPTLY on a seller-reported POST-AWARD FAILURE
     // (delivery_failed and its siblings execution_failed / no_sentinel), instead of stranding the
