@@ -1589,6 +1589,57 @@ async fn provision_delivery_workdir(
     }
 }
 
+/// #613 — the seller EMIT dual of the buyer's contribution parse. If `job_id` is a served
+/// contribution (a recorded pin), build the contribution result envelope tags to APPEND to the
+/// standard git result: the offer echo (`job-class`/`target-repo`/`base`/`accepts`) + the
+/// seller-signed `sig/seller-contribution` authorship tuple. The tuple is signed over the SAME fork
+/// repo/branch/tip the result carries ([`crate::contribution::seller_contribution_result_parts`]),
+/// through the signer actor (the seller key never leaves it), so the buyer's
+/// `parse_contribution_result_echo` + pre-pay tuple verify round-trip.
+///
+/// - `Ok(None)`  — a from-scratch job (no pin): the caller leaves the standard result unchanged.
+/// - `Ok(Some)`  — the contribution envelope tags to append.
+/// - `Err(msg)`  — a pin read / envelope build / tuple sign failure. Fail-closed: the caller emits a
+///   delivery-failed feedback and returns rather than delivering a from-scratch shape the buyer
+///   refuses. A free fn (store + signer, not `self`) so the real read -> build -> sign glue is
+///   unit-testable without standing up the whole runner.
+async fn contribution_result_envelope_tags(
+    store: &super::store::SellerStore,
+    signer: &super::signer::SignerHandle,
+    job_id: &str,
+    seller_pubkey_hex: &str,
+    fork_repo: &str,
+    fork_branch: &str,
+    commit_oid: &str,
+) -> Result<Option<Vec<gateway::TagSpec>>, String> {
+    let Some(pin) = store
+        .contribution_pin(job_id)
+        .map_err(|error| format!("contribution pin read failed ({error})"))?
+    else {
+        return Ok(None);
+    };
+    let (offer, tuple) = crate::contribution::seller_contribution_result_parts(
+        job_id,
+        seller_pubkey_hex,
+        &pin.owner_pubkey,
+        &pin.clone_url,
+        &pin.base_branch,
+        &pin.base_oid,
+        fork_repo,
+        fork_branch,
+        commit_oid,
+    )
+    .map_err(|error| format!("contribution result envelope build failed ({error})"))?;
+    let tuple_sig = signer
+        .sign_receipt_hash(tuple.digest_hex())
+        .await
+        .map_err(|error| format!("contribution tuple sign: signer actor gone ({error})"))?
+        .map_err(|error| format!("contribution tuple sign refused ({error})"))?;
+    Ok(Some(crate::contribution::contribution_result_tags(
+        &offer, &tuple_sig,
+    )))
+}
+
 /// Decide whether to claim `offer`, applying the always-on money-safety gates in the legacy order:
 /// a lapsed offer is refused BEFORE its deadline is re-derived (never resurrect a stale offer with a
 /// fresh `now + timeout`), then the #604 offer-age gate (a long-aged historical the backfill keeps
@@ -4561,7 +4612,7 @@ impl SellerNodeRunner {
             wall_time_ms,
             usage.as_ref(),
         );
-        let draft = git_result_draft(
+        let mut draft = git_result_draft(
             job_id,
             &offer.buyer_pubkey,
             &seller.git_remote,
@@ -4573,6 +4624,30 @@ impl SellerNodeRunner {
             format!("delivery commit {commit}"),
             &exec_metadata,
         );
+        // #613: a served contribution (recorded pin) delivers a CONTRIBUTION result envelope — the
+        // offer echo + the seller-signed authorship tuple — additive to the standard git result.
+        // Without it the buyer refuses a correctly-delivered fork ("...requires a contribution
+        // result..."). A from-scratch job (no pin) leaves the result unchanged; a build/sign failure
+        // is fail-closed (delivery_failed), never a from-scratch shape the buyer would refuse.
+        match contribution_result_envelope_tags(
+            self.node.store(),
+            self.node.signer(),
+            job_id,
+            &seller_pubkey,
+            &seller.git_remote,
+            &branch,
+            &commit,
+        )
+        .await
+        {
+            Ok(Some(extra)) => draft.tags.extend(extra),
+            Ok(None) => {}
+            Err(reason) => {
+                opline!("seller node execute fail job_id={job_id}: {reason}");
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                return;
+            }
+        }
         // Journal the delivery + enqueue the result in one transaction. Idempotent: a resumed job
         // that already delivered re-enqueues nothing (invariant 2 — no divergent double-publish).
         let now = now_unix();
@@ -4682,7 +4757,7 @@ impl SellerNodeRunner {
         };
         // No agent ran this pass, so usage/timing are absent (opportunistic — absent stays absent).
         let exec_metadata = seller_exec_metadata(&[], None, 0, None);
-        let draft = git_result_draft(
+        let mut draft = git_result_draft(
             job_id,
             &offer.buyer_pubkey,
             &seller.git_remote,
@@ -4694,6 +4769,28 @@ impl SellerNodeRunner {
             format!("delivery commit {commit}"),
             &exec_metadata,
         );
+        // #613: mirror the execute path — a resumed contribution delivery finalizes the SAME
+        // contribution result envelope (echo + seller-signed tuple) it would have on the live path,
+        // so the buyer accepts whichever pass produced it. From-scratch (no pin) is unchanged.
+        match contribution_result_envelope_tags(
+            self.node.store(),
+            self.node.signer(),
+            job_id,
+            &seller_pubkey,
+            &seller.git_remote,
+            &branch,
+            commit,
+        )
+        .await
+        {
+            Ok(Some(extra)) => draft.tags.extend(extra),
+            Ok(None) => {}
+            Err(reason) => {
+                opline!("seller node finalize fail job_id={job_id}: {reason}");
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                return;
+            }
+        }
         let now = now_unix();
         match self.node.store().deliver_and_enqueue(
             job_id,
@@ -8402,6 +8499,87 @@ mod tests {
             scratch.join(".git").exists(),
             "empty delivery workdir is an initialized git repo"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // #613 TOOTH — the seller EMIT wiring the execute/finalize deliver tail calls. A served
+    // contribution (recorded pin) produces a contribution result envelope that PARSES as a
+    // contribution result AND whose seller-signed tuple verifies over the buyer's OWN reconstruction
+    // (tuple rebuilt from the echo target/base + the fork facts, exactly as `authorize_pay`); a
+    // from-scratch job (no pin) produces NONE, so the standard result rides unchanged. Before the fix
+    // the deliver tail emitted the from-scratch shape for BOTH, so the buyer refused a correctly
+    // delivered fork ("...requires a contribution result..."). Signs through the REAL signer actor
+    // (the seller key never leaves it) — the same path production uses.
+    #[tokio::test]
+    async fn contribution_deliver_emits_result_envelope_pin_only() {
+        let root = temp_dir("contrib-envelope");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mk root");
+        let home = crate::home::bootstrap(&root).expect("bootstrap home");
+        let store = SellerStore::open(root.join("seller.sqlite")).expect("open store");
+        let signer = crate::seller_node::signer::spawn(&home).expect("spawn signer");
+        let seller_hex = signer.public_key_via_actor().await.expect("seller pubkey");
+
+        let fork_repo = "https://relay.maxplayer.test/git/seller/fork.git";
+        let branch = crate::contribution::ForkRef::unique_branch("contrib-job");
+        let commit = "d".repeat(40);
+
+        // From-scratch (no pin): no contribution envelope — the standard result rides unchanged.
+        assert!(
+            contribution_result_envelope_tags(
+                &store, &signer, "scratch-job", &seller_hex, fork_repo, &branch, &commit,
+            )
+            .await
+            .expect("no pin is not an error")
+            .is_none(),
+            "a from-scratch job produces no contribution envelope"
+        );
+
+        // A served contribution records its pin; the envelope tags parse as a contribution result
+        // echoing the pinned target/base.
+        let pin = crate::seller_node::store::ContributionPin {
+            owner_pubkey: "bb".repeat(32),
+            clone_url: "https://relay.maxplayer.test/git/owner/target.git".to_owned(),
+            base_branch: "main".to_owned(),
+            base_oid: "a".repeat(40),
+        };
+        store
+            .record_contribution_pin("contrib-job", &pin, 1)
+            .expect("record pin");
+
+        let extra = contribution_result_envelope_tags(
+            &store, &signer, "contrib-job", &seller_hex, fork_repo, &branch, &commit,
+        )
+        .await
+        .expect("build envelope")
+        .expect("a served contribution emits a contribution envelope");
+
+        let (echo, sig) = crate::contribution::parse_contribution_result_echo(&extra)
+            .expect("parse ok")
+            .expect("is a contribution result");
+        assert_eq!(echo.target.owner_pubkey(), pin.owner_pubkey);
+        assert_eq!(echo.target.clone_url(), pin.clone_url);
+        assert_eq!(echo.base.branch(), pin.base_branch);
+        assert_eq!(echo.base.oid(), pin.base_oid);
+
+        // The buyer reconstructs the tuple from the echo target/base + the fork facts on the result
+        // (authorize_pay), and the seller sig verifies over it.
+        let buyer_tuple = crate::contribution::AuthorshipTuple {
+            job_id: "contrib-job".to_owned(),
+            seller_pubkey: seller_hex.clone(),
+            target: crate::contribution::TargetRepoPin::new(
+                echo.target.owner_pubkey(),
+                echo.target.clone_url(),
+            )
+            .unwrap(),
+            base_oid: echo.base.oid().to_owned(),
+            fork: crate::contribution::ForkRef::new(fork_repo, &branch).unwrap(),
+            commit_oid: commit.clone(),
+        };
+        let seller_key = nostr_sdk::PublicKey::parse(&seller_hex).expect("seller pubkey parse");
+        crate::contribution::verify_tuple_sig(&buyer_tuple, &sig, &seller_key)
+            .expect("seller-signed tuple verifies over the buyer's reconstruction");
 
         let _ = std::fs::remove_dir_all(&root);
     }

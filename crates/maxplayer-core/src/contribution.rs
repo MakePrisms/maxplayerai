@@ -565,6 +565,51 @@ pub fn contribution_result_tags(offer: &ContributionOffer, tuple_sig_hex: &str) 
     tags
 }
 
+/// Seller-side EMIT dual of [`parse_contribution_result_echo`]: assemble the contribution result's
+/// offer ECHO and the AUTHORSHIP TUPLE for a delivered fork, from the seller's pinned target/base and
+/// the delivered fork facts. The caller schnorr-signs `tuple.digest_hex()` with the seller key and
+/// appends [`contribution_result_tags`]`(&offer, &sig)` to the standard git result — so the buyer's
+/// [`parse_contribution_result_echo`] + pre-pay tuple verify (`verify_seller_prepay_cosig`)
+/// round-trip. `fork_repo`/`fork_branch`/`commit_oid` MUST be the SAME repo/branch/tip the result's
+/// `repo`/`branch`/`commit` tags carry, because the buyer reconstructs the tuple from those tags
+/// (`authorize_pay`) — sign over exactly what you emit.
+///
+/// The echoed `accepts` is `["fork"]` (v1's only path): the buyer equality-checks the echoed
+/// target/base against its signed offer but NEVER the echoed accepts (`job_lifecycle`), and authorship
+/// is bound by the tuple over the pinned target + base_oid + fork + commit — so the echo need only
+/// PARSE (a non-empty `accepts` containing `fork`). Fail-closed: a malformed pin/base/fork is an
+/// `Err` the caller maps to a delivery refusal, never a silent from-scratch shape.
+#[allow(clippy::too_many_arguments)]
+pub fn seller_contribution_result_parts(
+    job_id: &str,
+    seller_pubkey_hex: &str,
+    target_owner_pubkey: &str,
+    target_clone_url: &str,
+    base_branch: &str,
+    base_oid: &str,
+    fork_repo: &str,
+    fork_branch: &str,
+    commit_oid: &str,
+) -> Result<(ContributionOffer, AuthorshipTuple), ContributionError> {
+    let target = TargetRepoPin::new(target_owner_pubkey, target_clone_url)?;
+    let base = ContributionBase::new(base_branch, base_oid)?;
+    let fork = ForkRef::new(fork_repo, fork_branch)?;
+    let offer = ContributionOffer {
+        target: target.clone(),
+        base,
+        accepts: vec![ACCEPTS_FORK.to_owned()],
+    };
+    let tuple = AuthorshipTuple {
+        job_id: job_id.to_owned(),
+        seller_pubkey: seller_pubkey_hex.to_owned(),
+        target,
+        base_oid: base_oid.to_owned(),
+        fork,
+        commit_oid: commit_oid.to_owned(),
+    };
+    Ok((offer, tuple))
+}
+
 #[cfg(feature = "gateway")]
 mod schnorr {
     use super::AuthorshipTuple;
@@ -792,6 +837,93 @@ mod tests {
             .expect("is a contribution result");
         assert_eq!(echo, offer);
         assert_eq!(parsed_sig, sig);
+    }
+
+    // #613 RED->GREEN: the seller EMIT path. A from-scratch result carries no contribution echo, so
+    // the buyer refuses it ("...requires a contribution result...", job_lifecycle) — that is the
+    // pre-fix delivered shape. `seller_contribution_result_parts` + a seller-signed tuple +
+    // `contribution_result_tags` turns the SAME result into a contribution result that round-trips
+    // through the buyer's parse AND whose authorship tuple verifies over the buyer's OWN
+    // reconstruction (rebuilt from the equality-checked echo target/base + the fork facts it reads
+    // off the result's repo/branch/commit — exactly as `authorize_pay` does). Non-vacuous: a wrong
+    // key and a tampered commit both refuse.
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn seller_result_parts_round_trip_through_buyer_parse_and_tuple_verify() {
+        use nostr_sdk::Keys;
+        let seller = Keys::generate();
+        let seller_hex = seller.public_key().to_hex();
+        let job_id = "job-613";
+        let target_owner = "aa".repeat(32);
+        let target_url = "https://relay.maxplayer.test/git/owner/repo.git";
+        let base_branch = "main";
+        let base_oid = "a".repeat(40);
+        let fork_repo = "https://relay.maxplayer.test/git/seller/fork.git";
+        let fork_branch = ForkRef::unique_branch(job_id);
+        let commit_oid = "d".repeat(40);
+
+        // RED — the pre-fix delivered shape: a standard git result with NO contribution tags is not
+        // a contribution result, so the buyer refuses it.
+        let from_scratch = vec![
+            TagSpec::new(["delivery", "git"]),
+            TagSpec::new(["commit", commit_oid.as_str()]),
+            TagSpec::new(["repo", fork_repo]),
+            TagSpec::new(["branch", fork_branch.as_str()]),
+            TagSpec::new(["sig", "seller", "receipt-cosig"]),
+        ];
+        assert_eq!(
+            parse_contribution_result_echo(&from_scratch).expect("parse ok"),
+            None,
+            "a from-scratch result carries no contribution echo — the buyer refuses it"
+        );
+
+        // GREEN — the seller builds the parts, signs the tuple digest, and appends the contribution
+        // result tags to the SAME result.
+        let (offer, tuple) = seller_contribution_result_parts(
+            job_id,
+            &seller_hex,
+            &target_owner,
+            target_url,
+            base_branch,
+            &base_oid,
+            fork_repo,
+            &fork_branch,
+            &commit_oid,
+        )
+        .expect("build parts");
+        let sig = sign_authorship_tuple(&seller, &tuple);
+        let mut tags = from_scratch.clone();
+        tags.extend(contribution_result_tags(&offer, &sig));
+
+        // Now it parses as a contribution result echoing the pinned target/base.
+        let (echo, parsed_sig) = parse_contribution_result_echo(&tags)
+            .expect("parse ok")
+            .expect("is a contribution result");
+        assert_eq!(echo.target.owner_pubkey(), target_owner);
+        assert_eq!(echo.target.clone_url(), target_url);
+        assert_eq!(echo.base.branch(), base_branch);
+        assert_eq!(echo.base.oid(), base_oid);
+        assert_eq!(parsed_sig, sig);
+
+        // The buyer reconstructs the tuple from the echo target/base + the fork facts on the result
+        // (authorize_pay), and the seller sig verifies over it.
+        let buyer_tuple = AuthorshipTuple {
+            job_id: job_id.to_owned(),
+            seller_pubkey: seller_hex.clone(),
+            target: TargetRepoPin::new(echo.target.owner_pubkey(), echo.target.clone_url()).unwrap(),
+            base_oid: echo.base.oid().to_owned(),
+            fork: ForkRef::new(fork_repo, &fork_branch).unwrap(),
+            commit_oid: commit_oid.clone(),
+        };
+        verify_tuple_sig(&buyer_tuple, &parsed_sig, &seller.public_key())
+            .expect("seller-signed tuple verifies over the buyer's reconstruction");
+
+        // Non-vacuous: a wrong key and a tampered commit both refuse.
+        let attacker = Keys::generate();
+        assert!(verify_tuple_sig(&buyer_tuple, &parsed_sig, &attacker.public_key()).is_err());
+        let mut tampered = buyer_tuple.clone();
+        tampered.commit_oid = "e".repeat(40);
+        assert!(verify_tuple_sig(&tampered, &parsed_sig, &seller.public_key()).is_err());
     }
 
     #[test]
