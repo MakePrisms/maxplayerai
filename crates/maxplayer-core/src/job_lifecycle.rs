@@ -2349,6 +2349,19 @@ fn parse_relayed_award(
     })
 }
 
+/// Whether the OFFER read for a job was ANSWERED — the sole discriminator [`JobView::read_confirmed`]
+/// carries, and the input [`crate::buyer::lifecycle::plan_missing_offer`] turns into a terminal park.
+///
+/// Rests on the offer filter's OWN evidence: `offer_present` (the relay returned our offer) or
+/// `offer_probe_confirmed` (the `EOSE` the relay owes us for the offer REQ, re-proven by a second
+/// offer fetch). A claim or result event is the relay answering a DIFFERENT filter — it proves the
+/// session is alive but says nothing about whether the offer subscription was served, so it can
+/// never certify offer-absence. #602 was exactly that substitution. Feedback/result are deliberately
+/// NOT parameters here so the blend cannot even type-check.
+fn offer_read_answered(offer_present: bool, offer_probe_confirmed: bool) -> bool {
+    offer_present || offer_probe_confirmed
+}
+
 /// Read one job's offer + claims + results from the relay, with claim liveness derived
 /// against `now` (a `processing` claim past the offer deadline is EXPIRED, not live). Exposed
 /// `pub(crate)` so the seller daemon can run the backfill money-safety pre-claim check
@@ -2367,36 +2380,95 @@ pub(crate) async fn fetch_job_view_async(
         .map_err(|error| JobLifecycleError::Input(format!("job_id: {error}")))?;
 
     let client = Client::new(keys.clone());
+    // Same discipline as `award_presence_async` / `presence_of_filter`: auto-auth ON so a
+    // NIP-42-gated read re-issues after the handshake, and WAIT for the socket before the first
+    // fetch — `connect()` only spawns, and a fetch racing the handshake burns its whole window and
+    // reads as empty.
+    client.automatic_authentication(true);
     client
         .add_relay(&home.config.relay_url)
         .await
         .map_err(|error| JobLifecycleError::Relay(format!("add relay: {error}")))?;
     client.connect().await;
+    let relay = client
+        .relay(&home.config.relay_url)
+        .await
+        .map_err(|error| JobLifecycleError::Relay(format!("relay handle: {error}")))?;
+    relay.wait_for_connection(RELAY_CONNECT_WAIT).await;
 
-    // Every fetch filter carries the `#t=maxplayer` namespace guard so a foreign event
-    // squatting a maxplayer kind is never returned.
+    // Every fetch filter carries the `#t=maxplayer` namespace guard so a foreign event squatting a
+    // maxplayer kind is never returned.
     let offer_filter = Filter::new()
         .id(offer_id)
         .kind(Kind::Custom(JOB_OFFER_KIND))
         .hashtag(gateway::MAXPLAYER_TAG);
-    // Claims (processing) and feedback (error) are distinct kinds — fetch both so the claim
-    // view surfaces both.
+
+    // ── The OFFER read is the SOLE evidence that may certify offer-ABSENCE (#291, #602).
+    //
+    // Read it through the SINGLE-RELAY api with `ExitOnEOSE`, not the pool: the pool SWALLOWS a
+    // per-relay stream error (a `CLOSED auth-required:`, a refused REQ) into `Ok(empty)`, so a
+    // refusal would read as absence. Here a refusal surfaces as `Err` and the caller treats the
+    // read as unknown — the discipline `award_presence_async` already relies on.
+    use nostr_sdk::pool::relay::ReqExitPolicy;
+    let offer_read_started = tokio::time::Instant::now();
+    let mut offer_events = relay
+        .fetch_events(offer_filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
+        .await
+        .map_err(|error| JobLifecycleError::Relay(format!("fetch offer: {error}")))?;
+
+    // `read_confirmed` is derived from the OFFER read ALONE. A claim or result event is the relay
+    // answering a DIFFERENT filter — it proves the session is alive but says NOTHING about whether
+    // the offer subscription was served. #602 was exactly that substitution: a non-empty claims
+    // read certifying an empty offer read as absence, terminally parking a retryable offer. The
+    // claim/result reads below are therefore taken AFTER this decision and cannot feed it —
+    // reintroducing the blend here would reference bindings that do not yet exist.
+    //
+    // The by-id filter means a compliant relay returns only our offer; we still assert `id ==
+    // offer_id` at every point we consult the set, so a misbehaving relay's foreign event can
+    // neither seed the view nor count as presence (matches the award path's rigor).
+    let offer_present = offer_events.iter().any(|event| event.id == offer_id);
+    let offer_probe_confirmed = if offer_present {
+        // The offer is in hand; there is nothing to disambiguate and the relay owes no round trip.
+        false
+    } else {
+        // Empty offer read: pay the round trip the relay OWES us (a `limit(0)` REQ's `EOSE`) and,
+        // only on that proof, RE-FETCH the offer once more before concluding absence — the proof
+        // must PRECEDE the read it vouches for, and a second read may land what a window-starved
+        // first one missed. Deliberately a RESPONSE, not a broadcast we merely hope to receive.
+        let confirmed =
+            crate::buyer::relay::probe_relay_serves_our_reqs(&client, keys.public_key(), timeout)
+                .await;
+        if confirmed {
+            offer_events = relay
+                .fetch_events(offer_filter, timeout, ReqExitPolicy::ExitOnEOSE)
+                .await
+                .map_err(|error| {
+                    JobLifecycleError::Relay(format!("fetch offer (recheck): {error}"))
+                })?;
+        }
+        // Make the why-empty question observable next time (the report the tree lacked): whether
+        // the relay answered our REQ, whether the recheck found the offer, and how long it took.
+        crate::opline!(
+            "buyer offer-read empty job={job_id} relay_answered={confirmed} offer_on_recheck={} \
+             elapsed_ms={} (#602)",
+            offer_events.iter().any(|event| event.id == offer_id),
+            offer_read_started.elapsed().as_millis()
+        );
+        confirmed
+    };
+    let read_confirmed = offer_read_answered(offer_present, offer_probe_confirmed);
+
+    // Claims (processing) and feedback (error) are distinct kinds — fetch both so the claim view
+    // surfaces both. These reads are informational for the view (liveness, accept, delivery); they
+    // run AFTER `read_confirmed` above precisely so they can never certify offer-absence (#602).
     let feedback_filter = Filter::new()
-        .kinds([
-            Kind::Custom(JOB_CLAIM_KIND),
-            Kind::Custom(JOB_FEEDBACK_KIND),
-        ])
+        .kinds([Kind::Custom(JOB_CLAIM_KIND), Kind::Custom(JOB_FEEDBACK_KIND)])
         .hashtag(gateway::MAXPLAYER_TAG)
         .event(offer_id);
     let result_filter = Filter::new()
         .kind(Kind::Custom(JOB_RESULT_KIND))
         .hashtag(gateway::MAXPLAYER_TAG)
         .event(offer_id);
-
-    let offer_events = client
-        .fetch_events(offer_filter, timeout)
-        .await
-        .map_err(|error| JobLifecycleError::Relay(format!("fetch offer: {error}")))?;
     let feedback_events = client
         .fetch_events(feedback_filter, timeout)
         .await
@@ -2406,23 +2478,9 @@ pub(crate) async fn fetch_job_view_async(
         .await
         .map_err(|error| JobLifecycleError::Relay(format!("fetch results: {error}")))?;
 
-    // ── Did the relay ANSWER, or did we merely stop waiting?
-    //
-    // Any event at all proves the session was serving us, so emptiness in the other filters is the
-    // relay's word and costs nothing to establish. Only when ALL THREE come back empty is the read
-    // ambiguous — and that is precisely the case a caller is most likely to act on. There we pay
-    // one extra round trip for something the relay OWES us: a `limit(0)` REQ's `EOSE`. Deliberately
-    // a RESPONSE and not a broadcast; an event we merely hope to receive proves nothing by its
-    // absence, because the relay may legitimately never send it.
-    let saw_any_event =
-        !offer_events.is_empty() || !feedback_events.is_empty() || !result_events.is_empty();
-    let read_confirmed = saw_any_event
-        || crate::buyer::relay::probe_relay_serves_our_reqs(&client, keys.public_key(), timeout)
-            .await;
-
     client.disconnect().await;
 
-    let offer = offer_events.into_iter().next().map(|event| {
+    let offer = offer_events.into_iter().find(|event| event.id == offer_id).map(|event| {
         let draft = event_to_draft(&event);
         let parsed = parse_offer(&draft).ok();
         OfferView {
@@ -2711,6 +2769,24 @@ fn result_attribution(tags: &[TagSpec]) -> (Option<String>, Option<String>) {
 mod tests {
     use super::*;
     use crate::home;
+
+    // #602: offer-ABSENCE is certified from the offer read ALONE. The bug was
+    // `read_confirmed = offer || feedback || result || probe`, which let a non-empty claims (or
+    // results) read stand in for the offer's own answer and terminally park a retryable offer. The
+    // contract is pinned here by SIGNATURE as much as by value: `offer_read_answered` takes only the
+    // offer's own evidence, so no future edit can feed a claim/result into it without a loud,
+    // reviewable change. (The derivation site enforces the same by ORDER — the claim/result reads
+    // run after this decision, so reintroducing the blend there is a compile error.)
+    #[test]
+    fn claims_and_results_are_not_inputs_to_offer_absence_certification() {
+        // Offer in hand → answered, no probe needed.
+        assert!(offer_read_answered(true, false));
+        // Offer empty but the relay proved it served the OFFER REQ (EOSE + re-fetch) → answered.
+        assert!(offer_read_answered(false, true));
+        // Offer empty AND its own read unconfirmed → NOT answered. No claim or result can flip this,
+        // because neither is an input: the driver must RETRY, never terminally park (#291/#602).
+        assert!(!offer_read_answered(false, false));
+    }
 
     // Finding A: accept-side creq verification is STRICT and fail-closed. A well-formed creq
     // whose payment terms match the job+offer yields its `m` mints; every other shape refuses.
