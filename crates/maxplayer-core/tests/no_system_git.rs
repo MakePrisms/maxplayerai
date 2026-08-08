@@ -12,11 +12,14 @@
 //!    an EMPTY dir it fails to spawn with `NotFound`. This proves the scrub is real — a silent
 //!    scrub failure would leave `git` reachable and fail this assertion rather than pass vacuously.
 //! 2. **Detection.** PATH is then pointed at a dir holding a stand-in `git` that RECORDS any
-//!    invocation to a marker file and exits non-zero (a tripwire). Every in-process production leg
-//!    is driven under it. libgit2 never consults PATH, so a leg that truly uses libgit2 succeeds
-//!    and never touches the tripwire; a leg that shells out trips the marker (caught even if the
-//!    caller ignores the exit status — the case a bare empty-PATH check would miss) and/or fails.
-//!    At the end the marker MUST NOT exist.
+//!    invocation to a marker file and exits non-zero (a tripwire). The tripwire is FIRST
+//!    self-checked — one direct `git` call must make the marker appear, which is then reset — so a
+//!    silently-broken detector (bad marker path, lost +x, shell failure) fails loudly here instead
+//!    of letting the final absent-assert pass vacuously. Every in-process production leg is then
+//!    driven under it. libgit2 never consults PATH, so a leg that truly uses libgit2 succeeds and
+//!    never touches the tripwire; a leg that shells out trips the marker (caught even if the caller
+//!    ignores the exit status — the case a bare empty-PATH check would miss) and/or fails. At the
+//!    end the marker MUST NOT exist.
 //!
 //! ## Legs exercised (all local, no network — avoids the debug-only #152 HTTP-transport lifecycle bug)
 //! - A: `seller_git` from-scratch delivery — `init_empty_delivery_workdir` + `snapshot_delivery`.
@@ -128,6 +131,20 @@ fn production_git_legs_never_shell_out_to_system_git() {
     unsafe {
         std::env::set_var("PATH", &tripwire_bin);
     }
+
+    // Positive control for the DETECTOR itself: fire system `git` once and confirm the marker
+    // appears, then reset it. Without this, a silently-broken tripwire would make the final
+    // absent-assert pass vacuously — missing exactly the ignored-error shell-out A5 exists to catch.
+    Command::new("git")
+        .arg("--version")
+        .status()
+        .expect("tripwire self-check: `git` must spawn the tripwire stand-in");
+    assert!(
+        marker.exists(),
+        "tripwire self-check failed: firing system `git` did not record the marker — the detector \
+         is broken, so the final absent-assert would be vacuous"
+    );
+    fs::remove_file(&marker).expect("tripwire self-check: reset marker before driving the legs");
 
     let identity = DeliveryAgentIdentity::for_seller(&"ab".repeat(32));
 
