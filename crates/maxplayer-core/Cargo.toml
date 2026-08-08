@@ -61,9 +61,18 @@ required-features = ["git-delivery"]
 name = "git_config_isolation"
 required-features = ["git-delivery"]
 
+# A5 (#55): the in-process git legs never shell out to system `git`. Drives the real seller/verify
+# entry points with `git` scrubbed from PATH — gated like above; runs in the money-path CI job.
+[[test]]
+name = "no_system_git"
+required-features = ["git-delivery"]
+
 [dev-dependencies]
 async-trait = "0.1.89"
 cdk-sqlite = "=0.17.2"
+# A5 (tests/no_system_git) builds git fixtures and reads commit graphs via libgit2 directly. Same
+# workspace pin as the optional [dependencies] git2, so it unifies to one crate instance.
+git2 = { workspace = true }
 # Sink/Stream helpers for the p-gate relay fixture's websocket split. Already in the workspace lock
 # via nostr-sdk; no new resolution.
 futures-util = { version = "0.3", default-features = false }
