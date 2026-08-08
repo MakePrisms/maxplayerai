@@ -545,6 +545,30 @@ pub async fn init_empty_delivery_workdir_off_runtime(
     off_runtime(move || init_empty_delivery_workdir(&workdir, &identity)).await
 }
 
+/// Off-runtime [`init_contribution_workdir`].
+pub async fn init_contribution_workdir_off_runtime(
+    workdir: PathBuf,
+    identity: DeliveryAgentIdentity,
+    base_clone_url: String,
+    base_branch: String,
+    base_oid: String,
+    branch: String,
+    auth: Option<PushAuth>,
+) -> Result<(), SellerGitError> {
+    off_runtime(move || {
+        init_contribution_workdir(
+            &workdir,
+            &identity,
+            &base_clone_url,
+            &base_branch,
+            &base_oid,
+            &branch,
+            auth.as_ref(),
+        )
+    })
+    .await
+}
+
 /// Off-runtime [`snapshot_delivery_at`].
 pub async fn snapshot_delivery_at_off_runtime(
     workdir: PathBuf,
