@@ -277,6 +277,11 @@ enum ClaimDecision {
 enum SkipReason {
     /// The offer's own absolute deadline already passed — dead, never resurrected.
     Lapsed,
+    /// #604: the offer was authored too long ago — its WIRE age (`now − created_at`) exceeds
+    /// [`MAX_OFFER_ADMIT_AGE_SECS`]. A long-aged, never-awarded historical the backfill keeps
+    /// re-surfacing; admitting it only parks an execution slot on work that will not be awarded.
+    /// Distinct from [`Self::Lapsed`]: that is the offer's self-declared expiry, this is its age.
+    TooOld,
     /// The seller runs a populated `accept_offers_only_from` allowlist and this offer's author (the
     /// buyer) is not on it — a hard fence (#482). Named (not silent) so the operator log records the
     /// declined pubkey; no buyer feedback is emitted (a private seller does not advertise the fence).
@@ -302,6 +307,7 @@ impl SkipReason {
     fn reason(self) -> &'static str {
         match self {
             Self::Lapsed => "offer deadline already passed (lapsed; never resurrected)",
+            Self::TooOld => "offer authored too long ago (aged historical; not re-admitted from backfill)",
             Self::NotAllowlisted => "buyer not in accept_offers_only_from allowlist",
             Self::RateGate => "rate-gate refused (untargeted without opt-in / below rate)",
             Self::AgentUnavailable => "requested agent harness not available on this node",
@@ -698,6 +704,17 @@ const OFFER_BACKFILL_LIMIT: usize = 500;
 /// ticks cannot open a permanent gap.
 const OFFER_BACKFILL_WINDOW_SECS: u64 = 3600;
 
+/// #604: the maximum WIRE AGE (`now − event.created_at`) at which an offer is still admitted for a
+/// claim, applied in [`classify_offer`] DISTINCT from the offer's self-declared `deadline_unix`. The
+/// periodic offer-backfill re-ingests every stored kind-3401 in its lookback window each tick, so a
+/// long-aged, never-awarded historical with a FAR-FUTURE deadline would otherwise be (re-)admitted,
+/// claimed, and hold an execution slot for the full claim-lapse — starving live offers (`SlotsBusy`)
+/// while a genuinely awardable one is refused. Set to the backfill window: everything within the
+/// routine recovery horizon stays admitted (so legitimate backfill of a genuinely-recent offer is
+/// never defeated), and only offers a WIDENED `offer_backfill_secs` reaches past that horizon are
+/// refused. Orthogonal to the live claim-lapse capacity guard — a claimed slot still lapses on time.
+const MAX_OFFER_ADMIT_AGE_SECS: u64 = OFFER_BACKFILL_WINDOW_SECS;
+
 /// Hard cap on one offer-backfill fetch, so an auth-gated relay that never EOSEs cannot wedge the
 /// tick. Mirrors [`WRAP_BACKFILL_FETCH_TIMEOUT`].
 const OFFER_BACKFILL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -712,8 +729,10 @@ const SETTLED_ELSEWHERE_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// The `since` cursor for a periodic offer backfill: a bounded lookback from `now`, never shorter than
 /// [`OFFER_BACKFILL_WINDOW_SECS`] and widened to the seller's configured `offer_backfill_secs` when
 /// that is larger, so the periodic recovery window is never narrower than the boot backfill's. Unlike
-/// the wrap cursor there is no store cursor to clamp to — offers carry their own staleness gate (the
-/// classify deadline refusal), so a wide, purely time-bounded window is safe by construction.
+/// the wrap cursor there is no store cursor to clamp to. What a fetched offer is then measured
+/// against is [`classify_offer`]'s admission gates: the self-declared `deadline_unix` refusal AND the
+/// #604 offer-age refusal ([`MAX_OFFER_ADMIT_AGE_SECS`]) — the latter is why a WIDENED window is safe,
+/// since a long-aged historical the wide window re-surfaces is refused rather than re-claimed.
 fn resolve_offer_backfill_since(now: u64, offer_backfill_secs: u64) -> nostr_sdk::Timestamp {
     let window = OFFER_BACKFILL_WINDOW_SECS.max(offer_backfill_secs);
     nostr_sdk::Timestamp::from(now.saturating_sub(window))
@@ -1497,8 +1516,10 @@ fn offer_row(job_id: &str, buyer_pubkey: &str, offer: &ParsedOffer) -> super::st
 
 /// Decide whether to claim `offer`, applying the always-on money-safety gates in the legacy order:
 /// a lapsed offer is refused BEFORE its deadline is re-derived (never resurrect a stale offer with a
-/// fresh `now + timeout`), then the buyer-allowlist fence (#482), then the targeting/rate gate, then
-/// the harness the offer asked for. Pure over (offer, config, registry, buyer, now).
+/// fresh `now + timeout`), then the #604 offer-age gate (a long-aged historical the backfill keeps
+/// re-surfacing is refused so it cannot park a slot on work that will not be awarded), then the
+/// buyer-allowlist fence (#482), then the targeting/rate gate, then the harness the offer asked for.
+/// Pure over (offer, config, registry, buyer, now, offer_created_at).
 ///
 /// The harness gate is a CLAIM-time decision, not a delivery-time one: a node that cannot run the
 /// requested harness never parks a claim at all, so the buyer's offer stays visible to a seller
@@ -1510,11 +1531,22 @@ fn classify_offer(
     seller_pubkey: &str,
     buyer_pubkey: &str,
     now_unix: u64,
+    offer_created_at: u64,
 ) -> ClaimDecision {
     // Offer-freshness (money-safety): an offer whose own absolute deadline already passed is dead,
     // refused here before `job_deadline_unix` could hand it a fresh window.
     if offer.deadline_unix <= now_unix {
         return ClaimDecision::Skip(SkipReason::Lapsed);
+    }
+    // #604 offer-age gate — DISTINCT from the self-declared deadline above. The periodic backfill
+    // re-ingests every stored offer in its lookback each tick; a long-aged, never-awarded historical
+    // with a far-future deadline clears the deadline gate but must NOT be (re-)admitted — claiming it
+    // holds an execution slot for the full claim-lapse and starves live offers (`SlotsBusy`). Refuse
+    // by WIRE age (`now − created_at`); the threshold spans the backfill recovery horizon so a
+    // genuinely-recent offer is untouched. Independent of the live claim-lapse guard — a claimed slot
+    // still lapses on time; this only stops the offer being claimed in the first place.
+    if now_unix.saturating_sub(offer_created_at) > MAX_OFFER_ADMIT_AGE_SECS {
+        return ClaimDecision::Skip(SkipReason::TooOld);
     }
     // Private-seller fence (#482): a populated `accept_offers_only_from` claims ONLY from a named
     // buyer. Empty/absent ⇒ accept-all (unchanged). Consulted after the lapsed refusal but before
@@ -2334,6 +2366,12 @@ impl SellerNodeRunner {
                 &self.agents,
                 &seller_pubkey,
                 &row.buyer_pubkey,
+                now as u64,
+                // #604: the age gate is a BACKFILL admission concern. A reconsider re-drives an
+                // already-recorded, already-age-vetted capacity-skip (an offer is recorded only after
+                // `classify_offer` returned `Claim`, so an aged historical never lands in this set),
+                // so pass `now` — the gate is a no-op here and cannot refuse a legitimately-vetted
+                // offer that is merely waiting on a slot.
                 now as u64,
             ) {
                 ClaimDecision::Claim { deadline_unix } => {
@@ -3426,7 +3464,7 @@ impl SellerNodeRunner {
         // allowlist fence can test it and the skip log can name the declined pubkey.
         let buyer_pubkey = event.pubkey.to_hex();
         let now = now_unix();
-        let deadline_unix = match classify_offer(&offer, &seller, &self.agents, &seller_pubkey, &buyer_pubkey, now as u64)
+        let deadline_unix = match classify_offer(&offer, &seller, &self.agents, &seller_pubkey, &buyer_pubkey, now as u64, event.created_at.as_secs())
         {
             ClaimDecision::Claim { deadline_unix } => deadline_unix,
             ClaimDecision::Skip(skip) => {
@@ -5198,7 +5236,7 @@ mod tests {
     // A fresh, in-rate, targeted offer is claimed and carries the resolved deadline.
     #[test]
     fn claims_fresh_targeted_offer_at_rate() {
-        let decision = classify_offer(&offer(5, Some(SELLER), NOW + 600), &seller_cfg(2, false), &claude_only(), SELLER, BUYER, NOW);
+        let decision = classify_offer(&offer(5, Some(SELLER), NOW + 600), &seller_cfg(2, false), &claude_only(), SELLER, BUYER, NOW, NOW);
         assert_eq!(decision, ClaimDecision::Claim { deadline_unix: NOW + 600 });
     }
 
@@ -5206,14 +5244,34 @@ mod tests {
     // it is never resurrected with a fresh window, even though it clears the rate floor.
     #[test]
     fn refuses_lapsed_offer_before_rate() {
-        let decision = classify_offer(&offer(100, Some(SELLER), NOW), &seller_cfg(2, false), &claude_only(), SELLER, BUYER, NOW);
+        let decision = classify_offer(&offer(100, Some(SELLER), NOW), &seller_cfg(2, false), &claude_only(), SELLER, BUYER, NOW, NOW);
         assert_eq!(decision, ClaimDecision::Skip(SkipReason::Lapsed));
+    }
+
+    // #604 OFFER-AGE GATE — an offer authored longer ago than MAX_OFFER_ADMIT_AGE_SECS is refused as a
+    // long-aged historical, DISTINCT from the deadline gate: the deadline is FAR IN THE FUTURE here, so
+    // only the age gate can produce this skip. The foil (an offer authored one second INSIDE the
+    // horizon, same far-future deadline) still claims — the gate refuses by age, never a blanket veto.
+    #[test]
+    fn refuses_an_offer_authored_before_the_admit_horizon() {
+        assert_eq!(
+            classify_offer(&offer(100, Some(SELLER), NOW + 3_600), &seller_cfg(2, false), &claude_only(), SELLER, BUYER, NOW, NOW - (MAX_OFFER_ADMIT_AGE_SECS + 1)),
+            ClaimDecision::Skip(SkipReason::TooOld),
+            "an offer older than the admit horizon is refused (aged historical)"
+        );
+        assert!(
+            matches!(
+                classify_offer(&offer(100, Some(SELLER), NOW + 3_600), &seller_cfg(2, false), &claude_only(), SELLER, BUYER, NOW, NOW - (MAX_OFFER_ADMIT_AGE_SECS - 1)),
+                ClaimDecision::Claim { .. }
+            ),
+            "an offer within the horizon (same far-future deadline) still claims — refused by age, not by a blanket veto"
+        );
     }
 
     // Below the rate floor ⇒ skip (never claim work priced under the seller's floor).
     #[test]
     fn refuses_below_rate() {
-        let decision = classify_offer(&offer(1, Some(SELLER), NOW + 600), &seller_cfg(5, false), &claude_only(), SELLER, BUYER, NOW);
+        let decision = classify_offer(&offer(1, Some(SELLER), NOW + 600), &seller_cfg(5, false), &claude_only(), SELLER, BUYER, NOW, NOW);
         assert_eq!(decision, ClaimDecision::Skip(SkipReason::RateGate));
     }
 
@@ -5230,13 +5288,13 @@ mod tests {
 
         // Listed buyer ⇒ still claims (same offer an empty allowlist would claim).
         assert_eq!(
-            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, ALLOWED, NOW),
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, ALLOWED, NOW, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 },
             "a listed buyer's offer must claim"
         );
         // Unlisted buyer ⇒ fenced out, named reason (NOT a silent drop, NOT a rate/harness reason).
         assert_eq!(
-            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, STRANGER, NOW),
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, STRANGER, NOW, NOW),
             ClaimDecision::Skip(SkipReason::NotAllowlisted),
             "an unlisted buyer's offer must be fenced — only the buyer changed"
         );
@@ -5250,7 +5308,7 @@ mod tests {
         let cfg = seller_cfg(2, false);
         assert!(cfg.accept_offers_only_from.is_empty(), "precondition: default allowlist is empty");
         assert_eq!(
-            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, "anybody99", NOW),
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, "anybody99", NOW, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 },
             "with no allowlist, any buyer's in-rate offer claims"
         );
@@ -5263,7 +5321,7 @@ mod tests {
         let mut cfg = seller_cfg(2, false);
         cfg.accept_offers_only_from = vec!["cafe01".to_owned()];
         assert_eq!(
-            classify_offer(&offer(100, Some(SELLER), NOW), &cfg, &claude_only(), SELLER, "dead02", NOW),
+            classify_offer(&offer(100, Some(SELLER), NOW), &cfg, &claude_only(), SELLER, "dead02", NOW, NOW),
             ClaimDecision::Skip(SkipReason::Lapsed),
             "a lapsed offer is refused before the allowlist is consulted"
         );
@@ -5443,11 +5501,11 @@ mod tests {
     #[test]
     fn untargeted_needs_open_pool_opt_in() {
         assert_eq!(
-            classify_offer(&offer(5, None, NOW + 600), &seller_cfg(2, false), &claude_only(), SELLER, BUYER, NOW),
+            classify_offer(&offer(5, None, NOW + 600), &seller_cfg(2, false), &claude_only(), SELLER, BUYER, NOW, NOW),
             ClaimDecision::Skip(SkipReason::RateGate)
         );
         assert_eq!(
-            classify_offer(&offer(5, None, NOW + 600), &seller_cfg(2, true), &claude_only(), SELLER, BUYER, NOW),
+            classify_offer(&offer(5, None, NOW + 600), &seller_cfg(2, true), &claude_only(), SELLER, BUYER, NOW, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 }
         );
     }
@@ -5462,7 +5520,7 @@ mod tests {
         let mut wants_codex = offer(5, Some(SELLER), NOW + 600);
         wants_codex.requested_agent = Some("codex".to_owned());
         assert_eq!(
-            classify_offer(&wants_codex, &seller_cfg(2, false), &claude_only(), SELLER, BUYER, NOW),
+            classify_offer(&wants_codex, &seller_cfg(2, false), &claude_only(), SELLER, BUYER, NOW, NOW),
             ClaimDecision::Skip(SkipReason::AgentUnavailable)
         );
 
@@ -5479,13 +5537,13 @@ mod tests {
             },
         ]));
         assert_eq!(
-            classify_offer(&wants_codex, &seller_cfg(2, false), &both, SELLER, BUYER, NOW),
+            classify_offer(&wants_codex, &seller_cfg(2, false), &both, SELLER, BUYER, NOW, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 }
         );
 
         // And an offer asking for nothing is claimed by the claude-only node exactly as before.
         assert_eq!(
-            classify_offer(&offer(5, Some(SELLER), NOW + 600), &seller_cfg(2, false), &claude_only(), SELLER, BUYER, NOW),
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &seller_cfg(2, false), &claude_only(), SELLER, BUYER, NOW, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 }
         );
     }
@@ -5509,7 +5567,7 @@ mod tests {
         // Precondition — the SAME offer is claimable before the drop, so the assertion below cannot
         // pass for some unrelated reason.
         assert_eq!(
-            classify_offer(&untargeted, &seller_cfg(2, false), &roster, SELLER, BUYER, NOW),
+            classify_offer(&untargeted, &seller_cfg(2, false), &roster, SELLER, BUYER, NOW, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 },
             "the offer must be claimable first, or the drop below proves nothing"
         );
@@ -5517,7 +5575,7 @@ mod tests {
         roster.fault(0, Fault::Unproven, std::time::Instant::now());
 
         assert_eq!(
-            classify_offer(&untargeted, &seller_cfg(2, false), &roster, SELLER, BUYER, NOW),
+            classify_offer(&untargeted, &seller_cfg(2, false), &roster, SELLER, BUYER, NOW, NOW),
             ClaimDecision::Skip(SkipReason::AgentUnavailable),
             "a node whose only harness is dropped must stop claiming"
         );
@@ -6869,6 +6927,108 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconsider_backfills_a_capacity_skipped_open_pool_offer_when_a_slot_frees() {
         drive_capacity_skip_backfill("cap-skip-open-pool", true, 0).await;
+    }
+
+    /// An OPEN-POOL offer signed by `buyer` with an explicit wire `created_at` — the field #604's
+    /// admission age gate reads (a live/backfilled event carries its real authored-at second), so a
+    /// test must be able to author an offer "in the past". `task` differs per offer: an event id is a
+    /// content hash, so identical content collapses to ONE id.
+    fn open_pool_offer(
+        buyer: &Keys,
+        task: &str,
+        amount: u64,
+        deadline_unix: u64,
+        created_at: u64,
+    ) -> nostr_sdk::Event {
+        let draft =
+            crate::gateway::OfferDraft::untargeted(task, "", amount, deadline_unix).to_event_draft();
+        crate::gateway::nostr::event_builder(&draft)
+            .expect("offer event builder")
+            .custom_created_at(nostr_sdk::Timestamp::from(created_at))
+            .sign_with_keys(buyer)
+            .expect("sign offer")
+    }
+
+    /// #604 REGRESSION (Rocky's 2-prong bar) — the periodic offer-backfill must not re-admit a
+    /// long-aged, never-awarded historical, and the fix must NOT weaken the live claim-lapse capacity
+    /// guard. Drives the REAL admission path (`on_offer`, which `run_offer_backfill` calls per fetched
+    /// event) with offers whose wire `created_at` is authored in the past — the knob the age gate reads.
+    ///
+    /// - PRONG 1 (re-admit stopped): an offer authored longer ago than the admit horizon, with a
+    ///   FAR-FUTURE deadline (so the pre-existing `deadline_unix` gate cannot catch it), is REFUSED —
+    ///   never claimed, and it does not consume the freed slot.
+    /// - PRONG 2 (capacity guard intact): a FRESH eligible offer STILL claims that freed slot — proving
+    ///   the gate left admission working, backfill was not disabled, and claim-lapse still frees slots.
+    ///
+    /// RED ON THE UNFIXED TIP: with no age gate `classify_offer` returns `Claim` for the aged offer, so
+    /// it is claimed and takes the single slot — prong 1's assertions fail. GREEN once the gate lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backfill_refuses_aged_historical_but_still_admits_a_fresh_offer() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+
+        // 1-slot open-pool seller with immediate claim-lapse (`Some(0)`) so a parked claim frees its
+        // slot the instant the sweep runs — the fixture the capacity-guard prong needs.
+        let (runner, root) =
+            boot_capacity_skip_seller("604-aged-historical", &relay_url, true, 0, Some(0)).await;
+        let buyer = Keys::generate();
+        let now = now_unix() as u64;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // FREED SLOT — a fresh offer is claimed, then lapses unawarded, returning its slot to
+                // the pool. This is the "lapse an unawarded claim" that the aged historical would re-fill.
+                let occupier = open_pool_offer(&buyer, "604 occupier", 100, now + 3_600, now);
+                runner.on_offer(&occupier).await;
+                assert_eq!(runner.slots.available(), 0, "the occupier claims the single slot");
+                runner.sweep_lapsed_claims();
+                assert_eq!(runner.slots.available(), 1, "the lapsed occupier frees the slot");
+
+                // PRONG 1 — the aged historical (authored before the admit horizon, deadline far in the
+                // future) is REFUSED at admission: no claim row, and the freed slot is untouched.
+                let aged = open_pool_offer(
+                    &buyer,
+                    "604 aged historical",
+                    100,
+                    now + 3_600,
+                    now - (OFFER_BACKFILL_WINDOW_SECS + 600),
+                );
+                runner.on_offer(&aged).await;
+                assert_eq!(
+                    runner.node.store().claim_row_state(&aged.id.to_hex()).expect("aged claim state"),
+                    None,
+                    "prong 1: the aged historical is REFUSED — never claimed (backfill re-admit stopped)"
+                );
+                assert_eq!(
+                    runner.slots.available(),
+                    1,
+                    "prong 1: the aged historical must NOT consume the freed slot"
+                );
+
+                // PRONG 2 — a FRESH eligible offer STILL claims the freed slot: the age gate left the
+                // capacity path intact (backfill not disabled, claim-lapse still frees slots).
+                let fresh = open_pool_offer(&buyer, "604 fresh eligible", 100, now + 3_600, now);
+                runner.on_offer(&fresh).await;
+                assert_eq!(
+                    runner
+                        .node
+                        .store()
+                        .claim_row_state(&fresh.id.to_hex())
+                        .expect("fresh claim state")
+                        .as_deref(),
+                    Some("claimed"),
+                    "prong 2: a fresh eligible offer still claims the freed slot"
+                );
+                assert_eq!(runner.slots.available(), 0, "prong 2: the fresh claim refills the slot");
+            })
+            .await;
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// #456 / #514 END-TO-END PIN — a losing open-pool claimant frees its reserved slot the MOMENT it
