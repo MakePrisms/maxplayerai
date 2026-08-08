@@ -56,6 +56,11 @@ toml = "0.8"
 name = "relay_git_http_auth"
 required-features = ["git-delivery"]
 
+# #610 regression: the transport must ignore ambient git config (insteadOf) — gated like above.
+[[test]]
+name = "git_config_isolation"
+required-features = ["git-delivery"]
+
 [dev-dependencies]
 async-trait = "0.1.89"
 cdk-sqlite = "=0.17.2"

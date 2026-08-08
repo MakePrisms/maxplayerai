@@ -12,21 +12,26 @@
 //!   [`assert_allowed_repo_locator`] first, and only `https` is registered — `ext:`/`file:`/`ssh:`
 //!   locators are refused before any remote is constructed. Belt-and-suspenders: the helpers
 //!   re-assert the allowlist internally.
-//! - **`insteadOf` immunity:** remotes are built with [`Repository::remote_anonymous`], which
-//!   uses the literal URL and does NOT apply `url.*.insteadOf` config rewrites — so an
-//!   agent-planted `.git/config` (or a poisoned `$HOME/.gitconfig`) can never rewrite an
-//!   allowlisted `https` URL onto a banned transport. No global/XDG/system config is consulted.
+//! - **`insteadOf` / ambient-config immunity:** at first use, [`ensure_registered`] empties
+//!   libgit2's global/XDG/system config search path, so NO ambient git config is consulted on any
+//!   in-process leg. This is load-bearing: libgit2 applies `url.*.insteadOf` at CONNECT time and
+//!   [`Repository::remote_anonymous`] does NOT prevent it — only clearing the search path does. So an
+//!   ambient or agent-planted/poisoned `$HOME`/XDG/system config can never rewrite an allowlisted
+//!   `https` URL onto another host or a banned transport after the allowlist check (#610). Only a
+//!   repo-LOCAL config (in a workdir we create) is ever read, and none rewrites.
 //! - **Key hygiene:** the seller/buyer secret is used ONLY in-process to sign the NIP-98 event.
 //!   It is never placed on argv, never in child env, and never spawns a subprocess.
 
 use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::sync::{Once, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use git2::transport::{Service, SmartSubtransport, SmartSubtransportStream, Transport};
-use git2::{AutotagOption, Direction, FetchOptions, PushOptions, RemoteCallbacks, Repository};
+use git2::{
+    AutotagOption, ConfigLevel, Direction, FetchOptions, PushOptions, RemoteCallbacks, Repository,
+};
 
 use crate::delivery_transport::{assert_allowed_repo_locator, TransportRefuse};
 
@@ -71,8 +76,6 @@ thread_local! {
     /// money-path fetch: a hung fetch must fail CLOSED before authorize_pay burns budget).
     static SHORT_TIMEOUT: RefCell<bool> = const { RefCell::new(false) };
 }
-
-static REGISTER: Once = Once::new();
 
 /// Per-HTTP-leg cap for the buyer money-path fetch. git2 has no whole-operation timeout, but a
 /// hung leg (info/refs GET or upload-pack POST) is bounded here so the fetch fails CLOSED well
@@ -148,20 +151,41 @@ fn client_short() -> &'static reqwest::blocking::Client {
     })
 }
 
-/// Register the https smart subtransport exactly once for this process.
-fn ensure_registered() {
-    REGISTER.call_once(|| {
-        // SAFETY: libgit2 requires transport registration be externally synchronized with other
-        // transport creation. `Once` guarantees a single registration, and maxplayer-core drives git2
-        // ONLY through this module, so overriding the `https` scheme affects no other code path.
+/// One-time libgit2 process init for this module: isolate from ambient git config, then register the
+/// `https` smart subtransport. Returns whether that init succeeded so every entry point surfaces a
+/// failure loudly instead of proceeding into an opaque downstream error. Runs exactly once; the
+/// stored outcome is returned on every later call.
+fn ensure_registered() -> Result<(), TransportError> {
+    static INIT: OnceLock<Result<(), String>> = OnceLock::new();
+    INIT.get_or_init(|| {
+        // SAFETY: `git2::opts` and `git2::transport::register` mutate libgit2 GLOBAL state and must be
+        // externally synchronized with transport creation / config access. `OnceLock::get_or_init`
+        // guarantees a single execution, every entry point calls this BEFORE building any remote, and
+        // maxplayer-core drives git2 ONLY through this module — so nothing else races or is affected.
         unsafe {
-            let _ = git2::transport::register("https", |remote| {
+            // Isolate from ambient git config so this module's documented insteadOf-immunity actually
+            // holds. libgit2 consults the global/XDG/system config on EVERY remote op (anonymous
+            // remotes included) and applies `url.*.insteadOf` at CONNECT time — `remote_anonymous`
+            // does NOT prevent it. Emptying the search path for these levels means no such config —
+            // hence no `insteadOf` — is ever read, so an ambient or poisoned config can't rewrite an
+            // allowlisted `https` URL onto another host or a banned transport after the allowlist
+            // check (#610). Only a repo-LOCAL config (in workdirs we create) remains, none rewrites.
+            for level in [ConfigLevel::Global, ConfigLevel::XDG, ConfigLevel::System] {
+                git2::opts::set_search_path(level, "").map_err(|error| {
+                    format!("isolate ambient git config ({level:?}): {}", error.message())
+                })?;
+            }
+            git2::transport::register("https", |remote| {
                 let header = AUTH_HEADER.with(|cell| cell.borrow().clone());
                 let short = SHORT_TIMEOUT.with(|cell| *cell.borrow());
                 Transport::smart(remote, true, NostrHttp { header, short })
-            });
+            })
+            .map_err(|error| format!("register https subtransport: {}", error.message()))?;
         }
-    });
+        Ok(())
+    })
+    .clone()
+    .map_err(TransportError::Io)
 }
 
 /// Run `body` with the NIP-98 header and timeout-class bound to this thread, clearing both
@@ -249,7 +273,7 @@ pub fn push_branch_with_header(
     header: Option<String>,
 ) -> Result<String, TransportError> {
     assert_allowed_repo_locator(remote_url)?;
-    ensure_registered();
+    ensure_registered()?;
 
     let repo = Repository::open(workdir)
         .map_err(|error| TransportError::Io(format!("open workdir repo: {error}")))?;
@@ -309,7 +333,7 @@ pub fn fetch_refspecs(
     auth: Option<&str>,
     short_timeout: bool,
 ) -> Result<(), TransportError> {
-    ensure_registered();
+    ensure_registered()?;
     let header = header_for(remote_url, auth)?;
 
     let mut remote = repo
@@ -334,7 +358,7 @@ pub fn list_remote(
     direction: Direction,
 ) -> Result<Vec<(String, String)>, TransportError> {
     assert_allowed_repo_locator(remote_url)?;
-    ensure_registered();
+    ensure_registered()?;
     let header = header_for(remote_url, auth)?;
 
     // A bare in-memory repo is enough to host an anonymous remote for a connect+list.
