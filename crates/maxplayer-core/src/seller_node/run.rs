@@ -24,7 +24,9 @@ use nostr_sdk::prelude::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::contribution::{contribution_serve_gate, ContributionServeGate};
+use crate::contribution::{
+    contribution_serve_gate, parse_contribution_offer, ContributionOffer, ContributionServeGate,
+};
 use crate::gateway::{
     self, claim_draft, error_draft, git_result_draft, parse_award, parse_offer, OfferParseError,
     ParsedOffer, ReasonCode,
@@ -1515,6 +1517,78 @@ fn offer_row(job_id: &str, buyer_pubkey: &str, offer: &ParsedOffer) -> super::st
     }
 }
 
+/// #591: how a job's delivery workdir is provisioned — a from-scratch empty repo, or a clone of a
+/// served contribution's pinned base at `base_oid` (the fork tip the agent extends). Pure over the
+/// stored pin so `execute_job`'s routing is unit-testable without a live node.
+#[derive(Debug, PartialEq, Eq)]
+enum DeliveryWorkdirPlan {
+    Empty,
+    ContributionClone {
+        clone_url: String,
+        base_branch: String,
+        base_oid: String,
+        branch: String,
+    },
+}
+
+/// Route a job to its workdir provisioning: a recorded contribution pin ⇒ clone at `base_oid` on a
+/// per-job fork branch carrying the full job id; no pin ⇒ the empty-workdir default (unchanged).
+fn plan_delivery_workdir(
+    pin: Option<super::store::ContributionPin>,
+    job_id: &str,
+) -> DeliveryWorkdirPlan {
+    match pin {
+        Some(pin) => DeliveryWorkdirPlan::ContributionClone {
+            clone_url: pin.clone_url,
+            base_branch: pin.base_branch,
+            base_oid: pin.base_oid,
+            branch: format!("maxplayer/contribution/{job_id}"),
+        },
+        None => DeliveryWorkdirPlan::Empty,
+    }
+}
+
+/// Provision a job's delivery workdir from its STORED contribution pin — the single routing seam
+/// `execute_job` uses on BOTH the fresh-award and restart/resume paths. Reads the pin, plans, and
+/// initializes: a recorded pin clones the pinned base at `base_oid` onto the per-job fork branch (the
+/// tip the agent extends); no pin gives the empty-workdir default (a from-scratch job, unchanged). A
+/// pin READ error is mapped to an init error so the caller fails the job rather than silently
+/// degrading a served contribution to an empty workdir. Free fn (not a method) so the REAL
+/// read→plan→init routing is unit-testable against a live store without standing up a whole node.
+async fn provision_delivery_workdir(
+    store: &super::store::SellerStore,
+    home: &MaxplayerHome,
+    job_id: &str,
+    workdir: std::path::PathBuf,
+    identity: DeliveryAgentIdentity,
+) -> Result<(), seller_git::SellerGitError> {
+    let pin = store
+        .contribution_pin(job_id)
+        .map_err(|error| seller_git::SellerGitError::Io(format!("contribution pin read failed: {error}")))?;
+    match plan_delivery_workdir(pin, job_id) {
+        DeliveryWorkdirPlan::Empty => {
+            seller_git::init_empty_delivery_workdir_off_runtime(workdir, identity).await
+        }
+        DeliveryWorkdirPlan::ContributionClone {
+            clone_url,
+            base_branch,
+            base_oid,
+            branch,
+        } => {
+            // NIP-98 auth for a relay-git base fetch; None for a public https base (libgit2 only
+            // invokes the credential when the server demands it). The secret enters the fetch closure
+            // only and is never logged (PushAuth: callers must not print it).
+            let auth = home::read_secret_key_hex(home)
+                .ok()
+                .map(|secret_key_hex| seller_git::PushAuth { secret_key_hex });
+            seller_git::init_contribution_workdir_off_runtime(
+                workdir, identity, clone_url, base_branch, base_oid, branch, auth,
+            )
+            .await
+        }
+    }
+}
+
 /// Decide whether to claim `offer`, applying the always-on money-safety gates in the legacy order:
 /// a lapsed offer is refused BEFORE its deadline is re-derived (never resurrect a stale offer with a
 /// fresh `now + timeout`), then the #604 offer-age gate (a long-aged historical the backfill keeps
@@ -2383,6 +2457,9 @@ impl SellerNodeRunner {
                         &seller_pubkey,
                         deadline_unix,
                         now,
+                        // A recorded offer re-driven from the store carries no tags; its pin (if any)
+                        // was already written at the original claim (INSERT OR IGNORE — idempotent).
+                        None,
                     )
                     .await;
                     reclaimed += 1;
@@ -3445,13 +3522,16 @@ impl SellerNodeRunner {
         };
         // Contribution offers are gated by the operator's `[seller] contribution_enabled` flag
         // (default on): served when enabled, refused when the operator turns them off, and a
-        // malformed contribution is refused either way (never run as from-scratch). A served
-        // contribution still runs in an empty workdir until #591 clones the target at base_oid —
-        // making the flag load-bearing here is the whole of #590.
-        match contribution_serve_gate(&draft.tags, seller.contribution_enabled) {
-            ContributionServeGate::NotContribution => {}
+        // malformed contribution is refused either way (never run as from-scratch). #591: a served
+        // contribution's pin is captured HERE — the only site with the offer tags — and persisted at
+        // claim, so execute clones the target at base_oid instead of an empty workdir.
+        let contribution = match contribution_serve_gate(&draft.tags, seller.contribution_enabled) {
+            ContributionServeGate::NotContribution => None,
             ContributionServeGate::Serve => {
                 opline!("seller node serving contribution offer id={}", event.id);
+                // The gate already confirmed a well-formed contribution; re-parse to carry the pin
+                // without widening #590's pure gate return. Total + cheap (contribution offers only).
+                parse_contribution_offer(&draft.tags).ok().flatten()
             }
             ContributionServeGate::RefuseDisabled => {
                 opline!(
@@ -3464,7 +3544,7 @@ impl SellerNodeRunner {
                 opline!("seller node offer skip id={}: malformed contribution ({error})", event.id);
                 return;
             }
-        }
+        };
 
         let seller_pubkey = self.seller_pubkey.to_hex();
         // The buyer is the offer's author. Resolved here — ahead of the classify call — so the
@@ -3516,8 +3596,16 @@ impl SellerNodeRunner {
         // The job id IS the offer event id (as on the legacy path); the buyer (its author) was
         // resolved above for the allowlist fence.
         let job_id = event.id.to_hex();
-        self.claim_offer(&job_id, &buyer_pubkey, &offer, &seller_pubkey, deadline_unix, now)
-            .await;
+        self.claim_offer(
+            &job_id,
+            &buyer_pubkey,
+            &offer,
+            &seller_pubkey,
+            deadline_unix,
+            now,
+            contribution.as_ref(),
+        )
+        .await;
     }
 
     /// #541: a co-signed kind-3400 settlement receipt marks its offer terminal. Cache
@@ -3551,6 +3639,7 @@ impl SellerNodeRunner {
         seller_pubkey: &str,
         deadline_unix: u64,
         now: i64,
+        contribution: Option<&ContributionOffer>,
     ) {
         // #541: refuse a SETTLED offer before any work. A co-signed kind-3400 receipt authored by
         // THIS offer's buyer means the offer was awarded + settled (to us or another seat) and is
@@ -3574,6 +3663,24 @@ impl SellerNodeRunner {
             Ok(_) => {}
             Err(error) => {
                 opline!("seller node offer skip id={job_id}: store health read failed ({error})");
+                return;
+            }
+        }
+
+        // #591: persist the contribution pin BEFORE record_offer. execute_job only runs on an awarded
+        // claim, which requires the recorded offer — so writing the pin first makes pin ≤ offer ≤
+        // claim: a crash can never leave an offer recorded (hence claimable) without its pin, which
+        // would silently fall back to an empty workdir and mis-deliver. A pin-write error fails the
+        // claim (fail-closed); the offer re-ingest retries both (INSERT OR IGNORE).
+        if let Some(contribution) = contribution {
+            let pin = super::store::ContributionPin {
+                owner_pubkey: contribution.target.owner_pubkey().to_owned(),
+                clone_url: contribution.target.clone_url().to_owned(),
+                base_branch: contribution.base.branch().to_owned(),
+                base_oid: contribution.base.oid().to_owned(),
+            };
+            if let Err(error) = self.node.store().record_contribution_pin(job_id, &pin, now) {
+                opline!("seller node offer skip id={job_id}: contribution pin persist failed ({error})");
                 return;
             }
         }
@@ -4255,7 +4362,19 @@ impl SellerNodeRunner {
         let seller_pubkey = self.seller_pubkey.to_hex();
         let identity = DeliveryAgentIdentity::for_seller(&seller_pubkey);
         let workdir = job_workdir(self.node.home(), job_id);
-        if let Err(error) = seller_git::init_empty_delivery_workdir_off_runtime(
+        // #591: provision the delivery workdir from the job's STORED contribution pin. The pin was
+        // written at claim (pin ≤ offer ≤ claim), so it is present on BOTH the fresh-award and the
+        // restart/resume path — the same durable-facts re-read the rest of execute_job relies on. A
+        // recorded pin ⇒ clone the pinned base at base_oid (the fork tip the agent extends); no pin ⇒
+        // the empty-workdir default (a from-scratch job, unchanged). A pin read error is fatal here
+        // rather than a silent degrade to an empty workdir: no fund risk either way (buyer verify is
+        // fail-closed pre-pay), but a loud fail is recoverable whereas an empty-workdir mis-delivery
+        // hides the fault. Routing lives in `provision_delivery_workdir` so the real read→plan→init
+        // path is unit-testable.
+        if let Err(error) = provision_delivery_workdir(
+            self.node.store(),
+            self.node.home(),
+            job_id,
             workdir.clone(),
             identity.clone(),
         )
@@ -5201,6 +5320,42 @@ mod tests {
     const SELLER: &str = "aa";
     const BUYER: &str = "bb";
     const NOW: u64 = 10_000;
+
+    // #591: PLANNER unit — plan_delivery_workdir maps a stored pin to a base_oid clone plan (on the
+    // per-job fork branch) and no pin to Empty. This is the pure mapping ONLY; that execute_job
+    // actually CALLS this routing is proven by the real-path test `clone_at_base_oid_not_empty_workdir`
+    // (an isolated planner assertion like this one is exactly what let the dead wiring slip green).
+    #[test]
+    fn plan_delivery_workdir_maps_pin_to_clone_and_none_to_empty() {
+        let base_oid = "a".repeat(40);
+        let pin = crate::seller_node::store::ContributionPin {
+            owner_pubkey: "b".repeat(64),
+            clone_url: "https://relay.maxplayer.ai/git/owner/repo.git".to_owned(),
+            base_branch: "main".to_owned(),
+            base_oid: base_oid.clone(),
+        };
+        match plan_delivery_workdir(Some(pin), "job-42") {
+            DeliveryWorkdirPlan::ContributionClone {
+                clone_url,
+                base_branch,
+                base_oid: planned_oid,
+                branch,
+            } => {
+                assert_eq!(planned_oid, base_oid, "the workdir clones AT the pinned base_oid");
+                assert_eq!(base_branch, "main");
+                assert_eq!(clone_url, "https://relay.maxplayer.ai/git/owner/repo.git");
+                assert_eq!(
+                    branch, "maxplayer/contribution/job-42",
+                    "the per-job fork branch carries the full job id"
+                );
+            }
+            DeliveryWorkdirPlan::Empty => {
+                panic!("a served contribution pin must NOT provision an empty workdir")
+            }
+        }
+        // A from-scratch job (no pin) stays on the empty-workdir path — the pin never touches it.
+        assert_eq!(plan_delivery_workdir(None, "job-99"), DeliveryWorkdirPlan::Empty);
+    }
 
     fn seller_cfg(rate_sats: u64, claim_open_pool: bool) -> crate::home::SellerConfig {
         crate::home::SellerConfig {
@@ -8190,6 +8345,65 @@ mod tests {
     fn temp_dir(label: &str) -> std::path::PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!("maxplayer-run-{label}-{}-{id}", std::process::id()))
+    }
+
+    // #591 A3 — the REAL provisioning seam `execute_job` calls (`provision_delivery_workdir`), NOT the
+    // pure planner: a served contribution's STORED pin routes the delivery workdir into the base-clone
+    // path (`init_contribution_workdir`), while a from-scratch job (no pin) takes the empty-workdir
+    // default. This is the wiring the isolated planner test could not prove — before the fix
+    // `execute_job` provisioned Empty unconditionally, so the pin never reached a clone. The
+    // `base_oid → HEAD == base_oid` value is the reused `init_contribution_workdir`'s contract
+    // (`seller_git::checkout_base_branch_from_oid_creates_fork_tip`); driven OFFLINE (no networked/paid
+    // e2e), the contribution route is proven by its base-locator refusal — the https-only allowlist
+    // that the empty path never touches — so no network base is fetched here.
+    #[tokio::test]
+    async fn clone_at_base_oid_not_empty_workdir() {
+        let root = temp_dir("provision");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mk root");
+        let home = crate::home::bootstrap(&root).expect("bootstrap home");
+        let store = SellerStore::open(root.join("seller.sqlite")).expect("open store");
+        let identity = DeliveryAgentIdentity::for_seller(&"aa".repeat(32));
+
+        // A served contribution records its pin at claim. Its buyer-controlled base is a LOCAL path
+        // here — refused by the https-only allowlist — so provision fails deterministically INSIDE the
+        // base-clone path, offline. `init_empty` never consults a locator, so this refusal proves the
+        // stored pin was READ and ROUTED to the contribution clone, not the empty default.
+        let pin = crate::seller_node::store::ContributionPin {
+            owner_pubkey: "bb".repeat(32),
+            clone_url: "/not/a/remote/base.git".to_owned(),
+            base_branch: "main".to_owned(),
+            base_oid: "a".repeat(40),
+        };
+        store
+            .record_contribution_pin("contrib-job", &pin, 1)
+            .expect("record pin");
+        let err = provision_delivery_workdir(
+            &store,
+            &home,
+            "contrib-job",
+            root.join("wd-contrib"),
+            identity.clone(),
+        )
+        .await
+        .expect_err("a served contribution must enter the base-clone path, not the empty default");
+        assert!(
+            matches!(err, seller_git::SellerGitError::Transport(_)),
+            "served contribution routed to init_contribution_workdir (locator allowlist), got {err:?}"
+        );
+
+        // A from-scratch job has no pin: provision takes the empty-workdir default and SUCCEEDS — there
+        // is no base to clone. The result is an initialized, empty delivery repo (the inverse route).
+        let scratch = root.join("wd-scratch");
+        provision_delivery_workdir(&store, &home, "scratch-job", scratch.clone(), identity)
+            .await
+            .expect("a from-scratch job provisions an empty workdir");
+        assert!(
+            scratch.join(".git").exists(),
+            "empty delivery workdir is an initialized git repo"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // A store with a full offer → claim(creq) → award already journaled, so the execute-body readers
