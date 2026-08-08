@@ -789,6 +789,96 @@ mod contribution_tests {
         );
     }
 
+    /// Author a seller CONTRIBUTION delivery the way the node does (#616): clone the pinned target,
+    /// check the fork branch out at `base_oid`, let the "agent" add a file, then mint the delivery
+    /// commit with the SELLER's real [`crate::seller_git::snapshot_delivery`] — the site the node
+    /// threads its base into. `snapshot_base` is exactly what the node passes there: `Some(base_oid)`
+    /// (contribution) parents the commit on the pinned base so it descends by construction; `None`
+    /// (the pre-#616 bug) makes a ROOT commit. Publish to a fresh fork remote and return its delivery.
+    fn seller_authored_delivery(fx: &Fx, snapshot_base: Option<&str>, agent_file: &str) -> GitDelivery {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let seller_work = fx.root.join(format!("seller_work_{n}"));
+        let fork_git = fx.root.join(format!("seller_fork_{n}.git"));
+        let branch = "maxplayer/deadbeef";
+        ok(["clone", fx.target_git.to_str().unwrap(), seller_work.to_str().unwrap()], &fx.root);
+        // The node checks the fork branch out AT base_oid (init_contribution_workdir); the agent then works.
+        ok(["checkout", "-B", branch, fx.base_oid.as_str()], &seller_work);
+        let agent_path = seller_work.join(agent_file);
+        if let Some(parent) = agent_path.parent() {
+            fs::create_dir_all(parent).expect("mkdir agent file parent");
+        }
+        fs::write(&agent_path, "agent contribution\n").expect("write agent file");
+        // The SELLER authors the delivery commit itself (the agent never commits) — the #616 snapshot.
+        let identity = crate::seller_git::DeliveryAgentIdentity::for_seller(&"cc".repeat(32));
+        let commit = crate::seller_git::snapshot_delivery(
+            &seller_work,
+            &identity,
+            snapshot_base,
+            branch,
+            "seller delivery",
+            "test-job-hash",
+        )
+        .expect("seller snapshot authors the delivery commit");
+        // Publish the delivery branch to a fork remote the buyer fetches from.
+        ok(["init", "--bare", fork_git.to_str().unwrap()], &fx.root);
+        ok(["remote", "add", "sellerfork", fork_git.to_str().unwrap()], &seller_work);
+        ok(["push", "sellerfork", branch], &seller_work);
+        GitDelivery::new(fork_git.to_str().unwrap(), branch, CommitOid::parse(commit).expect("commit oid"))
+            .expect("fork delivery")
+    }
+
+    // ── #616 POSITIVE CONTROL: the FIRST accepts-proof of the pay path sourced from the REAL seller
+    //    snapshot. Every prior contribution accept (`deep_history_contribution_verifies`) hand-builds
+    //    the fork with raw git, so none exercises the seller's snapshot base-parenting — the exact #616
+    //    site. Here the seller authors the delivery with `snapshot_delivery(Some(base_oid))`, and the
+    //    buyer verify path (parse ✓ + descendant ✓ + content ✓) ACCEPTS it end-to-end. Banked doctrine:
+    //    a negative that gates a spend needs a known-positive in the same run — this is that positive.
+    #[test]
+    fn seller_snapshot_contribution_is_accepted_by_buyer_verify() {
+        let fx = scenario(1, "unused");
+        let delivery = seller_authored_delivery(&fx, Some(fx.base_oid.as_str()), "src/feature.rs");
+        let mut v = GitDeliveryVerifier::new(&fx.store);
+        let verified = v
+            .contribution_verify(
+                &delivery,
+                fx.target_git.to_str().unwrap(),
+                "main",
+                &fx.base_oid,
+                &ContentPolicy::floor(),
+            )
+            .expect("a seller snapshot parented on base_oid must be ACCEPTED by the buyer verify path");
+        assert_eq!(verified.verified().commit_oid(), delivery.commit_oid());
+        // The delivery descends from base_oid, so the diff names the agent's file (alongside the
+        // seller's execution sentinel) — never empty, so the content-gate floor passes.
+        let changed: Vec<&str> = verified.changed_paths().iter().map(|c| c.path.as_str()).collect();
+        assert!(
+            changed.contains(&"src/feature.rs"),
+            "the agent's changed file must be in the accepted diff, got {changed:?}"
+        );
+    }
+
+    // ── #616 NON-VACUOUS FOIL (the RED proof): reverting the snapshot's base thread to `None` (the
+    //    pre-fix behavior — a root commit even for a contribution) makes the SAME buyer verify path
+    //    refuse at the descendant gate. This is exactly the bug #616 fixes: a correctly-executed
+    //    contribution that never pays because its delivery does not descend from the pinned base.
+    #[test]
+    fn seller_snapshot_without_base_oid_is_refused_not_descendant() {
+        let fx = scenario(1, "unused");
+        let delivery = seller_authored_delivery(&fx, None, "src/feature.rs");
+        let mut v = GitDeliveryVerifier::new(&fx.store);
+        let refused = v.contribution_verify(
+            &delivery,
+            fx.target_git.to_str().unwrap(),
+            "main",
+            &fx.base_oid,
+            &ContentPolicy::floor(),
+        );
+        assert!(
+            matches!(refused, Err(DeliveryError::NotDescendant { .. })),
+            "a from-scratch (root) snapshot for a contribution must be refused NotDescendant, got {refused:?}"
+        );
+    }
+
     // ── Descendant gate refuses unrelated history / swapped base ──────────────────────────────
     #[test]
     fn unrelated_history_refused_as_not_descendant() {

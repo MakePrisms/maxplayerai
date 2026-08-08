@@ -1555,19 +1555,26 @@ fn plan_delivery_workdir(
 /// pin READ error is mapped to an init error so the caller fails the job rather than silently
 /// degrading a served contribution to an empty workdir. Free fn (not a method) so the REAL
 /// read→plan→init routing is unit-testable against a live store without standing up a whole node.
+///
+/// Returns the base the delivery snapshot must be parented on: `Some(base_oid)` for a contribution,
+/// `None` for a from-scratch job. `execute_job` threads it into the snapshot so a contribution's
+/// delivery commit DESCENDS from `base_oid` by construction — the invariant the buyer's descendant
+/// gate enforces (#616). Single-sourced: the snapshot is parented on exactly the base provisioned.
 async fn provision_delivery_workdir(
     store: &super::store::SellerStore,
     home: &MaxplayerHome,
     job_id: &str,
     workdir: std::path::PathBuf,
     identity: DeliveryAgentIdentity,
-) -> Result<(), seller_git::SellerGitError> {
+) -> Result<Option<String>, seller_git::SellerGitError> {
     let pin = store
         .contribution_pin(job_id)
         .map_err(|error| seller_git::SellerGitError::Io(format!("contribution pin read failed: {error}")))?;
     match plan_delivery_workdir(pin, job_id) {
         DeliveryWorkdirPlan::Empty => {
-            seller_git::init_empty_delivery_workdir_off_runtime(workdir, identity).await
+            seller_git::init_empty_delivery_workdir_off_runtime(workdir, identity).await?;
+            // From-scratch: no pinned base ⇒ the delivery is a root commit (snapshot base_oid = None).
+            Ok(None)
         }
         DeliveryWorkdirPlan::ContributionClone {
             clone_url,
@@ -1582,9 +1589,10 @@ async fn provision_delivery_workdir(
                 .ok()
                 .map(|secret_key_hex| seller_git::PushAuth { secret_key_hex });
             seller_git::init_contribution_workdir_off_runtime(
-                workdir, identity, clone_url, base_branch, base_oid, branch, auth,
+                workdir, identity, clone_url, base_branch, base_oid.clone(), branch, auth,
             )
-            .await
+            .await?;
+            Ok(Some(base_oid))
         }
     }
 }
@@ -4422,7 +4430,7 @@ impl SellerNodeRunner {
         // fail-closed pre-pay), but a loud fail is recoverable whereas an empty-workdir mis-delivery
         // hides the fault. Routing lives in `provision_delivery_workdir` so the real read→plan→init
         // path is unit-testable.
-        if let Err(error) = provision_delivery_workdir(
+        let base_oid = match provision_delivery_workdir(
             self.node.store(),
             self.node.home(),
             job_id,
@@ -4431,10 +4439,13 @@ impl SellerNodeRunner {
         )
         .await
         {
-            opline!("seller node execute fail job_id={job_id}: workdir init failed ({error})");
-            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK).await;
-            return;
-        }
+            Ok(base_oid) => base_oid,
+            Err(error) => {
+                opline!("seller node execute fail job_id={job_id}: workdir init failed ({error})");
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK).await;
+                return;
+            }
+        };
 
         // Run the agent under the job's remaining deadline, retrying a transient error while the
         // deadline has room. The agent edits files in `workdir`; the node owns commit + push. The
@@ -4477,7 +4488,10 @@ impl SellerNodeRunner {
         if let Err(error) = seller_git::snapshot_delivery_at_off_runtime(
             workdir.clone(),
             identity.clone(),
-            None,
+            // #616: parent the delivery commit on the base the workdir was provisioned at. A
+            // contribution (Some(base_oid)) then descends from base_oid by construction; the buyer's
+            // descendant gate refuses a commit that doesn't. From-scratch (None) stays a root commit.
+            base_oid,
             branch.clone(),
             message,
             author_date,
