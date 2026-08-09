@@ -783,14 +783,18 @@ impl SellerStore {
     }
 
     /// Mark a job failed. Idempotent (last write wins) but never overwrites a terminal `paid`.
-    pub fn fail_job(&self, job_id: &str, now_unix: i64) -> Result<(), StoreError> {
+    ///
+    /// Returns the number of rows failed — 0 or 1. This is the write `ResumeAction::SkipLapsed`
+    /// uses to heal a stale `awarded` row, so a caller that treats it as unconditional can report a
+    /// heal that never happened: the `state != 'paid'` guard (and an absent row) both yield 0.
+    pub fn fail_job(&self, job_id: &str, now_unix: i64) -> Result<usize, StoreError> {
         let conn = self.lock()?;
-        conn.execute(
+        let failed = conn.execute(
             "UPDATE jobs SET state = 'failed', updated_at_unix = ?2
              WHERE job_id = ?1 AND state != 'paid'",
             params![job_id, now_unix],
         )?;
-        Ok(())
+        Ok(failed)
     }
 
     /// Record a collected receipt and mark the job paid. The `receipt_id` is deduped: the first
@@ -1280,6 +1284,47 @@ mod tests {
             params![job_id, format!("offer-{job_id}"), state.as_str()],
         )
         .expect("insert job");
+    }
+
+    /// The two narrowing mutators must REPORT that they moved nothing, not just decline to move it.
+    ///
+    /// Both guard on state (`release_claim` on `= 'claimed'`, `fail_job` on `!= 'paid'`), so zero
+    /// rows is a normal outcome rather than an error — which is exactly why the count has to reach
+    /// the caller. A discarded rowcount here is what let a losing seat announce a release it never
+    /// performed while its claim sat at `awarded` (#626), and `fail_job` is the write the lapse heal
+    /// depends on, so the same silence there would report a repair that did not happen.
+    #[test]
+    fn the_narrowing_mutators_report_when_they_move_nothing() {
+        let (store, path) = fresh_store("rowcount");
+
+        // fail_job: a real transition reports 1; `paid` is terminal and reports 0.
+        insert_job(&store, "job-live", JobState::Awarded);
+        assert_eq!(store.fail_job("job-live", 5).expect("fail live"), 1, "an awarded row fails");
+        insert_job(&store, "job-paid", JobState::Paid);
+        assert_eq!(
+            store.fail_job("job-paid", 5).expect("fail paid"),
+            0,
+            "`paid` is terminal — the guard refuses, and the caller must be able to see that"
+        );
+        assert_eq!(
+            store.fail_job("job-absent", 5).expect("fail absent"),
+            0,
+            "no row at all is also zero"
+        );
+
+        // release_claim: only a still-`claimed` row releases; an awarded one reports 0.
+        let draft = crate::gateway::claim_draft("job-c", &"b".repeat(64), &"s".repeat(64), "creq", &[]);
+        store
+            .claim_and_enqueue("job-c", "job-c", "creq", &draft, 1, 9_999_999_999, 1)
+            .expect("claim");
+        assert_eq!(store.release_claim("job-c", 6).expect("release"), 1, "a parked claim releases");
+        assert_eq!(
+            store.release_claim("job-c", 7).expect("re-release"),
+            0,
+            "already released — the second call moves nothing and says so"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The stored spellings, written out by hand.

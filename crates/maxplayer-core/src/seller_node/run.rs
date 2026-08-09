@@ -5178,8 +5178,29 @@ impl SellerNodeRunner {
     /// Mark a job failed (best-effort; a fail-mark that itself errors is logged, never propagated —
     /// the loop keeps serving).
     async fn fail_job(&self, job_id: &str) {
-        if let Err(error) = self.node.store().fail_job(job_id, now_unix()) {
-            opline!("seller node job_id={job_id}: fail_job write error (continuing): {error}");
+        match self.node.store().fail_job(job_id, now_unix()) {
+            // The callers announce WHY they are failing a job before they get here, so a successful
+            // write needs no line of its own. A write that moved NOTHING does: this is the same
+            // store call `SkipLapsed` uses to heal a stale awarded row, and a silent zero there
+            // would leave an operator reading a heal that did not happen.
+            Ok(0) => opline!(
+                "seller node job_id={job_id}: no job row moved to failed (state={}) — nothing was healed",
+                self.job_state_label(job_id)
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                opline!("seller node job_id={job_id}: fail_job write error (continuing): {error}")
+            }
+        }
+    }
+
+    /// The job row's state, for a LOG that must name why a write moved nothing. Never fails the
+    /// caller, for the same reason as [`Self::claim_state_label`].
+    fn job_state_label(&self, job_id: &str) -> String {
+        match self.node.store().job_state(job_id) {
+            Ok(Some(state)) => state.as_str().to_owned(),
+            Ok(None) => "absent".to_owned(),
+            Err(error) => format!("unreadable ({error})"),
         }
     }
 
