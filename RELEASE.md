@@ -77,41 +77,31 @@ fails outright.
    `npm/*/package.json`, and the `optionalDependencies` pins in `npm/maxplayer/package.json`. All of
    them must read the same string, and it must match the tag with the `v` dropped — the build
    asserts this and stops if anything disagrees.
-2. Open a PR to `dev` with the bump and let it merge. **Then cut `dev` into `main` as a pull request —
-   `main` rejects direct pushes**, and the merge must create a merge commit:
+2. **Open a PR from the bump branch to `main` and squash-merge it.** `main` rejects direct pushes, so
+   the bump reaches `main` through a PR, and pr-feedback gates the merge:
 
    ```sh
-   gh pr create --base main --head dev --title 'Cut dev to main: <what>'
-   gh pr merge --merge          # NOT --squash, NOT --rebase
+   gh pr create --base main --head <bump-branch> --title 'release: cut v<version>'
+   gh pr merge --squash
    ```
 
-   `--merge` rather than the alternatives because both others rewrite the commits: a squash gives
-   `main` a commit that exists nowhere in `dev`'s history, and a rebase does the same for every commit
-   it moves. Either one breaks the ancestor relation that step 3 exists to maintain, so they defeat
-   the next step rather than merely differing in style.
-3. **Merge `main` back into `dev`.** Not housekeeping — the cut itself is what makes this necessary,
-   so it belongs to the cut rather than to whoever notices later:
+   Squash is right here: the bump is a pure version-cut, and there is no `dev` branch whose ancestry a
+   squash would break. (`dev` is retired — the repo is main-only. An earlier revision of this doc cut
+   through `dev` and required `gh pr merge --merge` to preserve a `main`→`dev` back-merge; both the
+   back-merge and the `--merge` requirement are gone with `dev`.)
+
+   Confirm the squashed `main` tree matches the branch that was reviewed and clean-seat-verified, before
+   tagging — for a pure version-cut this is trivially empty:
 
    ```sh
-   git checkout dev && git merge --no-ff main && git push origin dev
+   git fetch origin && git diff origin/main origin/<bump-branch>   # expect no output
    ```
 
-   A `dev → main` merge leaves a commit on `main` that `dev` does not have, so `main` stops being an
-   ancestor of `dev`. While that holds, anything reaching `main` by a fast-forward or a reset silently
-   drops whatever `main` had and `dev` lacked — which includes every previous cut, and anything merged
-   straight to `main` such as a site change. The back-merge restores the ancestor relation, so there is
-   nothing for such a cut to drop.
-
-   Verify rather than assume — this prints nothing and exits `0` when the invariant holds:
-
+3. **Tag `main` at the squash-merge commit and push the tag.** Fetch first so you tag the commit the PR
+   produced, not a stale local `main`. The tag push still works as a direct push — `main`'s ruleset
+   targets branches, not tags, so the tag that triggers the release is not gated by it:
    ```sh
-   git fetch origin && git merge-base --is-ancestor origin/main origin/dev
-   ```
-
-4. **Tag `main` and push the tag** — this still works as a direct push. `main`'s ruleset targets
-   branches, not tags, so the tag that triggers the release is not gated by it:
-   ```sh
-   git tag v0.2.0 && git push origin v0.2.0
+   git fetch origin && git tag v0.2.0 origin/main && git push origin v0.2.0
    ```
 
 ## Version scheme: plain `0.x.y` while below v1
@@ -162,7 +152,7 @@ Use it after any change to the workflow. On a dispatch run the release and publi
 as skipped; that is the live confirmation that the gates hold, and it is worth watching once before
 the first real tag.
 
-### ⚠ Every trigger reads the workflow from a specific commit, not from `dev`
+### ⚠ Every trigger reads the workflow from a specific commit, not from the branch tip
 
 **`workflow_dispatch` runs the copy of the workflow at the ref you dispatch.** Being *offered* at
 all requires `release.yml` to exist on the default branch (`main`), but the run itself executes the
@@ -174,9 +164,9 @@ declares while `main` still declared three.
 predates `release.yml` starts **no run at all** — no output, no failure, nothing in the Actions tab.
 That is the failure mode to watch for, because an absent run looks identical to one nobody noticed.
 
-The fix for the tag is unchanged: **merge `dev` into `main` before tagging**, which step 2 above
-already does. The trap is only reachable by tagging without it — most easily by cutting a release
-from a `main` merged minutes *before* a workflow change landed on `dev`.
+The fix for the tag: tag a `main` that actually contains `release.yml` — which it does, since the
+workflow lives on `main`. The trap is only reachable by tagging a commit that predates the workflow —
+an old ref, or a `main` from before `release.yml` first landed.
 
 If a tag produced no run, confirm the workflow was actually in that tree rather than assuming the
 trigger misfired:
@@ -253,7 +243,7 @@ rebuild is a cross-check, and letting it gate the pipeline would quietly make it
 ## If a release goes wrong
 
 - **The tag produced no run at all.** The tagged commit has no `release.yml` — see the warning under
-  Dry run. Merge `dev` into `main`, delete the tag, tag again.
+  Dry run. Delete the tag, then tag a `main` that contains `release.yml` and push it again.
 - **Publish failed, Release exists.** Fix the cause and re-run just the publish job. The build is
   reproducible from the tag.
 - **A version disagreed with the tag.** Nothing was published — the check runs before any upload.
