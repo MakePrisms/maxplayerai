@@ -208,6 +208,17 @@ pub struct SellerConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<String>,
     /// Opt-in to claim untargeted/open offers. Default **false** (targeted-only).
+    ///
+    /// This flag decides whether the seat can LOSE a race, and that is what makes it more than a
+    /// throughput knob. A targeted offer has exactly one eligible claimant — `rate_gate_allows`
+    /// refuses any offer whose `p` tag is not this seat — so a targeted seat that claimed a job
+    /// necessarily won it. Opt in and the seat claims offers other seats also claim, so it receives
+    /// AWARD and ACCEPT events that select SOMEONE ELSE's claim (its award subscription is
+    /// deliberately unscoped when open-pool, #456, so a loser still learns to free its slot).
+    /// Binding local state from those events requires knowing they name OUR claim: `on_award` and
+    /// `on_accept` each match the event's claim id against this node's published claim id before
+    /// recording an award. Recording and claiming the offer proves only that the job is one of ours
+    /// (#626). Any handler added to that subscription inherits the same obligation.
     #[serde(default)]
     pub claim_open_pool: bool,
     /// Allowlist of buyer pubkeys (64-hex) whose offers this seller will claim. **Empty/absent =

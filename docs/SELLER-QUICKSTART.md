@@ -511,6 +511,14 @@ Opt in to also claim untargeted/open offers that still clear your rate:
 `--claim-open-pool` (or `claim_open_pool = true` in `config.toml`) widens claiming to the open pool;
 `--no-claim-open-pool` forces it off. **Targeted-only stays the default** — open-pool is your explicit choice.
 
+**What changes when you opt in:** your seat can now *lose*. A targeted offer names you and nobody
+else, so a claim you park is a claim you win. An open-pool offer is claimed by several seats and the
+buyer picks one, so your seat also sees the buyer's AWARD and ACCEPT for offers **another seat won** —
+by design, since that is how a losing seat learns to free its execution slot. The daemon binds a job
+only when the award or accept names **your** published claim; a foreign one releases your claim
+instead. If it ever bound one of those, the seat would report itself busy (`accepting=n`) while
+running nothing, so a seat that shows queued work with no agent process is worth reporting.
+
 ---
 
 ## 7. Fees & rate — set `--rate-sats` to net positive

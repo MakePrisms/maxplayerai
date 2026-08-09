@@ -109,8 +109,15 @@ impl JobState {
         })
     }
 
+    /// Execution is over for this job — nothing will run for it again, so a re-served offer naming
+    /// it is not re-claimable. `Delivered` counts: the work is finished and only payment is
+    /// outstanding, which is why it holds no execution slot either.
+    pub(super) fn is_finished(self) -> bool {
+        matches!(self, Self::Delivered | Self::Paid | Self::Failed)
+    }
+
     /// The stored spelling — the same literal the write statements use.
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Awarded => "awarded",
             Self::Executing => "executing",
@@ -572,14 +579,20 @@ impl SellerStore {
 
     /// Release a parked claim (offer expired, another seller won, capacity reached). Idempotent:
     /// only a still-`claimed` row is released; `awarded`/`released`/absent are no-ops.
-    pub fn release_claim(&self, job_id: &str, now_unix: i64) -> Result<(), StoreError> {
+    ///
+    /// Returns the number of rows released — 0 or 1. A caller that ANNOUNCES a release must read
+    /// this and log the disposition it actually got. The `state = 'claimed'` guard is deliberately
+    /// narrow (it is what stops a release from regressing an awarded or terminal row), so a 0 is a
+    /// normal outcome, not an error — and a caller that reports success on a 0 is reporting an
+    /// action the UPDATE never performed. Use [`Self::claim_row_state`] to name the state instead.
+    pub fn release_claim(&self, job_id: &str, now_unix: i64) -> Result<usize, StoreError> {
         let conn = self.lock()?;
-        conn.execute(
+        let released = conn.execute(
             "UPDATE claims SET state = 'released', updated_at_unix = ?2
              WHERE job_id = ?1 AND state = 'claimed'",
             params![job_id, now_unix],
         )?;
-        Ok(())
+        Ok(released)
     }
 
     /// Offers recorded but never claimed and still fresh (`deadline_unix > now`): the capacity-skip
@@ -617,10 +630,14 @@ impl SellerStore {
     }
 
     /// The claim row's state for `job_id` (`claimed` / `awarded` / `released`), or `None` if this
-    /// node never parked a claim for it. Test-only: the #450 capacity-skip regression asserts that a
-    /// lapsed claim's row survives as `released` (so a re-delivered offer dedups on it rather than
-    /// being re-claimed) while the freed slot lets the previously capacity-skipped offer claim.
-    #[cfg(test)]
+    /// node never parked a claim for it.
+    ///
+    /// Read by [`Self::release_claim`]'s callers to NAME the state when a release moved no row —
+    /// the `state = 'claimed'` guard is narrow by design, and a log that cannot say which state
+    /// blocked it reports a release it never made. Also the #450 capacity-skip regression's
+    /// assertion that a lapsed claim's row survives as `released` (so a re-delivered offer dedups
+    /// on it rather than being re-claimed) while the freed slot lets the capacity-skipped offer
+    /// claim.
     pub fn claim_row_state(&self, job_id: &str) -> Result<Option<String>, StoreError> {
         let conn = self.lock()?;
         let state = conn

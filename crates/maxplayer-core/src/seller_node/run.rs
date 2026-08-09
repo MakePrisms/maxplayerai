@@ -563,6 +563,25 @@ fn match_award(
     }
 }
 
+/// The operator line a re-seen, already-claimed offer earns — `None` when it earns only the verbose
+/// dedup no-op.
+///
+/// Pure over the job's state, so the exact rendered text is assertable rather than eyeballed (the
+/// same reason [`crate::oplog::line`] is a function instead of macro-internal). A guard nobody can
+/// assert on is the guard this line exists to replace.
+///
+/// `None` for an absent or unreadable state as well as an unfinished one: the loud line is for a
+/// job we KNOW is finished, and an unknown state is not evidence of one.
+fn already_handled_skip_line(job_id: &str, state: Option<super::store::JobState>) -> Option<String> {
+    let state = state?;
+    state.is_finished().then(|| {
+        format!(
+            "seller node offer skip id={job_id}: already handled (job {}; not re-claiming)",
+            state.as_str()
+        )
+    })
+}
+
 /// Build the delivery co-signature preimage. `creq_hash` is derived from the STORED claim-time creq
 /// (`stored_creq`) — never a rebuild from live config — so a config change between claim and delivery
 /// cannot break the buyer/seller cosignature (audit N-4 / invariant 8). The specific realized mint is
@@ -1007,10 +1026,14 @@ fn offer_subscription_filters(
 /// offers it can LOSE; an award p-tags ONLY the winner, so a loser scoped to its own pubkey never
 /// receives the award that should release its slot (#456) and holds that capacity until the lapse
 /// timeout fires. When open-pool we therefore drop the pubkey scope and match by kind + hashtag alone
-/// — mirroring the open-pool OFFER filter above, which is likewise unscoped. This is a VISIBILITY
-/// change only: `on_award`/`on_accept` bind ONLY offers this node recorded and claimed (offer_facts +
-/// job_creq), so a wider filter changes slot-release LATENCY, never money authorization. The filter
-/// is static for the node's lifetime — no per-claim re-subscription to drift or leak.
+/// — mirroring the open-pool OFFER filter above, which is likewise unscoped. An unscoped REQ
+/// therefore delivers events about OTHER seats' claims, and what keeps that a VISIBILITY change is
+/// the handlers: `on_award` and `on_accept` each match the event's claim id against THIS node's
+/// published claim id before binding, so a wider filter changes slot-release LATENCY, never money
+/// authorization. That identity match is the load-bearing part — recording and claiming the offer
+/// (offer_facts + job_creq) establishes only that the job is one of ours, never that the buyer chose
+/// our claim, and a handler resting on those alone binds other seats' wins (#626). The filter is
+/// static for the node's lifetime — no per-claim re-subscription to drift or leak.
 fn award_filter(seller_pubkey: nostr_sdk::PublicKey, open_pool: bool) -> Filter {
     let base = Filter::new()
         .kinds([Kind::Custom(JOB_AWARD_KIND), Kind::Custom(JOB_ACCEPT_KIND)])
@@ -3551,14 +3574,32 @@ impl SellerNodeRunner {
     fn sweep_lapsed_claims(&self) {
         for job_id in self.slots.sweep_lapsed(Instant::now()) {
             match self.node.store().release_claim(&job_id, now_unix()) {
-                Ok(()) => opline!(
+                Ok(1..) => opline!(
                     "seller node slot reclaimed job_id={job_id}: parked claim lapsed unawarded ({} slot(s) free)",
+                    self.slots.available()
+                ),
+                // The slot came back but no claim row moved: the row had already left `claimed`.
+                // Reported as what it is, so the log never credits a release that did not happen.
+                Ok(_) => opline!(
+                    "seller node slot reclaimed job_id={job_id}: no claim row to release (state={}) ({} slot(s) free)",
+                    self.claim_state_label(&job_id),
                     self.slots.available()
                 ),
                 Err(error) => {
                     opline!("seller node slot reclaim job_id={job_id}: release_claim failed ({error})")
                 }
             }
+        }
+    }
+
+    /// The claim row's state, for a LOG that must name why a release moved nothing. Never fails the
+    /// caller: a read error or a missing row becomes a label, because a logging path that can return
+    /// an error invites a caller to drop the line entirely and go back to saying nothing.
+    fn claim_state_label(&self, job_id: &str) -> String {
+        match self.node.store().claim_row_state(job_id) {
+            Ok(Some(state)) => state,
+            Ok(None) => "absent".to_owned(),
+            Err(error) => format!("unreadable ({error})"),
         }
     }
 
@@ -3820,7 +3861,23 @@ impl SellerNodeRunner {
                 // Verbose-only (#489): a re-seen offer we already claimed is nothing happening.
                 // It reports no state change and prompts no operator decision, and relays redeliver
                 // often enough that it crowds out lines that do.
-                opline_verbose!("seller node offer id={job_id}: already claimed (dedup no-op)");
+                //
+                // One case is exempt and logs at normal level: an offer whose job we already
+                // FINISHED. A buyer re-serves an offer for its whole deadline window, so a
+                // delivered/paid/failed job keeps arriving and THIS dedup is what declines it. The
+                // only skip reason visible on this path is slot exhaustion, which is a different
+                // guard — so an operator watching a seat with free slots decline its own completed
+                // work sees the decision and no reason for it, and would credit the wrong
+                // protector. A guard that is silent while it works is equally silent while it
+                // degrades. Naming it costs one line on a bounded population (finished jobs), not
+                // on the redelivery firehose #489 was written to suppress.
+                let finished = self.node.store().job_state(&job_id).ok().flatten();
+                match already_handled_skip_line(&job_id, finished) {
+                    Some(line) => opline!("{line}"),
+                    None => opline_verbose!(
+                        "seller node offer id={job_id}: already claimed (dedup no-op)"
+                    ),
+                }
                 release_on_no_claim(self);
             }
             Err(error) => {
@@ -3896,20 +3953,69 @@ impl SellerNodeRunner {
                     "seller node accept job_id={job_id} buyer={buyer}: pay-bind observed (already awarded — no action)"
                 );
             }
-            // The award never reached us. This ACCEPT is the only evidence our claim was selected,
-            // so bind from it — and stop there.
+            // The award never reached us, so this ACCEPT may be the only evidence of a selection —
+            // but of WHOSE claim is a question the guards above cannot answer. `job_creq` proves we
+            // claimed this job; it does not prove the buyer chose our claim. On an untargeted offer
+            // a LOSING claimant satisfies every guard so far while holding its own losing claim, so
+            // binding here on existence alone parks a slot on work another seat won (#626). The
+            // accepted claim id arrives in the same event, so ask the identity question directly.
             Ok(None) => {
-                match self.node.store().record_award(
-                    &event.id.to_hex(),
-                    &job_id,
+                // Ensure our claim is on the wire, then read its published id for the win check —
+                // the same order `on_award` uses, for the same reason.
+                self.drain().await;
+                let our_claim_id = match self.node.store().outbox_row(&format!("claim:{job_id}")) {
+                    Ok(Some((_, _, published))) => published,
+                    _ => None,
+                };
+                let accept_author = event.pubkey.to_hex();
+                match match_award(
+                    &accept.claim_id,
+                    our_claim_id.as_deref(),
+                    &accept_author,
                     &buyer,
-                    now_unix(),
                 ) {
-                    Ok(outcome) => opline!(
-                        "seller node accept job_id={job_id} buyer={buyer}: bound from ACCEPT with no prior award ({outcome:?}) — NOT executing"
-                    ),
-                    Err(error) => opline!(
-                        "seller node accept job_id={job_id}: bind from accept failed ({error})"
+                    // The matcher answers identity, never action: `Execute` here means only "this
+                    // ACCEPT names our claim". The AWARD path turns that answer into execution; an
+                    // ACCEPT binds and stops, exactly as this handler's doc states.
+                    AwardMatch::Execute => {
+                        match self.node.store().record_award(
+                            &event.id.to_hex(),
+                            &job_id,
+                            &buyer,
+                            now_unix(),
+                        ) {
+                            Ok(outcome) => opline!(
+                                "seller node accept job_id={job_id} buyer={buyer}: bound from ACCEPT with no prior award ({outcome:?}) — NOT executing"
+                            ),
+                            Err(error) => opline!(
+                                "seller node accept job_id={job_id}: bind from accept failed ({error})"
+                            ),
+                        }
+                    }
+                    // The buyer accepted another seat's claim. We lost, and this event says so as
+                    // conclusively as the award would: release the claim and the slot rather than
+                    // hold capacity for work that is already someone else's.
+                    AwardMatch::Release => {
+                        self.slots.release(&job_id);
+                        match self.node.store().release_claim(&job_id, now_unix()) {
+                            Ok(1..) => opline!(
+                                "seller node released claim job_id={job_id}: buyer accepted another seller's claim (bound nothing)"
+                            ),
+                            Ok(_) => opline!(
+                                "seller node accept job_id={job_id}: buyer accepted another seller's claim, but no claim row was in 'claimed' (state={}) — nothing released, bound nothing",
+                                self.claim_state_label(&job_id)
+                            ),
+                            Err(error) => opline!(
+                                "seller node accept release failed job_id={job_id}: {error}"
+                            ),
+                        }
+                    }
+                    // FAIL CLOSED. Our published claim id is unreadable, so nothing here can show
+                    // the buyer chose us — and binding on an unproven identity is the whole defect.
+                    // (The author leg of the match cannot fire: this handler already returned above
+                    // unless the author IS the offer's buyer.)
+                    AwardMatch::Ignore => opline!(
+                        "seller node accept ignore job_id={job_id}: our published claim id is unreadable — not binding"
                     ),
                 }
             }
@@ -4018,8 +4124,14 @@ impl SellerNodeRunner {
                 // The buyer picked another seller: release the durable claim AND its reserved slot.
                 self.slots.release(&job_id);
                 match self.node.store().release_claim(&job_id, now_unix()) {
-                    Ok(()) => opline!(
+                    Ok(1..) => opline!(
                         "seller node released claim job_id={job_id}: buyer picked another seller's claim"
+                    ),
+                    // The claim had already left `claimed`, so this release moved nothing. Say so:
+                    // announcing a release here on a 0 is how a bound row survived a loss unnoticed.
+                    Ok(_) => opline!(
+                        "seller node release job_id={job_id}: buyer picked another seller's claim, but no claim row was in 'claimed' (state={}) — nothing released",
+                        self.claim_state_label(&job_id)
                     ),
                     Err(error) => opline!("seller node release failed job_id={job_id}: {error}"),
                 }
@@ -4329,7 +4441,19 @@ impl SellerNodeRunner {
             false
         };
         match resume_action(state, has_delivery, has_receipt, settled_elsewhere, pushed, deadline_unix, now) {
-            ResumeAction::RunAgent => {}
+            ResumeAction::RunAgent => {
+                // #628: an `awarded` row records that a job was bound, never WHICH claim the buyer
+                // chose, so a resume cannot separate a job this seat won from one it lost in an
+                // open-pool race and bound anyway (#626). Both re-run here, and no local fact can
+                // tell them apart — declining unmarked rows would drop real awards. Said out loud
+                // at normal level so an operator watching a seat start work at boot can see which
+                // job it is, rather than inferring it from a busy seat that produces no result.
+                if resume && matches!(state, super::store::JobState::Awarded) {
+                    opline!(
+                        "seller node resume job_id={job_id}: re-driving an awarded row; if this seat lost an open-pool race for this offer, the run produces a result nobody awarded (#628)"
+                    );
+                }
+            }
             ResumeAction::FinalizeFromPushed(commit) => {
                 opline!(
                     "seller node execute job_id={job_id}: delivery already pushed (commit={commit}) — finalizing from the stored commit, NOT re-running the agent (#552)"
@@ -5570,6 +5694,47 @@ mod tests {
             classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, STRANGER, NOW, NOW),
             ClaimDecision::Skip(SkipReason::NotAllowlisted),
             "an unlisted buyer's offer must be fenced — only the buyer changed"
+        );
+    }
+
+    /// The already-handled suppression must NAME itself, and only for a job that is actually done.
+    ///
+    /// Checked over every `JobState` rather than the finished ones alone: the operative guard on the
+    /// re-serve path used to emit nothing at default verbosity, while the only visible skip reason
+    /// there is slot exhaustion — a different guard entirely. A reader watching a seat with free
+    /// slots decline its own completed work would credit the wrong protector, so the line must fire
+    /// on exactly the finished states and stay quiet on the rest.
+    #[test]
+    fn the_already_handled_skip_names_itself_on_finished_jobs_only() {
+        use super::super::store::JobState;
+
+        for state in JobState::ALL {
+            let line = already_handled_skip_line("job-7", Some(state));
+            if state.is_finished() {
+                assert_eq!(
+                    line.as_deref(),
+                    Some(
+                        format!(
+                            "seller node offer skip id=job-7: already handled (job {}; not re-claiming)",
+                            state.as_str()
+                        )
+                        .as_str()
+                    ),
+                    "a re-served offer whose job is {state:?} must say why it is not re-claimed"
+                );
+            } else {
+                assert_eq!(
+                    line, None,
+                    "{state:?} still occupies a slot — it is not `already handled` and must stay on \
+                     the verbose dedup line"
+                );
+            }
+        }
+        // An absent or unreadable state is not evidence of a finished job.
+        assert_eq!(
+            already_handled_skip_line("job-7", None),
+            None,
+            "no job row ⇒ no already-handled claim"
         );
     }
 
@@ -7488,6 +7653,223 @@ mod tests {
         drive_loser_release_on_award(true).await;
     }
 
+    /// Pump the shared AWARD/ACCEPT stream into `on_accept`. The twin of [`pump_awards_until`]: both
+    /// kinds ride ONE REQ, and dispatching only the kind under test keeps the ACCEPT path the sole
+    /// cause of whatever the predicate observes.
+    async fn pump_accepts_until(
+        runner: &Arc<SellerNodeRunner>,
+        notifications: &mut tokio::sync::broadcast::Receiver<RelayPoolNotification>,
+        deadline: std::time::Instant,
+        mut done: impl FnMut(&SellerNodeRunner) -> bool,
+    ) -> bool {
+        while !done(runner) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            if let Ok(Ok(RelayPoolNotification::Event { event, .. })) = tokio::time::timeout(
+                remaining.min(Duration::from_millis(150)),
+                notifications.recv(),
+            )
+            .await
+            {
+                if event.kind.as_u16() == JOB_ACCEPT_KIND {
+                    runner.on_accept(&event).await;
+                }
+            }
+        }
+        done(runner)
+    }
+
+    /// #626 — an ACCEPT that names ANOTHER seat's claim must not bind local state.
+    ///
+    /// The field shape, reproduced: two one-slot open-pool sellers claim ONE untargeted offer, the
+    /// buyer accepts the WINNER's claim, and the loser receives that ACCEPT because its open-pool
+    /// award REQ is unscoped (#456 — both kinds ride that one REQ). No award is published at all, so
+    /// both seats reach `on_accept` with `job_award_time == None`: the arm that WRITES. Binding there
+    /// on claim EXISTENCE alone gives the loser a phantom `awarded` job row, which `jobs_in_flight`
+    /// counts and the heartbeat then publishes as `accepting=n` — a seat stranded out of the market
+    /// by another seat's win, holding capacity for work it never had.
+    ///
+    /// The WINNER leg is the anti-vacuity control and it is load-bearing: the same ACCEPT, on the
+    /// seat whose claim it names, MUST still bind. Without it a handler that refused every accept
+    /// would satisfy the loser assertions completely.
+    ///
+    /// RED ON REVERT: drop the `match_award` identity match in `on_accept` and the loser binds — its
+    /// claim row reads `awarded` and `jobs_in_flight` reads 1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_accept_naming_another_seats_claim_never_binds_the_loser() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+
+        let (winner_runner, winner_root) =
+            boot_capacity_skip_seller("accept-identity-winner", &relay_url, true, 0, Some(3600))
+                .await;
+        let (loser_runner, loser_root) =
+            boot_capacity_skip_seller("accept-identity-loser", &relay_url, true, 0, Some(3600))
+                .await;
+        // `on_accept` binds `self: &Arc<Self>`, so both seats are driven through an Arc.
+        let winner = Arc::new(winner_runner);
+        let loser = Arc::new(loser_runner);
+        let winner_hex = winner.seller_pubkey();
+
+        // The buyer is a third key: a node is never delivered its own events, and the accept's author
+        // must be the recorded offer's buyer or `on_accept` refuses it before the identity match.
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let publisher = Client::new(buyer.clone());
+        publisher.add_relay(&relay_url).await.expect("publisher add relay");
+        publisher.connect().await;
+        publisher.wait_for_connection(Duration::from_secs(5)).await;
+
+        let mut winner_notifs = winner.client.notifications();
+        let mut loser_notifs = loser.client.notifications();
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Both seats need the offer REQ (to claim) and the award/accept REQ (to see it).
+                winner.subscribe_all(None).await.expect("winner subscriptions");
+                loser.subscribe_all(None).await.expect("loser subscriptions");
+
+                let deadline_unix = now_unix() as u64 + 3_600;
+                let job_id = post_offer(
+                    &publisher,
+                    &buyer,
+                    "accept-identity open-pool offer",
+                    None,
+                    100,
+                    deadline_unix,
+                )
+                .await;
+
+                for (label, seat, notifs) in [
+                    ("winner", &winner, &mut winner_notifs),
+                    ("loser", &loser, &mut loser_notifs),
+                ] {
+                    assert!(
+                        pump_offers_until(
+                            seat,
+                            notifs,
+                            std::time::Instant::now() + Duration::from_secs(5),
+                            |r| r.node.store().claim_row_state(&job_id).ok().flatten().is_some(),
+                        )
+                        .await,
+                        "the {label} must claim the open-pool offer"
+                    );
+                }
+
+                // Publish both claims so each has a real id on the wire; the accept names the
+                // winner's. Without this the loser's own id is unreadable and it would refuse to
+                // bind for the WRONG reason (fail-closed), which would not test the identity match.
+                winner.drain().await;
+                loser.drain().await;
+                let published = |seat: &Arc<SellerNodeRunner>, label: &str| match seat
+                    .node
+                    .store()
+                    .outbox_row(&format!("claim:{job_id}"))
+                {
+                    Ok(Some((_, _, Some(id)))) => id,
+                    other => panic!("{label} claim must be published with an id; got {other:?}"),
+                };
+                let winner_claim_id = published(&winner, "winner");
+                let loser_claim_id = published(&loser, "loser");
+                assert_ne!(
+                    winner_claim_id, loser_claim_id,
+                    "two distinct sellers publish two distinct claim events"
+                );
+
+                // The buyer ACCEPTS the winner's claim. No AWARD is ever published, so both seats
+                // reach the `job_award_time == None` arm — the one that writes.
+                let accept = crate::gateway::accept_draft(
+                    &job_id,
+                    &winner_claim_id,
+                    &buyer_hex,
+                    &winner_hex,
+                );
+                let event = crate::gateway::nostr::event_builder(&accept)
+                    .expect("accept event builder")
+                    .sign_with_keys(&buyer)
+                    .expect("sign accept as the buyer");
+                publisher.send_event(&event).await.expect("post accept to relay");
+
+                // Both seats leave `claimed` on this ACCEPT — the loser by releasing, the winner by
+                // binding — so this predicate terminates on a fixed AND an unfixed tree. It waits for
+                // the ACCEPT to be HANDLED rather than asserting on a state that already holds before
+                // it arrives, which would pass without the event ever being processed.
+                let left_claimed = |r: &SellerNodeRunner| {
+                    r.node.store().claim_row_state(&job_id).ok().flatten().as_deref()
+                        != Some("claimed")
+                };
+                let loser_acted = pump_accepts_until(
+                    &loser,
+                    &mut loser_notifs,
+                    std::time::Instant::now() + Duration::from_secs(5),
+                    left_claimed,
+                )
+                .await;
+                assert!(
+                    loser_acted,
+                    "the loser must handle the ACCEPT (claim_state={:?})",
+                    loser.node.store().claim_row_state(&job_id)
+                );
+
+                // THE DEFECT. A foreign ACCEPT must create no local state.
+                assert_eq!(
+                    loser.node.store().jobs_in_flight().expect("loser in-flight"),
+                    0,
+                    "an ACCEPT naming another seat's claim must not bind: the loser holds no \
+                     in-flight job (claim_state={:?})",
+                    loser.node.store().claim_row_state(&job_id)
+                );
+                assert_eq!(
+                    loser.node.store().claim_row_state(&job_id).expect("loser claim row"),
+                    Some("released".to_string()),
+                    "the loser's claim is `released` (it lost the race), never `awarded` (bound \
+                     from an accept that names someone else)"
+                );
+                assert_eq!(
+                    loser.slots.available(),
+                    1,
+                    "the loser's reserved slot returns, so the seat keeps advertising capacity"
+                );
+
+                // ANTI-VACUITY: the same ACCEPT, on the seat it names, still binds.
+                let winner_bound = pump_accepts_until(
+                    &winner,
+                    &mut winner_notifs,
+                    std::time::Instant::now() + Duration::from_secs(5),
+                    left_claimed,
+                )
+                .await;
+                assert!(
+                    winner_bound,
+                    "the winner must handle the ACCEPT (claim_state={:?})",
+                    winner.node.store().claim_row_state(&job_id)
+                );
+                assert_eq!(
+                    winner.node.store().claim_row_state(&job_id).expect("winner claim row"),
+                    Some("awarded".to_string()),
+                    "the ACCEPT names the winner's claim, so the winner binds from it (#143 \
+                     across-restart re-bind) — the identity match must not refuse everything"
+                );
+                assert!(
+                    winner.node.store().job_award_time(&job_id).expect("winner award time").is_some(),
+                    "the winner's bind records an award row"
+                );
+            })
+            .await;
+
+        winner.client.disconnect().await;
+        loser.client.disconnect().await;
+        publisher.disconnect().await;
+        let _ = std::fs::remove_dir_all(&winner_root);
+        let _ = std::fs::remove_dir_all(&loser_root);
+    }
+
     // TOOTH (offer backfill, DEAF-SUB RECOVERY — #560, the acceptance bar) — an offer a silently-deaf
     // live subscription NEVER delivered is recovered by the periodic offer backfill, WITHOUT a restart.
     // This is the offers analog of the wrap backfill's whole reason to exist.
@@ -8633,6 +9015,91 @@ mod tests {
             .record_award(&"w".repeat(64), job, buyer, award_time)
             .expect("award");
         (store, root)
+    }
+
+    /// A store carrying exactly the stranded shape a #626 phantom bind leaves behind: offer → claim →
+    /// award journaled, and the offer's own deadline already PASSED at `now`.
+    fn store_with_lapsed_awarded_job(
+        job: &str,
+        buyer: &str,
+        now: i64,
+    ) -> (SellerStore, std::path::PathBuf) {
+        let root = temp_dir("lapsed-awarded");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mk root");
+        let store = SellerStore::open(root.join("seller.sqlite")).expect("open store");
+        store
+            .record_offer(
+                &Offer {
+                    offer_id: job.to_owned(),
+                    buyer_pubkey: buyer.to_owned(),
+                    amount_sats: 21,
+                    unit: "sat".to_owned(),
+                    task: "an open-pool job another seat won".to_owned(),
+                    deadline_unix: now - 1,
+                    targeted: false,
+                    requested_agent: None,
+                },
+                1,
+            )
+            .expect("record offer");
+        let draft = claim_draft(job, buyer, &"s".repeat(64), "creqL", &[]);
+        store
+            .claim_and_enqueue(job, job, "creqL", &draft, 1, 9_999_999_999, 1)
+            .expect("claim");
+        store
+            .record_award(&"w".repeat(64), job, buyer, 2)
+            .expect("award");
+        (store, root)
+    }
+
+    /// CHARACTERIZATION — NOT a #626 red-prove. This passes with AND without the identity match,
+    /// because the path it exercises shipped in #552.
+    ///
+    /// It pins the self-heal that already-stranded seats depend on: a slot-occupying `awarded` row
+    /// with no delivery, no receipt, no pushed commit and a PASSED offer deadline classifies as
+    /// `SkipLapsed`, and once failed it stops counting toward `jobs_in_flight` — which is what puts
+    /// the seat back to `accepting=y`. #626 closes the source of such rows; this guards the path that
+    /// clears the ones already written, so a later change cannot delete the healing silently.
+    #[test]
+    fn characterization_a_lapsed_awarded_row_lapses_and_stops_counting_once_failed() {
+        let job = "j".repeat(64);
+        let buyer = "b".repeat(64);
+        let now = 2_000_i64;
+        let (store, root) = store_with_lapsed_awarded_job(&job, &buyer, now);
+
+        // The stranded shape, asserted rather than assumed: the seat reports itself busy.
+        assert_eq!(
+            store.jobs_in_flight().expect("in flight"),
+            1,
+            "precondition: the awarded row occupies a slot, so the heartbeat publishes accepting=n"
+        );
+        let state = store.job_state(&job).expect("job_state").expect("job row present");
+        assert!(!store.has_delivery(&job).expect("has_delivery"), "never delivered");
+        assert!(!store.has_receipt(&job).expect("has_receipt"), "never paid");
+        assert_eq!(store.pushed_commit(&job).expect("pushed_commit"), None, "never pushed");
+        let deadline = store
+            .offer_row(&job)
+            .expect("offer_row")
+            .expect("offer row present")
+            .deadline_unix;
+        assert!(deadline <= now, "precondition: the offer's own deadline has passed");
+
+        assert_eq!(
+            resume_action(state, false, false, false, None, Some(deadline), now),
+            ResumeAction::SkipLapsed,
+            "a restart must FAIL this row, not re-drive it — the award can no longer be paid"
+        );
+
+        // What the SkipLapsed arm does, and the property the seat is judged on.
+        store.fail_job(&job, now).expect("fail the stale award");
+        assert_eq!(
+            store.jobs_in_flight().expect("in flight"),
+            0,
+            "the failed row no longer occupies a slot, so the seat advertises capacity again"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // TOOTH (#552) — RESTART-SCOPED terminal-shape resume SELECTION over REAL persisted rows. The pure

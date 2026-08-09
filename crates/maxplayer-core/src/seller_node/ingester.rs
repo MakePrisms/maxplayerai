@@ -43,6 +43,9 @@ pub struct IngestCounts {
 }
 
 /// Persist one event into the store, idempotently. Returns the running counts unchanged-or-bumped.
+#[deprecated(
+    note = "binds an award without matching it to this seat's published claim (#626 shape, tracked in #627). Wiring this to a live stream requires the on_accept/on_award identity match first, and IngestEvent::Award does not yet carry a claim id."
+)]
 pub fn ingest(
     store: &SellerStore,
     event: &IngestEvent,
@@ -60,6 +63,10 @@ pub fn ingest(
             job_id,
             buyer_pubkey,
         } => {
+            // #626: this binds on the award's JOB id alone — it never checks that the award names
+            // THIS node's claim. Wiring this path to a live open-pool stream requires the identity
+            // match `on_award`/`on_accept` perform (compare the published claim id) FIRST, or a
+            // losing claimant binds other seats' wins and strands its own capacity.
             store.record_award(award_id, job_id, buyer_pubkey, now_unix)?;
             counts.awards += 1;
         }
@@ -80,12 +87,20 @@ where
 {
     let mut counts = IngestCounts::default();
     while let Some(event) = stream.next().await {
+        // #626/#627: this driver is the deprecated binding path's only in-crate caller and inherits
+        // the same constraint — it is allowed here so the attribute keeps flagging NEW callers, not
+        // because the identity match is satisfied. Wiring either to a live stream needs that first.
+        #[allow(deprecated)]
         ingest(store, &event, &mut counts, clock())?;
     }
     Ok(counts)
 }
 
 #[cfg(test)]
+// #626/#627: these tests pin the deprecated binding path's CURRENT behaviour so it cannot drift
+// while it waits for the identity match. Allowed for that reason alone — the attribute stays live
+// for any new caller.
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
