@@ -98,10 +98,12 @@ fails outright.
    ```
 
 3. **Tag `main` at the squash-merge commit and push the tag.** Fetch first so you tag the commit the PR
-   produced, not a stale local `main`. The tag push still works as a direct push — `main`'s ruleset
-   targets branches, not tags, so the tag that triggers the release is not gated by it:
+   produced, not a stale local `main`. The repo signs tags (`tag.gpgSign`, SSH format) and every prior
+   release tag is signed, so the tag must be **annotated with a message** — a bare `git tag v0.2.0` fails
+   `fatal: no tag message?`. Match the message convention `maxplayer vX.Y.Z`. The tag push still works as
+   a direct push — `main`'s ruleset targets branches, not tags:
    ```sh
-   git fetch origin && git tag v0.2.0 origin/main && git push origin v0.2.0
+   git fetch origin && git tag -s -m "maxplayer v0.2.0" v0.2.0 origin/main && git push origin v0.2.0
    ```
 
 ## Version scheme: plain `0.x.y` while below v1
