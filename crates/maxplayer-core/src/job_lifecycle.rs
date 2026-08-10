@@ -679,7 +679,9 @@ fn contribution_offer_from_spec(
     let owner = spec.target_repo_owner.trim().to_owned();
     let url = spec.target_repo_url.trim().to_owned();
     let branch = spec.base_branch.trim().to_owned();
-    let oid = spec.base_oid.trim().to_owned();
+    // Keep the supplied oid byte-for-byte so ContributionBase can enforce its canonical shape.
+    // Trimming here would let a non-exact value through the POST-time validation gate.
+    let oid = spec.base_oid.clone();
     let accepts: Vec<String> = spec
         .accepts
         .as_ref()
@@ -4976,7 +4978,7 @@ mod tests {
             contribution_offer_from_spec(&contribution_spec("nothex", url, "main", &oid, None))
                 .is_err()
         );
-        // bad oid (not 40/64-hex)
+        // bad oid (not 40 lowercase hex)
         assert!(
             contribution_offer_from_spec(&contribution_spec(&owner, url, "main", "xyz", None))
                 .is_err()
@@ -5003,6 +5005,39 @@ mod tests {
             Some(vec!["patch".into()])
         ))
         .is_err());
+    }
+
+    #[test]
+    fn post_job_contribution_requires_exactly_40_lowercase_hex_base_oid() {
+        let owner = "aa".repeat(32);
+        let url = "https://relay.maxplayer.test/git/owner/repo.git";
+
+        let malformed = contribution_spec(&owner, url, "main", &"a".repeat(64), None);
+        let error = contribution_offer_from_spec(&malformed)
+            .expect_err("post validation must refuse a 64-hex base_oid");
+        assert!(
+            matches!(&error, JobLifecycleError::Input(message) if message.contains(
+                "base_oid must be exactly 40 lowercase hex chars"
+            )),
+            "post refusal must identify the malformed base_oid: {error}"
+        );
+
+        let valid = contribution_spec(&owner, url, "main", &"a".repeat(40), None);
+        let offer = contribution_offer_from_spec(&valid)
+            .expect("post validation must accept a 40-lowercase-hex base_oid");
+        assert_eq!(offer.base.oid(), "a".repeat(40));
+
+        let padded = contribution_spec(
+            &owner,
+            url,
+            "main",
+            &format!(" {} ", "a".repeat(40)),
+            None,
+        );
+        assert!(
+            contribution_offer_from_spec(&padded).is_err(),
+            "post validation must not normalize a non-exact base_oid"
+        );
     }
 
     #[test]
