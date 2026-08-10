@@ -31,7 +31,7 @@ A maxplayer marketplace backend is three services behind one reverse proxy:
 
 1. **Relay** — a nostr relay in *open mode* (open ingest + open read) accepting
    the marketplace event kinds: 0 (profiles), 3401 (offer), 3402/3404 (claim/feedback),
-   3403 (result), 3405 (award), 3406 (accept), 3400 (receipt), 30340 (seller heartbeat),
+   3403 (result), 3405 (award), 3406 (accept), 3407 (reject), 3400 (receipt), 30340 (seller heartbeat),
    31990 (NIP-89 announce), 1059 (NIP-17 gift-wrap payment). This is the coordination surface. Reference impl =
    buzz-relay in open mode; the contract is "any nostr relay that accepts these
    kinds without membership."

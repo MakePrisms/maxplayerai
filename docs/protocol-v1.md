@@ -6,7 +6,7 @@ This protocol coordinates buyer-posted jobs over Nostr, delivers completed work 
 
 > **Status.** The flag-day flip (#355) has shipped: the live wire is `t=maxplayer`, `v=1`, `d=maxplayer-seller`, exactly as specified below.
 
-This protocol does not define escrow, relay policy, wallet internals, artifact execution attestation, or any proof that a seller’s self-description is true. A seller’s claim about itself is testimony. The independent settlement artifact is the receipt.
+This protocol does not define escrow, relay policy, wallet internals, or any proof that a seller’s self-description is true. It does define the narrow deterministic checks attestation in Sections 20–21. A seller’s claim about itself is testimony. The independent settlement artifact is the receipt.
 
 ## 2. Scope And Terms
 
@@ -74,12 +74,13 @@ The v1 kinds are:
 | `3404` | Feedback | maxplayer | seller | Progress, refusal, failure, or release |
 | `3405` | Award | maxplayer | buyer | Claim selection before work starts |
 | `3406` | Accept | maxplayer | buyer | Verified pay-bind for one result |
+| `3407` | Reject | maxplayer | buyer | Deterministic refusal of one delivered result/commit |
 
 `3405` is `AWARD` only in v1. `ACCEPT` is a separate event, not a second meaning of `3405`.
 
 ## 5. Namespace Tag
 
-Every maxplayer-owned event of kind `3400` through `3406` and `30340` MUST carry `["t","maxplayer"]`.
+Every maxplayer-owned event of kind `3400` through `3407` and `30340` MUST carry `["t","maxplayer"]`.
 
 A reader of those kinds MUST reject an event that lacks that exact tag.
 
@@ -319,7 +320,11 @@ The awarded seller delivers by pushing a git object to a delivery remote and pub
 
 ### Verify
 
-The buyer MUST verify delivery independently. For git delivery, the buyer runs its own remote read and tip-match. The buyer’s verified object hash, not the seller’s assertion, becomes the delivery bind for payment.
+The buyer MUST verify delivery independently. For git delivery, the buyer runs its own remote read and tip-match. If `.maxplayer/checks.toml` exists at the pinned base, the buyer also reads that exact declaration and environment lock, removes both reserved paths, and recomputes the declared checks. The buyer’s verified object hash, not the seller’s assertion, becomes the delivery bind for payment. Indeterminate outcomes retry and never terminalize.
+
+### Reject
+
+The buyer publishes `REJECT` for a deterministic refusal of a particular result and commit. A reader treats it as void unless its author is the buyer that authored the referenced job's `AWARD`.
 
 ### Accept
 
@@ -353,6 +358,7 @@ Every lifecycle event after `OFFER` MUST carry one `e` tag marked `root` whose v
 - `ACCEPT`
 - `FEEDBACK`
 - `RECEIPT`
+- `REJECT`
 
 Readers MUST reject a lifecycle event that lacks that root marker. Positional fallback is not part of v1.
 
@@ -536,3 +542,70 @@ A delivery produced without a sentinel MUST be a defined refusal carrying `no_se
 **Lapse is a protocol question, not a component defect.** Buyer-side parked jobs and seller-side stuck claims are the same failed trades seen from two ends; a replication measured seven of seven cross-side correspondences. No component owns lapse, so it is specified here rather than tracked as a defect in either implementation.
 
 Sections 9 and 10 are what make any of this computable. 9 makes awards joinable to their offers, so award-without-result becomes visible to an anonymous observer. 10 separates a seller's failure from a buyer's price. Without both, every reputation input available on the relay today is either unjoinable or class-ambiguous.
+
+## 20. Per-project environment + checks declaration
+
+A target MAY declare verification in `.maxplayer/checks.toml`, read only from the pinned `base_oid`.
+Absence means no checks and preserves v0.2.0 behavior. Presence is fail-closed: malformed TOML,
+unknown fields, unsupported schema, or an unsafe value is an error. The declaration is capped at 64
+KiB and `schema` MUST equal `1`.
+
+The environment is exactly one of:
+
+- `kind = "nix-flake"`: `flake_path` defaults to `"."` and otherwise is a clean relative path
+  inside the repository. `<flake_path>/flake.nix` and `<flake_path>/flake.lock` MUST both be blobs at
+  `base_oid`; an unpinned flake is refused. `devshell` is optional.
+- `kind = "container-image"`: `image` MUST match
+  `^[a-z0-9.\-_/]+@sha256:[0-9a-f]{64}$`. Tags, including `latest`, are forbidden.
+
+`checks.prepare` and `checks.commands` contain non-empty argv arrays, never shell strings;
+`commands` itself is non-empty. Prepare MAY use the network for provisioning. Every declared command
+MUST run network-free. `timeout_secs` is the overall bound. The stable environment reference is the
+SHA-256 digest of the declared `flake.lock` bytes or the digest-pinned container image reference.
+
+`MAXPLAYER_EXECUTION_SENTINEL` and `MAXPLAYER_CHECKS_ATTESTATION` are reserved protocol paths. A
+declaring target is refused with `verify_reserved_path` if either is already a blob in the base tree.
+
+## 21. Checks attestation
+
+A checked delivered tree carries the sibling `MAXPLAYER_CHECKS_ATTESTATION` in this deterministic
+line-oriented form:
+
+```text
+maxplayer-checks-attestation/v1 job-hash=<64 lowercase hex>
+raw-tree: <40 lowercase hex>
+declaration: <64 lowercase hex>
+env-kind: nix-flake
+env-ref: <lock digest or digest-pinned image reference>
+net: denied
+check[0]: ["cargo","build","--locked"] exit=0
+check[1]: ["cargo","test","--locked"] exit=0
+verdict: pass
+```
+
+`raw-tree` is the delivered tree with both reserved paths removed. `declaration` is SHA-256 of the
+exact declaration bytes at `base_oid`. `net` is the posture actually applied (`denied` or `open`);
+declared commands require denied networking. There are no timestamps, durations, host facts, or log
+bytes. Absence when declared is `verify_attestation_missing`; malformed or mismatched content is
+`verify_attestation_mismatch`.
+
+Classification uses child wait-status, never exit code alone. A normal nonzero exit is `Fail`.
+Timeout, signal termination (including OOM kill), launcher/provision/control fault, posture mismatch,
+resource limit, and I/O failure are indeterminate. A wrapper fault never masquerades as a command
+failure.
+
+## 22. REJECT kind 3407
+
+`REJECT` is buyer-authored with `status=rejected` and tags the offer as root, result as reply, seller,
+rejected commit, reason code, `t=maxplayer`, and `v=1`. Its content is capped,
+control-character-stripped human context.
+
+The closed vocabulary is `verify_not_descendant`, `verify_tip_mismatch`,
+`verify_content_refused`, `verify_no_sentinel`, `verify_reserved_path`,
+`verify_attestation_missing`, `verify_attestation_mismatch`, and `checks_failed`.
+Transport failures, timeouts, kills/signals, resource events, provisioning/control failures, posture
+mismatches, and I/O failures are excluded: they retry and MUST NOT terminalize or emit REJECT.
+
+> Reader author-gate invariant: kind 3407 is void unless its author is the buyer that authored the
+> referenced job's AWARD (3405). Relays enforce only the namespace. Every reader MUST join the root
+> offer to its award and verify `reject.author == award.author` before surfacing or recording it.

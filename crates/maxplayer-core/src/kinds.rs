@@ -2,7 +2,7 @@
 //!
 //! This module is the ONE place a kind *number* may appear. Every other site refers to a named
 //! constant from here (re-exported through [`crate::gateway`] for the trade-path kinds). The
-//! trade kinds form a contiguous maxplayer-owned block — `3400`–`3406` — plus the addressable
+//! trade kinds form a contiguous maxplayer-owned block — `3400`–`3407` — plus the addressable
 //! seller heartbeat `30340`.
 //!
 //! | Kind | Object | Author |
@@ -14,6 +14,7 @@
 //! | `3404` | FEEDBACK (progress / error / refusal) | seller |
 //! | `3405` | AWARD (claim selection) | buyer |
 //! | `3406` | ACCEPT (pay-bind for one verified result) | buyer |
+//! | `3407` | REJECT (verified delivery refusal) | buyer |
 //! | `30340` | SELLER HEARTBEAT (addressable, `d="maxplayer-seller"`) | seller |
 
 /// Co-signed settlement receipt (buyer + seller).
@@ -37,6 +38,8 @@ pub const JOB_AWARD_KIND: u16 = 3405;
 /// discriminator — the seller could not tell claim-won from pay-authorised, and any award-presence
 /// read had to reconcile a multiplicity it could not interpret.
 pub const JOB_ACCEPT_KIND: u16 = 3406;
+/// Buyer-authored terminal rejection of a specific delivered commit.
+pub const JOB_REJECT_KIND: u16 = 3407;
 /// Addressable seller liveness heartbeat, `d="maxplayer-seller"`. Must stay in the NIP-01
 /// parameterized-replaceable range `30000`–`39999`, hence `30340` (not a `34xx` value).
 pub const SELLER_HEARTBEAT_KIND: u16 = 30340;
@@ -57,8 +60,9 @@ mod tests {
                 JOB_FEEDBACK_KIND,
                 JOB_AWARD_KIND,
                 JOB_ACCEPT_KIND,
+                JOB_REJECT_KIND,
             ],
-            [3400, 3401, 3402, 3403, 3404, 3405, 3406]
+            [3400, 3401, 3402, 3403, 3404, 3405, 3406, 3407]
         );
         for kind in [5109u16, 6109, 7000] {
             assert!(
@@ -69,7 +73,8 @@ mod tests {
                     JOB_RESULT_KIND,
                     JOB_FEEDBACK_KIND,
                     JOB_AWARD_KIND,
-                    JOB_ACCEPT_KIND
+                    JOB_ACCEPT_KIND,
+                    JOB_REJECT_KIND
                 ]
                 .contains(&kind),
                 "generic DVM kind {kind} must not appear in the maxplayer block"
