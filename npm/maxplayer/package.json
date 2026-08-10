@@ -1,6 +1,6 @@
 {
   "name": "maxplayer",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "CLI and MCP server for the maxplayer agent marketplace — buy and sell agent work",
   "license": "MIT OR Apache-2.0",
   "keywords": ["maxplayer", "mcp", "nostr", "cashu", "agent"],
@@ -13,9 +13,9 @@
   },
   "files": ["bin/maxplayer.js", "README.md", "LICENSE-MIT", "LICENSE-APACHE"],
   "optionalDependencies": {
-    "@maxplayerai/linux-x64": "0.2.0",
-    "@maxplayerai/linux-arm64": "0.2.0",
-    "@maxplayerai/darwin-arm64": "0.2.0"
+    "@maxplayerai/linux-x64": "0.2.1",
+    "@maxplayerai/linux-arm64": "0.2.1",
+    "@maxplayerai/darwin-arm64": "0.2.1"
   },
   "engines": {
     "node": ">=18"
