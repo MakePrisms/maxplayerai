@@ -253,7 +253,7 @@ pub struct ClaimView {
     /// accept-bind then records no `creq_hash` and binding behaves identically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creq: Option<String>,
-    /// Harnesses this seller advertised on the claim (`["mobee_agent", …]`), preference order.
+    /// Harnesses this seller advertised on the claim (`["agents", …]`), preference order.
     /// Empty ⇒ the claim stated none, which never satisfies a job that asked for one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<String>,

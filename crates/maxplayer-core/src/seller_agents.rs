@@ -27,10 +27,14 @@ use std::collections::BTreeMap;
 use crate::agent_presets::resolve_agent_preset;
 use crate::home::{AgentPresetConfig, SellerConfig};
 
-/// Wire tag naming the harnesses an event's author can run — `["mobee_agent", "claude", "codex"]`,
-/// ordered by the seller's preference. Multi-value (the `protocol_versions` convention), so issue
-/// #170's single-harness `["mobee_agent", "claude"]` is the one-entry case of the same tag.
-pub const AGENT_TAG: &str = "mobee_agent";
+/// Wire tag naming the harnesses an event's author can run — `["agents", "claude", "codex"]`,
+/// ordered by the seller's preference. Multi-value, so a single-harness seat publishes
+/// `["agents", "claude"]`, the one-entry case of the same tag.
+///
+/// One constant, two emit sites: the kind-30340 seat announcement (§4.2) and the kind-3402 claim
+/// (§6.2). Both spell it `agents` — issue #645 renamed it from the singular-sounding `mobee_agent`,
+/// which the spec never used.
+pub const AGENT_TAG: &str = "agents";
 
 /// The offer parameter naming a requested harness: `["param", "agent", "claude"]`, a sibling of
 /// `["param", "deadline", …]`. The value is opaque to the wire — an exact harness name today,
