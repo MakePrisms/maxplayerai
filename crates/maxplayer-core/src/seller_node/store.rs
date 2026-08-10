@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+use crate::checks::EnvKind;
 use crate::gateway::EventDraft;
 
 /// Current on-disk schema version.
@@ -75,6 +76,15 @@ pub struct ContributionPin {
     pub clone_url: String,
     pub base_branch: String,
     pub base_oid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobChecks {
+    pub job_id: String,
+    pub declaration_bytes: Vec<u8>,
+    pub env_kind: EnvKind,
+    pub env_lock_ref: String,
+    pub captured_at_unix: i64,
 }
 
 /// The lifecycle state of a job (execution side of a claim that was awarded).
@@ -339,6 +349,15 @@ impl SellerStore {
                  base_branch     TEXT NOT NULL,
                  base_oid        TEXT NOT NULL,
                  created_at_unix INTEGER NOT NULL
+             );
+             -- #599: the exact checks declaration captured from the pinned base plus its resolved,
+             -- immutable environment reference. Additive: older stores simply have no rows.
+             CREATE TABLE IF NOT EXISTS job_checks (
+                 job_id             TEXT PRIMARY KEY,
+                 declaration_bytes  BLOB NOT NULL,
+                 env_kind           TEXT NOT NULL,
+                 env_lock_ref       TEXT NOT NULL,
+                 captured_at_unix   INTEGER NOT NULL
              );",
         )?;
         Self::migrate(conn)?;
@@ -529,6 +548,67 @@ impl SellerStore {
             )
             .optional()?;
         Ok(row)
+    }
+
+    pub fn record_job_checks(
+        &self,
+        job_id: &str,
+        declaration_bytes: &[u8],
+        env_kind: EnvKind,
+        env_lock_ref: &str,
+        now_unix: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO job_checks
+                 (job_id, declaration_bytes, env_kind, env_lock_ref, captured_at_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(job_id) DO UPDATE SET
+                 declaration_bytes = excluded.declaration_bytes,
+                 env_kind = excluded.env_kind,
+                 env_lock_ref = excluded.env_lock_ref,
+                 captured_at_unix = excluded.captured_at_unix",
+            params![
+                job_id,
+                declaration_bytes,
+                env_kind.as_str(),
+                env_lock_ref,
+                now_unix,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn job_checks(&self, job_id: &str) -> Result<Option<JobChecks>, StoreError> {
+        let conn = self.lock()?;
+        let raw = conn
+            .query_row(
+                "SELECT job_id, declaration_bytes, env_kind, env_lock_ref, captured_at_unix
+                 FROM job_checks WHERE job_id = ?1",
+                [job_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        raw.map(|(job_id, declaration_bytes, env_kind, env_lock_ref, captured_at_unix)| {
+            let env_kind = EnvKind::from_wire(&env_kind)
+                .ok_or_else(|| StoreError(format!("unknown persisted env_kind {env_kind:?}")))?;
+            Ok(JobChecks {
+                job_id,
+                declaration_bytes,
+                env_kind,
+                env_lock_ref,
+                captured_at_unix,
+            })
+        })
+        .transpose()
     }
 
     // ---- Claim (state change + outbox enqueue in one transaction) -------------------------------
@@ -1599,6 +1679,33 @@ mod tests {
             store.contribution_pin("job-c").expect("read"),
             Some(pin),
             "unchanged after the re-ingest"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn job_checks_round_trip_and_absent_row_is_none() {
+        let (store, path) = fresh_store("job-checks");
+        assert_eq!(store.job_checks("absent").expect("read absent"), None);
+        let bytes = b"schema = 1\n# retain exact base bytes\n";
+        store
+            .record_job_checks(
+                "checked-job",
+                bytes,
+                EnvKind::ContainerImage,
+                "registry.example/checks@sha256:abcd",
+                1234,
+            )
+            .expect("record checks");
+        assert_eq!(
+            store.job_checks("checked-job").expect("read checks"),
+            Some(JobChecks {
+                job_id: "checked-job".to_owned(),
+                declaration_bytes: bytes.to_vec(),
+                env_kind: EnvKind::ContainerImage,
+                env_lock_ref: "registry.example/checks@sha256:abcd".to_owned(),
+                captured_at_unix: 1234,
+            })
         );
         let _ = std::fs::remove_file(&path);
     }

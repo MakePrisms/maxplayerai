@@ -26,6 +26,14 @@ impl EnvKind {
             Self::ContainerImage => "container-image",
         }
     }
+
+    pub fn from_wire(text: &str) -> Option<Self> {
+        match text {
+            "nix-flake" => Some(Self::NixFlake),
+            "container-image" => Some(Self::ContainerImage),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -351,11 +359,8 @@ pub fn parse_attestation(content: &str) -> Result<ChecksAttestation, ChecksError
     let job_hash = prefixed(lines[0], &format!("{CHECKS_ATTESTATION_MARKER} job-hash="))?;
     let raw_tree = prefixed(lines[1], "raw-tree: ")?;
     let declaration = prefixed(lines[2], "declaration: ")?;
-    let env_kind = match prefixed(lines[3], "env-kind: ")? {
-        "nix-flake" => EnvKind::NixFlake,
-        "container-image" => EnvKind::ContainerImage,
-        _ => return Err(ChecksError::Malformed("unknown env-kind".to_owned())),
-    };
+    let env_kind = EnvKind::from_wire(prefixed(lines[3], "env-kind: ")?)
+        .ok_or_else(|| ChecksError::Malformed("unknown env-kind".to_owned()))?;
     let env_ref = prefixed(lines[4], "env-ref: ")?.to_owned();
     let net = prefixed(lines[5], "net: ")?.to_owned();
     if !matches!(net.as_str(), "denied" | "open") {
