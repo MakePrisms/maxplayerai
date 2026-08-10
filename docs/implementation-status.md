@@ -33,6 +33,13 @@ publisher.
 | §6.5 | A reader resolves the three `e` tags by marker. | `parse_offer_and_claim_tags` reads the `root`-marked tag as the offer and the first unmarked tag as the claim — `gateway.rs:534`. It has no result branch. | [#640](https://github.com/MakePrisms/maxplayerai/issues/640) |
 | §6.7 | `FEEDBACK` `status` is one of `progress`, `claim_released`, `refusal`, or `error`. | Only `error` is emitted. `error_draft` sets it (`gateway.rs:712`), and the other three literals appear nowhere in `crates/`. | — |
 | §7.1 | Seven reason codes are defined. | Four are emitted. `unsupported_version`, `mint_incompatible`, and `at_capacity` are constructed nowhere outside the enum that defines them (`gateway.rs:660`). The buyer reader already handles all three (`buyer/mod.rs:2323`). | — |
+| §2.1 | A reader MUST reject an event whose `v` is not `1`. | Enforced at `parse_offer` only — `gateway.rs:304`. The award, accept, and result parsers gate on kind. The offer gate covers trade entry, so this is defence in depth rather than an open hole. | — |
+
+## Delivery
+
+| Spec | v1 says | Code today | Issue |
+|---|---|---|---|
+| §8.1 | An implementation MUST assert a parent count of one in contribution mode, and zero in greenfield mode. | No production path asserts it. The buyer verifies descent and tip-match instead — `delivery_git.rs:254`, `delivery_git.rs:308`, `delivery.rs:93`. The only `parent_count()` assertions are tests — `seller_git.rs:952`, `seller_git.rs:1049`, both inside the `#[cfg(test)]` module that opens at `seller_git.rs:804`. | — |
 
 ## Verification checks and rejection
 
