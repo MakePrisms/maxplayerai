@@ -34,7 +34,8 @@ use crate::gateway::{
 use crate::home::{self, MaxplayerHome};
 use crate::job_lifecycle::{event_to_draft, job_hash_for_offer};
 use crate::kinds::{
-    JOB_ACCEPT_KIND, JOB_AWARD_KIND, JOB_OFFER_KIND, JOB_RECEIPT_KIND, JOB_RESULT_KIND,
+    JOB_ACCEPT_KIND, JOB_AWARD_KIND, JOB_OFFER_KIND, JOB_RECEIPT_KIND, JOB_REJECT_KIND,
+    JOB_RESULT_KIND,
 };
 use crate::receipt::{ReceiptPreimage, EXEC_METADATA_COMMITMENT_EMPTY};
 use crate::relay_auth::{self, AuthWait};
@@ -563,6 +564,11 @@ fn match_award(
     }
 }
 
+/// A REJECT is readable only when its signer is the buyer recorded on this job's AWARD.
+fn reject_author_gate(reject_author: &str, awarding_buyer: Option<&str>) -> bool {
+    awarding_buyer.is_some_and(|buyer| reject_author == buyer)
+}
+
 /// The operator line a re-seen, already-claimed offer earns — `None` when it earns only the verbose
 /// dedup no-op.
 ///
@@ -1019,7 +1025,7 @@ fn offer_subscription_filters(
     filters
 }
 
-/// The award/accept subscription filter. Both buyer-authored decisions about our claims ride ONE REQ
+/// The award/accept/reject subscription filter. Buyer-authored decisions about our claims ride ONE REQ
 /// — the AWARD that selects a claim, and the ACCEPT that pay-binds a delivered result. A TARGETED
 /// seller only claims offers addressed to it, and an award for such an offer p-tags it as the sole
 /// winner, so scoping the REQ to its own pubkey suffices. An OPEN-POOL seller ALSO claims untargeted
@@ -1036,7 +1042,11 @@ fn offer_subscription_filters(
 /// static for the node's lifetime — no per-claim re-subscription to drift or leak.
 fn award_filter(seller_pubkey: nostr_sdk::PublicKey, open_pool: bool) -> Filter {
     let base = Filter::new()
-        .kinds([Kind::Custom(JOB_AWARD_KIND), Kind::Custom(JOB_ACCEPT_KIND)])
+        .kinds([
+            Kind::Custom(JOB_AWARD_KIND),
+            Kind::Custom(JOB_ACCEPT_KIND),
+            Kind::Custom(JOB_REJECT_KIND),
+        ])
         .hashtag(crate::gateway::MAXPLAYER_TAG);
     if open_pool {
         base
@@ -2933,6 +2943,7 @@ impl SellerNodeRunner {
                                 k if k.as_u16() == JOB_OFFER_KIND => self.on_offer(&event).await,
                                 k if k.as_u16() == JOB_AWARD_KIND => self.on_award(&event).await,
                                 k if k.as_u16() == JOB_ACCEPT_KIND => self.on_accept(&event).await,
+                                k if k.as_u16() == JOB_REJECT_KIND => self.on_reject(&event).await,
                                 k if k.as_u16() == JOB_RECEIPT_KIND => self.on_receipt(&event).await,
                                 Kind::GiftWrap => self.on_gift_wrap(&event).await,
                                 _ => {}
@@ -4140,6 +4151,29 @@ impl SellerNodeRunner {
                 "seller node award ignore job_id={job_id}: author not the offer buyer, or our claim not yet published"
             ),
         }
+    }
+
+    /// Surface a REJECT only after joining it to the recorded AWARD author. Phase 0 deliberately
+    /// performs no terminal-state, execution, or payment action here.
+    async fn on_reject(&self, event: &nostr_sdk::Event) {
+        let Some(job_id) = event.tags.iter().find_map(|tag| {
+            let fields = tag.as_slice();
+            (fields.first().map(String::as_str) == Some("e")
+                && fields.get(3).map(String::as_str) == Some("root"))
+            .then(|| fields.get(1).cloned())
+            .flatten()
+        }) else { return; };
+        let awarding_buyer = match self.node.store().job_award_buyer(&job_id) {
+            Ok(buyer) => buyer,
+            Err(error) => {
+                opline!("seller node reject ignore job_id={job_id}: award read failed ({error})");
+                return;
+            }
+        };
+        if !reject_author_gate(&event.pubkey.to_hex(), awarding_buyer.as_deref()) {
+            return;
+        }
+        opline!("seller node reject observed job_id={job_id}: buyer rejected delivered result");
     }
 
     /// Start a self-probe for every dropped harness whose window has passed, each OFF the event loop.
@@ -5843,6 +5877,17 @@ mod tests {
             json.get("#p").is_some(),
             "targeted award filter must keep the pubkey scope: {json}"
         );
+    }
+
+    #[test]
+    fn reject_reader_gate_refuses_non_awarding_author_and_live_filter_includes_3407() {
+        assert!(reject_author_gate("buyer", Some("buyer")), "the buyer recorded on the award may author a rejection");
+        assert!(!reject_author_gate("attacker", Some("buyer")), "a non-awarding author is void even when the relay delivered kind 3407");
+        assert!(!reject_author_gate("buyer", None), "a rejection with no joined award is void");
+        let pk = nostr_sdk::prelude::Keys::generate().public_key();
+        let json = serde_json::to_value(award_filter(pk, true)).expect("serialize live seller filter");
+        let kinds = json.get("kinds").and_then(serde_json::Value::as_array).expect("live filter has kind list");
+        assert!(kinds.iter().any(|kind| kind.as_u64() == Some(JOB_REJECT_KIND.into())), "the live seller-node subscription must actually receive kind 3407: {json}");
     }
 
     // AWARD AUTHORIZATION (security-critical): only the offer's buyer may drive execute or release.

@@ -13,8 +13,27 @@ pub const PROTOCOL_VERSION: &str = "1";
 // `gateway::JOB_*_KIND` paths keep resolving.
 pub use crate::kinds::{
     JOB_ACCEPT_KIND, JOB_AWARD_KIND, JOB_CLAIM_KIND, JOB_FEEDBACK_KIND, JOB_OFFER_KIND,
-    JOB_RECEIPT_KIND, JOB_RESULT_KIND,
+    JOB_RECEIPT_KIND, JOB_REJECT_KIND, JOB_RESULT_KIND,
 };
+
+/// One cap and sanitizer for untrusted, human-readable text that reaches a bare log/event line.
+/// Strips Cc controls and invisible Unicode format characters (bidi/zero-width/line separators,
+/// annotation and tag-block controls), keeping the guarantee single-line and bounded.
+pub const LOG_SAFE_TEXT_CAP: usize = 64;
+
+pub fn log_safe_text(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control() && !is_invisible_format(*c))
+        .take(LOG_SAFE_TEXT_CAP)
+        .collect()
+}
+
+fn is_invisible_format(c: char) -> bool {
+    matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+        | '\u{202A}'..='\u{202E}' | '\u{2028}' | '\u{2029}' | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{1D173}'..='\u{1D17A}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TagSpec(pub Vec<String>);
@@ -702,6 +721,30 @@ pub fn error_draft(
     draft
 }
 
+/// Buyer-authored rejection of one specific result/commit after deterministic verification.
+pub fn reject_draft(
+    offer_id: &str,
+    result_id: &str,
+    seller_pubkey: &str,
+    rejected_commit_oid: &str,
+    reason_code: crate::checks::RejectReasonCode,
+    content: impl AsRef<str>,
+) -> EventDraft {
+    let mut draft = status_draft(
+        JOB_REJECT_KIND,
+        "rejected",
+        vec![
+            TagSpec::new(["e", offer_id, "", "root"]),
+            TagSpec::new(["e", result_id, "", "reply"]),
+            TagSpec::new(["p", seller_pubkey]),
+            TagSpec::new(["commit", rejected_commit_oid]),
+            TagSpec::new(["reason_code", reason_code.as_str()]),
+        ],
+    );
+    draft.content = log_safe_text(content.as_ref());
+    draft
+}
+
 /// Delivery binding echoed into a kind-3400 receipt. Both fields are in the
 /// co-signed preimage, so the settled receipt attests which git object was paid for and
 /// its kind (commit vs tree) is not forgeable.
@@ -937,6 +980,24 @@ pub mod creq {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reject_draft_carries_root_reply_commit_reason_and_safe_content() {
+        let oid = "a".repeat(40);
+        let draft = reject_draft("offer", "result", "seller", &oid,
+            crate::checks::RejectReasonCode::VerifyReservedPath,
+            format!("why\n{}", "x".repeat(100)));
+        assert_eq!(draft.kind, JOB_REJECT_KIND, "rejection uses kind 3407");
+        assert!(draft.tags.iter().any(|t| t.0 == ["e", "offer", "", "root"]), "root tag binds the offer");
+        assert!(draft.tags.iter().any(|t| t.0 == ["e", "result", "", "reply"]), "reply tag binds the rejected result");
+        assert!(draft.tags.iter().any(|t| t.first() == Some("commit") && t.value() == Some(oid.as_str())), "commit tag binds the refused oid");
+        assert!(draft.tags.iter().any(|t| t.0 == ["reason_code", "verify_reserved_path"]), "reason tag uses the closed enum wire code");
+        assert!(draft.tags.iter().any(|t| t.0 == ["status", "rejected"]), "status is rejected");
+        assert!(draft.tags.iter().any(|t| t.0 == ["t", "maxplayer"]), "namespace tag is present");
+        assert!(draft.tags.iter().any(|t| t.0 == ["v", "1"]), "version tag is present");
+        assert!(!draft.content.contains('\n'), "human reason strips control characters");
+        assert_eq!(draft.content.chars().count(), LOG_SAFE_TEXT_CAP, "human reason uses the shared log-safe cap");
+    }
+
     // TOOTH — an offer's harness request rides the existing `param` grammar and round-trips, and
     // "no preference" has exactly ONE representation on the wire: no tag. `any` and blank
     // canonicalise to that same absence, so a buyer stating indifference and one omitting it post

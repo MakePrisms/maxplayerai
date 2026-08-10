@@ -698,6 +698,14 @@ impl SellerStore {
         Ok(Awarded::New)
     }
 
+    /// Buyer pubkey carried by the recorded AWARD for this job.
+    pub fn job_award_buyer(&self, job_id: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn.query_row(
+            "SELECT buyer_pubkey FROM awards WHERE job_id = ?1 ORDER BY created_at_unix, award_id LIMIT 1",
+            [job_id], |row| row.get(0)).optional()?)
+    }
+
     // ---- Job execution --------------------------------------------------------------------------
 
     /// Record which harness ran a job. Idempotent (last write wins).

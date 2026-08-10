@@ -1521,11 +1521,7 @@ fn log_safe_agent(value: Option<&str>) -> String {
     match value {
         None => "unreported".to_owned(),
         Some(raw) => {
-            let cleaned: String = raw
-                .chars()
-                .filter(|c| !c.is_control() && !is_invisible_format(*c))
-                .take(64)
-                .collect();
+            let cleaned = crate::gateway::log_safe_text(raw);
             if cleaned.is_empty() {
                 "unprintable".to_owned()
             } else {
@@ -1533,32 +1529,6 @@ fn log_safe_agent(value: Option<&str>) -> String {
             }
         }
     }
-}
-
-/// Unicode format/invisible characters that survive `char::is_control` (Cc only) but can still
-/// reorder, hide, or split text in terminals and downstream viewers: the soft hyphen, bidi marks
-/// and overrides/isolates (incl. U+061C), zero-widths, line/paragraph separators, invisible
-/// operators, deprecated format controls, interlinear annotation anchors, musical formatting,
-/// the BOM/ZWNBSP, and the tag block (invisible ASCII smuggling into copied log text). Legit
-/// harness ids are ASCII kebab-case, so nothing real is ever stripped.
-fn is_invisible_format(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'
-            | '\u{061C}'
-            | '\u{180E}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206F}'
-            | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{1D173}'..='\u{1D17A}'
-            | '\u{E0001}'
-            | '\u{E0020}'..='\u{E007F}'
-    )
 }
 
 /// Backfill attribution for awards that SETTLED without it (#261) — the boot heal. Work set:
