@@ -8,9 +8,8 @@ of the owned range.
 | Site | Result | Reason |
 |---|---|---|
 | `crates/maxplayer-core/src/kinds.rs` module range/table/registry test | CHANGED | Owned contiguous block and registry now end at 3407. |
-| `docs/README.md` protocol map (the README occurrence at line 27 before this change) | CHANGED | Summary range now ends at 3407. |
+| `docs/README.md` protocol map | CHANGED | Summary range now ends at 3407. |
 | root `README.md` | VERIFIED-STILL-CORRECT | Contains no owned-kind range/count statement. |
-| `docs/protocol.md` range, flow, and kind table | CHANGED | Summary now describes checks/reject and kind 3407. |
 | `docs/protocol-v1.md` §4 table and §5 `t`-tag MUST clause | CHANGED | Kind and namespace range include 3407. |
 | `docs/protocol-v1.md` existing §7.5, §11, §12 ACCEPT references | VERIFIED-STILL-CORRECT | These define ACCEPT's distinct kind 3406, not a range endpoint. |
 | `docs/protocol-v1.md` §8 flows and §9 lifecycle-root list | CHANGED | Verify recompute and Reject flows/root membership were added. |
