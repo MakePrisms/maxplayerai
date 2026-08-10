@@ -27,6 +27,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::contribution::{
     contribution_serve_gate, parse_contribution_offer, ContributionOffer, ContributionServeGate,
 };
+use crate::env_provision::{
+    self, EffectOutput, EnvBackend, EnvEffects, EnvPosture, EnvProvisionError, HostEnvRunner,
+    ProvisionRefusal,
+};
 use crate::gateway::{
     self, claim_draft, error_draft, git_result_draft, parse_award, parse_offer, OfferParseError,
     ParsedOffer, ReasonCode,
@@ -1564,6 +1568,91 @@ enum DeliveryWorkdirPlan {
     },
 }
 
+#[derive(Debug)]
+enum DeliveryWorkdirError {
+    Git(seller_git::SellerGitError),
+    Refused(ProvisionRefusal),
+}
+
+impl std::fmt::Display for DeliveryWorkdirError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Git(error) => write!(f, "{error}"),
+            Self::Refused(refusal) => write!(f, "environment refused: {refusal:?}"),
+        }
+    }
+}
+
+impl From<seller_git::SellerGitError> for DeliveryWorkdirError {
+    fn from(error: seller_git::SellerGitError) -> Self {
+        Self::Git(error)
+    }
+}
+
+impl From<ProvisionRefusal> for DeliveryWorkdirError {
+    fn from(refusal: ProvisionRefusal) -> Self {
+        Self::Refused(refusal)
+    }
+}
+
+struct ProcessEnvEffects;
+
+impl EnvEffects for ProcessEnvEffects {
+    fn run(&self, argv: &[String]) -> Result<EffectOutput, EnvProvisionError> {
+        let (program, args) =
+            argv.split_first()
+                .ok_or_else(|| EnvProvisionError::EnvUnresolvable {
+                    detail: "empty provisioning command".to_owned(),
+                })?;
+        let output = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .map_err(|_| EnvProvisionError::BackendUnavailable {
+                backend: program.clone(),
+            })?;
+        Ok(EffectOutput {
+            status: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        })
+    }
+}
+
+fn available_container_runtime() -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    ["podman", "docker"].into_iter().find_map(|runtime| {
+        std::env::split_paths(&path)
+            .any(|dir| dir.join(runtime).is_file())
+            .then(|| runtime.to_owned())
+    })
+}
+
+fn checks_refusal(error: crate::checks::ChecksError) -> ProvisionRefusal {
+    use crate::checks::ChecksError;
+    match error {
+        ChecksError::ReservedPath(path) => ProvisionRefusal::ReservedPath { path },
+        ChecksError::MissingEnvLock(detail) | ChecksError::MissingFlake(detail) => {
+            ProvisionRefusal::EnvLockMissing { detail }
+        }
+        ChecksError::TooLarge => ProvisionRefusal::DeclarationUnparsable {
+            detail: "checks declaration exceeds size limit".to_owned(),
+        },
+        ChecksError::Malformed(detail) => ProvisionRefusal::DeclarationUnparsable { detail },
+        ChecksError::UnsupportedSchema(schema) => ProvisionRefusal::DeclarationUnparsable {
+            detail: format!("unsupported checks schema {schema}"),
+        },
+        ChecksError::InvalidFlakePath => ProvisionRefusal::DeclarationUnparsable {
+            detail: "invalid flake path".to_owned(),
+        },
+        ChecksError::InvalidImage => ProvisionRefusal::DeclarationUnparsable {
+            detail: "invalid container image".to_owned(),
+        },
+        ChecksError::EmptyCommand => ProvisionRefusal::DeclarationUnparsable {
+            detail: "empty checks command".to_owned(),
+        },
+        ChecksError::TreeRead(detail) => ProvisionRefusal::DeclarationUnparsable { detail },
+    }
+}
+
 /// Route a job to its workdir provisioning: a recorded contribution pin ⇒ clone at `base_oid` on a
 /// per-job fork branch carrying the full job id; no pin ⇒ the empty-workdir default (unchanged).
 fn plan_delivery_workdir(
@@ -1583,11 +1672,11 @@ fn plan_delivery_workdir(
 
 /// Provision a job's delivery workdir from its STORED contribution pin — the single routing seam
 /// `execute_job` uses on BOTH the fresh-award and restart/resume paths. Reads the pin, plans, and
-/// initializes: a recorded pin clones the pinned base at `base_oid` onto the per-job fork branch (the
-/// tip the agent extends); no pin gives the empty-workdir default (a from-scratch job, unchanged). A
-/// pin READ error is mapped to an init error so the caller fails the job rather than silently
-/// degrading a served contribution to an empty workdir. Free fn (not a method) so the REAL
-/// read→plan→init routing is unit-testable against a live store without standing up a whole node.
+/// initializes: a recorded pin clones the pinned base at `base_oid` onto the per-job fork branch,
+/// captures any checks declaration from that commit's tree, provisions its environment, and persists
+/// the exact declaration bytes plus resolved environment reference. No pin gives the empty-workdir
+/// default (a from-scratch job, unchanged). A pin READ error is mapped to an init error so the caller
+/// fails the job rather than silently degrading a served contribution to an empty workdir.
 ///
 /// Returns the base the delivery snapshot must be parented on: `Some(base_oid)` for a contribution,
 /// `None` for a from-scratch job. `execute_job` threads it into the snapshot so a contribution's
@@ -1599,15 +1688,15 @@ async fn provision_delivery_workdir(
     job_id: &str,
     workdir: std::path::PathBuf,
     identity: DeliveryAgentIdentity,
-) -> Result<Option<String>, seller_git::SellerGitError> {
+) -> Result<Option<String>, DeliveryWorkdirError> {
     let pin = store
         .contribution_pin(job_id)
         .map_err(|error| seller_git::SellerGitError::Io(format!("contribution pin read failed: {error}")))?;
-    match plan_delivery_workdir(pin, job_id) {
+    let base_oid = match plan_delivery_workdir(pin, job_id) {
         DeliveryWorkdirPlan::Empty => {
             seller_git::init_empty_delivery_workdir_off_runtime(workdir, identity).await?;
             // From-scratch: no pinned base ⇒ the delivery is a root commit (snapshot base_oid = None).
-            Ok(None)
+            return Ok(None);
         }
         DeliveryWorkdirPlan::ContributionClone {
             clone_url,
@@ -1622,12 +1711,77 @@ async fn provision_delivery_workdir(
                 .ok()
                 .map(|secret_key_hex| seller_git::PushAuth { secret_key_hex });
             seller_git::init_contribution_workdir_off_runtime(
-                workdir, identity, clone_url, base_branch, base_oid.clone(), branch, auth,
+                workdir.clone(), identity, clone_url, base_branch, base_oid.clone(), branch, auth,
             )
             .await?;
-            Ok(Some(base_oid))
+            base_oid
         }
-    }
+    };
+
+    let store = store.clone();
+    let checks_workdir = workdir.clone();
+    let checks_base_oid = base_oid.clone();
+    let checks_job_id = job_id.to_owned();
+    tokio::task::spawn_blocking(move || -> Result<(), DeliveryWorkdirError> {
+        let repo = git2::Repository::open(&checks_workdir).map_err(|error| {
+            seller_git::SellerGitError::Io(format!("open checked workdir: {error}"))
+        })?;
+        let oid = git2::Oid::from_str(&checks_base_oid).map_err(|error| {
+            seller_git::SellerGitError::Io(format!("invalid checked base oid: {error}"))
+        })?;
+        let commit = repo
+            .find_commit(oid)
+            .map_err(|error| {
+                seller_git::SellerGitError::Io(format!("find checked base commit: {error}"))
+            })?;
+        let tree = commit.tree().map_err(|error| {
+            seller_git::SellerGitError::Io(format!("read checked base tree: {error}"))
+        })?;
+        let base_tree = (&repo, &tree);
+        if crate::checks::BaseTree::blob_at(&base_tree, crate::checks::DECLARATION_PATH)
+            .map_err(checks_refusal)?
+            .is_none()
+        {
+            return Ok(());
+        }
+        let (declaration_bytes, declaration) =
+            env_provision::capture_job_checks(&base_tree).map_err(checks_refusal)?;
+        let env_lock_ref =
+            crate::checks::env_lock_ref(&declaration, &base_tree).map_err(checks_refusal)?;
+        let mut backend = env_provision::resolve_backend(&declaration).map_err(|error| {
+            DeliveryWorkdirError::Refused(ProvisionRefusal::Unprovisionable(error))
+        })?;
+        if let EnvBackend::NixFlake { workdir, .. } = &mut backend {
+            *workdir = checks_workdir.join(&*workdir);
+        }
+        let runner = HostEnvRunner {
+            container_runtime: available_container_runtime(),
+            mount_dir: checks_workdir,
+        };
+        env_provision::provision(&ProcessEnvEffects, &runner, backend, EnvPosture::Checks)
+            .map_err(|error| {
+                DeliveryWorkdirError::Refused(ProvisionRefusal::Unprovisionable(error))
+            })?;
+        store
+            .record_job_checks(
+                &checks_job_id,
+                &declaration_bytes,
+                declaration.env_kind,
+                &env_lock_ref,
+                now_unix(),
+            )
+            .map_err(|error| {
+                DeliveryWorkdirError::Git(seller_git::SellerGitError::Io(format!(
+                    "checks persistence failed: {error}"
+                )))
+            })?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| {
+        seller_git::SellerGitError::Io(format!("checks provisioning task failed: {error}"))
+    })??;
+    Ok(Some(base_oid))
 }
 
 /// #613 — the seller EMIT dual of the buyer's contribution parse. If `job_id` is a served
@@ -3207,14 +3361,20 @@ impl SellerNodeRunner {
         buyer_pubkey: &str,
         reason_code: ReasonCode,
         reason: &str,
+        reason_detail: Option<&str>,
     ) -> bool {
-        let draft = error_draft(
+        let mut draft = error_draft(
             offer_id,
             buyer_pubkey,
             &self.seller_pubkey.to_hex(),
             reason_code,
             reason,
         );
+        if let Some(reason_detail) = reason_detail {
+            draft
+                .tags
+                .push(gateway::TagSpec::new(["reason_detail", reason_detail]));
+        }
         match self.node.signer().sign(draft, now_unix()).await {
             Ok(Ok(signed)) => {
                 use nostr_sdk::JsonUtil as _;
@@ -3260,6 +3420,7 @@ impl SellerNodeRunner {
             &event.pubkey.to_hex(),
             ReasonCode::BelowRate,
             reason,
+            None,
         )
         .await
     }
@@ -4529,7 +4690,7 @@ impl SellerNodeRunner {
             Ok(Some(creq)) => creq,
             _ => {
                 opline!("seller node execute fail job_id={job_id}: stored creq missing");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
                 return;
             }
         };
@@ -4552,7 +4713,7 @@ impl SellerNodeRunner {
                  this node (never substituted)",
                 requested_agent.as_deref().unwrap_or("<any>")
             );
-            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK).await;
+            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
             return;
         };
         let agent_command = selected.agent.argv.clone();
@@ -4598,9 +4759,24 @@ impl SellerNodeRunner {
         .await
         {
             Ok(base_oid) => base_oid,
+            Err(DeliveryWorkdirError::Refused(refusal)) => {
+                let (reason_code, reason_detail) = env_provision::refusal_feedback(&refusal);
+                opline!(
+                    "seller node execute fail job_id={job_id}: environment provisioning refused ({refusal:?})"
+                );
+                self.fail_job_with_feedback(
+                    job_id,
+                    &offer.buyer_pubkey,
+                    reason_code,
+                    EXEC_FAILURE_FEEDBACK,
+                    Some(reason_detail),
+                )
+                .await;
+                return;
+            }
             Err(error) => {
                 opline!("seller node execute fail job_id={job_id}: workdir init failed ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
                 return;
             }
         };
@@ -4628,7 +4804,7 @@ impl SellerNodeRunner {
             Err(error) => {
                 opline!("seller node execute fail job_id={job_id}: agent run failed ({error})");
                 self.drop_harness(harness, harness_fault_for(&error));
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
                 return;
             }
         };
@@ -4675,7 +4851,7 @@ impl SellerNodeRunner {
                     (ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK)
                 }
             };
-            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, reason_code, feedback)
+            self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, reason_code, feedback, None)
                 .await;
             return;
         }
@@ -4689,12 +4865,12 @@ impl SellerNodeRunner {
                 Ok(Ok(header)) => Some(header),
                 Ok(Err(error)) => {
                     opline!("seller node execute fail job_id={job_id}: push auth sign failed ({error})");
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
                     return;
                 }
                 Err(error) => {
                     opline!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
-                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                    self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
                     return;
                 }
             }
@@ -4723,14 +4899,14 @@ impl SellerNodeRunner {
             Ok(oid) => oid,
             Err(DeliveryPushErr::Push(error)) => {
                 opline!("seller node execute fail job_id={job_id}: git push failed ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
                 return;
             }
             Err(DeliveryPushErr::TimedOut(secs)) => {
                 // Timeout lands in the SAME delivery_failed handling (lead 37896 — no new state); the
                 // lock is already released, so later deliveries are not starved behind this one.
                 opline!("seller node execute fail job_id={job_id}: git push exceeded {secs}s (delivery-push lock released; treated as delivery_failed)");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
                 return;
             }
         };
@@ -4748,7 +4924,7 @@ impl SellerNodeRunner {
             Ok(kind) => kind,
             Err(error) => {
                 opline!("seller node execute fail job_id={job_id}: delivery kind typing failed ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
                 return;
             }
         };
@@ -4766,12 +4942,12 @@ impl SellerNodeRunner {
             Ok(Ok(sig)) => sig,
             Ok(Err(error)) => {
                 opline!("seller node execute fail job_id={job_id}: receipt sign refused ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
                 return;
             }
             Err(error) => {
                 opline!("seller node execute fail job_id={job_id}: signer actor gone ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
                 return;
             }
         };
@@ -4816,7 +4992,7 @@ impl SellerNodeRunner {
             Ok(None) => {}
             Err(reason) => {
                 opline!("seller node execute fail job_id={job_id}: {reason}");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
                 return;
             }
         }
@@ -4853,7 +5029,7 @@ impl SellerNodeRunner {
             ),
             Err(error) => {
                 opline!("seller node execute fail job_id={job_id}: deliver journal failed ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
                 return;
             }
         }
@@ -4890,7 +5066,7 @@ impl SellerNodeRunner {
             Ok(Some(creq)) => creq,
             _ => {
                 opline!("seller node finalize fail job_id={job_id}: stored creq missing");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
                 return;
             }
         };
@@ -4900,7 +5076,7 @@ impl SellerNodeRunner {
             Ok(kind) => kind,
             Err(error) => {
                 opline!("seller node finalize fail job_id={job_id}: delivery kind typing failed ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
                 return;
             }
         };
@@ -4918,12 +5094,12 @@ impl SellerNodeRunner {
             Ok(Ok(sig)) => sig,
             Ok(Err(error)) => {
                 opline!("seller node finalize fail job_id={job_id}: receipt sign refused ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
                 return;
             }
             Err(error) => {
                 opline!("seller node finalize fail job_id={job_id}: signer actor gone ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
                 return;
             }
         };
@@ -4959,7 +5135,7 @@ impl SellerNodeRunner {
             Ok(None) => {}
             Err(reason) => {
                 opline!("seller node finalize fail job_id={job_id}: {reason}");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
                 return;
             }
         }
@@ -4980,7 +5156,7 @@ impl SellerNodeRunner {
             ),
             Err(error) => {
                 opline!("seller node finalize fail job_id={job_id}: deliver journal failed ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
                 return;
             }
         }
@@ -5249,9 +5425,10 @@ impl SellerNodeRunner {
         buyer_pubkey: &str,
         reason_code: ReasonCode,
         reason: &str,
+        reason_detail: Option<&str>,
     ) {
         self.fail_job(job_id).await;
-        self.publish_buyer_feedback(job_id, buyer_pubkey, reason_code, reason)
+        self.publish_buyer_feedback(job_id, buyer_pubkey, reason_code, reason, reason_detail)
             .await;
     }
 
@@ -8947,7 +9124,10 @@ mod tests {
         .await
         .expect_err("a served contribution must enter the base-clone path, not the empty default");
         assert!(
-            matches!(err, seller_git::SellerGitError::Transport(_)),
+            matches!(
+                err,
+                DeliveryWorkdirError::Git(seller_git::SellerGitError::Transport(_))
+            ),
             "served contribution routed to init_contribution_workdir (locator allowlist), got {err:?}"
         );
 

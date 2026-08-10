@@ -3567,18 +3567,30 @@ mod tests {
     /// the offer, both `p` tags, and the authoritative `reason_code`. Signed by `author` — the gate
     /// that matters is the AUTHOR, so passing a stranger's keys forges a griefer's event.
     fn failure_feedback(offer_id: &str, author: &nostr_sdk::Keys, reason_code: &str) -> nostr_sdk::Event {
+        failure_feedback_with_detail(offer_id, author, reason_code, None)
+    }
+
+    fn failure_feedback_with_detail(
+        offer_id: &str,
+        author: &nostr_sdk::Keys,
+        reason_code: &str,
+        reason_detail: Option<&str>,
+    ) -> nostr_sdk::Event {
         use nostr_sdk::prelude::{EventBuilder, Keys, Kind, Tag};
         let buyer_hex = Keys::generate().public_key().to_hex();
         // The exact wire `error_draft` emits; `Tag::parse` on these vecs is what the production
         // builder's `to_tag` does. `allow_self_tagging` mirrors `gateway::nostr::event_builder` —
         // the seller feedback p-tags the seller, a self-tag the default builder would reject.
-        let tags = [
+        let mut tags = vec![
             vec!["status".to_owned(), "error".to_owned()],
             vec!["e".to_owned(), offer_id.to_owned(), String::new(), "root".to_owned()],
             vec!["p".to_owned(), buyer_hex],
             vec!["p".to_owned(), author.public_key().to_hex()],
             vec!["reason_code".to_owned(), reason_code.to_owned()],
         ];
+        if let Some(reason_detail) = reason_detail {
+            tags.push(vec!["reason_detail".to_owned(), reason_detail.to_owned()]);
+        }
         let mut builder = EventBuilder::new(
             Kind::Custom(crate::kinds::JOB_FEEDBACK_KIND),
             format!("post-award failure: {reason_code}"),
@@ -3714,7 +3726,12 @@ mod tests {
         let job = "a".repeat(64);
         let store = awarded_unsettled(&root, &job, &seller, 100);
 
-        let event = failure_feedback(&job, &seller, reason_code);
+        let event = failure_feedback_with_detail(
+            &job,
+            &seller,
+            reason_code,
+            (reason_code == "execution_failed").then_some("env_unprovisionable"),
+        );
         let outcome =
             release_reservation_on_failure_feedback(&store, &event, now_unix()).expect("no store error");
 

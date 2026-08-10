@@ -1,11 +1,10 @@
-//! Pure environment-backend resolution and command-line composition.
-//!
-//! Host availability checks, environment warming, and process spawning belong to later layers.
+//! Environment-backend resolution and effect-injected provisioning.
 
 use std::fmt;
 use std::path::PathBuf;
 
-use crate::checks::{ChecksDeclaration, EnvKind};
+use crate::checks::{self, ChecksDeclaration, ChecksError, EnvKind};
+use crate::gateway;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EnvBackend {
@@ -21,11 +20,12 @@ pub enum EnvPosture {
 
 pub trait EnvRunner {
     fn argv_prefix(&self, backend: &EnvBackend, posture: EnvPosture) -> Vec<String>;
+    fn container_runtime(&self) -> Option<&str>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostEnvRunner {
-    pub container_runtime: String,
+    pub container_runtime: Option<String>,
     pub mount_dir: PathBuf,
 }
 
@@ -40,7 +40,9 @@ impl EnvRunner for HostEnvRunner {
             ],
             EnvBackend::ContainerImage { digest } => {
                 let mut prefix = vec![
-                    self.container_runtime.clone(),
+                    self.container_runtime
+                        .clone()
+                        .unwrap_or_default(),
                     "run".to_owned(),
                     "--rm".to_owned(),
                     "-v".to_owned(),
@@ -57,6 +59,20 @@ impl EnvRunner for HostEnvRunner {
             }
         }
     }
+
+    fn container_runtime(&self) -> Option<&str> {
+        self.container_runtime.as_deref()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectOutput {
+    pub status: i32,
+    pub stdout: String,
+}
+
+pub trait EnvEffects {
+    fn run(&self, argv: &[String]) -> Result<EffectOutput, EnvProvisionError>;
 }
 
 pub fn compose(
@@ -73,6 +89,7 @@ pub enum EnvProvisionError {
     BackendUnavailable { backend: String },
     EnvUnresolvable { detail: String },
     DigestMismatch { expected: String, actual: String },
+    ProvisionCommandFailed { argv: Vec<String>, status: i32 },
 }
 
 impl fmt::Display for EnvProvisionError {
@@ -90,6 +107,9 @@ impl fmt::Display for EnvProvisionError {
                     "environment digest mismatch: expected {expected}, got {actual}"
                 )
             }
+            Self::ProvisionCommandFailed { argv, status } => {
+                write!(f, "environment provisioning command {argv:?} exited with status {status}")
+            }
         }
     }
 }
@@ -101,6 +121,118 @@ pub struct ProvisionedEnv {
     pub backend: EnvBackend,
     pub posture_prefix: Vec<String>,
     pub warmed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProvisionOutcomeClass {
+    Infra,
+    Checks,
+}
+
+pub const ENV_UNPROVISIONABLE: &str = "env_unprovisionable";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProvisionRefusal {
+    DeclarationUnparsable { detail: String },
+    ReservedPath { path: String },
+    EnvLockMissing { detail: String },
+    Unprovisionable(EnvProvisionError),
+}
+
+pub fn provision(
+    effects: &dyn EnvEffects,
+    runner: &dyn EnvRunner,
+    backend: EnvBackend,
+    posture: EnvPosture,
+) -> Result<ProvisionedEnv, EnvProvisionError> {
+    let warmed = match &backend {
+        EnvBackend::NixFlake { .. } => {
+            let mut argv = runner.argv_prefix(&backend, EnvPosture::Provision);
+            argv.push("true".to_owned());
+            require_success(effects, argv)?;
+            true
+        }
+        EnvBackend::ContainerImage { digest } => {
+            let runtime = runner.container_runtime().ok_or_else(|| {
+                EnvProvisionError::BackendUnavailable {
+                    backend: "container".to_owned(),
+                }
+            })?;
+            require_success(
+                effects,
+                vec![runtime.to_owned(), "pull".to_owned(), digest.clone()],
+            )?;
+            let probe_argv = vec![
+                runtime.to_owned(),
+                "image".to_owned(),
+                "inspect".to_owned(),
+                "--format".to_owned(),
+                "{{index .RepoDigests 0}}".to_owned(),
+                digest.clone(),
+            ];
+            let output = require_success(effects, probe_argv)?;
+            let actual = output.stdout.trim().to_owned();
+            if actual != *digest {
+                return Err(EnvProvisionError::DigestMismatch {
+                    expected: digest.clone(),
+                    actual,
+                });
+            }
+            false
+        }
+    };
+    let posture_prefix = runner.argv_prefix(&backend, posture);
+    Ok(ProvisionedEnv {
+        backend,
+        posture_prefix,
+        warmed,
+    })
+}
+
+fn require_success(
+    effects: &dyn EnvEffects,
+    argv: Vec<String>,
+) -> Result<EffectOutput, EnvProvisionError> {
+    let output = effects.run(&argv)?;
+    if output.status != 0 {
+        return Err(EnvProvisionError::ProvisionCommandFailed {
+            argv,
+            status: output.status,
+        });
+    }
+    Ok(output)
+}
+
+pub fn classify_provision_failure(error: &EnvProvisionError) -> ProvisionOutcomeClass {
+    match error {
+        EnvProvisionError::BackendUnavailable { .. }
+        | EnvProvisionError::EnvUnresolvable { .. }
+        | EnvProvisionError::DigestMismatch { .. }
+        | EnvProvisionError::ProvisionCommandFailed { .. } => ProvisionOutcomeClass::Infra,
+    }
+}
+
+pub fn refusal_feedback(refusal: &ProvisionRefusal) -> (gateway::ReasonCode, &'static str) {
+    match refusal {
+        ProvisionRefusal::DeclarationUnparsable { .. }
+        | ProvisionRefusal::ReservedPath { .. }
+        | ProvisionRefusal::EnvLockMissing { .. }
+        | ProvisionRefusal::Unprovisionable(_) => {
+            (gateway::ReasonCode::ExecutionFailed, ENV_UNPROVISIONABLE)
+        }
+    }
+}
+
+pub fn capture_job_checks(
+    base_tree: &dyn checks::BaseTree,
+) -> Result<(Vec<u8>, ChecksDeclaration), ChecksError> {
+    let bytes = base_tree
+        .blob_at(checks::DECLARATION_PATH)?
+        .ok_or_else(|| ChecksError::Malformed("checks declaration is absent".to_owned()))?;
+    let declaration = checks::parse_declaration(&bytes)?
+        .ok_or_else(|| ChecksError::Malformed("checks declaration is empty".to_owned()))?;
+    checks::validate_against_base(&declaration, base_tree)?;
+    Ok((bytes, declaration))
 }
 
 pub fn resolve_backend(declaration: &ChecksDeclaration) -> Result<EnvBackend, EnvProvisionError> {
@@ -125,6 +257,37 @@ pub fn resolve_backend(declaration: &ChecksDeclaration) -> Result<EnvBackend, En
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    struct FakeEffects {
+        outputs: RefCell<Vec<Result<EffectOutput, EnvProvisionError>>>,
+        calls: RefCell<Vec<Vec<String>>>,
+    }
+
+    impl FakeEffects {
+        fn succeeding(stdout: &[&str]) -> Self {
+            Self {
+                outputs: RefCell::new(
+                    stdout
+                        .iter()
+                        .rev()
+                        .map(|stdout| Ok(EffectOutput {
+                            status: 0,
+                            stdout: (*stdout).to_owned(),
+                        }))
+                        .collect(),
+                ),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl EnvEffects for FakeEffects {
+        fn run(&self, argv: &[String]) -> Result<EffectOutput, EnvProvisionError> {
+            self.calls.borrow_mut().push(argv.to_vec());
+            self.outputs.borrow_mut().pop().expect("fake output")
+        }
+    }
 
     fn declaration(env_kind: EnvKind) -> ChecksDeclaration {
         ChecksDeclaration {
@@ -141,7 +304,7 @@ mod tests {
 
     fn runner() -> HostEnvRunner {
         HostEnvRunner {
-            container_runtime: "podman".to_owned(),
+            container_runtime: Some("podman".to_owned()),
             mount_dir: PathBuf::from("/materialized/job"),
         }
     }
@@ -250,6 +413,7 @@ mod tests {
                 EnvProvisionError::BackendUnavailable { .. } => "backend-unavailable",
                 EnvProvisionError::EnvUnresolvable { .. } => "env-unresolvable",
                 EnvProvisionError::DigestMismatch { .. } => "digest-mismatch",
+                EnvProvisionError::ProvisionCommandFailed { .. } => "command-failed",
             }
         }
 
@@ -264,18 +428,172 @@ mod tests {
     }
 
     #[test]
-    fn provisioned_env_prefix_comes_from_runner_for_the_same_posture() {
-        let backend = EnvBackend::ContainerImage {
-            digest: "image@sha256:digest".to_owned(),
+    fn nix_warms_once_with_the_provision_prefix_and_returns_requested_prefix() {
+        let backend = EnvBackend::NixFlake {
+            workdir: PathBuf::from("."),
+            devshell: "ci".to_owned(),
         };
-        for posture in [EnvPosture::Provision, EnvPosture::Checks] {
-            let posture_prefix = runner().argv_prefix(&backend, posture);
-            let provisioned = ProvisionedEnv {
-                backend: backend.clone(),
-                posture_prefix: posture_prefix.clone(),
-                warmed: posture == EnvPosture::Provision,
-            };
-            assert_eq!(provisioned.posture_prefix, posture_prefix);
+        let effects = FakeEffects::succeeding(&[""]);
+        let provisioned = provision(&effects, &runner(), backend.clone(), EnvPosture::Checks)
+            .expect("provision nix");
+        let mut warm = runner().argv_prefix(&backend, EnvPosture::Provision);
+        warm.push("true".to_owned());
+        assert_eq!(&*effects.calls.borrow(), &[warm]);
+        assert!(provisioned.warmed);
+        assert_eq!(
+            provisioned.posture_prefix,
+            runner().argv_prefix(&backend, EnvPosture::Checks)
+        );
+    }
+
+    #[test]
+    fn container_pull_is_followed_by_digest_probe_and_exact_comparison() {
+        let declared = "registry.example/checks@sha256:declared".to_owned();
+        let backend = EnvBackend::ContainerImage {
+            digest: declared.clone(),
+        };
+        let mismatch = FakeEffects::succeeding(&["", " registry.example/checks@sha256:actual\n"]);
+        assert_eq!(
+            provision(&mismatch, &runner(), backend.clone(), EnvPosture::Checks),
+            Err(EnvProvisionError::DigestMismatch {
+                expected: declared.clone(),
+                actual: "registry.example/checks@sha256:actual".to_owned(),
+            })
+        );
+        assert_eq!(mismatch.calls.borrow().len(), 2, "pull and probe both ran");
+        assert_eq!(
+            mismatch.calls.borrow()[1],
+            vec![
+                "podman",
+                "image",
+                "inspect",
+                "--format",
+                "{{index .RepoDigests 0}}",
+                declared.as_str(),
+            ]
+        );
+
+        let equal = FakeEffects::succeeding(&["", &format!(" {declared}\n")]);
+        let provisioned = provision(&equal, &runner(), backend.clone(), EnvPosture::Provision)
+            .expect("matching digest");
+        assert_eq!(equal.calls.borrow().len(), 2, "probe happened after pull");
+        assert_eq!(
+            provisioned.posture_prefix,
+            runner().argv_prefix(&backend, EnvPosture::Provision)
+        );
+        assert!(!provisioned.warmed);
+    }
+
+    #[test]
+    fn unavailable_container_runtime_and_nonzero_commands_keep_exact_error_facts() {
+        let backend = EnvBackend::ContainerImage {
+            digest: "registry.example/checks@sha256:declared".to_owned(),
+        };
+        let unavailable = HostEnvRunner {
+            container_runtime: None,
+            mount_dir: PathBuf::from("/materialized/job"),
+        };
+        let unused = FakeEffects::succeeding(&[]);
+        assert_eq!(
+            provision(&unused, &unavailable, backend, EnvPosture::Checks),
+            Err(EnvProvisionError::BackendUnavailable {
+                backend: "container".to_owned(),
+            })
+        );
+        assert!(unused.calls.borrow().is_empty());
+
+        let backend = EnvBackend::NixFlake {
+            workdir: PathBuf::from("."),
+            devshell: "default".to_owned(),
+        };
+        let effects = FakeEffects {
+            outputs: RefCell::new(vec![Ok(EffectOutput {
+                status: 101,
+                stdout: String::new(),
+            })]),
+            calls: RefCell::new(Vec::new()),
+        };
+        let mut expected_argv = runner().argv_prefix(&backend, EnvPosture::Provision);
+        expected_argv.push("true".to_owned());
+        assert_eq!(
+            provision(&effects, &runner(), backend, EnvPosture::Checks),
+            Err(EnvProvisionError::ProvisionCommandFailed {
+                argv: expected_argv,
+                status: 101,
+            })
+        );
+    }
+
+    #[test]
+    fn provisioning_failures_are_infrastructure_even_for_status_101() {
+        let errors = [
+            EnvProvisionError::BackendUnavailable {
+                backend: "container".to_owned(),
+            },
+            EnvProvisionError::EnvUnresolvable {
+                detail: "bad declaration".to_owned(),
+            },
+            EnvProvisionError::DigestMismatch {
+                expected: "expected".to_owned(),
+                actual: "actual".to_owned(),
+            },
+            EnvProvisionError::ProvisionCommandFailed {
+                argv: vec!["cargo".to_owned(), "test".to_owned()],
+                status: 101,
+            },
+        ];
+        for error in errors {
+            assert_eq!(classify_provision_failure(&error), ProvisionOutcomeClass::Infra);
         }
+    }
+
+    #[test]
+    fn every_refusal_has_execution_failed_unprovisionable_feedback() {
+        let refusals = [
+            ProvisionRefusal::DeclarationUnparsable {
+                detail: "bad toml".to_owned(),
+            },
+            ProvisionRefusal::ReservedPath {
+                path: "reserved".to_owned(),
+            },
+            ProvisionRefusal::EnvLockMissing {
+                detail: "flake.lock".to_owned(),
+            },
+            ProvisionRefusal::Unprovisionable(EnvProvisionError::BackendUnavailable {
+                backend: "container".to_owned(),
+            }),
+        ];
+        for refusal in refusals {
+            assert_eq!(
+                refusal_feedback(&refusal),
+                (gateway::ReasonCode::ExecutionFailed, ENV_UNPROVISIONABLE)
+            );
+        }
+    }
+
+    #[test]
+    fn captured_declaration_bytes_are_the_exact_base_blob() {
+        struct Tree(Vec<u8>);
+        impl checks::BaseTree for Tree {
+            fn blob_at(&self, path: &str) -> Result<Option<Vec<u8>>, ChecksError> {
+                Ok(match path {
+                    checks::DECLARATION_PATH => Some(self.0.clone()),
+                    "flake.nix" | "flake.lock" => Some(b"base bytes".to_vec()),
+                    _ => None,
+                })
+            }
+        }
+        let bytes = br#"schema = 1
+[env]
+kind = "nix-flake"
+[checks]
+prepare = []
+commands = [["true"]]
+timeout_secs = 60
+"#
+        .to_vec();
+        let (captured, declaration) = capture_job_checks(&Tree(bytes.clone())).expect("capture");
+        assert_eq!(captured, bytes);
+        assert_eq!(declaration.env_kind, EnvKind::NixFlake);
     }
 }
