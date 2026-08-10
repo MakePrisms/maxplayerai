@@ -24,8 +24,9 @@ server and on the wallet/profile CLI so both drive the same buyer.
 
 ## Protocol
 
-1. [`protocol-v1.md`](protocol-v1.md) — the single **v1 wire spec** (`t=maxplayer`, `v=1`): the
-   `3400`–`3407` event kinds, the job lifecycle, the money invariants, and the reader rules.
+1. [`protocol-v1.md`](protocol-v1.md) — the **v1 wire spec** (`t=maxplayer`, `v=1`): the
+   `3400`–`3407` event kinds, the seat announcement, the job lifecycle, and the payment rules.
+2. [`implementation-status.md`](implementation-status.md) — where the code stands against that spec.
 
 ## Reference
 
