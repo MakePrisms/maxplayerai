@@ -933,17 +933,24 @@ Award-without-result rate per seller then becomes computable from relay data alo
 
 ## 17. Reserved Paths
 
-Two root paths in a delivered tree are reserved for the protocol. A target MUST NOT ship either path
-in its own content.
+Two root paths in a delivered tree belong to the protocol. A target SHOULD NOT use either path for
+its own content.
 
 | Path | Written by | Defined in |
 |---|---|---|
 | `MAXPLAYER_EXECUTION_SENTINEL` | the node, on every delivery | Section 9.2 |
 | `MAXPLAYER_CHECKS_ATTESTATION` | the checks runner, when the base declares checks | Section 12 |
 
+The consequence of using one depends on whether the target declares checks.
+
 A declaring target is refused with `verify_reserved_path` if either path is already a blob in the
-base tree. Section 11 states that refusal. The `raw-tree` hash in Section 12 is computed with both
-paths removed.
+base tree. Section 11 states that refusal.
+
+A target that declares no checks meets no such refusal. The node writes the sentinel into the
+workdir and force-stages it. That write overwrites any file the target left at the same path, and it
+bypasses `.gitignore`.
+
+The `raw-tree` hash in Section 12 is computed with both paths removed.
 
 ## 18. Section Numbers Cited From Code
 

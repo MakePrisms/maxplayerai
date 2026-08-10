@@ -63,6 +63,10 @@ kind table, and the receipt field-semantics table.
 shipped behavior, and each amended row is marked in place with the Part D finding that drove it:
 rows 59, 60, and 67, plus the table and category rows 98 and 99.
 
+This part is a denominator over the **old** document only. Six normative atoms that this rewrite
+introduced have no old counterpart, so they cannot appear here. **Part E.1 enumerates those six.**
+Part B plus Part E.1 is the complete normative denominator.
+
 ### Old §2 — Scope And Terms
 
 | # | Statement | New location |
@@ -515,6 +519,39 @@ Everything below is new text. Each item was verified against the code named besi
 | 11 | The container checks posture adds `--network=none`; the provision posture does not. | `env_provision.rs:51` and the exact-argv test at `env_provision.rs:171`. |
 | 17 | The reserved-path registry table. | `checks.rs:12` (`CHECKS_ATTESTATION_FILE`), `delivery_sentinel.rs:38` (`SENTINEL_FILE`), `checks.rs:277` (`validate_against_base`). |
 | 18 | The code-citation index. | See Part F. |
+
+### Part E.1 — new normative atoms, the other half of the denominator
+
+Part B is a denominator over the **old** document. It cannot account for a normative statement this
+rewrite introduced, because such a statement has no old counterpart. Part E lists added content as
+prose, which is not the same as enumerating its normative atoms.
+
+This table closes that gap. Every sentence in the new document that carries MUST, MUST NOT, SHOULD,
+or SHOULD NOT, and that has no ancestor in the old document, is listed here with its evidence.
+
+**The full normative denominator for review is Part B (185 atoms from the old `protocol-v1.md`) plus
+Part H (22 claims from the folded `protocol.md`) plus Part E.1 (6 new atoms below).**
+
+Completeness was checked mechanically, not by eye. Every sentence carrying MUST or SHOULD was
+extracted from both documents and scored for content-word overlap against the old set. Sixteen new
+sentences scored below the ancestry threshold. Six are the atoms below. Two are the bind-first rule
+folded from `protocol.md`, which Part H covers. Seven trace to old atoms that this rewrite split into
+shorter sentences, which lowers the overlap score. One is not normative: it is the sentence naming
+issue #640.
+
+| # | New normative atom | Where | Evidence |
+|---:|---|---|---|
+| N1 | A reader MUST NOT infer from a delivery that any declared check ran. | 10 | No production path parses a declaration or verifies an attestation. Part E lists the eight entry points and their zero callers. |
+| N2 | An implementer SHOULD build against Sections 11 through 13 as written. | 10 | The layer is wire-complete and type-complete; `checks.rs` and `env_provision.rs` define it fully. It has no caller yet. |
+| N3 | A reader MUST gate on the kind before it reads `ACCEPT` tags. | 5.5 | `gateway.rs:524` gates on kind, then shares `parse_offer_and_claim_tags` with `AWARD` at `gateway.rs:534`. The two events are tag-identical. |
+| N4 | A reader MUST NOT let `AWARD` or `ACCEPT` satisfy a check meant for the other. | 5.5 | `gateway.rs:521` states this as the reason the two parsers stay separate. Restates old atom 107 at the tag level. |
+| N5 | A target SHOULD NOT use either reserved path for its own content. | 17 | Derived, not invented. A declaring target is refused at `checks.rs:277`; a non-declaring target has its file silently overwritten by the node's force-staged sentinel write at `seller_git.rs:363`. |
+| N6 | A reader MUST still accept the three unemitted `reason_code` values. | 8.1 | Applies old atoms 96 and 97 to the codes Part D2 found unproduced. The buyer reader already handles them at `buyer/mod.rs:2323`. |
+
+N5 replaced a stronger sentence. The first draft of Section 17 said "a target MUST NOT ship either
+path in its own content", which is broader than anything the code enforces. `validate_against_base`
+takes a `&ChecksDeclaration`, so the refusal exists only for a declaring target and only against the
+base tree. Section 17 now scopes the rule and states the non-declaring case separately.
 
 ## Part F — cross-references
 
