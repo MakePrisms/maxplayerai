@@ -27,6 +27,7 @@ pub mod delivery_transport;
 pub mod driver;
 pub mod durable;
 pub mod engine;
+pub mod env_provision;
 pub mod episode;
 pub mod event;
 pub mod format;
