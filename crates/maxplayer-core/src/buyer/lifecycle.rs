@@ -28,7 +28,7 @@ use super::store::{AttemptState, AwardAttempt, AwardRecord, BeginAttempt, BuyerS
 
 /// Hard filters an awardable claim must pass (issue #126). Grounded in the wire the offer/claim
 /// actually carry: the offer's signed `amount_sats` is the fixed price, the seller's claim `creq`
-/// carries the payable terms + accepted mints, and the claim's `mobee_agent` tag carries the
+/// carries the payable terms + accepted mints, and the claim's `agents` tag carries the
 /// harnesses the seller can run.
 pub struct AwardFilters<'a> {
     /// The offer's signed amount — authority for the price. A claim whose `creq` quotes a

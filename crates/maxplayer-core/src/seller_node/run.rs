@@ -2334,11 +2334,11 @@ pub fn proven_serving_indices(verdicts: &[HarnessProbeVerdict]) -> Vec<usize> {
 /// `verdicts` is the outcome of [`probe_configured_harnesses`], taken as a parameter so a caller can
 /// inject a passing result without spawning an agent. Two outcomes:
 ///
-/// - **None proved out** → publish NOTHING (0×kind-31990) and refuse to boot (0×kind-30340). Fail
+/// - **None proved out** → publish NOTHING (0×kind-0) and refuse to boot (0×kind-30340). Fail
 ///   loud, non-zero: a seat that cannot deliver any harness must not advertise, and lingering while
 ///   advertising nothing only hides the fault from the operator.
-/// - **Some proved out** → publish discoverability as before, boot, then pre-narrow the live roster
-///   to the provers so the kind-30340 heartbeat (which reads the roster) is honest for free.
+/// - **Some proved out** → publish the kind-0 identity, boot, then pre-narrow the live roster to
+///   the provers so the kind-30340 announcement (which reads the roster) is honest for free.
 ///
 /// The gate is the `is_empty` block below; reverting it — publishing unconditionally — reproduces the
 /// #357 bug (advertise, then fail every job).
@@ -2364,9 +2364,8 @@ pub async fn boot_advertising_only_proven(
         .await
         .map_err(|error| NodeError::Relay(format!("discoverability publish failed: {error}")))?;
     opline!(
-        "seller node discoverable kind0={} nip89={} name={} pubkey={}",
+        "seller node discoverable kind0={} name={} pubkey={}",
         disco.kind0_event_id,
-        disco.nip89_event_id,
         disco.name.as_deref().unwrap_or(""),
         disco.pubkey
     );
@@ -3621,10 +3620,15 @@ impl SellerNodeRunner {
         // ONE roster read for both wire signals: a seat that has dropped every harness advertises
         // `accepting=n`, so it stops attracting work instead of looking open and declining later.
         let roster = self.agents.advertisement();
+        // The mints ride the announcement every beat (§4.2). They come from the SAME config field
+        // the pay path validates against, so what a buyer reads here is what this seat can settle
+        // on — before #645 they were written once into a kind-31990 content at boot, which no
+        // config change ever revisited.
         let draft = crate::heartbeat::heartbeat_for_state(
             in_flight,
             roster.serving,
             seller.rate_sats,
+            self.node.home().config.accepted_mints.clone(),
             roster.names,
         )
         .to_event_draft();
@@ -10662,16 +10666,16 @@ mod tests {
     // ---- #357 prove-before-advertise -----------------------------------------------------------
     //
     // These drive `boot_advertising_only_proven` against the fixture relay and assert what reached
-    // the wire BY KIND (kind-31990 handler ad, kind-30340 heartbeat). Safe: the bogus case fails at
-    // spawn with ENOENT (no process created), and the healthy case injects a passing verdict so no
-    // agent is ever spawned.
+    // the wire BY KIND (kind-0 identity, kind-30340 seat announcement). Safe: the bogus case fails
+    // at spawn with ENOENT (no process created), and the healthy case injects a passing verdict so
+    // no agent is ever spawned.
 
     /// A seat whose every configured harness FAILS its pre-advertise probe must publish nothing: no
-    /// kind-31990 handler ad and no kind-30340 heartbeat. The `[sandbox]` launcher is unresolvable, so
+    /// kind-0 identity and no kind-30340 announcement. The `[sandbox]` launcher is unresolvable, so
     /// the probe's spawn fails ENOENT before any agent runs.
     ///
     /// RED ON REVERT: delete the `is_empty` gate block in `boot_advertising_only_proven` (publish
-    /// unconditionally) and the relay sees ≥1 kind-31990 — the #357 bug, advertise-then-fail.
+    /// unconditionally) and the relay sees ≥1 kind-0 — the #357 bug, advertise-then-fail.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_seat_whose_harness_fails_its_probe_advertises_nothing() {
         use crate::home::SandboxConfig;
@@ -10704,14 +10708,19 @@ mod tests {
 
         // The load-bearing property: a seat whose harness failed its probe put NOTHING on the wire.
         assert_eq!(
-            fixture.event_kind_count(31990).await,
+            fixture.event_kind_count(0).await,
             0,
-            "a dead seat must NOT publish the kind-31990 handler ad"
+            "a dead seat must NOT publish its kind-0 identity"
         );
         assert_eq!(
             fixture.event_kind_count(30340).await,
             0,
-            "a dead seat must NOT publish a kind-30340 heartbeat"
+            "a dead seat must NOT publish a kind-30340 announcement"
+        );
+        assert_eq!(
+            fixture.event_kind_count(31990).await,
+            0,
+            "kind-31990 is not part of the protocol (#645)"
         );
         // …and it refused to boot rather than lingering while advertising nothing (fail loud).
         match outcome {
@@ -10723,11 +10732,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A seat with a PROVEN harness advertises as before: discoverability (kind-31990) is published
-    /// and the live roster serves. The passing verdict is INJECTED — no agent is spawned — which is
-    /// exactly why the orchestrator takes probe outcomes as a parameter.
+    /// A seat with a PROVEN harness advertises and serves — and, since #645, its start publishes
+    /// ZERO kind-31990 events.
+    ///
+    /// The kind-0 count is the POSITIVE CONTROL and it is load-bearing: `31990 == 0` is also what a
+    /// seat that published nothing at all would report, and a boot that silently failed to reach the
+    /// relay would pass a bare zero-check while proving nothing. Asserting kind-0 ≥ 1 in the same
+    /// transcript establishes that the discoverability publish RAN and its events reached the wire,
+    /// so the zero next to it is a real absence rather than an empty transcript.
+    ///
+    /// RED ON REVERT: restore the `publish_nip89_announce_async` call in
+    /// `publish_seller_discoverability_async` and the 31990 count goes to 1.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_seat_with_a_proven_harness_still_advertises_and_serves() {
+    async fn seller_start_publishes_kind0_and_zero_kind_31990() {
         let fixture = PGateRelay::start(Duration::from_millis(0)).await;
         let root = throwaway_root("proven");
         let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
@@ -10750,9 +10767,17 @@ mod tests {
             .await
             .expect("a proven seat must boot");
 
+        // Positive control first: the publish path ran and its event reached this relay.
+        let kind0 = fixture.event_kind_count(0).await;
         assert!(
-            fixture.event_kind_count(31990).await >= 1,
-            "a proven seat MUST publish the kind-31990 handler ad"
+            kind0 >= 1,
+            "a proven seat MUST publish its kind-0 identity (positive control for the zero below)"
+        );
+        // The #645 property: nothing on the retired kind, in a transcript proven non-empty.
+        assert_eq!(
+            fixture.event_kind_count(31990).await,
+            0,
+            "seller start must publish ZERO kind-31990 events; the transcript holds {kind0} kind-0"
         );
         assert!(
             runner.agents.advertisement().serving,

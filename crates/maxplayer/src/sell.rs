@@ -254,8 +254,8 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
             RUNTIME_ERROR
         })?;
 
-    // Prove-before-advertise (#357): probe each configured harness once, THEN publish discoverability
-    // (clobber-safe kind-0 + idempotent kind-31990) and boot serving ONLY the harnesses that proved
+    // Prove-before-advertise (#357): probe each configured harness once, THEN publish the
+    // clobber-safe kind-0 identity and boot serving ONLY the harnesses that proved
     // they can deliver a probe artifact. If NONE prove out, advertise nothing and refuse to start
     // (fail loud) — a seat that cannot deliver must never appear on the market, because under
     // award-is-payment a buyer commits the sats at award. The probe is local compute only (no

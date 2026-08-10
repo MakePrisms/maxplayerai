@@ -38,19 +38,15 @@ pub struct SetProfileOutcome {
     pub relay_url: String,
 }
 
-/// Kind-0 + NIP-89 announce ids from seller discoverability publish.
+/// Kind-0 identity publish from seller start. Kind 0 carries the seat's NAME (§4.1); its
+/// capability rides the kind-30340 announcement (§4.2) and is published by the heartbeat, not here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SellerDiscoverabilityOutcome {
     pub pubkey: String,
     pub kind0_event_id: String,
-    pub nip89_event_id: String,
     pub name: Option<String>,
     pub relay_url: String,
 }
-
-/// NIP-89 handler information (kind 31990) — parameterized replaceable via `d`.
-const NIP89_HANDLER_KIND: u16 = 31990;
-const NIP89_HANDLER_D: &str = "maxplayer-seller";
 
 #[derive(Debug)]
 pub enum ProfileError {
@@ -125,10 +121,13 @@ pub async fn set_profile_async(
     })
 }
 
-/// Seller start: publish clobber-safe kind-0 + idempotent NIP-89 (d=`maxplayer-seller`).
+/// Seller start: publish the clobber-safe kind-0 identity. Fetch → merge name/about → publish;
+/// **abort on fetch failure**.
 ///
-/// Kind-0: fetch → merge name/about → publish; **abort on fetch failure**.
-/// NIP-89: same `d` tag every launch (parameterized replaceable — not spam).
+/// Kind-0 is the ONLY event this publishes. Issue #645 retired the kind-31990 handler announce
+/// that used to ride alongside it: every capability it carried (mints, rate, harness,
+/// `claim_open_pool`) is now on the kind-30340 seat announcement, which the heartbeat republishes
+/// each beat with live values — where the 31990 was written once at boot and then went stale.
 pub fn publish_seller_discoverability(
     home: &mut MaxplayerHome,
 ) -> Result<SellerDiscoverabilityOutcome, ProfileError> {
@@ -150,8 +149,9 @@ pub async fn publish_seller_discoverability_async(
         ProfileError::Input("missing [seller] config for discoverability publish".into())
     })?;
     let rate_sats = seller.rate_sats;
-    let claim_open_pool = seller.claim_open_pool;
-    // Advertised harness label = the first configured harness (issue #378 dropped the singular `agent`).
+    // Only the default `about` sentence reads these. The seat's ADVERTISED rate and harness roster
+    // are published by the kind-30340 heartbeat from live state; kind-0 `about` is display prose a
+    // reader must never target, pay, or dispatch on (§4.1).
     let agent = seller.agents.first().cloned();
 
     // Ensure a display name exists (config or short-hex default).
@@ -190,20 +190,10 @@ pub async fn publish_seller_discoverability_async(
     let profile = home.config.profile.clone().unwrap_or_default();
     let keys = buyer_keys(home)?;
     let kind0_event_id = publish_metadata_merged_async(home, &keys, &profile).await?;
-    let nip89_event_id = publish_nip89_announce_async(
-        home,
-        &keys,
-        &profile,
-        rate_sats,
-        claim_open_pool,
-        agent.as_deref(),
-    )
-    .await?;
 
     Ok(SellerDiscoverabilityOutcome {
         pubkey: keys.public_key().to_hex(),
         kind0_event_id,
-        nip89_event_id,
         name: profile.name,
         relay_url: home.config.relay_url.clone(),
     })
@@ -348,71 +338,6 @@ fn default_seller_about(agent: Option<&str>, rate_sats: u64, accepted_mints: &[S
         .map(String::as_str)
         .unwrap_or("no-mint");
     format!("maxplayer seller · {agent_label} · {rate_sats} sat/job · {mint_label}")
-}
-
-/// Build NIP-89 kind-31990 content from profile + seller knobs + accepted mints.
-///
-/// The advertised mint is always derived from `accepted_mints` (issue #209) — never a
-/// hard-coded `"testnut"` placeholder. When the list is empty the field is `""` rather
-/// than a misleading default (seller boot already refuses empty `accepted_mints`).
-///
-/// Wire shape keeps `"mint"` as a single URL string (primary = first accepted mint) so
-/// existing orderbook consumers stay compatible; the full list is also advertised under
-/// `"accepted_mints"` so a buyer can match membership on any accepted mint.
-///
-/// The seat name is deliberately NOT carried here: kind-0 metadata is its single publisher
-/// (§6.1 one value, one publisher / #275). `profile set --name` republishes kind-0 only, so a
-/// name embedded here would drift stale on every rename — readers resolve the name from kind-0.
-fn nip89_handler_content(
-    profile: &ProfileConfig,
-    rate_sats: u64,
-    claim_open_pool: bool,
-    agent: Option<&str>,
-    accepted_mints: &[String],
-) -> String {
-    let primary_mint = accepted_mints.first().map(String::as_str).unwrap_or("");
-    serde_json::json!({
-        "about": profile.about,
-        "rate_sats": rate_sats,
-        "claim_open_pool": claim_open_pool,
-        "agent": agent,
-        "mint": primary_mint,
-        "accepted_mints": accepted_mints,
-        "protocol": "maxplayer-seller",
-    })
-    .to_string()
-}
-
-async fn publish_nip89_announce_async(
-    home: &MaxplayerHome,
-    keys: &nostr_sdk::Keys,
-    profile: &ProfileConfig,
-    rate_sats: u64,
-    claim_open_pool: bool,
-    agent: Option<&str>,
-) -> Result<String, ProfileError> {
-    use nostr_sdk::prelude::{EventBuilder, Kind, Tag};
-
-    let content = nip89_handler_content(
-        profile,
-        rate_sats,
-        claim_open_pool,
-        agent,
-        &home.config.accepted_mints,
-    );
-
-    // NIP-89 handler advertises the maxplayer kinds this seller handles: the OFFER it consumes and the
-    // RESULT it produces.
-    let k_offer = Tag::parse(["k", &crate::gateway::JOB_OFFER_KIND.to_string()])
-        .map_err(|error| ProfileError::Relay(format!("NIP-89 k tag: {error}")))?;
-    let k_result = Tag::parse(["k", &crate::gateway::JOB_RESULT_KIND.to_string()])
-        .map_err(|error| ProfileError::Relay(format!("NIP-89 k tag: {error}")))?;
-    let event = EventBuilder::new(Kind::Custom(NIP89_HANDLER_KIND), content)
-        .tags([Tag::identifier(NIP89_HANDLER_D), k_offer, k_result])
-        .sign_with_keys(keys)
-        .map_err(|error| ProfileError::Relay(format!("sign NIP-89: {error}")))?;
-
-    send_signed_event(home, keys, &event, "NIP-89").await
 }
 
 /// NIP-34 kind-30617 announce for the seller delivery remote (required before push).
@@ -740,104 +665,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // Issue #209: NIP-89 announce must derive mint from config.accepted_mints — never hard-code
-    // "testnut". A home configured with a non-testnut mint must advertise that mint, and the
-    // announcement content must not contain the string "testnut".
+    /// Issue #209: the default `about` derives its mint label from `accepted_mints` — never a
+    /// hard-coded `"testnut"`. This guard outlived the kind-31990 announce it was written beside
+    /// (#645 retired that); `about` is the last config-derived mint label kind-0 still carries.
     #[test]
-    fn nip89_announce_mint_matches_config_not_testnut() {
-        let root = std::env::temp_dir().join(format!(
-            "maxplayer-nip89-mint-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let mut home = home::bootstrap(&root).expect("home");
-
+    fn default_about_mint_label_comes_from_config_not_testnut() {
         const REAL_MINT: &str = "https://mint.minibits.cash/Bitcoin";
-        home::save_config(&mut home, |config| {
-            config.accepted_mints = vec![REAL_MINT.to_owned()];
-            config.allow_real_mints = true;
-            config.profile = Some(ProfileConfig {
-                name: Some("frogger".into()),
-                about: Some("maxplayer seller · grok-4.5 · 100 sat/job · minibits".into()),
-            });
-        })
-        .expect("save");
-        home::reload_config(&mut home).expect("reload");
-
-        let profile = home.config.profile.clone().unwrap_or_default();
-        let content = nip89_handler_content(
-            &profile,
-            100,
-            true,
-            Some("grok-4.5"),
-            &home.config.accepted_mints,
-        );
-
-        assert!(
-            !content.contains("testnut"),
-            "announcement must not contain hard-coded testnut; got: {content}"
-        );
-
-        let parsed: serde_json::Value =
-            serde_json::from_str(&content).expect("announce content is JSON");
-        assert_eq!(
-            parsed["mint"].as_str(),
-            Some(REAL_MINT),
-            "advertised mint must match config.accepted_mints[0]; got: {content}"
-        );
-        let mints = parsed["accepted_mints"]
-            .as_array()
-            .expect("accepted_mints array present");
-        assert_eq!(
-            mints.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>(),
-            vec![REAL_MINT],
-            "full accepted_mints list must be advertised"
-        );
-
-        // Default about fallback must also derive mint from config (no testnut).
-        let about = default_seller_about(Some("agent"), 21, &home.config.accepted_mints);
+        let about = default_seller_about(Some("grok-4.5"), 21, &[REAL_MINT.to_owned()]);
         assert!(
             !about.contains("testnut"),
             "about fallback must not hard-code testnut; got: {about}"
         );
         assert!(
             about.contains(REAL_MINT),
-            "about fallback must include configured mint; got: {about}"
+            "about fallback must include the configured mint; got: {about}"
         );
 
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn nip89_announce_omits_name_kind0_is_the_single_publisher() {
-        // §6.1 / #275: the seat name has ONE publisher — kind-0 metadata. The kind-31990 handler
-        // content must NOT carry it, or a `profile set --name` rename (which republishes kind-0
-        // only) drifts stale against a 31990-sourced directory. Red-on-revert: re-adding
-        // `"name": profile.name` reintroduces the drift and fails both assertions below.
-        let profile = ProfileConfig {
-            name: Some("frogger".into()),
-            about: Some("about".into()),
-        };
-        let content = nip89_handler_content(
-            &profile,
-            100,
-            true,
-            Some("grok-4.5"),
-            &["https://mint.example/x".to_owned()],
-        );
-        let parsed: serde_json::Value =
-            serde_json::from_str(&content).expect("announce content is JSON");
-        assert!(
-            parsed.get("name").is_none(),
-            "kind-31990 content must not carry a name (kind-0 is the single publisher); got: {content}"
-        );
-        assert!(
-            !content.contains("frogger"),
-            "the seat name must not ride in the 31990 announce; got: {content}"
-        );
+        // A seat with no configured mint gets an honest placeholder, not a plausible wrong mint.
+        let none = default_seller_about(None, 21, &[]);
+        assert!(none.contains("no-mint"), "got: {none}");
     }
 }

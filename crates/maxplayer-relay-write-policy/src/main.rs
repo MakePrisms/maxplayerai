@@ -24,14 +24,18 @@ use serde::Serialize;
 use serde_json::Value;
 
 /// Kinds a seat publishes to be discovered, which `profile.rs` does not yet tag with
-/// `t` (kind 0 metadata, NIP-89 handler 31990, NIP-34 git repo announcement 30617).
+/// `t` (kind 0 metadata, NIP-34 git repo announcement 30617).
 ///
 /// ⚠ TEMPORARY allowlist — delete once #365 adds `["t", <tag>]` to those builders, after
 /// which the predicate is uniform. It is here because a relay that required the `t` tag
-/// on *every* event would reject kind-0 and kind-31990, which is exactly how a seat
-/// pubkey is resolved — the relay would serve normally and look healthy while making its
-/// own participants undiscoverable.
-const DISCOVERY_KINDS: &[u64] = &[0, 31990, 30617];
+/// on *every* event would reject kind-0, which is exactly how a seat pubkey is resolved —
+/// the relay would serve normally and look healthy while making its own participants
+/// undiscoverable.
+///
+/// Kind 31990 left this list with #645: a seat no longer publishes it, so admitting it
+/// would only let untagged foreign events through on a kind the protocol does not use.
+/// The kind-30340 seat announcement needs no exemption — it carries `["t", <tag>]` itself.
+const DISCOVERY_KINDS: &[u64] = &[0, 30617];
 
 /// NIP-17 private-DM kinds, admitted by KIND rather than by namespace tag. A NIP-59 gift wrap
 /// (1059) is signed by a throwaway ephemeral key and carries ONLY a recipient `p` tag — stamping
@@ -233,10 +237,26 @@ mod tests {
 
     #[test]
     fn discovery_kinds_bypass_the_tag() {
-        for kind in [0u64, 31990, 30617] {
+        for kind in [0u64, 30617] {
             let v = decide(&msg(kind, serde_json::json!([])), "maxplayer");
             assert_eq!(v.action, "accept", "kind {kind} should be allowlisted");
         }
+    }
+
+    /// #645 retired kind 31990, so it lost its tag exemption: an untagged 31990 is now just an
+    /// untagged foreign event. The seat announcement that replaced it carries the namespace tag
+    /// itself and is admitted by the ordinary predicate — the pair is the discriminator, since a
+    /// policy that dropped the exemption AND broke seat discovery would fail the second row.
+    #[test]
+    fn kind_31990_lost_its_exemption_and_the_seat_announcement_does_not_need_one() {
+        let untagged_31990 = decide(&msg(31990, serde_json::json!([])), "maxplayer");
+        assert_eq!(untagged_31990.action, "reject");
+
+        let announcement = decide(
+            &msg(30340, serde_json::json!([["t", "maxplayer"], ["d", "maxplayer-seller"]])),
+            "maxplayer",
+        );
+        assert_eq!(announcement.action, "accept");
     }
 
     #[test]

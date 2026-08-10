@@ -425,9 +425,9 @@ pub fn parse_bound_git_delivery(
 /// The offer `e` tag is marked `root`, so an observer holding only public tags can join the claim
 /// to its offer without guessing at `e`-tag position.
 ///
-/// `agents` advertises the harnesses this seller can run (preference order) as
-/// `["mobee_agent", …]`, so the buyer's award filter can hold the claim to the harness its job
-/// asked for. Empty ⇒ the tag is omitted rather than sent empty.
+/// `agents` advertises the harnesses this seller can run (preference order) as `["agents", …]`
+/// (§6.2), so the buyer's award filter can hold the claim to the harness its job asked for.
+/// Empty ⇒ the tag is omitted rather than sent empty.
 pub fn claim_draft(
     offer_id: &str,
     buyer_pubkey: &str,
@@ -1043,16 +1043,16 @@ mod tests {
         let tag = advertised
             .tags
             .iter()
-            .find(|tag| tag.first() == Some("mobee_agent"))
+            .find(|tag| tag.first() == Some("agents"))
             .expect("claim advertises its harnesses");
-        assert_eq!(tag.0, vec!["mobee_agent", "claude", "codex"]);
+        assert_eq!(tag.0, vec!["agents", "claude", "codex"]);
         assert_eq!(
             crate::heartbeat::agents_from_tags(&advertised.tags),
             vec!["claude", "codex"]
         );
 
         let silent = claim_draft("job-1", "buyer", "seller", "creqAtest", &[]);
-        assert!(silent.tags.iter().all(|tag| tag.first() != Some("mobee_agent")));
+        assert!(silent.tags.iter().all(|tag| tag.first() != Some("agents")));
         assert!(crate::heartbeat::agents_from_tags(&silent.tags).is_empty());
     }
 
