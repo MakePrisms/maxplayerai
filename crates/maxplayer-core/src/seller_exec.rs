@@ -257,12 +257,28 @@ impl DockerPolicy {
     /// construction, drops to the seller's uid/gid so the mounted output is owned by the seller,
     /// and carries the delivery-identity env. ACP stdio survives through
     /// `docker run -i` (stdin/stdout piped; no tty).
+    ///
+    /// Two hardening flags, because the job is a stranger's code and both defaults are wrong for it:
+    ///
+    /// `--security-opt no-new-privileges` — a non-root `--user` already leaves the process with an
+    /// EMPTY effective capability set, so this is not about caps. It is about the bounding set the
+    /// container still carries and the setuid-root binaries a base image ships (`node:22-bookworm-slim`
+    /// carries 8, `su`/`mount`/`umount` among them). Without the flag `NoNewPrivs` is 0 and a job can
+    /// try to become container-root; with it that route is closed. The host tree is unreachable either
+    /// way — this narrows what a job can do inside its own container, not what it can reach outside.
+    ///
+    /// `--init` — otherwise PID 1 is the ACP adapter, a node process that does not reap. An agent that
+    /// spawns subprocesses accumulates zombies for the life of the container. `--init` makes PID 1 a
+    /// real reaper instead.
     fn run_argv(&self, agent_command: &[String], job: &JobLaunch<'_>) -> Vec<String> {
         let mut argv: Vec<String> = vec![
             "docker".into(),
             "run".into(),
             "--rm".into(),
             "-i".into(),
+            "--init".into(),
+            "--security-opt".into(),
+            "no-new-privileges".into(),
             "--user".into(),
             format!("{}:{}", job.uid, job.gid),
             "-v".into(),
@@ -837,6 +853,54 @@ mod tests {
         assert!(windowed(&launch.args, &["-e", "GIT_AUTHOR_NAME=maxplayer-seller-abcd"]));
         // The image precedes the agent command, which is the final argv segment.
         assert_eq!(launch.args.last().map(String::as_str), Some("claude-agent-acp"));
+    }
+
+    // The container runs a STRANGER'S code, and two docker defaults are wrong for that. Measured
+    // against a live daemon: without `--security-opt no-new-privileges` the container reports
+    // `NoNewPrivs: 0`, and `node:22-bookworm-slim` ships 8 setuid-root binaries (su, mount, umount
+    // among them) — so a job may attempt to become container-root. Without `--init`, PID 1 is the
+    // adapter itself (a node process that never reaps), so a job's subprocesses accumulate as
+    // zombies; with it PID 1 is `docker-init`.
+    //
+    // Neither changes what the job can reach OUTSIDE the container — the host tree is unmounted
+    // either way — so this pins hardening, not the containment claim, which
+    // `docker_policy_mounts_only_the_job_workdir` owns.
+    #[test]
+    fn docker_policy_hardens_against_the_strangers_code_it_runs() {
+        let policy = SandboxPolicy::docker(DockerPolicy {
+            image: "maxplayer-sandbox:latest".into(),
+        });
+        let launch = policy
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
+            .expect("command");
+
+        assert!(
+            windowed(&launch.args, &["--security-opt", "no-new-privileges"]),
+            "a setuid-root binary in the image must not be a route to container-root: {:?}",
+            launch.args
+        );
+        assert!(
+            launch.args.iter().any(|a| a == "--init"),
+            "PID 1 must reap, or a job's subprocesses pile up as zombies: {:?}",
+            launch.args
+        );
+        // Both must precede the image, or docker reads them as arguments to the agent command.
+        let image_at = launch
+            .args
+            .iter()
+            .position(|a| a == "maxplayer-sandbox:latest")
+            .expect("the image is in the argv");
+        let init_at = launch.args.iter().position(|a| a == "--init").expect("--init");
+        let secopt_at = launch
+            .args
+            .iter()
+            .position(|a| a == "--security-opt")
+            .expect("--security-opt");
+        assert!(
+            init_at < image_at && secopt_at < image_at,
+            "hardening flags after the image would be passed to the agent, not to docker: {:?}",
+            launch.args
+        );
     }
 
     // from_config fails closed on a docker misconfiguration rather than launching a half-cage.
