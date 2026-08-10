@@ -241,17 +241,27 @@ reader MUST NOT treat it as proof that a given harness or model ran.
 |---|---|---:|---|
 | `["status","accepted"]` | 1 | yes | Accept state |
 | `["e", offer_id, "", "root"]` | 1 | yes | Root offer id |
-| `["e", claim_id]` | 1 | yes | Accepted claim id |
+| `["e", result_id, "", "reply"]` | 1 | yes | The result this payment authorises |
+| `["e", claim_id]` | 1 | yes | The claim being settled |
 | `["p", buyer_pubkey]` | 1 | yes | Accepting buyer |
 | `["p", seller_pubkey]` | 1 | yes | Bound seller |
+| `["job-hash", hash]` | 1 | yes | The bind the payment settles against |
 | `["t","maxplayer"]` | 1 | yes | Namespace |
 | `["v","1"]` | 1 | yes | Protocol major |
 
-`ACCEPT` carries the same tags as `AWARD`. The two differ only by kind, so a reader MUST gate on the
-kind before it reads the tags.
+`ACCEPT` carries three `e` tags. A reader resolves them by marker, never by position:
 
-The second `e` tag names the claim and carries no marker. A reader resolves the pair by marker: the
-`root`-marked `e` tag is the offer, and the other is the claim.
+| Marker | Names |
+|---|---|
+| `root` | the offer |
+| `reply` | the result |
+| none | the claim |
+
+`AWARD` selects a claim. `ACCEPT` authorises payment. A reader MUST gate on the kind before it reads
+the tags.
+
+The `job-hash` and the result `e` tag make the payment authorisation joinable. A third party can read
+an `ACCEPT` and name the result it pays for, without private state.
 
 ### 6.6 Reject, kind `3407`
 
