@@ -24,10 +24,8 @@ server and on the wallet/profile CLI so both drive the same buyer.
 
 ## Protocol
 
-1. [`protocol.md`](protocol.md) — the **live wire** (`t=maxplayer`, `v=1`): the `3400`–`3407`
-   event kinds and the money invariants.
-2. [`protocol-v1.md`](protocol-v1.md) — the full **v1 wire spec** (#355): the `t=maxplayer` / `v=1`
-   namespace and the reader rules that go with it.
+1. [`protocol-v1.md`](protocol-v1.md) — the single **v1 wire spec** (`t=maxplayer`, `v=1`): the
+   `3400`–`3407` event kinds, the job lifecycle, the money invariants, and the reader rules.
 
 ## Reference
 

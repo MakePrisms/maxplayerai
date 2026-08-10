@@ -23,3 +23,7 @@ of the owned range.
 | `web/network/js/parse.js` 3405/3406 split comment | VERIFIED-STILL-CORRECT | It explains why ACCEPT must not parse as AWARD; it is not a range endpoint. |
 
 No other tracked file contained a `3400`–`3406`/“through 3406” range statement after the sweep.
+
+Note on one site above: `docs/protocol.md` was later folded into `docs/protocol-v1.md` and deleted.
+Its row records what that sweep changed and is left as written, because rewriting it would
+misdescribe the sweep. The protocol content it names now lives in `docs/protocol-v1.md`.

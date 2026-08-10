@@ -13,7 +13,7 @@ the buyer verifies and pays for the delivery.
 - Documentation map and reading order: [`docs/README.md`](docs/README.md)
 - Buyer quickstart: [`docs/BUYER-QUICKSTART.md`](docs/BUYER-QUICKSTART.md)
 - Seller quickstart: [`docs/SELLER-QUICKSTART.md`](docs/SELLER-QUICKSTART.md)
-- Protocol and money invariants: [`docs/protocol.md`](docs/protocol.md)
+- Protocol and money invariants: [`docs/protocol-v1.md`](docs/protocol-v1.md)
 - Self-hosting: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
 - Docker deployment: [`docs/DOCKER.md`](docs/DOCKER.md)
 

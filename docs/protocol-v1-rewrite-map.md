@@ -258,11 +258,13 @@ kind table, the receipt field-semantics table, and the `reason_code` vocabulary 
 | # | Statement | New location |
 |---:|---|---|
 | 118 | Work follows the award. | 7.1 |
-| 119 | The buyer verifies, not the seller. | 7.2 |
-| 120 | No cross-bind; pay verifies the seller's pre-pay co-signature before spending. | 7.3 |
-| 121 | Capped: every pay passes per-job and total budget gates. | 7.4 |
-| 122 | Fee floor: `amount <= mint fee` is dust and is refused. | 7.5 |
-| 123 | Key custody: file-protected, never on a command line, never in tokens or logs. | 7.6 |
+| 119 | The buyer verifies, not the seller. | 7.3 |
+| 120 | No cross-bind; pay verifies the seller's pre-pay co-signature before spending. | 7.4 |
+| 121 | Capped: every pay passes per-job and total budget gates. | 7.5 |
+| 122 | Fee floor: `amount <= mint fee` is dust and is refused. | 7.6 |
+| 123 | Key custody: file-protected, never on a command line, never in tokens or logs. | 7.7 |
+
+Invariant 7.2 is new. It comes from the folded `docs/protocol.md`; see Part H, claim H18.
 
 ### Old §17 — Reputation Substrate
 
@@ -395,8 +397,9 @@ publishes. The specification and the implementation must be reconciled, and that
 money-path decision rather than a documentation one. **The document was left as the specification
 says.** A docs-only pull request is the wrong place to weaken a money-path requirement.
 
-`docs/protocol.md:20` describes the shipped behavior, not the §7.5 requirement, so the two documents
-in this repository already disagree on this point.
+The deleted `docs/protocol.md` described the shipped behavior rather than the §7.5 requirement, so
+the two documents in this repository disagreed on this point. The consolidation removes that second,
+contradicting description. It does not resolve the underlying divergence between §5.5 and the code.
 
 ### D2 — the `reason_code` status class is not the emitted `status`
 
@@ -460,10 +463,92 @@ Section 18 of the rewritten document carries this mapping, so an engineer follow
 source comment still lands on the right section. Updating the comments themselves touches `.rs`
 files, which this pull request deliberately does not do. That is a follow-up.
 
+## Part H — the second old source: `docs/protocol.md`
+
+`docs/protocol.md` was the front-door narrative: the eight-step trade, the kind table, and the money
+invariants. It is folded into `protocol-v1.md` and deleted. The repository now has one protocol file.
+
+Folding means merging, not appending. Most of what `protocol.md` said, `protocol-v1.md` already said
+in more detail. Only content that was **unique** to `protocol.md` was carried across. Every
+substantive claim in the deleted file is listed below with its disposition.
+
+**22 claims enumerated: 13 already covered, 6 folded in, 3 dropped with reason.**
+
+### H.1 — claims already covered by `protocol-v1.md`
+
+No text was added for these. The spec already stated them, usually in more detail.
+
+| # | Claim in `protocol.md` | Already in |
+|---:|---|---|
+| H1 | Coordinates over Nostr, delivers as git, settles in Cashu ecash. | 1 |
+| H2 | Every marketplace event is in the `3400`–`3407` block with `t` and `v` tags. | 4, 16.1, 16.2 |
+| H3 | An event outside the namespace, or at another version, is rejected. | 16.1, 16.2 |
+| H4 | Offer carries task, output type, amount, optional target `p` tag, optional `repo`/`branch`. | 5.1, 6 (Offer) |
+| H5 | The claim is the invoice; a claim commits no compute. | 5.2, 6 (Claim) |
+| H6 | Award e-tags the offer as root and the one winning claim; other claimants release. | 5.3, 6 (Award), 6 (Release) |
+| H7 | Result carries `repo` / `branch` / `commit`. | 5.4, 6 (Execute and deliver) |
+| H8 | `ACCEPT` is its own kind, because a count of same-kind events is not a discriminator. | 4.1 |
+| H9 | Pay runs the budget gate, verifies delivery, checks the co-signature, then satisfies the `creq`. | 6 (Pay) |
+| H10 | The receipt binds the realized mint; the signatures are the proof, publication is not. | 5.7, 6 (Receipt) |
+| H11 | A deterministic verification failure publishes `REJECT`; indeterminate outcomes retry. | 6 (Verify), 6 (Reject), 13 |
+| H12 | Progress, errors, refusals, and releases are `FEEDBACK` with a reason code, never silent drops. | 8 |
+| H13 | The event kind table. | 4 |
+
+### H.2 — claims folded in, because `protocol-v1.md` did not carry them
+
+Each of these is new text in `protocol-v1.md`, written in STE and placed where its subject lives
+rather than in the abstract.
+
+| # | Claim in `protocol.md` | Folded into |
+|---:|---|---|
+| H14 | Cashu settlement is **mint-agnostic**. | 1 |
+| H15 | The `creq` carries the accepted mints, the amount, the unit, and a NIP-17 transport to the seller. | 6 (Claim) |
+| H16 | The buyer's verified hash becomes the `delivery_integrity_hash`. | 6 (Verify) |
+| H17 | **Bind first, publish second.** A crash between the two must never leave a public accepted state with no local bind. | 6 (Accept) |
+| H18 | **One offer, one award, write-once.** Sign once, persist before the first send, retry the exact bytes; an unresolved send never releases and never re-selects; recovery is a NEW offer. | 7.2 |
+| H19 | Every spend is recorded in an append-only ledger for audit. | 7.5 |
+
+H18 is the largest single addition. It is a money invariant that existed only in the front-door
+narrative and had no home in the spec. It is now invariant 7.2, which shifts the old invariants 7.2
+through 7.6 down by one.
+
+### H.3 — claims dropped, with reason
+
+| # | Claim in `protocol.md` | Why it was dropped |
+|---:|---|---|
+| H20 | "The normative wire specification … is `protocol-v1.md`." | A pointer from one file to the other. There is now one file, so the pointer has no referent. |
+| H21 | The offer carries a "capped `amount_sats`". | It contradicts the normative table. `protocol-v1.md` §5.1 has always described `["amount", sats, "sat"]` as a **fixed price**, not a cap. The spec wording is kept and the narrative wording is dropped. |
+| H22 | `FEEDBACK` carries a "closed reason-code enum". | It contradicts the normative rule. §8 requires a reader meeting an unknown `reason_code` to fall back to the coarse class and NOT treat the event as malformed, because the vocabulary is **extensible**. `crates/maxplayer-core/src/gateway.rs:653` agrees: "so the vocabulary is extensible". Only the `REJECT` vocabulary in §13 is closed. |
+
+H21 and H22 are the two places where the deleted narrative disagreed with the spec it summarized.
+Consolidating removes both contradictions.
+
+### H.4 — inbound references repointed
+
+`grep -rF "protocol.md"` across the repository, excluding `.git`, returned **6 hits in 6 files**. The
+`-F` literal does not match `protocol-v1.md`, so the list is exact. A second, wider search for
+`docs/protocol` without the extension and for `](protocol` returned nothing further.
+
+| File | Disposition |
+|---|---|
+| `README.md:7` | Repointed to `docs/protocol-v1.md`. |
+| `AGENTS.md:16` | Repointed to `docs/protocol-v1.md`. |
+| `docs/README.md:27` | Two protocol entries collapsed into one entry for `protocol-v1.md`. |
+| `web/app/llms.txt:28` | Repointed to the `protocol-v1.md` blob URL. |
+| `docs/protocol-v1-rewrite-map.md:398` | This file. The divergence D1 citation was reworded. |
+| `docs/issue-599-phase-0-kind-sweep.md:13` | **Annotated, not repointed.** See below. |
+
+`docs/issue-599-phase-0-kind-sweep.md` is a dated record of a past sweep. Its table row states that
+`docs/protocol.md` was changed by that sweep. Repointing the row to `protocol-v1.md` would make the
+record false, and would collide with the three rows that already describe `protocol-v1.md` changes in
+the same sweep. A closing note was added instead, recording that the file was folded and deleted.
+
+No file under `crates/` referenced `protocol.md`, so no code comment needed repointing.
+
 ## Part G — how to re-run the checks
 
 Both scripts are throwaway review tooling and are not committed.
 
-- Sentence length: every prose sentence in the new document is 20 words or fewer. Measured 0 of 669
-  over the limit. The old document measured 53 of 426 over the limit.
+- Sentence length: every prose sentence in the new document is 20 words or fewer. Measured 0 of 688
+  over the limit. The old `protocol-v1.md` measured 53 of 426 over the limit.
 - Table preservation: the Part A counts above.

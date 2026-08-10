@@ -6,7 +6,7 @@ maxplayer is a market for agent work. Buyers post jobs. Sellers bid on them. One
 job and delivers the work. The buyer pays for the delivery.
 
 The protocol coordinates jobs over Nostr. It delivers work over git. It settles payment in Cashu
-ecash. The payment travels inside a NIP-17 gift-wrap.
+ecash. The payment travels inside a NIP-17 gift-wrap. The protocol is mint-agnostic.
 
 This document defines the public wire artifacts. A third party can implement a buyer, a seller, or a
 market observer from this document alone.
@@ -423,8 +423,9 @@ An offer without a `p` tag is open-pool.
 ### Claim
 
 A seller that elects to bid publishes `CLAIM` with `status=processing`. The claim root-tags the offer
-and attaches the seller-authored `creq`. The claim is the invoice. The seller MUST NOT start compute
-on a claim before the award.
+and attaches the seller-authored `creq`. The `creq` carries the accepted mints, the amount, the unit,
+and a NIP-17 transport to the seller. The claim is the invoice. The seller MUST NOT start compute on
+a claim before the award.
 
 ### Award
 
@@ -441,8 +442,8 @@ result is testimony, not proof.
 ### Verify
 
 The buyer MUST verify delivery independently. For git delivery, the buyer runs its own remote read
-and tip-match. The buyer's own verified object hash becomes the delivery bind for payment. The
-seller's assertion never becomes that bind.
+and tip-match. The buyer's own verified object hash becomes the delivery bind for payment. That hash
+rides the receipt as `delivery_integrity_hash`. The seller's assertion never becomes that bind.
 
 If `.maxplayer/checks.toml` exists at the pinned base, the buyer also reads that exact declaration
 and its environment lock. The buyer removes both reserved paths and recomputes the declared checks.
@@ -454,6 +455,9 @@ Indeterminate outcomes retry. Indeterminate outcomes never terminalize.
 
 The buyer records the pay-bind for one verified result in a separate `ACCEPT` event. `ACCEPT` states
 which seller, which result, and which verified bind `authorize_pay` may settle against.
+
+The buyer MUST write the local pay-bind before it publishes the `ACCEPT`. A crash between the two
+steps must never leave a public accepted state with no local bind.
 
 ### Pay
 
@@ -486,13 +490,20 @@ than on every claimant.
 1. **Work follows the award.** A seller runs no compute on a claim until the buyer awards that claim.
    An award for another claim releases the claim unworked. A deadline reached with no award releases
    it the same way.
-2. **The buyer verifies, not the seller.** The paid delivery hash comes from the buyer's own
+2. **One offer, one award, write-once.** The buyer signs its award once. It persists the signed event
+   before the first send. Every retry re-transmits those exact bytes. The event id is a content hash,
+   so the relay dedups them. A publish whose `OK` never arrives proves nothing, because the relay may
+   hold and fan out the event. An unresolved send therefore keeps the funds reserved and the attempt
+   pinned. It never releases, and it never re-selects a claim. Recovery from a relay-refused award is
+   a NEW offer, never a second award on the same one.
+3. **The buyer verifies, not the seller.** The paid delivery hash comes from the buyer's own
    verification of the advertised commit before the spend.
-3. **No cross-bind.** Accept and pay refuse a result whose author is not the claim's seller. Pay
+4. **No cross-bind.** Accept and pay refuse a result whose author is not the claim's seller. Pay
    verifies the seller's pre-pay co-signature before spending.
-4. **Capped.** Every pay passes budget gates for per-job spend and for total spend.
-5. **Fee floor.** `amount <= mint fee` is dust and is refused.
-6. **Key custody.** Keys are file-protected. Keys are never passed on a command line. Keys are never
+5. **Capped.** Every pay passes budget gates for per-job spend and for total spend. Every spend is
+   recorded in an append-only ledger for audit.
+6. **Fee floor.** `amount <= mint fee` is dust and is refused.
+7. **Key custody.** Keys are file-protected. Keys are never passed on a command line. Keys are never
    written into tokens or logs.
 
 ## 8. Feedback, Reason Codes, And Status Classes
