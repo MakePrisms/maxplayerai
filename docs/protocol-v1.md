@@ -58,7 +58,7 @@ that cannot take that form is a new major.
 |---|---|---|---|
 | `0` | Profile | seller or buyer | Identity metadata |
 | `1059` | Gift-wrap (NIP-17) | buyer | Carries the payment payload privately |
-| `30617` | Repository announce (NIP-34) | seller | Announces the delivery remote |
+| `30617` | Repository announce (NIP-34) | seller | Optional repository announcement |
 | `30340` | Seat announcement | seller | Addressable liveness and capability |
 | `3400` | Receipt | buyer and seller | Co-signed settlement artifact |
 | `3401` | Offer | buyer | Job posting |
@@ -74,7 +74,7 @@ separate kinds.
 
 ## 4. The Seat
 
-A seat is one seller identity on the market. A seat publishes three events.
+A seat is one seller identity on the market. A seat publishes the events below.
 
 ### 4.1 Identity, kind `0`
 
@@ -110,10 +110,13 @@ harness. It does not mean the seat can run none.
 `accepting` is the seat's own statement of intent. A reader MUST NOT treat it as a guarantee. The
 authoritative signal that a seat will take a job is that the seat claims one.
 
-### 4.3 Delivery remote, kind `30617`
+### 4.3 Repository announcement, kind `30617`
 
-Kind `30617` announces the git remote the seat delivers to, as NIP-34 defines it. A reader MUST
-resolve delivery remotes from kind `30617` only.
+Kind `30617` announces a git repository the seat uses, as NIP-34 defines it. It is informational, and
+a seat MAY publish it.
+
+A reader MUST NOT use kind `30617` to resolve the remote for a delivery. The `repo` tag on the
+`RESULT` names the remote for that delivery. Section 6.4 defines it.
 
 ### 4.4 Discovery
 
@@ -135,10 +138,12 @@ A trade moves through these steps:
    invoice. A claim commits no compute. The seller MUST NOT start work before the award.
 3. **Award.** The buyer publishes exactly one `AWARD` naming the winning claim. Work starts only
    after this event.
-4. **Execute and deliver.** The awarded seat runs the work, pushes a git object to its delivery
-   remote, and publishes `RESULT`. Section 8 defines what the delivered object contains.
-5. **Verify.** The buyer MUST verify the delivery itself. The buyer reads the remote and matches the
-   tip against the advertised commit. The buyer's own verified object hash becomes the payment bind.
+4. **Execute and deliver.** The awarded seat runs the work and pushes a git object to a delivery
+   remote. The seat then publishes `RESULT`, which names that remote. Section 8 defines what the
+   delivered object contains.
+5. **Verify.** The buyer MUST verify the delivery itself. The buyer reads the remote named by the
+   result's `repo` tag. The buyer matches the tip against the advertised commit. The buyer's own
+   verified object hash becomes the payment bind.
    A seller assertion never becomes that bind.
 6. **Accept.** The buyer publishes `ACCEPT` to authorise payment for that result. The buyer MUST
    record its local pay-bind before it publishes the `ACCEPT`.
