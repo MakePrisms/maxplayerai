@@ -11331,6 +11331,7 @@ mod tests {
                 mode: crate::home::SandboxMode::Launcher,
                 launcher: vec!["definitely-not-a-real-binary-xyz".to_owned()],
                 image: None,
+                forward_env: Vec::new(),
             });
         })
         .expect("persist config");

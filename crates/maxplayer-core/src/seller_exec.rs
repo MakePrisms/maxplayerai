@@ -100,13 +100,41 @@ enum PolicyKind {
     Docker(DockerPolicy),
 }
 
-/// A resolved `docker` executor: a validated image. Built from
-/// [`crate::home::SandboxConfig`] via [`SandboxPolicy::from_config`], which fails closed on a
-/// misconfiguration (no image) rather than launching a half-configured container.
+/// A resolved `docker` executor: a validated image, plus any operator-named extra environment to
+/// carry in. Built from [`crate::home::SandboxConfig`] via [`SandboxPolicy::from_config`], which
+/// fails closed on a misconfiguration (no image) rather than launching a half-configured container.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DockerPolicy {
     image: String,
+    forward_env: Vec<String>,
 }
+
+/// The agent-auth environment carried from the daemon into the container.
+///
+/// A host executor inherits the daemon's environment, so a signed-in CLI simply works; a container
+/// inherits NOTHING, and without this every docker job dies on an auth error the operator can only
+/// fix by baking a credential into an image layer. Forwarding at run time keeps the secret out of a
+/// distributable artifact and lets it be rotated by restarting the daemon.
+///
+/// An ALLOWLIST, never the whole environment: the container runs a stranger's code, so it receives
+/// the named variables and nothing else. The names come from the auth prerequisites the presets
+/// already state (`agent_presets::preset_prerequisite`) — nothing here is invented, and a preset
+/// whose CLI reads something else is served by `[sandbox] forward_env`.
+///
+/// The base-URL pair rides along deliberately. An operator who points the daemon at a gateway and
+/// gets the key forwarded WITHOUT the endpoint would have the credential sent to the default
+/// provider instead — a worse failure than not forwarding at all.
+pub const FORWARDED_AGENT_ENV: &[&str] = &[
+    // claude — `preset_prerequisite("claude")` names ANTHROPIC_API_KEY; the OAuth pair is what
+    // `claude /login` actually leaves behind.
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    // codex — `preset_prerequisite("codex")` names OPENAI_API_KEY.
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+];
 
 /// The per-job facts a launch needs beyond the agent command: where the job's workdir is on the
 /// host (the docker bind-mount source), the delivery-identity env to carry into the run, and the
@@ -172,7 +200,10 @@ impl SandboxPolicy {
                     .ok_or_else(|| {
                         ExecError::Config("[sandbox] mode=docker requires an image".into())
                     })?;
-                Ok(Self::docker(DockerPolicy { image }))
+                Ok(Self::docker(DockerPolicy {
+                    image,
+                    forward_env: config.forward_env.clone(),
+                }))
             }
         }
     }
@@ -191,6 +222,17 @@ impl SandboxPolicy {
         match &self.kind {
             PolicyKind::Launcher(launcher) => launcher,
             PolicyKind::Passthrough | PolicyKind::Docker(_) => &[],
+        }
+    }
+
+    /// The operator's extra `[sandbox] forward_env` names, `None` under a host policy — which needs
+    /// no forwarding at all, having inherited the daemon's environment. The `None`/`Some(&[])`
+    /// distinction is load-bearing: it separates "nothing to forward" from "forward the built-in
+    /// set and nothing more".
+    pub fn forward_env(&self) -> Option<&[String]> {
+        match &self.kind {
+            PolicyKind::Docker(policy) => Some(&policy.forward_env),
+            PolicyKind::Passthrough | PolicyKind::Launcher(_) => None,
         }
     }
 
@@ -294,6 +336,41 @@ impl DockerPolicy {
         argv.extend_from_slice(agent_command);
         argv
     }
+}
+
+/// The agent-auth environment to carry into a container launch, read from the daemon's own
+/// environment: the [`FORWARDED_AGENT_ENV`] allowlist plus anything `[sandbox] forward_env` adds.
+///
+/// Empty for a host executor — it already inherits the daemon's environment, so forwarding would be
+/// a no-op that only made the argv longer. Only variables actually SET are returned, so an unset
+/// name never becomes an empty `-e FOO=` that would override a value baked into the image.
+pub fn forwarded_agent_env(policy: &SandboxPolicy) -> Vec<(String, String)> {
+    forwarded_agent_env_from(policy, |key| std::env::var(key).ok())
+}
+
+/// [`forwarded_agent_env`] over an injected environment, so the allowlist can be tested without
+/// mutating the process environment out from under other tests.
+fn forwarded_agent_env_from(
+    policy: &SandboxPolicy,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let Some(extra) = policy.forward_env() else {
+        return Vec::new();
+    };
+    let mut seen: Vec<&str> = Vec::new();
+    let mut out = Vec::new();
+    for key in FORWARDED_AGENT_ENV.iter().copied().chain(extra.iter().map(String::as_str)) {
+        let key = key.trim();
+        // An operator repeating a built-in name must not produce a doubled `-e`.
+        if key.is_empty() || seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        if let Some(value) = lookup(key) {
+            out.push((key.to_owned(), value));
+        }
+    }
+    out
 }
 
 /// Split a non-empty argv into `(program, args)` and pair it with the session `cwd`.
@@ -682,7 +759,11 @@ pub async fn run_agent_job(
 
     // Run the container/process as the seller's own uid/gid so a docker bind-mount's output is owned
     // by the seller and the delivery snapshot can read it. Ignored by the host executors.
-    let env = identity.git_env();
+    //
+    // The delivery identity, plus the agent-auth allowlist a container needs because it inherits
+    // nothing from the daemon. Empty under a host executor, which already inherits it all.
+    let mut env = identity.git_env();
+    env.extend(forwarded_agent_env(policy));
     let job = JobLaunch {
         workdir,
         env: &env,
@@ -825,6 +906,7 @@ mod tests {
         let agent_command = argv(&["claude-agent-acp"]);
         let policy = SandboxPolicy::docker(DockerPolicy {
             image: "maxplayer-sandbox:latest".into(),
+            forward_env: Vec::new(),
         });
         let env = vec![("GIT_AUTHOR_NAME".to_string(), "maxplayer-seller-abcd".to_string())];
         let workdir = Path::new("/home/seller/.maxplayer/seller-jobs/job1");
@@ -869,6 +951,7 @@ mod tests {
     fn docker_policy_hardens_against_the_strangers_code_it_runs() {
         let policy = SandboxPolicy::docker(DockerPolicy {
             image: "maxplayer-sandbox:latest".into(),
+            forward_env: Vec::new(),
         });
         let launch = policy
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -903,6 +986,100 @@ mod tests {
         );
     }
 
+    // A container inherits NOTHING from the daemon, so an agent CLI inside it has no credential
+    // unless one is carried in. This is the allowlist that carries it — and the reason it is an
+    // allowlist rather than "forward the environment" is that the container runs a stranger's code:
+    // every variable that crosses is one the job can read. The whole-environment case below is the
+    // one that must never regress.
+    #[test]
+    fn only_allowlisted_agent_auth_env_crosses_into_the_container() {
+        let daemon_env = |key: &str| -> Option<String> {
+            match key {
+                "ANTHROPIC_API_KEY" => Some("sk-ant-xxx".to_owned()),
+                "OPENAI_API_KEY" => Some("sk-oai-xxx".to_owned()),
+                // Set in the daemon, NOT on the allowlist, and must not cross.
+                "AWS_SECRET_ACCESS_KEY" => Some("the-seat's-other-secret".to_owned()),
+                "MAXPLAYER_HOME" => Some("/home/seller/.maxplayer".to_owned()),
+                _ => None,
+            }
+        };
+        let docker = SandboxPolicy::docker(DockerPolicy {
+            image: "maxplayer-sandbox:latest".into(),
+            forward_env: Vec::new(),
+        });
+        let carried = forwarded_agent_env_from(&docker, daemon_env);
+        let names: Vec<&str> = carried.iter().map(|(k, _)| k.as_str()).collect();
+
+        assert!(names.contains(&"ANTHROPIC_API_KEY") && names.contains(&"OPENAI_API_KEY"));
+        assert!(
+            !names.contains(&"AWS_SECRET_ACCESS_KEY"),
+            "an unrelated daemon secret must never reach a stranger's job: {names:?}"
+        );
+        assert!(
+            !names.contains(&"MAXPLAYER_HOME"),
+            "the seat's own paths are not the agent's business: {names:?}"
+        );
+        // An allowlisted name that is UNSET must not become `-e FOO=`, which would blank out a value
+        // an operator baked into their image.
+        assert!(
+            !names.contains(&"ANTHROPIC_AUTH_TOKEN"),
+            "an unset variable must not be forwarded empty: {carried:?}"
+        );
+    }
+
+    // A host executor is already a child of the daemon and inherits its whole environment, so
+    // forwarding there would be a no-op that only lengthened the argv.
+    #[test]
+    fn a_host_executor_forwards_nothing_because_it_inherits_everything() {
+        let always_set = |_: &str| Some("value".to_owned());
+        assert!(forwarded_agent_env_from(&SandboxPolicy::passthrough(), always_set).is_empty());
+        assert!(
+            forwarded_agent_env_from(&SandboxPolicy::wrapped(argv(&["bwrap"])), always_set).is_empty()
+        );
+    }
+
+    // `[sandbox] forward_env` serves a custom preset whose CLI reads a name the built-in set cannot
+    // know. Repeating a built-in name must not double the `-e`.
+    #[test]
+    fn operator_named_env_extends_the_allowlist_without_duplicating_it() {
+        let env = |key: &str| match key {
+            "ANTHROPIC_API_KEY" => Some("sk-ant-xxx".to_owned()),
+            "MY_AGENT_TOKEN" => Some("custom".to_owned()),
+            _ => None,
+        };
+        let policy = SandboxPolicy::docker(DockerPolicy {
+            image: "img".into(),
+            forward_env: vec!["MY_AGENT_TOKEN".into(), "ANTHROPIC_API_KEY".into()],
+        });
+        let carried = forwarded_agent_env_from(&policy, env);
+        let names: Vec<&str> = carried.iter().map(|(k, _)| k.as_str()).collect();
+
+        assert!(names.contains(&"MY_AGENT_TOKEN"), "{names:?}");
+        assert_eq!(
+            names.iter().filter(|n| **n == "ANTHROPIC_API_KEY").count(),
+            1,
+            "a built-in repeated by the operator must appear once: {names:?}"
+        );
+    }
+
+    // The forwarded pairs must reach the container as real `-e` flags, or the allowlist is theatre.
+    #[test]
+    fn forwarded_env_reaches_the_container_argv() {
+        let policy = SandboxPolicy::docker(DockerPolicy {
+            image: "maxplayer-sandbox:latest".into(),
+            forward_env: Vec::new(),
+        });
+        let env = vec![("ANTHROPIC_API_KEY".to_string(), "sk-ant-xxx".to_string())];
+        let launch = policy
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &env))
+            .expect("command");
+        assert!(
+            windowed(&launch.args, &["-e", "ANTHROPIC_API_KEY=sk-ant-xxx"]),
+            "the credential must cross as a -e flag: {:?}",
+            launch.args
+        );
+    }
+
     // from_config fails closed on a docker misconfiguration rather than launching a half-cage.
     #[test]
     fn from_config_rejects_incomplete_docker() {
@@ -911,6 +1088,7 @@ mod tests {
             mode: SandboxMode::Docker,
             launcher: Vec::new(),
             image: None,
+            forward_env: Vec::new(),
         };
         // docker with no image.
         assert!(SandboxPolicy::from_config(Some(&base)).is_err());
@@ -958,7 +1136,7 @@ mod tests {
             home.join("wallet.secret").display()
         );
         let agent_command = argv(&["sh", "-c", &probe]);
-        let policy = SandboxPolicy::docker(DockerPolicy { image });
+        let policy = SandboxPolicy::docker(DockerPolicy { image, forward_env: Vec::new() });
         let job = JobLaunch {
             workdir: &workdir,
             env: &[],

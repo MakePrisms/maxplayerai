@@ -297,6 +297,18 @@ pub struct SandboxConfig {
     /// CA certs — see `docker/maxplayer-sandbox/Dockerfile`). Required under `docker` mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// `docker` mode: EXTRA environment variables to carry from the daemon into the container, on
+    /// top of the built-in agent-auth set (see `seller_exec::FORWARDED_AGENT_ENV`).
+    ///
+    /// A host executor inherits the daemon's environment wholesale; a container inherits nothing, so
+    /// without this an agent CLI inside the container has no credential and every job fails an auth
+    /// error. Named variables only — never the whole environment, which would hand a stranger's job
+    /// every secret the daemon happens to hold.
+    ///
+    /// Only needed for a custom `[agents]` preset whose CLI reads a variable the built-in set does
+    /// not name, or to carry a gateway base-URL. Unused under `launcher` mode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forward_env: Vec<String>,
 }
 
 /// Which executor the `[sandbox]` section selects.

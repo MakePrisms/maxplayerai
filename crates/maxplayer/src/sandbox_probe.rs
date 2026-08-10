@@ -808,6 +808,7 @@ mod tests {
             mode: maxplayer_core::home::SandboxMode::Docker,
             launcher: Vec::new(),
             image: Some(image),
+            forward_env: Vec::new(),
         }))
         .expect("mode=docker with an image resolves");
         let verdict = probe_containment(&policy, &root);

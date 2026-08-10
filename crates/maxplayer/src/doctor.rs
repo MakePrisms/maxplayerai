@@ -1520,6 +1520,7 @@ mod tests {
             mode: SandboxMode::Launcher,
             launcher: vec!["definitely-not-a-real-binary-xyz".into()],
             image: None,
+            forward_env: Vec::new(),
         }));
         assert_eq!(
             bogus.status,
@@ -1539,6 +1540,7 @@ mod tests {
                 mode: SandboxMode::Launcher,
                 launcher: vec![real],
                 image: None,
+                forward_env: Vec::new(),
             }))
             .status,
             Status::Pass,
@@ -1697,6 +1699,7 @@ mod tests {
                 mode: SandboxMode::Docker,
                 launcher: Vec::new(),
                 image: Some("maxplayer-sandbox:latest".into()),
+                forward_env: Vec::new(),
             })
         };
 
@@ -1750,6 +1753,7 @@ mod tests {
             mode: maxplayer_core::home::SandboxMode::Launcher,
             launcher: vec!["definitely-not-a-real-binary-xyz".into()],
             image: None,
+            forward_env: Vec::new(),
         });
         home.config.relay_url = "not-a-relay-url".into();
         home.config.accepted_mints = Vec::new();
