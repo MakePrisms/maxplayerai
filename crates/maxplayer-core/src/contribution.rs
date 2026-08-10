@@ -119,7 +119,10 @@ impl ContributionBase {
     /// published on the wire is byte-identical to what the seller's `rev-parse`/verify produces.
     pub fn new(branch: impl Into<String>, oid: impl Into<String>) -> Result<Self, ContributionError> {
         let branch = branch.into().trim().to_owned();
-        let oid = oid.into().trim().to_owned();
+        // Do not normalize the oid: the contribution tag must contain the exact canonical commit
+        // id supplied by the buyer. In particular, trimming here would make a value other than
+        // exactly 40 lowercase hex characters pass validation.
+        let oid = oid.into();
         if branch.is_empty()
             || branch.starts_with('-')
             || branch.bytes().any(|b| b.is_ascii_control())
@@ -692,6 +695,7 @@ mod tests {
         // Uppercase refused (not silently lowercased).
         assert!(ContributionBase::new("main", "A".repeat(40)).is_err());
         assert!(ContributionBase::new("main", "deadBEEF".to_owned() + &"a".repeat(32)).is_err());
+        assert!(ContributionBase::new("main", format!(" {} ", "a".repeat(40))).is_err());
         // Valid canonical 40 lowercase hex passes, unchanged on the way through.
         let ok = ContributionBase::new("main", "0123456789abcdef".to_owned() + &"a".repeat(24))
             .expect("canonical 40 lowercase hex must pass");
