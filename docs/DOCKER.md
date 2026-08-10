@@ -106,14 +106,19 @@ tools or keys, and no host secrets.
 
 ### The `[sandbox]` config section
 
-The seller config supports an optional `[sandbox]` section with a single key, `launcher` — an argv
-array. When the section is present, the launcher argv is **prepended** to the agent command, so the
-agent runs inside whatever OS-level sandbox the launcher provides:
+The seller config supports an optional `[sandbox]` section. `mode` selects the executor — `launcher`
+(the default) or `docker`:
 
 ```toml
 [sandbox]
+mode = "launcher"                                          # default; may be omitted
 launcher = ["<sandbox-binary>", "<arg1>", "<arg2>", "..."]
 ```
+
+Under `launcher` mode the launcher argv is **prepended** to the agent command, so the agent runs
+inside whatever OS-level sandbox the launcher provides. Under `docker` mode the daemon runs the agent
+in a container that mounts only the per-job workdir — see "`mode = \"docker\"` and this image" below
+before reaching for it, because **it does not work in this deployment**.
 
 Semantics, exactly as implemented:
 
@@ -135,6 +140,30 @@ in `/data` and the job workdir, but it blocks boot only for a seat claiming open
 targeted-only seat — the default for this image — it is advisory (a WARN), and either way it samples
 one canary read and one workdir write, not your other secret paths. Verifying that your launcher
 actually blocks `/data` remains your responsibility — see "Verify" below.
+
+### `mode = "docker"` and this image
+
+**Do not use `mode = "docker"` with this compose deployment.** It is meant for a seller running
+directly on a host, and the failure here is silent.
+
+The seller in `docker-compose.yml` is *itself* in a container, and `mode = "docker"` launches a
+**sibling** container through the host's docker daemon. Two things break:
+
+1. **No docker to call.** The runtime image carries only the binary and CA roots, and no
+   `/var/run/docker.sock` is mounted. `maxplayer doctor` FAILs on this before the seat advertises.
+2. **The bind mount resolves against the wrong filesystem.** This is the dangerous one. If you "fix"
+   (1) by mounting the socket and installing the docker CLI, the daemon runs
+   `docker run -v /data/seller-jobs/<job_id>:/work …` — and that path is interpreted by the **host**
+   daemon, where `/data` does not exist. It lives at `/var/lib/docker/volumes/seller-data/_data/…`
+   instead. Docker **creates a missing bind source as an empty directory** rather than refusing, so
+   the agent works in a phantom `/work`, the delivery snapshot finds the seller's real workdir
+   untouched, and the buyer is charged for an **empty delivery**.
+
+Because (2) produces no error anywhere, the boot gate refuses it outright: `maxplayer doctor` detects
+that the seller is itself containerized (`/.dockerenv`) and FAILs any `mode = "docker"` config.
+
+**To sandbox a compose-deployed seller, use `launcher` mode** — the bubblewrap example below runs
+inside this container and needs no docker socket. `mode = "docker"` is for a seller on the host.
 
 ### Working example: bubblewrap inside the container
 

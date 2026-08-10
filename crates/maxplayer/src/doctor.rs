@@ -648,6 +648,24 @@ mod checks {
     /// (#357/#358). A pass-through policy (no `[sandbox]` section) launches the agent directly, so
     /// there is nothing to resolve: a no-op Pass, never a spurious Fail.
     pub(super) fn check_sandbox_launcher(sandbox: Option<SandboxConfig>) -> Check {
+        check_sandbox_launcher_in(sandbox, container_marker())
+    }
+
+    /// The marker a container runtime plants in every container it starts — `Some(path)` when THIS
+    /// process is itself containerized. Parsing cgroups is not an alternative: under cgroup v2 a
+    /// container's `/proc/1/cgroup` reads `0::/`, byte-identical to the host's.
+    fn container_marker() -> Option<&'static str> {
+        ["/.dockerenv", "/run/.containerenv"]
+            .into_iter()
+            .find(|marker| std::path::Path::new(marker).exists())
+    }
+
+    /// [`check_sandbox_launcher`] over an injected container marker, so both sides of the
+    /// docker-in-docker refusal are testable on a host that is not itself in a container.
+    pub(super) fn check_sandbox_launcher_in(
+        sandbox: Option<SandboxConfig>,
+        container: Option<&str>,
+    ) -> Check {
         let policy = match SandboxPolicy::from_config(sandbox.as_ref()) {
             Ok(policy) => policy,
             Err(error) => {
@@ -661,6 +679,27 @@ mod checks {
         // Under `mode = "docker"` there is no launcher argv; the spawn is `docker run …`, so the
         // same "resolves before it can ENOENT every job" property is asked of `docker` itself.
         if let Some(image) = policy.docker_image() {
+            // Docker-in-docker. `docker run -v <host path>:/work` is resolved by the HOST daemon, so
+            // a seller that is itself containerized would name a workdir that exists only inside its
+            // own filesystem (under compose: `/data/seller-jobs/…` on a named volume). Docker CREATES
+            // a missing bind source as an empty directory rather than refusing — so the agent would
+            // work in a phantom `/work`, the delivery snapshot would find the seller's real workdir
+            // untouched, and the buyer would be charged for an EMPTY tree.
+            //
+            // Every other docker misconfiguration fails loudly at spawn. This one does not, which is
+            // why it is refused here rather than left to be discovered by a paying buyer.
+            if let Some(marker) = container {
+                return Check::fail(
+                    SANDBOX_CHECK,
+                    format!(
+                        "[sandbox] mode=docker (image '{image}'), but this seller is ITSELF running \
+                         in a container ({marker}) — the per-job bind mount would resolve against \
+                         the host filesystem, not this one, and a job would deliver an EMPTY tree"
+                    ),
+                    "run the seller directly on the host to use mode=docker, or switch [sandbox] to a \
+                     launcher that confines from inside a container",
+                );
+            }
             return if argv0_resolvable("docker") {
                 Check::pass(
                     SANDBOX_CHECK,
@@ -1640,6 +1679,51 @@ mod tests {
         assert_eq!(
             ContainmentModel::DenyList.guarantee_clause(),
             "assumed deny-list for this platform: probed paths only — unlisted paths remain reachable"
+        );
+    }
+
+    // Docker-in-docker is the ONE docker misconfiguration that does not fail at spawn: the per-job
+    // bind mount is resolved by the host daemon, docker creates the missing source as an empty dir,
+    // and the job delivers an empty tree a buyer has already paid for. Every other docker fault
+    // ENOENTs loudly, so this is the one the gate has to catch by reasoning rather than by trying.
+    // Delete the `container` branch in `check_sandbox_launcher_in` and this goes red.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn docker_mode_is_refused_when_the_seller_is_itself_containerized() {
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
+
+        let docker = || {
+            Some(SandboxConfig {
+                mode: SandboxMode::Docker,
+                launcher: Vec::new(),
+                image: Some("maxplayer-sandbox:latest".into()),
+            })
+        };
+
+        let inside = checks::check_sandbox_launcher_in(docker(), Some("/.dockerenv"));
+        assert_eq!(
+            inside.status,
+            Status::Fail,
+            "a containerized seller must not advertise mode=docker: {}",
+            inside.render()
+        );
+        assert!(
+            inside.detail.contains("EMPTY"),
+            "the refusal must name the SILENT outcome (an empty delivery), not just a bad mount: {}",
+            inside.detail
+        );
+        assert!(
+            inside.render().contains("fix:"),
+            "a FAIL must carry a fix hint"
+        );
+
+        // Off the host-in-a-container path the same config is judged only on whether docker resolves.
+        // Without this, a check that always failed would satisfy the assertions above.
+        let outside = checks::check_sandbox_launcher_in(docker(), None);
+        assert!(
+            !outside.detail.contains("ITSELF running"),
+            "a seller on the host must never be refused for being containerized: {}",
+            outside.detail
         );
     }
 
