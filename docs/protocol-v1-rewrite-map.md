@@ -24,32 +24,44 @@ one.
 ## Part A — tables, proven byte-identical
 
 Every markdown table row in the old document was compared against the new document as exact bytes.
+Many rows repeat across tables (`["t","maxplayer"]` appears in seven), so the comparison is over
+**distinct** rows.
 
 | Measure | Count |
 |---|---:|
-| Table rows in the old document | 115 |
-| Table rows in the new document | 126 |
-| Old rows byte-identical in the new document | 113 |
-| Old rows missing from the new document | 0 |
-| Old rows changed | 2 |
-| Rows new in this rewrite | 11 |
+| Table rows in the old document | 115 raw, 91 distinct |
+| Table rows in the new document | 134 raw, 106 distinct |
+| Distinct old rows preserved byte-identical | 81 |
+| Distinct old rows missing entirely | 0 |
+| Distinct old rows changed | 10 |
+| Distinct new rows | 25, of which 15 are wholly new |
 
-The two changed rows are both in the heartbeat table. Each changed only its cross-reference and its
-dash style, never its normative cell:
+**No old row was dropped.** The 10 changed rows fall into two groups.
+
+*Two heartbeat rows* changed only their cross-reference and dash style, never a normative cell:
 
 - `["accepting","y" or "n"]` — `see 7.8.1` became `see 5.8.1`.
 - `["queue_depth", n]` — `see 7.8.1` became `see 5.8.1`.
 
-The 11 new rows are the two navigation tables added by this rewrite: the reserved-path registry in
-Section 17 (1 header + 2 rows) and the code-citation index in Section 18 (1 header + 7 rows). Neither
-table states a new requirement.
+*Eight `reason_code` rows* — the header and all seven codes — gained a fourth column, `Emitted
+today`. The three original columns are unchanged in every row. Part D2 explains why the column was
+added: the table was presenting a specified class as though it were live wire behavior.
+
+The 25 distinct new rows are those 10 changed rows in their new form, plus 15 wholly new ones:
+
+- 4 rows in the §5.5 `ACCEPT` table, which Part D1 rewrote from a bullet list into the shipped tag
+  shape. Its other three rows are byte-identical to rows the old document already had.
+- 3 rows in the reserved-path registry (§17).
+- 8 rows in the code-citation index (§18).
 
 This covers, byte for byte, the `Card.` / `Req.` / `If absent` cells of every tag table, the event
-kind table, the receipt field-semantics table, and the `reason_code` vocabulary table.
+kind table, and the receipt field-semantics table.
 
 ## Part B — prose normative statements, old section to new section
 
-185 normative statements were mapped. None were dropped.
+185 normative statements were mapped. **None were dropped. Five were amended** to match verified
+shipped behavior, and each amended row is marked in place with the Part D finding that drove it:
+rows 59, 60, and 67, plus the table and category rows 98 and 99.
 
 ### Old §2 — Scope And Terms
 
@@ -163,15 +175,15 @@ kind table, the receipt field-semantics table, and the `reason_code` vocabulary 
 | 56 | A reader attempting bound delivery verification MUST reject a partial group. | 5.1 |
 | 57 | The claim is the invoice. A claim commits no compute. | 5.2 |
 | 58 | `ACCEPT` is buyer-authored and MUST be separate from `AWARD`. | 5.5 |
-| 59 | `ACCEPT` MUST carry the seven listed binding fields. | 5.5 |
-| 60 | A reader MUST reject `ACCEPT` if any required binding field is absent. | 5.5 |
+| 59 | `ACCEPT` MUST carry the seven listed binding fields. | 5.5, **AMENDED — see D1** |
+| 60 | A reader MUST reject `ACCEPT` if any required binding field is absent. | 5.5, **AMENDED — see D1** |
 | 61 | `FEEDBACK` `content` carries the machine-readable reason form. | 5.6 |
 | 62 | `queue_depth` MUST count jobs in a named non-terminal state, awarded or executing. | 5.8.1 |
 | 63 | `queue_depth` MUST return to `0` when none remain; never a lifetime total, never a flag. | 5.8.1 |
 | 64 | `accepting` MUST be the seller's assertion of intent: free of in-flight work AND ≥1 harness serving. | 5.8.1 |
 | 65 | A seat MAY define either condition more conservatively, never more loosely. | 5.8.1 |
 | 66 | Readers MUST NOT infer claim eligibility from `accepting` or `queue_depth`. | 5.8.1 |
-| 67 | The authoritative signals are a claim, or a `FEEDBACK` refusal carrying `at_capacity`. | 5.8.1 |
+| 67 | The authoritative signals are a claim, or a `FEEDBACK` refusal carrying `at_capacity`. | 5.8.1, **AMENDED — see D2** |
 | 68 | A seat MAY publish no `mobee_agent` while running an unadvertised harness. | 5.8.1 |
 | 69 | Readers MUST treat an absent `mobee_agent` as *unstated*, never as *none*. | 5.8.1 |
 | 70 | Kind `0`: readers MAY parse content; MUST treat malformed or absent fields as unset. | 5.9 |
@@ -217,8 +229,8 @@ kind table, the receipt field-semantics table, and the `reason_code` vocabulary 
 | 95 | A reader MUST NOT parse `content` to determine the class. | 8 |
 | 96 | A reader meeting an unknown `reason_code` MUST fall back to the class named by `status`. | 8 |
 | 97 | That reader MUST NOT treat the event as malformed; the vocabulary is extensible. | 8 |
-| 98 | The seven-code vocabulary table with its scoring column. | 8 (Part A) |
-| 99 | The four status categories and their terminality. | 8 |
+| 98 | The seven-code vocabulary table with its scoring column. | 8 (Part A), **column added — see D2** |
+| 99 | The four status categories and their terminality. | 8, emission marked in 8.1 — see D2 |
 | 100 | An unsupported protocol major MUST NOT be collapsed into "unparseable". | 8 |
 | 101 | The scoring column is normative for scoring, not for transport. | 8 |
 | 102 | One pass MUST enumerate every reject, decline, and error emission point in the seller daemon. | 8 |
@@ -364,6 +376,11 @@ Invariant 7.2 is new. It comes from the folded `docs/protocol.md`; see Part H, c
 
 None. No normative statement from the old document was dropped.
 
+Five statements were **amended** rather than dropped, after the Part D divergences were verified in
+the tree. An amendment replaces a requirement the code does not implement with a description of what
+the code does, and routes the design question to an issue. Nothing was deleted silently, and nothing
+unverified was imported as true. Part D gives the evidence for each.
+
 Four passages lost their historical framing while keeping their normative content. Each is a wording
 change, not a meaning change:
 
@@ -376,8 +393,14 @@ change, not a meaning change:
 
 ## Part D — divergences found between the document and the code
 
-These were found while cross-checking. **This pull request changed neither side.** They are reported
-here for the reviewer to route.
+Both were re-verified in the tree before any section was touched. Both are **CONFIRMED**. The
+document now describes the shipped behavior in each case, because this document describes what is.
+**No `.rs` file was changed.** The design questions are routed to issues, not settled here.
+
+| Divergence | Verify result | What changed in the doc | Where the design question went |
+|---|---|---|---|
+| D1 — `ACCEPT` binds neither `job-hash` nor a result `e` tag | CONFIRMED | §5.5 rewritten to the shipped wire | Issue #640 |
+| D2 — status classes are not the emitted `status` | CONFIRMED, and wider than first reported | §8 table gains an `Emitted today` column; new §8.1; §5.8.1 amended | Left with the existing follow-up comment at `gateway.rs:695` |
 
 ### D1 — `ACCEPT` carries neither `job-hash` nor a reply-marked result `e` tag
 
@@ -392,25 +415,88 @@ the `status`, `t`, and `v` tags added by `status_draft` at
 and `job_hash` in its local `AcceptedBind` instead, at
 `crates/maxplayer-core/src/job_lifecycle.rs:1300`.
 
-A reader that applies the Section 5.5 rule as written rejects every `ACCEPT` this implementation
-publishes. The specification and the implementation must be reconciled, and that decision is a
-money-path decision rather than a documentation one. **The document was left as the specification
-says.** A docs-only pull request is the wrong place to weaken a money-path requirement.
+**Re-verified independently before §5.5 was touched.** The first report checked the writer only. The
+second pass enumerated every construction site of kind `3406` and found the reader agrees with the
+writer:
+
+- `gateway.rs:524` — `parse_accept` gates on the kind, then calls `parse_offer_and_claim_tags`.
+- `gateway.rs:534` — that helper resolves the `root`-marked `e` tag as the offer and **the other `e`
+  tag as the claim**. It reads no `job-hash`. Its own doc comment says so.
+- `seller_node/run.rs:3924` — the seller consumes `ACCEPT` through the same parser.
+- `job_lifecycle.rs:1288` hands the draft straight to `publish_draft_async`. No tag is appended
+  between construction and publication.
+- The one other `accept_draft` call site, `seller_node/run.rs:7853`, is a test fixture.
+
+So the writer, the reader, and the seller-side consumer all agree on a shape that §7.5 did not
+describe. A reader applying §7.5 literally would reject every `ACCEPT` this implementation publishes.
+
+**Resolution.** §5.5 was rewritten to describe the shipped wire exactly, because this document
+describes what is. The design question — whether `ACCEPT` *should* bind the `job-hash` and a
+reply-marked result `e` tag — is filed as **issue #640**, citing both code sites and both doc
+readings. §5.5 links to it. No `.rs` file was changed; changing the wire here is a money-path
+decision.
 
 The deleted `docs/protocol.md` described the shipped behavior rather than the §7.5 requirement, so
 the two documents in this repository disagreed on this point. The consolidation removes that second,
-contradicting description. It does not resolve the underlying divergence between §5.5 and the code.
+contradicting description, and the §5.5 rewrite removes the first.
 
-### D2 — the `reason_code` status class is not the emitted `status`
+### D2 — declared values that no code path emits
 
-Section 8 classes `below_rate` and `no_sentinel` as `refusal`. Every site that builds feedback
-through `error_draft` emits `status=error`, at `crates/maxplayer-core/src/gateway.rs:703`. No code
-path emits `status` values `refusal`, `claim_released`, or `progress`; a repository-wide grep for
-those three literals in `crates/**/*.rs` returns nothing.
+**Re-verified, and the confirmed scope is wider than the first report.** The re-check enumerated
+every `status` tag construction and every `ReasonCode` construction in the workspace.
 
-The code comment at `crates/maxplayer-core/src/gateway.rs:695` names this gap and calls the
-re-classing "a deliberate view change left as a follow-up". The table was preserved unchanged,
-because it is the specification and the code documents itself as lagging it.
+`status_draft` at `gateway.rs:824` is the single chokepoint that writes a `status` tag. It has five
+production call sites, and their literals are the complete set of status values on this wire:
+
+| Value | Kind | Site |
+|---|---|---|
+| `processing` | `CLAIM` | `gateway.rs:447` |
+| `accepted` | `AWARD` | `gateway.rs:462` |
+| `accepted` | `ACCEPT` | `gateway.rs:488` |
+| `error` | `FEEDBACK` | `gateway.rs:712` |
+| `rejected` | `REJECT` | `gateway.rs:735` |
+
+Two findings follow.
+
+**Finding 1 — three status categories have no producer.** A search of `crates/**/*.rs` for the
+literals `progress`, `claim_released`, and `refusal` returns **zero** matches. Only `error` is
+emitted on `FEEDBACK`. `crates/maxplayer-core/src/buyer/mod.rs:2321` corroborates this from the
+reader side, in its own words: the codes "ride the byte-identical wire — same kind, same tags,
+`status=error`".
+
+**Finding 2 — three reason codes have no producer.** This was not in the first report. Counting
+`ReasonCode::` references outside the enum definition and its `as_str` arm:
+
+| Code | Production references | Emitted |
+|---|---:|---|
+| `below_rate` | 3 | yes |
+| `unsupported_version` | 0 | no |
+| `mint_incompatible` | 0 | no |
+| `at_capacity` | 0 | no |
+| `execution_failed` | 9 | yes |
+| `delivery_failed` | 17 | yes |
+| `no_sentinel` | 5 | yes |
+
+The only appearances of `at_capacity` outside the enum are two buyer-side doc comments and one buyer
+test. The buyer reader handles all three unemitted codes as pre-award declines that release no
+reservation, at `crates/maxplayer-core/src/buyer/mod.rs:2323`. So the vocabulary is reader-supported
+and partly unproduced.
+
+**Resolution.** No claim was lost and none was imported as true:
+
+- The `reason_code` table gains a fourth column, **`Emitted today`**, marking each of the seven codes.
+- A new **§8.1** states the three facts with their code cites: the `Status class` column is not the
+  `status` tag value, three status categories have no producer, and three reason codes have no
+  producer.
+- **§5.8.1 was amended.** It claimed the authoritative "will not take a job" signal is a `FEEDBACK`
+  refusal carrying `at_capacity`. No path emits that code, so the claim is now marked as specified
+  and not yet produced. This was a contradicted claim that the first pass carried forward unmarked.
+- The four status categories and the seven reason codes all stay defined. The extensibility rule
+  requires readers to tolerate values they have not seen, so deleting the unproduced ones would be
+  wrong.
+
+The comment at `crates/maxplayer-core/src/gateway.rs:695` already calls the re-classing "a deliberate
+view change left as a follow-up", so no new issue was filed for D2.
 
 ## Part E — content added by this rewrite, with its evidence
 

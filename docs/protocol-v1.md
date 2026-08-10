@@ -282,17 +282,32 @@ The claim is the invoice. A claim commits no compute.
 
 ### 5.5 Accept `3406`
 
-`ACCEPT` is buyer-authored. It MUST be separate from `AWARD`. It MUST carry:
+`ACCEPT` is buyer-authored. It MUST be separate from `AWARD`.
 
-- `["e", offer_id, "", "root"]`
-- `["e", result_id, "", "reply"]`
-- `["p", buyer_pubkey]`
-- `["p", seller_pubkey]`
-- `["job-hash", hash]`
-- `["t","maxplayer"]`
-- `["v","1"]`
+| Tag | Card. | Req. | Meaning | If absent |
+|---|---|---:|---|---|
+| `["status","accepted"]` | 1 | yes | Accept lifecycle state | not gated by the pay-bind parser |
+| `["e", offer_id, "", "root"]` | 1 | yes | Root offer id | reject |
+| `["e", claim_id]` | 1 | yes | Accepted claim id, unmarked | reject |
+| `["p", buyer_pubkey]` | 1 | yes | Accepting buyer | not gated by the pay-bind parser |
+| `["p", seller_pubkey]` | 1 | yes | Bound seller | not gated by the pay-bind parser |
+| `["t","maxplayer"]` | 1 | yes | Namespace | reject |
+| `["v","1"]` | 1 | yes | Protocol major | reject |
 
-A reader MUST reject `ACCEPT` if any required binding field is absent.
+`ACCEPT` carries the same tag shape as `AWARD`. The two events differ only by kind. A reader MUST
+gate on the kind before it reads the tags. A reader MUST NOT let one event satisfy a check meant for
+the other.
+
+The second `e` tag names the **claim**. It does not name the result, and it carries no `reply`
+marker. A reader resolves the pair by marker, not by position. The `root`-marked `e` tag is the
+offer. The other `e` tag is the claim. A reader MUST reject `ACCEPT` when either `e` tag is absent.
+
+`ACCEPT` carries no `job-hash` tag and no result id. The buyer holds those facts in its own local
+pay-bind. They are the result id, the commit, the repository, the branch, and the job hash. They do
+not ride the wire, so a third party cannot join an `ACCEPT` to the result it authorizes.
+
+That last property is a known open design question. Issue #640 asks whether `ACCEPT` should bind the
+`job-hash` and a reply-marked result `e` tag.
 
 ### 5.6 Feedback `3404`
 
@@ -390,6 +405,10 @@ buyer MUST preserve `metadata_trust=seller-claimed`.
 > The authoritative signal that a seat will take a job is that it claims one. The authoritative
 > signal that it will not is a `FEEDBACK` refusal carrying `at_capacity`, defined in Section 8. A
 > reader that waits on `accepting` waits on a field no implementation must consult.
+>
+> No seller path emits `at_capacity` today, as Section 8.1 records. The refusal signal is therefore
+> specified and not yet produced. A full seat stays absent from the market rather than announcing
+> itself.
 
 The seller asserts both tags, as Section 14 describes. Both ride on a replaceable event. A past value
 of either tag is therefore uncitable after the fact, as Section 3.4 states. Their observed values
@@ -536,15 +555,15 @@ The wire rule is:
 
 The v1 `reason_code` vocabulary is:
 
-| Code | Status class | Counts against the seller |
-|---|---|---|
-| `below_rate` | `refusal` | no |
-| `unsupported_version` | `refusal` | no |
-| `mint_incompatible` | `refusal` | no |
-| `at_capacity` | `refusal` | no |
-| `execution_failed` | `error` | yes |
-| `delivery_failed` | `error` | yes |
-| `no_sentinel` | `refusal` | yes |
+| Code | Status class | Counts against the seller | Emitted today |
+|---|---|---|---|
+| `below_rate` | `refusal` | no | yes |
+| `unsupported_version` | `refusal` | no | no |
+| `mint_incompatible` | `refusal` | no | no |
+| `at_capacity` | `refusal` | no | no |
+| `execution_failed` | `error` | yes | yes |
+| `delivery_failed` | `error` | yes | yes |
+| `no_sentinel` | `refusal` | yes | yes |
 
 The v1 status categories are:
 
@@ -553,6 +572,8 @@ The v1 status categories are:
 - `refusal`: terminal for that attempted action. Retryability of the job depends on a later claim or
   award.
 - `error`: terminal for that seller's attempt, unless a later replacement result succeeds.
+
+Section 8.1 states which of these values this implementation emits today.
 
 A cross-version refusal is distinct from a malformed-event refusal. An unsupported protocol major
 MUST NOT be collapsed into "unparseable".
@@ -563,6 +584,32 @@ count against a seller. Declines do not.
 Implementation note: one pass MUST enumerate every reject, decline, and error emission point in the
 seller daemon. A vocabulary added only at the sites that prompted it reproduces the original defect.
 The defect then carries a `reason_code` tag on top of it.
+
+### 8.1 What this implementation emits today
+
+The tables above define the vocabulary. They do not describe the wire this implementation currently
+produces. The gap is recorded here, so no reader mistakes a specified value for an observed one.
+
+**The `Status class` column is not the `status` tag value.** Every `FEEDBACK` this implementation
+publishes carries `status=error`. The single builder is `error_draft`, at
+`crates/maxplayer-core/src/gateway.rs:712`. A `below_rate` decline and a `no_sentinel` refusal both
+ride `status=error`, although the table classes each one as `refusal`. The comment at
+`crates/maxplayer-core/src/gateway.rs:695` records the re-classing as a deliberate follow-up. The
+reader side states the same fact at `crates/maxplayer-core/src/buyer/mod.rs:2321`: these codes "ride
+the byte-identical wire — same kind, same tags, `status=error`".
+
+**Three status categories have no producer.** Only `error` is emitted. A search of `crates/**/*.rs`
+for the literals `progress`, `claim_released`, and `refusal` returns no match. All three stay defined
+above, because the wire rule requires a reader to tolerate a class it has not seen.
+
+**Three reason codes have no producer.** No path constructs `unsupported_version`,
+`mint_incompatible`, or `at_capacity` outside the enum that defines them. The buyer reader already
+handles all three, as pre-award declines that release no reservation, at
+`crates/maxplayer-core/src/buyer/mod.rs:2323`. A reader MUST still accept these codes, exactly as it
+accepts a code it does not recognize.
+
+None of this relaxes the rules above. A publisher MUST still carry a `reason_code`. A reader MUST
+still treat that tag as authoritative for the class.
 
 ## 9. Delivery: The Node Workdir Snapshot
 
