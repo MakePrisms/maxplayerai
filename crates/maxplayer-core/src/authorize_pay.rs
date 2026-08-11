@@ -560,9 +560,9 @@ pub async fn authorize_pay_async(
     let charged = cap_charge(hop.as_ref().map(|(_, _, pairing)| pairing), amount);
     // Delivery already verified + bind-checked above (pre-budget). The budget append happens here,
     // before any melt and before the wallet send inside `run_verified`.
-    let state = gate.authorize_then_attempt(attempt_id.as_str(), charged, || {
+    let state = gate.authorize_then_attempt_with_gate(attempt_id.as_str(), charged, |gate| {
         if let Some((store, hop_effects, pairing)) = hop.as_mut() {
-            crossmint_hop::run_hop(store, hop_effects, pairing)?;
+            crossmint_hop::run_hop(store, hop_effects, pairing, gate)?;
         }
         let state =
             PaymentService::new(&journal).run_verified(&key, &terms, &authority, &mut effects)?;

@@ -230,6 +230,18 @@ impl BudgetGate {
         Ok(effect())
     }
 
+    /// Authorize keyed by `attempt_id`, then give the effect the same gate for nested,
+    /// distinctly-keyed charges. The initial reservation is still durable before the effect.
+    pub(crate) fn authorize_then_attempt_with_gate<T>(
+        &mut self,
+        attempt_id: &str,
+        amount: u64,
+        effect: impl FnOnce(&mut Self) -> T,
+    ) -> Result<T, BudgetRefuse> {
+        self.reserve(amount, Some(attempt_id))?;
+        Ok(effect(self))
+    }
+
     /// Reserve `amount` against the cap: hold the cross-process advisory lock over the whole
     /// refresh→check→append→in-memory-update section so two buyer processes sharing one home
     /// cannot both pass the cap check and both spend (TOCTOU closed). When `attempt_id` is set,
