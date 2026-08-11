@@ -12,6 +12,8 @@
 #   --version <x.y.z>   MAXPLAYER_VERSION   install this exact version instead of the latest release
 #   --bin-dir <dir>     MAXPLAYER_BIN_DIR   install here instead of ~/.local/bin
 #   --seller            MAXPLAYER_SELLER=1  accepted and ignored; see below
+#                        MAXPLAYER_MODIFY_PATH=1  non-interactive: append bin-dir to ~/.profile without asking
+#                        MAXPLAYER_MODIFY_PATH=0  never touch ~/.profile, even at an interactive terminal
 #
 # ── One artifact ────────────────────────────────────────────────────────────────────────────────
 # A release publishes ONE build per platform and this installs it. It carries the whole surface:
@@ -272,7 +274,7 @@ usage() {
     say "usage: install.sh [--version <x.y.z>] [--bin-dir <dir>] [--seller]"
     say '  --seller         deprecated no-op: one binary ships and it can already sell'
     say "  through a pipe:  curl -fsSL <url> | sh -s -- --version 0.1.0"
-    say "  environment:     MAXPLAYER_VERSION, MAXPLAYER_BIN_DIR"
+    say "  environment:     MAXPLAYER_VERSION, MAXPLAYER_BIN_DIR, MAXPLAYER_MODIFY_PATH"
 }
 
 main() {
@@ -394,10 +396,44 @@ main() {
     # separately because the remedies differ: one is a missing PATH entry, the other is an older copy
     # of maxplayer earlier in PATH that will keep winning until it is removed.
     if ! dir_on_path "$bin_dir"; then
-        say ""
-        say "$bin_dir is not on your PATH. Add it, then re-open your shell:"
-        say "  echo 'export PATH=\"\$PATH:$bin_dir\"' >> ~/.profile"
-        say "Until then, run it by path: $bin_dir/$BIN_NAME version"
+        modify_path=0
+        # A `curl | sh` install puts the SCRIPT SOURCE on fd 0 (stdin), so by the time execution
+        # reaches here stdin is exhausted or was never a terminal at all — even when a real user is
+        # watching. /dev/tty names the CONTROLLING TERMINAL independent of what's wired to stdin,
+        # which is why it (not stdin) is what rustup/uv read an interactive answer from.
+        if [ -z "${MAXPLAYER_MODIFY_PATH:-}" ] && [ -t 1 ] && [ -r /dev/tty ]; then
+            printf 'install.sh: add %s to your PATH in ~/.profile? [Y/n] ' "$bin_dir" > /dev/tty
+            reply=""
+            IFS= read -r reply < /dev/tty || reply=""
+            case "$reply" in
+                "" | [Yy] | [Yy][Ee][Ss]) modify_path=1 ;;
+                *) modify_path=0 ;;
+            esac
+        elif [ -n "${MAXPLAYER_MODIFY_PATH:-}" ] && [ "$MAXPLAYER_MODIFY_PATH" != "0" ]; then
+            modify_path=1
+        fi
+
+        if [ "$modify_path" = 1 ]; then
+            profile="${HOME:-}/.profile"
+            marker="# added by maxplayer install.sh"
+            line="export PATH=\"\$PATH:$bin_dir\""
+            if [ -n "$profile" ] && [ -f "$profile" ] && grep -qxF "$marker" "$profile" 2>/dev/null; then
+                say ""
+                say "$bin_dir is already added to $profile (marker found) — leaving it unchanged."
+            else
+                [ -n "${HOME:-}" ] || die "HOME is not set — cannot locate ~/.profile to modify. Add $bin_dir to PATH manually: export PATH=\"\$PATH:$bin_dir\""
+                { printf '\n%s\n%s\n' "$marker" "$line"; } >> "$profile" \
+                    || die "could not write to $profile"
+                say ""
+                say "added $bin_dir to PATH in $profile"
+                say "re-open your shell, or run: . $profile"
+            fi
+        else
+            say ""
+            say "$bin_dir is not on your PATH. Add it, then re-open your shell:"
+            say "  echo 'export PATH=\"\$PATH:$bin_dir\"' >> ~/.profile"
+            say "Until then, run it by path: $bin_dir/$BIN_NAME version"
+        fi
     else
         resolved="$(command -v "$BIN_NAME" 2>/dev/null || true)"
         if [ -n "$resolved" ] && [ "$resolved" != "$bin_dir/$BIN_NAME" ]; then
