@@ -21,7 +21,7 @@
 use serde::Serialize;
 
 use crate::gateway::{EventDraft, MAXPLAYER_TAG, PROTOCOL_VERSION, TagSpec};
-use crate::seller_agents::AGENT_TAG;
+use crate::seller_agents::{AGENT_TAG, LEGACY_AGENT_TAG};
 
 pub use crate::kinds::SELLER_HEARTBEAT_KIND;
 
@@ -100,25 +100,38 @@ impl HeartbeatDraft {
             TagSpec::new(["queue_depth", &queue_depth]),
             multi_value_tag(ACCEPTED_MINTS_TAG, &self.accepted_mints),
         ];
-        if let Some(tag) = agent_tag(&self.agents) {
-            tags.push(tag);
-        }
+        tags.extend(agent_tags(&self.agents));
         EventDraft::new(SELLER_HEARTBEAT_KIND, tags, "")
     }
 }
 
-/// The `["agents", …]` advertisement tag, or `None` for a seller that states no harness (the
-/// tag is then omitted rather than emitted empty — absent means "unstated", never "none").
-pub fn agent_tag(agents: &[String]) -> Option<TagSpec> {
+/// The roster advertisement tags, or empty for a seller that states no harness (the tags are then
+/// omitted rather than emitted empty — absent means "unstated", never "none").
+///
+/// Emits `["agents", …]` AND, for one transition release, the pre-#645 `["mobee_agent", …]` with
+/// the identical value list. Both emit sites use this, so a seat cannot advertise the roster under
+/// one spelling and not the other. See [`LEGACY_AGENT_TAG`] for why and for the removal checklist.
+pub fn agent_tags(agents: &[String]) -> Vec<TagSpec> {
     if agents.is_empty() {
-        return None;
+        return Vec::new();
     }
-    Some(multi_value_tag(AGENT_TAG, agents))
+    vec![
+        multi_value_tag(AGENT_TAG, agents),
+        multi_value_tag(LEGACY_AGENT_TAG, agents),
+    ]
 }
 
-/// Read an `["agents", …]` advertisement off any event's tags. Absent ⇒ empty.
+/// Read a roster advertisement off any event's tags. Absent ⇒ empty.
+///
+/// Prefers `["agents", …]`; falls back to the pre-#645 `["mobee_agent", …]` so this build can read
+/// a seat that has not upgraded yet. The fallback is the read half of the same transition window —
+/// it goes when [`LEGACY_AGENT_TAG`] goes.
 pub fn agents_from_tags(tags: &[TagSpec]) -> Vec<String> {
-    tag_values(tags, AGENT_TAG)
+    let agents = tag_values(tags, AGENT_TAG);
+    if agents.is_empty() {
+        return tag_values(tags, LEGACY_AGENT_TAG);
+    }
+    agents
 }
 
 /// Read the `["accepted_mints", …]` list off a seat announcement's tags. Absent ⇒ empty, which
@@ -420,15 +433,23 @@ mod tests {
         assert_eq!(key, parsed.key("seller-pubkey-hex"));
     }
 
-    /// RED-PROOF (#645): the announcement carries EXACTLY the §4.2 tag set — no more, no less.
+    /// RED-PROOF (#645): the announcement carries EXACTLY the §4.2 tag set — no more, no less,
+    /// plus the ONE deliberate transition tag.
     ///
     /// Set equality, not a list of presence checks, because a presence check cannot fail on a tag
     /// that should have LEFT. `protocol_versions` and `mobee_agent` satisfied every presence
-    /// assertion this file used to make, and they are precisely the two tags #645 removes.
-    /// Re-adding either turns this red; so does dropping `v` or `accepted_mints`.
+    /// assertion this file used to make, and they are precisely the two tags #645 removed.
+    ///
+    /// ⚠ `mobee_agent` is back ON PURPOSE and TEMPORARILY. Shipping #645's rename in one step made
+    /// a harness-targeted claim hang forever against a buyer on the previous release — field-proven
+    /// on the `ember` seat, see [`LEGACY_AGENT_TAG`]. It rides alongside `agents` for exactly one
+    /// release. `protocol_versions` stays retired and is still asserted absent below.
+    ///
+    /// REMOVAL: when the transition window closes, drop `mobee_agent` from both expected sets here
+    /// and move it back into the retired loop. That edit turning this test red is the point.
     #[test]
     fn the_announcement_carries_exactly_the_spec_4_2_tag_set() {
-        // No roster stated: `agents` is the one optional tag (§4.2 cardinality 0..1).
+        // No roster stated: the roster tags are the optional ones (§4.2 cardinality 0..1).
         let bare = draft(true, 0, 7).to_event_draft();
         assert_eq!(
             tag_names(&bare),
@@ -440,11 +461,21 @@ mod tests {
             .to_event_draft();
         assert_eq!(
             tag_names(&with_roster),
-            ["accepted_mints", "accepting", "agents", "d", "queue_depth", "rate", "t", "v"]
+            [
+                "accepted_mints",
+                "accepting",
+                "agents",
+                "d",
+                "mobee_agent",
+                "queue_depth",
+                "rate",
+                "t",
+                "v"
+            ]
         );
 
         // Named individually so a revert says WHICH tag came back rather than only diffing a list.
-        for retired in ["protocol_versions", "mobee_agent"] {
+        for retired in ["protocol_versions"] {
             assert!(
                 with_roster.tags.iter().all(|tag| tag.first() != Some(retired)),
                 "#645 retired {retired} from the seat announcement"
@@ -462,6 +493,65 @@ mod tests {
         assert_eq!(accepted_mints_from_tags(&with_roster.tags), mints());
         assert_eq!(agents_from_tags(&with_roster.tags), vec!["claude"]);
         assert!(bare.content.is_empty(), "capability rides tags, never content");
+    }
+
+    /// RED-PROOF (transition): a reader that knows ONLY the pre-#645 spelling still finds the
+    /// roster on what this build emits. This is the half that was missing when #645 shipped, and
+    /// its absence hung a real targeted job — the old buyer's award filter looked for
+    /// `mobee_agent`, the new seat published only `agents`, and the claim sat pending with no
+    /// error on either side.
+    ///
+    /// Asserted on BOTH emit sites, because a compat tag on one and not the other still hangs:
+    /// the claim (§6.2) drives the award filter, the announcement (§4.2) drives discovery.
+    #[test]
+    fn a_transition_old_reader_finds_the_roster_on_both_emit_sites() {
+        let roster = vec!["claude".to_owned(), "codex".to_owned()];
+
+        // What an OLD reader does: look up the legacy key, verbatim.
+        let old_reader = |tags: &[TagSpec]| -> Vec<String> {
+            first_tag(tags, LEGACY_AGENT_TAG)
+                .map(|tag| tag.0[1..].to_vec())
+                .unwrap_or_default()
+        };
+
+        let announcement = draft(true, 0, 7).with_agents(roster.clone()).to_event_draft();
+        assert_eq!(
+            old_reader(&announcement.tags),
+            roster,
+            "a pre-#645 buyer must still resolve the roster off the kind-30340 announcement"
+        );
+
+        let claim = crate::gateway::claim_draft("offer", "buyerpk", "sellerpk", "creq", &roster);
+        assert_eq!(
+            old_reader(&claim.tags),
+            roster,
+            "a pre-#645 award filter must still resolve the roster off the kind-3402 claim"
+        );
+
+        // Both spellings carry the SAME list — a seat must not advertise two different rosters.
+        assert_eq!(agents_from_tags(&announcement.tags), roster);
+        assert_eq!(old_reader(&announcement.tags), agents_from_tags(&announcement.tags));
+        assert_eq!(old_reader(&claim.tags), agents_from_tags(&claim.tags));
+    }
+
+    /// RED-PROOF (transition): the read half — this build resolves a roster from a seat that has
+    /// NOT upgraded yet and publishes only the legacy spelling. Without this, the break is simply
+    /// mirrored: new buyer, old seat, same silent hang.
+    #[test]
+    fn a_transition_new_reader_finds_the_roster_from_a_legacy_only_seat() {
+        let legacy_only = vec![TagSpec::new(["mobee_agent", "claude", "codex"])];
+        assert_eq!(agents_from_tags(&legacy_only), vec!["claude", "codex"]);
+
+        // The new spelling still WINS when both are present (they always agree today, but the
+        // fallback must never override a seat that has stated `agents` explicitly).
+        let both = vec![
+            TagSpec::new(["agents", "claude"]),
+            TagSpec::new(["mobee_agent", "stale"]),
+        ];
+        assert_eq!(agents_from_tags(&both), vec!["claude"]);
+
+        // Neither spelling ⇒ unstated, never a phantom roster.
+        assert!(agents_from_tags(&[TagSpec::new(["d", "x"])]).is_empty());
     }
 
     /// RED-PROOF (#645): the buyer-side seat reader takes mints AND roster off the kind-30340

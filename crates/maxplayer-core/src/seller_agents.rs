@@ -36,6 +36,29 @@ use crate::home::{AgentPresetConfig, SellerConfig};
 /// which the spec never used.
 pub const AGENT_TAG: &str = "agents";
 
+/// The pre-#645 spelling of [`AGENT_TAG`], emitted ALONGSIDE it for exactly one release so the
+/// rename is not a flag day.
+///
+/// #645 renamed the tag in a single step: a seat on the new build stops emitting `mobee_agent`,
+/// and a buyer still on the old build reads only `mobee_agent`. That buyer's award filter then
+/// cannot confirm the harness, so a harness-targeted claim **sits pending forever with no error on
+/// either side** — the seat looks idle, the buyer looks stuck, and nothing logs a cause.
+///
+/// Field-observed on the macOS seat `ember` (2026-08-11) against a v0.2.1 buyer: the targeted job
+/// hung, while the same buyer's `agent=any` job — which never consults the filter — settled in 63s.
+/// Relay evidence, same seat, same value, only the key differs:
+///
+/// ```text
+/// 1786387812 (v0.2.1) … creq, mobee_agent=["claude"], t, v
+/// 1786434123 (main)   … creq, agents=["claude"],      t, v
+/// ```
+///
+/// REMOVAL: delete this constant, [`crate::heartbeat::agent_tags`]'s second push, and the legacy
+/// fallback in [`crate::heartbeat::agents_from_tags`] in the release AFTER the one that first
+/// ships this. By then every seat and buyer emits and reads `agents`, and the compat tag is dead
+/// weight. The tests named `*_transition_*` are the removal checklist.
+pub const LEGACY_AGENT_TAG: &str = "mobee_agent";
+
 /// The offer parameter naming a requested harness: `["param", "agent", "claude"]`, a sibling of
 /// `["param", "deadline", …]`. The value is opaque to the wire — an exact harness name today,
 /// leaving room for a tier vocabulary later without a grammar change.

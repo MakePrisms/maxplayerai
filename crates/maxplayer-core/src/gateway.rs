@@ -428,6 +428,10 @@ pub fn parse_bound_git_delivery(
 /// `agents` advertises the harnesses this seller can run (preference order) as `["agents", …]`
 /// (§6.2), so the buyer's award filter can hold the claim to the harness its job asked for.
 /// Empty ⇒ the tag is omitted rather than sent empty.
+///
+/// For one transition release the roster also rides as the pre-#645 `["mobee_agent", …]`. This is
+/// the emit site whose absence hung a real targeted job: the award filter is what reads it. See
+/// [`crate::seller_agents::LEGACY_AGENT_TAG`].
 pub fn claim_draft(
     offer_id: &str,
     buyer_pubkey: &str,
@@ -441,9 +445,7 @@ pub fn claim_draft(
         TagSpec::new(["p", seller_pubkey]),
         TagSpec::new(["creq", creq]),
     ];
-    if let Some(tag) = crate::heartbeat::agent_tag(agents) {
-        tags.push(tag);
-    }
+    tags.extend(crate::heartbeat::agent_tags(agents));
     status_draft(JOB_CLAIM_KIND, "processing", tags)
 }
 
