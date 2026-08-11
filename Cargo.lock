@@ -2533,6 +2533,9 @@ dependencies = [
 name = "maxplayer"
 version = "0.3.0"
 dependencies = [
+ "cashu",
+ "cdk",
+ "cdk-sqlite",
  "git2",
  "maxplayer-core",
  "nostr-sdk",

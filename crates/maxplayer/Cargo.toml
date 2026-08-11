@@ -93,3 +93,8 @@ git2 = { workspace = true, optional = true }
 # already resolves under `wallet`, so no new resolution — gated by `wallet` because the public key
 # it encodes comes from `maxplayer-core::home::public_key_hex`, itself `wallet`-gated.
 nostr-sdk = { version = "0.44.1", optional = true }
+
+[dev-dependencies]
+cashu = "=0.17.2"
+cdk = { version = "=0.17.2", default-features = false, features = ["wallet"] }
+cdk-sqlite = "=0.17.2"

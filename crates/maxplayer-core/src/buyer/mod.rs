@@ -2779,15 +2779,19 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
         Err(error) => return Response::err(id, CODE_INTERNAL, format!("state DB task failed: {error}")),
     };
 
-    // Report EVERY configured mint's balance, not just the default (#496): a wallet funded across
-    // `extra_mints` otherwise hides every non-default balance from the live daemon, forcing a
-    // disruptive daemon-down CLI read to cross-foot a multi-mint wallet. The top-level `mint` +
-    // `balance_sats` (the default mint) stay for back-compat; `total_sats` + the per-mint `mints`
-    // list are added. Read through the wallet actor's single slot, so it never races a spend.
+    // Report every configured and wallet-DB-discovered mint's balance (#266). The top-level `mint`
+    // + `balance_sats` (the default mint) stay for back-compat; `total_sats` is whole-DB truth and
+    // `configured_total_sats` preserves the configured subset. Read through the wallet actor's
+    // single slot, so it never races a spend.
     let mint = context.home.config.default_mint().to_owned();
     let wallet = match context.wallet.balances().await {
         Ok(Ok(rows)) => {
             let total_sats: u64 = rows.iter().map(|row| row.balance_sats).sum();
+            let configured_total_sats: u64 = rows
+                .iter()
+                .filter(|row| row.configured)
+                .map(|row| row.balance_sats)
+                .sum();
             let default_balance = rows
                 .iter()
                 .find(|row| row.is_default)
@@ -2797,7 +2801,13 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
                 .map(|row| {
                     json!({
                         "mint": row.mint_url,
-                        "role": if row.is_default { "default" } else { "extra" },
+                        "role": if !row.configured {
+                            "unconfigured"
+                        } else if row.is_default {
+                            "default"
+                        } else {
+                            "extra"
+                        },
                         "balance_sats": row.balance_sats,
                     })
                 })
@@ -2805,6 +2815,7 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
             json!({
                 "mint": mint,
                 "balance_sats": default_balance,
+                "configured_total_sats": configured_total_sats,
                 "total_sats": total_sats,
                 "mints": mints,
             })
@@ -5340,6 +5351,7 @@ mod tests {
         // fresh home has exactly one configured mint (the default) at 0, so `total_sats` is 0 and the
         // per-mint list carries that one default row. Reverting the per-mint reporting drops these.
         assert_eq!(result["wallet"]["total_sats"], json!(0));
+        assert_eq!(result["wallet"]["configured_total_sats"], json!(0));
         let mints = result["wallet"]["mints"]
             .as_array()
             .expect("#496: status.wallet.mints is a per-mint array");
@@ -5378,6 +5390,69 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600, "buyer.sock must be user-only");
         }
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // #266 divergence case — the one the fresh-home assertions above cannot catch: with money at an
+    // unconfigured mint, `total_sats` must widen to the whole-DB truth while `configured_total_sats`
+    // keeps the configured subset, and the stray mint appears as role=unconfigured. Red if the RPC
+    // drops the configured total, mis-sums it, or filters the rows on the wrong predicate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_reports_unconfigured_db_proofs_with_both_totals() {
+        use std::str::FromStr;
+
+        use cashu::secret::Secret;
+        use cashu::{Amount as CashuAmount, CurrencyUnit, Id, MintUrl, Proof, SecretKey, State};
+        use cdk::cdk_database::WalletDatabase;
+        use cdk::wallet::types::ProofInfo;
+        use cdk_sqlite::wallet::WalletSqliteDatabase;
+
+        let root = temp_home("status-db-truth");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap_home(&root).expect("bootstrap home");
+
+        // Seed an unspent 37-sat proof at a mint OUTSIDE the configured set, directly in the shared
+        // wallet sqlite — the legally-reachable state (#266) the status RPC must not render as absent.
+        let stray = MintUrl::from_str("https://stray-mint.example/").expect("stray mint URL");
+        let store = WalletSqliteDatabase::new(home.wallet_dir.join("cdk-wallet.sqlite"))
+            .await
+            .expect("open on-disk wallet database");
+        let proof = Proof::new(
+            CashuAmount::from(37),
+            Id::from_str("009a1f293253e41e").expect("keyset id"),
+            Secret::new("status-266-unconfigured-db-truth"),
+            SecretKey::generate().public_key(),
+        );
+        let info =
+            ProofInfo::new(proof, stray, State::Unspent, CurrencyUnit::Sat).expect("proof info");
+        store.update_proofs(vec![info], vec![]).await.expect("seed unconfigured proof");
+
+        let (_lock, context, socket_path) = bootstrap(home).await.expect("buyer bootstrap");
+        let listener = bind_socket(&socket_path).expect("bind socket");
+        let server = tokio::spawn(accept_loop(listener, context));
+
+        let sock = socket_path.clone();
+        let response = tokio::task::spawn_blocking(move || client::status(&sock))
+            .await
+            .expect("join client")
+            .expect("client call");
+        let result = response.result.expect("status result");
+
+        assert_eq!(result["wallet"]["total_sats"], json!(37), "whole-DB truth includes the stray");
+        assert_eq!(
+            result["wallet"]["configured_total_sats"],
+            json!(0),
+            "configured subset excludes the stray"
+        );
+        let mints = result["wallet"]["mints"].as_array().expect("per-mint array");
+        let stray_row = mints
+            .iter()
+            .find(|row| row["mint"].as_str() == Some("https://stray-mint.example"))
+            .expect("unconfigured mint appears in the per-mint list");
+        assert_eq!(stray_row["role"], json!("unconfigured"));
+        assert_eq!(stray_row["balance_sats"], json!(37));
 
         server.abort();
         let _ = std::fs::remove_dir_all(&root);

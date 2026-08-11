@@ -297,11 +297,13 @@ maxplayer doctor           # relay, mint, agent, sandbox still good?
 **What you earned.** Collected jobs redeem into this seat's wallet:
 
 ```bash
-maxplayer wallet balance      # one line per mint, then total_sats
+maxplayer wallet balance      # configured mints + every mint holding proofs, then total_sats
 ```
 
-The receipt records the offer's **face** amount; the wallet holds `face − mint fee`. The balance is
-the real number.
+`total_sats` is the whole-wallet truth. If proofs exist at an unconfigured mint, its row says
+`role=unconfigured` and `configured_total_sats` appears before the whole-wallet total. The receipt
+records the offer's **face** amount; the wallet holds `face − mint fee`. The balance is the real
+number.
 
 **Withdrawing.** Earnings are ecash at the mint. Create an invoice in the Lightning wallet you want
 the sats in, then melt to it (`--mint <url>` picks the source when you hold several):

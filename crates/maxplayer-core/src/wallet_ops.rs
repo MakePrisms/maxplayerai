@@ -7,7 +7,7 @@
 //! FakeWallet-auto-pays mint quotes. For other configured mints, [`begin_mint_async`]
 //! returns the bolt11 and callers must pay it, then [`complete_mint_async`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use cashu::{MintUrl, Token};
 use sha2::{Digest, Sha256};
+use cdk::cdk_database::WalletDatabase;
 use cdk::nuts::{CurrencyUnit, MintQuoteState, PaymentMethod};
 use cdk::wallet::{ReceiveOptions, SendOptions, Wallet};
 use cdk::Amount;
@@ -79,6 +80,11 @@ pub struct MintBalance {
     pub mint_url: String,
     pub balance_sats: u64,
     pub is_default: bool,
+    /// Whether the mint is in this home's configured set (default + `extra_mints`). Rows with
+    /// `configured == false` are DISCOVERED — the shared wallet DB holds proofs or a registration
+    /// for a mint the config no longer (or never) names. Display surfaces them (#266); accept-time
+    /// source selection deliberately ignores them (see `crossmint::holds_at_least`).
+    pub configured: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,19 +370,68 @@ pub(crate) async fn poll_and_mint(
     Ok(funded)
 }
 
-/// Balance per configured mint (default + extras).
+/// Open the shared wallet database for seedless, offline balance discovery.
+async fn open_balance_store(home: &MaxplayerHome) -> Result<WalletSqliteDatabase, WalletOpsError> {
+    WalletSqliteDatabase::new(sqlite_path(&home.wallet_dir))
+        .await
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))
+}
+
+/// Balance per configured or wallet-database-discovered mint. The sqlite store is shared across
+/// every mint, and proofs legally land at mints outside the configured set (seller redemption at
+/// `accepted_mints[1..]`, cross-mint hop residue) — so the read enumerates the DB truth (proof
+/// table ∪ mint registrations ∪ configured set) rather than the config filter, and tags each row
+/// `configured` so callers can tell the sets apart (#266). One store open, no per-mint `Wallet`,
+/// no seed, no network, and no `mint_is_allowed` fence — that fence stays load-bearing on the
+/// funding paths only.
 pub async fn balances_async(home: &MaxplayerHome) -> Result<Vec<MintBalance>, WalletOpsError> {
     let default = normalize_mint_url(home.config.default_mint())?;
+    let configured = configured_mints(home)?;
+    let store = open_balance_store(home).await?;
+    let proofs = store
+        .get_proofs(
+            None,
+            Some(CurrencyUnit::Sat),
+            Some(vec![cashu::State::Unspent]),
+            None,
+        )
+        .await
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    let registered = store
+        .get_mints()
+        .await
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+
+    let mut discovered = BTreeSet::new();
+    for proof in proofs {
+        discovered.insert(normalize_mint_url(&proof.mint_url.to_string())?);
+    }
+    for mint_url in registered.keys() {
+        discovered.insert(normalize_mint_url(&mint_url.to_string())?);
+    }
+
+    let mut mint_urls = configured.clone();
+    for mint_url in discovered {
+        if !mint_urls.iter().any(|entry| entry == &mint_url) {
+            mint_urls.push(mint_url);
+        }
+    }
+
     let mut rows = Vec::new();
-    for mint_url in configured_mints(home)? {
-        let wallet = open_wallet_async(home, &mint_url).await?;
-        let balance = wallet
-            .total_balance()
+    for mint_url in mint_urls {
+        let balance = store
+            .get_balance(
+                Some(MintUrl::from_str(&mint_url).map_err(|error| {
+                    WalletOpsError::Wallet(format!("invalid normalized mint URL: {error}"))
+                })?),
+                Some(CurrencyUnit::Sat),
+                Some(vec![cashu::State::Unspent]),
+            )
             .await
-            .map_err(|error| WalletOpsError::Wallet(error.to_string()))?
-            .to_u64();
+            .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
         rows.push(MintBalance {
             is_default: mint_url == default,
+            configured: configured.iter().any(|entry| entry == &mint_url),
             mint_url,
             balance_sats: balance,
         });
@@ -742,6 +797,7 @@ pub fn list_mints(home: &MaxplayerHome) -> Result<Vec<MintBalance>, WalletOpsErr
         .into_iter()
         .map(|mint_url| MintBalance {
             is_default: mint_url == default,
+            configured: true,
             mint_url,
             balance_sats: 0,
         })
@@ -980,6 +1036,51 @@ mod tests {
 
         remove_mint(&mut home, "https://example.mint.test").expect("remove");
         assert_eq!(list_mints(&home).expect("list3").len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn balances_include_unconfigured_proofs_from_the_shared_database() {
+        use cashu::secret::Secret;
+        use cashu::{Amount, Id, Proof, SecretKey, State};
+        use cdk::wallet::types::ProofInfo;
+
+        let root = temp_home("db-truth");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        let stray = MintUrl::from_str("https://stray-mint.example/").expect("stray mint URL");
+        let store = WalletSqliteDatabase::new(sqlite_path(&home.wallet_dir))
+            .await
+            .expect("open on-disk wallet database");
+        let proof = Proof::new(
+            Amount::from(37),
+            Id::from_str("009a1f293253e41e").expect("keyset id"),
+            Secret::new("issue-266-unconfigured-db-truth"),
+            SecretKey::generate().public_key(),
+        );
+        let proof_info = ProofInfo::new(proof, stray.clone(), State::Unspent, CurrencyUnit::Sat)
+            .expect("proof info");
+        store
+            .update_proofs(vec![proof_info], vec![])
+            .await
+            .expect("seed unconfigured proof");
+
+        let rows = balances_async(&home).await.expect("read database truth");
+        let stray_row = rows
+            .iter()
+            .find(|row| row.mint_url == "https://stray-mint.example")
+            .expect("unconfigured proof mint appears");
+        assert_eq!(stray_row.balance_sats, 37);
+        assert!(!stray_row.configured);
+        assert!(!stray_row.is_default);
+
+        let row_total: u64 = rows.iter().map(|row| row.balance_sats).sum();
+        let db_total = store
+            .get_balance(None, Some(CurrencyUnit::Sat), Some(vec![State::Unspent]))
+            .await
+            .expect("whole database balance");
+        assert_eq!(row_total, db_total, "per-mint rows cross-foot to DB truth");
+        assert_eq!(row_total, 37);
         let _ = std::fs::remove_dir_all(&root);
     }
 
