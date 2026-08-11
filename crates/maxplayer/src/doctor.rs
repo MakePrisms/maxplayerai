@@ -225,7 +225,7 @@ mod checks {
     use maxplayer_core::home::{AgentPresetConfig, SandboxConfig, SellerConfig, TelemetryConfig};
     use maxplayer_core::seller_exec::SandboxPolicy;
 
-    use crate::sandbox_probe::Containment;
+    use crate::sandbox_probe::{Containment, ContainmentModel};
     use maxplayer_core::seller_git;
 
     use super::Check;
@@ -515,6 +515,22 @@ mod checks {
         claims_open_pool: bool,
         unsafe_override: bool,
     ) -> Check {
+        check_sandbox_containment_with_model(
+            sandbox,
+            home_root,
+            claims_open_pool,
+            unsafe_override,
+            ContainmentModel::assumed_for_platform(),
+        )
+    }
+
+    pub(super) fn check_sandbox_containment_with_model(
+        sandbox: Option<SandboxConfig>,
+        home_root: std::path::PathBuf,
+        claims_open_pool: bool,
+        unsafe_override: bool,
+        model: ContainmentModel,
+    ) -> Check {
         let policy = SandboxPolicy::from_config(sandbox.as_ref());
         let containment = crate::sandbox_probe::probe_containment(&policy, &home_root);
 
@@ -522,7 +538,10 @@ mod checks {
             return match containment {
                 Containment::Contained => Check::pass(
                     CONTAINMENT_CHECK,
-                    "launcher confines: a file outside the workdir was refused, the workdir was writable",
+                    format!(
+                        "launcher confines: a file outside the workdir was refused, the workdir was writable ({})",
+                        model.guarantee_clause()
+                    ),
                 ),
                 other => Check::warn(
                     CONTAINMENT_CHECK,
@@ -536,7 +555,10 @@ mod checks {
             return Check::warn(
                 CONTAINMENT_CHECK,
                 match containment {
-                    Containment::Contained => "--unsafe-no-sandbox passed, though the launcher does confine".to_owned(),
+                    Containment::Contained => format!(
+                        "--unsafe-no-sandbox passed, though the launcher does confine ({})",
+                        model.guarantee_clause()
+                    ),
                     ref other => format!("--unsafe-no-sandbox passed: SERVING THE OPEN POOL UNCONTAINED — {}", other.detail()),
                 },
                 "remove --unsafe-no-sandbox and configure a [sandbox] launcher that passes the probe",
@@ -546,7 +568,10 @@ mod checks {
         match crate::sandbox_probe::open_pool_admission(true, &containment, false) {
             Ok(()) => Check::pass(
                 CONTAINMENT_CHECK,
-                "launcher confines: a file outside the workdir was refused, the workdir was writable",
+                format!(
+                    "launcher confines: a file outside the workdir was refused, the workdir was writable ({})",
+                    model.guarantee_clause()
+                ),
             ),
             Err(detail) => Check::fail(
                 CONTAINMENT_CHECK,
@@ -1048,6 +1073,132 @@ mod tests {
             checks::check_sandbox_launcher(None).status,
             Status::Pass,
             "an unsandboxed seat (no [sandbox]) must not FAIL"
+        );
+    }
+
+    #[cfg(feature = "wallet")]
+    fn contained_probe_launcher() -> maxplayer_core::home::SandboxConfig {
+        maxplayer_core::home::SandboxConfig {
+            launcher: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf 'canary_read=denied\\nworkdir_write=ok\\n'".into(),
+            ],
+        }
+    }
+
+    #[cfg(feature = "wallet")]
+    fn containment_test_home(label: &str) -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "maxplayer-doctor-containment-{label}-{}-{stamp}",
+            std::process::id()
+        ))
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn containment_pass_names_the_assumed_platform_model() {
+        let home = containment_test_home("assumed-model");
+        let check = checks::check_sandbox_containment(
+            Some(contained_probe_launcher()),
+            home.clone(),
+            false,
+            false,
+        );
+
+        assert_eq!(check.status, Status::Pass, "{}", check.render());
+        #[cfg(target_os = "macos")]
+        assert!(
+            check.detail.contains("deny-list"),
+            "macOS PASS must name deny-list:\n{}",
+            check.detail
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert!(
+            check.detail.contains("allow-list"),
+            "non-macOS PASS must name allow-list:\n{}",
+            check.detail
+        );
+
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn containment_messages_name_each_model_on_every_contained_branch() {
+        use crate::sandbox_probe::ContainmentModel;
+
+        for (model, clause) in [
+            (
+                ContainmentModel::AllowList,
+                "allow-list: unprobed paths fail closed",
+            ),
+            (
+                ContainmentModel::DenyList,
+                "deny-list: probed paths only — unlisted paths remain reachable",
+            ),
+        ] {
+            let home = containment_test_home(match model {
+                ContainmentModel::AllowList => "allow-list",
+                ContainmentModel::DenyList => "deny-list",
+            });
+            let expected_pass = format!(
+                "launcher confines: a file outside the workdir was refused, the workdir was writable ({clause})"
+            );
+            let targeted = checks::check_sandbox_containment_with_model(
+                Some(contained_probe_launcher()),
+                home.clone(),
+                false,
+                false,
+                model,
+            );
+            assert_eq!(targeted.status, Status::Pass, "{}", targeted.render());
+            assert_eq!(targeted.detail, expected_pass);
+
+            let open_pool = checks::check_sandbox_containment_with_model(
+                Some(contained_probe_launcher()),
+                home.clone(),
+                true,
+                false,
+                model,
+            );
+            assert_eq!(open_pool.status, Status::Pass, "{}", open_pool.render());
+            assert_eq!(open_pool.detail, expected_pass);
+
+            let overridden = checks::check_sandbox_containment_with_model(
+                Some(contained_probe_launcher()),
+                home.clone(),
+                true,
+                true,
+                model,
+            );
+            assert_eq!(overridden.status, Status::Warn, "{}", overridden.render());
+            assert_eq!(
+                overridden.detail,
+                format!(
+                    "--unsafe-no-sandbox passed, though the launcher does confine ({clause})"
+                )
+            );
+
+            std::fs::remove_dir_all(home).ok();
+        }
+    }
+
+    #[test]
+    fn containment_model_guarantee_clauses_are_the_specified_wording() {
+        use crate::sandbox_probe::ContainmentModel;
+
+        assert_eq!(
+            ContainmentModel::AllowList.guarantee_clause(),
+            "allow-list: unprobed paths fail closed"
+        );
+        assert_eq!(
+            ContainmentModel::DenyList.guarantee_clause(),
+            "deny-list: probed paths only — unlisted paths remain reachable"
         );
     }
 

@@ -90,6 +90,46 @@ impl Containment {
     }
 }
 
+/// Which failure direction the configured launcher's containment model implies. Derived from
+/// the target platform because the launcher argv itself is operator-supplied and arbitrary
+/// (#475) — this is a documented ASSUMPTION (every launcher this repo ships examples for is
+/// bubblewrap-on-Linux or a seatbelt profile on macOS), not a verified property of the actual
+/// launcher. An operator running an atypical launcher (e.g. a hand-rolled deny-list script on
+/// Linux) gets a label that does not match their real exposure — see the #475 brief's Open
+/// Questions before treating this as authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainmentModel {
+    /// Unnamed paths are denied by default (Landlock/bubblewrap on Linux). The probe's deny leg
+    /// generalizes: an unprobed path also fails closed.
+    AllowList,
+    /// Unnamed paths are reachable by default (a seatbelt/sandbox-exec profile on macOS). The
+    /// probe proves only the specific probed paths; completeness is not provable this way.
+    DenyList,
+}
+
+impl ContainmentModel {
+    /// Assumed from the target platform — see the type doc for the accuracy caveat.
+    pub fn assumed_for_platform() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Self::DenyList
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self::AllowList
+        }
+    }
+
+    /// The clause this brief's PASS/WARN messages append, naming what the model does and
+    /// does not promise.
+    pub fn guarantee_clause(&self) -> &'static str {
+        match self {
+            Self::AllowList => "allow-list: unprobed paths fail closed",
+            Self::DenyList => "deny-list: probed paths only — unlisted paths remain reachable",
+        }
+    }
+}
+
 // ── The payload ─────────────────────────────────────────────────────────────────────────────────
 
 /// Help that was asked for goes to stdout and succeeds (issue #570). Distinct from the missing-args
