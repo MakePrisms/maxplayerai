@@ -98,12 +98,7 @@ pub async fn set_profile_async(
     home::save_config(home, |config| {
         // Ensure the section exists even when re-publishing empties (idempotent replace).
         let profile = config.profile.get_or_insert_with(ProfileConfig::default);
-        if let Some(name) = name {
-            profile.name = Some(name);
-        }
-        if let Some(about) = about {
-            profile.about = Some(about);
-        }
+        apply_profile_updates(profile, name, about);
     })?;
 
     let profile = home.config.profile.clone().unwrap_or_default();
@@ -170,20 +165,16 @@ pub async fn publish_seller_discoverability_async(
             config.profile.get_or_insert_with(ProfileConfig::default).name = Some(name);
         })?;
     }
-    if home
-        .config
-        .profile
-        .as_ref()
-        .and_then(|p| p.about.as_ref())
-        .is_none()
+    let existing_about = home.config.profile.as_ref().and_then(|p| p.about.as_deref());
+    let existing_generated = home.config.profile.as_ref().and_then(|p| p.about_generated);
+    let live_about = default_seller_about(agent.as_deref(), rate_sats, &home.config.accepted_mints);
+    if let Some((about, about_generated)) =
+        generated_about_update(existing_about, existing_generated, live_about)
     {
-        let about = default_seller_about(
-            agent.as_deref(),
-            rate_sats,
-            &home.config.accepted_mints,
-        );
         home::save_config(home, |config| {
-            config.profile.get_or_insert_with(ProfileConfig::default).about = Some(about);
+            let profile = config.profile.get_or_insert_with(ProfileConfig::default);
+            profile.about = Some(about);
+            profile.about_generated = Some(about_generated);
         })?;
     }
 
@@ -327,17 +318,53 @@ async fn publish_metadata_merged_async(
     Ok(output.val.to_hex())
 }
 
-/// Default kind-0 / profile `about` when the operator has not set one.
-///
-/// Mint label is config-derived from `accepted_mints` (issue #209) — never a hard-coded
-/// `"testnut"` placeholder.
+fn apply_profile_updates(profile: &mut ProfileConfig, name: Option<String>, about: Option<String>) {
+    if let Some(name) = name {
+        profile.name = Some(name);
+    }
+    if let Some(about) = about {
+        profile.about = Some(about);
+        profile.about_generated = Some(false);
+    }
+}
+
+/// Return a generated `about` update only for an empty profile or text previously stamped as
+/// generated. Unknown provenance is protected; issue #625 showed content-based inference cannot
+/// distinguish stale generated prose from intentional operator prose.
+fn generated_about_update(
+    existing_about: Option<&str>,
+    existing_generated: Option<bool>,
+    live_about: String,
+) -> Option<(String, bool)> {
+    match (existing_about, existing_generated) {
+        (None, _) | (Some(_), Some(true)) => Some((live_about, true)),
+        (Some(_), Some(false) | None) => None,
+    }
+}
+
+/// Default kind-0 / profile `about` when the operator has not set one. Mint label lists every
+/// accepted mint (issue #625: a multi-mint seat must not advertise only its first) shortened to
+/// its host. The fallback is the honest `"no-mint"`, never a placeholder mint (#453).
 fn default_seller_about(agent: Option<&str>, rate_sats: u64, accepted_mints: &[String]) -> String {
     let agent_label = agent.unwrap_or("agent");
-    let mint_label = accepted_mints
-        .first()
-        .map(String::as_str)
-        .unwrap_or("no-mint");
-    format!("maxplayer seller · {agent_label} · {rate_sats} sat/job · {mint_label}")
+    let mint_label = if accepted_mints.is_empty() {
+        "no-mint".to_owned()
+    } else {
+        accepted_mints.iter().map(|mint| mint_host_label(mint)).collect::<Vec<_>>().join(", ")
+    };
+    let about = format!("maxplayer seller · {agent_label} · {rate_sats} sat/job · {mint_label}");
+    clamp_field(&about, PROFILE_ABOUT_MAX).unwrap_or(about)
+}
+
+/// Shorten a mint URL to the host a short ad can carry. Values that do not parse as HTTP(S)-style
+/// URLs pass through untouched, preserving the deleted buzz persona's labeling behavior.
+fn mint_host_label(mint: &str) -> String {
+    let rest = mint
+        .strip_prefix("https://")
+        .or_else(|| mint.strip_prefix("http://"))
+        .unwrap_or(mint);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    if host.is_empty() { mint.to_owned() } else { host.to_owned() }
 }
 
 /// NIP-34 kind-30617 announce for the seller delivery remote (required before push).
@@ -628,6 +655,7 @@ mod tests {
             config.profile = Some(ProfileConfig {
                 name: Some("buyer-x".into()),
                 about: Some("about-x".into()),
+                about_generated: None,
             });
         })
         .expect("save");
@@ -677,12 +705,85 @@ mod tests {
             "about fallback must not hard-code testnut; got: {about}"
         );
         assert!(
-            about.contains(REAL_MINT),
+            about.contains("mint.minibits.cash"),
             "about fallback must include the configured mint; got: {about}"
         );
 
         // A seat with no configured mint gets an honest placeholder, not a plausible wrong mint.
         let none = default_seller_about(None, 21, &[]);
         assert!(none.contains("no-mint"), "got: {none}");
+    }
+
+    #[test]
+    fn generated_about_regenerates_when_live_config_changes() {
+        let first = default_seller_about(
+            Some("claude"), 2, &["https://testnut.cashu.space".to_owned()],
+        );
+        let (first, generated) =
+            generated_about_update(None, None, first).expect("first boot generates");
+        assert!(generated);
+        let changed = default_seller_about(
+            Some("claude"), 100, &["https://mint.cubabitcoin.org/path".to_owned()],
+        );
+        let (changed, generated) = generated_about_update(Some(&first), Some(true), changed)
+            .expect("generated text refreshes");
+        assert!(generated);
+        assert!(changed.contains("100 sat/job"), "got: {changed}");
+        assert!(changed.contains("mint.cubabitcoin.org"), "got: {changed}");
+        assert!(!changed.contains("testnut.cashu.space"), "got: {changed}");
+    }
+
+    #[test]
+    fn operator_about_update_marks_protected_and_is_preserved() {
+        let mut profile = ProfileConfig::default();
+        apply_profile_updates(&mut profile, None, Some("operator prose · 2 sat/job".into()));
+        assert_eq!(profile.about_generated, Some(false));
+        let replacement = default_seller_about(
+            Some("claude"), 100, &["https://mint.cubabitcoin.org".to_owned()],
+        );
+        assert_eq!(
+            generated_about_update(profile.about.as_deref(), profile.about_generated, replacement),
+            None
+        );
+        assert_eq!(profile.about.as_deref(), Some("operator prose · 2 sat/job"));
+    }
+
+    #[test]
+    fn pre_upgrade_about_with_unknown_provenance_is_preserved() {
+        let profile = ProfileConfig {
+            name: None,
+            about: Some("old text".into()),
+            about_generated: None,
+        };
+        let replacement = default_seller_about(Some("claude"), 100, &[]);
+        assert_eq!(
+            generated_about_update(profile.about.as_deref(), profile.about_generated, replacement),
+            None
+        );
+        assert_eq!(profile.about.as_deref(), Some("old text"));
+        assert_eq!(profile.about_generated, None);
+    }
+
+    #[test]
+    fn default_about_names_every_accepted_mint_in_order() {
+        let about = default_seller_about(
+            Some("claude"),
+            100,
+            &[
+                "https://mint.one.example/Bitcoin".to_owned(),
+                "http://mint.two.example/path".to_owned(),
+            ],
+        );
+        assert!(about.ends_with("mint.one.example, mint.two.example"), "got: {about}");
+    }
+
+    #[test]
+    fn mint_host_label_reduces_a_url_to_its_host() {
+        assert_eq!(
+            mint_host_label("https://mint.minibits.cash/Bitcoin"),
+            "mint.minibits.cash"
+        );
+        assert_eq!(mint_host_label("http://cashu.example/path?q=1"), "cashu.example");
+        assert_eq!(mint_host_label("custom-mint-label"), "custom-mint-label");
     }
 }
