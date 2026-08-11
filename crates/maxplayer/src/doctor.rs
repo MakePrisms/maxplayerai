@@ -1113,14 +1113,18 @@ mod tests {
         assert_eq!(check.status, Status::Pass, "{}", check.render());
         #[cfg(target_os = "macos")]
         assert!(
-            check.detail.contains("deny-list"),
-            "macOS PASS must name deny-list:\n{}",
+            check
+                .detail
+                .contains("assumed deny-list for this platform"),
+            "macOS PASS must name the assumed deny-list model:\n{}",
             check.detail
         );
         #[cfg(not(target_os = "macos"))]
         assert!(
-            check.detail.contains("allow-list"),
-            "non-macOS PASS must name allow-list:\n{}",
+            check
+                .detail
+                .contains("assumed allow-list for this platform"),
+            "non-macOS PASS must name the assumed allow-list model:\n{}",
             check.detail
         );
 
@@ -1135,11 +1139,11 @@ mod tests {
         for (model, clause) in [
             (
                 ContainmentModel::AllowList,
-                "allow-list: unprobed paths fail closed",
+                "assumed allow-list for this platform: unprobed paths fail closed",
             ),
             (
                 ContainmentModel::DenyList,
-                "deny-list: probed paths only — unlisted paths remain reachable",
+                "assumed deny-list for this platform: probed paths only — unlisted paths remain reachable",
             ),
         ] {
             let home = containment_test_home(match model {
@@ -1194,11 +1198,11 @@ mod tests {
 
         assert_eq!(
             ContainmentModel::AllowList.guarantee_clause(),
-            "allow-list: unprobed paths fail closed"
+            "assumed allow-list for this platform: unprobed paths fail closed"
         );
         assert_eq!(
             ContainmentModel::DenyList.guarantee_clause(),
-            "deny-list: probed paths only — unlisted paths remain reachable"
+            "assumed deny-list for this platform: probed paths only — unlisted paths remain reachable"
         );
     }
 

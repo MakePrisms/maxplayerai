@@ -120,12 +120,14 @@ impl ContainmentModel {
         }
     }
 
-    /// The clause this brief's PASS/WARN messages append, naming what the model does and
-    /// does not promise.
+    /// The clause this brief's PASS/WARN messages append, naming the assumed model and what
+    /// it does and does not promise.
     pub fn guarantee_clause(&self) -> &'static str {
         match self {
-            Self::AllowList => "allow-list: unprobed paths fail closed",
-            Self::DenyList => "deny-list: probed paths only — unlisted paths remain reachable",
+            Self::AllowList => "assumed allow-list for this platform: unprobed paths fail closed",
+            Self::DenyList => {
+                "assumed deny-list for this platform: probed paths only — unlisted paths remain reachable"
+            }
         }
     }
 }
