@@ -130,3 +130,4 @@ jobs:
       # drift #249 is about is a tree edit, so this catches it here, before a release is ever
       # dispatched, rather than only in the release workflow's own dry run.
       - run: ./scripts/verify-release-surface.sh --no-artifacts
+      - run: ./scripts/verify-reserved-paths.sh
