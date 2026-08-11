@@ -555,14 +555,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_auth_required_refusal_is_resent_after_auth_and_only_when_auto_auth_is_on() {
         use nostr_relay_builder::prelude::{
-            LocalRelay, RelayBuilder, RelayBuilderNip42, RelayBuilderNip42Mode,
+            RelayBuilder, RelayBuilderNip42, RelayBuilderNip42Mode,
         };
         use nostr_sdk::prelude::EventBuilder;
 
-        let relay_fixture = LocalRelay::new(RelayBuilder::default().nip42(RelayBuilderNip42 {
-            mode: RelayBuilderNip42Mode::Both,
-        }));
-        relay_fixture.run().await.expect("fixture relay run");
+        let relay_fixture = crate::test_support::start_relay(|| {
+            RelayBuilder::default().nip42(RelayBuilderNip42 {
+                mode: RelayBuilderNip42Mode::Both,
+            })
+        })
+        .await;
         let relay_url = relay_fixture.url().await.to_string();
 
         let buyer = Keys::generate();
@@ -759,14 +761,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_relay_that_accepts_nothing_is_reported_as_refused() {
         use nostr_relay_builder::prelude::{
-            LocalRelay, RelayBuilder, RelayBuilderNip42, RelayBuilderNip42Mode,
+            RelayBuilder, RelayBuilderNip42, RelayBuilderNip42Mode,
         };
         use nostr_sdk::prelude::EventBuilder;
 
-        let relay_fixture = LocalRelay::new(RelayBuilder::default().nip42(RelayBuilderNip42 {
-            mode: RelayBuilderNip42Mode::Both,
-        }));
-        relay_fixture.run().await.expect("fixture relay run");
+        let relay_fixture = crate::test_support::start_relay(|| {
+            RelayBuilder::default().nip42(RelayBuilderNip42 {
+                mode: RelayBuilderNip42Mode::Both,
+            })
+        })
+        .await;
         let relay_url = relay_fixture.url().await.to_string();
 
         let buyer = Keys::generate();

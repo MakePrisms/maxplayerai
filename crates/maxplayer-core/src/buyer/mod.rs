@@ -3121,13 +3121,12 @@ mod tests {
     // lands.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn reconcile_leaves_a_pending_attempts_reservation_alone() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
 
         let root = temp_home("reconcile-skips-attempts");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap_home(&root).expect("bootstrap home");
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         home.config.relay_url = relay.url().await.to_string();
 
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
@@ -3179,13 +3178,12 @@ mod tests {
     // ConfirmedAbsent-past-window arm end to end against a real (empty) relay.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_expired_award_retry_terminalizes_and_answers_without_wedging_the_daemon() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
 
         let root = temp_home("expired-award-rpc");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap_home(&root).expect("bootstrap home");
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         home.config.relay_url = relay.url().await.to_string();
 
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
@@ -3231,14 +3229,13 @@ mod tests {
     // below stops landing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_third_partys_junk_delivery_cannot_hold_the_refund() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
         use nostr_sdk::prelude::{Client, EventBuilder, Keys, Kind, Tag};
 
         let root = temp_home("junk-delivery");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap_home(&root).expect("bootstrap home");
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         home.config.relay_url = relay.url().await.to_string();
 
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
@@ -3292,14 +3289,13 @@ mod tests {
     // signature.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_present_claim_does_not_certify_an_empty_offer_read_as_absence() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
         use nostr_sdk::prelude::{Client, EventBuilder, Keys, Kind, Tag};
 
         let root = temp_home("offer-602-asymmetric");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap_home(&root).expect("bootstrap home");
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         home.config.relay_url = relay.url().await.to_string();
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
 
@@ -3348,14 +3344,13 @@ mod tests {
     // — the `event.id == offer_id` assertion the award path already carries.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_present_offer_is_returned_confirmed_and_by_exact_id() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
         use nostr_sdk::prelude::{Client, EventBuilder, Kind, Tag};
 
         let root = temp_home("offer-602-present");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap_home(&root).expect("bootstrap home");
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         home.config.relay_url = relay.url().await.to_string();
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
         let keys = buyer_keys(&context.home).expect("buyer keys");
@@ -3437,14 +3432,16 @@ mod tests {
     // the starve is NON-CONFOUNDED (the relay is alive) so the `Err` is the offer read's alone.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_refused_offer_read_is_not_certified_as_absence_even_with_a_live_claim() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
         use nostr_sdk::prelude::{Client, EventBuilder, EventId, Filter, Keys, Kind, Tag};
 
         let root = temp_home("offer-602-refused");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap_home(&root).expect("bootstrap home");
-        let relay = LocalRelay::new(RelayBuilder::default().query_policy(RefuseOfferReads));
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(|| {
+            RelayBuilder::default().query_policy(RefuseOfferReads)
+        })
+        .await;
         home.config.relay_url = relay.url().await.to_string();
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
 
@@ -3503,14 +3500,16 @@ mod tests {
     // the empty offer read as absence → `ParkOfferAbsent` → `parked_awards()` non-empty.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_starved_offer_with_a_live_claim_never_parks_the_retryable_intent() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
         use nostr_sdk::prelude::{Client, EventBuilder, Keys, Kind, Tag};
 
         let root = temp_home("offer-602-no-park");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap_home(&root).expect("bootstrap home");
-        let relay = LocalRelay::new(RelayBuilder::default().query_policy(RefuseOfferReads));
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(|| {
+            RelayBuilder::default().query_policy(RefuseOfferReads)
+        })
+        .await;
         home.config.relay_url = relay.url().await.to_string();
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
 
@@ -3928,13 +3927,12 @@ mod tests {
     // `award()` and the RPC transmits, incrementing send_count.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_deadline_crossed_while_queued_refuses_instead_of_transmitting_late() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
 
         let root = temp_home("deadline-toctou");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap_home(&root).expect("bootstrap home");
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         home.config.relay_url = relay.url().await.to_string();
 
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
@@ -3998,13 +3996,12 @@ mod tests {
     // PublishedButUnrecorded arm and `parked_awards` goes silent while a seller is owed money.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_unrepairable_heal_parks_the_intent_so_the_debt_is_visible() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
 
         let root = temp_home("unrepairable-heal-parks");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap_home(&root).expect("bootstrap home");
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         home.config.relay_url = relay.url().await.to_string();
 
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
@@ -4051,14 +4048,13 @@ mod tests {
     // stub the probe to always answer absent, and this fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_pinned_sellers_delivery_holds_the_refund() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
         use nostr_sdk::prelude::{Client, EventBuilder, Keys, Kind, Tag};
 
         let root = temp_home("seller-delivery-holds");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap_home(&root).expect("bootstrap home");
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         home.config.relay_url = relay.url().await.to_string();
 
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
@@ -4124,14 +4120,13 @@ mod tests {
     // — the test now says "I did not test what I meant to" rather than going quietly green.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_sweep_deadline_crossed_while_waiting_for_the_money_lock_transmits_nothing() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
         use nostr_sdk::prelude::{EventBuilder, JsonUtil, Kind};
 
         let root = temp_home("sweep-deadline-toctou");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap_home(&root).expect("bootstrap home");
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         home.config.relay_url = relay.url().await.to_string();
 
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
@@ -4278,14 +4273,13 @@ mod tests {
     // and every assertion below fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_attempt_sweep_drives_all_three_legs_and_holds_inside_the_window() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
         use nostr_sdk::prelude::{EventBuilder, JsonUtil, Kind};
 
         let root = temp_home("sweep-wiring");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap_home(&root).expect("bootstrap home");
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         home.config.relay_url = relay.url().await.to_string();
 
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
@@ -4484,7 +4478,7 @@ mod tests {
     // releases a job whose payment was already in flight.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_reconcile_cannot_release_a_reservation_mid_settle() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
 
         let root = temp_home("mid-settle");
         let _ = std::fs::remove_dir_all(&root);
@@ -4493,8 +4487,7 @@ mod tests {
         // A relay that serves NO claims, so the classification genuinely reaches `Dead` — with an
         // unreachable relay every job is conservatively treated as still-payable and the reconcile
         // would never try to release anything, which would make this test vacuous.
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         home.config.relay_url = relay.url().await.to_string();
 
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
@@ -4561,12 +4554,11 @@ mod tests {
     // Red-on-revert: no-op `invalidate_reconcile_snapshot` and this fails.
     #[tokio::test]
     async fn a_settle_invalidates_the_stale_reconcile_snapshot() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
         let root = temp_home("invalidate-reconcile");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap_home(&root).expect("bootstrap home");
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         home.config.relay_url = relay.url().await.to_string();
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
 
@@ -4621,12 +4613,11 @@ mod tests {
     // `awarded` assertion fails.
     #[tokio::test]
     async fn get_job_surfaces_a_committed_award_while_accepted_stays_null() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
         let root = temp_home("get-job-awarded");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap_home(&root).expect("bootstrap home");
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         home.config.relay_url = relay.url().await.to_string();
         let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
 
@@ -5123,7 +5114,7 @@ mod tests {
     // fixtures exactly as it bites production.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn delivery_watcher_refuses_a_forged_delivery_and_spends_nothing() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
         use nostr_sdk::prelude::{Client, Keys};
         use nostr_sdk::secp256k1::Message;
 
@@ -5131,8 +5122,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap_home(&root).expect("bootstrap home");
 
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         let relay_url = relay.url().await.to_string();
         home.config.relay_url = relay_url.clone();
 

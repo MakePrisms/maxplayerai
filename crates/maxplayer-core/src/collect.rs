@@ -481,7 +481,7 @@ mod tests {
     // reverting the fold, which would refuse with no bind written, turns this red).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn collect_folds_accept_then_refuses_forged_cosig_zero_spend() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
         use nostr_sdk::secp256k1::Message;
         use nostr_sdk::prelude::{Client, Keys};
 
@@ -490,8 +490,7 @@ mod tests {
         let mut home = home::bootstrap(&root).expect("home");
 
         // In-process NIP-01 relay; point the buyer home at it.
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         let relay_url = relay.url().await.to_string();
         home.config.relay_url = relay_url.clone();
 

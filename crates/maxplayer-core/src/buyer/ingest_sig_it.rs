@@ -29,7 +29,7 @@
 //! of band by no-op'ing `nostr::Event::verify` via a worktree-local `[patch.crates-io]` and
 //! observing this test fail at the drop assertion — a throwaway red-prove, never committed.
 
-use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+use nostr_relay_builder::prelude::RelayBuilder;
 use nostr_sdk::prelude::{
     Client, Event, EventBuilder, Filter, JsonUtil, Keys, Kind, PublicKey, RelayOptions,
     RelayPoolNotification, Tag,
@@ -114,8 +114,7 @@ async fn wait_seen(seen: &Arc<Mutex<HashSet<String>>>, id_hex: &str, timeout: Du
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_signature_invalid_event_is_dropped_at_client_ingest_before_any_consumer() {
     // A real in-process relay, and a client built EXACTLY as the buyer daemon builds it in prod.
-    let relay = LocalRelay::new(RelayBuilder::default());
-    relay.run().await.expect("relay run");
+    let relay = crate::test_support::start_relay(RelayBuilder::default).await;
     let url = relay.url().await.to_string();
 
     let author = Keys::generate(); // the "seller" whose pubkey a forgery would spoof

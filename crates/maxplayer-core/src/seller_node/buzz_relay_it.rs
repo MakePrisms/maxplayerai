@@ -29,8 +29,7 @@ fn unique_root(label: &str) -> std::path::PathBuf {
 }
 
 async fn start_relay() -> (LocalRelay, String) {
-    let relay = LocalRelay::new(RelayBuilder::default());
-    relay.run().await.expect("relay run");
+    let relay = crate::test_support::start_relay(RelayBuilder::default).await;
     let url = relay.url().await.to_string();
     (relay, url)
 }

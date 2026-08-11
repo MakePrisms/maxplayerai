@@ -6687,7 +6687,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconnect_reauthenticates_and_delivery_resumes_in_process() {
         use nostr_relay_builder::prelude::{
-            LocalRelay, RelayBuilder, RelayBuilderNip42, RelayBuilderNip42Mode,
+            RelayBuilder, RelayBuilderNip42, RelayBuilderNip42Mode,
         };
         use nostr_sdk::prelude::{Client, EventBuilder, Keys, RelayOptions, RelayUrl};
 
@@ -6695,10 +6695,12 @@ mod tests {
 
         // Auth-enforcing fixture: it will not serve a REQ (nor accept an EVENT) until the session
         // has completed NIP-42.
-        let relay_fixture = LocalRelay::new(RelayBuilder::default().nip42(RelayBuilderNip42 {
-            mode: RelayBuilderNip42Mode::Both,
-        }));
-        relay_fixture.run().await.expect("fixture relay run");
+        let relay_fixture = crate::test_support::start_relay(|| {
+            RelayBuilder::default().nip42(RelayBuilderNip42 {
+                mode: RelayBuilderNip42Mode::Both,
+            })
+        })
+        .await;
         let relay_url = relay_fixture.url().await.to_string();
 
         let seller = Keys::generate();
@@ -6892,15 +6894,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn liveness_probe_answers_only_on_an_authenticated_session() {
         use nostr_relay_builder::prelude::{
-            LocalRelay, RelayBuilder, RelayBuilderNip42, RelayBuilderNip42Mode,
+            RelayBuilder, RelayBuilderNip42, RelayBuilderNip42Mode,
         };
         use nostr_sdk::prelude::{Client, Keys, RelayOptions};
 
         let wait = std::time::Duration::from_secs(10);
-        let relay_fixture = LocalRelay::new(RelayBuilder::default().nip42(RelayBuilderNip42 {
-            mode: RelayBuilderNip42Mode::Both,
-        }));
-        relay_fixture.run().await.expect("fixture relay run");
+        let relay_fixture = crate::test_support::start_relay(|| {
+            RelayBuilder::default().nip42(RelayBuilderNip42 {
+                mode: RelayBuilderNip42Mode::Both,
+            })
+        })
+        .await;
         let relay_url = relay_fixture.url().await.to_string();
 
         // POSITIVE: an authenticated session. Auto-auth answers the fixture's challenge (raised on the
@@ -6993,14 +6997,14 @@ mod tests {
     // return; }` at the top of run_wrap_backfill → rc=101 here (verified).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wrap_backfill_fetches_even_with_nothing_pending() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
 
         let wrap_queries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let relay = LocalRelay::new(
+        let relay = crate::test_support::start_relay(|| {
             RelayBuilder::default()
-                .query_policy(CountWrapQueries(std::sync::Arc::clone(&wrap_queries))),
-        );
-        relay.run().await.expect("relay run");
+                .query_policy(CountWrapQueries(std::sync::Arc::clone(&wrap_queries)))
+        })
+        .await;
         let relay_url = relay.url().await.to_string();
 
         let root = temp_dir("backfill-empty");
@@ -7069,14 +7073,14 @@ mod tests {
     // assertion goes red.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn offer_backfill_fetches_even_with_nothing_pending() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
 
         let offer_queries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let relay = LocalRelay::new(
+        let relay = crate::test_support::start_relay(|| {
             RelayBuilder::default()
-                .query_policy(CountOfferQueries(std::sync::Arc::clone(&offer_queries))),
-        );
-        relay.run().await.expect("relay run");
+                .query_policy(CountOfferQueries(std::sync::Arc::clone(&offer_queries)))
+        })
+        .await;
         let relay_url = relay.url().await.to_string();
 
         // A real (targeted) seller seat: boot registers the live offer REQ, so only the delta across
@@ -7242,10 +7246,9 @@ mod tests {
     /// settled offer is recorded and reserves the slot, failing the first assertion block.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_settled_offer_won_by_another_seat_is_not_claimed() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
 
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         let relay_url = relay.url().await.to_string();
         // A 1-slot OPEN-POOL seller — the pool that claims an untargeted offer it can lose.
         let (runner, root) =
@@ -7370,10 +7373,9 @@ mod tests {
     /// the `settled_by` wait times out.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_receipt_sub_backfills_the_terminal_cache_on_boot() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
 
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         let relay_url = relay.url().await.to_string();
 
         // A buyer publishes an offer and its co-signed settlement receipt to the relay BEFORE any
@@ -7451,10 +7453,9 @@ mod tests {
     /// and open-pool cases. `open_pool` shapes both the seller's subscription and whether the offers
     /// are targeted; the mechanism under test is identical either way.
     async fn drive_capacity_skip_backfill(label: &str, open_pool: bool, backfill_secs: u64) {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
 
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         let relay_url = relay.url().await.to_string();
 
         let (runner, root) =
@@ -7649,10 +7650,9 @@ mod tests {
     /// it is claimed and takes the single slot — prong 1's assertions fail. GREEN once the gate lands.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn backfill_refuses_aged_historical_but_still_admits_a_fresh_offer() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
 
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         let relay_url = relay.url().await.to_string();
 
         // 1-slot open-pool seller with immediate claim-lapse (`Some(0)`) so a parked claim frees its
@@ -7735,10 +7735,9 @@ mod tests {
     /// in-window ⇒ this fails. Both prove the release is caused by the AWARD arriving — not by a slot
     /// that was never reserved, nor a claim row that defaulted to `released`.
     async fn drive_loser_release_on_award(publish_award: bool) {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
 
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         let relay_url = relay.url().await.to_string();
 
         // Two DISTINCT-key one-slot open-pool sellers (distinct labels ⇒ distinct homes ⇒ distinct
@@ -7946,10 +7945,9 @@ mod tests {
     /// claim row reads `awarded` and `jobs_in_flight` reads 1.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_accept_naming_another_seats_claim_never_binds_the_loser() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
 
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         let relay_url = relay.url().await.to_string();
 
         let (winner_runner, winner_root) =
@@ -8133,11 +8131,10 @@ mod tests {
     // → the offer stays unclaimed and the AFTER block goes red.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn offer_backfill_recovers_an_offer_the_deaf_live_sub_never_delivered() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
         use nostr_sdk::prelude::{Client, Keys};
 
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         let relay_url = relay.url().await.to_string();
 
         // A targeted 1-slot seller. `offer_backfill_secs = 0` proves recovery does not depend on a
@@ -8285,10 +8282,9 @@ mod tests {
     // composes to SkipTerminal instead of re-emitting a duplicate result inside the live window.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn belt_skips_a_live_residual_when_our_result_is_on_the_relay() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
 
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         let relay_url = relay.url().await.to_string();
 
         let (runner, seller_keys, root) = boot_seller_with_keys("belt-our-result", &relay_url).await;
@@ -8355,10 +8351,9 @@ mod tests {
     // skips rather than burning compute on finished work.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn belt_skips_a_live_residual_when_a_buyer_receipt_settled_elsewhere() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
 
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         let relay_url = relay.url().await.to_string();
 
         let (runner, root) = boot_capacity_skip_seller("belt-buyer-receipt", &relay_url, true, 0, Some(0)).await;
@@ -8420,10 +8415,9 @@ mod tests {
     // bounds wasted compute).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn belt_runs_the_agent_when_the_relay_holds_no_settlement_the_foil() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
 
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         let relay_url = relay.url().await.to_string();
 
         let (runner, root) = boot_capacity_skip_seller("belt-foil", &relay_url, true, 0, Some(0)).await;
@@ -8744,10 +8738,9 @@ mod tests {
     // feedbacks and the `== 1` assertion fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn under_rate_feedback_emitted_once_across_backfill_re_ingest() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
 
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         let relay_url = relay.url().await.to_string();
 
         // Rate floor 100 sat ⇒ a 10-sat TARGETED offer is under-rate (the RateGate skip that earns
@@ -8793,10 +8786,9 @@ mod tests {
     // offer is suppressed — its feedback count drops to 0 and its assertion fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn distinct_under_rate_offers_each_get_their_own_feedback() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
 
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         let relay_url = relay.url().await.to_string();
 
         let (runner, root) = boot_seller_with_rate("under-rate-per-offer", &relay_url, 100).await;

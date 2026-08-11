@@ -59,6 +59,10 @@ pub mod receipt;
 pub mod relay_auth;
 pub mod runtime_guard;
 pub mod seller;
+/// Shared test-only helpers (see module docs). Gated to `wallet` because every current caller
+/// (`collect`, `job_lifecycle`, `buyer`, `seller_node`) lives behind that feature.
+#[cfg(all(test, feature = "wallet"))]
+mod test_support;
 /// The seller's harness registry: the agent harnesses one node enables, what it advertises for
 /// them, and which one a given job dispatches to.
 pub mod seller_agents;

@@ -4418,10 +4418,9 @@ mod tests {
     // BITE: drop the `tx.send(...)` wake below and this goes red on elapsed, not on correctness.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_wait_resolves_on_arrival_rather_than_on_the_safety_recheck() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
 
-        let relay = LocalRelay::new(RelayBuilder::default());
-        relay.run().await.expect("relay run");
+        let relay = crate::test_support::start_relay(RelayBuilder::default).await;
         let (root, mut home) = temp_job_home("wait-on-arrival");
         home.config.relay_url = relay.url().await.to_string();
 
@@ -4499,15 +4498,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn get_job_default_skips_kind_zero_fetch() {
-        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_relay_builder::prelude::RelayBuilder;
 
         let metadata_queries =
             std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let relay = LocalRelay::new(
+        let relay = crate::test_support::start_relay(|| {
             RelayBuilder::default()
-                .query_policy(CountMetadataQueries(std::sync::Arc::clone(&metadata_queries))),
-        );
-        relay.run().await.expect("relay run");
+                .query_policy(CountMetadataQueries(std::sync::Arc::clone(&metadata_queries)))
+        })
+        .await;
 
         let (root, mut home) = temp_job_home("display-name-opt-in");
         home.config.relay_url = relay.url().await.to_string();
