@@ -12,8 +12,8 @@
 #   --version <x.y.z>   MAXPLAYER_VERSION   install this exact version instead of the latest release
 #   --bin-dir <dir>     MAXPLAYER_BIN_DIR   install here instead of ~/.local/bin
 #   --seller            MAXPLAYER_SELLER=1  accepted and ignored; see below
-#                        MAXPLAYER_MODIFY_PATH=1  non-interactive: append bin-dir to ~/.profile without asking
-#                        MAXPLAYER_MODIFY_PATH=0  never touch ~/.profile, even at an interactive terminal
+#                        MAXPLAYER_MODIFY_PATH=1  non-interactive: append bin-dir to the shell profile
+#                        any other value           never touch the shell profile or ask interactively
 #
 # ── One artifact ────────────────────────────────────────────────────────────────────────────────
 # A release publishes ONE build per platform and this installs it. It carries the whole surface:
@@ -397,42 +397,63 @@ main() {
     # of maxplayer earlier in PATH that will keep winning until it is removed.
     if ! dir_on_path "$bin_dir"; then
         modify_path=0
-        # A `curl | sh` install puts the SCRIPT SOURCE on fd 0 (stdin), so by the time execution
-        # reaches here stdin is exhausted or was never a terminal at all — even when a real user is
-        # watching. /dev/tty names the CONTROLLING TERMINAL independent of what's wired to stdin,
-        # which is why it (not stdin) is what rustup/uv read an interactive answer from.
-        if [ -z "${MAXPLAYER_MODIFY_PATH:-}" ] && [ -t 1 ] && [ -r /dev/tty ]; then
-            printf 'install.sh: add %s to your PATH in ~/.profile? [Y/n] ' "$bin_dir" > /dev/tty
-            reply=""
-            IFS= read -r reply < /dev/tty || reply=""
-            case "$reply" in
-                "" | [Yy] | [Yy][Ee][Ss]) modify_path=1 ;;
-                *) modify_path=0 ;;
-            esac
-        elif [ -n "${MAXPLAYER_MODIFY_PATH:-}" ] && [ "$MAXPLAYER_MODIFY_PATH" != "0" ]; then
-            modify_path=1
-        fi
+        marker="# added by maxplayer install.sh"
+        line="export PATH=\"\$PATH:$bin_dir\""
+        case "$PLATFORM" in
+            darwin-*) profile="${HOME:-}/.zprofile" ;;
+            *)        profile="${HOME:-}/.profile" ;;
+        esac
 
-        if [ "$modify_path" = 1 ]; then
-            profile="${HOME:-}/.profile"
-            marker="# added by maxplayer install.sh"
-            line="export PATH=\"\$PATH:$bin_dir\""
-            if [ -n "$profile" ] && [ -f "$profile" ] && grep -qxF "$marker" "$profile" 2>/dev/null; then
-                say ""
-                say "$bin_dir is already added to $profile (marker found) — leaving it unchanged."
-            else
-                [ -n "${HOME:-}" ] || die "HOME is not set — cannot locate ~/.profile to modify. Add $bin_dir to PATH manually: export PATH=\"\$PATH:$bin_dir\""
+        safe_path_line=1
+        case "$bin_dir" in
+            *'"'* | *'`'* | *'$'*)
+                safe_path_line=0
+                warn "not modifying $profile: $bin_dir contains a shell metacharacter that cannot be safely written to PATH automatically"
+                ;;
+        esac
+
+        # Test the exact line, not the installer's marker: the marker may describe another bin-dir,
+        # or may have survived after the export itself was removed. Do this before prompting so an
+        # affirmative answer is never followed by an "already added" response.
+        if [ "$safe_path_line" = 1 ] && [ -f "$profile" ] && grep -qxF "$line" "$profile" 2>/dev/null; then
+            say ""
+            say "$bin_dir is already added to $profile — leaving it unchanged."
+        else
+            # A `curl | sh` install puts the SCRIPT SOURCE on fd 0 (stdin), so by the time execution
+            # reaches here stdin is exhausted or was never a terminal at all — even when a real user
+            # is watching. /dev/tty names the CONTROLLING TERMINAL independent of what's wired to
+            # stdin, which is why it (not stdin) is what rustup/uv read an interactive answer from.
+            if [ "$safe_path_line" = 1 ] && [ -z "${MAXPLAYER_MODIFY_PATH:-}" ] && [ -t 1 ] && [ -r /dev/tty ]; then
+                if printf 'install.sh: add %s to your PATH in %s? [Y/n] ' "$bin_dir" "$profile" > /dev/tty; then
+                    reply=""
+                    if IFS= read -r reply < /dev/tty; then
+                        case "$reply" in
+                            "" | [Yy] | [Yy][Ee][Ss]) modify_path=1 ;;
+                            *) modify_path=0 ;;
+                        esac
+                    fi
+                fi
+            elif [ "$safe_path_line" = 1 ] && [ "${MAXPLAYER_MODIFY_PATH:-}" = 1 ]; then
+                modify_path=1
+            fi
+
+            if [ "$modify_path" = 1 ]; then
+                [ -n "${HOME:-}" ] || die "HOME is not set — cannot locate a shell profile to modify. Add $bin_dir to PATH manually: export PATH=\"\$PATH:$bin_dir\""
                 { printf '\n%s\n%s\n' "$marker" "$line"; } >> "$profile" \
                     || die "could not write to $profile"
                 say ""
                 say "added $bin_dir to PATH in $profile"
                 say "re-open your shell, or run: . $profile"
+            else
+                say ""
+                say "$bin_dir is not on your PATH. Add it, then re-open your shell:"
+                if [ "$safe_path_line" = 1 ]; then
+                    say "  echo 'export PATH=\"\$PATH:$bin_dir\"' >> $profile"
+                else
+                    say "  add the directory to PATH manually; its name is unsafe to place in a generated shell command"
+                fi
+                say "Until then, run it by path: $bin_dir/$BIN_NAME version"
             fi
-        else
-            say ""
-            say "$bin_dir is not on your PATH. Add it, then re-open your shell:"
-            say "  echo 'export PATH=\"\$PATH:$bin_dir\"' >> ~/.profile"
-            say "Until then, run it by path: $bin_dir/$BIN_NAME version"
         fi
     else
         resolved="$(command -v "$BIN_NAME" 2>/dev/null || true)"
