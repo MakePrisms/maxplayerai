@@ -38,8 +38,14 @@ pub fn ensure(home: &MaxplayerHome) -> Result<PathBuf, String> {
     // Poll until our daemon — or a racing winner's — answers, or time out.
     let deadline = Instant::now() + SPAWN_READY_TIMEOUT;
     loop {
-        if client::status(&sock).is_ok() {
-            return Ok(sock);
+        if let Ok(response) = client::status(&sock) {
+            if let Some(pid) = response.result.as_ref().and_then(|result| result["pid"].as_u64()) {
+                // Announce only on the path where this invocation spawned, after a daemon is ready.
+                // In a double-spawn race this reports the winner's pid, not necessarily our child.
+                let display_home = home.root.canonicalize().unwrap_or_else(|_| home.root.clone());
+                eprintln!("spawned buyer daemon pid={pid} home={}", display_home.display());
+                return Ok(sock);
+            }
         }
         if Instant::now() >= deadline {
             return Err(format!(
@@ -76,8 +82,8 @@ fn spawn_detached(home_root: &Path) -> Result<(), String> {
     }
     command
         .spawn()
-        .map(|_child| ())
-        .map_err(|error| format!("failed to spawn the buyer daemon (`maxplayer buyer serve`): {error}"))
+        .map_err(|error| format!("failed to spawn the buyer daemon (`maxplayer buyer serve`): {error}"))?;
+    Ok(())
 }
 
 /// Call a daemon method over the socket, returning its `result` value or a flattened error message.
