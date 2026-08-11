@@ -26,7 +26,7 @@ use crate::payment::{
     PaymentService, PaymentState, PaymentTerms, ReceiptAuthority, ReceiptEvidence, ResultId,
 };
 use crate::payment_send::NostrPaymentSend;
-use crate::payment_wallet::{CdkPaymentEffects, PaymentWalletError};
+use crate::payment_wallet::{CdkPaymentEffects, PaymentWalletError, PreflightError};
 use crate::receipt::{DeliveryKind, ReceiptPreimage, EXEC_METADATA_COMMITMENT_EMPTY};
 
 /// Trusted job-class input for [`authorize_pay_async`], derived by the caller from the buyer's
@@ -170,6 +170,8 @@ pub enum AuthorizePayError {
     Wallet(PaymentWalletError),
     Home(String),
     Effects(String),
+    /// The first direct-payment mint request failed before any journal or budget mutation.
+    CancelledMintUnreachable { mint: String, detail: String },
     /// Pre-pay seller co-signature refusal, carrying the buyer's computed preimage fields + digest
     /// (public trade data, no secrets) so the divergent field self-identifies (diagnostic).
     CosigRefused(String),
@@ -192,6 +194,10 @@ impl fmt::Display for AuthorizePayError {
             Self::CosigRefused(message) => write!(formatter, "authorize_pay payment: {message}"),
             Self::Home(message) => write!(formatter, "authorize_pay home: {message}"),
             Self::Effects(message) => write!(formatter, "authorize_pay effects: {message}"),
+            Self::CancelledMintUnreachable { mint, detail } => write!(
+                formatter,
+                "authorize_pay cancelled: mint {mint} unreachable or erroring ({detail}); no funds moved"
+            ),
             Self::NoSentinel(message) => write!(formatter, "authorize_pay no_sentinel: {message}"),
         }
     }
@@ -226,6 +232,17 @@ impl From<PaymentError> for AuthorizePayError {
 impl From<PaymentWalletError> for AuthorizePayError {
     fn from(value: PaymentWalletError) -> Self {
         Self::Wallet(value)
+    }
+}
+
+impl From<PreflightError> for AuthorizePayError {
+    fn from(value: PreflightError) -> Self {
+        match value {
+            PreflightError::MintUnreachable { mint, detail, .. } => {
+                Self::CancelledMintUnreachable { mint, detail }
+            }
+            PreflightError::Other(message) => Self::Effects(message),
+        }
     }
 }
 
@@ -521,7 +538,7 @@ pub async fn authorize_pay_async(
     // real input-count fee after prepare_send; this only refuses the dead-mint / N=1-dust cases early.
     effects
         .preflight_fee(terms.amount)
-        .map_err(|error| AuthorizePayError::Effects(error.to_string()))?;
+        .map_err(AuthorizePayError::from)?;
 
     // Payment journal — created only AFTER the pre-pay seam passed (a pre-pay refusal leaves no
     // journal on disk, preserving the zero-spend / no-record invariant).
