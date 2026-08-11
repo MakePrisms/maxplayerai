@@ -683,6 +683,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn buyer_serve_with_home_flag_refuses_instead_of_silently_ignoring_it() {
+        // #438: this must NOT silently start the daemon on $MAXPLAYER_HOME/~/.maxplayer.
+        let (code, out, err) = run_captured([
+            "maxplayer",
+            "buyer",
+            "serve",
+            "--home",
+            "/tmp/should-not-be-used",
+        ]);
+        assert_eq!(
+            code, 1,
+            "must refuse (usage error), not start the daemon:\nstdout={out}\nstderr={err}"
+        );
+        assert!(
+            out.is_empty(),
+            "no daemon-online banner on stdout:\nstdout={out}"
+        );
+        assert!(
+            err.contains("--home") && err.contains("MAXPLAYER_HOME"),
+            "error must name both --home and the sanctioned MAXPLAYER_HOME mechanism:\nstderr={err}"
+        );
+    }
+
+    #[test]
+    fn buyer_status_with_home_flag_refuses_instead_of_silently_ignoring_it() {
+        let (code, out, err) = run_captured([
+            "maxplayer",
+            "buyer",
+            "status",
+            "--home",
+            "/tmp/should-not-be-used",
+        ]);
+        assert_eq!(
+            code, 1,
+            "must refuse, not query a daemon on the wrong home:\nstdout={out}\nstderr={err}"
+        );
+        assert!(out.is_empty());
+        assert!(err.contains("--home") && err.contains("MAXPLAYER_HOME"));
+    }
+
+    #[test]
+    fn buyer_bare_with_home_flag_refuses_with_the_clear_message() {
+        // Case B from #438 — already refused pre-fix via the generic usage fallthrough;
+        // this pins that it now gets the SAME explanatory message as serve/status, not
+        // plain "Usage:" text.
+        let (code, out, err) = run_captured([
+            "maxplayer",
+            "buyer",
+            "--home",
+            "/tmp/should-not-be-used",
+        ]);
+        assert_eq!(code, 1);
+        assert!(out.is_empty());
+        assert!(err.contains("--home") && err.contains("MAXPLAYER_HOME"));
+    }
+
     // #360: the seller advertise surface is gated on `acp`. These two tests are the same assertion
     // read from opposite feature builds — the verdict must MOVE with the feature, which is what
     // proves the gate binds `seller` rather than something incidental.
