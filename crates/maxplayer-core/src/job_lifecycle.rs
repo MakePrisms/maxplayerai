@@ -31,9 +31,9 @@ use crate::{buyer_fund, payment_wallet};
 const JOBS_DIR: &str = "jobs";
 /// Per-relay-fetch budget. Kept well under [`WAIT_FOR_CAP_SECS`] / MCP tool deadline.
 const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 5;
-/// Cap for `get_job(wait_for=…)` long-poll. Must stay < MCP tool deadline (~15s) so
-/// cap-hit returns PENDING for re-poll instead of starving the client read-timeout (~60s).
-pub const WAIT_FOR_CAP_SECS: u64 = 10;
+/// Re-exported so this module's own callers (and `buyer`) keep their existing path. The constant
+/// itself lives in an UNGATED module because the MCP tool table needs it without `wallet`.
+pub use crate::long_poll::WAIT_FOR_CAP_SECS;
 const DEFAULT_DEADLINE_SECS: u64 = 3_600;
 /// Derived claim status surfaced when a `processing` claim is past its offer deadline and its
 /// seller has published NO payable delivery (or the delivery's pay window has itself lapsed).
