@@ -481,6 +481,84 @@ mod tests {
     use std::io::Cursor;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    // The post_job schema promises that harness constrains award selection while model does not.
+    // Keep those caller-facing claims tied to the real award predicate: removing the harness
+    // predicate or weakening either description makes this test fail. If AwardFilters grows a
+    // model filter, update both the model description and this test together.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn post_job_award_filter_descriptions_match_enforcement() {
+        use maxplayer_core::buyer::lifecycle::{select_awardable_claim, AwardFilters};
+        use maxplayer_core::gateway::creq::build_seller_creq;
+        use maxplayer_core::home::DEFAULT_MINT_URL;
+        use maxplayer_core::job_lifecycle::{ClaimView, JobView};
+
+        let listed_tools = tools();
+        let post_job = listed_tools
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|tool| tool["name"] == "post_job")
+            .expect("post_job tool");
+        let properties = &post_job["inputSchema"]["properties"];
+        let harness_description = properties["harness"]["description"]
+            .as_str()
+            .expect("harness description")
+            .to_ascii_lowercase();
+        let model_description = properties["model"]["description"]
+            .as_str()
+            .expect("model description")
+            .to_ascii_lowercase();
+
+        assert!(harness_description.contains("hard award filter"));
+        assert!(harness_description.contains("only a seller advertising"));
+        assert!(model_description.contains("recorded as an auto-award preference"));
+        assert!(model_description.contains("not yet a hard filter"));
+
+        let job_id = "a".repeat(64);
+        let seller_pubkey = "aa1e5f8c9d3b6a2f4e7c1d0b8a5f3e2c1d0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f";
+        let creq = build_seller_creq(
+            &job_id,
+            10,
+            "sat",
+            &[DEFAULT_MINT_URL.to_owned()],
+            seller_pubkey,
+        )
+        .expect("payable creq");
+        let view = JobView {
+            job_id,
+            offer: None,
+            claims: vec![ClaimView {
+                claim_id: "c".repeat(64),
+                created_at: 1,
+                seller_pubkey: seller_pubkey.to_owned(),
+                display_name: None,
+                status: "processing".to_owned(),
+                live: true,
+                creq: Some(creq),
+                agents: vec!["codex".to_owned()],
+            }],
+            results: Vec::new(),
+            live_claim_id: None,
+            accepted: None,
+            pending: false,
+            read_confirmed: true,
+        };
+        let filters = AwardFilters {
+            offer_amount_sats: 10,
+            max_sats: 10,
+            buyer_mint: DEFAULT_MINT_URL,
+            allow_real_mints: false,
+            requested_agent: Some("claude"),
+        };
+
+        assert_eq!(
+            select_awardable_claim(&view, &filters),
+            None,
+            "a payable codex-only claim must not win a job requesting claude"
+        );
+    }
+
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
     fn temp_home(label: &str) -> std::path::PathBuf {
