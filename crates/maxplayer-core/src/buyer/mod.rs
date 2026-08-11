@@ -523,6 +523,27 @@ impl From<store::AwardRecord> for AwardedView {
     }
 }
 
+/// Refuse a caller-supplied long-poll timeout above the effective ceiling at the RPC boundary,
+/// before any relay work can begin. The lifecycle layer keeps its clamp as a defensive backstop for
+/// non-RPC callers.
+fn get_job_timeout_error(id: Value, timeout_secs: Option<u64>) -> Option<Response> {
+    let timeout_secs = timeout_secs?;
+    if timeout_secs <= job_lifecycle::WAIT_FOR_CAP_SECS {
+        return None;
+    }
+    Some(Response::err(
+        id,
+        CODE_METHOD_NOT_FOUND,
+        format!(
+            "timeout_secs={timeout_secs} exceeds the get_job long-poll cap of {}s \
+             (bounded well under the MCP tool deadline); omit timeout_secs for the \
+             default or pass a value <= {}",
+            job_lifecycle::WAIT_FOR_CAP_SECS,
+            job_lifecycle::WAIT_FOR_CAP_SECS,
+        ),
+    ))
+}
+
 async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
     let params: GetJobParams = match serde_json::from_value(params) {
         Ok(params) => params,
@@ -532,6 +553,9 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
         Ok(wait_for) => wait_for,
         Err(error) => return Response::err(id, CODE_METHOD_NOT_FOUND, error.to_string()),
     };
+    if let Some(error) = get_job_timeout_error(id.clone(), params.timeout_secs) {
+        return error;
+    }
     let request = GetJobRequest {
         job_id: params.job_id,
         wait_for,
@@ -2896,6 +2920,33 @@ mod tests {
     fn temp_home(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!("maxplayer-buyer-mod-{label}-{}-{id}", std::process::id()))
+    }
+
+    #[test]
+    fn get_job_timeout_rpc_boundary_rejects_above_cap_and_accepts_cap_or_default() {
+        let rejected = get_job_timeout_error(json!(7), Some(300))
+            .expect("a timeout above the cap must be rejected");
+        let error = rejected.error.expect("rejection is an RPC error");
+        assert_eq!(error.code, CODE_METHOD_NOT_FOUND);
+        assert!(
+            error.message.contains("timeout_secs=300 exceeds"),
+            "message: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("10s"),
+            "message: {}",
+            error.message
+        );
+
+        assert!(
+            get_job_timeout_error(json!(8), Some(job_lifecycle::WAIT_FOR_CAP_SECS)).is_none(),
+            "the exact cap must pass boundary validation"
+        );
+        assert!(
+            get_job_timeout_error(json!(9), None).is_none(),
+            "omitting timeout_secs must retain the default behavior"
+        );
     }
 
     /// #539: the operator-console diagnostics for an unaffordable award and a failed settle must
