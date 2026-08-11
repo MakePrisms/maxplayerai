@@ -947,6 +947,15 @@ fn default_home_under(home_base: &Path) -> Result<PathBuf, HomeError> {
     Ok(new_default)
 }
 
+/// Whether `root` already holds an initialized maxplayer home — specifically, whether its key
+/// file exists. This is the one fact [`bootstrap`] uses to decide "create a new identity" vs.
+/// "use the existing one" (`key_path.exists()`), exposed so a caller that must NEVER silently
+/// mint a new identity (e.g. `profile set`, a publish command) can check it BEFORE calling
+/// `bootstrap`, rather than after.
+pub fn is_initialized(root: impl AsRef<Path>) -> bool {
+    root.as_ref().join(KEY_FILE).exists()
+}
+
 /// Ensure `root` exists with config, key (`0600`), and `wallet/` dir.
 ///
 /// Idempotent: existing config/key are left in place except dead-mint migration
