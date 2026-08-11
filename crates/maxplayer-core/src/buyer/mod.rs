@@ -2779,15 +2779,19 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
         Err(error) => return Response::err(id, CODE_INTERNAL, format!("state DB task failed: {error}")),
     };
 
-    // Report EVERY configured mint's balance, not just the default (#496): a wallet funded across
-    // `extra_mints` otherwise hides every non-default balance from the live daemon, forcing a
-    // disruptive daemon-down CLI read to cross-foot a multi-mint wallet. The top-level `mint` +
-    // `balance_sats` (the default mint) stay for back-compat; `total_sats` + the per-mint `mints`
-    // list are added. Read through the wallet actor's single slot, so it never races a spend.
+    // Report every configured and wallet-DB-discovered mint's balance (#266). The top-level `mint`
+    // + `balance_sats` (the default mint) stay for back-compat; `total_sats` is whole-DB truth and
+    // `configured_total_sats` preserves the configured subset. Read through the wallet actor's
+    // single slot, so it never races a spend.
     let mint = context.home.config.default_mint().to_owned();
     let wallet = match context.wallet.balances().await {
         Ok(Ok(rows)) => {
             let total_sats: u64 = rows.iter().map(|row| row.balance_sats).sum();
+            let configured_total_sats: u64 = rows
+                .iter()
+                .filter(|row| row.configured)
+                .map(|row| row.balance_sats)
+                .sum();
             let default_balance = rows
                 .iter()
                 .find(|row| row.is_default)
@@ -2797,7 +2801,13 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
                 .map(|row| {
                     json!({
                         "mint": row.mint_url,
-                        "role": if row.is_default { "default" } else { "extra" },
+                        "role": if !row.configured {
+                            "unconfigured"
+                        } else if row.is_default {
+                            "default"
+                        } else {
+                            "extra"
+                        },
                         "balance_sats": row.balance_sats,
                     })
                 })
@@ -2805,6 +2815,7 @@ async fn status(context: &BuyerContext, id: Value) -> Response {
             json!({
                 "mint": mint,
                 "balance_sats": default_balance,
+                "configured_total_sats": configured_total_sats,
                 "total_sats": total_sats,
                 "mints": mints,
             })
@@ -5340,6 +5351,7 @@ mod tests {
         // fresh home has exactly one configured mint (the default) at 0, so `total_sats` is 0 and the
         // per-mint list carries that one default row. Reverting the per-mint reporting drops these.
         assert_eq!(result["wallet"]["total_sats"], json!(0));
+        assert_eq!(result["wallet"]["configured_total_sats"], json!(0));
         let mints = result["wallet"]["mints"]
             .as_array()
             .expect("#496: status.wallet.mints is a per-mint array");

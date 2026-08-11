@@ -174,15 +174,19 @@ pub(crate) fn select_source_mint(
         .unwrap_or_else(|| config_default.to_owned())
 }
 
-/// Whether `balances` shows at least `amount_sats` at `mint`, comparing normalized mint URLs. A
-/// parse failure on either side is treated as "no match" (never a panic); the caller's fallback to
-/// the configured default keeps a malformed accepted entry from becoming a selected source.
+/// Whether configured `balances` shows at least `amount_sats` at `mint`, comparing normalized mint
+/// URLs. Balance display was widened in #266 to include DB-discovered, unconfigured mints; source
+/// selection deliberately excludes those rows because the selected mint is sealed into the
+/// pays-once attempt id. A parse failure on either side is treated as "no match" (never a panic);
+/// the caller's fallback to the configured default keeps a malformed accepted entry from becoming
+/// a selected source.
 fn holds_at_least(balances: &[crate::wallet_ops::MintBalance], mint: &str, amount_sats: u64) -> bool {
     let Ok(target) = MintUrl::from_str(mint) else {
         return false;
     };
     balances.iter().any(|entry| {
-        entry.balance_sats >= amount_sats
+        entry.configured
+            && entry.balance_sats >= amount_sats
             && MintUrl::from_str(&entry.mint_url).map(|url| url == target).unwrap_or(false)
     })
 }
@@ -504,6 +508,7 @@ mod tests {
             mint_url: mint_url.to_owned(),
             balance_sats: sats,
             is_default: false,
+            configured: true,
         }
     }
 
@@ -546,6 +551,24 @@ mod tests {
 
         // Legacy: an empty accepted set has nothing to prefer; the default stands.
         assert_eq!(select_source_mint(minibits, &[], true, &elsewhere, 100), minibits);
+    }
+
+    // #266 guard: the widened balance read surfaces DB-discovered, unconfigured mints for DISPLAY,
+    // but accept-time selection must ignore them — the selected mint is sealed into the pays-once
+    // attempt id, so this row must never move it. Red if holds_at_least drops the configured pin.
+    #[test]
+    fn select_ignores_a_covering_unconfigured_discovered_mint() {
+        let default_mint = "https://default.example";
+        let stray = "https://stray.example";
+        let accepted = vec![stray.to_owned()];
+        let mut discovered = balance(stray, 5_000);
+        discovered.configured = false;
+
+        assert_eq!(
+            select_source_mint(default_mint, &accepted, true, &[discovered], 100),
+            default_mint,
+            "DB discovery widens display only; it must not change the sealed funding mint"
+        );
     }
 
     // The real-mint fence gates SELECTION exactly as it gates plan_payment: a covered mint the fence

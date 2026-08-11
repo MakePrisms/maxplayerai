@@ -101,10 +101,13 @@ appear on its own:
 
 ```bash
 maxplayer wallet mint-complete <quote_id>
-maxplayer wallet balance          # the number to trust for spendable sats
+maxplayer wallet balance          # total_sats is whole-wallet spendable sats
 ```
 
-If `balance` is still `0`, you paid the invoice but never ran `mint-complete`. Nothing is lost —
+The command includes configured mints and any unconfigured mint where the wallet database holds
+proofs. Such rows say `role=unconfigured`; when they exist, `configured_total_sats` distinguishes
+the configured subset from whole-wallet `total_sats`. If `balance` is still `0`, you paid the
+invoice but never ran `mint-complete`. Nothing is lost —
 run it with the `quote_id` from the setup output.
 
 ## 4. Register the MCP server

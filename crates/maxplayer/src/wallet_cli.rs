@@ -228,7 +228,15 @@ fn cmd_balance(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32
         },
         None => None,
     };
-    let mut total = 0u64;
+    let total = rows
+        .iter()
+        .map(|row| row.balance_sats)
+        .fold(0u64, u64::saturating_add);
+    let configured_total = rows
+        .iter()
+        .filter(|row| row.configured)
+        .map(|row| row.balance_sats)
+        .fold(0u64, u64::saturating_add);
     let mut matched = 0u64;
     for row in &rows {
         if let Some(filter) = filter.as_deref() {
@@ -237,16 +245,18 @@ fn cmd_balance(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32
             }
         }
         matched = matched.saturating_add(1);
-        total = total.saturating_add(row.balance_sats);
         let _ = writeln!(out, "{}", balance_row_line(row));
     }
     if filter.is_some() && matched == 0 {
         let _ = writeln!(
             err,
-            "no balance row for mint={} (configured mints only; check `maxplayer wallet mints list`)",
+            "no proofs for mint={} (queried wallet db and configured mints; check 'maxplayer wallet mints list')",
             filter.as_deref().unwrap_or("")
         );
         return RUNTIME_ERROR;
+    }
+    if configured_total != total {
+        let _ = writeln!(out, "configured_total_sats={configured_total}");
     }
     let _ = writeln!(out, "total_sats={total}");
     SUCCESS
@@ -387,7 +397,13 @@ fn balance_row_line(row: &wallet_ops::MintBalance) -> String {
     format!(
         "mint={} role={} balance_sats={}{}",
         row.mint_url,
-        if row.is_default { "default" } else { "extra" },
+        if !row.configured {
+            "unconfigured"
+        } else if row.is_default {
+            "default"
+        } else {
+            "extra"
+        },
         row.balance_sats,
         play_money_marker(&row.mint_url),
     )
@@ -1228,6 +1244,158 @@ mod tests {
         .expect("seed testnut default on disk");
     }
 
+    #[cfg(feature = "wallet")]
+    fn seed_unconfigured_balance(root: &std::path::Path, mint_url: &str, amount: u64) {
+        use std::str::FromStr;
+
+        use cashu::secret::Secret;
+        use cashu::{Amount, CurrencyUnit, Id, MintUrl, Proof, SecretKey, State};
+        use cdk::cdk_database::WalletDatabase;
+        use cdk::wallet::types::ProofInfo;
+        use cdk_sqlite::wallet::WalletSqliteDatabase;
+
+        let home = home::bootstrap(root).expect("bootstrap proof home");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let store = WalletSqliteDatabase::new(home.wallet_dir.join("cdk-wallet.sqlite"))
+                .await
+                .expect("open on-disk wallet database");
+            let proof = Proof::new(
+                Amount::from(amount),
+                Id::from_str("009a1f293253e41e").expect("keyset id"),
+                Secret::new(format!("wallet-cli-issue-266-{amount}-{mint_url}")),
+                SecretKey::generate().public_key(),
+            );
+            let info = ProofInfo::new(
+                proof,
+                MintUrl::from_str(mint_url).expect("mint URL"),
+                State::Unspent,
+                CurrencyUnit::Sat,
+            )
+            .expect("proof info");
+            store
+                .update_proofs(vec![info], vec![])
+                .await
+                .expect("seed unconfigured proof");
+        });
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn balance_reports_unconfigured_db_proofs_and_both_totals() {
+        let root = ux_test_home("balance-db-truth");
+        let _ = std::fs::remove_dir_all(&root);
+        seed_testnut_default_home(&root);
+        seed_unconfigured_balance(&root, "https://stray-mint.example/", 37);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(
+            &[
+                "balance".into(),
+                "--home".into(),
+                root.to_string_lossy().into_owned(),
+            ],
+            &mut out,
+            &mut err,
+        );
+        let out = String::from_utf8(out).expect("utf8");
+        assert_eq!(code, SUCCESS, "stderr: {}", String::from_utf8_lossy(&err));
+        assert!(
+            out.contains("mint=https://stray-mint.example role=unconfigured balance_sats=37"),
+            "{out}"
+        );
+        assert!(
+            out.contains("configured_total_sats=0\ntotal_sats=37\n"),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn balance_mint_filter_distinguishes_discovered_from_never_seen() {
+        let root = ux_test_home("balance-filter-db-truth");
+        let _ = std::fs::remove_dir_all(&root);
+        seed_testnut_default_home(&root);
+        seed_unconfigured_balance(&root, "https://stray-mint.example/", 41);
+        let home_arg = root.to_string_lossy().into_owned();
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(
+            &[
+                "balance".into(),
+                "--mint".into(),
+                "https://stray-mint.example/".into(),
+                "--home".into(),
+                home_arg.clone(),
+            ],
+            &mut out,
+            &mut err,
+        );
+        let out = String::from_utf8(out).expect("utf8");
+        assert_eq!(code, SUCCESS, "stderr: {}", String::from_utf8_lossy(&err));
+        assert!(out.contains("role=unconfigured balance_sats=41"), "{out}");
+
+        let mut missing_out = Vec::new();
+        let mut missing_err = Vec::new();
+        let missing_code = run(
+            &[
+                "balance".into(),
+                "--mint".into(),
+                "https://never-seen.example".into(),
+                "--home".into(),
+                home_arg,
+            ],
+            &mut missing_out,
+            &mut missing_err,
+        );
+        let missing_err = String::from_utf8(missing_err).expect("utf8");
+        assert_eq!(missing_code, RUNTIME_ERROR);
+        assert!(
+            missing_err.contains("queried wallet db and configured mints"),
+            "{missing_err}"
+        );
+        assert!(
+            !missing_err.contains("configured mints only"),
+            "{missing_err}"
+        );
+        assert!(missing_out.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn balance_configured_only_output_keeps_the_existing_grammar() {
+        let root = ux_test_home("balance-configured-grammar");
+        let _ = std::fs::remove_dir_all(&root);
+        seed_testnut_default_home(&root);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(
+            &[
+                "balance".into(),
+                "--home".into(),
+                root.to_string_lossy().into_owned(),
+            ],
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, SUCCESS, "stderr: {}", String::from_utf8_lossy(&err));
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            format!(
+                "mint={DEFAULT_MINT_URL} role=default balance_sats=0 play_money=true\ntotal_sats=0\n"
+            )
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // #445 (Option 1, fail-closed): `wallet setup` on a home whose default is the testnut PLAY mint,
     // with NO explicit `--mint`, must REFUSE rather than silently auto-fund fake sats. The refusal is
     // reached before any mint round-trip, so this holds offline. RED-ON-REVERT: without the gate the
@@ -1259,7 +1427,10 @@ mod tests {
             "must refuse, not fund:\nstdout={out}\nstderr={err}"
         );
         assert!(out.is_empty(), "nothing funded => empty stdout:\n{out}");
-        assert!(err.contains("PLAY money"), "refusal must name play money:\n{err}");
+        assert!(
+            err.contains("PLAY money"),
+            "refusal must name play money:\n{err}"
+        );
         assert!(
             err.contains(DEFAULT_MINT_URL),
             "refusal must name the testnut mint (the --mint affirmation):\n{err}"
@@ -1288,17 +1459,34 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = run(
-            &["mint".into(), "100".into(), "--home".into(), home_str.clone()],
+            &[
+                "mint".into(),
+                "100".into(),
+                "--home".into(),
+                home_str.clone(),
+            ],
             &mut out,
             &mut err,
         );
         let out = String::from_utf8(out).expect("utf8");
         let err = String::from_utf8(err).expect("utf8");
-        assert_eq!(code, RUNTIME_ERROR, "must refuse, not fund:\nstdout={out}\nstderr={err}");
+        assert_eq!(
+            code, RUNTIME_ERROR,
+            "must refuse, not fund:\nstdout={out}\nstderr={err}"
+        );
         assert!(out.is_empty(), "nothing funded => empty stdout:\n{out}");
-        assert!(err.contains("PLAY money"), "refusal must name play money:\n{err}");
-        assert!(err.contains(DEFAULT_MINT_URL), "refusal must name the testnut mint:\n{err}");
-        assert!(err.contains("mints add"), "refusal must offer the other-mint remedy:\n{err}");
+        assert!(
+            err.contains("PLAY money"),
+            "refusal must name play money:\n{err}"
+        );
+        assert!(
+            err.contains(DEFAULT_MINT_URL),
+            "refusal must name the testnut mint:\n{err}"
+        );
+        assert!(
+            err.contains("mints add"),
+            "refusal must offer the other-mint remedy:\n{err}"
+        );
 
         // Allowed path: an explicit `--mint` affirms the choice, so the guard passes through.
         let mut out = Vec::new();
@@ -1316,7 +1504,10 @@ mod tests {
             &mut err,
         );
         let err = String::from_utf8(err).expect("utf8");
-        assert!(!err.contains("PLAY money"), "explicit --mint must pass the guard:\n{err}");
+        assert!(
+            !err.contains("PLAY money"),
+            "explicit --mint must pass the guard:\n{err}"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1335,17 +1526,34 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = run(
-            &["invoice".into(), "100".into(), "--home".into(), home_str.clone()],
+            &[
+                "invoice".into(),
+                "100".into(),
+                "--home".into(),
+                home_str.clone(),
+            ],
             &mut out,
             &mut err,
         );
         let out = String::from_utf8(out).expect("utf8");
         let err = String::from_utf8(err).expect("utf8");
-        assert_eq!(code, RUNTIME_ERROR, "must refuse, not fund:\nstdout={out}\nstderr={err}");
+        assert_eq!(
+            code, RUNTIME_ERROR,
+            "must refuse, not fund:\nstdout={out}\nstderr={err}"
+        );
         assert!(out.is_empty(), "nothing funded => empty stdout:\n{out}");
-        assert!(err.contains("PLAY money"), "refusal must name play money:\n{err}");
-        assert!(err.contains(DEFAULT_MINT_URL), "refusal must name the testnut mint:\n{err}");
-        assert!(err.contains("mints add"), "refusal must offer the other-mint remedy:\n{err}");
+        assert!(
+            err.contains("PLAY money"),
+            "refusal must name play money:\n{err}"
+        );
+        assert!(
+            err.contains(DEFAULT_MINT_URL),
+            "refusal must name the testnut mint:\n{err}"
+        );
+        assert!(
+            err.contains("mints add"),
+            "refusal must offer the other-mint remedy:\n{err}"
+        );
 
         // Allowed path: explicit `--mint` passes the guard (then fails on the unconfigured mint).
         let mut out = Vec::new();
@@ -1363,7 +1571,10 @@ mod tests {
             &mut err,
         );
         let err = String::from_utf8(err).expect("utf8");
-        assert!(!err.contains("PLAY money"), "explicit --mint must pass the guard:\n{err}");
+        assert!(
+            !err.contains("PLAY money"),
+            "explicit --mint must pass the guard:\n{err}"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1452,11 +1663,13 @@ mod tests {
             mint_url: DEFAULT_MINT_URL.to_owned(),
             balance_sats: 5,
             is_default: true,
+            configured: true,
         };
         let real_extra = MintBalance {
             mint_url: "https://real-mint.example".to_owned(),
             balance_sats: 0,
             is_default: false,
+            configured: true,
         };
         let balance = balance_row_line(&testnut_default);
         assert!(
