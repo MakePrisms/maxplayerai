@@ -693,7 +693,7 @@ where
 
         fn visit_str<E: de::Error>(self, _value: &str) -> Result<Self::Value, E> {
             Err(E::custom(
-                "agent_command must be an argv array, not a string/shell value",
+                "argv must be an array, not a string/shell value",
             ))
         }
 
@@ -707,7 +707,7 @@ where
                 out.push(item);
             }
             if out.is_empty() {
-                return Err(de::Error::custom("agent_command argv must be non-empty"));
+                return Err(de::Error::custom("argv must be non-empty"));
             }
             Ok(out)
         }
@@ -2104,6 +2104,49 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("config.toml"), "names the layer: {message}");
         assert!(message.contains("bogus_field"), "names the key: {message}");
+    }
+
+    #[test]
+    fn sandbox_launcher_empty_argv_error_names_sandbox_field_not_agent_command() {
+        // #381: an empty `[sandbox] launcher = []` must not misdirect debugging toward
+        // `agent_command` — the shared argv validator's message must be field-agnostic and
+        // let the per-call-site path (which `toml` already attaches) do the naming.
+        let message = parse_config_toml("[sandbox]\nlauncher = []\n")
+            .expect_err("empty sandbox.launcher must refuse")
+            .to_string();
+        assert!(
+            message.contains("sandbox.launcher"),
+            "names the actual field that failed: {message}"
+        );
+        assert!(
+            !message.contains("agent_command"),
+            "must not misdirect toward agent_command: {message}"
+        );
+
+        // The bare-string variant of the same field must get the same treatment.
+        let string_message = parse_config_toml("[sandbox]\nlauncher = 'x'\n")
+            .expect_err("string sandbox.launcher must refuse")
+            .to_string();
+        assert!(
+            string_message.contains("sandbox.launcher"),
+            "names the actual field that failed: {string_message}"
+        );
+        assert!(
+            !string_message.contains("agent_command"),
+            "must not misdirect toward agent_command: {string_message}"
+        );
+
+        // Guard the OTHER direction: `agent_command` itself must still be named when IT is
+        // the field that actually failed (regression guard for the shared deserializer).
+        let seller_message = parse_config_toml(
+            "[seller]\nagent_command = []\nrate_sats = 1\ngit_remote = 'https://relay.example/git/x/y.git'\n",
+        )
+        .expect_err("empty seller.agent_command must refuse")
+        .to_string();
+        assert!(
+            seller_message.contains("seller.agent_command"),
+            "still names agent_command when it's the actual offender: {seller_message}"
+        );
     }
 
     #[test]

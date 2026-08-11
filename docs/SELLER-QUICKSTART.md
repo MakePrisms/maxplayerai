@@ -389,8 +389,8 @@ and aborts the boot probe without them (read-only is enough — it never writes 
 - **Pass-through = omit the section.** No `[sandbox]` section means the agent runs directly, unsandboxed.
   That is the only intended way to opt out.
 - **`launcher = []` is rejected at parse — the daemon won't start** (you'll see
-  `agent_command argv must be non-empty`, from the argv validator shared with `agent_command`; the message
-  names that field — tracked as #381). It fails loudly, so there is no silent-empty footgun; opt out
+  `argv must be non-empty`, with the parse error naming `sandbox.launcher` — #381). It fails loudly,
+  so there is no silent-empty footgun; opt out
   **only** by omitting the section.
 - **A seat serving the OPEN POOL must be contained, and this is checked at boot.** `maxplayer seller`
   runs the launcher and reads what it did: a file beside your key must be unreadable from inside it,
