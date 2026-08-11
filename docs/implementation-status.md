@@ -24,13 +24,14 @@ matches the spec.
 
 ## Verification checks and rejection
 
-The checks layer is complete in the core types and absent from every running path.
+The checks declaration and environment-provisioning path is wired into contribution jobs. Running
+the declared checks and producing or verifying their attestation remain absent from production.
 
 | Spec | v1 says | Code today | Issue |
 |---|---|---|---|
-| §9.1 | A buyer reads `.maxplayer/checks.toml` from the pinned base and validates it. | No production path calls `parse_declaration`, `validate_against_base`, or `env_lock_ref`. `checks.rs` has no caller outside its own tests and `env_provision.rs`. | — |
+| §9.1 | A reader reads `.maxplayer/checks.toml` from the pinned base and validates it. | The seller's contribution-workdir path inspects the pinned base commit. If the declaration blob is absent, it returns `Ok(())` and silently skips provisioning. If present, `capture_job_checks` calls `parse_declaration` and `validate_against_base`; the path then calls `env_lock_ref` and records the declaration and resolved reference — `seller_node/run.rs:1739`. | — |
 | §9.2 | A checked delivery carries an attestation the buyer verifies. | No production path calls `render_attestation` or `parse_attestation`. | — |
-| §9.1 | The runner resolves an environment backend and composes the command. | No production path calls `resolve_backend` or `argv_prefix`. `env_provision.rs` is referenced only by the module declaration in `lib.rs:30`. | — |
+| §9.1 | The runner resolves an environment backend and runs declared commands with the required network posture. | The seller calls `resolve_backend` and `provision`: Nix provisioning warms the dev shell with `true`; container provisioning pulls and verifies the pinned digest; and `argv_prefix` produces the checks-posture prefix. Provisioning failures become `execution_failed` feedback with detail `env_unprovisionable` through `refusal_feedback` — `seller_node/run.rs:1751`, `seller_node/run.rs:4767`. No production path runs the declaration's `prepare` or `commands` arrays. | — |
 | §10 | A buyer publishes `REJECT` on a deterministic verification failure. | No production path publishes it. `reject_draft` exists (`gateway.rs:725`) and its only caller is its own unit test (`gateway.rs:986`). | — |
 
 The execution sentinel in §8.2 is a separate mechanism, and it **is** enforced. A buyer refuses to
