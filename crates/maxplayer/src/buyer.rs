@@ -22,11 +22,36 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         write_usage(out);
         return SUCCESS;
     }
-    match args.first().map(String::as_str) {
-        None | Some("serve") => serve(out, err),
-        Some("status") => status(out, err),
-        _ => usage(err),
+    let (dispatch, rest): (fn(&mut dyn Write, &mut dyn Write) -> i32, &[String]) =
+        match args.first().map(String::as_str) {
+            None => (serve, args),
+            Some("serve") => (serve, &args[1..]),
+            Some("status") => (status, &args[1..]),
+            Some("--home") => (serve, args),
+            _ => return usage(err),
+        };
+    // #438: `maxplayer buyer` takes its home ONLY from $MAXPLAYER_HOME (or ~/.maxplayer) —
+    // never from --home, in either its space-separated or `--home=<dir>` form. Honoring it
+    // would require the daemon to plumb an operator flag through its exclusive-lock/socket-path
+    // bootstrap; refusing loudly is the safer, smaller fix. A silently-ignored --home was the
+    // actual bug: the daemon bound $MAXPLAYER_HOME while the operator believed they'd selected
+    // --home's wallet. serve/status take no arguments at all, so ANY unrecognized trailing arg
+    // is refused rather than swallowed (the wallet CLI's catch-all property) — an exact-string
+    // match here previously let `--home=<dir>` through to the same silent divergence.
+    if let Some(arg) = rest.first() {
+        if arg == "--home" || arg.starts_with("--home=") {
+            let _ = writeln!(
+                err,
+                "error: 'maxplayer buyer' takes its home from $MAXPLAYER_HOME (or ~/.maxplayer); \
+                 --home is not supported here. Use: MAXPLAYER_HOME=<dir> maxplayer buyer"
+            );
+        } else {
+            let _ = writeln!(err, "error: unknown argument: {arg}");
+            write_usage(err);
+        }
+        return USAGE_ERROR;
     }
+    dispatch(out, err)
 }
 
 /// Help that was asked for goes to stdout and succeeds; the same text on stderr means the

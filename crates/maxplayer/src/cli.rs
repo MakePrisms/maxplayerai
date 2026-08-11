@@ -683,6 +683,114 @@ mod tests {
         );
     }
 
+    #[test]
+    fn buyer_serve_with_home_flag_refuses_instead_of_silently_ignoring_it() {
+        // #438: this must NOT silently start the daemon on $MAXPLAYER_HOME/~/.maxplayer.
+        let (code, out, err) = run_captured([
+            "maxplayer",
+            "buyer",
+            "serve",
+            "--home",
+            "/tmp/should-not-be-used",
+        ]);
+        assert_eq!(
+            code, 1,
+            "must refuse (usage error), not start the daemon:\nstdout={out}\nstderr={err}"
+        );
+        assert!(
+            out.is_empty(),
+            "no daemon-online banner on stdout:\nstdout={out}"
+        );
+        assert!(
+            err.contains("--home") && err.contains("MAXPLAYER_HOME"),
+            "error must name both --home and the sanctioned MAXPLAYER_HOME mechanism:\nstderr={err}"
+        );
+    }
+
+    #[test]
+    fn buyer_status_with_home_flag_refuses_instead_of_silently_ignoring_it() {
+        let (code, out, err) = run_captured([
+            "maxplayer",
+            "buyer",
+            "status",
+            "--home",
+            "/tmp/should-not-be-used",
+        ]);
+        assert_eq!(
+            code, 1,
+            "must refuse, not query a daemon on the wrong home:\nstdout={out}\nstderr={err}"
+        );
+        assert!(out.is_empty());
+        assert!(err.contains("--home") && err.contains("MAXPLAYER_HOME"));
+    }
+
+    #[test]
+    fn buyer_serve_with_home_equals_form_refuses_the_same_way() {
+        // #654 review on #438: `--home=<dir>` bypassed the exact-string match and serve() ran on
+        // $MAXPLAYER_HOME — the identical silent divergence, not a variant. Equals form must get
+        // the same refusal as the space-separated form.
+        let (code, out, err) = run_captured([
+            "maxplayer",
+            "buyer",
+            "serve",
+            "--home=/tmp/should-not-be-used",
+        ]);
+        assert_eq!(
+            code, 1,
+            "equals form must refuse, not start the daemon:\nstdout={out}\nstderr={err}"
+        );
+        assert!(out.is_empty(), "no daemon-online banner on stdout:\nstdout={out}");
+        assert!(
+            err.contains("--home") && err.contains("MAXPLAYER_HOME"),
+            "error must name both --home and MAXPLAYER_HOME:\nstderr={err}"
+        );
+    }
+
+    #[test]
+    fn buyer_status_with_home_equals_form_refuses_the_same_way() {
+        let (code, out, err) = run_captured([
+            "maxplayer",
+            "buyer",
+            "status",
+            "--home=/tmp/should-not-be-used",
+        ]);
+        assert_eq!(code, 1, "stdout={out}\nstderr={err}");
+        assert!(out.is_empty());
+        assert!(err.contains("--home") && err.contains("MAXPLAYER_HOME"));
+    }
+
+    #[test]
+    fn buyer_serve_with_stray_argument_refuses_instead_of_swallowing_it() {
+        // #654 review: serve/status take zero trailing args, so any unrecognized arg is refused
+        // (the wallet CLI's catch-all property) — never silently ignored.
+        let (code, out, err) = run_captured(["maxplayer", "buyer", "serve", "extra"]);
+        assert_eq!(
+            code, 1,
+            "a stray argument must refuse, not be swallowed:\nstdout={out}\nstderr={err}"
+        );
+        assert!(out.is_empty());
+        assert!(
+            err.contains("unknown argument") && err.contains("extra"),
+            "error must name the offending argument:\nstderr={err}"
+        );
+    }
+
+    #[test]
+    fn buyer_bare_with_home_flag_refuses_with_the_clear_message() {
+        // Case B from #438 — already refused pre-fix via the generic usage fallthrough;
+        // this pins that it now gets the SAME explanatory message as serve/status, not
+        // plain "Usage:" text.
+        let (code, out, err) = run_captured([
+            "maxplayer",
+            "buyer",
+            "--home",
+            "/tmp/should-not-be-used",
+        ]);
+        assert_eq!(code, 1);
+        assert!(out.is_empty());
+        assert!(err.contains("--home") && err.contains("MAXPLAYER_HOME"));
+    }
+
     // #360: the seller advertise surface is gated on `acp`. These two tests are the same assertion
     // read from opposite feature builds — the verdict must MOVE with the feature, which is what
     // proves the gate binds `seller` rather than something incidental.
