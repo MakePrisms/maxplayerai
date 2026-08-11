@@ -640,9 +640,12 @@ total_sats=1250
 ```
 
 The command shows every configured mint (including zero balances) and every mint where the shared
-wallet database holds spendable proofs. `total_sats` is the whole-wallet spendable figure. If funds
-exist at an unconfigured mint, its row has `role=unconfigured` and a separate
-`configured_total_sats` line appears before the whole-wallet total. The daemon's own `seller node
+wallet database holds spendable proofs. `total_sats` is the whole-wallet figure. If funds exist at
+an unconfigured mint, its row has `role=unconfigured` and a separate `configured_total_sats` line
+appears before the whole-wallet total — and that configured subset is what job payment can actually
+draw on: accept-time source selection deliberately ignores unconfigured balances, so money at an
+unconfigured mint is yours to `send`/`melt` manually but does not fund jobs until you
+`wallet mints add` it. The daemon's own `seller node
 status` line every ~5 minutes ([§9](#9-minimal-runbook)) tells you the loop is turning; `wallet
 balance` tells you what it earned.
 

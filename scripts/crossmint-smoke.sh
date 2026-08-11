@@ -73,7 +73,10 @@ rule() { echo "--- $* ---"; }
 # CANNOT produce: testnut auto-settles, so `status=needs_payment` never appears against a test
 # mint. Proving them against fixtures is the only honest coverage available before real sats.
 
-# `mint=<url> role=<default|extra> balance_sats=<n>` lines, then `total_sats=<n>`.
+# `mint=<url> role=<default|extra|unconfigured> balance_sats=<n>` lines, then `total_sats=<n>`
+# (preceded by `configured_total_sats=<n>` only when the two differ — never for this script's
+# configured-only mints). The parser keys on `mint=<url> ` and reads `balance_sats`, so the role
+# vocabulary is informational here.
 parse_balance_for_mint() { # <text> <mint-url>
     printf '%s\n' "$1" | command grep -F "mint=$2 " | command sed -n 's/.*balance_sats=\([0-9]*\).*/\1/p' | command head -1
 }
