@@ -813,9 +813,14 @@ agent_command = "claude --print"
 rate_sats = 1
 git_remote = "https://example.invalid/repo.git"
 "#;
-        let err = toml::from_str::<MaxplayerConfig>(raw).expect_err("string argv must refuse");
+        let err = crate::home::parse_config_toml(raw).expect_err("string argv must refuse");
+        let message = err.to_string();
         assert!(
-            err.to_string().contains("argv array") || err.to_string().contains("agent_command"),
+            message.contains("argv must be an array"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            message.contains("in `seller.agent_command`"),
             "unexpected error: {err}"
         );
     }

@@ -1128,6 +1128,9 @@ pub(crate) fn parse_config_toml(raw: &str) -> Result<MaxplayerConfig, HomeError>
         toml::from_str(raw).map_err(|error| HomeError::Config(format!("config.toml: {error}")))?;
     fold_legacy_mint_url(&mut table);
     fold_removed_config_fields(&mut table);
+    // LOAD-BEARING: Table -> try_into preserves dotted field-path attribution on value errors.
+    // Do not replace it with toml::from_str::<MaxplayerConfig>: the document deserializer sets
+    // span/raw context, suppressing the `in `<field>`` annotation the #381 test relies on.
     table
         .try_into()
         .map_err(|error| HomeError::Config(format!("config.toml: {error}")))
