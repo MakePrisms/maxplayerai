@@ -111,6 +111,42 @@ fn connect_or_spawn_starts_then_reuses_one_daemon() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+#[test]
+fn spawning_a_daemon_announces_pid_and_home_but_reuse_does_not() {
+    let home = temp_home("announce");
+    let _ = std::fs::remove_dir_all(&home);
+
+    // First call: no daemon exists yet, so this call's own process must spawn one and announce
+    // it on ITS OWN stderr (the spawning process, not the daemon's — daemon stdio is nulled).
+    let (_code, first_stdout, first_stderr) = run(&home, &["collect", &"a".repeat(64)]);
+    let first = wait_for_daemon(&home).expect("connect-or-spawn must start the daemon");
+    let pid = first["pid"].as_u64().expect("status carries a pid");
+
+    assert!(
+        !first_stdout.contains("spawned buyer daemon"),
+        "the spawn announce must never touch protocol stdout; stdout was: {first_stdout}"
+    );
+    assert!(
+        first_stderr.contains(&format!("spawned buyer daemon pid={pid}")),
+        "first connect-or-spawn must announce the pid it started; stderr was: {first_stderr}"
+    );
+    assert!(
+        first_stderr.contains(&home.display().to_string()),
+        "the announce line must name the home; stderr was: {first_stderr}"
+    );
+
+    // Second call: the daemon from the first call is already serving — this must NOT print a
+    // second announce line (connect-to-existing must stay silent per #191's acceptance sketch).
+    let (_code, _stdout, second_stderr) = run(&home, &["collect", &"b".repeat(64)]);
+    assert!(
+        !second_stderr.contains("spawned buyer daemon"),
+        "reusing an already-serving daemon must not announce a spawn; stderr was: {second_stderr}"
+    );
+
+    kill(pid);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// A money op is served by the daemon, never in-process: after a routed collect the daemon owns the
 /// home lock + socket, and a collect with no delivery burns nothing (no payment journal / results).
 #[test]
