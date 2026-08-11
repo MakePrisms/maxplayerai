@@ -1,18 +1,43 @@
 name: Release
 
-# A pushed tag is the ONLY thing that can publish anything.
+# A pushed tag is the ONLY thing that can publish a RELEASE.
 #
 # `workflow_dispatch` exists so the whole build and every verifier can be exercised on demand, and it
-# deliberately cannot reach the publishing jobs. Note that a dispatch can be aimed at a tag ref, so
+# cannot reach the release or publish jobs. Note that a dispatch can be aimed at a tag ref, so
 # `github.ref_type == 'tag'` is not on its own evidence of a tag PUSH — every gate below tests the
 # event name as well.
 #
 # `pull_request` is absent on purpose: a pull request cannot start this workflow at all.
+#
+# ★ ONE dispatch path does publish, and it lives here rather than in a workflow of its own for a
+#   reason worth stating: npm scopes a trusted publisher to a WORKFLOW FILENAME. A credential probe
+#   in `npm-oidc-probe.yml` would exercise a publisher entry for `npm-oidc-probe.yml` — a different
+#   credential from the one a release depends on, which is the only credential worth proving. So the
+#   probe is a job in THIS file, and what it may publish is fenced instead: an explicit non-empty
+#   input, a payload package by name, a `0.0.<n>` version no release can ever name, content
+#   generated in the job rather than taken from the tree, and the `probe` dist-tag. See `npm-probe`
+#   at the bottom, and `verify-release-workflow.sh`, which holds every one of those in place.
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      npm_probe_package:
+        description: 'Publish-credential probe: payload package to publish a placeholder for. Leave blank for an ordinary dry run.'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''
+          - '@maxplayerai/darwin-arm64'
+          - '@maxplayerai/linux-x64'
+          - '@maxplayerai/linux-arm64'
+      npm_probe_version:
+        description: 'Probe version, 0.0.<n> only — bump each run, npm never allows reusing one.'
+        required: false
+        default: '0.0.1'
+        type: string
 
 # Read-only for every job; the two that need to write ask for it themselves.
 permissions:
@@ -34,11 +59,16 @@ jobs:
     outputs:
       version: ${{ steps.plan.outputs.version }}
       prerelease: ${{ steps.plan.outputs.prerelease }}
+      # The release platform set, defined once in .github/release-platforms.json and derived here so
+      # nothing downstream keeps its own copy. `matrix` drives the build (via fromJSON); `platforms`
+      # is the space-separated name list the completeness gate and RELEASE_PLATFORMS consume.
+      matrix: ${{ steps.plan.outputs.matrix }}
+      platforms: ${{ steps.plan.outputs.platforms }}
     steps:
       - uses: actions/checkout@v4
 
       - id: plan
-        name: Resolve the version being built
+        name: Resolve the version and platform set being built
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
@@ -48,7 +78,7 @@ jobs:
             # A dry run has no tag. Take the version from the tree so the cross-checks in
             # verify-release-version.sh still compare the crate, the manifests and the pins against
             # each other.
-            version="$(node -p "require('./npm/mobee/package.json').version")"
+            version="$(node -p "require('./npm/maxplayer/package.json').version")"
           fi
           [ -n "$version" ] || { echo "could not resolve a version" >&2; exit 1; }
 
@@ -63,6 +93,20 @@ jobs:
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
           echo "Building $version (prerelease=$prerelease)"
 
+          # The platform set has ONE source: .github/release-platforms.json. The build matrix, the
+          # release completeness gate and publish's RELEASE_PLATFORMS all read it from here rather
+          # than restating it — this is #249, where those copies drifted and a dry run could not see
+          # it. The tree-side copies npm needs statically (the payload packages, the launcher's pins)
+          # cannot read a job output, so verify-release-surface.sh holds them to this same file.
+          manifest=.github/release-platforms.json
+          [ -f "$manifest" ] || { echo "$manifest is missing — the release platform set has no source" >&2; exit 1; }
+          matrix="$(node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync("./.github/release-platforms.json","utf8"));if(!Array.isArray(p)||p.length===0){console.error("release-platforms.json is not a non-empty array");process.exit(1)}process.stdout.write(JSON.stringify({include:p}))')"
+          platforms="$(node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync("./.github/release-platforms.json","utf8"));process.stdout.write(p.map(function(e){return e.platform}).join(" "))')"
+          [ -n "$platforms" ] || { echo "$manifest lists no platforms" >&2; exit 1; }
+          echo "matrix=$matrix"       >> "$GITHUB_OUTPUT"
+          echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
+          echo "Platforms: $platforms"
+
   build:
     name: Build ${{ matrix.platform }}
     needs: plan
@@ -71,23 +115,16 @@ jobs:
       # One platform failing must not hide another's result — the point of a dry run is to learn
       # about every platform at once.
       fail-fast: false
-      matrix:
-        include:
-          # Native runners throughout. Cross-building the aarch64 static artifact through nix
-          # compiles rustc from source, which dominates the build; a native runner per platform
-          # avoids that entirely.
-          - platform: linux-x64
-            runner: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            kind: linux-musl
-          - platform: linux-arm64
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-            kind: linux-musl
-          - platform: darwin-arm64
-            runner: macos-14
-            target: aarch64-apple-darwin
-            kind: darwin
+      # The matrix is .github/release-platforms.json, read by the plan job — the set of platforms and
+      # each one's runner/target/kind stated in exactly one place (#249, where independent copies of
+      # this list drifted). #510 made this ONE artifact per platform carrying the whole surface: a
+      # single `maxplayer` that both buys and sells, so the choice is a runtime one (`maxplayer` vs
+      # `maxplayer seller`), not a download-time one. The feature split is not gone —
+      # `crates/maxplayer/Cargo.toml` still gates the seller surface behind `acp` and ci.yml keeps the
+      # buyer-only set compiling — it is just no longer a SHIPPING dimension. Native runners
+      # throughout: cross-building the aarch64 static artifact through nix compiles rustc from source
+      # and dominates the build, which a native runner per platform avoids.
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -116,10 +153,11 @@ jobs:
           command -v gtar >/dev/null || { echo "gnu-tar installed but gtar is not on PATH" >&2; exit 1; }
           echo "TAR=gtar" >> "$GITHUB_ENV"
 
-      # `--no-default-features --features wallet` states the buyer surface explicitly instead of
-      # relying on `default`. The two are equal today (`default = ["wallet"]`), but naming the
-      # feature means a later change to `default` cannot quietly compile the seller's
-      # agent-execution path into the artifact handed to buyers.
+      # `--no-default-features --features wallet,acp` names the shipped surface explicitly instead of
+      # inheriting `default` (`["wallet"]` today). Stated rather than defaulted because `acp` is the
+      # whole of what makes this artifact able to sell: a later edit to `default` must not be able to
+      # decide, silently, what a release ships. `verify-seller-surface.sh` below is what proves the
+      # features actually landed — this line is only the request.
       - name: Build
         env:
           # Both linux targets are built on a runner of their own architecture, so `musl-gcc` is a
@@ -129,8 +167,8 @@ jobs:
           CC_aarch64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: |
-          cargo build -p mobee --release --locked \
-            --no-default-features --features wallet \
+          cargo build -p maxplayer --release --locked \
+            --no-default-features --features wallet,acp \
             --target ${{ matrix.target }}
 
       # `run: |` is load-bearing wherever the command is continued with a backslash. A plain scalar
@@ -142,10 +180,18 @@ jobs:
           ./scripts/verify-release-version.sh '${{ needs.plan.outputs.version }}' \
             "target/${{ matrix.target }}/release/maxplayer"
 
-      # Which features were compiled in — wallet present, acp absent. `version` succeeds in every
-      # build, so nothing else here can tell one feature combination from another.
-      - name: Verify the racer surface
-        run: ./scripts/verify-racer-surface.sh "target/${{ matrix.target }}/release/maxplayer"
+      # Which features were compiled in. `version` succeeds in every build, so nothing else here can
+      # tell one feature combination from another — a `--features` line that silently stopped naming
+      # `acp` would still build, package, checksum and install, and the first report would be a
+      # seller whose `maxplayer seller` does not exist. This is the only step that can see the
+      # difference, so it runs on every platform rather than on one.
+      #
+      # `verify-seller-surface.sh` is the whole-surface verifier: wallet in, acp in, `sell` in.
+      # `verify-racer-surface.sh` still exists and still runs in `ci.yml` against a default-feature
+      # build — nothing ships from that path any more, but the buyer-only feature set must keep
+      # compiling and keep being acp-free, which is what that job asserts.
+      - name: Verify the shipped surface
+        run: ./scripts/verify-seller-surface.sh "target/${{ matrix.target }}/release/maxplayer"
 
       # The decisive portability check for linux: run the artifact inside alpine and debian with no
       # nix and no toolchain present. This is what makes the choice of musl toolchain above safe to
@@ -170,6 +216,9 @@ jobs:
           fi
           echo "ok: links only against base-OS libraries"
 
+      # The archive name is left to `package-release-asset.sh`'s default, `maxplayer`, which is also
+      # the name of the binary inside it and the name it answers to. One asset stem is now the whole
+      # of the release, so naming it here would only add a second place for it to drift.
       - name: Package the asset
         run: |
           ./scripts/package-release-asset.sh \
@@ -204,16 +253,44 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: asset-racer-${{ matrix.platform }}
+          name: asset-${{ matrix.platform }}
           path: dist/*.tar.gz
           if-no-files-found: error
+
+  verify-surface:
+    name: Verify release surface
+    # The built⊆published guard used to live only in `publish` — tag-gated, and reached only AFTER
+    # `gh release create` had already made the release. So a matrix↔published-set drift (#249) sailed
+    # through every dry run and was first seen on a release that could no longer be un-made. This job
+    # runs wherever the build runs, a dry run included, and is deliberately NOT tag-gated. `release`
+    # and `publish` both `needs:` it, so a drift here stops them before anything is created.
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: asset-*
+          merge-multiple: true
+
+      # Holds every platform list to .github/release-platforms.json: the artifacts the build
+      # produced, the npm payload packages, the launcher's pins and the launcher's runtime resolver.
+      # `platforms` (the plan job's derived list) is passed so a derivation that drifted from the file
+      # is caught here directly, not only through the build it would have mis-driven.
+      - name: Verify the built, published and launcher surfaces match the source
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          PLATFORMS: ${{ needs.plan.outputs.platforms }}
+        run: ./scripts/verify-release-surface.sh dist "$VERSION" "$PLATFORMS"
 
   release:
     name: GitHub Release
     # A tag PUSH only. Both halves are needed: a dispatch can target a tag ref, so the ref type
     # alone does not establish that a tag was pushed.
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [plan, build]
+    needs: [plan, build, verify-surface]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -227,13 +304,25 @@ jobs:
           merge-multiple: true
 
       - name: Checksum
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          PLATFORMS: ${{ needs.plan.outputs.platforms }}
         run: |
           set -euo pipefail
           cd dist
-          # Guard the glob: with no assets, `sha256sum *.tar.gz` would write a SHA256SUMS naming a
-          # literal `*.tar.gz`, and the release would carry a checksum file for nothing.
-          count=$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)
-          [ "$count" -gt 0 ] || { echo "no assets were downloaded" >&2; exit 1; }
+          # Every platform the release builds, named — from the same source the matrix is (the plan
+          # job's platforms, read from .github/release-platforms.json). This also guards the glob
+          # below: with no assets at all, `sha256sum *.tar.gz` would write a SHA256SUMS naming a
+          # literal `*.tar.gz`.
+          #
+          # Named rather than counted because a count cannot tell a complete release from one missing
+          # a platform: two assets satisfy "some artifacts arrived", and the release would publish
+          # with the third platform's install 404ing. A build job that failed, or an upload whose
+          # name drifted, stops the release rather than shrinking it.
+          for platform in $PLATFORMS; do
+            asset="maxplayer-$VERSION-$platform.tar.gz"
+            [ -f "$asset" ] || { echo "$asset is missing — the release would ship without it" >&2; exit 1; }
+          done
           # `--` rather than `./*.tar.gz`: it stops option parsing without prefixing every path in
           # SHA256SUMS, which keeps `sha256sum -c SHA256SUMS` usable next to the downloaded files.
           sha256sum -- *.tar.gz > SHA256SUMS
@@ -273,36 +362,41 @@ jobs:
 
   publish:
     name: npm publish
-    # ★ The gate this workflow is judged on. Publishing requires a tag PUSH, and the job additionally
-    #   fails closed below if the token is absent, so merging this workflow publishes nothing:
-    #   `workflow_dispatch` never reaches here, a pull request cannot trigger the workflow at all,
-    #   and a tag pushed before the secret exists stops at the first step.
+    # ★ The gate this workflow is judged on. Publishing requires a tag PUSH, so merging this workflow
+    #   publishes nothing: `workflow_dispatch` never reaches here, and a pull request cannot trigger
+    #   the workflow at all.
     #
-    #   The token cannot be tested here — the `secrets` context is not available in a job-level `if`,
-    #   which is why that half is a step instead.
+    #   Authentication is npm trusted publishing (OIDC) — there is no NPM_TOKEN and therefore no
+    #   secret to be missing, so the fail-closed step this job used to open with is gone. That
+    #   property survives the change: `npm publish` ERRORS if this repo+workflow is not registered as
+    #   a trusted publisher for the package on npmjs.com. There is no silent-skip path — an
+    #   unconfigured publisher fails the job loudly, exactly as a missing token used to.
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [plan, build, release]
+    needs: [plan, build, release, verify-surface]
     runs-on: ubuntu-latest
+    # `id-token: write` mints the OIDC token npm exchanges for a short-lived publish credential. It is
+    # the whole of the job's write authority; `contents: read` restates the workflow default so that
+    # naming permissions here does not silently widen them.
+    permissions:
+      id-token: write
+      contents: read
     steps:
-      # Fail rather than skip. A silent skip is indistinguishable from a successful release, so a
-      # missing token would look like a published one until somebody tried to install it.
-      - name: Require the publish secret
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${NPM_TOKEN:-}" ]; then
-            echo "NPM_TOKEN is not configured — nothing has been published." >&2
-            echo "The GitHub Release above is complete; add the secret and re-run this job." >&2
-            exit 1
-          fi
-
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+          # No NODE_AUTH_TOKEN goes with this — it only points npm at the public registry, which is
+          # also where OIDC exchange happens.
           registry-url: https://registry.npmjs.org
+
+      # Pinned to the 11 line: @latest crossed into npm@12, whose engine floor (node >=22) rejects
+      # the node this job runs — and an install-time engine refusal here fails the publish before
+      # any OIDC exchange happens.
+      # Trusted publishing landed in npm 11.5; the npm bundled with any current setup-node runtime is
+      # older than that and would fall back to looking for a token that no longer exists.
+      - name: Upgrade npm for trusted publishing
+        run: npm install -g npm@11
 
       - uses: actions/download-artifact@v4
         with:
@@ -312,12 +406,14 @@ jobs:
 
       - name: Publish
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.plan.outputs.version }}
           PRERELEASE: ${{ needs.plan.outputs.prerelease }}
-          # Every platform whose payload package is published. Adding a platform package under npm/
-          # without adding it here is caught below rather than silently never shipping.
-          RELEASE_PLATFORMS: linux-x64 linux-arm64
+          # Every platform whose payload package is published — from the release platform source (the
+          # plan job reads .github/release-platforms.json), not a fourth hand-kept copy. The two
+          # guards below still cross-check it against what npm/ carries and what the build produced;
+          # verify-surface has already held all of it to the same source before this job runs, so
+          # these are defence in depth at the moment of publish rather than the only line.
+          RELEASE_PLATFORMS: ${{ needs.plan.outputs.platforms }}
         run: |
           set -euo pipefail
 
@@ -332,6 +428,22 @@ jobs:
             esac
           done
 
+          # The other direction, and the one that shipped #446: a platform the release BUILDS with no
+          # npm payload behind it. The two lists — what the build matrix produces and what npm
+          # publishes — were independent, so darwin could be a first-class release artifact for two
+          # releases while `npm i maxplayer` answered "no binary for darwin-arm64" on every mac. The
+          # assets in dist are the authority; nothing else here knows what was actually built.
+          for asset in dist/maxplayer-"$VERSION"-*.tar.gz; do
+            # An unmatched glob arrives as the literal pattern, and this loop would then report a
+            # platform named `*` rather than the download having produced nothing.
+            [ -f "$asset" ] || { echo "no release assets in dist — nothing was downloaded to publish from" >&2; exit 1; }
+            platform="$(basename "$asset" .tar.gz)"; platform="${platform#maxplayer-$VERSION-}"
+            case " $RELEASE_PLATFORMS " in
+              *" $platform "*) ;;
+              *) echo "the release builds a $platform artifact but publishes no npm payload for it — add npm/cli-$platform and $platform to RELEASE_PLATFORMS, or state here why that platform is archive-only" >&2; exit 1 ;;
+            esac
+          done
+
           # A pre-release goes out under the `rc` dist-tag so `npm i maxplayer` keeps resolving the last
           # stable version. The array always holds at least `--access public`, which is what the
           # scoped payload packages need on their first publish.
@@ -343,10 +455,10 @@ jobs:
           # Payload packages first. The launcher resolves them by exact version, so publishing it
           # ahead of them leaves a window where `npm i maxplayer` installs a launcher with no binary.
           for platform in $RELEASE_PLATFORMS; do
-            # ★ This filename is CONSTRUCTED and must never become a glob. The release attaches every
-            # artifact the matrix builds, and only the racer belongs in an npm payload — a glob here
-            # would publish whichever archive happened to sort first, which is how a seller binary
-            # ends up on the registry under the racer's package name.
+            # ★ This filename is CONSTRUCTED and must never become a glob. `dist/` holds every
+            # platform's archive at once, so a glob here would publish whichever one happened to
+            # sort first — an arm64 binary inside the linux-x64 payload package installs fine and
+            # cannot exec. The npm payload for a platform is that platform's asset and no other.
             asset="dist/maxplayer-$VERSION-$platform.tar.gz"
             [ -f "$asset" ] || { echo "no built asset for $platform at $asset" >&2; exit 1; }
 
@@ -358,5 +470,121 @@ jobs:
             ( cd "npm/cli-$platform" && npm publish "${publish_args[@]}" )
           done
 
-          cp LICENSE-MIT LICENSE-APACHE npm/mobee/
-          ( cd npm/mobee && npm publish "${publish_args[@]}" )
+          cp LICENSE-MIT LICENSE-APACHE npm/maxplayer/
+          ( cd npm/maxplayer && npm publish "${publish_args[@]}" )
+
+  npm-probe:
+    name: npm credential probe
+    # Dispatch only, and only when a package was explicitly named. An ordinary dry run leaves the
+    # input blank and this job never starts; a tag push cannot reach it at all, so a real release
+    # never publishes a probe version.
+    if: github.event_name == 'workflow_dispatch' && inputs.npm_probe_package != ''
+    runs-on: ubuntu-latest
+    permissions:
+      # The same authority the publish job has. Proving a different credential would prove nothing
+      # about the one a release uses.
+      id-token: write
+      contents: read
+    steps:
+      # No `actions/checkout`. The job has no repository content, so there is no path by which a
+      # file from the tree — a real payload package, a launcher — could reach the registry from
+      # here. What gets published is only what the next step writes.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      # Same pin as the publish job: trusted publishing landed in npm 11.5, and npm@12's engine
+      # floor rejects node 20. A probe on a different npm would exercise a different path.
+      - name: Upgrade npm for trusted publishing
+        run: npm install -g npm@11
+
+      - name: Build the placeholder package
+        env:
+          PACKAGE: ${{ inputs.npm_probe_package }}
+          VERSION: ${{ inputs.npm_probe_version }}
+        run: |
+          set -euo pipefail
+
+          # Digits only after `0.0.`, anchored by the case arms. `0.0.1-rc.1` and `0.0.1.0` are
+          # refused too: the point is a shape no release can ever name, not a blocklist of the
+          # versions that look dangerous today.
+          case "$VERSION" in
+            0.0.[0-9] | 0.0.[0-9][0-9] | 0.0.[0-9][0-9][0-9]) ;;
+            *) echo "refusing to publish '$VERSION': the probe may only publish 0.0.<n>, which no release will ever name" >&2; exit 1 ;;
+          esac
+
+          # `type: choice` constrains the dispatch FORM, not the API — a dispatch sent with the REST
+          # API carries whatever string it likes. The launcher (`maxplayer`) is deliberately absent:
+          # it is the package users type, and its dist-tags are how `npx maxplayer` resolves.
+          case "$PACKAGE" in
+            '@maxplayerai/darwin-arm64' | '@maxplayerai/linux-x64' | '@maxplayerai/linux-arm64') ;;
+            *) echo "refusing to publish '$PACKAGE': only the @maxplayerai payload packages may be probed" >&2; exit 1 ;;
+          esac
+
+          mkdir -p probe
+          cd probe
+          node -e '
+            const fs = require("fs");
+            fs.writeFileSync("package.json", JSON.stringify({
+              name: process.env.PACKAGE,
+              version: process.env.VERSION,
+              description: "Publish-credential probe. Carries no binary and belongs to no release; see README.",
+              license: "MIT OR Apache-2.0",
+              repository: { type: "git", url: "git+https://github.com/MakePrisms/maxplayerai.git" },
+              files: ["README.md"],
+            }, null, 2) + "\n");
+          '
+          {
+            echo "# Publish-credential probe"
+            echo
+            echo "Published by the \`npm-probe\` job in \`.github/workflows/release.yml\` to prove that"
+            echo "trusted publishing works for this package before a release depends on it."
+            echo
+            echo "It carries no binary. Nothing resolves it: the \`maxplayer\` launcher pins its"
+            echo "payload by exact version, and no release names a \`0.0.x\`."
+          } > README.md
+          cat package.json
+
+      - name: Publish through the release's own OIDC path
+        working-directory: probe
+        # `--tag probe` keeps `latest` where it is. A payload package's dist-tags are not decoration:
+        # they are what a bare `npm i @maxplayerai/<platform>` resolves.
+        run: npm publish --access public --tag probe
+
+      - name: Say what this run proves
+        env:
+          PACKAGE: ${{ inputs.npm_probe_package }}
+          VERSION: ${{ inputs.npm_probe_version }}
+        run: |
+          echo "ok: $PACKAGE@$VERSION published from release.yml with no token."
+          echo "The trusted-publisher entry for $PACKAGE admits THIS workflow file, which is the"
+          echo "same match npm makes when the publish job runs on a tag."
+          echo
+          echo "Not proven: the other packages. npm scopes a publisher entry per PACKAGE, so a green"
+          echo "run here says nothing about the launcher or the other payloads — probe each one."
+
+      # A red here has three causes that look identical from the log — npm answers a trusted-publishing
+      # mismatch with a 404 or ENEEDAUTH, which reads like a registry outage. Naming them at the point
+      # of failure is the difference between a five-second fix and a re-derivation.
+      - name: How to read this failure
+        if: failure()
+        env:
+          PACKAGE: ${{ inputs.npm_probe_package }}
+          VERSION: ${{ inputs.npm_probe_version }}
+        run: |
+          echo "The probe did not publish $PACKAGE@$VERSION. Three different things look like this:"
+          echo
+          echo "1. THIS VERSION ALREADY EXISTS. npm never allows republishing a version, probe or not."
+          echo "   Re-run with a higher npm_probe_version. Check: npm view $PACKAGE versions"
+          echo
+          echo "2. NO TRUSTED PUBLISHER for $PACKAGE at all. The package has no entry, so nothing"
+          echo "   could match. Fix: npmjs.com -> $PACKAGE -> Settings -> Trusted publishing -> add."
+          echo
+          echo "3. AN ENTRY EXISTS BUT NAMES SOMETHING ELSE. npm matches organization, repository AND"
+          echo "   WORKFLOW FILENAME exactly, case-sensitively — plus the environment when one is set."
+          echo "   This job runs from release.yml, so an entry naming any other workflow file will not"
+          echo "   match no matter how correct it looks. Fix: edit the entry to say release.yml."
+          echo
+          echo "2 and 3 are the same red and a different repair, which is why this job exists: the"
+          echo "alternative was finding out during a tag, after the packages ahead of it published."

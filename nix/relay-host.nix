@@ -43,9 +43,13 @@
 
     # NIP-11 / RELAY_URL the relay advertises. buzz derives its NIP-11 document from this URL; the old
     # strfry `info.{name,description}` fields have no buzz-module equivalent yet — if a custom relay
-    # name matters, wiring it is a buzz-source ask (see relay OPEN ITEMS in the deploy block). Note the
-    # #t "mobee"→"maxplayer" flip no longer gates relay acceptance: buzz admits by KIND, not the t tag,
-    # so the waived flip is now purely a client-side concern.
+    # name matters, wiring it is a buzz-source ask (see relay OPEN ITEMS in the deploy block).
+    #
+    # NOTE (merge of #402 into the post-rename main): main's strfry module took a `namespaceTag`
+    # ("mobee"→"maxplayer", #464/#467) to filter writes by the #t tag. buzz has NO such option — it
+    # admits by KIND, not by t tag — so `namespaceTag` is deliberately dropped here rather than
+    # carried over. It is not an oversight and it does not weaken acceptance: the t-tag flip is now
+    # purely a client-side concern. Setting it would be a nix eval error against the buzz module.
     relayUrl = "wss://relay.maxplayer.ai";
 
     # Public marketplace posture: allow UNAUTHENTICATED reads so the keyless web observatory and any

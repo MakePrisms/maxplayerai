@@ -7,13 +7,14 @@ git delivery runs in-process and TLS roots are bundled.
 ## What the image is
 
 - **Binary:** `maxplayer`, built with the `acp` + `wallet` features.
-- **Home:** `MOBEE_HOME=/data`, a mounted volume holding your key, wallet,
+- **Home:** `MAXPLAYER_HOME=/data`, a mounted volume holding your key, wallet,
   `config.toml`, and delivery journal.
-- **Entrypoint:** `maxplayer`. Default command: `sell`.
+- **Entrypoint:** `maxplayer`. Default command: `seller`.
 - **User:** unprivileged (`uid 10001`).
-- **Defaults baked in:** relay `wss://mobee-relay.orveth.dev` (the open-market
-  relay; override in `config.toml` or via `MOBEE_RELAY_URL` to sell against your
-  own), the default mint `https://testnut.cashudevkit.org` (a test mint).
+- **Defaults baked in:** relay `wss://relay.maxplayer.ai` (the open-market
+  relay; override in `config.toml` or via `MAXPLAYER_RELAY_URL` to sell against your
+  own), and the default mint `https://mint.minibits.cash/Bitcoin` with
+  `allow_real_mints = true`.
 
 ## Build
 
@@ -36,15 +37,21 @@ On first start the seller:
 3. **Comes online and authenticates** to the relay.
 4. **Publishes a heartbeat** so buyers can discover it.
 
-Verify it is live — look for these lines in the logs:
+Verify it is live — the daemon logs a line when it authenticates to the relay:
 
 ```bash
-docker compose logs seller | grep "seller daemon online" | grep "nip42=authenticated"
-docker compose logs seller | grep "seller heartbeat published id="
+docker compose logs seller | grep "seller node relay authenticated (NIP-42)"
 ```
 
-`nip42=authenticated` means the daemon reached the relay and authenticated;
-`no-challenge` is a warning state (payment receive may not work).
+That line means the daemon reached the relay and completed NIP-42 auth. If instead
+you see `seller node WARN: no NIP-42 challenge`, the relay did not challenge within
+the connect window — the daemon proceeds (auto-auth stays on; a challenge on the REQ
+still authenticates), but payment receive may not work until it does.
+
+> The seller does **not** log a line per heartbeat — a node cannot observe its own
+> published event, so there is no "heartbeat published" line to grep for. Seller
+> liveness shows up buyer-side instead (it appears in the network observatory).
+> Tracked as #423.
 
 Without `docker compose`, the same thing by hand:
 
@@ -52,7 +59,7 @@ Without `docker compose`, the same thing by hand:
 docker volume create seller-data
 docker run -d --name maxplayer-seller --restart unless-stopped \
   -v seller-data:/data \
-  maxplayer:latest sell --non-interactive --agent claude --rate-sats 2
+  maxplayer:latest seller --non-interactive --agent claude --rate-sats 100
 docker logs -f maxplayer-seller
 ```
 
@@ -64,7 +71,7 @@ above. To actually **execute** a claimed job it launches an ACP agent
 base image. Two options:
 
 > **Sandbox the job agent.** The seller's job agent executes untrusted buyer
-> task text. Run it sandboxed: no `~/.mobee` access, no wallet tools or keys, and
+> task text. Run it sandboxed: no `~/.maxplayer` access, no wallet tools or keys, and
 > no host secrets. The `/data` volume (key + wallet) must never be reachable from
 > the agent's execution environment.
 
@@ -83,7 +90,7 @@ base image. Two options:
   RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
       && npm i -g @agentclientprotocol/claude-agent-acp \
       && rm -rf /var/lib/apt/lists/*
-  USER mobee
+  USER maxplayer
   ```
 
   Then pass the agent's credential (never bake it in) at run time, e.g.
@@ -94,7 +101,7 @@ base image. Two options:
 **The shipped image does NOT satisfy this by default.** With no sandbox configured, the daemon spawns
 the job agent as a direct child process — same UID as the daemon, working directory `/data`. That means
 `/data` (your key, wallet, config, and journal) is fully readable and writable by the agent out of the
-box. Configure the `[sandbox]` section below so the agent gets no `~/.mobee`/`/data` access, no wallet
+box. Configure the `[sandbox]` section below so the agent gets no `~/.maxplayer`/`/data` access, no wallet
 tools or keys, and no host secrets.
 
 ### The `[sandbox]` config section
@@ -115,8 +122,8 @@ Semantics, exactly as implemented:
 - **Section absent** → pass-through: the agent command runs directly as a child of the daemon, with the
   daemon's UID and filesystem access. **This is the only supported way to express pass-through.**
 - **`launcher = []` (empty array)** → **rejected at config parse — the daemon refuses to start** (the
-  shared argv validator errors `agent_command argv must be non-empty`; it is shared with `agent_command`,
-  so the message names that field — tracked as #381). Fail-closed: you cannot accidentally ship an empty
+  shared argv validator errors `argv must be non-empty`, and the parse error names
+  `sandbox.launcher` — #381). Fail-closed: you cannot accidentally ship an empty
   launcher that silently disables the sandbox. Opt out **only** by omitting the whole `[sandbox]` section.
 
 **The daemon does NOT validate the launcher.** It does not check that the binary exists, that it is
@@ -127,7 +134,7 @@ actually a sandboxing tool, or that `/data` is unreachable from inside it. It bl
 ### Working example: bubblewrap inside the container
 
 Install `bubblewrap` in your image (e.g. `apk add bubblewrap` / `apt-get install bubblewrap`), then add
-to your seller config (the config file lives under `MOBEE_HOME`, i.e. `/data` in this image):
+to your seller config (the config file lives under `MAXPLAYER_HOME`, i.e. `/data` in this image):
 
 ```toml
 [sandbox]
@@ -140,6 +147,7 @@ launcher = [
   "--ro-bind", "/bin", "/bin",
   "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf",
   "--proc", "/proc",
+  "--ro-bind", "/sys", "/sys",
   "--dev", "/dev",
   "--tmpfs", "/tmp",
   "--bind", "/work/jobs", "/work/jobs",
@@ -156,6 +164,12 @@ Key points about this example:
   writable. Give the agent only the per-job workdir it needs, nothing more.
 - Adjust the read-only binds (`/usr`, `/lib`, `/bin`, `/lib64` on glibc systems, etc.) to whatever your
   agent binary needs to execute. Drop `--share-net` if the agent doesn't need network access.
+- **The agent runtime needs read-only `/proc` and `/sys`.** `--proc /proc` mounts a fresh procfs and
+  `--ro-bind /sys /sys` exposes `/sys` read-only. Claude's native runtime reads both at startup and
+  **aborts the pre-advertise probe** without them: the seat passes `doctor` and still cannot boot
+  (#470). Read-only is enough; the agent never needs to **write** either, so
+  do not grant write access to satisfy this. Omit them and a seat that passes `doctor` still fails the
+  real probe at boot.
 - Because `WORKDIR` in the image is `/data`, use `--chdir` so the agent does not start (and fail) in a
   directory that doesn't exist inside the sandbox.
 - `bwrap` needs user namespaces; depending on your container runtime you may need to run the container
@@ -174,8 +188,16 @@ bwrap <your args from launcher> -- sh -c 'ls /data' \
   && echo "FAIL: /data reachable" || echo "OK: /data unreachable"
 ```
 
-Do the same for any other secret paths on the host. Only put the seller into service once this probe
-fails to see `/data`.
+Then confirm the runtime's read-only paths ARE present — an over-restricted launcher fails the
+pre-advertise probe just as surely as a leaky one leaks (#470):
+
+```sh
+bwrap <your args from launcher> -- sh -c 'test -r /proc/self/status && test -d /sys' \
+  && echo "OK: /proc and /sys readable" || echo "FAIL: agent runtime needs read-only /proc and /sys"
+```
+
+Do the same for any other secret paths on the host. Only put the seller into service once the first
+probe fails to see `/data` and the second confirms `/proc` and `/sys`.
 
 ## Bring your own key
 

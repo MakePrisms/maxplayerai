@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# maxplayer installer — get the buyer CLI onto a machine that has never heard of nix.
+# maxplayer installer — get the CLI onto a machine that has never heard of nix.
 #
 #   curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/install.sh | sh
 #
@@ -11,6 +11,25 @@
 # Options (flags and environment are equivalent; the flag wins):
 #   --version <x.y.z>   MAXPLAYER_VERSION   install this exact version instead of the latest release
 #   --bin-dir <dir>     MAXPLAYER_BIN_DIR   install here instead of ~/.local/bin
+#   --seller            MAXPLAYER_SELLER=1  accepted and ignored; see below
+#                        MAXPLAYER_MODIFY_PATH=1  non-interactive: append bin-dir to the shell profile
+#                        any other value           never touch the shell profile or ask interactively
+#
+# ── One artifact ────────────────────────────────────────────────────────────────────────────────
+# A release publishes ONE build per platform and this installs it. It carries the whole surface:
+# buying, and — through `maxplayer seller` — advertising a seat, claiming a job and executing it. Buyer
+# and seller are runtime modes of one command, not two downloads (#510).
+#
+# `--seller` selected a second, separately named asset in earlier releases. That asset no longer exists, so
+# the flag is accepted and ignored rather than refused: a seller's install line, and any script
+# carrying it, keeps working and now installs a binary that can do strictly more than the one it
+# asked for. It prints a deprecation notice to stderr and will be removed.
+#
+# ★ What this means for the execution surface: every install now carries the agent-execution path,
+#   where the buyer-only asset compiled it out. That surface is the sandbox track's (#490, #499) to
+#   hold — packaging no longer stands in for it. A buyer-only binary is still buildable from source
+#   (`cargo build -p maxplayer --no-default-features --features wallet`); it is simply not a thing
+#   this installer can fetch, because no release publishes one.
 #
 # Through a pipe, flags need `sh -s --`:
 #   curl -fsSL <url> | sh -s -- --version 0.1.0 --bin-dir /usr/local/bin
@@ -37,7 +56,7 @@ set -eu
 
 REPO="MakePrisms/maxplayerai"
 # The name of the executable, which is deliberately not the crate name (`[[bin]] maxplayer` inside
-# package `mobee`). It names the asset, the directory inside the asset, the installed file, and the
+# package `maxplayer`). It names the asset, the directory inside the asset, the installed file, and the
 # first word this binary prints when asked for its version — asserted below, not assumed.
 BIN_NAME="maxplayer"
 
@@ -146,14 +165,14 @@ fetch() {
 # drafts and pre-releases. "Latest stable" is answered by the server rather than reconstructed here
 # from a list of tags — sorting tags locally is how an installer starts handing users an -rc build.
 #
-# It 404s when every release so far is a pre-release, which is a state this repo has really been in.
-# That is reported as the specific thing it is, with the way out, rather than as a download failure.
+# It 404s when a repo has published nothing but pre-releases. That is reported as the specific thing
+# it is, with the way out, rather than as a download failure.
 resolve_latest_version() {
     _api="https://api.github.com/repos/$REPO/releases/latest"
     _body="$(mktemp "$(tmpl api)")" || die "cannot create a temporary file"
     if ! fetch "$_api" "$_body"; then
         rm -f "$_body"
-        die "could not ask GitHub for the latest release of $REPO. If every release is still a pre-release, or the API is rate-limiting this host, name a version instead: MAXPLAYER_VERSION=x.y.z"
+        die "could not ask GitHub for the latest release of $REPO. The API may be rate-limiting this host; name a version instead: MAXPLAYER_VERSION=x.y.z"
     fi
 
     # `tr ',' '\n'` first so this works whether the API pretty-prints or returns one long line.
@@ -252,9 +271,10 @@ dir_on_path() {
 }
 
 usage() {
-    say "usage: install.sh [--version <x.y.z>] [--bin-dir <dir>]"
+    say "usage: install.sh [--version <x.y.z>] [--bin-dir <dir>] [--seller]"
+    say '  --seller         deprecated no-op: one binary ships and it can already sell'
     say "  through a pipe:  curl -fsSL <url> | sh -s -- --version 0.1.0"
-    say "  environment:     MAXPLAYER_VERSION, MAXPLAYER_BIN_DIR"
+    say "  environment:     MAXPLAYER_VERSION, MAXPLAYER_BIN_DIR, MAXPLAYER_MODIFY_PATH"
 }
 
 main() {
@@ -263,6 +283,10 @@ main() {
     DOWNLOADER=""
     HASHER=""
     bin_dir="${MAXPLAYER_BIN_DIR:-}"
+    # Retired selector, kept only so that a run carrying it is not refused. Any non-empty value
+    # counts, matching what it used to accept — the point is that no existing invocation changes
+    # meaning, and none of them can change what is installed either.
+    seller="${MAXPLAYER_SELLER:-}"
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -270,11 +294,20 @@ main() {
             --version=*) VERSION="${1#--version=}" ;;
             --bin-dir)   shift; [ $# -gt 0 ] || die "--bin-dir needs a value"; bin_dir="$1" ;;
             --bin-dir=*) bin_dir="${1#--bin-dir=}" ;;
+            --seller)    seller=1 ;;
             -h | --help) usage; return 0 ;;
             *) usage >&2; die "unknown option '$1'" ;;
         esac
         shift
     done
+
+    # Said once, here, before anything can fail for an unrelated reason — a deprecation notice that
+    # only prints on the happy path is one the people still passing the flag are least likely to see.
+    # stderr, not stdout: this is not part of the install's report, and the script is routinely run
+    # through a pipe whose stdout somebody is reading.
+    if [ -n "$seller" ]; then
+        warn "--seller (MAXPLAYER_SELLER) is deprecated and does nothing: one binary ships and it can already sell — run 'maxplayer seller'"
+    fi
 
     # A leading `v` is what a user copies out of a tag name, and `v0.1.0` would build an asset name
     # no release has. Accept it and normalise rather than 404 later on something avoidable.
@@ -300,7 +333,7 @@ main() {
         say "installing $BIN_NAME $VERSION for $PLATFORM"
     else
         resolve_latest_version
-        say "latest release is $VERSION; installing for $PLATFORM"
+        say "latest release is $VERSION; installing it for $PLATFORM"
     fi
 
     asset="$BIN_NAME-$VERSION-$PLATFORM.tar.gz"
@@ -321,6 +354,10 @@ main() {
 
     tar -xzf "$tmp/$asset" -C "$tmp" || die "could not unpack $asset"
 
+    # The archive holds a versioned directory whose name matches the tarball's, with the executable
+    # inside it named after the binary. Both are derived from the same two values the download URL
+    # was built from, so an archive whose layout does not match is caught here rather than producing
+    # a confusing "not found" from a path nobody printed.
     unpacked="$tmp/$BIN_NAME-$VERSION-$PLATFORM/$BIN_NAME"
     [ -f "$unpacked" ] \
         || die "$asset does not contain $BIN_NAME-$VERSION-$PLATFORM/$BIN_NAME — this is not the asset layout this installer expects"
@@ -359,10 +396,65 @@ main() {
     # separately because the remedies differ: one is a missing PATH entry, the other is an older copy
     # of maxplayer earlier in PATH that will keep winning until it is removed.
     if ! dir_on_path "$bin_dir"; then
-        say ""
-        say "$bin_dir is not on your PATH. Add it, then re-open your shell:"
-        say "  echo 'export PATH=\"\$PATH:$bin_dir\"' >> ~/.profile"
-        say "Until then, run it by path: $bin_dir/$BIN_NAME version"
+        modify_path=0
+        marker="# added by maxplayer install.sh"
+        line="export PATH=\"\$PATH:$bin_dir\""
+        case "$PLATFORM" in
+            darwin-*) profile="${HOME:-}/.zprofile" ;;
+            *)        profile="${HOME:-}/.profile" ;;
+        esac
+
+        safe_path_line=1
+        case "$bin_dir" in
+            *'"'* | *'`'* | *'$'*)
+                safe_path_line=0
+                warn "not modifying $profile: $bin_dir contains a shell metacharacter that cannot be safely written to PATH automatically"
+                ;;
+        esac
+
+        # Test the exact line, not the installer's marker: the marker may describe another bin-dir,
+        # or may have survived after the export itself was removed. Do this before prompting so an
+        # affirmative answer is never followed by an "already added" response.
+        if [ "$safe_path_line" = 1 ] && [ -f "$profile" ] && grep -qxF "$line" "$profile" 2>/dev/null; then
+            say ""
+            say "$bin_dir is already added to $profile — leaving it unchanged."
+        else
+            # A `curl | sh` install puts the SCRIPT SOURCE on fd 0 (stdin), so by the time execution
+            # reaches here stdin is exhausted or was never a terminal at all — even when a real user
+            # is watching. /dev/tty names the CONTROLLING TERMINAL independent of what's wired to
+            # stdin, which is why it (not stdin) is what rustup/uv read an interactive answer from.
+            if [ "$safe_path_line" = 1 ] && [ -z "${MAXPLAYER_MODIFY_PATH:-}" ] && [ -t 1 ] && [ -r /dev/tty ]; then
+                if printf 'install.sh: add %s to your PATH in %s? [Y/n] ' "$bin_dir" "$profile" > /dev/tty; then
+                    reply=""
+                    if IFS= read -r reply < /dev/tty; then
+                        case "$reply" in
+                            "" | [Yy] | [Yy][Ee][Ss]) modify_path=1 ;;
+                            *) modify_path=0 ;;
+                        esac
+                    fi
+                fi
+            elif [ "$safe_path_line" = 1 ] && [ "${MAXPLAYER_MODIFY_PATH:-}" = 1 ]; then
+                modify_path=1
+            fi
+
+            if [ "$modify_path" = 1 ]; then
+                [ -n "${HOME:-}" ] || die "HOME is not set — cannot locate a shell profile to modify. Add $bin_dir to PATH manually: export PATH=\"\$PATH:$bin_dir\""
+                { printf '\n%s\n%s\n' "$marker" "$line"; } >> "$profile" \
+                    || die "could not write to $profile"
+                say ""
+                say "added $bin_dir to PATH in $profile"
+                say "re-open your shell, or run: . $profile"
+            else
+                say ""
+                say "$bin_dir is not on your PATH. Add it, then re-open your shell:"
+                if [ "$safe_path_line" = 1 ]; then
+                    say "  echo 'export PATH=\"\$PATH:$bin_dir\"' >> $profile"
+                else
+                    say "  add the directory to PATH manually; its name is unsafe to place in a generated shell command"
+                fi
+                say "Until then, run it by path: $bin_dir/$BIN_NAME version"
+            fi
+        fi
     else
         resolved="$(command -v "$BIN_NAME" 2>/dev/null || true)"
         if [ -n "$resolved" ] && [ "$resolved" != "$bin_dir/$BIN_NAME" ]; then

@@ -9,7 +9,7 @@
  */
 import { buildTrades } from "./trades.js";
 import { parseEvent } from "./model.js";
-import { HANDLER, HEARTBEAT, RESULT } from "./kinds.js";
+import { HANDLER, HEARTBEAT, PROFILE, RESULT } from "./kinds.js";
 
 /** Selectable periods, longest label first so the UI can render them in order. */
 export const WINDOWS = Object.freeze([
@@ -44,6 +44,44 @@ const median = (xs) => {
 };
 
 /**
+ * Display names published as kind-0 metadata, keyed by pubkey.
+ *
+ * A kind-0 ENRICHES a participant; it never creates one. Publishing profile
+ * metadata makes an account, not a market participant — kind-0 is a Nostr
+ * standard that anyone on the relay publishes, so a row minted from one puts
+ * strangers in a column. Measured when kind-0 first began arriving: 13 of 24
+ * seller rows were profile-owners with no claim, no delivery, no advert and no
+ * heartbeat, including a pubkey whose only activity was BUYING.
+ *
+ * What earns a row stays evidence of doing the thing: a claim, a delivery or a
+ * receipt for a seller, plus the advert and heartbeat that say a seat is open
+ * for work; an offer or an award for a buyer.
+ */
+function profileNames(parsed) {
+  const names = new Map();
+  for (const p of parsed) {
+    if (p.kind !== PROFILE || !p.name) continue;
+    const prev = names.get(p.pubkey);
+    // Newest wins. The cache already resolves kind-0 to one per author, but
+    // these boards are pure over whatever array they are handed.
+    if (!prev || p.created_at >= prev.at) names.set(p.pubkey, { name: p.name, at: p.created_at });
+  }
+  return names;
+}
+
+/**
+ * Name the rows that exist. Applied AFTER every row-creating pass, so it cannot
+ * depend on whether a profile happened to arrive before or after the claim or
+ * advert that earned the row — relay order is not ours to choose.
+ */
+function applyProfileNames(rows, parsed) {
+  for (const [pubkey, { name }] of profileNames(parsed)) {
+    const row = rows.get(pubkey);
+    if (row) row.name = name;
+  }
+}
+
+/**
  * Buyers, ranked by sats paid.
  *
  * `satsPaid` counts published receipts only — the same floor that applies
@@ -51,12 +89,15 @@ const median = (xs) => {
  */
 export function buyerBoard(events, now) {
   const trades = buildTrades(events);
+  const parsed = events.map(parseEvent).filter(Boolean);
   const rows = new Map();
   const get = (pk) => {
     let r = rows.get(pk);
     if (!r) {
       r = { pubkey: pk, posted: 0, awarded: 0, receipted: 0, satsPaid: 0,
-            prices: [], lastSeen: 0, unpaidDeliveries: 0 };
+            prices: [], lastSeen: 0, unpaidDeliveries: 0,
+            // Self-published, from kind-0. A claim, like the seller's.
+            name: null };
       rows.set(pk, r);
     }
     return r;
@@ -79,6 +120,10 @@ export function buyerBoard(events, now) {
     }
     if (t.offerAmount != null) r.prices.push(t.offerAmount);
   }
+
+  // Same rule as the seller board: posting or awarding work earns the row, the
+  // profile only names it.
+  applyProfileNames(rows, parsed);
 
   return [...rows.values()]
     .map((r) => ({ ...r, medianPrice: median(r.prices) }))
@@ -142,14 +187,15 @@ export function sellerBoard(events, now) {
       r.lastSeen = Math.max(r.lastSeen, p.created_at);
       if (now - p.created_at <= LIVE_WITHIN_SECONDS) r.online = true;
     } else if (p.kind === HANDLER) {
-      // The advert is what a seller says about itself: its name, its asking
-      // rate, and whether it will take work nobody offered it directly. Kept
-      // distinct from measured behaviour — a claim, not a track record.
+      // The advert is what a seller says about itself: its asking rate and
+      // whether it will take work nobody offered it directly. Kept distinct
+      // from measured behaviour — a claim, not a track record. The seat NAME is
+      // no longer read here: kind-0 metadata is its single publisher (§6.1 /
+      // #275), resolved in the PROFILE arm below.
       const r = get(p.pubkey);
       if (p.name && !r.capabilities.includes(p.name)) r.capabilities.push(p.name);
       if (p.created_at >= r.advertisedAt) {
         r.advertisedAt = p.created_at;
-        r.name = p.name || r.name;
         r.about = p.about || r.about;
         r.askSats = p.askSats != null ? p.askSats : r.askSats;
         r.openPool = p.openPool;
@@ -160,6 +206,11 @@ export function sellerBoard(events, now) {
       r.harnessCounts[p.harness] = (r.harnessCounts[p.harness] || 0) + 1;
     }
   }
+
+  // kind-0 is the single publisher of the seat name (§6.1 / #275) and the 31990
+  // advert no longer carries it. Named last, once every row that earned a place
+  // on this board exists.
+  applyProfileNames(rows, parsed);
 
   return [...rows.values()]
     .map((r) => {

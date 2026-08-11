@@ -7,7 +7,7 @@
  * js/ or scripts/ except here.
  */
 
-/** NIP-01 profile metadata. Nostr-standard — carries no mobee tag. */
+/** NIP-01 profile metadata. Nostr-standard — carries no maxplayer tag. */
 export const PROFILE = 0;
 
 /** Job offer the buyer posts. Sellers claim it. */
@@ -29,7 +29,7 @@ export const AWARD = 3405;
 export const ACCEPT = 3406;
 /** Co-signed payment receipt — the settlement proof. */
 export const RECEIPT = 3400;
-/** NIP-89 seller handler announce (a seller capability advert). Carries no mobee tag. */
+/** NIP-89 seller handler announce (a seller capability advert). Carries no maxplayer tag. */
 export const HANDLER = 31990;
 /**
  * Seller liveness heartbeat. Addressable (parameterized-replaceable): keyed by
@@ -39,8 +39,8 @@ export const HANDLER = 31990;
  */
 export const HEARTBEAT = 30340;
 
-/** The mobee namespace tag value. Every trade event and the heartbeat carry `["t","mobee"]`. */
-export const MOBEE_TAG = "mobee";
+/** The maxplayer namespace tag value. Every trade event and the heartbeat carry `["t","maxplayer"]`. */
+export const MAXPLAYER_TAG = "maxplayer";
 
 /** Plain-English labels for a kind, for any place a kind must surface to a human. */
 export const KIND_LABELS = Object.freeze({
@@ -57,10 +57,10 @@ export const KIND_LABELS = Object.freeze({
 });
 
 /**
- * Marketplace kinds that carry `["t","mobee"]` — requested with a `#t:["mobee"]` filter.
- * The trade path plus the seller heartbeat all live in the mobee namespace.
+ * Marketplace kinds that carry `["t","maxplayer"]` — requested with a `#t:["maxplayer"]` filter.
+ * The trade path plus the seller heartbeat all live in the maxplayer namespace.
  */
-export const MOBEE_TAGGED_KINDS = Object.freeze([
+export const MAXPLAYER_TAGGED_KINDS = Object.freeze([
   OFFER,
   CLAIM,
   RESULT,
@@ -73,7 +73,7 @@ export const MOBEE_TAGGED_KINDS = Object.freeze([
 
 /**
  * Marketplace kinds requested WITHOUT a t-tag filter — the NIP-89 handler announce is a
- * standard advert that carries no mobee tag, so a `#t` filter would hide it. Gift-wrap
+ * standard advert that carries no maxplayer tag, so a `#t` filter would hide it. Gift-wrap
  * (1059) stays dark either way.
  */
 export const UNTAGGED_KINDS = Object.freeze([HANDLER]);

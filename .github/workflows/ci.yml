@@ -28,13 +28,32 @@ jobs:
       - name: Verify the release version check agrees with the built binary
         run: |
           VERSION="$(cargo metadata --no-deps --format-version 1 \
-            | node -e 'const m=JSON.parse(require("fs").readFileSync(0,"utf8"));const p=m.packages.find(p=>p.name==="mobee");if(!p){process.stderr.write("no mobee package in cargo metadata\n");process.exit(1)}process.stdout.write(p.version)')"
+            | node -e 'const m=JSON.parse(require("fs").readFileSync(0,"utf8"));const p=m.packages.find(p=>p.name==="maxplayer");if(!p){process.stderr.write("no maxplayer package in cargo metadata\n");process.exit(1)}process.stdout.write(p.version)')"
           ./scripts/verify-release-version.sh "$VERSION" target/debug/maxplayer
-      - name: Test mobee-core (default features)
-        run: cargo test -p mobee-core --locked
+      # One half of a pair — this build has `acp` off, and the acp job below runs the other verifier
+      # on a build that has it on. Since #510 this is the ONLY place the racer verifier runs: a
+      # release ships one binary with `acp` in, so nothing else exercises the buyer-only feature set.
+      # It stays because that feature set is still supported from source and must keep compiling and
+      # keep being acp-free, and because a surface verifier that has never run is not a guard.
+      - name: Verify the racer surface (default features)
+        run: ./scripts/verify-racer-surface.sh target/debug/maxplayer
+      - name: Test maxplayer-core (default features)
+        run: cargo test -p maxplayer-core --locked
+      # The CLI crate's tests (cli unit tests, cli_e2e.rs, and the #126/#127/#131 daemon self-spawn
+      # acceptance in mcp_daemon.rs, which drives the real built binary) run nowhere else: every
+      # other test invocation in this file is -p maxplayer-core (#264). mcp_daemon.rs is gated on the
+      # wallet feature, which is a default feature, so the default-feature job is the one that
+      # satisfies its cfg gate.
+      - name: Test maxplayer (CLI crate, default features)
+        run: cargo test -p maxplayer --locked
+      # Same gap, other crate (#264): the relay write-policy plugin's tests (the #372 config-flip
+      # red-prove, #397 NIP-17 admission) are built by the workspace build but named by no test
+      # invocation. The crate has no feature gates, so it runs here too.
+      - name: Test maxplayer-relay-write-policy
+        run: cargo test -p maxplayer-relay-write-policy --locked
 
   # The acp feature gates the seller-execute path and is off by default, so it rots silently unless
-  # CI compiles it explicitly (issue #108). Build BOTH crates with acp on — mobee-core with the full
+  # CI compiles it explicitly (issue #108). Build BOTH crates with acp on — maxplayer-core with the full
   # shipped feature combo — then run the acp-gated tests.
   build-acp:
     name: Build & test (acp)
@@ -43,15 +62,49 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build mobee (acp + wallet, release)
-        run: cargo build -p mobee --release --features acp,wallet --locked
-      - name: Build mobee-core (full shipped feature combo)
-        run: cargo build -p mobee-core --features acp,gateway,git-delivery,wallet --locked
+      - name: Build maxplayer (acp + wallet, release)
+        run: cargo build -p maxplayer --release --features acp,wallet --locked
+      - name: Build maxplayer-core (full shipped feature combo)
+        run: cargo build -p maxplayer-core --features acp,gateway,git-delivery,wallet --locked
       # The acp-gated tests (the ACP driver units + the #223 seller-concurrency regression:
       # N jobs must OVERLAP on one LocalSet thread and the loop must stay live) only exist under
       # the acp feature — the default-feature job above compiles them out, so run them here.
-      - name: Test mobee-core (acp)
-        run: cargo test -p mobee-core --features acp --locked
+      - name: Test maxplayer-core (acp)
+        run: cargo test -p maxplayer-core --features acp --locked
+      # The CLI crate's acp-gated tests run NOWHERE else: the default-feature job tests -p maxplayer
+      # WITHOUT acp (so `#[cfg(feature = "acp")]` tests compile out), and the acp steps here only
+      # BUILD -p maxplayer or TEST -p maxplayer-core (#264, same gap). Without this the seller-surface
+      # CLI locks are a false green — they compile but never execute (#549): the `seller --help`
+      # regression, the #542 no-alias foil, and the #533 doctor-wording pin. acp_smoke is `#[ignore]`d
+      # (env-gated real agent), so it is reported ignored here, not run.
+      - name: Test maxplayer (CLI crate, acp)
+        run: cargo test -p maxplayer --features acp,wallet --locked
+      # Paired with the racer check in the default-feature job: the two scripts must reach opposite
+      # verdicts on the two builds, which is what shows each one moves with the feature rather than
+      # with something incidental to the binary it happens to be handed.
+      - name: Verify the seller surface (acp)
+        run: ./scripts/verify-seller-surface.sh target/release/maxplayer
+
+  # web/app and web/network each ship a Node test suite ("node --test test/") that no CI
+  # job ran before #483 — a web-only PR could merge with its JS suite unverified while
+  # Rust CI stayed green. Both projects declare zero npm dependencies (no
+  # package.json "dependencies"/"devDependencies", no package-lock.json), so there is
+  # nothing to install: `npm test` runs directly. Kept as one job for both directories
+  # since neither takes meaningfully long; split them if that changes.
+  web-tests:
+    name: JS test suites (web/app, web/network)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Test web/app
+        working-directory: web/app
+        run: npm test
+      - name: Test web/network
+        working-directory: web/network
+        run: npm test
 
   # The money path runs in its OWN job, on its own runner, with no `needs:` — the isolation IS the
   # feature here, not an accident of layout (#271). Sharing a job means sharing fate: when the acp
@@ -80,8 +133,8 @@ jobs:
       # panics on drop under debug). Interim: release-only until that transport-lifecycle bug is
       # fixed (#152); the money assertions here (tip-match refusal, zero-burn, no
       # journal/materialization) hold in release.
-      - name: Test mobee-core (money-path suite)
-        run: cargo test -p mobee-core --release --no-default-features --features gateway,git-delivery,wallet --locked
+      - name: Test maxplayer-core (money-path suite)
+        run: cargo test -p maxplayer-core --release --no-default-features --features gateway,git-delivery,wallet --locked
 
   # The release workflow triggers only on a tag, so no pull request ever exercises it. What CI can
   # check is that the gates keeping it from publishing are still in place — otherwise the property
@@ -92,3 +145,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: ./scripts/verify-release-workflow.sh
+      # The tree-side platform surfaces — the npm payload packages, the launcher's pins and its
+      # runtime resolver — held to .github/release-platforms.json on every pull request.
+      # `--no-artifacts` skips only the built-artifact check (nothing is built in this job); the
+      # drift #249 is about is a tree edit, so this catches it here, before a release is ever
+      # dispatched, rather than only in the release workflow's own dry run.
+      - run: ./scripts/verify-release-surface.sh --no-artifacts
+      - run: ./scripts/verify-reserved-paths.sh

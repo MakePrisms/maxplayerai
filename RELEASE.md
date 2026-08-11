@@ -5,60 +5,105 @@ npm. Both come out of `.github/workflows/release.yml`, which runs on a pushed `v
 
 ## Before the first release
 
-One setup step, done once, and it is the only thing standing between a tag and a publish:
+One setup step, done once **per package**, and it is the only thing standing between a tag and a
+publish. On npmjs.com, for each of `maxplayer`, `@maxplayerai/linux-x64`, `@maxplayerai/linux-arm64`
+and `@maxplayerai/darwin-arm64`:
 
-- Add an npm **automation** token as the repository secret `NPM_TOKEN`
-  (Settings → Secrets and variables → Actions).
+- Settings → **Trusted publishing** → add a GitHub Actions publisher: organization `MakePrisms`,
+  repository `maxplayerai`, workflow `release.yml`.
 
-Until that secret exists the workflow builds, verifies and creates GitHub Releases as normal, and the
-publish job stops on its first step. That is deliberate: the token lives in repository secrets and
-never in the tree.
+There is no repository secret to add. The workflow authenticates by trusted publishing (OIDC): the
+`publish` job mints a short-lived GitHub identity token and npm exchanges it for publish rights, so
+no long-lived credential exists to expire, leak, or be rotated.
+
+Until a package's trusted publisher is configured the workflow builds, verifies and creates GitHub
+Releases as normal, and `npm publish` fails loudly for that package. There is no silent skip — an
+unconfigured package fails the job rather than producing a release that looks published.
 
 The launcher publishes as the unscoped package `maxplayer`; the per-platform payloads publish under
-the `maxplayer-linux-x64` and `maxplayer-linux-arm64` packages. Both need to be writable by the token's account; `--access public` (passed by the job) is required for scoped first-publishes and a
-first publish needs `--access public`, which the publish job already passes.
+the `@maxplayerai/linux-x64`, `@maxplayerai/linux-arm64` and `@maxplayerai/darwin-arm64` packages, in
+the npm organization `maxplayerai`. All four need their own trusted publisher entry — the setting is
+per package, not per account or per org. The GitHub side of that entry is the same for all four, and
+is unaffected by the npm scope: organization `MakePrisms`, repository `maxplayerai`.
+
+⚠ `@maxplayerai/darwin-arm64` is new (#446) and needs its entry before the tag that first publishes
+it. The setting lives on npmjs.com and needs an org admin — but whether it is really there is a
+question this repo CAN answer, by publishing something worthless through the same path. See below.
+
+### Proving an entry exists, before the tag
+
+`npm publish` fails only after the packages ahead of it in the release loop have already published,
+and npm does not allow republishing a version — so a missing entry discovered at tag time costs a
+version, not a re-run. "I think I added it" is not worth that. Run the probe instead:
+
+**Actions → Release → Run workflow**, set **npm_probe_package** to the package under test and
+**npm_probe_version** to a fresh `0.0.<n>`. The `npm-probe` job publishes a placeholder — no binary,
+no launcher, `probe` dist-tag, content generated in the job — through the same OIDC exchange the
+release uses. Green means that package's trusted-publisher entry exists and admits this workflow.
+
+Three things about it are load-bearing:
+
+- **It runs from `release.yml`, not a workflow of its own.** npm scopes a trusted publisher to a
+  workflow FILENAME, so a probe in `npm-oidc-probe.yml` would test a publisher entry for
+  `npm-oidc-probe.yml` — a credential no release uses. A green run there would look like proof and
+  be worth nothing.
+- **A green run covers ONE package.** The entry is per package. Probing the darwin payload says
+  nothing about the launcher or the linux payloads — those are proven by something else, not by this
+  run: `maxplayer`, `@maxplayerai/linux-x64` and `@maxplayerai/linux-arm64` published through this
+  same workflow file, tokenless, in the rc.1 and rc.2 releases. Production runs are the strongest
+  evidence an entry exists. `@maxplayerai/darwin-arm64` is the only one with no such run behind it,
+  which is why it is the one to probe.
+- **Bump the version every run.** npm never allows reusing a version, probe or not.
+
+A red has three causes that look identical — npm answers a trusted-publishing mismatch with a 404 or
+ENEEDAUTH, which reads like a registry problem. The job prints them at the point of failure: the
+version already exists; no entry for the package at all; or an entry that exists but names a
+different workflow file (npm matches org, repo and FILENAME exactly, case-sensitively). The last two
+are the same red and a different repair.
+
+Leaving `npm_probe_package` blank is an ordinary dry run and publishes nothing. Every fence on that
+job — dispatch-only, an explicitly named package, `0.0.<n>` only, payload packages only, the `probe`
+dist-tag, and no checkout — is asserted by `verify-release-workflow.sh`, each one red-proven.
+
+`--access public`, which the publish job already passes on every publish, is what the scoped payload
+packages need on a first publish — a scoped package defaults to restricted, which on a free account
+fails outright.
 
 ## Cutting one
 
-1. **Bump the version.** `[workspace.package].version` in `Cargo.toml`, and `version` in every
-   `npm/*/package.json`, and the `optionalDependencies` pins in `npm/mobee/package.json`. All of
+1. **Bump the version.** `[workspace.package].version` in `Cargo.toml`, the workspace crate
+   entries in `Cargo.lock` (refreshed by any `cargo` invocation — e.g. `cargo build` — since the
+   release build passes `--locked` and fails on a stale lockfile), and `version` in every
+   `npm/*/package.json`, and the `optionalDependencies` pins in `npm/maxplayer/package.json`. All of
    them must read the same string, and it must match the tag with the `v` dropped — the build
    asserts this and stops if anything disagrees.
-2. Open a PR to `dev` with the bump and let it merge. **Then cut `dev` into `main` as a pull request —
-   `main` rejects direct pushes**, and the merge must create a merge commit:
+2. **Open a PR from the bump branch to `main` and squash-merge it.** `main` rejects direct pushes, so
+   the bump reaches `main` through a PR, and pr-feedback gates the merge:
 
    ```sh
-   gh pr create --base main --head dev --title 'Cut dev to main: <what>'
-   gh pr merge --merge          # NOT --squash, NOT --rebase
+   gh pr create --base main --head <bump-branch> --title 'release: cut v<version>'
+   gh pr merge --squash
    ```
 
-   `--merge` rather than the alternatives because both others rewrite the commits: a squash gives
-   `main` a commit that exists nowhere in `dev`'s history, and a rebase does the same for every commit
-   it moves. Either one breaks the ancestor relation that step 3 exists to maintain, so they defeat
-   the next step rather than merely differing in style.
-3. **Merge `main` back into `dev`.** Not housekeeping — the cut itself is what makes this necessary,
-   so it belongs to the cut rather than to whoever notices later:
+   Squash is right here: the bump is a pure version-cut, and there is no `dev` branch whose ancestry a
+   squash would break. (`dev` is retired — the repo is main-only. An earlier revision of this doc cut
+   through `dev` and required `gh pr merge --merge` to preserve a `main`→`dev` back-merge; both the
+   back-merge and the `--merge` requirement are gone with `dev`.)
+
+   Confirm the squashed `main` tree matches the branch that was reviewed and clean-seat-verified, before
+   tagging — for a pure version-cut this is trivially empty:
 
    ```sh
-   git checkout dev && git merge --no-ff main && git push origin dev
+   git fetch origin && git diff origin/main origin/<bump-branch>   # expect no output
    ```
 
-   A `dev → main` merge leaves a commit on `main` that `dev` does not have, so `main` stops being an
-   ancestor of `dev`. While that holds, anything reaching `main` by a fast-forward or a reset silently
-   drops whatever `main` had and `dev` lacked — which includes every previous cut, and anything merged
-   straight to `main` such as a site change. The back-merge restores the ancestor relation, so there is
-   nothing for such a cut to drop.
-
-   Verify rather than assume — this prints nothing and exits `0` when the invariant holds:
-
+3. **Tag `main` at the squash-merge commit and push the tag.** Fetch first so you tag the commit the PR
+   produced, not a stale local `main`. The repo signs tags (`tag.gpgSign`, SSH format) and every prior
+   release tag is signed, so the tag must be **annotated with a message** — a bare `git tag v0.2.0` fails
+   `fatal: no tag message?`. Match the message convention `maxplayer vX.Y.Z`. The tag push still works as
+   a direct push — `main`'s ruleset targets branches, not tags:
    ```sh
-   git fetch origin && git merge-base --is-ancestor origin/main origin/dev
-   ```
-
-4. **Tag `main` and push the tag** — this still works as a direct push. `main`'s ruleset targets
-   branches, not tags, so the tag that triggers the release is not gated by it:
-   ```sh
-   git tag v0.2.0 && git push origin v0.2.0
+   git fetch origin && git tag -s -m "maxplayer v0.2.0" v0.2.0 origin/main && git push origin v0.2.0
    ```
 
 ## Version scheme: plain `0.x.y` while below v1
@@ -75,9 +120,9 @@ Before the first release there isn't one, so an `-rc` first release would leave 
 `npx maxplayer` with nothing to resolve. The dist-tag branch is correct in every case except the one
 that comes first.
 
-⚠ The `latest`-unset half of that has not been executed against the live registry — it is npm's
-documented behaviour and the workflow already assumes it, but nothing here has published yet. Plain
-`0.x.y` avoids depending on the answer. Should an `-rc` ever ship first, the repair is one command:
+The `latest`-unset half of that has never been executed against the live registry: `v0.1.0` was a
+plain version, so it published to `latest` directly. Plain `0.x.y` keeps it that way. Should an
+`-rc` ever ship without a stable behind it, the repair is one command:
 `npm dist-tag add maxplayer@<version> latest`.
 
 A genuine pre-release, once a stable exists, works as it always did: a semver suffix on both the tag
@@ -86,11 +131,14 @@ Release a pre-release and publishes under the `rc` dist-tag, leaving `latest` wh
 
 ## What the tag does
 
-- Builds the racer binary `maxplayer` for each platform on a runner of that architecture.
-- Verifies each artifact: the version matches the tag, the feature set is the racer surface
-  (`wallet` in, `acp` out), and on Linux that it runs inside alpine and debian with no toolchain
-  present.
-- Attaches `maxplayer-<version>-<platform>.tar.gz` plus `SHA256SUMS` to a GitHub Release.
+- Builds `maxplayer` once per platform, on a runner of that architecture, with
+  `--no-default-features --features wallet,acp` — the whole surface, buying and selling.
+- Verifies each artifact: the version matches the tag, `acp` and `sell` are compiled in
+  (`scripts/verify-seller-surface.sh`), and on Linux that it runs inside alpine and debian with no
+  toolchain present.
+- Attaches the three `maxplayer-<version>-<platform>.tar.gz` plus `SHA256SUMS` to a GitHub Release.
+  Each is required by name before the release is created: a count cannot tell a complete release
+  from one missing a platform.
 - Publishes the npm packages: every payload package first, then the `maxplayer` launcher.
 
 The publish order matters. The launcher pins its payload by exact version, so publishing it first
@@ -106,20 +154,21 @@ Use it after any change to the workflow. On a dispatch run the release and publi
 as skipped; that is the live confirmation that the gates hold, and it is worth watching once before
 the first real tag.
 
-### ⚠ Both triggers read the workflow from a specific commit, not from `dev`
+### ⚠ Every trigger reads the workflow from a specific commit, not from the branch tip
 
-**`workflow_dispatch` is only offered for a workflow that exists on the default branch (`main`).**
-Change `release.yml` on `dev` and there is nothing to dispatch until that change reaches `main` — the
-"Run workflow" button describes `main`'s copy, not yours.
+**`workflow_dispatch` runs the copy of the workflow at the ref you dispatch.** Being *offered* at
+all requires `release.yml` to exist on the default branch (`main`), but the run itself executes the
+ref's own file — so a workflow change can be dry-run from its branch, before it is merged anywhere.
+Measured: run 30975896474, dispatched at `seller-prebuilt-artifacts`, built the six jobs that branch
+declares while `main` still declared three.
 
 **A `v*` tag runs the copy of the workflow in the tagged commit.** So a tag cut from a `main` that
 predates `release.yml` starts **no run at all** — no output, no failure, nothing in the Actions tab.
 That is the failure mode to watch for, because an absent run looks identical to one nobody noticed.
 
-Both follow from the same fact and have the same fix: **merge `dev` into `main` before tagging or
-dispatching**, which step 2 above already does. The trap is only reachable by tagging or dispatching
-without it — most easily by cutting a release from a `main` merged minutes *before* a workflow change
-landed on `dev`.
+The fix for the tag: tag a `main` that actually contains `release.yml` — which it does, since the
+workflow lives on `main`. The trap is only reachable by tagging a commit that predates the workflow —
+an old ref, or a `main` from before `release.yml` first landed.
 
 If a tag produced no run, confirm the workflow was actually in that tree rather than assuming the
 trigger misfired:
@@ -132,23 +181,27 @@ git cat-file -e "$TAG":.github/workflows/release.yml && echo present || echo abs
 
 | platform | runner | shipped as |
 |---|---|---|
-| linux-x64 | `ubuntu-latest` | archive + `maxplayer-linux-x64` |
-| linux-arm64 | `ubuntu-24.04-arm` | archive + `maxplayer-linux-arm64` |
-| darwin-arm64 | `macos-14` | archive only |
-
-darwin-arm64 has no npm payload package yet, so macOS users download the archive; `npx maxplayer` tells
-them so rather than failing obscurely. Adding it means a `npm/cli-darwin-arm64` package and its entry
-in the launcher's platform map — at which point the publish job's platform list has to name it too,
-and the workflow fails at release time if it does not. That failure is the point: a payload package
-present in the tree but missing from the registry breaks every install on that platform, because the
-launcher pins it by exact version.
+| linux-x64 | `ubuntu-latest` | archive + `@maxplayerai/linux-x64` |
+| linux-arm64 | `ubuntu-24.04-arm` | archive + `@maxplayerai/linux-arm64` |
+| darwin-arm64 | `macos-14` | archive + `@maxplayerai/darwin-arm64` |
 
 **darwin-x64 and Windows are out of scope.**
 
 Adding a platform means: a matrix entry in `release.yml`, a package under `npm/`, an entry in
-`PLATFORM_PACKAGES` in `npm/mobee/bin/maxplayer.js`, an `optionalDependencies` pin, and the platform in
-`RELEASE_PLATFORMS`. Two of those five are asserted rather than trusted — the pin by
-`verify-release-version.sh`, and the platform list by the publish job.
+`PLATFORM_PACKAGES` in `npm/maxplayer/bin/maxplayer.js`, an `optionalDependencies` pin, the platform in
+`RELEASE_PLATFORMS`, and a trusted-publisher entry for the new package on npmjs.com. Three of those
+six are asserted rather than trusted — the pin by `verify-release-version.sh`, and both directions of
+the platform list by the publish job: a payload package in the tree that is not published, and a
+platform the release BUILDS with no payload behind it. The second is the one darwin needed. It was a
+first-class release artifact while `npm i maxplayer` answered `no binary for darwin-arm64` on every
+mac (#446), because the build matrix and the npm platform list were independent lists and nothing
+compared them.
+
+The trusted-publisher entry is the step no check can make: it lives on npmjs.com, needs an org admin,
+and must exist BEFORE the tag. Without it the publish job fails on that package — loudly, which is
+correct — but only after the packages ahead of it in the loop have published, and npm does not allow
+republishing a version. Recovering from that means cutting the next patch version, not re-running the
+job.
 
 ## Notes on the build
 
@@ -192,7 +245,7 @@ rebuild is a cross-check, and letting it gate the pipeline would quietly make it
 ## If a release goes wrong
 
 - **The tag produced no run at all.** The tagged commit has no `release.yml` — see the warning under
-  Dry run. Merge `dev` into `main`, delete the tag, tag again.
+  Dry run. Delete the tag, then tag a `main` that contains `release.yml` and push it again.
 - **Publish failed, Release exists.** Fix the cause and re-run just the publish job. The build is
   reproducible from the tag.
 - **A version disagreed with the tag.** Nothing was published — the check runs before any upload.

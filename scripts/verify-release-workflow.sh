@@ -2,11 +2,11 @@
 #
 # Assert the release workflow cannot publish by accident.
 #
-# The properties below are the reason the workflow is safe to merge with no token configured, and
-# every one of them is a single edit away from being lost — moving a gate, adding a trigger, or
-# copying an `npm publish` into another job. None of that breaks anything visibly: the workflow keeps
-# working, and the next release is simply published from somewhere it should not have been. This
-# script is what makes such an edit fail.
+# The properties below are the reason the workflow is safe to merge before any trusted publisher is
+# configured, and every one of them is a single edit away from being lost — moving a gate, adding a
+# trigger, or copying an `npm publish` into another job. None of that breaks anything visibly: the
+# workflow keeps working, and the next release is simply published from somewhere it should not have
+# been. This script is what makes such an edit fail.
 #
 # ★ This checks the workflow's STRUCTURE, which is what can be checked without GitHub. It cannot
 #   evaluate the `if:` expressions the way Actions does — observing the publish job actually skip on
@@ -45,7 +45,7 @@ echo "ok: no credential literal in the workflow"
 # shell as `\ ` — an escaped space, which joins onto the following word instead of continuing the
 # line. The next argument silently gains a leading space. Nothing about the YAML looks wrong and the
 # step runs; it just receives a path that cannot exist. That cost a full three-platform dry-run
-# (30476367671), where the argument arrived as ` target/x86_64-unknown-linux-musl/release/mobee`.
+# (30476367671), where the argument arrived as ` target/x86_64-unknown-linux-musl/release/maxplayer`.
 # Every such command belongs in a `run: |` block.
 #
 # ★ actionlint is silent on this shape — it reports zero findings on the exact file that failed — so
@@ -63,6 +63,51 @@ if [ -n "$folded" ]; then
     die "a plain-scalar 'run:' is continued with a backslash (see above) — use 'run: |'"
 fi
 echo "ok: every backslash-continued run: is a block scalar"
+
+# ── The one shipped artifact carries the whole surface, and it is asserted ──────────────────────
+# Since #510 a release ships ONE binary per platform, built with `acp` so that the same artifact
+# buys and sells. Both halves of that are checked, because losing either is invisible: a build that
+# quietly dropped `acp` still compiles, packages, checksums and installs, and the first report is a
+# seller whose `maxplayer seller` does not exist — on someone else's award.
+#
+# `--features wallet,acp` is the request; the verifier is the proof. Asserting only the first would
+# pass a workflow whose verify step had been deleted, and asserting only the second would pass one
+# that verifies a different build than it packages.
+grep -qF -- '--features wallet,acp' "$WORKFLOW" \
+    || die "$WORKFLOW does not build with 'wallet,acp' — the shipped binary would not carry the seller surface"
+
+# The verifier script is checked for existence too. A workflow naming a script that is not there
+# fails at the tag, after every build — and the `if:`-free step would be the last thing to run
+# before packaging, so the artifact would already exist.
+verifier="scripts/verify-seller-surface.sh"
+grep -qF -- "$verifier" "$WORKFLOW" \
+    || die "$WORKFLOW does not run $verifier — the shipped artifact would go out with its feature set unasserted"
+[ -x "$verifier" ] \
+    || die "$WORKFLOW runs $verifier, which is missing or not executable"
+
+# The surface verifier — the #249 gate that holds every platform list (built, npm payloads, launcher
+# pins and resolver) to one source. Named and executable for the same reason as the seller-surface
+# one: a workflow calling a script that is not there fails at the tag, after every build.
+surface_verifier="scripts/verify-release-surface.sh"
+grep -qF -- "$surface_verifier" "$WORKFLOW" \
+    || die "$WORKFLOW does not run $surface_verifier — a matrix↔published-set drift would be seen only at publish, after the release exists (#249)"
+[ -x "$surface_verifier" ] \
+    || die "$WORKFLOW runs $surface_verifier, which is missing or not executable"
+
+# The release completeness gate names the asset stem. It is what stops a release publishing with a
+# platform missing, and a stem that drifted from `maxplayer` would break every install URL and every
+# npm payload extraction at once.
+grep -qF -- 'maxplayer-$VERSION-$platform.tar.gz' "$WORKFLOW" \
+    || die "$WORKFLOW's completeness gate does not name maxplayer-\$VERSION-\$platform.tar.gz — the asset stem every install and npm payload resolves"
+
+# The retired second asset, asserted GONE rather than assumed. `install.sh` no longer constructs a
+# `maxplayer-seller-*` name, so a workflow that started building one again would publish assets
+# nothing installs — and the reverse mistake, a workflow still naming it while nothing builds it,
+# is how the completeness gate above would fail every release.
+if grep -q 'maxplayer-seller' "$WORKFLOW"; then
+    die "$WORKFLOW still names a 'maxplayer-seller' asset — #510 collapsed the release to one binary named maxplayer"
+fi
+echo "ok: one artifact, built with wallet,acp and verified by $verifier"
 
 # ── The privileged jobs are gated, and nothing else publishes ───────────────────────────────────
 # Job boundaries are found by their two-space-indented keys rather than parsed as YAML, so that this
@@ -104,27 +149,155 @@ for (const name of ["release", "publish"]) {
   }
 }
 
-// `npm publish` must live in exactly one job. A copy anywhere else would not be covered by the gate
-// checked above.
+// `npm publish` may appear in exactly two jobs, and the second one is a deliberate exception whose
+// fences are checked below. A copy in any THIRD job would be covered by no gate at all.
+const PUBLISHING_JOBS = ["publish", "npm-probe"];
 for (const [name, body] of jobs) {
-  if (name === "publish") continue;
+  if (PUBLISHING_JOBS.includes(name)) continue;
   const at = body.findIndex((l) => l.includes("npm publish"));
-  if (at >= 0) fail(`job '${name}' runs 'npm publish' — publishing belongs only in the gated publish job`);
+  if (at >= 0) fail(`job '${name}' runs 'npm publish' — only the gated publish job and the fenced npm-probe job may publish`);
 }
 if (!jobs.get("publish").some((l) => l.includes("npm publish"))) {
   fail("the publish job does not run 'npm publish' — this check is out of date with the workflow");
 }
 
-// The token half of the gate cannot be a job-level `if:` (the secrets context is unavailable there),
-// so it must be a step that stops the job when the secret is empty.
-const publish = jobs.get("publish").join("\n");
-if (!/NPM_TOKEN/.test(publish) || !/-z\s+"\$\{NPM_TOKEN/.test(publish)) {
-  fail("the publish job does not fail closed on an empty NPM_TOKEN");
+// ── The probe may publish, so what it CANNOT publish is the property ────────────────────────────
+// The probe exists because npm scopes a trusted publisher to a workflow FILENAME: a credential probe
+// living in its own workflow would exercise a publisher entry for that file, which is not the entry
+// a release depends on. So it publishes from here, and every fence that keeps it from reaching a
+// real version is asserted rather than trusted — an edit that removes one leaves a dispatch-triggered
+// path to the registry that looks exactly like the one that was safe.
+const probeBody = jobs.get("npm-probe");
+if (probeBody) {
+  const probeText = probeBody.join("\n");
+  const probeGate = probeText.match(/^ {4}if:(.*)$/m);
+  if (!probeGate) fail("job 'npm-probe' has no if: gate — it would run on a tag push, publishing a probe version during a real release");
+  if (!probeGate[1].includes("github.event_name == 'workflow_dispatch'")) {
+    fail("job 'npm-probe' is not gated on a workflow_dispatch — a tag push must never reach it");
+  }
+  // Without this half, an ordinary dry run — the thing this workflow is dispatched for most often —
+  // would publish to the registry every time somebody exercised the build.
+  if (!probeGate[1].includes("inputs.npm_probe_package != ''")) {
+    fail("job 'npm-probe' does not require an explicitly named package — an ordinary dry run would publish");
+  }
+
+  const probeCode = probeBody.filter((l) => !/^\s*#/.test(l)).join("\n");
+
+  // The version fence. `0.0.<n>` is a shape no release can name, which is what makes it safe rather
+  // than a blocklist that has to keep up with what looks dangerous.
+  if (!/0\.0\.\[0-9\]/.test(probeCode) || !probeCode.includes("may only publish 0.0.")) {
+    fail("job 'npm-probe' has lost its 0.0.<n> version fence — it could publish over a version a release wants");
+  }
+  // The package fence. `type: choice` constrains the dispatch form, not the REST API.
+  if (!probeCode.includes("only the @maxplayerai payload packages may be probed")) {
+    fail("job 'npm-probe' has lost its package allow-list — a dispatch sent through the API names any package it likes");
+  }
+  // The launcher is the package users type. It must not be probeable at all: its dist-tags are how
+  // `npx maxplayer` resolves, and the allow-list arm is what keeps it out.
+  if (/'maxplayer'\s*\)/.test(probeCode)) {
+    fail("job 'npm-probe' admits the launcher package — only the scoped payload packages may be probed");
+  }
+  // Publishing under `latest` would repoint what a bare install of a payload package resolves.
+  if (!probeCode.includes("--tag probe")) {
+    fail("job 'npm-probe' does not publish under the 'probe' dist-tag — it would move 'latest'");
+  }
+  // No checkout: with no repository content in the job there is no path by which a real payload
+  // package or the launcher could be published from it, whatever the inputs say.
+  if (probeCode.includes("actions/checkout")) {
+    fail("job 'npm-probe' checks out the repository — the probe must have no tree to publish from");
+  }
 }
 
+// A probe in a workflow of its own would prove a DIFFERENT credential (npm matches the workflow
+// filename), so a green run there would say nothing about the release path while looking like it
+// did. Nothing else in .github/workflows may publish.
+const nodePath = require("path");
+const workflowDir = nodePath.dirname(path);
+for (const entry of fs.readdirSync(workflowDir)) {
+  if (!/\.ya?ml$/.test(entry) || entry === nodePath.basename(path)) continue;
+  const text = fs.readFileSync(nodePath.join(workflowDir, entry), "utf8");
+  if (text.split("\n").filter((l) => !/^\s*#/.test(l)).some((l) => l.includes("npm publish"))) {
+    fail(`${entry} runs 'npm publish' — npm scopes a trusted publisher to a workflow filename, so publishing from any file but ${nodePath.basename(path)} exercises a credential no release uses`);
+  }
+}
+
+// ── The publish job cannot skip quietly ─────────────────────────────────────────────────────────
+// Authentication is npm trusted publishing (OIDC), so there is no secret to be empty and nothing to
+// check for emptiness. The property that guard existed to protect is unchanged and still checked
+// here: a publish that cannot happen must FAIL, never pass quietly. A silent skip is
+// indistinguishable from a successful release, and stays that way until somebody tries to install
+// what was never published.
+//
+// Under OIDC that property has two halves — the job must be able to authenticate at all, and
+// nothing may swallow the failure when it cannot.
+const publishBody = jobs.get("publish");
+
+// Half one. Without `id-token: write` no OIDC token is minted, npm falls back to looking for a
+// credential that no longer exists, and the job fails for a reason that reads like a registry
+// problem. The permissions block is matched at its own indentation so that a permissions block
+// belonging to some other job cannot satisfy this.
+if (!/^ {4}permissions:\s*$/m.test(publishBody.join("\n")) ||
+    !/^ {6}id-token:\s*write\s*$/m.test(publishBody.join("\n"))) {
+  fail("the publish job does not request 'id-token: write' — trusted publishing has no token to exchange");
+}
+
+// Half two. Comment-only lines are dropped first: this half searches for shapes that would suppress
+// a failure, and the prose around them necessarily describes those same shapes. A check that reads
+// its own explanation is a check that fails on documentation.
+const publishCode = publishBody.filter((l) => !/^\s*#/.test(l)).join("\n");
+
+// An early return reports success for a job that published nothing — the exact shape the deleted
+// token guard was careful NOT to have (it exited 1, not 0).
+if (/\bexit\s+0\b/.test(publishCode)) {
+  fail("the publish job can 'exit 0' early — a job that returns success without publishing is the silent skip");
+}
+// A step-level `if:` conditionally skips its step, and a skipped step is reported green. The job's
+// one legitimate gate is the job-level `if:` checked above, at four spaces; step keys sit at eight.
+if (/^ {8}if:/m.test(publishCode)) {
+  fail("a step in the publish job carries an 'if:' — a skipped publish step is green, which is the silent skip");
+}
+// `continue-on-error` turns a failed publish into a passing job, which is the same failure wearing
+// a different hat.
+if (/continue-on-error/.test(publishCode)) {
+  fail("the publish job uses 'continue-on-error' — a failed publish would be reported as a success");
+}
+// Nothing should be reaching for the retired token. Its presence means auth quietly went back to a
+// secret, and with it the expiry that trusted publishing was adopted to remove.
+if (/NODE_AUTH_TOKEN|secrets\.NPM_TOKEN/.test(publishCode)) {
+  fail("the publish job still references an npm token — authentication is trusted publishing (OIDC)");
+}
+
+// ── #249: the surface gate runs in dry runs, and gates the release ──────────────────────────────
+// The built-vs-published cross-check used to live only in the publish job — tag-gated, and reached
+// after the release was already created — so a matrix↔published-set drift passed every dry run and
+// was first seen on an un-createable release. It now lives in verify-surface, which release and
+// publish depend on. Two properties keep that true: the job must NOT be gated back onto a tag (or it
+// stops running in the dry run, which is the whole point), and the jobs that CREATE things must
+// depend on it (or a red there stops nothing).
+const surface = jobs.get("verify-surface");
+if (!surface) {
+  fail("no 'verify-surface' job — the built-vs-published cross-check would run only in publish (tag-only, after the release is created), which is #249");
+}
+const surfaceGate = surface.join("\n").match(/^ {4}if:(.*)$/m);
+if (surfaceGate && (surfaceGate[1].includes("github.ref_type == 'tag'") || surfaceGate[1].includes("github.event_name == 'push'"))) {
+  fail("job 'verify-surface' is gated on a tag/push — it must run on a workflow_dispatch dry run, or the drift it catches stays invisible until a real release");
+}
+for (const name of ["release", "publish"]) {
+  const needs = jobs.get(name).join("\n").match(/^ {4}needs:(.*)$/m);
+  if (!needs || !needs[1].includes("verify-surface")) {
+    fail(`job '${name}' does not depend on verify-surface (needs:) — a surface drift the gate catches would not stop the ${name}`);
+  }
+}
+if (!surface.join("\n").includes("verify-release-surface.sh")) {
+  fail("job 'verify-surface' does not run scripts/verify-release-surface.sh — it would gate on nothing");
+}
+
+console.log("ok: verify-surface runs in dry runs and gates release and publish (the #249 fix)");
 console.log("ok: release and publish are gated on a tag push");
-console.log("ok: 'npm publish' appears only in the publish job");
-console.log("ok: the publish job fails closed without NPM_TOKEN");
+console.log("ok: 'npm publish' appears only in the publish job and the fenced npm-probe job");
+console.log("ok: npm-probe is dispatch-only, needs a named package, and can publish 0.0.<n> of a payload package only");
+console.log("ok: no other workflow publishes to npm");
+console.log("ok: the publish job requests id-token: write and has no silent-skip path");
 NODE
 
-echo "PASS: $WORKFLOW publishes nothing without both a pushed tag and the secret"
+echo "PASS: $WORKFLOW publishes no RELEASE without a pushed tag, cannot skip publishing quietly, and its one dispatch-triggered publish reaches nothing a release can name"

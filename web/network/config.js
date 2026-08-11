@@ -1,7 +1,7 @@
 /**
  * Deploy-tunable constants. Kind numbers live in js/kinds.js (single source) — never here.
  *
- * The operator sets RELAY_URL to their mobee relay's wss URL before build/serve.
+ * The operator sets RELAY_URL to their maxplayer relay's wss URL before build/serve.
  * The relay may send a NIP-42 AUTH challenge first — the client ignores it; the
  * historical REQ is still served.
  */

@@ -2530,6 +2530,75 @@ dependencies = [
 ]
 
 [[package]]
+name = "maxplayer"
+version = "0.3.0"
+dependencies = [
+ "git2",
+ "maxplayer-core",
+ "nostr-sdk",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "maxplayer-core"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "cashu",
+ "cdk",
+ "cdk-sqlite",
+ "config",
+ "futures-util",
+ "getrandom 0.3.4",
+ "git2",
+ "hex",
+ "libc",
+ "nostr-relay-builder",
+ "nostr-sdk",
+ "rcgen",
+ "reqwest",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tokio-tungstenite",
+ "toml",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "maxplayer-desktop"
+version = "0.3.0"
+dependencies = [
+ "eframe",
+ "maxplayer-core",
+ "serde_json",
+]
+
+[[package]]
+name = "maxplayer-evals"
+version = "0.3.0"
+dependencies = [
+ "maxplayer-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "maxplayer-relay-write-policy"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2578,75 +2647,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "mobee"
-version = "0.1.0"
-dependencies = [
- "git2",
- "mobee-core",
- "nostr-sdk",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "mobee-core"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "cashu",
- "cdk",
- "cdk-sqlite",
- "config",
- "futures-util",
- "getrandom 0.3.4",
- "git2",
- "hex",
- "libc",
- "nostr-relay-builder",
- "nostr-sdk",
- "rcgen",
- "reqwest",
- "rusqlite",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tokio",
- "tokio-tungstenite",
- "toml",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "mobee-desktop"
-version = "0.1.0"
-dependencies = [
- "eframe",
- "mobee-core",
- "serde_json",
-]
-
-[[package]]
-name = "mobee-evals"
-version = "0.1.0"
-dependencies = [
- "mobee-core",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "mobee-relay-write-policy"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]

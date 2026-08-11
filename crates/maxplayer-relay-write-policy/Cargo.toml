@@ -1,0 +1,21 @@
+[package]
+name = "maxplayer-relay-write-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# strfry spawns this binary and speaks JSONL over stdin/stdout. `lib.getExe` on the
+# packaged derivation resolves this name via meta.mainProgram, so the two must agree.
+[[bin]]
+name = "maxplayer-write-policy"
+path = "src/main.rs"
+
+[dependencies]
+# Only serde_json + serde(derive), both already pinned in the workspace lock, so adding
+# this crate adds one package entry and no new transitive deps. The plugin reads three
+# fields off each event and emits a three-field verdict — it needs nothing heavier, and
+# deliberately does NOT depend on maxplayer-core: the wire shape it keys on is strfry's, not
+# ours, and a foreign event it must reject would not deserialise into our types.
+serde = { workspace = true }
+serde_json = { workspace = true }

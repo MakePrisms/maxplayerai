@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 #
-# Capability gate for a shipped racer artifact — asserts WHICH features were compiled in.
+# Capability gate for a BUYER-ONLY (racer) build — asserts WHICH features were compiled in.
+#
+# ★ Since #510 no release ships this build. One binary is published, carrying the full surface, and
+#   `verify-seller-surface.sh` is what gates it. This script keeps the buyer-only FEATURE SET
+#   honest: `ci.yml` builds with default features and runs this, so `--no-default-features --features
+#   wallet` stays a real, acp-free build for anyone compiling from source. A release that started
+#   running this again would be shipping a binary that cannot sell.
 #
 # `verify-static-artifact.sh` proves the artifact runs anywhere; it cannot tell which build it is,
 # because `maxplayer version` succeeds identically in every feature combination. This script answers the
@@ -31,12 +37,12 @@ die() { echo "verify-racer-surface: $*" >&2; exit 1; }
 [ -f "$BINARY" ] || die "no binary at $BINARY — build one with: nix build .#buyer-static"
 [ -x "$BINARY" ] || die "$BINARY is not executable"
 
-# A scratch home, unconditionally. With MOBEE_HOME unset, maxplayer falls back to ~/.mobee — a real
+# A scratch home, unconditionally. With MAXPLAYER_HOME unset, maxplayer falls back to ~/.maxplayer — a real
 # wallet home on a developer machine — and `wallet balance` below would read it. The value is forced
 # rather than checked so a caller's home can never leak in.
-MOBEE_HOME="$(mktemp -d)"
-export MOBEE_HOME
-trap 'rm -rf "$MOBEE_HOME"' EXIT
+MAXPLAYER_HOME="$(mktemp -d)"
+export MAXPLAYER_HOME
+trap 'rm -rf "$MAXPLAYER_HOME"' EXIT
 
 # Both builds exit non-zero on the probe below, so the exit code cannot tell them apart — only the
 # message can. These are the two it has to distinguish, and anything else is treated as inconclusive
@@ -50,7 +56,7 @@ ACP_PRESENT='spawn ACP agent'
 # is ever executed. Naming a real command instead would make the probe depend on that command
 # existing on the builder, which is not true across platforms (`/bin/true` is absent on NixOS).
 set +e
-acp_out="$("$BINARY" run --agent-command /nonexistent/mobee-acp-probe --task probe --log /dev/null 2>&1)"
+acp_out="$("$BINARY" run --agent-command /nonexistent/maxplayer-acp-probe --task probe --log /dev/null 2>&1)"
 acp_rc=$?
 set -e
 
@@ -79,25 +85,25 @@ help_rc=$?
 set -e
 [ "$help_rc" -eq 0 ] \
     || die "\`maxplayer --help\` exited $help_rc — cannot read the surface to check for \`sell\`:"$'\n'"$help_out"
-if grep -q 'maxplayer sell' <<<"$help_out"; then
-    die "\`maxplayer sell\` is listed in --help — the seller advertise surface is compiled into the racer artifact, which must ship buyer-only (#360):"$'\n'"$help_out"
+if grep -q 'maxplayer seller' <<<"$help_out"; then
+    die "\`maxplayer seller\` is listed in --help — the seller advertise surface is compiled into the racer artifact, which must ship buyer-only (#360):"$'\n'"$help_out"
 fi
 # Belt-and-suspenders: invoking it must land on the SAME generic usage error an unknown command
 # gets — positive proof the arm fell through to `usage`, not that `sell` booted and happened to fail
 # early (which would still be nonzero and might not print any of the advertise log strings below).
 set +e
-sell_out="$("$BINARY" sell --agent claude --rate-sats 100 2>&1)"
+sell_out="$("$BINARY" seller --agent claude --rate-sats 100 2>&1)"
 sell_rc=$?
 set -e
 if [ "$sell_rc" -ne 1 ]; then
-    die "\`maxplayer sell\` exited $sell_rc, not the usage-error 1 an absent command falls through to — the seller surface may be compiled in:"$'\n'"$sell_out"
+    die "\`maxplayer seller\` exited $sell_rc, not the usage-error 1 an absent command falls through to — the seller surface may be compiled in:"$'\n'"$sell_out"
 fi
 if ! grep -q 'Usage:' <<<"$sell_out"; then
-    die "\`maxplayer sell\` did not print the generic usage text, so it did not fall through to \`usage\` — the seller surface may be compiled in and failing after boot:"$'\n'"$sell_out"
+    die "\`maxplayer seller\` did not print the generic usage text, so it did not fall through to \`usage\` — the seller surface may be compiled in and failing after boot:"$'\n'"$sell_out"
 fi
 # Secondary: it must never have reached any advertise/boot log line (kind-0/NIP-89/heartbeat/NIP-34).
 if grep -qE 'discoverable kind0=|relay-git seed probe|relay-git NIP-34 announce|discoverability publish' <<<"$sell_out"; then
-    die "\`maxplayer sell\` reached the discoverability/boot path on the racer artifact:"$'\n'"$sell_out"
+    die "\`maxplayer seller\` reached the discoverability/boot path on the racer artifact:"$'\n'"$sell_out"
 fi
 echo "ok: sell absent — the seller advertise surface (kind-0/NIP-89/heartbeat) is not compiled in"
 

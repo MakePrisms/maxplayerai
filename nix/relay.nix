@@ -70,6 +70,11 @@ in
   options.services.maxplayer.relay = {
     enable = lib.mkEnableOption "the maxplayer launch relay (buzz-derived)";
 
+    # NOTE (merge of #402): the strfry module this replaces declared `namespaceTag` (the accepted `t`
+    # tag) and `writePolicyPackage` (the strfry write-policy plugin). buzz has neither concept — it
+    # admits by KIND in compiled relay code, with no external policy binary and no t-tag filter — so
+    # both options are dropped rather than carried forward. See nix/relay-host.nix for the same note
+    # on the consumer side.
     package = lib.mkOption {
       type = lib.types.package;
       description = ''

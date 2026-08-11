@@ -1,6 +1,7 @@
 # Run-anywhere maxplayer. `docker compose up -d seller` brings a seller daemon
-# online against the public relay + test mint. See docs/DOCKER.md for the full
-# quickstart, the bring-your-own-key pattern, and the upgrade path.
+# online against the public relay + the shipped default minibits mint. See
+# docs/DOCKER.md for the full quickstart,
+# the bring-your-own-key pattern, and the upgrade path.
 
 services:
   # -----------------------------------------------------------------------
@@ -21,15 +22,15 @@ services:
     # available INSIDE the container — see docs/DOCKER.md "Fulfilling jobs".
     # Without one the daemon still runs, authenticates, and heartbeats; leave
     # open-pool claiming OFF (the default) so it never claims work it can't do.
-    command: ["sell", "--non-interactive", "--agent", "claude", "--rate-sats", "2"]
+    command: ["seller", "--non-interactive", "--agent", "claude", "--rate-sats", "2"]
     volumes:
       # Named volume holds the seller home: key (0600, auto-generated on first
       # run), wallet, config.toml, and the delivery journal. Persists across
       # image upgrades.
       - seller-data:/data
     environment:
-      # MOBEE_HOME defaults to /data in the image; shown here for clarity.
-      - MOBEE_HOME=/data
+      # MAXPLAYER_HOME defaults to /data in the image; shown here for clarity.
+      - MAXPLAYER_HOME=/data
       #
       # --- Config: file + CLI flags. ---
       # Non-default relay/mint/rate go in config.toml on the volume (see
@@ -60,11 +61,11 @@ services:
   # seller-2:
   #   build: .
   #   restart: unless-stopped
-  #   command: ["sell", "--non-interactive", "--agent", "codex", "--rate-sats", "3"]
+  #   command: ["seller", "--non-interactive", "--agent", "codex", "--rate-sats", "3"]
   #   volumes:
   #     - seller-2-data:/data
   #   environment:
-  #     - MOBEE_HOME=/data
+  #     - MAXPLAYER_HOME=/data
 
   # -----------------------------------------------------------------------
   # Buyer MCP (commented) — `maxplayer mcp` is a STDIO server for an MCP client
@@ -74,8 +75,8 @@ services:
   #   docker run -i --rm -v buyer-data:/data maxplayer:latest mcp
   #
   # and point your MCP client at that command. It shares the same home layout
-  # (key + wallet in /data). Fund the buyer wallet with test ecash before
-  # posting jobs — see docs/DOCKER.md.
+  # (key + wallet in /data). Fund the buyer wallet before posting jobs — see
+  # docs/DOCKER.md.
   # -----------------------------------------------------------------------
   # buyer-mcp:
   #   build: .
@@ -84,7 +85,7 @@ services:
   #   volumes:
   #     - buyer-data:/data
   #   environment:
-  #     - MOBEE_HOME=/data
+  #     - MAXPLAYER_HOME=/data
 
 volumes:
   seller-data:

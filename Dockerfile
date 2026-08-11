@@ -29,7 +29,7 @@ COPY . .
 # A cache mount keeps the cargo registry + target dir warm across rebuilds.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p mobee --features acp,wallet \
+    cargo build --release -p maxplayer --features acp,wallet \
     && cp /src/target/release/maxplayer /usr/local/bin/maxplayer \
     && strip /usr/local/bin/maxplayer || true
 
@@ -45,27 +45,27 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Run as an unprivileged user. The key file must be 0600 and owned by this
-# user; /data (MOBEE_HOME) is created up front so a named volume inherits the
+# user; /data (MAXPLAYER_HOME) is created up front so a named volume inherits the
 # right ownership on first run.
-RUN useradd --system --create-home --uid 10001 --shell /usr/sbin/nologin mobee \
+RUN useradd --system --create-home --uid 10001 --shell /usr/sbin/nologin maxplayer \
     && mkdir -p /data \
-    && chown mobee:mobee /data
+    && chown maxplayer:maxplayer /data
 
 COPY --from=builder /usr/local/bin/maxplayer /usr/local/bin/maxplayer
 
 # Seller home lives on a mounted volume so the key, wallet, config, and journal
 # survive image upgrades. See docs/DOCKER.md for the upgrade path.
-ENV MOBEE_HOME=/data
+ENV MAXPLAYER_HOME=/data
 VOLUME ["/data"]
 
-USER mobee
+USER maxplayer
 WORKDIR /data
 
 # tini as PID 1 so SIGTERM from `docker stop` cleanly shuts the daemon.
 ENTRYPOINT ["/usr/bin/tini", "--", "maxplayer"]
 
-# Default to the seller daemon. `maxplayer sell` with no args relaunches zero-prompt
+# Default to the seller daemon. `maxplayer seller` with no args relaunches zero-prompt
 # from an existing config.toml; first run needs --agent + --rate-sats (see
 # docker-compose.yml / docs/DOCKER.md). Override the command for `mcp`, `doctor`,
 # `wallet`, etc.
-CMD ["sell"]
+CMD ["seller"]

@@ -1,0 +1,23 @@
+{
+  "name": "maxplayer",
+  "version": "0.3.0",
+  "description": "CLI and MCP server for the maxplayer agent marketplace — buy and sell agent work",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["maxplayer", "mcp", "nostr", "cashu", "agent"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MakePrisms/maxplayerai.git"
+  },
+  "bin": {
+    "maxplayer": "bin/maxplayer.js"
+  },
+  "files": ["bin/maxplayer.js", "README.md", "LICENSE-MIT", "LICENSE-APACHE"],
+  "optionalDependencies": {
+    "@maxplayerai/linux-x64": "0.3.0",
+    "@maxplayerai/linux-arm64": "0.3.0",
+    "@maxplayerai/darwin-arm64": "0.3.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
