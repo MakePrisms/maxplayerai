@@ -65,12 +65,16 @@ fn require_initialized(root: &Path) -> Result<(), String> {
         return Ok(());
     }
 
+    // #655 review: the recommended commands must stay REAL dispatch arms. `sell` is retired
+    // (cli.rs dispatches `Some("seller")`; retired_sell_subcommand_is_rejected_no_alias pins it)
+    // and doctor's parser accepts `--home` only — no `--fix`. A test below asserts both, so this
+    // remediation text cannot drift back to commands the operator cannot run.
     Err(format!(
         "profile set refused: no initialized maxplayer home at {}\n\
          {} — this looks like a typo'd or new --home path.\n\
-         `profile set` never creates a new identity: run `maxplayer sell --home {} ...` \
-         (or `maxplayer doctor --home {} --fix`) to initialize a home first, or check the \
-         path is correct.",
+         `profile set` never creates a new identity: run `maxplayer seller --home {} ...` \
+         (or check the home with `maxplayer doctor --home {}`) to initialize a home first, \
+         or check the path is correct.",
         root.display(),
         if root.exists() {
             "the directory exists but has no key file"
@@ -268,6 +272,33 @@ mod tests {
         assert!(!temp.0.join("key").exists());
         assert!(String::from_utf8(err).expect("utf8").contains("has no key file"));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn refusal_recommends_only_commands_that_exist() {
+        // #655 review: the remediation text once recommended the retired `maxplayer sell` and a
+        // nonexistent `doctor --fix` — the confused operator this refusal protects followed it
+        // verbatim into two more errors. The recommended commands must stay real dispatch arms:
+        // cli.rs dispatches Some("seller") (retired_sell_subcommand_is_rejected_no_alias pins
+        // that `sell` stays rejected), and parse_doctor_args accepts --home only.
+        let message = require_initialized(Path::new("/nonexistent/home/for-655"))
+            .expect_err("uninitialized home must refuse");
+        assert!(
+            message.contains("maxplayer seller --home"),
+            "must recommend the real seller subcommand: {message}"
+        );
+        assert!(
+            message.contains("maxplayer doctor --home"),
+            "must recommend the real doctor form: {message}"
+        );
+        assert!(
+            !message.contains("--fix"),
+            "doctor has no --fix flag: {message}"
+        );
+        assert!(
+            !message.contains("maxplayer sell "),
+            "`sell` is retired (dispatch arm is `seller`): {message}"
+        );
     }
 
     #[test]
