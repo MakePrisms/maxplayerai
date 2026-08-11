@@ -1463,6 +1463,28 @@ fn select_deliverable_claim(
     Ok(award.claim_id.clone())
 }
 
+/// Whether `claim_id` (already believed awarded to `seller_pubkey`) is currently PAYABLE +
+/// DELIVERED per relay truth in `view` — the same two facts [`select_deliverable_claim`] gates
+/// `collect` on (#540), factored out as an independent, deliberately small predicate so `get_job`
+/// (#544) can surface the identical "ready to settle" fact as a status field without depending on
+/// (or perturbing) `select_deliverable_claim`'s own named-refusal error strings, which #540's
+/// regression tests pin exactly.
+pub(crate) fn claim_is_payable_and_delivered(
+    view: &JobView,
+    claim_id: &str,
+    seller_pubkey: &str,
+) -> bool {
+    let Some(claim) = view.claims.iter().find(|c| c.claim_id == claim_id) else {
+        return false;
+    };
+    if claim.status != "processing" && claim.status != CLAIM_STATUS_DELIVERED {
+        return false;
+    }
+    view.results
+        .iter()
+        .any(|result| result.seller_pubkey == seller_pubkey && result.commit_oid.is_some())
+}
+
 /// Accept-time contribution resolution. Authority is the buyer's SIGNED OFFER:
 /// - not a contribution offer (`job_class != contribution`) ⇒ `Ok(None)` (from-scratch);
 /// - a `contribution`-class offer whose pins failed to parse ⇒ REFUSE (fail-closed — never
