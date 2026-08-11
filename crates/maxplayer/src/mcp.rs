@@ -11,6 +11,7 @@ use std::io::{BufRead, Write};
 use std::time::Duration;
 
 use maxplayer_core::home::{self, MaxplayerHome};
+use maxplayer_core::job_lifecycle;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -220,13 +221,13 @@ fn tools() -> Value {
         },
         {
             "name": "get_job",
-            "description": "Read job state from the relay (offer + claims + results). Surfaces claim created_at and flags the most-recent LIVE claim. Optional include_display_names=true adds best-effort cosmetic kind-0 names; the default skips that extra network fetch and hex pubkeys remain authoritative. Optional wait_for=claim|result long-poll. Local accept-bind attached if present. Results may carry seller-claimed exec-metadata attribution (harness, model): harness is the RESOLVED id (e.g. claude-agent-acp) — a DIFFERENT vocabulary from post_job's harness labels (claude), so never string-compare the two — and every such value is an attribution, not a verification. Never invents claims/results.",
+            "description": format!("Read job state from the relay (offer + claims + results). Surfaces claim created_at and flags the most-recent LIVE claim. Optional include_display_names=true adds best-effort cosmetic kind-0 names; the default skips that extra network fetch and hex pubkeys remain authoritative. Optional wait_for=claim|result long-poll; timeout_secs bounds the wait, capped internally at {cap}s (values above {cap} are refused, not silently shortened) — omit timeout_secs to use the {cap}s default. Local accept-bind attached if present. Results may carry seller-claimed exec-metadata attribution (harness, model): harness is the RESOLVED id (e.g. claude-agent-acp) — a DIFFERENT vocabulary from post_job's harness labels (claude), so never string-compare the two — and every such value is an attribution, not a verification. Never invents claims/results.", cap = job_lifecycle::WAIT_FOR_CAP_SECS),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "job_id": { "type": "string", "description": "Offer event id (hex)" },
                     "wait_for": { "type": "string", "enum": ["claim", "result"] },
-                    "timeout_secs": { "type": "integer", "minimum": 1 },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": job_lifecycle::WAIT_FOR_CAP_SECS },
                     "include_display_names": { "type": "boolean", "description": "Opt in to an additional kind-0 profile fetch for cosmetic display names (default false)." }
                 },
                 "required": ["job_id"],
@@ -546,6 +547,32 @@ mod tests {
             .map(|tool| tool["name"].as_str().expect("name"))
             .collect();
         assert_eq!(names, vec!["post_job", "get_job", "collect", "award_claim"]);
+    }
+
+    #[test]
+    fn get_job_timeout_schema_maximum_tracks_lifecycle_cap() {
+        let tools = tools();
+        let get_job = tools
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|tool| tool["name"] == "get_job")
+            .expect("get_job tool");
+        assert_eq!(
+            get_job["inputSchema"]["properties"]["timeout_secs"]["maximum"],
+            json!(job_lifecycle::WAIT_FOR_CAP_SECS)
+        );
+        let description = get_job["description"]
+            .as_str()
+            .expect("get_job description");
+        assert!(description.contains(&format!(
+            "values above {} are refused, not silently shortened",
+            job_lifecycle::WAIT_FOR_CAP_SECS
+        )));
+        assert!(description.contains(&format!(
+            "omit timeout_secs to use the {}s default",
+            job_lifecycle::WAIT_FOR_CAP_SECS
+        )));
     }
 
     // A moved tool called by a stale client returns an actionable error naming the CLI command.
