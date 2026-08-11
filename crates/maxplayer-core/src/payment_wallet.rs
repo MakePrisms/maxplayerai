@@ -1983,8 +1983,8 @@ fn wallet_error(error: impl std::fmt::Display) -> PaymentWalletError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
-    use std::sync::Arc;
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use cashu::secret::Secret;
@@ -3096,6 +3096,97 @@ mod tests {
         assert_eq!(amount, Amount::from(5));
     }
 
+    #[tokio::test]
+    async fn seller_receive_completes_a_real_swap_at_non_default_realized_mint_via_signing_mock() {
+        let seller_key = secret_key(1);
+        let transport = SigningSwapTransport::new(1_000); // 1 proof → fee = 1
+        let keyset = transport.keyset.clone();
+        let proof = signed_p2pk_proof_for_keyset(4, seller_key.public_key(), keyset.id);
+        let proof_y = proof.y().unwrap();
+        let token = Token::new(
+            mint(OTHER_MINT),
+            vec![proof],
+            None,
+            CurrencyUnit::Sat,
+        );
+        let swap_calls = transport.swap_calls.clone();
+        let spent_ys = transport.spent_ys.clone();
+        let wallet = seller_wallet_at(OTHER_MINT, transport, keyset).await;
+        let terms = PaymentTerms::new(
+            mint(OTHER_MINT),
+            Amount::from(4),
+            CurrencyUnit::Sat,
+            nostr_key_for_p2pk(seller_key.public_key()),
+            seller_key.public_key(),
+        );
+
+        let amount = CdkSellerReceive::new(&wallet, seller_key)
+            .receive(
+                &token,
+                &terms,
+                &accepted(&[MINT, OTHER_MINT]),
+                &mint(OTHER_MINT),
+            )
+            .await
+            .expect("real swap at realized non-default mint must succeed");
+
+        assert_eq!(amount, Amount::from(4));
+        assert_eq!(swap_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(wallet.total_balance().await.unwrap(), Amount::from(3));
+        assert_eq!(&*spent_ys.lock().unwrap(), &HashSet::from([proof_y]));
+    }
+
+    #[tokio::test]
+    async fn signing_swap_transport_refuses_replayed_receive_token() {
+        let seller_key = secret_key(1);
+        let transport = SigningSwapTransport::new(1_000);
+        let keyset = transport.keyset.clone();
+        let proof = signed_p2pk_proof_for_keyset(4, seller_key.public_key(), keyset.id);
+        let proof_y = proof.y().unwrap();
+        let token = Token::new(
+            mint(OTHER_MINT),
+            vec![proof],
+            None,
+            CurrencyUnit::Sat,
+        );
+        let swap_calls = transport.swap_calls.clone();
+        let spent_ys = transport.spent_ys.clone();
+        let first_wallet =
+            seller_wallet_at(OTHER_MINT, transport.clone(), keyset.clone()).await;
+        let replay_wallet = seller_wallet_at(OTHER_MINT, transport, keyset).await;
+        let terms = PaymentTerms::new(
+            mint(OTHER_MINT),
+            Amount::from(4),
+            CurrencyUnit::Sat,
+            nostr_key_for_p2pk(seller_key.public_key()),
+            seller_key.public_key(),
+        );
+
+        CdkSellerReceive::new(&first_wallet, seller_key.clone())
+            .receive(
+                &token,
+                &terms,
+                &accepted(&[MINT, OTHER_MINT]),
+                &mint(OTHER_MINT),
+            )
+            .await
+            .expect("first presentation must redeem");
+        let replay = CdkSellerReceive::new(&replay_wallet, seller_key)
+            .receive(
+                &token,
+                &terms,
+                &accepted(&[MINT, OTHER_MINT]),
+                &mint(OTHER_MINT),
+            )
+            .await;
+
+        assert!(matches!(replay, Err(PaymentWalletError::Wallet(_))));
+        assert_eq!(swap_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(spent_ys.lock().unwrap().len(), 1);
+        assert!(spent_ys.lock().unwrap().contains(&proof_y));
+        assert_eq!(replay_wallet.total_balance().await.unwrap(), Amount::ZERO);
+    }
+
     // Z2 pre-fix symptom: a wallet opened at the DEFAULT mint refuses a payment realized at a
     // different accepted mint — the "wallet mint ... does not match terms" failure the fix removes.
     #[tokio::test]
@@ -3712,9 +3803,9 @@ mod tests {
 
     /// Build a seller wallet bound to an EXPLICIT mint url (multi-mint tests). Mirrors
     /// `seller_wallet` but lets the wallet bind to a non-default mint.
-    async fn seller_wallet_at(
+    async fn seller_wallet_at<T: HttpTransport + 'static>(
         mint_url: &str,
-        transport: InflatedSwapTransport,
+        transport: T,
         keyset: KeySet,
     ) -> Wallet {
         let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
@@ -3910,6 +4001,21 @@ mod tests {
             secret,
             secret_key(9).public_key(),
         )
+    }
+
+    fn signed_p2pk_proof_for_keyset(
+        amount: u64,
+        seller: PublicKey,
+        keyset_id: Id,
+    ) -> Proof {
+        let secret = Secret::try_from(SpendingConditions::new_p2pk(
+            seller,
+            Some(Conditions::default()),
+        ))
+        .unwrap();
+        let y = cashu::dhke::hash_to_curve(secret.as_bytes()).unwrap();
+        let c = cashu::dhke::sign_message(&secret_key(amount as u8 + 10), &y).unwrap();
+        Proof::new(Amount::from(amount), keyset_id, secret, c)
     }
 
     fn secret_key(byte: u8) -> SecretKey {
@@ -4120,6 +4226,176 @@ mod tests {
                 presented.to_u64(),
                 0,
             ))
+        }
+    }
+
+    /// In-process signing mint for receive/swap tests.
+    ///
+    /// It enforces input/output conservation (including the configured input fee),
+    /// rejects already-spent input Ys, preserves output amount/keyset metadata, and
+    /// returns real `C_ = k * B_` signatures with real DLEQ proofs. It deliberately
+    /// does not model keyset rotation, NUT-19 caching, auth, or quote lifecycles;
+    /// those are later increments tracked in #91/#339.
+    #[derive(Clone, Debug)]
+    struct SigningSwapTransport {
+        keyset: KeySet,
+        signing_keys: BTreeMap<Amount, SecretKey>,
+        spent_ys: Arc<Mutex<HashSet<PublicKey>>>,
+        swap_calls: Arc<AtomicUsize>,
+    }
+
+    impl SigningSwapTransport {
+        fn new(input_fee_ppk: u64) -> Self {
+            let keyset = test_keyset_with_fee(input_fee_ppk);
+            let signing_keys = keyset
+                .keys
+                .keys()
+                .keys()
+                .map(|amount| (*amount, secret_key(amount.to_u64() as u8 + 10)))
+                .collect();
+            Self {
+                keyset,
+                signing_keys,
+                spent_ys: Arc::default(),
+                swap_calls: Arc::default(),
+            }
+        }
+
+        fn signing_key(&self, amount: Amount) -> Result<SecretKey, cdk::Error> {
+            self.signing_keys
+                .get(&amount)
+                .cloned()
+                .ok_or(cdk::Error::AmountKey)
+        }
+    }
+
+    impl Default for SigningSwapTransport {
+        fn default() -> Self {
+            Self::new(0)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HttpTransport for SigningSwapTransport {
+        fn with_proxy(
+            &mut self,
+            _proxy: Url,
+            _host_matcher: Option<&str>,
+            _accept_invalid_certs: bool,
+        ) -> Result<(), cdk::Error> {
+            Ok(())
+        }
+
+        async fn http_get<R>(
+            &self,
+            _url: Url,
+            _auth: Option<cashu::nuts::AuthToken>,
+        ) -> Result<R, cdk::Error>
+        where
+            R: DeserializeOwned,
+        {
+            Err(cdk::Error::Custom("unexpected GET".into()))
+        }
+
+        async fn http_post<P, R>(
+            &self,
+            url: Url,
+            _auth: Option<cashu::nuts::AuthToken>,
+            payload: &P,
+        ) -> Result<R, cdk::Error>
+        where
+            P: Serialize + ?Sized + Send + Sync,
+            R: DeserializeOwned,
+        {
+            if !url.path().ends_with("/v1/swap") {
+                return Err(cdk::Error::Custom(format!(
+                    "unexpected POST {}",
+                    url.path()
+                )));
+            }
+            self.swap_calls.fetch_add(1, Ordering::SeqCst);
+            let request: cashu::SwapRequest = serde_json::from_value(
+                serde_json::to_value(payload)
+                    .map_err(|error| cdk::Error::Custom(error.to_string()))?,
+            )
+            .map_err(|error| cdk::Error::Custom(error.to_string()))?;
+
+            let mut request_ys = HashSet::new();
+            for proof in request.inputs() {
+                if proof.keyset_id != self.keyset.id {
+                    return Err(cdk::Error::KeysetUnknown(proof.keyset_id));
+                }
+                let y = proof
+                    .y()
+                    .map_err(|error| cdk::Error::Custom(error.to_string()))?;
+                if !request_ys.insert(y) {
+                    return Err(cdk::Error::DuplicateInputs);
+                }
+            }
+            let mut spent = self
+                .spent_ys
+                .lock()
+                .map_err(|_| cdk::Error::Custom("spent-Y ledger poisoned".into()))?;
+            if request_ys.iter().any(|y| spent.contains(y)) {
+                return Err(cdk::Error::Custom("swap input is already spent".into()));
+            }
+
+            let inputs = request
+                .input_amount()
+                .map_err(|error| cdk::Error::Custom(error.to_string()))?;
+            let outputs = request
+                .output_amount()
+                .map_err(|error| cdk::Error::Custom(error.to_string()))?;
+            let fee_ppk = self
+                .keyset
+                .input_fee_ppk
+                .checked_mul(request.inputs().len() as u64)
+                .ok_or(cdk::Error::AmountOverflow)?;
+            let fee = fee_ppk.div_ceil(1_000);
+            if outputs
+                .to_u64()
+                .checked_add(fee)
+                .ok_or(cdk::Error::AmountOverflow)?
+                != inputs.to_u64()
+            {
+                return Err(cdk::Error::TransactionUnbalanced(
+                    inputs.to_u64(),
+                    outputs.to_u64(),
+                    fee,
+                ));
+            }
+
+            let signatures = request
+                .outputs()
+                .iter()
+                .map(|blinded_message| {
+                    if blinded_message.keyset_id != self.keyset.id {
+                        return Err(cdk::Error::KeysetUnknown(blinded_message.keyset_id));
+                    }
+                    let signing_key = self.signing_key(blinded_message.amount)?;
+                    let c = cashu::dhke::sign_message(
+                        &signing_key,
+                        &blinded_message.blinded_secret,
+                    )
+                    .map_err(|error| cdk::Error::Custom(error.to_string()))?;
+                    cashu::nuts::BlindSignature::new(
+                        blinded_message.amount,
+                        c,
+                        self.keyset.id,
+                        &blinded_message.blinded_secret,
+                        signing_key,
+                    )
+                    .map_err(|error| cdk::Error::Custom(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            spent.extend(request_ys);
+            let response = cashu::SwapResponse::new(signatures);
+            serde_json::from_value(
+                serde_json::to_value(response)
+                    .map_err(|error| cdk::Error::Custom(error.to_string()))?,
+            )
+            .map_err(|error| cdk::Error::Custom(error.to_string()))
         }
     }
 
