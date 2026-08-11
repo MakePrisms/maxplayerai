@@ -112,6 +112,37 @@ pub enum PaymentWalletError {
     },
 }
 
+/// Failure of the read-only, pre-budget mint fee probe.
+///
+/// This stays separate from [`EffectError`] so the one outcome the authorize path must cancel
+/// distinctly is not erased at the wallet-worker bridge. All other worker commands retain the
+/// existing generic effect-error plumbing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreflightError {
+    /// The configured mint returned no response, timed out, or answered with a server error.
+    MintUnreachable {
+        reason: &'static str,
+        mint: String,
+        detail: String,
+    },
+    /// Any other worker/fee-probe refusal.
+    Other(String),
+}
+
+impl std::fmt::Display for PreflightError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MintUnreachable { reason, mint, detail } => write!(
+                formatter,
+                "{reason}: mint {mint} unreachable or erroring ({detail})"
+            ),
+            Self::Other(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for PreflightError {}
+
 impl std::fmt::Display for PaymentWalletError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -558,11 +589,27 @@ enum BoundedFee {
     Failed(PaymentWalletError),
 }
 
-/// A transport-class cdk error means the mint returned no HTTP response at all —
-/// connection refused, DNS/routing failure, or connect timeout: `HttpError` with
-/// no status code. These are the "configured mint is down" signals.
-fn is_mint_unreachable(error: &cdk::Error) -> bool {
+/// A transport-class cdk error or a 5xx response means the configured mint is unavailable or
+/// erroring. A 4xx remains a protocol/request failure and must not be clean-cancelled as downtime.
+pub(crate) fn is_mint_unreachable(error: &cdk::Error) -> bool {
     matches!(error, cdk::Error::HttpError(None, _))
+        || matches!(error, cdk::Error::HttpError(Some(status), _) if (500..=599).contains(status))
+}
+
+/// Start a one-shot, same-process mint endpoint that answers its first request with HTTP 502.
+#[cfg(test)]
+pub(crate) fn http_502_mint() -> (String, thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 502 mint responder");
+    let address = listener.local_addr().expect("read 502 responder address");
+    let responder = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept mint request");
+        std::io::Write::write_all(
+            &mut stream,
+            b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .expect("write 502 mint response");
+    });
+    (format!("http://{address}"), responder)
 }
 
 fn mint_unreachable(
@@ -1753,8 +1800,29 @@ impl<R> CdkPaymentEffects<R> {
     /// dead/hung mint refuses with a bounded fail-closed error; the pay path returns BEFORE the budget
     /// gate, so a refusal burns ZERO spend — the property the removed pre-spawn check gave, minus the
     /// #387 cross-runtime deadlock. Read-only: queries the keyset fee, no proofs move.
-    pub fn preflight_fee(&self, amount: Amount) -> Result<(), EffectError> {
-        self.request(|response| BuyerCommand::PreflightFee { amount, response })
+    pub fn preflight_fee(&self, amount: Amount) -> Result<(), PreflightError> {
+        let (response, result) = mpsc::sync_channel(1);
+        self.commands
+            .as_ref()
+            .ok_or_else(|| PreflightError::Other("payment wallet worker is stopped".into()))?
+            .try_send(BuyerCommand::PreflightFee { amount, response })
+            .map_err(|error| {
+                PreflightError::Other(format!("payment wallet worker unavailable: {error}"))
+            })?;
+        match result.recv_timeout(self.recv_timeout) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(PaymentWalletError::MintUnreachable { reason, mint, detail })) => {
+                Err(PreflightError::MintUnreachable { reason, mint, detail })
+            }
+            Ok(Err(error)) => Err(PreflightError::Other(error.to_string())),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(PreflightError::Other(
+                "payment wallet worker dropped its response".into(),
+            )),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(PreflightError::Other(format!(
+                "payment wallet worker did not respond within {:?}; fail-closed refusal, no funds moved (see MakePrisms/maxplayerai#387)",
+                self.recv_timeout
+            ))),
+        }
     }
 }
 
@@ -2814,6 +2882,91 @@ mod tests {
     // the bounded fee query returns a transport error well inside the timeout — the
     // deterministic stand-in for a down mint (no live network, no real hang wait).
     const DEAD_MINT: &str = "https://127.0.0.1:1";
+
+    #[test]
+    fn is_mint_unreachable_classifies_502_through_fee_and_preflight_bridge() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Unit-level: drive a real cdk HTTP request through the bounded fee reader. This proves
+        // cdk represents the raw responder as the status-bearing error the shared predicate sees.
+        let (fee_mint, fee_responder) = http_502_mint();
+        let fee_store = runtime.block_on(cdk_sqlite::wallet::memory::empty()).unwrap();
+        let fee_wallet = Wallet::new(
+            &fee_mint,
+            CurrencyUnit::Sat,
+            Arc::new(fee_store),
+            [7; 64],
+            None,
+        )
+        .unwrap();
+        let fee_error = runtime
+            .block_on(require_fee_safe_amount(&fee_wallet, Amount::from(10)))
+            .expect_err("a 502 mint must refuse the pay-path fee probe");
+        fee_responder.join().unwrap();
+        assert!(
+            matches!(
+                fee_error,
+                PaymentWalletError::MintUnreachable {
+                    reason: MINT_UNREACHABLE_PAY,
+                    ref mint,
+                    ..
+                } if mint == &fee_mint
+            ),
+            "502 must classify as MintUnreachable, got: {fee_error}"
+        );
+
+        // Bridge-level: prove the typed result survives preflight_fee and authorize conversion.
+        let (bridge_mint, bridge_responder) = http_502_mint();
+        let bridge_store = runtime.block_on(cdk_sqlite::wallet::memory::empty()).unwrap();
+        let bridge_wallet = Wallet::new(
+            &bridge_mint,
+            CurrencyUnit::Sat,
+            Arc::new(bridge_store),
+            [8; 64],
+            None,
+        )
+        .unwrap();
+        let effects = CdkPaymentEffects::spawn(
+            bridge_wallet,
+            CountingSend(Arc::new(AtomicUsize::new(0))),
+            |key: &PaymentKey, _: &PaymentSent| {
+                Ok::<ReceiptEvidence, EffectError>(cosigned_receipt(key))
+            },
+        )
+        .unwrap();
+        let preflight = effects
+            .preflight_fee(Amount::from(10))
+            .expect_err("a 502 mint must survive the worker bridge as a typed refusal");
+        bridge_responder.join().unwrap();
+        assert!(
+            matches!(
+                preflight,
+                PreflightError::MintUnreachable {
+                    reason: MINT_UNREACHABLE_PAY,
+                    ref mint,
+                    ..
+                } if mint == &bridge_mint
+            ),
+            "502 bridge outcome must stay typed, got: {preflight}"
+        );
+        let authorize = crate::authorize_pay::AuthorizePayError::from(preflight);
+        assert!(
+            matches!(
+                authorize,
+                crate::authorize_pay::AuthorizePayError::CancelledMintUnreachable {
+                    ref mint,
+                    ..
+                } if mint == &bridge_mint
+            ),
+            "authorize outcome must stay typed, got: {authorize}"
+        );
+        let line = authorize.to_string();
+        assert!(line.contains(&bridge_mint), "operator text names the mint: {line}");
+        assert!(line.contains("unreachable"), "operator text classifies the refusal: {line}");
+    }
 
     /// Post-time dust guard fails fast with `mint_unreachable` (not a hang / generic
     /// deadline) when the mint is down and NO keyset is cached to fall back on.

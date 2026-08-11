@@ -405,7 +405,8 @@ async fn collect_passes_the_sentinel_gate_for_a_valid_delivery() {
 // The delivery is pinned + cosigned + carries THIS job's execution sentinel, so the cosig tooth, the
 // tip-match and the §19 gate all PASS and the flow reaches the wallet; the wallet then opens at a DEAD
 // realized mint (127.0.0.1:1, TCP connect refused), so the pre-reserve preflight is the one thing left
-// to refuse. It must refuse `mint_unreachable_pay` with ZERO spend, bounded (no park), no journal.
+// to refuse. It must cancel `CancelledMintUnreachable` ("no funds moved") with ZERO spend, bounded
+// (no park), no journal.
 //
 // Red-on-reorder (measured, non-vacuous): move the `effects.preflight_fee(..)?` guard BELOW
 // `gate.authorize_then_attempt` and the dead mint reaches the gate first — the reserve commits
@@ -467,14 +468,16 @@ async fn collect_refuses_dead_mint_at_preflight_before_the_budget_reserve() {
     drop(server);
     let _ = fs::remove_dir_all(&upstream);
 
-    // (a) The pre-reserve preflight refuses the dead mint with `mint_unreachable_pay` — NOT success,
-    // NOT the §19 `no_sentinel` gate (that PASSED, this job's sentinel is present), NOT a hang.
+    // (a) The pre-reserve preflight cancels on the dead mint with the typed
+    // `CancelledMintUnreachable` identity ("authorize_pay cancelled: mint … no funds moved") — NOT
+    // success, NOT the §19 `no_sentinel` gate (that PASSED, this job's sentinel is present), NOT a
+    // hang.
     let error = result.expect_err("a dead realized mint must refuse the pay BEFORE the budget reserve");
     assert!(matches!(error, CollectError::Pay(_)), "must be a pay refusal: {error}");
     let message = error.to_string();
     assert!(
-        message.contains("mint_unreachable_pay"),
-        "must refuse at the pre-reserve fee-safe preflight (dead mint), got: {error}"
+        message.contains("authorize_pay cancelled: mint") && message.contains("no funds moved"),
+        "must cancel at the pre-reserve fee-safe preflight (dead mint), got: {error}"
     );
     assert!(
         !message.contains("no_sentinel"),
