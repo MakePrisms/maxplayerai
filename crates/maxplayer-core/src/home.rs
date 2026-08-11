@@ -131,16 +131,17 @@ pub struct ProfileConfig {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub about: Option<String>,
+    /// Provenance of `about`. `Some(true)` means this is our generated default and may be
+    /// regenerated from live config on every seller boot. `Some(false)` and `None` are protected;
+    /// `None` includes pre-upgrade text of unknown provenance. To migrate a stale old default,
+    /// remove both `about` and `about_generated` from `[profile]`, then restart the seller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about_generated: Option<bool>,
 }
 
-/// Buzz persona config (`[buzz]` in config.toml). Absent ⇒ the feature is inert (the node opens
-/// no buzz relay connection and publishes no persona). Present ⇒ the seller node enrolls as a
-/// buzz inhabitant on `relay_url`: it publishes a NIP-01 kind-0 persona carrying a human-readable
-/// rate card and maintains a live presence heartbeat while the node is up. The persona is signed
-/// by the seller's EXISTING protocol key (one identity — no new keys); the key never lives here.
-///
-/// This is discovery/identity context only — nothing here feeds the pay gate, the journal, or the
-/// receipt bind. See [`crate::seller_node::buzz`].
+/// Deprecated, runtime-ignored schema compatibility for existing `[buzz]` tables. The buzz
+/// persona was never wired into production and has been removed; retaining this shape prevents
+/// an existing home from failing `deny_unknown_fields` config parsing on upgrade.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuzzConfig {
@@ -169,7 +170,7 @@ pub struct BuzzConfig {
     pub heartbeat_secs: u64,
 }
 
-/// serde default for [`BuzzConfig::heartbeat_secs`] — 30s (≤ the relay's ~90s presence TTL).
+/// Deprecated `[buzz]` schema default; retained only so old config files remain parse-tolerated.
 pub fn default_buzz_heartbeat_secs() -> u64 {
     30
 }
@@ -767,7 +768,8 @@ pub struct MaxplayerConfig {
     /// Optional `[seller]` daemon config. Absent until `maxplayer seller` setup writes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seller: Option<SellerConfig>,
-    /// Optional `[buzz]` persona config. Absent ⇒ the buzz persona feature is inert.
+    /// Deprecated compatibility field for the removed `[buzz]` persona. Parsed and preserved so
+    /// existing homes keep booting, but ignored by all runtime behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buzz: Option<BuzzConfig>,
     /// Optional `[agents]` table of custom presets: name -> `{ argv = [...] }`. A custom
@@ -1827,6 +1829,46 @@ mod tests {
     }
 
     #[test]
+    fn pre_upgrade_profile_without_about_provenance_still_parses() {
+        let root = temp_home("profile-schema-backcompat");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mkdir");
+        let config_path = root.join(CONFIG_FILE);
+        fs::write(
+            &config_path,
+            "relay_url = 'wss://relay.example'\n\
+             [profile]\nname = 'legacy-name'\nabout = 'legacy about'\n",
+        )
+        .expect("write legacy profile config");
+        let config = load_config(&config_path).expect("legacy profile parses");
+        let profile = config.profile.expect("profile present");
+        assert_eq!(profile.name.as_deref(), Some("legacy-name"));
+        assert_eq!(profile.about.as_deref(), Some("legacy about"));
+        assert_eq!(profile.about_generated, None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deprecated_buzz_table_remains_parse_tolerated_but_ignored() {
+        let root = temp_home("buzz-schema-backcompat");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mkdir");
+        let config_path = root.join(CONFIG_FILE);
+        fs::write(
+            &config_path,
+            "relay_url = 'wss://relay.example'\n\
+             [buzz]\nrelay_url = 'wss://buzz.example'\nname = 'legacy-buzz'\n",
+        )
+        .expect("write legacy buzz config");
+        let config = load_config(&config_path).expect("legacy buzz table parses");
+        let buzz = config.buzz.expect("buzz table preserved");
+        assert_eq!(buzz.relay_url, "wss://buzz.example");
+        assert_eq!(buzz.name, "legacy-buzz");
+        assert_eq!(buzz.heartbeat_secs, 30);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn save_and_reload_profile_round_trip() {
         let root = temp_home("profile-rt");
         let _ = fs::remove_dir_all(&root);
@@ -1835,6 +1877,7 @@ mod tests {
             config.profile = Some(ProfileConfig {
                 name: Some("test-buyer".into()),
                 about: Some("testnut only".into()),
+                about_generated: None,
             });
         })
         .expect("save");
@@ -1865,6 +1908,7 @@ mod tests {
             config.profile = Some(ProfileConfig {
                 name: Some("buyer".into()),
                 about: None,
+                about_generated: None,
             });
         })
         .expect("save");

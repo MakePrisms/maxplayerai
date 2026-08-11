@@ -39,7 +39,7 @@ use cdk::wallet::Wallet;
 use crate::buyer_fund;
 use crate::crossmint::{HopCost, HopJournal};
 use crate::home::MaxplayerHome;
-use crate::payment_wallet::MINT_TOUCH_TIMEOUT;
+use crate::payment_wallet::{MINT_TOUCH_TIMEOUT, is_mint_unreachable};
 
 /// What the source mint says about the melt leg.
 ///
@@ -91,6 +91,8 @@ pub enum HopError {
     Journal(String),
     /// A mint refused, or could not be reached, while the hop was under way.
     Mint(String),
+    /// A mint returned no response, timed out, or answered with a 5xx server error.
+    MintUnreachable { label: String, detail: String },
     /// Two different pairings claim one attempt id. Refusing is the whole point: acting on either
     /// pairing risks a second melt against an attempt that already has one.
     PairingConflict {
@@ -147,6 +149,10 @@ impl fmt::Display for HopError {
         match self {
             Self::Journal(detail) => write!(formatter, "cross-mint hop journal: {detail}"),
             Self::Mint(detail) => write!(formatter, "cross-mint hop: {detail}"),
+            Self::MintUnreachable { label, detail } => write!(
+                formatter,
+                "cross-mint hop: {label} mint unreachable or erroring ({detail})"
+            ),
             Self::PairingConflict {
                 attempt_id,
                 persisted,
@@ -181,7 +187,8 @@ impl fmt::Display for HopError {
                 formatter,
                 "cross-mint hop: the source mint reports melt quote {melt_quote_id} for attempt \
                  {attempt_id} as failed; no sats left the wallet, but this attempt cannot reach \
-                 the seller's mint through a failed melt quote"
+                 the seller's mint through a failed melt quote; see MakePrisms/maxplayerai#194 for \
+                 the recovery path"
             ),
             Self::InsufficientSource {
                 mint,
@@ -542,8 +549,15 @@ async fn bounded<T>(
     future: impl Future<Output = Result<T, cdk::Error>>,
 ) -> Result<T, HopError> {
     match tokio::time::timeout(timeout, future).await {
-        Err(_elapsed) => Err(HopError::Mint(format!("{label} exceeded {timeout:?}"))),
+        Err(_elapsed) => Err(HopError::MintUnreachable {
+            label: label.to_owned(),
+            detail: format!("request exceeded {timeout:?}"),
+        }),
         Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) if is_mint_unreachable(&error) => Err(HopError::MintUnreachable {
+            label: label.to_owned(),
+            detail: error.to_string(),
+        }),
         Ok(Err(error)) => Err(HopError::Mint(format!("{label}: {error}"))),
     }
 }
@@ -878,6 +892,7 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;
+    use std::sync::Arc;
 
     use super::*;
     use crate::budget::{BudgetGate, BudgetRefuse};
@@ -1194,6 +1209,75 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    async fn cdk_hop_with_target(target_mint: &str) -> CdkHopEffects {
+        let source_store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
+        let target_store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
+        CdkHopEffects {
+            source: Wallet::new(
+                "https://127.0.0.1:1",
+                cashu::CurrencyUnit::Sat,
+                source_store,
+                [7; 64],
+                None,
+            )
+            .unwrap(),
+            target: Wallet::new(
+                target_mint,
+                cashu::CurrencyUnit::Sat,
+                target_store,
+                [8; 64],
+                None,
+            )
+            .unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn crossmint_hop_plan_quotes_classifies_502_as_mint_unreachable_without_journal() {
+        let (target_mint, responder) = crate::payment_wallet::http_502_mint();
+        let effects = cdk_hop_with_target(&target_mint).await;
+        let journal_dir = scratch_dir("plan-502-no-journal");
+        let store = FsHopJournal::new(&journal_dir);
+
+        let error = effects
+            .plan_quotes("attempt-502", 100)
+            .await
+            .expect_err("a target mint returning 502 must refuse quote planning");
+        responder.join().unwrap();
+
+        assert!(
+            matches!(
+                error,
+                HopError::MintUnreachable { ref label, .. } if label == "target mint quote"
+            ),
+            "502 must be a typed mint-unreachable refusal, got: {error}"
+        );
+        assert!(!store.path_for("attempt-502").exists(), "quote-planning refusal must not create an attempt journal");
+        assert!(!journal_dir.exists(), "quote-planning refusal must not mutate the journal directory");
+    }
+
+    #[tokio::test]
+    async fn crossmint_hop_plan_quotes_classifies_connection_refused_without_journal() {
+        let effects = cdk_hop_with_target("https://127.0.0.1:1").await;
+        let journal_dir = scratch_dir("plan-refused-no-journal");
+        let store = FsHopJournal::new(&journal_dir);
+
+        let error = effects
+            .plan_quotes("attempt-refused", 100)
+            .await
+            .expect_err("an unreachable target mint must refuse quote planning");
+
+        assert!(
+            matches!(
+                error,
+                HopError::MintUnreachable { ref label, .. } if label == "target mint quote"
+            ),
+            "transport failure must be a typed mint-unreachable refusal, got: {error}"
+        );
+        assert!(!store.path_for("attempt-refused").exists(), "quote-planning refusal must not create an attempt journal");
+        assert!(!journal_dir.exists(), "quote-planning refusal must not mutate the journal directory");
     }
 
     #[test]
