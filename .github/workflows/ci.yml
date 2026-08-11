@@ -85,6 +85,27 @@ jobs:
       - name: Verify the seller surface (acp)
         run: ./scripts/verify-seller-surface.sh target/release/maxplayer
 
+  # web/app and web/network each ship a Node test suite ("node --test test/") that no CI
+  # job ran before #483 — a web-only PR could merge with its JS suite unverified while
+  # Rust CI stayed green. Both projects declare zero npm dependencies (no
+  # package.json "dependencies"/"devDependencies", no package-lock.json), so there is
+  # nothing to install: `npm test` runs directly. Kept as one job for both directories
+  # since neither takes meaningfully long; split them if that changes.
+  web-tests:
+    name: JS test suites (web/app, web/network)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Test web/app
+        working-directory: web/app
+        run: npm test
+      - name: Test web/network
+        working-directory: web/network
+        run: npm test
+
   # The money path runs in its OWN job, on its own runner, with no `needs:` — the isolation IS the
   # feature here, not an accident of layout (#271). Sharing a job means sharing fate: when the acp
   # concurrency test dies, every step still queued behind it is marked `skipped` while the job as a
