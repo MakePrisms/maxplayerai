@@ -38,8 +38,14 @@ pub fn ensure(home: &MaxplayerHome) -> Result<PathBuf, String> {
     // Poll until our daemon — or a racing winner's — answers, or time out.
     let deadline = Instant::now() + SPAWN_READY_TIMEOUT;
     loop {
-        if client::status(&sock).is_ok() {
-            return Ok(sock);
+        if let Ok(response) = client::status(&sock) {
+            if let Some(pid) = response.result.as_ref().and_then(|result| result["pid"].as_u64()) {
+                // Announce only on the path where this invocation spawned, after a daemon is ready.
+                // In a double-spawn race this reports the winner's pid, not necessarily our child.
+                let display_home = home.root.canonicalize().unwrap_or_else(|_| home.root.clone());
+                eprintln!("spawned buyer daemon pid={pid} home={}", display_home.display());
+                return Ok(sock);
+            }
         }
         if Instant::now() >= deadline {
             return Err(format!(
@@ -74,15 +80,9 @@ fn spawn_detached(home_root: &Path) -> Result<(), String> {
         // New process group: the daemon is not killed when the spawning session exits.
         command.process_group(0);
     }
-    let child = command
+    command
         .spawn()
         .map_err(|error| format!("failed to spawn the buyer daemon (`maxplayer buyer serve`): {error}"))?;
-    // #191: an operator relying on "no daemon running" (e.g. before a manual wallet op) must be
-    // able to see this happen — the auto-spawn was previously silent (stdio all nulled, Child
-    // discarded). One unconditional line, stderr only: it must never touch stdout, which the MCP
-    // surface uses for JSON-RPC protocol frames (mcp.rs's `out` handle) — stderr is a completely
-    // separate stream from that protocol channel, so this cannot corrupt it.
-    eprintln!("spawned buyer daemon pid={} home={}", child.id(), home_root.display());
     Ok(())
 }
 

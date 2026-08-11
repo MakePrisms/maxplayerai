@@ -116,8 +116,8 @@ fn spawning_a_daemon_announces_pid_and_home_but_reuse_does_not() {
     let home = temp_home("announce");
     let _ = std::fs::remove_dir_all(&home);
 
-    // First call: no daemon exists yet, so this call's own process must spawn one and announce
-    // it on ITS OWN stderr (the spawning process, not the daemon's — daemon stdio is nulled).
+    // First call: no daemon exists yet, so this call's own process must spawn and announce the
+    // ready daemon on ITS OWN stderr (the spawning process, not the daemon's — daemon stdio is nulled).
     let (_code, first_stdout, first_stderr) = run(&home, &["collect", &"a".repeat(64)]);
     let first = wait_for_daemon(&home).expect("connect-or-spawn must start the daemon");
     let pid = first["pid"].as_u64().expect("status carries a pid");
@@ -128,7 +128,12 @@ fn spawning_a_daemon_announces_pid_and_home_but_reuse_does_not() {
     );
     assert!(
         first_stderr.contains(&format!("spawned buyer daemon pid={pid}")),
-        "first connect-or-spawn must announce the pid it started; stderr was: {first_stderr}"
+        "first connect-or-spawn must announce the ready daemon's pid; stderr was: {first_stderr}"
+    );
+    assert_eq!(
+        first_stderr.matches("spawned buyer daemon pid=").count(),
+        1,
+        "first connect-or-spawn must announce exactly once; stderr was: {first_stderr}"
     );
     assert!(
         first_stderr.contains(&home.display().to_string()),
