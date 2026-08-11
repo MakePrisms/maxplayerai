@@ -122,8 +122,8 @@ Semantics, exactly as implemented:
 - **Section absent** → pass-through: the agent command runs directly as a child of the daemon, with the
   daemon's UID and filesystem access. **This is the only supported way to express pass-through.**
 - **`launcher = []` (empty array)** → **rejected at config parse — the daemon refuses to start** (the
-  shared argv validator errors `agent_command argv must be non-empty`; it is shared with `agent_command`,
-  so the message names that field — tracked as #381). Fail-closed: you cannot accidentally ship an empty
+  shared argv validator errors `argv must be non-empty`, and the parse error names
+  `sandbox.launcher` — #381). Fail-closed: you cannot accidentally ship an empty
   launcher that silently disables the sandbox. Opt out **only** by omitting the whole `[sandbox]` section.
 
 **The daemon does NOT validate the launcher.** It does not check that the binary exists, that it is
