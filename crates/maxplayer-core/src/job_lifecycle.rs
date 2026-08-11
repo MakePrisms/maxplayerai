@@ -1463,21 +1463,25 @@ fn select_deliverable_claim(
     Ok(award.claim_id.clone())
 }
 
-/// Whether `claim_id` (already believed awarded to `seller_pubkey`) is currently PAYABLE +
-/// DELIVERED per relay truth in `view` — the same two facts [`select_deliverable_claim`] gates
-/// `collect` on (#540), factored out as an independent, deliberately small predicate so `get_job`
-/// (#544) can surface the identical "ready to settle" fact as a status field without depending on
-/// (or perturbing) `select_deliverable_claim`'s own named-refusal error strings, which #540's
-/// regression tests pin exactly.
-pub(crate) fn claim_is_payable_and_delivered(
+/// Whether the awarded `claim_id` and `seller_pubkey` are currently ready for this job's one
+/// settlement: no result has already occupied the job-wide accept bind, the awarded claim is
+/// present and still payable, its seller matches the stored award, and that seller has delivered.
+/// Kept independent from [`select_deliverable_claim`] so its pinned named-refusal strings do not
+/// change while `get_job` (#544) and its wire-contract test share one production predicate.
+pub(crate) fn awarded_delivery_pending(
     view: &JobView,
     claim_id: &str,
     seller_pubkey: &str,
 ) -> bool {
+    if view.accepted.is_some() {
+        return false;
+    }
     let Some(claim) = view.claims.iter().find(|c| c.claim_id == claim_id) else {
         return false;
     };
-    if claim.status != "processing" && claim.status != CLAIM_STATUS_DELIVERED {
+    if claim.seller_pubkey != seller_pubkey
+        || (claim.status != "processing" && claim.status != CLAIM_STATUS_DELIVERED)
+    {
         return false;
     }
     view.results

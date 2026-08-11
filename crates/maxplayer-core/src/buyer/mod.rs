@@ -496,12 +496,11 @@ struct GetJobResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     awarded: Option<AwardedView>,
     /// True when: an award is committed (`awarded` is `Some`), the awarded seller has published a
-    /// payable+delivered result, AND this job has not yet been locally accepted (`view.accepted`
-    /// is not bound to the awarded claim) — money is owed and collectable but settlement has not
-    /// run. Independent of `live_claim_id` (#540's whole point) and independent of `accepted`
-    /// (the #481 discipline: award/deliver/accept stay three separate facts). Always omitted when
-    /// there is no award. (#544, fast-follow of #540 point 5.)
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// payable+delivered result, AND this job has no local accepted bind — money is owed and
+    /// collectable but settlement has not run. Independent of `live_claim_id` (#540's whole point);
+    /// any accepted bind makes it false because settlement is per job, not per claim. Always
+    /// omitted when false. (#544, fast-follow of #540 point 5.)
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     awarded_delivery_pending: bool,
 }
 
@@ -589,9 +588,7 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
                 }
             };
             let awarded_delivery_pending = awarded.as_ref().is_some_and(|a| {
-                job_lifecycle::claim_is_payable_and_delivered(&view, &a.claim_id, &a.seller_pubkey)
-                    && view.accepted.as_ref().map(|b| b.claim_id.as_str())
-                        != Some(a.claim_id.as_str())
+                job_lifecycle::awarded_delivery_pending(&view, &a.claim_id, &a.seller_pubkey)
             });
             Response::ok(id, json!(GetJobResponse { view, awarded, awarded_delivery_pending }))
         }
@@ -4797,12 +4794,7 @@ mod tests {
         ) -> Value {
             let awarded = record.map(AwardedView::from);
             let awarded_delivery_pending = awarded.as_ref().is_some_and(|a| {
-                job_lifecycle::claim_is_payable_and_delivered(
-                    &view,
-                    &a.claim_id,
-                    &a.seller_pubkey,
-                ) && view.accepted.as_ref().map(|b| b.claim_id.as_str())
-                    != Some(a.claim_id.as_str())
+                job_lifecycle::awarded_delivery_pending(&view, &a.claim_id, &a.seller_pubkey)
             });
             serde_json::to_value(GetJobResponse {
                 view,
@@ -4825,13 +4817,13 @@ mod tests {
             }
         }
 
-        fn claim() -> job_lifecycle::ClaimView {
+        fn claim_with(status: &str, seller_pubkey: String) -> job_lifecycle::ClaimView {
             job_lifecycle::ClaimView {
                 claim_id: "c".repeat(64),
                 created_at: 1,
-                seller_pubkey: "5".repeat(64),
+                seller_pubkey,
                 display_name: None,
-                status: "delivered".to_owned(),
+                status: status.to_owned(),
                 live: false,
                 creq: None,
                 agents: vec![],
@@ -4860,7 +4852,7 @@ mod tests {
             job_lifecycle::JobView {
                 job_id: "a".repeat(64),
                 offer: None,
-                claims: vec![claim()],
+                claims: vec![claim_with("delivered", "5".repeat(64))],
                 results: vec![result(Some("d".repeat(40)))],
                 live_claim_id: Some("f".repeat(64)),
                 accepted: None,
@@ -4875,7 +4867,7 @@ mod tests {
             job_lifecycle::JobView {
                 job_id: "a".repeat(64),
                 offer: None,
-                claims: vec![claim()],
+                claims: vec![claim_with("delivered", "5".repeat(64))],
                 results: vec![result(Some("d".repeat(40)))],
                 live_claim_id: None,
                 accepted: Some(job_lifecycle::AcceptedBind {
@@ -4909,11 +4901,49 @@ mod tests {
             "settled award ⇒ false field is omitted"
         );
 
+        let accepted_other_claim = serialize(
+            job_lifecycle::JobView {
+                job_id: "a".repeat(64),
+                offer: None,
+                claims: vec![claim_with("delivered", "5".repeat(64))],
+                results: vec![result(Some("d".repeat(40)))],
+                live_claim_id: None,
+                accepted: Some(job_lifecycle::AcceptedBind {
+                    job_id: "a".repeat(64),
+                    claim_id: "b".repeat(64),
+                    result_id: "q".repeat(64),
+                    seller_pubkey: "6".repeat(64),
+                    commit_oid: "e".repeat(40),
+                    repo: "https://example.invalid/other.git".to_owned(),
+                    branch: "main".to_owned(),
+                    job_hash: "h".repeat(64),
+                    amount_sats: 100,
+                    accept_event_id: "f".repeat(64),
+                    accepted_at: 3,
+                    seller_signature: String::new(),
+                    creq_hash: None,
+                    accepted_mints: vec![],
+                    funding_mint: None,
+                    delivery_mint: None,
+                    agent_used: None,
+                    model_used: None,
+                    contribution: None,
+                }),
+                pending: false,
+                read_confirmed: true,
+            },
+            Some(award()),
+        );
+        assert!(
+            accepted_other_claim.get("awarded_delivery_pending").is_none(),
+            "award A + accepted B occupies the job-wide settlement slot"
+        );
+
         let undelivered = serialize(
             job_lifecycle::JobView {
                 job_id: "a".repeat(64),
                 offer: None,
-                claims: vec![claim()],
+                claims: vec![claim_with("delivered", "5".repeat(64))],
                 results: vec![result(None)],
                 live_claim_id: None,
                 accepted: None,
@@ -4927,11 +4957,65 @@ mod tests {
             "missing commit oid ⇒ false field is omitted"
         );
 
+        let expired = serialize(
+            job_lifecycle::JobView {
+                job_id: "a".repeat(64),
+                offer: None,
+                claims: vec![claim_with("expired", "5".repeat(64))],
+                results: vec![result(Some("d".repeat(40)))],
+                live_claim_id: None,
+                accepted: None,
+                pending: false,
+                read_confirmed: true,
+            },
+            Some(award()),
+        );
+        assert!(
+            expired.get("awarded_delivery_pending").is_none(),
+            "expired awarded claim ⇒ false field is omitted"
+        );
+
+        let absent_claim = serialize(
+            job_lifecycle::JobView {
+                job_id: "a".repeat(64),
+                offer: None,
+                claims: vec![],
+                results: vec![result(Some("d".repeat(40)))],
+                live_claim_id: None,
+                accepted: None,
+                pending: false,
+                read_confirmed: true,
+            },
+            Some(award()),
+        );
+        assert!(
+            absent_claim.get("awarded_delivery_pending").is_none(),
+            "absent awarded claim ⇒ false field is omitted"
+        );
+
+        let claim_seller_mismatch = serialize(
+            job_lifecycle::JobView {
+                job_id: "a".repeat(64),
+                offer: None,
+                claims: vec![claim_with("delivered", "6".repeat(64))],
+                results: vec![result(Some("d".repeat(40)))],
+                live_claim_id: None,
+                accepted: None,
+                pending: false,
+                read_confirmed: true,
+            },
+            Some(award()),
+        );
+        assert!(
+            claim_seller_mismatch.get("awarded_delivery_pending").is_none(),
+            "claim seller must match the stored award seller"
+        );
+
         let no_award = serialize(
             job_lifecycle::JobView {
                 job_id: "a".repeat(64),
                 offer: None,
-                claims: vec![claim()],
+                claims: vec![claim_with("delivered", "5".repeat(64))],
                 results: vec![result(Some("d".repeat(40)))],
                 live_claim_id: None,
                 accepted: None,
