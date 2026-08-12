@@ -228,16 +228,14 @@ fn cmd_balance(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32
         },
         None => None,
     };
-    let total = rows
-        .iter()
-        .map(|row| row.balance_sats)
-        .fold(0u64, u64::saturating_add);
-    let configured_total = rows
-        .iter()
-        .filter(|row| row.configured)
-        .map(|row| row.balance_sats)
-        .fold(0u64, u64::saturating_add);
+    // #679: both totals accumulate INSIDE the loop, i.e. AFTER the `--mint` filter, so every printed
+    // total sums exactly the rows printed above it. #668 hoisted them out of the loop and made them
+    // whole-wallet, which under `--mint <X>` reported sats held at mints the filter excluded and that
+    // appear nowhere in the output — a total no line in the output adds up to. Unfiltered output is
+    // unchanged: with no filter every row is matched, so both sums are the whole-wallet figures.
     let mut matched = 0u64;
+    let mut total = 0u64;
+    let mut configured_total = 0u64;
     for row in &rows {
         if let Some(filter) = filter.as_deref() {
             if row.mint_url != filter {
@@ -245,6 +243,10 @@ fn cmd_balance(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32
             }
         }
         matched = matched.saturating_add(1);
+        total = total.saturating_add(row.balance_sats);
+        if row.configured {
+            configured_total = configured_total.saturating_add(row.balance_sats);
+        }
         let _ = writeln!(out, "{}", balance_row_line(row));
     }
     if filter.is_some() && matched == 0 {
@@ -1244,8 +1246,10 @@ mod tests {
         .expect("seed testnut default on disk");
     }
 
+    /// Seed `amount` unspent sats at `mint_url` in the on-disk wallet db. The mint may be configured
+    /// or not — the db does not care, and the `configured`/`role` split comes from the config alone.
     #[cfg(feature = "wallet")]
-    fn seed_unconfigured_balance(root: &std::path::Path, mint_url: &str, amount: u64) {
+    fn seed_mint_balance(root: &std::path::Path, mint_url: &str, amount: u64) {
         use std::str::FromStr;
 
         use cashu::secret::Secret;
@@ -1289,7 +1293,7 @@ mod tests {
         let root = ux_test_home("balance-db-truth");
         let _ = std::fs::remove_dir_all(&root);
         seed_testnut_default_home(&root);
-        seed_unconfigured_balance(&root, "https://stray-mint.example/", 37);
+        seed_mint_balance(&root, "https://stray-mint.example/", 37);
 
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -1321,7 +1325,7 @@ mod tests {
         let root = ux_test_home("balance-filter-db-truth");
         let _ = std::fs::remove_dir_all(&root);
         seed_testnut_default_home(&root);
-        seed_unconfigured_balance(&root, "https://stray-mint.example/", 41);
+        seed_mint_balance(&root, "https://stray-mint.example/", 41);
         let home_arg = root.to_string_lossy().into_owned();
 
         let mut out = Vec::new();
@@ -1365,6 +1369,79 @@ mod tests {
             "{missing_err}"
         );
         assert!(missing_out.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #679: under `--mint <X>` every printed total must sum the printed rows ONLY. The fixture holds
+    /// sats at three mints with three DIFFERENT amounts, so the filtered totals and the whole-wallet
+    /// totals cannot be byte-identical — that is the whole point, and is what the older filter test
+    /// (one stray mint, both totals equal either way) could not see when #668 hoisted the sums above
+    /// the filter and made them whole-wallet.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn balance_mint_filter_totals_count_only_the_matched_rows() {
+        let root = ux_test_home("balance-filter-totals");
+        let _ = std::fs::remove_dir_all(&root);
+        seed_testnut_default_home(&root);
+        // configured (the default) 23 + unconfigured 41 + unconfigured 17 = 81 whole-wallet.
+        seed_mint_balance(&root, DEFAULT_MINT_URL, 23);
+        seed_mint_balance(&root, "https://stray-a.example/", 41);
+        seed_mint_balance(&root, "https://stray-b.example/", 17);
+        let home_arg = root.to_string_lossy().into_owned();
+
+        let balance = |args: &[&str]| {
+            let mut argv: Vec<String> = vec!["balance".into()];
+            argv.extend(args.iter().map(|arg| (*arg).to_owned()));
+            argv.push("--home".into());
+            argv.push(home_arg.clone());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = run(&argv, &mut out, &mut err);
+            assert_eq!(code, SUCCESS, "stderr: {}", String::from_utf8_lossy(&err));
+            String::from_utf8(out).expect("utf8")
+        };
+
+        // Whole-wallet form: unchanged by this fix, and the baseline the filtered totals must differ
+        // from. Rows are configured-first, then discovered mints in sorted order.
+        let whole = balance(&[]);
+        assert_eq!(
+            whole,
+            format!(
+                "mint={DEFAULT_MINT_URL} role=default balance_sats=23 play_money=true\n\
+                 mint=https://stray-a.example role=unconfigured balance_sats=41\n\
+                 mint=https://stray-b.example role=unconfigured balance_sats=17\n\
+                 configured_total_sats=23\n\
+                 total_sats=81\n"
+            ),
+            "{whole}"
+        );
+
+        // Filtered to one UNCONFIGURED mint: 41 is the only row, so 41 is the only defensible total,
+        // and the configured subset OF THAT ROW is 0 — not the wallet-wide 23.
+        let stray = balance(&["--mint", "https://stray-a.example/"]);
+        assert_eq!(
+            stray,
+            "mint=https://stray-a.example role=unconfigured balance_sats=41\n\
+             configured_total_sats=0\n\
+             total_sats=41\n",
+            "{stray}"
+        );
+        assert!(!stray.contains("total_sats=81"), "{stray}");
+        assert!(!stray.contains("stray-b"), "{stray}");
+
+        // Filtered to the CONFIGURED default: 23 for both totals, so the configured line collapses by
+        // the existing `configured_total != total` grammar. The pre-fix code printed
+        // `configured_total_sats=23` (equal by luck) followed by the whole-wallet `total_sats=81`.
+        let default_only = balance(&["--mint", DEFAULT_MINT_URL]);
+        assert_eq!(
+            default_only,
+            format!(
+                "mint={DEFAULT_MINT_URL} role=default balance_sats=23 play_money=true\ntotal_sats=23\n"
+            ),
+            "{default_only}"
+        );
+        assert!(!default_only.contains("total_sats=81"), "{default_only}");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
