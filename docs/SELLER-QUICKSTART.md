@@ -38,7 +38,7 @@ MAXPLAYER_BIN="$HOME/.local/bin/maxplayer"
 "$MAXPLAYER_BIN" --version   # must print a version
 ```
 
-On npm: `npm install -g maxplayer` (needs Node 22+; see [npm global installs](#npm-global-installs-node-22-and-eacces) if that fails with `EACCES`).
+On npm: `npm install -g maxplayer` (needs Node 18+; see [npm global installs](#npm-global-installs-node-versions-and-eacces) if that fails with `EACCES`).
 
 Building it yourself instead:
 
@@ -58,16 +58,24 @@ MAXPLAYER_BIN="$(nix build --refresh --no-link --print-out-paths github:MakePris
 
 > ⚠ **Stale nix cache:** `nix run github:MakePrisms/maxplayerai -- …` without `--refresh` can serve yesterday's binary. Prefer `nix run --refresh github:MakePrisms/maxplayerai -- seller …` (or pin+bump the rev).
 
-### npm global installs: Node 22+ and `EACCES`
+### npm global installs: Node versions and `EACCES`
 
-Two things bite the npm route — for `maxplayer` itself and for the agent adapters in [§3b](#3b-setup-gotchas--two-environment-prerequisites-that-silently-break-execute) alike.
+Two things bite the npm route — for `maxplayer` itself and for the agent adapters in [§3b](#3b-setup-gotchas--two-environment-prerequisites-that-silently-break-execute) alike. The Node floor is **not
+the same for both**, and this page used to quote the adapters' floor for `maxplayer` too.
 
-**Node 22+.** The npm packages need it, and a stock box is often older (debian ships Node 20). Check
-first, and upgrade — or take the `curl` installer above, which carries no Node dependency:
+**`maxplayer` needs Node 18+**, the floor its package declares in `engines.node`. Debian's stock
+Node 20 is fine. The launcher is a small CommonJS shim whose own floor is lower still — Node 14.18,
+for the `node:` prefix in `require()` — and it starts a statically linked binary that needs no Node
+at all, so nothing in the install path requires 22.
+
+**The third-party CLIs in [§3b](#3b-setup-gotchas--two-environment-prerequisites-that-silently-break-execute) set their own, higher floors** — `@anthropic-ai/claude-code` wants Node 22+.
+That is their requirement, not `maxplayer`'s. Check before installing those:
 
 ```bash
-node --version    # must be v22 or newer for the npm route
+node --version    # v18+ for maxplayer; the agent CLIs below may want more (claude-code: v22+)
 ```
+
+Or take the `curl` installer above for `maxplayer`, which carries no Node dependency.
 
 **`EACCES` on `npm i -g`.** As a non-root user the global prefix is not writable, so the install
 fails with `The operation was rejected by your operating system`. Pick one:
@@ -246,9 +254,10 @@ it. Installing only the adapter is the most common way a fresh seat fails (see t
 | `cursor`  | `cursor-agent` (or `agent`), `acp` appended | `curl https://cursor.com/install -fsS \| bash` | none extra — `cursor-agent` **is** the CLI. Auth: `cursor-agent login`, or set `CURSOR_API_KEY` |
 | `codex`   | `codex-acp`                            | `npm i -g @agentclientprotocol/codex-acp` | `codex` — `npm i -g @openai/codex`. Auth: `codex login`, `codex login --device-auth`, or `printenv OPENAI_API_KEY \| codex login --with-api-key`. `OPENAI_API_KEY` is also read directly |
 
-> The `npm i -g` rows need **Node 22+**, and fail with `EACCES` for a non-root user until you set a
-> user-owned global prefix (or use `sudo`). Both are handled in
-> [npm global installs](#npm-global-installs-node-22-and-eacces).
+> The `npm i -g` rows above are third-party CLIs with their own Node floors — `@anthropic-ai/claude-code`
+> needs **Node 22+**, higher than the **Node 18+** `maxplayer` itself asks for. They also fail with
+> `EACCES` for a non-root user until you set a user-owned global prefix (or use `sudo`). Both are
+> handled in [npm global installs](#npm-global-installs-node-versions-and-eacces).
 
 > ⚠ **Do not `npm i -g cursor-agent`.** That npm package is an unrelated third party's and installs
 > **no binary at all** — you get a silent success and a `cursor-agent` that is still missing. The

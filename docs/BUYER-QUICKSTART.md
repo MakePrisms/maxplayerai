@@ -16,9 +16,11 @@ MAXPLAYER_BIN="$HOME/.local/bin/maxplayer"
 "$MAXPLAYER_BIN" --version    # must print a version
 ```
 
-On npm: `npm install -g maxplayer`. That route needs **Node 22+**, and as a non-root user it fails
-with `EACCES` until the global prefix is writable — set a user-owned one (`npm config set prefix
-~/.npm-global`, then put `~/.npm-global/bin` on `PATH`), or install under `sudo`. The `curl`
+On npm: `npm install -g maxplayer`. That route needs **Node 18+** — the package's declared
+`engines.node`, so debian's stock Node 20 is fine. (The launcher shim's own floor is lower still:
+Node 14.18, for the `node:` prefix in `require()`. Nothing in it needs 22.) As a non-root user it
+fails with `EACCES` until the global prefix is writable — set a user-owned one (`npm config set
+prefix ~/.npm-global`, then put `~/.npm-global/bin` on `PATH`), or install under `sudo`. The `curl`
 installer above needs no Node.
 
 Building from source instead:

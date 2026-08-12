@@ -49,3 +49,14 @@ than failing obscurely.
 
 Because the binary arrives as a dependency instead of a `postinstall` download, installs work under
 `--ignore-scripts`.
+
+## Node version
+
+**Node 18+**, as declared in `engines.node`. Debian's stock Node 20 is fine.
+
+That floor is deliberate and is the real one. The launcher is the only JavaScript this package
+ships, and the newest features it uses are the `node:` prefix in `require()` (Node 14.18) and `??`
+(Node 14.0); `spawnSync`, `require.resolve`, `os.constants.signals` and optional catch binding are
+older still. There is no ESM, no top-level await, and no use of any API added after 14 — so nothing
+in it requires Node 22, and `>=18` is already conservative. The binary it launches is a statically
+linked ELF/Mach-O with no Node dependency at all.
