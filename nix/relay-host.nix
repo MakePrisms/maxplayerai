@@ -27,44 +27,72 @@
 
 {
   # Bootloader, root-growth, SSH host keys, cloud-init. gudnuf's SSH key arrives via the instance's
-  # authorized_keys (EC2 injects it), so `root@34.225.223.145` works for the deploy without anything wired here.
+  # authorized_keys (EC2 injects it), so `root@34.225.223.145` works for the deploy out of the box.
   imports = [ "${modulesPath}/virtualisation/amazon-image.nix" ];
+
+  # Deploy/relay access (#399): petar's + jbojcic's keys alongside gudnuf's EC2-injected one. PUBLIC
+  # keys (safe in-repo); root because the deploy runs as root (nixos-rebuild --target-host root@).
+  # Ships in the PR gudnuf deploys, so his review of the grant is inherent.
+  users.users.root.openssh.authorizedKeys.keys = [
+    "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCoY4sE+HgKK8L2+1oWgnmynmtXCgyv9nNetJNDdmnUOS5YSEurmB/YSqcUdz1BISvM8ibyuwU1HAEJWID6+PpxYm3dPmFxUiKijwqAdVnw9Yb9UZLs8NpDglBDb416M5a+PY1wHtEFr3PwSiTvIllXXu3Xm6nXvMuoxSTYwlXLSy6P74/Bh5JbjNK57/LQ7lKJ9mCjobo4nm1ODlN7LL/DWEvXWEo9YQ8fjUaEigGz68zQe/tIGHItGB7xNFnOelp1QGr4zdcEvc0Fjs5WmqCgrkEQ6aJ6QKAY4UEjjGndhwkXZglC/ZN2AFdIij0Cl0hx+o5daMckVsQo5jB7BBgv pmilic@Petars-MacBook-Pro.local"
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID9ekhrL1FzCFemwd4g7J199V6cM4kf5FCGZ09txRQEV josip@agi.cash"
+  ];
 
   services.maxplayer.relay = {
     enable = true;
 
-    # The namespace this relay accepts. Every real market event carries ["t","maxplayer"]; a relay set
-    # to any other value would reject every real event while looking like a healthy quiet relay.
-    namespaceTag = "maxplayer";
+    # NIP-11 / RELAY_URL the relay advertises. buzz derives its NIP-11 document from this URL; the old
+    # strfry `info.{name,description}` fields have no buzz-module equivalent yet — if a custom relay
+    # name matters, wiring it is a buzz-source ask (see relay OPEN ITEMS in the deploy block).
+    #
+    # NOTE (merge of #402 into the post-rename main): main's strfry module took a `namespaceTag`
+    # ("mobee"→"maxplayer", #464/#467) to filter writes by the #t tag. buzz has NO such option — it
+    # admits by KIND, not by t tag — so `namespaceTag` is deliberately dropped here rather than
+    # carried over. It is not an oversight and it does not weaken acceptance: the t-tag flip is now
+    # purely a client-side concern. Setting it would be a nix eval error against the buzz module.
+    relayUrl = "wss://relay.maxplayer.ai";
 
-    # NIP-11 identity every client reads (drafted — correct freely). `contact` is optional.
-    info = {
-      name = "maxplayer launch relay";
-      description = "Launch relay for the maxplayer agent-hiring market. Single-namespace, born empty.";
-      contact = ""; # optional: admin contact — an email or npub, or leave empty.
-    };
+    # Public marketplace posture: allow UNAUTHENTICATED reads so the keyless web observatory and any
+    # account-less client can read events (matches skill.md's "readable by anyone without an account").
+    # This opens the READ path only — writes stay gated by NIP-42. Wires BUZZ_OPEN_READ=true.
+    openRead = true;
 
-    # Off-box backup — the module mandates it (a launch relay holding trade history must ship dumps
-    # off-box), so there is no "skip backup" here by design. Dumps land in the S3 bucket below via the
-    # instance's IAM role; no credentials live on the box.
+    # Relay identity key. Referenced by PATH only — gudnuf places a file here containing
+    #   BUZZ_RELAY_PRIVATE_KEY=<64-hex>
+    # before the first switch. It must PERSIST across reboots (the relay's stable NIP-42/NIP-11
+    # identity), so it lives on the root EBS volume, not tmpfs. The preflight refuses to start the
+    # relay if this file is missing or empty. Nothing here is a credential; the material is on the box.
+    privateKeyFile = "/var/lib/secrets/buzz-relay.env";
+
+    # Git-CAS + media object store: REAL AWS S3, reached via the box's instance IAM role — no static
+    # creds (the module sets BUZZ_S3_ACCESS_KEY/SECRET_KEY empty to select the AWS credential chain →
+    # IMDS). The role MUST grant Get/Put/List/DeleteObject on this bucket (buzz's storage_sweep prunes,
+    # hence Delete); s3Region MUST match the bucket's real region. buzz-relay runs a FATAL git
+    # object-store conformance probe against this bucket at boot, so the bucket must exist and the role
+    # be attached BEFORE the first switch (the preflight HeadBuckets it and fails loud otherwise).
+    s3Bucket = "maxplayer-relay-media";
+    s3Region = "us-east-1";
+
+    # Off-box backup — the Postgres event log only, shipped to S3 by the instance IAM role
+    # (maxplayer-relay-backups). The git-CAS + media objects are already in S3 (s3Bucket above),
+    # versioned and off-box, so they are not re-dumped. No static credentials on the box; the module
+    # mandates a destination + uploadCommand, so there is no "skip backup" here.
     backup = {
       destination = "s3://maxplayer-relay-backup/launch";
-      uploadCommand = ''${pkgs.awscli2}/bin/aws s3 cp "$DUMP" "$DESTINATION/$STAMP.jsonl"'';
-      # null by design: the EC2 instance's IAM role (maxplayer-relay-backups) grants S3 write, so there is
-      # no static credentials file on the box.
+      # Invoked once per artifact with $FILE (local path) and $KEY (destination suffix) in env.
+      uploadCommand = ''${pkgs.awscli2}/bin/aws s3 cp "$FILE" "$DESTINATION/$KEY"'';
+      # null by design: the EC2 instance's IAM role (maxplayer-relay-backups) grants S3 write, so there
+      # is no static credentials file on the box.
       environmentFile = null;
     };
-
-    # volumeDevice left unset: relay data lives on the root EBS volume (durable across reboots, backed up
-    # off-box to S3 by the unit above — that is the durability story). A dedicated EBS data volume mounted
-    # at the module's dataDir /var/lib/strfry would additionally survive instance *replacement*; not wired
-    # for launch (gudnuf's call — root EBS + S3 backups).
   };
 
-  # The relay binds 127.0.0.1:7777 by construction (single-namespace box, no public bind), so something must
-  # terminate TLS and proxy wss -> the relay or it is unreachable. This is the batteries-included default.
-  # Public domain relay.maxplayer.ai, ACME contact below. If TLS is terminated elsewhere (Cloudflare, an
-  # ALB), drop this nginx/acme/firewall trio and point that proxy at 127.0.0.1:7777 instead.
+  # The relay binds 127.0.0.1:3000 (loopback, no public bind), so something must terminate TLS and proxy
+  # wss -> the relay or it is unreachable. This is the batteries-included default, and it deliberately
+  # reuses the existing nginx + ACME cert for relay.maxplayer.ai across the strfry->buzz swap — only the
+  # upstream port changes (7777 -> 3000), so there is no cert re-issue or TLS cutover. Public domain
+  # relay.maxplayer.ai, ACME contact below. If TLS is terminated elsewhere (Cloudflare, an ALB), drop
+  # this nginx/acme/firewall trio and point that proxy at 127.0.0.1:3000 instead.
   services.nginx = {
     enable = true;
     recommendedProxySettings = true; # sets X-Forwarded-For, which the relay reads as realIpHeader.
@@ -74,7 +102,7 @@
       enableACME = true;
       forceSSL = true;
       locations."/" = {
-        proxyPass = "http://127.0.0.1:7777";
+        proxyPass = "http://127.0.0.1:3000";
         proxyWebsockets = true;
       };
     };
