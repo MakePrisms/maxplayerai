@@ -105,6 +105,46 @@
         proxyPass = "http://127.0.0.1:3000";
         proxyWebsockets = true;
       };
+
+      # Large-body paths. The vhost otherwise inherits the nixpkgs `clientMaxBodySize` default of
+      # 10m, which silently 413s git pushes and media uploads that the relay itself would accept
+      # (BUZZ_GIT_MAX_PACK_BYTES defaults to 500 MiB in crates/buzz .../config.rs). Raised
+      # PER-LOCATION, deliberately not vhost-wide: with proxy_request_buffering on, nginx spools the
+      # entire body to disk before it consults the relay, so a global raise costs 512 MiB of disk
+      # write per anonymous request on ANY path — measured: a 9 MiB POST to a nonexistent route
+      # uploaded all 9,437,184 bytes.
+      #
+      # 512m is intentional and is NOT a round-up to "just over 500": 512 MiB = 536,870,912 B sits
+      # 12 MiB above the relay's own 524,288,000 B ceiling so the RELAY's limit binds first. That
+      # matters because the relay logs and meters its own rejections and nginx does not — an nginx
+      # 413 is nearly invisible, a relay rejection is observable. Do not "tidy" this to 500m.
+      #
+      # proxy_request_buffering off is the load-bearing line, not the cap: without it nginx buffers
+      # the whole pack to disk before the relay sees a byte.
+      #
+      # Regex locations must re-declare proxyPass — Nix does not inherit it from locations."/", and a
+      # regex location outranks the "/" prefix match, so omitting it would stop proxying these paths
+      # entirely. Both blocks keep proxyPass so recommendedProxySettings still injects the
+      # proxy_set_header lines the relay reads as realIpHeader.
+      locations."~ ^/git/" = {
+        proxyPass = "http://127.0.0.1:3000";
+        extraConfig = ''
+          client_max_body_size 512m;
+          proxy_request_buffering off;
+          proxy_read_timeout 3600s;
+          proxy_send_timeout 3600s;
+        '';
+      };
+      # Matches the relay's two upload routes exactly (see upload_route_mode in
+      # crates/buzz/crates/buzz-relay/src/api/media.rs): /upload and the legacy /media/upload.
+      locations."~ ^/(upload|media/upload)$" = {
+        proxyPass = "http://127.0.0.1:3000";
+        extraConfig = ''
+          client_max_body_size 512m;
+          proxy_request_buffering off;
+          proxy_read_timeout 3600s;
+        '';
+      };
     };
   };
 
