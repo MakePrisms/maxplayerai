@@ -1431,6 +1431,40 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
         out.push_str(line);
         out.push('\n');
     }
+    // Onboarding (issue #376, extended): a commented [sandbox] template. A default config has NO
+    // [sandbox] section — pass-through — so there is no key to annotate; instead the options are
+    // shown inline, including the one difference that bites: gVisor (`runtime = "runsc"`) is
+    // Linux-only, and a Mac seat omits it. Every line is a comment, so the file still round-trips
+    // through parse_config_toml unchanged (the test asserts this).
+    out.push('\n');
+    out.push_str(
+        r#"# --- [sandbox]: how an awarded job runs. Uncomment ONE option below. ---
+# With no [sandbox] section (the default here) the agent runs PASS-THROUGH:
+# directly as this daemon, with no isolation. A seat that claims open-pool
+# work is refused at the boot gate until a real sandbox is configured.
+#
+# Option A - launcher (an OS sandbox such as bubblewrap; also works inside a
+# container). Full bwrap example: docs/DOCKER.md
+#   [sandbox]
+#   mode = "launcher"
+#   launcher = ["bwrap", "--unshare-all", "--die-with-parent", "..."]
+#
+# Option B - docker on LINUX. gVisor (runsc) is the primary boundary. Install
+# it first (docs/SANDBOXING.md), then confirm:  docker info | grep -i runsc
+#   [sandbox]
+#   mode = "docker"
+#   image = "maxplayer-sandbox:latest"
+#   runtime = "runsc"                  # gVisor - LINUX ONLY
+#   # forward_env = ["MY_AGENT_TOKEN"] # extra env names, atop the built-in auth allowlist
+#
+# Option C - docker on macOS. Docker Desktop cannot load runsc, so OMIT the
+# runtime line; the platform VM is the boundary. Otherwise identical to B.
+#   [sandbox]
+#   mode = "docker"
+#   image = "maxplayer-sandbox:latest"
+#   # (no runtime line on macOS)
+"#,
+    );
     Ok(out)
 }
 
@@ -1863,6 +1897,13 @@ mod tests {
         assert!(rendered.contains("REAL sats"), "must warn the shipped defaults move real sats");
         assert!(rendered.contains("minibits"), "must name the real default mint");
         assert!(rendered.contains("Per-job spend cap"), "must document the per-job cap");
+        // The commented [sandbox] onboarding template, including the Linux-vs-macOS runtime split.
+        assert!(rendered.contains("[sandbox]"), "must carry the sandbox onboarding template");
+        assert!(
+            rendered.contains("runtime = \"runsc\""),
+            "must show the Linux gVisor runtime line"
+        );
+        assert!(rendered.contains("macOS"), "must call out the macOS difference (omit runtime)");
     }
 
     #[test]
