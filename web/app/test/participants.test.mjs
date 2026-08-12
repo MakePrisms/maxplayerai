@@ -445,6 +445,33 @@ test("#681: the class comes from tags, never from content", () => {
     "feedback we cannot classify leaves the job running");
 });
 
+/**
+ * #681, third defect, found by Rocky. The reason-code table was an object
+ * literal, so a lookup answered for inherited Object.prototype names too:
+ * `table["constructor"]` returns a function, which is truthy, so an UNKNOWN
+ * code was reported as a class and never fell back to `status`.
+ *
+ * `reason_code` is an arbitrary string from an untrusted relay. A seller could
+ * publish a terminal `status=error` next to `reason_code=toString` and keep the
+ * job rendering as active work. The table is a Map now, which has no prototype
+ * chain to consult.
+ *
+ * The earlier `invented_future_code` test passed only because that string
+ * happens not to collide — a fixture chosen from the space of names nobody
+ * attacks with.
+ */
+test("#681: a reason_code colliding with Object.prototype still falls back to status", () => {
+  const at = DUE - 200;
+  for (const code of ["constructor", "toString", "__proto__", "hasOwnProperty", "valueOf"]) {
+    assert.deepEqual(
+      stateAt(lateJob([fb(`proto-${code}`, { at: DUE - 300, tags: [["reason_code", code], ["status", "error"]] })]), at),
+      [], `unknown code ${code} must fall back to terminal status=error`);
+    assert.deepEqual(
+      stateAt(lateJob([fb(`proto-prog-${code}`, { at: DUE - 300, tags: [["reason_code", code], ["status", "progress"]] })]), at),
+      [JOB_WORKING], `unknown code ${code} must fall back to non-terminal status=progress`);
+  }
+});
+
 test("#681: a non-awarded seller's terminal feedback cannot end the awarded attempt", () => {
   const at = DUE - 200;
   const loser = fb("loser-refusal", { at: DUE - 300, pubkey: pk("d"), tags: [["status", "refusal"]] });

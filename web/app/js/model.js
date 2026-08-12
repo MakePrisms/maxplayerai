@@ -101,15 +101,26 @@ export function param(event, name) {
  * so a reader that meets an unknown code MUST fall back to `status` (§7.1) and
  * MUST NOT treat the event as malformed.
  */
-const REASON_CODE_CLASS = Object.freeze({
-  below_rate: "refusal",
-  unsupported_version: "refusal",
-  mint_incompatible: "refusal",
-  at_capacity: "refusal",
-  execution_failed: "error",
-  delivery_failed: "error",
-  no_sentinel: "refusal",
-});
+/**
+ * A Map, not an object literal, and that is a correctness requirement rather
+ * than a style choice. `reason_code` is an arbitrary string from the relay, so
+ * an object lookup answers for inherited names too: `obj["constructor"]`
+ * returns a function, which is truthy, so an UNKNOWN code would be reported as
+ * a class and would never fall back to `status` as §7.1 requires. A seller
+ * could then publish a terminal `status=error` alongside `reason_code=toString`
+ * and keep the job showing as active. A Map has no prototype chain to consult,
+ * so the safety is structural — the next person to add a code cannot forget a
+ * guard that does not exist.
+ */
+const REASON_CODE_CLASS = new Map([
+  ["below_rate", "refusal"],
+  ["unsupported_version", "refusal"],
+  ["mint_incompatible", "refusal"],
+  ["at_capacity", "refusal"],
+  ["execution_failed", "error"],
+  ["delivery_failed", "error"],
+  ["no_sentinel", "refusal"],
+]);
 
 /** protocol-v1 §7.2. `progress` is explicitly non-terminal; the rest end an attempt. */
 const TERMINAL_FEEDBACK_CLASSES = Object.freeze(new Set(["claim_released", "refusal", "error"]));
@@ -124,7 +135,8 @@ const TERMINAL_FEEDBACK_CLASSES = Object.freeze(new Set(["claim_released", "refu
  */
 export function feedbackClass(event) {
   const code = firstTag(event, "reason_code");
-  if (code && REASON_CODE_CLASS[code]) return REASON_CODE_CLASS[code];
+  const known = code ? REASON_CODE_CLASS.get(code) : null;
+  if (known) return known;
   return firstTag(event, "status") || null;
 }
 
