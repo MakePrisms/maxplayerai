@@ -85,6 +85,31 @@ jobs:
       - name: Verify the seller surface (acp)
         run: ./scripts/verify-seller-surface.sh target/release/maxplayer
 
+  # The bare feature set — `wallet` off, so `acp` and the seller surface are off with it. NO other
+  # job compiles it: build-default builds `--workspace` with default features (wallet ON) and
+  # build-acp turns MORE features on, never fewer. Every job in this file moves in one direction
+  # from the default, so the floor of the feature graph was never built.
+  #
+  # It regressed the moment it was left unwatched. #203 closed on the reasoning that the build was
+  # fine — correct when it was made — and 86 minutes later ef3ff86 (#658) merged an ungated
+  # `use maxplayer_core::job_lifecycle` into mcp.rs, reaching a module gated on `wallet`. That is a
+  # compile error in this feature set and a no-op in every other, so it reached main and sat there.
+  # The defect was never the import: it was that no row in this file could go red on it.
+  #
+  # RED-PROVED before this job was written, which is the only thing that makes it a guard rather
+  # than a row that has never failed: `cargo build -p maxplayer --no-default-features --locked`
+  # gives E0432 at ae31bf85 and exits 0 at 48b83d7. Do not pipe the command — a pipe would report
+  # the exit status of the last stage and this job would pass on a failed build.
+  build-no-default:
+    name: Build (no default features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build maxplayer (no default features)
+        run: cargo build -p maxplayer --no-default-features --locked
+
   # web/app and web/network each ship a Node test suite ("node --test test/") that no CI
   # job ran before #483 — a web-only PR could merge with its JS suite unverified while
   # Rust CI stayed green. Both projects declare zero npm dependencies (no
