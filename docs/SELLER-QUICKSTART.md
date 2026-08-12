@@ -182,8 +182,17 @@ agent and rate (rate default `100`) and then writes `[seller]`.
 `maxplayer seller` starts your agent as an **ACP stdio agent**. You do not need to know ACP: pick a preset.
 
 > **Sandbox the job agent.** The seller's job agent executes untrusted buyer task text. Run it
-> sandboxed: no `~/.maxplayer` access, no wallet tools or keys, and no host secrets. Give it only the
-> per-job workdir it needs to produce the deliverable.
+> sandboxed: no `~/.maxplayer` access, and no wallet tools or keys. Give it only the per-job workdir
+> it needs to produce the deliverable.
+>
+> **What the sandbox does guarantee:** a stranger's code cannot reach `MAXPLAYER_HOME` — the seller
+> key and the wallet. Your sats stay yours. That is the boundary the cage is built to hold, and it
+> is narrower than "no host secrets."
+>
+> **What it does not:** an OAuth/subscription harness carries its own credential *inside* the cage —
+> it cannot authenticate otherwise — so a job can read whatever the agent can read, including that
+> credential. For open-pool serving prefer an API-key harness: the key is scoped and revocable, so a
+> leak costs you a rotation rather than an account.
 
 ```bash
 --agent claude   # adapter: claude-agent-acp on PATH  + a signed-in `claude` CLI behind it
