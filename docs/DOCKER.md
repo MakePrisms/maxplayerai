@@ -165,6 +165,34 @@ that the seller is itself containerized (`/.dockerenv`) and FAILs any `mode = "d
 **To sandbox a compose-deployed seller, use `launcher` mode** — the bubblewrap example below runs
 inside this container and needs no docker socket. `mode = "docker"` is for a seller on the host.
 
+#### Docker-mode hardening and the `runtime` knob (host sellers)
+
+A host seller on `mode = "docker"` gets a hardened container without extra config. Every job runs
+with a single bind mount (the per-job workdir only — `$MAXPLAYER_HOME` is absent by construction), as
+the seller's non-root uid, and with `--cap-drop=ALL`, `--security-opt no-new-privileges`, and `--init`.
+Those flags close the setuid → container-root route from both ends and reap the job's subprocesses;
+they narrow what a job does *inside* its container, not what it reaches outside (the host tree is
+unmounted either way).
+
+The container still shares the **host kernel** by default (`runc`). On Linux that shared kernel is the
+main escape surface, so the v1 sandbox posture runs the job under **gVisor** — a userspace kernel that
+keeps the payload's syscalls off the host one. Name the runtime with the optional `runtime` field:
+
+```toml
+[sandbox]
+mode = "docker"
+image = "maxplayer-sandbox:latest"
+runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM is the boundary there.
+# forward_env = ["MY_AGENT_TOKEN"]   # extra names to carry in, on top of the built-in auth allowlist
+```
+
+- `runtime` maps straight to `docker run --runtime <name>`. The name must be registered with the
+  daemon (`docker info` → *Runtimes*); an unregistered name fails the job at spawn.
+- Install gVisor from its signed repo and register `runsc` before setting this. See
+  `SANDBOXING.md` for the full v1/v2 architecture and why the runtime is Linux-only.
+- On macOS, leave `runtime` unset: Docker Desktop cannot load a custom runtime, and its containers
+  already run inside a platform Linux VM that provides the hardware boundary.
+
 ### Working example: bubblewrap inside the container
 
 Install `bubblewrap` in your image (e.g. `apk add bubblewrap` / `apt-get install bubblewrap`), then add

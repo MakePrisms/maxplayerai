@@ -809,6 +809,7 @@ mod tests {
             launcher: Vec::new(),
             image: Some(image),
             forward_env: Vec::new(),
+            runtime: None,
         }))
         .expect("mode=docker with an image resolves");
         let verdict = probe_containment(&policy, &root);

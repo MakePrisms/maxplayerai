@@ -11332,6 +11332,7 @@ mod tests {
                 launcher: vec!["definitely-not-a-real-binary-xyz".to_owned()],
                 image: None,
                 forward_env: Vec::new(),
+                runtime: None,
             });
         })
         .expect("persist config");

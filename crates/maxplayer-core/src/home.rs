@@ -309,6 +309,15 @@ pub struct SandboxConfig {
     /// not name, or to carry a gateway base-URL. Unused under `launcher` mode.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forward_env: Vec<String>,
+    /// `docker` mode: the container runtime to run the job under (`docker run --runtime <name>`).
+    /// Omitted ⇒ the daemon's default runtime (`runc`). The v1 sandbox posture sets this to `runsc`
+    /// on Linux, where the default container shares the host kernel and gVisor is the primary
+    /// boundary; a Mac seat leaves it unset and relies on the platform VM plus the hardening flags
+    /// (`--cap-drop=ALL`, `--security-opt no-new-privileges`). The named runtime must be registered
+    /// with the daemon (`docker info` → Runtimes); an unregistered name fails the run at spawn.
+    /// Unused under `launcher` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
 }
 
 /// Which executor the `[sandbox]` section selects.

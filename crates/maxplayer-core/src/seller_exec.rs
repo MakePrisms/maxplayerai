@@ -107,6 +107,11 @@ enum PolicyKind {
 pub struct DockerPolicy {
     image: String,
     forward_env: Vec<String>,
+    /// The container runtime (`docker run --runtime <name>`), `None` ⇒ the daemon default (`runc`).
+    /// The v1 posture sets this to `runsc` (gVisor) on Linux, where it is the primary boundary; a Mac
+    /// seat leaves it unset and leans on the platform VM plus the hardening flags. Resolved from
+    /// [`crate::home::SandboxConfig::runtime`].
+    runtime: Option<String>,
 }
 
 /// The agent-auth environment carried from the daemon into the container.
@@ -200,9 +205,14 @@ impl SandboxPolicy {
                     .ok_or_else(|| {
                         ExecError::Config("[sandbox] mode=docker requires an image".into())
                     })?;
+                let runtime = config
+                    .runtime
+                    .clone()
+                    .filter(|runtime| !runtime.trim().is_empty());
                 Ok(Self::docker(DockerPolicy {
                     image,
                     forward_env: config.forward_env.clone(),
+                    runtime,
                 }))
             }
         }
@@ -300,34 +310,57 @@ impl DockerPolicy {
     /// and carries the delivery-identity env. ACP stdio survives through
     /// `docker run -i` (stdin/stdout piped; no tty).
     ///
-    /// Two hardening flags, because the job is a stranger's code and both defaults are wrong for it:
+    /// Hardening, because the job is a stranger's code and the docker defaults are wrong for it:
     ///
-    /// `--security-opt no-new-privileges` — a non-root `--user` already leaves the process with an
-    /// EMPTY effective capability set, so this is not about caps. It is about the bounding set the
-    /// container still carries and the setuid-root binaries a base image ships (`node:22-bookworm-slim`
-    /// carries 8, `su`/`mount`/`umount` among them). Without the flag `NoNewPrivs` is 0 and a job can
-    /// try to become container-root; with it that route is closed. The host tree is unreachable either
-    /// way — this narrows what a job can do inside its own container, not what it can reach outside.
+    /// `--cap-drop ALL` — a non-root `--user` already leaves the process with an EMPTY effective
+    /// capability set, so this removes no capability the job could use today. It pins the BOUNDING
+    /// set to empty, so no capability can be regained (e.g. via a setuid-root binary), and states the
+    /// zero-capability posture explicitly rather than leaning on the uid to imply it. Cheap and safe
+    /// — dev toolchains (`npm`/`pip`/`cargo` installing under $HOME as the same uid) need no
+    /// capability. Paired with `no-new-privileges` below, the two close the setuid → container-root
+    /// route from both ends.
+    ///
+    /// `--security-opt no-new-privileges` — the setuid-root binaries a base image ships
+    /// (`node:22-bookworm-slim` carries 8, `su`/`mount`/`umount` among them) are the other half.
+    /// Without the flag `NoNewPrivs` is 0 and a job can try to become container-root; with it that
+    /// route is closed. The host tree is unreachable either way — this narrows what a job can do
+    /// inside its own container, not what it can reach outside.
     ///
     /// `--init` — otherwise PID 1 is the ACP adapter, a node process that does not reap. An agent that
     /// spawns subprocesses accumulates zombies for the life of the container. `--init` makes PID 1 a
     /// real reaper instead.
+    ///
+    /// `--runtime <name>` (optional) — the container runtime. Unset ⇒ the daemon default (`runc`,
+    /// which shares the host kernel). The v1 posture sets `runsc` (gVisor) on Linux so the payload
+    /// runs against a userspace kernel, not the host one; a Mac seat leaves it unset (the platform VM
+    /// is the boundary there). The named runtime must be registered with the daemon, or the run fails
+    /// at spawn — a fail-closed the seller boot doctor is meant to catch first.
     fn run_argv(&self, agent_command: &[String], job: &JobLaunch<'_>) -> Vec<String> {
-        let mut argv: Vec<String> = vec![
-            "docker".into(),
-            "run".into(),
-            "--rm".into(),
-            "-i".into(),
-            "--init".into(),
-            "--security-opt".into(),
-            "no-new-privileges".into(),
+        let mut argv: Vec<String> = vec!["docker".into(), "run".into(), "--rm".into(), "-i".into()];
+        // Runtime first, so it is unambiguously a `docker run` flag and not read as the image.
+        if let Some(runtime) = &self.runtime {
+            argv.push("--runtime".into());
+            argv.push(runtime.clone());
+        }
+        argv.extend(
+            [
+                "--init",
+                "--security-opt",
+                "no-new-privileges",
+                "--cap-drop",
+                "ALL",
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+        argv.extend([
             "--user".into(),
             format!("{}:{}", job.uid, job.gid),
             "-v".into(),
             format!("{}:{CONTAINER_WORKDIR}", job.workdir.display()),
             "-w".into(),
             CONTAINER_WORKDIR.into(),
-        ];
+        ]);
         for (key, value) in job.env {
             argv.push("-e".into());
             argv.push(format!("{key}={value}"));
@@ -907,6 +940,7 @@ mod tests {
         let policy = SandboxPolicy::docker(DockerPolicy {
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
+            runtime: None,
         });
         let env = vec![("GIT_AUTHOR_NAME".to_string(), "maxplayer-seller-abcd".to_string())];
         let workdir = Path::new("/home/seller/.maxplayer/seller-jobs/job1");
@@ -952,6 +986,7 @@ mod tests {
         let policy = SandboxPolicy::docker(DockerPolicy {
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
+            runtime: None,
         });
         let launch = policy
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -960,6 +995,11 @@ mod tests {
         assert!(
             windowed(&launch.args, &["--security-opt", "no-new-privileges"]),
             "a setuid-root binary in the image must not be a route to container-root: {:?}",
+            launch.args
+        );
+        assert!(
+            windowed(&launch.args, &["--cap-drop", "ALL"]),
+            "the bounding capability set must be empty, so no capability can be regained: {:?}",
             launch.args
         );
         assert!(
@@ -986,6 +1026,86 @@ mod tests {
         );
     }
 
+    // The v1 posture runs the job under gVisor on Linux by naming a container runtime. Unset ⇒ the
+    // argv carries no `--runtime` (the daemon default, `runc`); set ⇒ `docker run --runtime <name>`,
+    // and it must precede the image or docker reads it as the agent command. A Mac seat is the unset
+    // case — the platform VM is its boundary, so no runtime override is named.
+    #[test]
+    fn docker_runtime_is_named_only_when_configured_and_precedes_the_image() {
+        // Unset: no --runtime anywhere.
+        let default_rt = SandboxPolicy::docker(DockerPolicy {
+            image: "maxplayer-sandbox:latest".into(),
+            forward_env: Vec::new(),
+            runtime: None,
+        });
+        let launch = default_rt
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
+            .expect("command");
+        assert!(
+            !launch.args.iter().any(|a| a == "--runtime"),
+            "an unset runtime must not emit a --runtime flag: {:?}",
+            launch.args
+        );
+
+        // Set: --runtime runsc, before the image.
+        let gvisor = SandboxPolicy::docker(DockerPolicy {
+            image: "maxplayer-sandbox:latest".into(),
+            forward_env: Vec::new(),
+            runtime: Some("runsc".into()),
+        });
+        let launch = gvisor
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
+            .expect("command");
+        assert!(
+            windowed(&launch.args, &["--runtime", "runsc"]),
+            "a configured runtime must reach the argv: {:?}",
+            launch.args
+        );
+        let runtime_at =
+            launch.args.iter().position(|a| a == "runsc").expect("runtime value in argv");
+        let image_at = launch
+            .args
+            .iter()
+            .position(|a| a == "maxplayer-sandbox:latest")
+            .expect("the image is in the argv");
+        assert!(
+            runtime_at < image_at,
+            "the runtime must precede the image, or docker reads it as the agent command: {:?}",
+            launch.args
+        );
+    }
+
+    // from_config threads the runtime through, and a blank string is treated as unset rather than
+    // forwarded as an empty `--runtime ` that docker would reject.
+    #[test]
+    fn from_config_resolves_and_trims_the_runtime() {
+        use crate::home::{SandboxConfig, SandboxMode};
+        let with_runtime = SandboxConfig {
+            mode: SandboxMode::Docker,
+            launcher: Vec::new(),
+            image: Some("img".into()),
+            forward_env: Vec::new(),
+            runtime: Some("runsc".into()),
+        };
+        let policy = SandboxPolicy::from_config(Some(&with_runtime)).expect("ok");
+        let launch = policy
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
+            .expect("command");
+        assert!(windowed(&launch.args, &["--runtime", "runsc"]), "{:?}", launch.args);
+
+        // A blank runtime is a config no-op, not an empty flag.
+        let blank = SandboxConfig { runtime: Some("  ".into()), ..with_runtime };
+        let policy = SandboxPolicy::from_config(Some(&blank)).expect("ok");
+        let launch = policy
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
+            .expect("command");
+        assert!(
+            !launch.args.iter().any(|a| a == "--runtime"),
+            "a blank runtime must not emit a --runtime flag: {:?}",
+            launch.args
+        );
+    }
+
     // A container inherits NOTHING from the daemon, so an agent CLI inside it has no credential
     // unless one is carried in. This is the allowlist that carries it — and the reason it is an
     // allowlist rather than "forward the environment" is that the container runs a stranger's code:
@@ -1006,6 +1126,7 @@ mod tests {
         let docker = SandboxPolicy::docker(DockerPolicy {
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
+            runtime: None,
         });
         let carried = forwarded_agent_env_from(&docker, daemon_env);
         let names: Vec<&str> = carried.iter().map(|(k, _)| k.as_str()).collect();
@@ -1050,6 +1171,7 @@ mod tests {
         let policy = SandboxPolicy::docker(DockerPolicy {
             image: "img".into(),
             forward_env: vec!["MY_AGENT_TOKEN".into(), "ANTHROPIC_API_KEY".into()],
+            runtime: None,
         });
         let carried = forwarded_agent_env_from(&policy, env);
         let names: Vec<&str> = carried.iter().map(|(k, _)| k.as_str()).collect();
@@ -1068,6 +1190,7 @@ mod tests {
         let policy = SandboxPolicy::docker(DockerPolicy {
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
+            runtime: None,
         });
         let env = vec![("ANTHROPIC_API_KEY".to_string(), "sk-ant-xxx".to_string())];
         let launch = policy
@@ -1089,6 +1212,7 @@ mod tests {
             launcher: Vec::new(),
             image: None,
             forward_env: Vec::new(),
+            runtime: None,
         };
         // docker with no image.
         assert!(SandboxPolicy::from_config(Some(&base)).is_err());
@@ -1136,7 +1260,8 @@ mod tests {
             home.join("wallet.secret").display()
         );
         let agent_command = argv(&["sh", "-c", &probe]);
-        let policy = SandboxPolicy::docker(DockerPolicy { image, forward_env: Vec::new() });
+        let policy =
+            SandboxPolicy::docker(DockerPolicy { image, forward_env: Vec::new(), runtime: None });
         let job = JobLaunch {
             workdir: &workdir,
             env: &[],
