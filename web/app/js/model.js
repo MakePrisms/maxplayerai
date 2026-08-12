@@ -97,8 +97,56 @@ export function param(event, name) {
 }
 
 /**
+ * protocol-v1 §7.1: `reason_code` names the class. The vocabulary is extensible,
+ * so a reader that meets an unknown code MUST fall back to `status` (§7.1) and
+ * MUST NOT treat the event as malformed.
+ */
+const REASON_CODE_CLASS = Object.freeze({
+  below_rate: "refusal",
+  unsupported_version: "refusal",
+  mint_incompatible: "refusal",
+  at_capacity: "refusal",
+  execution_failed: "error",
+  delivery_failed: "error",
+  no_sentinel: "refusal",
+});
+
+/** protocol-v1 §7.2. `progress` is explicitly non-terminal; the rest end an attempt. */
+const TERMINAL_FEEDBACK_CLASSES = Object.freeze(new Set(["claim_released", "refusal", "error"]));
+
+/**
+ * The protocol class of a feedback event, read from tags only.
+ *
+ * protocol-v1 §7.1 is explicit: "A reader MUST NOT parse `content` to determine
+ * the class." `feedbackReason` below reads content on purpose, but it is a
+ * DISPLAY helper and must never decide whether work ended. Returns null when
+ * the event carries neither a known code nor a status.
+ */
+export function feedbackClass(event) {
+  const code = firstTag(event, "reason_code");
+  if (code && REASON_CODE_CLASS[code]) return REASON_CODE_CLASS[code];
+  return firstTag(event, "status") || null;
+}
+
+/**
+ * Whether a feedback event ends the awarded seller's attempt.
+ *
+ * Unclassified feedback is NOT terminal. Terminalizing on an event we cannot
+ * classify is what let a routine `progress` note clear the work lamp before any
+ * result. An unclassified event now leaves the job running, and the #681
+ * deadline clock is what stops it running forever — so the conservative choice
+ * here no longer costs us the indefinite-working bug it used to.
+ */
+export function feedbackIsTerminal(event) {
+  return TERMINAL_FEEDBACK_CLASSES.has(feedbackClass(event));
+}
+
+/**
  * A feedback event's reason is the code before the first colon
  * ("claim_released: ..."), not free text. Anything unlike a code is unspecified.
+ *
+ * DISPLAY ONLY. It reads `content`, so protocol-v1 §7.1 forbids using it to
+ * decide a feedback event's class — use `feedbackClass` for that.
  */
 export function feedbackReason(event) {
   const head = String(event.content || "").trim().split(":")[0].trim();
@@ -178,7 +226,13 @@ export function parseEvent(event) {
                wallTimeSeconds: firstNumber(event, "wall_time") };
     case FEEDBACK:
       return { ...base, offerId: rootOfferId(event), seller: event.pubkey,
-               reason: feedbackReason(event) };
+               // `reason` is for display. `feedbackClass`/`terminal` are the
+               // structural read the protocol requires — see §7.1.
+               reason: feedbackReason(event),
+               status: firstTag(event, "status"),
+               reasonCode: firstTag(event, "reason_code"),
+               feedbackClass: feedbackClass(event),
+               terminal: feedbackIsTerminal(event) };
     case RECEIPT:
       return { ...base, offerId: rootOfferId(event),
                amount: firstNumber(event, "amount", "amt", "sats") };

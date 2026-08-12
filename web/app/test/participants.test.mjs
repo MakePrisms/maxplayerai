@@ -271,7 +271,10 @@ test("working state follows the awarded claim and ends at the selected runner's 
     ev(RESULT, { id: "result", pubkey: winner, at: NOW - 250, tags: [root("work")] }),
     ev(ACCEPT, { id: "accept-working", pubkey: buyer, at: NOW - 240, tags: [root("work")] }),
     ev(RECEIPT, { id: "receipt-working", pubkey: buyer, at: NOW - 230, tags: [root("work")] }),
-    ev(FEEDBACK, { id: "release-working", pubkey: winner, at: NOW - 220, tags: [root("work")] }),
+    // protocol-v1 §7.2: only a terminal CLASS ends the attempt. A bare feedback
+    // used to be asserted terminal here, which locked in the early-clear bug.
+    ev(FEEDBACK, { id: "release-working", pubkey: winner, at: NOW - 220,
+      tags: [root("work"), ["status", "claim_released"]] }),
   ];
   for (const terminal of terminals) {
     assert.deepEqual(inProgressJobs([...underway, terminal], NOW), [], `kind ${terminal.kind} ends working state`);
@@ -379,6 +382,74 @@ test("#681: an unseen offer is not evidence of lateness — no deadline means wo
   assert.deepEqual(stateAt(noOffer, DUE + STALLED_GRACE_SECONDS + 100000), [JOB_WORKING],
     "without the offer there is no deadline to be late against");
   assert.equal(inProgressJobs(noOffer, NOW)[0].deadline, null);
+});
+
+/**
+ * #681, second defect, found by Rocky in review. The reducer counted EVERY
+ * feedback from the awarded seller as terminal. protocol-v1 §7.2 makes
+ * `status=progress` explicitly non-terminal, and §6.7 REQUIRES a seller to
+ * publish feedback for progress notes. So a seller doing exactly what the
+ * protocol demands cleared its own work lamp before delivering anything.
+ *
+ * The two defects point opposite ways: the missing clock showed work that had
+ * stopped, this hid work that was still running. Both are the same mistake —
+ * reading one signal as if it settled the question.
+ */
+const fb = (id, { at, tags = [], content = "", pubkey = pk("c") }) =>
+  ev(FEEDBACK, { id, pubkey, at, tags: [root("late"), ...tags], content });
+
+test("#681: a progress feedback is NOT terminal — the seller keeps working", () => {
+  const at = DUE - 200;
+  const progress = fb("progress-note", { at: DUE - 300, tags: [["status", "progress"]] });
+  assert.deepEqual(stateAt(lateJob([progress]), at), [JOB_WORKING],
+    "protocol-v1 §7.2: progress is explicitly non-terminal");
+  // And it still becomes overdue on the clock, rather than vanishing early.
+  assert.deepEqual(stateAt(lateJob([progress]), DUE + STALLED_GRACE_SECONDS + 1), [JOB_OVERDUE],
+    "a progress note does not exempt a job from the deadline either");
+});
+
+test("#681: every terminal feedback class ends the attempt", () => {
+  const at = DUE - 200;
+  for (const status of ["claim_released", "refusal", "error"]) {
+    assert.deepEqual(stateAt(lateJob([fb(`end-${status}`, { at: DUE - 300, tags: [["status", status]] })]), at),
+      [], `status=${status} is terminal per §7.2`);
+  }
+});
+
+test("#681: reason_code outranks status, and an unknown code falls back to status", () => {
+  const at = DUE - 200;
+  // §7.1: reason_code is authoritative for the class.
+  assert.deepEqual(stateAt(lateJob([fb("code-refusal", { at: DUE - 300, tags: [["reason_code", "at_capacity"]] })]), at),
+    [], "at_capacity maps to refusal, which is terminal");
+  assert.deepEqual(stateAt(lateJob([fb("code-error", { at: DUE - 300, tags: [["reason_code", "execution_failed"]] })]), at),
+    [], "execution_failed maps to error, which is terminal");
+  // §7.1: an unknown code MUST fall back to status, not be treated as malformed.
+  assert.deepEqual(stateAt(lateJob([fb("unknown-progress", { at: DUE - 300,
+    tags: [["reason_code", "invented_future_code"], ["status", "progress"]] })]), at),
+    [JOB_WORKING], "unknown code falls back to status=progress, still working");
+  assert.deepEqual(stateAt(lateJob([fb("unknown-refusal", { at: DUE - 300,
+    tags: [["reason_code", "invented_future_code"], ["status", "refusal"]] })]), at),
+    [], "unknown code falls back to status=refusal, terminal");
+});
+
+test("#681: the class comes from tags, never from content", () => {
+  const at = DUE - 200;
+  // §7.1 forbids parsing content for the class. A seller writing the words in a
+  // progress note must not terminalize its own job.
+  const lying = fb("prose-only", { at: DUE - 300, tags: [["status", "progress"]],
+    content: "claim_released: still working, ignore this line" });
+  assert.deepEqual(stateAt(lateJob([lying]), at), [JOB_WORKING],
+    "content saying claim_released cannot end a job whose status is progress");
+  // Unclassified feedback is not terminal either — the clock catches it instead.
+  assert.deepEqual(stateAt(lateJob([fb("bare", { at: DUE - 300 })]), at), [JOB_WORKING],
+    "feedback we cannot classify leaves the job running");
+});
+
+test("#681: a non-awarded seller's terminal feedback cannot end the awarded attempt", () => {
+  const at = DUE - 200;
+  const loser = fb("loser-refusal", { at: DUE - 300, pubkey: pk("d"), tags: [["status", "refusal"]] });
+  assert.deepEqual(stateAt(lateJob([loser]), at), [JOB_WORKING],
+    "only the awarded seller's terminal feedback counts");
 });
 
 test("#681: the clock is required, so no caller can silently restore the old behaviour", () => {

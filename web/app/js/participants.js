@@ -194,10 +194,16 @@ export function inProgressJobs(events, now, graceSeconds = STALLED_GRACE_SECONDS
     const seller = job.award.awardedSeller || claims.get(job.award.claimId) || null;
     const buyer = job.award.buyer || job.buyer;
     if (!buyer || !seller) continue;
+    // Feedback ends the attempt only when its protocol class says so. Every
+    // feedback used to count, so a `status=progress` note — which protocol-v1
+    // §7.2 calls explicitly non-terminal, and which a working seller is
+    // REQUIRED to publish — cleared the lamp before any result existed. That is
+    // the same defect as the missing clock, pointing the other way: one showed
+    // work that had stopped, this hid work that was still running.
     const finished = job.terminals.some((e) =>
       e.kind === ACCEPT || e.kind === RECEIPT ||
       (e.kind === RESULT && e.seller === seller) ||
-      (e.kind === FEEDBACK && e.seller === seller && e.created_at >= job.award.created_at));
+      (e.kind === FEEDBACK && e.seller === seller && e.created_at >= job.award.created_at && e.terminal));
     if (finished) continue;
     // No deadline means we never saw the offer, not that the job is on time.
     // An absence is not evidence of lateness, so it stays working and visible.
