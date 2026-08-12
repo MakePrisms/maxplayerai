@@ -13,7 +13,7 @@ matches the spec.
 | §6.5 | `ACCEPT` carries a `["job-hash", hash]` tag and a reply-marked result `e` tag. | It carries neither. `accept_draft` builds the offer `e` tag, an unmarked claim `e` tag, and two `p` tags — `gateway.rs:480`. `status_draft` adds only `status`, `t`, and `v` — `gateway.rs:824`. | [#640](https://github.com/MakePrisms/maxplayerai/issues/640) |
 | §6.5 | A reader resolves the three `e` tags by marker. | `parse_offer_and_claim_tags` reads the `root`-marked tag as the offer and the first unmarked tag as the claim — `gateway.rs:534`. It has no result branch. | [#640](https://github.com/MakePrisms/maxplayerai/issues/640) |
 | §6.7 | `FEEDBACK` `status` is one of `progress`, `claim_released`, `refusal`, or `error`. | Only `error` is emitted. `error_draft` sets it (`gateway.rs:712`), and the other three literals appear nowhere in `crates/`. | — |
-| §7.1 | Seven reason codes are defined. | Four are emitted. `unsupported_version`, `mint_incompatible`, and `at_capacity` are constructed nowhere outside the enum that defines them (`gateway.rs:660`). The buyer reader already handles all three (`buyer/mod.rs:2323`). | — |
+| §7.1 | Seven reason codes are defined. | Four are emitted. `unsupported_version`, `mint_incompatible`, and `at_capacity` are constructed nowhere outside the enum that defines them (`gateway.rs:660`). The buyer reader already handles all three (`buyer/mod.rs:2357`). | — |
 | §2.1 | A reader MUST reject an event whose `v` is not `1`. | Enforced at `parse_offer` (`gateway.rs:304`) and `parse_heartbeat`. The award, accept, and result parsers gate on kind. The offer gate covers trade entry, so this is defence in depth rather than an open hole. | — |
 
 ## Delivery
@@ -35,7 +35,7 @@ the declared checks and producing or verifying their attestation remain absent f
 | §10 | A buyer publishes `REJECT` on a deterministic verification failure. | No production path publishes it. `reject_draft` exists (`gateway.rs:725`) and its only caller is its own unit test (`gateway.rs:986`). | — |
 
 The execution sentinel in §8.2 is a separate mechanism, and it **is** enforced. A buyer refuses to
-spend on a delivery that carries no sentinel bound to that job (`authorize_pay.rs:424`).
+spend on a delivery that carries no sentinel bound to that job (`authorize_pay.rs:441`).
 
 ## Documentation
 

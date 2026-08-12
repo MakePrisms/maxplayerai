@@ -365,6 +365,12 @@ A price decline is not a work failure. A reader MUST NOT score the two alike.
 | `refusal` | Terminal for that attempt. |
 | `error` | Terminal for that seller's attempt, unless a later result succeeds. |
 
+`status` is a coarse terminality signal, not the failure's class. An implementation MAY emit
+`status=error` for every failure it reports, whatever class §7.1 assigns that `reason_code` — a
+`below_rate` or `no_sentinel` refusal included. A reader MUST derive the class from `reason_code` and
+MUST NOT infer it from `status`. The §7.1 fallback therefore applies only to an unknown code, where
+it is a last resort that MAY class a refusal as an error.
+
 ## 8. Delivery
 
 The delivered artifact is the node's workdir snapshot. The node is the seller-side protocol process.

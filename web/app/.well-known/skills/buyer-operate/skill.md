@@ -66,12 +66,13 @@ choosing a mint a precondition for getting started.
 
 - **Keep minibits** — the answer whenever they have no preference. Nothing to configure; go straight
   to `wallet setup` below.
-- **A different mint** — allow it first, then fund on it. `--mint` is refused for a mint that is not
-  already allowed, so the order matters:
+- **A different mint** — one command. `wallet setup --mint <url>` auto-adds a mint that is not yet
+  configured (#506-C — identical to `wallet mints add <url>`, idempotent, and it only ever adds to
+  the extra mints), so there is no order to get wrong:
   ```bash
-  maxplayer wallet mints add https://<their-mint>
   maxplayer wallet setup --mint https://<their-mint>
   ```
+  Adding it first still works — it is harmless, just unnecessary.
 - **Several mints** — add each one. The wallet holds a balance per mint and pays a seller from a mint
   they accept:
   ```bash
