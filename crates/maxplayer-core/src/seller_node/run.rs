@@ -1551,7 +1551,33 @@ fn offer_row(job_id: &str, buyer_pubkey: &str, offer: &ParsedOffer) -> super::st
         deadline_unix: offer.deadline_unix as i64,
         targeted: offer.is_targeted(),
         requested_agent: offer.requested_agent.clone(),
+        // #686: the buyer's declared output type is mandatory on the wire (`parse_offer` refuses an
+        // offer without it), so it is always `Some` here. It becomes `None` only for a row written
+        // before the column existed.
+        output: Some(offer.output.clone()),
     }
+}
+
+/// The agent prompt for a stored job — the ONE place a stored offer row becomes the hired agent's
+/// prompt.
+///
+/// Extracted from `execute_job` for the same reason [`offer_row`] was extracted from the claim path:
+/// this read is what decides which of the journaled facts the agent is ever told, and inlined at its
+/// single call site no test can reach it. It reads the ROW, not the event — execution can be a
+/// RESTART away from the claim, so the row is all a resumed job has.
+///
+/// `pub` so the shipped CLI crate can assert this seam under ITS OWN feature set: `maxplayer-core`'s
+/// wallet-gated unit tests do not run under `cargo test -p maxplayer-core` (the `wallet` feature is
+/// off by default there), so a tooth that lives only here is invisible to the repo's declared check
+/// set. See `crates/maxplayer/tests/seller_declared_output.rs`.
+pub fn job_prompt(offer: &super::store::Offer, git_remote: &str, deadline_unix: u64) -> String {
+    compose_agent_prompt(
+        &offer.task,
+        git_remote,
+        deadline_unix,
+        offer.output.as_deref(),
+        None,
+    )
 }
 
 /// #591: how a job's delivery workdir is provisioned — a from-scratch empty repo, or a clone of a
@@ -4789,7 +4815,7 @@ impl SellerNodeRunner {
         // deadline has room. The agent edits files in `workdir`; the node owns commit + push. The
         // configured `[sandbox]` policy launches the command (pass-through when absent).
         let deadline = offer.deadline_unix.max(0) as u64;
-        let prompt = compose_agent_prompt(&offer.task, &seller.git_remote, deadline, None);
+        let prompt = job_prompt(&offer, &seller.git_remote, deadline);
         let sandbox = SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref());
         let run_started = std::time::Instant::now();
         let run_result = run_agent_with_retry(
@@ -6472,12 +6498,71 @@ mod tests {
         assert_eq!(row.task, "do a task");
         assert_eq!(row.deadline_unix, (NOW + 600) as i64);
         assert!(row.targeted);
+        assert_eq!(row.output.as_deref(), Some("text/plain"));
 
         // An offer that asked for nothing stores nothing — absence is carried, not invented.
         let plain = gateway::OfferDraft::new("do a task", "text/plain", 5, NOW + 600, "a".repeat(64))
             .to_event_draft();
         let parsed = parse_offer(&plain).expect("parse offer");
         assert_eq!(offer_row("job-2", "buyer-1", &parsed).requested_agent, None);
+    }
+
+    // TOOTH (#686) — the buyer's DECLARED OUTPUT TYPE survives the whole trip: WIRE EVENT → stored
+    // row → (restart) → the agent's prompt.
+    //
+    // This is the seam the issue is about. The `output` tag is mandatory on ingest, so every offer
+    // carries one, but it used to stop at the parsed offer: the hired agent was never told what form
+    // the buyer asked for. The store is reopened between the write and the read because execution can
+    // be a RESTART away from the claim — an unpersisted field would be gone for that job permanently,
+    // exactly as the store's `requested_agent` comment says.
+    //
+    // Bites (each measured, one at a time — every one turns THIS test red and nothing else in the
+    // file): (1) `output: None` in `offer_row`; (2) drop `output` from `record_offer`'s INSERT;
+    // (3) pass `None` for the declared output in `job_prompt`.
+    #[test]
+    fn the_declared_output_type_survives_wire_to_row_to_prompt_across_a_restart() {
+        let job = "c".repeat(64);
+        let asked =
+            gateway::OfferDraft::new("do a task", "application/json", 5, NOW + 600, "a".repeat(64))
+                .to_event_draft();
+        let parsed = parse_offer(&asked).expect("parse offer");
+        let row = offer_row(&job, "buyer-1", &parsed);
+        assert_eq!(
+            row.output.as_deref(),
+            Some("application/json"),
+            "the declared output type must reach the row — the prompt is composed from the ROW"
+        );
+
+        let root = temp_dir("declared-output-restart");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mk root");
+        let db = root.join("seller.sqlite");
+        {
+            let store = SellerStore::open(&db).expect("open store");
+            store.record_offer(&row, 1).expect("record offer");
+        }
+        // …the process dies here. A fresh store handle is all the resumed node has.
+        let store = SellerStore::open(&db).expect("reopen store");
+        let resumed = store.offer_row(&job).expect("offer row").expect("offer survives");
+
+        // The exact call the execute path makes, over the exact row a resumed job reads.
+        let prompt = job_prompt(&resumed, "https://relay.example/git/abc.git", 2_000_000_000);
+        assert!(
+            prompt.contains("application/json"),
+            "the buyer's declared output type must reach the hired agent: {prompt}"
+        );
+        assert!(
+            prompt.contains("DECLARED OUTPUT TYPE:"),
+            "stated as the buyer's declared output type: {prompt}"
+        );
+        // A VALUE, not fixed prose: a different declared type produces a different prompt, and never
+        // the other job's type.
+        let mut other = resumed.clone();
+        other.output = Some("text/plain".to_owned());
+        let other_prompt = job_prompt(&other, "https://relay.example/git/abc.git", 2_000_000_000);
+        assert!(other_prompt.contains("text/plain"), "{other_prompt}");
+        assert!(!other_prompt.contains("application/json"), "{other_prompt}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // TOOTH (charter invariant 2, RESTART form — the strong one) — a job requesting harness X is
@@ -6517,6 +6602,7 @@ mod tests {
                         deadline_unix: 2_000_000_000,
                         targeted: true,
                         requested_agent: Some("codex".to_owned()),
+                        output: Some("text/plain".to_owned()),
                     },
                     1,
                 )
@@ -8254,6 +8340,7 @@ mod tests {
                     deadline_unix,
                     targeted: true,
                     requested_agent: None,
+                    output: Some("text/plain".to_owned()),
                 },
                 now,
             )
@@ -9253,6 +9340,7 @@ mod tests {
                     deadline_unix: 2_000_000_000,
                     targeted: true,
                     requested_agent: None,
+                    output: Some("text/plain".to_owned()),
                 },
                 1,
             )
@@ -9289,6 +9377,7 @@ mod tests {
                     deadline_unix: now - 1,
                     targeted: false,
                     requested_agent: None,
+                    output: Some("text/plain".to_owned()),
                 },
                 1,
             )
@@ -9404,6 +9493,7 @@ mod tests {
                             deadline_unix: deadline,
                             targeted: true,
                             requested_agent: None,
+                            output: Some("text/plain".to_owned()),
                         },
                         1,
                     )

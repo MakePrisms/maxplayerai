@@ -174,7 +174,7 @@ where
 }
 
 /// Daemon/node-owned delivery, plus the job agent's PROMPT PREAMBLE — identity, job context,
-/// boundaries (#685).
+/// boundaries (#685), and the buyer's declared output type (#686).
 ///
 /// ⚠ It is a PREAMBLE IN THE USER TURN, **not** a protocol-level system prompt, because ACP has no
 /// system-prompt surface: [`SessionConfig`](crate::driver::SessionConfig) is `{cwd, mcp_servers,
@@ -206,8 +206,24 @@ pub fn compose_agent_prompt(
     task: &str,
     git_remote: &str,
     deadline_unix: u64,
+    declared_output: Option<&str>,
     memory_section: Option<&str>,
 ) -> String {
+    // #686: the buyer's `["output", …]` tag is MANDATORY on ingest and is a MIME / output type
+    // (`text/plain`, `application/json`). Stating it here is the only way the hired agent learns what
+    // form was asked for — it reads this prompt and nothing else of the offer. `None` ⇒ say nothing:
+    // an offer recorded before the column existed has no declared type, and inventing a default would
+    // put a fact in the prompt that no buyer stated. Blank is treated as absent for the same reason.
+    //
+    // It is a STATEMENT, not a gate. Nothing downstream refuses or penalises a delivery whose format
+    // does not match — that is a money-path decision with its own blast radius, deliberately not here.
+    let output_section = match declared_output.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(output) => format!(
+            "DECLARED OUTPUT TYPE: {output}. The buyer declared this output type on the offer, so \
+             produce the deliverable in that form. The task above wins where the two disagree.\n"
+        ),
+        None => String::new(),
+    };
     let base = format!(
         "{task}\n\n\
          ---\n\
@@ -218,6 +234,7 @@ pub fn compose_agent_prompt(
          buyer settles payment when your work is delivered. Treat it as contracted work.\n\
          DEADLINE: {deadline_unix} (Unix epoch seconds, UTC). Work that is not on disk by then may \
          never be delivered, so finish and leave your work in place rather than running long.\n\
+         {output_section}\
          BOUNDARIES:\n\
          - Your current working directory is the job directory and the whole of your scope. Work \
          only inside it.\n\
@@ -619,7 +636,7 @@ mod tests {
     #[test]
     fn composed_prompt_carries_task_and_owned_delivery_instructions() {
         let remote = "https://relay.example/git/abc.git";
-        let prompt = compose_agent_prompt("build a widget", remote, 1_800_000_123, None);
+        let prompt = compose_agent_prompt("build a widget", remote, 1_800_000_123, None, None);
         // The original task stays up front.
         assert!(prompt.starts_with("build a widget"), "task preserved: {prompt}");
         // Explicit, seller-owned delivery instructions are appended.
@@ -663,8 +680,16 @@ mod tests {
     fn preamble_carries_this_jobs_own_values_and_never_invites_refusal() {
         let remote_a = "https://relay.example/git/aaa.git";
         let remote_b = "https://relay.example/git/bbb.git";
-        let a = compose_agent_prompt("task A", remote_a, 1_800_000_123, None);
-        let b = compose_agent_prompt("task B", remote_b, 1_900_000_456, None);
+        // Composed WITH a declared output type (#686) so every check below — the wrap-seam
+        // instruments and the refusal ban especially — covers that line too, not only the #685 text.
+        let a = compose_agent_prompt("task A", remote_a, 1_800_000_123, Some("text/plain"), None);
+        let b = compose_agent_prompt(
+            "task B",
+            remote_b,
+            1_900_000_456,
+            Some("application/json"),
+            None,
+        );
 
         // Identity, deadline and boundaries are present at all — the three things #685 adds.
         for prompt in [&a, &b] {
@@ -696,6 +721,7 @@ mod tests {
                 "may never be delivered",
                 "Work only inside it",
                 "or any file outside this directory",
+                "on the offer, so produce the deliverable in that form",
             ] {
                 assert!(
                     prompt.contains(joined),
@@ -713,8 +739,8 @@ mod tests {
         assert!(!a.contains("bbb.git"), "not the other job's remote: {a}");
 
         // The deadline VALUE reaches the text: hold every other input fixed and only it varies.
-        let early = compose_agent_prompt("t", "r", 1_000_000_001, None);
-        let late = compose_agent_prompt("t", "r", 1_000_000_002, None);
+        let early = compose_agent_prompt("t", "r", 1_000_000_001, None, None);
+        let late = compose_agent_prompt("t", "r", 1_000_000_002, None, None);
         assert_ne!(
             early, late,
             "the deadline argument must reach the prompt, not be dropped"
@@ -731,6 +757,71 @@ mod tests {
                 "must not invite refusal (found {banned:?}): {a}"
             );
         }
+    }
+
+    // TOOTH (#686) — the buyer's DECLARED OUTPUT TYPE reaches the hired agent, as a VALUE.
+    //
+    // The offer's `output` tag is mandatory on ingest and is a MIME / output type, but until this
+    // change it stopped at the parsed offer: the agent was never told what form the buyer asked for.
+    // Two prompts are composed with EVERY other input held fixed and only the output type varying,
+    // and each is checked for its own value AND for the absence of the other's — a hardcoded string
+    // (or a dropped argument) cannot satisfy both halves.
+    //
+    // Bite (measured): pass `None` for `declared_output` inside `compose_agent_prompt`, or drop
+    // `{output_section}` from the format string, and this test goes red on the first assertion.
+    #[test]
+    fn the_declared_output_type_reaches_the_prompt_and_absence_states_nothing() {
+        let json = compose_agent_prompt("t", "r", 1_000, Some("application/json"), None);
+        let plain = compose_agent_prompt("t", "r", 1_000, Some("text/plain"), None);
+
+        assert!(
+            json.contains("application/json"),
+            "the declared output type must reach the prompt: {json}"
+        );
+        assert!(
+            !json.contains("text/plain"),
+            "not some other job's output type: {json}"
+        );
+        assert!(
+            plain.contains("text/plain"),
+            "the declared output type must reach the prompt: {plain}"
+        );
+        assert_ne!(
+            json, plain,
+            "the output-type argument must reach the prompt, not be dropped"
+        );
+        assert!(
+            json.contains("DECLARED OUTPUT TYPE:"),
+            "it is stated as the buyer's declared output type, so the agent can tell whose fact it \
+             is: {json}"
+        );
+
+        // The task stays FIRST — our own prose never pushes the buyer's instructions down.
+        assert!(json.starts_with("t\n\n"), "task still first: {json}");
+
+        // ABSENT ⇒ SILENT, byte-for-byte. An offer recorded before the column existed declares no
+        // output type, and stating a default would put a fact in the prompt no buyer ever gave.
+        let absent = compose_agent_prompt("t", "r", 1_000, None, None);
+        assert!(
+            !absent.contains("DECLARED OUTPUT TYPE"),
+            "no declared type ⇒ nothing stated: {absent}"
+        );
+        // Blank is absence too (a whitespace-only tag value states nothing), so it lands on the
+        // very same bytes rather than on an empty "DECLARED OUTPUT TYPE: ." line.
+        assert_eq!(
+            compose_agent_prompt("t", "r", 1_000, Some("   "), None),
+            absent,
+            "a blank output type states nothing, exactly as an absent one does"
+        );
+
+        // ⛔ NOT ENFORCEMENT (#686 scope): the prompt STATES the type, and states that the task
+        // wins if the two disagree. Nothing here invites the agent to refuse over a format — the
+        // refusal ban asserted in the test above covers this line because it is composed with an
+        // output type set.
+        assert!(
+            json.contains("The task above wins where the two disagree."),
+            "the buyer's task, not our tag, is authoritative: {json}"
+        );
     }
 
     #[test]
