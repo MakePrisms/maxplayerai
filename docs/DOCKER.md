@@ -126,10 +126,15 @@ Semantics, exactly as implemented:
   `sandbox.launcher` — #381). Fail-closed: you cannot accidentally ship an empty
   launcher that silently disables the sandbox. Opt out **only** by omitting the whole `[sandbox]` section.
 
-**The daemon does NOT validate the launcher.** It does not check that the binary exists, that it is
-actually a sandboxing tool, or that `/data` is unreachable from inside it. It blindly prepends the argv.
-`launcher = ["env"]` would "work" and isolate nothing. Verifying that your launcher actually blocks
-`/data` is entirely your responsibility — see "Verify" below.
+**The daemon does NOT validate that the launcher sandboxes anything.** It does resolve the launcher:
+the boot gate refuses to start when argv0 is neither on `PATH` nor an existing file, because every job
+would then die at spawn with ENOENT (#357). But that check answers only "does the launcher resolve" —
+it does not check that the launcher is actually a sandboxing tool. `launcher = ["env"]` resolves and
+isolates nothing. A separate containment probe (#451) does run the launcher once against a canary file
+in `/data` and the job workdir, but it blocks boot only for a seat claiming open-pool jobs; on a
+targeted-only seat — the default for this image — it is advisory (a WARN), and either way it samples
+one canary read and one workdir write, not your other secret paths. Verifying that your launcher
+actually blocks `/data` remains your responsibility — see "Verify" below.
 
 ### Working example: bubblewrap inside the container
 
@@ -180,8 +185,9 @@ Key points about this example:
 
 ### Verify the sandbox actually works
 
-The daemon won't check this for you. After configuring, run your launcher by hand with a probe in place
-of the agent command and confirm `/data` is gone:
+Don't lean on the boot gate's containment probe for this: on the default targeted-only seat it only
+warns, and it samples a single canary path. After configuring, run your launcher by hand with a probe in
+place of the agent command and confirm `/data` is gone:
 
 ```sh
 bwrap <your args from launcher> -- sh -c 'ls /data' \
@@ -258,7 +264,7 @@ its wallet balance.
 
 ## Troubleshooting
 
-- **No `nip42=authenticated` line:** the relay is unreachable or refused auth.
+- **No `seller node relay authenticated (NIP-42)` line:** the relay is unreachable or refused auth.
   Run the self-check: `docker compose exec seller maxplayer doctor`.
 - **Config change ignored:** `config.toml` is read once at startup. Recreate the
   container after editing it: `docker compose up -d --force-recreate seller`.
