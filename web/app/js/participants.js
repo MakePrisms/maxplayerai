@@ -9,7 +9,27 @@
  */
 import { buildTrades } from "./trades.js";
 import { parseEvent } from "./model.js";
-import { ACCEPT, AWARD, CLAIM, FEEDBACK, HEARTBEAT, PROFILE, RECEIPT, RESULT } from "./kinds.js";
+import { ACCEPT, AWARD, CLAIM, FEEDBACK, HEARTBEAT, OFFER, PROFILE, RECEIPT, RESULT } from "./kinds.js";
+
+/**
+ * The two states an awarded, undelivered job can be in. Derived presentation
+ * state, not relay truth: the relay has no event that says "this job stalled",
+ * which is #682. Until it does, this is the site's own reading of an absence.
+ */
+export const JOB_WORKING = "working";
+export const JOB_OVERDUE = "overdue";
+
+/**
+ * How long after an offer's own deadline a job may still be called working.
+ *
+ * It exists for clock skew and propagation, not for patience: the seller, the
+ * relay and this browser each stamp their own time, and a result published a
+ * moment before the deadline can reach us a moment after it. Five minutes
+ * covers that without letting a genuinely dead award pose as live work for
+ * long. It is one constant on purpose — a threshold spelled inline at each
+ * call site is a threshold that drifts apart.
+ */
+export const STALLED_GRACE_SECONDS = 300;
 
 /** Selectable periods, longest label first so the UI can render them in order. */
 export const WINDOWS = Object.freeze([
@@ -117,11 +137,26 @@ function applyProfiles(rows, parsed) {
 }
 
 /**
- * Jobs currently between selection and delivery, joined to the exact winning
- * claim. A trade may have several claimants; only the seller named by AWARD is
- * working. Input order is irrelevant because relay pages do not promise it.
+ * Awarded jobs that have not been delivered, joined to the exact winning claim.
+ * A trade may have several claimants; only the seller named by AWARD is working.
+ * Input order is irrelevant because relay pages do not promise it.
+ *
+ * Each job carries a `state`: `working` while the offer's deadline (plus grace)
+ * is still ahead of `now`, `overdue` once it is behind. Delivery is still the
+ * only thing that ENDS a job — an overdue job is not finished and keeps its
+ * award, because the buyer may yet pay a late result and the history is real
+ * either way. Overdue only means "stop showing this as current execution."
+ *
+ * `now` is required, and deliberately so. Before #681 this function had no
+ * clock at all, so an award whose seller published nothing stayed "working"
+ * for as long as the award was in the query window — forever, in practice. A
+ * defaulted clock would let any caller silently reproduce exactly that bug, so
+ * omitting it is an error rather than a fallback.
  */
-export function inProgressJobs(events) {
+export function inProgressJobs(events, now, graceSeconds = STALLED_GRACE_SECONDS) {
+  if (!Number.isFinite(now)) {
+    throw new TypeError("inProgressJobs(events, now): now is required — see #681");
+  }
   const parsed = events.map(parseEvent).filter(Boolean);
   const claims = new Map(parsed
     .filter((e) => e.kind === CLAIM && e.seller)
@@ -130,7 +165,7 @@ export function inProgressJobs(events) {
   const get = (offerId) => {
     let job = jobs.get(offerId);
     if (!job) {
-      job = { offerId, buyer: null, award: null, terminals: [] };
+      job = { offerId, buyer: null, award: null, deadline: null, terminals: [] };
       jobs.set(offerId, job);
     }
     return job;
@@ -140,7 +175,12 @@ export function inProgressJobs(events) {
     if (!e.offerId) continue;
     const job = get(e.offerId);
     if (e.buyer) job.buyer ||= e.buyer;
-    if (e.kind === AWARD) {
+    if (e.kind === OFFER) {
+      // The deadline is the offer's own, and it is the only public statement of
+      // when the work was due. We may never see the offer — a window can start
+      // after it, and the relay can simply not return it.
+      if (e.deadline) job.deadline = e.deadline;
+    } else if (e.kind === AWARD) {
       if (!job.award || e.created_at < job.award.created_at ||
           (e.created_at === job.award.created_at && e.id < job.award.id)) job.award = e;
     } else if ([RESULT, ACCEPT, RECEIPT, FEEDBACK].includes(e.kind)) {
@@ -154,11 +194,20 @@ export function inProgressJobs(events) {
     const seller = job.award.awardedSeller || claims.get(job.award.claimId) || null;
     const buyer = job.award.buyer || job.buyer;
     if (!buyer || !seller) continue;
+    // Feedback ends the attempt only when its protocol class says so. Every
+    // feedback used to count, so a `status=progress` note — which protocol-v1
+    // §7.2 calls explicitly non-terminal, and which a working seller is
+    // REQUIRED to publish — cleared the lamp before any result existed. That is
+    // the same defect as the missing clock, pointing the other way: one showed
+    // work that had stopped, this hid work that was still running.
     const finished = job.terminals.some((e) =>
       e.kind === ACCEPT || e.kind === RECEIPT ||
       (e.kind === RESULT && e.seller === seller) ||
-      (e.kind === FEEDBACK && e.seller === seller && e.created_at >= job.award.created_at));
+      (e.kind === FEEDBACK && e.seller === seller && e.created_at >= job.award.created_at && e.terminal));
     if (finished) continue;
+    // No deadline means we never saw the offer, not that the job is on time.
+    // An absence is not evidence of lateness, so it stays working and visible.
+    const overdue = job.deadline != null && now > job.deadline + graceSeconds;
     active.push({
       offerId: job.offerId,
       awardId: job.award.id,
@@ -166,6 +215,8 @@ export function inProgressJobs(events) {
       buyer,
       seller,
       startedAt: job.award.created_at,
+      deadline: job.deadline,
+      state: overdue ? JOB_OVERDUE : JOB_WORKING,
     });
   }
   return active.sort((a, b) => b.startedAt - a.startedAt || a.offerId.localeCompare(b.offerId));
@@ -185,7 +236,7 @@ export function buyerBoard(events, now, activeEvents = events) {
     let r = rows.get(pk);
     if (!r) {
       r = { pubkey: pk, posted: 0, awarded: 0, receipted: 0, satsPaid: 0,
-            prices: [], lastSeen: 0, unpaidDeliveries: 0, inProgressJobs: [],
+            prices: [], lastSeen: 0, unpaidDeliveries: 0, inProgressJobs: [], workingJobs: [],
             // Self-published, from kind-0. A claim, like the seller's.
             name: null, about: null, profile: null, profileAt: 0 };
       rows.set(pk, r);
@@ -211,7 +262,15 @@ export function buyerBoard(events, now, activeEvents = events) {
     if (t.offerAmount != null) r.prices.push(t.offerAmount);
   }
 
-  for (const job of inProgressJobs(activeEvents)) get(job.buyer).inProgressJobs.push(job);
+  // `inProgressJobs` is every awarded-undelivered job, overdue included, because
+  // the detail view has to keep showing the award. `workingJobs` is the subset
+  // that is still current execution — the lamp and its count read that one.
+  // Split here, once, rather than at each of the three render sites.
+  for (const job of inProgressJobs(activeEvents, now)) {
+    const row = get(job.buyer);
+    row.inProgressJobs.push(job);
+    if (job.state === JOB_WORKING) row.workingJobs.push(job);
+  }
 
   // Same rule as the seller board: posting or awarding work earns the row, the
   // profile only names it.
@@ -247,7 +306,7 @@ export function sellerBoard(events, now, activeEvents = events) {
     let r = rows.get(pk);
     if (!r) {
       r = { pubkey: pk, claimed: 0, delivered: 0, receipted: 0, satsEarned: 0,
-            released: 0, deliverTimes: [], lastSeen: 0, online: false, inProgressJobs: [],
+            released: 0, deliverTimes: [], lastSeen: 0, online: false, inProgressJobs: [], workingJobs: [],
             // Which agent runtime actually did the work, counted per delivery —
             // a seller may move between harnesses, so this is a tally, not a label.
             harnessCounts: {},
@@ -298,7 +357,11 @@ export function sellerBoard(events, now, activeEvents = events) {
     }
   }
 
-  for (const job of inProgressJobs(activeEvents)) get(job.seller).inProgressJobs.push(job);
+  for (const job of inProgressJobs(activeEvents, now)) {
+    const row = get(job.seller);
+    row.inProgressJobs.push(job);
+    if (job.state === JOB_WORKING) row.workingJobs.push(job);
+  }
 
   // kind-0 is the single publisher of the seat name (§6.1 / #275) and the 31990
   // advert no longer carries it. Named last, once every row that earned a place

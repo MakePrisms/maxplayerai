@@ -117,5 +117,26 @@ test("every racer has a fixed 24-hour activity lamp with contextual hover text",
   assert.match(buyerRenderer[0], /t - lastAt <= RACER_ACTIVE_SECONDS/);
   assert.match(buyerRenderer[0], /Active in last 24 hours · last activity/);
   assert.match(buyerRenderer[0], /No activity in last 24 hours/);
-  assert.match(buyerRenderer[0], /\$\{statusDot\(active, r\.inProgressJobs, context\)\}/);
+  // #681: the lamp reads `workingJobs`, not `inProgressJobs`. The two differ by
+  // exactly the overdue awards, so binding it back to `inProgressJobs` would
+  // restore the bug where a seat that delivered nothing lights up as busy.
+  assert.match(buyerRenderer[0], /\$\{statusDot\(active, r\.workingJobs, context\)\}/);
+});
+
+test("#681: overdue awards render as their own stopped state, not as louder working", () => {
+  const detail = appSource.match(/function openParticipant[\s\S]*?const profile = profiles\.get/);
+  assert.ok(detail);
+  assert.match(detail[0], /job\.state === JOB_OVERDUE/);
+  assert.match(detail[0], /Overdue · \$\{nf\.format\(overdue\.length\)\}/);
+  assert.match(detail[0], /OVERDUE · \$\{short\(job\.offerId\)\}/);
+  // The award stays reachable: an overdue chip still opens its job history.
+  assert.match(detail[0], /class="chip overdue-chip" data-open="event" data-id="\$\{job\.awardId\}"/);
+  // And it must not claim a payment or cancellation the relay never recorded.
+  assert.match(detail[0], /nothing here says it was paid or cancelled/);
+
+  // Styled as stopped rather than as an alternative working state: no reuse of
+  // the working chip's red, which is what the lamp means.
+  const overdueRule = stylesSource.match(/\.overdue-chip \{[\s\S]*?\}/);
+  assert.ok(overdueRule, "overdue-chip needs its own rule");
+  assert.doesNotMatch(overdueRule[0], /--neon|rgba\(255, 40, 0/);
 });

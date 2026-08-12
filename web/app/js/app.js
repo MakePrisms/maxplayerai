@@ -12,7 +12,7 @@ import { parseEvent } from "./model.js";
 import { marketMetrics } from "./trades.js";
 import { KIND_LABELS, PROFILE, TRADE_STAGES } from "./kinds.js";
 import {
-  DEFAULT_WINDOW, WINDOWS, buyerBoard, participantDetail, participantNames,
+  DEFAULT_WINDOW, JOB_OVERDUE, WINDOWS, buyerBoard, participantDetail, participantNames,
   participantProfiles, racerLastActivity, relatedActivity, sellerBoard, withinWindow,
 } from "./participants.js";
 
@@ -158,7 +158,7 @@ function renderBuyers(events, names, allEvents = events) {
       return `
       <li class="row buyers-grid" data-open="buyer" data-pk="${r.pubkey}" tabindex="0">
         <span class="agent">
-          ${statusDot(active, r.inProgressJobs, context)}
+          ${statusDot(active, r.workingJobs, context)}
           <span class="nm">${nameOf(names, r.pubkey) ? esc(nameOf(names, r.pubkey)) : `<code>${short(r.pubkey)}</code>`}</span>
         </span>
         <span class="num">${nf.format(r.posted)}</span>
@@ -177,7 +177,7 @@ function renderSellers(events, names, allEvents = events) {
     ? rows.map((r) => `
       <li class="row sellers-grid" data-open="seller" data-pk="${r.pubkey}" tabindex="0">
         <span class="agent">
-          ${statusDot(r.online, r.inProgressJobs)}
+          ${statusDot(r.online, r.workingJobs)}
           <span class="nm">${nameOf(names, r.pubkey) ? esc(nameOf(names, r.pubkey)) : `<code>${short(r.pubkey)}</code>`}</span>
           ${r.harness ? `<span class="harness" title="${esc(r.harness)}">${esc(shortHarness(r.harness))}</span>` : ""}
         </span>
@@ -355,10 +355,22 @@ function openParticipant(role, pubkey, events, allEvents) {
   const activeJobs = [...new Map([
     ...(b?.inProgressJobs || []), ...(s?.inProgressJobs || []),
   ].map((job) => [job.offerId, job])).values()];
-  if (activeJobs.length) {
-    parts.push(`<h4>In progress · ${nf.format(activeJobs.length)} job${activeJobs.length === 1 ? "" : "s"}</h4>
-      <div class="chips active-jobs">${activeJobs.map((job) =>
+  // Overdue awards stay on the detail view on purpose. The board stops counting
+  // them as current work, but the award happened and hiding it here would turn
+  // a stalled job into a job that never existed.
+  const working = activeJobs.filter((job) => job.state !== JOB_OVERDUE);
+  const overdue = activeJobs.filter((job) => job.state === JOB_OVERDUE);
+  if (working.length) {
+    parts.push(`<h4>In progress · ${nf.format(working.length)} job${working.length === 1 ? "" : "s"}</h4>
+      <div class="chips active-jobs">${working.map((job) =>
         `<button type="button" class="chip working-chip" data-open="event" data-id="${job.awardId}" title="Open job history">IN PROGRESS · ${short(job.offerId)}</button>`,
+      ).join("")}</div>`);
+  }
+  if (overdue.length) {
+    parts.push(`<h4>Overdue · ${nf.format(overdue.length)} job${overdue.length === 1 ? "" : "s"}</h4>
+      <p class="job-note">Awarded, past the offer deadline, and no delivery has been published. The award stands; nothing here says it was paid or cancelled.</p>
+      <div class="chips active-jobs">${overdue.map((job) =>
+        `<button type="button" class="chip overdue-chip" data-open="event" data-id="${job.awardId}" title="${esc(`Deadline ${stamp(job.deadline)} · no delivery published`)}">OVERDUE · ${short(job.offerId)}</button>`,
       ).join("")}</div>`);
   }
 
