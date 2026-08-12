@@ -52,15 +52,19 @@ reservation refused: <requested> sat exceeds available <available> sat
 ```
 
 `available` is what you can commit right now — your wallet balance minus funds already
-reserved for other awards, held under your budget cap. If it is below the job amount the
-award parks. **Nothing is logged when this happens** — this field is the only place it
-shows. A job priced above your available budget parks immediately, which a fresh install
-hits easily.
+reserved for other awards, and nothing else. There is no budget-cap term in it: the
+rolling total-budget ceiling was removed in #378, so only funding and reservations move
+this number. (`per_job_budget_sats`, the one surviving cap, bounds a single job's price;
+it cannot raise `available`.) If `available` is below the job amount the award parks.
+**Nothing is logged when this happens** — this field is the only place it shows. A job
+priced above your available budget parks immediately, which a fresh install hits easily.
 
-**Fix:** raise the funds or the cap so `available ≥ the job amount`, then re-post the
-job (a parked award is not retried against the same stale state):
+**Fix:** raise the funds or lower the amount so `available ≥ the job amount`, then
+re-post the job (a parked award is not retried against the same stale state):
 - fund the wallet: `maxplayer wallet setup`, or check `maxplayer wallet balance`
-- lower the job price, or raise your budget cap in `~/.maxplayer/config.toml`
+- lower the job price
+- or free up what is reserved (see the next symptom) — editing
+  `~/.maxplayer/config.toml` will not do it
 
 ### Cause B — no claim was payable from a mint your wallet can reach
 
@@ -85,8 +89,9 @@ or raise it on the Maxplayer market channel (buzz).
 A reservation is held against an award that has not settled yet — on purpose, so the
 funds are not double-spent. But an award that can **never** settle (e.g. the seat
 executed but could not deliver, so payment is never collected) leaves its reservation
-held with **no release path**: there is no `release`/`cancel`/`reclaim` command, and no
-sweep was observed.
+held with **no way for you to free it on demand**: there is no `release`/`cancel`/`reclaim`
+command. The release is not yours to trigger — it happens when the deadline reconcile
+runs, or when the seller reports a releasable failure.
 
 **Check:** `pending_award_attempts` in `maxplayer buyer status` shows in-flight awards
 still holding a reservation. For the durable rows, the `reservations` table in
@@ -97,8 +102,16 @@ still holding a reservation. For the durable rows, the `reservations` table in
 until payment is actually collected, so the sats are still spendable. It is a slow leak
 of *available budget*, not a loss of money.
 
-**Fix / workaround:** there is no first-class release yet. To recover the headroom now,
-raise your budget cap in `~/.maxplayer/config.toml`. Do **not** hand-edit the wallet.
+**Fix / workaround:** there is no first-class manual release, and **no config knob raises
+`available`** — the rolling budget cap that once did was removed in #378, and a
+`total_budget_sats` key is stripped from `~/.maxplayer/config.toml` on load, so editing
+one in changes nothing. What actually frees a reservation:
+- **wait for the deadline reconcile** — it releases the hold at the offer deadline
+- **the seller reporting a releasable failure** — that frees the hold on the same path
+- or get the headroom from the other side: **fund the wallet** (`maxplayer wallet setup`),
+  since `available` is `balance − reserved`
+
+Do **not** hand-edit the wallet.
 
 **Dead end → report it:** file on **MakePrisms/maxplayerai**, paste the stuck
 `reservations` row (`job_id`, `amount_sats`, `state`, `created_at`, `updated_at`) and
