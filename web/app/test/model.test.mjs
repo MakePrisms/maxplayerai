@@ -72,8 +72,13 @@ test("rootOfferId prefers the root marker over an incidental e-tag", () => {
 });
 
 test("an award keyed off the winning claim would split a trade — it does not", () => {
-  const p = parseEvent(ev(AWARD, { id: "a1", tags: [["e", H("claim-1")], ["e", H("offer-1"), "", "root"]] }));
+  const p = parseEvent(ev(AWARD, { id: "a1", tags: [
+    ["e", H("claim-1")], ["e", H("offer-1"), "", "root"],
+    ["p", pk("a")], ["p", pk("c")],
+  ] }));
   assert.equal(p.offerId, H("offer-1"));
+  assert.equal(p.claimId, H("claim-1"), "the exact winning claim remains attached");
+  assert.equal(p.awardedSeller, pk("c"), "the selected runner is not confused with the racer");
   assert.equal(p.stage, "award");
 });
 
@@ -107,10 +112,21 @@ test("a feedback reason is the code before the colon, not the prose", () => {
   assert.equal(feedbackReason({ content: "" }), "unspecified");
 });
 
-test("a heartbeat exposes the slot it fills", () => {
-  const p = parseEvent(ev(HEARTBEAT, { tags: [["d", "seat-1"], ["status", "idle"]] }));
+test("a heartbeat exposes its complete current and future advertisement", () => {
+  const p = parseEvent(ev(HEARTBEAT, { tags: [
+    ["d", "seat-1"], ["v", "1"], ["accepting", "y"], ["queue_depth", "2"],
+    ["rate", "125"], ["accepted_mints", "https://mint.one", "https://mint.two"],
+    ["agents", "codex", "claude"], ["model", "gpt-future"], ["hardware", "gb10"],
+  ] }));
   assert.equal(p.d, "seat-1");
-  assert.equal(p.status, "idle");
+  assert.equal(p.version, "1");
+  assert.equal(p.accepting, "y");
+  assert.equal(p.queueDepth, 2);
+  assert.equal(p.rateSats, 125);
+  assert.deepEqual(p.acceptedMints, ["https://mint.one", "https://mint.two"]);
+  assert.deepEqual(p.agents, ["codex", "claude"]);
+  assert.deepEqual(p.advertisementTags.at(-1), { name: "hardware", values: ["gb10"] },
+    "unknown future fields remain available to the detail view");
   assert.equal(p.stage, null, "a heartbeat describes a seller, not a trade");
 });
 

@@ -36,12 +36,14 @@ export const ACCEPT = 3406;
  * FLOOR on what settled, never the total. Anything user-facing must say so.
  */
 export const RECEIPT = 3400;
-/** NIP-89 seller handler announce (a capability advert). Carries no maxplayer tag. */
-export const HANDLER = 31990;
 /**
- * Seller liveness heartbeat. Addressable (parameterized-replaceable): keyed by
- * (author, kind, d), newest `created_at` wins. NEVER resolve one by event id —
- * a superseded event goes missing and reads as a false "offline".
+ * Seller capability + liveness announcement. Addressable
+ * (parameterized-replaceable): keyed by (author, kind, d), newest
+ * `created_at` wins. NEVER resolve one by event id — a superseded event goes
+ * missing and reads as a false "offline".
+ *
+ * Protocol v1 retired kind-31990. Every live seat-level fact now comes from
+ * this event, including current and future fields the UI does not know yet.
  */
 export const HEARTBEAT = 30340;
 
@@ -65,10 +67,8 @@ export const MAXPLAYER_TAGGED_KINDS = Object.freeze([
 ]);
 
 /**
- * Kinds requested WITHOUT a t-tag filter. Both are Nostr standards that carry no
- * maxplayer tag of their own, so a `#t` filter would hide them: the NIP-89
- * handler announce is a plain advert, and NIP-01 profile metadata is plain
- * metadata.
+ * Kinds requested WITHOUT a t-tag filter. NIP-01 profile metadata carries no
+ * maxplayer tag of its own, so a `#t` filter would hide it.
  *
  * PROFILE belongs here because it is the SINGLE publisher of a seat's display
  * name (§6.1 / #275). It was parsed, cached and read by the seller board while
@@ -77,7 +77,7 @@ export const MAXPLAYER_TAGGED_KINDS = Object.freeze([
  *
  * Gift-wrap stays dark either way and is never requested or decoded.
  */
-export const UNTAGGED_KINDS = Object.freeze([HANDLER, PROFILE]);
+export const UNTAGGED_KINDS = Object.freeze([PROFILE]);
 
 /**
  * Kinds whose newest event per (author, kind, d) supersedes the rest.
@@ -88,7 +88,7 @@ export const REPLACEABLE_KINDS = Object.freeze([PROFILE]);
 
 /**
  * The stage each kind represents in a trade's life. Kinds absent from this map
- * (profile, handler, heartbeat) describe a participant, not a trade.
+ * (profile and heartbeat) describe a participant, not a trade.
  */
 export const TRADE_STAGES = Object.freeze({
   [OFFER]: "offer",
@@ -117,6 +117,5 @@ export const KIND_LABELS = Object.freeze({
   [AWARD]: "award",
   [ACCEPT]: "accept",
   [RECEIPT]: "receipt",
-  [HANDLER]: "handler",
   [HEARTBEAT]: "heartbeat",
 });

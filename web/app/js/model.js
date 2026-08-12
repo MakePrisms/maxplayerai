@@ -7,7 +7,7 @@
  * open relay must never take the page down.
  */
 import {
-  ACCEPT, AWARD, CLAIM, FEEDBACK, HANDLER, HEARTBEAT, OFFER, PROFILE, RECEIPT,
+  ACCEPT, AWARD, CLAIM, FEEDBACK, HEARTBEAT, OFFER, PROFILE, RECEIPT,
   RESULT, SELF_TRADE_TAG, TRADE_STAGES,
 } from "./kinds.js";
 
@@ -19,6 +19,23 @@ const firstTag = (event, ...names) => {
   }
   return null;
 };
+
+/** Every value on the first multi-value tag with this name. */
+const tagValues = (event, name) => {
+  const t = tagsNamed(event, name)[0];
+  return t ? t.slice(1).filter((v) => typeof v === "string" && v.length > 0) : [];
+};
+
+/**
+ * Preserve the complete public advertisement, including fields introduced by
+ * a newer seller than this reader knows about. The renderer escapes every
+ * value; this layer only normalises tag cells to strings.
+ */
+function advertisementTags(event) {
+  return (event.tags || [])
+    .filter((t) => Array.isArray(t) && typeof t[0] === "string" && t[0].length > 0)
+    .map((t) => ({ name: t[0], values: t.slice(1).map((v) => String(v)) }));
+}
 
 /** First finite number found under any of the given tag names. */
 function firstNumber(event, ...names) {
@@ -46,6 +63,22 @@ export function rootOfferId(event) {
   // not an event id is not one, whatever it claims.
   const named = firstTag(event, "E", "offer", "root");
   return isHex32(named) ? named : null;
+}
+
+/** The non-root event selected by an award (the winning claim). */
+function awardClaimId(event, offerId) {
+  for (const t of tagsNamed(event, "e")) {
+    if (isHex32(t[1]) && t[1] !== offerId) return t[1];
+  }
+  return null;
+}
+
+/** The other participant on a buyer-authored award is the selected seller. */
+function awardSeller(event) {
+  for (const t of tagsNamed(event, "p")) {
+    if (isHex32(t[1]) && t[1] !== event.pubkey) return t[1];
+  }
+  return null;
 }
 
 function parseJsonContent(event) {
@@ -119,11 +152,18 @@ export function parseEvent(event) {
                deadline: Number.parseInt(param(event, "deadline"), 10) || null };
     case CLAIM:
       return { ...base, offerId: rootOfferId(event), seller: event.pubkey,
-               status: firstTag(event, "status"), hasPaymentRequest: Boolean(firstTag(event, "creq")) };
-    // AWARD and ACCEPT are both buyer-authored and carry the same tags, so they
-    // parse identically. The kind is what says whether it selects a claim or
-    // binds payment to a result, and `base.stage` already carries that.
-    case AWARD:
+               status: firstTag(event, "status"), hasPaymentRequest: Boolean(firstTag(event, "creq")),
+               agents: tagValues(event, "agents") };
+    // An award is the moment work starts. Preserve the exact winning claim and
+    // seller: multiple runners may claim one offer, so the first claim on the
+    // trade is not necessarily the runner the racer selected.
+    case AWARD: {
+      const offerId = rootOfferId(event);
+      return { ...base, offerId, buyer: event.pubkey,
+               claimId: awardClaimId(event, offerId),
+               awardedSeller: awardSeller(event),
+               status: firstTag(event, "status") };
+    }
     case ACCEPT:
       return { ...base, offerId: rootOfferId(event), buyer: event.pubkey,
                status: firstTag(event, "status") };
@@ -132,6 +172,7 @@ export function parseEvent(event) {
                amount: firstNumber(event, "amount", "amt", "sats"),
                // What actually did the work, and how it was handed over.
                harness: firstTag(event, "harness"),
+               model: firstTag(event, "model"),
                deliveryVia: firstTag(event, "delivery"),
                commit: firstTag(event, "commit"),
                wallTimeSeconds: firstNumber(event, "wall_time") };
@@ -142,23 +183,20 @@ export function parseEvent(event) {
       return { ...base, offerId: rootOfferId(event),
                amount: firstNumber(event, "amount", "amt", "sats") };
     case HEARTBEAT:
-      return { ...base, d: firstTag(event, "d") || "", status: firstTag(event, "status") };
-    case HANDLER: {
-      // A seller's advert: who they are, what they charge, whether they will
-      // take work nobody offered them directly.
-      const h = parseJsonContent(event);
-      const rate = Number.parseFloat(h.rate_sats);
-      return { ...base, d: firstTag(event, "d") || "", handler: h,
-               name: h.name || h.display_name || null,
-               about: h.about || null,
-               askSats: Number.isFinite(rate) ? rate : null,
-               openPool: h.claim_open_pool === true,
-               mint: h.mint || null,
-               runtime: h.agent || null };
-    }
+      return { ...base,
+               d: firstTag(event, "d") || "",
+               version: firstTag(event, "v"),
+               accepting: firstTag(event, "accepting"),
+               queueDepth: firstNumber(event, "queue_depth"),
+               rateSats: firstNumber(event, "rate"),
+               acceptedMints: tagValues(event, "accepted_mints"),
+               agents: tagValues(event, "agents"),
+               advertisementTags: advertisementTags(event),
+               advertisementContent: String(event.content || "").trim() ? parseJsonContent(event) : null };
     case PROFILE: {
       const p = parseJsonContent(event);
-      return { ...base, name: p.name || p.display_name || null, about: p.about || null };
+      return { ...base, name: p.name || p.display_name || null, about: p.about || null,
+               profile: p };
     }
     default:
       return null;

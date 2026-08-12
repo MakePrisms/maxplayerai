@@ -9,7 +9,7 @@
  */
 import { buildTrades } from "./trades.js";
 import { parseEvent } from "./model.js";
-import { HANDLER, HEARTBEAT, PROFILE, RESULT } from "./kinds.js";
+import { ACCEPT, AWARD, CLAIM, FEEDBACK, HEARTBEAT, PROFILE, RECEIPT, RESULT } from "./kinds.js";
 
 /** Selectable periods, longest label first so the UI can render them in order. */
 export const WINDOWS = Object.freeze([
@@ -57,16 +57,46 @@ const median = (xs) => {
  * receipt for a seller, plus the advert and heartbeat that say a seat is open
  * for work; an offer or an award for a buyer.
  */
-function profileNames(parsed) {
-  const names = new Map();
+function profileMetadata(parsed) {
+  const profiles = new Map();
   for (const p of parsed) {
-    if (p.kind !== PROFILE || !p.name) continue;
-    const prev = names.get(p.pubkey);
+    if (p.kind !== PROFILE) continue;
+    const prev = profiles.get(p.pubkey);
     // Newest wins. The cache already resolves kind-0 to one per author, but
     // these boards are pure over whatever array they are handed.
-    if (!prev || p.created_at >= prev.at) names.set(p.pubkey, { name: p.name, at: p.created_at });
+    if (!prev || p.created_at >= prev.at) {
+      profiles.set(p.pubkey, { name: p.name, about: p.about, metadata: p.profile || {}, at: p.created_at });
+    }
   }
-  return names;
+  return profiles;
+}
+
+/** Public profile names for presentation. Hex remains the fallback, never the label beside a known name. */
+export function participantNames(events) {
+  return new Map([...participantProfiles(events)].map(([pubkey, p]) => [pubkey, p.name]).filter(([, name]) => name));
+}
+
+/** Latest complete public profile per participant, independent of the selected activity window. */
+export function participantProfiles(events) {
+  return profileMetadata(events.map(parseEvent).filter(Boolean));
+}
+
+/**
+ * Latest buyer-side job action per racer, independent of the board window.
+ *
+ * A racer is active when it authors a job lifecycle action, not merely because
+ * its profile exists or a runner acts on its job. Keeping this map over the
+ * complete cache lets the UI apply one fixed 24-hour lamp rule even while the
+ * board itself switches between 24 hours, week, and all time.
+ */
+export function racerLastActivity(events) {
+  const buyerStages = new Set(["offer", "award", "accept", "receipt"]);
+  const latest = new Map();
+  for (const e of events.map(parseEvent).filter(Boolean)) {
+    if (!buyerStages.has(e.stage)) continue;
+    latest.set(e.pubkey, Math.max(latest.get(e.pubkey) || 0, e.created_at));
+  }
+  return latest;
 }
 
 /**
@@ -74,11 +104,71 @@ function profileNames(parsed) {
  * depend on whether a profile happened to arrive before or after the claim or
  * advert that earned the row — relay order is not ours to choose.
  */
-function applyProfileNames(rows, parsed) {
-  for (const [pubkey, { name }] of profileNames(parsed)) {
+function applyProfiles(rows, parsed) {
+  for (const [pubkey, profile] of profileMetadata(parsed)) {
     const row = rows.get(pubkey);
-    if (row) row.name = name;
+    if (row) {
+      row.name = profile.name;
+      row.about = profile.about;
+      row.profile = profile.metadata;
+      row.profileAt = profile.at;
+    }
   }
+}
+
+/**
+ * Jobs currently between selection and delivery, joined to the exact winning
+ * claim. A trade may have several claimants; only the seller named by AWARD is
+ * working. Input order is irrelevant because relay pages do not promise it.
+ */
+export function inProgressJobs(events) {
+  const parsed = events.map(parseEvent).filter(Boolean);
+  const claims = new Map(parsed
+    .filter((e) => e.kind === CLAIM && e.seller)
+    .map((e) => [e.id, e.seller]));
+  const jobs = new Map();
+  const get = (offerId) => {
+    let job = jobs.get(offerId);
+    if (!job) {
+      job = { offerId, buyer: null, award: null, terminals: [] };
+      jobs.set(offerId, job);
+    }
+    return job;
+  };
+
+  for (const e of parsed) {
+    if (!e.offerId) continue;
+    const job = get(e.offerId);
+    if (e.buyer) job.buyer ||= e.buyer;
+    if (e.kind === AWARD) {
+      if (!job.award || e.created_at < job.award.created_at ||
+          (e.created_at === job.award.created_at && e.id < job.award.id)) job.award = e;
+    } else if ([RESULT, ACCEPT, RECEIPT, FEEDBACK].includes(e.kind)) {
+      job.terminals.push(e);
+    }
+  }
+
+  const active = [];
+  for (const job of jobs.values()) {
+    if (!job.award) continue;
+    const seller = job.award.awardedSeller || claims.get(job.award.claimId) || null;
+    const buyer = job.award.buyer || job.buyer;
+    if (!buyer || !seller) continue;
+    const finished = job.terminals.some((e) =>
+      e.kind === ACCEPT || e.kind === RECEIPT ||
+      (e.kind === RESULT && e.seller === seller) ||
+      (e.kind === FEEDBACK && e.seller === seller && e.created_at >= job.award.created_at));
+    if (finished) continue;
+    active.push({
+      offerId: job.offerId,
+      awardId: job.award.id,
+      claimId: job.award.claimId,
+      buyer,
+      seller,
+      startedAt: job.award.created_at,
+    });
+  }
+  return active.sort((a, b) => b.startedAt - a.startedAt || a.offerId.localeCompare(b.offerId));
 }
 
 /**
@@ -87,7 +177,7 @@ function applyProfileNames(rows, parsed) {
  * `satsPaid` counts published receipts only — the same floor that applies
  * everywhere, since a buyer can settle without announcing it.
  */
-export function buyerBoard(events, now) {
+export function buyerBoard(events, now, activeEvents = events) {
   const trades = buildTrades(events);
   const parsed = events.map(parseEvent).filter(Boolean);
   const rows = new Map();
@@ -95,9 +185,9 @@ export function buyerBoard(events, now) {
     let r = rows.get(pk);
     if (!r) {
       r = { pubkey: pk, posted: 0, awarded: 0, receipted: 0, satsPaid: 0,
-            prices: [], lastSeen: 0, unpaidDeliveries: 0,
+            prices: [], lastSeen: 0, unpaidDeliveries: 0, inProgressJobs: [],
             // Self-published, from kind-0. A claim, like the seller's.
-            name: null };
+            name: null, about: null, profile: null, profileAt: 0 };
       rows.set(pk, r);
     }
     return r;
@@ -121,9 +211,11 @@ export function buyerBoard(events, now) {
     if (t.offerAmount != null) r.prices.push(t.offerAmount);
   }
 
+  for (const job of inProgressJobs(activeEvents)) get(job.buyer).inProgressJobs.push(job);
+
   // Same rule as the seller board: posting or awarding work earns the row, the
   // profile only names it.
-  applyProfileNames(rows, parsed);
+  applyProfiles(rows, parsed);
 
   return [...rows.values()]
     .map((r) => ({ ...r, medianPrice: median(r.prices) }))
@@ -146,7 +238,7 @@ export function buyerBoard(events, now) {
  * kept apart because "traded recently" is not "available now", and conflating
  * them would advertise sellers that cannot take work.
  */
-export function sellerBoard(events, now) {
+export function sellerBoard(events, now, activeEvents = events) {
   const trades = buildTrades(events);
   const parsed = events.map(parseEvent).filter(Boolean);
 
@@ -155,12 +247,16 @@ export function sellerBoard(events, now) {
     let r = rows.get(pk);
     if (!r) {
       r = { pubkey: pk, claimed: 0, delivered: 0, receipted: 0, satsEarned: 0,
-            released: 0, deliverTimes: [], lastSeen: 0, online: false, capabilities: [],
+            released: 0, deliverTimes: [], lastSeen: 0, online: false, inProgressJobs: [],
             // Which agent runtime actually did the work, counted per delivery —
             // a seller may move between harnesses, so this is a tally, not a label.
             harnessCounts: {},
-            // Self-advertised, from the newest advert. Claims, not measurements.
-            name: null, about: null, askSats: null, openPool: false, mint: null, advertisedAt: 0 };
+            // Self-advertised, from the newest protocol-v1 heartbeat. Claims,
+            // not measurements. Unknown tags stay intact for the detail view.
+            name: null, about: null, profile: null, profileAt: 0,
+            askSats: null, accepting: null, queueDepth: null,
+            acceptedMints: [], advertisedAgents: [], advertisementTags: [],
+            advertisementContent: null, advertisedAt: 0 };
       rows.set(pk, r);
     }
     return r;
@@ -186,20 +282,15 @@ export function sellerBoard(events, now) {
       const r = get(p.pubkey);
       r.lastSeen = Math.max(r.lastSeen, p.created_at);
       if (now - p.created_at <= LIVE_WITHIN_SECONDS) r.online = true;
-    } else if (p.kind === HANDLER) {
-      // The advert is what a seller says about itself: its asking rate and
-      // whether it will take work nobody offered it directly. Kept distinct
-      // from measured behaviour — a claim, not a track record. The seat NAME is
-      // no longer read here: kind-0 metadata is its single publisher (§6.1 /
-      // #275), resolved in the PROFILE arm below.
-      const r = get(p.pubkey);
-      if (p.name && !r.capabilities.includes(p.name)) r.capabilities.push(p.name);
       if (p.created_at >= r.advertisedAt) {
         r.advertisedAt = p.created_at;
-        r.about = p.about || r.about;
-        r.askSats = p.askSats != null ? p.askSats : r.askSats;
-        r.openPool = p.openPool;
-        r.mint = p.mint || r.mint;
+        r.askSats = p.rateSats;
+        r.accepting = p.accepting;
+        r.queueDepth = p.queueDepth;
+        r.acceptedMints = p.acceptedMints;
+        r.advertisedAgents = p.agents;
+        r.advertisementTags = p.advertisementTags;
+        r.advertisementContent = p.advertisementContent;
       }
     } else if (p.kind === RESULT && p.harness) {
       const r = get(p.pubkey);
@@ -207,10 +298,12 @@ export function sellerBoard(events, now) {
     }
   }
 
+  for (const job of inProgressJobs(activeEvents)) get(job.seller).inProgressJobs.push(job);
+
   // kind-0 is the single publisher of the seat name (§6.1 / #275) and the 31990
   // advert no longer carries it. Named last, once every row that earned a place
   // on this board exists.
-  applyProfileNames(rows, parsed);
+  applyProfiles(rows, parsed);
 
   return [...rows.values()]
     .map((r) => {
@@ -237,11 +330,39 @@ export function sellerBoard(events, now) {
 }
 
 /** Everything known about one participant, for a detail view. */
-export function participantDetail(events, pubkey, now) {
-  const buyer = buyerBoard(events, now).find((r) => r.pubkey === pubkey) || null;
-  const seller = sellerBoard(events, now).find((r) => r.pubkey === pubkey) || null;
+export function participantDetail(events, pubkey, now, activeEvents = events) {
+  const buyer = buyerBoard(events, now, activeEvents).find((r) => r.pubkey === pubkey) || null;
+  const seller = sellerBoard(events, now, activeEvents).find((r) => r.pubkey === pubkey) || null;
   const trades = buildTrades(events)
     .filter((t) => t.buyer === pubkey || t.seller === pubkey)
     .sort((a, b) => (b.at.offer ?? b.at.claim ?? 0) - (a.at.offer ?? a.at.claim ?? 0));
-  return { pubkey, buyer, seller, trades };
+  const activity = participantActivity(events, pubkey);
+  return { pubkey, buyer, seller, trades, activity };
+}
+
+/**
+ * Every event that participant authored plus every public lifecycle event for
+ * a job they bought, sold, or were directly offered. This is deliberately
+ * broader than trades: profile and heartbeat activity remains visible, and a
+ * receipt is retained even when its author is neither displayed role.
+ */
+export function participantActivity(events, pubkey) {
+  const parsed = events.map(parseEvent).filter(Boolean);
+  const roots = new Set();
+  for (const e of parsed) {
+    if (e.pubkey === pubkey || e.buyer === pubkey || e.seller === pubkey ||
+        e.awardedSeller === pubkey || e.targetSeller === pubkey) {
+      if (e.offerId) roots.add(e.offerId);
+    }
+  }
+  return parsed
+    .filter((e) => e.pubkey === pubkey || (e.offerId && roots.has(e.offerId)))
+    .sort((a, b) => b.created_at - a.created_at || b.id.localeCompare(a.id));
+}
+
+/** One complete public job history, oldest stage first. */
+export function relatedActivity(events, offerId) {
+  if (!offerId) return [];
+  return events.map(parseEvent).filter((e) => e?.offerId === offerId)
+    .sort((a, b) => a.created_at - b.created_at || a.id.localeCompare(b.id));
 }
