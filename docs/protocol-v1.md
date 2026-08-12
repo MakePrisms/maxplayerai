@@ -246,27 +246,35 @@ reader MUST NOT treat it as proof that a given harness or model ran.
 |---|---|---:|---|
 | `["status","accepted"]` | 1 | yes | Accept state |
 | `["e", offer_id, "", "root"]` | 1 | yes | Root offer id |
-| `["e", result_id, "", "reply"]` | 1 | yes | The result this payment authorises |
 | `["e", claim_id]` | 1 | yes | The claim being settled |
 | `["p", buyer_pubkey]` | 1 | yes | Accepting buyer |
 | `["p", seller_pubkey]` | 1 | yes | Bound seller |
-| `["job-hash", hash]` | 1 | yes | The bind the payment settles against |
 | `["t","maxplayer"]` | 1 | yes | Namespace |
 | `["v","1"]` | 1 | yes | Protocol major |
 
-`ACCEPT` carries three `e` tags. A reader resolves them by marker, never by position:
+`ACCEPT` carries two `e` tags. A reader resolves them by marker, never by position:
 
 | Marker | Names |
 |---|---|
 | `root` | the offer |
-| `reply` | the result |
 | none | the claim |
 
-`AWARD` selects a claim. `ACCEPT` authorises payment. A reader MUST gate on the kind before it reads
-the tags.
+`AWARD` selects a claim. `ACCEPT` authorises payment. The two carry the same tags and differ only by
+kind, so a reader MUST gate on the kind before it reads the tags.
 
-The `job-hash` and the result `e` tag make the payment authorisation joinable. A third party can read
-an `ACCEPT` and name the result it pays for, without private state.
+An `ACCEPT` names no result. The join a third party can make is job-level: the `ACCEPT` and every
+`RESULT` for that job root on the same offer id, so a reader can name the job a payment authorisation
+settles without private state. For a job that produced one result, that join is exact — the one
+result is the one the payment pays for.
+
+Across re-deliveries it is ambiguous. A claim MAY produce more than one result, and the `ACCEPT`
+binds to none of them specifically. A reader MUST NOT infer which result a payment authorises when
+the job carries more than one.
+
+Binding an `ACCEPT` to a specific result is a deliberate future protocol rev, to be taken if
+trustless joins are ever needed. It is not a change that can be backfilled quietly: a reader deployed
+against this major does not see a tag this major does not define, so the added precision would be
+claimed on the wire before any deployed reader could rely on it.
 
 ### 6.6 Reject, kind `3407`
 
