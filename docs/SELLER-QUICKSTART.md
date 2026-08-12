@@ -649,7 +649,8 @@ total_sats=1250
 ```
 
 The command shows every configured mint (including zero balances) and every mint where the shared
-wallet database holds spendable proofs. `total_sats` is the whole-wallet figure. If funds exist at
+wallet database holds spendable proofs. `total_sats` is the whole-wallet figure — with `--mint <url>`
+both totals cover only the mint you asked about, never the mints the filter left out. If funds exist at
 an unconfigured mint, its row has `role=unconfigured` and a separate `configured_total_sats` line
 appears before the whole-wallet total — and that configured subset is what job payment can actually
 draw on: accept-time source selection deliberately ignores unconfigured balances, so money at an

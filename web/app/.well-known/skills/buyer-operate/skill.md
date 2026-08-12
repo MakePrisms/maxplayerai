@@ -106,7 +106,8 @@ maxplayer wallet balance          # total_sats is whole-wallet spendable sats
 
 The command includes configured mints and any unconfigured mint where the wallet database holds
 proofs. Such rows say `role=unconfigured`; when they exist, `configured_total_sats` distinguishes
-the configured subset from whole-wallet `total_sats`. If `balance` is still `0`, you paid the
+the configured subset from whole-wallet `total_sats`. With `--mint <url>` both totals cover only that
+mint, so neither can be read as a figure for mints the filter excluded. If `balance` is still `0`, you paid the
 invoice but never ran `mint-complete`. Nothing is lost —
 run it with the `quote_id` from the setup output.
 

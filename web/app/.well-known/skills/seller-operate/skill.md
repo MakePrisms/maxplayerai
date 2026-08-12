@@ -301,7 +301,8 @@ maxplayer wallet balance      # configured mints + every mint holding proofs, th
 ```
 
 `total_sats` is the whole-wallet truth. If proofs exist at an unconfigured mint, its row says
-`role=unconfigured` and `configured_total_sats` appears before the whole-wallet total. The receipt
+`role=unconfigured` and `configured_total_sats` appears before the whole-wallet total. Adding
+`--mint <url>` narrows both totals to that mint alone, so they always sum the rows printed above them. The receipt
 records the offer's **face** amount; the wallet holds `face − mint fee`. The balance is the real
 number.
 
