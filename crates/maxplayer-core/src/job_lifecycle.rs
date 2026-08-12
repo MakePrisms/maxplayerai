@@ -1463,6 +1463,32 @@ fn select_deliverable_claim(
     Ok(award.claim_id.clone())
 }
 
+/// Whether the awarded `claim_id` and `seller_pubkey` are currently ready for this job's one
+/// settlement: no result has already occupied the job-wide accept bind, the awarded claim is
+/// present and still payable, its seller matches the stored award, and that seller has delivered.
+/// Kept independent from [`select_deliverable_claim`] so its pinned named-refusal strings do not
+/// change while `get_job` (#544) and its wire-contract test share one production predicate.
+pub(crate) fn awarded_delivery_pending(
+    view: &JobView,
+    claim_id: &str,
+    seller_pubkey: &str,
+) -> bool {
+    if view.accepted.is_some() {
+        return false;
+    }
+    let Some(claim) = view.claims.iter().find(|c| c.claim_id == claim_id) else {
+        return false;
+    };
+    if claim.seller_pubkey != seller_pubkey
+        || (claim.status != "processing" && claim.status != CLAIM_STATUS_DELIVERED)
+    {
+        return false;
+    }
+    view.results
+        .iter()
+        .any(|result| result.seller_pubkey == seller_pubkey && result.commit_oid.is_some())
+}
+
 /// Accept-time contribution resolution. Authority is the buyer's SIGNED OFFER:
 /// - not a contribution offer (`job_class != contribution`) ⇒ `Ok(None)` (from-scratch);
 /// - a `contribution`-class offer whose pins failed to parse ⇒ REFUSE (fail-closed — never
