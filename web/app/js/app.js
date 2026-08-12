@@ -312,11 +312,15 @@ function activityLine(e, names) {
   return `${who} updated runner availability`;
 }
 
-function activityList(events, t, names, currentId = null) {
+function activityList(events, t, names, currentId = null, filter = "all") {
   if (!events.length) return '<p class="tiny">No activity in this period.</p>';
   return `<ul class="detail-activity">${events.map((e) => {
     const type = KIND_LABELS[e.kind] || "event";
-    return `<li class="activity-row ${e.id === currentId ? "current" : ""}" data-open="event" data-id="${e.id}" data-activity-type="${esc(type)}" tabindex="0">
+    // The chosen type is applied HERE rather than only by the click handler:
+    // the panel repaints every poll tick, and markup that always came back
+    // unfiltered would silently undo the reader's choice every three seconds.
+    const hide = filter !== "all" && type !== filter;
+    return `<li class="activity-row ${e.id === currentId ? "current" : ""}" data-open="event" data-id="${e.id}" data-activity-type="${esc(type)}" tabindex="0"${hide ? " hidden" : ""}>
       <span class="tag" data-s="${e.stage || type}">${esc(type)}</span>
       <span class="line">${activityLine(e, names)}</span>
       <span class="when">${ago(e.created_at, t)}</span>
@@ -324,21 +328,33 @@ function activityList(events, t, names, currentId = null) {
   }).join("")}</ul>`;
 }
 
+/**
+ * Which activity type the open panel is filtered to, "all" for unfiltered.
+ *
+ * Panel-scoped state, reset by `openParticipant` — a filter chosen on one
+ * participant must not follow the reader to the next one.
+ */
+let activityFilter = "all";
+
 function filteredActivity(activity, t, names) {
   const recent = activity.slice(0, 120);
   const availableTypes = new Set(recent.map((e) => KIND_LABELS[e.kind] || "event"));
   const types = ACTIVITY_FILTER_ORDER.filter((type) => availableTypes.has(type));
+  // A filtered type can fall out of the window as newer activity arrives. Fall
+  // back to All rather than render a panel whose every row is hidden and whose
+  // filter bar offers nothing pressed to explain why.
+  const active = types.includes(activityFilter) ? activityFilter : "all";
   return `<div class="activity-tools">
       <span class="activity-label">Activity type</span>
       <span class="activity-count">${nf.format(recent.length)} shown · ${nf.format(activity.length)} total</span>
       <div class="activity-filters windows" role="group" aria-label="Filter activity by type">
-        <button type="button" data-activity-filter="all" aria-pressed="true">All</button>${types
-          .map((type) => `<button type="button" data-activity-filter="${esc(type)}" aria-pressed="false">${esc(type)}</button>`).join("")}
+        <button type="button" data-activity-filter="all" aria-pressed="${active === "all"}">All</button>${types
+          .map((type) => `<button type="button" data-activity-filter="${esc(type)}" aria-pressed="${type === active}">${esc(type)}</button>`).join("")}
       </div>
-    </div>${activityList(recent, t, names)}`;
+    </div>${activityList(recent, t, names, null, active)}`;
 }
 
-function openParticipant(role, pubkey, events, allEvents) {
+function participantSheet(role, pubkey, events, allEvents) {
   const t = now();
   const d = participantDetail(events, pubkey, t, allEvents);
   const names = participantNames(allEvents);
@@ -409,7 +425,59 @@ function openParticipant(role, pubkey, events, allEvents) {
     ]));
   }
   parts.push(`<h4>Recent activity</h4>${filteredActivity(d.activity, t, names)}`);
-  showSheet(parts.join(""));
+  return parts.join("");
+}
+
+/**
+ * The participant panel currently on screen, `{role, pubkey}`, or null.
+ *
+ * This is the whole point of the split above: the panel used to be built once,
+ * at click time, and never again — so a reader watching one runner work saw the
+ * feed behind the sheet fill with that runner's claims and deliveries while the
+ * sheet itself stayed frozen at whatever the market looked like when they
+ * clicked. Remembering WHICH participant is open lets `render()` rebuild it from
+ * the cache on the same tick it repaints everything else. No extra fetching:
+ * `participantSheet` is a pure function of events we already hold.
+ *
+ * Cleared by `showSheet`, so any other sheet — an event, "not found" — takes
+ * the panel's place instead of being overwritten by it on the next tick.
+ */
+let openPanel = null;
+
+function openParticipant(role, pubkey, events, allEvents) {
+  // Before the markup is built, not after: `participantSheet` reads this, so a
+  // reset that landed later would render the new participant filtered to the
+  // previous one's chosen type while the bar showed All pressed.
+  activityFilter = "all";
+  showSheet(participantSheet(role, pubkey, events, allEvents));
+  openPanel = { role, pubkey };
+}
+
+/**
+ * Repaint the open participant panel in place.
+ *
+ * Deliberately NOT `showSheet`: that focuses the close button, which would drag
+ * focus off whatever the reader is on every three seconds. Focus is instead
+ * carried across the innerHTML swap, the same way `keepScroll` carries the
+ * columns' scroll position.
+ */
+function refreshParticipant(events, allEvents) {
+  if (!openPanel || el("detail").hidden) return;
+  const body = el("detail-body");
+  const focused = document.activeElement;
+  const focusKey = body.contains(focused) ? focusSelector(focused) : null;
+  body.innerHTML = participantSheet(openPanel.role, openPanel.pubkey, events, allEvents);
+  if (focusKey) body.querySelector(focusKey)?.focus();
+}
+
+/** Re-find a focused control after its markup is replaced, or give up quietly. */
+function focusSelector(node) {
+  const { activityFilter: filter, id } = node.dataset || {};
+  if (filter) return `[data-activity-filter="${CSS.escape(filter)}"]`;
+  // Tag-qualified: an in-progress chip and an activity row can carry the same
+  // event id, and focus must come back to the one it left, not its twin.
+  if (id) return `${node.localName}[data-id="${CSS.escape(id)}"]`;
+  return null;
 }
 
 function openEvent(id) {
@@ -463,12 +531,22 @@ function openEvent(id) {
     ${history.length ? `<h4>Related job history</h4>${activityList(history, now(), names, raw.id)}` : ""}`);
 }
 
+/**
+ * Every sheet goes through here, so this is the one place that can honestly
+ * say "the participant panel is no longer what is on screen". Opening an event
+ * from inside a panel therefore ends the panel's claim on the sheet, and the
+ * next tick leaves the event view alone.
+ */
 function showSheet(html) {
+  openPanel = null;
   el("detail-body").innerHTML = html;
   el("detail").hidden = false;
   el("detail-close").focus();
 }
-function closeSheet() { el("detail").hidden = true; }
+function closeSheet() {
+  openPanel = null;
+  el("detail").hidden = true;
+}
 
 /* ---------------- wiring ---------------- */
 
@@ -477,8 +555,12 @@ function closeSheet() { el("detail").hidden = true; }
  * innerHTML — which resets scrollTop to 0. Rare live events made that almost
  * invisible; on a 3s tick it would yank a reader back to the top of the list
  * they were reading, every three seconds. So carry the scroll across.
+ *
+ * `detail` — the participant sheet — is on this list for exactly the same
+ * reason, now that it repaints on the tick too. A panel that jumps back to its
+ * heading every three seconds is worse than one that never updates.
  */
-const SCROLLERS = ["buyers", "feed", "sellers"];
+const SCROLLERS = ["buyers", "feed", "sellers", "detail"];
 function keepScroll(paint) {
   const before = SCROLLERS.map((id) => [id, el(id).scrollTop]);
   paint();
@@ -498,6 +580,8 @@ function render() {
       renderSellers(events, names, allEvents);
       renderFeed(events, names);
       renderStats(events);
+      // Same tick, same cache, same window as the columns behind it.
+      refreshParticipant(events, allEvents);
     });
   });
 }
@@ -544,6 +628,9 @@ document.addEventListener("click", (ev) => {
   const filter = ev.target.closest("[data-activity-filter]");
   if (filter) {
     const selected = filter.dataset.activityFilter;
+    // Recorded, not just applied: the panel is rebuilt on every poll tick and
+    // reads this back, so the choice outlives the markup it was made on.
+    activityFilter = selected;
     for (const button of el("detail-body").querySelectorAll("[data-activity-filter]")) {
       button.setAttribute("aria-pressed", button === filter ? "true" : "false");
     }
