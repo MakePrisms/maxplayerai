@@ -1,0 +1,41 @@
+# Verification checks for this repository (protocol-v1 §9.1, schema 1).
+#
+# A reader reads this file only from the pinned base commit. Presence is fail-closed: malformed
+# TOML, an unknown field, or an unsafe value is an error, not a skip.
+#
+# `prepare` MAY use the network. Every command below MUST run WITHOUT it (`net: denied`), so each
+# argv here is byte-identical to one proven inside an empty network namespace on this tree — not
+# assumed to be hermetic.
+#
+# Deliberately NOT declared: the workspace-wide `cargo test --locked`. Because the `maxplayer`
+# crate sets `default = ["wallet"]`, feature unification hands `maxplayer-core` the wallet feature,
+# which pulls four tests that contact live third-party mints (mint.minibits.cash and
+# testnut.cashu.space). Under `net: denied` those fail DETERMINISTICALLY, so a workspace-wide test
+# command would refuse every honest contribution. The per-package commands below cover the same
+# code without importing that dependency.
+
+schema = 1
+
+[env]
+kind = "nix-flake"
+# flake_path defaults to "." and devshell defaults to "default"; both are correct for this repo, so
+# they are omitted rather than restated. flake.nix and flake.lock exist at the root, which §9.1
+# requires. The environment reference is the SHA-256 of the flake.lock bytes.
+
+[checks]
+prepare = [["cargo", "fetch", "--locked"]]
+
+# `--offline` on the test commands is not redundant with `net: denied`: it makes cargo fail fast and
+# legibly instead of attempting a fetch it cannot complete. `cargo build` is declared without it
+# because that is the exact argv that was proven.
+commands = [
+    ["cargo", "build", "--locked"],
+    ["cargo", "test", "-p", "maxplayer-core", "--locked", "--offline"],
+    ["cargo", "test", "-p", "maxplayer-core", "--features", "acp", "--locked", "--offline"],
+    ["cargo", "test", "-p", "maxplayer", "--locked", "--offline"],
+]
+
+# A cold run is dominated by compilation, not by the tests: three distinct feature configurations
+# are built from a fresh clone. The measured test time is ~45s total, but the example declaration's
+# 1200s would be a false failure on a cold machine.
+timeout_secs = 3600
