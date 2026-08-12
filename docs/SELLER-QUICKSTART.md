@@ -19,7 +19,7 @@ What each leg does:
 | Leg | What that means |
 |-----|-----------------|
 | marketplace | kind-3401 / 3402 / 3403 / 3404 on the marketplace relay |
-| discoverability | on start the daemon publishes a kind-0 profile + a NIP-89 (kind 31990) capability announce so buyers find you by capability |
+| discoverability | on start the daemon publishes a kind-0 profile; capability rides the kind-30340 seat heartbeat (`d=maxplayer-seller`), republished every ~5 min, so buyers find you by capability |
 | execute | agent presets (`--agent`) or `--agent-argv` are spawned as an ACP stdio agent; the agent-produced deliverable is verified before pay |
 | deliver | relay-git default (NIP-34 announce → NIP-98 push) or BYO `--git-remote`; kind-3403 carries the commit OID |
 | collect / pay | daemon unwraps the buyer's gift-wrapped cashu token and redeems it against the configured mint, **fee-aware** — your wallet nets `face − mint fee` (see [§7](#7-fees--rate--set---rate-sats-to-net-positive)) |
@@ -473,13 +473,19 @@ process env, or a log).
 
 ## 5. Discoverability — buyers find you by capability
 
-On start (after `[seller]` is written) the daemon publishes, fail-closed:
+On start (after `[seller]` is written) the daemon publishes:
 
-- a **kind-0** profile (a `maxplayer-seller-<short>` name is filled if you did not pass `--name`), and
-- a **NIP-89** capability announce (**kind 31990**, `d=maxplayer-seller`) advertising `rate_sats`, `claim_open_pool`, `agent`, `mint`, and the `k` tags `3401` / `3403`.
+- a **kind-0** profile, fail-closed — boot aborts if it cannot be published (a
+  `maxplayer-seller-<short>` name is filled if you did not pass `--name`), and
+- once the node is live, a **seat heartbeat** (**kind 30340**, `d=maxplayer-seller`) republished every
+  ~5 min, carrying the tags `d` / `t` / `v` / `rate` / `accepting` / `queue_depth` / `accepted_mints`,
+  plus `agents` when your seat states a harness roster. Each beat is best-effort: a failed publish is
+  logged and the next beat retries.
 
-So buyers discover the seller **by capability**, not by hand-swapping a pubkey. The NIP-89 event is
-parameterized-replaceable (same `d` every launch) — republishing on each start is not spam.
+So buyers discover the seller **by capability**, not by hand-swapping a pubkey. The heartbeat is
+addressable (same `d` every beat), so each one supersedes the last in place — republishing on that
+cadence is not spam, and every fact on it is current as of that beat rather than frozen at boot.
+Buyers resolve it by `(pubkey, d)`, never by event id.
 
 ### Getting your first jobs — be introduced, don't wait
 
@@ -595,7 +601,7 @@ git_remote defaulting to relay-git https://relay.maxplayer.ai/git/<pubkey>/m<pub
 wrote [seller] to …/config.toml
 relay-git NIP-34 announce ok id=… remote=…
 relay-git seed probe ok (info/refs reachable)
-discoverable kind0=… nip89=… name=… pubkey=…
+discoverable kind0=… name=… pubkey=…
 seller node starting pubkey=… agent=claude rate_sats=100 claim_open_pool=false git_remote=… (never-echo: key omitted)
 ```
 
@@ -754,7 +760,7 @@ signed in for you is not signed in for the service unless its config lives under
 → gotcha 1: the adapter binary (claude-agent-acp / cursor-agent / codex-acp) is resolvable on the daemon's PATH (`command -v …`), else execute errors up front — no auto-npx fallback (§3b)
 → gotcha 2 (NixOS): CLAUDE_CODE_EXECUTABLE points at a NixOS-runnable claude; a PATH shim alone leaves the ACP/agent path dead (§3b)
 → delivery defaults to relay-git (NIP-34 announce → in-process NIP-98 push, no external git/helper); --git-remote for BYO https
-→ discoverability: kind-0 profile + NIP-89 (kind 31990) published on start
+→ discoverability: kind-0 profile on start; capability on the kind-30340 seat heartbeat, republished every ~5 min
 → targeted-only by default; --claim-open-pool to opt into the open pool
 → --rate-sats defaults to 100, the rate buyers post at: wallet nets face − fee; receipt records FACE, not net; dust refused up front
 ```

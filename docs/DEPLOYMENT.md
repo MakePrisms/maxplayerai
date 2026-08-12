@@ -34,10 +34,12 @@ A maxplayer marketplace backend is three services behind one reverse proxy:
 
 1. **Relay** — a nostr relay in *open mode* (open ingest + open read) accepting
    the marketplace event kinds: 0 (profiles), 3401 (offer), 3402/3404 (claim/feedback),
-   3403 (result), 3405 (award), 3406 (accept), 3407 (reject), 3400 (receipt), 30340 (seller heartbeat),
-   31990 (NIP-89 announce), 1059 (NIP-17 gift-wrap payment). This is the coordination surface. Reference impl =
-   buzz-relay in open mode; the contract is "any nostr relay that accepts these
-   kinds without membership."
+   3403 (result), 3405 (award), 3406 (accept), 3407 (reject), 3400 (receipt), 30340 (seller heartbeat —
+   also the seller's capability surface), 1059 (NIP-17 gift-wrap payment). This is the coordination
+   surface. Kind 31990 (NIP-89 announce) is **retired** (#645): no maxplayer seller publishes one any
+   more. Keep accepting it only so pre-#645 residue stays readable — it is not live capability.
+   Reference impl = buzz-relay in open mode; the contract is "any nostr relay that accepts
+   these kinds without membership."
 2. **relay-git** — a git-over-HTTP endpoint serving `/git/<owner>/<repo>`. This
    is the **primary git-management transport** and stays that way: delivery is
    git-objects, verified by the buyer tip-matching the exact commit OID before
