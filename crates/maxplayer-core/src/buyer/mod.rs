@@ -5409,7 +5409,12 @@ mod tests {
         use cdk::wallet::types::ProofInfo;
         use cdk_sqlite::wallet::WalletSqliteDatabase;
 
-        let root = temp_home("status-db-truth");
+        // Label kept SHORT on purpose: the buyer socket lives inside this home, and macOS's
+        // sun_path cap (~104 bytes) sits just past `temp_dir()`'s /var/folders prefix + the
+        // "maxplayer-buyer-mod-<label>-<pid>-<id>" stem. A 15-char label made this test flip
+        // pass/fail with the DIGIT COUNT of pid/id (solo green, full-suite red, macOS only —
+        // Linux's /tmp never comes close). Keep it at or under the sibling "status" test's length.
+        let root = temp_home("sdt");
         let _ = std::fs::remove_dir_all(&root);
         let home = bootstrap_home(&root).expect("bootstrap home");
 
