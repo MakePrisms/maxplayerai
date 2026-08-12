@@ -173,15 +173,57 @@ where
     }
 }
 
-/// Daemon/node-owned delivery. The seller appends explicit, secret-free delivery instructions to the
-/// agent's task prompt so the agent delivers by committing its work to the git repository in its
-/// working directory — rather than guessing a delivery channel. The seller performs the
-/// authenticated push of the committed branch to the bound remote (NIP-98; the agent is never handed
-/// a key), so this text carries NO secret — it is public prompt text built only from the task and the
-/// (public) remote URL.
-pub fn compose_agent_prompt(task: &str, git_remote: &str, memory_section: Option<&str>) -> String {
+/// Daemon/node-owned delivery, plus the job agent's PROMPT PREAMBLE — identity, job context,
+/// boundaries (#685).
+///
+/// ⚠ It is a PREAMBLE IN THE USER TURN, **not** a protocol-level system prompt, because ACP has no
+/// system-prompt surface: [`SessionConfig`](crate::driver::SessionConfig) is `{cwd, mcp_servers,
+/// env}` — the whole of `session/new` — and the single `session/prompt` turn carries one text
+/// block. Composing it HERE hands every harness the same preamble from one place. The only form
+/// that would be a true system prompt is a per-harness launcher flag (`--append-system-prompt` and
+/// its equivalents), which has to be repeated per harness — so a newly added harness would
+/// silently ship without one.
+///
+/// The seller appends explicit, secret-free delivery instructions to the agent's task prompt so the
+/// agent delivers by committing its work to the git repository in its working directory — rather
+/// than guessing a delivery channel. The seller performs the authenticated push of the committed
+/// branch to the bound remote (NIP-98; the agent is never handed a key), so this text carries NO
+/// secret — it is public prompt text built only from the task, the deadline, and the (public)
+/// remote URL.
+///
+/// Three shape decisions worth keeping:
+/// - The task stays FIRST. The buyer's instructions must not be pushed down by our own prose.
+/// - `deadline_unix` is stated as an ABSOLUTE epoch second, never as a remaining budget: the prompt
+///   is composed once, before [`run_agent_with_retry`], so a relative figure would be a lie on the
+///   second attempt.
+/// - No `date` invocation is suggested. `date -u -d @…` is GNU-only and sellers run on macOS too.
+///
+/// It carries NO refusal instruction, deliberately (#685). A refusal today either writes nothing —
+/// quarantining the harness — or writes a refusal note that mints a sentinel and gets PAID, so
+/// inviting one before the pre-money seam handles it means paying for refusals. The test below
+/// asserts that ABSENCE, so it cannot be reintroduced by accident.
+pub fn compose_agent_prompt(
+    task: &str,
+    git_remote: &str,
+    deadline_unix: u64,
+    memory_section: Option<&str>,
+) -> String {
     let base = format!(
         "{task}\n\n\
+         ---\n\
+         CONTEXT — from the seller daemon running you, not from the buyer. It applies to how you \
+         carry out the task above.\n\
+         WHO YOU ARE: an autonomous agent working a PAID job on the maxplayer marketplace. A buyer \
+         posted the task above, the seller node running you claimed it on your behalf, and the \
+         buyer settles payment when your work is delivered. Treat it as contracted work.\n\
+         DEADLINE: {deadline_unix} (Unix epoch seconds, UTC). Work that is not on disk by then may \
+         never be delivered, so finish and leave your work in place rather than running long.\n\
+         BOUNDARIES:\n\
+         - Your current working directory is the job directory and the whole of your scope. Work \
+         only inside it.\n\
+         - Deliver only what the task asks for; do not add unrequested files.\n\
+         - Never read, write, or reveal credentials, tokens, key material, or any file outside \
+         this directory — not in your deliverable, and not in anything you print.\n\
          ---\n\
          DELIVERY (required). Your deliverable is the FINAL STATE OF YOUR CURRENT WORKING \
          DIRECTORY:\n\
@@ -577,7 +619,7 @@ mod tests {
     #[test]
     fn composed_prompt_carries_task_and_owned_delivery_instructions() {
         let remote = "https://relay.example/git/abc.git";
-        let prompt = compose_agent_prompt("build a widget", remote, None);
+        let prompt = compose_agent_prompt("build a widget", remote, 1_800_000_123, None);
         // The original task stays up front.
         assert!(prompt.starts_with("build a widget"), "task preserved: {prompt}");
         // Explicit, seller-owned delivery instructions are appended.
@@ -611,6 +653,84 @@ mod tests {
         assert!(!prompt.contains("nsec"), "no nostr secret key");
         assert!(!lower.contains("private key"), "no private key");
         assert!(!lower.contains("secret"), "no secret material");
+    }
+
+    // #685: the preamble must carry THIS JOB'S OWN VALUES, not fixed prose. Two different jobs are
+    // composed and each is checked for its own values AND for the absence of the other's — a
+    // hardcoded constant cannot satisfy both halves, which is what makes this a value check rather
+    // than a prose check.
+    #[test]
+    fn preamble_carries_this_jobs_own_values_and_never_invites_refusal() {
+        let remote_a = "https://relay.example/git/aaa.git";
+        let remote_b = "https://relay.example/git/bbb.git";
+        let a = compose_agent_prompt("task A", remote_a, 1_800_000_123, None);
+        let b = compose_agent_prompt("task B", remote_b, 1_900_000_456, None);
+
+        // Identity, deadline and boundaries are present at all — the three things #685 adds.
+        for prompt in [&a, &b] {
+            assert!(
+                prompt.contains("maxplayer marketplace"),
+                "identity present: {prompt}"
+            );
+            assert!(prompt.contains("DEADLINE:"), "deadline stated: {prompt}");
+            assert!(prompt.contains("BOUNDARIES:"), "boundaries stated: {prompt}");
+            // The preamble's sentences span `\`-continuations in the source, and each one swallows
+            // the newline AND the next line's indentation. Both failure modes are silent, and they
+            // need different instruments:
+            //
+            // - a DOUBLED space is caught totally, at every seam that exists or is ever added,
+            //   because our composed text contains no legitimate double space. This test's task
+            //   strings have none either, so any hit came from the seams.
+            // - a LOST space concatenates two words, which no general rule sees — so the joined
+            //   phrases are named, one per seam I introduced.
+            //
+            // Without these, a rewrap ships as mangled prose that only the hired agent ever reads.
+            assert!(
+                !prompt.contains("  "),
+                "no doubled space at any source-wrap seam: {prompt}"
+            );
+            for joined in [
+                "It applies to how you carry out the task above",
+                "A buyer posted the task above",
+                "and the buyer settles payment when your work is delivered",
+                "may never be delivered",
+                "Work only inside it",
+                "or any file outside this directory",
+            ] {
+                assert!(
+                    prompt.contains(joined),
+                    "preamble joins cleanly across a source wrap ({joined:?}): {prompt}"
+                );
+            }
+        }
+
+        // Each job's own task, deadline epoch and bound remote appear; the other job's do not.
+        assert!(a.contains("task A") && a.contains("aaa.git"), "job A values: {a}");
+        assert!(b.contains("task B") && b.contains("bbb.git"), "job B values: {b}");
+        assert!(a.contains("1800000123"), "job A's exact deadline epoch: {a}");
+        assert!(b.contains("1900000456"), "job B's exact deadline epoch: {b}");
+        assert!(!a.contains("1900000456"), "not the other job's deadline: {a}");
+        assert!(!a.contains("bbb.git"), "not the other job's remote: {a}");
+
+        // The deadline VALUE reaches the text: hold every other input fixed and only it varies.
+        let early = compose_agent_prompt("t", "r", 1_000_000_001, None);
+        let late = compose_agent_prompt("t", "r", 1_000_000_002, None);
+        assert_ne!(
+            early, late,
+            "the deadline argument must reach the prompt, not be dropped"
+        );
+
+        // ⛔ #685 excludes a refusal instruction: today a refusal either quarantines the harness or
+        // mints a sentinel and gets PAID, so inviting one before the pre-money seam handles it
+        // means paying for refusals. Asserted, not merely omitted — an omission leaves no trace
+        // and the next hand re-adds it.
+        let lower = a.to_lowercase();
+        for banned in ["refuse", "decline", "you may reject", "if you cannot"] {
+            assert!(
+                !lower.contains(banned),
+                "must not invite refusal (found {banned:?}): {a}"
+            );
+        }
     }
 
     #[test]
