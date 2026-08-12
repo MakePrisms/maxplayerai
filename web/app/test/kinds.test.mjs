@@ -13,14 +13,14 @@ const ROOT = fileURLToPath(new URL("..", import.meta.url));
  * Kind 0 is a NIP-01 standard that will not move and reads as an index
  * everywhere, so it is not gated by digits — it is still routed via PROFILE.
  */
-const RENUMBERABLE = [3400, 3401, 3402, 3403, 3404, 3405, 30340, 31990];
+const RENUMBERABLE = [3400, 3401, 3402, 3403, 3404, 3405, 30340];
 
 /**
  * Retired DVM kinds from maxplayer's earlier protocol. The app is a clean cut from
  * that era and does not read it, so a stray digit is always a bug — including
  * in js/kinds.js itself.
  */
-const RETIRED = [5109, 6109, 7000];
+const RETIRED = [5109, 6109, 7000, 31990];
 
 const stripComments = (src) =>
   src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
@@ -43,7 +43,6 @@ test("every kind the app touches is a named constant", () => {
   assert.equal(kinds.FEEDBACK, 3404);
   assert.equal(kinds.AWARD, 3405);
   assert.equal(kinds.HEARTBEAT, 30340);
-  assert.equal(kinds.HANDLER, 31990);
 });
 
 test("no kind literal appears outside js/kinds.js", () => {

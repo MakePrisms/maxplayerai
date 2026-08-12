@@ -3,9 +3,10 @@ import { test } from "node:test";
 
 import {
   DEFAULT_WINDOW, LIVE_WITHIN_SECONDS, WINDOWS,
-  buyerBoard, participantDetail, sellerBoard, withinWindow, windowSeconds,
+  buyerBoard, inProgressJobs, participantActivity, participantDetail, participantNames, racerLastActivity, relatedActivity,
+  sellerBoard, withinWindow, windowSeconds,
 } from "../js/participants.js";
-import { AWARD, CLAIM, FEEDBACK, HANDLER, HEARTBEAT, OFFER, PROFILE, RECEIPT, RESULT } from "../js/kinds.js";
+import { ACCEPT, AWARD, CLAIM, FEEDBACK, HEARTBEAT, OFFER, PROFILE, RECEIPT, RESULT } from "../js/kinds.js";
 
 
 /** Fixtures use readable labels; the wire uses 32 bytes of hex. Map one to the other. */
@@ -44,6 +45,21 @@ test("a window filters events, and all-time filters nothing", () => {
   assert.deepEqual(withinWindow(events, "24h", NOW).map((e) => e.id), [H("recent")]);
   assert.deepEqual(withinWindow(events, "week", NOW).map((e) => e.id), [H("recent")]);
   assert.equal(withinWindow(events, "all", NOW).length, 2);
+});
+
+test("racer activity is buyer-authored and independent of the selected board window", () => {
+  const recent = pk("1"), old = pk("2"), runner = pk("3");
+  const events = [
+    ev(OFFER, { id: "recent-offer", pubkey: recent, at: NOW - 3600 }),
+    ev(ACCEPT, { id: "recent-accept", pubkey: recent, at: NOW - 120, tags: [root("recent-offer")] }),
+    ev(OFFER, { id: "old-offer", pubkey: old, at: NOW - 86400 * 2 }),
+    ev(RESULT, { id: "runner-result", pubkey: runner, at: NOW - 10, tags: [root("recent-offer")] }),
+  ];
+
+  const latest = racerLastActivity(events);
+  assert.equal(latest.get(recent), NOW - 120, "the latest buyer-side action wins");
+  assert.equal(latest.get(old), NOW - 86400 * 2, "older activity remains available for a gray lamp");
+  assert.equal(latest.has(runner), false, "runner-authored delivery is not racer activity");
 });
 
 test("buyers rank by sats paid and carry their posting history", () => {
@@ -138,29 +154,36 @@ test("sellers rank by track record, and being online does not lift them", () => 
   assert.equal(board[3].online, true, "online, and still last — it is not a ranking signal");
 });
 
-test("a capability advert attaches to its seller", () => {
+test("the current heartbeat advertisement attaches every field to its seller", () => {
   const s = pk("9");
   const events = [
     ...trade("o1", { seller: s }),
-    ev(HANDLER, { id: "h1", pubkey: s, at: NOW - 100, tags: [["d", "code"]], content: '{"name":"code review"}' }),
+    ev(HEARTBEAT, { id: "h1", pubkey: s, at: NOW - 100, tags: [
+      ["d", "maxplayer-seller"], ["rate", "77"], ["accepting", "y"], ["queue_depth", "1"],
+      ["accepted_mints", "https://mint"], ["agents", "codex"], ["model", "gpt-future"], ["hardware", "gb10"],
+    ] }),
   ];
   const [row] = sellerBoard(events, NOW);
-  assert.deepEqual(row.capabilities, ["code review"]);
+  assert.equal(row.askSats, 77);
+  assert.equal(row.accepting, "y");
+  assert.equal(row.queueDepth, 1);
+  assert.deepEqual(row.acceptedMints, ["https://mint"]);
+  assert.deepEqual(row.advertisedAgents, ["codex"]);
+  assert.deepEqual(row.advertisementTags.at(-1), { name: "hardware", values: ["gb10"] });
 });
 
-test("the seat name resolves from kind-0, not the 31990 handler (#275)", () => {
+test("the seat name and full profile metadata resolve from kind-0", () => {
   const s = pk("e");
   const events = [
     ...trade("o1", { seller: s }),
-    ev(PROFILE, { id: "p1", pubkey: s, at: NOW - 100, content: '{"name":"frogger"}' }),
-    // A 31990 handler processed AFTER kind-0, carrying a STALE name, must NOT override it —
-    // kind-0 metadata is the single publisher (§6.1 / #275). Handler is last in the array on
-    // purpose: with the old `r.name = p.name || r.name` handler read still present this row
-    // would read "STALE", so this red-proves the removal, not just the kind-0 fall-through.
-    ev(HANDLER, { id: "h1", pubkey: s, at: NOW - 50, tags: [["d", "code"]], content: '{"name":"STALE"}' }),
+    ev(PROFILE, { id: "p1", pubkey: s, at: NOW - 100,
+      content: '{"name":"frogger","website":"https://frogger.example","about":"fast"}' }),
   ];
   const [row] = sellerBoard(events, NOW);
-  assert.equal(row.name, "frogger", "kind-0 name is authoritative; the 31990 name is ignored for display");
+  assert.equal(row.name, "frogger");
+  assert.equal(row.about, "fast");
+  assert.equal(row.profile.website, "https://frogger.example", "details retain every advertised profile field");
+  assert.equal(participantNames(events).get(s), "frogger");
 });
 
 /**
@@ -218,6 +241,40 @@ test("REGRESSION: a heartbeat-only seat is named whichever order kind-0 arrives 
   assert.equal(rowFrom([profile, beat])?.delivered, 0, "still a seat with no deliveries");
 });
 
+test("working state follows the awarded claim and ends at the selected runner's terminal event", () => {
+  const buyer = pk("b"), winner = pk("c"), other = pk("d");
+  const offer = ev(OFFER, { id: "work", pubkey: buyer, at: NOW - 300 });
+  const otherClaim = ev(CLAIM, { id: "other-claim", pubkey: other, at: NOW - 290, tags: [root("work")] });
+  const winningClaim = ev(CLAIM, { id: "winning-claim", pubkey: winner, at: NOW - 280, tags: [root("work")] });
+  const award = ev(AWARD, { id: "work-award", pubkey: buyer, at: NOW - 270, tags: [
+    root("work"), ["e", H("winning-claim")], ["p", buyer], ["p", winner],
+  ] });
+  // Deliberately shuffled: relay order cannot decide who appears to be working.
+  const underway = [award, otherClaim, offer, winningClaim];
+  assert.deepEqual(inProgressJobs(underway), [{
+    offerId: H("work"), awardId: H("work-award"), claimId: H("winning-claim"),
+    buyer, seller: winner, startedAt: NOW - 270,
+  }]);
+  assert.equal(buyerBoard(underway, NOW)[0].inProgressJobs.length, 1);
+  const sellers = Object.fromEntries(sellerBoard(underway, NOW).map((row) => [row.pubkey, row]));
+  assert.equal(sellers[winner].inProgressJobs.length, 1, "the awarded runner is working");
+  assert.equal(sellers[other].inProgressJobs.length, 0, "another claimant is not working");
+
+  const otherResult = ev(RESULT, { id: "other-result", pubkey: other, at: NOW - 260, tags: [root("work")] });
+  assert.equal(inProgressJobs([...underway, otherResult]).length, 1,
+    "a result from a non-selected claimant cannot stop the awarded runner");
+
+  const terminals = [
+    ev(RESULT, { id: "result", pubkey: winner, at: NOW - 250, tags: [root("work")] }),
+    ev(ACCEPT, { id: "accept-working", pubkey: buyer, at: NOW - 240, tags: [root("work")] }),
+    ev(RECEIPT, { id: "receipt-working", pubkey: buyer, at: NOW - 230, tags: [root("work")] }),
+    ev(FEEDBACK, { id: "release-working", pubkey: winner, at: NOW - 220, tags: [root("work")] }),
+  ];
+  for (const terminal of terminals) {
+    assert.deepEqual(inProgressJobs([...underway, terminal]), [], `kind ${terminal.kind} ends working state`);
+  }
+});
+
 test("a participant detail gathers both roles and their trades", () => {
   const who = pk("5");
   const events = [
@@ -229,6 +286,34 @@ test("a participant detail gathers both roles and their trades", () => {
   assert.equal(d.buyer.posted, 1);
   assert.equal(d.seller.delivered, 1);
   assert.equal(d.trades.length, 2, "only trades this participant took part in");
+  assert.ok(d.activity.length > d.trades.length, "activity is individual events, not collapsed trades");
+});
+
+test("participant activity includes profile, heartbeat, and the complete related job history", () => {
+  const buyer = pk("5"), seller = pk("6"), other = pk("7");
+  const events = [
+    ev(PROFILE, { id: "profile", pubkey: seller, at: NOW - 200, content: '{"name":"runner"}' }),
+    ev(HEARTBEAT, { id: "heartbeat", pubkey: seller, at: NOW - 190, tags: [["d", "maxplayer-seller"]] }),
+    ...trade("mine", { buyer, seller, t0: NOW - 180 }),
+    ev(ACCEPT, { id: "accept", pubkey: buyer, at: NOW - 50, tags: [root("mine")] }),
+    ...trade("unrelated", { buyer: other, seller: pk("8"), t0: NOW - 170 }),
+  ];
+  const activity = participantActivity(events, seller);
+  assert.deepEqual(new Set(activity.map((e) => e.kind)),
+    new Set([PROFILE, HEARTBEAT, OFFER, CLAIM, AWARD, RESULT, ACCEPT, RECEIPT]));
+  assert.equal(activity.some((e) => e.offerId === H("unrelated")), false, "unrelated jobs stay out");
+  assert.ok(activity.every((e, i) => i === 0 || activity[i - 1].created_at >= e.created_at), "newest first");
+});
+
+test("related activity returns the complete lifecycle in chronological order", () => {
+  const events = [
+    ...trade("mine", { t0: NOW - 200 }),
+    ev(ACCEPT, { id: "accept", at: NOW - 50, tags: [root("mine")] }),
+    ...trade("other", { t0: NOW - 100 }),
+  ];
+  const related = relatedActivity(events, H("mine"));
+  assert.deepEqual(related.map((e) => e.stage), ["offer", "claim", "award", "result", "receipt", "accept"]);
+  assert.ok(related.every((e, i) => i === 0 || related[i - 1].created_at <= e.created_at), "oldest first");
 });
 
 test("boards are empty, not broken, with no events", () => {

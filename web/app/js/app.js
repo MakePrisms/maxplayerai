@@ -10,9 +10,10 @@ import { createCache } from "./cache.js";
 import { POLL_MS, createRelayClient } from "./relay.js";
 import { parseEvent } from "./model.js";
 import { marketMetrics } from "./trades.js";
-import { KIND_LABELS, TRADE_STAGES } from "./kinds.js";
+import { KIND_LABELS, PROFILE, TRADE_STAGES } from "./kinds.js";
 import {
-  DEFAULT_WINDOW, WINDOWS, buyerBoard, participantDetail, sellerBoard, withinWindow,
+  DEFAULT_WINDOW, WINDOWS, buyerBoard, participantDetail, participantNames,
+  participantProfiles, racerLastActivity, relatedActivity, sellerBoard, withinWindow,
 } from "./participants.js";
 
 const el = (id) => document.getElementById(id);
@@ -20,9 +21,23 @@ const cache = createCache();
 const nf = new Intl.NumberFormat("en-US");
 let windowKey = DEFAULT_WINDOW;
 
+// Filter only the job lifecycle, in the order a successful trade occurs.
+// Participant-level profile/heartbeat events and feedback remain visible under
+// All, but do not compete with the primary workflow as standalone filters.
+const ACTIVITY_FILTER_ORDER = Object.freeze([
+  "offer", "claim", "award", "result", "accept", "receipt",
+]);
+const RACER_ACTIVE_SECONDS = 86400;
+const RACE_LIGHT_CYCLE_SECONDS = 1;
+
 const short = (pk) => pk.slice(0, 8);
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const now = () => Math.floor(Date.now() / 1000);
+const nameOf = (names, pubkey) => names.get(pubkey) || null;
+const identity = (names, pubkey) => {
+  const name = nameOf(names, pubkey);
+  return name ? `<span class="person">${esc(name)}</span>` : `<code>${short(pubkey)}</code>`;
+};
 
 function ago(ts, t = now()) {
   const s = Math.max(0, t - ts);
@@ -101,51 +116,85 @@ function emptyText(what) {
     : `No ${what} in this period.`;
 }
 
+/**
+ * Pit-lane status: a steady lamp for availability, race light for work.
+ *
+ * The three-second market redraw replaces row markup. A normal CSS animation
+ * would therefore restart at zero every time. Anchor its negative delay to the
+ * award clock instead: each replacement enters at the phase the uninterrupted
+ * animation would already have reached.
+ */
+function statusDot(on, jobs = [], context = null) {
+  const count = jobs.length;
+  const idle = context || (on ? "Available now" : "Not currently online");
+  const label = count
+    ? `Working · ${count} job${count === 1 ? "" : "s"} · ${idle}`
+    : idle;
+  let phase = "";
+  if (count) {
+    const startedAt = Math.min(...jobs.map((job) => job.startedAt).filter(Number.isFinite));
+    const elapsed = Math.max(0, Date.now() / 1000 - startedAt);
+    phase = ` style="--race-light-delay:-${(elapsed % RACE_LIGHT_CYCLE_SECONDS).toFixed(3)}s"`;
+  }
+  return `<span class="dot ${on ? "on" : ""} ${count ? "working" : ""}"${phase} role="img" aria-label="${esc(label)}" title="${esc(label)}"></span>`;
+}
+
 /* ---------------- columns ---------------- */
 
-function renderBuyers(events) {
-  const rows = buyerBoard(events, now());
+function renderBuyers(events, names, allEvents = events) {
+  const t = now();
+  const rows = buyerBoard(events, t, allEvents);
+  const lastActivity = racerLastActivity(allEvents);
   el("buyers-meta").textContent = rows.length ? `${rows.length} active` : "";
   el("buyers").innerHTML = rows.length
-    ? rows.map((r) => `
+    ? rows.map((r) => {
+      const lastAt = lastActivity.get(r.pubkey) || 0;
+      const active = lastAt > 0 && t - lastAt <= RACER_ACTIVE_SECONDS;
+      const context = active
+        ? `Active in last 24 hours · last activity ${ago(lastAt, t)} ago`
+        : (lastAt
+            ? `No activity in last 24 hours · last activity ${ago(lastAt, t)} ago`
+            : "No activity in last 24 hours");
+      return `
       <li class="row buyers-grid" data-open="buyer" data-pk="${r.pubkey}" tabindex="0">
         <span class="agent">
-          <span class="nm">${r.name ? esc(r.name) : `<code>${short(r.pubkey)}</code>`}</span>
+          ${statusDot(active, r.inProgressJobs, context)}
+          <span class="nm">${nameOf(names, r.pubkey) ? esc(nameOf(names, r.pubkey)) : `<code>${short(r.pubkey)}</code>`}</span>
         </span>
         <span class="num">${nf.format(r.posted)}</span>
         <span class="num ${r.receipted ? "" : "dim"}">${nf.format(r.receipted)}</span>
         <span class="num sats">${usd(r.satsPaid)}</span>
-      </li>`).join("")
+      </li>`;
+    }).join("")
     : `<li class="empty">${emptyText("racers")}</li>`;
 }
 
-function renderSellers(events) {
-  const rows = sellerBoard(events, now());
+function renderSellers(events, names, allEvents = events) {
+  const rows = sellerBoard(events, now(), allEvents);
   const online = rows.filter((r) => r.online).length;
   el("sellers-meta").textContent = rows.length ? `${online} online · ${rows.length} seen` : "";
   el("sellers").innerHTML = rows.length
     ? rows.map((r) => `
       <li class="row sellers-grid" data-open="seller" data-pk="${r.pubkey}" tabindex="0">
         <span class="agent">
-          <span class="dot ${r.online ? "on" : ""}" title="${r.online ? "online now" : "not currently online"}"></span>
-          <span class="nm">${r.name ? esc(r.name) : `<code>${short(r.pubkey)}</code>`}</span>
+          ${statusDot(r.online, r.inProgressJobs)}
+          <span class="nm">${nameOf(names, r.pubkey) ? esc(nameOf(names, r.pubkey)) : `<code>${short(r.pubkey)}</code>`}</span>
           ${r.harness ? `<span class="harness" title="${esc(r.harness)}">${esc(shortHarness(r.harness))}</span>` : ""}
-          ${r.askSats != null ? `<span class="ask" title="Ask — the rate this runner advertises">${usd(r.askSats)}</span>` : ""}
         </span>
         <span class="num">${nf.format(r.delivered)}</span>
-        <span class="num ${r.completionRate != null && r.completionRate < 0.5 ? "dim" : ""}">${pct(r.completionRate)}</span>
+        <span class="num ${r.askSats == null ? "dim" : ""}" title="Minimum price advertised by this runner">${r.askSats == null ? "—" : usd(r.askSats)}</span>
         <span class="num sats">${usd(r.satsEarned)}</span>
       </li>`).join("")
     : `<li class="empty">${emptyText("runners")}</li>`;
 }
 
 /** One line of plain English per event kind — the feed reads, not decodes. */
-function feedLine(e) {
-  const who = `<code>${short(e.pubkey)}</code>`;
+function feedLine(e, names) {
+  const who = identity(names, e.pubkey);
   switch (e.stage) {
     // The job itself is the most interesting thing on the board — it shows a
     // visitor what this market is actually for. Price after it, not before.
-    case "offer": return `${e.selfTrade ? '<span class="self" title="The racer operates the runner being paid — real work, but not market demand">self</span> ' : ""}${e.description ? esc(e.description) : "posted a job"}${e.amount != null ? ` · <span class="sats">${usd(e.amount)}</span>` : ""}`;
+    case "offer": return `${who} · ${e.selfTrade ? '<span class="self" title="The racer operates the runner being paid — real work, but not market demand">self</span> ' : ""}${e.description ? esc(e.description) : "posted a job"}${e.amount != null ? ` · <span class="sats">${usd(e.amount)}</span>` : ""}`;
     case "claim": return `${who} claimed a job`;
     case "award": return `${who} awarded a claim`;
     // No harness tag here — the activity stream reads as a sentence, and the
@@ -155,22 +204,25 @@ function feedLine(e) {
     // above "paid" in the feed, where a sentence about authorising payment
     // reads as the settlement itself rather than the step before it.
     case "accept": return `${who} accepted the delivery`;
-    case "receipt": return `paid${e.amount != null ? ` · <span class="sats">${usd(e.amount)}</span>` : ""} · receipt co-signed`;
+    case "receipt": return `${who} paid${e.amount != null ? ` · <span class="sats">${usd(e.amount)}</span>` : ""}`;
     case "feedback": return `${who} · ${esc(e.reason || "feedback")}`;
     default: return who;
   }
 }
 
-function renderFeed(events) {
+function renderFeed(events, names) {
   const t = now();
-  const rows = events.map(parseEvent).filter((e) => e && TRADE_STAGES[e.kind])
-    .sort((a, b) => b.created_at - a.created_at).slice(0, 60);
-  el("feed-meta").textContent = rows.length ? `${nf.format(rows.length)} shown` : "";
+  const activity = events.map(parseEvent).filter((e) => e && TRADE_STAGES[e.kind])
+    .sort((a, b) => b.created_at - a.created_at);
+  const rows = activity.slice(0, 60);
+  el("feed-meta").textContent = rows.length
+    ? `${nf.format(rows.length)} shown · ${nf.format(activity.length)} total`
+    : "";
   el("feed").innerHTML = rows.length
     ? rows.map((e) => `
       <li class="row" data-open="event" data-id="${e.id}" tabindex="0">
         <span class="tag" data-s="${e.stage}">${KIND_LABELS[e.kind]}</span>
-        <span class="line">${feedLine(e)}</span>
+        <span class="line">${feedLine(e, names)}</span>
         <span class="when">${ago(e.created_at, t)}</span>
       </li>`).join("")
     : `<li class="empty">${emptyText("activity")}</li>`;
@@ -215,28 +267,104 @@ function renderStats(events) {
 const statBlock = (pairs) =>
   `<dl class="stats-in">${pairs.map(([k, v, cls]) => `<div><dt>${k}</dt><dd class="${cls || ""}">${v}</dd></div>`).join("")}</dl>`;
 
-function tradeList(trades, t) {
-  if (!trades.length) return '<p class="tiny">No trades in this period.</p>';
-  return `<ul class="trades">${trades.slice(0, 12).map((tr) => {
-    const stage = tr.at.receipt ? "paid" : tr.at.result ? "delivered" : tr.at.award ? "awarded" : tr.at.claim ? "claimed" : "posted";
-    const when = tr.at.receipt ?? tr.at.result ?? tr.at.award ?? tr.at.claim ?? tr.at.offer;
-    return `<li><code>${short(tr.offerId)}</code>
-      <span class="num ${tr.receiptAmount ? "sats" : "dim"}">${tr.receiptAmount ? usd(tr.receiptAmount) : stage}</span>
-      <span class="when">${ago(when, t)}</span></li>`;
+const fieldLabel = (name) => ({
+  d: "Seat", t: "Namespace", v: "Protocol version", rate: "Rate (sats)",
+  accepting: "Accepting work", queue_depth: "Queue depth",
+  accepted_mints: "Accepted mints", agents: "Agents",
+  model: "Model", models: "Models", hardware: "Hardware",
+}[name] || String(name).replaceAll("_", " ").replace(/\b\w/g, (c) => c.toUpperCase()));
+
+function valueText(value) {
+  if (value == null || value === "") return "—";
+  if (typeof value === "object") {
+    try { return JSON.stringify(value); } catch { return String(value); }
+  }
+  return String(value);
+}
+
+const kvBlock = (pairs, cls = "") => `<dl class="kv ${cls}">${pairs.map(([k, v]) =>
+  `<div><dt>${esc(k)}</dt><dd>${esc(valueText(v))}</dd></div>`).join("")}</dl>`;
+
+function advertisedRows(seller) {
+  const rows = (seller?.advertisementTags || []).map(({ name, values }) =>
+    [fieldLabel(name), values.length ? values.join(" · ") : "—"]);
+  if (seller?.advertisementContent && typeof seller.advertisementContent === "object") {
+    for (const [key, value] of Object.entries(seller.advertisementContent)) {
+      rows.push([`Content · ${fieldLabel(key)}`, valueText(value)]);
+    }
+  }
+  return rows;
+}
+
+function profileRows(profile) {
+  return Object.entries(profile || {})
+    .filter(([, value]) => value != null && value !== "")
+    .map(([key, value]) => [fieldLabel(key), valueText(value)]);
+}
+
+function activityLine(e, names) {
+  const who = identity(names, e.pubkey);
+  if (e.stage === "offer") {
+    return `${who} posted${e.description ? ` · ${esc(e.description)}` : " a job"}${e.amount != null ? ` · <span class="sats">${usd(e.amount)}</span>` : ""}`;
+  }
+  if (e.stage) return feedLine(e, names);
+  if (e.kind === PROFILE) return `${who} updated their profile`;
+  return `${who} updated runner availability`;
+}
+
+function activityList(events, t, names, currentId = null) {
+  if (!events.length) return '<p class="tiny">No activity in this period.</p>';
+  return `<ul class="detail-activity">${events.map((e) => {
+    const type = KIND_LABELS[e.kind] || "event";
+    return `<li class="activity-row ${e.id === currentId ? "current" : ""}" data-open="event" data-id="${e.id}" data-activity-type="${esc(type)}" tabindex="0">
+      <span class="tag" data-s="${e.stage || type}">${esc(type)}</span>
+      <span class="line">${activityLine(e, names)}</span>
+      <span class="when">${ago(e.created_at, t)}</span>
+    </li>`;
   }).join("")}</ul>`;
 }
 
-function openParticipant(role, pubkey, events) {
+function filteredActivity(activity, t, names) {
+  const recent = activity.slice(0, 120);
+  const availableTypes = new Set(recent.map((e) => KIND_LABELS[e.kind] || "event"));
+  const types = ACTIVITY_FILTER_ORDER.filter((type) => availableTypes.has(type));
+  return `<div class="activity-tools">
+      <span class="activity-label">Activity type</span>
+      <span class="activity-count">${nf.format(recent.length)} shown · ${nf.format(activity.length)} total</span>
+      <div class="activity-filters windows" role="group" aria-label="Filter activity by type">
+        <button type="button" data-activity-filter="all" aria-pressed="true">All</button>${types
+          .map((type) => `<button type="button" data-activity-filter="${esc(type)}" aria-pressed="false">${esc(type)}</button>`).join("")}
+      </div>
+    </div>${activityList(recent, t, names)}`;
+}
+
+function openParticipant(role, pubkey, events, allEvents) {
   const t = now();
-  const d = participantDetail(events, pubkey, t);
+  const d = participantDetail(events, pubkey, t, allEvents);
+  const names = participantNames(allEvents);
+  const profiles = participantProfiles(allEvents);
   const b = d.buyer;
   const s = d.seller;
   // Both rows carry the same kind-0 name; take whichever role this participant
   // has, so a buyer who never sold is still named rather than shown as a hex stub.
-  const name = s?.name ?? b?.name ?? null;
+  const name = nameOf(names, pubkey);
   const title = name ? esc(name) : short(pubkey);
   const parts = [`<h3>${role === "seller" ? "Runner" : "Racer"} ${title}</h3>
-    <p class="sub">${pubkey}</p>`];
+    ${kvBlock([["Public key", pubkey]], "identity-kv")}`];
+
+  const activeJobs = [...new Map([
+    ...(b?.inProgressJobs || []), ...(s?.inProgressJobs || []),
+  ].map((job) => [job.offerId, job])).values()];
+  if (activeJobs.length) {
+    parts.push(`<h4>In progress · ${nf.format(activeJobs.length)} job${activeJobs.length === 1 ? "" : "s"}</h4>
+      <div class="chips active-jobs">${activeJobs.map((job) =>
+        `<button type="button" class="chip working-chip" data-open="event" data-id="${job.awardId}" title="Open job history">IN PROGRESS · ${short(job.offerId)}</button>`,
+      ).join("")}</div>`);
+  }
+
+  const profile = profiles.get(pubkey)?.metadata;
+  const metadata = profileRows(profile);
+  if (metadata.length) parts.push(`<h4>Profile advertises</h4>${kvBlock(metadata, "advertisement")}`);
 
   if (s) {
     parts.push(`<h4>As a runner${s.online ? " · online now" : ""}</h4>`);
@@ -246,38 +374,17 @@ function openParticipant(role, pubkey, events) {
       ["Completion", pct(s.completionRate)],
       ["Earned (USD)", usd(s.satsEarned), "sats"],
       ["Median deliver", duration(s.medianDeliverSeconds)],
-      ["Released", nf.format(s.released)],
     ]));
     if (s.harnesses.length) {
-      parts.push(`<h4>Runs on</h4><div class="chips">${s.harnesses
+      parts.push(`<h4>Observed delivery harnesses</h4><div class="chips">${s.harnesses
         .map((h) => `<span class="chip">${esc(h.name)} · ${nf.format(h.deliveries)}</span>`).join("")}</div>`);
     }
-    if (s.name || s.about || s.askSats != null) {
-      // What the seller says about itself, kept visibly separate from what it
-      // has actually done — an advert is a claim, and only the trades above
-      // are evidence.
-      // Only the structured fields — a seller's free-text `about` is often stale
-      // against its own numbers, and printing both publishes a contradiction.
-      //
-      // The advertised MINT is deliberately NOT shown. maxplayer #209: the mint in
-      // the announce is hardcoded "testnut" on stock builds and never reads
-      // config, so sellers settling in real bitcoin advertise a test mint. A
-      // reader seeing "testnut" would conclude no real money is involved, which
-      // is both false and the most costly way to be wrong. Better to show
-      // nothing than a money field known to be lying. Restore when #209 ships.
-      // "Advertises" is itself the disclosure — an advert is what someone says
-      // about themselves, and the trades above are the evidence. The prose that
-      // spelled this out is gone at the design owner's instruction; the fact it
-      // stated is recorded in the lane anchor.
-      parts.push('<h4>Advertises</h4>');
-      parts.push(`<p class="tiny">${[
-        s.askSats != null ? `asks <b>${usd(s.askSats)}</b> per job` : "",
-        s.openPool ? "takes open-pool work" : "direct offers only",
-      ].filter(Boolean).join(" · ")}</p>`);
-      // Advertised terms are self-reported and nothing checks them against what
-      // the seller actually does — observed diverging for weeks in practice.
-      // The trades above are the only evidence on this page.
-    }
+    const latestSeller = sellerBoard(allEvents, t).find((row) => row.pubkey === pubkey) || s;
+    const advertised = advertisedRows(latestSeller);
+    parts.push(`<h4>Latest runner advertisement${latestSeller.advertisedAt ? ` · ${ago(latestSeller.advertisedAt, t)} ago` : ""}</h4>`);
+    parts.push(advertised.length
+      ? kvBlock(advertised, "advertisement")
+      : '<p class="tiny">No current runner advertisement was found in this period.</p>');
   }
   if (b) {
     parts.push(`<h4>As a racer</h4>`);
@@ -287,25 +394,29 @@ function openParticipant(role, pubkey, events) {
       ["Receipts", nf.format(b.receipted)],
       ["Paid (USD)", usd(b.satsPaid), "sats"],
       ["Median price", b.medianPrice == null ? "—" : usd(b.medianPrice)],
-      ["Awaiting receipt", nf.format(b.unpaidDeliveries)],
     ]));
-    if (b.unpaidDeliveries) {
-      parts.push(`<p class="tiny">${b.unpaidDeliveries} delivered ${b.unpaidDeliveries === 1 ? "job has" : "jobs have"} no published receipt.
-        That is not evidence of non-payment — a trade can settle without publishing one — it only means the public record does not show it.</p>`);
-    }
   }
-  parts.push(`<h4>Recent trades</h4>${tradeList(d.trades, t)}`);
+  parts.push(`<h4>Recent activity</h4>${filteredActivity(d.activity, t, names)}`);
   showSheet(parts.join(""));
 }
 
 function openEvent(id) {
-  const raw = cache.all().find((e) => e.id === id);
+  const allEvents = cache.all();
+  const raw = allEvents.find((e) => e.id === id);
   if (!raw) return showSheet("<h3>Event not found</h3><p class=\"sub\">It may have scrolled out of the current window.</p>");
   const e = parseEvent(raw);
+  const names = participantNames(allEvents);
+  const authorName = nameOf(names, raw.pubkey) || short(raw.pubkey);
+  const sellerStages = new Set(["claim", "result", "feedback"]);
+  const participant = participantDetail(allEvents, raw.pubkey, now());
+  const authorRole = sellerStages.has(e?.stage) || e?.advertisementTags?.length || (!e?.stage && participant.seller)
+    ? "seller"
+    : "buyer";
   const rows = [
     ["Kind", `${KIND_LABELS[raw.kind] || "?"} (${raw.kind})`],
     ["Published", stamp(raw.created_at)],
-    ["Author", raw.pubkey],
+    ["Author", authorName],
+    ["Author public key", raw.pubkey],
     ["Event id", raw.id],
   ];
   if (e?.offerId) rows.push(["Job", e.offerId]);
@@ -313,21 +424,31 @@ function openEvent(id) {
   if (e?.outputType) rows.push(["Deliverable", e.outputType]);
   if (e?.deadline) rows.push(["Deadline", stamp(e.deadline)]);
   if (e?.harness) rows.push(["Harness", e.harness]);
+  if (e?.model) rows.push(["Model", e.model]);
+  if (e?.agents?.length) rows.push(["Agents", e.agents.join(" · ")]);
   if (e?.deliveryVia) rows.push(["Delivered via", e.deliveryVia]);
   if (e?.wallTimeSeconds != null) rows.push(["Took", duration(Math.round(e.wallTimeSeconds))]);
   if (e?.commit) rows.push(["Commit", e.commit]);
   if (e?.reason) rows.push(["Reason", e.reason]);
   if (e?.status) rows.push(["Status", e.status]);
-  if (e?.targetSeller) rows.push(["Offered to", e.targetSeller]);
+  if (e?.targetSeller) rows.push(["Offered to", nameOf(names, e.targetSeller) || short(e.targetSeller)]);
   if (e?.hasPaymentRequest) rows.push(["Payment request", "attached"]);
 
   const body = String(raw.content || "").trim();
-  showSheet(`<h3>${KIND_LABELS[raw.kind] || "Event"}</h3>
-    <p class="sub">${raw.id}</p>
+  const history = relatedActivity(allEvents, e?.offerId);
+  const eventAdvert = e?.advertisementTags?.length
+    ? `<h4>Advertisement</h4>${kvBlock(e.advertisementTags.map(({ name, values }) => [fieldLabel(name), values.join(" · ") || "—"]), "advertisement")}`
+    : "";
+  const eventProfile = e?.profile ? profileRows(e.profile) : [];
+  showSheet(`<h3>${KIND_LABELS[raw.kind] || "Event"} · <button type="button" class="detail-person" data-open="${authorRole}" data-pk="${esc(raw.pubkey)}" aria-label="Open ${esc(authorName)} user details">${esc(authorName)}</button></h3>
+    <p class="sub">Public event details</p>
     ${e?.selfTrade ? '<p class="selfnote"><b>Self-commissioned.</b> The racer operates the runner being paid. Real work, but not market demand — excluded from the figures on this page.</p>' : ""}
     ${e?.description ? `<h4>The job</h4><p class="job">${esc(e.description)}</p>` : ""}
-    <dl class="kv">${rows.map(([k, v]) => `<div><dt>${k}</dt><dd>${esc(v)}</dd></div>`).join("")}</dl>
-    ${body ? `<h4>Content</h4><p class="tiny"><code>${esc(body.slice(0, 600))}</code></p>` : ""}`);
+    ${kvBlock(rows)}
+    ${eventAdvert}
+    ${eventProfile.length ? `<h4>Profile advertisement</h4>${kvBlock(eventProfile, "advertisement")}` : ""}
+    ${body ? `<h4>Content</h4><p class="tiny"><code>${esc(body.slice(0, 600))}</code></p>` : ""}
+    ${history.length ? `<h4>Related job history</h4>${activityList(history, now(), names, raw.id)}` : ""}`);
 }
 
 function showSheet(html) {
@@ -357,11 +478,13 @@ function render() {
   if (pending) return;
   pending = requestAnimationFrame(() => {
     pending = 0;
-    const events = withinWindow(cache.all(), windowKey, now());
+    const allEvents = cache.all();
+    const events = withinWindow(allEvents, windowKey, now());
+    const names = participantNames(allEvents);
     keepScroll(() => {
-      renderBuyers(events);
-      renderSellers(events);
-      renderFeed(events);
+      renderBuyers(events, names, allEvents);
+      renderSellers(events, names, allEvents);
+      renderFeed(events, names);
       renderStats(events);
     });
   });
@@ -406,11 +529,23 @@ el("windows").addEventListener("click", (ev) => {
 });
 
 document.addEventListener("click", (ev) => {
+  const filter = ev.target.closest("[data-activity-filter]");
+  if (filter) {
+    const selected = filter.dataset.activityFilter;
+    for (const button of el("detail-body").querySelectorAll("[data-activity-filter]")) {
+      button.setAttribute("aria-pressed", button === filter ? "true" : "false");
+    }
+    for (const row of el("detail-body").querySelectorAll("[data-activity-type]")) {
+      row.hidden = selected !== "all" && row.dataset.activityType !== selected;
+    }
+    return;
+  }
   const row = ev.target.closest("[data-open]");
   if (!row) return;
-  const events = withinWindow(cache.all(), windowKey, now());
+  const allEvents = cache.all();
+  const events = withinWindow(allEvents, windowKey, now());
   if (row.dataset.open === "event") openEvent(row.dataset.id);
-  else openParticipant(row.dataset.open, row.dataset.pk, events);
+  else openParticipant(row.dataset.open, row.dataset.pk, events, allEvents);
 });
 document.addEventListener("keydown", (ev) => {
   if (ev.key === "Escape") closeSheet();
