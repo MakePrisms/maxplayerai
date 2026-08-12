@@ -753,4 +753,42 @@ timeout_secs = 1200
             "the buyer rejection enum emits only the protocol vocabulary"
         );
     }
+
+    // THIS repository's own declaration, parsed by the real parser. Presence is fail-closed at
+    // runtime — a malformed declaration refuses the job with `ENV_UNPROVISIONABLE` — so shipping
+    // one that nothing has ever parsed would hand every contributor an execution failure. A
+    // declaration no test reads is a claim.
+    #[test]
+    fn this_repos_own_declaration_parses_and_stays_hermetic() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../", ".maxplayer/checks.toml");
+        let bytes = std::fs::read(path).expect("this repo ships .maxplayer/checks.toml");
+        let declaration = parse_declaration(&bytes)
+            .expect("our own declaration must parse")
+            .expect("our own declaration must not be empty");
+
+        assert_eq!(declaration.env_kind, EnvKind::NixFlake);
+        assert_eq!(
+            declaration.flake_path, ".",
+            "the flake this repo declares is the one at its root"
+        );
+        assert!(!declaration.commands.is_empty());
+
+        // §9.1: every declared command runs with NO network. The workspace-wide form is the trap —
+        // the `maxplayer` crate sets `default = ["wallet"]`, so feature unification hands
+        // `maxplayer-core` the wallet feature and pulls four tests that contact live third-party
+        // mints (mint.minibits.cash ×2, testnut.cashu.space ×2). Measured: under an empty network
+        // namespace, workspace `cargo test --locked` exits 101 with those four failing — it would
+        // refuse every honest contribution, deterministically.
+        //
+        // This assertion exists so the declaration cannot be "simplified" back to the
+        // whole-workspace form by someone who has not run it without a network.
+        for argv in &declaration.commands {
+            let is_test = argv.get(1).map(String::as_str) == Some("test");
+            let scoped = argv.iter().any(|part| part == "-p");
+            assert!(
+                !is_test || scoped,
+                "a declared test command must be -p scoped, never workspace-wide: {argv:?}"
+            );
+        }
+    }
 }
