@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import {
   DEFAULT_WINDOW, LIVE_WITHIN_SECONDS, WINDOWS,
+  JOB_OVERDUE, JOB_WORKING, STALLED_GRACE_SECONDS,
   buyerBoard, inProgressJobs, participantActivity, participantDetail, participantNames, racerLastActivity, relatedActivity,
   sellerBoard, withinWindow, windowSeconds,
 } from "../js/participants.js";
@@ -251,9 +252,11 @@ test("working state follows the awarded claim and ends at the selected runner's 
   ] });
   // Deliberately shuffled: relay order cannot decide who appears to be working.
   const underway = [award, otherClaim, offer, winningClaim];
-  assert.deepEqual(inProgressJobs(underway), [{
+  assert.deepEqual(inProgressJobs(underway, NOW), [{
     offerId: H("work"), awardId: H("work-award"), claimId: H("winning-claim"),
     buyer, seller: winner, startedAt: NOW - 270,
+    // This offer carries no deadline, so there is nothing to be late against.
+    deadline: null, state: JOB_WORKING,
   }]);
   assert.equal(buyerBoard(underway, NOW)[0].inProgressJobs.length, 1);
   const sellers = Object.fromEntries(sellerBoard(underway, NOW).map((row) => [row.pubkey, row]));
@@ -261,7 +264,7 @@ test("working state follows the awarded claim and ends at the selected runner's 
   assert.equal(sellers[other].inProgressJobs.length, 0, "another claimant is not working");
 
   const otherResult = ev(RESULT, { id: "other-result", pubkey: other, at: NOW - 260, tags: [root("work")] });
-  assert.equal(inProgressJobs([...underway, otherResult]).length, 1,
+  assert.equal(inProgressJobs([...underway, otherResult], NOW).length, 1,
     "a result from a non-selected claimant cannot stop the awarded runner");
 
   const terminals = [
@@ -271,7 +274,119 @@ test("working state follows the awarded claim and ends at the selected runner's 
     ev(FEEDBACK, { id: "release-working", pubkey: winner, at: NOW - 220, tags: [root("work")] }),
   ];
   for (const terminal of terminals) {
-    assert.deepEqual(inProgressJobs([...underway, terminal]), [], `kind ${terminal.kind} ends working state`);
+    assert.deepEqual(inProgressJobs([...underway, terminal], NOW), [], `kind ${terminal.kind} ends working state`);
+  }
+});
+
+/**
+ * #681. `inProgressJobs` used to take no clock, so the only exit from "working"
+ * was a terminal event authored by the awarded seller. A seller that published
+ * nothing produced no exit condition and stayed "working" for as long as the
+ * award was in the window — which on a live board is indefinitely. The
+ * Sage/Ember canary sat that way on production after the buyer had already
+ * released its reservation privately, so a seat that delivered nothing rendered
+ * as maximally busy.
+ *
+ * Overdue is DERIVED presentation state, not relay truth: no event says a job
+ * stalled — that is #682. This is the site reading an absence, which is exactly
+ * why the threshold is one exported constant and why every boundary below is
+ * asserted against it rather than against a number spelled here.
+ */
+const DUE = NOW - 1000;
+const lateJob = (extra = []) => [
+  ev(OFFER, { id: "late", pubkey: pk("b"), at: DUE - 600, tags: [["param", "deadline", String(DUE)]] }),
+  ev(CLAIM, { id: "late-claim", pubkey: pk("c"), at: DUE - 500, tags: [root("late")] }),
+  ev(AWARD, { id: "late-award", pubkey: pk("b"), at: DUE - 400, tags: [
+    root("late"), ["e", H("late-claim")], ["p", pk("b")], ["p", pk("c")],
+  ] }),
+  ...extra,
+];
+const stateAt = (events, at) => inProgressJobs(events, at).map((job) => job.state);
+
+test("#681 case 1: delivery before the deadline finishes the job and never goes overdue", () => {
+  const delivered = lateJob([ev(RESULT, { id: "late-result", pubkey: pk("c"), at: DUE - 60, tags: [root("late")] })]);
+  assert.deepEqual(stateAt(delivered, DUE - 30), [], "finished before the deadline");
+  assert.deepEqual(stateAt(delivered, DUE + STALLED_GRACE_SECONDS + 5000), [],
+    "and it stays finished — delivered work cannot become overdue later");
+});
+
+test("#681 case 2: delivery inside the grace window finishes the job, it is not overdue", () => {
+  const inGrace = DUE + Math.floor(STALLED_GRACE_SECONDS / 2);
+  const delivered = lateJob([ev(RESULT, { id: "grace-result", pubkey: pk("c"), at: inGrace, tags: [root("late")] })]);
+  assert.deepEqual(stateAt(delivered, inGrace), [], "delivered during grace is finished, not overdue");
+  // The grace window is the whole point: without it, clock skew alone would
+  // mark a job overdue that was delivered on time by the seller's own clock.
+  assert.deepEqual(stateAt(lateJob(), DUE + STALLED_GRACE_SECONDS - 1), [JOB_WORKING],
+    "one second inside the window is still working");
+});
+
+test("#681 case 3: no delivery past deadline plus grace is overdue, and the award survives", () => {
+  const events = lateJob();
+  assert.deepEqual(stateAt(events, DUE - 1), [JOB_WORKING], "before the deadline");
+  assert.deepEqual(stateAt(events, DUE + STALLED_GRACE_SECONDS), [JOB_WORKING], "the boundary itself is not past it");
+  assert.deepEqual(stateAt(events, DUE + STALLED_GRACE_SECONDS + 1), [JOB_OVERDUE], "one second past is overdue");
+
+  // The award is preserved, not erased and not rewritten as completed.
+  const [job] = inProgressJobs(events, DUE + STALLED_GRACE_SECONDS + 1);
+  assert.equal(job.awardId, H("late-award"), "the award id is still there to link to");
+  assert.equal(job.seller, pk("c"), "and it still names who was awarded");
+  assert.equal(job.deadline, DUE, "the deadline it missed is carried, not just the verdict");
+
+  // The discriminator the boards actually read. If these two were equal the
+  // assertion above could pass while the lamp still counted a dead job.
+  const at = DUE + STALLED_GRACE_SECONDS + 1;
+  const seller = sellerBoard(events, at).find((r) => r.pubkey === pk("c"));
+  assert.equal(seller.inProgressJobs.length, 1, "the detail view still sees the award");
+  assert.equal(seller.workingJobs.length, 0, "the lamp does not count it as current work");
+  const buyer = buyerBoard(events, at).find((r) => r.pubkey === pk("b"));
+  assert.equal(buyer.inProgressJobs.length, 1);
+  assert.equal(buyer.workingJobs.length, 0, "and neither does the racer board");
+});
+
+test("#681 case 4: a terminal event arriving after the job went overdue still ends it", () => {
+  const at = DUE + STALLED_GRACE_SECONDS + 5000;
+  assert.deepEqual(stateAt(lateJob(), at), [JOB_OVERDUE], "overdue first");
+  for (const late of [
+    ev(RESULT, { id: "very-late-result", pubkey: pk("c"), at: at - 1, tags: [root("late")] }),
+    ev(ACCEPT, { id: "very-late-accept", pubkey: pk("b"), at: at - 1, tags: [root("late")] }),
+    ev(RECEIPT, { id: "very-late-receipt", pubkey: pk("b"), at: at - 1, tags: [root("late")] }),
+  ]) {
+    assert.deepEqual(stateAt(lateJob([late]), at), [],
+      `kind ${late.kind} ends the job even after it was shown overdue`);
+  }
+});
+
+test("#681 case 5: only the awarded seller's silence makes a job overdue", () => {
+  const at = DUE + STALLED_GRACE_SECONDS + 1;
+  const loser = pk("d");
+  const contested = lateJob([
+    ev(CLAIM, { id: "loser-claim", pubkey: loser, at: DUE - 490, tags: [root("late")] }),
+    ev(RESULT, { id: "loser-result", pubkey: loser, at: DUE - 100, tags: [root("late")] }),
+  ]);
+  // A losing claimant delivering does not rescue the awarded seller's record.
+  assert.deepEqual(stateAt(contested, at), [JOB_OVERDUE],
+    "a non-awarded claimant's result cannot clear the awarded seller's overdue job");
+  const rows = Object.fromEntries(sellerBoard(contested, at).map((r) => [r.pubkey, r]));
+  assert.equal(rows[pk("c")].inProgressJobs.length, 1, "the overdue job belongs to the awarded seller");
+  assert.equal(rows[loser]?.inProgressJobs.length ?? 0, 0, "and not to the claimant who lost");
+});
+
+test("#681: an unseen offer is not evidence of lateness — no deadline means working", () => {
+  // A window can start after the offer, and a relay can simply not return it.
+  // Concluding "overdue" from a missing deadline would turn our own blind spot
+  // into a verdict about someone else's seat.
+  const noOffer = lateJob().filter((e) => e.kind !== OFFER);
+  assert.deepEqual(stateAt(noOffer, DUE + STALLED_GRACE_SECONDS + 100000), [JOB_WORKING],
+    "without the offer there is no deadline to be late against");
+  assert.equal(inProgressJobs(noOffer, NOW)[0].deadline, null);
+});
+
+test("#681: the clock is required, so no caller can silently restore the old behaviour", () => {
+  // The bug was the absence of a clock. A defaulted one would let a caller
+  // reintroduce it with no signal at all, so omitting it fails loudly instead.
+  for (const bad of [undefined, null, NaN, "1800000000"]) {
+    assert.throws(() => inProgressJobs(lateJob(), bad), TypeError,
+      `now=${String(bad)} must be rejected, not treated as "no deadline"`);
   }
 });
 

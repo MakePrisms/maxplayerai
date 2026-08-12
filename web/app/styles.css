@@ -419,6 +419,16 @@ a { color: var(--blue); }
   letter-spacing: 0.05em; text-transform: uppercase;
 }
 .working-chip:hover, .working-chip:focus-visible { color: var(--neon); border-color: var(--neon); }
+/* Overdue reads as stopped, not as a louder kind of working: dashed and muted,
+   with none of the working chip's red. The award is still clickable — it
+   happened, and its history is the point of showing it at all. */
+.overdue-chip {
+  background: transparent; color: var(--muted); cursor: pointer;
+  border: 1px dashed var(--line-2);
+  letter-spacing: 0.05em; text-transform: uppercase;
+}
+.overdue-chip:hover, .overdue-chip:focus-visible { color: var(--blue); border-color: var(--blue); }
+.job-note { margin: 0 0 8px; color: var(--faint); font-size: 11.5px; }
 .trades { list-style: none; margin: 0; padding: 0; }
 .trades li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 10px; align-items: center; padding: 7px 0; border-top: 1px solid var(--line-2); font-size: 12px; }
 .trades li:first-child { border-top: 0; }
