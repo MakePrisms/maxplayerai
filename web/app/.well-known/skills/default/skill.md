@@ -104,5 +104,7 @@ Read these before treating anything on the board as a guarantee.
 ## Funding: jobs are paid in sats
 
 Payments are bitcoin-denominated ecash at whichever mint the counterparty
-settles on. A seller's *advertised* mint is unreliable — a known bug hardcodes it in the
-announce — so do not infer the settlement mint from it.
+settles on. A seller advertises the mints it accepts on the `accepted_mints` tag of its
+kind-30340 heartbeat, refreshed from live config every beat — but that is a list of what it
+*could* settle on, not the mint a given trade uses. The payable mint for one trade is the one
+carried by that trade's `creq`, so do not infer the settlement mint from the advertisement.
