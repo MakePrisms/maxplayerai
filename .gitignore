@@ -20,6 +20,9 @@
 # Environment / secrets
 .env
 .env.*
+# also files NAMED <something>.env — e.g. docker/seller.env, docker/claude-token.env,
+# which hold live tokens. The `.env` / `.env.*` patterns above do NOT match these.
+*.env
 
 # Editor / OS
 .DS_Store
