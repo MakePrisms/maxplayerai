@@ -173,6 +173,52 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Raise this process's soft open-file limit to its hard limit (#774).
+///
+/// ⚠ THIS IS NOT THE FIX FOR #774, AND MUST NOT BE READ AS ONE. The fix is bounding the buyer
+/// store's packfile count (`crate::store_maint`); descriptor demand is what that removes. This is
+/// defence in depth for the interval before a compaction runs, and for the first compaction of a
+/// store that predates it — the one case where the compaction's own descriptor need is set by the
+/// pack count it inherited.
+///
+/// An unprivileged process can raise its SOFT limit up to the hard one but can never raise the
+/// HARD one. On a host whose hard ceiling is also low this buys exactly nothing, which is the
+/// reason it cannot be the fix. What it does buy is independence from a launchd plist or a systemd
+/// `LimitNOFILE=` being set correctly on every machine an operator installs on.
+///
+/// Best-effort and deliberately silent on failure: a daemon that cannot raise its own limit should
+/// still start, at the limit it was given.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    // Safety: `getrlimit`/`setrlimit` are plain libc calls over a fully initialized local struct.
+    unsafe {
+        let mut limit = std::mem::zeroed::<libc::rlimit>();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return;
+        }
+        // An unbounded hard limit is not a licence to ask for an unbounded soft one: some
+        // platforms cap NOFILE well below `RLIM_INFINITY` and refuse the call outright, and code
+        // that sizes descriptor tables from the soft limit behaves badly with it. Ask for a large
+        // finite number instead, which is far past anything a delivery store needs.
+        const AMPLE: libc::rlim_t = 65_536;
+        let target = if limit.rlim_max == libc::RLIM_INFINITY {
+            AMPLE
+        } else {
+            limit.rlim_max
+        };
+        if target <= limit.rlim_cur {
+            return;
+        }
+        limit.rlim_cur = target;
+        let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+    }
+}
+
+/// Non-unix targets have no `RLIMIT_NOFILE` to raise; the compaction in `crate::store_maint` is
+/// the whole of the fix there.
+#[cfg(not(unix))]
+fn raise_open_file_limit() {}
+
 /// Bring up the buyer's owned resources: take the exclusive lock, open the state
 /// DB and record the start, then open the wallet and identity behind their
 /// serialized actors. Returns the held lock (keep it alive for the buyer's life),
@@ -180,6 +226,8 @@ fn now_unix() -> i64 {
 ///
 /// Fails closed at the lock step if another daemon already owns this home.
 async fn bootstrap(home: MaxplayerHome) -> Result<(HomeLock, Arc<BuyerContext>, PathBuf), BuyerError> {
+    raise_open_file_limit();
+
     let lock = HomeLock::acquire(home.root.join(LOCK_FILE))?;
 
     let store = BuyerStore::open(home.root.join(STATE_DB_FILE))?;
@@ -2937,6 +2985,87 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    // #774 defence in depth. `raise_open_file_limit` claims it lifts the soft descriptor limit
+    // toward the hard one; a comment saying so is not evidence, so this executes it.
+    //
+    // In a CHILD process, for the same reason the #774 reproduction uses one: the call mutates a
+    // process-wide limit, and doing that inside the shared test binary would change the ceiling
+    // every sibling test runs under. `ulimit -S` lowers only the SOFT limit, leaving the hard one
+    // where it was — which is precisely the situation the function exists to recover from, and
+    // would be untestable had the fixture used a bare `ulimit -n` (that lowers BOTH, and no
+    // unprivileged process can raise a hard limit back).
+    const RAISE_CHILD_ENV: &str = "MAXPLAYER_RAISE_NOFILE_CHILD";
+    #[cfg(target_os = "linux")]
+    const RAISE_CHILD_SOFT: usize = 64;
+
+    #[cfg(target_os = "linux")]
+    fn soft_nofile() -> usize {
+        let limits = std::fs::read_to_string("/proc/self/limits").expect("read /proc/self/limits");
+        for line in limits.lines() {
+            let Some(rest) = line.strip_prefix("Max open files") else {
+                continue;
+            };
+            return rest
+                .split_whitespace()
+                .next()
+                .expect("soft-limit column")
+                .parse()
+                .expect("numeric soft limit");
+        }
+        panic!("no 'Max open files' row in /proc/self/limits");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn raise_nofile_child_leg() {
+        if std::env::var(RAISE_CHILD_ENV).is_err() {
+            return;
+        }
+        let before = soft_nofile();
+        assert_eq!(
+            before, RAISE_CHILD_SOFT,
+            "fixture must hand this child a lowered SOFT limit; got {before}"
+        );
+
+        raise_open_file_limit();
+
+        let after = soft_nofile();
+        assert!(
+            after > before,
+            "raise_open_file_limit must lift the soft limit above {before}, got {after}"
+        );
+        // Positive control for the parent: a child that took the early return above would also
+        // exit 0, so success alone does not prove the body ran. This line does.
+        println!("RAISED {before} -> {after}");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn raise_open_file_limit_lifts_a_lowered_soft_limit() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "ulimit -S -n {RAISE_CHILD_SOFT}; exec \"$0\" \
+                 --exact buyer::tests::raise_nofile_child_leg --nocapture --test-threads=1"
+            ))
+            .arg(&exe)
+            .env(RAISE_CHILD_ENV, "1")
+            .output()
+            .expect("spawn soft-limited child");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "child leg failed:\n{combined}");
+        assert!(
+            combined.contains("RAISED "),
+            "the child exited 0 without running its body — the env guard or the test name is \
+             wrong, and this test proves nothing:\n{combined}"
+        );
+    }
 
     fn temp_home(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);

@@ -62,6 +62,50 @@ impl GitDeliveryVerifier {
             })
     }
 
+    /// Collapse the store's packfiles if they have piled up, so a long-lived buyer never fetches
+    /// into a store whose pack count has walked past the platform's file-descriptor ceiling (#774).
+    ///
+    /// ADVISORY BY DESIGN. Maintenance is not a money gate: when compaction aborts it has left the
+    /// store exactly as it found it, so this reports the reason and lets the fetch proceed exactly
+    /// as it did before compaction existed. Refusing there would invent a brand-new way to strand a
+    /// delivery the pay path would otherwise verify and pay for.
+    ///
+    /// The ONE fail-closed case is a failed rollback: the store may then be missing objects, and
+    /// fetching into a store we can no longer vouch for is worse than refusing.
+    ///
+    /// NOTE ON THE FIRST RUN OF AN ALREADY-BLOATED STORE: compaction must open the packs it is
+    /// collapsing, so its own descriptor need is proportional to the CURRENT pack count. The
+    /// threshold keeps that small in steady state, but a store that predates this code can arrive
+    /// with enough packs that the compaction itself hits the ceiling. That aborts, changes nothing,
+    /// and leaves the store no worse than it already was — raising `RLIMIT_NOFILE` at startup
+    /// (`crate::buyer`) is what gets that first compaction through.
+    fn compact_store(&self) -> Result<(), DeliveryError> {
+        use crate::store_maint::{self, Compaction, StoreMaintError};
+
+        match store_maint::compact_if_needed(&self.repository) {
+            Ok(Compaction::Skipped { .. }) => Ok(()),
+            Ok(Compaction::Compacted {
+                packs_before,
+                objects,
+            }) => {
+                crate::opline_verbose!(
+                    "buyer store: compacted {packs_before} packfiles into 1 ({objects} objects preserved)"
+                );
+                Ok(())
+            }
+            Err(error @ StoreMaintError::Aborted(_)) => {
+                crate::opline!("buyer store: {error}");
+                Ok(())
+            }
+            Err(error @ StoreMaintError::RollbackFailed(_)) => {
+                Err(DeliveryError::GitCommandFailed {
+                    operation: "store-compact",
+                    cause: error.to_string(),
+                })
+            }
+        }
+    }
+
     /// Ensure the buyer store exists. maxplayer sellers always emit sha1 objects (they `init` without
     /// `--object-format`), so the store is sha1; a sha256 (64-hex) delivery is not reachable in the
     /// maxplayer system and git2 0.19 cannot init a sha256 odb — so it fails CLOSED here rather than
@@ -110,6 +154,10 @@ impl GitDeliveryVerifier {
         // verify-fetch is invoked synchronously inside `authorize_pay_async`, so run it off any
         // ambient runtime, on a dedicated OS thread.
         git_transport::off_runtime(|| {
+            // Bound the pack count BEFORE this fetch adds another one (#774), and with its own
+            // short-lived handle, so the fetch below opens a store whose pack set is already
+            // collapsed rather than one this thread has cached mid-compaction.
+            self.compact_store()?;
             let repo = self.open_store()?;
             let fetched_ref = format!("refs/maxplayer/deliveries/{}", delivery.commit_oid().as_str());
             let refspec = format!("+refs/heads/{}:{fetched_ref}", delivery.branch());
@@ -153,6 +201,8 @@ impl GitDeliveryVerifier {
         self.check_branch(base_branch)?;
         // Same #152 constraint as `fetch`: run the git2 base fetch off any ambient async runtime.
         git_transport::off_runtime(|| {
+            // Same #774 bound as `fetch`: this leg writes into the same store and grows it too.
+            self.compact_store()?;
             let repo = self.open_store()?;
             let fetched_ref = format!("refs/maxplayer/bases/{}", base_oid.as_str());
             let refspec = format!("+refs/heads/{base_branch}:{fetched_ref}");
@@ -568,6 +618,288 @@ mod tests {
             output.status.success(),
             "git fixture command failed: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // #774 — unbounded packfile growth exhausts the process file-descriptor ceiling.
+    //
+    // WHY A CHILD PROCESS. Lowering `RLIMIT_NOFILE` inside a Rust test lowers it for the WHOLE
+    // test binary: `cargo test` runs tests as THREADS in one process, so a test that drops the
+    // limit makes unrelated tests fail non-deterministically — a flaky suite shipped to fix a
+    // reliability bug. The limit here is applied by `ulimit -n` in the shell that execs the child,
+    // BEFORE the child process begins, so it is a property of a separate process image and cannot
+    // be observed by any sibling test. `emfile_child_leg` is inert unless it finds
+    // `MAXPLAYER_EMFILE_LEG` in its environment, so in the ordinary suite pass it returns without
+    // touching a limit, a store, or the filesystem.
+    //
+    // THE MEASURED MECHANISM (this differs from the obvious guess, so it is written down).
+    // Descriptors are NOT consumed by a pack merely existing, and NOT by the fetch that creates it.
+    // They are consumed by an operation that READS ACROSS packs: libgit2 opens a pack's `.pack`
+    // file the first time it must read an object out of it, and holds it for the lifetime of that
+    // `Repository` handle. The buyer's descendant gate (`assert_descendant`) walks the delivered
+    // chain, which reads one commit out of EVERY pack the store holds. Measured on this tree by
+    // sampling `/proc/self/fd` during the walk: peak descriptors track the pack count almost
+    // exactly (249 packs -> 253 descriptors), and fall back to ~4 between operations. So the
+    // pressure is a spike inside one verify, which is why an at-rest descriptor count looks
+    // healthy right up until a verify fails.
+    //
+    // HOW IT PRESENTS, which is worse than the issue title suggests: at the ceiling libgit2 does
+    // NOT report "Too many open files". It fails to open the pack and reports the object as
+    // ABSENT — `merge-base: object not found - no match for id (<oid>)`. On the money path that is
+    // a descendant gate REFUSING a delivery that is perfectly valid. The failure mode of pack
+    // growth is a false refusal, not a legible resource error, so this test asserts on the leg
+    // FAILING and on the ceiling being the only difference — never on an error string.
+    //
+    // WHY THREE LEGS. Two legs would show that one run fails and another passes, but not WHY. The
+    // third isolates the variable: the same growing workload at an ample ceiling must PASS, which
+    // is what pins the failure on descriptor pressure rather than on the fixture, the chain
+    // length, or the walk itself.
+    //   - `growing-limited`    — the fetch+walk this crate performed BEFORE this fix, at the low
+    //                            ceiling. MUST FAIL. This is the mutation: executable and
+    //                            permanent, not a transcript of a run that no longer exists.
+    //   - `growing-ample`      — byte-identical workload, ample ceiling. MUST PASS.
+    //   - `compacting-limited` — the production entry point `GitDeliveryVerifier::verify`, whose
+    //                            `fetch` now calls `compact_store` first, at the low ceiling.
+    //                            MUST PASS.
+    // RED-ON-REVERT: delete the `self.compact_store()?` line in `fetch` and `compacting-limited`
+    // fails exactly like `growing-limited`.
+    const EMFILE_LEG_ENV: &str = "MAXPLAYER_EMFILE_LEG";
+    /// The constrained child's soft descriptor ceiling. Far above what a compacted store needs
+    /// (~16 packs plus the harness, comfortably under 40) and far below what the uncompacted
+    /// workload below reaches.
+    const EMFILE_FD_CEILING: usize = 64;
+    /// Deliveries fetched in sequence. Each leaves one more pack behind when nothing compacts, so
+    /// this carries the uncompacted store past the ceiling with margin — and is several times
+    /// `store_maint::COMPACT_PACK_THRESHOLD`, so the compacting leg is driven through repeated
+    /// compactions rather than a single lucky one.
+    const EMFILE_DELIVERIES: usize = 80;
+
+    /// The process's CURRENT soft descriptor limit, read from the kernel rather than assumed.
+    /// Positive control: if `ulimit -n` silently failed to apply, the child asserts on this and
+    /// says so, instead of passing vacuously at the ambient (high) limit.
+    #[cfg(target_os = "linux")]
+    fn soft_fd_limit() -> usize {
+        let limits = fs::read_to_string("/proc/self/limits").expect("read /proc/self/limits");
+        for line in limits.lines() {
+            let Some(rest) = line.strip_prefix("Max open files") else {
+                continue;
+            };
+            let soft = rest.split_whitespace().next().expect("soft-limit column");
+            return soft.parse().expect("numeric soft limit");
+        }
+        panic!("no 'Max open files' row in /proc/self/limits");
+    }
+
+    /// Drive `EMFILE_DELIVERIES` deliveries into a fresh store under the inherited descriptor
+    /// ceiling. Inert — and completely side-effect-free — unless spawned as a leg.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn emfile_child_leg() {
+        let Ok(leg) = std::env::var(EMFILE_LEG_ENV) else {
+            return;
+        };
+
+        // Positive control on the ONE variable this test turns. Each leg states which side of the
+        // ceiling it believes it is on and refuses to run if the kernel disagrees — so a `ulimit`
+        // that silently failed to apply is reported here rather than passing vacuously (which is
+        // exactly what happened during development, at the ambient limit of 524288).
+        let constrained = leg.ends_with("-limited");
+        let limit = soft_fd_limit();
+        if constrained {
+            assert!(
+                limit <= EMFILE_FD_CEILING,
+                "leg {leg} needs the lowered ceiling and did not get it (soft limit {limit}); it \
+                 would prove nothing"
+            );
+        } else {
+            assert!(
+                limit > EMFILE_FD_CEILING,
+                "leg {leg} is the ample-ceiling control and must NOT be descriptor-constrained \
+                 (soft limit {limit})"
+            );
+        }
+
+        let root = std::env::temp_dir().join(format!("maxplayer-emfile-{leg}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let remote_path = root.join("remote.git");
+        let store_path = root.join("store.git");
+        let remote = Repository::init_bare(&remote_path).expect("init remote");
+        Repository::init_bare(&store_path).expect("init store");
+        // Authored in-process: spawning a `git` child per commit would itself need descriptors
+        // under this ceiling, which would confound the store's pack cost with fixture cost.
+        let who = git2::Signature::new("t", "t@e", &git2::Time::new(1_700_000_000, 0)).expect("sig");
+
+        let mut parent: Option<Oid> = None;
+        let mut genesis: Option<CommitOid> = None;
+        for index in 0..EMFILE_DELIVERIES {
+            let blob = remote
+                .blob(format!("delivery {index}\n").as_bytes())
+                .expect("blob");
+            let mut builder = remote.treebuilder(None).expect("treebuilder");
+            builder.insert("delivery.txt", blob, 0o100644).expect("insert");
+            let tree_oid = builder.write().expect("write tree");
+            let tree = remote.find_tree(tree_oid).expect("find tree");
+            let parent_commit = parent.map(|oid| remote.find_commit(oid).expect("find parent"));
+            let parents: Vec<&git2::Commit<'_>> = parent_commit.iter().collect();
+            let commit = remote
+                .commit(
+                    Some("refs/heads/main"),
+                    &who,
+                    &who,
+                    &format!("delivery {index}"),
+                    &tree,
+                    &parents,
+                )
+                .expect("commit");
+            parent = Some(commit);
+
+            let packs = fs::read_dir(store_path.join("objects").join("pack"))
+                .map(|entries| {
+                    entries
+                        .filter_map(|entry| entry.ok())
+                        .filter(|entry| {
+                            entry.file_name().to_string_lossy().ends_with(".pack")
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            // Progress, so a failure names the pack count it died at rather than only an oid.
+            println!("leg={leg} delivery={index} packs_in_store={packs}");
+
+            let oid = CommitOid::parse(commit.to_string()).expect("oid");
+            let mut verifier = GitDeliveryVerifier::new(&store_path);
+            if leg.starts_with("compacting") {
+                // The production path: verify() -> fetch() -> compact_store() then fetch.
+                let delivery =
+                    GitDelivery::new(remote_path.to_str().expect("remote path"), "main", oid.clone())
+                        .expect("delivery");
+                verifier
+                    .verify(&delivery)
+                    .unwrap_or_else(|error| panic!("delivery {index} failed: {error:?}"));
+            } else {
+                // The pre-fix behaviour: the same fetch, with nothing bounding the pack count.
+                let repo = Repository::open_bare(&store_path).expect("open store");
+                let refspec =
+                    format!("+refs/heads/main:refs/maxplayer/deliveries/{}", oid.as_str());
+                git_transport::fetch_refspecs(
+                    &repo,
+                    remote_path.to_str().expect("remote path"),
+                    &[&refspec],
+                    None,
+                    true,
+                )
+                .unwrap_or_else(|error| panic!("delivery {index} failed: {error}"));
+            }
+
+            // The descendant gate the contribution path runs on every delivery
+            // (`assert_descendant`). It is what turns an accumulated pack set into descriptor
+            // pressure: walking the chain reads a commit out of EVERY pack the store holds, and
+            // libgit2 opens a pack's `.pack` file the first time it must actually read from it.
+            // A fetch alone touches only the newest objects, so a store can carry many packs
+            // without cost until something reads across them — which is why the fetch is not the
+            // whole reproduction and this call is not decoration.
+            if let Some(genesis) = genesis.as_ref() {
+                if let Err(error) = verifier.assert_descendant(genesis, &oid) {
+                    // Classify by TYPE, with a compiler-checked match on the enum — not by
+                    // sniffing an error string. The token is only the transport that carries the
+                    // verdict across the process boundary to the parent. See the parent test for
+                    // why `NotDescendant` here would be a money-path defect.
+                    match &error {
+                        DeliveryError::GitCommandFailed { operation, cause } => {
+                            println!("LEG_ERR variant=GitCommandFailed operation={operation} cause={cause}")
+                        }
+                        DeliveryError::NotDescendant { .. } => {
+                            println!("LEG_ERR variant=NotDescendant")
+                        }
+                        other => println!("LEG_ERR variant=other detail={other:?}"),
+                    }
+                    panic!("descendant walk {index} failed at {packs} packs: {error:?}");
+                }
+            } else {
+                genesis = Some(oid);
+            }
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The ample ceiling for the control leg. Above the uncompacted workload's peak, so the only
+    /// thing that changes between it and `growing-limited` is the descriptor budget.
+    #[cfg(target_os = "linux")]
+    const EMFILE_FD_AMPLE: usize = 4096;
+
+    /// Run one leg in its own process, under a descriptor ceiling applied by the spawning shell.
+    ///
+    /// `ulimit -n` runs BEFORE `exec`, so the limit belongs to the child's process image. Nothing
+    /// in this process — or in any sibling test thread — ever has its limit changed, which is the
+    /// property that keeps this test from turning the suite flaky.
+    #[cfg(target_os = "linux")]
+    fn run_emfile_leg(leg: &str, ceiling: usize) -> (bool, String) {
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "ulimit -n {ceiling}; exec \"$0\" \
+                 --exact delivery_git::tests::emfile_child_leg --nocapture --test-threads=1"
+            ))
+            .arg(&exe)
+            .env(EMFILE_LEG_ENV, leg)
+            .output()
+            .expect("spawn descriptor-limited child");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (output.status.success(), combined)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn pack_growth_exhausts_the_fd_ceiling_and_compaction_prevents_it() {
+        // Leg 1 — THE DEFECT. Unbounded pack growth must genuinely break under the ceiling.
+        let (grew_ok, grew) = run_emfile_leg("growing-limited", EMFILE_FD_CEILING);
+        assert!(
+            !grew_ok,
+            "unbounded pack growth was expected to break under a {EMFILE_FD_CEILING}-descriptor \
+             ceiling, but the leg passed — the ceiling or {EMFILE_DELIVERIES} deliveries no longer \
+             reaches the limit, and leg 3 has stopped proving anything:\n{grew}"
+        );
+        // It must break in the specific way the odb actually fails: `assert_descendant` maps a
+        // libgit2 read error to GitCommandFailed{operation:"merge-base"}. Asserted on the typed
+        // variant (classified by a match in the child), never on an error string — no Linux error
+        // here says "Too many open files"; libgit2 reports the object as absent instead.
+        assert!(
+            grew.contains("LEG_ERR variant=GitCommandFailed operation=merge-base"),
+            "the growing leg must fail at the descendant gate's odb read, as \
+             GitCommandFailed{{operation:\"merge-base\"}}:\n{grew}"
+        );
+        // ⛔ MONEY-PATH GUARD. A descriptor-starved odb read must NEVER surface as NotDescendant.
+        // `assert_descendant` maps Ok(false) -> NotDescendant and Err(_) -> GitCommandFailed; if a
+        // refactor ever collapsed the error arm into Ok(false), a VALID delivery would be refused
+        // for the fabricated reason "does not descend from base" — a wrong answer on a gate rather
+        // than a surfaced resource failure. This pins that distinction while it is still true.
+        assert!(
+            !grew.contains("LEG_ERR variant=NotDescendant"),
+            "a descriptor-starved odb read was reported as NotDescendant — a valid delivery is \
+             being refused for a fabricated reason:\n{grew}"
+        );
+
+        // Leg 2 — THE CONTROL that names the cause. Identical workload, ample ceiling. Without
+        // this, leg 1 failing would be equally consistent with a broken fixture.
+        let (ample_ok, ample) = run_emfile_leg("growing-ample", EMFILE_FD_AMPLE);
+        assert!(
+            ample_ok,
+            "the same uncompacted workload must succeed at a {EMFILE_FD_AMPLE}-descriptor \
+             ceiling — if it fails here the descriptor limit is not what leg 1 is measuring:\n{ample}"
+        );
+
+        // Leg 3 — THE FIX. Leg 1's ceiling, leg 1's workload, compaction in the loop.
+        let (compacted_ok, compacted) = run_emfile_leg("compacting-limited", EMFILE_FD_CEILING);
+        assert!(
+            compacted_ok,
+            "with compaction, {EMFILE_DELIVERIES} deliveries must verify cleanly under the same \
+             {EMFILE_FD_CEILING}-descriptor ceiling that broke leg 1:\n{compacted}"
         );
     }
 
