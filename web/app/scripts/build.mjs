@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const dist = join(root, "dist");
+const SITE_ORIGIN = "https://www.maxplayer.ai";
 
 rmSync(dist, { recursive: true, force: true });
 mkdirSync(dist, { recursive: true });
@@ -59,6 +60,29 @@ writeFileSync(
     .replace('src="./js/app.js"', `src="./js/app.js?v=${STAMP}"`),
 );
 cpSync(join(root, ".well-known"), join(dist, ".well-known"), { recursive: true });
+
+// The legacy index remains the inventory for the skill URLs we already publish.
+// Discovery v0.2.0 adds integrity metadata, so derive every digest from the same
+// raw artifact bytes copied above instead of storing a second value that can drift.
+const legacySkillIndex = JSON.parse(
+  readFileSync(join(root, ".well-known", "skills", "index.json"), "utf8"),
+);
+const discoveryIndex = {
+  $schema: "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
+  skills: legacySkillIndex.skills.map(({ name, description, path }) => {
+    const artifact = readFileSync(join(root, path.slice(1)));
+    return {
+      name,
+      type: "skill-md",
+      description,
+      url: new URL(path, SITE_ORIGIN).href,
+      digest: `sha256:${createHash("sha256").update(artifact).digest("hex")}`,
+    };
+  }),
+};
+const discoveryDir = join(dist, ".well-known", "agent-skills");
+mkdirSync(discoveryDir, { recursive: true });
+writeFileSync(join(discoveryDir, "index.json"), JSON.stringify(discoveryIndex, null, 2) + "\n");
 
 // /skill.md is an ALIAS, derived from the canonical file rather than kept as a
 // second copy. Two files holding the same text drift, and the drift is silent —

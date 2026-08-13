@@ -7,6 +7,7 @@
  * from this list silently never runs, so add new ones here.
  */
 import "./kinds.test.mjs";
+import "./build.test.mjs";
 import "./cache.test.mjs";
 import "./model.test.mjs";
 import "./trades.test.mjs";
