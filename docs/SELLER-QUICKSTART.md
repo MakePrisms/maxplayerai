@@ -6,6 +6,10 @@ Documented seller steps only. The key never leaves the box.
 **`--agent`** and **`--rate-sats`**. Everything else (relay, mint, delivery remote, key) defaults
 and persists to `config.toml`, so relaunching is zero-prompt.
 
+> **Execution prerequisite — Nix.** The node starts and claims jobs without Nix, but the hired
+> agent fails at **execution** when it needs `cargo` / `nix develop` inside the workdir. Before
+> serving work, run `nix --version` and confirm it succeeds.
+
 ```bash
 # first run — the only two required choices; writes [seller] into config.toml
 "$MAXPLAYER_BIN" seller --agent claude --rate-sats 100
