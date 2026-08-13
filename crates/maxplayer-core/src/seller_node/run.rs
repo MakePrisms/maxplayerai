@@ -47,9 +47,10 @@ use crate::seller::rate_gate_allows;
 use crate::seller_agents::AgentRegistry;
 use crate::seller_exec::{
     compose_agent_prompt, delivery_message, job_workdir, run_agent_job, run_agent_with_retry,
-    seller_delivery_kind, seller_exec_metadata, unified_job_timeout, ExecError, SandboxPolicy,
+    seller_delivery_kind, seller_exec_metadata, unified_job_timeout, AgentRunTimeout, ExecError,
+    SandboxPolicy,
 };
-use crate::seller_roster::{Fault, LiveRoster, MissingCapability};
+use crate::seller_roster::{ExecutionFailure, Fault, LiveRoster, MissingCapability};
 use crate::seller_git::{self, DeliveryAgentIdentity};
 
 use super::outbox::drain_once;
@@ -1551,7 +1552,33 @@ fn offer_row(job_id: &str, buyer_pubkey: &str, offer: &ParsedOffer) -> super::st
         deadline_unix: offer.deadline_unix as i64,
         targeted: offer.is_targeted(),
         requested_agent: offer.requested_agent.clone(),
+        // #686: the buyer's declared output type is mandatory on the wire (`parse_offer` refuses an
+        // offer without it), so it is always `Some` here. It becomes `None` only for a row written
+        // before the column existed.
+        output: Some(offer.output.clone()),
     }
+}
+
+/// The agent prompt for a stored job — the ONE place a stored offer row becomes the hired agent's
+/// prompt.
+///
+/// Extracted from `execute_job` for the same reason [`offer_row`] was extracted from the claim path:
+/// this read is what decides which of the journaled facts the agent is ever told, and inlined at its
+/// single call site no test can reach it. It reads the ROW, not the event — execution can be a
+/// RESTART away from the claim, so the row is all a resumed job has.
+///
+/// `pub` so the shipped CLI crate can assert this seam under ITS OWN feature set: `maxplayer-core`'s
+/// wallet-gated unit tests do not run under `cargo test -p maxplayer-core` (the `wallet` feature is
+/// off by default there), so a tooth that lives only here is invisible to the repo's declared check
+/// set. See `crates/maxplayer/tests/seller_declared_output.rs`.
+pub fn job_prompt(offer: &super::store::Offer, git_remote: &str, deadline_unix: u64) -> String {
+    compose_agent_prompt(
+        &offer.task,
+        git_remote,
+        deadline_unix,
+        offer.output.as_deref(),
+        None,
+    )
 }
 
 /// #591: how a job's delivery workdir is provisioned — a from-scratch empty repo, or a clone of a
@@ -1930,16 +1957,21 @@ fn boot_agent_registry(home: &MaxplayerHome) -> Result<AgentRegistry, NodeError>
 /// - [`ExecError::Config`] — a misconfiguration surfaced before the run. Also structural, and the
 ///   remedy is derived from the reported detail rather than assumed to be a rebuild: a harness whose
 ///   barrier is an unset provider is not fixed by rebuilding, and saying so would be a lie.
-/// - [`ExecError::Agent`] — deliberately UNPROVEN. A timeout and a provider that will never resolve
-///   arrive here byte-identically, so this classifier does not guess which; the self-probe decides.
+/// - [`ExecError::DeadlineExceeded`] — the deadline-derived clock expired. Typed upstream, so it is
+///   attributable to the job budget and reaches the roster as a non-striking failure.
+/// - [`ExecError::Agent`] — deliberately UNPROVEN. Remaining agent errors do not carry enough
+///   evidence to distinguish transient from structural, so the self-probe decides.
 /// - [`ExecError::Policy`] — OUR OWN refusal (e.g. an un-typeable delivery oid). Never the harness.
-fn harness_fault_for(error: &ExecError) -> Option<Fault> {
+fn harness_fault_for(error: &ExecError) -> Option<ExecutionFailure> {
     match error {
-        ExecError::AcpRequired => Some(Fault::Incapable(MissingCapability::AcpFeature)),
-        ExecError::Config(detail) => Some(Fault::Incapable(MissingCapability::HarnessConfig(
-            detail.clone(),
+        ExecError::AcpRequired => Some(ExecutionFailure::Harness(Fault::Incapable(
+            MissingCapability::AcpFeature,
         ))),
-        ExecError::Agent(_) => Some(Fault::Unproven),
+        ExecError::Config(detail) => Some(ExecutionFailure::Harness(Fault::Incapable(
+            MissingCapability::HarnessConfig(detail.clone()),
+        ))),
+        ExecError::DeadlineExceeded => Some(ExecutionFailure::DeadlineExceeded),
+        ExecError::Agent(_) => Some(ExecutionFailure::Harness(Fault::Unproven)),
         ExecError::Policy(_) => None,
     }
 }
@@ -2177,14 +2209,17 @@ async fn run_harness_probe_once(
         &harness_probe_prompt(sentinel),
         workdir,
         identity,
-        HARNESS_PROBE_TIMEOUT,
+        AgentRunTimeout::HarnessProbe(HARNESS_PROBE_TIMEOUT),
     )
     .await
     {
         // The turn never ran: structural, so do not retry. The remedy STRING is routed by class —
         // an auth failure needs a sign-in, not a containment fix (#555) — but the shape and fault
         // are unchanged either way.
-        let fault = harness_fault_for(&error).unwrap_or(Fault::Unproven);
+        let fault = match harness_fault_for(&error) {
+            Some(ExecutionFailure::Harness(fault)) => fault,
+            Some(ExecutionFailure::DeadlineExceeded) | None => Fault::Unproven,
+        };
         return ProbeAttempt::Unrunnable {
             reason: unrunnable_reason(&error),
             fault,
@@ -4418,11 +4453,16 @@ impl SellerNodeRunner {
     /// `None` is the deliberate no-op: a failure that does not implicate the harness must not narrow
     /// the roster, or the node inflicts its own outage. Only the sites that can attribute a failure
     /// call this at all — see [`harness_fault_for`].
-    fn drop_harness(&self, harness: usize, fault: Option<Fault>) {
+    fn drop_harness(&self, harness: usize, fault: Option<ExecutionFailure>) {
         let Some(fault) = fault else {
             return;
         };
-        let state = self.agents.fault(harness, fault, Instant::now());
+        let Some(state) = self
+            .agents
+            .execution_failure(harness, fault, Instant::now())
+        else {
+            return;
+        };
         let label = self.agents.label(harness).unwrap_or_else(|| "<unlabelled>".to_owned());
         // The denominator belongs in the line: "1 harness dropped" means nothing without how many
         // this node had, and a roster that has reached 0 is a node that has gone quiet on the market.
@@ -4789,7 +4829,7 @@ impl SellerNodeRunner {
         // deadline has room. The agent edits files in `workdir`; the node owns commit + push. The
         // configured `[sandbox]` policy launches the command (pass-through when absent).
         let deadline = offer.deadline_unix.max(0) as u64;
-        let prompt = compose_agent_prompt(&offer.task, &seller.git_remote, None);
+        let prompt = job_prompt(&offer, &seller.git_remote, deadline);
         let sandbox = SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref());
         let run_started = std::time::Instant::now();
         let run_result = run_agent_with_retry(
@@ -4798,7 +4838,14 @@ impl SellerNodeRunner {
             || now_unix() as u64,
             |_attempt| {
                 let job_timeout = unified_job_timeout(deadline, now_unix() as u64);
-                run_agent_job(&agent_command, &sandbox, &prompt, &workdir, &identity, job_timeout)
+                run_agent_job(
+                    &agent_command,
+                    &sandbox,
+                    &prompt,
+                    &workdir,
+                    &identity,
+                    AgentRunTimeout::JobDeadline(job_timeout),
+                )
             },
         )
         .await;
@@ -4840,7 +4887,10 @@ impl SellerNodeRunner {
             // Harness-attributable: the agent returned success having left nothing to deliver. This
             // is the site that fires on a quota-dead harness — its turn "completes", so the agent-run
             // arm above sees no error at all — which is why the trigger cannot live at one site.
-            self.drop_harness(harness, Some(Fault::Unproven));
+            self.drop_harness(
+                harness,
+                Some(ExecutionFailure::Harness(Fault::Unproven)),
+            );
             let (reason_code, feedback) = match error {
                 seller_git::SellerGitError::NoExecutionObserved(_) => {
                     opline!(
@@ -6418,14 +6468,29 @@ mod tests {
         // A missing build feature is structural and NAMED — no probe can supply it.
         assert_eq!(
             harness_fault_for(&ExecError::AcpRequired),
-            Some(Fault::Incapable(MissingCapability::AcpFeature))
+            Some(ExecutionFailure::Harness(Fault::Incapable(
+                MissingCapability::AcpFeature
+            )))
         );
 
         // An untyped agent failure is deliberately UNPROVEN: a timeout and a provider that will
         // never resolve arrive here identically, so the probe decides rather than this classifier.
         assert_eq!(
             harness_fault_for(&ExecError::Agent("turn ended non-terminal".into())),
-            Some(Fault::Unproven)
+            Some(ExecutionFailure::Harness(Fault::Unproven))
+        );
+
+        // The deadline-derived response timer is already attributed before this seam. It reaches
+        // the roster as a typed non-striking failure, never as message text to re-parse.
+        assert_eq!(
+            harness_fault_for(&ExecError::DeadlineExceeded),
+            Some(ExecutionFailure::DeadlineExceeded)
+        );
+        assert!(
+            ExecError::DeadlineExceeded
+                .to_string()
+                .contains("job deadline reached"),
+            "the operator line must name the job clock, not an ACP request timeout"
         );
 
         // A config barrier is structural too, but its remedy is DERIVED — reporting "rebuild" for a
@@ -6433,7 +6498,7 @@ mod tests {
         let config = harness_fault_for(&ExecError::Config("GOOSE_PROVIDER is unset".into()))
             .expect("a config barrier implicates the harness");
         match config {
-            Fault::Incapable(capability) => {
+            ExecutionFailure::Harness(Fault::Incapable(capability)) => {
                 let remedy = capability.remedy();
                 assert!(remedy.contains("GOOSE_PROVIDER"), "{remedy}");
                 assert!(
@@ -6472,12 +6537,71 @@ mod tests {
         assert_eq!(row.task, "do a task");
         assert_eq!(row.deadline_unix, (NOW + 600) as i64);
         assert!(row.targeted);
+        assert_eq!(row.output.as_deref(), Some("text/plain"));
 
         // An offer that asked for nothing stores nothing — absence is carried, not invented.
         let plain = gateway::OfferDraft::new("do a task", "text/plain", 5, NOW + 600, "a".repeat(64))
             .to_event_draft();
         let parsed = parse_offer(&plain).expect("parse offer");
         assert_eq!(offer_row("job-2", "buyer-1", &parsed).requested_agent, None);
+    }
+
+    // TOOTH (#686) — the buyer's DECLARED OUTPUT TYPE survives the whole trip: WIRE EVENT → stored
+    // row → (restart) → the agent's prompt.
+    //
+    // This is the seam the issue is about. The `output` tag is mandatory on ingest, so every offer
+    // carries one, but it used to stop at the parsed offer: the hired agent was never told what form
+    // the buyer asked for. The store is reopened between the write and the read because execution can
+    // be a RESTART away from the claim — an unpersisted field would be gone for that job permanently,
+    // exactly as the store's `requested_agent` comment says.
+    //
+    // Bites (each measured, one at a time — every one turns THIS test red and nothing else in the
+    // file): (1) `output: None` in `offer_row`; (2) drop `output` from `record_offer`'s INSERT;
+    // (3) pass `None` for the declared output in `job_prompt`.
+    #[test]
+    fn the_declared_output_type_survives_wire_to_row_to_prompt_across_a_restart() {
+        let job = "c".repeat(64);
+        let asked =
+            gateway::OfferDraft::new("do a task", "application/json", 5, NOW + 600, "a".repeat(64))
+                .to_event_draft();
+        let parsed = parse_offer(&asked).expect("parse offer");
+        let row = offer_row(&job, "buyer-1", &parsed);
+        assert_eq!(
+            row.output.as_deref(),
+            Some("application/json"),
+            "the declared output type must reach the row — the prompt is composed from the ROW"
+        );
+
+        let root = temp_dir("declared-output-restart");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mk root");
+        let db = root.join("seller.sqlite");
+        {
+            let store = SellerStore::open(&db).expect("open store");
+            store.record_offer(&row, 1).expect("record offer");
+        }
+        // …the process dies here. A fresh store handle is all the resumed node has.
+        let store = SellerStore::open(&db).expect("reopen store");
+        let resumed = store.offer_row(&job).expect("offer row").expect("offer survives");
+
+        // The exact call the execute path makes, over the exact row a resumed job reads.
+        let prompt = job_prompt(&resumed, "https://relay.example/git/abc.git", 2_000_000_000);
+        assert!(
+            prompt.contains("application/json"),
+            "the buyer's declared output type must reach the hired agent: {prompt}"
+        );
+        assert!(
+            prompt.contains("DECLARED OUTPUT TYPE:"),
+            "stated as the buyer's declared output type: {prompt}"
+        );
+        // A VALUE, not fixed prose: a different declared type produces a different prompt, and never
+        // the other job's type.
+        let mut other = resumed.clone();
+        other.output = Some("text/plain".to_owned());
+        let other_prompt = job_prompt(&other, "https://relay.example/git/abc.git", 2_000_000_000);
+        assert!(other_prompt.contains("text/plain"), "{other_prompt}");
+        assert!(!other_prompt.contains("application/json"), "{other_prompt}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // TOOTH (charter invariant 2, RESTART form — the strong one) — a job requesting harness X is
@@ -6517,6 +6641,7 @@ mod tests {
                         deadline_unix: 2_000_000_000,
                         targeted: true,
                         requested_agent: Some("codex".to_owned()),
+                        output: Some("text/plain".to_owned()),
                     },
                     1,
                 )
@@ -8254,6 +8379,7 @@ mod tests {
                     deadline_unix,
                     targeted: true,
                     requested_agent: None,
+                    output: Some("text/plain".to_owned()),
                 },
                 now,
             )
@@ -9253,6 +9379,7 @@ mod tests {
                     deadline_unix: 2_000_000_000,
                     targeted: true,
                     requested_agent: None,
+                    output: Some("text/plain".to_owned()),
                 },
                 1,
             )
@@ -9289,6 +9416,7 @@ mod tests {
                     deadline_unix: now - 1,
                     targeted: false,
                     requested_agent: None,
+                    output: Some("text/plain".to_owned()),
                 },
                 1,
             )
@@ -9404,6 +9532,7 @@ mod tests {
                             deadline_unix: deadline,
                             targeted: true,
                             requested_agent: None,
+                            output: Some("text/plain".to_owned()),
                         },
                         1,
                     )

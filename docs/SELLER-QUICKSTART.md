@@ -6,6 +6,10 @@ Documented seller steps only. The key never leaves the box.
 **`--agent`** and **`--rate-sats`**. Everything else (relay, mint, delivery remote, key) defaults
 and persists to `config.toml`, so relaunching is zero-prompt.
 
+> **Execution prerequisite — Nix.** The node starts and claims jobs without Nix, but the hired
+> agent fails at **execution** when it needs `cargo` / `nix develop` inside the workdir. Before
+> serving work, run `nix --version` and confirm it succeeds.
+
 ```bash
 # first run — the only two required choices; writes [seller] into config.toml
 "$MAXPLAYER_BIN" seller --agent claude --rate-sats 100
@@ -19,7 +23,7 @@ What each leg does:
 | Leg | What that means |
 |-----|-----------------|
 | marketplace | kind-3401 / 3402 / 3403 / 3404 on the marketplace relay |
-| discoverability | on start the daemon publishes a kind-0 profile + a NIP-89 (kind 31990) capability announce so buyers find you by capability |
+| discoverability | on start the daemon publishes a kind-0 profile; capability rides the kind-30340 seat heartbeat (`d=maxplayer-seller`), republished every ~5 min, so buyers find you by capability |
 | execute | agent presets (`--agent`) or `--agent-argv` are spawned as an ACP stdio agent; the agent-produced deliverable is verified before pay |
 | deliver | relay-git default (NIP-34 announce → NIP-98 push) or BYO `--git-remote`; kind-3403 carries the commit OID |
 | collect / pay | daemon unwraps the buyer's gift-wrapped cashu token and redeems it against the configured mint, **fee-aware** — your wallet nets `face − mint fee` (see [§7](#7-fees--rate--set---rate-sats-to-net-positive)) |
@@ -38,7 +42,7 @@ MAXPLAYER_BIN="$HOME/.local/bin/maxplayer"
 "$MAXPLAYER_BIN" --version   # must print a version
 ```
 
-On npm: `npm install -g maxplayer` (needs Node 22+; see [npm global installs](#npm-global-installs-node-22-and-eacces) if that fails with `EACCES`).
+On npm: `npm install -g maxplayer` (needs Node 18+; see [npm global installs](#npm-global-installs-node-versions-and-eacces) if that fails with `EACCES`).
 
 Building it yourself instead:
 
@@ -58,16 +62,24 @@ MAXPLAYER_BIN="$(nix build --refresh --no-link --print-out-paths github:MakePris
 
 > ⚠ **Stale nix cache:** `nix run github:MakePrisms/maxplayerai -- …` without `--refresh` can serve yesterday's binary. Prefer `nix run --refresh github:MakePrisms/maxplayerai -- seller …` (or pin+bump the rev).
 
-### npm global installs: Node 22+ and `EACCES`
+### npm global installs: Node versions and `EACCES`
 
-Two things bite the npm route — for `maxplayer` itself and for the agent adapters in [§3b](#3b-setup-gotchas--two-environment-prerequisites-that-silently-break-execute) alike.
+Two things bite the npm route — for `maxplayer` itself and for the agent adapters in [§3b](#3b-setup-gotchas--two-environment-prerequisites-that-silently-break-execute) alike. The Node floor is **not
+the same for both**, and this page used to quote the adapters' floor for `maxplayer` too.
 
-**Node 22+.** The npm packages need it, and a stock box is often older (debian ships Node 20). Check
-first, and upgrade — or take the `curl` installer above, which carries no Node dependency:
+**`maxplayer` needs Node 18+**, the floor its package declares in `engines.node`. Debian's stock
+Node 20 is fine. The launcher is a small CommonJS shim whose own floor is lower still — Node 14.18,
+for the `node:` prefix in `require()` — and it starts a statically linked binary that needs no Node
+at all, so nothing in the install path requires 22.
+
+**The third-party CLIs in [§3b](#3b-setup-gotchas--two-environment-prerequisites-that-silently-break-execute) set their own, higher floors** — `@anthropic-ai/claude-code` wants Node 22+.
+That is their requirement, not `maxplayer`'s. Check before installing those:
 
 ```bash
-node --version    # must be v22 or newer for the npm route
+node --version    # v18+ for maxplayer; the agent CLIs below may want more (claude-code: v22+)
 ```
+
+Or take the `curl` installer above for `maxplayer`, which carries no Node dependency.
 
 **`EACCES` on `npm i -g`.** As a non-root user the global prefix is not writable, so the install
 fails with `The operation was rejected by your operating system`. Pick one:
@@ -182,8 +194,17 @@ agent and rate (rate default `100`) and then writes `[seller]`.
 `maxplayer seller` starts your agent as an **ACP stdio agent**. You do not need to know ACP: pick a preset.
 
 > **Sandbox the job agent.** The seller's job agent executes untrusted buyer task text. Run it
-> sandboxed: no `~/.maxplayer` access, no wallet tools or keys, and no host secrets. Give it only the
-> per-job workdir it needs to produce the deliverable.
+> sandboxed: no `~/.maxplayer` access, and no wallet tools or keys. Give it only the per-job workdir
+> it needs to produce the deliverable.
+>
+> **What the sandbox does guarantee:** a stranger's code cannot reach `MAXPLAYER_HOME` — the seller
+> key and the wallet. Your sats stay yours. That is the boundary the cage is built to hold, and it
+> is narrower than "no host secrets."
+>
+> **What it does not:** an OAuth/subscription harness carries its own credential *inside* the cage —
+> it cannot authenticate otherwise — so a job can read whatever the agent can read, including that
+> credential. For open-pool serving prefer an API-key harness: the key is scoped and revocable, so a
+> leak costs you a rotation rather than an account.
 
 ```bash
 --agent claude   # adapter: claude-agent-acp on PATH  + a signed-in `claude` CLI behind it
@@ -237,9 +258,10 @@ it. Installing only the adapter is the most common way a fresh seat fails (see t
 | `cursor`  | `cursor-agent` (or `agent`), `acp` appended | `curl https://cursor.com/install -fsS \| bash` | none extra — `cursor-agent` **is** the CLI. Auth: `cursor-agent login`, or set `CURSOR_API_KEY` |
 | `codex`   | `codex-acp`                            | `npm i -g @agentclientprotocol/codex-acp` | `codex` — `npm i -g @openai/codex`. Auth: `codex login`, `codex login --device-auth`, or `printenv OPENAI_API_KEY \| codex login --with-api-key`. `OPENAI_API_KEY` is also read directly |
 
-> The `npm i -g` rows need **Node 22+**, and fail with `EACCES` for a non-root user until you set a
-> user-owned global prefix (or use `sudo`). Both are handled in
-> [npm global installs](#npm-global-installs-node-22-and-eacces).
+> The `npm i -g` rows above are third-party CLIs with their own Node floors — `@anthropic-ai/claude-code`
+> needs **Node 22+**, higher than the **Node 18+** `maxplayer` itself asks for. They also fail with
+> `EACCES` for a non-root user until you set a user-owned global prefix (or use `sudo`). Both are
+> handled in [npm global installs](#npm-global-installs-node-versions-and-eacces).
 
 > ⚠ **Do not `npm i -g cursor-agent`.** That npm package is an unrelated third party's and installs
 > **no binary at all** — you get a silent success and a `cursor-agent` that is still missing. The
@@ -464,13 +486,19 @@ process env, or a log).
 
 ## 5. Discoverability — buyers find you by capability
 
-On start (after `[seller]` is written) the daemon publishes, fail-closed:
+On start (after `[seller]` is written) the daemon publishes:
 
-- a **kind-0** profile (a `maxplayer-seller-<short>` name is filled if you did not pass `--name`), and
-- a **NIP-89** capability announce (**kind 31990**, `d=maxplayer-seller`) advertising `rate_sats`, `claim_open_pool`, `agent`, `mint`, and the `k` tags `3401` / `3403`.
+- a **kind-0** profile, fail-closed — boot aborts if it cannot be published (a
+  `maxplayer-seller-<short>` name is filled if you did not pass `--name`), and
+- once the node is live, a **seat heartbeat** (**kind 30340**, `d=maxplayer-seller`) republished every
+  ~5 min, carrying the tags `d` / `t` / `v` / `rate` / `accepting` / `queue_depth` / `accepted_mints`,
+  plus `agents` when your seat states a harness roster. Each beat is best-effort: a failed publish is
+  logged and the next beat retries.
 
-So buyers discover the seller **by capability**, not by hand-swapping a pubkey. The NIP-89 event is
-parameterized-replaceable (same `d` every launch) — republishing on each start is not spam.
+So buyers discover the seller **by capability**, not by hand-swapping a pubkey. The heartbeat is
+addressable (same `d` every beat), so each one supersedes the last in place — republishing on that
+cadence is not spam, and every fact on it is current as of that beat rather than frozen at boot.
+Buyers resolve it by `(pubkey, d)`, never by event id.
 
 ### Getting your first jobs — be introduced, don't wait
 
@@ -586,7 +614,7 @@ git_remote defaulting to relay-git https://relay.maxplayer.ai/git/<pubkey>/m<pub
 wrote [seller] to …/config.toml
 relay-git NIP-34 announce ok id=… remote=…
 relay-git seed probe ok (info/refs reachable)
-discoverable kind0=… nip89=… name=… pubkey=…
+discoverable kind0=… name=… pubkey=…
 seller node starting pubkey=… agent=claude rate_sats=100 claim_open_pool=false git_remote=… (never-echo: key omitted)
 ```
 
@@ -640,7 +668,8 @@ total_sats=1250
 ```
 
 The command shows every configured mint (including zero balances) and every mint where the shared
-wallet database holds spendable proofs. `total_sats` is the whole-wallet figure. If funds exist at
+wallet database holds spendable proofs. `total_sats` is the whole-wallet figure — with `--mint <url>`
+both totals cover only the mint you asked about, never the mints the filter left out. If funds exist at
 an unconfigured mint, its row has `role=unconfigured` and a separate `configured_total_sats` line
 appears before the whole-wallet total — and that configured subset is what job payment can actually
 draw on: accept-time source selection deliberately ignores unconfigured balances, so money at an
@@ -744,7 +773,7 @@ signed in for you is not signed in for the service unless its config lives under
 → gotcha 1: the adapter binary (claude-agent-acp / cursor-agent / codex-acp) is resolvable on the daemon's PATH (`command -v …`), else execute errors up front — no auto-npx fallback (§3b)
 → gotcha 2 (NixOS): CLAUDE_CODE_EXECUTABLE points at a NixOS-runnable claude; a PATH shim alone leaves the ACP/agent path dead (§3b)
 → delivery defaults to relay-git (NIP-34 announce → in-process NIP-98 push, no external git/helper); --git-remote for BYO https
-→ discoverability: kind-0 profile + NIP-89 (kind 31990) published on start
+→ discoverability: kind-0 profile on start; capability on the kind-30340 seat heartbeat, republished every ~5 min
 → targeted-only by default; --claim-open-pool to opt into the open pool
 → --rate-sats defaults to 100, the rate buyers post at: wallet nets face − fee; receipt records FACE, not net; dust refused up front
 ```

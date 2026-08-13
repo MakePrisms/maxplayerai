@@ -35,6 +35,8 @@ pub struct MockDriver {
     permission_history: Vec<(PermissionRequest, PermissionOutcome)>,
     prompt_history: Vec<(SessionId, PromptTurn)>,
     usage: Option<UsageMetadata>,
+    shutdown_calls: u32,
+    shutdown_error: Option<DriverError>,
 }
 
 impl MockDriver {
@@ -48,6 +50,8 @@ impl MockDriver {
             permission_history: Vec::new(),
             prompt_history: Vec::new(),
             usage: None,
+            shutdown_calls: 0,
+            shutdown_error: None,
         }
     }
 
@@ -61,6 +65,19 @@ impl MockDriver {
     pub fn with_usage(mut self, usage: UsageMetadata) -> Self {
         self.usage = Some(usage);
         self
+    }
+
+    /// Script `shutdown()` to fail, so the engine's error precedence at the shutdown seam is
+    /// exercisable (#729: a run error must not be masked by a secondary shutdown failure).
+    pub fn with_shutdown_error(mut self, error: DriverError) -> Self {
+        self.shutdown_error = Some(error);
+        self
+    }
+
+    /// How many times `shutdown()` was called — the observable for #729 (shutdown must run on
+    /// every exit of a run, failure paths included).
+    pub fn shutdown_calls(&self) -> u32 {
+        self.shutdown_calls
     }
 
     pub fn permission_history(&self) -> &[(PermissionRequest, PermissionOutcome)] {
@@ -148,10 +165,14 @@ impl Driver for MockDriver {
     }
 
     async fn shutdown(&mut self) -> Result<(), DriverError> {
+        self.shutdown_calls += 1;
         for session in &self.sessions {
             session.cancelled.store(true, Ordering::SeqCst);
         }
-        Ok(())
+        match self.shutdown_error.clone() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn usage(&self) -> Option<UsageMetadata> {

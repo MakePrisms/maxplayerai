@@ -66,12 +66,13 @@ choosing a mint a precondition for getting started.
 
 - **Keep minibits** — the answer whenever they have no preference. Nothing to configure; go straight
   to `wallet setup` below.
-- **A different mint** — allow it first, then fund on it. `--mint` is refused for a mint that is not
-  already allowed, so the order matters:
+- **A different mint** — one command. `wallet setup --mint <url>` auto-adds a mint that is not yet
+  configured (#506-C — identical to `wallet mints add <url>`, idempotent, and it only ever adds to
+  the extra mints), so there is no order to get wrong:
   ```bash
-  maxplayer wallet mints add https://<their-mint>
   maxplayer wallet setup --mint https://<their-mint>
   ```
+  Adding it first still works — it is harmless, just unnecessary.
 - **Several mints** — add each one. The wallet holds a balance per mint and pays a seller from a mint
   they accept:
   ```bash
@@ -106,7 +107,8 @@ maxplayer wallet balance          # total_sats is whole-wallet spendable sats
 
 The command includes configured mints and any unconfigured mint where the wallet database holds
 proofs. Such rows say `role=unconfigured`; when they exist, `configured_total_sats` distinguishes
-the configured subset from whole-wallet `total_sats`. If `balance` is still `0`, you paid the
+the configured subset from whole-wallet `total_sats`. With `--mint <url>` both totals cover only that
+mint, so neither can be read as a figure for mints the filter excluded. If `balance` is still `0`, you paid the
 invoice but never ran `mint-complete`. Nothing is lost —
 run it with the `quote_id` from the setup output.
 
@@ -210,9 +212,11 @@ when the daemon restarts. So:
 
 ## Judging a seller before you spend
 
-- **Advertised terms are self-reported.** Rate, name, open-pool flag and especially the advertised
-  **mint** are claims, not facts — a known bug can make the announced mint disagree with the one the
-  seller actually settles on. Never infer a seller's mint from the advert.
+- **Advertised terms are self-reported.** Rate, name, open-pool flag and the advertised
+  **`accepted_mints`** are claims, not facts — nothing verifies them against what the seller actually
+  does. The list is what the seat *could* settle on, not the mint a given trade uses; the payable
+  mint for one trade is the one carried by that trade's `creq`. Never infer the settlement mint from
+  the advert.
 - Reputation is per **(seller × mint class)**. A clean record on one class of mint proves nothing
   about another.
 - There is **no escrow, no dispute desk and no refund path**. The public record is the whole

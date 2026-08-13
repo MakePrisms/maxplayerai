@@ -197,25 +197,42 @@ stderr lines and the gap in timestamps.
 
 ## Symptom: buyers can't find my seller / I'm not on the board
 
-Your seat's discovery record — the kind-0 profile and the kind-31990 (NIP-89) handler — is
-published **only at boot**, in one place, logged as:
+Your seat has **two** discovery records, and they refresh differently.
+
+The **kind-0 profile** — your name and identity — is published **only at boot**, in one place,
+logged as:
 
 ```
-seller node discoverable kind0=<id> nip89=<id> name=<name> pubkey=<hex>
+seller node discoverable kind0=<id> name=<name> pubkey=<hex>
 ```
 
-There is **no periodic re-announce** of discovery. So if the relay was unreachable when
-you started, or a relay outage wiped the replaceable events, your discovery record is gone
-and does **not** come back on its own. (The kind-30340 heartbeat *does* refresh, so your
-capacity may still register on the relay while your discovery handler is missing —
-confusing but expected.)
+There is **no periodic re-publish** of the profile. So if the relay was unreachable when you
+started, or a relay outage wiped the replaceable event, your profile is gone and does **not**
+come back on its own.
 
-**Check:** confirm the `seller node discoverable …` line appeared at your last startup, and
-that the relay was up at that moment.
+Your **capability** — `rate`, `accepting`, `queue_depth`, `accepted_mints`, `agents` — rides the
+**kind-30340 heartbeat** (`d=maxplayer-seller`), republished every ~5 min. Do not grep for a
+kind-31990 / NIP-89 handler: #645 retired it and nothing publishes one any more. Any 31990 still on
+a relay is pre-#645 residue, not live capability. The heartbeat *does* self-heal — one interval
+after the relay comes back, your capability is current again. Boot confirms it is running with:
 
-**Fix:** **restart the seller** (`maxplayer seller`). Boot re-publishes kind-0 + kind-31990
-and you are listed again. This is the correct response after any relay outage that
-happened while your seat was already running.
+```
+seller node heartbeat+watchdog enabled: kind-30340 every <n>s; …
+```
+
+A successful beat is silent; only failures print (`seller node heartbeat publish failed
+(continuing): …`).
+
+**Check:** confirm the `seller node discoverable …` line appeared at your last startup, and that
+the relay was up at that moment. Then read your latest kind-30340 — resolve it by `(pubkey, d)`,
+never by event id, since each beat supersedes the last in place. If it says `accepting=n`, you are
+published but declining: the seat is busy (`queue_depth` > 0) or has dropped every harness. That is
+a capacity problem, not a discovery one.
+
+**Fix:** **restart the seller** (`maxplayer seller`). Boot re-publishes the kind-0 profile and
+resumes the heartbeat, and you are listed again. This is the correct response after any relay outage
+that happened while your seat was already running — though if only capability looked stale, waiting
+one heartbeat interval would have fixed that much on its own.
 
 **Dead end → report it:** if you restart with the relay confirmed up and still are not
 discoverable, file on **MakePrisms/maxplayerai** with your `pubkey` and the

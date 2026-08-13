@@ -24,7 +24,7 @@ use crate::checks::EnvKind;
 use crate::gateway::EventDraft;
 
 /// Current on-disk schema version.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// A cloneable handle to the node-owned SQLite state.
 #[derive(Clone)]
@@ -65,6 +65,15 @@ pub struct Offer {
     /// from the claim: a resumed job reads its requested harness from here, so it dispatches to
     /// the harness the buyer asked for and not to whichever one happens to be preferred now.
     pub requested_agent: Option<String>,
+    /// #686: the output type the buyer declared on the offer's `["output", …]` tag — a MIME / output
+    /// type (`text/plain`, `application/json`). Mandatory on ingest, so a row this binary wrote always
+    /// carries it; `None` ⇒ a row recorded before this column existed (absence, never a default —
+    /// there is no output type to state that a buyer did not state).
+    ///
+    /// Journaled for the SAME reason as `requested_agent` above: execution can be a RESTART away from
+    /// the claim, and the resumed job composes its agent prompt from this row. Unpersisted, the buyer's
+    /// declared type would be gone for that job permanently.
+    pub output: Option<String>,
 }
 
 /// #591: the target + base a SERVED contribution job clones into its delivery workdir. The buyer's
@@ -242,7 +251,11 @@ impl SellerStore {
                  created_at_unix INTEGER NOT NULL,
                  -- The harness the offer requested. NULL ⇒ no preference, which is also what an
                  -- offer recorded before this column existed reads as.
-                 requested_agent TEXT
+                 requested_agent TEXT,
+                 -- #686: the buyer's declared output type (the offer's `output` tag — a MIME / output
+                 -- type). Mandatory on ingest, so this binary always writes it; NULL ⇒ an offer
+                 -- recorded before this column existed, which states no output type to the agent.
+                 output          TEXT
              );
              -- Claims the node parked. `state` is the claim's own lifecycle; `awarded` marks the
              -- one the buyer selected, `released` the ones it stepped back from.
@@ -393,6 +406,12 @@ impl SellerStore {
         if !Self::column_exists(conn, "jobs", "settled_elsewhere_at_unix")? {
             conn.execute_batch("ALTER TABLE jobs ADD COLUMN settled_elsewhere_at_unix INTEGER;")?;
         }
+        // #686: the buyer's declared output type. A store from a pre-#686 binary reads NULL for its
+        // existing offers — those jobs simply state no output type in their agent prompt — and is
+        // armed going forward at the next ingest. Additive + idempotent, exactly like the columns above.
+        if !Self::column_exists(conn, "offers", "output")? {
+            conn.execute_batch("ALTER TABLE offers ADD COLUMN output TEXT;")?;
+        }
         Ok(())
     }
 
@@ -433,8 +452,8 @@ impl SellerStore {
         let changed = conn.execute(
             "INSERT OR IGNORE INTO offers
                  (offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted, created_at_unix,
-                  requested_agent)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                  requested_agent, output)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 offer.offer_id,
                 offer.buyer_pubkey,
@@ -445,6 +464,7 @@ impl SellerStore {
                 offer.targeted as i64,
                 now_unix,
                 offer.requested_agent,
+                offer.output,
             ],
         )?;
         Ok(changed == 1)
@@ -479,7 +499,7 @@ impl SellerStore {
         let row = conn
             .query_row(
                 "SELECT offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted,
-                        requested_agent
+                        requested_agent, output
                  FROM offers WHERE offer_id = ?1",
                 [offer_id],
                 |row| {
@@ -492,6 +512,7 @@ impl SellerStore {
                         deadline_unix: row.get(5)?,
                         targeted: row.get::<_, i64>(6)? != 0,
                         requested_agent: row.get(7)?,
+                        output: row.get(8)?,
                     })
                 },
             )
@@ -685,7 +706,7 @@ impl SellerStore {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT offer_id, buyer_pubkey, amount_sats, unit, task, deadline_unix, targeted,
-                    requested_agent
+                    requested_agent, output
              FROM offers
              WHERE deadline_unix > ?1
                AND offer_id NOT IN (SELECT job_id FROM claims)",
@@ -700,6 +721,7 @@ impl SellerStore {
                 deadline_unix: row.get(5)?,
                 targeted: row.get::<_, i64>(6)? != 0,
                 requested_agent: row.get(7)?,
+                output: row.get(8)?,
             })
         })?;
         let mut offers = Vec::new();
@@ -1517,6 +1539,7 @@ mod tests {
             deadline_unix: 10_000,
             targeted: true,
             requested_agent: None,
+            output: Some("text/plain".to_owned()),
         }
     }
 
@@ -1585,6 +1608,44 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // TOOTH (#686) — the output type the buyer DECLARED is journaled with the other offer facts and
+    // READS BACK across a reopen. Same reason as the harness request above: execution can be a
+    // restart away from the claim, and the resumed job composes its agent prompt from this row, so a
+    // type that lived only in memory would be gone for that job permanently.
+    //
+    // Bite (measured): drop `output` from the INSERT column list in `record_offer` (or from the
+    // `offer_row` SELECT) and this test goes red — the reopened row reads None.
+    #[test]
+    fn the_declared_output_type_survives_a_reopen() {
+        let path = temp_db("declared-output");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = SellerStore::open(&path).expect("open");
+            let mut offer = sample_offer("o1");
+            offer.output = Some("application/json".to_owned());
+            store.record_offer(&offer, 1).expect("record");
+            // A second offer with a DIFFERENT type: the read must return each row's own value, which
+            // a single hardcoded default would not.
+            store.record_offer(&sample_offer("o2"), 1).expect("record");
+        }
+        let store = SellerStore::open(&path).expect("reopen");
+        assert_eq!(
+            store.offer_row("o1").expect("row").expect("o1").output.as_deref(),
+            Some("application/json"),
+            "the declared output type must survive a restart — the prompt is composed from this row"
+        );
+        assert_eq!(
+            store.offer_row("o2").expect("row").expect("o2").output.as_deref(),
+            Some("text/plain")
+        );
+        // The capacity-skip re-drive reads offers through a DIFFERENT statement; it carries the
+        // field too, so a re-considered offer is not silently stripped of it.
+        let awaiting = store.offers_awaiting_claim(1).expect("awaiting");
+        let o1 = awaiting.iter().find(|offer| offer.offer_id == "o1").expect("o1 awaits a claim");
+        assert_eq!(o1.output.as_deref(), Some("application/json"));
+        let _ = std::fs::remove_file(&path);
+    }
+
     // TOOTH — a store written by a binary from before this column opens, MIGRATES, and reads its
     // existing rows as "no preference". `CREATE TABLE IF NOT EXISTS` silently skips an existing
     // table, so without the ALTER an upgraded node would fail every offer read on a live store.
@@ -1615,6 +1676,16 @@ mod tests {
         let row = store.offer_row("old").expect("read").expect("the pre-existing row survives");
         assert_eq!(row.amount_sats, 21, "the row is migrated, not replaced");
         assert_eq!(row.requested_agent, None, "an offer from before the column asked for no harness");
+        // #686: the same store predates the `output` column. It migrates and its live row reads as
+        // "no declared type" — that job's prompt simply states none, rather than the read failing.
+        assert_eq!(row.output, None, "an offer from before the column declared no output type");
+        // Forward from here the column is armed: a fresh ingest into the SAME migrated store keeps
+        // its type, so the migration adds a working column and not just a silent one.
+        store.record_offer(&sample_offer("new"), 2).expect("record into the migrated store");
+        assert_eq!(
+            store.offer_row("new").expect("read").expect("new row").output.as_deref(),
+            Some("text/plain")
+        );
         // Migration is idempotent: opening again neither errors nor double-adds.
         drop(store);
         let store = SellerStore::open(&path).expect("second open");

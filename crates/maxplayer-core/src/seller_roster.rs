@@ -150,6 +150,17 @@ pub enum Fault {
     Unproven,
 }
 
+/// A failed execution classified before it reaches the live roster.
+///
+/// Keeping the job deadline separate from [`Fault`] is load-bearing: [`Fault`] always implicates the
+/// harness, while a deadline expiry is attributable to the job clock and must leave both availability
+/// and strike history untouched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecutionFailure {
+    Harness(Fault),
+    DeadlineExceeded,
+}
+
 /// One harness's live state.
 struct HarnessState {
     /// `None` ⇒ serving.
@@ -268,6 +279,20 @@ impl LiveRoster {
     /// Whether a job requesting `requested` can be served right now — the claim-decision predicate.
     pub fn serves(&self, requested: Option<&str>) -> bool {
         self.dispatch(requested).is_some()
+    }
+
+    /// Record a typed execution failure. Deadline expiry is a deliberate no-op; harness faults retain
+    /// the existing drop/incapable rule through [`Self::fault`].
+    pub fn execution_failure(
+        &self,
+        index: usize,
+        failure: ExecutionFailure,
+        now: Instant,
+    ) -> Option<Unavailable> {
+        match failure {
+            ExecutionFailure::Harness(fault) => Some(self.fault(index, fault, now)),
+            ExecutionFailure::DeadlineExceeded => None,
+        }
     }
 
     /// Record a harness-attributable failure against `index` and return the state it produced, so the
@@ -402,6 +427,33 @@ mod tests {
 
     fn named(names: &[&str]) -> LiveRoster {
         roster(&names.iter().map(|n| Some(*n)).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_deadline_expiry_neither_drops_the_harness_nor_consumes_a_strike() {
+        let roster = named(&["claude"]);
+        let now = Instant::now();
+
+        assert_eq!(
+            roster.execution_failure(0, ExecutionFailure::DeadlineExceeded, now),
+            None,
+            "the job clock is not a harness fault"
+        );
+        assert!(roster.serves(Some("claude")));
+        assert_eq!(roster.advertised(), vec!["claude"]);
+        assert_eq!(roster.unavailable(0), None);
+
+        // A later genuinely unproven failure must still drop, and must be strike ONE: the deadline
+        // event above did not silently advance the backoff history.
+        let dropped = roster
+            .execution_failure(
+                0,
+                ExecutionFailure::Harness(Fault::Unproven),
+                now,
+            )
+            .expect("unproven failures still drop");
+        assert!(matches!(dropped, Unavailable::Dropped { strikes: 1, .. }));
+        assert!(!roster.serves(Some("claude")));
     }
 
     #[test]

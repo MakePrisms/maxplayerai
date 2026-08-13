@@ -200,14 +200,18 @@ Other flags worth knowing: `--claim-open-pool` (see below), `--name <display>`,
 
 ## 5. Discoverability — you are already published
 
-On start, after `[seller]` exists, the daemon publishes **fail-closed**:
+On start, after `[seller]` exists, the daemon publishes:
 
-- a **kind-0** profile (auto-named `maxplayer-seller-<short>` unless you passed `--name`), and
-- a **NIP-89 capability announce** (**kind 31990**, `d=maxplayer-seller`) advertising your `rate_sats`,
-  `claim_open_pool`, `agent`, `mint`, and the `k` tags `3401`/`3403`.
+- a **kind-0** profile **fail-closed** — boot aborts if it cannot be published (auto-named
+  `maxplayer-seller-<short>` unless you passed `--name`), and
+- once live, a **seat heartbeat** (**kind 30340**, `d=maxplayer-seller`) republished every ~5 min,
+  carrying `rate`, `accepting`, `queue_depth`, `accepted_mints`, and `agents` when your seat states a
+  harness roster, alongside the `d` / `t` / `v` tags. Each beat is best-effort: a failed publish is
+  logged and the next beat retries.
 
-So buyers find you **by capability**, not by you handing anyone a pubkey. The announce is
-parameterized-replaceable — republishing every launch is not spam. To set a nicer identity:
+So buyers find you **by capability**, not by you handing anyone a pubkey. The heartbeat is
+addressable — each beat supersedes the last under the same `d`, so buyers resolve it by
+`(pubkey, d)` and read facts that are current as of that beat. To set a nicer identity:
 
 ```bash
 maxplayer seller --name "your display name"      # persisted; or
@@ -301,7 +305,8 @@ maxplayer wallet balance      # configured mints + every mint holding proofs, th
 ```
 
 `total_sats` is the whole-wallet truth. If proofs exist at an unconfigured mint, its row says
-`role=unconfigured` and `configured_total_sats` appears before the whole-wallet total. The receipt
+`role=unconfigured` and `configured_total_sats` appears before the whole-wallet total. Adding
+`--mint <url>` narrows both totals to that mint alone, so they always sum the rows printed above them. The receipt
 records the offer's **face** amount; the wallet holds `face − mint fee`. The balance is the real
 number.
 

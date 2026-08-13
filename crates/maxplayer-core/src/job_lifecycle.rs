@@ -31,9 +31,9 @@ use crate::{buyer_fund, payment_wallet};
 const JOBS_DIR: &str = "jobs";
 /// Per-relay-fetch budget. Kept well under [`WAIT_FOR_CAP_SECS`] / MCP tool deadline.
 const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 5;
-/// Cap for `get_job(wait_for=…)` long-poll. Must stay < MCP tool deadline (~15s) so
-/// cap-hit returns PENDING for re-poll instead of starving the client read-timeout (~60s).
-pub const WAIT_FOR_CAP_SECS: u64 = 10;
+/// Re-exported so this module's own callers (and `buyer`) keep their existing path. The constant
+/// itself lives in an UNGATED module because the MCP tool table needs it without `wallet`.
+pub use crate::long_poll::WAIT_FOR_CAP_SECS;
 const DEFAULT_DEADLINE_SECS: u64 = 3_600;
 /// Derived claim status surfaced when a `processing` claim is past its offer deadline and its
 /// seller has published NO payable delivery (or the delivery's pay window has itself lapsed).
@@ -4309,9 +4309,13 @@ mod tests {
         (root, home)
     }
 
+    // Read by `get_job_default_skips_kind_zero_fetch` only, which is `live-mints`-gated below; the
+    // gate travels with its one caller so the offline build has no dead struct.
+    #[cfg(feature = "live-mints")]
     #[derive(Debug)]
     struct CountMetadataQueries(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
+    #[cfg(feature = "live-mints")]
     impl nostr_relay_builder::prelude::QueryPolicy for CountMetadataQueries {
         fn admit_query<'a>(
             &'a self,
@@ -4442,6 +4446,14 @@ mod tests {
     // and the safe one: a single client can never observe its own published events.
     //
     // BITE: drop the `tx.send(...)` wake below and this goes red on elapsed, not on correctness.
+    //
+    // NETWORK (#720): the relay here is local, but `post_job_async` resolves a fee floor at the
+    // home's mint BEFORE it publishes, and `temp_job_home` bootstraps the shipped default
+    // (mint.minibits.cash). With no network that preflight refuses `mint_unreachable` and the
+    // `.expect("post job")` below panics — the test never reaches its own subject. Not silenced:
+    // `live-mints` is ON in the money-path CI job, which has a network. See the feature's comment
+    // in Cargo.toml.
+    #[cfg(feature = "live-mints")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_wait_resolves_on_arrival_rather_than_on_the_safety_recheck() {
         use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
@@ -4523,6 +4535,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // NETWORK (#720): same shape as the wait test above — the relay is local, but the
+    // `post_job_async` fee floor reaches the home's shipped default mint before publishing, so this
+    // cannot run under `net: denied`. ON in the money-path CI job; see `live-mints` in Cargo.toml.
+    #[cfg(feature = "live-mints")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn get_job_default_skips_kind_zero_fetch() {
         use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};

@@ -85,6 +85,31 @@ jobs:
       - name: Verify the seller surface (acp)
         run: ./scripts/verify-seller-surface.sh target/release/maxplayer
 
+  # The bare feature set — `wallet` off, so `acp` and the seller surface are off with it. NO other
+  # job compiles it: build-default builds `--workspace` with default features (wallet ON) and
+  # build-acp turns MORE features on, never fewer. Every job in this file moves in one direction
+  # from the default, so the floor of the feature graph was never built.
+  #
+  # It regressed the moment it was left unwatched. #203 closed on the reasoning that the build was
+  # fine — correct when it was made — and 86 minutes later ef3ff86 (#658) merged an ungated
+  # `use maxplayer_core::job_lifecycle` into mcp.rs, reaching a module gated on `wallet`. That is a
+  # compile error in this feature set and a no-op in every other, so it reached main and sat there.
+  # The defect was never the import: it was that no row in this file could go red on it.
+  #
+  # RED-PROVED before this job was written, which is the only thing that makes it a guard rather
+  # than a row that has never failed: `cargo build -p maxplayer --no-default-features --locked`
+  # gives E0432 at ae31bf85 and exits 0 at 48b83d7. Do not pipe the command — a pipe would report
+  # the exit status of the last stage and this job would pass on a failed build.
+  build-no-default:
+    name: Build (no default features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build maxplayer (no default features)
+        run: cargo build -p maxplayer --no-default-features --locked
+
   # web/app and web/network each ship a Node test suite ("node --test test/") that no CI
   # job ran before #483 — a web-only PR could merge with its JS suite unverified while
   # Rust CI stayed green. Both projects declare zero npm dependencies (no
@@ -133,8 +158,16 @@ jobs:
       # panics on drop under debug). Interim: release-only until that transport-lifecycle bug is
       # fixed (#152); the money assertions here (tip-match refusal, zero-burn, no
       # journal/materialization) hold in release.
+      # `live-mints` is ON here and NOWHERE else (#720). It carries the four tests that reach a live
+      # third-party mint over the public internet — two `job_lifecycle` post_job waits and two
+      # `payment_wallet` worker sends. They used to ride along with `wallet`, which is what made
+      # `wallet` undeclarable in `.maxplayer/checks.toml` (every declared command runs with NO
+      # network), and that cost the repo its whole wallet-gated suite — tests/collect_integrity.rs
+      # and every seller_node test ran in zero declared commands. Splitting them off did not silence
+      # them: this runner has a network, and this row is the one that runs them. Dropping the
+      # feature here is a SILENT loss of those four — nothing else names them.
       - name: Test maxplayer-core (money-path suite)
-        run: cargo test -p maxplayer-core --release --no-default-features --features gateway,git-delivery,wallet --locked
+        run: cargo test -p maxplayer-core --release --no-default-features --features gateway,git-delivery,wallet,live-mints --locked
 
   # The release workflow triggers only on a tag, so no pull request ever exercises it. What CI can
   # check is that the gates keeping it from publishing are still in place — otherwise the property

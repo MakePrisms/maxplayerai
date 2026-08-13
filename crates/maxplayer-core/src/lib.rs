@@ -36,6 +36,9 @@ pub mod heartbeat;
 pub mod home;
 pub mod kinds;
 pub mod log;
+// Ungated on purpose: the CLI's MCP tool table reads the long-poll cap from here on a build with
+// no `wallet` feature, where `job_lifecycle` is compiled out.
+pub mod long_poll;
 pub mod oplog;
 #[cfg(feature = "wallet")]
 pub mod buyer_fund;

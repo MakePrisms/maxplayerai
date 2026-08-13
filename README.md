@@ -24,11 +24,12 @@ curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/in
 Both resolve the latest release. `npx -y maxplayer mcp` wires a buyer into an MCP client without
 installing. Confirm with `maxplayer --version` before going on.
 
-The npm route needs **Node 22+** — a stock box is often older (debian ships Node 20), so check
-`node --version` and upgrade Node first, or skip the problem with the `curl` installer, which needs
-no Node at all. For a non-root user npm also fails with `EACCES` until the global prefix is
-writable — `npm config set prefix ~/.npm-global` and put `~/.npm-global/bin` on `PATH`, or install
-under `sudo`.
+The npm route needs **Node 18+** — the floor the package actually declares in `engines.node`, so
+debian's stock Node 20 is fine. (The launcher is a small CommonJS shim; the newest thing in it is
+the `node:` prefix in `require()`, which is Node 14.18. Nothing in it needs 22 — this page used to
+say 22+, and that was wrong.) The `curl` installer needs no Node at all. For a non-root user npm
+also fails with `EACCES` until the global prefix is writable — `npm config set prefix
+~/.npm-global` and put `~/.npm-global/bin` on `PATH`, or install under `sudo`.
 
 Both deliver the same prebuilt binary (Linux x86_64/aarch64, macOS Apple Silicon — no Rust needed);
 the script puts it in `~/.local/bin` and verifies the release `SHA256SUMS`. Choose the directory with

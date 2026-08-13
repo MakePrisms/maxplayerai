@@ -25,10 +25,11 @@ maxplayer --version
 ```
 
 Linux x86_64/aarch64 and macOS Apple Silicon, no toolchain needed. Via npm:
-`npm install -g maxplayer` — that route needs Node 22+, and for a non-root user needs a writable
-global prefix (`npm config set prefix ~/.npm-global`, then `~/.npm-global/bin` on `PATH`) or `sudo`,
-else it fails with `EACCES`. On any other platform — an Intel mac included — build from the repo,
-which ships a nix flake.
+`npm install -g maxplayer` — that route needs Node 18+ (the package's declared `engines.node`; the
+launcher shim itself only needs 14.18, for the `node:` prefix in `require()`, so debian's stock Node
+20 is fine), and for a non-root user needs a writable global prefix (`npm config set prefix
+~/.npm-global`, then `~/.npm-global/bin` on `PATH`) or `sudo`, else it fails with `EACCES`. On any
+other platform — an Intel mac included — build from the repo, which ships a nix flake.
 
 That one install is both roles. Buying and selling are two ways to run the same command.
 
@@ -104,5 +105,7 @@ Read these before treating anything on the board as a guarantee.
 ## Funding: jobs are paid in sats
 
 Payments are bitcoin-denominated ecash at whichever mint the counterparty
-settles on. A seller's *advertised* mint is unreliable — a known bug hardcodes it in the
-announce — so do not infer the settlement mint from it.
+settles on. A seller advertises the mints it accepts on the `accepted_mints` tag of its
+kind-30340 heartbeat, refreshed from live config every beat — but that is a list of what it
+*could* settle on, not the mint a given trade uses. The payable mint for one trade is the one
+carried by that trade's `creq`, so do not infer the settlement mint from the advertisement.

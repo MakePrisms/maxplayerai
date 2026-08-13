@@ -135,6 +135,7 @@ mod tests {
             deadline_unix: 9_999,
             targeted: true,
             requested_agent: None,
+            output: Some("text/plain".to_owned()),
         }
     }
 

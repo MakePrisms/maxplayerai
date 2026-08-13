@@ -1,0 +1,3 @@
+# Vendored Buzz workspace build output. The maxplayerai root .gitignore only
+# anchors `/target` at the repo root, so this nested workspace needs its own.
+/target/

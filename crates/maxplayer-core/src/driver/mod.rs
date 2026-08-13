@@ -86,6 +86,12 @@ pub enum DriverError {
     SessionNotFound(SessionId),
     SessionCancelled(SessionId),
     ScriptExhausted,
+    /// The driver's response timer expired while waiting for this request.
+    ///
+    /// Typed because the caller knows what supplied the timer. In the seller job path it is the
+    /// job's absolute deadline; flattening it into [`Self::Other`] would discard that attribution
+    /// and make a healthy harness look broken.
+    ResponseTimeout { request_id: u64 },
     Other(String),
 }
 
@@ -96,6 +102,9 @@ impl Display for DriverError {
             Self::SessionNotFound(session_id) => write!(f, "session not found: {session_id}"),
             Self::SessionCancelled(session_id) => write!(f, "session is cancelled: {session_id}"),
             Self::ScriptExhausted => write!(f, "mock driver script exhausted"),
+            Self::ResponseTimeout { request_id } => {
+                write!(f, "ACP request {request_id} timed out waiting for response")
+            }
             Self::Other(message) => write!(f, "{message}"),
         }
     }

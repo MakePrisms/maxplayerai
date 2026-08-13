@@ -26,6 +26,8 @@ pub enum ExecError {
     Config(String),
     /// The agent process failed, timed out, or ended non-terminal.
     Agent(String),
+    /// The deadline-derived unified job timer expired. This says nothing about harness health.
+    DeadlineExceeded,
     /// A delivery-shaping policy refusal (e.g. an un-typeable delivery oid).
     Policy(String),
     /// The binary was built without the `acp` feature, so no agent can run.
@@ -37,6 +39,9 @@ impl std::fmt::Display for ExecError {
         match self {
             Self::Config(message) => write!(f, "seller config: {message}"),
             Self::Agent(message) => write!(f, "seller agent error: {message}"),
+            Self::DeadlineExceeded => {
+                write!(f, "job deadline reached while the agent was still running")
+            }
             Self::Policy(message) => write!(f, "seller policy: {message}"),
             Self::AcpRequired => write!(
                 f,
@@ -48,6 +53,26 @@ impl std::fmt::Display for ExecError {
 }
 
 impl std::error::Error for ExecError {}
+
+/// What supplied the ACP response timer for an agent run.
+///
+/// Both real jobs and self-probes use the same ACP driver, but only the former inherits its timer
+/// from the job deadline. Keeping the source typed lets a real job expiry bypass harness strikes
+/// while a probe that cannot answer inside its own health-check limit still fails the probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentRunTimeout {
+    JobDeadline(Duration),
+    HarnessProbe(Duration),
+}
+
+impl AgentRunTimeout {
+    #[cfg(feature = "acp")]
+    fn duration(self) -> Duration {
+        match self {
+            Self::JobDeadline(duration) | Self::HarnessProbe(duration) => duration,
+        }
+    }
+}
 
 /// How the awarded agent command is launched: either directly (pass-through) or inside a launcher
 /// (e.g. `bwrap …`, `systemd-nspawn …`) the command runs under. The wrap is a pure argv transform,
@@ -173,15 +198,77 @@ where
     }
 }
 
-/// Daemon/node-owned delivery. The seller appends explicit, secret-free delivery instructions to the
-/// agent's task prompt so the agent delivers by committing its work to the git repository in its
-/// working directory — rather than guessing a delivery channel. The seller performs the
-/// authenticated push of the committed branch to the bound remote (NIP-98; the agent is never handed
-/// a key), so this text carries NO secret — it is public prompt text built only from the task and the
-/// (public) remote URL.
-pub fn compose_agent_prompt(task: &str, git_remote: &str, memory_section: Option<&str>) -> String {
+/// Daemon/node-owned delivery, plus the job agent's PROMPT PREAMBLE — identity, job context,
+/// boundaries (#685, #731), and the buyer's declared output type (#686).
+///
+/// ⚠ It is a PREAMBLE IN THE USER TURN, **not** a protocol-level system prompt, because ACP has no
+/// system-prompt surface: [`SessionConfig`](crate::driver::SessionConfig) is `{cwd, mcp_servers,
+/// env}` — the whole of `session/new` — and the single `session/prompt` turn carries one text
+/// block. Composing it HERE hands every harness the same preamble from one place. The only form
+/// that would be a true system prompt is a per-harness launcher flag (`--append-system-prompt` and
+/// its equivalents), which has to be repeated per harness — so a newly added harness would
+/// silently ship without one.
+///
+/// The seller appends explicit, secret-free delivery instructions to the agent's task prompt so the
+/// agent delivers by committing its work to the git repository in its working directory — rather
+/// than guessing a delivery channel. The seller performs the authenticated push of the committed
+/// branch to the bound remote (NIP-98; the agent is never handed a key), so this text carries NO
+/// secret — it is public prompt text built only from the task, the deadline, and the (public)
+/// remote URL.
+///
+/// Three shape decisions worth keeping:
+/// - The task stays FIRST. The buyer's instructions must not be pushed down by our own prose.
+/// - `deadline_unix` is stated as an ABSOLUTE epoch second, never as a remaining budget: the prompt
+///   is composed once, before [`run_agent_with_retry`], so a relative figure would be a lie on the
+///   second attempt.
+/// - No `date` invocation is suggested. `date -u -d @…` is GNU-only and sellers run on macOS too.
+///
+/// It carries NO refusal instruction, deliberately (#685). A refusal today either writes nothing —
+/// quarantining the harness — or writes a refusal note that mints a sentinel and gets PAID, so
+/// inviting one before the pre-money seam handles it means paying for refusals. The test below
+/// asserts that ABSENCE, so it cannot be reintroduced by accident.
+pub fn compose_agent_prompt(
+    task: &str,
+    git_remote: &str,
+    deadline_unix: u64,
+    declared_output: Option<&str>,
+    memory_section: Option<&str>,
+) -> String {
+    // #686: the buyer's `["output", …]` tag is MANDATORY on ingest and is a MIME / output type
+    // (`text/plain`, `application/json`). Stating it here is the only way the hired agent learns what
+    // form was asked for — it reads this prompt and nothing else of the offer. `None` ⇒ say nothing:
+    // an offer recorded before the column existed has no declared type, and inventing a default would
+    // put a fact in the prompt that no buyer stated. Blank is treated as absent for the same reason.
+    //
+    // It is a STATEMENT, not a gate. Nothing downstream refuses or penalises a delivery whose format
+    // does not match — that is a money-path decision with its own blast radius, deliberately not here.
+    let output_section = match declared_output.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(output) => format!(
+            "DECLARED OUTPUT TYPE: {output}. The buyer declared this output type on the offer, so \
+             produce the deliverable in that form. The task above wins where the two disagree.\n"
+        ),
+        None => String::new(),
+    };
     let base = format!(
         "{task}\n\n\
+         ---\n\
+         CONTEXT — from the seller daemon running you, not from the buyer. It applies to how you \
+         carry out the task above.\n\
+         WHO YOU ARE: an autonomous agent working a PAID job on the maxplayer marketplace. A buyer \
+         posted the task above, the seller node running you claimed it on your behalf, and the \
+         buyer settles payment when your work is delivered. Treat it as contracted work.\n\
+         DEADLINE: {deadline_unix} (Unix epoch seconds, UTC). Work that is not on disk by then may \
+         never be delivered, so finish and leave your work in place rather than running long.\n\
+         {output_section}\
+         BOUNDARIES:\n\
+         - Your current working directory is the job directory and the whole of your scope. Work \
+         only inside it.\n\
+         - Deliver only what the task asks for; do not add unrequested files.\n\
+         - Never read, write, or reveal credentials, tokens, key material, or any file outside \
+         this directory — not in your deliverable, and not in anything you print.\n\
+         - If you wait on a background process, match something your own waiter cannot contain — \
+         a PID or pidfile captured at start, or `pgrep -x` against an exact program name — never \
+         `pgrep -f` on a substring of your own command line.\n\
          ---\n\
          DELIVERY (required). Your deliverable is the FINAL STATE OF YOUR CURRENT WORKING \
          DIRECTORY:\n\
@@ -369,7 +456,7 @@ pub async fn run_agent_job(
     prompt: &str,
     workdir: &Path,
     identity: &DeliveryAgentIdentity,
-    timeout: Duration,
+    timeout: AgentRunTimeout,
 ) -> Result<Option<UsageMetadata>, ExecError> {
     use crate::driver::{AcpDriver, AgentCommand, ContentBlock, PromptTurn, SessionConfig};
     use crate::engine::{run_job, RunParams};
@@ -382,7 +469,7 @@ pub async fn run_agent_job(
     let mut driver = AcpDriver::new(
         AgentCommand::new(program, args),
         crate::driver::PermissionOutcome::Allow,
-        timeout,
+        timeout.duration(),
     );
     let log_path = workdir.join(crate::seller_git::SELLER_RUN_LOG);
     let mut log = EventLog::open(&log_path).map_err(|error| ExecError::Agent(error.to_string()))?;
@@ -406,10 +493,21 @@ pub async fn run_agent_job(
         &mut |_| {},
     )
     .await
-    .map_err(|error| ExecError::Agent(error.to_string()))?;
+    .map_err(|error| classify_run_error(error, timeout))?;
     match outcome.terminal {
         crate::event::JobExecutionStatus::Completed => Ok(outcome.usage),
         other => Err(ExecError::Agent(format!("agent terminal {other:?}"))),
+    }
+}
+
+#[cfg(feature = "acp")]
+fn classify_run_error(error: crate::engine::EngineError, timeout: AgentRunTimeout) -> ExecError {
+    match (error, timeout) {
+        (
+            crate::engine::EngineError::Driver(crate::driver::DriverError::ResponseTimeout { .. }),
+            AgentRunTimeout::JobDeadline(_),
+        ) => ExecError::DeadlineExceeded,
+        (error, _) => ExecError::Agent(error.to_string()),
     }
 }
 
@@ -421,7 +519,7 @@ pub async fn run_agent_job(
     _prompt: &str,
     _workdir: &Path,
     _identity: &DeliveryAgentIdentity,
-    _timeout: Duration,
+    _timeout: AgentRunTimeout,
 ) -> Result<Option<UsageMetadata>, ExecError> {
     Err(ExecError::AcpRequired)
 }
@@ -503,6 +601,32 @@ mod tests {
         assert_eq!(kind.as_str(), "fork");
     }
 
+    #[cfg(feature = "acp")]
+    #[test]
+    fn response_timeout_is_classified_by_its_typed_timer_source() {
+        use crate::driver::DriverError;
+        use crate::engine::EngineError;
+
+        let deadline = classify_run_error(
+            EngineError::Driver(DriverError::ResponseTimeout { request_id: 3 }),
+            AgentRunTimeout::JobDeadline(Duration::from_secs(60)),
+        );
+        assert!(matches!(deadline, ExecError::DeadlineExceeded));
+        assert_eq!(
+            deadline.to_string(),
+            "job deadline reached while the agent was still running"
+        );
+
+        // The same driver timer is a health failure under the independently bounded self-probe.
+        // This guards against exempting genuine probe timeouts from the existing drop rule.
+        let probe = classify_run_error(
+            EngineError::Driver(DriverError::ResponseTimeout { request_id: 7 }),
+            AgentRunTimeout::HarnessProbe(Duration::from_secs(120)),
+        );
+        assert!(matches!(probe, ExecError::Agent(_)));
+        assert!(probe.to_string().contains("ACP request 7 timed out"));
+    }
+
     // The ACP timeout is unified with `--job-timeout-secs` — one deadline.
     #[test]
     fn unified_job_timeout_is_the_remaining_deadline_not_a_hardcoded_constant() {
@@ -577,7 +701,7 @@ mod tests {
     #[test]
     fn composed_prompt_carries_task_and_owned_delivery_instructions() {
         let remote = "https://relay.example/git/abc.git";
-        let prompt = compose_agent_prompt("build a widget", remote, None);
+        let prompt = compose_agent_prompt("build a widget", remote, 1_800_000_123, None, None);
         // The original task stays up front.
         assert!(prompt.starts_with("build a widget"), "task preserved: {prompt}");
         // Explicit, seller-owned delivery instructions are appended.
@@ -611,6 +735,197 @@ mod tests {
         assert!(!prompt.contains("nsec"), "no nostr secret key");
         assert!(!lower.contains("private key"), "no private key");
         assert!(!lower.contains("secret"), "no secret material");
+    }
+
+    // #685: the preamble must carry THIS JOB'S OWN VALUES, not fixed prose. Two different jobs are
+    // composed and each is checked for its own values AND for the absence of the other's — a
+    // hardcoded constant cannot satisfy both halves, which is what makes this a value check rather
+    // than a prose check.
+    #[test]
+    fn preamble_carries_this_jobs_own_values_and_never_invites_refusal() {
+        let remote_a = "https://relay.example/git/aaa.git";
+        let remote_b = "https://relay.example/git/bbb.git";
+        // Composed WITH a declared output type (#686) so every check below — the wrap-seam
+        // instruments and the refusal ban especially — covers that line too, not only the #685 text.
+        let a = compose_agent_prompt("task A", remote_a, 1_800_000_123, Some("text/plain"), None);
+        let b = compose_agent_prompt(
+            "task B",
+            remote_b,
+            1_900_000_456,
+            Some("application/json"),
+            None,
+        );
+
+        // Identity, deadline and boundaries are present at all — the three things #685 adds.
+        for prompt in [&a, &b] {
+            assert!(
+                prompt.contains("maxplayer marketplace"),
+                "identity present: {prompt}"
+            );
+            assert!(prompt.contains("DEADLINE:"), "deadline stated: {prompt}");
+            assert!(prompt.contains("BOUNDARIES:"), "boundaries stated: {prompt}");
+            // The preamble's sentences span `\`-continuations in the source, and each one swallows
+            // the newline AND the next line's indentation. Both failure modes are silent, and they
+            // need different instruments:
+            //
+            // - a DOUBLED space is caught totally, at every seam that exists or is ever added,
+            //   because our composed text contains no legitimate double space. This test's task
+            //   strings have none either, so any hit came from the seams.
+            // - a LOST space concatenates two words, which no general rule sees — so the joined
+            //   phrases are named, one per seam I introduced.
+            //
+            // Without these, a rewrap ships as mangled prose that only the hired agent ever reads.
+            assert!(
+                !prompt.contains("  "),
+                "no doubled space at any source-wrap seam: {prompt}"
+            );
+            for joined in [
+                "It applies to how you carry out the task above",
+                "A buyer posted the task above",
+                "and the buyer settles payment when your work is delivered",
+                "may never be delivered",
+                "Work only inside it",
+                "or any file outside this directory",
+                "on the offer, so produce the deliverable in that form",
+                "cannot contain — a PID or pidfile captured at start",
+                "never `pgrep -f` on a substring of your own command line",
+            ] {
+                assert!(
+                    prompt.contains(joined),
+                    "preamble joins cleanly across a source wrap ({joined:?}): {prompt}"
+                );
+            }
+        }
+
+        // Each job's own task, deadline epoch and bound remote appear; the other job's do not.
+        assert!(a.contains("task A") && a.contains("aaa.git"), "job A values: {a}");
+        assert!(b.contains("task B") && b.contains("bbb.git"), "job B values: {b}");
+        assert!(a.contains("1800000123"), "job A's exact deadline epoch: {a}");
+        assert!(b.contains("1900000456"), "job B's exact deadline epoch: {b}");
+        assert!(!a.contains("1900000456"), "not the other job's deadline: {a}");
+        assert!(!a.contains("bbb.git"), "not the other job's remote: {a}");
+
+        // The deadline VALUE reaches the text: hold every other input fixed and only it varies.
+        let early = compose_agent_prompt("t", "r", 1_000_000_001, None, None);
+        let late = compose_agent_prompt("t", "r", 1_000_000_002, None, None);
+        assert_ne!(
+            early, late,
+            "the deadline argument must reach the prompt, not be dropped"
+        );
+
+        // ⛔ #685 excludes a refusal instruction: today a refusal either quarantines the harness or
+        // mints a sentinel and gets PAID, so inviting one before the pre-money seam handles it
+        // means paying for refusals. Asserted, not merely omitted — an omission leaves no trace
+        // and the next hand re-adds it.
+        let lower = a.to_lowercase();
+        for banned in ["refuse", "decline", "you may reject", "if you cannot"] {
+            assert!(
+                !lower.contains(banned),
+                "must not invite refusal (found {banned:?}): {a}"
+            );
+        }
+    }
+
+    // TOOTH (#686) — the buyer's DECLARED OUTPUT TYPE reaches the hired agent, as a VALUE.
+    //
+    // The offer's `output` tag is mandatory on ingest and is a MIME / output type, but until this
+    // change it stopped at the parsed offer: the agent was never told what form the buyer asked for.
+    // Two prompts are composed with EVERY other input held fixed and only the output type varying,
+    // and each is checked for its own value AND for the absence of the other's — a hardcoded string
+    // (or a dropped argument) cannot satisfy both halves.
+    //
+    // Bite (measured): pass `None` for `declared_output` inside `compose_agent_prompt`, or drop
+    // `{output_section}` from the format string, and this test goes red on the first assertion.
+    #[test]
+    fn the_declared_output_type_reaches_the_prompt_and_absence_states_nothing() {
+        let json = compose_agent_prompt("t", "r", 1_000, Some("application/json"), None);
+        let plain = compose_agent_prompt("t", "r", 1_000, Some("text/plain"), None);
+
+        assert!(
+            json.contains("application/json"),
+            "the declared output type must reach the prompt: {json}"
+        );
+        assert!(
+            !json.contains("text/plain"),
+            "not some other job's output type: {json}"
+        );
+        assert!(
+            plain.contains("text/plain"),
+            "the declared output type must reach the prompt: {plain}"
+        );
+        assert_ne!(
+            json, plain,
+            "the output-type argument must reach the prompt, not be dropped"
+        );
+        assert!(
+            json.contains("DECLARED OUTPUT TYPE:"),
+            "it is stated as the buyer's declared output type, so the agent can tell whose fact it \
+             is: {json}"
+        );
+
+        // The task stays FIRST — our own prose never pushes the buyer's instructions down.
+        assert!(json.starts_with("t\n\n"), "task still first: {json}");
+
+        // ABSENT ⇒ SILENT, byte-for-byte. An offer recorded before the column existed declares no
+        // output type, and stating a default would put a fact in the prompt no buyer ever gave.
+        let absent = compose_agent_prompt("t", "r", 1_000, None, None);
+        assert!(
+            !absent.contains("DECLARED OUTPUT TYPE"),
+            "no declared type ⇒ nothing stated: {absent}"
+        );
+        // Blank is absence too (a whitespace-only tag value states nothing), so it lands on the
+        // very same bytes rather than on an empty "DECLARED OUTPUT TYPE: ." line.
+        assert_eq!(
+            compose_agent_prompt("t", "r", 1_000, Some("   "), None),
+            absent,
+            "a blank output type states nothing, exactly as an absent one does"
+        );
+
+        // ⛔ NOT ENFORCEMENT (#686 scope): the prompt STATES the type, and states that the task
+        // wins if the two disagree. Nothing here invites the agent to refuse over a format — the
+        // refusal ban asserted in the test above covers this line because it is composed with an
+        // output type set.
+        assert!(
+            json.contains("The task above wins where the two disagree."),
+            "the buyer's task, not our tag, is authoritative: {json}"
+        );
+    }
+
+    // TOOTH (#731) — the preamble warns the hired agent off self-matching process waiters.
+    //
+    // A waiter whose command line CONTAINS the substring it greps for (`pgrep -f "cargo test …"`)
+    // matches sibling waiters forever. Measured on a live seller: after the job had already failed,
+    // 6 processes matched the needle, 0 real cargo, 0 real rustc. Daemon cleanup tolerates leaking
+    // a grandchild ("recoverable"), which is true for mortal grandchildren; a self-matching waiter
+    // is not mortal. The preamble is the only place this reaches: it is agent-authored shell.
+    // Daemon-side reaping is #733, not this change.
+    //
+    // Bite: drop the BOUNDARIES bullet, and the first assertion goes red.
+    #[test]
+    fn preamble_warns_off_self_matching_process_waiters() {
+        let prompt = compose_agent_prompt("t", "r", 1_000, None, None);
+        let boundaries = prompt
+            .split("BOUNDARIES:\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n---\n").next())
+            .expect("BOUNDARIES section");
+
+        assert!(
+            boundaries.contains("never `pgrep -f`"),
+            "forbids pgrep -f, the self-matching waiter: {prompt}"
+        );
+        assert!(
+            boundaries.contains("`pgrep -x`"),
+            "names pgrep -x as the exact-name alternative: {prompt}"
+        );
+        assert!(
+            boundaries.contains("pidfile"),
+            "names a pidfile captured at start as a match the waiter cannot contain: {prompt}"
+        );
+        assert!(
+            boundaries.contains("cannot contain"),
+            "states the invariant — match something the waiter itself cannot contain: {prompt}"
+        );
     }
 
     #[test]
@@ -812,7 +1127,7 @@ mod tests {
             "task",
             Path::new("."),
             &identity,
-            Duration::from_secs(1),
+            AgentRunTimeout::JobDeadline(Duration::from_secs(1)),
         )
         .await
         .expect_err("acp required");
