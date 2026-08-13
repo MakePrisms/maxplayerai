@@ -530,7 +530,16 @@ impl<'a> CdkBuyerMint<'a> {
     }
 
     async fn recover_unmapped_sagas(&self) -> Result<(), PaymentWalletError> {
-        retire_eligible_incomplete_sagas(self.wallet).await?;
+        let report = retire_eligible_incomplete_sagas(self.wallet).await?;
+        // A fail-closed refuse that only lands in `report.unresolved` is silent on this
+        // path — the daemon already runs this every pay attempt, and nothing else prints
+        // the vector. Surface the resolver's own reason so a wedged wallet names why.
+        if !report.unresolved.is_empty() {
+            crate::opline!(
+                "buyer wallet: saga resolve refused: {}",
+                report.unresolved.join("; ")
+            );
+        }
         let incomplete = self
             .wallet
             .localstore
@@ -552,25 +561,31 @@ impl<'a> CdkBuyerMint<'a> {
                     continue;
                 }
                 WalletSagaState::Send(SendSagaState::ProofsReserved) => {
-                    return Err(PaymentWalletError::Reconcile(
-                        "wallet has an incomplete ProofsReserved operation that could not be retired safely".into(),
+                    return Err(refuse_unmapped(
+                        "wallet has an incomplete ProofsReserved operation that could not be retired safely",
+                        &report,
                     ));
                 }
                 WalletSagaState::Send(SendSagaState::TokenCreated) => {
-                    return Err(PaymentWalletError::Reconcile(
-                        "wallet has an incomplete TokenCreated operation with no matching confirmed attempt".into(),
+                    return Err(refuse_unmapped(
+                        "wallet has an incomplete TokenCreated operation with no matching confirmed attempt",
+                        &report,
                     ));
                 }
                 WalletSagaState::Send(SendSagaState::RollingBack) => {
-                    return Err(PaymentWalletError::Reconcile(
-                        "wallet has an in-flight RollingBack send; refuse rather than retire".into(),
+                    return Err(refuse_unmapped(
+                        "wallet has an in-flight RollingBack send; refuse rather than retire",
+                        &report,
                     ));
                 }
                 other => {
-                    return Err(PaymentWalletError::Reconcile(format!(
-                        "wallet has an incomplete non-eligible saga ({}); refuse rather than retire",
-                        other.state_str()
-                    )));
+                    return Err(refuse_unmapped(
+                        &format!(
+                            "wallet has an incomplete non-eligible saga ({}); refuse rather than retire",
+                            other.state_str()
+                        ),
+                        &report,
+                    ));
                 }
             }
         }
@@ -881,6 +896,33 @@ async fn saga_has_confirmed_outgoing_tx(
     Ok(txs.iter().any(|tx| tx.saga_id == Some(saga.id)))
 }
 
+/// Any `transactions` row whose `saga_id` is this saga — direction does not matter.
+///
+/// `get_reserved_proofs` only asks about proof bindings. A healthy wallet also
+/// records a `saga_id` on every transaction. Together the two signals distinguish
+/// a never-bound orphan (neither) from Spent-then-deleted under old
+/// `check_proofs_spent` (transaction row still present).
+async fn saga_has_referencing_transaction(
+    wallet: &Wallet,
+    saga: &cdk::wallet::types::WalletSaga,
+) -> Result<bool, PaymentWalletError> {
+    let txs = wallet.list_transactions(None).await.map_err(wallet_error)?;
+    Ok(txs.iter().any(|tx| tx.saga_id == Some(saga.id)))
+}
+
+/// Fold resolver refusals into the wallet-wide recover error so the daemon retry
+/// log names the actual cause instead of only the downstream "incomplete saga" line.
+fn refuse_unmapped(message: &str, report: &RetireReport) -> PaymentWalletError {
+    if report.unresolved.is_empty() {
+        PaymentWalletError::Reconcile(message.into())
+    } else {
+        PaymentWalletError::Reconcile(format!(
+            "{message}; resolver: {}",
+            report.unresolved.join("; ")
+        ))
+    }
+}
+
 /// NUT-07 via mint connector only — does not mutate localstore.
 async fn nut07_check_state_non_mutating(
     wallet: &Wallet,
@@ -1152,8 +1194,12 @@ fn classify_reserved_inputs(
 ///   * all SPENT   ⇒ the swap executed ⇒ re-derive the outputs from the wallet
 ///     seed (NUT-13 `Wallet::restore`), then mark the inputs spent and drop the
 ///     saga (via [`complete_spent_swap_saga`]).
-///   * mixed/pending, incomplete NUT-07, empty reservation, or an unreachable mint
-///     ⇒ keep refusing fail-closed.
+///   * mixed/pending, incomplete NUT-07, empty reservation **with** a referencing
+///     transaction, or an unreachable mint ⇒ keep refusing fail-closed.
+///   * empty reservation **and** no referencing transaction ⇒ never-bound orphan;
+///     drop the row. Proof bindings alone cannot tell orphan from Spent-then-deleted
+///     under old `check_proofs_spent`; the transaction row can. If either signal is
+///     present, refuse exactly as before.
 async fn resolve_one_swap_saga(
     wallet: &Wallet,
     saga: &cdk::wallet::types::WalletSaga,
@@ -1164,14 +1210,19 @@ async fn resolve_one_swap_saga(
         .get_reserved_proofs(&saga.id)
         .await
         .map_err(wallet_error)?;
-    // Migration-safe fail-closed: an empty reservation is ambiguous (never-bound
-    // orphan vs Spent-then-deleted under old check_proofs_spent) — same posture as
-    // the Send path. Refuse rather than guess.
+    // Empty reservation is ambiguous given only proof bindings (never-bound orphan
+    // vs Spent-then-deleted under old check_proofs_spent). A referencing
+    // `transactions.saga_id` is the discriminator: the Spent-then-deleted case
+    // still has a row, so it still refuses. Neither signal ⇒ never-bound orphan.
     if reserved.is_empty() {
-        return Err(PaymentWalletError::Reconcile(
-            "swap-saga resolve refused: empty reserved set (migration-safe fail-closed; leave wedged-safer-than-double-spend)"
-                .into(),
-        ));
+        if saga_has_referencing_transaction(wallet, saga).await? {
+            return Err(PaymentWalletError::Reconcile(
+                "swap-saga resolve refused: empty reserved set (migration-safe fail-closed; leave wedged-safer-than-double-spend)"
+                    .into(),
+            ));
+        }
+        drop_never_bound_swap_orphan(wallet, saga).await?;
+        return Ok(());
     }
     let ys = reserved.iter().map(|info| info.y).collect::<Vec<_>>();
     // Non-mutating NUT-07 — never check_proofs_spent (it deletes Spent ys from
@@ -1188,6 +1239,63 @@ async fn resolve_one_swap_saga(
             report.swap_recovered += 1;
         }
     }
+    Ok(())
+}
+
+/// Drop a Swap saga that bound nothing and recorded nothing: no reserved proofs
+/// and no `transactions.saga_id`. That pair is the never-bound orphan; deleting
+/// the row touches no proof and no movement record.
+///
+/// TOCTOU: re-prove both absences immediately before mutating. If either signal
+/// appears, refuse — this must not become a back door around the fail-closed
+/// empty-reserved branch.
+async fn drop_never_bound_swap_orphan(
+    wallet: &Wallet,
+    saga: &cdk::wallet::types::WalletSaga,
+) -> Result<(), PaymentWalletError> {
+    let fresh = wallet
+        .localstore
+        .get_saga(&saga.id)
+        .await
+        .map_err(wallet_error)?
+        .ok_or_else(|| {
+            PaymentWalletError::Reconcile(
+                "swap-saga orphan drop refused: saga disappeared before mutate".into(),
+            )
+        })?;
+    if !matches!(fresh.state, WalletSagaState::Swap(_)) {
+        return Err(PaymentWalletError::Reconcile(
+            "swap-saga orphan drop refused: saga no longer a Swap saga before mutate (TOCTOU)"
+                .into(),
+        ));
+    }
+    let reserved = wallet
+        .localstore
+        .get_reserved_proofs(&saga.id)
+        .await
+        .map_err(wallet_error)?;
+    if !reserved.is_empty() {
+        return Err(PaymentWalletError::Reconcile(
+            "swap-saga orphan drop refused: proofs bound before mutate (TOCTOU / fail-closed)"
+                .into(),
+        ));
+    }
+    if saga_has_referencing_transaction(wallet, &fresh).await? {
+        return Err(PaymentWalletError::Reconcile(
+            "swap-saga orphan drop refused: a transaction referenced this saga before mutate \
+             (TOCTOU / fail-closed)"
+                .into(),
+        ));
+    }
+    wallet
+        .localstore
+        .delete_saga(&saga.id)
+        .await
+        .map_err(|error| {
+            PaymentWalletError::Reconcile(format!(
+                "swap-saga orphan drop failed deleting saga: {error}"
+            ))
+        })?;
     Ok(())
 }
 
@@ -4819,6 +4927,29 @@ mod tests {
         saga_id
     }
 
+    /// Attach one `Swap(SwapRequested)` saga that binds nothing — the never-bound
+    /// orphan shape. Callers that need a referencing transaction add it separately
+    /// via [`add_tx_for_saga`].
+    async fn add_empty_swap_saga(wallet: &Wallet) -> uuid::Uuid {
+        let saga_id = uuid::Uuid::now_v7();
+        let saga = WalletSaga::new(
+            saga_id,
+            WalletSagaState::Swap(cdk::wallet::types::SwapSagaState::SwapRequested),
+            Amount::ZERO,
+            mint(MINT),
+            CurrencyUnit::Sat,
+            cdk::wallet::types::OperationData::Swap(cdk::wallet::types::SwapOperationData {
+                input_amount: Amount::ZERO,
+                output_amount: Amount::ZERO,
+                counter_start: Some(0),
+                counter_end: Some(1),
+                blinded_messages: None,
+            }),
+        );
+        wallet.localstore.add_saga(saga).await.unwrap();
+        saga_id
+    }
+
     async fn all_proof_ys(wallet: &Wallet) -> HashSet<CashuPublicKey> {
         wallet
             .localstore
@@ -5336,5 +5467,105 @@ mod tests {
             2,
             "reserved inputs must remain untouched on refuse"
         );
+    }
+
+    // #748. A Swap saga with no bound proofs and no referencing transaction is a
+    // never-bound orphan — nothing was reserved to it and nothing was recorded as
+    // moving for it. Drop it so it stops wedging every outbound payment.
+    #[tokio::test]
+    async fn empty_swap_orphan_with_no_transaction_is_dropped_and_pay_resumes() {
+        let fixture = wallet_fixture().await;
+        let key = payment_key(&fixture.terms);
+        let attempt_id = key.attempt_id();
+        store_confirmed_attempt(&fixture.wallet, &attempt_id, &fixture.token).await;
+        let saga_id = add_empty_swap_saga(&fixture.wallet).await;
+
+        let locked = CdkBuyerMint::new(&fixture.wallet)
+            .lock_or_reconcile(&attempt_id, &fixture.terms)
+            .await
+            .expect("a never-bound swap orphan must not wedge pay");
+
+        assert_eq!(locked.token(), &fixture.token);
+        assert!(
+            fixture
+                .wallet
+                .localstore
+                .get_saga(&saga_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the never-bound orphan must be dropped"
+        );
+    }
+
+    // #748. The branch that protects against double-spend: empty reserved PLUS a
+    // referencing transaction is the Spent-then-deleted shape. Still refuse.
+    #[tokio::test]
+    async fn empty_swap_saga_with_a_referencing_transaction_still_refuses() {
+        let wallet = send_saga_wallet(70, vec![], vec![]).await;
+        let saga_id = add_empty_swap_saga(&wallet).await;
+        add_tx_for_saga(&wallet, Some(saga_id), TransactionDirection::Outgoing, 0).await;
+
+        let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
+        assert_eq!(
+            report.unresolved.len(),
+            1,
+            "empty-reserved + referencing tx must refuse: {:?}",
+            report.unresolved
+        );
+        assert!(
+            report.unresolved[0].contains("empty reserved set"),
+            "the reason must name the empty reservation: {}",
+            report.unresolved[0]
+        );
+        assert!(
+            wallet.localstore.get_saga(&saga_id).await.unwrap().is_some(),
+            "the saga must survive — this is the Spent-then-deleted fail-closed branch"
+        );
+
+        // Daemon path: the resolver reason must reach the recover error, not vanish
+        // into report.unresolved while recover only says "incomplete non-eligible saga".
+        let refused = CdkBuyerMint::new(&wallet).recover_unmapped_sagas().await;
+        match &refused {
+            Err(PaymentWalletError::Reconcile(message))
+                if message.contains("empty reserved set") => {}
+            other => panic!(
+                "resolver refusal must surface on the recover/daemon path, got: {other:?}"
+            ),
+        }
+        assert!(
+            wallet.localstore.get_saga(&saga_id).await.unwrap().is_some(),
+            "refuse must be sticky"
+        );
+    }
+
+    // A transaction whose saga_id is someone else's must not keep THIS orphan wedged.
+    // Same identifier control as the mapped-send near-misses: only this saga's row counts.
+    #[tokio::test]
+    async fn empty_swap_orphan_is_not_kept_by_a_transaction_for_a_different_saga() {
+        let wallet = send_saga_wallet(71, vec![], vec![]).await;
+        let saga_id = add_empty_swap_saga(&wallet).await;
+        add_tx_for_saga(
+            &wallet,
+            Some(uuid::Uuid::now_v7()),
+            TransactionDirection::Outgoing,
+            0,
+        )
+        .await;
+
+        let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
+        assert!(
+            report.unresolved.is_empty(),
+            "a tx for a different saga must not refuse this orphan: {:?}",
+            report.unresolved
+        );
+        assert!(
+            wallet.localstore.get_saga(&saga_id).await.unwrap().is_none(),
+            "the orphan must still drop when the only tx names a different saga"
+        );
+        CdkBuyerMint::new(&wallet)
+            .recover_unmapped_sagas()
+            .await
+            .expect("pay path must resume after dropping the orphan");
     }
 }
