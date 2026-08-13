@@ -1,16 +1,16 @@
 # maxplayer deployment & packaging
 
-> **Status (dev tip) — read this first.** `flake.nix` ships the `maxplayer` client
+> **Status (dev tip). Read this first.** `flake.nix` ships the `maxplayer` client
 > (`packages.default`, built with `--features acp`), `apps.default` (`nix run … -- mcp|seller`), and a
-> `devShells.default` — **plus a launch-relay slice**: `packages.maxplayer-relay` (the buzz-derived
-> relay, crate `buzz-relay`, scoped by a closed compiled kind allowlist — no write-policy plugin),
+> `devShells.default`, **plus a launch-relay slice**: `packages.maxplayer-relay` (the buzz-derived
+> relay, crate `buzz-relay`, scoped by a closed compiled kind allowlist with no write-policy plugin),
 > `nixosModules.relay` + `nixosConfigurations.relay` (a deployable relay box,
 > `nixos-rebuild switch --flake .#relay`), and static buyer builds `packages.buyer-static` /
-> `buyer-static-aarch64`. `packages.relay-write-policy` still builds but is **legacy** — it is the
+> `buyer-static-aarch64`. `packages.relay-write-policy` still builds but is **legacy**: it is the
 > retired strfry plugin and nothing in the shipping relay module consumes it. A root `Dockerfile` +
 > `docker-compose.yml` package the **client** only (see
 > [`DOCKER.md`](DOCKER.md)). The rest of the multi-service backend below (relay-git / blossom / Caddy /
-> Postgres bundle, per-service split packages) is the **target architecture — not yet in-tree.** Verify
+> Postgres bundle, per-service split packages) is the **target architecture, not yet in-tree.** Verify
 > any target against `flake.nix` before relying on it.
 
 This is the self-host design for the maxplayer marketplace: one Rust workspace, Nix as the packaging
@@ -24,7 +24,7 @@ Nix + Rust is the foundation: the whole system is one cargo workspace, so every
 persona is a package built from the same source and pinned by one `Cargo.lock` +
 `flake.lock`. The design target is Docker images built *from* the Nix packages
 (one build path, no drift between the two runtimes). The client `Dockerfile` that
-ships today is not there yet — it is a standalone multi-stage `cargo` build
+ships today is not there yet. It is a standalone multi-stage `cargo` build
 (`rust:1-bookworm` builder → `debian:bookworm-slim` runtime); folding it onto the
 Nix packages is roadmap.
 
@@ -32,23 +32,23 @@ Nix packages is roadmap.
 
 A maxplayer marketplace backend is three services behind one reverse proxy:
 
-1. **Relay** — a nostr relay in *open mode* (open ingest + open read) accepting
+1. **Relay.** A nostr relay in *open mode* (open ingest + open read) accepting
    the marketplace event kinds: 0 (profiles), 3401 (offer), 3402/3404 (claim/feedback),
-   3403 (result), 3405 (award), 3406 (accept), 3407 (reject), 3400 (receipt), 30340 (seller heartbeat —
+   3403 (result), 3405 (award), 3406 (accept), 3407 (reject), 3400 (receipt), 30340 (seller heartbeat,
    also the seller's capability surface), 1059 (NIP-17 gift-wrap payment). This is the coordination
    surface. Kind 31990 (NIP-89 announce) is **retired** (#645): no maxplayer seller publishes one any
-   more. Keep accepting it only so pre-#645 residue stays readable — it is not live capability.
+   more. Keep accepting it only so pre-#645 residue stays readable. It is not live capability.
    Reference impl = buzz-relay in open mode; the contract is "any nostr relay that accepts
    these kinds without membership."
-2. **relay-git** — a git-over-HTTP endpoint serving `/git/<owner>/<repo>`. This
+2. **relay-git.** A git-over-HTTP endpoint serving `/git/<owner>/<repo>`. This
    is the **primary git-management transport** and stays that way: delivery is
    git-objects, verified by the buyer tip-matching the exact commit OID before
    paying. Keeping git as git is what makes delivery cryptographically
    verifiable. Removes the GitHub dependency from the loop.
-3. **blossom** — a Blossom blob server (BUD spec, kind-24242 auth) for **blob
-   uploads** — for artifacts that aren't naturally
+3. **blossom.** A Blossom blob server (BUD spec, kind-24242 auth) for **blob
+   uploads**: artifacts that aren't naturally
    git (large binaries, datasets, build outputs). A result/receipt can reference
-   a blossom blob hash alongside — or instead of — a git commit, so sellers
+   a blossom blob hash alongside a git commit, or instead of one, so sellers
    choose the right transport per job. Git stays primary for code; blossom
    covers everything else.
 
@@ -61,41 +61,41 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
 - **blossom blobs = additive.** For non-git artifacts. The `delivery_integrity_hash`
   binds either a git commit OID or a blossom blob sha256; the verifier accepts
   both, the transport allowlist governs both. (Blossom's content-address IS the
-  integrity hash — verification is a sha256 check, cleaner than the git tip-match.)
+  integrity hash. Verification is a sha256 check, cleaner than the git tip-match.)
 
 ## Packaging targets
 
-### Today — what `flake.nix` actually exposes
+### Today: what `flake.nix` actually exposes
 
-- `packages.default` — the `maxplayer` client binary, built with `--features acp` (buyer MCP + seller).
-- `apps.default` — `nix run --refresh github:MakePrisms/maxplayerai/<ref> -- mcp|seller` (buyer + ad-hoc
-  seller), no clone. Always `--refresh` (or pin+bump the rev) — nix caches the git ref and will
+- `packages.default`: the `maxplayer` client binary, built with `--features acp` (buyer MCP + seller).
+- `apps.default`: `nix run --refresh github:MakePrisms/maxplayerai/<ref> -- mcp|seller` (buyer + ad-hoc
+  seller), no clone. Always `--refresh` (or pin+bump the rev). Nix caches the git ref and will
   otherwise serve a stale binary.
-- `devShells.default` — the workspace build/dev shell.
-- `packages.maxplayer-relay` — the launch relay: the in-tree vendored buzz-derived relay (crate
+- `devShells.default`: the workspace build/dev shell.
+- `packages.maxplayer-relay`: the launch relay: the in-tree vendored buzz-derived relay (crate
   `buzz-relay`), one binary serving events + git + payments. Consumed by the relay module below.
-- `packages.relay-write-policy` — **legacy; not wired into the shipping relay module.** The strfry
+- `packages.relay-write-policy`: **legacy; not wired into the shipping relay module.** The strfry
   write-policy plugin (crate `maxplayer-relay-write-policy`). It retired with the strfry relay it
   fronted (#402): buzz admits by *kind* in compiled relay code, so there is no external policy binary
   to front it with. The package still builds from the flake; nothing consumes it.
-- `packages.buyer-static` / `packages.buyer-static-aarch64` — statically-linked (musl) buyer builds.
-- `nixosModules.relay` + `nixosConfigurations.relay` — the launch relay as a deployable NixOS box
+- `packages.buyer-static` / `packages.buyer-static-aarch64`: statically-linked (musl) buyer builds.
+- `nixosModules.relay` + `nixosConfigurations.relay`: the launch relay as a deployable NixOS box
   (`nixos-rebuild switch --flake .#relay`); `nix/relay.nix` runs `buzz-relay` in open mode, scoped to
-  the marketplace kinds by its closed compiled allowlist — the mobee namespace *is* the allowlist.
+  the marketplace kinds by its closed compiled allowlist. The mobee namespace *is* the allowlist.
   Open means "not membership-gated", never "anonymous": buzz still mandates a signed NIP-42 handshake
   on every write. The relay component of the backend, shipping today.
-- Root `Dockerfile` + `docker-compose.yml` — a **client** container only: a `maxplayer seller` daemon
+- Root `Dockerfile` + `docker-compose.yml`: a **client** container only: a `maxplayer seller` daemon
   (the compose `seller` service) or an attached buyer `maxplayer mcp`. Standalone cargo build, not
   derived from the flake. See [`DOCKER.md`](DOCKER.md).
-- **GitHub Releases + `install.sh`** — outside the flake entirely.
-  `.github/workflows/release.yml` builds one artifact per platform — `linux-x64` and `linux-arm64`
+- **GitHub Releases + `install.sh`**, outside the flake entirely.
+  `.github/workflows/release.yml` builds one artifact per platform (`linux-x64` and `linux-arm64`
   statically linked against musl, `darwin-arm64` linked against the base macOS libraries (macOS cannot
   link libSystem statically, so the check there is that it pulls in no Homebrew or `/usr/local`
-  dylib) — and attaches them with a `SHA256SUMS`. `install.sh` is attached to every release and
-  resolves, verifies and installs one — `releases/latest/download/install.sh` resolves the latest
+  dylib)) and attaches them with a `SHA256SUMS`. `install.sh` is attached to every release and
+  resolves, verifies and installs one. `releases/latest/download/install.sh` resolves the latest
   release, and `MAXPLAYER_VERSION=x.y.z` pins a specific one. Intel macs are not
   covered: the matrix builds `aarch64-apple-darwin` only. ★ These artifacts are
-  built `--no-default-features --features wallet,acp` — the whole surface. `maxplayer seller` is in
+  built `--no-default-features --features wallet,acp`, the whole surface. `maxplayer seller` is in
   every one of them, so this path deploys a seller as readily as a buyer. A buyer-only narrowing
   (`--no-default-features --features wallet`) is buildable from source; no release publishes it.
 
@@ -105,25 +105,25 @@ builds, the client Docker image, the released binaries, and the launch-relay sli
 the full **backend-bundle** compose (relay-git + blossom + Caddy + Postgres), a blossom crate, and
 per-service split `packages.{relay-git,blossom}` / `apps.*`.
 
-### Roadmap — not yet built (do not assume these exist)
+### Roadmap (not yet built; do not assume these exist)
 
-**Docker** — a `docker-compose.yml` bundling relay + relay-git + blossom + Caddy +
+**Docker.** A `docker-compose.yml` bundling relay + relay-git + blossom + Caddy +
 Postgres (relay DB) + an object store (S3 or local for blossom/media). Images
 built from the Nix packages. `docker compose up` = a running marketplace backend.
 
-**Nix** — split the flake into `packages.{relay,relay-git,blossom,maxplayer}`, one per
+**Nix.** Split the flake into `packages.{relay,relay-git,blossom,maxplayer}`, one per
 component plus the client binary, so each service builds from the same source and
 `Cargo.lock` as the client.
 
 ## Personas
 
-- **relay-operator** — deploys the backend bundle with `docker compose up`.
-- **seller** — `maxplayer seller`, run two ways by taste: `nix run --refresh … -- seller`
+- **relay-operator** deploys the backend bundle with `docker compose up`.
+- **seller** runs `maxplayer seller` two ways by taste: `nix run --refresh … -- seller`
   (quick) or the Docker image. Same binary, same config contract.
-- **buyer** — `curl -fsSL …/releases/latest/download/install.sh | sh`, then `maxplayer mcp` wired into
+- **buyer** runs `curl -fsSL …/releases/latest/download/install.sh | sh`, then `maxplayer mcp` wired into
   their agent (Claude etc.). Zero clone, no nix; linux x86_64/aarch64 and macOS Apple Silicon.
   `nix run --refresh … -- mcp` stays supported and is the answer on any platform the release does not
-  cover — an Intel mac, or a linux architecture outside those two.
+  cover: an Intel mac, or a linux architecture outside those two.
 
 Secrets (relay key, seller key, mint auth) are always file-references with 0600
 perms, never baked into images or the nix store.
@@ -131,7 +131,7 @@ perms, never baked into images or the nix store.
 ## Sequencing
 
 1. **Flake foundation first**: stabilize the client flake so
-   `nix run --refresh … -- mcp|seller` works hermetically — the packaging base everything
+   `nix run --refresh … -- mcp|seller` works hermetically. That is the packaging base everything
    else builds on.
 2. **Relay bundle**: relay open-mode + relay-git endpoint + Caddy, as a
    docker-compose bundle.
@@ -140,5 +140,5 @@ perms, never baked into images or the nix store.
 4. **Persona modules**: `maxplayer-seller` / buyer NixOS modules.
 
 Build the loop working (seller slice) and the client runnable (flake) before the
-self-host bundle — strangers should run a working marketplace before deploying
+self-host bundle. Strangers should run a working marketplace before deploying
 the backend.
