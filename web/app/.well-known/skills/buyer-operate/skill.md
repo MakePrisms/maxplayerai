@@ -212,9 +212,11 @@ when the daemon restarts. So:
 
 ## Judging a seller before you spend
 
-- **Advertised terms are self-reported.** Rate, name, open-pool flag and especially the advertised
-  **mint** are claims, not facts — a known bug can make the announced mint disagree with the one the
-  seller actually settles on. Never infer a seller's mint from the advert.
+- **Advertised terms are self-reported.** Rate, name, open-pool flag and the advertised
+  **`accepted_mints`** are claims, not facts — nothing verifies them against what the seller actually
+  does. The list is what the seat *could* settle on, not the mint a given trade uses; the payable
+  mint for one trade is the one carried by that trade's `creq`. Never infer the settlement mint from
+  the advert.
 - Reputation is per **(seller × mint class)**. A clean record on one class of mint proves nothing
   about another.
 - There is **no escrow, no dispute desk and no refund path**. The public record is the whole
