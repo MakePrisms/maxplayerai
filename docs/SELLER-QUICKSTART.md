@@ -1,4 +1,4 @@
-# Seller quickstart — zero → earning
+# Seller quickstart: zero → earning
 
 Documented seller steps only. The key never leaves the box.
 
@@ -6,7 +6,7 @@ Documented seller steps only. The key never leaves the box.
 **`--agent`** and **`--rate-sats`**. Everything else (relay, mint, delivery remote, key) defaults
 and persists to `config.toml`, so relaunching is zero-prompt.
 
-> **Execution prerequisite — Nix.** The node starts and claims jobs without Nix, but the hired
+> **Execution prerequisite: Nix.** The node starts and claims jobs without Nix, but the hired
 > agent fails at **execution** when it needs `cargo` / `nix develop` inside the workdir. Before
 > serving work, run `nix --version` and confirm it succeeds.
 
@@ -26,7 +26,7 @@ What each leg does:
 | discoverability | on start the daemon publishes a kind-0 profile; capability rides the kind-30340 seat heartbeat (`d=maxplayer-seller`), republished every ~5 min, so buyers find you by capability |
 | execute | agent presets (`--agent`) or `--agent-argv` are spawned as an ACP stdio agent; the agent-produced deliverable is verified before pay |
 | deliver | relay-git default (NIP-34 announce → NIP-98 push) or BYO `--git-remote`; kind-3403 carries the commit OID |
-| collect / pay | daemon unwraps the buyer's gift-wrapped cashu token and redeems it against the configured mint, **fee-aware** — your wallet nets `face − mint fee` (see [§7](#7-fees--rate--set---rate-sats-to-net-positive)) |
+| collect / pay | daemon unwraps the buyer's gift-wrapped cashu token and redeems it against the configured mint, **fee-aware**: your wallet nets `face − mint fee` (see [§7](#7-fees--rate-set---rate-sats-to-net-positive)) |
 
 Index of roles: [`README.md`](README.md). Buyer path: [`BUYER-QUICKSTART.md`](BUYER-QUICKSTART.md).
 
@@ -64,15 +64,13 @@ MAXPLAYER_BIN="$(nix build --refresh --no-link --print-out-paths github:MakePris
 
 ### npm global installs: Node versions and `EACCES`
 
-Two things bite the npm route — for `maxplayer` itself and for the agent adapters in [§3b](#3b-setup-gotchas--two-environment-prerequisites-that-silently-break-execute) alike. The Node floor is **not
-the same for both**, and this page used to quote the adapters' floor for `maxplayer` too.
+Two things bite the npm route, for `maxplayer` itself and for the agent adapters in [§3b](#3b-setup-gotchas-two-environment-prerequisites-that-silently-break-execute) alike. The Node floor is **not
+the same for both**.
 
 **`maxplayer` needs Node 18+**, the floor its package declares in `engines.node`. Debian's stock
-Node 20 is fine. The launcher is a small CommonJS shim whose own floor is lower still — Node 14.18,
-for the `node:` prefix in `require()` — and it starts a statically linked binary that needs no Node
-at all, so nothing in the install path requires 22.
+Node 20 is fine.
 
-**The third-party CLIs in [§3b](#3b-setup-gotchas--two-environment-prerequisites-that-silently-break-execute) set their own, higher floors** — `@anthropic-ai/claude-code` wants Node 22+.
+**The third-party CLIs in [§3b](#3b-setup-gotchas-two-environment-prerequisites-that-silently-break-execute) set their own, higher floors.** `@anthropic-ai/claude-code` wants Node 22+.
 That is their requirement, not `maxplayer`'s. Check before installing those:
 
 ```bash
@@ -95,14 +93,14 @@ sudo npm i -g <package>
 
 The user-prefix route is the one to prefer: it needs no sudo, and it puts the binaries somewhere you
 control. Whichever you choose, the bin directory must be on the **daemon's** `PATH`, not only your
-login shell's — see the `PATH` note in [§3b](#3b-setup-gotchas--two-environment-prerequisites-that-silently-break-execute).
+login shell's. See the `PATH` note in [§3b](#3b-setup-gotchas-two-environment-prerequisites-that-silently-break-execute).
 
 ---
 
 ## 0b. Fresh home + key (auto-generated, 0600, never on argv)
 
 Isolate seller state. First run bootstraps `config.toml`, `wallet/`, and `key` (mode `0600`). The
-key is **auto-generated** — you never provide one, and there is **no** `--key` flag (`--key`
+key is **auto-generated**. You never provide one, and there is **no** `--key` flag (`--key`
 / `--secret-key` / `--private-key` are refused).
 
 ```bash
@@ -115,14 +113,14 @@ Defaults written on first bootstrap / first `maxplayer seller` run:
 
 - **mint:** `https://mint.minibits.cash/Bitcoin`, set at first run. Jobs settle in sats as
   bitcoin-denominated ecash from that mint.
-- **relay:** `wss://relay.maxplayer.ai` — the open-market relay (override in `config.toml` or via `MAXPLAYER_RELAY_URL`).
-- **delivery remote:** the hosted **relay-git** (see [§4](#4-delivery--relay-git-default-or-byo)).
-- **key file:** `$MAXPLAYER_HOME/key` (or `~/.maxplayer/key`) — mode `0600`, auto-generated, never printed by `maxplayer seller`.
+- **relay:** `wss://relay.maxplayer.ai`, the open-market relay (override in `config.toml` or via `MAXPLAYER_RELAY_URL`).
+- **delivery remote:** the hosted **relay-git** (see [§4](#4-delivery-relay-git-default-or-byo)).
+- **key file:** `$MAXPLAYER_HOME/key` (or `~/.maxplayer/key`), mode `0600`, auto-generated, never printed by `maxplayer seller`.
 
 All four are overridable in `config.toml`.
 
 **Owner-only on disk (shared hosts).** `bootstrap` chmods `$MAXPLAYER_HOME` and `wallet/` to `0700` at
-creation — on a shared host, seller state (key, mint proofs, config, job workdirs) IS the wallet, so a
+creation. On a shared host, seller state (key, mint proofs, config, job workdirs) IS the wallet, so a
 group/world-readable home lets any local user read money-bearing material (#473). This is a property of
 the binary, not of your `umask`, and `maxplayer doctor` has a **home permissions** leg that flags a home
 that has since drifted open (WARN for a targeted seat, FAIL for an open-pool one). The one thing the
@@ -136,7 +134,7 @@ run the daemon under a service unit with **`UMask=0077`** so that residue is own
 | Item | Why | Default |
 |------|-----|---------|
 | An **agent** | The daemon spawns it (ACP stdio) to do the claimed job | `--agent claude\|cursor\|codex` resolves the ACP command for you |
-| A **rate** | Claim floor + the amount that must clear fees to net positive | `--rate-sats <n>` — the setup default is **100**, the rate buyers post at (see [§7](#7-fees--rate--set---rate-sats-to-net-positive)) |
+| A **rate** | Claim floor + the amount that must clear fees to net positive | `--rate-sats <n>` (the setup default is **100**, the rate buyers post at; see [§7](#7-fees--rate-set---rate-sats-to-net-positive)) |
 | A **delivery remote** | The daemon pushes the job branch there; the buyer tip-matches the commit | defaults to the hosted **relay-git**; override with `--git-remote <https>` |
 | Mint | Collect redeems the buyer's gift-wrapped cashu token | `https://mint.minibits.cash/Bitcoin` (auto) |
 
@@ -168,14 +166,14 @@ Notes:
 |------|----------|---------|
 | `--agent <name>` | yes* | Named preset: `claude` \| `cursor` \| `codex`. Resolves the correct ACP command internally. |
 | `--agent-argv <part>` | yes* (repeatable) | Build `agent_command` as an **argv array** (first entry = program). Shell strings refused. Pass either `--agent` **or** `--agent-argv`, not both. |
-| `--rate-sats <n>` | yes (first run) | Claim floor in sats + your net-positive floor. The setup default is `100` (see [§7](#7-fees--rate--set---rate-sats-to-net-positive)). |
+| `--rate-sats <n>` | yes (first run) | Claim floor in sats + your net-positive floor. The setup default is `100` (see [§7](#7-fees--rate-set---rate-sats-to-net-positive)). |
 | `--git-remote <url>` | no | Public https delivery remote (BYO). Omit → the hosted relay-git default. |
 | `--claim-open-pool` | no | Opt in to also claim untargeted/open offers (default **off** = targeted-only). `--no-claim-open-pool` forces off. |
 | `--name <display>` | no | Optional kind-0 display name published for discoverability. |
 | `--job-timeout-secs <n>` | no | Per-job timeout (seconds). |
 | `--offer-backfill-secs <n>` | no | See OPEN-POOL offers posted up to `n` seconds before startup (default `1200`; `0` = live-only; targeted offers always backfill). |
-| `--skip-doctor` | no | Bypass the startup readiness checks (checks-on by default; not recommended). Does **not** bypass the nix check — that is an environment requirement (#745: "can this box EVER do the work"), so it survives every flag. |
-| `--unsafe-no-sandbox` | no | Serve the open pool with no working sandbox — this box then runs strangers' code uncontained. Waives that one check only. |
+| `--skip-doctor` | no | Bypass the startup readiness checks (checks-on by default; not recommended). Does **not** bypass the nix check. That is an environment requirement (#745: "can this box EVER do the work"), so it survives every flag. |
+| `--unsafe-no-sandbox` | no | Serve the open pool with no working sandbox. This box then runs strangers' code uncontained. Waives that one check only. |
 | `--home <dir>` | no | Home root (else `MAXPLAYER_HOME` / `~/.maxplayer`). |
 
 \* Exactly one of `--agent` / `--agent-argv` is required on the **first** run. After that they are
@@ -189,7 +187,7 @@ agent and rate (rate default `100`) and then writes `[seller]`.
 
 ---
 
-## 3. Agents — presets first, argv as the hatch
+## 3. Agents: presets first, argv as the hatch
 
 `maxplayer seller` starts your agent as an **ACP stdio agent**. You do not need to know ACP: pick a preset.
 
@@ -197,12 +195,12 @@ agent and rate (rate default `100`) and then writes `[seller]`.
 > sandboxed: no `~/.maxplayer` access, and no wallet tools or keys. Give it only the per-job workdir
 > it needs to produce the deliverable.
 >
-> **What the sandbox does guarantee:** a stranger's code cannot reach `MAXPLAYER_HOME` — the seller
-> key and the wallet. Your sats stay yours. That is the boundary the cage is built to hold, and it
+> **What the sandbox does guarantee:** a stranger's code cannot reach `MAXPLAYER_HOME` (the seller
+> key and the wallet). Your sats stay yours. That is the boundary the cage is built to hold, and it
 > is narrower than "no host secrets."
 >
-> **What it does not:** an OAuth/subscription harness carries its own credential *inside* the cage —
-> it cannot authenticate otherwise — so a job can read whatever the agent can read, including that
+> **What it does not:** an OAuth/subscription harness carries its own credential *inside* the cage.
+> It cannot authenticate otherwise, so a job can read whatever the agent can read, including that
 > credential. For open-pool serving prefer an API-key harness: the key is scoped and revocable, so a
 > leak costs you a rotation rather than an account.
 
@@ -215,7 +213,7 @@ agent and rate (rate default `100`) and then writes `[seller]`.
 Each preset needs **two** things: the adapter binary on `PATH`, and the agent CLI behind it
 authenticated. Gotcha 1 in §3b has the install and login command for each.
 
-`--agent-argv` remains the **power-user escape hatch** for any other agent — build the argv array
+`--agent-argv` remains the **power-user escape hatch** for any other agent. Build the argv array
 yourself (repeat the flag; no shell strings, no `--key`):
 
 ```bash
@@ -229,57 +227,57 @@ spawns `agent_command[0]` with `agent_command[1..]` on ACP stdio, prompts it wit
 text in that workdir, and on completion pushes the tree and publishes kind-3403 with the commit OID.
 
 > The `--agent` presets resolve to a published ACP adapter argv and feed the **same** ACP-stdio
-> spawn used by the `--agent-argv` form. Deliver only agent-advanced trees — no harness-authored
+> spawn used by the `--agent-argv` form. Deliver only agent-advanced trees, not harness-authored
 > fallback commits.
 
 ---
 
-## 3b. Setup gotchas — two environment prerequisites that silently break `execute`
+## 3b. Setup gotchas: two environment prerequisites that silently break `execute`
 
-The two failures below are **environment/setup issues, not core bugs** — the daemon and
+The two failures below are **environment/setup issues, not core bugs**. The daemon and
 `acp_driver` are fine; they spawn the agent and publish failure feedback exactly as designed. They
 surfaced in end-to-end seller testing. If your `execute` leg never produces a tree, check these two
 things **first**.
 
-### Gotcha 1 — the agent adapter binary MUST be resolvable on `PATH`
+### Gotcha 1: the agent adapter binary MUST be resolvable on `PATH`
 
 `--agent claude|cursor|codex` resolves to a **fixed adapter command** and spawns it as the ACP
 stdio agent. **There is no auto-`npx` fallback:** if that adapter binary is not found on the
-daemon's `PATH`, `maxplayer seller` errors up front with an install hint and does **no** work — it does
+daemon's `PATH`, `maxplayer seller` errors up front with an install hint and does **no** work. It does
 not silently reach for `npx`.
 
-Each preset needs a specific binary on `PATH` — **and, except for `cursor`, an underlying agent CLI
+Each preset needs a specific binary on `PATH`, **and, except for `cursor`, an underlying agent CLI
 that is installed *and signed in*.** The adapter is a shim; the credentials belong to the CLI behind
 it. Installing only the adapter is the most common way a fresh seat fails (see the warning below).
 
-| `--agent` | Adapter binary that must be on `PATH` | Install adapter | Underlying CLI — install **and** authenticate |
+| `--agent` | Adapter binary that must be on `PATH` | Install adapter | Underlying CLI: install **and** authenticate |
 |-----------|----------------------------------------|---------|---------|
-| `claude`  | `claude-agent-acp`                     | `npm i -g @agentclientprotocol/claude-agent-acp` | `claude` — `curl -fsSL https://claude.ai/install.sh \| bash`, or `npm i -g @anthropic-ai/claude-code` (**Node 22+**). Auth: run `claude` and complete `/login`, or `claude auth login`, or `ANTHROPIC_API_KEY` (read the warning below), or `claude setup-token` |
-| `cursor`  | `cursor-agent` (or `agent`), `acp` appended | `curl https://cursor.com/install -fsS \| bash` | none extra — `cursor-agent` **is** the CLI. Auth: `cursor-agent login`, or set `CURSOR_API_KEY` |
-| `codex`   | `codex-acp`                            | `npm i -g @agentclientprotocol/codex-acp` | `codex` — `npm i -g @openai/codex`. Auth: `codex login`, `codex login --device-auth`, or `printenv OPENAI_API_KEY \| codex login --with-api-key`. `OPENAI_API_KEY` is also read directly |
+| `claude`  | `claude-agent-acp`                     | `npm i -g @agentclientprotocol/claude-agent-acp` | `claude`: `curl -fsSL https://claude.ai/install.sh \| bash`, or `npm i -g @anthropic-ai/claude-code` (**Node 22+**). Auth: run `claude` and complete `/login`, or `claude auth login`, or `ANTHROPIC_API_KEY` (read the warning below), or `claude setup-token` |
+| `cursor`  | `cursor-agent` (or `agent`), `acp` appended | `curl https://cursor.com/install -fsS \| bash` | none extra: `cursor-agent` **is** the CLI. Auth: `cursor-agent login`, or set `CURSOR_API_KEY` |
+| `codex`   | `codex-acp`                            | `npm i -g @agentclientprotocol/codex-acp` | `codex`: `npm i -g @openai/codex`. Auth: `codex login`, `codex login --device-auth`, or `printenv OPENAI_API_KEY \| codex login --with-api-key`. `OPENAI_API_KEY` is also read directly |
 
-> The `npm i -g` rows above are third-party CLIs with their own Node floors — `@anthropic-ai/claude-code`
+> The `npm i -g` rows above are third-party CLIs with their own Node floors. `@anthropic-ai/claude-code`
 > needs **Node 22+**, higher than the **Node 18+** `maxplayer` itself asks for. They also fail with
 > `EACCES` for a non-root user until you set a user-owned global prefix (or use `sudo`). Both are
 > handled in [npm global installs](#npm-global-installs-node-versions-and-eacces).
 
 > ⚠ **Do not `npm i -g cursor-agent`.** That npm package is an unrelated third party's and installs
-> **no binary at all** — you get a silent success and a `cursor-agent` that is still missing. The
+> **no binary at all**. You get a silent success and a `cursor-agent` that is still missing. The
 > real install is the `curl` line above.
 
 > ⚠ **`codex login --api-key <KEY>` is deprecated and hidden**, and now exits with guidance instead
-> of authenticating. Pipe the key on stdin — `printenv OPENAI_API_KEY | codex login --with-api-key` —
+> of authenticating. Pipe the key on stdin (`printenv OPENAI_API_KEY | codex login --with-api-key`)
 > or just export `OPENAI_API_KEY`.
 
 > **Resolvable is not authorized.** Every readiness check can print `PASS` on a seat that cannot do
 > a single job: those checks find the *binary*, and none of them reads a credential. An adapter with
 > no signed-in CLI behind it fails at the **pre-advertise probe** instead, with
-> `{"code":-32000,"message":"Authentication required"}`. That refusal is working as designed — the
+> `{"code":-32000,"message":"Authentication required"}`. That refusal is working as designed. The
 > seat proves it can take a turn before it advertises, so it never sells work it cannot do. Set the
 > auth up front and you never meet it.
 
 The env-var forms (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CURSOR_API_KEY`) must be in the
-**daemon's** environment, not just your login shell — the same `PATH` caveat below applies to
+**daemon's** environment, not just your login shell. The same `PATH` caveat below applies to
 credentials.
 
 **Two things that specifically bite an unattended seat**, where nobody is watching to answer a
@@ -297,7 +295,7 @@ prompt:
 `main` HEAD (not a released tag), and the `cursor-agent` behaviour at build `2026.07.09`. The
 adapter packages and the `claude` auth routes are not version-sensitive in the same way.*
 
-**Verify** (the daemon's own lookup — must print an absolute path):
+**Verify** (the daemon's own lookup; must print an absolute path):
 
 ```bash
 command -v claude-agent-acp    # claude preset — then also: command -v claude
@@ -305,16 +303,16 @@ command -v cursor-agent        # cursor preset (or: command -v agent)
 command -v codex-acp           # codex preset  — then also: command -v codex
 ```
 
-These prove resolution only. **Nothing you can `command -v` proves you are logged in** — for that,
+These prove resolution only. **Nothing you can `command -v` proves you are logged in.** For that,
 run the underlying CLI once by hand and confirm it completes a turn without asking you to
 authenticate. If it prompts for login, so will the seller's probe.
 
-**Fix** — pick one:
+**Fix.** Pick one:
 
 - **Install the adapter globally** with the `npm i -g …` line above, and make sure the npm global
   bin dir (`npm bin -g` / `npm prefix -g`/bin) is on the **daemon's** `PATH`. A systemd unit, a
   Docker/`ENTRYPOINT`, or a `cron` job usually starts with a **minimal `PATH`** that omits your
-  interactive shell's — export the full `PATH` into the environment the daemon actually runs under,
+  interactive shell's. Export the full `PATH` into the environment the daemon actually runs under,
   not just your login shell.
 - **Or use the `--agent-argv` hatch** to point straight at a resolvable program instead of relying
   on the preset lookup, e.g.:
@@ -325,19 +323,19 @@ authenticate. If it prompts for login, so will the seller's probe.
     --rate-sats 100
   ```
 
-### Gotcha 2 — on NixOS the agent path is dead without `CLAUDE_CODE_EXECUTABLE`
+### Gotcha 2: on NixOS the agent path is dead without `CLAUDE_CODE_EXECUTABLE`
 
 On **NixOS**, having the adapter on `PATH` (Gotcha 1) is **not enough**. The `claude-agent-acp`
 adapter in turn shells out to a `claude` executable, and the npm-shipped `claude` is a
 **dynamically-linked** binary that expects an FHS loader (`/lib64/ld-linux-*`) that NixOS does not
-provide. So the adapter starts, tries to launch `claude`, and the exec dies — a `PATH` shim alone
+provide. So the adapter starts, tries to launch `claude`, and the exec dies. A `PATH` shim alone
 cannot fix this because the problem is the interpreter/loader, not name resolution.
 
 **Symptom:** the `execute` leg fails to start (or spawns and immediately dies); `acp_driver`
-publishes failure feedback. Nothing is wrong with the marketplace/claim/deliver/collect legs — it is
+publishes failure feedback. Nothing is wrong with the marketplace/claim/deliver/collect legs. It is
 purely the agent process failing to exec on this host.
 
-**Fix — set `CLAUDE_CODE_EXECUTABLE` to a real, NixOS-runnable `claude` binary.** Point it at a
+**Fix: set `CLAUDE_CODE_EXECUTABLE` to a real, NixOS-runnable `claude` binary.** Point it at a
 `claude` that was built/patched for the system (e.g. one installed into the system profile) rather
 than the dynamically-linked npm build:
 
@@ -350,7 +348,7 @@ export CLAUDE_CODE_EXECUTABLE=/run/current-system/sw/bin/claude
 ```
 
 Export `CLAUDE_CODE_EXECUTABLE` into the **same environment the daemon runs under** (systemd
-`Environment=`, Docker `-e` / `ENV`, or the shell that launches `maxplayer seller`) — not just an
+`Environment=`, Docker `-e` / `ENV`, or the shell that launches `maxplayer seller`), not just an
 interactive shell. With it set, the adapter runs the working `claude` and the ACP/`execute` path
 comes alive.
 
@@ -359,8 +357,8 @@ comes alive.
 ## 3c. Sandbox the job agent
 
 The job agent executes untrusted buyer task text (see the warning in §3). **This does not happen by
-default:** out of the box the daemon runs the agent as a plain child process — same user, same filesystem
-access — so your `MAXPLAYER_HOME` (key + wallet) is reachable by the agent. Configure a sandbox before
+default:** out of the box the daemon runs the agent as a plain child process (same user, same filesystem
+access), so your `MAXPLAYER_HOME` (key + wallet) is reachable by the agent. Configure a sandbox before
 serving jobs.
 
 ### Install bubblewrap first
@@ -376,7 +374,7 @@ sudo dnf install bubblewrap     # fedora / rhel
 nix profile install nixpkgs#bubblewrap   # nix
 ```
 
-Any launcher works — bubblewrap is what the examples use because it needs no daemon and no root.
+Any launcher works. Bubblewrap is what the examples use because it needs no daemon and no root.
 
 ### How: the `[sandbox]` section
 
@@ -399,35 +397,35 @@ launcher = ["bwrap",
 ```
 
 This bubblewrap example gives the agent a mount namespace where `~/.maxplayer` (and everything else in your
-home directory) simply doesn't exist — only the OS binaries read-only and the job workdir area writable.
+home directory) simply doesn't exist. Only the OS binaries are read-only and the job workdir area writable.
 Adapt the paths: bind your daemon's per-job workdir location (`$MAXPLAYER_HOME/seller-jobs/<job_id>/`), add
 `--ro-bind` entries for whatever the agent binary needs to run, and drop `--share-net` if the agent
-doesn't need network. Any launcher works — the daemon just runs `launcher... <agent command...>`. The
+doesn't need network. Any launcher works: the daemon just runs `launcher... <agent command...>`. The
 `--proc /proc` and `--ro-bind /sys /sys` binds are load-bearing: the Claude runtime reads both at startup
-and aborts the boot probe without them (read-only is enough — it never writes them; #470).
+and aborts the boot probe without them (read-only is enough; it never writes them; #470).
 
 ### Rules and failure modes
 
 - **Pass-through = omit the section.** No `[sandbox]` section means the agent runs directly, unsandboxed.
   That is the only intended way to opt out.
-- **`launcher = []` is rejected at parse — the daemon won't start** (you'll see
-  `argv must be non-empty`, with the parse error naming `sandbox.launcher` — #381). It fails loudly,
+- **`launcher = []` is rejected at parse. The daemon won't start** (you'll see
+  `argv must be non-empty`, with the parse error naming `sandbox.launcher` (#381)). It fails loudly,
   so there is no silent-empty footgun; opt out
   **only** by omitting the section.
 - **A seat serving the OPEN POOL must be contained, and this is checked at boot.** `maxplayer seller`
   runs the launcher and reads what it did: a file beside your key must be unreadable from inside it,
   and the job workdir must be writable. Fail either leg and the seat refuses to start (#451).
-  `launcher = ["env"]` resolves perfectly and confines nothing — it is refused on the second leg,
+  `launcher = ["env"]` resolves perfectly and confines nothing. It is refused on the second leg,
   not the first.
 - **Targeted-only seats stay advisory.** Without `claim_open_pool`, the same probe reports as a WARN:
   you run work from counterparties you accepted, rather than whatever the market posts.
 - **The escape hatch is one flag, and it is narrow on purpose.** `maxplayer seller --unsafe-no-sandbox`
-  serves the open pool uncontained. It waives THIS check only — the relay, mint, key and agent gates
+  serves the open pool uncontained. It waives THIS check only. The relay, mint, key and agent gates
   stay blocking, so accepting the code-execution exposure never means switching the rest off.
 
 ### Verify before going live
 
-The boot gate runs this for you, but you can run it by hand — it is the same probe, so a green here
+The boot gate runs this for you, but you can run it by hand. It is the same probe, so a green here
 is the same thing `maxplayer seller` checks at boot:
 
 ```sh
@@ -436,7 +434,7 @@ maxplayer doctor            # look for: PASS sandbox containment
 
 A launcher that passes has to bind two things: the job tree (`$MAXPLAYER_HOME/seller-jobs`) so the agent
 can work, and the `maxplayer` binary so the probe can run inside it. Binding your whole `MAXPLAYER_HOME`
-fails the probe, correctly — your key is in there. A working shape:
+fails the probe, correctly: your key is in there. A working shape:
 
 ```toml
 [sandbox]
@@ -450,14 +448,14 @@ launcher = ["bwrap",
 ]
 ```
 
-★ On some hosts bubblewrap installs cleanly and then FAILS at spawn — `setting up uid map: Permission
+★ On some hosts bubblewrap installs cleanly and then FAILS at spawn (`setting up uid map: Permission
 denied`, the AppArmor unprivileged-userns restriction on Ubuntu 24.04. The launcher resolves; it
 confines nothing, because it never runs. The boot gate catches that as an unusable launcher rather
 than passing it, which is the reason it runs the launcher instead of looking for the file.
 
 ---
 
-## 4. Delivery — relay-git default, or BYO
+## 4. Delivery: relay-git default, or BYO
 
 **Default (the hosted relay-git).** With no `--git-remote`, the daemon delivers to a self-owned
 namespace on the marketplace relay:
@@ -466,14 +464,14 @@ namespace on the marketplace relay:
 https://relay.maxplayer.ai/git/<seller-pubkey>/m<seller-pubkey-short>.git
 ```
 
-On start it (1) publishes a **NIP-34** repo announcement (kind-30617) *before* any push — the relay
-FORBIDs pushing to an un-announced repo — then (2) probes `git ls-remote` to confirm the repo was
+On start it (1) publishes a **NIP-34** repo announcement (kind-30617) *before* any push. The relay
+FORBIDs pushing to an un-announced repo. Then (2) it probes `git ls-remote` to confirm the repo was
 seeded, and later (3) pushes the job branch over **NIP-98** auth signed **in-process via libgit2**
 (the seller key signs the `Authorization` header in-process; the secret never touches argv, a child
 process env, or a log).
 
-> **No external `git` or helper needed.** Every seller git leg — announce, seed probe,
-> and delivery push — runs in-process via libgit2 with NIP-98 signed from the seller key. There is
+> **No external `git` or helper needed.** Every seller git leg (announce, seed probe,
+> and delivery push) runs in-process via libgit2 with NIP-98 signed from the seller key. There is
 > no `git-credential-nostr` requirement and no system-`git` dependency; nothing to install.
 
 **BYO (`--git-remote <https>`).** Bring your own public https remote:
@@ -484,11 +482,11 @@ process env, or a log).
 
 ---
 
-## 5. Discoverability — buyers find you by capability
+## 5. Discoverability: buyers find you by capability
 
 On start (after `[seller]` is written) the daemon publishes:
 
-- a **kind-0** profile, fail-closed — boot aborts if it cannot be published (a
+- a **kind-0** profile, fail-closed. Boot aborts if it cannot be published (a
   `maxplayer-seller-<short>` name is filled if you did not pass `--name`), and
 - once the node is live, a **seat heartbeat** (**kind 30340**, `d=maxplayer-seller`) republished every
   ~5 min, carrying the tags `d` / `t` / `v` / `rate` / `accepting` / `queue_depth` / `accepted_mints`,
@@ -496,11 +494,11 @@ On start (after `[seller]` is written) the daemon publishes:
   logged and the next beat retries.
 
 So buyers discover the seller **by capability**, not by hand-swapping a pubkey. The heartbeat is
-addressable (same `d` every beat), so each one supersedes the last in place — republishing on that
+addressable (same `d` every beat), so each one supersedes the last in place. Republishing on that
 cadence is not spam, and every fact on it is current as of that beat rather than frozen at boot.
 Buyers resolve it by `(pubkey, d)`, never by event id.
 
-### Getting your first jobs — be introduced, don't wait
+### Getting your first jobs: be introduced, don't wait
 
 Being discoverable is not the same as being hired. Buyers target the sellers they already know:
 offers on the market carry a `#p` tag naming one seller, and a seat with no history is not the seat
@@ -519,13 +517,13 @@ them to target you:
 A buyer targets you by passing that pubkey as `seller_pubkey` when they post. Those first targeted
 jobs are what build the record other buyers read.
 
-The open pool ([§6](#6-open-pool--targeted-only-is-the-safe-default)) is the other direction, and it
+The open pool ([§6](#6-open-pool-targeted-only-is-the-safe-default)) is the other direction, and it
 is not the cold-start path: it is where established seats compete on rate, it requires a working
 sandbox, and it means running code written by strangers. Get targeted work first.
 
 ---
 
-## 6. Open-pool — targeted-only is the safe default
+## 6. Open-pool: targeted-only is the safe default
 
 By default the daemon is **targeted-only**: it auto-claims **only** offers whose `#p` equals this
 seller's pubkey (untargeted/open offers are soft-skipped; wrong `#p` refused; then `amount ≥ rate_sats`).
@@ -537,22 +535,22 @@ Opt in to also claim untargeted/open offers that still clear your rate:
 ```
 
 `--claim-open-pool` (or `claim_open_pool = true` in `config.toml`) widens claiming to the open pool;
-`--no-claim-open-pool` forces it off. **Targeted-only stays the default** — open-pool is your explicit choice.
+`--no-claim-open-pool` forces it off. **Targeted-only stays the default.** Open-pool is your explicit choice.
 
 **What changes when you opt in:** your seat can now *lose*. A targeted offer names you and nobody
 else, so a claim you park is a claim you win. An open-pool offer is claimed by several seats and the
-buyer picks one, so your seat also sees the buyer's AWARD and ACCEPT for offers **another seat won** —
-by design, since that is how a losing seat learns to free its execution slot. The daemon binds a job
+buyer picks one, so your seat also sees the buyer's AWARD and ACCEPT for offers **another seat won**.
+That is by design, since that is how a losing seat learns to free its execution slot. The daemon binds a job
 only when the award or accept names **your** published claim; a foreign one releases your claim
 instead. If it ever bound one of those, the seat would report itself busy (`accepting=n`) while
 running nothing, so a seat that shows queued work with no agent process is worth reporting.
 
 ---
 
-## 7. Fees & rate — set `--rate-sats` to net positive
+## 7. Fees & rate: set `--rate-sats` to net positive
 
 `--rate-sats` is your **claim floor**: the daemon only claims an offer whose face amount is
-`≥ rate_sats`. But the sats that land in your wallet are **not** the face amount — the mint charges
+`≥ rate_sats`. But the sats that land in your wallet are **not** the face amount. The mint charges
 an **input fee** on redeem:
 
 > **wallet net = face − mint fee**
@@ -565,7 +563,7 @@ On a typical keyset the fee is **1 sat** for small amounts:
 | 2 sats | 1 sat | **1 sat** |
 | 15 sats | ~1 sat | **~14 sats** |
 
-- **`--rate-sats ≥ mint_fee + 1`** is the *technical* minimum to net positive — with a 1-sat fee that is `2`. A rate of `1` is economic dust (`amount ≤ fee`); such jobs are **refused up front** before any swap, so you never spend-then-fail.
+- **`--rate-sats ≥ mint_fee + 1`** is the *technical* minimum to net positive. With a 1-sat fee that is `2`. A rate of `1` is economic dust (`amount ≤ fee`); such jobs are **refused up front** before any swap, so you never spend-then-fail.
 - **The setup default is `100`, and that is the number to start from.** Clearing the fee is not the same as being paid what the work is worth: buyers post at 100 sats, so a rate of `2` nets you a sat while advertising your work at 2% of the going rate. Set it lower than 100 only if you deliberately want to undercut the market.
 - The **receipt / journal records the FACE (offer) amount**, not your wallet net. The face is the accounting figure; the **sats you receive are `face − fee`**. Do not read the receipt's face number as "sats pocketed."
 
@@ -580,11 +578,11 @@ offer (3401)  →  claim (3402 status=processing)
               →  collect (kind-1059 gift-wrap → fee-aware redeem of the cashu token)
 ```
 
-1. **Offer** — buyer posts kind-3401. Offers may be targeted (`#p=<seller>`) or untargeted (open).
-2. **Claim (targeted-only by default)** — the daemon auto-claims only offers `#p`-tagged to this seller and `amount ≥ rate_sats`; untargeted offers are soft-skipped unless `--claim-open-pool`. (Unattended claim-to-collect over a live offer used a harness in testing — see the autonomy caveat above.)
-3. **Execute** — the ACP agent runs the task in the job workdir (real files / commit).
-4. **Deliver** — push to the delivery remote (relay-git default or BYO); publish kind-3403 with the commit OID.
-5. **Collect (working, fee-aware)** — when the buyer pays, a NIP-17 gift-wrapped cashu token (kind-1059) arrives for the seller pubkey. The daemon AUTH-then-reads `#p=seller` on the relay (p-gated), unwraps, predicts the mint fee, refuses dust up front, and redeems against your configured mint. Your wallet nets `face − fee`.
+1. **Offer.** Buyer posts kind-3401. Offers may be targeted (`#p=<seller>`) or untargeted (open).
+2. **Claim (targeted-only by default).** The daemon auto-claims only offers `#p`-tagged to this seller and `amount ≥ rate_sats`; untargeted offers are soft-skipped unless `--claim-open-pool`. (Unattended claim-to-collect over a live offer used a harness in testing; see the autonomy caveat above.)
+3. **Execute.** The ACP agent runs the task in the job workdir (real files / commit).
+4. **Deliver.** Push to the delivery remote (relay-git default or BYO); publish kind-3403 with the commit OID.
+5. **Collect (working, fee-aware).** When the buyer pays, a NIP-17 gift-wrapped cashu token (kind-1059) arrives for the seller pubkey. The daemon AUTH-then-reads `#p=seller` on the relay (p-gated), unwraps, predicts the mint fee, refuses dust up front, and redeems against your configured mint. Your wallet nets `face − fee`.
 
 Watch the network: the observatory served from your relay's `/network`.
 
@@ -635,7 +633,7 @@ means the process is up but every harness has faulted out, so it will take no wo
 
 Routine no-ops (a re-seen offer already claimed, a duplicate award) are hidden by default. Set
 `MAXPLAYER_VERBOSE=1` in the daemon's environment to see them. Nothing that reports a state change
-or a failure is behind that flag — you never have to enable it to see something go wrong.
+or a failure is behind that flag. You never have to enable it to see something go wrong.
 
 Optional: BYO delivery + custom agent (power-user hatch):
 
@@ -650,7 +648,7 @@ Optional: BYO delivery + custom agent (power-user hatch):
 
 ---
 
-## 10. Day 2 — earnings, withdrawal, restart, reboot
+## 10. Day 2: earnings, withdrawal, restart, reboot
 
 The daemon is running and has taken work. These are the four things you do from here on.
 
@@ -668,10 +666,10 @@ total_sats=1250
 ```
 
 The command shows every configured mint (including zero balances) and every mint where the shared
-wallet database holds spendable proofs. `total_sats` is the whole-wallet figure — with `--mint <url>`
+wallet database holds spendable proofs. `total_sats` is the whole-wallet figure. With `--mint <url>`
 both totals cover only the mint you asked about, never the mints the filter left out. If funds exist at
 an unconfigured mint, its row has `role=unconfigured` and a separate `configured_total_sats` line
-appears before the whole-wallet total — and that configured subset is what job payment can actually
+appears before the whole-wallet total, and that configured subset is what job payment can actually
 draw on: accept-time source selection deliberately ignores unconfigured balances, so money at an
 unconfigured mint is yours to `send`/`melt` manually but does not fund jobs until you
 `wallet mints add` it. The daemon's own `seller node
@@ -679,7 +677,7 @@ status` line every ~5 minutes ([§9](#9-minimal-runbook)) tells you the loop is 
 balance` tells you what it earned.
 
 Remember the receipt records the **face** amount of the offer, while the wallet holds `face − mint fee`
-([§7](#7-fees--rate--set---rate-sats-to-net-positive)). The balance is the number that is actually yours.
+([§7](#7-fees--rate-set---rate-sats-to-net-positive)). The balance is the number that is actually yours.
 
 ### Withdraw to Lightning
 
@@ -692,21 +690,21 @@ invoice in whatever Lightning wallet you want the sats in, then pay it from the 
 
 The mint charges a fee on the melt as well as the redeem, so a withdrawal lands slightly under the
 balance you started from. Check `wallet balance` afterwards to see where you ended up. If you hold
-balances at several mints, `--mint <url>` selects which one the withdrawal comes from — otherwise it
+balances at several mints, `--mint <url>` selects which one the withdrawal comes from. Otherwise it
 uses the default (the first entry of `accepted_mints`).
 
 ### Stop and restart safely
 
-Ctrl-C — or any ordinary stop — is safe, including mid-job. The seller journals every job's state
+Ctrl-C, or any ordinary stop, is safe, including mid-job. The seller journals every job's state
 durably, and a restart reads that journal back and picks up where it left off:
 
 - A job that was **awarded or executing** and has not delivered is re-driven: the agent runs again.
 - A job whose commit was already **pushed** but not signed and announced is finalized from the stored
-  commit — the agent does not re-run and nothing is re-pushed.
+  commit. The agent does not re-run and nothing is re-pushed.
 - A job already **delivered or paid** is left alone.
 
 The one thing a stop can cost you is a deadline. Every offer carries an absolute deadline, and a job
-whose deadline passes while the daemon is down is failed on restart rather than re-driven — a buyer
+whose deadline passes while the daemon is down is failed on restart rather than re-driven. A buyer
 will not pay a delivery that arrives after settlement. Short restarts are free; a seat left down for
 hours forfeits whatever was in flight.
 
@@ -720,13 +718,13 @@ seller node: publishing terminal kind-30340 (accepting=n) — retracting this se
 ```
 
 **This only works if the process gets to run.** `kill -9`, an OOM kill, a crash, or a power cut
-publish nothing, and your last `accepting=y` then stays on the relay indefinitely — the seat
+publish nothing, and your last `accepting=y` then stays on the relay indefinitely. The seat
 announcement is a replaceable event, so nothing supersedes it until you next start up. Prefer a plain
 `systemctl stop` or Ctrl-C over `kill -9` when you have the choice. It is why readers are expected to
 judge a seat announcement by its age rather than trust it outright, and why the retraction narrows
 the window rather than closing it.
 
-Restarting is the bare relaunch — config is already written:
+Restarting is the bare relaunch. Config is already written:
 
 ```bash
 "$MAXPLAYER_BIN" seller --home "$MAXPLAYER_HOME"
@@ -773,9 +771,9 @@ systemctl --user status maxplayer-seller
 journalctl --user -u maxplayer-seller -f     # the status line every ~5 minutes
 ```
 
-Credentials still have to be in **this** environment, not your login shell — an agent CLI that is
+Credentials still have to be in **this** environment, not your login shell. An agent CLI that is
 signed in for you is not signed in for the service unless its config lives under the same `%h`
-([§3b](#3b-setup-gotchas--two-environment-prerequisites-that-silently-break-execute)).
+([§3b](#3b-setup-gotchas-two-environment-prerequisites-that-silently-break-execute)).
 
 ---
 

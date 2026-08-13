@@ -26,8 +26,8 @@ The protocol does not define escrow, relay policy, or wallet internals.
 
 Every maxplayer-owned event carries two tags:
 
-- `["t","maxplayer"]` — the namespace.
-- `["v","1"]` — the protocol major, a decimal string. There is no minor version.
+- `["t","maxplayer"]`: the namespace.
+- `["v","1"]`: the protocol major, a decimal string. There is no minor version.
 
 A reader MUST reject a maxplayer-owned event that lacks either tag. A reader MUST reject an event
 whose `v` is not `1`. A reader MUST ignore tags it does not recognize.
@@ -113,11 +113,11 @@ authoritative signal that a seat will take a job is that the seat claims one.
 A seat leaving the selling role SHOULD publish one last announcement with `accepting` set to `n`
 before it exits. Because the kind is addressable, the last announcement a seat published stands as
 its answer indefinitely: a seat that simply stops publishing leaves an `accepting=y` in place that no
-later event corrects. The terminal announcement is an ordinary announcement of this kind — same `d`,
-same tag set — so it replaces that answer at the same address.
+later event corrects. The terminal announcement is an ordinary announcement of this kind (same `d`,
+same tag set), so it replaces that answer at the same address.
 
 A reader MUST NOT rely on it. Only a seat that is still running can publish one, so it covers an
-orderly exit and nothing else — a killed process, a crashed one, or a host that lost power publishes
+orderly exit and nothing else. A killed process, a crashed one, or a host that lost power publishes
 nothing, and leaves its last `accepting=y` exactly where it was. Section 4.4 is what covers those,
 and it is not made optional by this.
 
@@ -139,8 +139,8 @@ published. It does not prove that the seat will accept work or deliver it.
 
 A reader MUST therefore weigh an announcement by its age. An announcement is not evidence that the
 seat still exists, however recently the seat published it, and an old one is evidence of nothing at
-all. This requirement stands whether or not seats publish the terminal announcement of section 4.2 —
-a seat that dies abruptly publishes no terminal announcement, so age is the only signal a reader has
+all. This requirement stands whether or not seats publish the terminal announcement of section 4.2.
+A seat that dies abruptly publishes no terminal announcement, so age is the only signal a reader has
 for that case.
 
 ## 5. Job Lifecycle
@@ -281,7 +281,7 @@ kind, so a reader MUST gate on the kind before it reads the tags.
 
 An `ACCEPT` names no result. The join a third party can make is job-level: the `ACCEPT` and every
 `RESULT` for that job root on the same offer id, so a reader can name the job a payment authorisation
-settles without private state. For a job that produced one result, that join is exact — the one
+settles without private state. For a job that produced one result, that join is exact: the one
 result is the one the payment pays for.
 
 Across re-deliveries it is ambiguous. A claim MAY produce more than one result, and the `ACCEPT`
@@ -391,8 +391,8 @@ A price decline is not a work failure. A reader MUST NOT score the two alike.
 | `error` | Terminal for that seller's attempt, unless a later result succeeds. |
 
 `status` is a coarse terminality signal, not the failure's class. An implementation MAY emit
-`status=error` for every failure it reports, whatever class §7.1 assigns that `reason_code` — a
-`below_rate` or `no_sentinel` refusal included. A reader MUST derive the class from `reason_code` and
+`status=error` for every failure it reports, whatever class §7.1 assigns that `reason_code`, including a
+`below_rate` or `no_sentinel` refusal. A reader MUST derive the class from `reason_code` and
 MUST NOT infer it from `status`. The §7.1 fallback therefore applies only to an unknown code, where
 it is a last resort that MAY class a refusal as an error.
 
