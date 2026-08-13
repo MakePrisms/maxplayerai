@@ -8,6 +8,7 @@
 //! returns a graceful tool-error — the server never exits.
 
 use std::io::{BufRead, Write};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use maxplayer_core::home::{self, MaxplayerHome};
@@ -25,6 +26,12 @@ const RUNTIME_ERROR: i32 = 2;
 /// with margin (Scribe ★1). Cap-hit → graceful tool-error; server stays up.
 const TOOL_DEADLINE_SECS: u64 = 15;
 
+const INSTRUCTION_MARKETPLACE: &str = "maxplayer is an agent marketplace — post jobs for other agents to do, or claim and deliver jobs for bitcoin ecash.";
+const INSTRUCTION_REAL_MONEY: &str = "Posting a job commits payment automatically at award. Treat post_job as spending real money: confirm amount and job text with your user before calling it. The daemon commits up to `max_sats` (which defaults to `amount_sats`).";
+const INSTRUCTION_GUIDES: &str = "Setup, operation, and debugging guides: https://www.maxplayer.ai/skill.md — start there before first use.";
+const INSTRUCTION_WALLET: &str = "Buyer wallet funding is CLI-only: run `maxplayer wallet setup` (and mint-complete) before post_job; MCP has no wallet tools.";
+const INSTRUCTION_NIX_MISSING: &str = "nix is not installed on this machine — selling and delivery verification are unavailable. To enable: `curl -fsSL https://install.determinate.systems/nix | sh -s -- install` (asks for sudo once).";
+
 #[derive(Debug, Deserialize)]
 struct McpRequest {
     id: Option<Value>,
@@ -37,6 +44,10 @@ struct McpRequest {
 /// the daemon socket (connect-or-spawn) and to run the never-echo-secret guard over daemon replies.
 struct McpState {
     home: MaxplayerHome,
+    /// Advisory MCP handshake text, composed once at server startup. Tools whose safety depends on
+    /// nix availability must continue to perform their own call-time checks: clients may discard
+    /// the initialize `instructions` field, and there is no mechanism for updating it later.
+    instructions: String,
 }
 
 /// Run the MCP server on the provided stdio handles until stdin EOF.
@@ -103,7 +114,31 @@ pub fn run(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 fn bootstrap_state() -> Result<McpState, String> {
     let root = home::default_home_dir().map_err(|error| error.to_string())?;
     let home = home::bootstrap(root).map_err(|error| error.to_string())?;
-    Ok(McpState { home })
+    let instructions = compose_instructions(nix_probe_succeeds());
+    Ok(McpState { home, instructions })
+}
+
+fn nix_probe_succeeds() -> bool {
+    Command::new("nix")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn compose_instructions(nix_available: bool) -> String {
+    let mut lines = vec![
+        INSTRUCTION_MARKETPLACE,
+        INSTRUCTION_REAL_MONEY,
+        INSTRUCTION_GUIDES,
+        INSTRUCTION_WALLET,
+    ];
+    if !nix_available {
+        lines.push(INSTRUCTION_NIX_MISSING);
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -128,6 +163,7 @@ async fn dispatch_async(state: &McpState, request: &McpRequest) -> Value {
                     "name": "maxplayer",
                     "version": maxplayer_core::version(),
                 },
+                "instructions": state.instructions,
             }),
         ),
         "ping" => ok(id, json!({})),
@@ -572,7 +608,56 @@ mod tests {
 
     fn state_at(root: &std::path::Path) -> McpState {
         let home = home::bootstrap(root).expect("bootstrap");
-        McpState { home }
+        McpState {
+            home,
+            instructions: compose_instructions(true),
+        }
+    }
+
+    #[test]
+    fn initialize_instructions_are_exact_when_nix_is_available() {
+        let expected = concat!(
+            "maxplayer is an agent marketplace — post jobs for other agents to do, or claim and deliver jobs for bitcoin ecash.\n",
+            "Posting a job commits payment automatically at award. Treat post_job as spending real money: confirm amount and job text with your user before calling it. The daemon commits up to `max_sats` (which defaults to `amount_sats`).\n",
+            "Setup, operation, and debugging guides: https://www.maxplayer.ai/skill.md — start there before first use.\n",
+            "Buyer wallet funding is CLI-only: run `maxplayer wallet setup` (and mint-complete) before post_job; MCP has no wallet tools.",
+        );
+        assert_eq!(compose_instructions(true), expected);
+        assert!(!expected.contains("wait_for"));
+        assert!(!expected.contains(INSTRUCTION_NIX_MISSING));
+    }
+
+    #[test]
+    fn initialize_instructions_add_exact_nix_hint_only_when_probe_fails() {
+        let expected = concat!(
+            "maxplayer is an agent marketplace — post jobs for other agents to do, or claim and deliver jobs for bitcoin ecash.\n",
+            "Posting a job commits payment automatically at award. Treat post_job as spending real money: confirm amount and job text with your user before calling it. The daemon commits up to `max_sats` (which defaults to `amount_sats`).\n",
+            "Setup, operation, and debugging guides: https://www.maxplayer.ai/skill.md — start there before first use.\n",
+            "Buyer wallet funding is CLI-only: run `maxplayer wallet setup` (and mint-complete) before post_job; MCP has no wallet tools.\n",
+            "nix is not installed on this machine — selling and delivery verification are unavailable. To enable: `curl -fsSL https://install.determinate.systems/nix | sh -s -- install` (asks for sudo once).",
+        );
+        assert_eq!(compose_instructions(false), expected);
+    }
+
+    #[test]
+    fn initialize_returns_startup_composed_instructions() {
+        let root = temp_home("initialize-instructions");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut state = state_at(&root);
+        state.instructions = "startup snapshot".to_owned();
+
+        let response = dispatch(
+            &state,
+            &McpRequest {
+                id: Some(json!(1)),
+                method: "initialize".into(),
+                params: json!({}),
+            },
+        );
+
+        assert_eq!(response["result"]["instructions"], "startup snapshot");
+        assert_eq!(response["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(response["result"]["serverInfo"]["name"], "maxplayer");
     }
 
     // #98: get_result materializes a PAID delivery's files to <home>/results/<job_id> and returns
