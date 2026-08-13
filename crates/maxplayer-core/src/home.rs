@@ -762,6 +762,10 @@ pub struct MaxplayerConfig {
     /// co-signatures) is unchanged — the per-job cap is the standing spend bound on the real path.
     #[serde(default = "default_allow_real_mints")]
     pub allow_real_mints: bool,
+    /// Gates only the boot sweep's authority to raise replacement cross-mint melt quotes. Foreground
+    /// recovery under a caller-provided budget gate is unaffected. Default **false**.
+    #[serde(default)]
+    pub hop_sweep_supersede: bool,
     /// Optional `[profile] name / about`. Skipped when absent so fresh homes stay unnamed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ProfileConfig>,
@@ -886,6 +890,7 @@ impl Default for MaxplayerConfig {
             per_job_budget_sats: DEFAULT_PER_JOB_BUDGET_SATS,
             extra_mints: Vec::new(),
             allow_real_mints: true,
+            hop_sweep_supersede: false,
             profile: None,
             seller: None,
             buzz: None,

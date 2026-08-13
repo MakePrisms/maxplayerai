@@ -19,7 +19,9 @@
 //! | `Unpaid`  | —          | nothing left the source; melt (the source mint's own answer, not a guess) |
 //! | `Pending` | —          | money in flight; refuse, stay retryable, never melt again |
 //! | `Failed`  | unpaid     | raise one bounded, separately-gated replacement against the same invoice |
-//! | `Failed`  | not unpaid | ambiguous target truth; refuse without another melt |
+//! | `Failed`  | paid       | the strand: issue the ecash at the target, and say so LOUDLY |
+//! | `Failed`  | issued     | both legs already landed; complete without touching either mint |
+//! | `Failed`  | pending / unknown | ambiguous target truth; refuse without another melt |
 //! | `Paid`    | not issued | the strand: issue the ecash at the target, and say so LOUDLY |
 //! | `Paid`    | issued     | both legs already landed; complete without touching either mint |
 //!
@@ -105,6 +107,13 @@ pub enum HopError {
         /// The pairing this run arrived with.
         planned: Box<HopJournal>,
     },
+    /// A process tried to append a second pairing while the first pairing was still active.
+    DuplicatePlanned {
+        /// The attempt both pairings claim.
+        attempt_id: String,
+        /// Melt quote belonging to the active pairing already on disk.
+        active_melt_quote_id: String,
+    },
     /// The melt is settling at the source mint. Money is in flight, so this attempt must not melt
     /// again; it refuses and stays retryable once the source mint reaches a terminal answer.
     MeltInFlight {
@@ -134,6 +143,13 @@ pub enum HopError {
         attempt_id: String,
         /// Number of superseding melt quotes already journalled.
         attempts: usize,
+    },
+    /// The boot sweep found a safe replacement candidate, but has no replacement-spend authority.
+    SweepSupersessionDisabled {
+        /// The attempt left retryable for an operator or foreground caller.
+        attempt_id: String,
+        /// The failed active melt quote.
+        melt_quote_id: String,
     },
     /// The source wallet cannot fund the hop. Raised while planning, so the cap is never charged
     /// for a melt that could not have run.
@@ -182,6 +198,11 @@ impl fmt::Display for HopError {
                 planned.mint_quote_id,
                 planned.target_mint,
             ),
+            Self::DuplicatePlanned { attempt_id, active_melt_quote_id } => write!(
+                formatter,
+                "cross-mint hop journal: attempt {attempt_id} already has active Planned melt quote \
+                 {active_melt_quote_id}; refusing a duplicate Planned record"
+            ),
             Self::MeltInFlight {
                 attempt_id,
                 melt_quote_id,
@@ -205,6 +226,12 @@ impl fmt::Display for HopError {
                 formatter,
                 "cross-mint hop: attempt {attempt_id} exhausted its {attempts} superseding melt \
                  quotes while the target invoice remained unpaid; operator attention required"
+            ),
+            Self::SweepSupersessionDisabled { attempt_id, melt_quote_id } => write!(
+                formatter,
+                "attempt {attempt_id} has failed melt quote {melt_quote_id} and an unpaid target \
+                 invoice; hop_sweep_supersede=false leaves it retryable without raising or \
+                 charging a replacement quote"
             ),
             Self::InsufficientSource {
                 mint,
@@ -245,6 +272,9 @@ pub(crate) trait HopEffects {
 
     /// Raise, but do not pay, a fresh source-mint melt quote against `bolt11`.
     fn supersede_melt_quote(&mut self, bolt11: &str) -> Result<(String, u64), HopError>;
+
+    /// Refuse before budget authorization if the source no longer covers a replacement quote.
+    fn require_source_covers(&mut self, planned_cost: u64) -> Result<(), HopError>;
 
     /// Melt at the source mint, paying the invoice the target raised.
     fn melt(&mut self, melt_quote_id: &str) -> Result<(), HopError>;
@@ -392,6 +422,16 @@ fn require_current_superseded_melt(
     }
 }
 
+fn require_no_active_planned(records: &[HopRecord], attempt_id: &str) -> Result<(), HopError> {
+    if let Some(HopRecord::Planned(journal)) = records.last() {
+        return Err(HopError::DuplicatePlanned {
+            attempt_id: attempt_id.to_owned(),
+            active_melt_quote_id: journal.melt_quote_id.clone(),
+        });
+    }
+    Ok(())
+}
+
 impl HopJournalStore for FsHopJournal {
     fn replay(&self, attempt_id: &str) -> Result<Vec<HopRecord>, HopError> {
         let path = self.path_for(attempt_id);
@@ -424,14 +464,24 @@ impl HopJournalStore for FsHopJournal {
             .open(&path)
             .map_err(|error| journal_error("open for append", error))?;
         file.lock().map_err(|error| journal_error("lock", error))?;
-        if let HopRecord::MeltSuperseded { superseded_melt_quote_id, .. } = record {
+        if matches!(record, HopRecord::Planned(_) | HopRecord::MeltSuperseded { .. }) {
             file.seek(SeekFrom::Start(0))
                 .map_err(|error| journal_error("seek", error))?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes)
                 .map_err(|error| journal_error("read", error))?;
             let records = decode_records(attempt_id, &bytes)?;
-            require_current_superseded_melt(&records, attempt_id, superseded_melt_quote_id)?;
+            match record {
+                HopRecord::Planned(_) => require_no_active_planned(&records, attempt_id)?,
+                HopRecord::MeltSuperseded { superseded_melt_quote_id, .. } => {
+                    require_current_superseded_melt(
+                        &records,
+                        attempt_id,
+                        superseded_melt_quote_id,
+                    )?;
+                }
+                HopRecord::Settled { .. } => unreachable!(),
+            }
         }
         let mut line =
             serde_json::to_vec(record).map_err(|error| journal_error("encode", error))?;
@@ -492,13 +542,13 @@ fn active_melt(records: &[HopRecord]) -> Option<(String, usize)> {
 ///
 /// Written to stderr on its own line and prefixed with a fixed, greppable marker: the point is that
 /// somebody watching the buyer's output sees it without having to know what a mint quote is.
-fn strand_line(journal: &HopJournal) -> String {
+fn strand_line(journal: &HopJournal, active_melt_quote_id: &str) -> String {
     format!(
         "CROSSMINT STRAND attempt={} melted at {} (melt quote {}) but the ecash at {} was never \
          issued (mint quote {}); {} sats are paid and unissued — completing the mint leg now",
         journal.attempt_id,
         journal.source_mint,
-        journal.melt_quote_id,
+        active_melt_quote_id,
         journal.target_mint,
         journal.mint_quote_id,
         journal.delivered_sats,
@@ -527,6 +577,16 @@ pub(crate) fn run_hop<S: HopJournalStore, E: HopEffects>(
     effects: &mut E,
     journal: &HopJournal,
     budget: &mut crate::budget::BudgetGate,
+) -> Result<HopSettled, HopError> {
+    run_hop_with_supersede_authority(store, effects, journal, budget, true)
+}
+
+fn run_hop_with_supersede_authority<S: HopJournalStore, E: HopEffects>(
+    store: &S,
+    effects: &mut E,
+    journal: &HopJournal,
+    budget: &mut crate::budget::BudgetGate,
+    allow_supersede: bool,
 ) -> Result<HopSettled, HopError> {
     let records = store.replay(&journal.attempt_id)?;
     if let Some(minted_sats) = settled_of(&records) {
@@ -571,6 +631,17 @@ pub(crate) fn run_hop<S: HopJournalStore, E: HopEffects>(
             });
         }
         MeltLeg::Failed => {
+            let (invoice_state, bolt11) = effects.target_invoice(&pairing.mint_quote_id)?;
+            match invoice_state {
+                MintLeg::Paid | MintLeg::Issued => break true,
+                MintLeg::Unpaid => {}
+            }
+            if !allow_supersede {
+                return Err(HopError::SweepSupersessionDisabled {
+                    attempt_id: pairing.attempt_id.clone(),
+                    melt_quote_id: active_melt_quote_id.clone(),
+                });
+            }
             if supersessions >= MAX_MELT_SUPERSESSIONS {
                 eprintln!("{}", melt_exhausted_line(&pairing, &active_melt_quote_id, supersessions));
                 return Err(HopError::MeltSupersessionExhausted {
@@ -578,16 +649,8 @@ pub(crate) fn run_hop<S: HopJournalStore, E: HopEffects>(
                     attempts: supersessions,
                 });
             }
-            let (invoice_state, bolt11) = effects.target_invoice(&pairing.mint_quote_id)?;
-            if invoice_state != MintLeg::Unpaid {
-                return Err(HopError::Mint(format!(
-                    "cross-mint hop: melt quote {active_melt_quote_id} for attempt {} failed, \
-                     but target mint quote {} is no longer Unpaid ({invoice_state:?}); refusing \
-                     an ambiguous supersession",
-                    pairing.attempt_id, pairing.mint_quote_id
-                )));
-            }
             let (new_melt_quote_id, planned_cost) = effects.supersede_melt_quote(&bolt11)?;
+            effects.require_source_covers(planned_cost)?;
             let sub_key = format!("{}#melt{}", pairing.attempt_id, supersessions + 1);
             budget.authorize_then_attempt(&sub_key, planned_cost, || ()).map_err(|refusal| {
                 HopError::Mint(format!(
@@ -615,7 +678,7 @@ pub(crate) fn run_hop<S: HopJournalStore, E: HopEffects>(
     let mint_leg = effects.mint_leg(&pairing.mint_quote_id)?;
     let recovered_strand = melted_earlier && mint_leg != MintLeg::Issued;
     if recovered_strand {
-        eprintln!("{}", strand_line(&pairing));
+        eprintln!("{}", strand_line(&pairing, &active_melt_quote_id));
     }
     let minted_sats = match mint_leg {
         MintLeg::Issued => pairing.delivered_sats,
@@ -908,6 +971,13 @@ impl HopEffects for CdkHopEffects {
         block_on_leg("source melt quote", async move { effects.raise_melt_quote(&bolt11).await })?
     }
 
+    fn require_source_covers(&mut self, planned_cost: u64) -> Result<(), HopError> {
+        let effects = Self { source: self.source.clone(), target: self.target.clone() };
+        block_on_leg("source coverage", async move {
+            effects.require_source_covers(planned_cost).await
+        })?
+    }
+
     fn melt(&mut self, melt_quote_id: &str) -> Result<(), HopError> {
         let wallet = self.source.clone();
         let quote_id = melt_quote_id.to_owned();
@@ -1035,7 +1105,16 @@ async fn sweep_one(
     // `run_hop` blocks (it bridges each leg onto its own runtime), so it may not run on the
     // caller's async thread.
     let store = store.clone();
-    tokio::task::spawn_blocking(move || run_hop(&store, &mut effects, &pairing, &mut budget))
+    let allow_supersede = home.config.hop_sweep_supersede;
+    tokio::task::spawn_blocking(move || {
+        run_hop_with_supersede_authority(
+            &store,
+            &mut effects,
+            &pairing,
+            &mut budget,
+            allow_supersede,
+        )
+    })
         .await
         .map_err(|error| HopError::Mint(format!("hop sweep task: {error}")))?
 }
@@ -1071,11 +1150,14 @@ mod tests {
         mints: Vec<String>,
         /// Melt succeeds, then the process dies before the mint leg — the crash window.
         die_after_melt: bool,
+        /// The melt effect refuses before firing, after its caller has journalled it.
+        fail_before_melt: bool,
         mint_fails: bool,
         target_invoice_fails: bool,
         supersede_quote_fails: bool,
         superseding_quotes: Vec<(String, String, u64)>,
         superseding_planned_cost: u64,
+        source_coverage: u64,
         fail_all_melts: bool,
     }
 
@@ -1085,6 +1167,7 @@ mod tests {
                 melt_leg: Some(MeltLeg::Unpaid),
                 mint_leg: Some(MintLeg::Unpaid),
                 superseding_planned_cost: 109,
+                source_coverage: u64::MAX,
                 ..Self::default()
             }))
         }
@@ -1129,8 +1212,23 @@ mod tests {
             Ok((id, planned_cost))
         }
 
+        fn require_source_covers(&mut self, planned_cost: u64) -> Result<(), HopError> {
+            let world = self.world.borrow();
+            if world.source_coverage < planned_cost {
+                return Err(HopError::InsufficientSource {
+                    mint: "https://a.example".into(),
+                    balance: world.source_coverage,
+                    planned_cost,
+                });
+            }
+            Ok(())
+        }
+
         fn melt(&mut self, melt_quote_id: &str) -> Result<(), HopError> {
             let mut world = self.world.borrow_mut();
+            if world.fail_before_melt {
+                return Err(HopError::Mint("melt effect failed before firing".into()));
+            }
             world.melts.push(melt_quote_id.to_owned());
             world.melt_leg = Some(if world.fail_all_melts { MeltLeg::Failed } else { MeltLeg::Paid });
             // The target's invoice is paid by the melt, so its quote flips too — unless the target
@@ -1179,8 +1277,16 @@ mod tests {
             };
             let mut all_records = self.records.borrow_mut();
             let records = all_records.entry(attempt_id.clone()).or_default();
-            if let HopRecord::MeltSuperseded { superseded_melt_quote_id, .. } = record {
-                require_current_superseded_melt(records, &attempt_id, superseded_melt_quote_id)?;
+            match record {
+                HopRecord::Planned(_) => require_no_active_planned(records, &attempt_id)?,
+                HopRecord::MeltSuperseded { superseded_melt_quote_id, .. } => {
+                    require_current_superseded_melt(
+                        records,
+                        &attempt_id,
+                        superseded_melt_quote_id,
+                    )?;
+                }
+                HopRecord::Settled { .. } => {}
             }
             records.push(record.clone());
             Ok(())
@@ -1262,7 +1368,7 @@ mod tests {
 
         // The loud line names both quote ids and both mints, so an operator reading stderr can act
         // on it without opening the journal.
-        let line = strand_line(&journal("attempt-1"));
+        let line = strand_line(&journal("attempt-1"), "melt-1");
         for needle in [
             "CROSSMINT STRAND",
             "attempt-1",
@@ -1276,6 +1382,25 @@ mod tests {
                 "strand line missing {needle}: {line}"
             );
         }
+        let superseded_pairing = journal("superseded-strand");
+        store.append_sync(&HopRecord::Planned(superseded_pairing.clone())).unwrap();
+        store.append_sync(&HopRecord::MeltSuperseded {
+            attempt_id: superseded_pairing.attempt_id.clone(),
+            superseded_melt_quote_id: "melt-1".into(),
+            melt_quote_id: "melt-2".into(),
+            planned_cost: 109,
+        }).unwrap();
+        let superseded_world = MintWorld::shared();
+        superseded_world.borrow_mut().melt_leg = Some(MeltLeg::Paid);
+        superseded_world.borrow_mut().mint_leg = Some(MintLeg::Paid);
+        let mut superseded_effects = FakeMints { world: Rc::clone(&superseded_world) };
+        let superseded = run_hop_uncapped(&store, &mut superseded_effects, &superseded_pairing)
+            .expect("the superseded strand recovers");
+        assert!(superseded.recovered_strand);
+        let active = active_melt(&store.replay("superseded-strand").unwrap()).unwrap().0;
+        let superseded_line = strand_line(&superseded_pairing, &active);
+        assert!(superseded_line.contains("melt quote melt-2"));
+        assert!(!superseded_line.contains("melt quote melt-1"));
     }
 
     // A completed hop is never re-run: neither mint is touched again, no matter how many times the
@@ -1367,6 +1492,7 @@ mod tests {
             }
             fn target_invoice(&mut self, _: &str) -> Result<(MintLeg, String), HopError> { unreachable!() }
             fn supersede_melt_quote(&mut self, _: &str) -> Result<(String, u64), HopError> { unreachable!() }
+            fn require_source_covers(&mut self, _: u64) -> Result<(), HopError> { unreachable!() }
             fn melt(&mut self, _: &str) -> Result<(), HopError> {
                 Ok(())
             }
@@ -1701,7 +1827,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_melt_supersedes_the_same_invoice_journals_before_melt_and_settles() {
+    fn a_failed_melt_supersedes_the_same_invoice_and_settles() {
         let store = MemJournal::default();
         let world = MintWorld::shared();
         world.borrow_mut().melt_leg = Some(MeltLeg::Failed);
@@ -1728,19 +1854,109 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_melt_with_non_unpaid_target_refuses_ambiguity_without_superseding() {
-        for state in [MintLeg::Paid, MintLeg::Issued] {
-            let store = MemJournal::default();
-            let world = MintWorld::shared();
-            world.borrow_mut().melt_leg = Some(MeltLeg::Failed);
-            world.borrow_mut().mint_leg = Some(state);
-            let mut effects = FakeMints { world: Rc::clone(&world) };
-            let error = run_hop_uncapped(&store, &mut effects, &journal("attempt-1")).unwrap_err();
-            assert!(matches!(error, HopError::Mint(ref detail) if detail.contains("ambiguous supersession")));
-            assert!(world.borrow().melts.is_empty());
-            assert!(world.borrow().superseding_quotes.is_empty());
-            assert_eq!(store.replay("attempt-1").unwrap().len(), 1);
-        }
+    fn a_failed_melt_with_issued_target_completes_without_touching_either_mint() {
+        let store = MemJournal::default();
+        let world = MintWorld::shared();
+        world.borrow_mut().melt_leg = Some(MeltLeg::Failed);
+        world.borrow_mut().mint_leg = Some(MintLeg::Issued);
+        let mut effects = FakeMints { world: Rc::clone(&world) };
+        let settled = run_hop_uncapped(&store, &mut effects, &journal("attempt-1")).unwrap();
+        assert_eq!(settled.minted_sats, 100);
+        assert!(!settled.recovered_strand);
+        assert!(world.borrow().melts.is_empty());
+        assert!(world.borrow().mints.is_empty());
+        assert!(world.borrow().superseding_quotes.is_empty());
+        assert!(matches!(store.replay("attempt-1").unwrap().as_slice(), [
+            HopRecord::Planned(_), HopRecord::Settled { minted_sats: 100, .. }
+        ]));
+    }
+
+    #[test]
+    fn a_failed_melt_with_paid_target_uses_the_existing_strand_path() {
+        let store = MemJournal::default();
+        let world = MintWorld::shared();
+        world.borrow_mut().melt_leg = Some(MeltLeg::Failed);
+        world.borrow_mut().mint_leg = Some(MintLeg::Paid);
+        let mut effects = FakeMints { world: Rc::clone(&world) };
+        let settled = run_hop_uncapped(&store, &mut effects, &journal("attempt-1")).unwrap();
+        assert!(settled.recovered_strand, "the loud strand path must be selected");
+        assert!(world.borrow().melts.is_empty());
+        assert_eq!(world.borrow().mints, vec!["mint-1"]);
+        assert!(world.borrow().superseding_quotes.is_empty());
+        let line = strand_line(&journal("attempt-1"), "melt-1");
+        assert!(line.contains("CROSSMINT STRAND"));
+    }
+
+    #[test]
+    fn a_supersession_is_durable_when_the_melt_effect_fails_before_firing_and_recovery_uses_it() {
+        let journal_dir = scratch_dir("supersession-crash-window");
+        let store = FsHopJournal::new(&journal_dir);
+        let world = MintWorld::shared();
+        world.borrow_mut().melt_leg = Some(MeltLeg::Failed);
+        world.borrow_mut().fail_before_melt = true;
+        let mut effects = FakeMints { world: Rc::clone(&world) };
+
+        run_hop_uncapped(&store, &mut effects, &journal("attempt-1"))
+            .expect_err("the injected melt failure stops the run");
+        assert!(world.borrow().melts.is_empty(), "the melt effect never fired");
+        let restarted_store = FsHopJournal::new(&journal_dir);
+        let fresh_records = restarted_store.replay("attempt-1").expect("fresh journal read");
+        assert!(matches!(fresh_records.as_slice(), [
+            HopRecord::Planned(_),
+            HopRecord::MeltSuperseded {
+                superseded_melt_quote_id,
+                melt_quote_id,
+                ..
+            }
+        ] if superseded_melt_quote_id == "melt-1" && melt_quote_id == "melt-2"));
+
+        world.borrow_mut().fail_before_melt = false;
+        world.borrow_mut().melt_leg = Some(MeltLeg::Unpaid);
+        let settled = run_hop_uncapped(&restarted_store, &mut effects, &journal("attempt-1"))
+            .expect("recovery resumes the journalled replacement");
+        assert_eq!(settled.minted_sats, 100);
+        assert_eq!(world.borrow().melts, vec!["melt-2"]);
+        assert_eq!(world.borrow().superseding_quotes.len(), 1);
+    }
+
+    #[test]
+    fn the_sweep_default_cannot_supersede_or_charge_budget_but_opt_in_can() {
+        let pairing = journal("sweep-attempt");
+
+        let store = MemJournal::default();
+        let world = MintWorld::shared();
+        world.borrow_mut().melt_leg = Some(MeltLeg::Failed);
+        let mut effects = FakeMints { world: Rc::clone(&world) };
+        let mut gate = BudgetGate::new(u64::MAX);
+        let config = crate::home::MaxplayerConfig::default();
+        assert!(!config.hop_sweep_supersede);
+        let error = run_hop_with_supersede_authority(
+            &store,
+            &mut effects,
+            &pairing,
+            &mut gate,
+            config.hop_sweep_supersede,
+        )
+        .unwrap_err();
+        assert!(matches!(error, HopError::SweepSupersessionDisabled { .. }));
+        assert!(error.to_string().contains("hop_sweep_supersede=false"));
+        assert!(world.borrow().superseding_quotes.is_empty());
+        assert!(world.borrow().melts.is_empty());
+        assert_eq!(gate.spent(), 0);
+
+        let mut config = config;
+        config.hop_sweep_supersede = true;
+        run_hop_with_supersede_authority(
+            &store,
+            &mut effects,
+            &pairing,
+            &mut gate,
+            config.hop_sweep_supersede,
+        )
+        .expect("the opt-in sweep supersedes");
+        assert_eq!(world.borrow().superseding_quotes.len(), 1);
+        assert_eq!(world.borrow().melts, vec!["melt-2"]);
+        assert_eq!(gate.spent(), world.borrow().superseding_planned_cost);
     }
 
     #[test]
@@ -1791,6 +2007,31 @@ mod tests {
     }
 
     #[test]
+    fn replacement_cost_over_remaining_source_coverage_refuses_before_journal_or_budget() {
+        let pairing = journal("attempt-source-coverage");
+        let store = MemJournal::default();
+        store.append_sync(&HopRecord::Planned(pairing.clone())).unwrap();
+        let world = MintWorld::shared();
+        world.borrow_mut().melt_leg = Some(MeltLeg::Failed);
+        world.borrow_mut().superseding_planned_cost = 200;
+        world.borrow_mut().source_coverage = 199;
+        let mut effects = FakeMints { world: Rc::clone(&world) };
+        let mut gate = BudgetGate::new(u64::MAX);
+
+        let error = run_hop(&store, &mut effects, &pairing, &mut gate).unwrap_err();
+        assert!(matches!(
+            error,
+            HopError::InsufficientSource { balance: 199, planned_cost: 200, .. }
+        ));
+        assert_eq!(world.borrow().superseding_quotes.len(), 1);
+        assert!(world.borrow().melts.is_empty());
+        assert_eq!(gate.spent(), 0);
+        assert!(matches!(store.replay(&pairing.attempt_id).unwrap().as_slice(), [
+            HopRecord::Planned(_)
+        ]));
+    }
+
+    #[test]
     fn a_stale_concurrent_supersession_cannot_replace_the_journal_tail() {
         let store = FsHopJournal::new(scratch_dir("stale-supersession"));
         store.append_sync(&HopRecord::Planned(journal("attempt-1"))).unwrap();
@@ -1804,6 +2045,33 @@ mod tests {
         }).unwrap_err();
         assert!(matches!(error, HopError::Journal(_)));
         assert_eq!(active_melt(&store.replay("attempt-1").unwrap()), Some(("melt-2".into(), 1)));
+    }
+
+    #[test]
+    fn duplicate_planned_refuses_until_the_prior_planned_is_superseded() {
+        let store = FsHopJournal::new(scratch_dir("duplicate-planned"));
+        store.append_sync(&HopRecord::Planned(journal("attempt-1"))).unwrap();
+
+        let mut duplicate = journal("attempt-1");
+        duplicate.melt_quote_id = "melt-racing".into();
+        let error = store.append_sync(&HopRecord::Planned(duplicate.clone())).unwrap_err();
+        assert!(matches!(
+            error,
+            HopError::DuplicatePlanned {
+                ref attempt_id,
+                ref active_melt_quote_id,
+            } if attempt_id == "attempt-1" && active_melt_quote_id == "melt-1"
+        ));
+
+        store.append_sync(&HopRecord::MeltSuperseded {
+            attempt_id: "attempt-1".into(),
+            superseded_melt_quote_id: "melt-1".into(),
+            melt_quote_id: "melt-2".into(),
+            planned_cost: 109,
+        }).unwrap();
+        store.append_sync(&HopRecord::Planned(duplicate)).expect(
+            "a supersession closes the prior Planned record before a later Planned is appended",
+        );
     }
 
     // Every leg that can fail must leave the attempt un-completed: no completion record, so a later
