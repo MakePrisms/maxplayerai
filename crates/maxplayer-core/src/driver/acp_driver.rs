@@ -187,9 +187,7 @@ impl AcpDriver {
         loop {
             let response = tokio::time::timeout(idle_timeout, responses.recv())
                 .await
-                .map_err(|_| {
-                    DriverError::Other(format!("ACP request {id} timed out waiting for response"))
-                })?
+                .map_err(|_| DriverError::ResponseTimeout { request_id: id })?
                 .ok_or_else(|| {
                     DriverError::Other(format!(
                         "ACP agent exited before responding to request {id}"
@@ -1205,5 +1203,23 @@ mod tests {
             std::task::Poll::Ready(outcome) => outcome,
             std::task::Poll::Pending => panic!("permission future should not pend"),
         }
+    }
+
+    #[tokio::test]
+    async fn response_timeout_keeps_a_typed_driver_error() {
+        // Keep the sender alive so this waits for the timer instead of observing a closed channel.
+        let (_response_tx, response_rx) = mpsc::unbounded_channel();
+        let mut driver = AcpDriver::new(
+            AgentCommand::new("fake".into(), Vec::new()),
+            PermissionOutcome::Allow,
+            Duration::from_millis(1),
+        );
+        driver.responses = Some(response_rx);
+
+        assert_eq!(
+            driver.wait_response(3).await.expect_err("must time out"),
+            DriverError::ResponseTimeout { request_id: 3 },
+            "the timer's classification must not be flattened into message text"
+        );
     }
 }
