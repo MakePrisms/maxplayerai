@@ -288,8 +288,61 @@ pub fn compose_agent_prompt(
     }
 }
 
+/// The fixed delivery-subject prefix. Its 20 bytes are charged against [`SUBJECT_BYTE_BUDGET`].
+const SUBJECT_PREFIX: &str = "maxplayer delivery: ";
+
+/// Byte budget for the WHOLE emitted subject line — prefix included, not the summary alone (#637).
+///
+/// Two deliberate choices, neither inherited:
+///
+/// * **72 BYTES, not 72 chars.** A git subject is bytes on the wire and 72 is git's own subject
+///   width (the 50/72 convention `git log` formats to, and where GitHub truncates a title). The
+///   pre-fix `summary.chars().take(72)` bounded Unicode scalar values, which bounds nothing a
+///   subject cares about: 72 chars of non-ASCII is up to 288 bytes.
+/// * **The budget covers the LINE, so the prefix is charged to it.** What the convention bounds is
+///   the rendered line, and the prefix is part of every rendered line. Spending 72 on the summary
+///   alone is precisely what put a 92-byte subject on `main` (#635, quoted in #637) — so keeping
+///   72-for-the-summary would have preserved the number while leaving the complaint standing.
+///   The summary's own budget is therefore what is left over: 72 - 20 = 52 bytes.
+const SUBJECT_BYTE_BUDGET: usize = 72;
+
+/// Truncate `summary` to at most `budget` BYTES, cutting only at a word boundary and never inside a
+/// UTF-8 character.
+///
+/// Boundary-safe BY CONSTRUCTION, which is the whole point: `&s[..n]` panics when `n` is not a char
+/// boundary, so the index is walked DOWN to the nearest boundary BEFORE any slicing happens. The
+/// walk always terminates because index 0 is a boundary. Every slice below is taken at an index that
+/// has already been proven to be one, so no input can panic here.
+///
+/// The head is then trimmed back to the last ASCII space — which is exactly a word boundary, since
+/// the caller has already collapsed all whitespace to single spaces. Two edge arms: a cut landing
+/// exactly ON a space is already word-complete (trimming would drop a whole word for nothing), and a
+/// single word longer than the entire budget has no boundary to trim to, so it is hard-cut at the
+/// char boundary rather than truncated away to nothing.
+///
+/// No ellipsis is appended, consistently, in every arm: a git subject is scarce, every byte spent
+/// marking the truncation is a byte not spent saying what was delivered, and the emitted result must
+/// never differ from the input for an under-budget summary.
+fn cap_summary_bytes(summary: &str, budget: usize) -> &str {
+    if summary.len() <= budget {
+        return summary;
+    }
+    let mut end = budget;
+    while !summary.is_char_boundary(end) {
+        end -= 1;
+    }
+    if summary.as_bytes().get(end) == Some(&b' ') {
+        return &summary[..end];
+    }
+    match summary[..end].rfind(' ') {
+        Some(space) => &summary[..space],
+        None => &summary[..end],
+    }
+}
+
 /// A concise, single-line delivery-commit message derived from the offer task: the first non-empty
-/// line, whitespace-collapsed and length-capped. Falls back to a fixed label for an empty task.
+/// line, whitespace-collapsed and capped to [`SUBJECT_BYTE_BUDGET`] bytes at a word boundary. Falls
+/// back to a fixed label for an empty task.
 pub fn delivery_message(task: &str) -> String {
     let summary: String = task
         .lines()
@@ -302,8 +355,17 @@ pub fn delivery_message(task: &str) -> String {
     if summary.is_empty() {
         return "maxplayer delivery".to_owned();
     }
-    let capped: String = summary.chars().take(72).collect();
-    format!("maxplayer delivery: {capped}")
+    let capped = cap_summary_bytes(
+        &summary,
+        SUBJECT_BYTE_BUDGET.saturating_sub(SUBJECT_PREFIX.len()),
+    );
+    // Unreachable at the const budget (52 bytes leaves room for at least one char of any summary),
+    // but it is what keeps the no-trailing-space invariant true by construction rather than by
+    // arithmetic: a prefix with nothing after it is the bare label, never `"…delivery: "`.
+    if capped.is_empty() {
+        return "maxplayer delivery".to_owned();
+    }
+    format!("{SUBJECT_PREFIX}{capped}")
 }
 
 /// Delivery discriminator for the seller's commit/fork delivery, derived from the SAME typed
@@ -1110,11 +1172,177 @@ mod tests {
         );
         // Empty task falls back to a fixed label.
         assert_eq!(delivery_message("   \n  "), "maxplayer delivery");
-        // Long first line is capped.
+        // Long first line is capped. #637 moved the budget from the summary alone to the WHOLE
+        // subject line, so the expected total moved with it: 72 bytes of subject, not 20 + 72 = 92.
+        // The fixture and its intent are unchanged — a 200-byte first line must come out capped —
+        // only the constant it is anchored to, which is the constant the fix deliberately changed.
         let long = "x".repeat(200);
         let msg = delivery_message(&long);
         assert!(msg.starts_with("maxplayer delivery: "));
-        assert_eq!(msg.len(), "maxplayer delivery: ".len() + 72);
+        assert_eq!(msg.len(), SUBJECT_BYTE_BUDGET);
+    }
+
+    // ── #637: the subject cap cuts mid-word, and it counts chars where a subject counts bytes ────
+    //
+    // RED-PROVE, run at this commit with
+    // `cargo test -p maxplayer-core --features wallet --locked --offline --lib -- \
+    //  seller_exec::tests::delivery_message`:
+    //
+    //   (a) REVERTED — `crates/maxplayer-core/src/seller_exec.rs:358`, the capping call in
+    //       `delivery_message`, put back to the pre-fix one-liner it replaced:
+    //         `let capped: String = summary.chars().take(72).collect();`
+    //       and, so that field (c) reports the pre-existing test as it actually stood, its length
+    //       assertion (this file, :1182) put back to its own pre-fix form:
+    //         `assert_eq!(msg.len(), "maxplayer delivery: ".len() + 72);`
+    //
+    //   (b) FAILED ASSERTIONS, quoted verbatim from that run — 3 failed, 1 passed. Line numbers
+    //       are this file's, i.e. where each assertion sits in the delivered diff; the reverted
+    //       build printed slightly different ones, offset by the reverted edit itself:
+    //
+    //       seller_exec.rs:1248, delivery_message_caps_a_multibyte_summary_by_bytes_not_chars —
+    //         "72-byte subject budget, got 91 bytes: maxplayer delivery: ünïcödé ünïcödé ünïcödé
+    //          ünïcödé ünïcödé ünïcödé"
+    //       47 chars slid under the 72-CHAR cap untouched and emitted a 91-byte subject: the char
+    //       cap is not a byte bound.
+    //
+    //       seller_exec.rs:1299, delivery_message_cuts_a_long_summary_at_a_word_boundary —
+    //         "assertion `left == right` failed: no partial trailing word — the original must
+    //          continue with a space after the cut, not mid-token
+    //            left: Some(118)
+    //           right: Some(32)"
+    //       118 is `v`, not a space: the cut landed inside `delivery`, emitting #637's own exhibit
+    //         "maxplayer delivery: Implement Phase 0 of maxplayerai issue #599 (\"verified
+    //          contribution deli"
+    //       — 92 bytes, unclosed paren, unclosed quote.
+    //
+    //       seller_exec.rs:1344, delivery_message_leaves_an_under_budget_summary_byte_identical —
+    //         "assertion `left == right` failed
+    //            left: "maxplayer delivery: wwwwwwwwww…" (53 w, 73 bytes)
+    //           right: "maxplayer delivery: wwwwwwwwww…" (52 w, 72 bytes)"
+    //
+    //   (c) PRE-EXISTING COVERAGE under that break: NONE — `delivery_message_summarizes_the_task`
+    //       stayed GREEN. That is the finding rather than an accident: its long-line fixture is
+    //       `"x".repeat(200)`, a single ASCII word, with no word boundary to cut badly and no
+    //       multi-byte char to widen, so it pinned the byte count of a case both defects are
+    //       invisible in. It is also the only pre-existing test anywhere that feeds
+    //       `delivery_message` a summary over the cap (`seller_node::run`'s caller test uses
+    //       "build a widget"). Nothing else in the suite could go red for either defect.
+
+    #[test]
+    fn delivery_message_caps_a_multibyte_summary_by_bytes_not_chars() {
+        // The input that separates a byte cap from a char cap: FEWER chars than the old 72-char cap
+        // (so the pre-fix code passes it through whole) but MORE bytes than the 52-byte summary
+        // budget. Truncation must happen, must not panic, and must not emit a broken scalar.
+        let word = "ünïcödé"; // 7 chars, 11 bytes
+        let summary = vec![word; 6].join(" "); // 47 chars, 71 bytes
+        assert!(
+            summary.chars().count() < 72
+                && summary.len() > SUBJECT_BYTE_BUDGET - SUBJECT_PREFIX.len(),
+            "fixture must slip a 72-CHAR cap while busting the 52-byte summary budget: \
+             {} chars, {} bytes",
+            summary.chars().count(),
+            summary.len()
+        );
+
+        let msg = delivery_message(&summary);
+        assert!(
+            msg.len() <= SUBJECT_BYTE_BUDGET,
+            "72-byte subject budget, got {} bytes: {msg}",
+            msg.len()
+        );
+        // Valid UTF-8, explicitly: a byte-sliced subject that split a scalar could not round-trip.
+        assert_eq!(
+            std::str::from_utf8(msg.as_bytes()).expect("subject is valid UTF-8"),
+            msg
+        );
+        let capped = msg
+            .strip_prefix(SUBJECT_PREFIX)
+            .expect("prefixed subject: {msg}");
+        assert!(
+            summary.starts_with(capped),
+            "the cut is a prefix of the input — no mangled or re-encoded scalar: {capped}"
+        );
+        // Byte 52 of this fixture falls INSIDE the `ï` of the fifth word, so the boundary walk runs
+        // and then the word trim takes it back to four whole words.
+        assert_eq!(capped, vec![word; 4].join(" "));
+
+        // Hard-cut arm, multi-byte: one word with no space anywhere to trim back to. Byte 52 lands
+        // inside an `é` (the leading "a" makes every char boundary odd), so a naive `&summary[..52]`
+        // would PANIC here — this is the case the boundary walk exists for.
+        let one_word = format!("a{}", "é".repeat(60)); // 61 chars, 121 bytes
+        assert!(!one_word.is_char_boundary(SUBJECT_BYTE_BUDGET - SUBJECT_PREFIX.len()));
+        let msg = delivery_message(&one_word);
+        let capped = msg.strip_prefix(SUBJECT_PREFIX).expect("prefixed subject");
+        assert_eq!(
+            capped.len(),
+            51,
+            "floored to the char boundary below 52: {capped}"
+        );
+        assert_eq!(capped.chars().count(), 26, "'a' + 25 whole é: {capped}");
+        assert!(one_word.starts_with(capped));
+        assert_eq!(msg.len(), SUBJECT_PREFIX.len() + 51);
+    }
+
+    #[test]
+    fn delivery_message_cuts_a_long_summary_at_a_word_boundary() {
+        // #637's own exhibit: the first line of #635, which reached `main` cut mid-token with an
+        // unclosed paren and an unclosed quote.
+        let summary =
+            "Implement Phase 0 of maxplayerai issue #599 (\"verified contribution delivery\") e2e";
+        let msg = delivery_message(summary);
+        let capped = msg.strip_prefix(SUBJECT_PREFIX).expect("prefixed subject");
+
+        assert!(
+            summary.starts_with(capped),
+            "the cut is a prefix of the input: {capped}"
+        );
+        assert_eq!(
+            summary.as_bytes().get(capped.len()),
+            Some(&b' '),
+            "no partial trailing word — the original must continue with a space after the cut, \
+             not mid-token"
+        );
+        assert!(
+            msg.len() <= SUBJECT_BYTE_BUDGET,
+            "{} bytes: {msg}",
+            msg.len()
+        );
+        assert!(
+            !capped.ends_with(' '),
+            "no trailing-space damage: {capped:?}"
+        );
+        assert_eq!(capped, "Implement Phase 0 of maxplayerai issue #599");
+    }
+
+    #[test]
+    fn delivery_message_leaves_an_under_budget_summary_byte_identical() {
+        // The other arm: a fix that mangles short subjects trades one defect for another. Nothing is
+        // appended, nothing is trimmed, no ellipsis — right up to the budget, ASCII or not.
+        let budget = SUBJECT_BYTE_BUDGET - SUBJECT_PREFIX.len();
+        for summary in [
+            "Fix the parser",
+            "add retry logic and a regression test", // spaces, comfortably under
+            "café ☕ ünïcödé — short but multi-byte", // multi-byte, under budget in BYTES
+            &"w".repeat(budget),                     // exactly AT the budget
+            &format!("{} tail", "w".repeat(budget - 5)), // ends exactly at the budget, with words
+        ] {
+            assert!(
+                summary.len() <= budget,
+                "fixture is under budget: {summary}"
+            );
+            assert_eq!(
+                delivery_message(summary),
+                format!("{SUBJECT_PREFIX}{summary}"),
+                "under-budget summaries pass through byte-identical"
+            );
+        }
+
+        // One byte over the budget, single word: the hard-cut arm fills the budget exactly and adds
+        // nothing — 72 bytes of subject, no ellipsis, no trailing space.
+        let over = "w".repeat(budget + 1);
+        let msg = delivery_message(&over);
+        assert_eq!(msg, format!("{SUBJECT_PREFIX}{}", "w".repeat(budget)));
+        assert_eq!(msg.len(), SUBJECT_BYTE_BUDGET);
     }
 
     #[cfg(not(feature = "acp"))]
