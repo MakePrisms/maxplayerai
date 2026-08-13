@@ -1126,6 +1126,73 @@ mod tests {
         );
     }
 
+    /// #729 end-to-end, on a live child: `cat` echoes the `initialize` request back verbatim and
+    /// never answers it, so `ready()` times out and `run_job` exits through its very first `?`.
+    /// That failure exit must still shut the driver down AND reap the child — the measured leak
+    /// was a healthy ACP child parented to the seller daemon 80 minutes past `execute fail`, and
+    /// a zombie (kill without `wait`) once killed by hand.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_run_still_reaps_the_acp_child() {
+        use crate::engine::{RunParams, run_job};
+        use crate::event::JobId;
+        use crate::log::EventLog;
+
+        let mut driver = AcpDriver::new(
+            AgentCommand::new("cat".into(), Vec::new()),
+            PermissionOutcome::Allow,
+            Duration::from_millis(200),
+        );
+        // Spawn first so the child pid is observable before the run consumes the driver;
+        // `spawn` is idempotent, so `ready()` reuses this same child.
+        driver.spawn().expect("spawn cat");
+        let pid = driver.child.as_ref().expect("child present").id();
+
+        let log_path = std::env::temp_dir().join(format!(
+            "maxplayer-acp-reap-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        let mut log = EventLog::open(&log_path).expect("open log");
+
+        let result = run_job(
+            &mut driver,
+            &mut log,
+            &JobId("job-reap".into()),
+            RunParams::mock_defaults(),
+            &mut |_| {},
+        )
+        .await;
+        assert!(result.is_err(), "initialize must time out under cat");
+
+        // `shutdown()` ran on the failure exit and took the child…
+        assert!(
+            driver.child.is_none(),
+            "the failure exit must shut the driver down (the #729 leak)"
+        );
+        // …and `wait()` reaped it: `run_job` awaited the off-runtime kill+wait, so by now the
+        // pid is gone from the process table (or reused — a stranger's ppid). A `Z`-state child
+        // of THIS process is the exact absent-`wait` signature from the live seat.
+        if let Some((state, ppid)) = state_and_ppid(pid) {
+            assert!(
+                !(state == 'Z' && ppid == std::process::id()),
+                "ACP child {pid} is a zombie of this process — killed but never waited"
+            );
+        }
+    }
+
+    /// `(state, ppid)` from `/proc/<pid>/stat`, parsed from the right of `comm` like
+    /// [`super::parse_pgrp_from_stat`]; `None` when the pid is gone (fully reaped).
+    #[cfg(unix)]
+    fn state_and_ppid(pid: u32) -> Option<(char, u32)> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after_comm = stat.rsplit_once(')')?.1;
+        let mut fields = after_comm.split_whitespace();
+        let state = fields.next()?.chars().next()?;
+        let ppid = fields.next()?.parse().ok()?;
+        Some((state, ppid))
+    }
+
     fn futures_free_on_permission(
         driver: &mut AcpDriver,
         request: PermissionRequest,
