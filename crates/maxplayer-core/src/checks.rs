@@ -843,6 +843,46 @@ timeout_secs = 1200
         );
     }
 
+    /// Whether a declared argv is allowed by the cargo-test `-p` rule.
+    ///
+    /// #753. The rule is cargo feature-unification: a `cargo test` row must name the one package
+    /// it proves, so a red says which configuration failed. A node runner has no feature graph
+    /// and no `-p`, so the predicate is gated on the toolchain it reasons about — not on whether
+    /// the second token happens to be `test`.
+    fn cargo_test_is_package_scoped(argv: &[String]) -> bool {
+        let is_cargo = argv.first().map(String::as_str) == Some("cargo");
+        let is_test = is_cargo && argv.get(1).map(String::as_str) == Some("test");
+        let scoped = argv.iter().any(|part| part == "-p");
+        !is_test || scoped
+    }
+
+    // #753. The narrowing must not weaken the cargo property, and must stop judging non-cargo
+    // runners by cargo's shape. Proven here against argv, not against this repo's current
+    // declaration — adding a web row that the guard polices is a separate change.
+    #[test]
+    fn cargo_test_scope_rule_is_about_cargo_not_the_second_token() {
+        fn argv(parts: &[&str]) -> Vec<String> {
+            parts.iter().map(|part| (*part).to_owned()).collect()
+        }
+
+        assert!(
+            cargo_test_is_package_scoped(&argv(&["cargo", "test", "-p", "x"])),
+            "a -p scoped cargo test is the form the rule requires"
+        );
+        assert!(
+            !cargo_test_is_package_scoped(&argv(&["cargo", "test"])),
+            "workspace-wide cargo test must still fail: that is the property being protected"
+        );
+        assert!(
+            cargo_test_is_package_scoped(&argv(&["npm", "test"])),
+            "[\"npm\", \"test\"] is not a cargo row and must not be rejected for lacking -p"
+        );
+        assert!(
+            cargo_test_is_package_scoped(&argv(&["node", "--test", "web/app/test/"])),
+            "node --test passes because it is not cargo, not because argv[1] starts with a dash"
+        );
+    }
+
     // THIS repository's own declaration, parsed by the real parser. Presence is fail-closed at
     // runtime — a malformed declaration refuses the job with `ENV_UNPROVISIONABLE` — so shipping
     // one that nothing has ever parsed would hand every contributor an execution failure. A
@@ -867,11 +907,15 @@ timeout_secs = 1200
         // would re-unify features across crates and report a red without saying which
         // configuration produced it. This assertion exists so the declaration cannot be
         // "simplified" back to the whole-workspace form.
+        //
+        // #753. That intent is cargo feature-unification. `is_test` is therefore cargo's
+        // `argv[1] == "test"`, not "the second token happens to be test": a node runner has no
+        // `-p` and must not be accepted or rejected on the accident of that token. The predicate
+        // is proven against cargo and non-cargo shapes in
+        // `cargo_test_scope_rule_is_about_cargo_not_the_second_token`.
         for argv in &declaration.commands {
-            let is_test = argv.get(1).map(String::as_str) == Some("test");
-            let scoped = argv.iter().any(|part| part == "-p");
             assert!(
-                !is_test || scoped,
+                cargo_test_is_package_scoped(argv),
                 "a declared test command must be -p scoped, never workspace-wide: {argv:?}"
             );
         }
