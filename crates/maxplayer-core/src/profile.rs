@@ -754,6 +754,140 @@ mod tests {
         );
     }
 
+    /// Trailing TOML comment `write_config` will drop. Surviving bytes prove `save_config` was not
+    /// reached; disappearance proves it was. Not mtime — coarse, and a same-content rewrite still
+    /// answers the wrong question.
+    const CONFIG_REWRITE_CANARY: &str = "\n# issue-726-rewrite-canary\n";
+
+    fn profile_test_root(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-profile-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    fn wiring_seller(rate_sats: u64) -> home::SellerConfig {
+        home::SellerConfig {
+            agent_command: vec!["claude".into()],
+            rate_sats,
+            git_remote: "https://example.invalid/repo.git".into(),
+            job_timeout_secs: None,
+            agents: vec!["claude".into()],
+            claim_open_pool: false,
+            accept_offers_only_from: Vec::new(),
+            offer_backfill_secs: home::default_offer_backfill_secs(),
+            contribution_enabled: true,
+            slots: home::default_slots(),
+            claim_award_timeout_secs: None,
+        }
+    }
+
+    fn inject_rewrite_canary(path: &std::path::Path) -> Vec<u8> {
+        let mut bytes = std::fs::read(path).expect("read config.toml");
+        bytes.extend_from_slice(CONFIG_REWRITE_CANARY.as_bytes());
+        std::fs::write(path, &bytes).expect("inject rewrite canary");
+        bytes
+    }
+
+    /// Issue #726: the #678 `None` must actually skip `home::save_config` on the seller
+    /// discoverability **publish path**, not merely in the pure decision function.
+    ///
+    /// Drives `publish_seller_discoverability_async` twice against an unchanged generated about,
+    /// then once more after a live rate change. Asserts on `config.toml` bytes (a trailing comment
+    /// `write_config` strips) — never mtime.
+    ///
+    /// RED-PROVE (wiring): move the `save_config` call in `publish_seller_discoverability_async`
+    /// outside the `if let Some(...)` and the unchanged pass goes red (canary stripped). Disable
+    /// the generated-about update entirely and the changed pass goes red (stale about stays on disk).
+    /// The existing `generated_about_is_noop_when_unchanged` test stays green in both sabotages.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn generated_about_noop_is_wired_into_the_publish_path() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+
+        let root = profile_test_root("about-rewrite-726");
+        let mut home = home::bootstrap(&root).expect("home");
+        let rate_sats = 2u64;
+        let live_about = default_seller_about(
+            Some("claude"),
+            rate_sats,
+            &home.config.accepted_mints,
+        );
+        home::save_config(&mut home, |config| {
+            config.relay_url = relay_url;
+            config.seller = Some(wiring_seller(rate_sats));
+            config.profile = Some(ProfileConfig {
+                name: Some("wired-seller".into()),
+                about: Some(live_about),
+                about_generated: Some(true),
+            });
+        })
+        .expect("persist generated about + fixture relay");
+
+        let config_path = home.root.join("config.toml");
+
+        // Pass 1: the publish path runs against an already-stamped generated about.
+        publish_seller_discoverability_async(&mut home)
+            .await
+            .expect("first publish");
+
+        // Canary after pass 1 so a same-content `write_config` is still visible: pretty-printed
+        // TOML of an unchanged profile would otherwise byte-match, which is the adjacent question.
+        let after_first = inject_rewrite_canary(&config_path);
+
+        // Pass 2: unchanged live config — `generated_about_update` returns `None`, and that `None`
+        // must skip `save_config`. Byte identity (canary included) is the wiring assertion.
+        publish_seller_discoverability_async(&mut home)
+            .await
+            .expect("second publish (unchanged)");
+        let after_second = std::fs::read(&config_path).expect("read after unchanged publish");
+        assert_eq!(
+            after_second, after_first,
+            "unchanged generated about must not rewrite config.toml; save_config outside the \
+             if-let would strip the canary even when the typed profile is identical"
+        );
+
+        // Other direction: a genuinely changed live config must still rewrite. A test that would
+        // pass with the update disabled entirely proves nothing.
+        home::save_config(&mut home, |config| {
+            config.seller.as_mut().expect("seller").rate_sats = 100;
+        })
+        .expect("change live rate");
+        let after_rate_change = inject_rewrite_canary(&config_path);
+        publish_seller_discoverability_async(&mut home)
+            .await
+            .expect("third publish (rate changed)");
+        let after_changed = std::fs::read(&config_path).expect("read after changed publish");
+        assert_ne!(
+            after_changed, after_rate_change,
+            "a changed generated about must rewrite config.toml"
+        );
+        let after_changed_text = String::from_utf8(after_changed).expect("config.toml utf-8");
+        assert!(
+            !after_changed_text.contains("issue-726-rewrite-canary"),
+            "save_config must have run (canary stripped); got:\n{after_changed_text}"
+        );
+        assert!(
+            after_changed_text.contains("100 sat/job"),
+            "rewritten about must carry the new rate; got:\n{after_changed_text}"
+        );
+        assert!(
+            after_changed_text.contains("about_generated = true"),
+            "provenance must stay generated; got:\n{after_changed_text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn operator_about_update_marks_protected_and_is_preserved() {
         let mut profile = ProfileConfig::default();
