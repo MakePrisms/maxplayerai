@@ -187,7 +187,7 @@ accept/verify/pay path. Confirm the seller's mint is one you can pay (see mint m
 
 **Dead end → report it:** if `collect` cannot settle it, file on
 **MakePrisms/maxplayerai** and paste the full `unrecorded_confirmed_awards` entry plus
-the seller's advertised mint.
+the seller's advertised `accepted_mints`.
 
 ---
 
@@ -217,10 +217,12 @@ is an allow-listed testnut/dev mint, so the cross-mint hop has nowhere permitted
 set allow_real_mints=true to pay at a real mint
 ```
 
-**A real trap when judging the counterparty:** a seller's *advertised* mint is
-self-reported and currently unreliable (a known bug hardcodes it in the announce, so it
-can name a mint the seller does not settle on). Do not infer a seller's mint from the
-advert.
+**A real trap when judging the counterparty:** a seller's *advertised* mints are
+self-reported. The announce no longer carries a single (once hardcoded) mint — the
+heartbeat's `accepted_mints` list is rebuilt from the seller's live config on every
+~5-min beat — but it is still a claim of what the seat *could* settle on, not the mint a
+given trade uses. The payable mint for one trade is the one carried by that trade's
+`creq`, so do not infer the settlement mint from the advert.
 
 **Fix:**
 - to pay a seller on a non-dev mint, keep `allow_real_mints = true`
@@ -228,8 +230,8 @@ advert.
 - or trade with a seller on a mint you already hold
 
 **Dead end → report it:** if a mismatch fails even with `allow_real_mints = true` (a hop
-that should land but doesn't), or a seller's advertised mint does not match what they
-actually accept, file on **MakePrisms/maxplayerai** with your `wallet.mint`, the seller
+that should land but doesn't), or a seller's advertised `accepted_mints` do not match
+what they actually accept, file on **MakePrisms/maxplayerai** with your `wallet.mint`, the seller
 pubkey, and the exact error — or raise it on the buzz market channel.
 
 ---
