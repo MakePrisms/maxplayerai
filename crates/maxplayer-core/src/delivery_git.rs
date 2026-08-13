@@ -56,7 +56,10 @@ impl GitDeliveryVerifier {
     /// Open the buyer store (a buyer-owned local bare repository).
     fn open_store(&self) -> Result<Repository, DeliveryError> {
         Repository::open_bare(&self.repository)
-            .map_err(|_| DeliveryError::GitCommandFailed("open-store"))
+            .map_err(|error| DeliveryError::GitCommandFailed {
+                operation: "open-store",
+                cause: error.message().to_owned(),
+            })
     }
 
     /// Ensure the buyer store exists. maxplayer sellers always emit sha1 objects (they `init` without
@@ -65,7 +68,10 @@ impl GitDeliveryVerifier {
     /// silently mishandling one.
     fn ensure_repository(&self, oid: &CommitOid) -> Result<(), DeliveryError> {
         if oid.as_str().len() == 64 {
-            return Err(DeliveryError::GitCommandFailed("object-format"));
+            return Err(DeliveryError::GitCommandFailed {
+                operation: "object-format",
+                cause: "delivery oid is 64 hex (sha256); git2 0.19 cannot init a sha256 odb".to_owned(),
+            });
         }
         if self.repository.join("HEAD").is_file() {
             // Already a git dir — confirm it opens; a corrupt store fails closed.
@@ -73,9 +79,15 @@ impl GitDeliveryVerifier {
             return Ok(());
         }
         if let Some(parent) = self.repository.parent() {
-            fs::create_dir_all(parent).map_err(|_| DeliveryError::GitCommandFailed("init"))?;
+            fs::create_dir_all(parent).map_err(|error| DeliveryError::GitCommandFailed {
+                operation: "init",
+                cause: error.to_string(),
+            })?;
         }
-        Repository::init_bare(&self.repository).map_err(|_| DeliveryError::GitCommandFailed("init"))?;
+        Repository::init_bare(&self.repository).map_err(|error| DeliveryError::GitCommandFailed {
+            operation: "init",
+            cause: error.message().to_owned(),
+        })?;
         Ok(())
     }
 
@@ -104,7 +116,10 @@ impl GitDeliveryVerifier {
             // short_timeout=true: a hung fetch must not own the MCP stdio loop past the client
             // timeout, and must fail CLOSED before authorize_pay burns budget (verify-before-pay).
             git_transport::fetch_refspecs(&repo, delivery.repo(), &[&refspec], self.read_auth(), true)
-                .map_err(|_| DeliveryError::GitCommandFailed("fetch"))?;
+                .map_err(|error| DeliveryError::GitCommandFailed {
+                    operation: "fetch",
+                    cause: error.to_string(),
+                })?;
 
             let fetched_object = format!("{fetched_ref}^{{commit}}");
             let commit = repo
@@ -142,7 +157,10 @@ impl GitDeliveryVerifier {
             let fetched_ref = format!("refs/maxplayer/bases/{}", base_oid.as_str());
             let refspec = format!("+refs/heads/{base_branch}:{fetched_ref}");
             git_transport::fetch_refspecs(&repo, base_clone_url, &[&refspec], self.read_auth(), true)
-                .map_err(|_| DeliveryError::GitCommandFailed("fetch-base"))?;
+                .map_err(|error| DeliveryError::GitCommandFailed {
+                    operation: "fetch-base",
+                    cause: error.to_string(),
+                })?;
             // The pinned target MUST actually contain base_oid — resolve it as a commit in the store.
             let parsed = Self::parse_oid(base_oid)?;
             repo.find_commit(parsed)
@@ -171,7 +189,10 @@ impl GitDeliveryVerifier {
                 base_oid: base_oid.as_str().to_owned(),
                 commit_oid: commit_oid.as_str().to_owned(),
             }),
-            Err(_) => Err(DeliveryError::GitCommandFailed("merge-base")),
+            Err(error) => Err(DeliveryError::GitCommandFailed {
+                operation: "merge-base",
+                cause: error.message().to_owned(),
+            }),
         }
     }
 
@@ -188,23 +209,35 @@ impl GitDeliveryVerifier {
         let base_tree = repo
             .find_commit(Self::parse_oid(base_oid)?)
             .and_then(|c| c.tree())
-            .map_err(|_| DeliveryError::GitCommandFailed("diff-numstat"))?;
+            .map_err(|error| DeliveryError::GitCommandFailed {
+                operation: "diff-numstat",
+                cause: error.message().to_owned(),
+            })?;
         let commit_tree = repo
             .find_commit(Self::parse_oid(commit_oid)?)
             .and_then(|c| c.tree())
-            .map_err(|_| DeliveryError::GitCommandFailed("diff-numstat"))?;
+            .map_err(|error| DeliveryError::GitCommandFailed {
+                operation: "diff-numstat",
+                cause: error.message().to_owned(),
+            })?;
         // Default git2 diff detects NO renames (parity with `--no-renames`).
         let mut opts = DiffOptions::new();
         let diff = repo
             .diff_tree_to_tree(Some(&base_tree), Some(&commit_tree), Some(&mut opts))
-            .map_err(|_| DeliveryError::GitCommandFailed("diff-numstat"))?;
+            .map_err(|error| DeliveryError::GitCommandFailed {
+                operation: "diff-numstat",
+                cause: error.message().to_owned(),
+            })?;
 
         let mut changed = Vec::new();
         let deltas = diff.deltas().len();
         for idx in 0..deltas {
             let delta = diff
                 .get_delta(idx)
-                .ok_or(DeliveryError::GitCommandFailed("diff-numstat"))?;
+                .ok_or_else(|| DeliveryError::GitCommandFailed {
+                    operation: "diff-numstat",
+                    cause: format!("delta {idx} absent from a diff reporting {deltas} deltas"),
+                })?;
             // Path: new side for adds/mods, old side for deletions.
             let path = delta
                 .new_file()
@@ -219,12 +252,20 @@ impl GitDeliveryVerifier {
                 Ok(Some(patch)) => {
                     let (_context, additions, deletions) = patch
                         .line_stats()
-                        .map_err(|_| DeliveryError::GitCommandFailed("diff-numstat"))?;
+                        .map_err(|error| DeliveryError::GitCommandFailed {
+                            operation: "diff-numstat",
+                            cause: error.message().to_owned(),
+                        })?;
                     (additions + deletions) as u64
                 }
                 // A binary delta has no textual patch (None); count it as churn 1 below.
                 Ok(None) => 0,
-                Err(_) => return Err(DeliveryError::GitCommandFailed("diff-numstat")),
+                Err(error) => {
+                    return Err(DeliveryError::GitCommandFailed {
+                        operation: "diff-numstat",
+                        cause: error.message().to_owned(),
+                    })
+                }
             };
             // Binary files report `-`/`-` in `git diff --numstat`; register them as churn 1 so a
             // binary-only change is neither invisible (empty-diff false-pass) nor unbounded.
@@ -387,10 +428,16 @@ impl PayPathDeliveryVerifier {
         let fetch_spec = format!("+{local_ref}:{merge_ref}");
 
         let target = Repository::open(target_workdir)
-            .map_err(|_| DeliveryError::GitCommandFailed("merge-open"))?;
+            .map_err(|error| DeliveryError::GitCommandFailed {
+                operation: "merge-open",
+                cause: error.message().to_owned(),
+            })?;
         // Local store→target fetch (no network, no auth, no allowlist — both are buyer-owned).
         git_transport::fetch_refspecs(&target, &store_url, &[&fetch_spec], None, false)
-            .map_err(|_| DeliveryError::GitCommandFailed("fetch-from-store"))?;
+            .map_err(|error| DeliveryError::GitCommandFailed {
+                operation: "fetch-from-store",
+                cause: error.to_string(),
+            })?;
 
         let merged = GitDeliveryVerifier::parse_oid(commit_oid)?;
         // Fast-forward-only: the retained commit must be the current HEAD or a descendant of it.

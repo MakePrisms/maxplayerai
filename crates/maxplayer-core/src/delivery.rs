@@ -131,7 +131,18 @@ pub enum DeliveryError {
         program: &'static str,
         kind: std::io::ErrorKind,
     },
-    GitCommandFailed(&'static str),
+    /// A libgit2 / transport operation failed, with the underlying cause.
+    ///
+    /// `cause` is the reason the operation failed — for a fetch leg it is the `TransportError`
+    /// Display, which already separates `auth failed: …` (401/403/permission/404) from
+    /// `io error: …` (connect/TLS/resolve). Before #774 this variant held only the operation name
+    /// and every construction site discarded the error with `map_err(|_| …)`, so an expired token
+    /// and a TLS failure printed the identical line — `git fetch failed` — and an operator could
+    /// not tell which repair applied without reproducing the request by hand.
+    GitCommandFailed {
+        operation: &'static str,
+        cause: String,
+    },
     MissingFetchedTip,
     TipMismatch {
         expected: CommitOid,
@@ -167,7 +178,9 @@ impl fmt::Display for DeliveryError {
             Self::GitSpawnFailed { program, kind } => {
                 write!(formatter, "failed to spawn {program}: {kind:?}")
             }
-            Self::GitCommandFailed(operation) => write!(formatter, "git {operation} failed"),
+            Self::GitCommandFailed { operation, cause } => {
+                write!(formatter, "git {operation} failed: {cause}")
+            }
             Self::MissingFetchedTip => {
                 formatter.write_str("git fetch did not produce one commit tip")
             }
@@ -209,6 +222,36 @@ impl From<crate::delivery_transport::TransportRefuse> for DeliveryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #774: the pay-path fetch reported only `git fetch failed` — byte-identical text for a 401 and
+    /// for a TLS failure, which have opposite repairs. An operator could not tell which applied, and
+    /// no log or RPC on such a build could tell them, because the typed cause was destroyed at the
+    /// call site by `map_err(|_| …)` before it was ever formatted.
+    ///
+    /// RED ON REVERT: drop `cause` back to a bare `GitCommandFailed(&'static str)` and the
+    /// `assert_ne!` below fails — the two failures render identically again, which WAS the bug.
+    #[test]
+    fn git_command_failed_carries_the_cause_so_two_failures_do_not_render_alike() {
+        let auth = DeliveryError::GitCommandFailed {
+            operation: "fetch",
+            cause: "auth failed: 401 Unauthorized".to_owned(),
+        };
+        let io = DeliveryError::GitCommandFailed {
+            operation: "fetch",
+            cause: "io error: connection closed before advertisement".to_owned(),
+        };
+
+        assert_eq!(
+            auth.to_string(),
+            "git fetch failed: auth failed: 401 Unauthorized",
+            "the refusal must name the operation AND the cause"
+        );
+        assert_ne!(
+            auth.to_string(),
+            io.to_string(),
+            "an auth refusal and a transport failure must not be indistinguishable to an operator"
+        );
+    }
 
     #[test]
     fn commit_oid_requires_full_hex() {

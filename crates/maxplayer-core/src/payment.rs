@@ -2515,7 +2515,10 @@ mod tests {
             &mut self,
             _delivery: &GitDelivery,
         ) -> Result<crate::delivery::VerifiedDelivery, DeliveryError> {
-            Err(DeliveryError::GitCommandFailed("fetch"))
+            Err(DeliveryError::GitCommandFailed {
+                operation: "fetch",
+                cause: "auth failed: stub refusal".to_owned(),
+            })
         }
     }
 
