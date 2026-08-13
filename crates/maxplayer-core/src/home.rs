@@ -42,6 +42,7 @@
 //! | `telemetry.mirror_file` | `MAXPLAYER_TELEMETRY__MIRROR_FILE` |
 //! | `seller_heartbeat.interval_secs` | `MAXPLAYER_SELLER_HEARTBEAT__INTERVAL_SECS` |
 //! | `seller_preflight.boot_push_preflight` | `MAXPLAYER_SELLER_PREFLIGHT__BOOT_PUSH_PREFLIGHT` |
+//! | `buyer.hop_fee_buffer_multiplier` | `MAXPLAYER_BUYER__HOP_FEE_BUFFER_MULTIPLIER` |
 //! | `contribution.allowed_paths` (list) | `MAXPLAYER_CONTRIBUTION__ALLOWED_PATHS=…` |
 //!
 //! List fields comma-split only for the paths in [`LIST_ENV_KEYS`]. The `agents` map is file-only
@@ -726,6 +727,43 @@ pub struct AgentPresetConfig {
     pub argv: Vec<String>,
 }
 
+/// `[buyer]` hop planner knobs.
+///
+/// The fee-buffer multiplier is applied at hop **plan time** to the record's authorized cost
+/// (quoted cost + multiplier × the source mint's own melt fee reserve). Recovery still compares
+/// a replacement quote against that recorded ceiling unchanged — the tolerance lives in the
+/// record, not in the comparison (issue #760). Default **2**. **0** restores exact quoted-cost
+/// authorization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuyerConfig {
+    /// Multiplier on the source mint's melt fee reserve, added to the hop record's authorized
+    /// cost at plan time. Default **2**. **0** restores exact quoted-cost authorization.
+    #[serde(default = "default_hop_fee_buffer_multiplier")]
+    pub hop_fee_buffer_multiplier: u64,
+}
+
+impl Default for BuyerConfig {
+    fn default() -> Self {
+        Self {
+            hop_fee_buffer_multiplier: default_hop_fee_buffer_multiplier(),
+        }
+    }
+}
+
+impl BuyerConfig {
+    /// True when every field is at its shipped default (so config.toml stays clean — the section
+    /// only serializes once an operator sets a non-default knob).
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// serde default for [`BuyerConfig::hop_fee_buffer_multiplier`] — 2× the mint's melt fee reserve.
+pub fn default_hop_fee_buffer_multiplier() -> u64 {
+    2
+}
+
 /// Buyer-facing packaged config (`~/.maxplayer/config.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -795,6 +833,9 @@ pub struct MaxplayerConfig {
     /// Defaults (feature OFF) when absent.
     #[serde(default, skip_serializing_if = "BuyerReservationFloorConfig::is_default")]
     pub buyer_reservation_floor: BuyerReservationFloorConfig,
+    /// `[buyer]` hop planner knobs. Defaults (fee-buffer multiplier 2) when absent.
+    #[serde(default, skip_serializing_if = "BuyerConfig::is_default")]
+    pub buyer: BuyerConfig,
     /// Optional buyer-side contribution content policy (the content-policy hook). Absent
     /// ⇒ the FLOOR (refuse only empty diffs). Present ⇒ tighten pre-pay with a path allowlist /
     /// forbidden paths / max diff size.
@@ -896,6 +937,7 @@ impl Default for MaxplayerConfig {
             seller_heartbeat: SellerHeartbeatConfig::default(),
             seller_preflight: SellerPreflightConfig::default(),
             buyer_reservation_floor: BuyerReservationFloorConfig::default(),
+            buyer: BuyerConfig::default(),
             contribution: None,
             sandbox: None,
         }
@@ -2231,5 +2273,47 @@ mod tests {
         );
         assert_eq!(seller_cfg.rate_sats, 3);
         assert_eq!(seller_cfg.git_remote, "https://relay.example/git/x/y.git");
+    }
+
+    #[test]
+    fn hop_fee_buffer_multiplier_defaults_to_two_and_zero_is_exact() {
+        assert_eq!(default_hop_fee_buffer_multiplier(), 2);
+        assert_eq!(
+            MaxplayerConfig::default().buyer.hop_fee_buffer_multiplier,
+            2
+        );
+
+        let absent = parse_config_toml("relay_url = 'r'\nper_job_budget_sats = 1\n")
+            .expect("absent [buyer] parses");
+        assert_eq!(absent.buyer.hop_fee_buffer_multiplier, 2);
+        assert!(
+            !toml::to_string_pretty(&absent)
+                .expect("ser")
+                .contains("[buyer]"),
+            "default multiplier must not invent a [buyer] section"
+        );
+
+        let zero = parse_config_toml(
+            "relay_url = 'r'\nper_job_budget_sats = 1\n[buyer]\nhop_fee_buffer_multiplier = 0\n",
+        )
+        .expect("zero multiplier parses");
+        assert_eq!(zero.buyer.hop_fee_buffer_multiplier, 0);
+        assert!(
+            toml::to_string_pretty(&zero)
+                .expect("ser")
+                .contains("hop_fee_buffer_multiplier = 0"),
+            "a non-default multiplier must serialize so an operator can see it"
+        );
+
+        let empty_table = parse_config_toml("relay_url = 'r'\nper_job_budget_sats = 1\n[buyer]\n")
+            .expect("empty [buyer] parses");
+        assert_eq!(empty_table.buyer.hop_fee_buffer_multiplier, 2);
+
+        let from_env = apply_env_layer(
+            &MaxplayerConfig::default(),
+            env(&[("MAXPLAYER_BUYER__HOP_FEE_BUFFER_MULTIPLIER", "0")]),
+        )
+        .expect("nested env");
+        assert_eq!(from_env.buyer.hop_fee_buffer_multiplier, 0);
     }
 }
