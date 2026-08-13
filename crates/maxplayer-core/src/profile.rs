@@ -331,12 +331,21 @@ fn apply_profile_updates(profile: &mut ProfileConfig, name: Option<String>, abou
 /// Return a generated `about` update only for an empty profile or text previously stamped as
 /// generated. Unknown provenance is protected; issue #625 showed content-based inference cannot
 /// distinguish stale generated prose from intentional operator prose.
+///
+/// Issue #678: when `about_generated = Some(true)` and the live text is unchanged, return `None`
+/// so boot does not rewrite `config.toml`. Comparison is byte-equal on already-clamped text:
+/// - live: `default_seller_about` clamps to `PROFILE_ABOUT_MAX` before calling here
+/// - stored: the only writer that stamps `about_generated = Some(true)` is this path (or the
+///   prior unconditional arm), which always persists that same clamped `live_about`; operator
+///   `set_profile_async` clamps too but stamps `Some(false)`. So both sides are comparable
+///   without re-clamping the stored value.
 fn generated_about_update(
     existing_about: Option<&str>,
     existing_generated: Option<bool>,
     live_about: String,
 ) -> Option<(String, bool)> {
     match (existing_about, existing_generated) {
+        (Some(current), Some(true)) if current == live_about => None,
         (None, _) | (Some(_), Some(true)) => Some((live_about, true)),
         (Some(_), Some(false) | None) => None,
     }
@@ -731,6 +740,18 @@ mod tests {
         assert!(changed.contains("100 sat/job"), "got: {changed}");
         assert!(changed.contains("mint.cubabitcoin.org"), "got: {changed}");
         assert!(!changed.contains("testnut.cashu.space"), "got: {changed}");
+    }
+
+    /// Issue #678: identical generated about must not force a config.toml rewrite every boot.
+    #[test]
+    fn generated_about_is_noop_when_unchanged() {
+        let about = default_seller_about(
+            Some("claude"), 2, &["https://testnut.cashu.space".to_owned()],
+        );
+        assert_eq!(
+            generated_about_update(Some(&about), Some(true), about.clone()),
+            None
+        );
     }
 
     #[test]
