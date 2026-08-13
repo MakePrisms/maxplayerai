@@ -13,7 +13,10 @@
 #
 # ── Why containers, and why two ─────────────────────────────────────────────────────────────────
 # The claim is "installs on a machine that has never heard of nix", so it has to be tested somewhere
-# that has no nix, no rust and no prior maxplayer. The two images are not redundant:
+# that has no nix, no rust and no prior maxplayer. Since #745 the installer probes nix first and
+# refuses (no TTY) or chains Determinate (TTY) when it is missing; the no-nix refusal is proven on
+# the image as-is, and a PATH stub is injected only after that so the download/verify legs still
+# run. The two images are not redundant:
 #
 #   alpine:3              musl; busybox wget, NO curl   → exercises the wget branch, zero packages added
 #   debian:bookworm-slim  glibc; neither downloader     → curl installed, exercises the curl branch
@@ -112,6 +115,73 @@ elif command -v wget >/dev/null 2>&1; then DL=wget
 else fail "no downloader in this image — the harness was supposed to provide one"
 fi
 echo "  (downloader under test: $DL)"
+
+# ── Legs 0 — nix probe (#745), before any download ──────────────────────────────────────────────
+# These run BEFORE the stub nix is injected. The image has no nix (asserted above); docker did not
+# allocate a TTY, so this is the no-TTY path: print the two lines, do not prompt, do not hang,
+# install nothing. The decline path is the first property this installer is judged on.
+
+echo "leg 0: missing nix and no TTY refuses before any download"
+BIN0="$(leg_dir nonix)"
+if MAXPLAYER_VERSION="$VERSION" MAXPLAYER_BIN_DIR="$BIN0" sh "$INSTALLER" >/legs/nonix.out 2>&1; then
+    fail "the installer exited 0 with no nix and no TTY — it must refuse, having installed nothing"
+fi
+grep -q 'Nix is required to use maxplayer.' /legs/nonix.out \
+    || fail "leg 0: refused, but the first required line is missing. Output: $(cat /legs/nonix.out)"
+grep -q 'Enter your password to install it from determinate.systems' /legs/nonix.out \
+    || fail "leg 0: refused, but the second required line is missing. Output: $(cat /legs/nonix.out)"
+# Refused at the probe, not after fetching something. `installing maxplayer` is the first thing a
+# run prints once it has committed to a platform/version, so its absence places the refusal before
+# that. `if`, not `grep … && fail`: under `set -e` an AND-list whose left side fails takes the
+# whole list non-zero and kills the driver.
+if grep -q 'installing maxplayer' /legs/nonix.out; then
+    fail "the nix refusal happened after the installer had already committed to a download"
+fi
+if grep -q 'latest release is' /legs/nonix.out; then
+    fail "the nix refusal happened after the installer had already asked GitHub for a release"
+fi
+assert_empty "$BIN0" "leg 0"
+ok "no nix, no TTY -> non-zero, the two required lines, nothing installed, no download"
+
+echo "leg 0b: --help does not require nix"
+BIN0B="$(leg_dir help-nonix)"
+if MAXPLAYER_BIN_DIR="$BIN0B" sh "$INSTALLER" --help >/legs/help-nonix.out 2>&1; then
+    :
+else
+    fail "--help exited non-zero on a nix-less box, so the probe is running before flag parsing"
+fi
+grep -q 'usage:' /legs/help-nonix.out \
+    || fail "--help on a nix-less box did not print usage. Output: $(cat /legs/help-nonix.out)"
+assert_empty "$BIN0B" "leg 0b"
+ok "--help -> rc=0 with no nix (flags before the probe)"
+
+echo "leg 0c: an unknown option is refused by name even with no nix"
+BIN0C="$(leg_dir badopt-nonix)"
+if MAXPLAYER_BIN_DIR="$BIN0C" sh "$INSTALLER" --not-a-flag >/legs/badopt-nonix.out 2>&1; then
+    fail "the installer accepted an unknown option"
+fi
+grep -q "unknown option" /legs/badopt-nonix.out \
+    || fail "refused with no nix, but not for the unknown option (probe-before-flags would print the nix lines instead). Output: $(cat /legs/badopt-nonix.out)"
+assert_empty "$BIN0C" "leg 0c"
+ok "--not-a-flag with no nix -> unknown option, not the nix probe"
+
+# Existing install/verify legs need `nix --version` to succeed so they still exercise the
+# download path. A stub, not a real nix: this image must remain a machine that has never heard
+# of nix (no /nix), and the stub must not leak into leg 0 above.
+mkdir -p /shim
+cat > /shim/nix <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = --version ]; then
+    echo "nix (Nix) 2.24.0"
+    exit 0
+fi
+exit 1
+EOF
+chmod 755 /shim/nix
+PATH="/shim:$PATH"
+export PATH
+command -v nix >/dev/null 2>&1 || fail "the nix stub is not on PATH — later legs would hit the no-TTY refuse and prove nothing about the download"
+nix --version >/dev/null 2>&1 || fail "the nix stub's --version does not succeed"
 
 # ── Leg 1 — install ─────────────────────────────────────────────────────────────────────────────
 echo "leg 1: install $VERSION"
