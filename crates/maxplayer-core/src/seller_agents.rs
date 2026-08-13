@@ -23,6 +23,7 @@
 //! names, and this homogeneous node-level count is the only concurrency knob.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use crate::agent_presets::resolve_agent_preset;
 use crate::home::{AgentPresetConfig, SellerConfig};
@@ -181,6 +182,24 @@ pub fn normalize_request(requested: Option<&str>) -> Option<String> {
         return None;
     }
     Some(value)
+}
+
+/// The on-disk credential directory for a registered harness, if we know one.
+///
+/// Only the three built-in preset labels have a known directory under `user_home`:
+/// `claude` → `<home>/.claude`, `cursor` → `<home>/.cursor`, `codex` → `<home>/.codex`.
+/// A raw `--agent-argv` hatch (`name == None`) and any other label return `None`.
+///
+/// The argv is never consulted. Guessing a path from a binary name would inspect the wrong
+/// directory and pass — worse than reporting that we cannot resolve (issue #715). Absence is
+/// carried, not invented.
+pub fn harness_credential_dir(agent: &RegisteredAgent, user_home: &Path) -> Option<PathBuf> {
+    match agent.name.as_deref()?.trim().to_ascii_lowercase().as_str() {
+        "claude" => Some(user_home.join(".claude")),
+        "cursor" => Some(user_home.join(".cursor")),
+        "codex" => Some(user_home.join(".codex")),
+        _ => None,
+    }
 }
 
 /// Resolved registry plus the per-preset verdicts that produced it. `verdicts` is empty when the
@@ -463,5 +482,72 @@ mod tests {
         let mut seller = seller_with(Vec::new());
         seller.agent_command = Vec::new();
         assert_eq!(resolve(&seller, &BTreeMap::new()), Err(RegistryError::Empty));
+    }
+
+    // ---- Issue #715: harness credential directory is resolved from the preset label, never guessed ----
+
+    fn labelled(name: &str) -> RegisteredAgent {
+        RegisteredAgent {
+            name: Some(name.to_owned()),
+            argv: vec![format!("{name}-acp")],
+        }
+    }
+
+    /// RED-PROVE: a raw `--agent-argv` hatch has no preset label. Mapping it to a default
+    /// harness's directory (or sniffing argv for "claude") would inspect the wrong path and
+    /// pass — the failure #715 names as worse than no check. Drop the `name == None ⇒ None`
+    /// arm (or consult argv) and this goes red.
+    #[test]
+    fn harness_credential_dir_never_guesses_from_an_unlabelled_hatch() {
+        use std::path::Path;
+        let home = Path::new("/home/seat");
+        let hatch = RegisteredAgent {
+            name: None,
+            argv: vec![
+                "claude-agent-acp".into(),
+                "/home/seat/.claude/bin/claude".into(),
+            ],
+        };
+        assert_eq!(
+            harness_credential_dir(&hatch, home),
+            None,
+            "an unlabelled hatch must not resolve, even when argv names a known harness"
+        );
+        assert_eq!(
+            harness_credential_dir(&labelled("grok"), home),
+            None,
+            "an unknown label must not fall back to a built-in's directory"
+        );
+        assert_eq!(
+            harness_credential_dir(&labelled("my-claude"), home),
+            None,
+            "a substring of a built-in name is not a built-in"
+        );
+    }
+
+    /// Every built-in preset maps to a directory under the given home. Enumerating
+    /// `BUILTIN_PRESETS` (not a hand-listed three) means a preset added later cannot ship
+    /// without a known credential directory — guessing nothing for a known harness is the
+    /// same class of bug as guessing a path for an unknown one.
+    #[test]
+    fn every_builtin_preset_maps_to_a_credential_directory_under_user_home() {
+        use std::path::Path;
+        let home = Path::new("/home/seat");
+        for name in crate::agent_presets::BUILTIN_PRESETS {
+            let dir = harness_credential_dir(&labelled(name), home)
+                .unwrap_or_else(|| panic!("built-in preset {name} has no credential directory"));
+            assert_eq!(dir, home.join(format!(".{name}")));
+            assert!(
+                dir.starts_with(home),
+                "{name} credential dir must live under the given user home, not a hardcoded path: {}",
+                dir.display()
+            );
+        }
+        // Case/whitespace follow the same normalisation as dispatch, so a label the registry
+        // stored in any case still finds its directory.
+        assert_eq!(
+            harness_credential_dir(&labelled(" Claude "), home),
+            harness_credential_dir(&labelled("claude"), home)
+        );
     }
 }

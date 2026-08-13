@@ -245,6 +245,9 @@ mod checks {
     /// confines, and a reader scanning the output must be able to tell which one passed.
     const CONTAINMENT_CHECK: &str = "sandbox containment";
     const HOME_PERMS_CHECK: &str = "home permissions";
+    /// Named apart from HOME_PERMS_CHECK: that one is the seat home/wallet; this one is the
+    /// harness credential directory the cage cannot exclude (#689/#715).
+    const HARNESS_CREDS_CHECK: &str = "harness credential permissions";
 
     // Informational only: the seller signs NIP-98 in-process (libgit2 transport), so the
     // external `git-credential-nostr` helper is not required for delivery push / base fetch.
@@ -639,6 +642,169 @@ mod checks {
         }
     }
 
+    /// The configured harness's credential directory, for loose permissions. Sibling of
+    /// [`check_home_permissions`]: same unix-guard / metadata-error-is-warn / empty-`too_open`-is-pass
+    /// shape, but a different directory and a different finding.
+    ///
+    /// Since #689 the seller quickstart tells operators the harness credential lives inside the cage
+    /// and is readable by whatever the agent can read. That names it in the threat model; this check
+    /// is the inspection half that was missing (#715). It does not change permissions, widen or
+    /// narrow the sandbox, or revisit #689's conclusion that a subscription credential cannot be
+    /// excluded from the cage.
+    ///
+    /// Resolution is [`seller_agents::harness_credential_dir`] over the same registry boot uses.
+    /// An unlabelled `--agent-argv` hatch and any non-built-in label cannot be resolved: the check
+    /// SAYS so and inspects nothing. Guessing a default harness's directory (or sniffing argv) would
+    /// inspect the wrong path and pass — worse than no check.
+    ///
+    /// **Mask (0o022, not 0o077).** The home/wallet check flags any group/other access because those
+    /// directories contain the key and proofs — a read is money-bearing. The harness credential FILE
+    /// is already owner-only on a measured seat; group-read of the directory lists names, it does not
+    /// leak the secret. The finding is group/other WRITABILITY of the directory and of `settings.json`,
+    /// which STEERS the harness: write access is a configuration-injection surface, not merely an
+    /// information leak. Flagging 0o077 would warn on a typical 0755 directory that is not that threat.
+    ///
+    /// **Always Warn, never Fail.** Open-pool vs targeted is about stranger code inside the cage
+    /// reading the credential (#689) — a different axis from local group-write. Group-write is inert
+    /// on a single-account host (the group has no other members) and only becomes a problem if the
+    /// host grows a second account. Failing boot for a measured 0775 `~/.claude` would alarm an
+    /// operator who is not currently exposed. Copy must not imply the seat is compromised.
+    pub(super) fn check_harness_credential_permissions(
+        seller: Option<SellerConfig>,
+        presets: BTreeMap<String, AgentPresetConfig>,
+        user_home: Option<std::path::PathBuf>,
+    ) -> Check {
+        let Some(seller) = seller else {
+            return Check::warn(
+                HARNESS_CREDS_CHECK,
+                "no [seller] section configured — cannot resolve a harness credential directory",
+                "run `maxplayer seller --agent <claude|cursor|codex> --rate-sats <n>` once to configure; doctor will not guess a harness",
+            );
+        };
+        let resolved = match seller_agents::resolve(&seller, &presets) {
+            Ok(resolved) => resolved,
+            Err(_) => {
+                return Check::warn(
+                    HARNESS_CREDS_CHECK,
+                    "harness registry did not resolve — cannot inspect a credential directory",
+                    "fix the agent preset check first; doctor will not guess a harness credential path",
+                );
+            }
+        };
+        let Some(user_home) = user_home else {
+            return Check::warn(
+                HARNESS_CREDS_CHECK,
+                "HOME is unset — cannot resolve a harness credential directory",
+                "set HOME so doctor can inspect $HOME/.claude (or .cursor / .codex); doctor will not guess a path",
+            );
+        };
+
+        let mut unresolvable: Vec<String> = Vec::new();
+        let mut inspect: Vec<std::path::PathBuf> = Vec::new();
+        for agent in resolved.registry.entries() {
+            match seller_agents::harness_credential_dir(agent, &user_home) {
+                Some(dir) => inspect.push(dir),
+                None => match &agent.name {
+                    None => unresolvable
+                        .push("raw --agent-argv hatch (no preset label)".to_owned()),
+                    Some(name) => unresolvable
+                        .push(format!("harness {name} (no known credential directory)")),
+                },
+            }
+        }
+        if inspect.is_empty() && unresolvable.is_empty() {
+            return Check::warn(
+                HARNESS_CREDS_CHECK,
+                "no harness to inspect — cannot resolve a credential directory",
+                "doctor will not guess a harness credential path",
+            );
+        }
+
+        let mut too_open: Vec<String> = Vec::new();
+        #[cfg(unix)]
+        {
+            use std::io::ErrorKind;
+            use std::os::unix::fs::PermissionsExt;
+
+            let consider = |path: &Path, missing_ok: bool, too_open: &mut Vec<String>| -> Option<Check> {
+                let metadata = match std::fs::metadata(path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if missing_ok && error.kind() == ErrorKind::NotFound => {
+                        return None;
+                    }
+                    Err(error) => {
+                        return Some(Check::warn(
+                            HARNESS_CREDS_CHECK,
+                            format!("could not read {} permissions: {error}", path.display()),
+                            "check the harness credential path exists and is readable",
+                        ));
+                    }
+                };
+                let mode = metadata.permissions().mode() & 0o777;
+                // Group/other WRITE only. See the check's doc comment for why not 0o077.
+                if mode & 0o022 != 0 {
+                    too_open.push(format!("{} ({mode:#o})", path.display()));
+                }
+                None
+            };
+
+            for dir in &inspect {
+                if let Some(check) = consider(dir, false, &mut too_open) {
+                    return check;
+                }
+                // settings.json STEERS the harness when present; absence is not a permissions
+                // problem (the file is optional) so NotFound is skipped, never a silent skip of
+                // a metadata error on a file that does exist.
+                if let Some(check) = consider(&dir.join("settings.json"), true, &mut too_open) {
+                    return check;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = &inspect;
+        }
+
+        if too_open.is_empty() && unresolvable.is_empty() {
+            return Check::pass(
+                HARNESS_CREDS_CHECK,
+                format!(
+                    "not group/world-writable: {}",
+                    inspect
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+        }
+        if too_open.is_empty() {
+            return Check::warn(
+                HARNESS_CREDS_CHECK,
+                format!(
+                    "cannot resolve a credential directory for {} — not inspected (doctor will not guess a path)",
+                    unresolvable.join(", ")
+                ),
+                "use a named preset (claude|cursor|codex) to inspect that harness's credential directory; a raw --agent-argv hatch and unknown labels have no known path",
+            );
+        }
+        let mut detail = format!(
+            "group/world-writable: {} — another local account in this group could write harness settings (configuration injection, not just an information leak). On a single-account host this is inert; it stops being inert if this host grows a second account",
+            too_open.join(", ")
+        );
+        if !unresolvable.is_empty() {
+            detail.push_str(&format!(
+                "; also cannot resolve a credential directory for {} — not inspected (doctor will not guess a path)",
+                unresolvable.join(", ")
+            ));
+        }
+        Check::warn(
+            HARNESS_CREDS_CHECK,
+            detail,
+            "chmod go-w the named path(s); doctor reports, it does not change permissions",
+        )
+    }
+
     fn build_runtime() -> Result<tokio::runtime::Runtime, String> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -667,7 +833,7 @@ mod checks {
 fn write_usage(out: &mut dyn Write) {
     let _ = writeln!(
         out,
-        "Usage:\n  maxplayer doctor [--home <dir>]   # seller environment self-check (credential helper, seller key, relay, mint, agent, sandbox, home permissions)\n\nExit codes: 0 all checks passed, 1 a blocking check FAILed"
+        "Usage:\n  maxplayer doctor [--home <dir>]   # seller environment self-check (credential helper, seller key, relay, mint, agent, sandbox, home permissions, harness credential permissions)\n\nExit codes: 0 all checks passed, 1 a blocking check FAILed"
     );
 }
 
@@ -757,6 +923,8 @@ fn build_checks(
     let accepted_mints = home.config.accepted_mints.clone();
     let seller = home.config.seller.clone();
     let custom_agents = home.config.agents.clone();
+    let seller_for_creds = home.config.seller.clone();
+    let custom_agents_for_creds = home.config.agents.clone();
     let telemetry = home.config.telemetry.clone();
     let sandbox = home.config.sandbox.clone();
     let sandbox_for_launcher = sandbox.clone();
@@ -773,6 +941,15 @@ fn build_checks(
     // Home/wallet perms are verified against the SAME resolved home the rest of the gate inspects.
     let perms_home_root = home.root.clone();
     let perms_wallet_dir = home.wallet_dir.clone();
+    // Harness credentials live under the operator $HOME, not the seat home. Empty HOME is
+    // carried as None — never guessed as a relative `.claude`.
+    let user_home = std::env::var_os("HOME").and_then(|home| {
+        if home.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(home))
+        }
+    });
 
     let mut checks: Vec<Box<dyn FnOnce() -> Check>> = vec![
         Box::new(checks::check_credential_helper),
@@ -795,6 +972,15 @@ fn build_checks(
     // WARN for a targeted seat, FAIL for an open-pool one.
     checks.push(Box::new(move || {
         checks::check_home_permissions(perms_home_root, perms_wallet_dir, claims_open_pool)
+    }));
+    // #715: inspect the configured harness's credential directory. Advisory WARN; never blocks
+    // boot (group-write is inert on a single-account host).
+    checks.push(Box::new(move || {
+        checks::check_harness_credential_permissions(
+            seller_for_creds,
+            custom_agents_for_creds,
+            user_home,
+        )
     }));
     checks
 }
@@ -1464,6 +1650,317 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- Issue #715: doctor inspects the configured harness's credential directory ----
+
+    #[cfg(feature = "wallet")]
+    fn seller_for_agents(agents: Vec<String>, agent_command: Vec<String>) -> maxplayer_core::home::SellerConfig {
+        maxplayer_core::home::SellerConfig {
+            agent_command,
+            rate_sats: 5,
+            git_remote: "https://example.invalid/repo".into(),
+            job_timeout_secs: None,
+            agents,
+            claim_open_pool: false,
+            accept_offers_only_from: Vec::new(),
+            offer_backfill_secs: 0,
+            contribution_enabled: true,
+            slots: 1,
+            claim_award_timeout_secs: None,
+        }
+    }
+
+    #[cfg(feature = "wallet")]
+    fn claude_preset_table() -> std::collections::BTreeMap<String, maxplayer_core::home::AgentPresetConfig> {
+        let existing = std::env::current_exe()
+            .expect("current exe")
+            .to_string_lossy()
+            .into_owned();
+        let mut presets = std::collections::BTreeMap::new();
+        presets.insert(
+            "claude".to_owned(),
+            maxplayer_core::home::AgentPresetConfig {
+                argv: vec![existing],
+            },
+        );
+        presets
+    }
+
+    /// RED-PROVE: a raw `--agent-argv` hatch must SAY it cannot resolve, and must not name a
+    /// guessed path. Fall back to `~/.claude` (or sniff argv) and this goes red — the detail
+    /// would contain `.claude` and the status might even Pass.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn harness_credential_check_unresolvable_hatch_says_so_and_does_not_guess() {
+        let existing = std::env::current_exe()
+            .expect("current exe")
+            .to_string_lossy()
+            .into_owned();
+        let seller = seller_for_agents(Vec::new(), vec![existing, "claude-agent-acp".into()]);
+        let check = checks::check_harness_credential_permissions(
+            Some(seller),
+            std::collections::BTreeMap::new(),
+            Some(std::path::PathBuf::from("/home/seat")),
+        );
+        assert_eq!(
+            check.status,
+            Status::Warn,
+            "an unresolvable hatch must be a WARN, not a silent pass: {}",
+            check.render()
+        );
+        let rendered = check.render();
+        assert!(
+            rendered.contains("cannot resolve") || rendered.contains("will not guess"),
+            "must say it cannot resolve: {rendered}"
+        );
+        assert!(
+            !rendered.contains(".claude"),
+            "must not guess a default harness directory: {rendered}"
+        );
+        assert_ne!(
+            check.status,
+            Status::Fail,
+            "unresolvable is advisory, not a boot-blocker: {rendered}"
+        );
+    }
+
+    /// An unknown / custom label is the same case as the hatch: say so, never fall back.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn harness_credential_check_unknown_label_does_not_fall_back_to_a_builtin() {
+        let existing = std::env::current_exe()
+            .expect("current exe")
+            .to_string_lossy()
+            .into_owned();
+        let mut presets = std::collections::BTreeMap::new();
+        presets.insert(
+            "grok".to_owned(),
+            maxplayer_core::home::AgentPresetConfig {
+                argv: vec![existing],
+            },
+        );
+        let seller = seller_for_agents(vec!["grok".into()], vec!["ignored".into()]);
+        let check = checks::check_harness_credential_permissions(
+            Some(seller),
+            presets,
+            Some(std::path::PathBuf::from("/home/seat")),
+        );
+        assert_eq!(check.status, Status::Warn, "{}", check.render());
+        let rendered = check.render();
+        assert!(rendered.contains("grok"), "must name the unresolvable harness: {rendered}");
+        assert!(
+            !rendered.contains(".claude") && !rendered.contains(".cursor") && !rendered.contains(".codex"),
+            "must not fall back to a built-in directory: {rendered}"
+        );
+    }
+
+    /// No [seller] / no HOME / registry refusal: each is a named cannot-resolve WARN, never a
+    /// guessed path and never a silent skip.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn harness_credential_check_carries_absence_rather_than_inventing_a_path() {
+        let none = checks::check_harness_credential_permissions(
+            None,
+            std::collections::BTreeMap::new(),
+            Some(std::path::PathBuf::from("/home/seat")),
+        );
+        assert_eq!(none.status, Status::Warn, "{}", none.render());
+        assert!(none.detail.contains("cannot resolve"), "{}", none.render());
+
+        let seller = seller_for_agents(vec!["claude".into()], vec!["ignored".into()]);
+        let no_home = checks::check_harness_credential_permissions(
+            Some(seller.clone()),
+            claude_preset_table(),
+            None,
+        );
+        assert_eq!(no_home.status, Status::Warn, "{}", no_home.render());
+        assert!(
+            no_home.detail.contains("HOME") && no_home.detail.contains("cannot resolve"),
+            "{}",
+            no_home.render()
+        );
+
+        let refused = checks::check_harness_credential_permissions(
+            Some(seller_for_agents(
+                vec!["ghostxyz-not-a-preset".into()],
+                vec!["ignored".into()],
+            )),
+            std::collections::BTreeMap::new(),
+            Some(std::path::PathBuf::from("/home/seat")),
+        );
+        assert_eq!(refused.status, Status::Warn, "{}", refused.render());
+        assert!(
+            refused.detail.contains("cannot inspect") || refused.detail.contains("did not resolve"),
+            "{}",
+            refused.render()
+        );
+    }
+
+    // The mask is 0o022 (group/other WRITE), not 0o077 (any group/other access). A 0755 directory
+    // is the typical umask leftover that is NOT the issue's finding; a 0775 directory and a 0664
+    // settings.json are. RED-PROVE: switching the mask to 0o077 reds the 0755 Pass.
+    #[cfg(all(unix, feature = "wallet"))]
+    #[test]
+    fn harness_credential_check_flags_group_write_not_group_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!(
+            "mp-harness-creds-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let claude_dir = base.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("mk .claude");
+        let seller = seller_for_agents(vec!["claude".into()], vec!["ignored".into()]);
+        let presets = claude_preset_table();
+        let run = |user_home: &std::path::PathBuf| {
+            checks::check_harness_credential_permissions(
+                Some(seller.clone()),
+                presets.clone(),
+                Some(user_home.clone()),
+            )
+        };
+
+        // Owner-only directory, no settings.json ⇒ Pass.
+        std::fs::set_permissions(&claude_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let tight = run(&base);
+        assert_eq!(tight.status, Status::Pass, "owner-only dir must pass: {}", tight.render());
+        assert!(tight.detail.contains(&claude_dir.display().to_string()), "{}", tight.render());
+
+        // 0755 = group/other read+execute, not write. 0o077 would flag this; 0o022 must not.
+        std::fs::set_permissions(&claude_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let readable = run(&base);
+        assert_eq!(
+            readable.status,
+            Status::Pass,
+            "group-readable (0755) is not the write-injection finding: {}",
+            readable.render()
+        );
+
+        // 0775 = group-writable directory — the issue's measured dir mode.
+        std::fs::set_permissions(&claude_dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let writable = run(&base);
+        assert_eq!(
+            writable.status,
+            Status::Warn,
+            "a group-writable credential dir must WARN: {}",
+            writable.render()
+        );
+        assert_ne!(writable.status, Status::Fail, "advisory, not an alarm: {}", writable.render());
+        assert!(
+            writable.detail.contains("inert") && writable.detail.contains("second account"),
+            "copy must carry the single-account bound: {}",
+            writable.render()
+        );
+        assert!(
+            !writable.detail.to_lowercase().contains("compromis"),
+            "must not imply the operator is currently compromised: {}",
+            writable.render()
+        );
+
+        // Directory tight again; settings.json group-writable — the sharper half (steers the harness).
+        std::fs::set_permissions(&claude_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let settings = claude_dir.join("settings.json");
+        std::fs::write(&settings, "{}\n").unwrap();
+        std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let steered = run(&base);
+        assert_eq!(
+            steered.status,
+            Status::Warn,
+            "group-writable settings.json must WARN: {}",
+            steered.render()
+        );
+        assert!(
+            steered.detail.contains("settings.json"),
+            "must name the steering file: {}",
+            steered.render()
+        );
+
+        // 0644 settings.json is group-readable, not writable — not the injection surface.
+        std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let readable_settings = run(&base);
+        assert_eq!(
+            readable_settings.status,
+            Status::Pass,
+            "group-readable settings.json is not the write finding: {}",
+            readable_settings.render()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A metadata read error is a WARN, never a silent skip — same tooth as the home-perms check.
+    /// RED-PROVE: `continue` on a missing dir and a 0755-passing mask would Pass this.
+    #[cfg(all(unix, feature = "wallet"))]
+    #[test]
+    fn harness_credential_check_metadata_error_is_warn_not_silent_skip() {
+        let base = std::env::temp_dir().join(format!(
+            "mp-harness-creds-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).expect("mk user home");
+        // No `.claude` directory — metadata of the credential dir fails.
+        let seller = seller_for_agents(vec!["claude".into()], vec!["ignored".into()]);
+        let check = checks::check_harness_credential_permissions(
+            Some(seller),
+            claude_preset_table(),
+            Some(base.clone()),
+        );
+        assert_eq!(
+            check.status,
+            Status::Warn,
+            "a missing credential dir must WARN, not skip: {}",
+            check.render()
+        );
+        assert!(
+            check.detail.contains("could not read") && check.detail.contains(".claude"),
+            "must name the path it failed to stat: {}",
+            check.render()
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // RED-PROVE (wiring): drop the `check_harness_credential_permissions` push from `build_checks`
+    // and this goes red — no boot-gate result names the unlabelled hatch as unresolvable.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn harness_credential_check_is_wired_into_the_boot_gate() {
+        let tmp = std::env::temp_dir().join(format!(
+            "maxplayer-doctor-harness-creds-715-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut home = resolve_doctor_home(Some(tmp.clone())).expect("bootstrap the home");
+        let existing = std::env::current_exe()
+            .expect("current exe")
+            .to_string_lossy()
+            .into_owned();
+        home.config.seller = Some(seller_for_agents(Vec::new(), vec![existing]));
+        home.config.relay_url = "not-a-relay-url".into();
+        home.config.accepted_mints = Vec::new();
+
+        let results = run_checks(build_checks(&home, false));
+        assert!(
+            results.iter().any(|c| {
+                c.name == "harness credential permissions"
+                    && c.status == Status::Warn
+                    && (c.detail.contains("cannot resolve") || c.detail.contains("will not guess") || c.detail.contains("no preset label"))
+            }),
+            "build_checks must run the harness credential check and WARN on an unlabelled hatch; got: {:?}",
+            results.iter().map(Check::render).collect::<Vec<_>>()
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     // ---- Issue #553: bounded transient-retry over the startup readiness gate ----
