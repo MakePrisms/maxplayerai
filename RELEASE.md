@@ -216,10 +216,31 @@ toolchain. If the musl toolchain ever produces something dynamically linked, the
 turns out to produce something unacceptable for another reason, the fallback is
 `cachix/install-nix-action` plus `nix build .#buyer-static`, and nothing else in the pipeline changes.
 
-**The feature set is named explicitly.** CI builds `--no-default-features --features wallet` rather
-than relying on `default`. The two are equal today, but `acp` compiles the seller's agent-execution
-path, and a later change to `default` should not be able to put that into the binary handed to
-buyers. `flake.nix` still relies on `default` for `buyer-static`; making it explicit there too is a
+**The feature set is named explicitly, and the release build is not the CI build.** Two different
+commands, two different surfaces:
+
+- The release build (`.github/workflows/release.yml`, lines 170-172 — one command over three
+  backslash-continued lines, `--target` included):
+
+  ```
+  cargo build -p maxplayer --release --locked \
+    --no-default-features --features wallet,acp \
+    --target ${{ matrix.target }}
+  ```
+
+- The default CI build (`.github/workflows/ci.yml`, line 21, step "Build workspace (default
+  features)"): `cargo build --workspace --locked`, which takes `default` as-is.
+
+Those are not the same feature set. `crates/maxplayer/Cargo.toml` has `default = ["wallet"]`, so the
+released binary carries `acp` — the seller's agent-execution path — on top of the default surface.
+That is deliberate: since #510 there is one universal binary and every buyer gets the seller surface
+compiled in.
+
+Naming the features rather than inheriting `default` is anti-drift, in either direction. `release.yml`
+lines 156-160 put it as: a later edit to `default` must not be able to decide, silently, what a
+release ships. That line is only the request, though — `scripts/verify-seller-surface.sh`, named at
+`release.yml` line 159 and run on every platform, is what proves the features actually landed in the
+artifact. `flake.nix` still relies on `default` for `buyer-static`; making it explicit there too is a
 loose end.
 
 ## Reproducibility cross-check (darwin, optional)
@@ -228,19 +249,15 @@ A darwin binary built on a different machine will not hash the same as CI's even
 identical: `LC_UUID` and the ad-hoc code signature differ per link. Comparing raw `shasum` output
 therefore reports a mismatch on a perfectly good build, which looks exactly like tampering.
 
-A comparison worth trusting needs both of:
+**This cross-check is manual, and as of today it has not been performed.** There is no tooling in the
+repo for it: nothing normalizes a Mach-O binary, and no step of any workflow compares an independent
+darwin rebuild against the released artifact. A meaningful comparison would have to account for the
+per-link volatile regions described above rather than hashing the file as it sits, and the
+requirements for such a tool are tracked separately.
 
-1. **Locate the volatile regions structurally** — read `LC_UUID` and the `LC_CODE_SIGNATURE`
-   `dataoff`/`datasize` out of the load commands, and zero those. Never hardcode byte offsets: they
-   move with code size, and a stale offset produces a false match.
-2. **Negative-test the normalizer** — flip one byte deep in `__TEXT` and confirm the normalized hash
-   changes. A normalizer that zeroes too much would call two different binaries identical, and that
-   failure is invisible without this step.
-
-Fail closed: not Mach-O, missing file, or an ambiguous `LC_UUID` must exit non-zero, never a quiet 0.
-
-This is advisory. A mismatch is a prompt to investigate, not a release blocker — an independent
-rebuild is a cross-check, and letting it gate the pipeline would quietly make it load-bearing.
+If it does get built, it stays advisory. A mismatch is a prompt to investigate, not a release
+blocker — an independent rebuild is a cross-check, and letting it gate the pipeline would quietly
+make it load-bearing.
 
 ## If a release goes wrong
 
