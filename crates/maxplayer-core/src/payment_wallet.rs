@@ -3523,6 +3523,12 @@ mod tests {
         );
     }
 
+    // NETWORK (#720): the injected `connector` below only answers check-state. The send leg this
+    // test drives to `Closed` runs through `fixture.wallet`'s OWN http client, which fetches
+    // `MINT`'s (testnut's) keysets over the public internet — so this cannot run under
+    // `net: denied`. Not silenced: `live-mints` is ON in the money-path CI job, which has a
+    // network. See the feature's comment in Cargo.toml.
+    #[cfg(feature = "live-mints")]
     #[test]
     fn worker_wires_reconcile_verify_and_send_into_the_real_state_machine() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3695,6 +3701,10 @@ mod tests {
         );
     }
 
+    // NETWORK (#720): reaches the same real send leg as
+    // `worker_wires_reconcile_verify_and_send_into_the_real_state_machine`, so it fetches the live
+    // mint's keysets too. ON in the money-path CI job; see `live-mints` in Cargo.toml.
+    #[cfg(feature = "live-mints")]
     #[test]
     fn worker_sends_to_the_nostr_identity_not_the_odd_parity_p2pk_lock() {
         let runtime = tokio::runtime::Builder::new_current_thread()

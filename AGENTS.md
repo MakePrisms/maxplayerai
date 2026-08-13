@@ -25,7 +25,14 @@ All links above resolve to files in this repository.
 cargo build -p maxplayer --release --no-default-features --features wallet,acp   # what releases ship
 cargo build -p maxplayer --release --no-default-features --features wallet       # buyer only, source-only
 cargo test -p maxplayer-core
+cargo test -p maxplayer-core --features wallet              # the money path; runs with NO network
+cargo test -p maxplayer-core --features wallet,live-mints   # adds four tests that need a LIVE mint
 ```
+
+`live-mints` is off by default and is the only part of the suite that reaches the public internet
+(mint.minibits.cash, testnut.cashu.space). Everything else — including `--features wallet` — passes
+with the network denied, which is what lets `.maxplayer/checks.toml` declare the money path at all.
+CI runs the `live-mints` four in its money-path job; nothing else runs them.
 
 ## Buyer track
 

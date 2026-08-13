@@ -26,6 +26,19 @@ git-delivery = ["gateway", "dep:git2", "dep:reqwest", "dep:base64"]
 # exclusive home lock (libc flock), the durable state DB (rusqlite, bundled sqlite so
 # there is no system dependency), and the async unix-socket surface (tokio net + io-util).
 wallet = ["git-delivery", "gateway", "dep:cashu", "dep:cdk", "dep:cdk-sqlite", "dep:nostr-sdk", "dep:rusqlite", "dep:libc", "tokio/sync", "tokio/time", "tokio/net", "tokio/io-util"]
+# TESTS ONLY, opt-in, OFF by default (issue #720). The four tests that reach a LIVE third-party mint
+# over the public internet — two in `job_lifecycle` (post_job's pre-publish fee floor resolves the
+# home's shipped minibits default) and two in `payment_wallet` (the worker's real send leg fetches
+# testnut's keysets through the wallet's own HTTP client). Nothing but test code reads this flag; it
+# enables NO product behaviour and adds NO dependency.
+#
+# It exists so `wallet` is offline-safe. Before it, `--features wallet` could not be declared in
+# `.maxplayer/checks.toml` at all (every declared command runs under `net: denied`), which cost the
+# repo its entire wallet-gated test surface — `tests/collect_integrity.rs` and every `seller_node`
+# test ran in ZERO declared commands. Those four tests are NOT silenced: the money-path CI job in
+# `.github/workflows/ci.yml` turns this feature ON, and that runner has a network. Run them locally
+# with `cargo test -p maxplayer-core --features wallet,live-mints` — with a network.
+live-mints = []
 test-support = []
 
 [dependencies]
