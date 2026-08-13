@@ -26,6 +26,8 @@ pub enum ExecError {
     Config(String),
     /// The agent process failed, timed out, or ended non-terminal.
     Agent(String),
+    /// The deadline-derived unified job timer expired. This says nothing about harness health.
+    DeadlineExceeded,
     /// A delivery-shaping policy refusal (e.g. an un-typeable delivery oid).
     Policy(String),
     /// The binary was built without the `acp` feature, so no agent can run.
@@ -37,6 +39,9 @@ impl std::fmt::Display for ExecError {
         match self {
             Self::Config(message) => write!(f, "seller config: {message}"),
             Self::Agent(message) => write!(f, "seller agent error: {message}"),
+            Self::DeadlineExceeded => {
+                write!(f, "job deadline reached while the agent was still running")
+            }
             Self::Policy(message) => write!(f, "seller policy: {message}"),
             Self::AcpRequired => write!(
                 f,
@@ -48,6 +53,26 @@ impl std::fmt::Display for ExecError {
 }
 
 impl std::error::Error for ExecError {}
+
+/// What supplied the ACP response timer for an agent run.
+///
+/// Both real jobs and self-probes use the same ACP driver, but only the former inherits its timer
+/// from the job deadline. Keeping the source typed lets a real job expiry bypass harness strikes
+/// while a probe that cannot answer inside its own health-check limit still fails the probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentRunTimeout {
+    JobDeadline(Duration),
+    HarnessProbe(Duration),
+}
+
+impl AgentRunTimeout {
+    #[cfg(feature = "acp")]
+    fn duration(self) -> Duration {
+        match self {
+            Self::JobDeadline(duration) | Self::HarnessProbe(duration) => duration,
+        }
+    }
+}
 
 /// How the awarded agent command is launched: either directly (pass-through) or inside a launcher
 /// (e.g. `bwrap …`, `systemd-nspawn …`) the command runs under. The wrap is a pure argv transform,
@@ -428,7 +453,7 @@ pub async fn run_agent_job(
     prompt: &str,
     workdir: &Path,
     identity: &DeliveryAgentIdentity,
-    timeout: Duration,
+    timeout: AgentRunTimeout,
 ) -> Result<Option<UsageMetadata>, ExecError> {
     use crate::driver::{AcpDriver, AgentCommand, ContentBlock, PromptTurn, SessionConfig};
     use crate::engine::{run_job, RunParams};
@@ -441,7 +466,7 @@ pub async fn run_agent_job(
     let mut driver = AcpDriver::new(
         AgentCommand::new(program, args),
         crate::driver::PermissionOutcome::Allow,
-        timeout,
+        timeout.duration(),
     );
     let log_path = workdir.join(crate::seller_git::SELLER_RUN_LOG);
     let mut log = EventLog::open(&log_path).map_err(|error| ExecError::Agent(error.to_string()))?;
@@ -465,10 +490,21 @@ pub async fn run_agent_job(
         &mut |_| {},
     )
     .await
-    .map_err(|error| ExecError::Agent(error.to_string()))?;
+    .map_err(|error| classify_run_error(error, timeout))?;
     match outcome.terminal {
         crate::event::JobExecutionStatus::Completed => Ok(outcome.usage),
         other => Err(ExecError::Agent(format!("agent terminal {other:?}"))),
+    }
+}
+
+#[cfg(feature = "acp")]
+fn classify_run_error(error: crate::engine::EngineError, timeout: AgentRunTimeout) -> ExecError {
+    match (error, timeout) {
+        (
+            crate::engine::EngineError::Driver(crate::driver::DriverError::ResponseTimeout { .. }),
+            AgentRunTimeout::JobDeadline(_),
+        ) => ExecError::DeadlineExceeded,
+        (error, _) => ExecError::Agent(error.to_string()),
     }
 }
 
@@ -480,7 +516,7 @@ pub async fn run_agent_job(
     _prompt: &str,
     _workdir: &Path,
     _identity: &DeliveryAgentIdentity,
-    _timeout: Duration,
+    _timeout: AgentRunTimeout,
 ) -> Result<Option<UsageMetadata>, ExecError> {
     Err(ExecError::AcpRequired)
 }
@@ -560,6 +596,32 @@ mod tests {
         .expect("commit delivery types");
         assert_eq!(kind, crate::receipt::DeliveryKind::Fork);
         assert_eq!(kind.as_str(), "fork");
+    }
+
+    #[cfg(feature = "acp")]
+    #[test]
+    fn response_timeout_is_classified_by_its_typed_timer_source() {
+        use crate::driver::DriverError;
+        use crate::engine::EngineError;
+
+        let deadline = classify_run_error(
+            EngineError::Driver(DriverError::ResponseTimeout { request_id: 3 }),
+            AgentRunTimeout::JobDeadline(Duration::from_secs(60)),
+        );
+        assert!(matches!(deadline, ExecError::DeadlineExceeded));
+        assert_eq!(
+            deadline.to_string(),
+            "job deadline reached while the agent was still running"
+        );
+
+        // The same driver timer is a health failure under the independently bounded self-probe.
+        // This guards against exempting genuine probe timeouts from the existing drop rule.
+        let probe = classify_run_error(
+            EngineError::Driver(DriverError::ResponseTimeout { request_id: 7 }),
+            AgentRunTimeout::HarnessProbe(Duration::from_secs(120)),
+        );
+        assert!(matches!(probe, ExecError::Agent(_)));
+        assert!(probe.to_string().contains("ACP request 7 timed out"));
     }
 
     // The ACP timeout is unified with `--job-timeout-secs` — one deadline.
@@ -1023,7 +1085,7 @@ mod tests {
             "task",
             Path::new("."),
             &identity,
-            Duration::from_secs(1),
+            AgentRunTimeout::JobDeadline(Duration::from_secs(1)),
         )
         .await
         .expect_err("acp required");

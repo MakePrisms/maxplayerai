@@ -47,9 +47,10 @@ use crate::seller::rate_gate_allows;
 use crate::seller_agents::AgentRegistry;
 use crate::seller_exec::{
     compose_agent_prompt, delivery_message, job_workdir, run_agent_job, run_agent_with_retry,
-    seller_delivery_kind, seller_exec_metadata, unified_job_timeout, ExecError, SandboxPolicy,
+    seller_delivery_kind, seller_exec_metadata, unified_job_timeout, AgentRunTimeout, ExecError,
+    SandboxPolicy,
 };
-use crate::seller_roster::{Fault, LiveRoster, MissingCapability};
+use crate::seller_roster::{ExecutionFailure, Fault, LiveRoster, MissingCapability};
 use crate::seller_git::{self, DeliveryAgentIdentity};
 
 use super::outbox::drain_once;
@@ -1956,16 +1957,21 @@ fn boot_agent_registry(home: &MaxplayerHome) -> Result<AgentRegistry, NodeError>
 /// - [`ExecError::Config`] — a misconfiguration surfaced before the run. Also structural, and the
 ///   remedy is derived from the reported detail rather than assumed to be a rebuild: a harness whose
 ///   barrier is an unset provider is not fixed by rebuilding, and saying so would be a lie.
-/// - [`ExecError::Agent`] — deliberately UNPROVEN. A timeout and a provider that will never resolve
-///   arrive here byte-identically, so this classifier does not guess which; the self-probe decides.
+/// - [`ExecError::DeadlineExceeded`] — the deadline-derived clock expired. Typed upstream, so it is
+///   attributable to the job budget and reaches the roster as a non-striking failure.
+/// - [`ExecError::Agent`] — deliberately UNPROVEN. Remaining agent errors do not carry enough
+///   evidence to distinguish transient from structural, so the self-probe decides.
 /// - [`ExecError::Policy`] — OUR OWN refusal (e.g. an un-typeable delivery oid). Never the harness.
-fn harness_fault_for(error: &ExecError) -> Option<Fault> {
+fn harness_fault_for(error: &ExecError) -> Option<ExecutionFailure> {
     match error {
-        ExecError::AcpRequired => Some(Fault::Incapable(MissingCapability::AcpFeature)),
-        ExecError::Config(detail) => Some(Fault::Incapable(MissingCapability::HarnessConfig(
-            detail.clone(),
+        ExecError::AcpRequired => Some(ExecutionFailure::Harness(Fault::Incapable(
+            MissingCapability::AcpFeature,
         ))),
-        ExecError::Agent(_) => Some(Fault::Unproven),
+        ExecError::Config(detail) => Some(ExecutionFailure::Harness(Fault::Incapable(
+            MissingCapability::HarnessConfig(detail.clone()),
+        ))),
+        ExecError::DeadlineExceeded => Some(ExecutionFailure::DeadlineExceeded),
+        ExecError::Agent(_) => Some(ExecutionFailure::Harness(Fault::Unproven)),
         ExecError::Policy(_) => None,
     }
 }
@@ -2203,14 +2209,17 @@ async fn run_harness_probe_once(
         &harness_probe_prompt(sentinel),
         workdir,
         identity,
-        HARNESS_PROBE_TIMEOUT,
+        AgentRunTimeout::HarnessProbe(HARNESS_PROBE_TIMEOUT),
     )
     .await
     {
         // The turn never ran: structural, so do not retry. The remedy STRING is routed by class —
         // an auth failure needs a sign-in, not a containment fix (#555) — but the shape and fault
         // are unchanged either way.
-        let fault = harness_fault_for(&error).unwrap_or(Fault::Unproven);
+        let fault = match harness_fault_for(&error) {
+            Some(ExecutionFailure::Harness(fault)) => fault,
+            Some(ExecutionFailure::DeadlineExceeded) | None => Fault::Unproven,
+        };
         return ProbeAttempt::Unrunnable {
             reason: unrunnable_reason(&error),
             fault,
@@ -4444,11 +4453,16 @@ impl SellerNodeRunner {
     /// `None` is the deliberate no-op: a failure that does not implicate the harness must not narrow
     /// the roster, or the node inflicts its own outage. Only the sites that can attribute a failure
     /// call this at all — see [`harness_fault_for`].
-    fn drop_harness(&self, harness: usize, fault: Option<Fault>) {
+    fn drop_harness(&self, harness: usize, fault: Option<ExecutionFailure>) {
         let Some(fault) = fault else {
             return;
         };
-        let state = self.agents.fault(harness, fault, Instant::now());
+        let Some(state) = self
+            .agents
+            .execution_failure(harness, fault, Instant::now())
+        else {
+            return;
+        };
         let label = self.agents.label(harness).unwrap_or_else(|| "<unlabelled>".to_owned());
         // The denominator belongs in the line: "1 harness dropped" means nothing without how many
         // this node had, and a roster that has reached 0 is a node that has gone quiet on the market.
@@ -4824,7 +4838,14 @@ impl SellerNodeRunner {
             || now_unix() as u64,
             |_attempt| {
                 let job_timeout = unified_job_timeout(deadline, now_unix() as u64);
-                run_agent_job(&agent_command, &sandbox, &prompt, &workdir, &identity, job_timeout)
+                run_agent_job(
+                    &agent_command,
+                    &sandbox,
+                    &prompt,
+                    &workdir,
+                    &identity,
+                    AgentRunTimeout::JobDeadline(job_timeout),
+                )
             },
         )
         .await;
@@ -4866,7 +4887,10 @@ impl SellerNodeRunner {
             // Harness-attributable: the agent returned success having left nothing to deliver. This
             // is the site that fires on a quota-dead harness — its turn "completes", so the agent-run
             // arm above sees no error at all — which is why the trigger cannot live at one site.
-            self.drop_harness(harness, Some(Fault::Unproven));
+            self.drop_harness(
+                harness,
+                Some(ExecutionFailure::Harness(Fault::Unproven)),
+            );
             let (reason_code, feedback) = match error {
                 seller_git::SellerGitError::NoExecutionObserved(_) => {
                     opline!(
@@ -6444,14 +6468,29 @@ mod tests {
         // A missing build feature is structural and NAMED — no probe can supply it.
         assert_eq!(
             harness_fault_for(&ExecError::AcpRequired),
-            Some(Fault::Incapable(MissingCapability::AcpFeature))
+            Some(ExecutionFailure::Harness(Fault::Incapable(
+                MissingCapability::AcpFeature
+            )))
         );
 
         // An untyped agent failure is deliberately UNPROVEN: a timeout and a provider that will
         // never resolve arrive here identically, so the probe decides rather than this classifier.
         assert_eq!(
             harness_fault_for(&ExecError::Agent("turn ended non-terminal".into())),
-            Some(Fault::Unproven)
+            Some(ExecutionFailure::Harness(Fault::Unproven))
+        );
+
+        // The deadline-derived response timer is already attributed before this seam. It reaches
+        // the roster as a typed non-striking failure, never as message text to re-parse.
+        assert_eq!(
+            harness_fault_for(&ExecError::DeadlineExceeded),
+            Some(ExecutionFailure::DeadlineExceeded)
+        );
+        assert!(
+            ExecError::DeadlineExceeded
+                .to_string()
+                .contains("job deadline reached"),
+            "the operator line must name the job clock, not an ACP request timeout"
         );
 
         // A config barrier is structural too, but its remedy is DERIVED — reporting "rebuild" for a
@@ -6459,7 +6498,7 @@ mod tests {
         let config = harness_fault_for(&ExecError::Config("GOOSE_PROVIDER is unset".into()))
             .expect("a config barrier implicates the harness");
         match config {
-            Fault::Incapable(capability) => {
+            ExecutionFailure::Harness(Fault::Incapable(capability)) => {
                 let remedy = capability.remedy();
                 assert!(remedy.contains("GOOSE_PROVIDER"), "{remedy}");
                 assert!(
