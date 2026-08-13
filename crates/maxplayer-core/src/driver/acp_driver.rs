@@ -398,6 +398,13 @@ mod group_scope_tests {
 
     /// Live control: this test's own process must be readable, and its pgrp non-zero. Without this,
     /// every assertion above is about a string literal and none about `/proc`.
+    ///
+    /// Linux-only (#662): `process_group_of` reads `/proc/<pid>/stat`, which darwin lacks. A
+    /// portable `libc::getpgid` probe was not worth it — `libc` is wallet-feature-only and this
+    /// module builds under `default = []`; pulling it in just so a live control runs on macOS
+    /// would break the default build. The string-parse tests above already cover the parser on
+    /// every unix; this gate is the narrowest fix for the darwin phantom red.
+    #[cfg(target_os = "linux")]
     #[test]
     fn our_own_process_group_is_readable() {
         let pgid = super::process_group_of(std::process::id())
