@@ -1,6 +1,6 @@
 {
   "name": "maxplayer",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "CLI and MCP server for the maxplayer agent marketplace — buy and sell agent work",
   "license": "MIT OR Apache-2.0",
   "keywords": ["maxplayer", "mcp", "nostr", "cashu", "agent"],
@@ -13,9 +13,9 @@
   },
   "files": ["bin/maxplayer.js", "README.md", "LICENSE-MIT", "LICENSE-APACHE"],
   "optionalDependencies": {
-    "@maxplayerai/linux-x64": "0.3.0",
-    "@maxplayerai/linux-arm64": "0.3.0",
-    "@maxplayerai/darwin-arm64": "0.3.0"
+    "@maxplayerai/linux-x64": "0.4.0",
+    "@maxplayerai/linux-arm64": "0.4.0",
+    "@maxplayerai/darwin-arm64": "0.4.0"
   },
   "//": "engines is deliberately >=18 and NOT 22 (issue #696). bin/maxplayer.js is the only JS this package ships, and its real floor is Node 14.18: the highest-versioned things in it are the `node:` prefix in require() (14.18) and `??` (14.0). spawnSync, require.resolve, os.constants.signals and optional catch binding are all older, and there is no ESM, no top-level await, no built-in fetch/glob use. Nothing above 18 was found. Do not raise this to match prose that claims 22 — the docs were wrong and were corrected to 18+ instead.",
   "engines": {
