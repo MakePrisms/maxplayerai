@@ -922,7 +922,7 @@ mod checks {
                 "run `maxplayer seller --agent <claude|cursor|codex> --rate-sats <n>` once to configure; doctor will not guess a harness",
             );
         };
-        let resolved = match seller_agents::resolve(&seller, &presets) {
+        let resolved = match seller_agents::resolve(&seller, &presets, AdapterHost::Host) {
             Ok(resolved) => resolved,
             Err(_) => {
                 return Check::warn(
@@ -1564,11 +1564,15 @@ mod tests {
     #[cfg(feature = "wallet")]
     fn contained_probe_launcher() -> maxplayer_core::home::SandboxConfig {
         maxplayer_core::home::SandboxConfig {
+            mode: maxplayer_core::home::SandboxMode::Launcher,
             launcher: vec![
                 "/bin/sh".into(),
                 "-c".into(),
                 "printf 'canary_read=denied\\nworkdir_write=ok\\n'".into(),
             ],
+            image: None,
+            forward_env: Vec::new(),
+            runtime: None,
         }
     }
 

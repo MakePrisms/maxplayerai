@@ -4620,8 +4620,8 @@ impl SellerNodeRunner {
             let sandbox = match SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref()) {
                 Ok(sandbox) => sandbox,
                 Err(error) => {
-                    if let Some(fault) = harness_fault_for(&error) {
-                        self.agents.fault(harness, fault, Instant::now());
+                    if let Some(failure) = harness_fault_for(&error) {
+                        self.agents.execution_failure(harness, failure, Instant::now());
                     }
                     continue;
                 }
@@ -5072,7 +5072,7 @@ impl SellerNodeRunner {
             Ok(sandbox) => sandbox,
             Err(error) => {
                 opline!("seller node execute fail job_id={job_id}: sandbox config invalid ({error})");
-                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK).await;
+                self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::ExecutionFailed, EXEC_FAILURE_FEEDBACK, None).await;
                 return;
             }
         };
