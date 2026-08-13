@@ -1992,8 +1992,12 @@ fn boot_agent_registry(home: &MaxplayerHome) -> Result<AgentRegistry, NodeError>
         // registry keeps that path unchanged rather than turning it into a boot failure.
         return Ok(AgentRegistry::new(Vec::new()));
     };
-    let resolved =
-        crate::seller_agents::resolve(seller, &home.config.agents).map_err(NodeError::Agents)?;
+    let resolved = crate::seller_agents::resolve(
+        seller,
+        &home.config.agents,
+        crate::agent_presets::AdapterHost::for_sandbox(home.config.sandbox.as_ref()),
+    )
+    .map_err(NodeError::Agents)?;
     for verdict in &resolved.verdicts {
         opline!("seller node agent {}", verdict.line());
     }

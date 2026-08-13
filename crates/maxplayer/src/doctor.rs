@@ -279,6 +279,7 @@ mod checks {
     use maxplayer_core::seller_git;
 
     use super::Check;
+    use maxplayer_core::agent_presets::AdapterHost;
     use maxplayer_core::seller_agents::{self, AgentRegistry};
 
     const RELAY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -557,6 +558,7 @@ mod checks {
     pub(super) fn check_agent_registry(
         seller: Option<SellerConfig>,
         presets: BTreeMap<String, AgentPresetConfig>,
+        host: AdapterHost,
     ) -> Check {
         let Some(seller) = seller else {
             return Check::warn(
@@ -565,7 +567,7 @@ mod checks {
                 "run `maxplayer seller --agent <claude|cursor|codex> --rate-sats <n>` once to configure",
             );
         };
-        match seller_agents::resolve(&seller, &presets) {
+        match seller_agents::resolve(&seller, &presets, host) {
             // Fully resolved ⇒ PASS. A partial resolve still BOOTS (it serves with the remainder),
             // so it is an advisory WARN carrying the same loud degrade line boot would print — never
             // a boot-blocking FAIL, because boot does not refuse it.
@@ -1192,7 +1194,10 @@ fn build_checks(
     checks.push(Box::new(move || checks::check_relay(relay_url, secret)));
     // One aggregate mint check across the accept-policy: "can I settle anywhere?".
     checks.push(Box::new(move || checks::check_mints(accepted_mints)));
-    checks.push(Box::new(move || checks::check_agent_registry(seller, custom_agents)));
+    let agent_host = maxplayer_core::agent_presets::AdapterHost::for_sandbox(sandbox.as_ref());
+    checks.push(Box::new(move || {
+        checks::check_agent_registry(seller, custom_agents, agent_host)
+    }));
     checks.push(Box::new(move || checks::check_telemetry(telemetry)));
     // The seller boot gate blocks on this (issue #357): a launcher that cannot spawn would let the
     // node advertise and then fail every job. Bypassable, like every check, via --skip-doctor.
@@ -1814,11 +1819,16 @@ mod tests {
         };
 
         // Boot's verdict: the registry the seller node actually boots with.
-        let boot = seller_agents::resolve(&seller, &presets);
+        let boot =
+            seller_agents::resolve(&seller, &presets, maxplayer_core::agent_presets::AdapterHost::Host);
         assert!(boot.is_ok(), "boot resolves the verbatim agent_command");
 
         // Doctor must report the SAME verdict, not a FAIL derived from a PATH probe of the preset.
-        let check = checks::check_agent_registry(Some(seller), presets);
+        let check = checks::check_agent_registry(
+            Some(seller),
+            presets,
+            maxplayer_core::agent_presets::AdapterHost::Host,
+        );
         assert_eq!(
             check.status,
             Status::Pass,
@@ -1854,7 +1864,11 @@ mod tests {
             claim_award_timeout_secs: None,
         };
 
-        let check = checks::check_agent_registry(Some(seller), BTreeMap::new());
+        let check = checks::check_agent_registry(
+            Some(seller),
+            BTreeMap::new(),
+            maxplayer_core::agent_presets::AdapterHost::Host,
+        );
         assert_eq!(
             check.status,
             Status::Pass,
@@ -1901,12 +1915,17 @@ mod tests {
             claim_award_timeout_secs: None,
         };
 
-        let boot = seller_agents::resolve(&seller, &presets);
+        let boot =
+            seller_agents::resolve(&seller, &presets, maxplayer_core::agent_presets::AdapterHost::Host);
         assert!(
             matches!(boot, Err(RegistryError::AllFailed(_))),
             "boot must refuse a registry with no launchable harness"
         );
-        let check = checks::check_agent_registry(Some(seller), presets);
+        let check = checks::check_agent_registry(
+            Some(seller),
+            presets,
+            maxplayer_core::agent_presets::AdapterHost::Host,
+        );
         assert_eq!(
             check.status,
             Status::Fail,

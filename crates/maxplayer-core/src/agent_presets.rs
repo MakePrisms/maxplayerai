@@ -12,12 +12,52 @@ use crate::home::AgentPresetConfig;
 /// Built-in preset names, in the order they are suggested/detected.
 pub const BUILTIN_PRESETS: [&str; 3] = ["claude", "cursor", "codex"];
 
-/// Resolve a preset name to an argv array suitable for the seller ACP driver.
-///
-/// Config-defined presets win over built-ins; the returned label is the preset name.
+/// Where a resolved adapter will execute — which decides whether argv[0] is resolved against THIS
+/// host's PATH or kept bare for a container's PATH.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterHost {
+    /// The adapter runs on this machine (pass-through / launcher sandbox). Resolve argv[0] to an
+    /// absolute path via the host PATH and fail fast when it is absent.
+    Host,
+    /// The adapter runs inside the docker sandbox IMAGE (`[sandbox] mode = "docker"`). The host
+    /// filesystem is irrelevant: keep argv[0] bare (e.g. `claude-agent-acp`) for the image's PATH,
+    /// and never consult — or fail on — the host PATH. The image's contents are a BUILD-TIME
+    /// guarantee (the sandbox Dockerfile bakes the adapters in), so there is nothing to probe.
+    Container,
+}
+
+impl AdapterHost {
+    /// Docker mode runs the adapter inside the image; every other executor runs it on the host.
+    pub fn for_sandbox(sandbox: Option<&crate::home::SandboxConfig>) -> Self {
+        match sandbox {
+            Some(config) if matches!(config.mode, crate::home::SandboxMode::Docker) => {
+                Self::Container
+            }
+            _ => Self::Host,
+        }
+    }
+}
+
+/// Resolve a preset name to an argv for the seller ACP driver, for an adapter that runs on the HOST.
+/// The default for pass-through and launcher executors; docker mode calls [`resolve_agent_preset_in`]
+/// with [`AdapterHost::Container`].
 pub fn resolve_agent_preset(
     name: &str,
     custom: &BTreeMap<String, AgentPresetConfig>,
+) -> Result<(String, Vec<String>), String> {
+    resolve_agent_preset_in(name, custom, AdapterHost::Host)
+}
+
+/// Resolve a preset name to an argv for the seller ACP driver, for an adapter that runs on `host`.
+///
+/// Config-defined presets win over built-ins; the returned label is the preset name. A custom
+/// preset's argv is the operator's and is returned verbatim in both modes. Only a built-in differs:
+/// on the host it resolves argv[0] to an absolute path (fail-fast if absent), in a container it stays
+/// a bare command for the image's PATH to resolve.
+pub fn resolve_agent_preset_in(
+    name: &str,
+    custom: &BTreeMap<String, AgentPresetConfig>,
+    host: AdapterHost,
 ) -> Result<(String, Vec<String>), String> {
     let trimmed = name.trim();
     let key = trimmed.to_ascii_lowercase();
@@ -31,9 +71,9 @@ pub fn resolve_agent_preset(
         return Ok((configured.clone(), preset.argv.clone()));
     }
     match key.as_str() {
-        "claude" => resolve_claude().map(|argv| ("claude".into(), argv)),
-        "cursor" => resolve_cursor().map(|argv| ("cursor".into(), argv)),
-        "codex" => resolve_codex().map(|argv| ("codex".into(), argv)),
+        "claude" => resolve_claude(host).map(|argv| ("claude".into(), argv)),
+        "cursor" => resolve_cursor(host).map(|argv| ("cursor".into(), argv)),
+        "codex" => resolve_codex(host).map(|argv| ("codex".into(), argv)),
         other => Err(format!(
             "unknown --agent {other:?} (want {}, or use --agent-argv)",
             preset_choices(custom)
@@ -91,37 +131,57 @@ fn custom_preset_available(preset: &AgentPresetConfig) -> bool {
     }
 }
 
-fn resolve_claude() -> Result<Vec<String>, String> {
-    match which("claude-agent-acp") {
-        Some(bin) => Ok(vec![bin.to_string_lossy().into_owned()]),
-        None => Err(
-            "claude ACP adapter not found on PATH: install it \
-             (npm i -g @agentclientprotocol/claude-agent-acp) or put claude-agent-acp on PATH"
-                .into(),
-        ),
-    }
+/// Resolve a built-in ACP adapter for an adapter that runs on `host`. `candidates` are the accepted
+/// argv[0] names in preference order; `tail` are the fixed args that follow (cursor's `acp`). On the
+/// host the first candidate found on PATH is expanded to its absolute path, failing with `not_found`
+/// when none resolve; in a container the FIRST candidate is kept bare for the image's PATH — no host
+/// lookup, no host-absence failure.
+fn resolve_adapter(
+    candidates: &[&str],
+    tail: &[&str],
+    host: AdapterHost,
+    not_found: &str,
+) -> Result<Vec<String>, String> {
+    let argv0 = match host {
+        AdapterHost::Container => candidates[0].to_owned(),
+        AdapterHost::Host => match candidates.iter().find_map(|name| which(name)) {
+            Some(bin) => bin.to_string_lossy().into_owned(),
+            None => return Err(not_found.to_owned()),
+        },
+    };
+    let mut argv = vec![argv0];
+    argv.extend(tail.iter().map(|arg| (*arg).to_owned()));
+    Ok(argv)
 }
 
-fn resolve_cursor() -> Result<Vec<String>, String> {
-    match which("cursor-agent").or_else(|| which("agent")) {
-        Some(bin) => Ok(vec![bin.to_string_lossy().into_owned(), "acp".into()]),
-        None => Err(
-            "cursor ACP adapter not found on PATH: install the cursor agent and put \
-             cursor-agent (or agent) on PATH"
-                .into(),
-        ),
-    }
+fn resolve_claude(host: AdapterHost) -> Result<Vec<String>, String> {
+    resolve_adapter(
+        &["claude-agent-acp"],
+        &[],
+        host,
+        "claude ACP adapter not found on PATH: install it \
+         (npm i -g @agentclientprotocol/claude-agent-acp) or put claude-agent-acp on PATH",
+    )
 }
 
-fn resolve_codex() -> Result<Vec<String>, String> {
-    match which("codex-acp") {
-        Some(bin) => Ok(vec![bin.to_string_lossy().into_owned()]),
-        None => Err(
-            "codex ACP adapter not found on PATH: install it \
-             (npm i -g @agentclientprotocol/codex-acp) or put codex-acp on PATH"
-                .into(),
-        ),
-    }
+fn resolve_cursor(host: AdapterHost) -> Result<Vec<String>, String> {
+    resolve_adapter(
+        &["cursor-agent", "agent"],
+        &["acp"],
+        host,
+        "cursor ACP adapter not found on PATH: install the cursor agent and put \
+         cursor-agent (or agent) on PATH",
+    )
+}
+
+fn resolve_codex(host: AdapterHost) -> Result<Vec<String>, String> {
+    resolve_adapter(
+        &["codex-acp"],
+        &[],
+        host,
+        "codex ACP adapter not found on PATH: install it \
+         (npm i -g @agentclientprotocol/codex-acp) or put codex-acp on PATH",
+    )
 }
 
 /// What a built-in preset needs BEYOND its ACP adapter binary: the underlying agent CLI, installed
@@ -266,6 +326,50 @@ mod tests {
         let (label, argv) = resolve_agent_preset("codex", &table).expect("override");
         assert_eq!(label, "codex");
         assert_eq!(argv, vec!["my-codex-acp", "--stdio"]);
+    }
+
+    // In docker mode the adapter lives in the IMAGE, so resolution must NOT consult the host PATH and
+    // must NOT fail when the host lacks the adapter (the bug that blocked every docker-mode seller on
+    // a host without node). It returns the bare command for the container's PATH to resolve.
+    #[test]
+    fn container_mode_resolves_builtins_bare_without_touching_the_host() {
+        let none = BTreeMap::new();
+        let (label, argv) = resolve_agent_preset_in("claude", &none, AdapterHost::Container)
+            .expect("container resolution never fails on host absence");
+        assert_eq!(label, "claude");
+        assert_eq!(argv, vec!["claude-agent-acp"], "bare command, no host absolute path");
+        let (_, argv) =
+            resolve_agent_preset_in("codex", &none, AdapterHost::Container).expect("codex");
+        assert_eq!(argv, vec!["codex-acp"]);
+        // A custom preset is the operator's argv verbatim in either mode.
+        let table = custom(&[("grok", &["grok", "acp"])]);
+        let (_, argv) =
+            resolve_agent_preset_in("grok", &table, AdapterHost::Container).expect("custom");
+        assert_eq!(argv, vec!["grok", "acp"]);
+    }
+
+    // The adapter runs in the image only under `[sandbox] mode = "docker"`; every other executor runs
+    // it on the host, so the mode selects the resolution target.
+    #[test]
+    fn adapter_host_follows_the_sandbox_mode() {
+        use crate::home::{SandboxConfig, SandboxMode};
+        assert_eq!(AdapterHost::for_sandbox(None), AdapterHost::Host);
+        let docker = SandboxConfig {
+            mode: SandboxMode::Docker,
+            launcher: Vec::new(),
+            image: Some("img".into()),
+            forward_env: Vec::new(),
+            runtime: None,
+        };
+        assert_eq!(AdapterHost::for_sandbox(Some(&docker)), AdapterHost::Container);
+        let launcher = SandboxConfig {
+            mode: SandboxMode::Launcher,
+            launcher: Vec::new(),
+            image: None,
+            forward_env: Vec::new(),
+            runtime: None,
+        };
+        assert_eq!(AdapterHost::for_sandbox(Some(&launcher)), AdapterHost::Host);
     }
 
     #[test]
