@@ -27,6 +27,7 @@ pub mod outbox;
 mod p_gate_relay_fixture;
 pub mod publisher;
 pub mod run;
+pub mod shutdown;
 pub mod signer;
 pub mod store;
 pub mod wallet_actor;

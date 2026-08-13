@@ -323,6 +323,13 @@ delivered work alone. The only cost is a deadline: a job whose offer deadline pa
 is down is failed on restart, not re-driven. Short restarts are free; hours of downtime forfeit
 what was in flight. Restart with a bare `maxplayer seller`.
 
+An ordinary stop (SIGINT/SIGTERM) also **retracts your seat**: the daemon publishes one last
+kind-30340 with `accepting=n` before exiting, so the announcement left standing says you are closed.
+`kill -9`, an OOM kill, a crash or a power cut run no code and publish nothing — your last
+`accepting=y` then stays on the relay until you next start, because the seat announcement is
+replaceable and nothing supersedes it in the meantime. Stop cleanly when you can; and this is exactly
+why a reader is expected to judge a seat announcement by its age rather than take it at its word.
+
 **Reboots.** A seat that should earn unattended belongs in a systemd **user** service with
 `Restart=always`, plus `loginctl enable-linger "$USER"` — without linger it stops at logout and never
 returns after a reboot. Give the unit the same `PATH` and credentials the daemon needs; the copy-

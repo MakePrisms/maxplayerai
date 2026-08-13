@@ -58,6 +58,22 @@ pub(super) struct ReqRecord {
 #[derive(Debug, Clone)]
 pub(super) struct PublishedEvent {
     pub kind: u64,
+    /// The event's tags, as they arrived. Kept because "advertised" is not only a claim about which
+    /// kinds reached the wire but about what they SAID: the #747 terminal beat is an ordinary
+    /// kind-30340, so a count of kind-30340s cannot tell a seat retracting itself from a seat
+    /// announcing that it is open.
+    pub tags: Vec<Vec<String>>,
+}
+
+impl PublishedEvent {
+    /// First value of the first `name` tag, e.g. `accepting` → `y`/`n`.
+    pub fn tag_value(&self, name: &str) -> Option<&str> {
+        self.tags
+            .iter()
+            .find(|tag| tag.first().map(String::as_str) == Some(name))
+            .and_then(|tag| tag.get(1))
+            .map(String::as_str)
+    }
 }
 
 /// A refusal the test has armed, spent on the next `REQ` for this subscription that carries an
@@ -236,6 +252,24 @@ impl PGateRelay {
             .count()
     }
 
+    /// Wait until `predicate` holds over the published EVENTs, or give up. Same contract as
+    /// [`Self::wait_until`], over what the client published rather than what it subscribed to.
+    pub(super) async fn wait_until_published<F>(&self, timeout: Duration, predicate: F) -> bool
+    where
+        F: Fn(&[PublishedEvent]) -> bool,
+    {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if predicate(&self.events().await) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
     /// Wait until `predicate` holds over the transcript, or give up. Returns whether it held —
     /// the caller asserts, so a timeout reads as the failure it is rather than a hang.
     pub(super) async fn wait_until<F>(&self, timeout: Duration, predicate: F) -> bool
@@ -327,7 +361,22 @@ async fn serve_connection(
                 // Record what was published, by kind, BEFORE the OK: what reaches the wire is exactly
                 // the property the pre-advertise gate is asserted against (#357).
                 if let Some(kind) = event.get("kind").and_then(Value::as_u64) {
-                    events.lock().await.push(PublishedEvent { kind });
+                    let tags = event
+                        .get("tags")
+                        .and_then(Value::as_array)
+                        .map(|tags| {
+                            tags.iter()
+                                .filter_map(Value::as_array)
+                                .map(|tag| {
+                                    tag.iter()
+                                        .filter_map(Value::as_str)
+                                        .map(str::to_owned)
+                                        .collect()
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    events.lock().await.push(PublishedEvent { kind, tags });
                 }
                 send(&writer, json!(["OK", id, true, ""])).await?;
             }

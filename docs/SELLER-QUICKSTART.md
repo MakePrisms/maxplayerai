@@ -710,6 +710,22 @@ whose deadline passes while the daemon is down is failed on restart rather than 
 will not pay a delivery that arrives after settlement. Short restarts are free; a seat left down for
 hours forfeits whatever was in flight.
 
+An ordinary stop also takes your seat off the market. Ctrl-C and `systemctl stop` (SIGINT/SIGTERM)
+let the daemon publish one last kind-30340 saying `accepting=n` before it exits, so the seat
+announcement you leave behind says you are closed rather than open. You will see it in the log:
+
+```
+seller node: shutdown requested (SIGTERM); retracting the seat and ending the loop
+seller node: publishing terminal kind-30340 (accepting=n) — retracting this seat
+```
+
+**This only works if the process gets to run.** `kill -9`, an OOM kill, a crash, or a power cut
+publish nothing, and your last `accepting=y` then stays on the relay indefinitely — the seat
+announcement is a replaceable event, so nothing supersedes it until you next start up. Prefer a plain
+`systemctl stop` or Ctrl-C over `kill -9` when you have the choice. It is why readers are expected to
+judge a seat announcement by its age rather than trust it outright, and why the retraction narrows
+the window rather than closing it.
+
 Restarting is the bare relaunch — config is already written:
 
 ```bash

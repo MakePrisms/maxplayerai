@@ -279,10 +279,25 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
         seller.claim_open_pool,
         seller.git_remote
     );
-    runtime.block_on(runner.run()).map_err(|error| {
-        let _ = writeln!(err, "{error}");
-        RUNTIME_ERROR
-    })?;
+    // #747: SIGTERM/SIGINT must reach the run loop rather than the kernel's default disposition. A
+    // seat's kind-30340 announcement is addressable, so whatever it published last is its permanent
+    // public answer — a process killed outright leaves `accepting=y` standing forever, and because
+    // the kind is replaceable no later event ever corrects it. Listening lets the loop exit through
+    // its own path and publish the terminal `accepting=n` beat first. This covers `Ctrl-C`,
+    // `systemctl stop`, `docker stop` and a pod delete; it CANNOT cover SIGKILL, a panic, an OOM
+    // kill or a power cut, which run no code at all — a reader must still treat an old announcement
+    // as stale.
+    runtime
+        .block_on(async {
+            maxplayer_core::seller_node::shutdown::spawn_os_signal_listener(
+                runner.shutdown_handle(),
+            );
+            runner.run().await
+        })
+        .map_err(|error| {
+            let _ = writeln!(err, "{error}");
+            RUNTIME_ERROR
+        })?;
     Ok(())
 }
 

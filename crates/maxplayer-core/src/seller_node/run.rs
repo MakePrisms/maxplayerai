@@ -55,6 +55,7 @@ use crate::seller_git::{self, DeliveryAgentIdentity};
 
 use super::outbox::drain_once;
 use super::publisher::RelayPublisher;
+use super::shutdown;
 use super::{now_unix, NodeError, SellerNode};
 
 /// How long (seconds) the outbox publisher keeps retrying a claim event before it expires. Matches
@@ -2473,6 +2474,14 @@ pub async fn boot_advertising_only_proven(
 
 /// How long boot waits for the relay connection and the NIP-42 challenge.
 const CONNECT_WAIT: Duration = Duration::from_secs(20);
+/// Ceiling on the #747 terminal `accepting=n` publish, which runs on the EXIT path.
+///
+/// Bounded because an unbounded one would be self-defeating: a stop that never returns gets a
+/// SIGKILL from the operator or the supervisor, and SIGKILL is exactly the exit no retraction can
+/// cover. Long enough for a sign + one round trip to a healthy relay, short enough to stay well
+/// inside a supervisor's own stop grace period (systemd's default `TimeoutStopSec` is 90s, and
+/// `docker stop` allows 10s before it escalates).
+const RETRACTION_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cadence of the outbox drain / housekeeping tick.
 const DRAIN_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -2520,6 +2529,9 @@ pub struct SellerNodeRunner {
     /// every pass. Feedback-only wire-noise dedup — never consulted on the claim/money path. See
     /// [`FedUnderRateOffers`].
     fed_under_rate_offers: FedUnderRateOffers,
+    /// #747: how this node is asked to leave the selling role, so it can publish its terminal
+    /// `accepting=n` beat before exiting. See [`shutdown`] and [`Self::shutdown_handle`].
+    shutdown: shutdown::ShutdownChannel,
 }
 
 impl SellerNodeRunner {
@@ -2636,12 +2648,22 @@ impl SellerNodeRunner {
             delivery_push_lock: tokio::sync::Mutex::new(()),
             terminal_offers: TerminalOffers::new(TERMINAL_OFFERS_CAP, TERMINAL_AUTHORS_PER_OFFER),
             fed_under_rate_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
+            shutdown: shutdown::ShutdownChannel::new(),
         })
     }
 
     /// The seller public key (hex).
     pub fn seller_pubkey(&self) -> String {
         self.seller_pubkey.to_hex()
+    }
+
+    /// A handle asking this node to leave the selling role: the run loop stops, publishes its
+    /// terminal `accepting=n` beat (#747), and [`Self::run`] returns `Ok(())`.
+    ///
+    /// Take it BEFORE [`Self::run`], which consumes the runner. The daemon wires it to SIGTERM/SIGINT
+    /// via [`shutdown::spawn_os_signal_listener`]; an embedder can drive it directly.
+    pub fn shutdown_handle(&self) -> shutdown::ShutdownHandle {
+        self.shutdown.handle()
     }
 
     /// Subscribe (or re-subscribe) the offer REQ. `open_pool` false forces the targeted-only shape —
@@ -2902,11 +2924,13 @@ impl SellerNodeRunner {
             .is_some_and(|seller| seller.claim_open_pool)
     }
 
-    /// Run the live loop until the relay pool closes: ingests offers/awards/gift-wraps, drains the
-    /// outbox on a periodic tick, and — when heartbeat is enabled — publishes an own-heartbeat each
-    /// heartbeat tick and runs the #150 relay-stall watchdog (reconnect + resubscribe-with-overlap if
-    /// no own heartbeat has round-tripped within the stall threshold), with #162 bounded recovery
-    /// retries.
+    /// Run the live loop until the relay pool closes or a shutdown is requested: ingests
+    /// offers/awards/gift-wraps, drains the outbox on a periodic tick, and — when heartbeat is
+    /// enabled — publishes an own-heartbeat each heartbeat tick and runs the #150 relay-stall
+    /// watchdog (reconnect + resubscribe-with-overlap if no own heartbeat has round-tripped within
+    /// the stall threshold), with #162 bounded recovery retries.
+    ///
+    /// However it ends, the seat publishes one terminal `accepting=n` beat on the way out (#747).
     pub async fn run(self) -> Result<(), NodeError> {
         // Consume the runner into an `Arc` so each awarded job's execution runs as its own task (see
         // [`SlotGate`]) while this loop stays responsive to new offers, awards, and payments — the
@@ -2923,7 +2947,25 @@ impl SellerNodeRunner {
         local.run_until(Arc::new(self).run_loop()).await
     }
 
+    /// [`Self::serve`], plus the one thing that must happen no matter how serving ended: the
+    /// terminal `accepting=n` beat (#747).
+    ///
+    /// Shaped like the #729 driver-shutdown seam for the same reason. The retraction sits on the
+    /// ONE exit path rather than beside each `break`/`?`, so a `?` added to the loop tomorrow still
+    /// funnels through it. The serving outcome is carried across untouched — a failing seat must
+    /// still report WHY it failed, and a retraction publish is never allowed to mask that.
+    ///
+    /// ⛔ This runs only when the process is still alive to run it. SIGKILL, a panic that skips
+    /// unwinding, an OOM kill and a power cut reach no exit path at all, and leave the seat's last
+    /// `accepting=y` standing exactly as before. Consumer-side recency filtering stays the only
+    /// cover for those. Belt AND braces, never a replacement.
     async fn run_loop(self: Arc<Self>) -> Result<(), NodeError> {
+        let served = Arc::clone(&self).serve().await;
+        self.publish_retraction().await;
+        served
+    }
+
+    async fn serve(self: Arc<Self>) -> Result<(), NodeError> {
         // Heartbeat + relay-stall watchdog config. Disabled ⇒ no heartbeat publish and the watchdog
         // branch is inert (the loop only waits on the drain tick + relay stream).
         let hb = &self.node.home().config.seller_heartbeat;
@@ -3050,8 +3092,26 @@ impl SellerNodeRunner {
         // never once succeeded went unnoticed (#171). The next answered probe names it.
         let mut stalled_since_recovery = false;
         let mut manual_recovery_succeeded = false;
+        // #747: the departure request (SIGTERM/SIGINT via
+        // [`shutdown::spawn_os_signal_listener`], or an embedder's handle). Taken once — a second
+        // loop on the same node would get `None` and simply never see a request.
+        let mut shutdown_rx = self.shutdown.take_receiver();
         loop {
             tokio::select! {
+                // #747: leave the selling role. Breaking here — rather than exiting the process
+                // where the signal arrived — is the whole point: the ONE exit path in
+                // [`Self::run_loop`] then publishes the terminal `accepting=n` beat before this
+                // seat goes quiet, instead of leaving its last `accepting=y` standing forever on a
+                // replaceable event no later beat will ever correct.
+                //
+                // Jobs still executing on the LocalSet stop with the loop. Their durable rows stay
+                // exactly as they are and the boot resume path re-drives them on the next start, so
+                // a graceful stop loses no awarded work — it is strictly gentler than the SIGKILL
+                // an unlistened SIGTERM used to be.
+                reason = shutdown::next_request(&mut shutdown_rx) => {
+                    opline!("seller node: shutdown requested ({reason}); retracting the seat and ending the loop");
+                    break;
+                }
                 _ = drain_tick.tick() => {
                     self.sweep_lapsed_claims();
                     self.reconsider_capacity_skips().await;
@@ -3699,20 +3759,7 @@ impl SellerNodeRunner {
         let Some(seller) = self.node.home().config.seller.clone() else {
             return;
         };
-        // A LIVE count of jobs occupying execution capacity — never `health().jobs`, which counts
-        // every row ever written and so never returns to zero (#313).
-        let in_flight = match self.node.store().jobs_in_flight() {
-            Ok(count) => count,
-            Err(error) => {
-                // Fail toward AVAILABLE, as this path always has, but say so: a silent read failure
-                // that parked the seat would be the same invisible-refusal shape as #313 itself.
-                opline!(
-                    "seller node heartbeat: in-flight count unavailable ({error}); \
-                     advertising as free this tick"
-                );
-                0
-            }
-        };
+        let in_flight = self.live_in_flight("heartbeat");
         // ONE roster read for both wire signals: a seat that has dropped every harness advertises
         // `accepting=n`, so it stops attracting work instead of looking open and declining later.
         let roster = self.agents.advertisement();
@@ -3728,23 +3775,128 @@ impl SellerNodeRunner {
             roster.names,
         )
         .to_event_draft();
+        self.publish_seat_announcement(draft, "heartbeat").await;
+    }
+
+    /// #747 — publish the seat's TERMINAL announcement: the same kind-30340, `accepting=n`, once,
+    /// as this node leaves the selling role. Called from the single exit path in [`Self::run_loop`],
+    /// so it covers a requested shutdown, a relay-pool close, and a loop that ended on an error
+    /// alike.
+    ///
+    /// WHY IT MATTERS THAT THIS IS THE SAME EVENT: kind-30340 is addressable, so the relay keeps one
+    /// announcement per `(pubkey, d)` and the last one published stands as the seat's permanent
+    /// public answer. A seat that just stops beating leaves `accepting=y` there forever — no newer
+    /// event exists to correct it, and none ever will, so the lie is stable rather than transient.
+    /// Overwriting that slot is the only correction available, and this is it.
+    ///
+    /// ⛔ **INSURANCE, NOT REPAIR.** Nothing here runs unless the process is alive to run it. SIGKILL,
+    /// a panic that skips unwinding, an OOM kill and a power cut leave the stale `accepting=y`
+    /// standing exactly as before, and consumer-side recency filtering remains the only thing
+    /// covering those. This narrows the window; it does not make the directory truthful.
+    ///
+    /// Best-effort and BOUNDED. It is on the exit path, where a hung relay must not turn a stop into
+    /// a hang — an operator whose `Ctrl-C` did not return would send SIGKILL, which is precisely the
+    /// exit no retraction can cover. So a slow relay costs at most
+    /// [`RETRACTION_PUBLISH_TIMEOUT`] and then the node leaves anyway, as loudly as it failed.
+    async fn publish_retraction(&self) {
+        let Some(seller) = self.node.home().config.seller.clone() else {
+            return;
+        };
+        // A node configured to publish no seat announcements publishes no terminal one either: with
+        // heartbeats off this run, nothing of ours is in the directory to retract. Residue from an
+        // EARLIER run that had them on is not corrected here — that case is left to consumer-side
+        // recency filtering, exactly as a crash is.
+        if !crate::heartbeat::resolve_enabled(&self.node.home().config.seller_heartbeat) {
+            return;
+        }
+        // The roster still names what this seat can run: leaving the market is not a claim to have
+        // forgotten how to work, and `accepting` is the field that carries "not taking work".
+        let roster = self.agents.advertisement();
+        let draft = crate::heartbeat::retraction_for_state(
+            self.live_in_flight("retraction"),
+            seller.rate_sats,
+            self.node.home().config.accepted_mints.clone(),
+            roster.names,
+        )
+        .to_event_draft();
+
+        opline!("seller node: publishing terminal kind-30340 (accepting=n) — retracting this seat");
+        match tokio::time::timeout(
+            RETRACTION_PUBLISH_TIMEOUT,
+            self.publish_seat_announcement(draft, "retraction"),
+        )
+        .await
+        {
+            Ok(true) => opline!(
+                "seller node: seat retracted (accepting=n published); a reader must still treat an \
+                 old announcement as stale — this covers a graceful exit only"
+            ),
+            // Both failures are the SAME field outcome as before #747 — the seat's last
+            // `accepting=y` stands — so say so rather than let a quiet exit imply it was corrected.
+            Ok(false) => opline!(
+                "seller node WARN: seat retraction did not reach the relay; this seat's last \
+                 accepting=y announcement stands until a future run replaces it"
+            ),
+            Err(_) => opline!(
+                "seller node WARN: seat retraction timed out after {}s; leaving anyway — this \
+                 seat's last accepting=y announcement stands until a future run replaces it",
+                RETRACTION_PUBLISH_TIMEOUT.as_secs()
+            ),
+        }
+    }
+
+    /// A LIVE count of jobs occupying execution capacity — never `health().jobs`, which counts
+    /// every row ever written and so never returns to zero (#313).
+    fn live_in_flight(&self, what: &str) -> u32 {
+        match self.node.store().jobs_in_flight() {
+            Ok(count) => count,
+            Err(error) => {
+                // Fail toward AVAILABLE, as this path always has, but say so: a silent read failure
+                // that parked the seat would be the same invisible-refusal shape as #313 itself.
+                // On the retraction path the fallback costs nothing either way — that beat says
+                // `accepting=n` whatever the count is (`retraction_for_state` passes
+                // `anything_serving = false` as a literal), so only `queue_depth` is affected.
+                opline!(
+                    "seller node {what}: in-flight count unavailable ({error}); \
+                     advertising as free this tick"
+                );
+                0
+            }
+        }
+    }
+
+    /// Sign one kind-30340 seat announcement through the signer actor and put it on the wire.
+    /// Returns whether it reached the relay. Every failure is logged and none ever wedges the
+    /// caller.
+    ///
+    /// Shared by the periodic beat and the #747 terminal beat so both leave by exactly one path: the
+    /// retraction has to be the ordinary publisher told `accepting=false`, or it is not a
+    /// replacement for what the ordinary publisher put there.
+    async fn publish_seat_announcement(&self, draft: gateway::EventDraft, what: &str) -> bool {
         match self.node.signer().sign(draft, now_unix()).await {
             Ok(Ok(signed)) => {
                 use nostr_sdk::JsonUtil as _;
                 match nostr_sdk::Event::from_json(&signed.json) {
-                    Ok(event) => {
-                        if let Err(error) = self.client.send_event_to([&self.relay_url], &event).await {
-                            opline!("seller node heartbeat publish failed (continuing): {error}");
+                    Ok(event) => match self.client.send_event_to([&self.relay_url], &event).await {
+                        Ok(_) => true,
+                        Err(error) => {
+                            opline!("seller node {what} publish failed (continuing): {error}");
+                            false
                         }
-                    }
+                    },
                     Err(error) => {
-                        opline!("seller node heartbeat encode failed (continuing): {error}")
+                        opline!("seller node {what} encode failed (continuing): {error}");
+                        false
                     }
                 }
             }
-            Ok(Err(error)) => opline!("seller node heartbeat sign failed (continuing): {error}"),
+            Ok(Err(error)) => {
+                opline!("seller node {what} sign failed (continuing): {error}");
+                false
+            }
             Err(error) => {
-                opline!("seller node signer actor gone at heartbeat (continuing): {error}")
+                opline!("seller node signer actor gone at {what} (continuing): {error}");
+                false
             }
         }
     }
@@ -10171,7 +10323,7 @@ mod tests {
     // maxplayer-relay does. The nostr-relay-builder fixture used above cannot express this: it says
     // `auth-required:`, which nostr-sdk keeps and restores by itself, so every ordering would pass.
 
-    use crate::seller_node::p_gate_relay_fixture::{PGateRelay, ReqRecord, Verdict};
+    use crate::seller_node::p_gate_relay_fixture::{PGateRelay, PublishedEvent, ReqRecord, Verdict};
 
     /// Generous enough that a slow box never flakes, short enough that a real failure fails fast.
     const FIXTURE_WAIT: Duration = Duration::from_secs(15);
@@ -10571,6 +10723,107 @@ mod tests {
             })
             .await;
         loop_handle.abort();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every kind-30340 seat announcement that reached the relay, in arrival order.
+    fn seat_announcements(events: &[PublishedEvent]) -> Vec<&PublishedEvent> {
+        events
+            .iter()
+            .filter(|event| event.kind == u64::from(crate::heartbeat::SELLER_HEARTBEAT_KIND))
+            .collect()
+    }
+
+    /// TOOTH #747 — a seat that leaves the selling role RETRACTS its announcement on the way out.
+    ///
+    /// Why this needs a wire test rather than a unit test of the draft: kind-30340 is addressable,
+    /// so the seat's LAST published announcement is its permanent public answer. A builder that
+    /// produces `accepting=n` proves nothing unless that beat actually reaches the relay after the
+    /// loop has decided to stop — which is a property of the exit path, not of the draft. The
+    /// assertion is therefore on the last announcement the relay received, after a real run loop was
+    /// asked to shut down and returned.
+    ///
+    /// The shutdown is driven through the handle rather than a real SIGTERM because a signal would
+    /// hit the whole test binary. `sell.rs` wires that same handle to SIGTERM/SIGINT via
+    /// `shutdown::spawn_os_signal_listener`; this covers everything downstream of the request.
+    ///
+    /// ⛔ WHAT THIS DOES NOT PROVE — and no test could: that the directory is now truthful. This
+    /// path runs only on a graceful exit. SIGKILL, a panic that skips unwinding, an OOM kill and a
+    /// power cut publish nothing at all, and leave the seat's last `accepting=y` standing exactly as
+    /// the issue describes. Consumer-side recency filtering stays the only cover for those.
+    ///
+    /// RED ON REVERT: drop the `self.publish_retraction().await` from `run_loop` (or the
+    /// `shutdown::next_request` arm from the select, which strands the loop so the join times out)
+    /// and this goes red.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_seat_leaving_the_selling_role_retracts_its_announcement() {
+        use_fast_backfill_tick();
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("retract-on-leave");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, false));
+        home.config.seller_heartbeat.enabled = true;
+        home.config.seller_heartbeat.interval_secs = 1;
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        // Taken BEFORE `run`, which consumes the runner — the same order `sell.rs` uses.
+        let shutdown = runner.shutdown_handle();
+
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        let joined = local
+            .run_until(async {
+                // Harness check: the seat must first be OPEN on the wire. Without this the terminal
+                // `accepting=n` would be asserted against a seat that never advertised itself as
+                // available, and the tooth would pass on a node that simply never published.
+                assert!(
+                    fixture
+                        .wait_until_published(FIXTURE_WAIT, |events| seat_announcements(events)
+                            .iter()
+                            .any(|beat| beat.tag_value("accepting") == Some("y")))
+                        .await,
+                    "harness check: the seat must advertise itself as open before it retracts"
+                );
+
+                assert!(
+                    shutdown.request("test-requested stop"),
+                    "the loop must accept a shutdown request"
+                );
+                tokio::time::timeout(FIXTURE_WAIT, loop_handle).await
+            })
+            .await;
+
+        // The loop returns rather than being killed — the exit path is what publishes the terminal
+        // beat, so a loop that never returns cannot have published one.
+        let outcome = joined
+            .expect("the run loop must RETURN on a shutdown request, not have to be killed")
+            .expect("the loop task must not panic");
+        assert!(outcome.is_ok(), "a requested shutdown is a clean exit: {outcome:?}");
+
+        let events = fixture.events().await;
+        let beats = seat_announcements(&events);
+        let terminal = beats
+            .last()
+            .expect("the seat published at least one announcement");
+        assert_eq!(
+            terminal.tag_value("accepting"),
+            Some("n"),
+            "the LAST announcement a departing seat leaves standing must retract it — it is \
+             addressable, so no later event will ever correct it"
+        );
+        // It must land at the SAME address, or it sits beside the stale announcement instead of
+        // replacing it, and the directory goes on reading the old one.
+        assert_eq!(
+            terminal.tag_value("d"),
+            Some(crate::heartbeat::SELLER_HEARTBEAT_D)
+        );
+        assert_eq!(terminal.tag_value("v"), Some(crate::gateway::PROTOCOL_VERSION));
+        assert_eq!(
+            terminal.tag_value("t"),
+            Some(crate::gateway::MAXPLAYER_TAG),
+            "the terminal beat is an ordinary §4.2 announcement, not a special-cased event"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

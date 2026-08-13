@@ -17,6 +17,20 @@
 //! **Resolve by `(pubkey, d)`, never by event id.** An addressable event is superseded in place,
 //! so a superseded id goes empty and a by-id lookup would read as "seller gone." Consumers must
 //! always resolve the latest heartbeat by author + `d`. See [`HeartbeatKey`].
+//!
+//! **A seat that leaves the role publishes one last beat saying so** — [`retraction_for_state`],
+//! issue #747. Because the kind is addressable, whatever a seat published last is its permanent
+//! public answer: a seat that simply stops beating leaves `accepting=y` standing forever, and no
+//! amount of waiting produces a newer event to correct it. The retraction is not a new event type;
+//! it is this same publisher told `accepting=false`, which is the only thing that can overwrite that
+//! answer at the same address.
+//!
+//! ⛔ That terminal beat is INSURANCE, NOT REPAIR, and it must never be described as making the
+//! directory truthful. Only a process that is still running can publish it, so it covers a graceful
+//! exit and nothing else — SIGKILL, a panic that skips unwinding, an OOM kill and a power cut all
+//! leave the last `accepting=y` exactly where it was. Consumer-side recency filtering (protocol-v1
+//! §4.4: a recent announcement proves only that the seat published) stays the only cover for those,
+//! and stays required with this in place. Belt AND braces.
 
 use serde::Serialize;
 
@@ -177,6 +191,47 @@ pub fn heartbeat_for_state(
         accepted_mints,
     )
     .with_agents(agents)
+}
+
+/// The seat's **terminal beat** (#747): the ordinary announcement, published one last time with
+/// `accepting=n`, as the seat leaves the selling role — shutdown, or any role change away from
+/// selling.
+///
+/// WHY THE EXISTING EVENT rather than a new kind or a deletion: kind-30340 is addressable, so the
+/// relay holds exactly ONE announcement per `(pubkey, d)` and each beat replaces the last IN PLACE.
+/// That is also precisely the defect — a seat that stops beating leaves its final `accepting=y`
+/// standing as its permanent public answer, and since the kind is replaceable there is no newer
+/// event to correct it and no amount of waiting produces one. The lie is stable, not transient. The
+/// only thing that can overwrite it is another event at the SAME address, which is exactly this.
+///
+/// ⛔ **INSURANCE, NOT REPAIR.** A beat can only be published by a process that is still running, so
+/// this covers a GRACEFUL exit and nothing else: SIGKILL, a panic that skips unwinding, an OOM kill
+/// and a power cut leave the last `accepting=y` in place exactly as before. Consumer-side recency
+/// filtering stays the only cover for those, and stays REQUIRED with this in place. Never document
+/// this as making the directory truthful.
+///
+/// WHY NOT A KIND-5 DELETION (#747 item 2, deliberately not taken): a NIP-09 deletion request is
+/// advisory — the relay decides — so a reader could not rely on it, and every reader would have to
+/// learn a second event class to discover the same fact this one already carries. It also asks for
+/// the announcement to VANISH, and an absent announcement is indistinguishable from a seat that
+/// never published, whereas `accepting=n` is a seat saying it is closed. The retraction needs
+/// neither relay cooperation nor a new reader rule.
+///
+/// `in_flight` stays the LIVE count rather than a hopeful `0`: a seat can leave holding non-terminal
+/// jobs it will resume on its next boot, and a terminal beat is no licence to misreport them.
+/// `agents` stays the roster for the same reason — leaving the market is not a claim to have
+/// forgotten how to work, and `accepting` is the field that carries "not taking work" (see
+/// [`heartbeat_for_state`] on why the roster tag has no spare state to mean it).
+pub fn retraction_for_state(
+    in_flight: u32,
+    rate_sats: u64,
+    accepted_mints: Vec<String>,
+    agents: Vec<String>,
+) -> HeartbeatDraft {
+    // `anything_serving = false` BY CONSTRUCTION: nothing serves a seat that is leaving the role. It
+    // is passed as a literal, not taken as a parameter, so no caller and no in-flight count can make
+    // a terminal beat come out `accepting=y` — the one property this whole path exists to guarantee.
+    heartbeat_for_state(in_flight, false, rate_sats, accepted_mints, agents)
 }
 
 /// A parsed heartbeat's payload. The author pubkey is NOT carried here — combine it with [`d`]
@@ -618,6 +673,61 @@ mod tests {
         let free = heartbeat_for_state(0, true, 5, mints(), Vec::new()).to_event_draft();
         assert_eq!(first_tag_value(&free.tags, "accepting"), Some("y"));
         assert_eq!(first_tag_value(&free.tags, "queue_depth"), Some("0"));
+    }
+
+    /// #747 — the terminal beat says `accepting=n`, and there is no input that makes it say
+    /// anything else. An idle seat is the case that matters: it is the one whose ordinary beat says
+    /// `y`, so it is the one whose stopped-forever announcement advertises an open seat forever.
+    #[test]
+    fn the_terminal_beat_is_accepting_n_whatever_the_seat_was_doing() {
+        for in_flight in [0_u32, 1, 9] {
+            let event = retraction_for_state(in_flight, 5, mints(), vec!["claude".into()])
+                .to_event_draft();
+            assert_eq!(
+                first_tag_value(&event.tags, "accepting"),
+                Some("n"),
+                "a terminal beat must retract the seat (in_flight={in_flight})"
+            );
+            // The live count rides it unchanged: leaving is not a licence to misreport held work.
+            assert_eq!(
+                first_tag_value(&event.tags, "queue_depth"),
+                Some(in_flight.to_string().as_str())
+            );
+            // Capability is unchanged — the seat still knows how to work, it is just not taking any.
+            assert_eq!(agents_from_tags(&event.tags), vec!["claude"]);
+            assert_eq!(accepted_mints_from_tags(&event.tags), mints());
+        }
+    }
+
+    /// #747 RED-PROOF — the retraction must land at the SAME addressable slot as the live beat, or
+    /// it corrects nothing: kind-30340 is replaceable by `(pubkey, d)`, so only an event at that
+    /// address can overwrite the `accepting=y` a departed seat left standing. Anything published
+    /// under a different `d` (or kind) would sit BESIDE the stale announcement rather than replace
+    /// it, and the directory would go on reading the old one.
+    #[test]
+    fn the_terminal_beat_replaces_the_live_one_at_the_same_address() {
+        let live = heartbeat_for_state(0, true, 5, mints(), vec!["claude".into()]).to_event_draft();
+        let terminal = retraction_for_state(0, 5, mints(), vec!["claude".into()]).to_event_draft();
+
+        assert_eq!(first_tag_value(&live.tags, "accepting"), Some("y"));
+        assert_eq!(terminal.kind, live.kind, "same kind, or it is not a replacement");
+        assert_eq!(
+            first_tag_value(&terminal.tags, "d"),
+            first_tag_value(&live.tags, "d"),
+            "same d, or the relay keeps BOTH and the stale accepting=y survives"
+        );
+
+        // A buyer reads it as a full, valid §4.2 announcement — including `v`, whose absence is the
+        // pre-v1 shape a stopped seat's residue is stuck in — and reads the seat as closed.
+        let parsed = parse_heartbeat(&terminal).expect("a terminal beat is an ordinary heartbeat");
+        assert!(!parsed.accepting, "the retraction must read as a closed seat");
+        assert_eq!(first_tag_value(&terminal.tags, "v"), Some(PROTOCOL_VERSION));
+        assert_eq!(
+            parsed.key("seller-pubkey-hex"),
+            parse_heartbeat(&live).expect("parse live").key("seller-pubkey-hex"),
+            "the two beats must resolve to ONE identity — that is what makes this a retraction"
+        );
+        assert_eq!(tag_names(&terminal), tag_names(&live), "no new tag, no missing tag");
     }
 
     #[test]
