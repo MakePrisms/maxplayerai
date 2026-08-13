@@ -441,7 +441,7 @@ pub fn content_carries_attestation(content: &str, job_hash: &str, subtract_path:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     const NIX: &str = r#"schema = 1
 [env]
@@ -754,6 +754,95 @@ timeout_secs = 1200
         );
     }
 
+    /// Every feature name an argv turns on, collected across cargo's spellings of one flag.
+    ///
+    /// #737. Cargo accepts `--features a,b`, `--features=a,b`, `-F a,b`, `-F=a,b` and `-Fa,b`
+    /// interchangeably, and treats spaces inside the value like commas. The guard below asserts
+    /// that `live-mints` is not in the declared set; a reader that knows only the argv-position
+    /// form asserts that only about rows spelled that way, so `--features=live-mints` would pass a
+    /// check whose whole purpose is to refuse it. Normalise first, then test membership once —
+    /// the membership question is about the feature, not about how the flag was written.
+    fn declared_features(argv: &[String]) -> BTreeSet<String> {
+        let mut features = BTreeSet::new();
+        let mut parts = argv.iter();
+        while let Some(part) = parts.next() {
+            let value = if part == "--features" {
+                // Argv-position: the value is the next element, and may be absent at the end.
+                parts.next().cloned()
+            } else if let Some(value) = part.strip_prefix("--features=") {
+                Some(value.to_owned())
+            } else if let Some(value) = part.strip_prefix("-F") {
+                match value {
+                    "" => parts.next().cloned(),
+                    _ => Some(value.strip_prefix('=').unwrap_or(value).to_owned()),
+                }
+            } else {
+                None
+            };
+            let Some(value) = value else { continue };
+            features.extend(
+                value
+                    .split([',', ' '])
+                    .filter(|feature| !feature.is_empty())
+                    .map(str::to_owned),
+            );
+        }
+        features
+    }
+
+    // #737. The normaliser is what the guard below stands on, so it is proven against every
+    // spelling directly rather than only against the one spelling this repo happens to use. Each
+    // row here is a form cargo would accept and act on; if any stops being read, a declaration
+    // written that way becomes invisible to the `live-mints` ban.
+    #[test]
+    fn feature_flag_reader_sees_every_cargo_spelling_of_one_feature() {
+        fn argv(parts: &[&str]) -> Vec<String> {
+            parts.iter().map(|part| (*part).to_owned()).collect()
+        }
+
+        // Each row is a spelling cargo accepts and acts on. Every one of them turns `live-mints`
+        // ON, so every one of them must be visible to the ban below.
+        let live: [(&[&str], &str); 8] = [
+            (&["cargo", "--features", "live-mints"], "argv-position"),
+            (&["cargo", "--features=live-mints"], "equals"),
+            (&["cargo", "-F", "live-mints"], "short argv-position"),
+            (&["cargo", "-F=live-mints"], "short equals"),
+            (&["cargo", "-Flive-mints"], "short attached"),
+            (&["cargo", "--features=a,live-mints"], "equals list"),
+            (&["cargo", "--features", "a live-mints"], "space list"),
+            (&["cargo", "-Fa", "--features=live-mints"], "two flags"),
+        ];
+        for (parts, label) in live {
+            assert!(
+                declared_features(&argv(parts)).contains("live-mints"),
+                "the {label} spelling turns `live-mints` on and must read as such: {parts:?}"
+            );
+        }
+
+        let no_flag = argv(&["cargo", "test", "-p", "maxplayer-core"]);
+        assert_eq!(
+            declared_features(&no_flag),
+            BTreeSet::new(),
+            "a row that names no feature flag turns no feature on"
+        );
+        let wallet_only = argv(&["cargo", "--features=wallet"]);
+        assert!(
+            !declared_features(&wallet_only).contains("live-mints"),
+            "reading a feature list must not invent members that are not in it"
+        );
+        let dangling = argv(&["cargo", "test", "--features"]);
+        assert_eq!(
+            declared_features(&dangling),
+            BTreeSet::new(),
+            "a trailing `--features` carrying no value is read as naming no feature"
+        );
+        let wallet_row = argv(&["cargo", "--features", "wallet"]);
+        assert!(
+            declared_features(&wallet_row).contains("wallet"),
+            "the form this repo actually declares still reads: that is half (a) of the guard"
+        );
+    }
+
     // THIS repository's own declaration, parsed by the real parser. Presence is fail-closed at
     // runtime — a malformed declaration refuses the job with `ENV_UNPROVISIONABLE` — so shipping
     // one that nothing has ever parsed would hand every contributor an execution failure. A
@@ -800,13 +889,14 @@ timeout_secs = 1200
         // money-path CI job instead (.github/workflows/ci.yml), which has one.
         //
         // Red-on-revert, measured: drop the wallet row and (a) fails; append "live-mints" to its
-        // feature list and (b) fails.
-        // Reads `--features a,b,c` in argv position, which is the only form this file uses.
-        let has_feature = |argv: &[String], name: &str| {
-            argv.windows(2)
-                .filter(|pair| pair[0] == "--features")
-                .any(|pair| pair[1].split(',').any(|feature| feature == name))
-        };
+        // feature list — in any spelling cargo accepts — and (b) fails.
+        // #737. Both halves ask the same question — is this feature ON for this row — so both go
+        // through `declared_features`, which normalises cargo's several spellings of the flag
+        // before the membership test. Reading only the argv-position form left half (b) blind to
+        // `--features=live-mints`: the guard names its subject in one spelling, and the subject
+        // has more than one. The normaliser is proven spelling-by-spelling in
+        // `feature_flag_reader_sees_every_cargo_spelling_of_one_feature`.
+        let has_feature = |argv: &[String], name: &str| declared_features(argv).contains(name);
         let wallet_row = declaration.commands.iter().any(|argv| {
             argv.get(1).map(String::as_str) == Some("test")
                 && argv.iter().any(|part| part == "maxplayer-core")

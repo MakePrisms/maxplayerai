@@ -199,7 +199,7 @@ where
 }
 
 /// Daemon/node-owned delivery, plus the job agent's PROMPT PREAMBLE — identity, job context,
-/// boundaries (#685), and the buyer's declared output type (#686).
+/// boundaries (#685, #731), and the buyer's declared output type (#686).
 ///
 /// ⚠ It is a PREAMBLE IN THE USER TURN, **not** a protocol-level system prompt, because ACP has no
 /// system-prompt surface: [`SessionConfig`](crate::driver::SessionConfig) is `{cwd, mcp_servers,
@@ -266,6 +266,9 @@ pub fn compose_agent_prompt(
          - Deliver only what the task asks for; do not add unrequested files.\n\
          - Never read, write, or reveal credentials, tokens, key material, or any file outside \
          this directory — not in your deliverable, and not in anything you print.\n\
+         - If you wait on a background process, match something your own waiter cannot contain — \
+         a PID or pidfile captured at start, or `pgrep -x` against an exact program name — never \
+         `pgrep -f` on a substring of your own command line.\n\
          ---\n\
          DELIVERY (required). Your deliverable is the FINAL STATE OF YOUR CURRENT WORKING \
          DIRECTORY:\n\
@@ -784,6 +787,8 @@ mod tests {
                 "Work only inside it",
                 "or any file outside this directory",
                 "on the offer, so produce the deliverable in that form",
+                "cannot contain — a PID or pidfile captured at start",
+                "never `pgrep -f` on a substring of your own command line",
             ] {
                 assert!(
                     prompt.contains(joined),
@@ -883,6 +888,43 @@ mod tests {
         assert!(
             json.contains("The task above wins where the two disagree."),
             "the buyer's task, not our tag, is authoritative: {json}"
+        );
+    }
+
+    // TOOTH (#731) — the preamble warns the hired agent off self-matching process waiters.
+    //
+    // A waiter whose command line CONTAINS the substring it greps for (`pgrep -f "cargo test …"`)
+    // matches sibling waiters forever. Measured on a live seller: after the job had already failed,
+    // 6 processes matched the needle, 0 real cargo, 0 real rustc. Daemon cleanup tolerates leaking
+    // a grandchild ("recoverable"), which is true for mortal grandchildren; a self-matching waiter
+    // is not mortal. The preamble is the only place this reaches: it is agent-authored shell.
+    // Daemon-side reaping is #733, not this change.
+    //
+    // Bite: drop the BOUNDARIES bullet, and the first assertion goes red.
+    #[test]
+    fn preamble_warns_off_self_matching_process_waiters() {
+        let prompt = compose_agent_prompt("t", "r", 1_000, None, None);
+        let boundaries = prompt
+            .split("BOUNDARIES:\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n---\n").next())
+            .expect("BOUNDARIES section");
+
+        assert!(
+            boundaries.contains("never `pgrep -f`"),
+            "forbids pgrep -f, the self-matching waiter: {prompt}"
+        );
+        assert!(
+            boundaries.contains("`pgrep -x`"),
+            "names pgrep -x as the exact-name alternative: {prompt}"
+        );
+        assert!(
+            boundaries.contains("pidfile"),
+            "names a pidfile captured at start as a match the waiter cannot contain: {prompt}"
+        );
+        assert!(
+            boundaries.contains("cannot contain"),
+            "states the invariant — match something the waiter itself cannot contain: {prompt}"
         );
     }
 
