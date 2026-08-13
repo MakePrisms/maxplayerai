@@ -87,7 +87,43 @@ impl From<LogError> for EngineError {
     }
 }
 
+/// Drive one job to its terminal state, then shut the driver down.
+///
+/// #729: `shutdown()` runs on EVERY exit, not only the success epilogue. The old shape placed it
+/// after the last `?`, so exactly the runs that failed — the ones that repeat — returned early and
+/// left the ACP child alive and unreaped (measured on a live seat: the child still healthy 80
+/// minutes past `execute fail`, then a zombie after a manual kill — kill without `wait`).
+///
+/// The can't-forget form chosen here is a single-exit wrapper, not a `Drop` guard, because a
+/// guard cannot exist for this trait: `Driver::shutdown` is async (the ACP driver reaps
+/// off-runtime via `spawn_blocking` and must be awaited) and `Drop` cannot await — a blocking
+/// Drop on the seller node's single-threaded LocalSet would stall every sibling job, the exact
+/// hazard #223 removed. The wrapper keeps the guard's property: ALL fallible work lives in
+/// [`run_turn`], so any `?` added to the turn tomorrow still funnels through the one shutdown
+/// below. (No caller drops this future mid-await — the job deadline is enforced inside the
+/// driver's response wait and surfaces as an `Err` through this same seam.)
 pub async fn run_job<D: Driver>(
+    driver: &mut D,
+    log: &mut EventLog,
+    job_id: &JobId,
+    params: RunParams,
+    sink: &mut dyn FnMut(RunEvent<'_>),
+) -> Result<RunOutcome, EngineError> {
+    let outcome = run_turn(driver, log, job_id, params, sink).await;
+    let shutdown = driver.shutdown().await;
+    match outcome {
+        Ok(run) => {
+            shutdown?;
+            Ok(run)
+        }
+        // The run error is what the seller reports and routes feedback on; a secondary shutdown
+        // failure must not mask it.
+        Err(error) => Err(error),
+    }
+}
+
+/// The fallible body of [`run_job`]: readiness through usage capture, shutdown excluded.
+async fn run_turn<D: Driver>(
     driver: &mut D,
     log: &mut EventLog,
     job_id: &JobId,
@@ -150,7 +186,6 @@ pub async fn run_job<D: Driver>(
     }
     // Lift whatever usage the driver captured (absent-stays-absent → None).
     let usage = driver.usage();
-    driver.shutdown().await?;
     Ok(RunOutcome {
         terminal,
         artifacts,
@@ -205,8 +240,8 @@ mod tests {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
     use crate::driver::{
-        Artifact, ContentBlock, MockDriver, ScriptedSession, SessionUpdate, StopReason,
-        UsageMetadata,
+        Artifact, ContentBlock, DriverError, MockDriver, ScriptedSession, SessionUpdate,
+        StopReason, UsageMetadata,
     };
     use crate::engine::{EngineError, RunEvent, RunOutcome, RunParams, run_job};
     use crate::event::{ArtifactId, Event, JobExecutionStatus, JobId, RuntimeId};
@@ -250,6 +285,7 @@ mod tests {
                 usage: None,
             }
         );
+        assert_eq!(driver.shutdown_calls(), 1);
         assert_eq!(
             replay_payloads(&log),
             vec![
@@ -341,6 +377,83 @@ mod tests {
                 status: JobExecutionStatus::Failed
             })
         );
+        // #729 regression: cleanup used to sit after the last `?`, so this exact early return
+        // skipped `shutdown()` and left the ACP child alive and unreaped.
+        assert_eq!(driver.shutdown_calls(), 1);
+    }
+
+    #[test]
+    fn shutdown_runs_when_an_early_question_mark_fails_the_run() {
+        // No scripts: `start_session` is the first `?` after readiness — the earliest failure
+        // exit. #729: the driver must be shut down through it all the same.
+        let mut driver = MockDriver::new(RuntimeId("mock".into()), Vec::new());
+        let mut log = EventLog::open(test_path("early-exit-shutdown")).expect("open log");
+
+        let result = block_on(run_job(
+            &mut driver,
+            &mut log,
+            &JobId("job-1".into()),
+            RunParams::mock_defaults(),
+            &mut |_| {},
+        ));
+
+        assert!(matches!(
+            result,
+            Err(EngineError::Driver(DriverError::ScriptExhausted))
+        ));
+        assert_eq!(driver.shutdown_calls(), 1);
+    }
+
+    #[test]
+    fn a_run_error_is_not_masked_by_a_failing_shutdown() {
+        // Both the run AND the shutdown fail: the run error is what the seller reports and routes
+        // feedback on, so it must win. Shutdown still ran (the child was still reaped).
+        let script = ScriptedSession {
+            session_id: "session-1".into(),
+            updates: Vec::new(), // stream ends without turn_ended → MissingTerminal
+            artifacts: Vec::new(),
+        };
+        let mut driver = MockDriver::new(RuntimeId("mock".into()), vec![script])
+            .with_shutdown_error(DriverError::Other("shutdown broke".into()));
+        let mut log = EventLog::open(test_path("run-error-wins")).expect("open log");
+
+        let result = block_on(run_job(
+            &mut driver,
+            &mut log,
+            &JobId("job-1".into()),
+            RunParams::mock_defaults(),
+            &mut |_| {},
+        ));
+
+        assert!(matches!(result, Err(EngineError::MissingTerminal)));
+        assert_eq!(driver.shutdown_calls(), 1);
+    }
+
+    #[test]
+    fn a_clean_run_still_surfaces_a_shutdown_error() {
+        // Unchanged behavior from before #729: when the run itself succeeded, a shutdown failure
+        // is the only fault and must not be swallowed.
+        let script = ScriptedSession {
+            session_id: "session-1".into(),
+            updates: vec![SessionUpdate::TurnEnded(StopReason::Completed)],
+            artifacts: Vec::new(),
+        };
+        let mut driver = MockDriver::new(RuntimeId("mock".into()), vec![script])
+            .with_shutdown_error(DriverError::Other("shutdown broke".into()));
+        let mut log = EventLog::open(test_path("shutdown-error-surfaces")).expect("open log");
+
+        let result = block_on(run_job(
+            &mut driver,
+            &mut log,
+            &JobId("job-1".into()),
+            RunParams::mock_defaults(),
+            &mut |_| {},
+        ));
+
+        assert!(matches!(
+            result,
+            Err(EngineError::Driver(DriverError::Other(message))) if message == "shutdown broke"
+        ));
     }
 
     #[test]
