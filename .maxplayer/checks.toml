@@ -7,12 +7,33 @@
 # argv here is byte-identical to one proven inside an empty network namespace on this tree — not
 # assumed to be hermetic.
 #
-# Deliberately NOT declared: the workspace-wide `cargo test --locked`. Because the `maxplayer`
-# crate sets `default = ["wallet"]`, feature unification hands `maxplayer-core` the wallet feature,
-# which pulls four tests that contact live third-party mints (mint.minibits.cash and
-# testnut.cashu.space). Under `net: denied` those fail DETERMINISTICALLY, so a workspace-wide test
-# command would refuse every honest contribution. The per-package commands below cover the same
-# code without importing that dependency.
+# WALLET COVERAGE (#720) — why the fourth command below exists, and what it cost to get it.
+#
+# `maxplayer-core`'s `wallet` feature gates the money path: the buyer's single-call `collect`
+# (tests/collect_integrity.rs), the seller node and its durable store, buyer_fund, wallet_ops,
+# payment. Until this row, NO declared command turned `wallet` on, so every one of those tests ran
+# ZERO times here — a contributor could break collect/settle integrity and all four checks stayed
+# green. That blind spot was fallout, never a decision.
+#
+# What blocked the row was four tests that reach a LIVE third-party mint over the public internet:
+# two in `job_lifecycle` (post_job resolves a fee floor at the home's shipped mint.minibits.cash
+# default before it publishes) and two in `payment_wallet` (the worker's real send leg fetches
+# testnut.cashu.space's keysets through the wallet's own HTTP client). Under `net: denied` all four
+# fail DETERMINISTICALLY — measured on this tree, in an empty network namespace with loopback up:
+# `--features wallet` was 912 passed / 4 failed, and those four were the only failures.
+#
+# They now sit behind `maxplayer-core`'s `live-mints` feature — OFF by default, enabled by NO
+# command in this file — which is what makes `--features wallet` offline-safe and declarable. They
+# are NOT silenced and NOT ignored: the money-path job in .github/workflows/ci.yml turns
+# `live-mints` ON, on a runner that has a network, and that job is the only place they run. If that
+# `--features …,live-mints` is ever dropped, those four stop running anywhere — check it before
+# trusting this note. Gating a test away to make this file pass would be the failure mode, not the
+# fix; the split is what made the OTHER 900-odd wallet tests start running under `net: denied`.
+#
+# Still deliberately NOT declared: the workspace-wide `cargo test --locked`. Each `-p` row names the
+# exact feature configuration it proves, which is what makes a red row legible; a workspace row
+# would re-unify features across crates and hide which configuration failed. `crate::checks` holds
+# that rule — and the wallet row, and the ban on `live-mints` here — as a test.
 
 schema = 1
 
@@ -32,10 +53,18 @@ commands = [
     ["cargo", "build", "--locked"],
     ["cargo", "test", "-p", "maxplayer-core", "--locked", "--offline"],
     ["cargo", "test", "-p", "maxplayer-core", "--features", "acp", "--locked", "--offline"],
+    # The money path, per the WALLET COVERAGE note above. `wallet` composes `gateway` and
+    # `git-delivery`, so this row is also the only one that runs tests/collect_integrity.rs and the
+    # three `required-features` binaries (relay_git_http_auth, git_config_isolation, no_system_git).
+    # Its fixtures are loopback-only; it needs `lo`, never a route off the box.
+    ["cargo", "test", "-p", "maxplayer-core", "--features", "wallet", "--locked", "--offline"],
     ["cargo", "test", "-p", "maxplayer", "--locked", "--offline"],
 ]
 
-# A cold run is dominated by compilation, not by the tests: three distinct feature configurations
-# are built from a fresh clone. The measured test time is ~45s total, but the example declaration's
-# 1200s would be a false failure on a cold machine.
-timeout_secs = 3600
+# A cold run is dominated by compilation, not by the tests: four distinct feature configurations are
+# built from a fresh clone. Measured on this tree: the wallet configuration alone compiles in ~5min
+# and its tests take ~3.5min (the seller-node reconnect suites are the slow part), against ~45s of
+# test time for the other three. The example declaration's 1200s would be a false failure on a cold
+# machine; 3600s was already comfortable for three configurations and is not for four, so it is
+# raised rather than left to time out on a slow runner. This bounds the run — it weakens no check.
+timeout_secs = 5400

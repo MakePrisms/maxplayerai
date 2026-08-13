@@ -773,21 +773,56 @@ timeout_secs = 1200
         );
         assert!(!declaration.commands.is_empty());
 
-        // §9.1: every declared command runs with NO network. The workspace-wide form is the trap —
-        // the `maxplayer` crate sets `default = ["wallet"]`, so feature unification hands
-        // `maxplayer-core` the wallet feature and pulls four tests that contact live third-party
-        // mints (mint.minibits.cash ×2, testnut.cashu.space ×2). Measured: under an empty network
-        // namespace, workspace `cargo test --locked` exits 101 with those four failing — it would
-        // refuse every honest contribution, deterministically.
-        //
-        // This assertion exists so the declaration cannot be "simplified" back to the
-        // whole-workspace form by someone who has not run it without a network.
+        // §9.1: every declared command runs with NO network, and every declared TEST command names
+        // the one package (and so the one feature configuration) it proves. A workspace-wide row
+        // would re-unify features across crates and report a red without saying which
+        // configuration produced it. This assertion exists so the declaration cannot be
+        // "simplified" back to the whole-workspace form.
         for argv in &declaration.commands {
             let is_test = argv.get(1).map(String::as_str) == Some("test");
             let scoped = argv.iter().any(|part| part == "-p");
             assert!(
                 !is_test || scoped,
                 "a declared test command must be -p scoped, never workspace-wide: {argv:?}"
+            );
+        }
+
+        // #720. Two halves of one guard, and neither is worth anything alone.
+        //
+        // (a) The money path must be DECLARED. `wallet` gates collect (tests/collect_integrity.rs),
+        // the seller node and its store, buyer_fund, wallet_ops, payment. With no wallet row, all
+        // of it ran zero times under the declared set and collect/settle integrity could be broken
+        // with every check green — that was the state this repo shipped in.
+        //
+        // (b) `live-mints` must stay OUT of the declared set. It is the opt-in that carries the
+        // four tests which reach a live third-party mint; enabling it here is exactly how (a) gets
+        // "fixed" back into a suite that cannot pass without a network. Those four run in the
+        // money-path CI job instead (.github/workflows/ci.yml), which has one.
+        //
+        // Red-on-revert, measured: drop the wallet row and (a) fails; append "live-mints" to its
+        // feature list and (b) fails.
+        // Reads `--features a,b,c` in argv position, which is the only form this file uses.
+        let has_feature = |argv: &[String], name: &str| {
+            argv.windows(2)
+                .filter(|pair| pair[0] == "--features")
+                .any(|pair| pair[1].split(',').any(|feature| feature == name))
+        };
+        let wallet_row = declaration.commands.iter().any(|argv| {
+            argv.get(1).map(String::as_str) == Some("test")
+                && argv.iter().any(|part| part == "maxplayer-core")
+                && has_feature(argv, "wallet")
+        });
+        assert!(
+            wallet_row,
+            "the declared set must run maxplayer-core's wallet configuration — without it collect \
+             and the seller node are covered by nothing: {:?}",
+            declaration.commands
+        );
+        for argv in &declaration.commands {
+            assert!(
+                !has_feature(argv, "live-mints"),
+                "`live-mints` reaches real mints over the network and can never be declared here \
+                 (§9.1 runs every command with net denied): {argv:?}"
             );
         }
     }
