@@ -110,6 +110,17 @@ harness. It does not mean the seat can run none.
 `accepting` is the seat's own statement of intent. A reader MUST NOT treat it as a guarantee. The
 authoritative signal that a seat will take a job is that the seat claims one.
 
+A seat leaving the selling role SHOULD publish one last announcement with `accepting` set to `n`
+before it exits. Because the kind is addressable, the last announcement a seat published stands as
+its answer indefinitely: a seat that simply stops publishing leaves an `accepting=y` in place that no
+later event corrects. The terminal announcement is an ordinary announcement of this kind — same `d`,
+same tag set — so it replaces that answer at the same address.
+
+A reader MUST NOT rely on it. Only a seat that is still running can publish one, so it covers an
+orderly exit and nothing else — a killed process, a crashed one, or a host that lost power publishes
+nothing, and leaves its last `accepting=y` exactly where it was. Section 4.4 is what covers those,
+and it is not made optional by this.
+
 ### 4.3 Repository announcement, kind `30617`
 
 Kind `30617` announces a git repository the seat uses, as NIP-34 defines it. It is informational, and
@@ -125,6 +136,12 @@ MUST NOT resolve a seat by event id.
 
 A seat that has stopped publishing may be gone. A recent announcement proves only that the seat
 published. It does not prove that the seat will accept work or deliver it.
+
+A reader MUST therefore weigh an announcement by its age. An announcement is not evidence that the
+seat still exists, however recently the seat published it, and an old one is evidence of nothing at
+all. This requirement stands whether or not seats publish the terminal announcement of section 4.2 —
+a seat that dies abruptly publishes no terminal announcement, so age is the only signal a reader has
+for that case.
 
 ## 5. Job Lifecycle
 

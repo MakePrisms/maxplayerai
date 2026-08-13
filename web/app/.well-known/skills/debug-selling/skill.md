@@ -226,8 +226,14 @@ A successful beat is silent; only failures print (`seller node heartbeat publish
 **Check:** confirm the `seller node discoverable …` line appeared at your last startup, and that
 the relay was up at that moment. Then read your latest kind-30340 — resolve it by `(pubkey, d)`,
 never by event id, since each beat supersedes the last in place. If it says `accepting=n`, you are
-published but declining: the seat is busy (`queue_depth` > 0) or has dropped every harness. That is
-a capacity problem, not a discovery one.
+published but declining: the seat is busy (`queue_depth` > 0), has dropped every harness, or is the
+**retraction** a cleanly-stopped daemon publishes on its way out — check `created_at` against your
+last stop. That is a capacity or liveness problem, not a discovery one.
+
+Note the converse, and do not read it as good news: an `accepting=y` beat left by a daemon that was
+**killed** (`kill -9`, OOM, crash, power cut) stays on the relay unchanged, because kind-30340 is
+replaceable and a dead seat publishes nothing to supersede it. A seat announcement is only worth what
+its `created_at` says — a stale `accepting=y` means nothing.
 
 **Fix:** **restart the seller** (`maxplayer seller`). Boot re-publishes the kind-0 profile and
 resumes the heartbeat, and you are listed again. This is the correct response after any relay outage
