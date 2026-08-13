@@ -749,6 +749,29 @@ pub(crate) fn run_hop<S: HopJournalStore, E: HopEffects>(
     })
 }
 
+/// Plan-time hop authorization: quoted cost plus a fee-market buffer.
+///
+/// Buffer = `multiplier × fee_reserve` (the source mint's own melt fee reserve for this quote).
+/// The ceiling is committed here, when the fee market is known; recovery compares replacement
+/// quotes against this number **unchanged**. `multiplier == 0` restores exact quoted-cost
+/// authorization.
+fn authorized_hop_cost(
+    quoted_cost: u64,
+    fee_reserve: u64,
+    multiplier: u64,
+) -> Result<u64, HopError> {
+    let buffer = fee_reserve.checked_mul(multiplier).ok_or_else(|| {
+        HopError::Mint(format!(
+            "cross-mint hop fee buffer overflows u64: fee_reserve={fee_reserve} multiplier={multiplier}"
+        ))
+    })?;
+    quoted_cost.checked_add(buffer).ok_or_else(|| {
+        HopError::Mint(format!(
+            "cross-mint hop authorized cost overflows u64: quoted_cost={quoted_cost} fee_buffer={buffer}"
+        ))
+    })
+}
+
 /// Bound on one hop leg that moves money.
 ///
 /// Longer than [`MINT_TOUCH_TIMEOUT`], which bounds mint *reads*: a melt is a Lightning payment
@@ -815,6 +838,8 @@ async fn bounded<T>(
 pub(crate) struct CdkHopEffects {
     source: Wallet,
     target: Wallet,
+    /// `[buyer] hop_fee_buffer_multiplier`. Applied only when writing the Planned record.
+    hop_fee_buffer_multiplier: u64,
 }
 
 impl CdkHopEffects {
@@ -830,7 +855,11 @@ impl CdkHopEffects {
         let target = buyer_fund::open_wallet_at_mint_async(home, target_mint)
             .await
             .map_err(|error| HopError::Mint(format!("target mint {target_mint}: {error}")))?;
-        Ok(Self { source, target })
+        Ok(Self {
+            source,
+            target,
+            hop_fee_buffer_multiplier: home.config.buyer.hop_fee_buffer_multiplier,
+        })
     }
 
     /// Price the hop and raise both quotes, moving no money.
@@ -841,6 +870,11 @@ impl CdkHopEffects {
     /// seller receives.
     ///
     /// Runs before the budget gate, so every failure here refuses with zero spend.
+    ///
+    /// The journalled `planned_cost` is the quoted cost plus a fee buffer (`multiplier ×` the
+    /// source mint's melt fee reserve). That buffered figure is the authorization the budget
+    /// gate charges and the ceiling recovery compares against — the comparison itself is not
+    /// loosened.
     pub(crate) async fn plan_quotes(
         &self,
         attempt_id: &str,
@@ -870,8 +904,11 @@ impl CdkHopEffects {
                 self.target.mint_url, mint_quote.id
             )));
         }
-        let (melt_quote_id, planned_cost) = self.raise_melt_quote(&mint_quote.request).await?;
-        self.require_source_covers(planned_cost).await?;
+        let (melt_quote_id, quoted_cost, fee_reserve) =
+            self.raise_melt_quote(&mint_quote.request).await?;
+        self.require_source_covers(quoted_cost).await?;
+        let planned_cost =
+            authorized_hop_cost(quoted_cost, fee_reserve, self.hop_fee_buffer_multiplier)?;
         Ok(HopJournal {
             attempt_id: attempt_id.to_owned(),
             source_mint: self.source.mint_url.to_string(),
@@ -884,7 +921,12 @@ impl CdkHopEffects {
     }
 
     /// Raise and price one source-mint melt quote without moving money.
-    async fn raise_melt_quote(&self, bolt11: &str) -> Result<(String, u64), HopError> {
+    ///
+    /// Returns `(quote id, quoted cost, fee reserve)`. Quoted cost is melt amount + fee reserve
+    /// + input fee — the actual quote, with no buffer. The buffer is applied only in
+    /// [`Self::plan_quotes`], so a superseding quote is compared against the already-buffered
+    /// record rather than growing the ceiling.
+    async fn raise_melt_quote(&self, bolt11: &str) -> Result<(String, u64, u64), HopError> {
         let melt_quote = bounded(
             "source melt quote",
             MINT_TOUCH_TIMEOUT,
@@ -897,10 +939,10 @@ impl CdkHopEffects {
             fee_reserve: melt_quote.fee_reserve.to_u64(),
             input_fee: self.source_input_fee_ceiling().await?,
         };
-        let planned_cost = cost
+        let quoted_cost = cost
             .planned_cost()
             .map_err(|error| HopError::Mint(error.to_string()))?;
-        Ok((mint_quote_id(&melt_quote.id), planned_cost))
+        Ok((mint_quote_id(&melt_quote.id), quoted_cost, cost.fee_reserve))
     }
 
     /// Refuse a hop the source wallet cannot fund, BEFORE the cap is charged.
@@ -1024,10 +1066,14 @@ impl HopEffects for CdkHopEffects {
         let effects = Self {
             source: self.source.clone(),
             target: self.target.clone(),
+            hop_fee_buffer_multiplier: self.hop_fee_buffer_multiplier,
         };
         let bolt11 = bolt11.to_owned();
         block_on_leg("source melt quote", async move {
-            effects.raise_melt_quote(&bolt11).await
+            effects
+                .raise_melt_quote(&bolt11)
+                .await
+                .map(|(id, quoted_cost, _fee_reserve)| (id, quoted_cost))
         })?
     }
 
@@ -1035,6 +1081,7 @@ impl HopEffects for CdkHopEffects {
         let effects = Self {
             source: self.source.clone(),
             target: self.target.clone(),
+            hop_fee_buffer_multiplier: self.hop_fee_buffer_multiplier,
         };
         block_on_leg("source coverage", async move {
             effects.require_source_covers(planned_cost).await
@@ -1183,6 +1230,7 @@ mod tests {
 
     use super::*;
     use crate::budget::{BudgetGate, BudgetRefuse};
+    use crate::home::default_hop_fee_buffer_multiplier;
 
     fn journal(attempt: &str) -> HopJournal {
         HopJournal {
@@ -1651,6 +1699,7 @@ mod tests {
                 None,
             )
             .unwrap(),
+            hop_fee_buffer_multiplier: default_hop_fee_buffer_multiplier(),
         }
     }
 
@@ -1674,6 +1723,7 @@ mod tests {
                 None,
             )
             .unwrap(),
+            hop_fee_buffer_multiplier: default_hop_fee_buffer_multiplier(),
         }
     }
 
@@ -2270,6 +2320,164 @@ mod tests {
         assert_eq!(gate.spent(), pairing.planned_cost);
         assert!(world.borrow().melts.is_empty());
         assert_eq!(world.borrow().superseding_quotes.len(), 1);
+        assert!(matches!(
+            store.replay(&pairing.attempt_id).unwrap().as_slice(),
+            [HopRecord::Planned(_)]
+        ));
+    }
+
+    /// Quoted hop used by [`journal`]: melt 100 + reserve 7 + input fee 2.
+    const QUOTED_HOP_COST: u64 = 109;
+    const QUOTED_FEE_RESERVE: u64 = 7;
+    /// A fee-market bump inside the default 2×-reserve buffer (14) and above the quote.
+    /// Without the buffer this replacement would refuse; with it, it must proceed.
+    const WITHIN_BUFFER_REPLACEMENT: u64 = 120;
+
+    fn journal_authorized(attempt: &str, multiplier: u64) -> HopJournal {
+        let mut pairing = journal(attempt);
+        pairing.planned_cost = authorized_hop_cost(QUOTED_HOP_COST, QUOTED_FEE_RESERVE, multiplier)
+            .expect("quoted cost plus buffer fits in u64");
+        pairing
+    }
+
+    #[test]
+    fn authorized_hop_cost_adds_multiplier_times_the_mint_fee_reserve() {
+        assert_eq!(
+            authorized_hop_cost(QUOTED_HOP_COST, QUOTED_FEE_RESERVE, 2).unwrap(),
+            123,
+            "default buffer is 2× the mint's own fee reserve"
+        );
+        assert_eq!(
+            authorized_hop_cost(QUOTED_HOP_COST, QUOTED_FEE_RESERVE, 0).unwrap(),
+            QUOTED_HOP_COST,
+            "multiplier 0 restores exact quoted-cost authorization"
+        );
+        assert!(
+            authorized_hop_cost(u64::MAX, 1, 1).is_err(),
+            "an unrepresentable authorized cost must refuse rather than wrap"
+        );
+    }
+
+    #[test]
+    fn a_replacement_quote_within_the_fee_buffer_proceeds() {
+        let pairing =
+            journal_authorized("attempt-within-buffer", default_hop_fee_buffer_multiplier());
+        assert_eq!(pairing.planned_cost, 123);
+        assert!(
+            WITHIN_BUFFER_REPLACEMENT > QUOTED_HOP_COST,
+            "the replacement must be dearer than the quote, or this does not prove a buffer"
+        );
+        assert!(WITHIN_BUFFER_REPLACEMENT <= pairing.planned_cost);
+
+        let store = MemJournal::default();
+        store
+            .append_sync(&HopRecord::Planned(pairing.clone()))
+            .unwrap();
+        let world = MintWorld::shared();
+        world.borrow_mut().melt_leg = Some(MeltLeg::Failed);
+        world.borrow_mut().superseding_planned_cost = WITHIN_BUFFER_REPLACEMENT;
+        let mut effects = FakeMints {
+            world: Rc::clone(&world),
+        };
+
+        let mut gate = BudgetGate::new(pairing.planned_cost);
+        gate.authorize_then_attempt(&pairing.attempt_id, pairing.planned_cost, || ())
+            .unwrap();
+        let spent_before = gate.spent();
+        run_hop(&store, &mut effects, &pairing).expect("within-buffer replacement must proceed");
+        assert_eq!(
+            gate.spent(),
+            spent_before,
+            "a within-buffer supersession is not a new budget interaction"
+        );
+        assert_eq!(world.borrow().melts, vec!["melt-2".to_owned()]);
+        assert!(matches!(
+            store.replay(&pairing.attempt_id).unwrap().as_slice(),
+            [
+                HopRecord::Planned(_),
+                HopRecord::MeltSuperseded {
+                    planned_cost: WITHIN_BUFFER_REPLACEMENT,
+                    ..
+                },
+                HopRecord::Settled { .. }
+            ]
+        ));
+    }
+
+    #[test]
+    fn a_replacement_quote_above_the_fee_buffer_refuses_naming_the_recorded_ceiling() {
+        let pairing =
+            journal_authorized("attempt-above-buffer", default_hop_fee_buffer_multiplier());
+        let store = MemJournal::default();
+        store
+            .append_sync(&HopRecord::Planned(pairing.clone()))
+            .unwrap();
+        let world = MintWorld::shared();
+        world.borrow_mut().melt_leg = Some(MeltLeg::Failed);
+        world.borrow_mut().superseding_planned_cost = pairing.planned_cost + 1;
+        let mut effects = FakeMints {
+            world: Rc::clone(&world),
+        };
+
+        let mut gate = BudgetGate::new(u64::MAX);
+        gate.authorize_then_attempt(&pairing.attempt_id, pairing.planned_cost, || ())
+            .unwrap();
+        let error = run_hop(&store, &mut effects, &pairing).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                HopError::ReplacementCostExceedsAuthorization {
+                    authorized_cost: 123,
+                    replacement_cost: 124,
+                    ..
+                }
+            ),
+            "got: {error}"
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("123"),
+            "the refusal must name the recorded ceiling: {rendered}"
+        );
+        assert_eq!(gate.spent(), pairing.planned_cost);
+        assert!(world.borrow().melts.is_empty());
+        assert!(matches!(
+            store.replay(&pairing.attempt_id).unwrap().as_slice(),
+            [HopRecord::Planned(_)]
+        ));
+    }
+
+    #[test]
+    fn a_zero_fee_buffer_makes_the_within_buffer_replacement_refuse() {
+        // Red-prove: the same replacement that proceeds under the default buffer must go RED
+        // when the multiplier is 0. If it still proceeded, the tolerance would be in the
+        // comparison (vacuous) rather than in the recorded authorization.
+        let pairing = journal_authorized("attempt-zero-buffer", 0);
+        assert_eq!(pairing.planned_cost, QUOTED_HOP_COST);
+        let store = MemJournal::default();
+        store
+            .append_sync(&HopRecord::Planned(pairing.clone()))
+            .unwrap();
+        let world = MintWorld::shared();
+        world.borrow_mut().melt_leg = Some(MeltLeg::Failed);
+        world.borrow_mut().superseding_planned_cost = WITHIN_BUFFER_REPLACEMENT;
+        let mut effects = FakeMints {
+            world: Rc::clone(&world),
+        };
+
+        let error = run_hop(&store, &mut effects, &pairing).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                HopError::ReplacementCostExceedsAuthorization {
+                    authorized_cost: QUOTED_HOP_COST,
+                    replacement_cost: WITHIN_BUFFER_REPLACEMENT,
+                    ..
+                }
+            ),
+            "got: {error}"
+        );
+        assert!(world.borrow().melts.is_empty());
         assert!(matches!(
             store.replay(&pairing.attempt_id).unwrap().as_slice(),
             [HopRecord::Planned(_)]
