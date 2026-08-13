@@ -5,8 +5,9 @@
 //! `config.toml` so subsequent launches are zero-prompt.
 //!
 //! On startup it runs the `doctor` readiness gate (issue #107) and REFUSES to boot when a blocking
-//! check fails (agent unresolvable, no mint reachable, seller key missing, relay unreachable),
-//! printing a per-failure fix hint. Pass `--skip-doctor` to bypass the gate (default: checks-on).
+//! check fails (no working nix, agent unresolvable, no mint reachable, seller key missing, relay
+//! unreachable), printing a per-failure fix hint. Pass `--skip-doctor` to bypass the readiness
+//! checks (default: checks-on); the nix ENVIRONMENT check (#745) still runs — it has no bypass.
 //!
 //! Never accepts `--key` (key stays in `~/.maxplayer/key`; never argv).
 
@@ -25,15 +26,12 @@ const SUCCESS: i32 = 0;
 const USAGE_ERROR: i32 = 1;
 const RUNTIME_ERROR: i32 = 2;
 
-/// Decide whether `maxplayer seller` may proceed past the startup readiness gate. `gate` is `None` when
-/// `--skip-doctor` bypassed the checks (the gate was never run), `Some(Ok)` when every blocking
-/// check passed, and `Some(Err)` when one failed. Only a run gate that failed aborts startup —
-/// `--skip-doctor` always proceeds. Pure so the run_sell wiring is unit-tested both ways.
-fn readiness_decision(gate: Option<Result<(), ()>>) -> Result<(), i32> {
-    match gate {
-        None | Some(Ok(())) => Ok(()),
-        Some(Err(())) => Err(RUNTIME_ERROR),
-    }
+/// Decide whether `maxplayer seller` may proceed past the startup gate. The gate ALWAYS runs
+/// (#745): `--skip-doctor` narrows it to the environment requirement (nix) instead of skipping it,
+/// so there is deliberately no "gate never ran" arm here — that arm was the escape hatch #745
+/// rules out. A failed gate aborts startup. Pure so the run_sell wiring is unit-tested both ways.
+fn readiness_decision(gate: Result<(), ()>) -> Result<(), i32> {
+    gate.map_err(|()| RUNTIME_ERROR)
 }
 
 #[derive(Debug, Default)]
@@ -160,21 +158,16 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
     // side effects. Still fail-closed, but a purely TRANSIENT failure (relay or all mints briefly
     // unreachable) is retried with backoff before refusing, so an unsupervised seat rides out a
     // boot-time dependency blip instead of dying to it (issue #553); an unrecoverable failure still
-    // refuses at once. `--skip-doctor` bypasses the gate entirely (the checks are never run).
-    let gate = if options.skip_doctor {
-        let _ = writeln!(
-            err,
-            "maxplayer seller --skip-doctor: startup readiness checks bypassed (box may be unable to sell)"
-        );
-        None
-    } else {
-        Some(crate::doctor::sell_readiness_gate(
-            &home,
-            options.unsafe_no_sandbox,
-            out,
-            err,
-        ))
-    };
+    // refuses at once. `--skip-doctor` bypasses the READINESS checks only — the gate itself always
+    // runs, narrowed to the nix ENVIRONMENT check (#745): nix asks whether this box can EVER do
+    // the work, not whether it is ready right now, and #745 rules out any escape hatch for it.
+    let gate = crate::doctor::sell_readiness_gate(
+        &home,
+        options.unsafe_no_sandbox,
+        options.skip_doctor,
+        out,
+        err,
+    );
     readiness_decision(gate)?;
 
     if let Some(name) = options.name.as_ref() {
@@ -751,7 +744,7 @@ impl SellOptions {
 fn sell_usage(w: &mut dyn Write) {
     let _ = writeln!(
         w,
-        "Usage:\n  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>] [--skip-doctor]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n  maxplayer seller --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint\n  - --skip-doctor: bypass the startup readiness gate (default: checks-on; not recommended)\n  - --unsafe-no-sandbox: serve the OPEN POOL with no working sandbox — this box then runs code written by strangers with no containment (waives only that one check)\n  - open-pool claiming is OFF by default; pass --claim-open-pool to opt in\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)"
+        "Usage:\n  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>] [--skip-doctor]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n  maxplayer seller --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (no working nix, agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint\n  - --skip-doctor: bypass the startup readiness checks (default: checks-on; not recommended). The nix check still runs — it is an environment requirement (#745) with no bypass\n  - --unsafe-no-sandbox: serve the OPEN POOL with no working sandbox — this box then runs code written by strangers with no containment (waives only that one check)\n  - open-pool claiming is OFF by default; pass --claim-open-pool to opt in\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)"
     );
 }
 
@@ -904,28 +897,24 @@ mod tests {
             "--skip-doctor".into(),
         ])
         .expect("parse");
-        assert!(skipped.skip_doctor, "--skip-doctor bypasses the gate");
+        assert!(
+            skipped.skip_doctor,
+            "--skip-doctor bypasses the readiness checks (the nix environment check still runs)"
+        );
     }
 
-    // The readiness wiring run_sell uses: a failed gate refuses startup; a passed gate proceeds;
-    // and --skip-doctor (gate never run ⇒ None) proceeds even though the box may be unable to sell.
+    // The gate wiring run_sell uses: a failed gate refuses startup; a passed gate proceeds. There
+    // is deliberately NO "gate never ran" arm anymore (#745): --skip-doctor narrows the gate to
+    // the nix environment check instead of skipping it, so even a --skip-doctor boot flows a real
+    // gate verdict through here — the type no longer admits a bypassed-entirely state.
     #[test]
-    fn readiness_decision_refuses_on_fail_and_skip_bypasses() {
+    fn readiness_decision_refuses_on_fail_and_proceeds_on_pass() {
         assert_eq!(
-            readiness_decision(Some(Err(()))),
+            readiness_decision(Err(())),
             Err(RUNTIME_ERROR),
-            "a failed readiness gate must refuse run_sell"
+            "a failed gate must refuse run_sell — including the narrowed --skip-doctor gate"
         );
-        assert_eq!(
-            readiness_decision(Some(Ok(()))),
-            Ok(()),
-            "a passed readiness gate proceeds"
-        );
-        assert_eq!(
-            readiness_decision(None),
-            Ok(()),
-            "--skip-doctor bypasses the gate and proceeds"
-        );
+        assert_eq!(readiness_decision(Ok(())), Ok(()), "a passed gate proceeds");
     }
 
     #[test]

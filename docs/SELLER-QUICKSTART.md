@@ -157,8 +157,8 @@ Notes:
   - required user choices: --agent (or --agent-argv) + --rate-sats (first run)
   - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash git-remote=relay-git key=0600 auto
   - no --key (packaged key file only)
-  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint
-  - --skip-doctor: bypass the startup readiness gate (default: checks-on; not recommended)
+  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (no working nix, agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint
+  - --skip-doctor: bypass the startup readiness checks (default: checks-on; not recommended). The nix check still runs — it is an environment requirement (#745) with no bypass
   - --unsafe-no-sandbox: serve the OPEN POOL with no working sandbox — this box then runs code written by strangers with no containment (waives only that one check)
   - open-pool claiming is OFF by default; pass --claim-open-pool to opt in
   - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)
@@ -174,7 +174,7 @@ Notes:
 | `--name <display>` | no | Optional kind-0 display name published for discoverability. |
 | `--job-timeout-secs <n>` | no | Per-job timeout (seconds). |
 | `--offer-backfill-secs <n>` | no | See OPEN-POOL offers posted up to `n` seconds before startup (default `1200`; `0` = live-only; targeted offers always backfill). |
-| `--skip-doctor` | no | Bypass the startup doctor readiness gate (checks-on by default; not recommended). |
+| `--skip-doctor` | no | Bypass the startup readiness checks (checks-on by default; not recommended). Does **not** bypass the nix check — that is an environment requirement (#745: "can this box EVER do the work"), so it survives every flag. |
 | `--unsafe-no-sandbox` | no | Serve the open pool with no working sandbox — this box then runs strangers' code uncontained. Waives that one check only. |
 | `--home <dir>` | no | Home root (else `MAXPLAYER_HOME` / `~/.maxplayer`). |
 
