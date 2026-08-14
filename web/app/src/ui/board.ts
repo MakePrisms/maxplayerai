@@ -34,13 +34,27 @@ function label(view: MarketView, r: { pubkey: string; name: string | null }): st
   return name ? esc(name) : `<code>${short(r.pubkey)}</code>`;
 }
 
+/**
+ * Named when the buyer-signed records disagree on the winner. The "paid" and
+ * "accepted the delivery from" lines must not name a runner the trade could not
+ * resolve — a wrong name beside "paid" is exactly the attribution this join
+ * guards against.
+ */
+const CONFLICTED_SELLER =
+  '<span class="unknown" title="The buyer-signed award, accept and receipt for this job name different runners — the winner cannot be determined from the public record.">an undetermined runner</span>';
+
 /** The other side of an event: named, or null when the record doesn't say. */
 function counterparty(view: MarketView, e: ParsedEvent, want: "buyer" | "seller"): string | null {
   const t = e.offerId ? view.trades.get(e.offerId) : null;
-  const pk = want === "buyer"
-    ? (e.buyer || t?.buyer)
-    : (e.awardedSeller || e.targetSeller || t?.seller);
-  return pk && pk !== e.pubkey ? identity(view.names, pk) : null;
+  if (want === "buyer") {
+    const pk = e.buyer || t?.buyer;
+    return pk && pk !== e.pubkey ? identity(view.names, pk) : null;
+  }
+  // An award states its own winner directly; accept/receipt lines defer to the
+  // trade's resolved winner. A conflicted trade names no one — it says so.
+  const pk = e.awardedSeller || e.targetSeller || t?.seller;
+  if (pk && pk !== e.pubkey) return identity(view.names, pk);
+  return t?.sellerConflict ? CONFLICTED_SELLER : null;
 }
 
 /** One line of plain English per event kind — the feed reads, not decodes. */

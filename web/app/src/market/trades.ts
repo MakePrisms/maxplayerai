@@ -18,7 +18,18 @@ import type { Stage } from "../model/kinds.js";
 export interface Trade {
   offerId: string;
   buyer: string | null;
+  /**
+   * The runner that actually won and was paid — resolved from the buyer-signed
+   * award/accept/receipt, NOT from whoever claimed first. Null when no seller
+   * is yet known, or when `sellerConflict` is set.
+   */
   seller: string | null;
+  /**
+   * The buyer-authenticated records name more than one seller (e.g. an award
+   * for X but an accept/receipt for Y). The winner cannot be trusted, so
+   * `seller` is null and the UI must say so rather than pick one.
+   */
+  sellerConflict: boolean;
   offerAmount: number | null;
   receiptAmount: number | null;
   declineReason: string | null;
@@ -43,14 +54,49 @@ export function buildTrades(events: (RawEvent | ParsedEvent)[]): Trade[] {
   return trades;
 }
 
+/**
+ * The seller signals gathered for one trade, in trust order. `authenticated`
+ * holds every seller named by a buyer-signed record (award/accept/receipt): one
+ * distinct value is the winner, two or more is a conflict. `delivered` and
+ * `claimed` are seller-authored fallbacks used only when no buyer-signed record
+ * exists — and each is the EARLIEST such event, so the result is independent of
+ * relay arrival order.
+ */
+interface SellerSignals {
+  authenticated: Set<string>;
+  delivered: string | null;
+  deliveredAt: number;
+  claimed: string | null;
+  claimedAt: number;
+}
+
+/**
+ * Resolve the winning seller from the gathered signals.
+ *
+ * Buyer-signed records decide it: they are the only statements a claimant
+ * cannot forge for itself. A losing late claim carries no award, accept or
+ * receipt, so it can never be named here. When those records disagree the
+ * winner is genuinely unknown — reported as a conflict, never guessed. Only in
+ * the total absence of a buyer-signed record do we fall back to the runner that
+ * delivered, then to the earliest claimant.
+ */
+function resolveSeller(sig: SellerSignals): { seller: string | null; conflict: boolean } {
+  if (sig.authenticated.size > 1) return { seller: null, conflict: true };
+  if (sig.authenticated.size === 1) return { seller: [...sig.authenticated][0]!, conflict: false };
+  return { seller: sig.delivered ?? sig.claimed ?? null, conflict: false };
+}
+
 function buildTradesUncached(events: (RawEvent | ParsedEvent)[]): Trade[] {
   const trades = new Map<string, Trade>();
+  const signals = new Map<string, SellerSignals>();
   const ensure = (offerId: string): Trade => {
     let t = trades.get(offerId);
     if (!t) {
-      t = { offerId, buyer: null, seller: null, offerAmount: null, receiptAmount: null,
-            declineReason: null, selfTrade: false, at: {} };
+      t = { offerId, buyer: null, seller: null, sellerConflict: false, offerAmount: null,
+            receiptAmount: null, declineReason: null, selfTrade: false, at: {} };
       trades.set(offerId, t);
+      signals.set(offerId, { authenticated: new Set(), delivered: null, deliveredAt: Infinity,
+                             claimed: null, claimedAt: Infinity });
     }
     return t;
   };
@@ -63,9 +109,19 @@ function buildTradesUncached(events: (RawEvent | ParsedEvent)[]): Trade[] {
     const e = raw && (raw as ParsedEvent).stage !== undefined ? (raw as ParsedEvent) : parseEvent(raw as RawEvent);
     if (!e || !e.stage || !e.offerId) continue;
     const t = ensure(e.offerId);
+    const sig = signals.get(e.offerId)!;
     earliest(t, e.stage, e.created_at);
     if (e.buyer) t.buyer = t.buyer || e.buyer;
-    if (e.seller) t.seller = t.seller || e.seller;
+    // Buyer-signed seller bindings — the authoritative winner. See resolveSeller.
+    const authed = e.awardedSeller || e.acceptedSeller || e.receiptSeller;
+    if (authed) sig.authenticated.add(authed);
+    // Seller-authored fallbacks, earliest-wins so arrival order can't decide it.
+    if (e.stage === "result" && e.seller && e.created_at < sig.deliveredAt) {
+      sig.delivered = e.seller; sig.deliveredAt = e.created_at;
+    }
+    if (e.stage === "claim" && e.seller && e.created_at < sig.claimedAt) {
+      sig.claimed = e.seller; sig.claimedAt = e.created_at;
+    }
     if (e.stage === "offer" && e.amount != null) t.offerAmount = e.amount;
     if (e.stage === "offer" && e.selfTrade) t.selfTrade = true;
     if (e.stage === "receipt" && e.amount != null) t.receiptAmount = e.amount;
@@ -75,6 +131,11 @@ function buildTradesUncached(events: (RawEvent | ParsedEvent)[]): Trade[] {
     // `progress` note read as a decline — ending working lamps and counting
     // as a release.
     if (e.stage === "feedback" && e.terminal && e.reason) t.declineReason = t.declineReason || e.reason;
+  }
+  for (const t of trades.values()) {
+    const { seller, conflict } = resolveSeller(signals.get(t.offerId)!);
+    t.seller = seller;
+    t.sellerConflict = conflict;
   }
   return [...trades.values()];
 }

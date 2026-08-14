@@ -52,6 +52,8 @@ export interface ParsedEvent {
   agents?: string[];
   claimId?: string | null;
   awardedSeller?: string | null;
+  acceptedSeller?: string | null;
+  receiptSeller?: string | null;
   harness?: string | null;
   model?: string | null;
   deliveryVia?: string | null;
@@ -149,8 +151,13 @@ function awardClaimId(event: RawEvent, offerId: string | null): string | null {
   return null;
 }
 
-/** The other participant on a buyer-authored award is the selected seller. */
-function awardSeller(event: RawEvent): string | null {
+/**
+ * The seller a buyer-authored event binds to. AWARD, ACCEPT and RECEIPT are all
+ * authored by the buyer and carry two `p` tags — the buyer (the author) and the
+ * seller — so the seller is the `p` that is not the author. This is the
+ * buyer-authenticated name of the runner, independent of who claimed first.
+ */
+function boundSeller(event: RawEvent): string | null {
   for (const t of tagsNamed(event, "p")) {
     if (isHex32(t[1]) && t[1] !== event.pubkey) return t[1] as string;
   }
@@ -290,11 +297,15 @@ function parseEventUncached(event: RawEvent): ParsedEvent | null {
       const offerId = rootOfferId(event);
       return { ...base, offerId, buyer: event.pubkey,
                claimId: awardClaimId(event, offerId),
-               awardedSeller: awardSeller(event),
+               awardedSeller: boundSeller(event),
                status: firstTag(event, "status") };
     }
+    // The accept is the buyer's pay-authorisation (§6.5). Like the award it is
+    // buyer-authored and p-tags the bound seller — the authenticated winner,
+    // never the first claimant to arrive.
     case ACCEPT:
       return { ...base, offerId: rootOfferId(event), buyer: event.pubkey,
+               acceptedSeller: boundSeller(event),
                status: firstTag(event, "status") };
     case RESULT:
       return { ...base, offerId: rootOfferId(event), seller: event.pubkey,
@@ -314,8 +325,13 @@ function parseEventUncached(event: RawEvent): ParsedEvent | null {
                reasonCode: firstTag(event, "reason_code"),
                feedbackClass: feedbackClass(event),
                terminal: feedbackIsTerminal(event) };
+    // The co-signed settlement (§6.8). Buyer-authored, and its `p` tags name
+    // buyer and seller with the seller's own co-signature — the strongest
+    // public statement of who was actually paid. Preserve that binding; the
+    // amount alone throws the authoritative counterparty away.
     case RECEIPT:
       return { ...base, offerId: rootOfferId(event),
+               receiptSeller: boundSeller(event),
                amount: firstNumber(event, "amount", "amt", "sats") };
     case HEARTBEAT:
       return { ...base,
