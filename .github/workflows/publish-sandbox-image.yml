@@ -1,0 +1,130 @@
+name: Publish sandbox image
+
+# Builds `docker/maxplayer-sandbox/Dockerfile` and pushes it to GHCR so sellers PULL the sandbox image
+# instead of building it from a repo checkout (docs/SANDBOXING.md §4, issue #792 phase 1).
+#
+# This workflow ONLY publishes. It changes no runtime behaviour: the shipped config sample still offers
+# `image = "maxplayer-sandbox:latest"`, `doctor` is unchanged, and a seller who does nothing keeps
+# working exactly as today. Pointing the default ref at the published image, layered agent images, and a
+# doctor present-or-pullable check are later phases.
+#
+# TAGS vs DIGEST (both, deliberately — #792 / ADR §4):
+#   * A seat REFERENCES the image by VERSION TAG. We push `:<release-tag>` (e.g. `:v0.4.2`, matching the
+#     git/release tag this repo already publishes) and, for a non-prerelease, `:latest`.
+#   * VERIFIABLE DELIVERY wants the exact bytes that ran to be identifiable, which a moving tag cannot
+#     give. So we ALSO capture build-push-action's `outputs.digest` and record it (job summary + job
+#     output). Seats still pull by tag; the digest is the verification handle. These coexist — the tag
+#     is how you ask for the image, the digest is how you prove which one you got.
+#
+# CREDENTIAL: the workflow's own GITHUB_TOKEN (no PAT, no org secret), scoped by the job-level
+# `packages: write`. Pattern copied from MakePrisms/cdk .github/workflows/docker-publish.yml.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image version tag to build and publish (e.g. v0.4.2). A manual run never moves :latest.'
+        required: true
+        type: string
+
+# Read-only default; the one job that needs to write to the registry asks for it itself.
+permissions:
+  contents: read
+
+jobs:
+  build-and-push:
+    name: Build and push (linux/amd64, linux/arm64)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: makeprisms/maxplayer-sandbox
+    steps:
+      # Check out the ref being released so the Dockerfile (and its pinned adapters) is exactly the one
+      # that tag names — not whatever main happens to be at publish time.
+      - name: Checkout the released ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+
+      # Resolve the version tag and decide whether :latest moves. A prerelease (or any manual dispatch)
+      # publishes the version tag ALONE, leaving :latest pointing at the last stable image — mirroring
+      # the npm publish job, which keeps `latest` stable and ships prereleases under `rc`.
+      - name: Determine image tags
+        id: meta
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = release ]; then
+            version="${{ github.event.release.tag_name }}"
+            prerelease="${{ github.event.release.prerelease }}"
+          else
+            version="${{ github.event.inputs.tag }}"
+            # A manual build is not a release; never let it move the stable pointer.
+            prerelease=true
+          fi
+          [ -n "$version" ] || { echo "no version resolved to tag the image with" >&2; exit 1; }
+
+          tags="${REGISTRY}/${IMAGE_NAME}:${version}"
+          if [ "$prerelease" != true ]; then
+            tags="${tags},${REGISTRY}/${IMAGE_NAME}:latest"
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags"       >> "$GITHUB_OUTPUT"
+          echo "Building $version (prerelease=$prerelease)"
+          echo "Tags: $tags"
+
+      # QEMU so the amd64 runner can also emit the linux/arm64 layer (Apple Silicon Macs run linux
+      # containers). No native arm runner is configured for this job, so the cross-build needs it.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: docker/maxplayer-sandbox
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Record the multi-arch manifest digest so a buyer can verify exactly which bytes ran. Seats still
+      # reference the image by version tag (above); this is the separate verification handle from ADR §4.
+      # Kept in the run summary + job output rather than attached to the GitHub release, which would need
+      # `contents: write` — a later phase can promote it to a durable release artifact if wanted.
+      - name: Record image digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          [ -n "$DIGEST" ] || { echo "build produced no digest" >&2; exit 1; }
+          ref="${REGISTRY}/${IMAGE_NAME}:${VERSION}"
+          pin="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+          {
+            echo "## Sandbox image published"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| version tag (how a seat pulls) | \`${ref}\` |"
+            echo "| digest (verifiable delivery) | \`${DIGEST}\` |"
+            echo "| pin-by-digest reference | \`${pin}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "digest=$DIGEST"    >> "$GITHUB_OUTPUT"
+          echo "published ${ref} (${DIGEST})"
