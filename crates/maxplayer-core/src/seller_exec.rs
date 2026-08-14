@@ -361,6 +361,20 @@ impl DockerPolicy {
             "-w".into(),
             CONTAINER_WORKDIR.into(),
         ]);
+        // Credential containment (#647): when the env points the agent at the host-side proxy
+        // (`…=http://host.docker.internal:<port>`), the container must be able to resolve that alias.
+        // On Linux docker does not provide it by default; `--add-host …:host-gateway` maps it to the
+        // host. This is the single pinhole to the proxy's host:port that #797's host-services deny must
+        // preserve. Added only when something actually references the alias, so a docker run with no
+        // containment carries no inert flag.
+        if job
+            .env
+            .iter()
+            .any(|(_, value)| value.contains(crate::credential_proxy::PROXY_HOST_ALIAS))
+        {
+            argv.push("--add-host".into());
+            argv.push(format!("{}:host-gateway", crate::credential_proxy::PROXY_HOST_ALIAS));
+        }
         for (key, value) in job.env {
             argv.push("-e".into());
             argv.push(format!("{key}={value}"));
@@ -796,7 +810,26 @@ pub async fn run_agent_job(
     // The delivery identity, plus the agent-auth allowlist a container needs because it inherits
     // nothing from the daemon. Empty under a host executor, which already inherits it all.
     let mut env = identity.git_env();
-    env.extend(forwarded_agent_env(policy));
+    let forwarded = forwarded_agent_env(policy);
+    // Credential containment (#647). Under docker the real model credential must NOT enter the
+    // container: a stranger's job can read `-e ANTHROPIC_API_KEY` and exfiltrate a reusable secret.
+    // Start a per-job host proxy that holds the real credential, forward a format-plausible
+    // placeholder + a base-URL override pointing at the proxy in its place, and keep the proxy alive
+    // for the run (dropping `_proxy` at fn end revokes the placeholder). If containment is required
+    // but cannot be established, the job FAILS — there is no fallback to putting the real credential
+    // in the container.
+    let _proxy;
+    if policy.docker_image().is_some() {
+        match start_credential_containment(&forwarded).await? {
+            Some((contained, proxy)) => {
+                env.extend(contained);
+                _proxy = Some(proxy);
+            }
+            None => env.extend(forwarded),
+        }
+    } else {
+        env.extend(forwarded);
+    }
     let job = JobLaunch {
         workdir,
         env: &env,
@@ -838,6 +871,98 @@ pub async fn run_agent_job(
         crate::event::JobExecutionStatus::Completed => Ok(outcome.usage),
         other => Err(ExecError::Agent(format!("agent terminal {other:?}"))),
     }
+}
+
+/// The credential this PR contains: the Anthropic API-key path the spike proved (the key rides a
+/// single `x-api-key` header verbatim). The proxy's substitution is value-based, so nothing here is
+/// header-specific — this names only WHICH forwarded variable holds the secret to contain.
+#[cfg(feature = "acp")]
+const CONTAINED_CREDENTIAL_ENV: &str = "ANTHROPIC_API_KEY";
+
+/// The base-URL variable overridden to point the container at the proxy instead of the vendor.
+#[cfg(feature = "acp")]
+const CONTAINED_BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
+
+/// Establish credential containment for a docker job, or `Ok(None)` when there is nothing in scope to
+/// contain (no real Anthropic API key was forwarded — e.g. an OAuth-only or codex-only seat, whose
+/// containment is a separate follow-up).
+///
+/// `Err` on any failure to stand up the proxy or register the job: the caller turns that into a failed
+/// job. This is the no-fallback invariant — the one failure mode that must never silently leave the
+/// real credential in the container.
+#[cfg(feature = "acp")]
+async fn start_credential_containment(
+    forwarded: &[(String, String)],
+) -> Result<Option<(Vec<(String, String)>, crate::credential_proxy::RunningProxy)>, ExecError> {
+    use crate::credential_proxy as proxy;
+    use std::sync::Arc;
+
+    let Some(real) = forwarded
+        .iter()
+        .find(|(key, _)| key == CONTAINED_CREDENTIAL_ENV)
+        .map(|(_, value)| value.clone())
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+
+    // The real upstream is the operator's gateway if they set one, else the vendor default. Whichever
+    // it is becomes the ONLY allowlisted destination, so the proxy substitutes the real credential for
+    // nothing else.
+    let upstream = forwarded
+        .iter()
+        .find(|(key, _)| key == CONTAINED_BASE_URL_ENV)
+        .map(|(_, value)| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| proxy::ANTHROPIC_DEFAULT_UPSTREAM.to_owned());
+    let upstream_host = proxy::authority_of(&upstream).ok_or_else(|| {
+        ExecError::Config(format!("[sandbox] docker: {CONTAINED_BASE_URL_ENV}={upstream} is not a valid URL"))
+    })?;
+
+    let engine = Arc::new(proxy::ProxyEngine::new([upstream_host]));
+    let proxy = proxy::start(Arc::clone(&engine), reqwest::Client::new())
+        .await
+        .map_err(|error| ExecError::Agent(format!("credential proxy failed to start: {error}")))?;
+
+    let placeholder = proxy::mint_anthropic_placeholder();
+    engine
+        .register(proxy::JobCredential {
+            placeholder: placeholder.clone(),
+            real: real.clone(),
+            upstream: upstream.clone(),
+        })
+        .map_err(|refusal| {
+            ExecError::Agent(format!("credential proxy registration refused: {refusal}"))
+        })?;
+
+    let contained = contain_env_values(forwarded, &real, &placeholder, &proxy.container_base_url());
+    Ok(Some((contained, proxy)))
+}
+
+/// Rewrite the forwarded env into what the container actually receives: every occurrence of the real
+/// credential `real` is replaced by `placeholder` (value-based, so an operator-added `[sandbox]
+/// forward_env` variable carrying the same secret is scrubbed too — #647 acceptance #2), and
+/// `ANTHROPIC_BASE_URL` is overridden to `base_url` so the container talks to the proxy, not the
+/// vendor. The real credential value appears in NO returned pair.
+///
+/// A pure transform so the red-prove test can assert the real credential is absent from the container
+/// view without a container, a network, or a real key.
+#[cfg(feature = "acp")]
+pub fn contain_env_values(
+    forwarded: &[(String, String)],
+    real: &str,
+    placeholder: &str,
+    base_url: &str,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = forwarded
+        .iter()
+        .map(|(key, value)| (key.clone(), value.replace(real, placeholder)))
+        .collect();
+    match out.iter_mut().find(|(key, _)| key == CONTAINED_BASE_URL_ENV) {
+        Some(entry) => entry.1 = base_url.to_owned(),
+        None => out.push((CONTAINED_BASE_URL_ENV.to_owned(), base_url.to_owned())),
+    }
+    out
 }
 
 #[cfg(feature = "acp")]
@@ -1199,6 +1324,133 @@ mod tests {
         assert!(
             windowed(&launch.args, &["-e", "ANTHROPIC_API_KEY=sk-ant-xxx"]),
             "the credential must cross as a -e flag: {:?}",
+            launch.args
+        );
+    }
+
+    // ── Credential containment red-prove (#647 acceptance #2) ────────────────────────────────────
+
+    // A SYNTHETIC stand-in for a real model credential — never a real key (#647 discipline). Vendor
+    // prefix + length so it is realistic, with an obvious `SYNTHETIC` marker so no reader mistakes it.
+    #[cfg(feature = "acp")]
+    const SYNTHETIC_REAL_KEY: &str =
+        "sk-ant-api03-SYNTHETICreal00000000000000000000000000000000000000000000000000000000000000AA";
+
+    // The entire container view of a launch: the program plus every argument, as one searchable list.
+    #[cfg(feature = "acp")]
+    fn container_view(launch: &AgentLaunch) -> Vec<String> {
+        let mut view = vec![launch.program.clone()];
+        view.extend(launch.args.iter().cloned());
+        view
+    }
+
+    // RED-PROVE, the FAILING half. Today the real credential is forwarded verbatim as
+    // `-e ANTHROPIC_API_KEY=<real>`, so the container view CONTAINS the secret — this is the exact
+    // state the containment removes. Asserting the leak here proves the green test below is not
+    // vacuous: strip the containment and this same "absent" assertion goes red.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn todays_forwarding_leaks_the_real_credential_into_the_container_view() {
+        let policy = SandboxPolicy::docker(DockerPolicy {
+            image: "maxplayer-sandbox:latest".into(),
+            forward_env: Vec::new(),
+            runtime: None,
+        });
+        let forwarded = vec![
+            ("ANTHROPIC_API_KEY".to_string(), SYNTHETIC_REAL_KEY.to_string()),
+            ("MY_AGENT_TOKEN".to_string(), SYNTHETIC_REAL_KEY.to_string()),
+        ];
+        let launch = policy
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &forwarded))
+            .expect("launch");
+        assert!(
+            container_view(&launch).iter().any(|s| s.contains(SYNTHETIC_REAL_KEY)),
+            "precondition: today's -e forwarding must leak the credential, else the red-prove is vacuous"
+        );
+    }
+
+    // RED-PROVE, the PASSING half (#647 acceptance #2). With containment the real credential appears
+    // NOWHERE in the container view — not in ANTHROPIC_API_KEY, and not in an operator-added
+    // forward_env var that carried the same secret — while a format-plausible placeholder and the
+    // proxy base-URL override take its place and the host-gateway pinhole is opened.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn contained_launch_keeps_the_real_credential_out_of_the_container_view() {
+        let policy = SandboxPolicy::docker(DockerPolicy {
+            image: "maxplayer-sandbox:latest".into(),
+            forward_env: Vec::new(),
+            runtime: None,
+        });
+        // Forwarded env as it is TODAY: the real key, an operator var carrying the same secret, and
+        // an operator base URL (which the override must replace, not append to).
+        let forwarded = vec![
+            ("ANTHROPIC_API_KEY".to_string(), SYNTHETIC_REAL_KEY.to_string()),
+            ("MY_AGENT_TOKEN".to_string(), SYNTHETIC_REAL_KEY.to_string()),
+            ("ANTHROPIC_BASE_URL".to_string(), "https://api.anthropic.com".to_string()),
+        ];
+        let placeholder = crate::credential_proxy::mint_anthropic_placeholder();
+        let base_url = "http://host.docker.internal:54321";
+        let contained = contain_env_values(&forwarded, SYNTHETIC_REAL_KEY, &placeholder, base_url);
+
+        let launch = policy
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &contained))
+            .expect("launch");
+
+        for element in container_view(&launch) {
+            assert!(
+                !element.contains(SYNTHETIC_REAL_KEY),
+                "real credential leaked into the container view: {element}"
+            );
+        }
+
+        let api_key = format!("ANTHROPIC_API_KEY={placeholder}");
+        let base = format!("ANTHROPIC_BASE_URL={base_url}");
+        let operator = format!("MY_AGENT_TOKEN={placeholder}");
+        assert!(
+            windowed(&launch.args, &["-e", api_key.as_str()]),
+            "the placeholder must cross as the API key: {:?}",
+            launch.args
+        );
+        assert!(
+            windowed(&launch.args, &["-e", base.as_str()]),
+            "the base-URL override must point at the proxy: {:?}",
+            launch.args
+        );
+        assert!(
+            windowed(&launch.args, &["--add-host", "host.docker.internal:host-gateway"]),
+            "the host-gateway pinhole must be opened: {:?}",
+            launch.args
+        );
+        assert!(
+            windowed(&launch.args, &["-e", operator.as_str()]),
+            "an operator forward_env var carrying the secret must be scrubbed to the placeholder: {:?}",
+            launch.args
+        );
+        // Exactly one ANTHROPIC_BASE_URL is present — the override replaced, not appended.
+        assert_eq!(
+            launch.args.iter().filter(|a| a.starts_with("ANTHROPIC_BASE_URL=")).count(),
+            1,
+            "base URL must be overridden in place, not duplicated: {:?}",
+            launch.args
+        );
+    }
+
+    // A docker launch that carries no proxy alias opens no host-gateway pinhole — the flag is added
+    // only when something references the alias (cleancut: no inert flags).
+    #[cfg(feature = "acp")]
+    #[test]
+    fn docker_launch_without_containment_opens_no_pinhole() {
+        let policy = SandboxPolicy::docker(DockerPolicy {
+            image: "img".into(),
+            forward_env: Vec::new(),
+            runtime: None,
+        });
+        let launch = policy
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
+            .expect("launch");
+        assert!(
+            !launch.args.iter().any(|a| a == "--add-host"),
+            "no alias referenced ⇒ no --add-host: {:?}",
             launch.args
         );
     }
