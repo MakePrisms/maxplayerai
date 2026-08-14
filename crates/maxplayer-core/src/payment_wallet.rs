@@ -1673,7 +1673,7 @@ enum BuyerCommand {
     /// HTTP that deadlocked #387. Read-only (queries the keyset fee); no proofs move.
     PreflightFee {
         amount: Amount,
-        response: mpsc::SyncSender<Result<(), PaymentWalletError>>,
+        response: mpsc::SyncSender<Result<Amount, PaymentWalletError>>,
     },
     Lock {
         attempt_id: AttemptId,
@@ -1800,8 +1800,9 @@ impl<R> CdkPaymentEffects<R> {
                             BuyerCommand::PreflightFee { amount, response } => {
                                 // Read-only dust/liveness probe on the worker runtime; a dead mint
                                 // fails closed (bounded by MINT_TOUCH_TIMEOUT) before any budget commit.
-                                let result =
-                                    require_fee_safe_amount(&wallet, amount).await.map(|_fee| ());
+                                // Returns the N=1 active-keyset input fee so the direct pay path can
+                                // fold it into the cap charge (MakePrisms/maxplayerai#185).
+                                let result = require_fee_safe_amount(&wallet, amount).await;
                                 let _ = response.send(result);
                             }
                             BuyerCommand::Lock {
@@ -1908,7 +1909,13 @@ impl<R> CdkPaymentEffects<R> {
     /// dead/hung mint refuses with a bounded fail-closed error; the pay path returns BEFORE the budget
     /// gate, so a refusal burns ZERO spend — the property the removed pre-spawn check gave, minus the
     /// #387 cross-runtime deadlock. Read-only: queries the keyset fee, no proofs move.
-    pub fn preflight_fee(&self, amount: Amount) -> Result<(), PreflightError> {
+    ///
+    /// On success returns the estimated active-keyset input fee (the N=1 floor,
+    /// `ceil(input_fee_ppk / 1000)`) for the send, so the DIRECT pay path can fold it into the cap
+    /// charge — the swap input fee otherwise leaves the wallet uncounted by the per-job cap
+    /// (MakePrisms/maxplayerai#185). It is a floor, not the exact `send_fee`: the real input count is
+    /// unknown until `prepare_send`, so the cap counts at least one input's worth of fee.
+    pub fn preflight_fee(&self, amount: Amount) -> Result<u64, PreflightError> {
         let (response, result) = mpsc::sync_channel(1);
         self.commands
             .as_ref()
@@ -1918,7 +1925,7 @@ impl<R> CdkPaymentEffects<R> {
                 PreflightError::Other(format!("payment wallet worker unavailable: {error}"))
             })?;
         match result.recv_timeout(self.recv_timeout) {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(fee)) => Ok(fee.to_u64()),
             Ok(Err(PaymentWalletError::MintUnreachable { reason, mint, detail })) => {
                 Err(PreflightError::MintUnreachable { reason, mint, detail })
             }

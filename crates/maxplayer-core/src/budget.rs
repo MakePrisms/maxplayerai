@@ -87,12 +87,28 @@ struct LegacySpentFile {
 struct LedgerRecord {
     /// Sats counted toward spent by this record.
     amount_sats: u64,
-    /// Present on the real pay path; folds idempotently (counted at most once).
+    /// Sats credited BACK (subtracted from spent) by this record — a reconciliation entry.
+    /// A record is either a spend (`amount_sats > 0`, `credit_sats == 0`) or a credit
+    /// (`amount_sats == 0`, `credit_sats > 0`); the fold applies add-then-saturating-sub, so a
+    /// pure credit lowers spent and a pure spend raises it. Used by the cross-mint hop to return
+    /// the unused Lightning fee reserve once the melt reconciles the reserve against the actual
+    /// fee (MakePrisms/maxplayerai#186). A pre-#186 line has no field and defaults to 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    credit_sats: u64,
+    /// Present on the real pay path; folds idempotently (counted at most once). A credit record
+    /// carries its OWN reconcile key here (namespaced away from the spend's attempt id) so the
+    /// credit dedupes independently of the spend it reconciles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     attempt_id: Option<String>,
     /// Unix seconds at append — diagnostic only, never feeds the cap check.
     #[serde(default)]
     recorded_at: u64,
+}
+
+/// serde skip predicate: a zero credit is the common (spend) case, kept off disk so spend lines
+/// stay byte-identical to pre-#186 records.
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Spent state derived by folding the legacy base and the ledger records.
@@ -230,6 +246,44 @@ impl BudgetGate {
         Ok(effect())
     }
 
+    /// Credit an over-reserved amount back to spent, keyed by `reconcile_id` (at-most-once).
+    ///
+    /// The cross-mint hop charges the cap a worst-case Lightning fee reserve BEFORE the melt
+    /// (fail-closed: it must pass the cap before any money moves). Once the melt settles, the fee
+    /// actually paid is known and the unused reserve came back to the wallet as change — so leaving
+    /// the full reserve counted understates the remaining allowance. This returns that difference
+    /// (MakePrisms/maxplayerai#186).
+    ///
+    /// Discipline mirrors [`Self::reserve`]: the same cross-process advisory lock guards
+    /// refresh→dedupe→append→update, and the credit is idempotent — a retry of the same
+    /// `reconcile_id` (judged against a fresh fold under the lock) is a no-op, so a reconciliation
+    /// can never be applied twice. `reconcile_id` MUST be distinct from the spend's attempt id (the
+    /// caller namespaces it) so the credit dedupes independently of the spend it reconciles.
+    ///
+    /// Fail direction is safe: this only ever LOWERS spent, and the durable append happens before
+    /// the in-memory update, so a crash mid-credit leaves spent at the higher (over-counted) value —
+    /// never below real outlay. A zero credit is a no-op.
+    pub fn credit_reserve(
+        &mut self,
+        reconcile_id: &str,
+        credit_sats: u64,
+    ) -> Result<(), BudgetRefuse> {
+        if credit_sats == 0 {
+            return Ok(());
+        }
+        let _lock = self.acquire_lock()?;
+        self.refresh()?;
+        if self.counted_attempts.contains(reconcile_id) {
+            // Already reconciled and persisted — do not credit twice.
+            return Ok(());
+        }
+        // Durable append-before in-memory update, exactly as a spend commits.
+        self.append_credit(reconcile_id, credit_sats)?;
+        self.spent = self.spent.saturating_sub(credit_sats);
+        self.counted_attempts.insert(reconcile_id.to_owned());
+        Ok(())
+    }
+
     /// Reserve `amount` against the cap: hold the cross-process advisory lock over the whole
     /// refresh→check→append→in-memory-update section so two buyer processes sharing one home
     /// cannot both pass the cap check and both spend (TOCTOU closed). When `attempt_id` is set,
@@ -286,7 +340,24 @@ impl BudgetGate {
             path,
             &LedgerRecord {
                 amount_sats: amount,
+                credit_sats: 0,
                 attempt_id: attempt_id.map(str::to_owned),
+                recorded_at: now_unix(),
+            },
+        )
+    }
+
+    /// Append one reconciliation credit record (durable). No-op for the in-memory gate.
+    fn append_credit(&self, reconcile_id: &str, credit_sats: u64) -> Result<(), BudgetRefuse> {
+        let Some(path) = self.ledger_path.as_ref() else {
+            return Ok(());
+        };
+        append_record(
+            path,
+            &LedgerRecord {
+                amount_sats: 0,
+                credit_sats,
+                attempt_id: Some(reconcile_id.to_owned()),
                 recorded_at: now_unix(),
             },
         )
@@ -334,13 +405,20 @@ fn fold_ledger(path: &Path, base: Option<&FoldedSpent>) -> Result<FoldedSpent, B
         }
         let record: LedgerRecord = serde_json::from_str(trimmed)
             .map_err(|error| BudgetRefuse::Persist(error.to_string()))?;
+        // A spend raises spent; a credit (reconciliation) lowers it. `saturating_sub` floors spent
+        // at 0 so a credit can never drive the total negative even if records are read out of order.
+        // Bind the amounts before matching on `attempt_id` (which moves the String out of `record`).
+        let amount_sats = record.amount_sats;
+        let credit_sats = record.credit_sats;
+        let apply =
+            |spent: u64| spent.saturating_add(amount_sats).saturating_sub(credit_sats);
         match record.attempt_id {
             Some(id) => {
                 if folded.counted_attempts.insert(id) {
-                    folded.spent = folded.spent.saturating_add(record.amount_sats);
+                    folded.spent = apply(folded.spent);
                 }
             }
-            None => folded.spent = folded.spent.saturating_add(record.amount_sats),
+            None => folded.spent = apply(folded.spent),
         }
     }
     Ok(folded)
@@ -547,6 +625,40 @@ mod tests {
         assert_eq!(reloaded.spent(), 21);
     }
 
+    // #186 RED-PROVE: mirror the hop pay flow — charge the worst-case reserve, then reconcile against
+    // the actual fee. The credit must lower spent to real outlay, survive reload (durable), and be
+    // idempotent (a retried reconciliation credits at most once). Before #186 there was no
+    // credit_reserve at all, so spent stayed pinned at the worst-case charge.
+    #[test]
+    fn hop_fee_reserve_credit_reconciles_spent_to_real_outlay_durably_and_at_most_once() {
+        let root = temp_home("hop-reconcile");
+        let _ = fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("bootstrap");
+        let mut gate = BudgetGate::from_home(&home).expect("gate");
+
+        // Charge the hop's worst-case planned cost: 100 delivered + 7 reserved fee + 2 input fee.
+        gate.authorize_then_attempt("attempt-1", 109, || "paid")
+            .expect("charge planned cost");
+        assert_eq!(gate.spent(), 109, "worst-case reservation is counted first");
+
+        // The melt actually paid 2 sats of the 7 reserved; credit the 5-sat difference back.
+        let reconcile_id = "attempt-1:hop-fee-reconcile";
+        gate.credit_reserve(reconcile_id, 5).expect("credit unused reserve");
+        assert_eq!(gate.spent(), 104, "spent must reflect real outlay after reconcile");
+
+        // Durable: a fresh gate folds the credit from disk.
+        let reloaded = BudgetGate::from_home(&home).expect("reload");
+        assert_eq!(reloaded.spent(), 104, "the credit must survive reload");
+
+        // At-most-once: replaying the same reconciliation is a no-op — never a second credit.
+        gate.credit_reserve(reconcile_id, 5).expect("idempotent replay");
+        assert_eq!(gate.spent(), 104, "a repeated reconcile must not credit twice");
+
+        // The spend's own attempt id is a DISTINCT dedupe key from the reconcile id.
+        assert!(gate.has_counted_attempt("attempt-1"));
+        assert!(gate.has_counted_attempt(reconcile_id));
+    }
+
     #[test]
     fn durable_refuse_leaves_spent_file_unchanged() {
         let root = temp_home("refuse-persist");
@@ -730,19 +842,19 @@ mod tests {
         let ledger = home.root.join(LEDGER_FILE);
         append_record(
             &ledger,
-            &LedgerRecord { amount_sats: 10, attempt_id: Some("x".into()), recorded_at: 0 },
+            &LedgerRecord { amount_sats: 10, credit_sats: 0, attempt_id: Some("x".into()), recorded_at: 0 },
         )
         .expect("append x");
         // Duplicate append of the same attempt id — must fold once.
         append_record(
             &ledger,
-            &LedgerRecord { amount_sats: 10, attempt_id: Some("x".into()), recorded_at: 0 },
+            &LedgerRecord { amount_sats: 10, credit_sats: 0, attempt_id: Some("x".into()), recorded_at: 0 },
         )
         .expect("append x dup");
         // Keyless record — always counts.
         append_record(
             &ledger,
-            &LedgerRecord { amount_sats: 5, attempt_id: None, recorded_at: 0 },
+            &LedgerRecord { amount_sats: 5, credit_sats: 0, attempt_id: None, recorded_at: 0 },
         )
         .expect("append keyless");
 
@@ -761,7 +873,7 @@ mod tests {
         let ledger = home.root.join(LEDGER_FILE);
         append_record(
             &ledger,
-            &LedgerRecord { amount_sats: 10, attempt_id: None, recorded_at: 0 },
+            &LedgerRecord { amount_sats: 10, credit_sats: 0, attempt_id: None, recorded_at: 0 },
         )
         .expect("append");
         {
@@ -819,7 +931,7 @@ mod tests {
         // Process 1 records the SAME attempt's 40-sat spend, then releases the lock.
         append_record(
             &ledger,
-            &LedgerRecord { amount_sats: 40, attempt_id: Some("shared".into()), recorded_at: 0 },
+            &LedgerRecord { amount_sats: 40, credit_sats: 0, attempt_id: Some("shared".into()), recorded_at: 0 },
         )
         .expect("process-1 spend");
         held.unlock().expect("release lock");
