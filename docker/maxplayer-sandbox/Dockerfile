@@ -20,9 +20,15 @@ RUN apt-get update \
 # shells out to its underlying CLI (the `claude` / `codex` binary, via CLAUDE_CODE_EXECUTABLE for
 # claude); provisioning that CLI + its credentials into this image is the seller-operator step layered
 # on top of this base.
+#
+# Versions are PINNED to exact releases. An unpinned `npm install -g` resolves to whatever is latest at
+# build time, so two builds of the same commit could bake different adapters — which makes the published
+# image's digest identify the artifact without the artifact being reproducible. Pinning is what lets the
+# digest correspond to a known adapter set, closing the gap called out in #792 (babu's F6 from the #221
+# security review). Bump these deliberately alongside a release.
 RUN npm install -g \
-    @agentclientprotocol/claude-agent-acp \
-    @agentclientprotocol/codex-acp \
+    @agentclientprotocol/claude-agent-acp@0.67.0 \
+    @agentclientprotocol/codex-acp@1.2.0 \
     && npm cache clean --force
 
 # HOME is a CONTAINER-ONLY path, deliberately NOT the mounted workdir.
