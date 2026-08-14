@@ -294,7 +294,10 @@ pub struct SandboxConfig {
     )]
     pub launcher: Vec<String>,
     /// `docker` mode: the container image carrying the agent runtime (node + ACP adapter + git +
-    /// CA certs — see `docker/maxplayer-sandbox/Dockerfile`). Required under `docker` mode.
+    /// CA certs — see `docker/maxplayer-sandbox/Dockerfile`). OPTIONAL: omitted ⇒ the binary supplies
+    /// the version-pinned default [`crate::seller_exec::DEFAULT_SANDBOX_IMAGE`], so a fresh seller who
+    /// sets only `mode = "docker"` gets a working container. Set this ONLY to run a fully-custom image;
+    /// it is NOT a version selector (the binary owns the version).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
     /// `docker` mode: EXTRA environment variables to carry from the daemon into the container, on
@@ -1451,18 +1454,19 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
 #
 # Option B - docker on LINUX. gVisor (runsc) is the primary boundary. Install
 # it first (docs/SANDBOXING.md), then confirm:  docker info | grep -i runsc
+# The image is supplied by this binary (a version-pinned GHCR ref); leave it
+# unset. `doctor` prints the exact `docker pull` command if it is not present.
 #   [sandbox]
 #   mode = "docker"
-#   image = "maxplayer-sandbox:latest"
 #   runtime = "runsc"                  # gVisor - LINUX ONLY
+#   # image = "ghcr.io/you/custom:tag" # ONLY to run a fully-custom image; NOT a version pin
 #   # forward_env = ["MY_AGENT_TOKEN"] # extra env names, atop the built-in auth allowlist
 #
 # Option C - docker on macOS. Docker Desktop cannot load runsc, so OMIT the
 # runtime line; the platform VM is the boundary. Otherwise identical to B.
 #   [sandbox]
 #   mode = "docker"
-#   image = "maxplayer-sandbox:latest"
-#   # (no runtime line on macOS)
+#   # (no runtime line on macOS; image defaulted by the binary as in Option B)
 "#,
     );
     Ok(out)
