@@ -31,7 +31,6 @@
   --sans: "Saira", ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 
   --nav-h: 46px;
-  --tape-h: 30px;
 }
 
 * { box-sizing: border-box; }
@@ -100,83 +99,19 @@ a { color: var(--neon); }
 .nav-toggle[aria-expanded="true"] span:nth-child(2) { opacity: 0; }
 .nav-toggle[aria-expanded="true"] span:nth-child(3) { transform: translateY(-7px) rotate(-45deg); }
 
-/* ---------- tape: the ticker ---------- */
-.tape {
-  cursor: pointer;
-  height: var(--tape-h); overflow: hidden;
-  border-bottom: 1px solid var(--line);
-  background: var(--bg-2);
-  display: flex; align-items: center;
-  position: relative;
-}
-/* the arrival sequence: a red streak races right across the empty strip, then
-   an opaque cover with a yellow leading edge races back left — the tape is
-   already gliding underneath, so the yellow wiper reveals it on its way out.
-   The strip's 30px slot is reserved from first paint; nothing below moves. */
-.tape::before {
-  content: ""; position: absolute; z-index: 3; top: 0; bottom: 0;
-  left: -140px; width: 100px;
-  background: var(--blue);
-  transform: skewX(-14deg);
-  opacity: 0; pointer-events: none;
-}
-.tape::after {
-  content: ""; position: absolute; z-index: 2; top: 0; bottom: 0;
-  left: -3%; width: 106%;
-  /* the cover: strip-colored body, yellow trailing edge */
-  background: linear-gradient(90deg, var(--bg-2) 0 calc(100% - 14px), #ffdf00 calc(100% - 14px) 100%);
-  transform: skewX(-14deg);
-  pointer-events: none;
-}
-.tape.live::before { animation: tape-red 0.5s ease-in forwards; }
-.tape.live::after { animation: tape-wipe 0.65s ease-out 0.45s forwards; }
-@keyframes tape-red {
-  0% { opacity: 1; transform: skewX(-14deg) translateX(0); }
-  100% { opacity: 1; transform: skewX(-14deg) translateX(calc(100vw + 280px)); }
-}
-@keyframes tape-wipe {
-  0% { transform: skewX(-14deg) translateX(0); }
-  100% { transform: skewX(-14deg) translateX(-112%); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .tape::before { display: none; }
-  .tape.live::after { animation: none; opacity: 0; }
-}
-.tape:empty, .tape-in:empty { display: none; }
-.tape-in {
-  display: inline-flex; gap: 0; white-space: nowrap;
-  /* scrolled by ui/board.ts in PIXELS, not a CSS %-based marquee: content
-     width changes when skeletons become data and when the spot quote lands,
-     and a %-based animation jumps at every such swap. The JS keeps the pixel
-     offset across rebuilds, so items repaint in place while the glide
-     continues unbroken. */
-  will-change: transform;
-}
-.tape-item {
-  display: inline-flex; align-items: baseline; gap: 7px;
-  padding: 0 22px; font-size: 11px; letter-spacing: 0.04em;
-  color: var(--ink-2); text-transform: uppercase;
-}
-.tape-item .t-tag { color: var(--faint); }
-.tape-item .t-new { color: var(--neon); font-weight: 700; }
-.tape-item .t-pass { color: #ff6a4d; font-weight: 700; }
-.tape-item .t-amt { color: var(--neon); font-weight: 700; }
-.tape-item .t-sep { color: var(--line); }
-.tape-item.t-spot .t-amt { color: var(--ink); }
-
 /* ---------- anchor landings ---------- */
 /* The nav is sticky, so an anchored section scrolls up underneath it without
-   a scroll margin. #top's margin equals nav+tape exactly: the scroll lands at
-   the true page top, tape visible, hero starting right below it. #market's
-   extra 1px keeps the hero's bottom rule — the line above "Marketplace" —
-   visible just under the nav. */
-.hero { scroll-margin-top: calc(var(--nav-h) + var(--tape-h)); }
+   a scroll margin. #top's margin equals the nav height, so the scroll lands at
+   the true page top with the hero starting right below it. #market's extra 1px
+   keeps the hero's bottom rule — the line above "Marketplace" — visible just
+   under the nav. */
+.hero { scroll-margin-top: var(--nav-h); }
 .market { scroll-margin-top: calc(var(--nav-h) + 1px); }
 .pitch { scroll-margin-top: var(--nav-h); }
 
 /* ---------- hero ---------- */
 .hero {
-  min-height: min(calc(52vh - var(--nav-h) - var(--tape-h)), 560px);
+  min-height: min(calc(52vh - var(--nav-h)), 560px);
   display: flex; align-items: center; justify-content: center;
   padding: 52px 18px 44px; text-align: center;
   border-bottom: 1px solid var(--line);
@@ -667,7 +602,7 @@ ol .row:hover .dot.working i, ol .row:focus-visible .dot.working i {
 }
 /* pinned: the classic docked layout — anchored to its edge, full height below
    the chrome, no drag or resize. The pin button pops it out. */
-.dock.pinned { resize: none; top: calc(var(--nav-h) + var(--tape-h)); bottom: 0; width: min(420px, 94vw); max-height: none; }
+.dock.pinned { resize: none; top: var(--nav-h); bottom: 0; width: min(420px, 94vw); max-height: none; }
 .dock-left.pinned { left: 0; border-left: 0; }
 .dock-right.pinned { left: auto; right: 0; border-right: 0; }
 .dock-mid.pinned { left: 50%; transform: translateX(-50%); width: min(460px, 94vw); }
@@ -861,8 +796,8 @@ button.chip { cursor: pointer; }
      chrome and stack, last opened on top. !important beats the inline
      geometry the window manager writes on desktop. */
   .dock {
-    left: 0 !important; top: calc(var(--nav-h) + var(--tape-h)) !important;
-    width: 100% !important; height: calc(100vh - var(--nav-h) - var(--tape-h)) !important;
+    left: 0 !important; top: var(--nav-h) !important;
+    width: 100% !important; height: calc(100vh - var(--nav-h)) !important;
     max-width: 100vw; resize: none;
     /* the mid dock centers itself with translateX(-50%) on desktop — with
        left forced to 0 here, that transform dragged event screens half a
@@ -878,7 +813,7 @@ button.chip { cursor: pointer; }
 /* ---------- reduced motion ---------- */
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
-  .tape-in, .dot.working, .dot.working i, .sl { animation: none !important; }
+  .dot.working, .dot.working i, .sl { animation: none !important; }
   /* motion gone, meaning kept: a static bright streak still reads as working */
   .dot.working i:first-child { background: var(--neon); }
   .conn[data-state="connecting"] .sl, .conn[data-state="history"] .sl { background: var(--blue); }

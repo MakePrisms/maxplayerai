@@ -17,7 +17,7 @@ import { DEFAULT_WINDOW, WINDOWS } from "./market/participants.js";
 import { createRelaySource } from "./source/relay.js";
 import { createEventDb } from "./store/db.js";
 import type { RawEvent } from "./model/events.js";
-import { renderBuyers, renderFeed, renderSellers, renderStats, renderTicker, startTape } from "./ui/board.js";
+import { renderBuyers, renderFeed, renderSellers, renderStats } from "./ui/board.js";
 import { refreshDocks, wireDocks, writeClipboard } from "./ui/docks.js";
 import { ago, now } from "./ui/format.js";
 import { refreshAges } from "./ui/reconcile.js";
@@ -90,7 +90,6 @@ async function boot(): Promise<void> {
   wirePicker();
   renderWindows();
   startSpot();
-  startTape();
 
   const engine = createEngine({ windowKey });
   const db = await createEventDb();
@@ -136,7 +135,6 @@ async function boot(): Promise<void> {
     renderSellers(view);
     renderFeed(view);
     renderStats(view);
-    renderTicker(view);
     refreshDocks(view);
   });
   onSpotChange(() => engine.flush()); // money cells re-derive on a new quote

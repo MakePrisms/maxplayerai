@@ -47,7 +47,7 @@ const dockGeom: Record<DockKey, Geom | null> = { left: null, mid: null, right: n
 const dockPinned: Record<DockKey, boolean> = { left: true, mid: true, right: true };
 
 /** Space reserved for the fixed chrome above the page. */
-const CHROME_TOP = 76; // --nav-h + --tape-h
+const CHROME_TOP = 46; // --nav-h
 
 const isMobile = (): boolean => window.matchMedia("(max-width: 700px)").matches;
 
