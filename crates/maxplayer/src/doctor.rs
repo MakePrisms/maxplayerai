@@ -292,6 +292,9 @@ mod checks {
     const AGENT_CHECK: &str = "agent preset";
     const TELEMETRY_CHECK: &str = "telemetry";
     const SANDBOX_CHECK: &str = "sandbox launcher";
+    /// Named apart from SANDBOX_CHECK: that one says `docker` resolves, this one says the docker IMAGE
+    /// the seat will run jobs in is actually available (present locally or pullable).
+    const SANDBOX_IMAGE_CHECK: &str = "sandbox image";
     /// Named apart from SANDBOX_CHECK on purpose: one says the launcher exists, the other says it
     /// confines, and a reader scanning the output must be able to tell which one passed.
     const CONTAINMENT_CHECK: &str = "sandbox containment";
@@ -779,6 +782,99 @@ mod checks {
         )
     }
 
+    /// Whether the docker sandbox image is on hand for the first job.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ImageAvailability {
+        /// `docker image inspect <ref>` succeeded — the image is already pulled locally.
+        Present,
+        /// Not local, but `docker manifest inspect <ref>` reached it in the registry — `docker run`
+        /// will auto-pull it on the first job. Pre-pulling avoids that first-job latency.
+        Pullable,
+        /// Neither local nor reachable in the registry (not yet published, wrong ref, auth, or no
+        /// network). The operator has to act before a job can run.
+        Absent,
+    }
+
+    /// The docker sandbox image the seat runs jobs in must be present locally or pullable, or the
+    /// FIRST awarded job stalls (or fails) on an image `docker run` cannot find. `check_sandbox_launcher`
+    /// one layer out only proves `docker` itself resolves; the image is a separate object with its own
+    /// failure mode. Under a non-docker policy there is no image, so this is a no-op Pass.
+    ///
+    /// On absence the check prints the EXACT `docker pull <ref>` command, so the operator acts without
+    /// reading source — and running it surfaces the real reason (unpublished, auth, offline) directly.
+    pub(super) fn check_sandbox_image(sandbox: Option<SandboxConfig>) -> Check {
+        let policy = match SandboxPolicy::from_config(sandbox.as_ref()) {
+            Ok(policy) => policy,
+            // The launcher check already reports an unresolvable [sandbox]; don't double-fail here.
+            Err(_) => return Check::pass(SANDBOX_IMAGE_CHECK, "no docker image to check"),
+        };
+        let Some(image) = policy.docker_image() else {
+            return Check::pass(SANDBOX_IMAGE_CHECK, "no docker image to check (not mode=docker)");
+        };
+        // Only probe the image once docker itself resolves — otherwise the inspect would ENOENT and be
+        // misread as an absent image. A missing docker is the launcher check's verdict, not this one's.
+        if !argv0_resolvable("docker") {
+            return Check::pass(
+                SANDBOX_IMAGE_CHECK,
+                format!("docker not resolvable; image '{image}' unchecked (see sandbox launcher)"),
+            );
+        }
+        fold_sandbox_image(image, probe_image_availability(image))
+    }
+
+    /// Turn a probed [`ImageAvailability`] into a Check. Pure, so the verdict wording — and the exact
+    /// `docker pull` hint on absence — is testable without a docker daemon.
+    pub(super) fn fold_sandbox_image(image: &str, availability: ImageAvailability) -> Check {
+        let pull = format!("docker pull {image}");
+        match availability {
+            ImageAvailability::Present => {
+                Check::pass(SANDBOX_IMAGE_CHECK, format!("image '{image}' present locally"))
+            }
+            ImageAvailability::Pullable => Check::warn(
+                SANDBOX_IMAGE_CHECK,
+                format!(
+                    "image '{image}' is not present locally but is pullable — docker will fetch it on \
+                     the first job"
+                ),
+                format!("pre-pull to avoid a first-job delay: {pull}"),
+            ),
+            ImageAvailability::Absent => Check::fail(
+                SANDBOX_IMAGE_CHECK,
+                format!(
+                    "image '{image}' is not present locally and could not be reached in the registry — \
+                     the first awarded job would fail to start"
+                ),
+                pull,
+            ),
+        }
+    }
+
+    /// Probe whether `image` is present locally or pullable, executing docker with every stdio stream
+    /// nulled (same discipline as [`nix_runs`]) so the gate's output is never polluted or blocked.
+    /// `docker image inspect` is a purely-local lookup; `docker manifest inspect` is a registry HEAD
+    /// that pulls no layers.
+    fn probe_image_availability(image: &str) -> ImageAvailability {
+        if docker_probe_ok(&["image", "inspect", image]) {
+            ImageAvailability::Present
+        } else if docker_probe_ok(&["manifest", "inspect", image]) {
+            ImageAvailability::Pullable
+        } else {
+            ImageAvailability::Absent
+        }
+    }
+
+    /// True when `docker <args>` spawns and exits 0, all stdio nulled.
+    fn docker_probe_ok(args: &[&str]) -> bool {
+        std::process::Command::new("docker")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
     /// Containment, for a seat that serves the OPEN POOL — which means executing code posted by
     /// strangers. `check_sandbox_launcher` above answers "does the launcher resolve", a property
     /// one layer out from this one: bubblewrap resolves on Ubuntu 24.04 and then fails at spawn on
@@ -1098,7 +1194,7 @@ mod checks {
 
     /// True when `argv0` names a runnable program: an existing file path, or a bare name found on
     /// PATH. Mirrors how the seller daemon would launch it.
-    fn argv0_resolvable(argv0: &str) -> bool {
+    pub(super) fn argv0_resolvable(argv0: &str) -> bool {
         if argv0.is_empty() {
             return false;
         }
@@ -1213,6 +1309,7 @@ fn build_checks(
     let sandbox = home.config.sandbox.clone();
     let sandbox_for_launcher = sandbox.clone();
     let sandbox_for_creds = sandbox.clone();
+    let sandbox_for_image = sandbox.clone();
     // The probe runs in the seat's OWN home, because that is where a launcher's config points.
     let home_root = home.root.clone();
     // Open-pool claiming is the exposure the containment gate is about: it is what makes this box
@@ -1246,13 +1343,16 @@ fn build_checks(
     // The seller boot gate blocks on this (issue #357): a launcher that cannot spawn would let the
     // node advertise and then fail every job. Bypassable, like every check, via --skip-doctor.
     checks.push(Box::new(move || checks::check_sandbox_launcher(sandbox_for_launcher)));
-    // #647 P2a: the credential proxy contains ANTHROPIC_API_KEY only. A docker seat that also forwards
-    // an OAuth token or an OpenAI key still leaks that reusable secret into the container. Advisory
-    // WARN — never blocks boot (the containment gap is a known, ticketed scope limit, not a
-    // misconfiguration).
+    // #647 P2: the credential proxy contains every KNOWN model-credential variable. What it cannot
+    // recognize is an operator-added forward_env var (which may itself be a credential), so this WARNs
+    // when one is set. Advisory — never blocks boot; the operator chose to forward it.
     checks.push(Box::new(move || {
         checks::check_sandbox_credential_containment(sandbox_for_creds)
     }));
+    // #792 phase 3: under mode=docker, the image the seat runs jobs in must be present or pullable,
+    // or the first awarded job stalls. On absence this prints the exact `docker pull` command. A
+    // non-docker policy is a no-op Pass. Placed after the launcher (docker-resolves) check.
+    checks.push(Box::new(move || checks::check_sandbox_image(sandbox_for_image)));
     // Blocking for an open-pool seat (#451). Placed after the resolve check so that a launcher which
     // is not there reports as the missing file it is, rather than as a containment failure.
     checks.push(Box::new(move || {
@@ -1832,6 +1932,94 @@ mod tests {
             checks::check_sandbox_credential_containment_in(None, |_| Some("set".to_owned())).status,
             Status::Pass,
         );
+    }
+
+    // RED-PROVE (#792 phase 3): an absent docker sandbox image is flagged with the ACTIONABLE
+    // `docker pull <ref>` command, not a raw failure — the operator can act without reading source.
+    // A present image passes; a pullable one warns and still prints the pre-pull command.
+    #[test]
+    fn doctor_sandbox_image_flags_absence_with_pull_command() {
+        use checks::ImageAvailability;
+        let image = "ghcr.io/makeprisms/maxplayer-sandbox:v9.9.9";
+        let pull = format!("docker pull {image}");
+
+        let absent = checks::fold_sandbox_image(image, ImageAvailability::Absent);
+        assert_eq!(absent.status, Status::Fail, "an absent image must FAIL: {}", absent.render());
+        assert!(
+            absent.render().contains(&pull),
+            "an absent image must print the exact `{pull}` command: {}",
+            absent.render()
+        );
+
+        let present = checks::fold_sandbox_image(image, ImageAvailability::Present);
+        assert_eq!(present.status, Status::Pass, "a present image must PASS: {}", present.render());
+
+        let pullable = checks::fold_sandbox_image(image, ImageAvailability::Pullable);
+        assert_eq!(pullable.status, Status::Warn, "a pullable image WARNs: {}", pullable.render());
+        assert!(
+            pullable.render().contains(&pull),
+            "a pullable image must still offer the pre-pull command: {}",
+            pullable.render()
+        );
+    }
+
+    // A non-docker (or absent) [sandbox] has no image to check: a no-op Pass, never a spurious fault.
+    #[test]
+    fn doctor_sandbox_image_is_a_noop_without_docker_mode() {
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
+        assert_eq!(checks::check_sandbox_image(None).status, Status::Pass);
+        let launcher = Some(SandboxConfig {
+            mode: SandboxMode::Launcher,
+            launcher: vec!["bwrap".into()],
+            image: None,
+            forward_env: Vec::new(),
+            runtime: None,
+        });
+        assert_eq!(checks::check_sandbox_image(launcher).status, Status::Pass);
+    }
+
+    // RED-PROVE (wiring): the sandbox IMAGE check must be part of the boot-gate registry, or a docker
+    // seat boots with an unavailable image and stalls the first job. A docker seat with an image that
+    // cannot exist locally or in the registry (bogus registry host) must surface a "sandbox image"
+    // FAIL naming the pull command. Drop the `check_sandbox_image` push from `build_checks` → red.
+    // Network-touch is bounded: the ref points at an unresolvable host, so `docker manifest inspect`
+    // fails fast; the test is skipped where docker is not installed (nothing to probe).
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn sandbox_image_check_is_wired_into_the_boot_gate() {
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
+        if !checks::argv0_resolvable("docker") {
+            return; // no docker on this host; the image probe is a no-op Pass — nothing to assert
+        }
+        let tmp = std::env::temp_dir().join(format!(
+            "maxplayer-doctor-image-792-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut home = resolve_doctor_home(Some(tmp.clone())).expect("bootstrap the home");
+        home.config.sandbox = Some(SandboxConfig {
+            mode: SandboxMode::Docker,
+            launcher: Vec::new(),
+            image: Some("no-such-registry.invalid/nope:v0".into()),
+            forward_env: Vec::new(),
+            runtime: None,
+        });
+        home.config.relay_url = "not-a-relay-url".into();
+        home.config.accepted_mints = Vec::new();
+
+        let results = run_checks(build_checks(&home, false));
+        assert!(
+            results.iter().any(|c| c.status == Status::Fail
+                && c.detail.contains("no-such-registry.invalid/nope:v0")
+                && c.render().contains("docker pull no-such-registry.invalid/nope:v0")),
+            "build_checks must run the sandbox image check and FAIL with the pull command; got: {:?}",
+            results.iter().map(Check::render).collect::<Vec<_>>()
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     // RED-PROVE (wiring): the sandbox launcher check must be part of the seller boot gate registry,
