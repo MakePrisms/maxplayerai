@@ -123,10 +123,16 @@ test("activeTradeJobs: racer active from offer, runner from claim, losses and pa
   assert.ok(active.bySeller.get(SELLER)?.length, "winner stays active");
   assert.ok(!active.bySeller.get(SELLER2)?.length, "loser stops the moment they lose");
 
+  // Accepting the delivery ends the work: the buyer signed off on it. The
+  // receipt (payment) is a separate, optional announcement, so the lamp must
+  // not wait on it — that kept it flashing long after each completed job.
   const accepted = [...awarded, result(o.id, SELLER, T0 + 4), accept(o.id, T0 + 5)];
   active = activeTradeJobs(accepted, T0 + 10);
-  assert.ok(active.bySeller.get(SELLER)?.length, "accept alone keeps the lamp on — payment is the receipt");
-  const paid = [...accepted, receipt(o.id, T0 + 6, 5)];
+  assert.ok(!active.bySeller.get(SELLER)?.length, "accept ends the runner's work");
+  assert.ok(!active.byBuyer.get(BUYER)?.length, "and the racer's");
+
+  // A receipt with no prior accept also ends it — the money landed.
+  const paid = [...awarded, result(o.id, SELLER, T0 + 4), receipt(o.id, T0 + 6, 5)];
   active = activeTradeJobs(paid, T0 + 10);
   assert.ok(!active.byBuyer.get(BUYER)?.length, "the receipt ends the racer's activity");
   assert.ok(!active.bySeller.get(SELLER)?.length, "and the runner's");

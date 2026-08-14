@@ -84,10 +84,12 @@ export function activeTradeJobs(allEvents: RawEvent[], t: number): {
   const tradeByOffer = new Map(trades.map((tr) => [tr.offerId, tr]));
   const over = (trade: Trade | undefined, offerId: string): boolean => {
     if (!trade) return true;
-    // Paid means the RECEIPT — an accept only authorizes payment, and the
-    // lamp should keep running until the money lands (or the grace below
-    // expires it, since receipts are optional announcements).
-    if (trade.at.receipt != null) return true;
+    // Done means the buyer ACCEPTED the delivery: the work is finished and
+    // signed off. Payment (the receipt) is a separate, OPTIONAL announcement —
+    // most settled trades never publish one, so gating solely on the receipt
+    // left the lamp flashing through the whole grace window after every job
+    // that completed normally. Either the accept or a receipt ends it.
+    if (trade.at.accept != null || trade.at.receipt != null) return true;
     if (trade.declineReason) return true;                                // declined
     const deadline = deadlines.get(offerId);
     if (deadline && deadline < t && trade.at.result == null) return true; // blown, nothing delivered
