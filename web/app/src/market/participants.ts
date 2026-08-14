@@ -474,7 +474,8 @@ export function participantActivity(events: RawEvent[], pubkey: string): ParsedE
   const roots = new Set<string>();
   for (const e of parsed) {
     if (e.pubkey === pubkey || e.buyer === pubkey || e.seller === pubkey ||
-        e.awardedSeller === pubkey || e.targetSeller === pubkey) {
+        e.awardedSeller === pubkey || e.acceptedSeller === pubkey ||
+        e.receiptSeller === pubkey || e.targetSeller === pubkey) {
       if (e.offerId) roots.add(e.offerId);
     }
   }
