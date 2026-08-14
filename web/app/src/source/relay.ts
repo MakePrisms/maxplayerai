@@ -206,17 +206,21 @@ export function createRelaySource(
    * everything, and only then may a later visit skip the walk. Collapsing the
    * two is a green that cannot go red — a truncated read would report itself
    * fully synced and bake its own gap in.
+   *
+   * The distinction is deliberately NOT surfaced in the connection line: per
+   * bob, the page says `live` either way. It still governs what the store may
+   * claim about itself and still reaches the console, so the correctness
+   * tracking is intact — only the display was dropped.
    */
   function goLive(complete: boolean) {
     if (complete) {
       historyComplete = true;
       cursors.clear();
       drained.clear();
-      status("live");
     } else {
       console.warn(`[relay] history stopped at the ${MAX_PAGES}-page backstop; the store is not known complete`);
-      status("live", "partial history");
     }
+    status("live");
     callbacks.onSynced({ complete });
     if (transport === "stream") {
       // One subscription, left open: the relay pushes every new event as it
