@@ -298,6 +298,10 @@ pub struct SandboxConfig {
     /// the version-pinned default [`crate::seller_exec::DEFAULT_SANDBOX_IMAGE`], so a fresh seller who
     /// sets only `mode = "docker"` gets a working container. Set this ONLY to run a fully-custom image;
     /// it is NOT a version selector (the binary owns the version).
+    ///
+    /// LOCAL DEVELOPMENT: the default ref pins this build's version (`:v<CARGO_PKG_VERSION>`), which is
+    /// NOT published for dev builds — set `image` to a locally-built tag (e.g. `maxplayer-sandbox:latest`)
+    /// to override, or docker will fail to pull the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
     /// `docker` mode: EXTRA environment variables to carry from the daemon into the container, on
@@ -1456,10 +1460,14 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
 # it first (docs/SANDBOXING.md), then confirm:  docker info | grep -i runsc
 # The image is supplied by this binary (a version-pinned GHCR ref); leave it
 # unset. `doctor` prints the exact `docker pull` command if it is not present.
+# LOCAL DEV: the default ref is `:v<this build's version>`, which is NOT
+# published for dev builds — set `image` to a locally-built tag (e.g.
+# "maxplayer-sandbox:latest") to override, or the default will fail to pull.
 #   [sandbox]
 #   mode = "docker"
 #   runtime = "runsc"                  # gVisor - LINUX ONLY
 #   # image = "ghcr.io/you/custom:tag" # ONLY to run a fully-custom image; NOT a version pin
+#   # image = "maxplayer-sandbox:latest" # LOCAL DEV: your locally-built tag (default GHCR ref is unpublished for dev)
 #   # forward_env = ["MY_AGENT_TOKEN"] # extra env names, atop the built-in auth allowlist
 #
 # Option C - docker on macOS. Docker Desktop cannot load runsc, so OMIT the
