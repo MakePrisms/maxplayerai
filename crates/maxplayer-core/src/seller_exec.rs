@@ -74,84 +74,349 @@ impl AgentRunTimeout {
     }
 }
 
-/// How the awarded agent command is launched: either directly (pass-through) or inside a launcher
-/// (e.g. `bwrap …`, `systemd-nspawn …`) the command runs under. The wrap is a pure argv transform,
-/// so the run/exec path stays launcher-agnostic — the launcher is the only thing a future OS
-/// sandbox changes here.
+/// The in-container mount point for the per-job workdir under `docker` mode. The agent works here
+/// (its ACP session cwd), the host workdir is bind-mounted here read-write, and NOTHING ELSE of the
+/// host is mounted — so `$MAXPLAYER_HOME` (wallet/keys/journal) is absent from the container by
+/// construction.
+const CONTAINER_WORKDIR: &str = "/work";
+
+/// How the awarded agent command is launched. Pass-through and launcher runs stay on the host; a
+/// docker run puts the command inside a container that mounts only the per-job workdir. The launch
+/// is a pure transform over `(agent_command, JobLaunch)`, so the run/exec path stays executor-
+/// agnostic — swapping executors is the only thing that changes here.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxPolicy {
-    /// The launcher argv prepended to the agent command. Empty ⇒ pass-through.
-    launcher: Vec<String>,
+    kind: PolicyKind,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum PolicyKind {
+    /// Spawn the agent command exactly as configured, on the host.
+    #[default]
+    Passthrough,
+    /// Prepend a launcher argv (e.g. `bwrap …`) the command runs under, on the host.
+    Launcher(Vec<String>),
+    /// Run the command inside a container that mounts only the per-job workdir.
+    Docker(DockerPolicy),
+}
+
+/// A resolved `docker` executor: a validated image, plus any operator-named extra environment to
+/// carry in. Built from [`crate::home::SandboxConfig`] via [`SandboxPolicy::from_config`], which
+/// fails closed on a misconfiguration (no image) rather than launching a half-configured container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerPolicy {
+    image: String,
+    forward_env: Vec<String>,
+    /// The container runtime (`docker run --runtime <name>`), `None` ⇒ the daemon default (`runc`).
+    /// The v1 posture sets this to `runsc` (gVisor) on Linux, where it is the primary boundary; a Mac
+    /// seat leaves it unset and leans on the platform VM plus the hardening flags. Resolved from
+    /// [`crate::home::SandboxConfig::runtime`].
+    runtime: Option<String>,
+}
+
+/// The agent-auth environment carried from the daemon into the container.
+///
+/// A host executor inherits the daemon's environment, so a signed-in CLI simply works; a container
+/// inherits NOTHING, and without this every docker job dies on an auth error the operator can only
+/// fix by baking a credential into an image layer. Forwarding at run time keeps the secret out of a
+/// distributable artifact and lets it be rotated by restarting the daemon.
+///
+/// An ALLOWLIST, never the whole environment: the container runs a stranger's code, so it receives
+/// the named variables and nothing else. The names come from the auth prerequisites the presets
+/// already state (`agent_presets::preset_prerequisite`) — nothing here is invented, and a preset
+/// whose CLI reads something else is served by `[sandbox] forward_env`.
+///
+/// The base-URL pair rides along deliberately. An operator who points the daemon at a gateway and
+/// gets the key forwarded WITHOUT the endpoint would have the credential sent to the default
+/// provider instead — a worse failure than not forwarding at all.
+pub const FORWARDED_AGENT_ENV: &[&str] = &[
+    // claude — `preset_prerequisite("claude")` names ANTHROPIC_API_KEY; the OAuth pair is what
+    // `claude /login` actually leaves behind.
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    // codex — `preset_prerequisite("codex")` names OPENAI_API_KEY.
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+];
+
+/// The per-job facts a launch needs beyond the agent command: where the job's workdir is on the
+/// host (the docker bind-mount source), the delivery-identity env to carry into the run, and the
+/// host uid/gid to run the container as (so bind-mounted output is owned by the seller and the
+/// snapshot can read it).
+pub struct JobLaunch<'a> {
+    pub workdir: &'a Path,
+    pub env: &'a [(String, String)],
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// What the ACP driver spawns: the process `program` + `args`, and the `cwd` the ACP session runs
+/// in. `cwd` is the host workdir for a host launch, and the in-container mount point for a docker
+/// launch (the host path does not exist inside the container).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentLaunch {
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
 }
 
 impl SandboxPolicy {
     /// A pass-through policy: the agent command runs exactly as configured.
     pub fn passthrough() -> Self {
         Self {
-            launcher: Vec::new(),
+            kind: PolicyKind::Passthrough,
         }
     }
 
     /// A policy that runs the agent command inside `launcher` (its argv is prepended). An empty
     /// launcher is a pass-through.
     pub fn wrapped(launcher: Vec<String>) -> Self {
-        Self { launcher }
+        let kind = if launcher.is_empty() {
+            PolicyKind::Passthrough
+        } else {
+            PolicyKind::Launcher(launcher)
+        };
+        Self { kind }
     }
 
-    /// Resolve the policy from the optional `[sandbox]` config: present ⇒ its launcher, absent ⇒
-    /// pass-through.
-    pub fn from_config(config: Option<&crate::home::SandboxConfig>) -> Self {
-        match config {
-            Some(config) => Self::wrapped(config.launcher.clone()),
-            None => Self::passthrough(),
+    /// A policy that runs the agent command inside a container.
+    pub fn docker(policy: DockerPolicy) -> Self {
+        Self {
+            kind: PolicyKind::Docker(policy),
         }
     }
 
-    /// Whether this policy launches the command directly (no launcher).
+    /// Resolve the policy from the optional `[sandbox]` config. Absent ⇒ pass-through. Fails closed
+    /// on a docker misconfiguration (no image) rather than launching a half-configured container.
+    pub fn from_config(config: Option<&crate::home::SandboxConfig>) -> Result<Self, ExecError> {
+        use crate::home::SandboxMode;
+        let Some(config) = config else {
+            return Ok(Self::passthrough());
+        };
+        match config.mode {
+            SandboxMode::Launcher => Ok(Self::wrapped(config.launcher.clone())),
+            SandboxMode::Docker => {
+                let image = config
+                    .image
+                    .clone()
+                    .filter(|image| !image.trim().is_empty())
+                    .ok_or_else(|| {
+                        ExecError::Config("[sandbox] mode=docker requires an image".into())
+                    })?;
+                let runtime = config
+                    .runtime
+                    .clone()
+                    .filter(|runtime| !runtime.trim().is_empty());
+                Ok(Self::docker(DockerPolicy {
+                    image,
+                    forward_env: config.forward_env.clone(),
+                    runtime,
+                }))
+            }
+        }
+    }
+
+    /// Whether this policy launches the command directly on the host with no wrapping.
     pub fn is_passthrough(&self) -> bool {
-        self.launcher.is_empty()
+        matches!(self.kind, PolicyKind::Passthrough)
     }
 
-    /// The launcher argv this policy prepends, empty under a pass-through policy. The seller boot
-    /// gate's doctor check reads argv0 from here to verify the launcher resolves BEFORE it can break
-    /// every job at spawn — the same structure [`Self::wrap`] prepends, so the check tests exactly
-    /// what the exec path runs.
+    /// The launcher argv this policy prepends, empty under a pass-through or a docker policy. The
+    /// seller boot gate's doctor check reads argv0 from here to verify the launcher resolves BEFORE
+    /// it can break every job at spawn — the same argv [`Self::launch`] prepends, so the check tests
+    /// exactly what the exec path runs. Under `docker` there is no launcher argv to resolve; the
+    /// executor is named by [`Self::docker_image`] instead.
     pub fn launcher(&self) -> &[String] {
-        &self.launcher
+        match &self.kind {
+            PolicyKind::Launcher(launcher) => launcher,
+            PolicyKind::Passthrough | PolicyKind::Docker(_) => &[],
+        }
     }
 
-    /// The full argv to spawn: the agent command unchanged under a pass-through policy, otherwise
-    /// the launcher argv followed by the agent command.
-    pub fn wrap(&self, agent_command: &[String]) -> Vec<String> {
-        if self.launcher.is_empty() {
-            return agent_command.to_vec();
+    /// The operator's extra `[sandbox] forward_env` names, `None` under a host policy — which needs
+    /// no forwarding at all, having inherited the daemon's environment. The `None`/`Some(&[])`
+    /// distinction is load-bearing: it separates "nothing to forward" from "forward the built-in
+    /// set and nothing more".
+    pub fn forward_env(&self) -> Option<&[String]> {
+        match &self.kind {
+            PolicyKind::Docker(policy) => Some(&policy.forward_env),
+            PolicyKind::Passthrough | PolicyKind::Launcher(_) => None,
         }
-        let mut argv = Vec::with_capacity(self.launcher.len() + agent_command.len());
-        argv.extend_from_slice(&self.launcher);
+    }
+
+    /// The image a docker policy runs the command in, `None` under a host policy. The doctor checks
+    /// read it to name the executor the seat is actually configured for: `launcher()` is empty under
+    /// docker too, and reporting that as "no launcher" would read as "unsandboxed".
+    pub fn docker_image(&self) -> Option<&str> {
+        match &self.kind {
+            PolicyKind::Docker(policy) => Some(policy.image.as_str()),
+            PolicyKind::Passthrough | PolicyKind::Launcher(_) => None,
+        }
+    }
+
+    /// The host argv for `agent_command` under this policy — the command unchanged under
+    /// pass-through, the launcher argv followed by the command under a launcher — or `None` under a
+    /// docker policy, whose launch is not expressible as a bare host argv (it needs the per-job
+    /// mount, uid and env; see [`Self::launch`]). The containment probe, which measures a policy
+    /// with no job to launch, is the only caller.
+    pub fn wrap(&self, agent_command: &[String]) -> Option<Vec<String>> {
+        match &self.kind {
+            PolicyKind::Passthrough => Some(agent_command.to_vec()),
+            PolicyKind::Launcher(launcher) => {
+                let mut argv = Vec::with_capacity(launcher.len() + agent_command.len());
+                argv.extend_from_slice(launcher);
+                argv.extend_from_slice(agent_command);
+                Some(argv)
+            }
+            PolicyKind::Docker(_) => None,
+        }
+    }
+
+    /// Build what the ACP driver spawns for `agent_command` under this policy and the per-job
+    /// `job`. Fails closed when the agent command is empty (a wrapper alone is not a runnable
+    /// command).
+    pub fn launch(
+        &self,
+        agent_command: &[String],
+        job: &JobLaunch<'_>,
+    ) -> Result<AgentLaunch, ExecError> {
+        if agent_command.is_empty() {
+            return Err(ExecError::Config("agent_command empty".into()));
+        }
+        let argv = match &self.kind {
+            PolicyKind::Passthrough => agent_command.to_vec(),
+            PolicyKind::Launcher(launcher) => {
+                let mut argv = Vec::with_capacity(launcher.len() + agent_command.len());
+                argv.extend_from_slice(launcher);
+                argv.extend_from_slice(agent_command);
+                argv
+            }
+            PolicyKind::Docker(policy) => {
+                let argv = policy.run_argv(agent_command, job);
+                // The ACP session runs at the in-container mount point, not the host path.
+                return Ok(split_argv(argv, PathBuf::from(CONTAINER_WORKDIR)));
+            }
+        };
+        Ok(split_argv(argv, job.workdir.to_path_buf()))
+    }
+}
+
+impl DockerPolicy {
+    /// The `docker run …` argv that launches `agent_command` in the container. It mounts ONLY the
+    /// per-job workdir (read-write, at [`CONTAINER_WORKDIR`]) so the host `$MAXPLAYER_HOME` is absent by
+    /// construction, drops to the seller's uid/gid so the mounted output is owned by the seller,
+    /// and carries the delivery-identity env. ACP stdio survives through
+    /// `docker run -i` (stdin/stdout piped; no tty).
+    ///
+    /// Hardening, because the job is a stranger's code and the docker defaults are wrong for it:
+    ///
+    /// `--cap-drop ALL` — a non-root `--user` already leaves the process with an EMPTY effective
+    /// capability set, so this removes no capability the job could use today. It pins the BOUNDING
+    /// set to empty, so no capability can be regained (e.g. via a setuid-root binary), and states the
+    /// zero-capability posture explicitly rather than leaning on the uid to imply it. Cheap and safe
+    /// — dev toolchains (`npm`/`pip`/`cargo` installing under $HOME as the same uid) need no
+    /// capability. Paired with `no-new-privileges` below, the two close the setuid → container-root
+    /// route from both ends.
+    ///
+    /// `--security-opt no-new-privileges` — the setuid-root binaries a base image ships
+    /// (`node:22-bookworm-slim` carries 8, `su`/`mount`/`umount` among them) are the other half.
+    /// Without the flag `NoNewPrivs` is 0 and a job can try to become container-root; with it that
+    /// route is closed. The host tree is unreachable either way — this narrows what a job can do
+    /// inside its own container, not what it can reach outside.
+    ///
+    /// `--init` — otherwise PID 1 is the ACP adapter, a node process that does not reap. An agent that
+    /// spawns subprocesses accumulates zombies for the life of the container. `--init` makes PID 1 a
+    /// real reaper instead.
+    ///
+    /// `--runtime <name>` (optional) — the container runtime. Unset ⇒ the daemon default (`runc`,
+    /// which shares the host kernel). The v1 posture sets `runsc` (gVisor) on Linux so the payload
+    /// runs against a userspace kernel, not the host one; a Mac seat leaves it unset (the platform VM
+    /// is the boundary there). The named runtime must be registered with the daemon, or the run fails
+    /// at spawn — a fail-closed the seller boot doctor is meant to catch first.
+    fn run_argv(&self, agent_command: &[String], job: &JobLaunch<'_>) -> Vec<String> {
+        let mut argv: Vec<String> = vec!["docker".into(), "run".into(), "--rm".into(), "-i".into()];
+        // Runtime first, so it is unambiguously a `docker run` flag and not read as the image.
+        if let Some(runtime) = &self.runtime {
+            argv.push("--runtime".into());
+            argv.push(runtime.clone());
+        }
+        argv.extend(
+            [
+                "--init",
+                "--security-opt",
+                "no-new-privileges",
+                "--cap-drop",
+                "ALL",
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+        argv.extend([
+            "--user".into(),
+            format!("{}:{}", job.uid, job.gid),
+            "-v".into(),
+            format!("{}:{CONTAINER_WORKDIR}", job.workdir.display()),
+            "-w".into(),
+            CONTAINER_WORKDIR.into(),
+        ]);
+        for (key, value) in job.env {
+            argv.push("-e".into());
+            argv.push(format!("{key}={value}"));
+        }
+        argv.push(self.image.clone());
         argv.extend_from_slice(agent_command);
         argv
     }
 }
 
-/// The `(program, args)` the ACP driver actually spawns for `agent_command` under `policy`: wrap
-/// the command in the policy's launcher, then split argv0 from the rest. Fails closed when the
-/// agent command is empty (a launcher alone is not a runnable command).
+/// The agent-auth environment to carry into a container launch, read from the daemon's own
+/// environment: the [`FORWARDED_AGENT_ENV`] allowlist plus anything `[sandbox] forward_env` adds.
 ///
-/// Gated to match its only production caller, `run_acp_job`: without `acp` there is no spawn path
-/// to build argv for, and the wrap/refuse behaviour is still covered by the tests below.
-#[cfg(any(feature = "acp", test))]
-fn launch_argv(
+/// Empty for a host executor — it already inherits the daemon's environment, so forwarding would be
+/// a no-op that only made the argv longer. Only variables actually SET are returned, so an unset
+/// name never becomes an empty `-e FOO=` that would override a value baked into the image.
+pub fn forwarded_agent_env(policy: &SandboxPolicy) -> Vec<(String, String)> {
+    forwarded_agent_env_from(policy, |key| std::env::var(key).ok())
+}
+
+/// [`forwarded_agent_env`] over an injected environment, so the allowlist can be tested without
+/// mutating the process environment out from under other tests.
+fn forwarded_agent_env_from(
     policy: &SandboxPolicy,
-    agent_command: &[String],
-) -> Result<(String, Vec<String>), ExecError> {
-    if agent_command.is_empty() {
-        return Err(ExecError::Config("agent_command empty".into()));
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let Some(extra) = policy.forward_env() else {
+        return Vec::new();
+    };
+    let mut seen: Vec<&str> = Vec::new();
+    let mut out = Vec::new();
+    for key in FORWARDED_AGENT_ENV.iter().copied().chain(extra.iter().map(String::as_str)) {
+        let key = key.trim();
+        // An operator repeating a built-in name must not produce a doubled `-e`.
+        if key.is_empty() || seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        if let Some(value) = lookup(key) {
+            out.push((key.to_owned(), value));
+        }
     }
-    let mut argv = policy.wrap(agent_command).into_iter();
+    out
+}
+
+/// Split a non-empty argv into `(program, args)` and pair it with the session `cwd`.
+fn split_argv(argv: Vec<String>, cwd: PathBuf) -> AgentLaunch {
+    let mut argv = argv.into_iter();
     let program = argv
         .next()
-        .expect("wrap of a non-empty command yields a non-empty argv");
-    Ok((program, argv.collect()))
+        .expect("split_argv is only called with a non-empty argv");
+    AgentLaunch {
+        program,
+        args: argv.collect(),
+        cwd,
+    }
 }
 
 /// The per-job working directory under the home (`$MAXPLAYER_HOME/seller-jobs/<job_id>`).
@@ -525,11 +790,24 @@ pub async fn run_agent_job(
     use crate::event::JobId;
     use crate::log::EventLog;
 
-    let (program, args) = launch_argv(policy, agent_command)?;
+    // Run the container/process as the seller's own uid/gid so a docker bind-mount's output is owned
+    // by the seller and the delivery snapshot can read it. Ignored by the host executors.
+    //
+    // The delivery identity, plus the agent-auth allowlist a container needs because it inherits
+    // nothing from the daemon. Empty under a host executor, which already inherits it all.
+    let mut env = identity.git_env();
+    env.extend(forwarded_agent_env(policy));
+    let job = JobLaunch {
+        workdir,
+        env: &env,
+        uid: unsafe { libc::getuid() },
+        gid: unsafe { libc::getgid() },
+    };
+    let launch = policy.launch(agent_command, &job)?;
     // The ACP idle/response timeout IS the unified job timeout — never a hardcoded 300s that could
     // override or conflict with `--job-timeout-secs`.
     let mut driver = AcpDriver::new(
-        AgentCommand::new(program, args),
+        AgentCommand::new(launch.program, launch.args),
         crate::driver::PermissionOutcome::Allow,
         timeout.duration(),
     );
@@ -537,7 +815,7 @@ pub async fn run_agent_job(
     let mut log = EventLog::open(&log_path).map_err(|error| ExecError::Agent(error.to_string()))?;
     let params = RunParams {
         session_config: SessionConfig {
-            cwd: workdir.to_path_buf(),
+            cwd: launch.cwd,
             mcp_servers: Vec::new(),
             env: identity.git_env(),
         },
@@ -596,57 +874,417 @@ fn short_hash(input: &str) -> String {
 mod tests {
     use super::*;
 
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn job<'a>(workdir: &'a Path, env: &'a [(String, String)]) -> JobLaunch<'a> {
+        JobLaunch {
+            workdir,
+            env,
+            uid: 1000,
+            gid: 1000,
+        }
+    }
+
     // The default (pass-through) policy launches the agent command exactly as configured: the
-    // spawned `(program, args)` reconstruct the configured argv byte-for-byte, with no launcher.
+    // spawned `(program, args)` reconstruct the configured argv byte-for-byte, at the host workdir,
+    // with no wrapper.
     #[test]
     fn passthrough_policy_launches_the_configured_command_byte_identical() {
-        let agent_command: Vec<String> = ["claude", "--print", "--flag=a b"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let agent_command = argv(&["claude", "--print", "--flag=a b"]);
         let policy = SandboxPolicy::passthrough();
         assert!(policy.is_passthrough());
-        // The argv `wrap` hands the driver is the configured command, unchanged.
-        assert_eq!(policy.wrap(&agent_command), agent_command);
-        // Split into what the ACP driver spawns: program = argv0, args = the rest — reconstructing
-        // the configured command exactly (byte-identical to before the seam existed).
-        let (program, args) = launch_argv(&policy, &agent_command).expect("non-empty command");
-        assert_eq!(program, agent_command[0]);
-        assert_eq!(args, agent_command[1..]);
+        assert_eq!(SandboxPolicy::default(), policy);
+        let workdir = Path::new("/srv/jobs/j1");
+        let launch = policy.launch(&agent_command, &job(workdir, &[])).expect("non-empty command");
+        // program = argv0, args = the rest — reconstructing the configured command exactly
+        // (byte-identical to before the seam existed), run at the host workdir.
+        assert_eq!(launch.program, agent_command[0]);
+        assert_eq!(launch.args, agent_command[1..]);
         assert_eq!(
-            std::iter::once(program).chain(args).collect::<Vec<_>>(),
+            std::iter::once(launch.program).chain(launch.args).collect::<Vec<_>>(),
             agent_command
         );
-        // The default policy is the pass-through policy.
-        assert_eq!(SandboxPolicy::default(), policy);
+        assert_eq!(launch.cwd, workdir);
     }
 
     // A launcher policy runs the agent command INSIDE the launcher: argv0 becomes the launcher, the
     // configured command follows unchanged.
     #[test]
     fn launcher_policy_makes_the_launcher_argv0() {
-        let agent_command: Vec<String> =
-            ["claude", "--print"].iter().map(|s| s.to_string()).collect();
-        let launcher: Vec<String> = ["bwrap", "--unshare-all", "--"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let agent_command = argv(&["claude", "--print"]);
+        let launcher = argv(&["bwrap", "--unshare-all", "--"]);
         let policy = SandboxPolicy::wrapped(launcher.clone());
         assert!(!policy.is_passthrough());
-        let (program, args) = launch_argv(&policy, &agent_command).expect("non-empty command");
-        assert_eq!(program, launcher[0]);
-        // Full spawned argv is launcher then the agent command, in order.
-        let spawned: Vec<String> = std::iter::once(program).chain(args).collect();
+        let launch = policy.launch(&agent_command, &job(Path::new("/w"), &[])).expect("command");
+        assert_eq!(launch.program, launcher[0]);
+        let spawned: Vec<String> = std::iter::once(launch.program).chain(launch.args).collect();
         let expected: Vec<String> = launcher.iter().chain(agent_command.iter()).cloned().collect();
         assert_eq!(spawned, expected);
     }
 
-    // A launcher with no agent command is a misconfig — a launcher alone is not a runnable command.
+    // An empty agent command is a misconfig under every policy — a wrapper alone is not runnable.
     #[test]
-    fn empty_agent_command_fails_closed_even_with_a_launcher() {
-        let policy = SandboxPolicy::wrapped(vec!["bwrap".into()]);
-        let err = launch_argv(&policy, &[]).expect_err("empty command refused");
+    fn empty_agent_command_fails_closed() {
+        let policy = SandboxPolicy::wrapped(argv(&["bwrap"]));
+        let err = policy.launch(&[], &job(Path::new("/w"), &[])).expect_err("refused");
         assert!(matches!(err, ExecError::Config(_)));
+    }
+
+    // A docker policy mounts ONLY the per-job workdir at the container mount point, so no host path
+    // outside the workdir — $MAXPLAYER_HOME included — is reachable in the container by construction.
+    #[test]
+    fn docker_policy_mounts_only_the_job_workdir() {
+        let agent_command = argv(&["claude-agent-acp"]);
+        let policy = SandboxPolicy::docker(DockerPolicy {
+            image: "maxplayer-sandbox:latest".into(),
+            forward_env: Vec::new(),
+            runtime: None,
+        });
+        let env = vec![("GIT_AUTHOR_NAME".to_string(), "maxplayer-seller-abcd".to_string())];
+        let workdir = Path::new("/home/seller/.maxplayer/seller-jobs/job1");
+        let launch = policy.launch(&agent_command, &job(workdir, &env)).expect("command");
+
+        assert_eq!(launch.program, "docker");
+        // The ACP session runs at the in-container mount point, never the host path.
+        assert_eq!(launch.cwd, Path::new(CONTAINER_WORKDIR));
+        // Exactly one bind mount, and it is the job workdir → the container mount point.
+        let mounts: Vec<&String> = launch
+            .args
+            .iter()
+            .zip(launch.args.iter().skip(1))
+            .filter(|(flag, _)| flag.as_str() == "-v")
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(mounts, vec![&format!("{}:{CONTAINER_WORKDIR}", workdir.display())]);
+        // The seller's home path never appears anywhere in the argv — not as a mount, not elsewhere.
+        assert!(
+            !launch.args.iter().any(|a| a.contains(".maxplayer") && !a.contains("seller-jobs/job1")),
+            "no host $MAXPLAYER_HOME path leaks into the container argv: {:?}",
+            launch.args
+        );
+        // Runs as the seller uid/gid and carries the delivery-identity env.
+        assert!(windowed(&launch.args, &["--user", "1000:1000"]));
+        assert!(windowed(&launch.args, &["-e", "GIT_AUTHOR_NAME=maxplayer-seller-abcd"]));
+        // The image precedes the agent command, which is the final argv segment.
+        assert_eq!(launch.args.last().map(String::as_str), Some("claude-agent-acp"));
+    }
+
+    // The container runs a STRANGER'S code, and two docker defaults are wrong for that. Measured
+    // against a live daemon: without `--security-opt no-new-privileges` the container reports
+    // `NoNewPrivs: 0`, and `node:22-bookworm-slim` ships 8 setuid-root binaries (su, mount, umount
+    // among them) — so a job may attempt to become container-root. Without `--init`, PID 1 is the
+    // adapter itself (a node process that never reaps), so a job's subprocesses accumulate as
+    // zombies; with it PID 1 is `docker-init`.
+    //
+    // Neither changes what the job can reach OUTSIDE the container — the host tree is unmounted
+    // either way — so this pins hardening, not the containment claim, which
+    // `docker_policy_mounts_only_the_job_workdir` owns.
+    #[test]
+    fn docker_policy_hardens_against_the_strangers_code_it_runs() {
+        let policy = SandboxPolicy::docker(DockerPolicy {
+            image: "maxplayer-sandbox:latest".into(),
+            forward_env: Vec::new(),
+            runtime: None,
+        });
+        let launch = policy
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
+            .expect("command");
+
+        assert!(
+            windowed(&launch.args, &["--security-opt", "no-new-privileges"]),
+            "a setuid-root binary in the image must not be a route to container-root: {:?}",
+            launch.args
+        );
+        assert!(
+            windowed(&launch.args, &["--cap-drop", "ALL"]),
+            "the bounding capability set must be empty, so no capability can be regained: {:?}",
+            launch.args
+        );
+        assert!(
+            launch.args.iter().any(|a| a == "--init"),
+            "PID 1 must reap, or a job's subprocesses pile up as zombies: {:?}",
+            launch.args
+        );
+        // Both must precede the image, or docker reads them as arguments to the agent command.
+        let image_at = launch
+            .args
+            .iter()
+            .position(|a| a == "maxplayer-sandbox:latest")
+            .expect("the image is in the argv");
+        let init_at = launch.args.iter().position(|a| a == "--init").expect("--init");
+        let secopt_at = launch
+            .args
+            .iter()
+            .position(|a| a == "--security-opt")
+            .expect("--security-opt");
+        assert!(
+            init_at < image_at && secopt_at < image_at,
+            "hardening flags after the image would be passed to the agent, not to docker: {:?}",
+            launch.args
+        );
+    }
+
+    // The v1 posture runs the job under gVisor on Linux by naming a container runtime. Unset ⇒ the
+    // argv carries no `--runtime` (the daemon default, `runc`); set ⇒ `docker run --runtime <name>`,
+    // and it must precede the image or docker reads it as the agent command. A Mac seat is the unset
+    // case — the platform VM is its boundary, so no runtime override is named.
+    #[test]
+    fn docker_runtime_is_named_only_when_configured_and_precedes_the_image() {
+        // Unset: no --runtime anywhere.
+        let default_rt = SandboxPolicy::docker(DockerPolicy {
+            image: "maxplayer-sandbox:latest".into(),
+            forward_env: Vec::new(),
+            runtime: None,
+        });
+        let launch = default_rt
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
+            .expect("command");
+        assert!(
+            !launch.args.iter().any(|a| a == "--runtime"),
+            "an unset runtime must not emit a --runtime flag: {:?}",
+            launch.args
+        );
+
+        // Set: --runtime runsc, before the image.
+        let gvisor = SandboxPolicy::docker(DockerPolicy {
+            image: "maxplayer-sandbox:latest".into(),
+            forward_env: Vec::new(),
+            runtime: Some("runsc".into()),
+        });
+        let launch = gvisor
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
+            .expect("command");
+        assert!(
+            windowed(&launch.args, &["--runtime", "runsc"]),
+            "a configured runtime must reach the argv: {:?}",
+            launch.args
+        );
+        let runtime_at =
+            launch.args.iter().position(|a| a == "runsc").expect("runtime value in argv");
+        let image_at = launch
+            .args
+            .iter()
+            .position(|a| a == "maxplayer-sandbox:latest")
+            .expect("the image is in the argv");
+        assert!(
+            runtime_at < image_at,
+            "the runtime must precede the image, or docker reads it as the agent command: {:?}",
+            launch.args
+        );
+    }
+
+    // from_config threads the runtime through, and a blank string is treated as unset rather than
+    // forwarded as an empty `--runtime ` that docker would reject.
+    #[test]
+    fn from_config_resolves_and_trims_the_runtime() {
+        use crate::home::{SandboxConfig, SandboxMode};
+        let with_runtime = SandboxConfig {
+            mode: SandboxMode::Docker,
+            launcher: Vec::new(),
+            image: Some("img".into()),
+            forward_env: Vec::new(),
+            runtime: Some("runsc".into()),
+        };
+        let policy = SandboxPolicy::from_config(Some(&with_runtime)).expect("ok");
+        let launch = policy
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
+            .expect("command");
+        assert!(windowed(&launch.args, &["--runtime", "runsc"]), "{:?}", launch.args);
+
+        // A blank runtime is a config no-op, not an empty flag.
+        let blank = SandboxConfig { runtime: Some("  ".into()), ..with_runtime };
+        let policy = SandboxPolicy::from_config(Some(&blank)).expect("ok");
+        let launch = policy
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
+            .expect("command");
+        assert!(
+            !launch.args.iter().any(|a| a == "--runtime"),
+            "a blank runtime must not emit a --runtime flag: {:?}",
+            launch.args
+        );
+    }
+
+    // A container inherits NOTHING from the daemon, so an agent CLI inside it has no credential
+    // unless one is carried in. This is the allowlist that carries it — and the reason it is an
+    // allowlist rather than "forward the environment" is that the container runs a stranger's code:
+    // every variable that crosses is one the job can read. The whole-environment case below is the
+    // one that must never regress.
+    #[test]
+    fn only_allowlisted_agent_auth_env_crosses_into_the_container() {
+        let daemon_env = |key: &str| -> Option<String> {
+            match key {
+                "ANTHROPIC_API_KEY" => Some("sk-ant-xxx".to_owned()),
+                "OPENAI_API_KEY" => Some("sk-oai-xxx".to_owned()),
+                // Set in the daemon, NOT on the allowlist, and must not cross.
+                "AWS_SECRET_ACCESS_KEY" => Some("the-seat's-other-secret".to_owned()),
+                "MAXPLAYER_HOME" => Some("/home/seller/.maxplayer".to_owned()),
+                _ => None,
+            }
+        };
+        let docker = SandboxPolicy::docker(DockerPolicy {
+            image: "maxplayer-sandbox:latest".into(),
+            forward_env: Vec::new(),
+            runtime: None,
+        });
+        let carried = forwarded_agent_env_from(&docker, daemon_env);
+        let names: Vec<&str> = carried.iter().map(|(k, _)| k.as_str()).collect();
+
+        assert!(names.contains(&"ANTHROPIC_API_KEY") && names.contains(&"OPENAI_API_KEY"));
+        assert!(
+            !names.contains(&"AWS_SECRET_ACCESS_KEY"),
+            "an unrelated daemon secret must never reach a stranger's job: {names:?}"
+        );
+        assert!(
+            !names.contains(&"MAXPLAYER_HOME"),
+            "the seat's own paths are not the agent's business: {names:?}"
+        );
+        // An allowlisted name that is UNSET must not become `-e FOO=`, which would blank out a value
+        // an operator baked into their image.
+        assert!(
+            !names.contains(&"ANTHROPIC_AUTH_TOKEN"),
+            "an unset variable must not be forwarded empty: {carried:?}"
+        );
+    }
+
+    // A host executor is already a child of the daemon and inherits its whole environment, so
+    // forwarding there would be a no-op that only lengthened the argv.
+    #[test]
+    fn a_host_executor_forwards_nothing_because_it_inherits_everything() {
+        let always_set = |_: &str| Some("value".to_owned());
+        assert!(forwarded_agent_env_from(&SandboxPolicy::passthrough(), always_set).is_empty());
+        assert!(
+            forwarded_agent_env_from(&SandboxPolicy::wrapped(argv(&["bwrap"])), always_set).is_empty()
+        );
+    }
+
+    // `[sandbox] forward_env` serves a custom preset whose CLI reads a name the built-in set cannot
+    // know. Repeating a built-in name must not double the `-e`.
+    #[test]
+    fn operator_named_env_extends_the_allowlist_without_duplicating_it() {
+        let env = |key: &str| match key {
+            "ANTHROPIC_API_KEY" => Some("sk-ant-xxx".to_owned()),
+            "MY_AGENT_TOKEN" => Some("custom".to_owned()),
+            _ => None,
+        };
+        let policy = SandboxPolicy::docker(DockerPolicy {
+            image: "img".into(),
+            forward_env: vec!["MY_AGENT_TOKEN".into(), "ANTHROPIC_API_KEY".into()],
+            runtime: None,
+        });
+        let carried = forwarded_agent_env_from(&policy, env);
+        let names: Vec<&str> = carried.iter().map(|(k, _)| k.as_str()).collect();
+
+        assert!(names.contains(&"MY_AGENT_TOKEN"), "{names:?}");
+        assert_eq!(
+            names.iter().filter(|n| **n == "ANTHROPIC_API_KEY").count(),
+            1,
+            "a built-in repeated by the operator must appear once: {names:?}"
+        );
+    }
+
+    // The forwarded pairs must reach the container as real `-e` flags, or the allowlist is theatre.
+    #[test]
+    fn forwarded_env_reaches_the_container_argv() {
+        let policy = SandboxPolicy::docker(DockerPolicy {
+            image: "maxplayer-sandbox:latest".into(),
+            forward_env: Vec::new(),
+            runtime: None,
+        });
+        let env = vec![("ANTHROPIC_API_KEY".to_string(), "sk-ant-xxx".to_string())];
+        let launch = policy
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &env))
+            .expect("command");
+        assert!(
+            windowed(&launch.args, &["-e", "ANTHROPIC_API_KEY=sk-ant-xxx"]),
+            "the credential must cross as a -e flag: {:?}",
+            launch.args
+        );
+    }
+
+    // from_config fails closed on a docker misconfiguration rather than launching a half-cage.
+    #[test]
+    fn from_config_rejects_incomplete_docker() {
+        use crate::home::{SandboxConfig, SandboxMode};
+        let base = SandboxConfig {
+            mode: SandboxMode::Docker,
+            launcher: Vec::new(),
+            image: None,
+            forward_env: Vec::new(),
+            runtime: None,
+        };
+        // docker with no image.
+        assert!(SandboxPolicy::from_config(Some(&base)).is_err());
+        // A docker config with an image resolves.
+        let complete = SandboxConfig {
+            image: Some("img".into()),
+            ..base
+        };
+        assert!(SandboxPolicy::from_config(Some(&complete)).is_ok());
+        // Absent config ⇒ pass-through.
+        assert!(SandboxPolicy::from_config(None).expect("ok").is_passthrough());
+    }
+
+    // Does `haystack` contain `needle` as a contiguous run? (argv flag/value adjacency check.)
+    fn windowed(haystack: &[String], needle: &[&str]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|w| w.iter().zip(needle).all(|(a, b)| a == b))
+    }
+
+    // END-TO-END: actually run the docker launch and prove the isolation property. Gated on
+    // `MAXPLAYER_SANDBOX_DOCKER_E2E=1` (and needs a docker daemon + a base image with a shell), so it is
+    // a no-op in CI/unit runs and runs only where docker is available. The probe stands in for the
+    // agent: it tries to read a secret placed under the host $MAXPLAYER_HOME (which is a PARENT of the
+    // mounted workdir) and writes its verdict + a file into the workdir.
+    #[test]
+    fn docker_run_hides_maxplayer_home_and_persists_workdir_output() {
+        if std::env::var("MAXPLAYER_SANDBOX_DOCKER_E2E").as_deref() != Ok("1") {
+            return; // docker-dependent; skipped unless explicitly enabled
+        }
+        let image = std::env::var("MAXPLAYER_SANDBOX_E2E_IMAGE").unwrap_or_else(|_| "alpine:latest".into());
+
+        // Host layout: <home>/wallet.secret (the thing to protect) and <home>/seller-jobs/job1 (the
+        // ONLY directory the container mounts). workdir is a child of the sensitive home.
+        let home = std::env::temp_dir().join(format!("maxplayer-e2e-{}", std::process::id()));
+        let workdir = home.join("seller-jobs").join("job1");
+        std::fs::create_dir_all(&workdir).expect("mkdir workdir");
+        std::fs::write(home.join("wallet.secret"), b"SEED PHRASE").expect("write secret");
+
+        // Probe: cat the secret by its HOST absolute path (absent in the container) and via the
+        // container root (`/work/..`); either success would be a LEAK. Then write into the workdir.
+        let probe = format!(
+            "if cat '{}' 2>/dev/null || cat /work/../wallet.secret 2>/dev/null; then echo LEAKED; \
+             else echo ISOLATED; fi > /work/verdict.txt; echo hello > /work/wrote.txt",
+            home.join("wallet.secret").display()
+        );
+        let agent_command = argv(&["sh", "-c", &probe]);
+        let policy =
+            SandboxPolicy::docker(DockerPolicy { image, forward_env: Vec::new(), runtime: None });
+        let job = JobLaunch {
+            workdir: &workdir,
+            env: &[],
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+        };
+        let launch = policy.launch(&agent_command, &job).expect("docker launch");
+
+        let status = std::process::Command::new(&launch.program)
+            .args(&launch.args)
+            .status()
+            .expect("run docker");
+        assert!(status.success(), "docker run exited non-zero");
+
+        // $MAXPLAYER_HOME was unreadable in the container, and the workdir write persisted to the host.
+        let verdict = std::fs::read_to_string(workdir.join("verdict.txt")).expect("verdict");
+        assert_eq!(verdict.trim(), "ISOLATED", "the container could reach $MAXPLAYER_HOME");
+        assert_eq!(
+            std::fs::read_to_string(workdir.join("wrote.txt")).expect("wrote").trim(),
+            "hello",
+            "workdir output did not land on the host for the snapshot"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     // The seller-side receipt-preimage delivery discriminator is DERIVED from the typed

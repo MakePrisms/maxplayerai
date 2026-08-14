@@ -106,14 +106,19 @@ tools or keys, and no host secrets.
 
 ### The `[sandbox]` config section
 
-The seller config supports an optional `[sandbox]` section with a single key, `launcher` — an argv
-array. When the section is present, the launcher argv is **prepended** to the agent command, so the
-agent runs inside whatever OS-level sandbox the launcher provides:
+The seller config supports an optional `[sandbox]` section. `mode` selects the executor — `launcher`
+(the default) or `docker`:
 
 ```toml
 [sandbox]
+mode = "launcher"                                          # default; may be omitted
 launcher = ["<sandbox-binary>", "<arg1>", "<arg2>", "..."]
 ```
+
+Under `launcher` mode the launcher argv is **prepended** to the agent command, so the agent runs
+inside whatever OS-level sandbox the launcher provides. Under `docker` mode the daemon runs the agent
+in a container that mounts only the per-job workdir — see "`mode = \"docker\"` and this image" below
+before reaching for it, because **it does not work in this deployment**.
 
 Semantics, exactly as implemented:
 
@@ -135,6 +140,58 @@ in `/data` and the job workdir, but it blocks boot only for a seat claiming open
 targeted-only seat — the default for this image — it is advisory (a WARN), and either way it samples
 one canary read and one workdir write, not your other secret paths. Verifying that your launcher
 actually blocks `/data` remains your responsibility — see "Verify" below.
+
+### `mode = "docker"` and this image
+
+**Do not use `mode = "docker"` with this compose deployment.** It is meant for a seller running
+directly on a host, and the failure here is silent.
+
+The seller in `docker-compose.yml` is *itself* in a container, and `mode = "docker"` launches a
+**sibling** container through the host's docker daemon. Two things break:
+
+1. **No docker to call.** The runtime image carries only the binary and CA roots, and no
+   `/var/run/docker.sock` is mounted. `maxplayer doctor` FAILs on this before the seat advertises.
+2. **The bind mount resolves against the wrong filesystem.** This is the dangerous one. If you "fix"
+   (1) by mounting the socket and installing the docker CLI, the daemon runs
+   `docker run -v /data/seller-jobs/<job_id>:/work …` — and that path is interpreted by the **host**
+   daemon, where `/data` does not exist. It lives at `/var/lib/docker/volumes/seller-data/_data/…`
+   instead. Docker **creates a missing bind source as an empty directory** rather than refusing, so
+   the agent works in a phantom `/work`, the delivery snapshot finds the seller's real workdir
+   untouched, and the buyer is charged for an **empty delivery**.
+
+Because (2) produces no error anywhere, the boot gate refuses it outright: `maxplayer doctor` detects
+that the seller is itself containerized (`/.dockerenv`) and FAILs any `mode = "docker"` config.
+
+**To sandbox a compose-deployed seller, use `launcher` mode** — the bubblewrap example below runs
+inside this container and needs no docker socket. `mode = "docker"` is for a seller on the host.
+
+#### Docker-mode hardening and the `runtime` knob (host sellers)
+
+A host seller on `mode = "docker"` gets a hardened container without extra config. Every job runs
+with a single bind mount (the per-job workdir only — `$MAXPLAYER_HOME` is absent by construction), as
+the seller's non-root uid, and with `--cap-drop=ALL`, `--security-opt no-new-privileges`, and `--init`.
+Those flags close the setuid → container-root route from both ends and reap the job's subprocesses;
+they narrow what a job does *inside* its container, not what it reaches outside (the host tree is
+unmounted either way).
+
+The container still shares the **host kernel** by default (`runc`). On Linux that shared kernel is the
+main escape surface, so the v1 sandbox posture runs the job under **gVisor** — a userspace kernel that
+keeps the payload's syscalls off the host one. Name the runtime with the optional `runtime` field:
+
+```toml
+[sandbox]
+mode = "docker"
+image = "maxplayer-sandbox:latest"
+runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM is the boundary there.
+# forward_env = ["MY_AGENT_TOKEN"]   # extra names to carry in, on top of the built-in auth allowlist
+```
+
+- `runtime` maps straight to `docker run --runtime <name>`. The name must be registered with the
+  daemon (`docker info` → *Runtimes*); an unregistered name fails the job at spawn.
+- Install gVisor from its signed repo and register `runsc` before setting this. See
+  `SANDBOXING.md` for the full v1/v2 architecture and why the runtime is Linux-only.
+- On macOS, leave `runtime` unset: Docker Desktop cannot load a custom runtime, and its containers
+  already run inside a platform Linux VM that provides the hardware boundary.
 
 ### Working example: bubblewrap inside the container
 

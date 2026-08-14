@@ -268,10 +268,11 @@ pub struct SellerConfig {
     pub claim_award_timeout_secs: Option<u64>,
 }
 
-/// Executor sandbox config (`[sandbox]` section): the launcher the awarded agent command runs
-/// inside. Absent ⇒ pass-through — the command runs exactly as configured, byte-identical to no
-/// sandbox. Present ⇒ the launcher argv is prepended to the agent command so it runs inside an OS
-/// sandbox, without the run/exec path knowing which launcher.
+/// Executor sandbox config (`[sandbox]` section): which executor the awarded agent command runs
+/// under. Absent ⇒ pass-through — the command runs exactly as configured, byte-identical to no
+/// sandbox. Present ⇒ [`SandboxMode`] selects the executor: `launcher` prepends a launcher argv so
+/// the command runs inside an OS sandbox, `docker` runs it inside a container mounting only the
+/// per-job workdir. Either way the run/exec path never learns which executor it got.
 ///
 /// Top-level on `MaxplayerConfig`, not nested under `[seller]`: `SellerConfig`'s literal is built in
 /// the money-path `seller.rs`, which this must not touch (same placement rationale as
@@ -279,11 +280,55 @@ pub struct SellerConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxConfig {
-    /// The launcher argv the agent command runs inside (no-shell argv array, same rule as
-    /// `agent_command`: a bare string is refused, and the array must be non-empty — an empty
-    /// launcher is expressed by omitting the whole `[sandbox]` section, not by an empty array).
-    #[serde(deserialize_with = "deserialize_agent_command_argv")]
+    /// Which executor runs the agent command. `launcher` (default) prepends a launcher argv;
+    /// `docker` runs the command inside a container that mounts ONLY the per-job workdir.
+    #[serde(default)]
+    pub mode: SandboxMode,
+    /// `launcher` mode: the launcher argv the agent command runs inside (no-shell argv array, same
+    /// rule as `agent_command`: a bare string is refused, and a present array must be non-empty).
+    /// Omitted ⇒ pass-through under `launcher` mode. Unused under `docker` mode.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_agent_command_argv",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub launcher: Vec<String>,
+    /// `docker` mode: the container image carrying the agent runtime (node + ACP adapter + git +
+    /// CA certs — see `docker/maxplayer-sandbox/Dockerfile`). Required under `docker` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// `docker` mode: EXTRA environment variables to carry from the daemon into the container, on
+    /// top of the built-in agent-auth set (see `seller_exec::FORWARDED_AGENT_ENV`).
+    ///
+    /// A host executor inherits the daemon's environment wholesale; a container inherits nothing, so
+    /// without this an agent CLI inside the container has no credential and every job fails an auth
+    /// error. Named variables only — never the whole environment, which would hand a stranger's job
+    /// every secret the daemon happens to hold.
+    ///
+    /// Only needed for a custom `[agents]` preset whose CLI reads a variable the built-in set does
+    /// not name, or to carry a gateway base-URL. Unused under `launcher` mode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forward_env: Vec<String>,
+    /// `docker` mode: the container runtime to run the job under (`docker run --runtime <name>`).
+    /// Omitted ⇒ the daemon's default runtime (`runc`). The v1 sandbox posture sets this to `runsc`
+    /// on Linux, where the default container shares the host kernel and gVisor is the primary
+    /// boundary; a Mac seat leaves it unset and relies on the platform VM plus the hardening flags
+    /// (`--cap-drop=ALL`, `--security-opt no-new-privileges`). The named runtime must be registered
+    /// with the daemon (`docker info` → Runtimes); an unregistered name fails the run at spawn.
+    /// Unused under `launcher` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+}
+
+/// Which executor the `[sandbox]` section selects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxMode {
+    /// Prepend a launcher argv to the agent command (Phase-0 behavior; empty launcher = pass-through).
+    #[default]
+    Launcher,
+    /// Run the agent command inside a container that mounts only the per-job workdir.
+    Docker,
 }
 
 /// Persistent-seller-memory config (`[seller_memory]` section): the read-on-start +
@@ -1386,6 +1431,40 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
         out.push_str(line);
         out.push('\n');
     }
+    // Onboarding (issue #376, extended): a commented [sandbox] template. A default config has NO
+    // [sandbox] section — pass-through — so there is no key to annotate; instead the options are
+    // shown inline, including the one difference that bites: gVisor (`runtime = "runsc"`) is
+    // Linux-only, and a Mac seat omits it. Every line is a comment, so the file still round-trips
+    // through parse_config_toml unchanged (the test asserts this).
+    out.push('\n');
+    out.push_str(
+        r#"# --- [sandbox]: how an awarded job runs. Uncomment ONE option below. ---
+# With no [sandbox] section (the default here) the agent runs PASS-THROUGH:
+# directly as this daemon, with no isolation. A seat that claims open-pool
+# work is refused at the boot gate until a real sandbox is configured.
+#
+# Option A - launcher (an OS sandbox such as bubblewrap; also works inside a
+# container). Full bwrap example: docs/DOCKER.md
+#   [sandbox]
+#   mode = "launcher"
+#   launcher = ["bwrap", "--unshare-all", "--die-with-parent", "..."]
+#
+# Option B - docker on LINUX. gVisor (runsc) is the primary boundary. Install
+# it first (docs/SANDBOXING.md), then confirm:  docker info | grep -i runsc
+#   [sandbox]
+#   mode = "docker"
+#   image = "maxplayer-sandbox:latest"
+#   runtime = "runsc"                  # gVisor - LINUX ONLY
+#   # forward_env = ["MY_AGENT_TOKEN"] # extra env names, atop the built-in auth allowlist
+#
+# Option C - docker on macOS. Docker Desktop cannot load runsc, so OMIT the
+# runtime line; the platform VM is the boundary. Otherwise identical to B.
+#   [sandbox]
+#   mode = "docker"
+#   image = "maxplayer-sandbox:latest"
+#   # (no runtime line on macOS)
+"#,
+    );
     Ok(out)
 }
 
@@ -1818,6 +1897,13 @@ mod tests {
         assert!(rendered.contains("REAL sats"), "must warn the shipped defaults move real sats");
         assert!(rendered.contains("minibits"), "must name the real default mint");
         assert!(rendered.contains("Per-job spend cap"), "must document the per-job cap");
+        // The commented [sandbox] onboarding template, including the Linux-vs-macOS runtime split.
+        assert!(rendered.contains("[sandbox]"), "must carry the sandbox onboarding template");
+        assert!(
+            rendered.contains("runtime = \"runsc\""),
+            "must show the Linux gVisor runtime line"
+        );
+        assert!(rendered.contains("macOS"), "must call out the macOS difference (omit runtime)");
     }
 
     #[test]

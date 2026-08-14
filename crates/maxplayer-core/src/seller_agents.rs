@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::agent_presets::resolve_agent_preset;
+use crate::agent_presets::{resolve_agent_preset_in, AdapterHost};
 use crate::home::{AgentPresetConfig, SellerConfig};
 
 /// Wire tag naming the harnesses an event's author can run — `["agents", "claude", "codex"]`,
@@ -247,6 +247,7 @@ impl ResolvedRegistry {
 pub fn resolve(
     seller: &SellerConfig,
     presets: &BTreeMap<String, AgentPresetConfig>,
+    host: AdapterHost,
 ) -> Result<ResolvedRegistry, RegistryError> {
     if seller.agents.is_empty() {
         return fallback_registry(seller);
@@ -255,7 +256,7 @@ pub fn resolve(
     let mut verdicts = Vec::with_capacity(seller.agents.len());
     let mut entries = Vec::new();
     for name in &seller.agents {
-        match resolve_agent_preset(name, presets) {
+        match resolve_agent_preset_in(name, presets, host) {
             Ok((label, argv)) => {
                 verdicts.push(AgentVerdict {
                     name: label.clone(),
@@ -408,7 +409,7 @@ mod tests {
     #[test]
     fn unlabelled_argv_hatch_advertises_nothing_but_still_runs_untargeted_jobs() {
         let seller = seller_with(Vec::new());
-        let resolved = resolve(&seller, &BTreeMap::new()).expect("hatch resolves");
+        let resolved = resolve(&seller, &BTreeMap::new(), AdapterHost::Host).expect("hatch resolves");
         assert!(
             resolved.registry.advertised().is_empty(),
             "a raw argv seller has no honest harness name to publish"
@@ -427,7 +428,7 @@ mod tests {
         // which resolves through the preset table and advertises exactly that name.
         let table = presets(&[("claude", &["claude-acp"])]);
         let seller = seller_with(names(&["claude"]));
-        let resolved = resolve(&seller, &table).expect("single preset resolves");
+        let resolved = resolve(&seller, &table, AdapterHost::Host).expect("single preset resolves");
         assert_eq!(resolved.registry.advertised(), vec!["claude"]);
         assert_eq!(
             resolved.registry.dispatch(None).map(|a| a.argv.clone()),
@@ -442,7 +443,7 @@ mod tests {
     fn partial_failure_degrades_loud_and_serves_with_the_remainder() {
         let table = presets(&[("good", &["/bin/sh"])]);
         let seller = seller_with(names(&["good", "nope-not-a-preset"]));
-        let resolved = resolve(&seller, &table).expect("partial failure still serves");
+        let resolved = resolve(&seller, &table, AdapterHost::Host).expect("partial failure still serves");
         assert_eq!(resolved.registry.advertised(), vec!["good"]);
         assert_eq!(resolved.failures().len(), 1);
         let line = resolved.degrade_line().expect("degrade line");
@@ -457,7 +458,7 @@ mod tests {
     #[test]
     fn every_preset_failing_refuses_rather_than_serving_nothing() {
         let seller = seller_with(names(&["nope-one", "nope-two"]));
-        match resolve(&seller, &BTreeMap::new()) {
+        match resolve(&seller, &BTreeMap::new(), AdapterHost::Host) {
             Err(RegistryError::AllFailed(verdicts)) => {
                 assert_eq!(verdicts.len(), 2);
                 assert!(verdicts.iter().all(|v| !v.passed()));
@@ -472,7 +473,7 @@ mod tests {
     fn a_duplicate_listing_keeps_one_entry_so_advertisement_matches_dispatch() {
         let table = presets(&[("good", &["/bin/sh"])]);
         let seller = seller_with(names(&["good", "good"]));
-        let resolved = resolve(&seller, &table).expect("duplicates resolve");
+        let resolved = resolve(&seller, &table, AdapterHost::Host).expect("duplicates resolve");
         assert_eq!(resolved.registry.advertised(), vec!["good"]);
         assert_eq!(resolved.registry.entries().len(), 1);
     }
@@ -481,7 +482,7 @@ mod tests {
     fn no_harness_at_all_refuses() {
         let mut seller = seller_with(Vec::new());
         seller.agent_command = Vec::new();
-        assert_eq!(resolve(&seller, &BTreeMap::new()), Err(RegistryError::Empty));
+        assert_eq!(resolve(&seller, &BTreeMap::new(), AdapterHost::Host), Err(RegistryError::Empty));
     }
 
     // ---- Issue #715: harness credential directory is resolved from the preset label, never guessed ----

@@ -312,9 +312,12 @@ fn ensure_seller_config(
         && options.git_remote.is_none();
 
     // Agent: preset | argv hatch | persisted config. Never re-prompt argv in steady state.
+    // Docker mode runs the adapter INSIDE the image, so resolution must not consult the host PATH
+    // (the image bakes the adapter in); every other executor runs it on the host.
     let custom_agents = home.config.agents.clone();
+    let adapter_host = agent_presets::AdapterHost::for_sandbox(home.config.sandbox.as_ref());
     let (mut agent_label, mut agent_command) =
-        resolve_agent(options, existing.as_ref(), &custom_agents, out, err)?;
+        resolve_agent(options, existing.as_ref(), &custom_agents, adapter_host, out, err)?;
 
     let mut rate_sats = options
         .rate_sats
@@ -392,7 +395,7 @@ fn ensure_seller_config(
                 agent_presets::preset_choices(&custom_agents)
             );
             let picked = prompt_line(out, err, "Agent", suggestion)?;
-            let (label, argv) = agent_presets::resolve_agent_preset(&picked, &custom_agents)
+            let (label, argv) = agent_presets::resolve_agent_preset_in(&picked, &custom_agents, adapter_host)
                 .map_err(|message| {
                     let _ = writeln!(err, "{message}");
                     USAGE_ERROR
@@ -433,7 +436,7 @@ fn ensure_seller_config(
         // Multiple `--agent`s: resolve each named preset in preference order (dedup, order kept).
         let mut resolved: Vec<String> = Vec::with_capacity(options.agents.len());
         for name in &options.agents {
-            let (label, _argv) = agent_presets::resolve_agent_preset(name, &custom_agents)
+            let (label, _argv) = agent_presets::resolve_agent_preset_in(name, &custom_agents, adapter_host)
                 .map_err(|message| {
                     let _ = writeln!(err, "{message}");
                     USAGE_ERROR
@@ -518,6 +521,7 @@ fn resolve_agent(
     options: &SellOptions,
     existing: Option<&SellerConfig>,
     custom_agents: &std::collections::BTreeMap<String, home::AgentPresetConfig>,
+    host: agent_presets::AdapterHost,
     _out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<(Option<String>, Vec<String>), i32> {
@@ -530,7 +534,7 @@ fn resolve_agent(
     }
     if let Some(name) = options.agent.as_ref() {
         let (label, argv) =
-            agent_presets::resolve_agent_preset(name, custom_agents).map_err(|message| {
+            agent_presets::resolve_agent_preset_in(name, custom_agents, host).map_err(|message| {
                 let _ = writeln!(err, "{message}");
                 USAGE_ERROR
             })?;
@@ -852,7 +856,15 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let (label, resolved) =
-            resolve_agent(&options, None, &custom, &mut out, &mut err).expect("resolves");
+            resolve_agent(
+                &options,
+                None,
+                &custom,
+                maxplayer_core::agent_presets::AdapterHost::Host,
+                &mut out,
+                &mut err,
+            )
+            .expect("resolves");
 
         assert_eq!(label.as_deref(), Some("mine"));
         assert_eq!(resolved, vec![argv0.clone()]);

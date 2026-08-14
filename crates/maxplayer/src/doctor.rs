@@ -279,6 +279,7 @@ mod checks {
     use maxplayer_core::seller_git;
 
     use super::Check;
+    use maxplayer_core::agent_presets::AdapterHost;
     use maxplayer_core::seller_agents::{self, AgentRegistry};
 
     const RELAY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -557,6 +558,7 @@ mod checks {
     pub(super) fn check_agent_registry(
         seller: Option<SellerConfig>,
         presets: BTreeMap<String, AgentPresetConfig>,
+        host: AdapterHost,
     ) -> Check {
         let Some(seller) = seller else {
             return Check::warn(
@@ -565,7 +567,7 @@ mod checks {
                 "run `maxplayer seller --agent <claude|cursor|codex> --rate-sats <n>` once to configure",
             );
         };
-        match seller_agents::resolve(&seller, &presets) {
+        match seller_agents::resolve(&seller, &presets, host) {
             // Fully resolved ⇒ PASS. A partial resolve still BOOTS (it serves with the remainder),
             // so it is an advisory WARN carrying the same loud degrade line boot would print — never
             // a boot-blocking FAIL, because boot does not refuse it.
@@ -648,7 +650,73 @@ mod checks {
     /// (#357/#358). A pass-through policy (no `[sandbox]` section) launches the agent directly, so
     /// there is nothing to resolve: a no-op Pass, never a spurious Fail.
     pub(super) fn check_sandbox_launcher(sandbox: Option<SandboxConfig>) -> Check {
-        let policy = SandboxPolicy::from_config(sandbox.as_ref());
+        check_sandbox_launcher_in(sandbox, container_marker())
+    }
+
+    /// The marker a container runtime plants in every container it starts — `Some(path)` when THIS
+    /// process is itself containerized. Parsing cgroups is not an alternative: under cgroup v2 a
+    /// container's `/proc/1/cgroup` reads `0::/`, byte-identical to the host's.
+    fn container_marker() -> Option<&'static str> {
+        ["/.dockerenv", "/run/.containerenv"]
+            .into_iter()
+            .find(|marker| std::path::Path::new(marker).exists())
+    }
+
+    /// [`check_sandbox_launcher`] over an injected container marker, so both sides of the
+    /// docker-in-docker refusal are testable on a host that is not itself in a container.
+    pub(super) fn check_sandbox_launcher_in(
+        sandbox: Option<SandboxConfig>,
+        container: Option<&str>,
+    ) -> Check {
+        let policy = match SandboxPolicy::from_config(sandbox.as_ref()) {
+            Ok(policy) => policy,
+            Err(error) => {
+                return Check::fail(
+                    SANDBOX_CHECK,
+                    format!("[sandbox] does not resolve into an executor: {error}"),
+                    "fix the [sandbox] section (or remove it to run unsandboxed)",
+                )
+            }
+        };
+        // Under `mode = "docker"` there is no launcher argv; the spawn is `docker run …`, so the
+        // same "resolves before it can ENOENT every job" property is asked of `docker` itself.
+        if let Some(image) = policy.docker_image() {
+            // Docker-in-docker. `docker run -v <host path>:/work` is resolved by the HOST daemon, so
+            // a seller that is itself containerized would name a workdir that exists only inside its
+            // own filesystem (under compose: `/data/seller-jobs/…` on a named volume). Docker CREATES
+            // a missing bind source as an empty directory rather than refusing — so the agent would
+            // work in a phantom `/work`, the delivery snapshot would find the seller's real workdir
+            // untouched, and the buyer would be charged for an EMPTY tree.
+            //
+            // Every other docker misconfiguration fails loudly at spawn. This one does not, which is
+            // why it is refused here rather than left to be discovered by a paying buyer.
+            if let Some(marker) = container {
+                return Check::fail(
+                    SANDBOX_CHECK,
+                    format!(
+                        "[sandbox] mode=docker (image '{image}'), but this seller is ITSELF running \
+                         in a container ({marker}) — the per-job bind mount would resolve against \
+                         the host filesystem, not this one, and a job would deliver an EMPTY tree"
+                    ),
+                    "run the seller directly on the host to use mode=docker, or switch [sandbox] to a \
+                     launcher that confines from inside a container",
+                );
+            }
+            return if argv0_resolvable("docker") {
+                Check::pass(
+                    SANDBOX_CHECK,
+                    format!("[sandbox] mode=docker, image '{image}' — docker resolvable"),
+                )
+            } else {
+                Check::fail(
+                    SANDBOX_CHECK,
+                    "[sandbox] mode=docker but 'docker' is neither on PATH nor an existing file — \
+                     every job would fail at spawn (ENOENT)"
+                        .to_owned(),
+                    "install docker or switch [sandbox] mode (or remove [sandbox] to run unsandboxed)",
+                )
+            };
+        }
         match policy.launcher().first() {
             None => Check::pass(
                 SANDBOX_CHECK,
@@ -698,7 +766,16 @@ mod checks {
         unsafe_override: bool,
         model: ContainmentModel,
     ) -> Check {
-        let policy = SandboxPolicy::from_config(sandbox.as_ref());
+        let policy = match SandboxPolicy::from_config(sandbox.as_ref()) {
+            Ok(policy) => policy,
+            Err(error) => {
+                return Check::fail(
+                    CONTAINMENT_CHECK,
+                    format!("[sandbox] does not resolve into an executor: {error}"),
+                    "fix the [sandbox] section so the containment probe has an executor to measure",
+                )
+            }
+        };
         let containment = crate::sandbox_probe::probe_containment(&policy, &home_root);
 
         if !claims_open_pool {
@@ -845,7 +922,7 @@ mod checks {
                 "run `maxplayer seller --agent <claude|cursor|codex> --rate-sats <n>` once to configure; doctor will not guess a harness",
             );
         };
-        let resolved = match seller_agents::resolve(&seller, &presets) {
+        let resolved = match seller_agents::resolve(&seller, &presets, AdapterHost::Host) {
             Ok(resolved) => resolved,
             Err(_) => {
                 return Check::warn(
@@ -1117,7 +1194,10 @@ fn build_checks(
     checks.push(Box::new(move || checks::check_relay(relay_url, secret)));
     // One aggregate mint check across the accept-policy: "can I settle anywhere?".
     checks.push(Box::new(move || checks::check_mints(accepted_mints)));
-    checks.push(Box::new(move || checks::check_agent_registry(seller, custom_agents)));
+    let agent_host = maxplayer_core::agent_presets::AdapterHost::for_sandbox(sandbox.as_ref());
+    checks.push(Box::new(move || {
+        checks::check_agent_registry(seller, custom_agents, agent_host)
+    }));
     checks.push(Box::new(move || checks::check_telemetry(telemetry)));
     // The seller boot gate blocks on this (issue #357): a launcher that cannot spawn would let the
     // node advertise and then fail every job. Bypassable, like every check, via --skip-doctor.
@@ -1439,10 +1519,14 @@ mod tests {
     #[cfg(feature = "wallet")]
     #[test]
     fn sandbox_launcher_check_fails_only_on_an_unresolvable_launcher() {
-        use maxplayer_core::home::SandboxConfig;
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
 
         let bogus = checks::check_sandbox_launcher(Some(SandboxConfig {
+            mode: SandboxMode::Launcher,
             launcher: vec!["definitely-not-a-real-binary-xyz".into()],
+            image: None,
+            forward_env: Vec::new(),
+            runtime: None,
         }));
         assert_eq!(
             bogus.status,
@@ -1458,7 +1542,14 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(
-            checks::check_sandbox_launcher(Some(SandboxConfig { launcher: vec![real] })).status,
+            checks::check_sandbox_launcher(Some(SandboxConfig {
+                mode: SandboxMode::Launcher,
+                launcher: vec![real],
+                image: None,
+                forward_env: Vec::new(),
+                runtime: None,
+            }))
+            .status,
             Status::Pass,
             "a resolvable launcher must PASS"
         );
@@ -1473,11 +1564,15 @@ mod tests {
     #[cfg(feature = "wallet")]
     fn contained_probe_launcher() -> maxplayer_core::home::SandboxConfig {
         maxplayer_core::home::SandboxConfig {
+            mode: maxplayer_core::home::SandboxMode::Launcher,
             launcher: vec![
                 "/bin/sh".into(),
                 "-c".into(),
                 "printf 'canary_read=denied\\nworkdir_write=ok\\n'".into(),
             ],
+            image: None,
+            forward_env: Vec::new(),
+            runtime: None,
         }
     }
 
@@ -1600,6 +1695,53 @@ mod tests {
         );
     }
 
+    // Docker-in-docker is the ONE docker misconfiguration that does not fail at spawn: the per-job
+    // bind mount is resolved by the host daemon, docker creates the missing source as an empty dir,
+    // and the job delivers an empty tree a buyer has already paid for. Every other docker fault
+    // ENOENTs loudly, so this is the one the gate has to catch by reasoning rather than by trying.
+    // Delete the `container` branch in `check_sandbox_launcher_in` and this goes red.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn docker_mode_is_refused_when_the_seller_is_itself_containerized() {
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
+
+        let docker = || {
+            Some(SandboxConfig {
+                mode: SandboxMode::Docker,
+                launcher: Vec::new(),
+                image: Some("maxplayer-sandbox:latest".into()),
+                forward_env: Vec::new(),
+                runtime: None,
+            })
+        };
+
+        let inside = checks::check_sandbox_launcher_in(docker(), Some("/.dockerenv"));
+        assert_eq!(
+            inside.status,
+            Status::Fail,
+            "a containerized seller must not advertise mode=docker: {}",
+            inside.render()
+        );
+        assert!(
+            inside.detail.contains("EMPTY"),
+            "the refusal must name the SILENT outcome (an empty delivery), not just a bad mount: {}",
+            inside.detail
+        );
+        assert!(
+            inside.render().contains("fix:"),
+            "a FAIL must carry a fix hint"
+        );
+
+        // Off the host-in-a-container path the same config is judged only on whether docker resolves.
+        // Without this, a check that always failed would satisfy the assertions above.
+        let outside = checks::check_sandbox_launcher_in(docker(), None);
+        assert!(
+            !outside.detail.contains("ITSELF running"),
+            "a seller on the host must never be refused for being containerized: {}",
+            outside.detail
+        );
+    }
+
     // RED-PROVE (wiring): the sandbox launcher check must be part of the seller boot gate registry,
     // or a box with an unresolvable launcher boots and then fails EVERY job. Drop the
     // `check_sandbox_launcher` push from `build_checks` and this goes red — no boot-gate result names
@@ -1620,7 +1762,11 @@ mod tests {
         ));
         let mut home = resolve_doctor_home(Some(tmp.clone())).expect("bootstrap the home");
         home.config.sandbox = Some(SandboxConfig {
+            mode: maxplayer_core::home::SandboxMode::Launcher,
             launcher: vec!["definitely-not-a-real-binary-xyz".into()],
+            image: None,
+            forward_env: Vec::new(),
+            runtime: None,
         });
         home.config.relay_url = "not-a-relay-url".into();
         home.config.accepted_mints = Vec::new();
@@ -1677,11 +1823,16 @@ mod tests {
         };
 
         // Boot's verdict: the registry the seller node actually boots with.
-        let boot = seller_agents::resolve(&seller, &presets);
+        let boot =
+            seller_agents::resolve(&seller, &presets, maxplayer_core::agent_presets::AdapterHost::Host);
         assert!(boot.is_ok(), "boot resolves the verbatim agent_command");
 
         // Doctor must report the SAME verdict, not a FAIL derived from a PATH probe of the preset.
-        let check = checks::check_agent_registry(Some(seller), presets);
+        let check = checks::check_agent_registry(
+            Some(seller),
+            presets,
+            maxplayer_core::agent_presets::AdapterHost::Host,
+        );
         assert_eq!(
             check.status,
             Status::Pass,
@@ -1717,7 +1868,11 @@ mod tests {
             claim_award_timeout_secs: None,
         };
 
-        let check = checks::check_agent_registry(Some(seller), BTreeMap::new());
+        let check = checks::check_agent_registry(
+            Some(seller),
+            BTreeMap::new(),
+            maxplayer_core::agent_presets::AdapterHost::Host,
+        );
         assert_eq!(
             check.status,
             Status::Pass,
@@ -1764,12 +1919,17 @@ mod tests {
             claim_award_timeout_secs: None,
         };
 
-        let boot = seller_agents::resolve(&seller, &presets);
+        let boot =
+            seller_agents::resolve(&seller, &presets, maxplayer_core::agent_presets::AdapterHost::Host);
         assert!(
             matches!(boot, Err(RegistryError::AllFailed(_))),
             "boot must refuse a registry with no launchable harness"
         );
-        let check = checks::check_agent_registry(Some(seller), presets);
+        let check = checks::check_agent_registry(
+            Some(seller),
+            presets,
+            maxplayer_core::agent_presets::AdapterHost::Host,
+        );
         assert_eq!(
             check.status,
             Status::Fail,

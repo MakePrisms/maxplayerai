@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use maxplayer_core::seller_exec::SandboxPolicy;
+use maxplayer_core::seller_exec::{JobLaunch, SandboxPolicy};
 
 const SUCCESS: i32 = 0;
 const USAGE_ERROR: i32 = 1;
@@ -56,6 +56,9 @@ const PROBE_WORKDIR_NAME: &str = ".sandbox-probe";
 /// The canary, in the home root beside the seller key. Its NAME says what it is: a leftover from a
 /// crashed probe should not look like something an operator must protect.
 const CANARY_NAME: &str = ".sandbox-canary-not-a-secret";
+/// The file the container payload touches to prove the workdir is writable. Relative to the session
+/// cwd, which the docker launch pins to the in-container mount point.
+const PROBE_WRITE_NAME: &str = ".sandbox-probe-write";
 
 /// The verdict the boot gate acts on. Every variant that is not [`Contained`] carries the sentence
 /// an operator needs to fix it — a refusal that only says "sandbox failed" sends them to the source.
@@ -280,15 +283,6 @@ pub fn probe_containment(policy: &SandboxPolicy, home_root: &Path) -> Containmen
         );
     }
 
-    let exe = match std::env::current_exe() {
-        Ok(path) => path,
-        Err(error) => {
-            return Containment::Inconclusive(format!(
-                "cannot locate this executable to run the probe with ({error})"
-            ))
-        }
-    };
-
     // ★ The paths are the seat's REAL ones, and that is the whole design. A launcher is configured
     //   for where jobs run — `$MAXPLAYER_HOME/seller-jobs/<job_id>` — so a probe in a scratch directory
     //   under /tmp would be denied by a perfectly good sandbox that simply never heard of it, and
@@ -337,6 +331,32 @@ pub fn probe_containment(policy: &SandboxPolicy, home_root: &Path) -> Containmen
     }
     let _ = std::fs::remove_file(&control_write);
 
+    // Both executors answer the SAME question — is the seat's private tree reachable from inside a
+    // job — but they can only be asked it in their own shape, so the payload differs and the verdict
+    // does not. Both emit the same markers, and `verdict_from_payload` judges both without knowing
+    // which produced them.
+    let verdict = match policy.docker_image() {
+        Some(_) => run_in_container(policy, &canary, &workdir),
+        None => run_under_launcher(policy, &canary, &workdir),
+    };
+
+    cleanup(&workdir, &canary);
+    verdict
+}
+
+/// The launcher probe: spawn OUR binary under the launcher and let it report what it could reach.
+///
+/// A launcher RESTRICTS a filesystem it shares with us, so the canary is genuinely present inside
+/// and a pass means the launcher actively DENIED the read.
+fn run_under_launcher(policy: &SandboxPolicy, canary: &Path, workdir: &Path) -> Containment {
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            return Containment::Inconclusive(format!(
+                "cannot locate this executable to run the probe with ({error})"
+            ))
+        }
+    };
     let payload: Vec<String> = vec![
         exe.to_string_lossy().into_owned(),
         "sandbox-probe".to_owned(),
@@ -345,22 +365,106 @@ pub fn probe_containment(policy: &SandboxPolicy, home_root: &Path) -> Containmen
         "--workdir".to_owned(),
         workdir.to_string_lossy().into_owned(),
     ];
-    let argv = policy.wrap(&payload);
-    let verdict = spawn_and_read(&argv);
-
-    cleanup(&workdir, &canary);
+    // Non-docker on this arm, so the policy always yields a host argv.
+    let argv = policy
+        .wrap(&payload)
+        .expect("a launcher/pass-through policy always wraps into a host argv");
 
     // Measured while building this: a bubblewrap launcher that binds only the agent's paths cannot
     // execute OUR binary, and the run fails with ENOENT that reads like a missing launcher. The
     // remedy is a bind, so the message has to name the path that needs binding — otherwise the
     // operator debugs the wrong end of a correctly-configured sandbox.
-    match verdict {
+    match spawn_and_read(&argv) {
         Containment::LauncherUnusable(detail) => Containment::LauncherUnusable(format!(
             "{detail}. The probe runs `{} sandbox-probe`, so the launcher must be able to execute \
              that path — a launcher that binds only the agent's paths will not see it",
             exe.display()
         )),
         other => other,
+    }
+}
+
+/// The container probe: run the IMAGE'S OWN SHELL and let it report the same two legs.
+///
+/// A container SUBSTITUTES the filesystem rather than restricting it, so the canary is absent unless
+/// someone mounted the home in — and "absent" is the honest containment answer here, the way
+/// "denied" is under a launcher. The leg still earns its keep: it goes red if a mount is ever added
+/// that exposes the seat's tree, which is the regression a gate exists to catch.
+///
+/// The payload is `sh`, not `maxplayer sandbox-probe`: this binary is not in the sandbox image, and
+/// bind-mounting it would demand the host's libc match the image's — impossible when the seller runs
+/// on darwin. It prints the SAME markers the Rust payload does, so the judgment (including "neither
+/// leg reported ⇒ the payload never ran") is shared rather than duplicated.
+///
+/// The launch comes from [`SandboxPolicy::launch`] — the very call the awarded-job path uses — so
+/// this measures the operator's REAL image under the REAL mount and uid flags, never a stand-in.
+fn run_in_container(policy: &SandboxPolicy, canary: &Path, workdir: &Path) -> Containment {
+    let Some((uid, gid)) = owner_of(workdir) else {
+        return Containment::Inconclusive(
+            "cannot read the probe workdir's owner, so the container could not be run as the uid an \
+             awarded job would get"
+                .to_owned(),
+        );
+    };
+
+    let payload = container_payload(canary);
+
+    let job = JobLaunch {
+        workdir,
+        env: &[],
+        uid,
+        gid,
+    };
+    let launch = match policy.launch(&payload, &job) {
+        Ok(launch) => launch,
+        Err(error) => {
+            return Containment::Inconclusive(format!(
+                "could not build the container launch for the probe ({error})"
+            ))
+        }
+    };
+    let mut argv = Vec::with_capacity(launch.args.len() + 1);
+    argv.push(launch.program);
+    argv.extend(launch.args);
+    spawn_and_read(&argv)
+}
+
+/// The shell payload the container runs: the two legs, in the image's own `sh`, printing the same
+/// markers the Rust payload prints.
+///
+/// The canary path arrives as an ARGUMENT (`$1`) and is never interpolated into the script, so a
+/// home path carrying a space or a quote cannot become shell syntax. The write leg is relative to
+/// the session cwd, which the docker launch pins to the in-container mount point — so the payload
+/// never has to know the host path or the mount point's name.
+fn container_payload(canary: &Path) -> Vec<String> {
+    let script = format!(
+        "if [ -r \"$1\" ]; then echo {CANARY_READ_OK}; else echo {CANARY_READ_DENIED}; fi; \
+         if touch ./{PROBE_WRITE_NAME} 2>/dev/null; then echo {WORKDIR_WRITE_OK}; \
+         rm -f ./{PROBE_WRITE_NAME}; else echo {WORKDIR_WRITE_DENIED}; fi"
+    );
+    vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        script,
+        // $0, then $1 — the canary path the script tests.
+        "maxplayer-sandbox-probe".to_owned(),
+        canary.to_string_lossy().into_owned(),
+    ]
+}
+
+/// The uid/gid owning `path`. The probe workdir was just created by THIS process, so its owner is
+/// the uid an awarded job's container would be run as — read from the filesystem rather than pulled
+/// in through a `libc` dependency this crate does not otherwise carry.
+fn owner_of(path: &Path) -> Option<(u32, u32)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| (m.uid(), m.gid()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
     }
 }
 
@@ -619,5 +723,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         assert!(matches!(verdict, Containment::NotContained(_)), "{verdict:?}");
         assert!(verdict.detail().contains("no [sandbox] launcher"), "{verdict:?}");
+    }
+
+    // ── the container payload ───────────────────────────────────────────────────────────────────
+    // The shell payload is judged by the SAME `verdict_from_payload` as the Rust one, so what has to
+    // be pinned is that its output actually speaks that contract. Run it under the host's own `sh`:
+    // no docker, so it runs in CI, and it isolates the script's grammar and markers from anything
+    // the container adds. Both directions, because a script that always printed `denied` would pass
+    // a one-sided test while proving nothing.
+    fn run_payload_on_host(canary: &Path, cwd: &Path) -> String {
+        let payload = super::container_payload(canary);
+        let output = Command::new(&payload[0])
+            .args(&payload[1..])
+            .current_dir(cwd)
+            .output()
+            .expect("run the container payload under the host shell");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[test]
+    fn the_container_payload_speaks_the_shared_verdict_contract() {
+        let root = scratch();
+        let workdir = root.join("work");
+        std::fs::create_dir_all(&workdir).expect("mk workdir");
+        let canary = root.join(CANARY_NAME);
+
+        // Canary REACHABLE (as it would be if someone mounted the home in) ⇒ not contained.
+        std::fs::write(&canary, b"canary\n").expect("write canary");
+        let reachable = run_payload_on_host(&canary, &workdir);
+        assert!(
+            matches!(verdict_from_payload(&reachable), Containment::NotContained(_)),
+            "a readable canary must read as NotContained, got: {reachable:?}"
+        );
+
+        // Canary ABSENT (the container's normal state — the home was never mounted) ⇒ contained,
+        // and the write leg still had to succeed for that verdict to be reachable.
+        std::fs::remove_file(&canary).expect("rm canary");
+        let absent = run_payload_on_host(&canary, &workdir);
+        assert_eq!(
+            verdict_from_payload(&absent),
+            Containment::Contained,
+            "an absent canary plus a writable workdir is containment, got: {absent:?}"
+        );
+
+        // The write leg is REAL: a workdir the payload cannot write must not read as contained.
+        let readonly = root.join("readonly");
+        std::fs::create_dir_all(&readonly).expect("mk readonly");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o500))
+                .expect("chmod 0500");
+            // Root ignores the mode bits, so this leg would false-pass when tests run as root.
+            if super::owner_of(&readonly).map(|(uid, _)| uid) != Some(0) {
+                let denied = run_payload_on_host(&canary, &readonly);
+                assert!(
+                    matches!(verdict_from_payload(&denied), Containment::WorkdirUnwritable(_)),
+                    "an unwritable workdir must not read as contained, got: {denied:?}"
+                );
+            }
+            let _ = std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o700));
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // End-to-end against a REAL container, opt-in via `MAXPLAYER_SANDBOX_PROBE_DOCKER_E2E=1` because
+    // it needs a docker daemon and an image with a shell. This is the one that proves the whole
+    // claim: an image mounting only the job workdir is CONTAINED — the seat's home is unreachable
+    // not because a rule denied it, but because it was never mounted.
+    #[test]
+    fn docker_probe_reports_containment_against_a_real_container() {
+        if std::env::var("MAXPLAYER_SANDBOX_PROBE_DOCKER_E2E").as_deref() != Ok("1") {
+            return;
+        }
+        let image = std::env::var("MAXPLAYER_SANDBOX_PROBE_E2E_IMAGE")
+            .unwrap_or_else(|_| "alpine:latest".to_owned());
+        let root = scratch();
+        std::fs::create_dir_all(&root).expect("mk home root");
+
+        // Built through the real config route, so the test exercises the same resolution an
+        // operator's `[sandbox]` section goes through — not a hand-made policy.
+        let policy = SandboxPolicy::from_config(Some(&maxplayer_core::home::SandboxConfig {
+            mode: maxplayer_core::home::SandboxMode::Docker,
+            launcher: Vec::new(),
+            image: Some(image),
+            forward_env: Vec::new(),
+            runtime: None,
+        }))
+        .expect("mode=docker with an image resolves");
+        let verdict = probe_containment(&policy, &root);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(
+            verdict,
+            Containment::Contained,
+            "a container mounting only the job workdir must prove containment; got {verdict:?}"
+        );
     }
 }

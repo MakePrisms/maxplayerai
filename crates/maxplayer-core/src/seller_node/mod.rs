@@ -63,6 +63,10 @@ pub enum NodeError {
     /// under award-is-payment a buyer commits the sats at award, so advertising a dead capability
     /// makes the buyer pay for our outage (#357).
     NoProvenHarness(String),
+    /// The `[sandbox]` section does not resolve into an executor (e.g. `mode = "docker"` with no
+    /// image). Boot refuses rather than fall back to running the agent unsandboxed: a seat
+    /// configured to contain strangers' code must not silently serve without containment.
+    Sandbox(String),
 }
 
 impl std::fmt::Display for NodeError {
@@ -76,6 +80,9 @@ impl std::fmt::Display for NodeError {
             Self::Agents(error) => write!(formatter, "seller node agent config error: {error}"),
             Self::NoProvenHarness(message) => {
                 write!(formatter, "seller node prove-before-advertise: {message}")
+            }
+            Self::Sandbox(message) => {
+                write!(formatter, "seller node sandbox config error: {message}")
             }
         }
     }
