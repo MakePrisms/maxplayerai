@@ -120,7 +120,16 @@ export function createRelaySource(
 ): MarketSource {
   let ws: WebSocket | null = null;
   let phase: SourceState = "idle";
-  let pages = 0;
+  /**
+   * Pages spent PER STREAM. One shared counter let the deep tagged stream spend
+   * the whole allowance, after which every remaining stream went live having
+   * read nothing — a truncated market reporting itself fully synced.
+   */
+  const pageCounts = new Map<string, number>();
+  /** Streams that stopped on the backstop rather than running out. */
+  const truncated = new Set<string>();
+  /** A relay refusal, as opposed to a transient drop: retrying cannot help. */
+  let refused = false;
   let seenThisPage = 0;
   let streams: Stream[] = [];
   let streamIndex = 0;
@@ -165,6 +174,14 @@ export function createRelaySource(
     const stream = streams[streamIndex];
     if (!stream) return goLive(true);
     send(["REQ", activeSub, historyFilter(stream, oldestSeen == null ? null : oldestSeen - 1)]);
+  }
+
+  /** Move to the next stream, resuming it from its own cursor. */
+  function nextStream() {
+    streamIndex += 1;
+    oldestSeen = cursors.get(streams[streamIndex]?.name ?? "") ?? null;
+    if (streamIndex >= streams.length) return goLive(truncated.size === 0);
+    requestHistory();
   }
 
   /** One incremental ask. A quiet market costs an empty round trip. */
@@ -214,7 +231,6 @@ export function createRelaySource(
 
   function handleEose(subId: string) {
     if (phase === "history") {
-      pages += 1;
       if (activeSub) {
         closedByUs.add(activeSub);
         send(["CLOSE", activeSub]);
@@ -224,13 +240,16 @@ export function createRelaySource(
       // the next EOSE resumes here instead of restarting or skipping ahead.
       const current = streams[streamIndex];
       if (current && oldestSeen != null) cursors.set(current.name, oldestSeen);
-      if (pages >= MAX_PAGES) return goLive(false);
-      if (exhausted) {
-        if (current) drained.add(current.name);
-        // This stream is drained; the next resumes from its own cursor.
-        streamIndex += 1;
-        oldestSeen = cursors.get(streams[streamIndex]?.name ?? "") ?? null;
-        if (streamIndex >= streams.length) return goLive(true);
+      if (current) pageCounts.set(current.name, (pageCounts.get(current.name) ?? 0) + 1);
+      const spent = current ? (pageCounts.get(current.name) ?? 0) >= MAX_PAGES : true;
+      if (exhausted || spent) {
+        // Drained is an answer; the backstop is an admission. Recorded apart so
+        // a short read cannot certify the store as complete.
+        if (current) (exhausted ? drained : truncated).add(current.name);
+        if (current && !exhausted) {
+          console.warn(`[relay] stream ${current.name} stopped at the ${MAX_PAGES}-page backstop`);
+        }
+        return nextStream();
       }
       requestHistory();
       return;
@@ -260,6 +279,9 @@ export function createRelaySource(
       const subId = String(frame[1]);
       const verdict = classifyClosed(frame[2], closedByUs.has(subId));
       if (verdict === "acknowledged") { closedByUs.delete(subId); return; }
+      // `restricted:` will not become permitted by asking again; anything else
+      // stays retryable, so the ordinary reconnect path keeps working.
+      if (verdict === "refused") refused = true;
       status("failed", `relay declined the read (${verdict})`);
       teardown();
       if (verdict === "retryable") scheduleRetry();
@@ -289,7 +311,12 @@ export function createRelaySource(
   function connect() {
     if (stopped) return;
     teardown();
-    pages = 0;
+    // The backstop is per connection, like the page counter it replaced: a
+    // reconnect resumes deeper thanks to the cursors, so it makes progress
+    // rather than re-spending the same allowance on the same pages.
+    pageCounts.clear();
+    truncated.clear();
+    refused = false;
     // The forward read is only sound once a walk has genuinely finished:
     // `since` asserts there is nothing below it. Otherwise walk backward and
     // resume each stream from its own recorded cursor — reconnecting mid-read
@@ -311,7 +338,12 @@ export function createRelaySource(
       if (Array.isArray(frame)) handleFrame(frame);
     };
     ws.onerror = () => { if (phase !== "failed") status("failed", "connection error"); };
-    ws.onclose = () => { if (!stopped && phase !== "failed") scheduleRetry(); };
+    // An error followed by a close is THE ordinary browser drop, and gating the
+    // retry on `phase !== "failed"` meant onerror had already disqualified it —
+    // the app sat disconnected forever. A deliberate teardown detaches this
+    // handler first, so reaching here at all means the drop was involuntary;
+    // only an outright refusal by the relay is worth not retrying.
+    ws.onclose = () => { if (!stopped && !refused) scheduleRetry(); };
   }
 
   return {

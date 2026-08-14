@@ -117,6 +117,59 @@ test("a drop mid-history resumes the same stream where it stopped, never forward
   );
 });
 
+test("each stream gets its OWN page budget — a deep stream cannot silence a sparse one", async () => {
+  // Same defect the baker had: one `pages` counter for every stream. The tagged
+  // stream is the deep one and the untagged kinds are sparse, so the tagged
+  // walk spent the whole allowance and the rest went live having read nothing —
+  // a truncated market reporting itself fully synced.
+  const h = harness();
+  h.source.start();
+  const sock = h.latest();
+  sock.onopen!();
+
+  // Answer every page with a full page of events, so nothing ever drains and
+  // only the backstop can stop it.
+  let guard = 0;
+  let seen = new Set<string>();
+  while (guard++ < 5000) {
+    const req = sock.reqs[sock.reqs.length - 1]!;
+    if (seen.has(req.sub)) break;
+    seen.add(req.sub);
+    sock.deliver(req.sub, ev(T0 + 100_000 - guard));
+    sock.eose(req.sub);
+    if (h.source.state !== "history") break;
+  }
+
+  // Every stream must have been asked at least twice — i.e. each got a budget
+  // of its own rather than inheriting an exhausted shared one.
+  const names = new Set(sock.reqs.map((r) => JSON.stringify(r.filter.kinds)));
+  assert.ok(names.size >= 2, "more than one stream was walked");
+  for (const kinds of names) {
+    const pages = sock.reqs.filter((r) => JSON.stringify(r.filter.kinds) === kinds).length;
+    assert.ok(pages > 1, `stream ${kinds} was paged on its own budget, got ${pages}`);
+  }
+});
+
+test("an onerror followed by onclose still reconnects", () => {
+  // The ordinary browser drop: the socket errors and then closes. onerror set
+  // the phase to "failed", and onclose skips the retry when the phase is
+  // "failed" — so the app sat there permanently disconnected. This is the most
+  // common failure path there is, and the deleted relay.test.mjs covered it.
+  const h = harness();
+  h.source.start();
+  const first = h.latest();
+  first.onopen!();
+  assert.equal(h.source.state, "history");
+
+  first.onerror!();
+  first.onclose!();
+  h.runTimer();
+
+  assert.equal(h.sockets.length, 2, "a reconnect was attempted");
+  h.latest().onopen!();
+  assert.equal(h.source.state, "history", "and the read resumes");
+});
+
 test("the since-hint is used only when the cached store is known complete", () => {
   // A store is only a valid floor for a forward read if a history walk ever
   // finished. Trusting the hint unconditionally makes a partial cache

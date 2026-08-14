@@ -3,6 +3,9 @@
   "version": "0.2.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "description": "MAXPLAYER AI — the public market terminal. Client-only: instant paint, cached market, swappable poll/stream relay source.",
   "scripts": {
     "build": "node scripts/build.mjs",

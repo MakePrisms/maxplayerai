@@ -23,7 +23,18 @@ import { renameSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 export const RELAY_URL = "wss://relay.maxplayer.ai";
+
+/**
+ * THE ONLY kind numbers outside src/model/kinds.ts, and they are here under
+ * protest: this file runs under plain `node` at deploy time with no TypeScript
+ * loader, so it cannot import the canonical list. Duplication that cannot be
+ * removed is instead made unable to drift — test/bake.test.mjs asserts these
+ * two against kinds.ts, so a renumber that misses this file fails the suite
+ * rather than silently baking the wrong market.
+ */
 export const TAGGED_KINDS = [3401, 3402, 3403, 3404, 3405, 3406, 3400, 30340];
+export const PROFILE_KIND = 0;
+
 export const PAGE = 500;
 /** Per-stream backstop, not a shared allowance. */
 export const MAX_PAGES = 40;
@@ -40,7 +51,7 @@ export const TIMEOUT_MS = 60_000;
 export function defaultStreams() {
   return [
     { name: "tagged", filter: { kinds: TAGGED_KINDS, limit: PAGE, "#t": ["maxplayer"] } },
-    { name: "profiles", filter: { kinds: [0], limit: PAGE } },
+    { name: "profiles", filter: { kinds: [PROFILE_KIND], limit: PAGE } },
   ];
 }
 

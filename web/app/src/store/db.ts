@@ -18,6 +18,19 @@ const META = "meta";
 const COMPLETE_KEY = "historyComplete";
 const VERSION = 2;
 
+/**
+ * Safety valve on the cache, not a routine working limit — roughly an order of
+ * magnitude above the live market, so reaching it means something changed.
+ *
+ * The trade-off is deliberate and worth stating: pruning makes the store no
+ * longer a COMPLETE history, so it also clears the completeness marker and the
+ * relay walks the full history again next boot. That costs a slower boot. The
+ * alternative — pruning quietly and leaving the marker set — would resume the
+ * cheap forward read above the events just deleted, which is a permanent hole.
+ * Slow is recoverable; a hole is not.
+ */
+const MAX_CACHED_EVENTS = 50_000;
+
 export interface EventDb {
   /** Everything held, in no particular order. Empty on any failure. */
   loadAll(): Promise<RawEvent[]>;
@@ -41,7 +54,8 @@ function openDb(): Promise<IDBDatabase | null> {
     let request: IDBOpenDBRequest;
     try {
       request = indexedDB.open(DB_NAME, VERSION);
-    } catch {
+    } catch (err) {
+      console.warn("[db] IndexedDB is unavailable; every visit will be a first visit", err);
       resolve(null);
       return;
     }
@@ -57,8 +71,14 @@ function openDb(): Promise<IDBDatabase | null> {
       }
     };
     request.onsuccess = () => resolve(request.result);
-    request.onerror = () => resolve(null);
-    request.onblocked = () => resolve(null);
+    request.onerror = () => {
+      console.warn("[db] could not open the event cache; every visit will be a first visit", request.error);
+      resolve(null);
+    };
+    request.onblocked = () => {
+      console.warn("[db] the event cache is blocked by another tab; this session will not persist");
+      resolve(null);
+    };
   });
 }
 
@@ -81,9 +101,15 @@ export async function createEventDb(): Promise<EventDb> {
       const store = tx.objectStore(STORE);
       for (const event of toWrite) store.put(event);
       for (const id of toEvict) store.delete(id);
-      // Errors are absorbed: persistence is an optimization, never a dependency.
-      tx.onerror = () => {};
-    } catch { /* storage gone mid-session; next visit is a first visit */ }
+      // Persistence is an optimization, never a dependency — a failed write
+      // costs one re-fetch. But it is not allowed to be INVISIBLE: a store that
+      // silently accepts nothing looks exactly like a working one.
+      tx.onerror = () => {
+        console.warn(`[db] a batch of ${toWrite.length} writes and ${toEvict.length} evictions failed`, tx.error);
+      };
+    } catch (err) {
+      console.warn("[db] storage is unavailable; this session will not persist", err);
+    }
   }
 
   function queueFlush() {
@@ -92,15 +118,42 @@ export async function createEventDb(): Promise<EventDb> {
     queueMicrotask(flush);
   }
 
+  function clearHistoryComplete(): void {
+    if (!db) return;
+    try {
+      db.transaction(META, "readwrite").objectStore(META).delete(COMPLETE_KEY);
+    } catch (err) {
+      console.warn("[db] could not clear the completeness marker", err);
+    }
+  }
+
+  /** Enforce the cap, newest kept. Returns what the caller should boot from. */
+  function capped(all: RawEvent[]): RawEvent[] {
+    if (all.length <= MAX_CACHED_EVENTS) return all;
+    const byNewest = [...all].sort((a, b) => (b?.created_at ?? 0) - (a?.created_at ?? 0));
+    const keep = byNewest.slice(0, MAX_CACHED_EVENTS);
+    const drop = byNewest.slice(MAX_CACHED_EVENTS);
+    console.warn(`[db] cache holds ${all.length} events, over the ${MAX_CACHED_EVENTS} cap — pruning ${drop.length} oldest`);
+    pendingEvictions.push(...drop.map((e) => e.id));
+    queueFlush();
+    // The store is no longer a complete history, so it must stop claiming to be.
+    clearHistoryComplete();
+    return keep;
+  }
+
   return {
     loadAll(): Promise<RawEvent[]> {
       if (!db) return Promise.resolve([]);
       return new Promise((resolve) => {
         try {
           const request = db.transaction(STORE, "readonly").objectStore(STORE).getAll();
-          request.onsuccess = () => resolve((request.result as RawEvent[]) || []);
-          request.onerror = () => resolve([]);
-        } catch {
+          request.onsuccess = () => resolve(capped((request.result as RawEvent[]) || []));
+          request.onerror = () => {
+            console.warn("[db] could not read the cache; booting as a first visit", request.error);
+            resolve([]);
+          };
+        } catch (err) {
+          console.warn("[db] could not read the cache; booting as a first visit", err);
           resolve([]);
         }
       });
