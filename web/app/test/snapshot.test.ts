@@ -21,8 +21,15 @@ test("a STALLED fetch gives up on its own deadline instead of holding the boot o
       observed?.addEventListener("abort", () => reject(observed!.reason));
     });
 
+  // AbortSignal.timeout's timer does NOT hold the event loop open. With nothing
+  // else pending, the loop drains while this fetch is still in flight, and the
+  // runner tears the file down ("Promise resolution is still pending but the
+  // event loop has already resolved") — which reports as CANCELLED, not failed.
+  // A browser always has a live loop; a test has to supply one.
+  const keepAlive = setTimeout(() => {}, 10_000);
   const started = Date.now();
   const result = await loadSnapshot({ url: URL_, timeoutMs: 50, fetchImpl: hang });
+  clearTimeout(keepAlive);
 
   assert.ok(observed, "the fetch is given an abort signal");
   assert.equal(result.outcome, "absent");
