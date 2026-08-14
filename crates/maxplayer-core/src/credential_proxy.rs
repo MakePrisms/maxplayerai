@@ -82,6 +82,10 @@ const BODY_READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// the real credential is substituted, so this constant also seeds the default allowlist entry.
 pub const ANTHROPIC_DEFAULT_UPSTREAM: &str = "https://api.anthropic.com";
 
+/// The default real upstream for the OpenAI API-key path (codex seats) when no `OPENAI_BASE_URL`
+/// override is set. Seeds an allowlist entry the same way [`ANTHROPIC_DEFAULT_UPSTREAM`] does.
+pub const OPENAI_DEFAULT_UPSTREAM: &str = "https://api.openai.com";
+
 /// The hostname a container uses to reach the host-side proxy. On Linux the docker launch maps it to
 /// the host with `--add-host <alias>:host-gateway`; on macOS docker provides it natively. Shared with
 /// [`crate::seller_exec`] so the alias the container is told to use and the alias the launch resolves
@@ -324,9 +328,15 @@ pub fn authority_of(base_url: &str) -> Option<String> {
 /// proxy.
 pub fn mint_anthropic_placeholder() -> String {
     // Real keys are `sk-ant-api03-` + ~93 url-safe chars. Match the prefix and total length.
-    const PREFIX: &str = "sk-ant-api03-";
-    const RANDOM_LEN: usize = 93;
-    format!("{PREFIX}{}", random_token(RANDOM_LEN))
+    mint_placeholder("sk-ant-api03-", 93)
+}
+
+/// Mint a format-plausible placeholder: `prefix` followed by `random_len` random url-safe characters.
+/// The prefix carries the vendor's credential shape (so a client that shape-validates locally does not
+/// refuse before the call) and the random tail makes each per-job value unique. Used per credential
+/// variable so every contained secret gets its own distinct placeholder to substitute at egress.
+pub fn mint_placeholder(prefix: &str, random_len: usize) -> String {
+    format!("{prefix}{}", random_token(random_len))
 }
 
 /// `len` random characters from the url-safe base64 alphabet (the charset vendor keys use).

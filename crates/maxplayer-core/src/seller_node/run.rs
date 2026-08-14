@@ -2408,18 +2408,18 @@ pub async fn probe_configured_harnesses(
     // under a pass-through fallback would prove a harness the awarded job will never run under.
     let sandbox = SandboxPolicy::from_config(home.config.sandbox.as_ref())
         .map_err(|error| NodeError::Sandbox(error.to_string()))?;
-    // #647 credential-containment scope (P2a): the proxy contains ANTHROPIC_API_KEY only. A docker
-    // seat that also forwards an OAuth token or an OpenAI key still hands that reusable secret to a
-    // stranger's job RAW. Say so LOUDLY at boot — the same gap the doctor WARN reports — so an OAuth
-    // (`claude /login`) seat is never silently uncontained.
+    // #647 credential-containment scope (P2): every KNOWN model-credential variable is contained by
+    // the proxy. What can still cross RAW is an operator-added `[sandbox] forward_env` variable the
+    // daemon cannot recognize — it may be a credential, and the daemon has no way to know. Say so
+    // LOUDLY at boot — the same gap the doctor WARN reports.
     for var in crate::seller_exec::uncontained_forwarded_credentials(&sandbox, |key| {
         std::env::var(key).ok()
     }) {
         opline!(
-            "seller node SECURITY: [sandbox] mode=docker forwards {var} into the container \
-             UNCONTAINED — #647 contains ANTHROPIC_API_KEY only, so a stranger's job can read {var} \
-             and reuse it. Use an Anthropic API-key seat, or treat this credential as compromised \
-             and spend-cap it at the provider."
+            "seller node SECURITY: [sandbox] forward_env carries {var} into the container \
+             UNCONTAINED — the credential proxy contains only the known model-credential variables, \
+             so if {var} is a secret a stranger's job can read and reuse it. Remove it from \
+             forward_env, or treat that credential as compromised and spend-cap it at the provider."
         );
     }
     let identity = DeliveryAgentIdentity::for_seller(&home::public_key_hex(home)?);

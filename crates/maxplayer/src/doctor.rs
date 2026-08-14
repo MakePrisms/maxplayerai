@@ -738,12 +738,11 @@ mod checks {
 
     const CREDENTIAL_CONTAINMENT_CHECK: &str = "sandbox credential containment";
 
-    /// The #647 credential proxy keeps the model credential out of a docker container — but for the
-    /// **Anthropic API-key path only**. A docker seat that forwards an OAuth token
-    /// (`CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_AUTH_TOKEN`) or an OpenAI key still hands that reusable
-    /// secret to a stranger's job raw. This surfaces that scope gap as a WARN so the common
-    /// `claude /login` OAuth seat is never silently uncontained. Advisory — it never blocks boot,
-    /// because the gap is a ticketed scope limit, not a misconfiguration to fix here.
+    /// The #647 credential proxy keeps every KNOWN model-credential variable out of a docker container.
+    /// What it cannot contain is an operator-added `[sandbox] forward_env` variable the daemon does not
+    /// recognize — a `MY_AGENT_TOKEN` may be a credential, and the daemon has no way to know, so it
+    /// still crosses raw. This surfaces that as a WARN. Advisory — it never blocks boot, because the
+    /// operator chose to forward the variable; the fix is theirs.
     pub(super) fn check_sandbox_credential_containment(sandbox: Option<SandboxConfig>) -> Check {
         check_sandbox_credential_containment_in(sandbox, |key| std::env::var(key).ok())
     }
@@ -764,18 +763,19 @@ mod checks {
         if uncontained.is_empty() {
             return Check::pass(
                 CREDENTIAL_CONTAINMENT_CHECK,
-                "no uncontained model credential is forwarded into the container",
+                "every known model credential is contained; no unrecognized forward_env var is set",
             );
         }
         let names = uncontained.join(", ");
         Check::warn(
             CREDENTIAL_CONTAINMENT_CHECK,
             format!(
-                "[sandbox] mode=docker forwards {names} into the container UNCONTAINED — #647 \
-                 contains ANTHROPIC_API_KEY only, so a stranger's job can read {names} and reuse it"
+                "[sandbox] forward_env carries {names} into the container UNCONTAINED — the proxy \
+                 contains only known model-credential variables, so if {names} is a secret a \
+                 stranger's job can read and reuse it"
             ),
-            "use an Anthropic API-key seat, or treat this credential as compromised and spend-cap it \
-             at the provider (contained OAuth/OpenAI paths are a separate ticket)",
+            "remove it from [sandbox] forward_env, or treat that credential as compromised and \
+             spend-cap it at the provider",
         )
     }
 
@@ -1793,37 +1793,39 @@ mod tests {
         );
     }
 
-    // #647 P2a: a docker seat forwarding an OAuth token is WARNed (uncontained), an API-key-only seat
-    // passes, and a non-docker seat never warns.
+    // #647 P2: every KNOWN credential var is contained, so an OAuth/api-key seat passes; only an
+    // operator-added forward_env var the daemon cannot recognize is WARNed as possibly-uncontained.
     #[cfg(feature = "wallet")]
     #[test]
-    fn docker_oauth_seat_warns_that_the_credential_is_uncontained() {
+    fn docker_operator_forwarded_var_warns_that_it_is_uncontained() {
         use maxplayer_core::home::{SandboxConfig, SandboxMode};
-        let docker = || {
+        let docker = |forward_env: Vec<String>| {
             Some(SandboxConfig {
                 mode: SandboxMode::Docker,
                 launcher: Vec::new(),
                 image: Some("maxplayer-sandbox:latest".into()),
-                forward_env: Vec::new(),
+                forward_env,
                 runtime: None,
             })
         };
-        // An OAuth seat: the leaking credential is named, and the WARN is advisory, never a boot-block.
-        let oauth = |key: &str| (key == "CLAUDE_CODE_OAUTH_TOKEN").then(|| "oauth-real".to_owned());
-        let warned = checks::check_sandbox_credential_containment_in(docker(), oauth);
+        // An operator-added var that is set: named, advisory (never a boot-block).
+        let cfg = docker(vec!["MY_AGENT_TOKEN".into()]);
+        let set = |key: &str| (key == "MY_AGENT_TOKEN").then(|| "operator-secret".to_owned());
+        let warned = checks::check_sandbox_credential_containment_in(cfg, set);
         assert_eq!(warned.status, Status::Warn, "{}", warned.render());
-        assert_ne!(warned.status, Status::Fail, "scope gap is advisory: {}", warned.render());
+        assert_ne!(warned.status, Status::Fail, "advisory: {}", warned.render());
         assert!(
-            warned.detail.contains("CLAUDE_CODE_OAUTH_TOKEN") && warned.detail.contains("UNCONTAINED"),
-            "must name the leaking credential: {}",
+            warned.detail.contains("MY_AGENT_TOKEN") && warned.detail.contains("UNCONTAINED"),
+            "must name the operator var: {}",
             warned.detail
         );
 
-        // An Anthropic API-key seat is the contained path ⇒ Pass.
-        let api = |key: &str| (key == "ANTHROPIC_API_KEY").then(|| "sk-ant-real".to_owned());
+        // A known credential (now contained) is NOT flagged, even when set.
+        let contained_env = |key: &str| (key == "CLAUDE_CODE_OAUTH_TOKEN").then(|| "oauth-real".to_owned());
         assert_eq!(
-            checks::check_sandbox_credential_containment_in(docker(), api).status,
+            checks::check_sandbox_credential_containment_in(docker(Vec::new()), contained_env).status,
             Status::Pass,
+            "a contained credential must not be flagged",
         );
         // A non-docker seat forwards nothing into a container ⇒ Pass regardless of the environment.
         assert_eq!(
