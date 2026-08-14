@@ -470,7 +470,7 @@ ol .row:hover .dot.working i, ol .row:focus-visible .dot.working i {
 .tag[data-s="award"] { color: #ff6a4d; border-color: rgba(255, 40, 0, 0.4); }
 .tag[data-s="result"] { color: var(--ink-2); }
 .tag[data-s="accept"] { color: var(--neon); border-color: rgba(255, 223, 0, 0.35); }
-.tag[data-s="receipt"] { color: #0a0a0b; background: var(--neon); border-color: var(--neon); }
+.tag[data-s="receipt"] { color: #0a0a0b; background: var(--blue); border-color: var(--blue); }
 
 /* ---------- key stats ---------- */
 .stats { padding: 26px 16px 34px; border-bottom: 1px solid var(--line); }
