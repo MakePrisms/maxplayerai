@@ -100,9 +100,18 @@ enum PolicyKind {
     Docker(DockerPolicy),
 }
 
+/// The default `docker` sandbox image a seat runs jobs in when `[sandbox] image` is unset. The
+/// binary OWNS this ref: it pins the version to this build's `CARGO_PKG_VERSION`, so a seller who
+/// installs the npm package and does nothing gets the sandbox image published for exactly that
+/// release (`.github/workflows/publish-sandbox-image.yml` pushes `:v<release-tag>`, matching this
+/// crate's version). The `[sandbox] image` config field remains ONLY for a future fully-custom
+/// image — it is deliberately NOT a version selector; sellers never pin a version by hand.
+pub const DEFAULT_SANDBOX_IMAGE: &str =
+    concat!("ghcr.io/makeprisms/maxplayer-sandbox:v", env!("CARGO_PKG_VERSION"));
+
 /// A resolved `docker` executor: a validated image, plus any operator-named extra environment to
 /// carry in. Built from [`crate::home::SandboxConfig`] via [`SandboxPolicy::from_config`], which
-/// fails closed on a misconfiguration (no image) rather than launching a half-configured container.
+/// defaults the image to [`DEFAULT_SANDBOX_IMAGE`] when the operator names none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DockerPolicy {
     image: String,
@@ -188,8 +197,10 @@ impl SandboxPolicy {
         }
     }
 
-    /// Resolve the policy from the optional `[sandbox]` config. Absent ⇒ pass-through. Fails closed
-    /// on a docker misconfiguration (no image) rather than launching a half-configured container.
+    /// Resolve the policy from the optional `[sandbox]` config. Absent ⇒ pass-through. Under docker
+    /// mode a missing (or blank) `image` DEFAULTS to [`DEFAULT_SANDBOX_IMAGE`] — the binary supplies
+    /// the version-pinned GHCR ref — so a fresh seller who sets only `mode = "docker"` gets a working
+    /// container without naming an image.
     pub fn from_config(config: Option<&crate::home::SandboxConfig>) -> Result<Self, ExecError> {
         use crate::home::SandboxMode;
         let Some(config) = config else {
@@ -202,9 +213,7 @@ impl SandboxPolicy {
                     .image
                     .clone()
                     .filter(|image| !image.trim().is_empty())
-                    .ok_or_else(|| {
-                        ExecError::Config("[sandbox] mode=docker requires an image".into())
-                    })?;
+                    .unwrap_or_else(|| DEFAULT_SANDBOX_IMAGE.to_string());
                 let runtime = config
                     .runtime
                     .clone()
@@ -1203,9 +1212,12 @@ mod tests {
         );
     }
 
-    // from_config fails closed on a docker misconfiguration rather than launching a half-cage.
+    // A docker seat with no `image` set DEFAULTS to the binary-owned GHCR ref (issue #792 phase 3):
+    // it resolves instead of failing closed, and that exact ref appears in the docker run argv, so a
+    // fresh seller who sets only `mode = "docker"` gets a working container. An explicit image still
+    // wins; an absent config is still pass-through.
     #[test]
-    fn from_config_rejects_incomplete_docker() {
+    fn from_config_defaults_docker_image_when_unset() {
         use crate::home::{SandboxConfig, SandboxMode};
         let base = SandboxConfig {
             mode: SandboxMode::Docker,
@@ -1214,14 +1226,35 @@ mod tests {
             forward_env: Vec::new(),
             runtime: None,
         };
-        // docker with no image.
-        assert!(SandboxPolicy::from_config(Some(&base)).is_err());
-        // A docker config with an image resolves.
-        let complete = SandboxConfig {
-            image: Some("img".into()),
-            ..base
-        };
-        assert!(SandboxPolicy::from_config(Some(&complete)).is_ok());
+        // docker with no image ⇒ resolves to the default, NOT an error.
+        let policy = SandboxPolicy::from_config(Some(&base)).expect("defaults the image");
+        assert_eq!(policy.docker_image(), Some(DEFAULT_SANDBOX_IMAGE));
+        // The default ref is the version-pinned GHCR image this build owns.
+        assert_eq!(
+            DEFAULT_SANDBOX_IMAGE,
+            concat!("ghcr.io/makeprisms/maxplayer-sandbox:v", env!("CARGO_PKG_VERSION")),
+        );
+        // The default ref must actually reach the docker run argv the ACP driver spawns.
+        let launch = policy
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
+            .expect("command");
+        assert!(
+            launch.args.iter().any(|a| a == DEFAULT_SANDBOX_IMAGE),
+            "default image ref {DEFAULT_SANDBOX_IMAGE:?} must appear in argv: {:?}",
+            launch.args,
+        );
+        // A blank image is treated as unset and defaults too.
+        let blank = SandboxConfig { image: Some("   ".into()), ..base.clone() };
+        assert_eq!(
+            SandboxPolicy::from_config(Some(&blank)).expect("ok").docker_image(),
+            Some(DEFAULT_SANDBOX_IMAGE),
+        );
+        // An explicit image still wins over the default.
+        let complete = SandboxConfig { image: Some("img".into()), ..base };
+        assert_eq!(
+            SandboxPolicy::from_config(Some(&complete)).expect("ok").docker_image(),
+            Some("img"),
+        );
         // Absent config ⇒ pass-through.
         assert!(SandboxPolicy::from_config(None).expect("ok").is_passthrough());
     }
