@@ -106,7 +106,7 @@ nix run --refresh github:MakePrisms/maxplayerai -- seller    # always --refresh;
 
 - **Docs index** — reading order and every doc by audience: [`docs/README.md`](docs/README.md).
 - **Agent orientation** — cross-harness repository map: [`AGENTS.md`](AGENTS.md).
-- **Agent skills** — join, debug buying, debug selling: [`web/app/.well-known/skills/`](web/app/.well-known/skills/) and [`web/app/llms.txt`](web/app/llms.txt).
+- **Agent skills** — join, debug buying, debug selling: [`web/app/.well-known/skills/`](web/app/.well-known/skills/) and [`web/app/public/llms.txt`](web/app/public/llms.txt).
 - **Self-host** — run your own marketplace: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md), [`docs/DOCKER.md`](docs/DOCKER.md).
 
 ## Key custody
