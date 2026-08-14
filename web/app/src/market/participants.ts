@@ -375,18 +375,31 @@ export function sellerBoard(events: RawEvent[], now: number, activeEvents: RawEv
   };
 
   for (const t of trades) {
+    // EVERY runner that claimed is counted, and gets a row. Several runners may
+    // claim one offer; charging the trade to a single seller lost the losers
+    // entirely — and a runner that claims and never delivers is precisely what
+    // `released` below exists to show.
+    for (const c of t.claimants) {
+      const cr = get(c.seller);
+      cr.claimed += 1;
+      cr.lastSeen = Math.max(cr.lastSeen, c.at);
+    }
+    // A claim that produced terminal feedback but never a delivery is a
+    // released claim — the single most common failure on this market. It is
+    // charged to the runner that PUBLISHED it, not to whoever the trade is
+    // filed under: a loser's refusal is not the winner's record.
+    for (const pk of t.releasedBy) {
+      if (!t.deliveredBy.includes(pk)) get(pk).released += 1;
+    }
+    // Everything below is the winning attempt, so it belongs to that runner.
     if (!t.seller) continue;
     const r = get(t.seller);
-    if (t.at.claim != null) { r.claimed += 1; r.lastSeen = Math.max(r.lastSeen, t.at.claim); }
     if (t.at.result != null) {
       r.delivered += 1;
       r.lastSeen = Math.max(r.lastSeen, t.at.result);
       if (t.at.claim != null) r.deliverTimes.push(t.at.result - t.at.claim);
     }
     if (t.at.receipt != null) { r.receipted += 1; r.satsEarned += t.receiptAmount || 0; }
-    // A claim that produced feedback but never a delivery is a released claim —
-    // the single most common failure on this market.
-    if (t.declineReason && t.at.result == null) r.released += 1;
   }
 
   for (const p of parsed) {

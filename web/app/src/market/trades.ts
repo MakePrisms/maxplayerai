@@ -32,7 +32,17 @@ export interface Trade {
   sellerConflict: boolean;
   offerAmount: number | null;
   receiptAmount: number | null;
+  /** Terminal feedback published by `seller` — the winning attempt ending. A
+   *  losing claimant's refusal is its own business and belongs in `releasedBy`,
+   *  not here; with no identified winner there is no attempt to end, so this
+   *  stays null rather than guessing at whichever refusal paged first. */
   declineReason: string | null;
+  /** Every runner that claimed this trade, earliest first. */
+  claimants: { seller: string; at: number }[];
+  /** Runners whose own terminal feedback ended their own claim. */
+  releasedBy: string[];
+  /** Runners that published a result for this trade. */
+  deliveredBy: string[];
   selfTrade: boolean;
   at: Partial<Record<Stage, number>>;
 }
@@ -93,13 +103,18 @@ function buildTradesUncached(events: (RawEvent | ParsedEvent)[]): Trade[] {
     let t = trades.get(offerId);
     if (!t) {
       t = { offerId, buyer: null, seller: null, sellerConflict: false, offerAmount: null,
-            receiptAmount: null, declineReason: null, selfTrade: false, at: {} };
+            receiptAmount: null, declineReason: null,
+            claimants: [], releasedBy: [], deliveredBy: [], selfTrade: false, at: {} };
       trades.set(offerId, t);
       signals.set(offerId, { authenticated: new Set(), delivered: null, deliveredAt: Infinity,
                              claimed: null, claimedAt: Infinity });
     }
     return t;
   };
+  // Charging a refusal cannot happen in the ingest pass: the buyer-signed record
+  // that names the winner may arrive AFTER the feedback it has to be compared
+  // against. So collect every terminal refusal, then resolve.
+  const terminals = new Map<string, { seller: string; at: number; reason: string }[]>();
   const earliest = (trade: Trade, stage: Stage, ts: number) => {
     const seen = trade.at[stage];
     trade.at[stage] = seen == null ? ts : Math.min(seen, ts);
@@ -122,6 +137,12 @@ function buildTradesUncached(events: (RawEvent | ParsedEvent)[]): Trade[] {
     if (e.stage === "claim" && e.seller && e.created_at < sig.claimedAt) {
       sig.claimed = e.seller; sig.claimedAt = e.created_at;
     }
+    // The full rosters the runner board counts off: one row per runner that
+    // claimed, and delivery checked per runner rather than trade-wide.
+    if (e.stage === "claim" && e.seller && !t.claimants.some((c) => c.seller === e.seller)) {
+      t.claimants.push({ seller: e.seller, at: e.created_at });
+    }
+    if (e.stage === "result" && e.seller && !t.deliveredBy.includes(e.seller)) t.deliveredBy.push(e.seller);
     if (e.stage === "offer" && e.amount != null) t.offerAmount = e.amount;
     if (e.stage === "offer" && e.selfTrade) t.selfTrade = true;
     // A floor, like the stamp above is an earliest: several receipts can name
@@ -135,12 +156,29 @@ function buildTradesUncached(events: (RawEvent | ParsedEvent)[]): Trade[] {
     // text ("unspecified" at worst), so keying on it made every routine
     // `progress` note read as a decline — ending working lamps and counting
     // as a release.
-    if (e.stage === "feedback" && e.terminal && e.reason) t.declineReason = t.declineReason || e.reason;
+    if (e.stage === "feedback" && e.terminal && e.reason && e.seller) {
+      const list = terminals.get(e.offerId) ?? [];
+      list.push({ seller: e.seller, at: e.created_at, reason: e.reason });
+      terminals.set(e.offerId, list);
+    }
   }
+
   for (const t of trades.values()) {
     const { seller, conflict } = resolveSeller(signals.get(t.offerId)!);
     t.seller = seller;
     t.sellerConflict = conflict;
+
+    t.claimants.sort((a, b) => a.at - b.at || a.seller.localeCompare(b.seller));
+    const seen = (terminals.get(t.offerId) ?? []).slice().sort((a, b) => a.at - b.at || a.seller.localeCompare(b.seller));
+    for (const f of seen) {
+      if (!t.releasedBy.includes(f.seller)) t.releasedBy.push(f.seller);
+    }
+    // The trade declines when the WINNER's attempt ends, so only the winner's
+    // own refusal counts — a losing claimant refusing is that claimant's record
+    // (`releasedBy`) and nothing more. With no winner identified, or with the
+    // buyer-signed records in conflict, there is no attempt to call ended:
+    // null, on the same principle that leaves `seller` null rather than guess.
+    t.declineReason = t.seller ? seen.find((f) => f.seller === t.seller)?.reason ?? null : null;
   }
   return [...trades.values()];
 }

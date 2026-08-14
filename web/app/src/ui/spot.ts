@@ -23,11 +23,38 @@ export function onSpotChange(listener: () => void): void {
   listeners.add(listener);
 }
 
-async function fetchSpot(): Promise<void> {
+/**
+ * The plausibility band for a BTC-USD quote.
+ *
+ * Deliberately enormous — this is not a forecast, it is a garbage filter. The
+ * failures worth catching are shaped like a wrong field, a missing decimal, or
+ * cents read as dollars, and those land orders of magnitude out. Rejecting a
+ * quote costs us a stale display, which is its own kind of wrong, so the band
+ * errs heavily towards accepting anything a real market could produce.
+ */
+const RATE_MIN = 1_000;
+const RATE_MAX = 10_000_000;
+
+/**
+ * `> 0` is not enough. It admits 0.00001 and 1e12, and the number reaches the
+ * page as a fact — every dollar figure on the board derives from it, with
+ * nothing to tell a reader the rate was nonsense.
+ */
+export function isPlausibleRate(rate: unknown): rate is number {
+  return typeof rate === "number" && Number.isFinite(rate) && rate >= RATE_MIN && rate <= RATE_MAX;
+}
+
+export async function fetchSpot(fetchImpl: typeof fetch = fetch): Promise<void> {
   try {
-    const res = await fetch("https://api.coinbase.com/v2/prices/BTC-USD/spot");
+    const res = await fetchImpl("https://api.coinbase.com/v2/prices/BTC-USD/spot");
     const rate = Number((await res.json())?.data?.amount);
-    if (rate > 0 && rate !== btcUsd) {
+    if (!isPlausibleRate(rate)) {
+      // Never silent: a refused quote means the page keeps showing the last
+      // known rate (or "…"), and that is worth being able to see.
+      console.warn(`[spot] refused an implausible BTC-USD quote: ${rate}`);
+      return;
+    }
+    if (rate !== btcUsd) {
       btcUsd = rate;
       for (const listener of listeners) listener();
     }
