@@ -19,3 +19,9 @@ export const DB_NAME = "maxplayer-terminal";
 
 /** Baked market snapshot served next to the page (static file, optional). */
 export const SNAPSHOT_URL = "./snapshot.json";
+
+/**
+ * Deadline for the snapshot fetch. It is a first-paint optimization, so a slow
+ * or stalled request must lose to the relay rather than delay it.
+ */
+export const SNAPSHOT_TIMEOUT_MS = 5000;

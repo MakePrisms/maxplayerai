@@ -78,6 +78,22 @@ test("trades key on the root offer and take the earliest stamp per stage", () =>
   assert.equal(trades[0]!.at.receipt, T0 + 50, "earliest receipt stamp wins");
 });
 
+test("a receipt amount is a FLOOR — relay order never lowers it", () => {
+  // The stamp test above uses two receipts of the SAME amount, so it cannot
+  // see this: the amount was a plain assignment, making the figure whichever
+  // receipt the relay happened to page last. Two orders of the same three
+  // events must not produce two different numbers.
+  const o = offer(T0, { amount: 1000 });
+  const high = receipt(o.id, T0 + 5, 1000);
+  const low = receipt(o.id, T0 + 9, 1);
+
+  assert.equal(buildTrades([o, high, low])[0]!.receiptAmount, 1000, "a later low receipt cannot lower the floor");
+  assert.equal(buildTrades([o, low, high])[0]!.receiptAmount, 1000, "and the reverse order agrees");
+  // The figure the page actually renders.
+  assert.equal(marketMetrics([o, high, low]).satsInReceipts, 1000);
+  assert.equal(marketMetrics([o, low, high]).satsInReceipts, 1000);
+});
+
 test("self-trades are excluded from metrics and counted, never silent", () => {
   const arms = offer(T0, { amount: 10 });
   const self = offer(T0 + 1, { amount: 10, self: true });

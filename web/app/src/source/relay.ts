@@ -91,6 +91,14 @@ export interface RelaySourceOptions {
   transport: Transport;
   /** Newest created_at already held by the cache; history resumes from here. */
   sinceHint?: number | null;
+  /**
+   * Whether the cached store is known to hold a COMPLETE history — i.e. a
+   * previous walk ran to genuine exhaustion. The since-hint is an optimization
+   * that assumes there is nothing below it; applied to a store with a hole,
+   * every future read starts above that hole and the store can never repair
+   * itself. Default false: re-walk unless completeness was actually proven.
+   */
+  storeComplete?: boolean;
   openSocket?: (url: string) => WebSocket;
   now?: () => number;
   setTimer?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
@@ -102,6 +110,7 @@ export function createRelaySource(
     url,
     transport,
     sinceHint = null,
+    storeComplete = false,
     openSocket = (u) => new WebSocket(u),
     now = () => Math.floor(Date.now() / 1000),
     setTimer = (fn, ms) => setTimeout(fn, ms),
@@ -119,6 +128,21 @@ export function createRelaySource(
   let oldestSeen: number | null = null;
   /** Forward cursor: the newest created_at we have ingested. */
   let newestSeen: number | null = sinceHint;
+  /**
+   * Per-stream backward cursors and drained marks, kept ACROSS reconnects.
+   *
+   * A dropped socket must resume each stream where that stream stopped. One
+   * shared cursor cannot do it — streams run out at different depths, so
+   * resuming them all from the globally-oldest event steps past everything a
+   * shallower stream has not delivered. That is the same defect the per-filter
+   * cursors above exist to prevent, and it has to survive the reconnect too.
+   * Recorded at page boundaries (EOSE), so a drop mid-page costs a re-read of
+   * one page and can never skip.
+   */
+  const cursors = new Map<string, number>();
+  const drained = new Set<string>();
+  /** Has a history walk ever run to genuine exhaustion? */
+  let historyComplete = storeComplete;
   let subCounter = 0;
   let activeSub: string | null = null;
   /** The long-lived subscription in stream mode; never closed by us. */
@@ -139,7 +163,7 @@ export function createRelaySource(
     seenThisPage = 0;
     activeSub = `h${++subCounter}`;
     const stream = streams[streamIndex];
-    if (!stream) return goLive();
+    if (!stream) return goLive(true);
     send(["REQ", activeSub, historyFilter(stream, oldestSeen == null ? null : oldestSeen - 1)]);
   }
 
@@ -157,10 +181,26 @@ export function createRelaySource(
     pollTimer = setTimer(() => { pollOnce(); schedulePoll(); }, POLL_MS);
   }
 
-  /** History is exhausted — switch to staying current, per transport. */
-  function goLive() {
-    status("live");
-    callbacks.onSynced();
+  /**
+   * History reading is over — switch to staying current, per transport.
+   *
+   * `complete` says WHY it is over: every stream genuinely drained, or the
+   * MAX_PAGES backstop cut a read short. Only the first proves the store holds
+   * everything, and only then may a later visit skip the walk. Collapsing the
+   * two is a green that cannot go red — a truncated read would report itself
+   * fully synced and bake its own gap in.
+   */
+  function goLive(complete: boolean) {
+    if (complete) {
+      historyComplete = true;
+      cursors.clear();
+      drained.clear();
+      status("live");
+    } else {
+      console.warn(`[relay] history stopped at the ${MAX_PAGES}-page backstop; the store is not known complete`);
+      status("live", "partial history");
+    }
+    callbacks.onSynced({ complete });
     if (transport === "stream") {
       // One subscription, left open: the relay pushes every new event as it
       // lands. No timers at all in this mode.
@@ -180,12 +220,17 @@ export function createRelaySource(
         send(["CLOSE", activeSub]);
       }
       const exhausted = seenThisPage === 0 || oldestSeen == null;
-      if (pages >= MAX_PAGES) return goLive();
+      // Record this stream's progress at the page boundary, so a drop before
+      // the next EOSE resumes here instead of restarting or skipping ahead.
+      const current = streams[streamIndex];
+      if (current && oldestSeen != null) cursors.set(current.name, oldestSeen);
+      if (pages >= MAX_PAGES) return goLive(false);
       if (exhausted) {
-        // This stream is drained; the next starts from its own beginning.
+        if (current) drained.add(current.name);
+        // This stream is drained; the next resumes from its own cursor.
         streamIndex += 1;
-        oldestSeen = null;
-        if (streamIndex >= streams.length) return goLive();
+        oldestSeen = cursors.get(streams[streamIndex]?.name ?? "") ?? null;
+        if (streamIndex >= streams.length) return goLive(true);
       }
       requestHistory();
       return;
@@ -245,11 +290,15 @@ export function createRelaySource(
     if (stopped) return;
     teardown();
     pages = 0;
-    oldestSeen = null;
-    // Resume from what we already hold — reconnects and cached boots both walk
-    // forward from the cursor instead of re-reading the world.
-    streams = historyStreams(newestSeen == null ? null : newestSeen + 1);
-    streamIndex = 0;
+    // The forward read is only sound once a walk has genuinely finished:
+    // `since` asserts there is nothing below it. Otherwise walk backward and
+    // resume each stream from its own recorded cursor — reconnecting mid-read
+    // must not step over history it has never seen.
+    const forward = historyComplete && newestSeen != null;
+    streams = historyStreams(forward ? newestSeen! + 1 : null);
+    streamIndex = forward ? 0 : streams.findIndex((s) => !drained.has(s.name));
+    if (streamIndex < 0) streamIndex = streams.length;
+    oldestSeen = forward ? null : cursors.get(streams[streamIndex]?.name ?? "") ?? null;
     liveSub = null;
     closedByUs.clear();
     status("connecting");

@@ -124,7 +124,12 @@ function buildTradesUncached(events: (RawEvent | ParsedEvent)[]): Trade[] {
     }
     if (e.stage === "offer" && e.amount != null) t.offerAmount = e.amount;
     if (e.stage === "offer" && e.selfTrade) t.selfTrade = true;
-    if (e.stage === "receipt" && e.amount != null) t.receiptAmount = e.amount;
+    // A floor, like the stamp above is an earliest: several receipts can name
+    // one trade, they arrive in relay order, and a plain assignment would let
+    // whichever paged last decide the figure.
+    if (e.stage === "receipt" && e.amount != null) {
+      t.receiptAmount = Math.max(t.receiptAmount ?? 0, e.amount);
+    }
     // Only a TERMINAL feedback (claim_released / refusal / error, §7.2) is a
     // decline. `reason` alone can't gate this: feedbackReason() always returns
     // text ("unspecified" at worst), so keying on it made every routine

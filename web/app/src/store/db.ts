@@ -14,7 +14,9 @@ import { DB_NAME } from "../config.js";
 import type { RawEvent } from "../model/events.js";
 
 const STORE = "events";
-const VERSION = 1;
+const META = "meta";
+const COMPLETE_KEY = "historyComplete";
+const VERSION = 2;
 
 export interface EventDb {
   /** Everything held, in no particular order. Empty on any failure. */
@@ -23,6 +25,15 @@ export interface EventDb {
   save(events: RawEvent[]): void;
   /** Remove superseded replaceable versions so the store tracks the cache. */
   evict(ids: string[]): void;
+  /**
+   * Did a history walk ever finish? Without this the cache is just a bag of
+   * events with no way to tell "everything" from "everything above a hole",
+   * and the relay's cheap forward read would resume above the hole forever.
+   * Unknown answers false: re-reading is cheap, a permanent gap is not.
+   */
+  historyComplete(): Promise<boolean>;
+  /** Record that a walk reached genuine exhaustion. */
+  markHistoryComplete(): void;
 }
 
 function openDb(): Promise<IDBDatabase | null> {
@@ -38,6 +49,11 @@ function openDb(): Promise<IDBDatabase | null> {
       const db = request.result;
       if (!db.objectStoreNames.contains(STORE)) {
         db.createObjectStore(STORE, { keyPath: "id" });
+      }
+      // Kept out of the event store: a marker sharing that keyspace would come
+      // back from loadAll() and be ingested as if it were market data.
+      if (!db.objectStoreNames.contains(META)) {
+        db.createObjectStore(META);
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -98,6 +114,26 @@ export async function createEventDb(): Promise<EventDb> {
       if (!ids.length) return;
       pendingEvictions.push(...ids);
       queueFlush();
+    },
+    historyComplete(): Promise<boolean> {
+      if (!db) return Promise.resolve(false);
+      return new Promise((resolve) => {
+        try {
+          const request = db.transaction(META, "readonly").objectStore(META).get(COMPLETE_KEY);
+          request.onsuccess = () => resolve(request.result === true);
+          request.onerror = () => resolve(false);
+        } catch {
+          resolve(false);
+        }
+      });
+    },
+    markHistoryComplete() {
+      if (!db) return;
+      try {
+        db.transaction(META, "readwrite").objectStore(META).put(true, COMPLETE_KEY);
+      } catch (err) {
+        console.warn("[db] could not record history completeness; next visit re-walks", err);
+      }
     },
   };
 }

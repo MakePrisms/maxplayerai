@@ -88,6 +88,18 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
   assert.ok(!/url\((['"])\.\/fonts\/[^'"?]+\1\)/.test(fontsCss), "no unstamped font URL remains in fonts.css");
 });
 
+test("llms.txt ships at the site root, byte-identical to the source", () => {
+  // Part of the agent-facing surface and a live URL: maxplayer.ai/llms.txt.
+  // The rebuild dropped it once already, and nothing else fails when it goes
+  // missing: the build stays green and the URL just starts 404ing. Living
+  // under public/ is what carries it today — this pins the OUTCOME, so moving
+  // it back out without a copy step goes red instead of shipping a 404.
+  assert.deepEqual(
+    readFileSync(join(root, "dist", "llms.txt")),
+    readFileSync(join(root, "public", "llms.txt")),
+  );
+});
+
 test("the bundle ships as one module and the snapshot stays out of git", () => {
   assert.ok(existsSync(join(root, "dist", "terminal.js")));
   // A local bake writes public/snapshot.json (that's fine); git must ignore
