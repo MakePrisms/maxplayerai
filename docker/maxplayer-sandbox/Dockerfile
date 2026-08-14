@@ -17,18 +17,23 @@ RUN apt-get update \
 # The ACP adapters the built-in harness presets resolve on PATH (`claude-agent-acp`, `codex-acp` —
 # see crates/maxplayer-core/src/agent_presets.rs). Baking them in means the job container does not fetch
 # them at run time, so a job's first turn is not spent installing its own harness. NOTE: each adapter
-# shells out to its underlying CLI (the `claude` / `codex` binary, via CLAUDE_CODE_EXECUTABLE for
-# claude); provisioning that CLI + its credentials into this image is the seller-operator step layered
-# on top of this base.
+# shells out to its underlying CLI — the `claude` / `codex` binary. codex-acp bundles `@openai/codex`,
+# so its CLI comes for free; the claude adapter needs the `claude` binary provisioned separately, so we
+# install `@anthropic-ai/claude-code` here too. Both CLIs are now IN this base image; the seller-operator
+# only needs to forward CREDENTIALS at run time (`docker run -e …` / the #647 credential proxy) — no
+# token is baked. On a standard glibc image the adapter auto-resolves `claude` on PATH, so no
+# CLAUDE_CODE_EXECUTABLE is needed here (that override is only for hosts like NixOS whose loader can't
+# run the npm-shipped binary — see docs/SELLER-QUICKSTART.md Gotcha 2).
 #
 # Versions are PINNED to exact releases. An unpinned `npm install -g` resolves to whatever is latest at
 # build time, so two builds of the same commit could bake different adapters — which makes the published
 # image's digest identify the artifact without the artifact being reproducible. Pinning is what lets the
-# digest correspond to a known adapter set, closing the gap called out in #792 (babu's F6 from the #221
+# digest correspond to a known adapter/CLI set, closing the gap called out in #792 (babu's F6 from the #221
 # security review). Bump these deliberately alongside a release.
 RUN npm install -g \
     @agentclientprotocol/claude-agent-acp@0.67.0 \
     @agentclientprotocol/codex-acp@1.2.0 \
+    @anthropic-ai/claude-code@2.1.223 \
     && npm cache clean --force
 
 # HOME is a CONTAINER-ONLY path, deliberately NOT the mounted workdir.
