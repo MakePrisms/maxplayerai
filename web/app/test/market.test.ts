@@ -1,0 +1,249 @@
+/**
+ * Core market semantics — the invariants that survived the redesign, pinned
+ * against the TypeScript rebuild. Fixture events are hand-built raw events;
+ * ids/pubkeys must be 64-char lowercase hex or parseEvent rejects them (that
+ * rejection is itself under test).
+ */
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { parseEvent } from "../src/model/events.js";
+import { OFFER, CLAIM, AWARD, RESULT, RECEIPT, ACCEPT, FEEDBACK, HEARTBEAT, PROFILE } from "../src/model/kinds.js";
+import { createCache } from "../src/store/cache.js";
+import { buildTrades, marketMetrics } from "../src/market/trades.js";
+import { buyerBoard, sellerBoard, inProgressJobs, participantActivity, relatedActivity, JOB_OVERDUE, JOB_WORKING, withinWindow } from "../src/market/participants.js";
+import { activeTradeJobs, createEngine, rankClimbs, ACTIVE_GRACE_SECONDS } from "../src/market/engine.js";
+import type { RawEvent } from "../src/model/events.js";
+
+const hex = (seed: string): string => seed.repeat(64).slice(0, 64);
+const BUYER = hex("a");
+const SELLER = hex("b");
+const SELLER2 = hex("c");
+const T0 = 1_700_000_000;
+
+let idCounter = 0;
+const id = (): string => (idCounter++).toString(16).padStart(64, "0");
+
+function ev(kind: number, pubkey: string, created_at: number, tags: string[][] = [], content = ""): RawEvent {
+  return { id: id(), kind, pubkey, created_at, tags, content };
+}
+
+function offer(created_at: number, opts: { amount?: number; deadline?: number; self?: boolean } = {}): RawEvent {
+  const tags: string[][] = [["t", "maxplayer"], ["i", "do the thing"]];
+  if (opts.amount != null) tags.push(["amount", String(opts.amount)]);
+  if (opts.deadline != null) tags.push(["param", "deadline", String(opts.deadline)]);
+  if (opts.self) tags.push(["t", "self-trade"]);
+  return ev(OFFER, BUYER, created_at, tags);
+}
+
+const claim = (offerId: string, seller: string, created_at: number): RawEvent =>
+  ev(CLAIM, seller, created_at, [["e", offerId, "", "root"]]);
+const award = (offerId: string, seller: string, created_at: number): RawEvent =>
+  ev(AWARD, BUYER, created_at, [["e", offerId, "", "root"], ["p", seller]]);
+const result = (offerId: string, seller: string, created_at: number): RawEvent =>
+  ev(RESULT, seller, created_at, [["e", offerId, "", "root"]]);
+const receipt = (offerId: string, created_at: number, amount: number): RawEvent =>
+  ev(RECEIPT, BUYER, created_at, [["e", offerId, "", "root"], ["amount", String(amount)]]);
+const accept = (offerId: string, created_at: number): RawEvent =>
+  ev(ACCEPT, BUYER, created_at, [["e", offerId, "", "root"]]);
+const feedback = (offerId: string, seller: string, created_at: number, tags: string[][] = [], content = ""): RawEvent =>
+  ev(FEEDBACK, seller, created_at, [["e", offerId, "", "root"], ...tags], content);
+
+test("parseEvent rejects non-hex ids and pubkeys at the boundary", () => {
+  assert.equal(parseEvent({ id: "nope", kind: OFFER, pubkey: BUYER, created_at: T0 }), null);
+  assert.equal(parseEvent({ id: id(), kind: OFFER, pubkey: "NOT-HEX", created_at: T0 }), null);
+  assert.ok(parseEvent(offer(T0)));
+});
+
+test("cache dedupes, resolves replaceable slots newest-wins, reports eviction", () => {
+  const cache = createCache();
+  const beat1 = ev(HEARTBEAT, SELLER, T0, [["d", "seat"]]);
+  const beat2 = ev(HEARTBEAT, SELLER, T0 + 10, [["d", "seat"]]);
+  assert.equal(cache.ingest(beat1).stored, true);
+  assert.equal(cache.ingest(beat1).stored, false);
+  const second = cache.ingest(beat2);
+  assert.equal(second.stored, true);
+  assert.equal(second.evictedId, beat1.id, "eviction is reported so the DB can follow");
+  assert.equal(cache.size, 1, "superseded heartbeat is gone");
+  // Ties go to the incumbent.
+  const beat3 = ev(HEARTBEAT, SELLER, T0 + 10, [["d", "seat"]]);
+  assert.equal(cache.ingest(beat3).reason, "superseded");
+});
+
+test("trades key on the root offer and take the earliest stamp per stage", () => {
+  const o = offer(T0, { amount: 100 });
+  const dup = { ...receipt(o.id, T0 + 50, 100) };
+  const later = { ...receipt(o.id, T0 + 90, 100), id: id() };
+  const trades = buildTrades([o, later, dup]);
+  assert.equal(trades.length, 1);
+  assert.equal(trades[0]!.at.receipt, T0 + 50, "earliest receipt stamp wins");
+});
+
+test("self-trades are excluded from metrics and counted, never silent", () => {
+  const arms = offer(T0, { amount: 10 });
+  const self = offer(T0 + 1, { amount: 10, self: true });
+  const m = marketMetrics([arms, self, receipt(arms.id, T0 + 2, 10), receipt(self.id, T0 + 3, 10)]);
+  assert.equal(m.funnel.posted, 1);
+  assert.equal(m.selfTrades, 1);
+  assert.equal(m.satsInReceipts, 10, "the self-trade's receipt is not in the floor");
+});
+
+test("boards rank deterministically with pubkey tiebreaks", () => {
+  const o1 = offer(T0, { amount: 5 });
+  const o2 = offer(T0 + 1, { amount: 5 });
+  const events = [o1, o2, claim(o1.id, SELLER, T0 + 2), claim(o2.id, SELLER2, T0 + 3)];
+  const a = sellerBoard(events, T0 + 10);
+  const b = sellerBoard([...events].reverse(), T0 + 10);
+  assert.deepEqual(a.map((r) => r.pubkey), b.map((r) => r.pubkey), "arrival order must not affect rank");
+});
+
+test("inProgressJobs: awarded-undelivered is working, blown deadline is overdue, delivery ends it", () => {
+  const deadline = T0 + 1000;
+  const o = offer(T0, { deadline });
+  const events = [o, claim(o.id, SELLER, T0 + 1), award(o.id, SELLER, T0 + 2)];
+  const working = inProgressJobs(events, T0 + 100);
+  assert.equal(working.length, 1);
+  assert.equal(working[0]!.state, JOB_WORKING);
+  const overdue = inProgressJobs(events, deadline + 400);
+  assert.equal(overdue[0]!.state, JOB_OVERDUE);
+  const done = inProgressJobs([...events, result(o.id, SELLER, T0 + 50)], T0 + 100);
+  assert.equal(done.length, 0, "delivery ends the job");
+  assert.throws(() => inProgressJobs(events, NaN), /now is required/);
+});
+
+test("activeTradeJobs: racer active from offer, runner from claim, losses and payment end it", () => {
+  const o = offer(T0, { deadline: T0 + 5000 });
+  const both = [o, claim(o.id, SELLER, T0 + 1), claim(o.id, SELLER2, T0 + 2)];
+  let active = activeTradeJobs(both, T0 + 10);
+  assert.ok(active.byBuyer.get(BUYER)?.length, "racer active from posting");
+  assert.ok(active.bySeller.get(SELLER)?.length, "claimer active from claiming");
+  assert.ok(active.bySeller.get(SELLER2)?.length, "second claimer too");
+
+  const awarded = [...both, award(o.id, SELLER, T0 + 3)];
+  active = activeTradeJobs(awarded, T0 + 10);
+  assert.ok(active.bySeller.get(SELLER)?.length, "winner stays active");
+  assert.ok(!active.bySeller.get(SELLER2)?.length, "loser stops the moment they lose");
+
+  const accepted = [...awarded, result(o.id, SELLER, T0 + 4), accept(o.id, T0 + 5)];
+  active = activeTradeJobs(accepted, T0 + 10);
+  assert.ok(active.bySeller.get(SELLER)?.length, "accept alone keeps the lamp on — payment is the receipt");
+  const paid = [...accepted, receipt(o.id, T0 + 6, 5)];
+  active = activeTradeJobs(paid, T0 + 10);
+  assert.ok(!active.byBuyer.get(BUYER)?.length, "the receipt ends the racer's activity");
+  assert.ok(!active.bySeller.get(SELLER)?.length, "and the runner's");
+});
+
+test("activeTradeJobs: only TERMINAL feedback ends a job — progress notes never do (§7.2)", () => {
+  const o = offer(T0, { deadline: T0 + 5000 });
+  const base = [o, claim(o.id, SELLER, T0 + 1), award(o.id, SELLER, T0 + 2)];
+
+  // A routine progress note carries a status tag and readable content. It must
+  // NOT read as a decline: feedbackReason() always returns text, so gating on
+  // the reason alone once ended lamps on every progress update.
+  const progressing = [...base, feedback(o.id, SELLER, T0 + 3, [["status", "progress"]], "progress: halfway there")];
+  let active = activeTradeJobs(progressing, T0 + 10);
+  assert.ok(active.bySeller.get(SELLER)?.length, "progress keeps the runner working");
+  assert.ok(active.byBuyer.get(BUYER)?.length, "and the racer");
+  assert.equal(buildTrades(progressing.map(parseEvent).filter((e) => e != null))[0]!.declineReason, null,
+    "a progress note is not a decline");
+
+  // A classified terminal code ends it.
+  const released = [...base, feedback(o.id, SELLER, T0 + 4, [["reason_code", "execution_failed"]], "execution_failed: no dice")];
+  active = activeTradeJobs(released, T0 + 10);
+  assert.ok(!active.bySeller.get(SELLER)?.length, "terminal feedback ends the runner's job");
+  assert.ok(!active.byBuyer.get(BUYER)?.length, "and the racer's");
+
+  // Unclassified feedback (no tags) is conservative: NOT terminal.
+  const vague = [...base, feedback(o.id, SELLER, T0 + 5, [], "hm")];
+  active = activeTradeJobs(vague, T0 + 10);
+  assert.ok(active.bySeller.get(SELLER)?.length, "unclassified feedback leaves the job running");
+});
+
+test("activeTradeJobs: delivered-but-never-receipted expires after the grace period", () => {
+  const o = offer(T0, { deadline: T0 + 5000 });
+  const events = [o, claim(o.id, SELLER, T0 + 1), award(o.id, SELLER, T0 + 2), result(o.id, SELLER, T0 + 3)];
+  const fresh = activeTradeJobs(events, T0 + 100);
+  assert.ok(fresh.bySeller.get(SELLER)?.length, "awaiting payment reads active");
+  const stale = activeTradeJobs(events, T0 + 3 + ACTIVE_GRACE_SECONDS + 1);
+  assert.ok(!stale.bySeller.get(SELLER)?.length, "receipts are optional, so activity must expire");
+});
+
+test("rankClimbs diffs all-time standings now vs 24h ago; new entrants are not climbers", () => {
+  const o1 = offer(T0, { amount: 5 });
+  const day = 86400;
+  const t = T0 + day + 100;
+  const events = [
+    o1, claim(o1.id, SELLER, T0 + 1), award(o1.id, SELLER, T0 + 2), result(o1.id, SELLER, T0 + 3),
+  ];
+  // Yesterday SELLER2 had one delivery, SELLER had none → today SELLER passes.
+  const o0 = offer(T0 - 10, { amount: 5 });
+  const o2 = offer(T0 - 9, { amount: 5 });
+  const history = [
+    o0, claim(o0.id, SELLER2, T0 - 8), award(o0.id, SELLER2, T0 - 7), result(o0.id, SELLER2, T0 - 6),
+    o2, claim(o2.id, SELLER, T0 - 5),
+  ];
+  const all = [...history, ...events, result(o1.id, SELLER, t - 50), result(o2.id, SELLER, t - 40)];
+  const climbs = rankClimbs((evts, now) => sellerBoard(evts, now), all, t);
+  assert.ok((climbs.get(SELLER) ?? 0) >= 1, "seller passed someone since yesterday");
+  assert.equal(climbs.get(SELLER2), undefined, "the seller passed does not climb");
+});
+
+test("windowed views include only in-window events", () => {
+  const oldEvent = offer(T0);
+  const newEvent = offer(T0 + 100_000);
+  const t = T0 + 100_100;
+  const day = withinWindow([oldEvent, newEvent], "24h", t);
+  assert.deepEqual(day.map((e) => e.id), [newEvent.id]);
+  const all = withinWindow([oldEvent, newEvent], "all", t);
+  assert.equal(all.length, 2);
+});
+
+test("engine recomputes on ingest (coalesced), exposes a coherent view", async () => {
+  const t = T0 + 50;
+  const engine = createEngine({ windowKey: "all", now: () => t });
+  const o = offer(T0, { amount: 42 });
+  const views: number[] = [];
+  engine.subscribe((view) => views.push(view.buyers.length));
+  engine.ingest(o);
+  engine.ingest(claim(o.id, SELLER, T0 + 1));
+  engine.ingest(o); // duplicate — must not schedule anything
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(views.length, 1, "a burst coalesces to one recompute");
+  const view = engine.view();
+  assert.ok(view);
+  assert.equal(view.buyers[0]?.pubkey, BUYER);
+  assert.equal(view.buyers[0]?.posted, 1);
+  assert.ok(view.trades.get(o.id), "counterparty join is on the view");
+  assert.ok(view.activeByBuyer.get(BUYER)?.length, "racer is active from the offer");
+});
+
+test("buyer board counts receipts as the floor and prices as medians", () => {
+  const o1 = offer(T0, { amount: 10 });
+  const o2 = offer(T0 + 1, { amount: 30 });
+  const events = [o1, o2, receipt(o1.id, T0 + 5, 10)];
+  const board = buyerBoard(events, T0 + 10);
+  assert.equal(board.length, 1);
+  assert.equal(board[0]!.posted, 2);
+  assert.equal(board[0]!.receipted, 1);
+  assert.equal(board[0]!.satsPaid, 10);
+  assert.equal(board[0]!.medianPrice, 20);
+});
+
+test("profiles enrich rows but never create them", () => {
+  const profile = ev(PROFILE, hex("d"), T0, [], JSON.stringify({ name: "lurker" }));
+  const board = sellerBoard([profile], T0 + 10);
+  assert.equal(board.length, 0, "a kind-0 alone earns no seller row");
+});
+
+test("same-second events sort by lifecycle order, not by random id", () => {
+  // Offer and claim published in the SAME second — the coarse timestamp
+  // cannot order them, the stage must.
+  const o = offer(T0, { amount: 5 });
+  const c = claim(o.id, SELLER, T0);
+  const r = receipt(o.id, T0, 5);
+  const history = relatedActivity([c, r, o], o.id);
+  assert.deepEqual(history.map((e) => e.stage), ["offer", "claim", "receipt"],
+    "job history reads oldest-first in lifecycle order");
+  const activity = participantActivity([c, r, o], BUYER);
+  assert.deepEqual(activity.map((e) => e.stage), ["receipt", "claim", "offer"],
+    "participant activity reads newest-first in reverse lifecycle order");
+});
