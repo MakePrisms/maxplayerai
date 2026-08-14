@@ -876,12 +876,45 @@ pub async fn run_agent_job(
 /// The credential this PR contains: the Anthropic API-key path the spike proved (the key rides a
 /// single `x-api-key` header verbatim). The proxy's substitution is value-based, so nothing here is
 /// header-specific — this names only WHICH forwarded variable holds the secret to contain.
-#[cfg(feature = "acp")]
 const CONTAINED_CREDENTIAL_ENV: &str = "ANTHROPIC_API_KEY";
 
 /// The base-URL variable overridden to point the container at the proxy instead of the vendor.
 #[cfg(feature = "acp")]
 const CONTAINED_BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
+
+/// Forwarded environment variables that carry a REUSABLE model credential (as opposed to a base URL).
+/// The #647 proxy contains only [`CONTAINED_CREDENTIAL_ENV`]; every other name here still crosses into
+/// a docker container RAW, so a docker seat that forwards one leaks a reusable secret. Kept beside the
+/// forwarding allowlist so the "what is a credential" list cannot drift from what is actually
+/// forwarded.
+pub const CREDENTIAL_ENV_VARS: &[&str] = &[
+    "ANTHROPIC_API_KEY",       // CONTAINED by the proxy (this PR)
+    "ANTHROPIC_AUTH_TOKEN",    // NOT yet contained
+    "CLAUDE_CODE_OAUTH_TOKEN", // NOT yet contained — the common `claude /login` OAuth seat
+    "OPENAI_API_KEY",          // NOT yet contained — codex seats
+];
+
+/// Of the known credential variables a docker job would forward, those that are SET in the daemon
+/// environment but NOT contained by the #647 proxy — i.e. they still cross into the container raw.
+///
+/// Empty for a non-docker policy (a host executor inherits the daemon environment; there is no
+/// container to leak into) and empty when the only credential present is the contained
+/// [`CONTAINED_CREDENTIAL_ENV`]. `lookup` injects the environment so the scope gap is testable without
+/// mutating the process environment. Drives both the loud boot log and the doctor WARN (#647 P2a).
+pub fn uncontained_forwarded_credentials(
+    policy: &SandboxPolicy,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Vec<&'static str> {
+    if policy.docker_image().is_none() {
+        return Vec::new();
+    }
+    CREDENTIAL_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|name| *name != CONTAINED_CREDENTIAL_ENV)
+        .filter(|name| lookup(name).is_some_and(|value| !value.trim().is_empty()))
+        .collect()
+}
 
 /// Establish credential containment for a docker job, or `Ok(None)` when there is nothing in scope to
 /// contain (no real Anthropic API key was forwarded — e.g. an OAuth-only or codex-only seat, whose
@@ -1453,6 +1486,35 @@ mod tests {
             "no alias referenced ⇒ no --add-host: {:?}",
             launch.args
         );
+    }
+
+    // The scope-gap detector (#647 P2a): a docker seat forwarding an UNCONTAINED credential is named,
+    // the contained one is not, and a non-docker policy reports nothing (host inherits, no container).
+    #[test]
+    fn uncontained_forwarded_credentials_names_only_the_uncontained_docker_vars() {
+        let docker =
+            SandboxPolicy::docker(DockerPolicy { image: "img".into(), forward_env: Vec::new(), runtime: None });
+        // An OAuth seat (the common `claude /login`) plus the contained API key: only the OAuth token
+        // is flagged.
+        let env = |key: &str| match key {
+            "ANTHROPIC_API_KEY" => Some("sk-ant-real".to_owned()),
+            "CLAUDE_CODE_OAUTH_TOKEN" => Some("oauth-real".to_owned()),
+            "OPENAI_API_KEY" => Some("  ".to_owned()), // set-but-blank must not count
+            _ => None,
+        };
+        assert_eq!(
+            uncontained_forwarded_credentials(&docker, env),
+            vec!["CLAUDE_CODE_OAUTH_TOKEN"]
+        );
+        // Only the contained credential present ⇒ nothing to warn about.
+        let only_contained = |key: &str| (key == "ANTHROPIC_API_KEY").then(|| "sk-ant-real".to_owned());
+        assert!(uncontained_forwarded_credentials(&docker, only_contained).is_empty());
+        // A non-docker policy forwards nothing into a container ⇒ never flagged.
+        assert!(uncontained_forwarded_credentials(
+            &SandboxPolicy::passthrough(),
+            |_| Some("set".to_owned())
+        )
+        .is_empty());
     }
 
     // from_config fails closed on a docker misconfiguration rather than launching a half-cage.

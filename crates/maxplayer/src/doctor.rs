@@ -736,6 +736,49 @@ mod checks {
         }
     }
 
+    const CREDENTIAL_CONTAINMENT_CHECK: &str = "sandbox credential containment";
+
+    /// The #647 credential proxy keeps the model credential out of a docker container — but for the
+    /// **Anthropic API-key path only**. A docker seat that forwards an OAuth token
+    /// (`CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_AUTH_TOKEN`) or an OpenAI key still hands that reusable
+    /// secret to a stranger's job raw. This surfaces that scope gap as a WARN so the common
+    /// `claude /login` OAuth seat is never silently uncontained. Advisory — it never blocks boot,
+    /// because the gap is a ticketed scope limit, not a misconfiguration to fix here.
+    pub(super) fn check_sandbox_credential_containment(sandbox: Option<SandboxConfig>) -> Check {
+        check_sandbox_credential_containment_in(sandbox, |key| std::env::var(key).ok())
+    }
+
+    /// [`check_sandbox_credential_containment`] over an injected environment, so both the contained
+    /// and the leaking case are testable without mutating the process environment.
+    pub(super) fn check_sandbox_credential_containment_in(
+        sandbox: Option<SandboxConfig>,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Check {
+        let policy = match SandboxPolicy::from_config(sandbox.as_ref()) {
+            Ok(policy) => policy,
+            // A config that does not resolve is already FAILed by the launcher check; do not double-report.
+            Err(_) => return Check::pass(CREDENTIAL_CONTAINMENT_CHECK, "no resolvable docker executor"),
+        };
+        let uncontained =
+            maxplayer_core::seller_exec::uncontained_forwarded_credentials(&policy, lookup);
+        if uncontained.is_empty() {
+            return Check::pass(
+                CREDENTIAL_CONTAINMENT_CHECK,
+                "no uncontained model credential is forwarded into the container",
+            );
+        }
+        let names = uncontained.join(", ");
+        Check::warn(
+            CREDENTIAL_CONTAINMENT_CHECK,
+            format!(
+                "[sandbox] mode=docker forwards {names} into the container UNCONTAINED — #647 \
+                 contains ANTHROPIC_API_KEY only, so a stranger's job can read {names} and reuse it"
+            ),
+            "use an Anthropic API-key seat, or treat this credential as compromised and spend-cap it \
+             at the provider (contained OAuth/OpenAI paths are a separate ticket)",
+        )
+    }
+
     /// Containment, for a seat that serves the OPEN POOL — which means executing code posted by
     /// strangers. `check_sandbox_launcher` above answers "does the launcher resolve", a property
     /// one layer out from this one: bubblewrap resolves on Ubuntu 24.04 and then fails at spawn on
@@ -1169,6 +1212,7 @@ fn build_checks(
     let telemetry = home.config.telemetry.clone();
     let sandbox = home.config.sandbox.clone();
     let sandbox_for_launcher = sandbox.clone();
+    let sandbox_for_creds = sandbox.clone();
     // The probe runs in the seat's OWN home, because that is where a launcher's config points.
     let home_root = home.root.clone();
     // Open-pool claiming is the exposure the containment gate is about: it is what makes this box
@@ -1202,6 +1246,13 @@ fn build_checks(
     // The seller boot gate blocks on this (issue #357): a launcher that cannot spawn would let the
     // node advertise and then fail every job. Bypassable, like every check, via --skip-doctor.
     checks.push(Box::new(move || checks::check_sandbox_launcher(sandbox_for_launcher)));
+    // #647 P2a: the credential proxy contains ANTHROPIC_API_KEY only. A docker seat that also forwards
+    // an OAuth token or an OpenAI key still leaks that reusable secret into the container. Advisory
+    // WARN — never blocks boot (the containment gap is a known, ticketed scope limit, not a
+    // misconfiguration).
+    checks.push(Box::new(move || {
+        checks::check_sandbox_credential_containment(sandbox_for_creds)
+    }));
     // Blocking for an open-pool seat (#451). Placed after the resolve check so that a launcher which
     // is not there reports as the missing file it is, rather than as a containment failure.
     checks.push(Box::new(move || {
@@ -1739,6 +1790,45 @@ mod tests {
             !outside.detail.contains("ITSELF running"),
             "a seller on the host must never be refused for being containerized: {}",
             outside.detail
+        );
+    }
+
+    // #647 P2a: a docker seat forwarding an OAuth token is WARNed (uncontained), an API-key-only seat
+    // passes, and a non-docker seat never warns.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn docker_oauth_seat_warns_that_the_credential_is_uncontained() {
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
+        let docker = || {
+            Some(SandboxConfig {
+                mode: SandboxMode::Docker,
+                launcher: Vec::new(),
+                image: Some("maxplayer-sandbox:latest".into()),
+                forward_env: Vec::new(),
+                runtime: None,
+            })
+        };
+        // An OAuth seat: the leaking credential is named, and the WARN is advisory, never a boot-block.
+        let oauth = |key: &str| (key == "CLAUDE_CODE_OAUTH_TOKEN").then(|| "oauth-real".to_owned());
+        let warned = checks::check_sandbox_credential_containment_in(docker(), oauth);
+        assert_eq!(warned.status, Status::Warn, "{}", warned.render());
+        assert_ne!(warned.status, Status::Fail, "scope gap is advisory: {}", warned.render());
+        assert!(
+            warned.detail.contains("CLAUDE_CODE_OAUTH_TOKEN") && warned.detail.contains("UNCONTAINED"),
+            "must name the leaking credential: {}",
+            warned.detail
+        );
+
+        // An Anthropic API-key seat is the contained path ⇒ Pass.
+        let api = |key: &str| (key == "ANTHROPIC_API_KEY").then(|| "sk-ant-real".to_owned());
+        assert_eq!(
+            checks::check_sandbox_credential_containment_in(docker(), api).status,
+            Status::Pass,
+        );
+        // A non-docker seat forwards nothing into a container ⇒ Pass regardless of the environment.
+        assert_eq!(
+            checks::check_sandbox_credential_containment_in(None, |_| Some("set".to_owned())).status,
+            Status::Pass,
         );
     }
 

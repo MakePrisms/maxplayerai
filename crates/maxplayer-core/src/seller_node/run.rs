@@ -2408,6 +2408,20 @@ pub async fn probe_configured_harnesses(
     // under a pass-through fallback would prove a harness the awarded job will never run under.
     let sandbox = SandboxPolicy::from_config(home.config.sandbox.as_ref())
         .map_err(|error| NodeError::Sandbox(error.to_string()))?;
+    // #647 credential-containment scope (P2a): the proxy contains ANTHROPIC_API_KEY only. A docker
+    // seat that also forwards an OAuth token or an OpenAI key still hands that reusable secret to a
+    // stranger's job RAW. Say so LOUDLY at boot — the same gap the doctor WARN reports — so an OAuth
+    // (`claude /login`) seat is never silently uncontained.
+    for var in crate::seller_exec::uncontained_forwarded_credentials(&sandbox, |key| {
+        std::env::var(key).ok()
+    }) {
+        opline!(
+            "seller node SECURITY: [sandbox] mode=docker forwards {var} into the container \
+             UNCONTAINED — #647 contains ANTHROPIC_API_KEY only, so a stranger's job can read {var} \
+             and reuse it. Use an Anthropic API-key seat, or treat this credential as compromised \
+             and spend-cap it at the provider."
+        );
+    }
     let identity = DeliveryAgentIdentity::for_seller(&home::public_key_hex(home)?);
     let mut verdicts = Vec::with_capacity(registry.entries().len());
     for (index, entry) in registry.entries().iter().enumerate() {

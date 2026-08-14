@@ -48,13 +48,34 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
+use http_body_util::{combinators::BoxBody, BodyExt, Full, Limited, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use tokio::sync::Semaphore;
+
+/// The proxy listener terminates INSIDE the seller daemon (a money-path process), and the caller is a
+/// stranger's job. These bound what one job can make the daemon hold or spawn, so an unbounded or
+/// trickled request cannot OOM or exhaust it.
+///
+/// The request body is buffered (it must be, to find and substitute the placeholder before egress);
+/// this caps that buffer. 32 MiB is far above any real model request and far below a memory hazard.
+pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// Concurrent connections the proxy will service at once. A per-job proxy serves ONE agent, so a
+/// modest ceiling is generous for legitimate use and caps a connection flood. Excess connections wait
+/// at the OS accept backlog rather than each spawning an unbounded task.
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+/// How long the head (request line + headers) may take to arrive. hyper enforces this itself; without
+/// it a trickled header stream pins a connection open indefinitely.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the request BODY may take to arrive in full. Bounds a slow-loris body that dribbles bytes
+/// under the size cap forever. It bounds only the REQUEST read — the upstream RESPONSE (an SSE stream)
+/// is relayed without any such deadline, so a long completion is never cut off.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The default real upstream for the Anthropic API-key path when the operator has not pointed the
 /// daemon at a custom gateway. Any resolved destination must appear on the proxy's allowlist before
@@ -362,19 +383,31 @@ pub async fn start(engine: Arc<ProxyEngine>, client: reqwest::Client) -> std::io
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", 0)).await?;
     let addr = listener.local_addr()?;
     let engine_for_task = Arc::clone(&engine);
+    let connections = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     let task = tokio::spawn(async move {
         loop {
             let Ok((stream, _peer)) = listener.accept().await else {
                 continue;
             };
+            // Bound concurrent connections: acquire a permit before spawning, hold it for the life of
+            // the connection. When all permits are out, this awaits — new connections queue at the OS
+            // accept backlog instead of each spawning an unbounded task and exhausting the daemon.
+            let Ok(permit) = Arc::clone(&connections).acquire_owned().await else {
+                continue; // semaphore closed — proxy shutting down
+            };
             let engine = Arc::clone(&engine_for_task);
             let client = client.clone();
             tokio::spawn(async move {
+                let _permit = permit; // released when the connection ends
                 let io = TokioIo::new(stream);
                 let service = service_fn(move |req| {
                     handle_request(req, Arc::clone(&engine), client.clone())
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
+                    // A timer is required for hyper's own timeouts to arm.
+                    .timer(TokioTimer::new())
+                    // Bound the head read so a trickled header stream cannot pin a connection open.
+                    .header_read_timeout(HEADER_READ_TIMEOUT)
                     .serve_connection(io, service)
                     .await;
             });
@@ -407,9 +440,32 @@ async fn handle_request(
             value.to_str().ok().map(|v| (name.as_str().to_owned(), v.to_owned()))
         })
         .collect();
-    let body = match req.into_body().collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => return Ok(refusal_response(StatusCode::BAD_GATEWAY, "failed to read request body")),
+    // Buffer the body under a size cap AND a read deadline: the listener lives in the seller daemon,
+    // so a stranger's job must not be able to OOM it with an unbounded body or pin memory by
+    // trickling one under the cap forever. `Limited` stops reading past the cap (413); the timeout
+    // bounds a slow-loris body (408). Neither touches the upstream RESPONSE stream.
+    let capped = Limited::new(req.into_body(), MAX_REQUEST_BODY_BYTES);
+    let body = match tokio::time::timeout(BODY_READ_TIMEOUT, capped.collect()).await {
+        Ok(Ok(collected)) => collected.to_bytes(),
+        Ok(Err(error)) => {
+            let over_cap = error
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some();
+            return Ok(if over_cap {
+                refusal_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body exceeds the proxy limit",
+                )
+            } else {
+                refusal_response(StatusCode::BAD_GATEWAY, "failed to read request body")
+            });
+        }
+        Err(_) => {
+            return Ok(refusal_response(
+                StatusCode::REQUEST_TIMEOUT,
+                "request body read timed out",
+            ))
+        }
     };
 
     match engine.authorize(&headers, &body) {
@@ -767,5 +823,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 502);
+    }
+
+    // P1 regression (babu review): the listener lives in the money-path daemon, so a body over the cap
+    // must be REFUSED (413), not buffered. `Limited` stops reading past `MAX_REQUEST_BODY_BYTES`, so
+    // the proxy never holds more than the cap — the daemon stays under a fixed memory ceiling no matter
+    // how large the body a stranger's job sends. (Cap applies BEFORE authorize, so no registration is
+    // needed to reach it.)
+    #[tokio::test]
+    async fn proxy_rejects_an_over_cap_body_with_413() {
+        let engine = Arc::new(ProxyEngine::new([authority_of(UPSTREAM).unwrap()]));
+        let proxy = start(Arc::clone(&engine), reqwest::Client::new()).await.unwrap();
+        let port = proxy.local_addr().port();
+        let over_cap = vec![b'a'; MAX_REQUEST_BODY_BYTES + 1];
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .body(over_cap)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 413, "an over-cap body must be refused, not buffered");
     }
 }
