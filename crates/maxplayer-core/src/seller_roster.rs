@@ -371,6 +371,44 @@ impl LiveRoster {
         due
     }
 
+    /// Release a claimed probe's in-flight mark WITHOUT reaching a verdict — the path neither
+    /// [`Self::restore`] nor [`Self::fault`] covers.
+    ///
+    /// A restore self-probe runs OFF the event loop as a spawned task whose `JoinHandle` is dropped
+    /// (run.rs `start_due_harness_probes`). If that task PANICS — a poisoned mutex `.expect`, say —
+    /// neither verdict arm runs and the panic is otherwise silent, so `probing` would stay `true` for
+    /// the life of the process and [`Self::claim_due_probes`] would never hand the harness out again:
+    /// it sits `Dropped`, never re-probed. This method exists to be driven from a Drop guard armed
+    /// BEFORE the probe runs, so the mark is released as the stack unwinds (#301).
+    ///
+    /// It NEVER clears `unavailable`. A probe that died proved nothing, so a harness abandoned
+    /// mid-probe stays exactly as unavailable as it was — this can never turn a dead harness back to
+    /// serving. When the harness is still `Dropped` and still marked probing, it advances a strike and
+    /// re-arms the backoff window from `now`, so a harness whose probe panics or hangs repeatedly backs
+    /// off on the normal schedule instead of hot-looping panics every tick.
+    ///
+    /// Idempotent by design: the two verdict paths clear `probing` themselves, so once a verdict has
+    /// landed this is a no-op. That is what lets the Drop guard fire unconditionally on every path —
+    /// verdict or not — without double-counting a strike on the happy path.
+    pub fn abandon_probe(&self, index: usize, now: Instant) {
+        let mut state = self.state.lock().expect("live roster poisoned");
+        let Some(harness) = state.get_mut(&index) else {
+            return;
+        };
+        if !harness.probing {
+            return;
+        }
+        harness.probing = false;
+        if let Some(Unavailable::Dropped {
+            probe_due_at,
+            strikes,
+        }) = &mut harness.unavailable
+        {
+            *strikes = strikes.saturating_add(1);
+            *probe_due_at = now + probe_delay(*strikes);
+        }
+    }
+
     /// A index's current unavailability, or `None` when it is serving.
     pub fn unavailable(&self, index: usize) -> Option<Unavailable> {
         self.state
@@ -736,6 +774,97 @@ mod tests {
             "a dropped harness must stay launchable for its own probe"
         );
         assert_eq!(roster.label(0), Some("claude".to_owned()));
+    }
+
+    #[test]
+    fn abandoning_a_claimed_probe_releases_the_mark_and_re_arms_it_without_restoring() {
+        // The panic/hang path #301 closes: a probe task that reaches NEITHER verdict (it panicked, or
+        // an outer wall-clock ceiling elapsed and the guard fired) must still release `probing`, or the
+        // harness sits Dropped and is never re-probed for the life of the process. Abandoning must NOT
+        // restore it — a probe that died proved nothing, and flipping a dead harness to serving is the
+        // one thing this whole module exists to prevent.
+        let roster = named(&["claude"]);
+        let now = Instant::now();
+        roster.fault(0, Fault::Unproven, now); // strike 1, 15m window
+        let due = now + PROBE_BACKOFF[0];
+        assert_eq!(roster.claim_due_probes(due), vec![0], "the window is due, claim marks probing");
+        assert!(
+            roster.claim_due_probes(due).is_empty(),
+            "the in-flight mark suppresses a second claim"
+        );
+
+        // The probe never reached a verdict; the guard fires.
+        roster.abandon_probe(0, due);
+
+        assert!(!roster.serves(None), "abandoning must NEVER restore a dropped harness to service");
+        assert!(roster.advertised().is_empty());
+        match roster.unavailable(0) {
+            Some(Unavailable::Dropped { strikes, probe_due_at }) => {
+                assert_eq!(strikes, 2, "a panicking probe advances a strike so it backs off");
+                assert_eq!(
+                    probe_due_at,
+                    due + PROBE_BACKOFF[1],
+                    "the window is re-armed from the abandonment, not left in the past"
+                );
+            }
+            other => panic!("must stay Dropped, got {other:?}"),
+        }
+
+        // Released: once the re-armed window passes the harness is claimable again — the property the
+        // stuck-probing bug destroyed.
+        assert!(
+            roster.claim_due_probes(due).is_empty(),
+            "the re-armed window has not passed yet"
+        );
+        assert_eq!(
+            roster.claim_due_probes(due + PROBE_BACKOFF[1]),
+            vec![0],
+            "once the re-armed window passes the harness is re-probed — probing WAS released"
+        );
+    }
+
+    #[test]
+    fn abandoning_after_a_verdict_landed_is_an_idempotent_no_op() {
+        // The Drop guard fires on EVERY path, including the happy one where a verdict already cleared
+        // `probing`. It must not then advance a phantom strike or disturb the harness the verdict left.
+        let now = Instant::now();
+
+        // Happy path: a probe passed → restore cleared probing. Abandon after must not re-drop it.
+        let restored = named(&["claude"]);
+        restored.fault(0, Fault::Unproven, now);
+        let due = now + PROBE_BACKOFF[0];
+        assert_eq!(restored.claim_due_probes(due), vec![0]);
+        restored.restore(0);
+        restored.abandon_probe(0, due);
+        assert!(restored.serves(None), "abandon after restore must not un-restore the harness");
+        assert_eq!(restored.unavailable(0), None);
+
+        // Fault path: a probe failed → fault cleared probing and set strike 2. Abandon must not make it 3.
+        let faulted = named(&["claude"]);
+        faulted.fault(0, Fault::Unproven, now);
+        assert_eq!(faulted.claim_due_probes(due), vec![0]);
+        faulted.fault(0, Fault::Unproven, due); // the verdict: strike 2
+        faulted.abandon_probe(0, due);
+        match faulted.unavailable(0) {
+            Some(Unavailable::Dropped { strikes, .. }) => {
+                assert_eq!(strikes, 2, "abandon after a fault must not double-count the strike");
+            }
+            other => panic!("expected Dropped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn abandoning_an_incapable_probe_leaves_the_capability_untouched() {
+        // An Incapable harness is never handed to a probe, but should a mark ever be set on one,
+        // abandoning it must not rewrite the capability into a Dropped/strike state — the remedy the
+        // operator needs is in that variant.
+        let roster = named(&["claude"]);
+        roster.fault(0, Fault::Incapable(MissingCapability::AcpFeature), Instant::now());
+        roster.abandon_probe(0, Instant::now());
+        assert!(
+            matches!(roster.unavailable(0), Some(Unavailable::Incapable(MissingCapability::AcpFeature))),
+            "abandon must not convert an Incapable state into a Dropped one"
+        );
     }
 
     #[test]
