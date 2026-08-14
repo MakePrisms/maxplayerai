@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use crate::{opline, opline_verbose};
 
 use nostr_sdk::prelude::{
-    Client, EventId, Filter, Keys, Kind, RelayOptions, RelayPoolNotification, RelayUrl,
+    Client, EventId, Filter, Keys, Kind, Output, RelayOptions, RelayPoolNotification, RelayUrl,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -797,6 +797,37 @@ fn stall_threshold_secs(interval_secs: u64, missed_intervals: u32) -> u64 {
 /// `threshold_secs`. Pure over an elapsed-seconds reading (fake-clock testable).
 fn subscription_stalled(elapsed_secs: u64, threshold_secs: u64) -> bool {
     elapsed_secs >= threshold_secs
+}
+
+/// Whether a single-relay publish was CONFIRMED accepted by the relay it was sent to (#509).
+///
+/// `Client::send_event_to` returns `Ok(Output { success, failed })` EVEN WHEN the sole relay
+/// REJECTS the write: an `OK: false` lands that relay in `output.failed`, NOT a top-level `Err`. So
+/// the old `Ok(_) => true` match read a rejection as success — the "health inferred, not confirmed"
+/// defect. A publish is confirmed only when the relay acknowledged it (`success` non-empty) and none
+/// rejected it (`failed` empty). Because the seat sends to exactly ONE relay, that is equivalent to
+/// "`output.success` contains our relay url", but this form needs no url parse and no re-derivation
+/// of which relay we sent to. An empty `success` (relay in `failed`, or nothing acknowledged) is the
+/// HEALTH-RED signal — the seat is dark on the relay even though the connection is up.
+fn publish_confirmed<T: std::fmt::Debug>(output: &Output<T>) -> bool {
+    output.failed.is_empty() && !output.success.is_empty()
+}
+
+/// Whether a heartbeat tick observed CONFIRMED relay-observed liveness — the sole condition that may
+/// refresh the watchdog clock (`last_liveness_seen*`), #509.
+///
+/// Relay-observed liveness has TWO independent legs and BOTH must hold this tick:
+/// - `probe_ok`: the relay served our `limit(0)` REQ on this authenticated session (READ path,
+///   [`probe_relay_serves_our_reqs`]).
+/// - `publish_ok`: the relay ACCEPTED our own kind-30340 heartbeat write ([`publish_confirmed`]).
+///
+/// The bug in #509 is precisely that these two diverge: a seat whose reads keep answering while its
+/// heartbeat writes are silently rejected/lost is DARK on the relay yet the read probe alone kept the
+/// clock fresh, so the watchdog never fired ("recovery SUCCEEDED" logged across a 2691s outage). AND-
+/// gating the clock on the publish leg makes a rejected/absent heartbeat OK leave the clock
+/// un-refreshed and drive the RELAY-STALL watchdog, exactly as a failed read probe does.
+fn relay_liveness_confirmed(probe_ok: bool, publish_ok: bool) -> bool {
+    probe_ok && publish_ok
 }
 
 /// Overlap margin (seconds) subtracted from the last-known-good heartbeat timestamp when computing
@@ -3370,17 +3401,19 @@ impl SellerNodeRunner {
                     }
                     continue;
                 }
-                // The heartbeat tick rides the SAME loop (never a blocking side-thread). Probe first,
-                // then evaluate staleness: the probe is what proves the relay is still serving our
-                // REQs on this session, and it is bounded so the tick cannot hang on a dead link.
+                // The heartbeat tick rides the SAME loop (never a blocking side-thread). Probe the
+                // READ leg first, evaluate staleness, then publish the heartbeat (the WRITE leg) —
+                // both bounded so the tick cannot hang on a dead link. #509: relay-observed liveness
+                // needs BOTH legs, so the watchdog clock is refreshed only after the publish, and
+                // only when read AND publish both confirmed this tick (see below).
                 _ = heartbeat_tick.tick(), if heartbeat_enabled => {
-                    if probe_relay_serves_our_reqs(
+                    let probe_ok = probe_relay_serves_our_reqs(
                         &self.client,
                         self.seller_pubkey,
                         LIVENESS_PROBE_TIMEOUT,
                     )
-                    .await
-                    {
+                    .await;
+                    if probe_ok {
                         if stalled_since_recovery {
                             if manual_recovery_succeeded {
                                 opline!(
@@ -3397,8 +3430,11 @@ impl SellerNodeRunner {
                             stalled_since_recovery = false;
                             manual_recovery_succeeded = false;
                         }
-                        last_liveness_seen = tokio::time::Instant::now();
-                        last_liveness_seen_unix = now_unix();
+                        // #509: the read leg passed, but the clock refresh is DEFERRED to after the
+                        // publish leg below. A seat whose reads answer while its heartbeat writes are
+                        // silently rejected is dark on the relay yet used to keep the clock fresh
+                        // here — the exact 2691s blind spot. The clock now moves only when both legs
+                        // confirm.
                     }
                     let stall_elapsed = last_liveness_seen.elapsed().as_secs();
                     let stalled = subscription_stalled(stall_elapsed, stall_threshold);
@@ -3450,7 +3486,17 @@ impl SellerNodeRunner {
                             }
                         }
                     }
-                    self.publish_heartbeat().await;
+                    // The WRITE leg: publish the heartbeat and CONFIRM the relay accepted it (#509),
+                    // not merely that the SDK send returned `Ok`. Only a tick where the relay both
+                    // served our REQs (`probe_ok`) AND acknowledged our heartbeat (`publish_ok`)
+                    // refreshes the watchdog clock; a rejected/absent OK therefore leaves the clock
+                    // to age and drives the RELAY-STALL branch above on a later tick, exactly as a
+                    // failed read probe does.
+                    let publish_ok = self.publish_heartbeat().await;
+                    if relay_liveness_confirmed(probe_ok, publish_ok) {
+                        last_liveness_seen = tokio::time::Instant::now();
+                        last_liveness_seen_unix = now_unix();
+                    }
                     continue;
                 }
                 recv = notifications.recv() => {
@@ -3961,11 +4007,16 @@ impl SellerNodeRunner {
     }
 
     /// Publish one own-heartbeat (kind-30340) — best-effort liveness/discovery + the watchdog's
-    /// round-trip probe. Signed through the signer actor and sent on the shared client; a failure is
-    /// logged and never wedges the loop. No-op without `[seller]` config.
-    async fn publish_heartbeat(&self) {
+    /// publish-liveness leg. Signed through the signer actor and sent on the shared client; a failure
+    /// is logged and never wedges the loop.
+    ///
+    /// Returns whether the relay CONFIRMED the write (#509) — the publish leg of relay-observed
+    /// liveness the watchdog AND-gates its clock on. A `true` from the no-seller no-op path means
+    /// "nothing to publish", never "publish landed": with no `[seller]` config there is no heartbeat
+    /// to lose, so it must not spuriously drive the watchdog RED.
+    async fn publish_heartbeat(&self) -> bool {
         let Some(seller) = self.node.home().config.seller.clone() else {
-            return;
+            return true;
         };
         let in_flight = self.live_in_flight("heartbeat");
         // ONE roster read for both wire signals: a seat that has dropped every harness advertises
@@ -3983,7 +4034,7 @@ impl SellerNodeRunner {
             roster.names,
         )
         .to_event_draft();
-        self.publish_seat_announcement(draft, "heartbeat").await;
+        self.publish_seat_announcement(draft, "heartbeat").await
     }
 
     /// #747 — publish the seat's TERMINAL announcement: the same kind-30340, `accepting=n`, once,
@@ -4086,7 +4137,28 @@ impl SellerNodeRunner {
                 use nostr_sdk::JsonUtil as _;
                 match nostr_sdk::Event::from_json(&signed.json) {
                     Ok(event) => match self.client.send_event_to([&self.relay_url], &event).await {
-                        Ok(_) => true,
+                        // #509: an `Ok(Output)` is NOT proof the relay stored the event — a single
+                        // relay that rejects the write returns `Ok` with itself in `output.failed`.
+                        // Confirm the relay actually acknowledged it; an `OK: false`, an empty
+                        // `success`, or a top-level `Err`/timeout is the health-RED signal.
+                        Ok(output) if publish_confirmed(&output) => true,
+                        Ok(output) => {
+                            let reasons: Vec<String> = output
+                                .failed
+                                .iter()
+                                .map(|(url, reason)| format!("{url}: {reason}"))
+                                .collect();
+                            let detail = if reasons.is_empty() {
+                                "no relay acknowledged the event".to_string()
+                            } else {
+                                reasons.join("; ")
+                            };
+                            opline!(
+                                "seller node {what} publish NOT confirmed by relay (continuing): \
+                                 {detail}"
+                            );
+                            false
+                        }
                         Err(error) => {
                             opline!("seller node {what} publish failed (continuing): {error}");
                             false
@@ -11216,6 +11288,76 @@ mod tests {
         assert!(!subscription_stalled(899, 900), "below threshold ⇒ live");
         assert!(subscription_stalled(900, 900), "at threshold ⇒ stalled");
         assert!(subscription_stalled(901, 900));
+    }
+
+    // #509 red-prove helper: build a `send_event_to`-shaped `Output` with the given per-relay verdict.
+    fn publish_output(accepted: bool, rejected: bool) -> Output<()> {
+        use std::collections::{HashMap, HashSet};
+        let url = RelayUrl::parse("wss://relay.example").expect("relay url");
+        let mut success = HashSet::new();
+        let mut failed = HashMap::new();
+        if accepted {
+            success.insert(url.clone());
+        }
+        if rejected {
+            failed.insert(url, "blocked: not accepting this kind".to_string());
+        }
+        Output {
+            val: (),
+            success,
+            failed,
+        }
+    }
+
+    // TOOTH (#509) — the seat's heartbeat health is CONFIRMED, not inferred. `send_event_to` returns
+    // `Ok(Output)` even when the sole relay REJECTS the write (`OK: false` ⇒ relay lands in
+    // `output.failed`, NOT a top-level `Err`). The pre-fix `Ok(_) => true` read that rejection as
+    // success. `publish_confirmed` must treat it — and an empty `success` — as health-RED.
+    //
+    // RED ON REVERT: give `publish_confirmed` the old semantics (`|_| true`) and the two `!`
+    // assertions below fail — a relay rejection / silent drop reads as a healthy publish again.
+    #[test]
+    fn heartbeat_publish_is_confirmed_only_on_a_relay_ok() {
+        // Relay acknowledged and none rejected ⇒ confirmed.
+        assert!(
+            publish_confirmed(&publish_output(true, false)),
+            "an accepted publish is confirmed"
+        );
+        // Relay `OK: false` — the #509 fingerprint: connection up, event rejected.
+        assert!(
+            !publish_confirmed(&publish_output(false, true)),
+            "an OK-false (relay in `failed`) is NOT confirmed — the #509 defect"
+        );
+        // Nothing acknowledged at all (silent drop): empty `success`, empty `failed`.
+        assert!(
+            !publish_confirmed(&publish_output(false, false)),
+            "an empty `success` set is NOT confirmed"
+        );
+    }
+
+    // TOOTH (#509) — relay-observed liveness AND-gates the watchdog clock on BOTH legs. The read
+    // probe answering (`probe_ok`) while the heartbeat WRITE is rejected (`publish_ok == false`) is
+    // the exact 2691s blind spot: the seat is dark on the relay yet used to refresh the clock on the
+    // read leg alone and never trip. `relay_liveness_confirmed` must return false there, so the clock
+    // ages and the RELAY-STALL branch fires.
+    //
+    // RED ON REVERT: make `relay_liveness_confirmed` return `probe_ok` (the pre-fix wiring) and the
+    // read-alive/publish-dead assertion fails — the watchdog goes blind to publish-death again.
+    #[test]
+    fn watchdog_clock_refreshes_only_when_both_legs_confirm() {
+        assert!(
+            relay_liveness_confirmed(true, true),
+            "read + publish both confirmed ⇒ liveness confirmed"
+        );
+        assert!(
+            !relay_liveness_confirmed(true, false),
+            "read alive but publish dead ⇒ NOT confirmed (the #509 blind spot)"
+        );
+        assert!(
+            !relay_liveness_confirmed(false, true),
+            "publish landed but reads dead ⇒ NOT confirmed"
+        );
+        assert!(!relay_liveness_confirmed(false, false));
     }
 
     // TOOTH (invariant 3, security) — a payment settles a job ONLY when the authenticated seal sender
