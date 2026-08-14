@@ -112,9 +112,9 @@ jobs:
 
   # web/app and web/network each ship a Node test suite ("node --test test/") that no CI
   # job ran before #483 — a web-only PR could merge with its JS suite unverified while
-  # Rust CI stayed green. Both projects declare zero npm dependencies (no
-  # package.json "dependencies"/"devDependencies", no package-lock.json), so there is
-  # nothing to install: `npm test` runs directly. Kept as one job for both directories
+  # Rust CI stayed green. web/app is TypeScript bundled with esbuild, so it installs its
+  # devDependencies (lockfile-pinned) before testing; web/network still declares zero npm
+  # dependencies, so `npm test` runs directly. Kept as one job for both directories
   # since neither takes meaningfully long; split them if that changes.
   web-tests:
     name: JS test suites (web/app, web/network)
@@ -126,7 +126,7 @@ jobs:
           node-version: 20
       - name: Test web/app
         working-directory: web/app
-        run: npm test
+        run: npm ci && npm test
       - name: Test web/network
         working-directory: web/network
         run: npm test

@@ -1,10 +1,21 @@
 {
   "name": "maxplayer-market",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
+  "description": "MAXPLAYER AI — the public market terminal. Client-only: instant paint, cached market, swappable poll/stream relay source.",
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "node --test test/",
-    "live-check": "node scripts/live-check.mjs"
+    "dev": "node scripts/build.mjs --watch",
+    "serve": "python3 -m http.server 490 --directory dist",
+    "typecheck": "tsc --noEmit",
+    "bake": "node scripts/bake-snapshot.mjs",
+    "test": "npm run typecheck && node --import tsx --test test/*.test.ts test/*.test.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "esbuild": "^0.25.9",
+    "tsx": "^4.20.4",
+    "typescript": "^5.9.2"
   }
 }

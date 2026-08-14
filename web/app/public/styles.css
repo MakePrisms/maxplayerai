@@ -1,0 +1,842 @@
+/* MAXPLAYER TERMINAL — Lando Norris × Bloomberg, in Ferrari livery.
+   Carbon black, Giallo Modena yellow doing all the money/live work, Rosso
+   Corsa as counter-accent (sell lane, alerts). Display type is Archivo
+   Expanded Black Italic — the speed slant; everything else is mono, dense,
+   uppercase-labelled, like a machine you lease by the month.
+   NOTE: legacy var names kept — --neon is the yellow (money, live), --blue is
+   the rosso (alerts, sell) — so JS-rendered markup recolors without edits. */
+:root {
+  color-scheme: dark;
+  --row-h: 34px;
+  --bg: #0a0a0b;
+  --bg-2: #0e0e10;
+  --panel: #121214;
+  --raise: #1a1a1d;
+  --line: #232327;
+  --line-2: #1b1b1f;
+
+  --ink: #f4f4f1;
+  --ink-2: #c9c9c4;
+  --muted: #8b8b93;
+  --faint: #5b5b63;
+
+  --neon: #ffdf00;          /* money, prices, live — Giallo Modena */
+  --neon-dim: rgba(255, 223, 0, 0.12);
+  --blue: #ff2800;          /* alerts, sell lane, counter-accent — rosso */
+  --blue-dim: rgba(255, 40, 0, 0.14);
+  --warn: #ff8a3d;
+
+  --display: "Archivo", ui-sans-serif, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", "Roboto Mono", Menlo, Consolas, monospace;
+  --sans: "Saira", ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+
+  --nav-h: 46px;
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; overflow-x: clip; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 13px/1.5 var(--mono);
+  -webkit-font-smoothing: antialiased;
+  overflow-x: clip;
+}
+code { font-family: var(--mono); }
+button { font: inherit; color: inherit; }
+a { color: var(--neon); }
+::selection { background: var(--neon); color: #0a0a0b; }
+:focus-visible { outline: 2px solid var(--neon); outline-offset: 2px; }
+
+/* ---------- status bar ---------- */
+.nav {
+  position: sticky; top: 0; z-index: 40;
+  display: flex; align-items: center; gap: 18px;
+  height: var(--nav-h); padding: 0 14px;
+  background: rgba(10, 10, 11, 0.92);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--line);
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+}
+.brand {
+  display: flex; align-items: center; gap: 8px;
+  color: var(--ink); text-decoration: none;
+  /* the wordmark in miniature — same face and lean as the hero */
+  font-family: var(--display); font-style: italic; font-weight: 900; font-stretch: 125%;
+  font-size: 14px; letter-spacing: 0.04em;
+}
+.brand b { color: var(--neon); font-weight: 700; margin-left: 5px; }
+.brand .mark { width: 32px; height: 32px; }
+.nav-links { display: flex; align-items: center; gap: 18px; margin-left: 4px; }
+.nav-links a { color: var(--ink-2); text-decoration: none; }
+.nav-links a:hover { color: var(--neon); }
+
+/* connection status: just the word, colored by state — muted while working
+   toward live, Giallo when live, rosso when something is wrong. */
+.conn {
+  display: flex; align-items: center; gap: 10px; margin: 0 0 0 auto;
+  color: var(--muted); white-space: nowrap;
+}
+.conn[data-state="live"] { color: var(--neon); }
+.conn[data-state="failed"], .conn[data-state="reconnecting"] { color: var(--blue); }
+
+.clock { color: var(--faint); white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+/* hamburger: hidden on desktop, revealed in the mobile media query below */
+.nav-toggle {
+  display: none; flex: none; margin-left: 6px;
+  width: 34px; height: 34px; padding: 8px 6px;
+  flex-direction: column; justify-content: space-between;
+  background: transparent; border: 0; cursor: pointer;
+}
+.nav-toggle span {
+  display: block; height: 2px; width: 100%; border-radius: 2px;
+  background: var(--ink-2);
+  transition: transform 0.2s ease, opacity 0.2s ease;
+}
+.nav-toggle[aria-expanded="true"] span:nth-child(1) { transform: translateY(7px) rotate(45deg); }
+.nav-toggle[aria-expanded="true"] span:nth-child(2) { opacity: 0; }
+.nav-toggle[aria-expanded="true"] span:nth-child(3) { transform: translateY(-7px) rotate(-45deg); }
+
+/* ---------- anchor landings ---------- */
+/* The nav is sticky, so an anchored section scrolls up underneath it without
+   a scroll margin. #top's margin equals the nav height, so the scroll lands at
+   the true page top with the hero starting right below it. #market's extra 1px
+   keeps the hero's bottom rule — the line above "Marketplace" — visible just
+   under the nav. */
+.hero { scroll-margin-top: var(--nav-h); }
+.market { scroll-margin-top: calc(var(--nav-h) + 1px); }
+.pitch { scroll-margin-top: var(--nav-h); }
+
+/* ---------- hero ---------- */
+.hero {
+  min-height: min(calc(52vh - var(--nav-h)), 560px);
+  display: flex; align-items: center; justify-content: center;
+  padding: 52px 18px 44px; text-align: center;
+  border-bottom: 1px solid var(--line);
+  position: relative;
+  overflow: hidden; /* clips the skewed stripe elements at the hero's edges */
+  /* just the soft dark panel stays in the gradient — near-invisible behind
+     text. The bright stripes live in ::before/::after below, pinned in pixels
+     to the right edge so they can never drift into the wordmark the way
+     percentage gradient stops do. */
+  background:
+    linear-gradient(102deg,
+      var(--bg) 0 57%,
+      #150d0b 57% 74%,
+      var(--bg) 74% 100%);
+}
+/* the livery: two solid bars leaning with the italic, hugging the right edge.
+   Fixed pixel offsets, not gradient percentages — the wordmark below is sized
+   to ~80% of the viewport, so the outer ~10% is permanently stripe country. */
+.hero::before, .hero::after {
+  content: ""; position: absolute; top: -40px; bottom: -40px;
+  transform: skewX(-14deg); pointer-events: none;
+}
+/* the offset scales with the viewport: full 148px at 1440-wide, easing back
+   toward the edge on narrower screens so the stripes never reach the "AI" */
+.hero::before { right: clamp(60px, 10.3vw, 148px); width: 24px; background: #ff2800; }
+.hero::after { right: clamp(24px, 7.2vw, 104px); width: 10px; background: #ffdf00; }
+
+/* full width: the wordmark is wider than a content column, and a centered
+   line that overflows its box spills right, not evenly — so give it the whole
+   hero. The picker and copy rows carry their own max-widths and stay narrow. */
+.hero-in { width: 100%; min-width: 0; position: relative; }
+.hero h1 {
+  margin: 0;
+  font-family: var(--display);
+  font-style: italic;
+  font-weight: 900;
+  font-stretch: 125%;
+  /* sized so "MAXPLAYER AI" stays one centered line at ~80% of the viewport,
+     leaving the right edge clear for the livery stripes at every width */
+  font-size: clamp(40px, 7.4vw, 100px);
+  line-height: 0.9;
+  letter-spacing: -0.01em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.hero h1 { color: var(--ink); }
+.hero .sub {
+  margin: 16px 0 0;
+  font-family: var(--display); font-style: italic; font-weight: 700; font-stretch: 125%;
+  font-size: clamp(14px, 2.1vw, 19px);
+  letter-spacing: 0.22em; text-transform: uppercase;
+  color: var(--blue);
+}
+
+/* role picker */
+.runs.pick { margin-top: 38px; }
+.pick-lbl {
+  margin: 0 0 12px;
+  font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase;
+  color: var(--muted);
+}
+/* One grid cell, two states. The ROLES row sizes the cell (justify-content
+   centers the track); the picked box contributes zero width of its own
+   (width:0) and then stretches to fill the cell (min-width:100%) — so the
+   instruction box is always exactly as wide as the two buttons above it. */
+.pick-swap { display: grid; justify-content: center; }
+.pick-swap > * { grid-area: 1 / 1; }
+.pick[data-picked="no"] .pick-picked { visibility: hidden; }
+.pick[data-picked="yes"] .pick-roles { visibility: hidden; }
+/* role buttons: outlined parallelogram plates, both the same slant. Racer is
+   Giallo, Runner is Rosso; hover fills the outline in. The slant comes from a
+   skew transform, not clip-path, so the border is real — labels counter-skew
+   back upright (skewX(-a) then skewX(a) composes to identity). */
+.pick-roles { display: flex; gap: 18px; justify-content: center; align-items: stretch; }
+.role {
+  cursor: pointer;
+  font-family: var(--display); font-style: italic; font-weight: 900; font-stretch: 125%;
+  font-size: 17px; text-transform: uppercase; letter-spacing: 0.05em;
+  padding: 13px 28px;
+  background: transparent; border-radius: 0;
+  transform: skewX(-14deg);
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.role > span { display: inline-block; transform: skewX(14deg); }
+.role.racer { border: 2px solid var(--blue); color: var(--ink); }
+.role.racer:hover { background: var(--blue); color: #0a0a0b; }
+.role.runner { border: 2px solid #ffdf00; color: var(--ink); }
+.role.runner:hover { background: #ffdf00; color: #0a0a0b; }
+
+/* the picked state: plain rectangles — a yellow outlined box for the
+   instruction, a red outlined square for clear. Same colors as the role
+   plates, none of the slant. */
+.pick-picked { display: flex; gap: 14px; align-items: stretch; width: 0; min-width: 100%; margin: 0; padding: 0; }
+/* inside the flex row the box takes the row's width; auto margins here would
+   shove the clear button to the far edge instead of keeping the pair together */
+.pick-picked .run {
+  flex: 1; min-width: 0; margin: 0; max-width: none;
+  border: 2px solid var(--blue);
+}
+.pick-clear {
+  flex: none; width: 46px;
+  background: transparent; border: 2px solid #ffdf00; border-radius: 0;
+  color: var(--ink); cursor: pointer; font-size: 16px; line-height: 1;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.pick-clear:hover { background: #ffdf00; color: #0a0a0b; }
+
+/* copy rows: layout only — the hero's picked state dresses them above */
+.run {
+  display: flex; align-items: center; gap: 12px;
+  max-width: 640px; margin: 0 auto;
+  background: transparent; border: 0; border-radius: 0;
+  padding: 10px 18px;
+  text-align: left;
+}
+.run .lbl {
+  flex: none; font-size: 10px; font-weight: 700; letter-spacing: 0.14em;
+  text-transform: uppercase; color: var(--neon);
+}
+.run code {
+  flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap;
+  font-size: 12px; color: var(--ink-2);
+  scrollbar-width: none;
+}
+.run.prose code { white-space: normal; overflow: visible; }
+.run button {
+  flex: none; cursor: pointer;
+  /* fixed box: the label swaps between "copy" and a checkmark, and the
+     button must not change size when it does */
+  min-width: 48px; height: 27px; padding: 0 10px;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
+  color: #0a0a0b; background: var(--neon);
+  border: 0; border-radius: 0;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.run button:hover { background: var(--blue); color: #fff; }
+.run button.ok { background: var(--ink); font-size: 16px; letter-spacing: 0; }
+
+/* ---------- market: the board ---------- */
+.market { border-bottom: 1px solid var(--line); }
+.market-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 14px 16px 12px;
+}
+.market-bar h2, .stats h2 {
+  display: flex; align-items: center; gap: 10px;
+  margin: 0;
+  font-family: var(--display); font-style: italic; font-weight: 900; font-stretch: 125%;
+  font-size: 19px; letter-spacing: 0.04em; text-transform: uppercase;
+}
+
+/* window buttons — terminal toggles, inverse-video when pressed */
+.windows { display: flex; gap: 6px; flex-wrap: wrap; }
+.windows button {
+  cursor: pointer;
+  font-size: 10.5px; font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--muted); background: transparent;
+  border: 1px solid var(--line); border-radius: 2px;
+  padding: 4px 10px;
+}
+.windows button:hover { color: var(--ink); border-color: var(--muted); }
+.windows button[aria-pressed="true"] {
+  color: #0a0a0b; background: var(--neon); border-color: var(--neon); font-weight: 700;
+}
+
+.book {
+  display: grid; grid-template-columns: 1fr 1.2fr 1fr;
+  border-top: 1px solid var(--line);
+  background: var(--line);
+  gap: 1px; /* the grid IS the border — bloomberg panel seams */
+}
+.col { background: var(--bg); display: flex; flex-direction: column; min-width: 0; }
+.col-bar {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.col-bar h3 {
+  display: flex; align-items: center; gap: 8px;
+  margin: 0; font-size: 12px; font-weight: 700;
+  letter-spacing: 0.14em; text-transform: uppercase;
+}
+.col-meta { font-size: 10px; color: var(--faint); letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
+
+.rows {
+  list-style: none; margin: 0; padding: 0;
+  /* FIXED height, not max-height: the column's size must never depend on
+     what's inside it — that is the no-layout-shift contract. Skeletons, empty
+     states, and live rows all render inside the same box. */
+  height: calc(var(--row-h) * 11); overflow-y: auto;
+  scrollbar-width: thin; scrollbar-color: var(--raise) transparent;
+}
+/* ONE row height for live rows and skeletons alike — the separator lines in
+   all three columns sit on the same pixels, loading or loaded. */
+.row {
+  display: grid; align-items: center; gap: 10px;
+  height: var(--row-h);
+  padding: 0 12px;
+  border-bottom: 1px solid var(--line-2);
+  font-size: 12px;
+}
+.buyers-grid { grid-template-columns: minmax(0, 1fr) 52px 52px 74px; }
+.sellers-grid { grid-template-columns: minmax(0, 1fr) 44px 60px 74px; }
+.row.head {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--bg);
+  height: 26px;
+  font-size: 9.5px; font-weight: 500; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--faint);
+  border-bottom: 1px solid var(--line);
+}
+.feed-grid { grid-template-columns: 58px minmax(0, 1fr) 34px; }
+ol .row { cursor: pointer; }
+/* inverse-video hover — the terminal way, not a soft tint */
+ol .row:hover, ol .row:focus-visible { background: var(--neon); color: #0a0a0b; }
+ol .row:hover .num, ol .row:focus-visible .num,
+ol .row:hover .sats, ol .row:focus-visible .sats,
+ol .row:hover .when, ol .row:focus-visible .when,
+ol .row:hover code, ol .row:focus-visible code,
+ol .row:hover .dim, ol .row:focus-visible .dim,
+ol .row:hover .harness, ol .row:focus-visible .harness,
+ol .row:hover .person, ol .row:focus-visible .person { color: #0a0a0b; }
+ol .row:hover .tag, ol .row:focus-visible .tag { border-color: #0a0a0b; color: #0a0a0b; background: transparent; }
+
+.agent { display: flex; align-items: center; gap: 8px; min-width: 0; }
+/* the rank gutter: an arrow climbs for anyone up a place or more in the last
+   24 hours; everyone else gets quiet air. Rosso — position gained is the
+   sharpest signal on the board. */
+.pos {
+  flex: none; width: 14px; display: inline-flex; justify-content: center; align-items: center;
+  font-size: 9px; font-weight: 700; letter-spacing: 0.05em;
+  font-variant-numeric: tabular-nums;
+  color: var(--faint);
+}
+/* the climb marker: thin open chevrons in solid rosso, one per place gained
+   (max three). They nest into each other like road chevrons, so even the full
+   stack stays inside a row's cap height. */
+.pos.up { flex-direction: column; gap: 0; }
+/* a touch taller than the original flat dashes, without going full triangle */
+.pos.up i {
+  flex: none; width: 9px; height: 5px;
+  background: var(--blue);
+  /* same thin parallel strokes — each arm ends on ONE pure vertical cut,
+     no horizontal edges anywhere in the glyph */
+  clip-path: polygon(16% 68%, 50% 0%, 84% 68%, 84% 100%, 50% 32%, 16% 100%);
+}
+.pos.up i + i { margin-top: -2px; }
+ol .row:hover .pos.up i, ol .row:focus-visible .pos.up i { background: #0a0a0b; }
+.agent .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.agent code { color: var(--muted); font-size: 11px; }
+.num { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink-2); }
+.num.dim, .dim { color: var(--faint); }
+.sats { color: var(--neon); font-weight: 700; }
+.person { color: var(--ink); font-weight: 500; }
+.self { color: var(--warn); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; }
+.empty { padding: 18px 12px; color: var(--faint); font-size: 11.5px; }
+
+/* status streaks: three bars skewed to the display italic's lean.
+   Offline = hollow, available = steady lime, working = the bars light in
+   sequence left→right — motion lines. The sweep is phase-anchored to the award
+   clock (--race-light-delay) so the 3s board repaint re-enters the animation
+   mid-flight instead of restarting it. Background-only keyframes on purpose:
+   nothing here should cost layout or paint beyond a color swap. */
+.dot {
+  flex: none; display: inline-flex; gap: 2px;
+  padding: 1px 0;
+}
+.dot i {
+  /* the logo's silhouette in miniature: thick leader, two thinner chasers
+     (4:2:1, same lean, sharp corners). Behavior and colors unchanged. */
+  width: 4.5px; height: 10px;
+  transform: skewX(-14deg);
+  background: var(--raise);
+}
+.dot i:nth-child(2) { width: 2.5px; }
+.dot i:nth-child(3) { width: 1.5px; }
+/* available: lit nose, neutral trail — standing still, ready to go.
+   working keeps a lime-tinted trail under its sweep, so even a single frozen
+   frame of the two states reads differently. */
+.dot.on i { background: var(--raise); }
+.dot.on i:first-child { background: var(--neon); }
+/* one light sweeps left → right per second; each bar holds it for a slice
+   proportional to its width (48% / 26% / 16%, then a beat of rest). One
+   shared clock and phase anchor, so the sweep survives repaints. */
+.dot.working i {
+  --lamp-lit: var(--neon);
+  --lamp-off: var(--raise);
+  background: var(--raise);
+  animation-duration: 2.2s;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+  animation-delay: var(--race-light-delay, 0s);
+}
+.dot.working i:nth-child(1) { animation-name: lamp-a; }
+.dot.working i:nth-child(2) { animation-name: lamp-b; }
+.dot.working i:nth-child(3) { animation-name: lamp-c; }
+/* the CHARGE: bars fill one by one — 1, 2, 3 — hold full, then release and
+   begin again. Colors are custom properties so hover recolors without ever
+   restarting the clock, and every lamp on the page shares one phase. */
+@keyframes lamp-a {
+  0%, 2% { background: var(--lamp-off); }
+  8%, 88% { background: var(--lamp-lit); }
+  96%, 100% { background: var(--lamp-off); }
+}
+@keyframes lamp-b {
+  0%, 26% { background: var(--lamp-off); }
+  32%, 88% { background: var(--lamp-lit); }
+  96%, 100% { background: var(--lamp-off); }
+}
+@keyframes lamp-c {
+  0%, 50% { background: var(--lamp-off); }
+  56%, 88% { background: var(--lamp-lit); }
+  96%, 100% { background: var(--lamp-off); }
+}
+@keyframes speed-flow {
+  0% { background: var(--neon); }
+  33.333%, 100% { background: var(--raise); }
+}
+/* inverse-video hover: lime streaks vanish on a lime row — go dark instead */
+/* inverse-video hover: yellow row swallows the yellow lamps, so lit bars
+   flip to rosso — active vs inactive stays readable under the highlight.
+   A WORKING lamp keeps its sweep, recolored red: the animation swaps to the
+   red keyframes but the phase anchor (--race-light-delay) re-enters it at
+   the same point in the cycle, so hovering never restarts the motion. */
+/* translucent, not solid: inactive lamps are LOW-contrast on the dark page,
+   so on the yellow highlight they get a wash that lets the yellow through —
+   the same subtlety, adapted to the new background */
+ol .row:hover .dot:not(.working) i, ol .row:focus-visible .dot:not(.working) i { animation: none; background: rgba(10, 10, 11, 0.24); }
+ol .row:hover .dot.on i:first-child, ol .row:focus-visible .dot.on i:first-child { background: var(--blue); }
+ol .row:hover .dot.working i, ol .row:focus-visible .dot.working i {
+  --lamp-lit: var(--blue);
+  --lamp-off: rgba(10, 10, 11, 0.24);
+}
+@keyframes speed-flow-red {
+  0% { background: var(--blue); }
+  33.333%, 100% { background: #0a0a0b; }
+}
+.harness {
+  flex: none; font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--muted); border: 1px solid var(--line); border-radius: 2px; padding: 1px 4px;
+}
+
+/* feed rows */
+.feed .row { grid-template-columns: 58px minmax(0, 1fr) 34px; }
+.feed .line { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.when { text-align: right; color: var(--faint); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.tag {
+  font-size: 9px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
+  text-align: center;
+  border: 1px solid var(--line); border-radius: 2px; padding: 2px 0;
+  color: var(--muted);
+}
+.tag[data-s="offer"] { color: var(--ink); border-color: var(--muted); }
+.tag[data-s="claim"] { color: var(--warn); border-color: rgba(255, 138, 61, 0.4); }
+.tag[data-s="award"] { color: #ff6a4d; border-color: rgba(255, 40, 0, 0.4); }
+.tag[data-s="result"] { color: var(--ink-2); }
+.tag[data-s="accept"] { color: var(--neon); border-color: rgba(255, 223, 0, 0.35); }
+.tag[data-s="receipt"] { color: #0a0a0b; background: var(--blue); border-color: var(--blue); }
+
+/* ---------- key stats ---------- */
+.stats { padding: 26px 16px 34px; border-bottom: 1px solid var(--line); }
+.statgrid {
+  display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 1px; margin: 18px 0 0;
+  background: var(--line); border: 1px solid var(--line);
+}
+.statgrid > div { background: var(--bg); padding: 14px 14px 12px; }
+.statgrid dt {
+  font-size: 9.5px; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--faint); margin: 0 0 8px;
+}
+.statgrid dd {
+  margin: 0;
+  font-family: var(--display); font-style: italic; font-weight: 900; font-stretch: 125%;
+  font-size: clamp(20px, 2.6vw, 30px); line-height: 1;
+  color: var(--ink); font-variant-numeric: tabular-nums;
+}
+.statgrid dd.neon { color: var(--neon); }
+.foot-note { margin: 14px 2px 0; font-size: 11px; color: var(--muted); max-width: 720px; }
+
+/* ---------- pitch lanes ---------- */
+/* the pitch lanes wear the hero's livery instead of a flat vertical rule:
+   Buy carries the stripes on the right, Sell answers from the left, colors
+   swapped. They live in the section's outer margins and vanish below 1280px,
+   so they can never run under the text. */
+.pitch { border-bottom: 1px solid var(--line); position: relative; overflow: hidden; }
+.pitch::before, .pitch::after {
+  content: ""; position: absolute; top: -40px; bottom: -40px;
+  transform: skewX(-14deg); pointer-events: none;
+}
+.pitch::before { right: 68px; width: 22px; background: #ffdf00; }
+.pitch::after { right: 28px; width: 9px; background: #ff2800; }
+.pitch.alt::before { right: auto; left: 68px; background: #ff2800; }
+.pitch.alt::after { right: auto; left: 28px; background: #ffdf00; }
+@media (max-width: 1280px) {
+  .pitch::before, .pitch::after { display: none; }
+}
+.pitch-in {
+  max-width: 1060px; margin: 0 auto;
+  padding: 58px 18px 62px;
+}
+.eyebrow {
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.28em; text-transform: uppercase;
+  color: #ff6a4d;
+}
+.pitch.alt .eyebrow { color: var(--neon); }
+.pitch h2 {
+  margin: 12px 0 0;
+  font-family: var(--display); font-style: italic; font-weight: 900; font-stretch: 125%;
+  font-size: clamp(28px, 4.6vw, 46px); line-height: 1;
+  letter-spacing: 0; text-transform: uppercase;
+}
+.lede { margin: 14px 0 0; font-family: var(--sans); font-size: 16px; color: var(--ink-2); max-width: 560px; }
+.steps {
+  list-style: none; margin: 38px 0 0; padding: 0;
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 26px;
+}
+.steps .n {
+  display: block;
+  font-family: var(--display); font-style: italic; font-weight: 900; font-stretch: 125%;
+  font-size: 30px; line-height: 1; color: transparent;
+  -webkit-text-stroke: 1px var(--muted);
+}
+.steps li:hover .n { color: #ff6a4d; -webkit-text-stroke: 0; }
+.pitch.alt .steps li:hover .n { color: var(--neon); }
+.steps h3 {
+  margin: 12px 0 6px; font-size: 12.5px; font-weight: 700;
+  letter-spacing: 0.1em; text-transform: uppercase;
+}
+.steps p { margin: 0; font-family: var(--sans); font-size: 13.5px; line-height: 1.55; color: var(--muted); }
+.steps p code { font-size: 12px; color: var(--ink-2); background: var(--panel); border: 1px solid var(--line); border-radius: 2px; padding: 1px 5px; }
+
+/* ---------- footer: the sign-off ----------
+   Big-type close, not a legal strip: link columns up top, a ghost wordmark
+   half-cropped at the bottom edge like it's driving out of frame, and the
+   finish line — a red/yellow double stripe — as the very last pixels. */
+.site-foot { padding: 44px 18px 0; overflow: hidden; }
+.foot-cols {
+  max-width: 1060px; margin: 0 auto;
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 20px;
+}
+.brand.small span { font-size: 12px; letter-spacing: 0.04em; }
+.foot-brand p { margin: 6px 0 0; font-size: 11px; color: var(--faint); text-transform: uppercase; letter-spacing: 0.1em; }
+.foot-nav { display: flex; gap: 18px; }
+.foot-nav a {
+  color: var(--muted); text-decoration: none;
+  font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
+}
+.foot-nav a:hover { color: var(--neon); }
+.foot-word {
+  margin: 34px 22px 22px; /* the same breath of room on all three sides */
+  font-family: var(--display); font-style: italic; font-weight: 900; font-stretch: 125%;
+  /* sized to span the width inside the 22px side margins: the wordmark's
+     width ≈ 9.85 × its font size, so this calc fills the space exactly */
+  font-size: calc((100vw - 44px) / 10.15); line-height: 0.82;
+  letter-spacing: -0.01em; text-transform: uppercase;
+  text-align: center; white-space: nowrap;
+  /* optical centering: the italic pushes the cap line right (the M's top
+     corner sits ~17px deeper than the AI's), so the box-centered word reads
+     right-shifted. Half that lean, in em so it scales with the font. */
+  transform: translateX(-0.06em);
+  color: transparent;
+  -webkit-text-stroke: 1px #2e2e33;
+  user-select: none;
+}
+/* same move as the step numbers: the WHOLE wordmark fills solid — rosso when
+   the cursor is on MAXPLAYER, giallo when it's on AI */
+.foot-word { transition: color 0.25s ease; }
+.foot-word:has(.fw-max:hover) { color: var(--blue); -webkit-text-stroke: 0; }
+.foot-word:has(.fw-ai:hover) { color: #ffdf00; -webkit-text-stroke: 0; }
+
+/* ---------- docks: floating terminal windows ----------
+   Spawn docked (racer left, event mid, runner right), then behave like real
+   windows: drag by the title bar, resize from the corner (native handle),
+   double-click the bar to snap home. Geometry rides on inline styles set by
+   ui/docks.ts; these rules are the frame. */
+.dock[hidden] { display: none; }
+.dock {
+  position: fixed; z-index: 60;
+  display: flex; flex-direction: column;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.65);
+  resize: both; overflow: hidden;
+  min-width: 320px; min-height: 240px;
+  max-width: 96vw; max-height: calc(100vh - var(--nav-h) - 8px);
+}
+/* pinned: the classic docked layout — anchored to its edge, full height below
+   the chrome, no drag or resize. The pin button pops it out. */
+.dock.pinned { resize: none; top: var(--nav-h); bottom: 0; width: min(420px, 94vw); max-height: none; }
+.dock-left.pinned { left: 0; border-left: 0; }
+.dock-right.pinned { left: auto; right: 0; border-right: 0; }
+.dock-mid.pinned { left: 50%; transform: translateX(-50%); width: min(460px, 94vw); }
+.dock.pinned .dock-bar { cursor: default; }
+.dock-bar {
+  flex: none;
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 8px 12px;
+  background: var(--panel); border-bottom: 1px solid var(--line);
+  cursor: grab; user-select: none; touch-action: none;
+}
+.dock-bar:active { cursor: grabbing; }
+.dock-title {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 11px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase;
+}
+.dock-controls { flex: none; display: flex; gap: 6px; }
+.dock-pin,
+.dock-close {
+  flex: none; width: 26px; height: 26px;
+  background: transparent; border: 1px solid var(--line); border-radius: 2px;
+  color: var(--muted); cursor: pointer; font-size: 14px; line-height: 1;
+}
+.dock-pin:hover,
+.dock-close:hover { color: var(--ink); border-color: var(--muted); }
+.dock-pin { font-size: 12px; }
+.dock-body {
+  flex: 1; overflow-y: auto; overscroll-behavior: contain;
+  padding: 14px 16px 34px;
+  scrollbar-width: thin; scrollbar-color: var(--raise) transparent;
+}
+.dock h3 {
+  margin: 4px 0 14px;
+  display: flex; align-items: center; gap: 10px;
+  font-family: var(--display); font-style: italic; font-weight: 900; font-stretch: 125%;
+  font-size: 19px; text-transform: uppercase; letter-spacing: 0.02em;
+}
+/* headline-sized status streaks, same rules as the board rows */
+.dock h3 .dot { padding: 0; }
+.dock h3 .dot i { width: 7px; height: 16px; }
+.dock h3 .dot i:nth-child(2) { width: 4px; }
+.dock h3 .dot i:nth-child(3) { width: 2.5px; }
+.dock h4 {
+  margin: 22px 0 8px;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.18em; text-transform: uppercase;
+  color: var(--neon);
+}
+.dock .sub { margin: -8px 0 12px; font-size: 11px; color: var(--faint); text-transform: uppercase; letter-spacing: 0.1em; }
+
+.close-all {
+  /* bottom-center, always ABOVE every dock: the docks raise their z-index as
+     they're touched (dockZ counts up from 60), so this rides far higher */
+  position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%); z-index: 9999;
+  cursor: pointer;
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--ink); background: var(--raise);
+  border: 1px solid var(--muted); border-radius: 2px;
+  padding: 8px 16px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.6);
+}
+.close-all:hover { color: #0a0a0b; background: var(--neon); border-color: var(--neon); }
+.close-all[hidden] { display: none; }
+.detail-person {
+  background: transparent; border: 0; padding: 0; cursor: pointer;
+  font: inherit; color: var(--neon); text-decoration: underline;
+  text-decoration-color: rgba(255, 223, 0, 0.4);
+}
+.selfnote {
+  font-size: 12px; color: var(--warn);
+  border: 1px solid rgba(255, 138, 61, 0.3); border-radius: 2px;
+  background: rgba(255, 138, 61, 0.06);
+  padding: 9px 11px;
+}
+.job { font-family: var(--sans); font-size: 14px; color: var(--ink-2); margin: 6px 0 0; }
+/* offers can carry long briefs — show a few lines, the chip copies all of it.
+   The clamp changes NOTHING but the line count: margins live on the wrapper,
+   so toggling show/hide cannot move the first line. */
+.job.clamp {
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.job-wrap { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; margin-top: 6px; }
+.job-wrap .job { margin: 0; }
+.show-chip, .copy-chip { cursor: pointer; color: var(--muted); }
+.show-chip:hover { color: var(--neon); border-color: var(--neon); }
+.copy-chip:hover { color: var(--neon); border-color: var(--neon); }
+.copy-chip.ok { color: var(--neon); border-color: var(--neon); }
+.job-note { font-size: 11.5px; color: var(--muted); margin: 4px 0 8px; }
+.tiny { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+.tiny code { color: var(--ink-2); }
+
+/* truncated public key — the click copies the full key */
+.pk-copy {
+  background: transparent; border: 0; padding: 0; cursor: pointer;
+  font: inherit; color: var(--ink-2);
+}
+.pk-copy code {
+  font-size: 12px; color: var(--ink-2);
+  border-bottom: 1px dashed var(--faint);
+}
+.pk-copy:hover code { color: var(--neon); border-bottom-color: var(--neon); }
+.pk-copy.ok code { color: var(--neon); border-bottom-color: transparent; }
+
+.kv { margin: 0; display: grid; gap: 6px; }
+.kv > div { display: grid; grid-template-columns: 148px minmax(0, 1fr); gap: 10px; align-items: baseline; }
+.kv dt { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); }
+.kv dd { margin: 0; font-size: 12px; color: var(--ink-2); overflow-wrap: anywhere; }
+.kv.identity-kv dd { color: var(--muted); font-size: 11px; }
+.kv.advertisement dd { color: var(--ink-2); }
+
+/* six boxes, three per row — racer and runner docks line up box for box */
+.stats-in { margin: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); }
+.stats-in > div { background: var(--bg); padding: 10px 10px 8px; }
+.stats-in dt { font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--faint); margin-bottom: 5px; }
+.stats-in dd { margin: 0; font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.stats-in dd.sats { color: var(--neon); }
+
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  font-size: 10.5px; letter-spacing: 0.05em;
+  border: 1px solid var(--line); border-radius: 2px;
+  padding: 4px 8px; color: var(--ink-2); background: var(--panel);
+}
+button.chip { cursor: pointer; }
+.working-chip { color: var(--neon); border-color: rgba(255, 223, 0, 0.35); }
+.overdue-chip { color: var(--warn); border-color: rgba(255, 138, 61, 0.4); }
+
+.detail-activity { list-style: none; margin: 0; padding: 0; }
+/* display:grid on the row OVERRIDES the browser's [hidden]{display:none} —
+   author rules beat UA rules — so without this line the filters set `hidden`
+   and nothing visibly happened. */
+.activity-row[hidden] { display: none; }
+.activity-row {
+  display: grid; grid-template-columns: 58px minmax(0, 1fr) 34px;
+  gap: 10px; align-items: center;
+  padding: 6px 4px; font-size: 12px;
+  border-bottom: 1px solid var(--line-2);
+  cursor: pointer;
+}
+.activity-row .line { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.activity-row:hover { background: var(--panel); }
+.activity-row.current { background: var(--neon-dim); }
+.activity-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px; }
+.activity-label { font-size: 9.5px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--faint); }
+.activity-count { font-size: 10px; color: var(--faint); margin-left: auto; }
+.activity-filters { width: max-content; max-width: 100%; box-sizing: border-box; }
+/* compact enough that the full lifecycle fits one line at the default dock
+   width; they still wrap gracefully when the window is resized narrower */
+.activity-filters button { font-size: 9px; padding: 3px 6px; letter-spacing: 0.05em; }
+
+/* ---------- responsive ---------- */
+@media (max-width: 980px) {
+  .book { grid-template-columns: 1fr 1fr; }
+  .col.mid { grid-column: 1 / -1; grid-row: 2; }
+  .statgrid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .steps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .clock { display: none; }
+}
+@media (max-width: 700px) {
+  .nav { gap: 12px; }
+  .nav-links {
+    display: none;
+    position: absolute; top: var(--nav-h); left: 0; right: 0;
+    flex-direction: column; align-items: flex-start; gap: 0;
+    background: var(--bg-2); border-bottom: 1px solid var(--line);
+    padding: 6px 0;
+  }
+  .nav-links.open { display: flex; }
+  .nav-links a { width: 100%; padding: 11px 16px; }
+  .nav-toggle { display: flex; }
+  .conn #conn-text { display: none; }
+  .book { grid-template-columns: 1fr; }
+  .col.mid { grid-column: auto; grid-row: auto; }
+  .rows { height: calc(var(--row-h) * 9); }
+  .statgrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .steps { grid-template-columns: 1fr; gap: 22px; }
+  .hero { padding: 40px 14px 36px; }
+  /* no room for a stripe lane on a phone — the wordmark takes the width */
+  .hero::before, .hero::after { display: none; }
+  .hero h1 { font-size: clamp(28px, 8.2vw, 48px); }
+  .hero .sub { letter-spacing: 0.12em; }
+  .market-bar { flex-wrap: wrap; }
+  .pick-roles { flex-direction: column; }
+  /* small screens: the instruction shows one truncated line — the copy
+     button still copies the FULL text (it reads the element's content,
+     not what's visibly painted) */
+  .pick-picked .run code { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .role { width: 100%; max-width: 320px; }
+  .kv > div { grid-template-columns: 1fr; gap: 2px; }
+  /* one column of screen: no room to float — docks go full-screen below the
+     chrome and stack, last opened on top. !important beats the inline
+     geometry the window manager writes on desktop. */
+  .dock {
+    left: 0 !important; top: var(--nav-h) !important;
+    width: 100% !important; height: calc(100vh - var(--nav-h)) !important;
+    max-width: 100vw; resize: none;
+    /* the mid dock centers itself with translateX(-50%) on desktop — with
+       left forced to 0 here, that transform dragged event screens half a
+       viewport off the left edge */
+    transform: none !important;
+  }
+  .dock-bar { cursor: default; }
+  .dock-pin { display: none; }
+  /* one dock at a time on phones — the floating Close All is noise */
+  .close-all { display: none !important; }
+}
+
+/* ---------- reduced motion ---------- */
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .dot.working, .dot.working i, .sl { animation: none !important; }
+  /* motion gone, meaning kept: a static bright streak still reads as working */
+  .dot.working i:first-child { background: var(--neon); }
+  .conn[data-state="connecting"] .sl, .conn[data-state="history"] .sl { background: var(--blue); }
+  .role, .nav-toggle span { transition: none; }
+}
+
+/* ---------- skeletons: first-ever load only ----------
+   The chrome is static HTML and never moves; only data cells shimmer while
+   the first events arrive. Fixed heights match real rows exactly, so the
+   swap from skeleton to data cannot shift layout. */
+.skel-row {
+  display: grid; align-items: center; gap: 10px;
+  height: var(--row-h);
+  padding: 0 12px; border-bottom: 1px solid var(--line-2);
+}
+.skel {
+  height: 10px; border-radius: 2px;
+  background: linear-gradient(90deg, var(--raise) 0%, #232326 50%, var(--raise) 100%);
+  background-size: 200% 100%;
+  animation: skel-sheen 1.4s linear infinite;
+}
+@keyframes skel-sheen { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+.skel.w-name { width: 60%; }
+.skel.w-num { width: 70%; justify-self: end; }
+.skel.w-line { width: 85%; }
+@media (prefers-reduced-motion: reduce) { .skel { animation: none !important; } }

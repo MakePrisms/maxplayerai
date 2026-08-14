@@ -1,6 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "buildCommand": "node scripts/build.mjs",
+  "buildCommand": "node scripts/build.mjs && (node scripts/bake-snapshot.mjs || echo 'snapshot bake skipped — client falls back to skeletons + relay')",
   "outputDirectory": "dist",
   "framework": null,
   "cleanUrls": true,
