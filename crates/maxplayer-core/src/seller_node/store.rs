@@ -1213,11 +1213,21 @@ impl SellerStore {
     /// value (written once at `record_award`), so the execute path uses it as the delivery commit's
     /// authored-at — a re-created delivery after a restart is then byte-identical (invariant 2). `None`
     /// when the job was never awarded.
+    ///
+    /// ORDERED, and that is what makes "restart-STABLE" true rather than merely usually-true. The
+    /// `awards` PRIMARY KEY is the AWARD id, not the job id, so ONE JOB CAN HOLD MORE THAN ONE ROW —
+    /// `SellerNodeRunner::on_accept`'s doc names the hazard in the code's own words, and
+    /// `execute_job`'s notes a redundant second award "seen live in the smoke". A bare `SELECT` then
+    /// returns whichever row SQLite hands back first, which is free to differ across restarts — and a
+    /// differing authored-at is exactly the invariant-2 break this value exists to prevent. Taking the
+    /// EARLIEST (`created_at_unix`, `award_id` as the tie-break) is deterministic for any row set, and
+    /// matches [`Self::job_award_buyer`] one function below, which has always read this way.
     pub fn job_award_time(&self, job_id: &str) -> Result<Option<i64>, StoreError> {
         let conn = self.lock()?;
         let ts: Option<i64> = conn
             .query_row(
-                "SELECT created_at_unix FROM awards WHERE job_id = ?1",
+                "SELECT created_at_unix FROM awards WHERE job_id = ?1
+                 ORDER BY created_at_unix, award_id LIMIT 1",
                 [job_id],
                 |row| row.get(0),
             )
@@ -1949,6 +1959,46 @@ mod tests {
             store.job_creq(&job).expect("creq").as_deref(),
             Some("creqA"),
             "the claim-time creq is immutable across replays"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `job_award_time` must be DETERMINISTIC when one job holds more than one award row. The
+    /// `awards` PRIMARY KEY is the award id, not the job id, so two rows are possible — a redundant
+    /// award was "seen live in the smoke" (see `run.rs` `execute_job`). The value is the delivery
+    /// commit's authored-at, so a reading that can vary across restarts breaks invariant 2
+    /// (byte-identical re-created delivery), which is the property the buyer verifies.
+    ///
+    /// ⛔ THE ROW ORDER HERE IS THE TEST. Inserting the LATER-timestamped award FIRST is what makes
+    /// the pre-fix query deterministically WRONG: an unordered `SELECT … LIMIT 1` walks the table in
+    /// rowid order and hands back that first-inserted later row, while the ordered query returns the
+    /// earlier one. Insert them the other way round and the pre-fix code returns the right answer BY
+    /// LUCK — the test would pass against the very bug it exists to catch.
+    ///
+    /// RED ON REVERT: drop `ORDER BY created_at_unix, award_id LIMIT 1` from `job_award_time` and
+    /// this fails with `assertion left == right failed … left: Some(900), right: Some(100)`.
+    #[test]
+    fn job_award_time_is_deterministic_when_a_job_holds_two_awards() {
+        let (store, path) = fresh_store("award-time-order");
+        let job = "j".repeat(64);
+        let offer = "o".repeat(64);
+        let buyer = "b".repeat(64);
+        store.claim_and_enqueue(&job, &offer, "creqA", &claim(), 1, 999, 1).expect("claim");
+
+        // The LATER award is inserted FIRST — see the note above.
+        store.record_award(&"z".repeat(64), &job, &buyer, 900).expect("later award");
+        store.record_award(&"a".repeat(64), &job, &buyer, 100).expect("earlier award");
+
+        assert_eq!(
+            store.job_award_time(&job).expect("award time"),
+            Some(100),
+            "with two award rows the EARLIEST must win, whatever order they were written in"
+        );
+        // The sibling read has always been ordered; assert they agree rather than trusting it.
+        assert_eq!(
+            store.job_award_buyer(&job).expect("award buyer"),
+            Some(buyer),
+            "job_award_buyer resolves the same row"
         );
         let _ = std::fs::remove_file(&path);
     }
