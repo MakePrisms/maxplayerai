@@ -383,7 +383,7 @@ impl SkipReason {
             Self::RateGate => "rate-gate refused (untargeted without opt-in / below rate)",
             Self::AgentUnavailable => "requested agent harness not available on this node",
             Self::SlotsBusy => "all execution slots busy (node fully loaded; not claiming)",
-            Self::Settled => "offer already settled (co-signed receipt seen; terminal, never claimed)",
+            Self::Settled => "offer already decided (buyer-authenticated award/acceptance or co-signed receipt seen; not ours to claim)",
         }
     }
 }
@@ -399,32 +399,82 @@ const TERMINAL_OFFERS_CAP: usize = 4096;
 /// receipt can never displace it.
 const TERMINAL_AUTHORS_PER_OFFER: usize = 4;
 
-/// Offers known to be SETTLED — a co-signed kind-3400 receipt has been seen for them — keyed by offer
-/// id to the receipt-author pubkeys observed. Relay-derived, populated by
-/// [`SellerNodeRunner::on_receipt`] off the live 3400 subscription plus its boot/reconnect backfill.
+/// How long a terminal/suppression entry for one (offer, author) stays in force.
 ///
-/// The gate ([`SellerNodeRunner::claim_offer`]) skips an offer ONLY when a receipt authored by the
-/// offer's OWN buyer is present ([`Self::settled_by`]). Deliberately NOT the local
+/// Two buyer-authenticated signals mark a recorded offer as no longer ours to claim, and they differ
+/// only in lifetime:
+/// - [`Self::Settled`] (#541) — a co-signed kind-3400 receipt. The offer is settled; terminal
+///   FOREVER, never re-claimable.
+/// - [`Self::TakenElsewhere`] (#814) — a buyer-authenticated AWARD or ACCEPTANCE of the offer to
+///   ANOTHER seller. The offer is taken, but suppressed only until its own `param:deadline` (the
+///   ONLY deadline the protocol defines — there is no separate award/delivery deadline). Fail-open,
+///   mirroring the receipt cache's bounded eviction: a legitimately re-runnable job always carries a
+///   NEW offer id (awards are write-once per offer), so expiring at the offer deadline can never drop
+///   a real re-claim — an offer past its deadline is already `Lapsed` at the claim gate anyway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Suppression {
+    /// A co-signed receipt was seen — terminal forever.
+    Settled,
+    /// A buyer-authenticated award/acceptance to another seller was seen — suppressed until
+    /// `until_unix` (the offer's own absolute deadline).
+    TakenElsewhere { until_unix: u64 },
+}
+
+impl Suppression {
+    /// Whether this suppression still bars a claim at `now_unix`. `Settled` never expires.
+    fn in_force(self, now_unix: u64) -> bool {
+        match self {
+            Self::Settled => true,
+            Self::TakenElsewhere { until_unix } => now_unix < until_unix,
+        }
+    }
+
+    /// Combine two suppressions seen for the SAME (offer, author): the stronger wins. `Settled`
+    /// (permanent) always dominates, so a later receipt UPGRADES a prior award-suppression to
+    /// terminal and a receipt is never weakened back to an expiring award; two award-suppressions
+    /// keep the later expiry.
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Settled, _) | (_, Self::Settled) => Self::Settled,
+            (
+                Self::TakenElsewhere { until_unix: a },
+                Self::TakenElsewhere { until_unix: b },
+            ) => Self::TakenElsewhere { until_unix: a.max(b) },
+        }
+    }
+}
+
+/// Offers no longer ours to claim, keyed by offer id to the buyer-authored suppression signals seen
+/// for them ([`Suppression`]). Relay-derived, populated by [`SellerNodeRunner::on_receipt`] (the
+/// co-signed 3400) and [`SellerNodeRunner::on_award`] / [`SellerNodeRunner::on_accept`] (a
+/// buyer-authenticated award/acceptance to another seller, #814) off their live subscriptions plus
+/// the boot/reconnect backfill — the offer row that authorizes each award is itself persisted, so a
+/// relay redelivery on restart re-derives the suppression, exactly as the receipt path does.
+///
+/// The gate ([`SellerNodeRunner::claim_offer`]) skips an offer ONLY when an IN-FORCE suppression
+/// authored by the offer's OWN buyer is present ([`Self::suppressed_by`]). Deliberately NOT the local
 /// `store.has_receipt`, which knows only settlements THIS node collected — an offer another seat won
-/// and settled is absent there, so a local check would be vacuous. And buyer-bound: a receipt is
-/// buyer-signed and its outer event signature is client-verified, so a forged receipt (author != the
-/// offer's buyer) is stored but never matches at claim time, where the offer's real buyer is known.
+/// and settled is absent there, so a local check would be vacuous. And buyer-bound: award, acceptance
+/// and receipt are all buyer-signed and their outer event signatures are client-verified, so a forged
+/// event (author != the offer's buyer) is stored but never matches at claim time, where the offer's
+/// real buyer is known.
 ///
 /// Bounded twice so it can neither grow without limit nor be displaced by a flood:
 /// - authors-per-offer caps at [`TERMINAL_AUTHORS_PER_OFFER`], DROP-NEWEST, so an established
-///   real-buyer entry can never be evicted by later (forged) receipts;
+///   real-buyer entry can never be evicted by later (forged) events;
 /// - the offer map caps at [`TERMINAL_OFFERS_CAP`], FIFO by first-seen.
 ///
-/// FAIL-OPEN throughout: an unknown / evicted / flood-displaced offer stays claimable. The worst a
-/// forger or a flood achieves is the PRE-#541 behaviour — a wasted slot until the claim lapses —
-/// never a spend and never worse than today.
+/// FAIL-OPEN throughout: an unknown / evicted / flood-displaced / expired offer stays claimable. The
+/// worst a forger or a flood achieves is the PRE-#541 behaviour — a wasted slot until the claim
+/// lapses — never a spend and never worse than today.
 struct TerminalOffers {
     inner: std::sync::Mutex<TerminalOffersInner>,
 }
 
 struct TerminalOffersInner {
-    /// offer id → the receipt-author pubkeys seen for it (a bounded, drop-newest set).
-    by_offer: std::collections::HashMap<String, Vec<String>>,
+    /// offer id → the buyer-authored suppressions seen for it (a bounded, drop-newest set keyed by
+    /// author pubkey).
+    by_offer: std::collections::HashMap<String, Vec<(String, Suppression)>>,
     /// offer ids in first-seen order, for FIFO eviction of the whole map.
     order: std::collections::VecDeque<String>,
     offers_cap: usize,
@@ -441,14 +491,18 @@ impl TerminalOffersInner {
         }
     }
 
-    /// Record `author` as having published a settlement receipt for `offer_id`. Idempotent per
-    /// (offer, author). DROP-NEWEST once an offer holds `authors_cap` distinct authors (so an
+    /// Record `author` as having published `suppression` for `offer_id`. Idempotent per
+    /// (offer, author): a repeat entry from the same author COMBINES with the existing one
+    /// ([`Suppression::combine`]) so a receipt upgrades a prior award-suppression to terminal and is
+    /// never weakened back. DROP-NEWEST once an offer holds `authors_cap` distinct authors (so an
     /// established real-buyer entry is never displaced); FIFO-evict the oldest offer when a NEW offer
     /// would exceed `offers_cap`.
-    fn record(&mut self, offer_id: &str, author: &str) {
+    fn record(&mut self, offer_id: &str, author: &str, suppression: Suppression) {
         if let Some(authors) = self.by_offer.get_mut(offer_id) {
-            if authors.len() < self.authors_cap && !authors.iter().any(|a| a == author) {
-                authors.push(author.to_owned());
+            if let Some(entry) = authors.iter_mut().find(|(a, _)| a == author) {
+                entry.1 = entry.1.combine(suppression);
+            } else if authors.len() < self.authors_cap {
+                authors.push((author.to_owned(), suppression));
             }
             return;
         }
@@ -457,17 +511,21 @@ impl TerminalOffersInner {
                 self.by_offer.remove(&evicted);
             }
         }
-        self.by_offer.insert(offer_id.to_owned(), vec![author.to_owned()]);
+        self.by_offer
+            .insert(offer_id.to_owned(), vec![(author.to_owned(), suppression)]);
         self.order.push_back(offer_id.to_owned());
     }
 
-    /// Whether a receipt authored by `buyer` (the offer's own buyer) has been seen for `offer_id`.
-    /// The buyer-binding is the whole of the anti-grief property: a forged receipt authored by any
-    /// other key is present in the set but never satisfies this test.
-    fn settled_by(&self, offer_id: &str, buyer: &str) -> bool {
-        self.by_offer
-            .get(offer_id)
-            .is_some_and(|authors| authors.iter().any(|a| a == buyer))
+    /// Whether an IN-FORCE suppression authored by `buyer` (the offer's own buyer) bars `offer_id` at
+    /// `now_unix`. The buyer-binding is the whole of the anti-grief property: a forged event authored
+    /// by any other key is present in the set but never satisfies this test. An expired
+    /// award-suppression ([`Suppression::TakenElsewhere`] past its deadline) also fails it — fail-open.
+    fn suppressed_by(&self, offer_id: &str, buyer: &str, now_unix: u64) -> bool {
+        self.by_offer.get(offer_id).is_some_and(|authors| {
+            authors
+                .iter()
+                .any(|(a, s)| a == buyer && s.in_force(now_unix))
+        })
     }
 
     #[cfg(test)]
@@ -483,18 +541,28 @@ impl TerminalOffers {
         }
     }
 
-    fn record(&self, offer_id: &str, author: &str) {
+    /// #541: a co-signed receipt makes `offer_id` terminal FOREVER for `author` (the buyer).
+    fn record_receipt(&self, offer_id: &str, author: &str) {
         self.inner
             .lock()
             .expect("terminal offers mutex poisoned")
-            .record(offer_id, author);
+            .record(offer_id, author, Suppression::Settled);
     }
 
-    fn settled_by(&self, offer_id: &str, buyer: &str) -> bool {
+    /// #814: a buyer-authenticated award/acceptance to another seller marks `offer_id` taken by
+    /// `author` (the buyer) until `until_unix` (the offer's own deadline). Fail-open past that.
+    fn record_taken_elsewhere(&self, offer_id: &str, author: &str, until_unix: u64) {
         self.inner
             .lock()
             .expect("terminal offers mutex poisoned")
-            .settled_by(offer_id, buyer)
+            .record(offer_id, author, Suppression::TakenElsewhere { until_unix });
+    }
+
+    fn suppressed_by(&self, offer_id: &str, buyer: &str, now_unix: u64) -> bool {
+        self.inner
+            .lock()
+            .expect("terminal offers mutex poisoned")
+            .suppressed_by(offer_id, buyer, now_unix)
     }
 }
 
