@@ -86,6 +86,11 @@ pub struct HopSettled {
     /// Whether this run found the melt already paid and the ecash not yet issued — a hop that an
     /// earlier run left stranded and this one recovered.
     pub recovered_strand: bool,
+    /// Unused Lightning fee reserve to credit back to the budget: the reserved fee ceiling minus the
+    /// fee ACTUALLY paid by the melt this run (MakePrisms/maxplayerai#186). Zero when this run did not
+    /// perform the melt itself — a melt that landed on an earlier run cannot be reconciled here, so
+    /// the spend stays at the safe over-counted value rather than crediting a fee we never observed.
+    pub unused_fee_reserve_sats: u64,
 }
 
 /// A hop failure. Every variant refuses fail-closed; none of them can be reached with the seller's
@@ -307,8 +312,10 @@ pub(crate) trait HopEffects {
     /// Refuse before any journal write if the source no longer covers a replacement quote.
     fn require_source_covers(&mut self, planned_cost: u64) -> Result<(), HopError>;
 
-    /// Melt at the source mint, paying the invoice the target raised.
-    fn melt(&mut self, melt_quote_id: &str) -> Result<(), HopError>;
+    /// Melt at the source mint, paying the invoice the target raised. Returns the ACTUAL Lightning
+    /// fee paid (`Melted::fee_paid`), so the caller can reconcile it against the reserved fee and
+    /// credit the unused reserve back to the budget (MakePrisms/maxplayerai#186).
+    fn melt(&mut self, melt_quote_id: &str) -> Result<u64, HopError>;
 
     /// Issue the ecash at the target mint. Returns what was actually issued, which the caller checks
     /// against the pinned delivery amount rather than trusting.
@@ -623,10 +630,12 @@ pub(crate) fn run_hop<S: HopJournalStore, E: HopEffects>(
 ) -> Result<HopSettled, HopError> {
     let records = store.replay(&journal.attempt_id)?;
     if let Some(minted_sats) = settled_of(&records) {
-        // Already complete. Neither mint is touched — this is the pays-once row.
+        // Already complete. Neither mint is touched — this is the pays-once row. No melt ran this
+        // run, so there is no actual fee to reconcile: the credit is 0 (spend stays over-counted).
         return Ok(HopSettled {
             minted_sats,
             recovered_strand: false,
+            unused_fee_reserve_sats: 0,
         });
     }
 
@@ -655,10 +664,14 @@ pub(crate) fn run_hop<S: HopJournalStore, E: HopEffects>(
         ))
     })?;
     let mut melted_this_run = false;
+    // Actual Lightning fee paid by the melt THIS run, set by whichever `melt` call fires. Stays
+    // `None` when no melt runs this pass (a melt that landed earlier), which keeps the reconciliation
+    // a no-op on the recovery path (#186).
+    let mut actual_fee_this_run: Option<u64> = None;
     let melted_earlier = loop {
         break match effects.melt_leg(&active_melt_quote_id)? {
             MeltLeg::Unpaid => {
-                effects.melt(&active_melt_quote_id)?;
+                actual_fee_this_run = Some(effects.melt(&active_melt_quote_id)?);
                 false
             }
             MeltLeg::Pending => {
@@ -704,7 +717,7 @@ pub(crate) fn run_hop<S: HopJournalStore, E: HopEffects>(
                     melt_quote_id: new_melt_quote_id.clone(),
                     planned_cost,
                 })?;
-                effects.melt(&new_melt_quote_id)?;
+                actual_fee_this_run = Some(effects.melt(&new_melt_quote_id)?);
                 melted_this_run = true;
                 active_melt_quote_id = new_melt_quote_id;
                 supersessions += 1;
@@ -743,9 +756,16 @@ pub(crate) fn run_hop<S: HopJournalStore, E: HopEffects>(
         attempt_id: pairing.attempt_id.clone(),
         minted_sats,
     })?;
+    // Reconcile the reserved Lightning fee against what the melt actually paid THIS run, and report
+    // the unused remainder so the caller can credit it back to the budget (#186). A run that did not
+    // melt (recovered a prior melt) has no observed fee, so it credits nothing — the safe direction.
+    let unused_fee_reserve_sats = actual_fee_this_run
+        .map(|actual| pairing.reserved_ln_fee_sats().saturating_sub(actual))
+        .unwrap_or(0);
     Ok(HopSettled {
         minted_sats,
         recovered_strand,
+        unused_fee_reserve_sats,
     })
 }
 
@@ -904,11 +924,11 @@ impl CdkHopEffects {
                 self.target.mint_url, mint_quote.id
             )));
         }
-        let (melt_quote_id, quoted_cost, fee_reserve) =
+        let (melt_quote_id, quoted_cost, cost) =
             self.raise_melt_quote(&mint_quote.request).await?;
         self.require_source_covers(quoted_cost).await?;
         let planned_cost =
-            authorized_hop_cost(quoted_cost, fee_reserve, self.hop_fee_buffer_multiplier)?;
+            authorized_hop_cost(quoted_cost, cost.fee_reserve, self.hop_fee_buffer_multiplier)?;
         Ok(HopJournal {
             attempt_id: attempt_id.to_owned(),
             source_mint: self.source.mint_url.to_string(),
@@ -917,16 +937,19 @@ impl CdkHopEffects {
             mint_quote_id: mint_quote_id(&mint_quote.id),
             delivered_sats,
             planned_cost,
+            fee_reserve: cost.fee_reserve,
+            input_fee: cost.input_fee,
         })
     }
 
     /// Raise and price one source-mint melt quote without moving money.
     ///
-    /// Returns `(quote id, quoted cost, fee reserve)`. Quoted cost is melt amount + fee reserve
+    /// Returns `(quote id, quoted cost, HopCost)`. Quoted cost is melt amount + fee reserve
     /// + input fee — the actual quote, with no buffer. The buffer is applied only in
     /// [`Self::plan_quotes`], so a superseding quote is compared against the already-buffered
-    /// record rather than growing the ceiling.
-    async fn raise_melt_quote(&self, bolt11: &str) -> Result<(String, u64, u64), HopError> {
+    /// record rather than growing the ceiling. The full [`HopCost`] is returned so the caller can
+    /// journal `fee_reserve` and `input_fee` for the post-melt reconciliation (#186).
+    async fn raise_melt_quote(&self, bolt11: &str) -> Result<(String, u64, HopCost), HopError> {
         let melt_quote = bounded(
             "source melt quote",
             MINT_TOUCH_TIMEOUT,
@@ -942,7 +965,7 @@ impl CdkHopEffects {
         let quoted_cost = cost
             .planned_cost()
             .map_err(|error| HopError::Mint(error.to_string()))?;
-        Ok((mint_quote_id(&melt_quote.id), quoted_cost, cost.fee_reserve))
+        Ok((mint_quote_id(&melt_quote.id), quoted_cost, cost))
     }
 
     /// Refuse a hop the source wallet cannot fund, BEFORE the cap is charged.
@@ -1073,7 +1096,7 @@ impl HopEffects for CdkHopEffects {
             effects
                 .raise_melt_quote(&bolt11)
                 .await
-                .map(|(id, quoted_cost, _fee_reserve)| (id, quoted_cost))
+                .map(|(id, quoted_cost, _cost)| (id, quoted_cost))
         })?
     }
 
@@ -1088,7 +1111,7 @@ impl HopEffects for CdkHopEffects {
         })?
     }
 
-    fn melt(&mut self, melt_quote_id: &str) -> Result<(), HopError> {
+    fn melt(&mut self, melt_quote_id: &str) -> Result<u64, HopError> {
         let wallet = self.source.clone();
         let quote_id = melt_quote_id.to_owned();
         block_on_leg("melt", async move {
@@ -1098,8 +1121,11 @@ impl HopEffects for CdkHopEffects {
                 wallet.prepare_melt(&quote_id, HashMap::new()),
             )
             .await?;
-            bounded("melt confirm", HOP_LEG_TIMEOUT, prepared.confirm()).await?;
-            Ok::<(), HopError>(())
+            let melted = bounded("melt confirm", HOP_LEG_TIMEOUT, prepared.confirm()).await?;
+            // `confirm` is the effect boundary — the melt has settled and the fee actually paid is
+            // known here. The mint returned the unused reserve as change; reporting the real fee lets
+            // the caller credit that difference back to the cap (#186).
+            Ok::<u64, HopError>(melted.fee_paid().to_u64())
         })?
     }
 
@@ -1241,6 +1267,10 @@ mod tests {
             mint_quote_id: "mint-1".to_owned(),
             delivered_sats: 100,
             planned_cost: 109,
+            // 109 = 100 delivered + 7 fee reserve + 2 input fee (multiplier 0), so
+            // reserved_ln_fee_sats() == 7.
+            fee_reserve: 7,
+            input_fee: 2,
         }
     }
 
@@ -1262,6 +1292,8 @@ mod tests {
         superseding_planned_cost: u64,
         source_coverage: u64,
         fail_all_melts: bool,
+        /// Actual Lightning fee the melt effect reports as paid (#186 reconciliation input).
+        melt_fee: u64,
         /// Shared with the journal so a test can assert write-before-effect order.
         ops: Rc<RefCell<Vec<String>>>,
     }
@@ -1337,7 +1369,7 @@ mod tests {
             Ok(())
         }
 
-        fn melt(&mut self, melt_quote_id: &str) -> Result<(), HopError> {
+        fn melt(&mut self, melt_quote_id: &str) -> Result<u64, HopError> {
             let mut world = self.world.borrow_mut();
             world.ops.borrow_mut().push(format!("melt:{melt_quote_id}"));
             if world.fail_before_melt {
@@ -1357,7 +1389,7 @@ mod tests {
             if world.die_after_melt {
                 return Err(HopError::Mint("process died after the melt".into()));
             }
-            Ok(())
+            Ok(world.melt_fee)
         }
 
         fn mint(&mut self, mint_quote_id: &str, expected_sats: u64) -> Result<u64, HopError> {
@@ -1463,6 +1495,67 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // #186 RED-PROVE: a hop whose melt pays LESS than the reserved Lightning fee must report the
+    // unused reserve so the caller can credit it back. `journal("…")` reserves 7 fee sats
+    // (planned 109 − delivered 100 − input 2); a melt that actually pays 2 leaves 5 to credit.
+    // Before #186 there was nothing to carry the difference and remaining() stayed understated.
+    #[test]
+    fn hop_reconciles_the_unused_fee_reserve_when_the_actual_fee_is_lower() {
+        let store = MemJournal::default();
+        let world = MintWorld::shared();
+        world.borrow_mut().melt_fee = 2; // actual fee < reserved 7
+        let mut effects = FakeMints {
+            world: Rc::clone(&world),
+        };
+        let settled = run_hop(&store, &mut effects, &journal("attempt-1")).expect("hop completes");
+        assert_eq!(
+            settled.unused_fee_reserve_sats, 5,
+            "reserved 7 − actual 2 = 5 must be credited back (#186)"
+        );
+    }
+
+    // #186 boundary: a melt that consumes the ENTIRE reserve credits nothing back (no phantom credit).
+    #[test]
+    fn hop_credits_nothing_when_the_actual_fee_equals_the_reserve() {
+        let store = MemJournal::default();
+        let world = MintWorld::shared();
+        world.borrow_mut().melt_fee = 7; // actual fee == reserved 7
+        let mut effects = FakeMints {
+            world: Rc::clone(&world),
+        };
+        let settled = run_hop(&store, &mut effects, &journal("attempt-1")).expect("hop completes");
+        assert_eq!(
+            settled.unused_fee_reserve_sats, 0,
+            "a fully-consumed reserve credits nothing"
+        );
+    }
+
+    // #186 fail-safe: a run that RECOVERS a melt landed on an earlier run never observed a fee this
+    // pass, so it must credit nothing rather than invent a reconciliation from a fee it did not see.
+    #[test]
+    fn recovered_melt_reconciles_nothing() {
+        let store = MemJournal::default();
+        let world = MintWorld::shared();
+        world.borrow_mut().die_after_melt = true;
+        world.borrow_mut().melt_fee = 2;
+        let mut dying = FakeMints {
+            world: Rc::clone(&world),
+        };
+        let _ = run_hop(&store, &mut dying, &journal("attempt-1"));
+        // Restart: the melt already landed, so this run does not melt again.
+        world.borrow_mut().die_after_melt = false;
+        let mut restarted = FakeMints {
+            world: Rc::clone(&world),
+        };
+        let settled =
+            run_hop(&store, &mut restarted, &journal("attempt-1")).expect("the restart recovers");
+        assert_eq!(world.borrow().melts.len(), 1, "the restart must not melt again");
+        assert_eq!(
+            settled.unused_fee_reserve_sats, 0,
+            "a recovered melt has no observed fee to reconcile (fail-safe)"
+        );
     }
 
     // Invariant 4, strong form. Kill between the melt and the mint, restart, and the hop must pay
@@ -1643,8 +1736,8 @@ mod tests {
             fn require_source_covers(&mut self, _: u64) -> Result<(), HopError> {
                 unreachable!()
             }
-            fn melt(&mut self, _: &str) -> Result<(), HopError> {
-                Ok(())
+            fn melt(&mut self, _: &str) -> Result<u64, HopError> {
+                Ok(0)
             }
             fn mint(&mut self, _: &str, expected_sats: u64) -> Result<u64, HopError> {
                 Ok(expected_sats.saturating_sub(1))

@@ -112,9 +112,13 @@ pub struct AuthorizePayOutcome {
     pub attempt_id: String,
     /// What the seller received — the buyer-signed offer amount.
     pub amount_sats: u64,
-    /// What the budget cap was charged. Equals `amount_sats` on the direct path; a cross-mint hop
-    /// costs the buyer the Lightning fee reserve and the source mint's input fee on top, so the two
-    /// differ and the gap is the hop's cost rather than anything the seller was paid.
+    /// What the budget cap was charged BEFORE the send/melt. On the direct path this is
+    /// `amount_sats` plus the estimated mint input fee for the send (#185) — that fee leaves the
+    /// wallet on the swap, so it must pass the cap. A cross-mint hop instead costs the buyer the
+    /// Lightning fee reserve and the source mint's input fee on top, so the two differ and the gap is
+    /// the hop's cost rather than anything the seller was paid. For a hop, this is the WORST-CASE
+    /// charge: the unused Lightning fee reserve is reconciled and credited back to the ledger after
+    /// the melt (#186), so `spent_total_sats` can be lower than this value reflects.
     pub charged_sats: u64,
     pub spent_total_sats: u64,
 }
@@ -536,7 +540,10 @@ pub async fn authorize_pay_async(
     // check did, but with wallet HTTP on the worker (no cross-runtime deadlock). Bounded by
     // MINT_TOUCH_TIMEOUT (inside the check) + the bridge recv ceiling. lock_or_reconcile re-checks the
     // real input-count fee after prepare_send; this only refuses the dead-mint / N=1-dust cases early.
-    effects
+    // #185: the returned value is the estimated active-keyset input fee for the send. On the DIRECT
+    // path that fee leaves the wallet on the swap but was never counted against the per-job cap; it is
+    // folded into `charged` below so the cap sees the full outlay before the send.
+    let estimated_input_fee = effects
         .preflight_fee(terms.amount)
         .map_err(AuthorizePayError::from)?;
 
@@ -547,27 +554,52 @@ pub async fn authorize_pay_async(
         .map_err(|error| AuthorizePayError::Home(format!("payment journal dir: {error}")))?;
     let journal = FsPaymentJournal::new(journal_dir.join(format!("{}.jsonl", attempt_id.as_str())));
 
-    // What the cap is asked to cover. On the direct path that is the amount, exactly as before —
-    // general fee-dust behaviour is a separate question and stays untouched here. A hop costs the
-    // buyer more than it delivers, and every sat of that difference must pass the cap BEFORE the
+    // What the cap is asked to cover. On the direct path that is the amount PLUS the estimated mint
+    // input fee for the send (#185): that fee leaves the wallet on the swap, so the cap must see it
+    // before the send — charging the bare amount let the input fee past the per-job cap. A hop costs
+    // the buyer more than it delivers, and every sat of that difference must pass the cap BEFORE the
     // melt, so the hop is charged its planned cost: melt amount + the source mint's Lightning fee
-    // reserve + its input fee.
+    // reserve + its input fee (the hop's own fees are already counted there; the direct estimate does
+    // not apply to it).
     //
-    // interim: the fee reserve is charged in full rather than reconciled against the fee actually
-    // paid, so a hop can leave the cap reporting less remaining budget than the buyer really spent.
-    // That is the safe direction; reconciling reserve-versus-actual would reshape the spend ledger,
-    // which is money-gate machinery and its own slice — see MakePrisms/maxplayerai#186.
-    let charged = cap_charge(hop.as_ref().map(|(_, _, pairing)| pairing), amount);
+    // The hop's fee reserve is charged worst-case here, then reconciled against the fee actually paid
+    // AFTER the melt (#186, below), crediting the unused reserve back to the ledger.
+    let charged = cap_charge(
+        hop.as_ref().map(|(_, _, pairing)| pairing),
+        amount,
+        estimated_input_fee,
+    );
     // Delivery already verified + bind-checked above (pre-budget). The budget append happens here,
-    // before any melt and before the wallet send inside `run_verified`.
+    // before any melt and before the wallet send inside `run_verified`. `hop_reserve_credit` captures
+    // the unused Lightning fee reserve the hop reconciled (#186); it is credited back after the gate
+    // closure returns, never inside it (the gate is borrowed there).
+    let mut hop_reserve_credit: u64 = 0;
     let state = gate.authorize_then_attempt(attempt_id.as_str(), charged, || {
         if let Some((store, hop_effects, pairing)) = hop.as_mut() {
-            crossmint_hop::run_hop(store, hop_effects, pairing)?;
+            let settled = crossmint_hop::run_hop(store, hop_effects, pairing)?;
+            hop_reserve_credit = settled.unused_fee_reserve_sats;
         }
         let state =
             PaymentService::new(&journal).run_verified(&key, &terms, &authority, &mut effects)?;
         Ok::<_, AuthorizePayError>(state)
     })??;
+
+    // #186: the hop reserved a worst-case Lightning fee against the cap before the melt; the melt has
+    // now settled and returned the unused reserve as change. Credit that difference back so the ledger
+    // reflects real outlay rather than the worst-case reservation. Keyed by an id NAMESPACED away from
+    // the spend's attempt id, so the credit dedupes independently and cannot be applied twice. A
+    // failed credit must NOT fail an already-completed payment (the seller is paid); it leaves spent
+    // at the safe over-counted value, so we log and carry on rather than propagate.
+    if hop_reserve_credit > 0 {
+        let reconcile_id = format!("{}:hop-fee-reconcile", attempt_id.as_str());
+        if let Err(error) = gate.credit_reserve(&reconcile_id, hop_reserve_credit) {
+            eprintln!(
+                "budget reconcile: could not credit {hop_reserve_credit} unused hop fee-reserve sats \
+                 for attempt {} ({error}); spent stays over-counted (safe)",
+                attempt_id.as_str()
+            );
+        }
+    }
 
     Ok(AuthorizePayOutcome {
         state,
@@ -794,15 +826,25 @@ pub(crate) fn wallet_open_mint_url(home: &MaxplayerHome, terms: &PaymentTerms) -
 
 /// What the budget cap is asked to cover for one payment.
 ///
-/// The direct path is charged the amount, exactly as it always has been — general fee-dust behaviour
-/// is a separate question and is untouched here. A hop costs the buyer more than it delivers, and
-/// every sat of that difference has to pass the cap BEFORE the melt, so a hop is charged its planned
-/// cost. A hop charged the delivered amount would put the Lightning fee reserve and the source
-/// mint's input fee on the wire without the cap ever seeing them.
-fn cap_charge(hop: Option<&crate::crossmint::HopJournal>, amount: u64) -> u64 {
+/// The direct path is charged the amount PLUS the estimated mint input fee for the send (#185). That
+/// input fee leaves the wallet on the swap that produces the seller-locked token, so charging the
+/// bare amount let it past the per-job cap — a hop's fees were counted, the direct path's were not.
+/// `estimated_input_fee` is the N=1 active-keyset floor from the pre-send preflight; it is a floor,
+/// so the cap counts at least one input's worth of fee before the send.
+///
+/// A hop costs the buyer more than it delivers, and every sat of that difference has to pass the cap
+/// BEFORE the melt, so a hop is charged its planned cost (which already folds in the hop's own fee
+/// reserve and input fee); the direct estimate does not apply to it. A hop charged the delivered
+/// amount would put the Lightning fee reserve and the source mint's input fee on the wire without the
+/// cap ever seeing them.
+fn cap_charge(
+    hop: Option<&crate::crossmint::HopJournal>,
+    amount: u64,
+    estimated_input_fee: u64,
+) -> u64 {
     match hop {
         Some(pairing) => pairing.planned_cost,
-        None => amount,
+        None => amount.saturating_add(estimated_input_fee),
     }
 }
 
@@ -1474,18 +1516,57 @@ mod tests {
             mint_quote_id: "mint-1".to_owned(),
             delivered_sats: 100,
             planned_cost: 109,
+            fee_reserve: 7,
+            input_fee: 2,
         };
-        assert_eq!(cap_charge(None, 100), 100, "the direct path is unchanged");
+        // Direct path with no input fee is the amount, exactly as before.
+        assert_eq!(cap_charge(None, 100, 0), 100, "zero-fee direct is the amount");
+        // #185: the direct path folds the estimated mint input fee into the cap charge, so the swap
+        // fee cannot reach the wire uncounted.
         assert_eq!(
-            cap_charge(Some(&pairing), 100),
+            cap_charge(None, 100, 3),
+            103,
+            "the direct path must charge amount + estimated input fee (#185)"
+        );
+        // The hop is charged its planned cost regardless of the direct estimate.
+        assert_eq!(
+            cap_charge(Some(&pairing), 100, 3),
             109,
             "a hop must be charged its cost, not the amount it delivers"
         );
         assert_ne!(
-            cap_charge(Some(&pairing), pairing.delivered_sats),
+            cap_charge(Some(&pairing), pairing.delivered_sats, 0),
             pairing.delivered_sats,
             "charging the delivered amount would let the hop's fees past the cap"
         );
+    }
+
+    // #185 RED-PROVE at the cap seam: when the per-job cap equals the bare amount and the swap input
+    // fee is >= 1, the direct trade's true outlay (amount + input fee) exceeds the cap, so it MUST
+    // refuse with PerJob and burn zero spend. On the pre-#185 code `cap_charge(None, amount)` returned
+    // the bare amount, which passed the cap and sent amount + fee — this assertion fails there.
+    #[test]
+    fn direct_swap_input_fee_must_not_bypass_the_per_job_cap() {
+        use crate::budget::{BudgetGate, BudgetRefuse};
+        let amount = 100u64;
+        let input_fee = 1u64;
+        let mut gate = BudgetGate::new(amount); // per_job_cap == amount
+        let charged = cap_charge(None, amount, input_fee);
+        assert_eq!(charged, amount + input_fee, "the fee must be inside the charge");
+        let refusal = gate
+            .authorize_then_attempt("attempt-185", charged, || unreachable!("send must not run"))
+            .expect_err("amount + input fee exceeds a cap equal to the bare amount");
+        assert!(
+            matches!(
+                refusal,
+                BudgetRefuse::PerJob {
+                    amount: a,
+                    per_job_cap
+                } if a == amount + input_fee && per_job_cap == amount
+            ),
+            "expected a PerJob refusal on amount+fee, got: {refusal}"
+        );
+        assert_eq!(gate.spent(), 0, "a refused direct trade must burn zero spend");
     }
 
     // The replacement invariant, at the pay entry point. `mint_unreachable_pay` no longer refuses a

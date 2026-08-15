@@ -250,10 +250,35 @@ pub struct HopJournal {
     pub mint_quote_id: String,
     /// What the seller receives: the amount pinned by the buyer-signed offer. Journalled so a
     /// recovering process knows what to expect at the target without re-reading it from anywhere
-    /// that could have changed since the offer was signed.
+    /// that could have changed since the offer was signed. Equals the source melt amount (the melt
+    /// quote is raised against the target invoice for exactly this many sats).
     pub delivered_sats: u64,
     /// Cost charged against the cap before the melt.
     pub planned_cost: u64,
+    /// Source mint's raw Lightning fee reserve for this melt quote (`MeltQuote::fee_reserve`).
+    /// Journalled so the post-melt reconciliation (MakePrisms/maxplayerai#186) can credit the unused
+    /// reserve back to the budget without re-reading the quote. A pre-#186 pairing has no field and
+    /// defaults to 0, which makes the reconciliation a no-op (spend stays at the safe over-count).
+    #[serde(default)]
+    pub fee_reserve: u64,
+    /// Source mint's input fee for spending the proofs that fund the melt (the fixed, actually-spent
+    /// component). Journalled alongside `fee_reserve` so the reconciliation can isolate the LN-fee
+    /// reserve portion of `planned_cost` — the only part that reconciles against the actual fee.
+    #[serde(default)]
+    pub input_fee: u64,
+}
+
+impl HopJournal {
+    /// The portion of `planned_cost` reserved for the Lightning fee — everything above the fixed,
+    /// actually-spent costs (melt amount + input fee), i.e. the raw fee reserve plus any plan-time
+    /// buffer. This is the ceiling the post-melt reconciliation nets the ACTUAL fee against; the
+    /// remainder is credited back to the budget (MakePrisms/maxplayerai#186). Saturating so a
+    /// legacy pairing (zero components) yields 0 — a safe no-op credit.
+    pub fn reserved_ln_fee_sats(&self) -> u64 {
+        self.planned_cost
+            .saturating_sub(self.delivered_sats)
+            .saturating_sub(self.input_fee)
+    }
 }
 
 #[cfg(test)]
@@ -477,6 +502,8 @@ mod tests {
             mint_quote_id: "mint-quote-1".to_owned(),
             delivered_sats: 100,
             planned_cost: 109,
+            fee_reserve: 7,
+            input_fee: 2,
         };
         let encoded = serde_json::to_string(&journal).expect("journal serializes");
         let decoded: HopJournal = serde_json::from_str(&encoded).expect("journal deserializes");
