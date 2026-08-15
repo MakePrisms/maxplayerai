@@ -758,6 +758,20 @@ impl SellerStore {
     /// moves the claim to `awarded` and creates the job row; a re-seen award id is a
     /// [`Awarded::Duplicate`] no-op (never a second job). An award naming a claim this node never
     /// parked is recorded but creates no job ([`Awarded::NoClaim`]).
+    ///
+    /// ⛔ AUTHORIZATION IS THE CALLER'S. This writes the `awards` row on the strength of its
+    /// arguments alone — it does NOT check that the award's author is the offer's buyer. Every caller
+    /// must gate on that first (`on_award` via `match_award`, `on_accept` and the #814 suppression
+    /// path inline), or a forged award writes a row and suppresses real work. Pass the buyer read
+    /// from OUR OWN recorded offer, never the event's author — that is what keeps the check
+    /// non-circular.
+    ///
+    /// #814 WIDENED WHAT A ROW MEANS, and a reader must know it: an `awards` row used to imply "we
+    /// won this job", because the only caller held a claim. The suppression path now records an
+    /// authentic buyer award for an offer we recorded but never claimed — someone ELSE's win — so the
+    /// row means "an award for this job exists", nothing more. The discriminator for "we won" is a
+    /// CLAIM row (what this function's own `claim_state` read uses), never the presence of an award.
+    /// [`Self::offers_awarded_elsewhere`] is the complement, and encodes that in SQL.
     pub fn record_award(
         &self,
         award_id: &str,
@@ -806,6 +820,51 @@ impl SellerStore {
         Ok(conn.query_row(
             "SELECT buyer_pubkey FROM awards WHERE job_id = ?1 ORDER BY created_at_unix, award_id LIMIT 1",
             [job_id], |row| row.get(0)).optional()?)
+    }
+
+    /// #814 — offers this node recorded that were AWARDED TO SOMEONE ELSE and are still live:
+    /// `(offer_id, buyer_pubkey, deadline_unix)` for every offer holding an award row, holding NO
+    /// claim row of ours, whose `deadline_unix` has not passed. The boot re-hydration source for the
+    /// in-memory suppression cache, so the claim gate is correct on the FIRST event after a restart
+    /// rather than only after a relay backfill succeeds — "relay deafness manufactures absence"
+    /// (#560/#563), so a redelivery that never arrives must not be what stands between us and
+    /// re-publishing a losing claim.
+    ///
+    /// Three clauses, each load-bearing:
+    /// - `NOT IN (SELECT job_id FROM claims)` IS the hard invariant of #814 in SQL: a job we hold a
+    ///   claim for can never be re-hydrated as suppressed, so a resumed award is never stranded (the
+    ///   #563 FOIL). It also carries the widened `awards` meaning — an award row alone no longer says
+    ///   whose win it was, and only the absent claim says it was not ours. `claims` is keyed by
+    ///   `job_id` and matched against `offers.offer_id` because a claim's job id IS its offer id
+    ///   (see [`Self::offers_awaiting_claim`], which excludes on the same identity).
+    /// - `deadline_unix > ?1` keeps this FAIL-OPEN and bounded: a suppression outlives neither the
+    ///   offer it belongs to nor the gate's own `Lapsed` check, so the set cannot grow without limit.
+    /// - `buyer_pubkey` comes from the OFFER, never from the award — the same non-circularity the
+    ///   live path relies on. A forged award that somehow reached the table still re-hydrates under
+    ///   the REAL buyer's key, so it can never satisfy the buyer-bound gate at claim time.
+    ///
+    /// `EXISTS` rather than a JOIN so two award rows for one job (they are possible — see
+    /// [`Self::job_award_time`]) yield ONE row here, not a duplicate.
+    pub fn offers_awarded_elsewhere(
+        &self,
+        now_unix: i64,
+    ) -> Result<Vec<(String, String, i64)>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT offer_id, buyer_pubkey, deadline_unix
+             FROM offers
+             WHERE deadline_unix > ?1
+               AND offer_id NOT IN (SELECT job_id FROM claims)
+               AND EXISTS (SELECT 1 FROM awards WHERE awards.job_id = offers.offer_id)",
+        )?;
+        let rows = stmt.query_map([now_unix], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     // ---- Job execution --------------------------------------------------------------------------
@@ -1222,6 +1281,9 @@ impl SellerStore {
     /// differing authored-at is exactly the invariant-2 break this value exists to prevent. Taking the
     /// EARLIEST (`created_at_unix`, `award_id` as the tie-break) is deterministic for any row set, and
     /// matches [`Self::job_award_buyer`] one function below, which has always read this way.
+    ///
+    /// #814 adds a SECOND route to two rows — an award for an offer we recorded but never claimed is
+    /// now persisted too — so this ordering is a precondition of that change, not a nicety.
     pub fn job_award_time(&self, job_id: &str) -> Result<Option<i64>, StoreError> {
         let conn = self.lock()?;
         let ts: Option<i64> = conn
@@ -1999,6 +2061,58 @@ mod tests {
             store.job_award_buyer(&job).expect("award buyer"),
             Some(buyer),
             "job_award_buyer resolves the same row"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #814 — the boot re-hydration source. An offer is returned ONLY when an award exists for it, we
+    /// hold NO claim, and its deadline has not passed. Each of the three clauses is asserted by a
+    /// counter-example, because a query that simply returned every offer would satisfy the happy path
+    /// alone.
+    ///
+    /// The claim clause is the #563 FOIL in SQL: re-hydrating a suppression for a job we hold would
+    /// strand our own award. RED ON REVERT: delete `AND offer_id NOT IN (SELECT job_id FROM claims)`
+    /// and the "ours" case appears in the result set.
+    #[test]
+    fn offers_awarded_elsewhere_selects_only_live_unclaimed_awarded_offers() {
+        let (store, path) = fresh_store("awarded-elsewhere");
+        let buyer = "b".repeat(64);
+        let now = 5_000;
+
+        let offer_at = |id: &str, deadline: i64| {
+            let mut offer = sample_offer(id);
+            offer.buyer_pubkey = buyer.clone();
+            offer.deadline_unix = deadline;
+            store.record_offer(&offer, 1).expect("record offer");
+        };
+        // (1) THE CASE: recorded, awarded, unclaimed, still live.
+        offer_at(&"1".repeat(64), 10_000);
+        store.record_award(&"w1".repeat(32), &"1".repeat(64), &buyer, 2).expect("award 1");
+        // (2) awarded and live, but WE HOLD THE CLAIM — ours, never suppressed.
+        offer_at(&"2".repeat(64), 10_000);
+        store
+            .claim_and_enqueue(&"2".repeat(64), &"2".repeat(64), "creq", &claim(), 1, 999, 1)
+            .expect("claim 2");
+        store.record_award(&"w2".repeat(32), &"2".repeat(64), &buyer, 2).expect("award 2");
+        // (3) recorded and unclaimed, but NO award — nothing decided it.
+        offer_at(&"3".repeat(64), 10_000);
+        // (4) awarded and unclaimed, but its deadline has PASSED — fail-open, already `Lapsed`.
+        offer_at(&"4".repeat(64), 4_000);
+        store.record_award(&"w4".repeat(32), &"4".repeat(64), &buyer, 2).expect("award 4");
+
+        let rows = store.offers_awarded_elsewhere(now).expect("read");
+        assert_eq!(
+            rows,
+            vec![("1".repeat(64), buyer.clone(), 10_000)],
+            "only the recorded + awarded + unclaimed + live offer re-hydrates"
+        );
+
+        // Two award rows for one job must still yield ONE row (EXISTS, not a JOIN).
+        store.record_award(&"w5".repeat(32), &"1".repeat(64), &buyer, 3).expect("second award");
+        assert_eq!(
+            store.offers_awarded_elsewhere(now).expect("read again").len(),
+            1,
+            "a second award row must not duplicate the offer"
         );
         let _ = std::fs::remove_file(&path);
     }

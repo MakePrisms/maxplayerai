@@ -371,6 +371,17 @@ enum SkipReason {
     /// by [`SellerNodeRunner::claim_offer`], never by the pure [`classify_offer`], because it depends
     /// on the live relay-derived terminal cache — the same reason `SlotsBusy` lives here, not there.
     Settled,
+    /// #814: the offer was AWARDED (or its delivery ACCEPTED) to ANOTHER seller — a buyer-authenticated
+    /// kind-3405/3406 naming a claim that is not ours has been seen for an offer we recorded but never
+    /// claimed. Emitted by [`SellerNodeRunner::claim_offer`] for the same reason as `Settled`.
+    ///
+    /// DELIBERATELY NOT FOLDED INTO `Settled`, though both mean "not ours to claim". The whole harm of
+    /// #814 is FALSE MARKETPLACE ACTIVITY — a losing claim published after the race was over — so the
+    /// operator reading this line is usually asking "did we lose this one, or was it paid and closed?"
+    /// One string covering both states answers neither. The two also differ in LIFETIME, which is the
+    /// same distinction [`Suppression`] draws in the type: a receipt is terminal forever, an award
+    /// binds only until the offer's own deadline.
+    TakenElsewhere,
 }
 
 impl SkipReason {
@@ -383,7 +394,11 @@ impl SkipReason {
             Self::RateGate => "rate-gate refused (untargeted without opt-in / below rate)",
             Self::AgentUnavailable => "requested agent harness not available on this node",
             Self::SlotsBusy => "all execution slots busy (node fully loaded; not claiming)",
-            Self::Settled => "offer already decided (buyer-authenticated award/acceptance or co-signed receipt seen; not ours to claim)",
+            Self::Settled => "offer already settled (co-signed receipt seen; terminal, never claimed)",
+            Self::TakenElsewhere => {
+                "offer awarded to another seller (buyer-authenticated award/acceptance seen; not ours \
+                 to claim)"
+            }
         }
     }
 }
@@ -421,6 +436,15 @@ enum Suppression {
 }
 
 impl Suppression {
+    /// The operator line this suppression earns at the claim gate. The two states are reported
+    /// separately on purpose — see [`SkipReason::TakenElsewhere`].
+    fn skip_reason(self) -> SkipReason {
+        match self {
+            Self::Settled => SkipReason::Settled,
+            Self::TakenElsewhere { .. } => SkipReason::TakenElsewhere,
+        }
+    }
+
     /// Whether this suppression still bars a claim at `now_unix`. `Settled` never expires.
     fn in_force(self, now_unix: u64) -> bool {
         match self {
@@ -516,16 +540,23 @@ impl TerminalOffersInner {
         self.order.push_back(offer_id.to_owned());
     }
 
-    /// Whether an IN-FORCE suppression authored by `buyer` (the offer's own buyer) bars `offer_id` at
-    /// `now_unix`. The buyer-binding is the whole of the anti-grief property: a forged event authored
-    /// by any other key is present in the set but never satisfies this test. An expired
-    /// award-suppression ([`Suppression::TakenElsewhere`] past its deadline) also fails it — fail-open.
-    fn suppressed_by(&self, offer_id: &str, buyer: &str, now_unix: u64) -> bool {
-        self.by_offer.get(offer_id).is_some_and(|authors| {
-            authors
-                .iter()
-                .any(|(a, s)| a == buyer && s.in_force(now_unix))
-        })
+    /// The IN-FORCE suppression authored by `buyer` (the offer's own buyer) barring `offer_id` at
+    /// `now_unix` — `None` when the offer is still ours to claim. The buyer-binding is the whole of
+    /// the anti-grief property: a forged event authored by any other key is present in the set but
+    /// never satisfies this test. An expired award-suppression ([`Suppression::TakenElsewhere`] past
+    /// its deadline) also yields `None` — fail-open.
+    ///
+    /// Returns WHICH suppression rather than a bool so the gate can name it: "another seller won
+    /// this" and "this was paid and closed" are different operator lines (see [`SkipReason`]). At most
+    /// one entry per author exists — [`Self::record`] combines a repeat from the same author — so the
+    /// first match is the whole answer.
+    fn suppressed_by(&self, offer_id: &str, buyer: &str, now_unix: u64) -> Option<Suppression> {
+        self.by_offer
+            .get(offer_id)?
+            .iter()
+            .find(|(a, _)| a == buyer)
+            .map(|(_, s)| *s)
+            .filter(|s| s.in_force(now_unix))
     }
 
     #[cfg(test)]
@@ -558,7 +589,7 @@ impl TerminalOffers {
             .record(offer_id, author, Suppression::TakenElsewhere { until_unix });
     }
 
-    fn suppressed_by(&self, offer_id: &str, buyer: &str, now_unix: u64) -> bool {
+    fn suppressed_by(&self, offer_id: &str, buyer: &str, now_unix: u64) -> Option<Suppression> {
         self.inner
             .lock()
             .expect("terminal offers mutex poisoned")
@@ -3061,6 +3092,10 @@ impl SellerNodeRunner {
             .ok_or_else(|| NodeError::Relay("relay missing in run loop".into()))?;
 
         let mut notifications = self.client.notifications();
+        // #814: refill the suppression cache BEFORE any REQ goes out, so the very first offer the
+        // backfill re-feeds is already gated. After the subscribe it would be a race against our own
+        // recovery path.
+        self.rehydrate_suppressions();
         self.subscribe_all(None).await?;
         opline!(
             "seller node live: pubkey={} relay={}",
@@ -4220,7 +4255,7 @@ impl SellerNodeRunner {
             return;
         };
         let author = event.pubkey.to_hex();
-        self.terminal_offers.record(&offer_id, &author);
+        self.terminal_offers.record_receipt(&offer_id, &author);
         opline_verbose!("seller node receipt: offer {offer_id} settled by author={author} (terminal)");
     }
 
@@ -4240,15 +4275,32 @@ impl SellerNodeRunner {
         now: i64,
         contribution: Option<&ContributionOffer>,
     ) {
-        // #541: refuse a SETTLED offer before any work. A co-signed kind-3400 receipt authored by
-        // THIS offer's buyer means the offer was awarded + settled (to us or another seat) and is
-        // terminal — claiming it would park a slot on finished work and mask real availability. The
-        // buyer-binding is load-bearing: a forged receipt (author != buyer) sits in the cache but never
-        // matches here, so the worst a forger or a flood achieves is the pre-#541 wasted slot, never a
-        // spend. FAIL-OPEN: an unknown / cold / evicted offer is not skipped. Consulted only on the
-        // event loop, before record_offer / try_reserve, so nothing is reserved for a terminal offer.
-        if self.terminal_offers.settled_by(job_id, buyer_pubkey) {
-            opline!("seller node offer skip id={job_id}: {}", SkipReason::Settled.reason());
+        // #541/#814: refuse an offer that is no longer ours to claim, before any work. Two
+        // buyer-authenticated signals land here (see [`Suppression`]): a co-signed kind-3400 receipt
+        // means the offer was awarded + settled (to us or another seat) and is terminal; a kind-3405
+        // award or kind-3406 acceptance naming another seller's claim means the race is already over.
+        // Either way, claiming would park a slot on decided work, mask real availability, and — the
+        // whole of #814 — publish a LOSING CLAIM into the market after the fact.
+        //
+        // THE SINGLE CHOKE POINT, and that is why the check lives here rather than in `on_offer`:
+        // `claim_offer` is shared by `on_offer` (the wire path) and `reconsider_capacity_skips` (a
+        // recorded offer re-driven once a slot frees). #814's repro runs through the SECOND of those,
+        // so a gate on the first alone would not have caught it.
+        //
+        // The buyer-binding is load-bearing: a forged event (author != buyer) sits in the cache but
+        // never matches here, so the worst a forger or a flood achieves is the pre-#541 wasted slot,
+        // never a spend. FAIL-OPEN: an unknown / cold / evicted / EXPIRED offer is not skipped —
+        // over-suppression would strand a real award (compute spent, nothing paid), which is the one
+        // outcome worse than the bug. Consulted only on the event loop, before record_offer /
+        // try_reserve, so nothing is reserved for a decided offer.
+        if let Some(suppression) = self
+            .terminal_offers
+            .suppressed_by(job_id, buyer_pubkey, now as u64)
+        {
+            opline!(
+                "seller node offer skip id={job_id}: {}",
+                suppression.skip_reason().reason()
+            );
             return;
         }
         // Capacity back-pressure: never hold unbounded parked claims.
@@ -4435,7 +4487,11 @@ impl SellerNodeRunner {
         match self.node.store().job_creq(&job_id) {
             Ok(Some(_)) => {}
             Ok(None) => {
-                opline!("seller node accept ignore job_id={job_id}: no claim of ours");
+                // #814 requirement (2), the BACKUP suppression: an acceptance is buyer-authenticated
+                // evidence that this offer was decided, and it is the only such evidence when the
+                // award itself never reached us. Same treatment as the award path — the author gate
+                // above has already run, and the helper re-checks it rather than trusting the caller.
+                self.suppress_taken_elsewhere(&job_id, &buyer, event, "accept");
                 return;
             }
             Err(error) => {
@@ -4524,6 +4580,160 @@ impl SellerNodeRunner {
         }
     }
 
+    /// #814 — an offer we RECORDED but never claimed has just been decided by its buyer. Mark it
+    /// taken so the claim gate stops re-driving it, and persist that fact so a restart does not undo
+    /// the decision.
+    ///
+    /// The bug this closes: at capacity we record an offer and skip the claim; the buyer awards
+    /// another seller; a slot frees; `reconsider_capacity_skips` re-drives the offer and we publish a
+    /// claim for a race that is already over. Nothing downstream catches it — the award named someone
+    /// else's claim, so no release fires — and the losing claim sits in the market as false activity
+    /// until it lapses. Both handlers previously DISCARDED this event at "no claim of ours".
+    ///
+    /// OPEN-POOL ONLY, by construction rather than by choice: `award_filter` scopes a targeted
+    /// seller's REQ to its own pubkey, and an award p-tags only the WINNER, so a targeted seller never
+    /// receives another seat's award and no design could suppress on one. An open-pool seller drops
+    /// that scope (#456) and does receive them.
+    ///
+    /// AUTHORIZATION IS RE-CHECKED HERE rather than assumed from the caller. `on_accept` has already
+    /// gated author == buyer; `on_award` has NOT (its check lives inside `match_award`, which this
+    /// path returns before ever reaching). A string compare is cheap, and the alternative is a guard
+    /// whose correctness depends on which of two callers you arrived from. `buyer` is read from OUR
+    /// OWN recorded offer, never from the event — that non-circularity is what makes a forged award
+    /// inert: it is refused here, and even a row that somehow reached the table re-hydrates under the
+    /// real buyer's key and never matches the buyer-bound gate.
+    ///
+    /// FAIL-OPEN on every unknown: a foreign author, an unreadable or vanished offer row, or a failed
+    /// persist all leave the offer claimable. Over-suppression is the one direction that costs money
+    /// (a stranded award = compute spent, nothing paid); under-suppression is only the status quo.
+    ///
+    /// The caller guarantees the #814 HARD INVARIANT: both call sites are the `job_creq` == `None`
+    /// arm, so we hold NO claim for this job, and neither reads it again across an await. A job we DO
+    /// hold is never suppressed — that is the #563 foil, where suppressing would strand our own award.
+    fn suppress_taken_elsewhere(
+        &self,
+        job_id: &str,
+        buyer: &str,
+        event: &nostr_sdk::Event,
+        signal: &str,
+    ) {
+        let author = event.pubkey.to_hex();
+        if author != buyer {
+            opline_verbose!(
+                "seller node {signal} job_id={job_id}: author={author} is not the offer's buyer; \
+                 not suppressing (a forged decision can never take an offer off us)"
+            );
+            return;
+        }
+        // The offer's own `param:deadline` bounds the suppression — the only deadline the protocol
+        // defines. A legitimately re-runnable job carries a NEW offer id (an award is write-once per
+        // offer), and an offer past its deadline is already `Lapsed` at the gate, so expiring here can
+        // never drop a real re-claim.
+        let deadline_unix = match self.node.store().offer_row(job_id) {
+            Ok(Some(offer)) => offer.deadline_unix as u64,
+            Ok(None) => {
+                opline!(
+                    "seller node {signal} job_id={job_id}: offer row vanished before suppression; \
+                     leaving it claimable (fail-open)"
+                );
+                return;
+            }
+            Err(error) => {
+                opline!(
+                    "seller node {signal} job_id={job_id}: offer read failed ({error}); leaving it \
+                     claimable (fail-open)"
+                );
+                return;
+            }
+        };
+        // DURABLE leg first, then the hot path. The `awards` row is what survives a restart with no
+        // relay dependency — the in-memory cache alone would lose this on every bounce and the #560
+        // offer-backfill would re-drive the offer straight back into a losing claim. A relay
+        // redelivery would usually re-derive it, but "relay deafness manufactures absence" (#560/#563)
+        // makes that recovery, not durability. `record_award` writes the row and creates NO job when
+        // we hold no claim — the primitive already existed; only the early return kept it unreachable.
+        let recorded = self
+            .node
+            .store()
+            .record_award(&event.id.to_hex(), job_id, buyer, now_unix());
+        match recorded {
+            // The expected arm: award recorded, no claim of ours to bind, no job created.
+            Ok(super::store::Awarded::NoClaim) => opline!(
+                "seller node {signal} job_id={job_id} buyer={buyer}: decided in another seller's \
+                 favour — not claiming (suppressed until the offer's deadline {deadline_unix})"
+            ),
+            // A redelivery of a decision we already recorded. Verbose-only, the #489 convention the
+            // award path already follows: the FIRST sighting logs, the duplicate stays quiet.
+            Ok(super::store::Awarded::Duplicate) => opline_verbose!(
+                "seller node {signal} dedup job_id={job_id} (decision already recorded)"
+            ),
+            // ⛔ Unreachable: `record_award` returns `New` only when a claim row EXISTS, and both call
+            // sites just read `job_creq` == `None` with no await in between on a single-threaded
+            // LocalSet. If it ever fires, a claim appeared underneath us and this call bound an award
+            // to it WITHOUT the `match_award` identity check that proves the buyer chose OUR claim
+            // (#626). Say so loudly and do NOT suppress: we now hold a claim, and suppressing a job we
+            // hold is precisely what strands a real award.
+            Ok(super::store::Awarded::New) => {
+                opline!(
+                    "seller node {signal} job_id={job_id}: BUG — a claim appeared during suppression \
+                     and the award bound it unchecked; not suppressing"
+                );
+                return;
+            }
+            // The suppression still holds for THIS process off the cache below; it just will not
+            // survive a restart. Logged, never propagated — the same shape as the #563 marker's
+            // persist failure.
+            Err(error) => opline!(
+                "seller node {signal} job_id={job_id}: decision persist failed ({error}); \
+                 suppressing in memory only (re-derives from the relay next restart)"
+            ),
+        }
+        self.terminal_offers
+            .record_taken_elsewhere(job_id, buyer, deadline_unix);
+    }
+
+    /// #814 — refill the suppression cache from the store before the first event is served.
+    ///
+    /// This is the leg that makes the fix survive a restart. The cache is in-memory, so a bounce
+    /// empties it, and the #560 periodic offer-backfill re-feeds EVERY stored offer through
+    /// [`Self::on_offer`] each tick — so without this, a restart puts every recorded-but-lost offer
+    /// straight back on the claim path and #814 returns intact. A relay redelivery of the award would
+    /// usually re-derive the suppression, but that is RECOVERY, NOT DURABILITY: "relay deafness
+    /// manufactures absence" (#560/#563), and an award the relay does not redeliver is
+    /// indistinguishable from one that never happened.
+    ///
+    /// Runs BEFORE `subscribe_all`, so the gate is right on the FIRST event rather than only once a
+    /// backfill lands. Read-only — no migration, no write, just the cache — and FAIL-OPEN: a store
+    /// error leaves the cache cold, which is exactly today's behaviour.
+    ///
+    /// Restoring more than [`TERMINAL_OFFERS_CAP`] live offers would FIFO-evict the earliest of them,
+    /// which is fail-open in the same direction as every other bound here: an evicted offer is
+    /// claimable again, still bounded by its own deadline.
+    fn rehydrate_suppressions(&self) {
+        let taken = match self.node.store().offers_awarded_elsewhere(now_unix()) {
+            Ok(rows) => rows,
+            Err(error) => {
+                opline!(
+                    "seller node suppression re-hydrate: store read failed ({error}); starting cold \
+                     (fail-open — offers stay claimable, as before #814)"
+                );
+                return;
+            }
+        };
+        if taken.is_empty() {
+            return;
+        }
+        for (offer_id, buyer, deadline_unix) in &taken {
+            self.terminal_offers
+                .record_taken_elsewhere(offer_id, buyer, *deadline_unix as u64);
+        }
+        opline!(
+            "seller node suppression re-hydrate: {} live offer(s) already awarded to another seller \
+             restored from the store — not re-claiming them after this restart (#814)",
+            taken.len()
+        );
+    }
+
     /// Handle one award event: authorize it (author must be the offer's buyer), decide whether it
     /// names OUR claim, and bind or release accordingly. Binding records the award (which moves the
     /// claim → awarded and creates the job row); execution of the awarded job is the next port step.
@@ -4550,7 +4760,11 @@ impl SellerNodeRunner {
         match self.node.store().job_creq(&job_id) {
             Ok(Some(_)) => {}
             Ok(None) => {
-                opline!("seller node award ignore job_id={job_id}: no claim of ours");
+                // #814: nothing of ours to bind — but this is NOT a nothing-event. An authentic award
+                // for an offer WE RECORDED means the race is over, and the capacity-skip reconsider
+                // would otherwise re-drive that offer into a losing claim. Discarding it here is the
+                // bug. `buyer` is from our own recorded offer, so the authorization stays non-circular.
+                self.suppress_taken_elsewhere(&job_id, &buyer, event, "award");
                 return;
             }
             Err(error) => {
@@ -6629,22 +6843,25 @@ mod tests {
         // for buyer B makes the offer terminal for B; a forged receipt authored by anyone else is
         // stored but never satisfies the buyer-bound test — the whole of the anti-grief property.
         let mut t = TerminalOffersInner::new(16, 4);
-        t.record("offerX", "buyerB");
-        assert!(t.settled_by("offerX", "buyerB"), "the offer's own buyer settled it ⇒ terminal");
+        t.record("offerX", "buyerB", Suppression::Settled);
         assert!(
-            !t.settled_by("offerX", "forgerF"),
+            t.suppressed_by("offerX", "buyerB", 0).is_some(),
+            "the offer's own buyer settled it ⇒ terminal"
+        );
+        assert!(
+            t.suppressed_by("offerX", "forgerF", 0).is_none(),
             "a receipt author who is not the offer's buyer never matches"
         );
         assert!(
-            !t.settled_by("otherOffer", "buyerB"),
+            t.suppressed_by("otherOffer", "buyerB", 0).is_none(),
             "an unrelated offer is not terminal (fail-open on the unknown)"
         );
 
         // A forger publishing alone cannot make the offer terminal for its real buyer.
         let mut g = TerminalOffersInner::new(16, 4);
-        g.record("offerY", "forgerF");
+        g.record("offerY", "forgerF", Suppression::Settled);
         assert!(
-            !g.settled_by("offerY", "buyerB"),
+            g.suppressed_by("offerY", "buyerB", 0).is_none(),
             "a forger-only receipt does NOT suppress the real buyer's offer"
         );
     }
@@ -6654,12 +6871,12 @@ mod tests {
         // Once the real buyer's author is recorded, a flood of later (forged) authors can NEVER
         // displace it: the per-offer author set is DROP-NEWEST at its cap.
         let mut sticky = TerminalOffersInner::new(16, 2); // authors_cap = 2
-        sticky.record("offerX", "buyerB");
-        sticky.record("offerX", "f1"); // fills the 2-cap
-        sticky.record("offerX", "f2"); // over cap ⇒ dropped (newest)
-        sticky.record("offerX", "f3"); // over cap ⇒ dropped
+        sticky.record("offerX", "buyerB", Suppression::Settled);
+        sticky.record("offerX", "f1", Suppression::Settled); // fills the 2-cap
+        sticky.record("offerX", "f2", Suppression::Settled); // over cap ⇒ dropped (newest)
+        sticky.record("offerX", "f3", Suppression::Settled); // over cap ⇒ dropped
         assert!(
-            sticky.settled_by("offerX", "buyerB"),
+            sticky.suppressed_by("offerX", "buyerB", 0).is_some(),
             "an established real-buyer entry is never evicted by a later flood"
         );
 
@@ -6667,11 +6884,12 @@ mod tests {
         // flood that fills the cap with fakes BEFORE the buyer's receipt blocks the buyer entry, so
         // the offer degrades to PRE-#541 (claimable, wasted slot until lapse) — never a spend.
         let mut flooded = TerminalOffersInner::new(16, 2);
-        flooded.record("offerZ", "f1");
-        flooded.record("offerZ", "f2"); // cap full with fakes
-        flooded.record("offerZ", "buyerB"); // over cap ⇒ dropped-newest ⇒ buyer blocked
+        flooded.record("offerZ", "f1", Suppression::Settled);
+        flooded.record("offerZ", "f2", Suppression::Settled); // cap full with fakes
+        // over cap ⇒ dropped-newest ⇒ buyer blocked
+        flooded.record("offerZ", "buyerB", Suppression::Settled);
         assert!(
-            !flooded.settled_by("offerZ", "buyerB"),
+            flooded.suppressed_by("offerZ", "buyerB", 0).is_none(),
             "first-flood degrades that offer to pre-fix (fail-open), by design"
         );
     }
@@ -6681,14 +6899,17 @@ mod tests {
         // The offer map is FIFO-bounded: a new offer past the cap evicts the OLDEST, so memory is
         // bounded and an aged-out offer fails open — claimable again.
         let mut t = TerminalOffersInner::new(2, 4); // offers_cap = 2
-        t.record("o1", "b1");
-        t.record("o2", "b2");
+        t.record("o1", "b1", Suppression::Settled);
+        t.record("o2", "b2", Suppression::Settled);
         assert_eq!(t.offer_count(), 2);
-        t.record("o3", "b3"); // evicts o1 (oldest first-seen)
+        t.record("o3", "b3", Suppression::Settled); // evicts o1 (oldest first-seen)
         assert_eq!(t.offer_count(), 2, "the map never exceeds its cap");
-        assert!(!t.settled_by("o1", "b1"), "the oldest offer aged out ⇒ claimable again (fail-open)");
         assert!(
-            t.settled_by("o2", "b2") && t.settled_by("o3", "b3"),
+            t.suppressed_by("o1", "b1", 0).is_none(),
+            "the oldest offer aged out ⇒ claimable again (fail-open)"
+        );
+        assert!(
+            t.suppressed_by("o2", "b2", 0).is_some() && t.suppressed_by("o3", "b3", 0).is_some(),
             "the two newest offers stay terminal"
         );
     }
@@ -6698,16 +6919,112 @@ mod tests {
         // A replayed receipt (same offer + same author) is a no-op: the offer is tracked once, not
         // once per redelivery, and the replay does not consume the per-offer author cap.
         let mut t = TerminalOffersInner::new(4, 2);
-        t.record("offerX", "buyerB");
-        t.record("offerX", "buyerB");
-        t.record("offerX", "buyerB");
+        t.record("offerX", "buyerB", Suppression::Settled);
+        t.record("offerX", "buyerB", Suppression::Settled);
+        t.record("offerX", "buyerB", Suppression::Settled);
         assert_eq!(t.offer_count(), 1, "the offer is tracked once, not once per redelivery");
-        assert!(t.settled_by("offerX", "buyerB"));
+        assert!(t.suppressed_by("offerX", "buyerB", 0).is_some());
         // The idempotent replays did not consume the cap: a second DISTINCT author still fits.
-        t.record("offerX", "buyerB-2nd-device");
+        t.record("offerX", "buyerB-2nd-device", Suppression::Settled);
         assert!(
-            t.settled_by("offerX", "buyerB-2nd-device"),
+            t.suppressed_by("offerX", "buyerB-2nd-device", 0).is_some(),
             "a distinct author still fits under the cap after idempotent replays"
+        );
+    }
+
+    // ---- #814 suppression semantics (award/acceptance to another seller) --------------------------
+
+    // The lifetime distinction, which is the whole reason `Suppression` is an enum rather than a bool:
+    // a receipt is terminal FOREVER, an award binds only until the offer's own deadline. Both legs
+    // asserted — a test that only proves the permanent one would pass with `in_force` hard-coded true.
+    #[test]
+    fn taken_elsewhere_expires_at_the_offer_deadline_and_settled_never_does() {
+        let taken = Suppression::TakenElsewhere { until_unix: 1_000 };
+        assert!(taken.in_force(999), "before the offer deadline the award still bars a claim");
+        assert!(
+            !taken.in_force(1_000),
+            "AT the deadline it lapses — fail-open, and the gate's own Lapsed check already refuses \
+             a past-deadline offer"
+        );
+        assert!(!taken.in_force(5_000), "and stays lapsed after it");
+
+        assert!(Suppression::Settled.in_force(0), "a settlement is terminal from the moment it lands");
+        assert!(
+            Suppression::Settled.in_force(u64::MAX),
+            "…and never expires: #541's terminality must not be weakened by #814's expiry"
+        );
+    }
+
+    // `combine` is the guard on requirement (3): a later receipt UPGRADES an award-suppression to
+    // terminal, and a later award NEVER weakens a receipt back to something that expires. Asserted in
+    // BOTH orders, because a `combine` that simply returned its second argument would pass one of them.
+    #[test]
+    fn combine_upgrades_to_settled_and_never_weakens_back() {
+        let award = Suppression::TakenElsewhere { until_unix: 1_000 };
+        assert_eq!(
+            award.combine(Suppression::Settled),
+            Suppression::Settled,
+            "a receipt arriving after an award upgrades the offer to terminal"
+        );
+        assert_eq!(
+            Suppression::Settled.combine(award),
+            Suppression::Settled,
+            "an award arriving after a receipt must NOT downgrade it to an expiring suppression"
+        );
+        assert_eq!(
+            award.combine(Suppression::TakenElsewhere { until_unix: 2_000 }),
+            Suppression::TakenElsewhere { until_unix: 2_000 },
+            "two awards keep the LATER expiry"
+        );
+        assert_eq!(
+            Suppression::TakenElsewhere { until_unix: 2_000 }.combine(award),
+            Suppression::TakenElsewhere { until_unix: 2_000 },
+            "…in either order — the later expiry wins, not the last writer"
+        );
+    }
+
+    // The buyer-binding that makes a FORGED award inert, and the expiry fail-open, both through the
+    // real cache rather than the pure enum.
+    #[test]
+    fn taken_elsewhere_is_buyer_bound_and_fails_open_once_expired() {
+        let mut t = TerminalOffersInner::new(16, 4);
+        t.record("offerX", "buyerB", Suppression::TakenElsewhere { until_unix: 1_000 });
+        assert!(
+            t.suppressed_by("offerX", "buyerB", 500).is_some(),
+            "the offer's own buyer decided it ⇒ suppressed"
+        );
+        assert!(
+            t.suppressed_by("offerX", "forgerF", 500).is_none(),
+            "a forged award (author != the offer's buyer) is stored but never suppresses"
+        );
+        assert!(
+            t.suppressed_by("offerX", "buyerB", 1_500).is_none(),
+            "past the offer's deadline the suppression lapses — an unknown state never suppresses"
+        );
+    }
+
+    // #814 §5.4: the operator line must distinguish "another seller won this" from "this was paid and
+    // closed". One string covering both is what makes an incident unreadable after the fact.
+    #[test]
+    fn skip_reason_names_taken_elsewhere_apart_from_settled() {
+        let settled = Suppression::Settled.skip_reason();
+        let taken = Suppression::TakenElsewhere { until_unix: 1 }.skip_reason();
+        assert_eq!(settled, SkipReason::Settled);
+        assert_eq!(taken, SkipReason::TakenElsewhere);
+        assert_ne!(
+            settled.reason(),
+            taken.reason(),
+            "the two states must not collapse to one operator string"
+        );
+        assert!(
+            taken.reason().contains("another seller"),
+            "the awarded-elsewhere line must say another seller won it: {}",
+            taken.reason()
+        );
+        assert!(
+            settled.reason().contains("settled"),
+            "the settled line must keep naming settlement: {}",
+            settled.reason()
         );
     }
 
@@ -7938,6 +8255,513 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // ---- #814 late losing claims (award/acceptance to another seller) ----------------------------
+
+    /// A buyer-authored AWARD naming `claim_id` for `offer_id`. `author` is separate from `buyer` on
+    /// purpose: the forgery leg signs the very same event with a stranger's key, so the two cases
+    /// differ ONLY by signer.
+    fn award_event(
+        offer_id: &str,
+        claim_id: &str,
+        buyer: &Keys,
+        winner_seller_hex: &str,
+        author: &Keys,
+    ) -> nostr_sdk::Event {
+        let draft = crate::gateway::award_draft(
+            offer_id,
+            claim_id,
+            &buyer.public_key().to_hex(),
+            winner_seller_hex,
+        );
+        crate::gateway::nostr::event_builder(&draft)
+            .expect("award builder")
+            .sign_with_keys(author)
+            .expect("sign award")
+    }
+
+    /// The kind-3406 twin of [`award_event`] — the delivery ACCEPT, #814's backup signal.
+    fn accept_event(
+        offer_id: &str,
+        claim_id: &str,
+        buyer: &Keys,
+        winner_seller_hex: &str,
+        author: &Keys,
+    ) -> nostr_sdk::Event {
+        let draft = crate::gateway::accept_draft(
+            offer_id,
+            claim_id,
+            &buyer.public_key().to_hex(),
+            winner_seller_hex,
+        );
+        crate::gateway::nostr::event_builder(&draft)
+            .expect("accept builder")
+            .sign_with_keys(author)
+            .expect("sign accept")
+    }
+
+    /// Boot a 1-slot OPEN-POOL seller whose claims lapse instantly, drive it to the exact #814 state —
+    /// one offer claimed and holding the only slot, a SECOND offer recorded but capacity-skipped — and
+    /// return `(runner, root, buyer, skipped_offer_id)`.
+    ///
+    /// OPEN-POOL is not a test convenience, it is the precondition: `award_filter` scopes a TARGETED
+    /// seller's REQ to its own pubkey and an award p-tags only the winner, so a targeted seller never
+    /// receives another seat's award and #814 cannot occur there at all.
+    async fn boot_at_capacity_with_a_skipped_offer(
+        label: &str,
+        relay_url: &str,
+    ) -> (Arc<SellerNodeRunner>, std::path::PathBuf, Keys, String) {
+        let (runner, root) = boot_capacity_skip_seller(label, relay_url, true, 0, Some(0)).await;
+        let runner = Arc::new(runner);
+        let buyer = Keys::generate();
+        let deadline_unix = now_unix() as u64 + 3_600;
+
+        // Two untargeted offers an open-pool seller would otherwise BOTH claim, so any later skip can
+        // only be the suppression gate. The tasks differ because an event id is a hash of its content.
+        let mut ids = Vec::new();
+        for task in ["#814 busy job", "#814 skipped job"] {
+            let draft = crate::gateway::OfferDraft::untargeted(task, "", 100, deadline_unix)
+                .to_event_draft();
+            let event = crate::gateway::nostr::event_builder(&draft)
+                .expect("offer builder")
+                .sign_with_keys(&buyer)
+                .expect("sign offer");
+            ids.push(event.id.to_hex());
+            runner.on_offer(&event).await;
+        }
+        let (claimed_id, skipped_id) = (ids[0].clone(), ids[1].clone());
+
+        assert_eq!(runner.slots.available(), 0, "the first offer must take the only slot");
+        assert_eq!(
+            runner.node.store().claim_row_state(&claimed_id).expect("claim row"),
+            Some("claimed".to_owned()),
+            "precondition: the first offer is claimed"
+        );
+        assert!(
+            runner.node.store().offer_facts(&skipped_id).expect("offer facts").is_some(),
+            "precondition: the second offer is RECORDED (record_offer runs before the slot reserve)"
+        );
+        assert!(
+            runner.node.store().claim_row_state(&skipped_id).expect("skip row").is_none(),
+            "precondition: the second offer is capacity-SKIPPED — recorded with no claim, which is \
+             exactly the state #814 re-drives into a losing claim"
+        );
+        assert!(
+            runner.capacity_skip_pending.load(std::sync::atomic::Ordering::Relaxed),
+            "precondition: the SlotsBusy skip armed the reconsider flag"
+        );
+        (runner, root, buyer, skipped_id)
+    }
+
+    /// Free the slot the way the drain tick does, then run the one-shot capacity reconsider.
+    async fn free_the_slot_and_reconsider(runner: &Arc<SellerNodeRunner>) {
+        runner.sweep_lapsed_claims();
+        assert_eq!(runner.slots.available(), 1, "the lapsed claim frees the slot");
+        runner.reconsider_capacity_skips().await;
+    }
+
+    /// #814 REGRESSION 1 — THE REPRO. An authentic buyer award to ANOTHER seller arrives while this
+    /// seller is at capacity; freeing capacity must not produce a claim.
+    ///
+    /// Non-vacuous by construction: after the sweep, the capacity-skipped offer is the ONLY row
+    /// `offers_awaiting_claim` can return (the other offer holds a `released` claim row and is
+    /// excluded), so the reconsider loop provably reaches it. The free slot afterwards is the proof it
+    /// was REACHED AND REFUSED rather than never visited.
+    ///
+    /// RED ON REVERT: replace the `suppress_taken_elsewhere` call in `on_award`'s `job_creq == None`
+    /// arm with the old `opline!("… no claim of ours"); return;` and the reconsider claims the offer —
+    /// `claim_row_state` becomes `Some("claimed")` and the slot drops to 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_authentic_award_to_another_seller_is_not_claimed_when_capacity_frees() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, root, buyer, skipped_id) =
+            boot_at_capacity_with_a_skipped_offer("814-award-repro", &relay_url).await;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // The buyer awards ANOTHER seller's claim for the offer we recorded but never claimed.
+                let other_seller = Keys::generate().public_key().to_hex();
+                let award =
+                    award_event(&skipped_id, "another-seats-claim", &buyer, &other_seller, &buyer);
+                runner.on_award(&award).await;
+
+                // The durable leg: the decision is on disk, so a restart cannot forget it.
+                assert!(
+                    runner.node.store().job_award_time(&skipped_id).expect("award time").is_some(),
+                    "an authentic award for a recorded offer must be PERSISTED, not discarded"
+                );
+                // …and it created no job, because we hold no claim to bind.
+                assert!(
+                    runner.node.store().job_state(&skipped_id).expect("job state").is_none(),
+                    "recording another seat's award must never create a job of ours"
+                );
+
+                free_the_slot_and_reconsider(&runner).await;
+
+                assert!(
+                    runner.node.store().claim_row_state(&skipped_id).expect("claim row").is_none(),
+                    "#814: the capacity reconsider must NOT publish a losing claim for an offer \
+                     already awarded to another seller"
+                );
+                assert_eq!(
+                    runner.slots.available(),
+                    1,
+                    "no slot is burned on a race that is already over"
+                );
+
+                // FAIL-OPEN CONTROL, same runner and same slot: a fresh offer with no decision against
+                // it is still claimed — so the refusal above was the suppression gate, not a node that
+                // had simply stopped claiming.
+                let fresh_draft = crate::gateway::OfferDraft::untargeted(
+                    "#814 fresh job",
+                    "",
+                    100,
+                    now_unix() as u64 + 3_600,
+                )
+                .to_event_draft();
+                let fresh = crate::gateway::nostr::event_builder(&fresh_draft)
+                    .expect("fresh builder")
+                    .sign_with_keys(&buyer)
+                    .expect("sign fresh");
+                runner.on_offer(&fresh).await;
+                assert_eq!(
+                    runner.node.store().claim_row_state(&fresh.id.to_hex()).expect("fresh row"),
+                    Some("claimed".to_owned()),
+                    "an undecided offer is still claimed (fail-open on the unknown)"
+                );
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #814 REGRESSION 2 — an authentic buyer ACCEPTANCE gives the same backup behaviour. This is the
+    /// signal that carries when the award itself never reached us.
+    ///
+    /// RED ON REVERT: restore `on_accept`'s `job_creq == None` arm to its old
+    /// `opline!("… no claim of ours"); return;` and the reconsider claims the offer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_authentic_acceptance_is_the_backup_suppression() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, root, buyer, skipped_id) =
+            boot_at_capacity_with_a_skipped_offer("814-accept-backup", &relay_url).await;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // No award ever arrives — only the buyer's acceptance of another seat's delivery.
+                let other_seller = Keys::generate().public_key().to_hex();
+                let accept =
+                    accept_event(&skipped_id, "another-seats-claim", &buyer, &other_seller, &buyer);
+                runner.on_accept(&accept).await;
+
+                free_the_slot_and_reconsider(&runner).await;
+
+                assert!(
+                    runner.node.store().claim_row_state(&skipped_id).expect("claim row").is_none(),
+                    "an acceptance is buyer-authenticated evidence the offer is decided; the \
+                     reconsider must not claim it"
+                );
+                assert_eq!(runner.slots.available(), 1, "no slot is burned");
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #814 REGRESSION 3 — BOTH forgery legs the issue names. A decision from a NON-BUYER, and a
+    /// decision bound to the WRONG OFFER, must each leave the job claimable.
+    ///
+    /// This is the anti-grief property: if either leg failed, anyone on an open relay could silence a
+    /// seller by publishing awards for offers it recorded. The buyer is read from OUR OWN recorded
+    /// offer, never from the event, which is what keeps the check non-circular.
+    ///
+    /// RED ON REVERT: delete the `if author != buyer` gate at the top of `suppress_taken_elsewhere`
+    /// and the stranger's award suppresses the offer — the reconsider stops claiming and the final
+    /// assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forged_or_misbound_decision_never_suppresses() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, root, buyer, skipped_id) =
+            boot_at_capacity_with_a_skipped_offer("814-forged", &relay_url).await;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let other_seller = Keys::generate().public_key().to_hex();
+
+                // LEG 1 — a stranger signs an otherwise well-formed award for OUR offer.
+                let forger = Keys::generate();
+                let forged =
+                    award_event(&skipped_id, "any-claim", &buyer, &other_seller, &forger);
+                runner.on_award(&forged).await;
+                assert!(
+                    runner.node.store().job_award_time(&skipped_id).expect("award time").is_none(),
+                    "a forged award must not even be PERSISTED — the author gate runs before the write"
+                );
+
+                // LEG 2 — the REAL buyer, but the award roots on a different offer. It can only ever
+                // speak about the offer it names, and that one is not recorded here.
+                let stranger_offer_id = "f".repeat(64);
+                let misbound =
+                    award_event(&stranger_offer_id, "any-claim", &buyer, &other_seller, &buyer);
+                runner.on_award(&misbound).await;
+                assert!(
+                    runner.node.store().job_award_time(&skipped_id).expect("award time").is_none(),
+                    "an award bound to another offer must not touch this one"
+                );
+
+                // The offer therefore stays ours to claim, and the reconsider claims it.
+                free_the_slot_and_reconsider(&runner).await;
+                assert_eq!(
+                    runner.node.store().claim_row_state(&skipped_id).expect("claim row"),
+                    Some("claimed".to_owned()),
+                    "neither a forged nor a misbound decision may take an offer off this seller"
+                );
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #814 REGRESSION 4 — the RECEIPT stays terminal, including out-of-order against an award.
+    ///
+    /// Both orders asserted, because `combine` must be order-independent: an award landing after a
+    /// receipt must not downgrade a permanent suppression to one that expires at the offer deadline.
+    /// The probe time is far past every deadline used here, so only a PERMANENT suppression survives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_receipt_stays_terminal_against_an_award_in_either_order() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, root) =
+            boot_capacity_skip_seller("814-receipt-order", &relay_url, true, 0, Some(0)).await;
+        let runner = Arc::new(runner);
+
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let other_seller = Keys::generate().public_key().to_hex();
+        let deadline_unix = now_unix() as u64 + 3_600;
+        let far_future = deadline_unix + 86_400;
+
+        let receipt_for = |offer_id: &str| {
+            let draft = crate::gateway::receipt_draft(
+                offer_id,
+                "result-id",
+                &buyer_hex,
+                &other_seller,
+                "https://mint.invalid",
+                100,
+                "job-hash",
+                "seller-sig",
+                "buyer-sig",
+                None,
+                None,
+                &[],
+            );
+            crate::gateway::nostr::event_builder(&draft)
+                .expect("receipt builder")
+                .sign_with_keys(&buyer)
+                .expect("sign receipt")
+        };
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // ORDER A — award first, then the receipt UPGRADES it to permanent.
+                let a = "a".repeat(64);
+                runner.terminal_offers.record_taken_elsewhere(&a, &buyer_hex, deadline_unix);
+                assert!(
+                    runner.terminal_offers.suppressed_by(&a, &buyer_hex, far_future).is_none(),
+                    "control: an award-only suppression HAS expired by the probe time"
+                );
+                runner.on_receipt(&receipt_for(&a)).await;
+                assert_eq!(
+                    runner.terminal_offers.suppressed_by(&a, &buyer_hex, far_future),
+                    Some(Suppression::Settled),
+                    "a receipt after an award upgrades the offer to terminal FOREVER"
+                );
+
+                // ORDER B — receipt first; a later award must not weaken it.
+                let b = "b".repeat(64);
+                runner.on_receipt(&receipt_for(&b)).await;
+                runner.terminal_offers.record_taken_elsewhere(&b, &buyer_hex, deadline_unix);
+                assert_eq!(
+                    runner.terminal_offers.suppressed_by(&b, &buyer_hex, far_future),
+                    Some(Suppression::Settled),
+                    "an award arriving after a receipt must NOT downgrade it to an expiring \
+                     suppression — #541 terminality is not weakened by #814"
+                );
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ⛔ THE #563 FOIL — the money-adjacent invariant. Suppression must NEVER apply to a job we hold
+    /// a CLAIM for, because suppressing our own live award strands it: compute spent, nothing paid.
+    ///
+    /// The discriminator is the CLAIM row, not the award row. That distinction is load-bearing
+    /// precisely because #814 makes the suppression path itself write an award row — keying the
+    /// invariant on "we hold an award" would have made the whole fix inert.
+    ///
+    /// Here the seller genuinely claims the offer and the buyer then awards a DIFFERENT seat. The
+    /// handler must take the existing `match_award` → `Release` path (the claim row moves to
+    /// `released`) and must NOT record a suppression, so the claim's own lifecycle stays in charge.
+    ///
+    /// RED ON REVERT: move the `suppress_taken_elsewhere` call out of the `job_creq == None` arm so it
+    /// runs unconditionally, and this test goes red on the suppression assertion — the exact
+    /// over-suppression that would strand a real award.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_we_hold_a_claim_for_is_never_suppressed() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        // A LONG lapse timeout: the parked claim must still be ours when the award lands.
+        let (runner, root) =
+            boot_capacity_skip_seller("814-563-foil", &relay_url, true, 0, Some(3_600)).await;
+        let runner = Arc::new(runner);
+
+        let buyer = Keys::generate();
+        let deadline_unix = now_unix() as u64 + 3_600;
+        let draft = crate::gateway::OfferDraft::untargeted("#814 foil job", "", 100, deadline_unix)
+            .to_event_draft();
+        let offer = crate::gateway::nostr::event_builder(&draft)
+            .expect("offer builder")
+            .sign_with_keys(&buyer)
+            .expect("sign offer");
+        let job_id = offer.id.to_hex();
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                runner.on_offer(&offer).await;
+                assert_eq!(
+                    runner.node.store().claim_row_state(&job_id).expect("claim row"),
+                    Some("claimed".to_owned()),
+                    "precondition: WE HOLD A CLAIM for this job — the complement of #814's case"
+                );
+
+                // The buyer picks another seat. This is the #563 shape: an award rooting an offer we
+                // are live on.
+                let other_seller = Keys::generate().public_key().to_hex();
+                let award = award_event(&job_id, "another-seats-claim", &buyer, &other_seller, &buyer);
+                runner.on_award(&award).await;
+
+                assert!(
+                    runner
+                        .terminal_offers
+                        .suppressed_by(&job_id, &buyer.public_key().to_hex(), now_unix() as u64)
+                        .is_none(),
+                    "⛔ a job we hold a claim for must NEVER be suppressed — that is how a real award \
+                     gets stranded (#563 foil)"
+                );
+                assert_eq!(
+                    runner.node.store().claim_row_state(&job_id).expect("claim row"),
+                    Some("released".to_owned()),
+                    "the existing match_award → Release path still owns this case, untouched"
+                );
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #814 REQUIREMENT 5 — the suppression survives a RESTART, with no relay in the loop.
+    ///
+    /// This is the leg the in-memory cache cannot provide alone, and the exposure is measured, not
+    /// hypothetical: the #560 periodic offer-backfill re-feeds every stored offer through `on_offer`
+    /// each tick, so a bounce that forgets the decision re-drives the offer straight back into a
+    /// losing claim. A relay redelivery would usually re-derive it, but "relay deafness manufactures
+    /// absence" (#560/#563) — recovery is not durability.
+    ///
+    /// The second runner opens the SAME home directory with no subscription and no relay traffic, so
+    /// anything it knows came off disk.
+    ///
+    /// RED ON REVERT: delete the `rehydrate_suppressions()` call in `serve` — or the `record_award`
+    /// write in `suppress_taken_elsewhere` — and the restarted node claims the offer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_suppression_survives_a_restart_off_the_store_alone() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, root, buyer, skipped_id) =
+            boot_at_capacity_with_a_skipped_offer("814-restart", &relay_url).await;
+        let buyer_hex = buyer.public_key().to_hex();
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let other_seller = Keys::generate().public_key().to_hex();
+                let award =
+                    award_event(&skipped_id, "another-seats-claim", &buyer, &other_seller, &buyer);
+                runner.on_award(&award).await;
+                // Free the slot but do NOT reconsider — the pre-restart node stops here.
+                runner.sweep_lapsed_claims();
+            })
+            .await;
+        drop(runner);
+
+        // ---- restart: a brand-new runner over the SAME store ----------------------------------
+        let mut home = crate::home::bootstrap(&root).expect("re-bootstrap the same home");
+        home.config.relay_url = relay_url.clone();
+        let mut seller = seller_cfg(1, true);
+        seller.claim_award_timeout_secs = Some(0);
+        seller.offer_backfill_secs = 0;
+        home.config.seller = Some(seller);
+        let restarted = Arc::new(
+            SellerNodeRunner::boot(home).await.expect("boot the restarted seller"),
+        );
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Cold cache proves the assertion below is about DISK, not leftover memory.
+                assert!(
+                    restarted
+                        .terminal_offers
+                        .suppressed_by(&skipped_id, &buyer_hex, now_unix() as u64)
+                        .is_none(),
+                    "a fresh process starts with an empty in-memory cache"
+                );
+
+                restarted.rehydrate_suppressions();
+
+                assert!(
+                    restarted
+                        .terminal_offers
+                        .suppressed_by(&skipped_id, &buyer_hex, now_unix() as u64)
+                        .is_some(),
+                    "the decision must be restored from the store, with no relay redelivery"
+                );
+
+                // And the behaviour that matters: the reconsider still refuses to claim it.
+                restarted
+                    .capacity_skip_pending
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                restarted.reconsider_capacity_skips().await;
+                assert!(
+                    restarted.node.store().claim_row_state(&skipped_id).expect("claim row").is_none(),
+                    "#814 must not come back after a restart"
+                );
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Feed JOB_RECEIPT events off the seller's live notification stream into `on_receipt` — exactly
     /// what the run loop's select arm does — until `done` holds or the deadline passes. Mirrors
     /// [`pump_offers_until`]; the receipt path is `&self` (no execution spawn), so no `Arc` is needed.
@@ -8034,7 +8858,11 @@ mod tests {
                         &runner,
                         &mut notifications,
                         std::time::Instant::now() + Duration::from_secs(5),
-                        |r| r.terminal_offers.settled_by(&settled_id, &buyer_hex),
+                        |r| {
+                            r.terminal_offers
+                                .suppressed_by(&settled_id, &buyer_hex, now_unix() as u64)
+                                .is_some()
+                        },
                     )
                     .await,
                     "the receipt sub must backfill the past 3400 into the terminal cache"
