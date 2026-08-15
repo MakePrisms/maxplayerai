@@ -50,7 +50,7 @@ use crate::seller_exec::{
     seller_delivery_kind, seller_exec_metadata, unified_job_timeout, AgentRunTimeout, ExecError,
     SandboxPolicy,
 };
-use crate::seller_roster::{ExecutionFailure, Fault, LiveRoster, MissingCapability};
+use crate::seller_roster::{ExecutionFailure, Fault, LiveRoster, MissingCapability, Unavailable};
 use crate::seller_git::{self, DeliveryAgentIdentity};
 
 use super::outbox::drain_once;
@@ -2143,7 +2143,26 @@ fn harness_fault_for(error: &ExecError) -> Option<ExecutionFailure> {
 
 /// How long a harness self-probe turn may take. Deliberately short: the probe asks for one tiny file,
 /// so a harness that cannot manage that inside this window is not one to hand a paid job to either.
+///
+/// ⚠ This is an ACP *idle* timeout: it resets on every stream event (`driver`/`acp_driver`), so it
+/// bounds the gap BETWEEN updates, not the whole turn. A harness that drip-feeds a status update every
+/// few seconds never trips it and can hold a probe open forever — which is exactly why the restore path
+/// wraps the probe in an outer wall-clock ceiling too ([`HARNESS_PROBE_WALL_TIMEOUT`], #301).
 const HARNESS_PROBE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Outer WALL-CLOCK ceiling on a single restore self-probe, wrapping the whole `run_harness_probe`
+/// turn. Strictly above [`HARNESS_PROBE_TIMEOUT`] (asserted below) because the idle timeout structurally
+/// cannot bound a harness that keeps its stream alive with periodic events: without this ceiling such a
+/// hang leaves the harness marked `probing` forever and it is never re-probed (#301). Set well clear of
+/// the idle cap so a merely SLOW-but-live probe still completes and is not mis-faulted as hung.
+const HARNESS_PROBE_WALL_TIMEOUT: Duration = Duration::from_secs(300);
+
+// The wall ceiling only helps if it sits ABOVE the idle cap: below it, it would kill live-but-slow
+// probes the idle timeout was content with. A compile-time guard, since both are constants (#301).
+const _: () = assert!(
+    HARNESS_PROBE_WALL_TIMEOUT.as_secs() > HARNESS_PROBE_TIMEOUT.as_secs(),
+    "the wall-clock probe ceiling must be strictly above the ACP idle timeout"
+);
 
 /// Prefix of a probe sentinel.
 ///
@@ -2417,6 +2436,85 @@ async fn run_harness_probe(
         ProbeAttempt::Proven => Ok(()),
         ProbeAttempt::Unrunnable { reason, fault } => Err((reason, fault)),
         ProbeAttempt::CompletedNoArtifact => Err((flaky_harness_reason(1), Fault::Unproven)),
+    }
+}
+
+/// Releases a claimed probe's in-flight mark if — and only if — no verdict already did.
+///
+/// A restore self-probe runs as a `spawn_local` task whose `JoinHandle` is DROPPED (see
+/// [`SellerNode::start_due_harness_probes`]), so a panic inside the probe is otherwise swallowed
+/// entirely: neither the `Ok`→restore nor the `Err`→fault arm runs, and the harness would stay marked
+/// `probing` for the life of the process, never re-probed. This guard is armed BEFORE the probe future
+/// is polled, so the panic unwinding through it still releases the mark. On the normal paths the verdict
+/// arms clear `probing` first, which makes [`LiveRoster::abandon_probe`] a no-op here — the guard fires
+/// on every path but only DOES anything on the one that reached no verdict (#301).
+struct ProbeInFlightGuard {
+    roster: Arc<LiveRoster>,
+    harness: usize,
+}
+
+impl Drop for ProbeInFlightGuard {
+    fn drop(&mut self) {
+        self.roster.abandon_probe(self.harness, Instant::now());
+    }
+}
+
+/// What a supervised restore probe did. The roster mutation (restore / fault / re-arm) has already
+/// happened by the time this is returned; the variant only tells the caller which line to log.
+#[derive(Debug)]
+enum ProbeOutcome {
+    /// The probe proved its sentinel — the harness is back in service.
+    Restored,
+    /// The probe reached a verdict of failure — the harness is dropped with `state`.
+    Faulted { reason: String, state: Unavailable },
+    /// The outer wall-clock ceiling elapsed before the probe returned — a live-but-endless stream the
+    /// idle timeout could not bound. Faulted `Unproven`, exactly as a failed turn would be.
+    WallTimeout { state: Unavailable },
+}
+
+/// Run ONE restore self-probe under two guarantees the raw `run_harness_probe` future lacks:
+///
+/// 1. An outer WALL-CLOCK timeout ([`HARNESS_PROBE_WALL_TIMEOUT`]). The 120s cap inside the probe is an
+///    ACP *idle* timeout that resets on every stream event, so a harness that drip-feeds updates hangs
+///    the probe forever without ever tripping it. `tokio::time::timeout` bounds the whole turn.
+/// 2. A Drop guard armed BEFORE the probe is polled, so a PANIC in the probe task (whose `JoinHandle`
+///    the spawner drops) still releases the harness's in-flight mark as the stack unwinds.
+///
+/// Together they close both paths on which the old spawn body left a harness marked `probing` forever
+/// and thus never re-probed — stuck `Dropped` for the life of the process (#301). Neither path can
+/// restore a harness: a hang faults it `Unproven`, a panic re-arms it through the guard, and both leave
+/// it `Dropped`, so a probe that failed to prove anything can never leave a dead harness serving.
+///
+/// The probe future is taken as a parameter (rather than built here) purely so a test can inject one
+/// that hangs or panics; production passes `run_harness_probe(..)`, which is not polled until awaited
+/// below, inside the guard's scope.
+async fn supervise_harness_probe(
+    roster: Arc<LiveRoster>,
+    harness: usize,
+    probe: impl std::future::Future<Output = Result<(), (String, Fault)>>,
+) -> ProbeOutcome {
+    // Armed before the await: releases `probing` even if `probe` panics through it. Idempotent with the
+    // verdict arms below, which clear the mark themselves on the paths that reach a verdict.
+    let _guard = ProbeInFlightGuard {
+        roster: Arc::clone(&roster),
+        harness,
+    };
+    match tokio::time::timeout(HARNESS_PROBE_WALL_TIMEOUT, probe).await {
+        Ok(Ok(())) => {
+            roster.restore(harness);
+            ProbeOutcome::Restored
+        }
+        Ok(Err((reason, fault))) => {
+            let state = roster.fault(harness, fault, Instant::now());
+            ProbeOutcome::Faulted { reason, state }
+        }
+        Err(_elapsed) => {
+            // The idle timeout never fired because the harness kept its stream alive; the wall ceiling
+            // did. Record it as an unattributable failure so the harness backs off and re-arms rather
+            // than staying `probing` forever — the exact stuck state #301 is about.
+            let state = roster.fault(harness, Fault::Unproven, Instant::now());
+            ProbeOutcome::WallTimeout { state }
+        }
     }
 }
 
@@ -4920,23 +5018,33 @@ impl SellerNodeRunner {
                 let label = roster
                     .label(harness)
                     .unwrap_or_else(|| "<unlabelled>".to_owned());
-                match run_harness_probe(&argv, &sandbox, &identity, &workdir, &sentinel).await {
-                    Ok(()) => {
-                        roster.restore(harness);
-                        opline!(
-                            "seller node harness RESTORED {label}: self-probe delivered its sentinel — \
-                             now advertising {:?} of {} resolved",
-                            roster.advertised(),
-                            roster.entry_count()
-                        );
-                    }
-                    Err((reason, fault)) => {
-                        let state = roster.fault(harness, fault, Instant::now());
-                        opline!(
-                            "seller node harness probe FAILED {label}: {reason} — {}",
-                            state.reason()
-                        );
-                    }
+                // Supervised: an outer wall-clock ceiling bounds a live-but-endless-stream hang the
+                // idle timeout cannot, and a Drop guard releases the in-flight mark even if the probe
+                // panics — both close the "stuck probing, never re-probed" paths of #301. The probe
+                // future is not polled until `supervise_harness_probe` awaits it, inside the guard.
+                let outcome = supervise_harness_probe(
+                    Arc::clone(&roster),
+                    harness,
+                    run_harness_probe(&argv, &sandbox, &identity, &workdir, &sentinel),
+                )
+                .await;
+                match outcome {
+                    ProbeOutcome::Restored => opline!(
+                        "seller node harness RESTORED {label}: self-probe delivered its sentinel — \
+                         now advertising {:?} of {} resolved",
+                        roster.advertised(),
+                        roster.entry_count()
+                    ),
+                    ProbeOutcome::Faulted { reason, state } => opline!(
+                        "seller node harness probe FAILED {label}: {reason} — {}",
+                        state.reason()
+                    ),
+                    ProbeOutcome::WallTimeout { state } => opline!(
+                        "seller node harness probe TIMED OUT {label}: exceeded {}s wall clock (the ACP \
+                         idle timeout cannot bound a drip-feeding stream) — {}",
+                        HARNESS_PROBE_WALL_TIMEOUT.as_secs(),
+                        state.reason()
+                    ),
                 }
                 let _ = std::fs::remove_dir_all(&workdir);
             });
@@ -12522,6 +12630,107 @@ mod tests {
                 Some(Err((_, Fault::Incapable(MissingCapability::AcpFeature))))
             ),
             "the unrunnable fault must be the recorded verdict: {verdict:?}"
+        );
+    }
+}
+
+/// The supervision #301 adds around a restore self-probe: an outer wall-clock ceiling for a
+/// live-but-endless-stream hang, and a Drop guard that releases the in-flight mark when the probe task
+/// PANICS (its `JoinHandle` is dropped in production, so the panic is otherwise silent). Both paths
+/// used to leave the harness marked `probing` for the life of the process — stuck `Dropped`, never
+/// re-probed. Each test drives the extracted [`supervise_harness_probe`] directly with an injected
+/// probe body, then proves the harness is claimable again afterwards (the mark WAS released) and was
+/// never restored to service (a died probe proves nothing).
+#[cfg(test)]
+mod supervised_probe_tests {
+    use super::{supervise_harness_probe, ProbeOutcome};
+    use crate::seller_agents::{AgentRegistry, RegisteredAgent};
+    use crate::seller_roster::{Fault, LiveRoster};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// A one-harness roster already dropped (strike 1) with its due probe CLAIMED, i.e. marked
+    /// `probing` — the exact state `start_due_harness_probes` hands to the spawned task. Returns the
+    /// roster and a `due` instant past the probe window.
+    fn claimed_probe(now: Instant) -> (Arc<LiveRoster>, Instant) {
+        let roster = Arc::new(LiveRoster::new(AgentRegistry::new(vec![RegisteredAgent {
+            name: Some("claude".to_owned()),
+            argv: vec!["claude-acp".to_owned()],
+        }])));
+        roster.fault(0, Fault::Unproven, now);
+        let due = now + Duration::from_secs(24 * 60 * 60);
+        assert_eq!(
+            roster.claim_due_probes(due),
+            vec![0],
+            "the probe is due and gets claimed, marking the harness probing"
+        );
+        assert!(
+            roster.claim_due_probes(due).is_empty(),
+            "the in-flight mark must suppress a second claim while the probe runs"
+        );
+        (roster, due)
+    }
+
+    #[tokio::test]
+    async fn a_panicking_probe_releases_the_in_flight_mark_so_the_harness_is_re_probed() {
+        // A poisoned-mutex `.expect`, in the wild: the probe task panics. In production its JoinHandle
+        // is dropped and the panic vanishes; here we spawn+join so the test proceeds only once the task
+        // (and its Drop guard) has fully unwound.
+        let now = Instant::now();
+        let (roster, due) = claimed_probe(now);
+
+        let handle = tokio::spawn(supervise_harness_probe(Arc::clone(&roster), 0, async {
+            panic!("probe task panicked (a poisoned-mutex .expect, say)")
+        }));
+        let joined = handle.await;
+        assert!(joined.is_err(), "the injected probe must have panicked");
+        assert!(joined.unwrap_err().is_panic(), "and it must be a panic, not a cancellation");
+
+        // WITHOUT the Drop guard `probing` stays true forever and this is empty — the harness is stuck
+        // Dropped and never re-probed. WITH it, the mark is released and the window re-armed, so far
+        // enough out the harness is claimable again.
+        let long_after = due + Duration::from_secs(24 * 60 * 60);
+        assert_eq!(
+            roster.claim_due_probes(long_after),
+            vec![0],
+            "a panicking probe must release the in-flight mark so the harness is probed again (#301)"
+        );
+        assert!(
+            !roster.serves(None),
+            "a probe that died proved nothing — it must NEVER restore the dead harness to service"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_probe_hits_the_wall_clock_ceiling_and_the_harness_is_re_probed() {
+        // A probe the 120s ACP IDLE timeout can never bound: it never resolves (in the wild it holds
+        // its stream alive with periodic updates, resetting the idle timer each time). Under paused
+        // time `tokio::time::timeout` auto-advances and fires the outer WALL ceiling.
+        let now = Instant::now();
+        let (roster, due) = claimed_probe(now);
+
+        let outcome = supervise_harness_probe(
+            Arc::clone(&roster),
+            0,
+            std::future::pending::<Result<(), (String, Fault)>>(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, ProbeOutcome::WallTimeout { .. }),
+            "the wall-clock ceiling must fire on a probe the idle timeout cannot bound"
+        );
+
+        // WITHOUT the outer timeout this await never returns (the test hangs). WITH it the harness is
+        // faulted, released, and re-armed — claimable again, and never restored.
+        let long_after = due + Duration::from_secs(24 * 60 * 60);
+        assert_eq!(
+            roster.claim_due_probes(long_after),
+            vec![0],
+            "after the wall timeout the harness must be re-probed, not stuck probing forever (#301)"
+        );
+        assert!(
+            !roster.serves(None),
+            "a hung probe must never restore the dead harness to service"
         );
     }
 }
