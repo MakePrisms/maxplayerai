@@ -88,6 +88,28 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
   assert.ok(!/url\((['"])\.\/fonts\/[^'"?]+\1\)/.test(fontsCss), "no unstamped font URL remains in fonts.css");
 });
 
+test("the Node floor the bake actually needs is declared", () => {
+  // scripts/bake-snapshot.mjs needs a GLOBAL WebSocket, which arrived in Node
+  // 22. Undeclared, the host picks its own version and the bake becomes a
+  // permanent no-op that fails the deploy quietly — the client just never gets
+  // a snapshot, which looks exactly like a first visit.
+  const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+  const floor = Number(/(\d+)/.exec(pkg.engines?.node ?? "")?.[1]);
+  assert.ok(floor >= 22, `engines.node must require >=22, got ${pkg.engines?.node}`);
+});
+
+test("llms.txt ships at the site root, byte-identical to the source", () => {
+  // Part of the agent-facing surface and a live URL: maxplayer.ai/llms.txt.
+  // The rebuild dropped it once already, and nothing else fails when it goes
+  // missing: the build stays green and the URL just starts 404ing. Living
+  // under public/ is what carries it today — this pins the OUTCOME, so moving
+  // it back out without a copy step goes red instead of shipping a 404.
+  assert.deepEqual(
+    readFileSync(join(root, "dist", "llms.txt")),
+    readFileSync(join(root, "public", "llms.txt")),
+  );
+});
+
 test("the bundle ships as one module and the snapshot stays out of git", () => {
   assert.ok(existsSync(join(root, "dist", "terminal.js")));
   // A local bake writes public/snapshot.json (that's fine); git must ignore

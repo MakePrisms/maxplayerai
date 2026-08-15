@@ -405,7 +405,7 @@ function eventSheet(view: MarketView, id: string, jobExpanded = false): string {
     : null;
   const workingDot = workingJob ? statusDot(true, [workingJob]) : "";
   return `<h3>${workingDot}<span>${esc(KIND_LABELS[raw.kind] || "Event")}</span></h3>
-    ${e?.selfTrade ? '<p class="selfnote"><b>Self-commissioned.</b> The racer operates the runner being paid. Real work, but not market demand — excluded from the figures on this page.</p>' : ""}
+    ${e?.selfTrade ? '<p class="selfnote"><b>Self-commissioned.</b> The racer operates the runner being paid. Real work, but not market demand.</p>' : ""}
     <h4>Event details</h4>${detailsKv}
     ${e?.description ? `<h4>The job</h4><div class="job-wrap"><p class="job ${jobExpanded ? "" : "clamp"}">${esc(e.description)}</p><div class="chips">${e.description.length > 160 ? `<button type="button" class="chip show-chip" data-job-toggle>${jobExpanded ? "hide" : "show"}</button>` : ""}<button type="button" class="chip copy-chip" data-copy-text="${esc(e.description)}">copy</button></div></div>` : ""}
     ${eventAdvert}

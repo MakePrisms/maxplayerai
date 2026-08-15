@@ -5,7 +5,10 @@
  * rejection is itself under test).
  */
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { parseEvent } from "../src/model/events.js";
 import { OFFER, CLAIM, AWARD, RESULT, RECEIPT, ACCEPT, FEEDBACK, HEARTBEAT, PROFILE } from "../src/model/kinds.js";
 import { createCache } from "../src/store/cache.js";
@@ -13,6 +16,8 @@ import { buildTrades, marketMetrics } from "../src/market/trades.js";
 import { buyerBoard, sellerBoard, inProgressJobs, participantActivity, relatedActivity, JOB_OVERDUE, JOB_WORKING, withinWindow } from "../src/market/participants.js";
 import { activeTradeJobs, createEngine, rankClimbs, ACTIVE_GRACE_SECONDS } from "../src/market/engine.js";
 import type { RawEvent } from "../src/model/events.js";
+
+const SRC = join(dirname(fileURLToPath(import.meta.url)), "..", "src");
 
 const hex = (seed: string): string => seed.repeat(64).slice(0, 64);
 const BUYER = hex("a");
@@ -76,6 +81,22 @@ test("trades key on the root offer and take the earliest stamp per stage", () =>
   const trades = buildTrades([o, later, dup]);
   assert.equal(trades.length, 1);
   assert.equal(trades[0]!.at.receipt, T0 + 50, "earliest receipt stamp wins");
+});
+
+test("a receipt amount is a FLOOR — relay order never lowers it", () => {
+  // The stamp test above uses two receipts of the SAME amount, so it cannot
+  // see this: the amount was a plain assignment, making the figure whichever
+  // receipt the relay happened to page last. Two orders of the same three
+  // events must not produce two different numbers.
+  const o = offer(T0, { amount: 1000 });
+  const high = receipt(o.id, T0 + 5, 1000);
+  const low = receipt(o.id, T0 + 9, 1);
+
+  assert.equal(buildTrades([o, high, low])[0]!.receiptAmount, 1000, "a later low receipt cannot lower the floor");
+  assert.equal(buildTrades([o, low, high])[0]!.receiptAmount, 1000, "and the reverse order agrees");
+  // The figure the page actually renders.
+  assert.equal(marketMetrics([o, high, low]).satsInReceipts, 1000);
+  assert.equal(marketMetrics([o, low, high]).satsInReceipts, 1000);
 });
 
 test("self-trades are excluded from metrics and counted, never silent", () => {
@@ -232,6 +253,71 @@ test("buyer board counts receipts as the floor and prices as medians", () => {
   assert.equal(board[0]!.receipted, 1);
   assert.equal(board[0]!.satsPaid, 10);
   assert.equal(board[0]!.medianPrice, 20);
+});
+
+test("a losing claimant's refusal ends only its OWN claim, not the awarded runner's job", () => {
+  // Two runners claim one offer; the racer picks the second. The FIRST one then
+  // refuses. Nothing about that should touch the winner — but the trade join
+  // took the first seller it saw in array order, and the decline was recorded
+  // trade-wide, so the loser's refusal darkened the winner's lamp AND the
+  // racer's, and the release was charged to whichever seat came first in the
+  // array. Both orders of the same events must agree.
+  const o = offer(T0, { deadline: T0 + 5000 });
+  const events = [
+    o,
+    claim(o.id, SELLER, T0 + 1),   // claims, loses, refuses
+    claim(o.id, SELLER2, T0 + 2),  // claims, wins, still working
+    award(o.id, SELLER2, T0 + 3),
+    feedback(o.id, SELLER, T0 + 4, [["reason_code", "execution_failed"]], "execution_failed: not mine"),
+  ];
+
+  for (const [label, arr] of [["in order", events], ["reversed", [...events].reverse()]] as const) {
+    const trade = buildTrades(arr.map(parseEvent).filter((e) => e != null))[0]!;
+    assert.equal(trade.seller, SELLER2, `${label}: the buyer-signed award names the runner, not the first claim`);
+    assert.equal(trade.sellerConflict, false, `${label}: one award, so nothing to conflict`);
+    assert.equal(trade.declineReason, null, `${label}: a loser's refusal is not the trade's decline`);
+    assert.deepEqual(trade.releasedBy, [SELLER], `${label}: it is the loser's own record`);
+
+    const active = activeTradeJobs(arr, T0 + 10);
+    assert.ok(active.bySeller.get(SELLER2)?.length, `${label}: the awarded runner is still working`);
+    assert.ok(active.byBuyer.get(BUYER)?.length, `${label}: and the racer's lamp stays on`);
+    assert.ok(!active.bySeller.get(SELLER)?.length, `${label}: the runner that refused is done`);
+
+    const board = sellerBoard(arr, T0 + 10);
+    const won = board.find((r) => r.pubkey === SELLER2);
+    const lost = board.find((r) => r.pubkey === SELLER);
+    assert.ok(won, `${label}: the awarded runner has a row`);
+    assert.ok(lost, `${label}: the second claimant has a row of its own`);
+    assert.equal(lost!.claimed, 1, `${label}: every claim is counted`);
+    assert.equal(won!.claimed, 1);
+    assert.equal(lost!.released, 1, `${label}: the release is charged to whoever refused`);
+    assert.equal(won!.released, 0, `${label}: never to the runner still working`);
+  }
+});
+
+test("the boards COUNT self-trades, and no copy claims the page excludes them", () => {
+  // Two halves of one invariant, because the defect was the gap between them.
+  //
+  // Ruled by bob: the boards keep counting self-trades and the misleading
+  // sentence goes. So this is a DECISION pinned here, not an oversight — if
+  // someone later "fixes" it by filtering the boards, the standings move and
+  // this goes red on purpose.
+  const arms = offer(T0, { amount: 10 });
+  const self = offer(T0 + 1, { amount: 10, self: true });
+
+  const board = buyerBoard([arms, self], T0 + 10);
+  assert.equal(board[0]!.posted, 2, "the boards include self-trades");
+  // The stats figures are the ones that genuinely exclude them, which is why
+  // the note in board.ts saying so is accurate and stays.
+  assert.equal(marketMetrics([arms, self]).funnel.posted, 1, "metrics still exclude them");
+
+  // Therefore no copy may tell a reader the whole page excludes them. The
+  // boards are on that page.
+  const docks = readFileSync(join(SRC, "ui", "docks.ts"), "utf8");
+  assert.ok(
+    !/excluded from the figures on this page/.test(docks),
+    "the self-trade note must not claim a page-wide exclusion the boards do not honour",
+  );
 });
 
 test("profiles enrich rows but never create them", () => {

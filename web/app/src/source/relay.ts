@@ -91,6 +91,14 @@ export interface RelaySourceOptions {
   transport: Transport;
   /** Newest created_at already held by the cache; history resumes from here. */
   sinceHint?: number | null;
+  /**
+   * Whether the cached store is known to hold a COMPLETE history — i.e. a
+   * previous walk ran to genuine exhaustion. The since-hint is an optimization
+   * that assumes there is nothing below it; applied to a store with a hole,
+   * every future read starts above that hole and the store can never repair
+   * itself. Default false: re-walk unless completeness was actually proven.
+   */
+  storeComplete?: boolean;
   openSocket?: (url: string) => WebSocket;
   now?: () => number;
   setTimer?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
@@ -102,6 +110,7 @@ export function createRelaySource(
     url,
     transport,
     sinceHint = null,
+    storeComplete = false,
     openSocket = (u) => new WebSocket(u),
     now = () => Math.floor(Date.now() / 1000),
     setTimer = (fn, ms) => setTimeout(fn, ms),
@@ -111,7 +120,16 @@ export function createRelaySource(
 ): MarketSource {
   let ws: WebSocket | null = null;
   let phase: SourceState = "idle";
-  let pages = 0;
+  /**
+   * Pages spent PER STREAM. One shared counter let the deep tagged stream spend
+   * the whole allowance, after which every remaining stream went live having
+   * read nothing — a truncated market reporting itself fully synced.
+   */
+  const pageCounts = new Map<string, number>();
+  /** Streams that stopped on the backstop rather than running out. */
+  const truncated = new Set<string>();
+  /** A relay refusal, as opposed to a transient drop: retrying cannot help. */
+  let refused = false;
   let seenThisPage = 0;
   let streams: Stream[] = [];
   let streamIndex = 0;
@@ -119,6 +137,21 @@ export function createRelaySource(
   let oldestSeen: number | null = null;
   /** Forward cursor: the newest created_at we have ingested. */
   let newestSeen: number | null = sinceHint;
+  /**
+   * Per-stream backward cursors and drained marks, kept ACROSS reconnects.
+   *
+   * A dropped socket must resume each stream where that stream stopped. One
+   * shared cursor cannot do it — streams run out at different depths, so
+   * resuming them all from the globally-oldest event steps past everything a
+   * shallower stream has not delivered. That is the same defect the per-filter
+   * cursors above exist to prevent, and it has to survive the reconnect too.
+   * Recorded at page boundaries (EOSE), so a drop mid-page costs a re-read of
+   * one page and can never skip.
+   */
+  const cursors = new Map<string, number>();
+  const drained = new Set<string>();
+  /** Has a history walk ever run to genuine exhaustion? */
+  let historyComplete = storeComplete;
   let subCounter = 0;
   let activeSub: string | null = null;
   /** The long-lived subscription in stream mode; never closed by us. */
@@ -139,8 +172,16 @@ export function createRelaySource(
     seenThisPage = 0;
     activeSub = `h${++subCounter}`;
     const stream = streams[streamIndex];
-    if (!stream) return goLive();
+    if (!stream) return goLive(true);
     send(["REQ", activeSub, historyFilter(stream, oldestSeen == null ? null : oldestSeen - 1)]);
+  }
+
+  /** Move to the next stream, resuming it from its own cursor. */
+  function nextStream() {
+    streamIndex += 1;
+    oldestSeen = cursors.get(streams[streamIndex]?.name ?? "") ?? null;
+    if (streamIndex >= streams.length) return goLive(truncated.size === 0);
+    requestHistory();
   }
 
   /** One incremental ask. A quiet market costs an empty round trip. */
@@ -157,10 +198,30 @@ export function createRelaySource(
     pollTimer = setTimer(() => { pollOnce(); schedulePoll(); }, POLL_MS);
   }
 
-  /** History is exhausted — switch to staying current, per transport. */
-  function goLive() {
+  /**
+   * History reading is over — switch to staying current, per transport.
+   *
+   * `complete` says WHY it is over: every stream genuinely drained, or the
+   * MAX_PAGES backstop cut a read short. Only the first proves the store holds
+   * everything, and only then may a later visit skip the walk. Collapsing the
+   * two is a green that cannot go red — a truncated read would report itself
+   * fully synced and bake its own gap in.
+   *
+   * The distinction is deliberately NOT surfaced in the connection line: per
+   * bob, the page says `live` either way. It still governs what the store may
+   * claim about itself and still reaches the console, so the correctness
+   * tracking is intact — only the display was dropped.
+   */
+  function goLive(complete: boolean) {
+    if (complete) {
+      historyComplete = true;
+      cursors.clear();
+      drained.clear();
+    } else {
+      console.warn(`[relay] history stopped at the ${MAX_PAGES}-page backstop; the store is not known complete`);
+    }
     status("live");
-    callbacks.onSynced();
+    callbacks.onSynced({ complete });
     if (transport === "stream") {
       // One subscription, left open: the relay pushes every new event as it
       // lands. No timers at all in this mode.
@@ -174,18 +235,25 @@ export function createRelaySource(
 
   function handleEose(subId: string) {
     if (phase === "history") {
-      pages += 1;
       if (activeSub) {
         closedByUs.add(activeSub);
         send(["CLOSE", activeSub]);
       }
       const exhausted = seenThisPage === 0 || oldestSeen == null;
-      if (pages >= MAX_PAGES) return goLive();
-      if (exhausted) {
-        // This stream is drained; the next starts from its own beginning.
-        streamIndex += 1;
-        oldestSeen = null;
-        if (streamIndex >= streams.length) return goLive();
+      // Record this stream's progress at the page boundary, so a drop before
+      // the next EOSE resumes here instead of restarting or skipping ahead.
+      const current = streams[streamIndex];
+      if (current && oldestSeen != null) cursors.set(current.name, oldestSeen);
+      if (current) pageCounts.set(current.name, (pageCounts.get(current.name) ?? 0) + 1);
+      const spent = current ? (pageCounts.get(current.name) ?? 0) >= MAX_PAGES : true;
+      if (exhausted || spent) {
+        // Drained is an answer; the backstop is an admission. Recorded apart so
+        // a short read cannot certify the store as complete.
+        if (current) (exhausted ? drained : truncated).add(current.name);
+        if (current && !exhausted) {
+          console.warn(`[relay] stream ${current.name} stopped at the ${MAX_PAGES}-page backstop`);
+        }
+        return nextStream();
       }
       requestHistory();
       return;
@@ -215,6 +283,9 @@ export function createRelaySource(
       const subId = String(frame[1]);
       const verdict = classifyClosed(frame[2], closedByUs.has(subId));
       if (verdict === "acknowledged") { closedByUs.delete(subId); return; }
+      // `restricted:` will not become permitted by asking again; anything else
+      // stays retryable, so the ordinary reconnect path keeps working.
+      if (verdict === "refused") refused = true;
       status("failed", `relay declined the read (${verdict})`);
       teardown();
       if (verdict === "retryable") scheduleRetry();
@@ -244,12 +315,21 @@ export function createRelaySource(
   function connect() {
     if (stopped) return;
     teardown();
-    pages = 0;
-    oldestSeen = null;
-    // Resume from what we already hold — reconnects and cached boots both walk
-    // forward from the cursor instead of re-reading the world.
-    streams = historyStreams(newestSeen == null ? null : newestSeen + 1);
-    streamIndex = 0;
+    // The backstop is per connection, like the page counter it replaced: a
+    // reconnect resumes deeper thanks to the cursors, so it makes progress
+    // rather than re-spending the same allowance on the same pages.
+    pageCounts.clear();
+    truncated.clear();
+    refused = false;
+    // The forward read is only sound once a walk has genuinely finished:
+    // `since` asserts there is nothing below it. Otherwise walk backward and
+    // resume each stream from its own recorded cursor — reconnecting mid-read
+    // must not step over history it has never seen.
+    const forward = historyComplete && newestSeen != null;
+    streams = historyStreams(forward ? newestSeen! + 1 : null);
+    streamIndex = forward ? 0 : streams.findIndex((s) => !drained.has(s.name));
+    if (streamIndex < 0) streamIndex = streams.length;
+    oldestSeen = forward ? null : cursors.get(streams[streamIndex]?.name ?? "") ?? null;
     liveSub = null;
     closedByUs.clear();
     status("connecting");
@@ -262,7 +342,12 @@ export function createRelaySource(
       if (Array.isArray(frame)) handleFrame(frame);
     };
     ws.onerror = () => { if (phase !== "failed") status("failed", "connection error"); };
-    ws.onclose = () => { if (!stopped && phase !== "failed") scheduleRetry(); };
+    // An error followed by a close is THE ordinary browser drop, and gating the
+    // retry on `phase !== "failed"` meant onerror had already disqualified it —
+    // the app sat disconnected forever. A deliberate teardown detaches this
+    // handler first, so reaching here at all means the drop was involuntary;
+    // only an outright refusal by the relay is worth not retrying.
+    ws.onclose = () => { if (!stopped && !refused) scheduleRetry(); };
   }
 
   return {

@@ -11,11 +11,12 @@
  * reconciler touches only rows that changed. The only timers are cosmetic —
  * label aging and online-staleness — and they never rebuild structure.
  */
-import { RELAY_URL, SNAPSHOT_URL, TRANSPORT } from "./config.js";
+import { RELAY_URL, SNAPSHOT_TIMEOUT_MS, SNAPSHOT_URL, TRANSPORT } from "./config.js";
 import { createEngine } from "./market/engine.js";
 import { DEFAULT_WINDOW, WINDOWS } from "./market/participants.js";
 import { createRelaySource } from "./source/relay.js";
 import { createEventDb } from "./store/db.js";
+import { loadSnapshot } from "./store/snapshot.js";
 import type { RawEvent } from "./model/events.js";
 import { renderBuyers, renderFeed, renderSellers, renderStats } from "./ui/board.js";
 import { refreshDocks, wireDocks, writeClipboard } from "./ui/docks.js";
@@ -109,14 +110,16 @@ async function boot(): Promise<void> {
   for (const event of cached) ingest(event, false);
 
   // 2) The baked snapshot — instant boards for a first-time visitor.
-  if (!cached.length) {
-    try {
-      const res = await fetch(SNAPSHOT_URL);
-      if (res.ok) {
-        const events = (await res.json()) as RawEvent[];
-        for (const event of events) ingest(event, true);
-      }
-    } catch { /* no snapshot deployed — skeletons cover the gap */ }
+  //
+  // An OPTIMIZATION, never a gate. It is a ~2.5MB static file, and a request
+  // that hangs rather than fails would otherwise hold the whole boot: no
+  // relay, no error, skeletons forever, and a `catch` that can never fire
+  // because a stall is not a rejection. So it carries its own deadline, and
+  // the relay (below) is started before anyone waits on it.
+  async function ingestSnapshot(): Promise<void> {
+    if (cached.length) return;
+    const { events } = await loadSnapshot({ url: SNAPSHOT_URL, timeoutMs: SNAPSHOT_TIMEOUT_MS });
+    for (const event of events) ingest(event, true);
   }
 
   // 3) Nothing local at all: the STATIC skeletons already in the HTML hold
@@ -157,7 +160,13 @@ async function boot(): Promise<void> {
   const conn = el("conn");
   const connText = el("conn-text");
   const source = createRelaySource(
-    { url: RELAY_URL, transport: TRANSPORT, sinceHint: engine.cache.newest },
+    {
+      url: RELAY_URL,
+      transport: TRANSPORT,
+      sinceHint: engine.cache.newest,
+      // The hint may only be trusted if a previous walk actually finished.
+      storeComplete: await db.historyComplete(),
+    },
     {
       onEvent: (event) => ingest(event, true),
       onStatus: ({ state, detail }) => {
@@ -167,10 +176,20 @@ async function boot(): Promise<void> {
         const word = state === "history" ? "syncing" : state;
         connText.textContent = detail ? `${word} · ${detail}` : word;
       },
-      onSynced: () => { sawData = true; engine.flush(); },
+      onSynced: ({ complete }) => {
+        sawData = true;
+        // Only a genuinely drained walk earns the marker that lets the NEXT
+        // visit skip history. A truncated read must never certify itself.
+        if (complete) db.markHistoryComplete();
+        engine.flush();
+      },
     },
   );
   source.start();
+
+  // Last, and deliberately after the relay is already reading: the snapshot
+  // only ever makes the first paint earlier, so nothing waits behind it.
+  await ingestSnapshot();
 }
 
 void boot();

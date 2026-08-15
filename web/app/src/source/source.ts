@@ -27,8 +27,12 @@ export interface SourceCallbacks {
   /** One raw event. May be a duplicate; the store dedupes. */
   onEvent(event: RawEvent): void;
   onStatus(status: SourceStatus): void;
-  /** History exhausted — everything stored has been delivered once. */
-  onSynced(): void;
+  /**
+   * History reading is over. `complete` is true only when every stream drained
+   * genuinely; false means a backstop cut the read short, so the store holds a
+   * hole and must not be treated as a floor for a later forward read.
+   */
+  onSynced(result: { complete: boolean }): void;
 }
 
 export interface MarketSource {

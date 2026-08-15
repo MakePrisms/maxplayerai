@@ -9,7 +9,11 @@
     "noImplicitOverride": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "isolatedModules": true
+    "isolatedModules": true,
+    // Without this the "scripts/**/*.mjs" include below loads NOTHING — tsc
+    // silently ignores .mjs, so the deploy scripts were outside typechecking
+    // while appearing to be inside it.
+    "allowJs": true
   },
   "include": ["src/**/*.ts", "test/**/*.ts", "scripts/**/*.mjs"]
 }
