@@ -557,6 +557,14 @@ pub fn compose_agent_prompt(
          - If you wait on a background process, match something your own waiter cannot contain — \
          a PID or pidfile captured at start, or `pgrep -x` against an exact program name — never \
          `pgrep -f` on a substring of your own command line.\n\
+         TOOLING: this runtime is deliberately thin, so a compiler, runtime or CLI your task \
+         needs may be absent — installing it is expected, and the container is yours alone and \
+         is discarded when the job ends. You run as an unprivileged user with no sudo and no \
+         capabilities, so a system package manager will fail; install under `$HOME` instead, and \
+         never into the job directory, where it would become part of your deliverable. Prefer \
+         `nix develop` when the project ships a flake and nix is present, otherwise a user-local \
+         installer such as rustup, `pip install --user`, or `npm install -g` with a prefix under \
+         `$HOME`.\n\
          ---\n\
          DELIVERY (required). Your deliverable is the FINAL STATE OF YOUR CURRENT WORKING \
          DIRECTORY:\n\
@@ -1965,6 +1973,13 @@ mod tests {
                 "on the offer, so produce the deliverable in that form",
                 "cannot contain — a PID or pidfile captured at start",
                 "never `pgrep -f` on a substring of your own command line",
+                "so a compiler, runtime or CLI your task needs may be absent",
+                "the container is yours alone and is discarded when the job ends",
+                "an unprivileged user with no sudo and no capabilities",
+                "install under `$HOME` instead, and never into the job directory",
+                "your deliverable. Prefer `nix develop` when the project ships a flake",
+                "otherwise a user-local installer such as rustup",
+                "with a prefix under `$HOME`.",
             ] {
                 assert!(
                     prompt.contains(joined),
