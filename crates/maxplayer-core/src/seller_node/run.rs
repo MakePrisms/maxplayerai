@@ -2636,6 +2636,20 @@ pub async fn probe_configured_harnesses(
     // under a pass-through fallback would prove a harness the awarded job will never run under.
     let sandbox = SandboxPolicy::from_config(home.config.sandbox.as_ref())
         .map_err(|error| NodeError::Sandbox(error.to_string()))?;
+    // #647 credential-containment scope (P2): every KNOWN model-credential variable is contained by
+    // the proxy. What can still cross RAW is an operator-added `[sandbox] forward_env` variable the
+    // daemon cannot recognize — it may be a credential, and the daemon has no way to know. Say so
+    // LOUDLY at boot — the same gap the doctor WARN reports.
+    for var in crate::seller_exec::uncontained_forwarded_credentials(&sandbox, |key| {
+        std::env::var(key).ok()
+    }) {
+        opline!(
+            "seller node SECURITY: [sandbox] forward_env carries {var} into the container \
+             UNCONTAINED — the credential proxy contains only the known model-credential variables, \
+             so if {var} is a secret a stranger's job can read and reuse it. Remove it from \
+             forward_env, or treat that credential as compromised and spend-cap it at the provider."
+        );
+    }
     let identity = DeliveryAgentIdentity::for_seller(&home::public_key_hex(home)?);
     let mut verdicts = Vec::with_capacity(registry.entries().len());
     for (index, entry) in registry.entries().iter().enumerate() {

@@ -29,7 +29,12 @@ git-delivery = ["gateway", "dep:git2", "dep:reqwest", "dep:base64"]
 # must reach the run loop so it can publish its terminal `accepting=n` seat announcement before
 # exiting. With the kernel's default disposition the process dies outright and the seat's last
 # `accepting=y` — an addressable event no later beat will correct — stands forever.
-wallet = ["git-delivery", "gateway", "dep:cashu", "dep:cdk", "dep:cdk-sqlite", "dep:nostr-sdk", "dep:rusqlite", "dep:libc", "tokio/sync", "tokio/time", "tokio/net", "tokio/io-util", "tokio/signal"]
+# The credential-containment proxy (#647) is a host service the seller node runs for a docker-mode
+# job: a tokio TCP listener (`tokio/net`), a hyper/1 HTTP server terminating the container's plain-HTTP
+# calls, and a reqwest async client (with `stream`, for SSE responses) forwarding to the real upstream.
+# It lives under `wallet` because `seller_exec` — the only caller — already does, so reqwest and
+# `tokio/net` are guaranteed present here.
+wallet = ["git-delivery", "gateway", "dep:cashu", "dep:cdk", "dep:cdk-sqlite", "dep:nostr-sdk", "dep:rusqlite", "dep:libc", "dep:bytes", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:futures-util", "tokio/sync", "tokio/time", "tokio/net", "tokio/io-util", "tokio/signal"]
 # TESTS ONLY, opt-in, OFF by default (issue #720). The four tests that reach a LIVE third-party mint
 # over the public internet — two in `job_lifecycle` (post_job's pre-publish fee floor resolves the
 # home's shipped minibits default) and two in `payment_wallet` (the worker's real send leg fetches
@@ -50,7 +55,17 @@ base64 = { workspace = true, optional = true }
 cashu = { version = "=0.17.2", optional = true }
 config.workspace = true
 git2 = { workspace = true, optional = true }
-reqwest = { workspace = true, optional = true }
+# `stream` adds `Response::bytes_stream`, so the credential proxy (#647) can relay an SSE upstream
+# response to the container without buffering it. Unions with the workspace feature set.
+reqwest = { workspace = true, optional = true, features = ["stream"] }
+# Credential-containment proxy transport (#647), all gated to `wallet`. hyper/1 terminates the
+# container's plain-HTTP calls; http-body-util streams the upstream response back; bytes is the shared
+# body type; futures-util maps the reqwest byte stream into a hyper body.
+bytes = { version = "1", optional = true }
+hyper = { version = "1", optional = true, features = ["server", "http1"] }
+hyper-util = { version = "0.1", optional = true, features = ["tokio"] }
+http-body-util = { version = "0.1", optional = true }
+futures-util = { version = "0.3", optional = true, default-features = false }
 cdk = { version = "=0.17.2", default-features = false, features = ["wallet"], optional = true }
 cdk-sqlite = { version = "=0.17.2", optional = true }
 getrandom = "0.3"

@@ -72,6 +72,12 @@ pub mod seller_agents;
 /// own module (with a neutral error) so the run loop stays focused on the relay surface.
 #[cfg(feature = "wallet")]
 pub mod seller_exec;
+/// Host-side credential-containment proxy (#647): the real model credential never enters a
+/// docker-mode job's container. A per-job placeholder is forwarded in its place and substituted for
+/// the real value at egress, only for an allowlisted upstream. Gated to `wallet` like its sole caller
+/// [`seller_exec`].
+#[cfg(feature = "wallet")]
+pub mod credential_proxy;
 /// Which of a node's resolved harnesses are serving right now: the live availability layer over the
 /// boot registry, so a harness that cannot deliver stops being advertised and stops attracting awards.
 pub mod seller_roster;
