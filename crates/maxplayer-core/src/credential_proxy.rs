@@ -11,11 +11,43 @@
 //! vendor's credential shape (`sk-ant-…`), forward *that* into the container in place of the real
 //! key, and point the container's `ANTHROPIC_BASE_URL` at this proxy. The proxy:
 //!
-//! 1. **identifies the job** by finding the placeholder value in the request, and
-//! 2. **substitutes** the real credential for the placeholder on the way out — **value-based**, so it
-//!    matches wherever the placeholder appears in headers or body without knowing any vendor's header
-//!    name (`x-api-key`, `authorization`, …). That header-agnosticism is what lets the same proxy
+//! 1. **identifies the job** by finding the placeholder value in a request header, and
+//! 2. **substitutes** the real credential for the placeholder on the way out — **value-based across
+//!    header values**, so it matches whichever header a vendor uses (`x-api-key`, `authorization`,
+//!    `api-key`, …) without knowing the name. That header-agnosticism is what lets the same proxy
 //!    serve `codex`, `cursor`, and any future harness with no per-vendor code.
+//!
+//! ## Why the BODY is never a substitution surface
+//!
+//! An earlier revision substituted the placeholder wherever it appeared, body included. That was a
+//! **credential-recovery hole**, and closing it is why this module now touches headers only.
+//!
+//! Value-based matching over header VALUES already gives full header-agnosticism — the reason body
+//! substitution was there in the first place. It bought no vendor coverage: every credential this
+//! proxy contains travels in a header (`x-api-key` for the Anthropic API key, `Authorization: Bearer`
+//! for the Anthropic auth/OAuth tokens and the OpenAI key). What it did buy was an injection surface,
+//! because the body is the one part of the request a stranger's job writes freely:
+//!
+//! 1. The job reads its own placeholder (`/proc/1/environ` — the container env is readable to it).
+//! 2. It posts to the proxy with the placeholder in the auth header AND inside a prompt string.
+//! 3. The proxy substitutes BOTH, so the REAL credential lands in the prompt.
+//! 4. The model repeats the prompt back, and the response reaches the container.
+//!
+//! The job now holds the real credential and containment is defeated. A variant needs no model
+//! cooperation at all: put the placeholder in a field the API rejects and read the real value out of
+//! the echoed error.
+//!
+//! The same reasoning already kept the URL path off the substitution surface; the body belongs in that
+//! exclusion for identical reasons, and it is the larger surface of the two. The body is therefore
+//! forwarded VERBATIM — it is not even an input to [`ProxyEngine::authorize`], so no future code path
+//! can reintroduce the substitution. If some future harness genuinely carries a credential in the
+//! body, it BREAKS here rather than leaking: the same fail-closed rule this module applies to derived
+//! tokens.
+//!
+//! Defence in depth on the return leg: [`relay`] scrubs the real credential back to the placeholder in
+//! the response headers and body. With the body no longer substituted, the only value that can echo is
+//! the header the upstream itself reflects (a `401` quoting the key it rejected, say) — that scrub
+//! catches it. It is the second line, never the first.
 //!
 //! What leaks from the container is now worthless: it only authenticates against *our* proxy, only
 //! for the life of the job, and only for an allowlisted upstream.
@@ -30,8 +62,9 @@
 //!   placeholder present, destination refused) the request fails; the caller NEVER falls back to
 //!   putting the real credential in the container. A silent fallback is the one failure mode invisible
 //!   from outside — jobs keep passing while containment is gone.
-//! - **Substitute in headers and body only, NEVER the URL path.** [`ProxyEngine::authorize`] rewrites
-//!   header values and the body; the request target is forwarded verbatim.
+//! - **Substitute in header values ONLY — never the body, never the URL path.**
+//!   [`ProxyEngine::authorize`] rewrites header values and nothing else; the request target and the
+//!   body are forwarded verbatim. Both are attacker-authored, so neither may carry a real credential.
 //! - **Format-plausible placeholder**, not a readable sentinel — see [`mint_anthropic_placeholder`].
 //! - **No secret in any image.** The proxy is a host process; the container receives only the
 //!   placeholder and the base-URL override.
@@ -145,17 +178,20 @@ impl std::fmt::Display for Refusal {
     }
 }
 
-/// The outcome of authorizing one request against the engine: either a fully-substituted forward plan
-/// (real credential now in the headers/body, destination approved) or a typed [`Refusal`].
+/// The outcome of authorizing one request against the engine: either a forward plan whose HEADERS
+/// carry the real credential (destination approved) or a typed [`Refusal`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
-    /// Forward to `upstream` (base URL) with these substituted headers and body. The path/query is
-    /// taken unchanged from the original request by the transport — it is deliberately absent here so
-    /// no code path can substitute into it.
+    /// Forward to `upstream` (base URL) with these substituted headers.
+    ///
+    /// The body and the path/query are BOTH taken unchanged from the original request by the
+    /// transport — they are deliberately absent here so no code path can substitute into either. The
+    /// body exclusion is load-bearing, not tidiness: a job authors its own request body, so
+    /// substituting there hands it the real credential the moment the upstream echoes the body back
+    /// (see the module docs).
     Forward {
         upstream: String,
         headers: Vec<(String, String)>,
-        body: Bytes,
     },
     Refuse(Refusal),
 }
@@ -210,21 +246,24 @@ impl ProxyEngine {
         self.creds.lock().unwrap().remove(placeholder).is_some()
     }
 
-    /// The decision for one request. `headers` are the incoming header (name, value) pairs and `body`
-    /// the buffered request body. The path is intentionally not an input to substitution.
+    /// The decision for one request, from its headers alone.
     ///
-    /// 1. **Identify the job** — find a registered placeholder that appears in any header value or in
-    ///    the body. None ⇒ [`Refusal::NoKnownPlaceholder`] (no-fallback: we will not forward a real
-    ///    credential we cannot attribute to a job).
+    /// The request BODY is deliberately not a parameter, and neither is the path. Both are authored by
+    /// a stranger's job, so neither may become a place the real credential is written — see the module
+    /// docs for the recovery attack that body substitution enabled. Keeping them out of the signature
+    /// is what makes the exclusion structural rather than a rule someone must remember.
+    ///
+    /// 1. **Identify the job** — find a registered placeholder that appears in a header VALUE. None ⇒
+    ///    [`Refusal::NoKnownPlaceholder`] (no-fallback: we will not forward a real credential we cannot
+    ///    attribute to a job).
     /// 2. **Allowlist the destination** — the resolved upstream host must be approved, else
     ///    [`Refusal::DestinationNotAllowed`] with NO substitution.
-    /// 3. **Substitute** — replace the placeholder with the real credential in every header value and
-    ///    in the body. The path/query is never touched (it is not even passed here).
-    pub fn authorize(&self, headers: &[(String, String)], body: &Bytes) -> Decision {
+    /// 3. **Substitute** — replace the placeholder with the real credential in every header value.
+    pub fn authorize(&self, headers: &[(String, String)]) -> Decision {
         let creds = self.creds.lock().unwrap();
         let Some(cred) = creds
             .values()
-            .find(|c| placeholder_present(&c.placeholder, headers, body))
+            .find(|c| placeholder_present(&c.placeholder, headers))
             .cloned()
         else {
             return Decision::Refuse(Refusal::NoKnownPlaceholder);
@@ -245,51 +284,57 @@ impl ProxyEngine {
             .filter(|(name, _)| !is_hop_by_hop(name))
             .map(|(name, value)| (name.clone(), value.replace(&cred.placeholder, &cred.real)))
             .collect();
-        let body = substitute_bytes(body, &cred.placeholder, &cred.real);
         Decision::Forward {
             upstream: cred.upstream,
             headers,
-            body,
         }
     }
-}
 
-/// Whether `placeholder` appears in any header value or in the body. Header *names* are not searched:
-/// the placeholder is a credential value, and matching a name would be a false positive.
-fn placeholder_present(placeholder: &str, headers: &[(String, String)], body: &Bytes) -> bool {
-    headers.iter().any(|(_, v)| v.contains(placeholder))
-        || twoway_contains(body, placeholder.as_bytes())
-}
-
-/// Replace every occurrence of `needle` with `real` in a byte body. Bodies are not required to be
-/// UTF-8, so this works on raw bytes rather than going through `String`.
-fn substitute_bytes(body: &Bytes, needle: &str, real: &str) -> Bytes {
-    let needle = needle.as_bytes();
-    if needle.is_empty() || !twoway_contains(body, needle) {
-        return body.clone();
+    /// The real credential registered under `placeholder`, for the response scrub in [`relay`].
+    ///
+    /// Returned as `(real, placeholder)` so the caller can run the substitution in REVERSE on the way
+    /// back. Not a leak of anything the caller does not already hold: [`Self::authorize`] just put this
+    /// same value into the outgoing headers.
+    fn scrub_pair_for(&self, headers: &[(String, String)]) -> Option<(String, String)> {
+        let creds = self.creds.lock().unwrap();
+        creds
+            .values()
+            .find(|c| placeholder_present(&c.placeholder, headers))
+            .map(|c| (c.real.clone(), c.placeholder.clone()))
     }
-    let real = real.as_bytes();
-    let mut out = Vec::with_capacity(body.len());
+}
+
+/// Whether `placeholder` appears in any header value. Header *names* are not searched: the placeholder
+/// is a credential value, and matching a name would be a false positive.
+///
+/// The BODY is not searched either. A body-only match could never authenticate anything (the upstream
+/// reads the header), so it identified nothing while widening what counted as "a request from this
+/// job" — and it was the first half of the recovery attack the module docs describe.
+fn placeholder_present(placeholder: &str, headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(_, v)| v.contains(placeholder))
+}
+
+/// Replace every occurrence of `needle` with `replacement` in a byte buffer. Bodies are not required to
+/// be UTF-8, so this works on raw bytes rather than going through `String`.
+///
+/// Used on the RESPONSE leg only (real ⇒ placeholder). The request leg deliberately has no body
+/// substitution at all.
+fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+    if needle.is_empty() {
+        return haystack.to_vec();
+    }
+    let mut out = Vec::with_capacity(haystack.len());
     let mut i = 0;
-    while i < body.len() {
-        if body[i..].starts_with(needle) {
-            out.extend_from_slice(real);
+    while i < haystack.len() {
+        if haystack[i..].starts_with(needle) {
+            out.extend_from_slice(replacement);
             i += needle.len();
         } else {
-            out.push(body[i]);
+            out.push(haystack[i]);
             i += 1;
         }
     }
-    Bytes::from(out)
-}
-
-/// Naive substring search over bytes — the needle (a credential) is short and requests are small, so
-/// a dependency-free scan is fine and keeps the match identical to [`substitute_bytes`].
-fn twoway_contains(haystack: &Bytes, needle: &[u8]) -> bool {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return false;
-    }
-    haystack.windows(needle.len()).any(|w| w == needle)
+    out
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -390,6 +435,18 @@ impl Drop for RunningProxy {
 /// allowlist, and the listener dies with the job. Tightening the bind to the docker bridge address is
 /// a follow-up that dovetails with the #797 egress work.
 pub async fn start(engine: Arc<ProxyEngine>, client: reqwest::Client) -> std::io::Result<RunningProxy> {
+    // KNOWN EXPOSURE, deliberately unchanged for now. `0.0.0.0` is every interface, so on a seller with
+    // a public IP and no firewall this per-job listener is internet-reachable on a random high port.
+    // The placeholder is the bearer — a caller without it gets `NoKnownPlaceholder` — so this is not an
+    // open relay. But the job HOLDS the placeholder by construction, so it can hand placeholder+port to
+    // an outside accomplice, who can then burn the seller's model quota for the job's lifetime. Quota
+    // theft, bounded by job duration; not credential theft (the real value never leaves this process).
+    //
+    // Narrowing the bind is platform-split and must not be guessed: Docker Desktop reaches a
+    // loopback-bound host service through `host.docker.internal`, but on Linux the alias maps to the
+    // bridge gateway (`--add-host …:host-gateway`), where a `127.0.0.1` bind is unreachable and the
+    // correct target is the bridge address. Changing this needs a Linux docker seat to verify against;
+    // until then, seller-operators on a public box should firewall inbound ports.
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", 0)).await?;
     let addr = listener.local_addr()?;
     let engine_for_task = Arc::clone(&engine);
@@ -478,7 +535,12 @@ async fn handle_request(
         }
     };
 
-    match engine.authorize(&headers, &body) {
+    // The reverse-substitution pair for the response leg, resolved from the SAME header match that
+    // authorizes the request. Taken before `authorize` consumes nothing — both read the incoming
+    // headers, so they agree on which job this is.
+    let scrub = engine.scrub_pair_for(&headers);
+
+    match engine.authorize(&headers) {
         Decision::Refuse(reason) => {
             let status = match reason {
                 Refusal::DestinationNotAllowed { .. } => StatusCode::FORBIDDEN,
@@ -486,8 +548,10 @@ async fn handle_request(
             };
             Ok(refusal_response(status, &reason.to_string()))
         }
-        Decision::Forward { upstream, headers, body } => {
-            match relay(&client, &method, &upstream, &path_and_query, headers, body).await {
+        // `body` is the ORIGINAL buffered request body, forwarded verbatim: the decision never
+        // carried it, so nothing substituted a credential into it.
+        Decision::Forward { upstream, headers } => {
+            match relay(&client, &method, &upstream, &path_and_query, headers, body, scrub).await {
                 Ok(response) => Ok(response),
                 // No-fallback: an upstream failure fails the request; it never resends without the
                 // proxy or with the real credential in the container.
@@ -497,8 +561,15 @@ async fn handle_request(
     }
 }
 
-/// Relay a substituted request to the real upstream and stream the response body straight back to the
+/// Relay a header-substituted request to the real upstream and stream the response back to the
 /// container without buffering — model responses are SSE streams.
+///
+/// `scrub` is the `(real, placeholder)` pair for this job. Every occurrence of the real credential in
+/// the response — headers and body alike — is rewritten back to the placeholder before the container
+/// sees it. This is DEFENCE IN DEPTH, not the primary control: the primary control is that the real
+/// credential only ever exists in a request HEADER, so the sole way it can return is an upstream that
+/// reflects that header (a `401` quoting the key it rejected). The scrub catches that class, plus any
+/// echo behaviour a future upstream invents.
 async fn relay(
     client: &reqwest::Client,
     method: &hyper::Method,
@@ -506,6 +577,7 @@ async fn relay(
     path_and_query: &str,
     headers: Vec<(String, String)>,
     body: Bytes,
+    scrub: Option<(String, String)>,
 ) -> Result<Response<ProxyBody>, String> {
     let url = format!("{}{}", upstream.trim_end_matches('/'), path_and_query);
     let method = reqwest::Method::from_bytes(method.as_str().as_bytes())
@@ -522,17 +594,90 @@ async fn relay(
     let status = upstream_response.status();
     let mut builder = Response::builder().status(status.as_u16());
     for (name, value) in upstream_response.headers() {
-        if !is_hop_by_hop(name.as_str()) {
-            builder = builder.header(name, value);
+        if is_hop_by_hop(name.as_str()) {
+            continue;
+        }
+        // Response headers are scrubbed too: an upstream that reflects the credential in a header
+        // (`www-authenticate`, a debug echo) must not hand it to the container.
+        match (&scrub, value.to_str()) {
+            (Some((real, placeholder)), Ok(text)) if text.contains(real.as_str()) => {
+                builder = builder.header(name, text.replace(real.as_str(), placeholder));
+            }
+            _ => builder = builder.header(name, value),
         }
     }
-    let stream = upstream_response
-        .bytes_stream()
-        .map(|chunk| chunk.map(Frame::data).map_err(std::io::Error::other));
-    let body = BodyExt::boxed(StreamBody::new(stream));
+    let upstream_body = Box::pin(upstream_response.bytes_stream());
+    let body = match scrub {
+        Some((real, placeholder)) => {
+            BodyExt::boxed(StreamBody::new(scrub_stream(upstream_body, real, placeholder)))
+        }
+        None => BodyExt::boxed(StreamBody::new(
+            upstream_body.map(|chunk| chunk.map(Frame::data).map_err(std::io::Error::other)),
+        )),
+    };
     builder
         .body(body)
         .map_err(|error| format!("building proxied response failed: {error}"))
+}
+
+/// Rewrite `real` back to `placeholder` across a streamed response body, without buffering the stream.
+///
+/// A credential can straddle a chunk boundary, so a naive per-chunk replace would miss it. This holds
+/// back the last `real.len() - 1` bytes of what it would otherwise emit — the longest possible partial
+/// match — and re-examines them once the next chunk arrives. The held-back tail is flushed when the
+/// upstream stream ends.
+///
+/// SSE responses stay streaming: each chunk is forwarded as it arrives, minus that small carry-over.
+fn scrub_stream<S>(
+    inner: S,
+    real: String,
+    placeholder: String,
+) -> impl futures_util::Stream<Item = Result<Frame<Bytes>, std::io::Error>>
+where
+    S: futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin,
+{
+    // `None` inner ⇒ the stream is finished (ended or errored); stop yielding.
+    futures_util::stream::unfold(
+        (Some(inner), Vec::<u8>::new()),
+        move |(inner, carry)| {
+            let (real, placeholder) = (real.clone(), placeholder.clone());
+            async move {
+                let mut inner = inner?;
+                let mut carry = carry;
+                loop {
+                    match inner.next().await {
+                        Some(Ok(chunk)) => {
+                            carry.extend_from_slice(&chunk);
+                            let replaced =
+                                replace_bytes(&carry, real.as_bytes(), placeholder.as_bytes());
+                            // Everything but a possible split match at the tail is safe to emit.
+                            let hold = real.len().saturating_sub(1).min(replaced.len());
+                            let split = replaced.len() - hold;
+                            if split == 0 {
+                                // Nothing emittable yet — keep pulling rather than yielding empty.
+                                carry = replaced;
+                                continue;
+                            }
+                            let emit = Bytes::copy_from_slice(&replaced[..split]);
+                            let rest = replaced[split..].to_vec();
+                            return Some((Ok(Frame::data(emit)), (Some(inner), rest)));
+                        }
+                        Some(Err(error)) => {
+                            return Some((Err(std::io::Error::other(error)), (None, Vec::new())));
+                        }
+                        None => {
+                            let tail =
+                                replace_bytes(&carry, real.as_bytes(), placeholder.as_bytes());
+                            if tail.is_empty() {
+                                return None;
+                            }
+                            return Some((Ok(Frame::data(Bytes::from(tail))), (None, Vec::new())));
+                        }
+                    }
+                }
+            }
+        },
+    )
 }
 
 /// A small text response for a refusal or transport error — the container sees a `4xx`/`5xx`, never a
@@ -576,6 +721,14 @@ mod tests {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     }
 
+    /// Substring search over raw bytes, for asserting a credential is (or is not) present.
+    fn contains(haystack: &[u8], needle: &str) -> bool {
+        let needle = needle.as_bytes();
+        !needle.is_empty()
+            && needle.len() <= haystack.len()
+            && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
     // #647 acceptance #5: the minted placeholder is format-plausible (vendor prefix, vendor charset)
     // yet distinct from any real credential — a leak of it is harmless.
     #[test]
@@ -599,8 +752,7 @@ mod tests {
         let ph = mint_anthropic_placeholder();
         let engine = engine_with_job(&ph, UPSTREAM);
         let headers = hdr(&[("x-api-key", &ph), ("anthropic-version", "2023-06-01")]);
-        let body = Bytes::from_static(b"{\"model\":\"claude\"}");
-        match engine.authorize(&headers, &body) {
+        match engine.authorize(&headers) {
             Decision::Forward { upstream, headers, .. } => {
                 assert_eq!(upstream, UPSTREAM);
                 let api_key = headers.iter().find(|(n, _)| n == "x-api-key").unwrap();
@@ -617,18 +769,81 @@ mod tests {
     // Value-based substitution also rewrites the placeholder wherever it rides in the BODY, with no
     // knowledge of a header name — the property that lets this serve future harnesses.
     #[test]
-    fn authorize_substitutes_placeholder_in_the_body() {
+    fn authorize_substitutes_whichever_header_carries_the_placeholder() {
         let ph = mint_anthropic_placeholder();
         let engine = engine_with_job(&ph, UPSTREAM);
-        let headers = hdr(&[("authorization", &format!("Bearer {ph}"))]);
-        let body = Bytes::from(format!("{{\"key\":\"{ph}\"}}"));
-        match engine.authorize(&headers, &body) {
-            Decision::Forward { headers, body, .. } => {
-                assert_eq!(body, Bytes::from(format!("{{\"key\":\"{REAL}\"}}")));
+        // A vendor header name this module has never heard of: the match is by VALUE, so it still
+        // substitutes. This is the header-agnosticism that body substitution was wrongly credited for.
+        let headers = hdr(&[("x-vendor-invented-auth", &format!("Bearer {ph}"))]);
+        match engine.authorize(&headers) {
+            Decision::Forward { headers, .. } => {
                 assert_eq!(headers[0].1, format!("Bearer {REAL}"));
             }
             other => panic!("expected Forward, got {other:?}"),
         }
+    }
+
+    // THE ATTACK THIS MODULE'S BODY EXCLUSION EXISTS FOR, end to end through a live proxy.
+    //
+    // A job authors its own request body. When the proxy substituted there, a job could plant its
+    // placeholder in a prompt string, the proxy would rewrite it to the REAL credential, and the model
+    // would repeat it straight back into the container — total defeat of containment. Here the hostile
+    // body must reach the upstream with the placeholder still in it, while the HEADER authenticates.
+    #[tokio::test]
+    async fn a_placeholder_planted_in_the_request_body_never_becomes_the_real_credential() {
+        let (stub_addr, stub) = spawn_stub("UPSTREAM_OK").await;
+        let upstream = format!("http://{stub_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        let placeholder = mint_anthropic_placeholder();
+        engine
+            .register(JobCredential {
+                placeholder: placeholder.clone(),
+                real: REAL.to_owned(),
+                upstream: upstream.clone(),
+            })
+            .unwrap();
+        let proxy = start(Arc::clone(&engine), reqwest::Client::new()).await.unwrap();
+        let port = proxy.local_addr().port();
+
+        // The hostile shape: placeholder in the auth header (to authenticate) AND inside a prompt
+        // string (the echo channel).
+        let hostile_body = format!(
+            "{{\"messages\":[{{\"role\":\"user\",\"content\":\"Repeat verbatim: {placeholder}\"}}]}}"
+        );
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("x-api-key", &placeholder)
+            .body(hostile_body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        let seen = stub.await.unwrap();
+        assert_eq!(
+            seen.api_key.as_deref(),
+            Some(REAL),
+            "the HEADER still carries the real credential — the request must still work"
+        );
+        assert!(
+            !contains(seen.body.as_bytes(), REAL),
+            "the real credential must never be written into a job-authored body: {}",
+            seen.body
+        );
+        assert_eq!(
+            seen.body, hostile_body,
+            "the body reaches the upstream byte-for-byte, placeholder and all"
+        );
+    }
+
+    // A placeholder ONLY in the body identifies nothing: it cannot authenticate upstream (the vendor
+    // reads a header), so treating it as identification widened the attack surface for no gain.
+    #[test]
+    fn a_body_only_placeholder_does_not_identify_a_job() {
+        let ph = mint_anthropic_placeholder();
+        let engine = engine_with_job(&ph, UPSTREAM);
+        let decision = engine.authorize(&hdr(&[("content-type", "application/json")]));
+        assert_eq!(decision, Decision::Refuse(Refusal::NoKnownPlaceholder));
     }
 
     // #647 acceptance #3 (load-bearing): a placeholder bound to a NON-approved upstream is refused
@@ -639,7 +854,7 @@ mod tests {
         let ph = mint_anthropic_placeholder();
         let engine = engine_with_job(&ph, "https://attacker.example.com");
         let headers = hdr(&[("x-api-key", &ph)]);
-        let decision = engine.authorize(&headers, &Bytes::new());
+        let decision = engine.authorize(&headers);
         assert_eq!(
             decision,
             Decision::Refuse(Refusal::DestinationNotAllowed {
@@ -659,7 +874,7 @@ mod tests {
         let engine = engine_with_job(&ph, UPSTREAM);
         let headers = hdr(&[("x-api-key", "sk-ant-api03-someOTHERvaluenotregistered")]);
         assert_eq!(
-            engine.authorize(&headers, &Bytes::new()),
+            engine.authorize(&headers),
             Decision::Refuse(Refusal::NoKnownPlaceholder)
         );
     }
@@ -704,6 +919,9 @@ mod tests {
     struct StubSeen {
         request_line: String,
         api_key: Option<String>,
+        /// The request BODY as the upstream received it — the ground truth for "no credential was
+        /// written into a job-authored body".
+        body: String,
     }
 
     fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -713,8 +931,18 @@ mod tests {
     /// A one-shot plain-HTTP stub upstream standing in for `api.anthropic.com`. It records the request
     /// line (to prove the path is forwarded verbatim) and the `x-api-key` it received (to prove the
     /// real credential was substituted), then answers `200` with `body_out`.
-    async fn spawn_stub(body_out: &'static str) -> (SocketAddr, tokio::task::JoinHandle<StubSeen>) {
+    async fn spawn_stub(body_out: impl Into<String>) -> (SocketAddr, tokio::task::JoinHandle<StubSeen>) {
+        spawn_stub_with(body_out, None).await
+    }
+
+    /// [`spawn_stub`] plus an optional extra response header line (`"name: value"`), so a test can make
+    /// the upstream reflect a credential in a HEADER as well as in the body.
+    async fn spawn_stub_with(
+        body_out: impl Into<String>,
+        extra_header: Option<String>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<StubSeen>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let body_out = body_out.into();
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
@@ -731,26 +959,147 @@ mod tests {
                     break;
                 }
             }
-            let text = String::from_utf8_lossy(&buf).to_string();
+            // Read the body too: `content-length` bytes past the header terminator. Without this the
+            // stub could not prove what the upstream actually received in the body.
+            let head_end = find_subslice(&buf, b"\r\n\r\n").map(|i| i + 4).unwrap_or(buf.len());
+            let head_text = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            let content_length = head_text
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            while buf.len() < head_end + content_length {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let body = String::from_utf8_lossy(&buf[head_end..]).to_string();
+
+            let text = head_text;
             let request_line = text.lines().next().unwrap_or_default().to_owned();
             let api_key = text.lines().find_map(|line| {
                 let (name, value) = line.split_once(':')?;
                 name.eq_ignore_ascii_case("x-api-key").then(|| value.trim().to_owned())
             });
+            let extra = extra_header.map(|h| format!("{h}\r\n")).unwrap_or_default();
             let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/plain\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/plain\r\n{}\r\n{}",
                 body_out.len(),
+                extra,
                 body_out
             );
             sock.write_all(response.as_bytes()).await.unwrap();
             sock.flush().await.unwrap();
-            StubSeen { request_line, api_key }
+            StubSeen { request_line, api_key, body }
         });
         (addr, handle)
     }
 
     fn arc_engine_with_job(placeholder: &str, upstream: &str) -> Arc<ProxyEngine> {
         Arc::new(engine_with_job(placeholder, upstream))
+    }
+
+    /// Drive one request through a live proxy against a stub upstream, returning `(headers, body)` as
+    /// the CONTAINER sees them. Shared by the response-scrub tests.
+    async fn round_trip(
+        stub_body: impl Into<String>,
+        stub_header: Option<String>,
+    ) -> (reqwest::header::HeaderMap, String) {
+        let (stub_addr, _stub) = spawn_stub_with(stub_body, stub_header).await;
+        let upstream = format!("http://{stub_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        let placeholder = mint_anthropic_placeholder();
+        engine
+            .register(JobCredential {
+                placeholder: placeholder.clone(),
+                real: REAL.to_owned(),
+                upstream: upstream.clone(),
+            })
+            .unwrap();
+        let proxy = start(Arc::clone(&engine), reqwest::Client::new()).await.unwrap();
+        let port = proxy.local_addr().port();
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("x-api-key", &placeholder)
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        let headers = response.headers().clone();
+        (headers, response.text().await.unwrap())
+    }
+
+    // DEFENCE IN DEPTH on the return leg: an upstream that reflects the real credential in its response
+    // BODY (a 401 quoting the key it rejected, a debug echo) must not hand it to the container. The
+    // scrub rewrites it back to the worthless placeholder.
+    #[tokio::test]
+    async fn a_real_credential_echoed_in_the_response_body_is_scrubbed_to_the_placeholder() {
+        let echoed = format!("upstream said: invalid key {REAL} — retry");
+        let (_headers, body) = round_trip(echoed, None).await;
+        assert!(
+            !body.contains(REAL),
+            "the real credential must never reach the container: {body}"
+        );
+        assert!(
+            body.contains("sk-ant-api03-") && body.contains("upstream said: invalid key "),
+            "the echo is rewritten in place, not dropped: {body}"
+        );
+    }
+
+    // The same scrub applies to response HEADERS — `www-authenticate` and friends reflect credentials.
+    #[tokio::test]
+    async fn a_real_credential_echoed_in_a_response_header_is_scrubbed() {
+        let (headers, _body) =
+            round_trip("ok", Some(format!("www-authenticate: Bearer key={REAL}"))).await;
+        let seen = headers
+            .get("www-authenticate")
+            .expect("stub set the header")
+            .to_str()
+            .unwrap();
+        assert!(!seen.contains(REAL), "real credential leaked in a response header: {seen}");
+        assert!(seen.contains("sk-ant-api03-"), "rewritten to the placeholder: {seen}");
+    }
+
+    // The scrub must survive CHUNK BOUNDARIES. A credential split across two stream frames would slip
+    // past a naive per-chunk replace, so `scrub_stream` holds back `len(real) - 1` bytes and re-checks.
+    // Driven directly with hand-split frames, since a stub cannot reliably force the split.
+    #[tokio::test]
+    async fn the_response_scrub_catches_a_credential_split_across_chunks() {
+        use futures_util::TryStreamExt as _;
+        let placeholder = mint_anthropic_placeholder();
+        let (head, tail) = REAL.split_at(20);
+        // Three frames: the credential straddles frames 1→2, and frame 3 is ordinary trailing data.
+        let frames: Vec<reqwest::Result<Bytes>> = vec![
+            Ok(Bytes::from(format!("prefix-{head}"))),
+            Ok(Bytes::from(format!("{tail}-middle"))),
+            Ok(Bytes::from_static(b"-suffix")),
+        ];
+        let scrubbed = scrub_stream(
+            futures_util::stream::iter(frames),
+            REAL.to_owned(),
+            placeholder.clone(),
+        );
+        let collected: Vec<u8> = scrubbed
+            .try_fold(Vec::new(), |mut acc, frame| async move {
+                if let Ok(data) = frame.into_data() {
+                    acc.extend_from_slice(&data);
+                }
+                Ok(acc)
+            })
+            .await
+            .unwrap();
+        let text = String::from_utf8(collected).unwrap();
+        assert_eq!(
+            text,
+            format!("prefix-{placeholder}-middle-suffix"),
+            "a split credential must still be rewritten, and nothing else may be lost"
+        );
+        assert!(!text.contains(REAL), "no fragment of the real credential survives");
     }
 
     // #647 acceptance #1 (plumbing): a request carrying the placeholder is forwarded to the approved
