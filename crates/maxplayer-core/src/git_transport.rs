@@ -248,6 +248,98 @@ fn header_for(remote_url: &str, auth: Option<&str>) -> Result<Option<String>, Tr
     }
 }
 
+/// Where hook lookup is pinned on a job workdir's git legs. `/dev/null` is not a directory, so a
+/// `git` CLI resolving a hook beneath it finds nothing and runs nothing.
+const NEUTRALISED_HOOKS_PATH: &str = "/dev/null";
+
+/// What a job left in its workdir's `.git/`, found by [`neutralise_workdir_hooks`] while pinning hook
+/// lookup off. Reported, never fatal — see that function for why refusing would be the worse trade.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HookFindings {
+    /// Live hook file names under `hooks/`. `*.sample` is excluded: git writes those itself and they
+    /// are inert, so counting them would flag every normal workdir as planted.
+    pub hooks: Vec<String>,
+    /// A repo-LOCAL `core.hooksPath` that was already set to something other than our own pin —
+    /// i.e. the job pointed hook lookup at a directory it controls.
+    pub hooks_path: Option<String>,
+}
+
+impl HookFindings {
+    /// Nothing planted: no live hook file and no `core.hooksPath` of the job's own.
+    pub fn is_clean(&self) -> bool {
+        self.hooks.is_empty() && self.hooks_path.is_none()
+    }
+}
+
+/// Pin `core.hooksPath` to [`NEUTRALISED_HOOKS_PATH`] in a job workdir's LOCAL config, reporting any
+/// hook the job planted (#826).
+///
+/// The job agent owns this workdir by design — it is bind-mounted read-write into the container at
+/// `/work`, so `.git/` is reachable from inside the sandbox and the agent can leave a `pre-push` or a
+/// `core.hooksPath` behind. The delivery legs then run on the HOST, and `git push` executes hooks.
+/// That would be sandbox → host code execution on the delivery path, in the daemon's environment,
+/// beside the wallet and keys the sandbox exists to protect.
+///
+/// **Why a config write and not the `-c core.hooksPath=/dev/null` / `--no-verify` flags #826 asks
+/// for: there is no argv to put them on.** Every leg here is in-process libgit2, which executes NO
+/// hooks at all — `seller_git::tests::snapshot_bypasses_base_repo_hooks` proves it by planting a
+/// failing `pre-commit` and asserting delivery still succeeds. So no planted hook runs today and a
+/// CLI flag has nothing to attach to. Writing the pin into the repo's own config puts it where the
+/// `git` CLI *would* honour it, so the property holds for a future call site that shells out — the
+/// only way this vector can actually open. `tests/no_system_git.rs` is what keeps such a call site
+/// from arriving unnoticed, and it runs only in the `git-delivery` money-path job.
+///
+/// **Why report and not refuse**, which is the one place this departs from the issue's suggestion:
+/// the planted hook is inert, so refusing would trade nothing for a real availability loss — the
+/// untrusted agent could fail its own seller's delivery, and an unpushed delivery is an unpaid job.
+/// Refusing would also invert the deliberate property that base-repo hooks cannot block a delivery.
+///
+/// Ordering is load-bearing: this runs on the delivery legs, after the container is gone. Pinning at
+/// workdir init instead would leave the agent free to overwrite it.
+pub(crate) fn neutralise_workdir_hooks(repo: &Repository) -> Result<HookFindings, TransportError> {
+    let mut findings = HookFindings::default();
+
+    let mut config = repo
+        .config()
+        .and_then(|config| config.open_level(ConfigLevel::Local))
+        .map_err(|error| TransportError::Io(format!("open local config: {error}")))?;
+    if let Ok(existing) = config.get_string("core.hooksPath") {
+        if existing != NEUTRALISED_HOOKS_PATH {
+            findings.hooks_path = Some(existing);
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir(repo.path().join("hooks")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".sample") {
+                findings.hooks.push(name);
+            }
+        }
+        findings.hooks.sort();
+    }
+
+    config
+        .set_str("core.hooksPath", NEUTRALISED_HOOKS_PATH)
+        .map_err(|error| TransportError::Io(format!("pin core.hooksPath: {error}")))?;
+
+    Ok(findings)
+}
+
+/// Pin hooks off for `repo` and surface anything the job planted on stderr, beside the push/snapshot
+/// lines the delivery legs already emit. A job writing into `.git/` is a signal worth seeing even
+/// though it cannot execute.
+pub(crate) fn neutralise_and_report_hooks(repo: &Repository, leg: &str) -> Result<(), TransportError> {
+    let findings = neutralise_workdir_hooks(repo)?;
+    if !findings.is_clean() {
+        eprintln!(
+            "seller {leg} hooks-neutralised planted={:?} prior-hooksPath={:?}",
+            findings.hooks, findings.hooks_path
+        );
+    }
+    Ok(())
+}
+
 /// Push `refs/heads/<branch>:refs/heads/<branch>` to `remote_url` in-process, returning the pushed
 /// commit OID (full hex). `auth` is the seller secret hex (NIP-98 for relay-git; `None`/public https
 /// pushes unauthenticated and fail closed at the remote).
@@ -277,6 +369,9 @@ pub fn push_branch_with_header(
 
     let repo = Repository::open(workdir)
         .map_err(|error| TransportError::Io(format!("open workdir repo: {error}")))?;
+    // #826: the workdir was writable by the sandboxed job, and this leg runs on the HOST. Pin hook
+    // lookup off before any git write, and surface anything the job planted.
+    neutralise_and_report_hooks(&repo, "push")?;
     let mut remote = repo
         .remote_anonymous(remote_url)
         .map_err(|error| TransportError::Io(format!("anonymous remote: {error}")))?;
@@ -682,5 +777,105 @@ mod tests {
                 .send()
         });
         assert!(result.is_err(), "the request should fail to connect, but must not panic");
+    }
+
+    // ── #826: hook neutralisation on the delivery legs ──────────────────────────────────────────
+    fn hooks_repo(label: &str) -> (std::path::PathBuf, Repository) {
+        let dir = std::env::temp_dir().join(format!(
+            "maxplayer-hooks-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let repo = Repository::init(&dir).expect("init repo");
+        (dir, repo)
+    }
+
+    fn planted_hook(repo: &Repository, name: &str, body: &str) {
+        let hooks = repo.path().join("hooks");
+        std::fs::create_dir_all(&hooks).expect("hooks dir");
+        std::fs::write(hooks.join(name), body).expect("write hook");
+    }
+
+    fn local_hooks_path(repo: &Repository) -> Option<String> {
+        repo.config()
+            .and_then(|config| config.open_level(ConfigLevel::Local))
+            .and_then(|config| config.get_string("core.hooksPath"))
+            .ok()
+    }
+
+    // POSITIVE CONTROL for the `*.sample` trap. `git init` populates `hooks/` with sample files, so a
+    // naive "non-empty `.git/hooks`" check would flag EVERY workdir — a guard that fires on everything
+    // is not a guard. A normal workdir must read CLEAN. The sample is planted explicitly rather than
+    // trusting whatever libgit2's `init` happens to write, so the exclusion is red-on-revert: drop the
+    // `.sample` filter and this test fails.
+    #[test]
+    fn a_normal_workdir_and_its_samples_read_clean() {
+        let (dir, repo) = hooks_repo("clean");
+        planted_hook(&repo, "pre-push.sample", "#!/bin/sh\nexit 1\n");
+
+        let findings = neutralise_workdir_hooks(&repo).expect("neutralise");
+
+        assert!(
+            findings.is_clean(),
+            "a normal workdir must still deliver; samples are inert, got {findings:?}"
+        );
+        assert_eq!(local_hooks_path(&repo).as_deref(), Some(NEUTRALISED_HOOKS_PATH));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A hook the job planted is REPORTED — the write into `.git/` is the signal worth surfacing — and
+    // hook lookup is pinned off, so a `git` CLI call site would find nothing to run. Delivery is NOT
+    // refused: refusing would let the untrusted agent fail its own seller's push.
+    #[test]
+    fn a_planted_hook_is_reported_and_lookup_is_pinned_off() {
+        let (dir, repo) = hooks_repo("planted");
+        planted_hook(&repo, "pre-push", "#!/bin/sh\nid > /tmp/escaped\n");
+
+        let findings = neutralise_workdir_hooks(&repo).expect("neutralise");
+
+        assert_eq!(findings.hooks, vec!["pre-push".to_string()]);
+        assert!(!findings.is_clean());
+        assert_eq!(local_hooks_path(&repo).as_deref(), Some(NEUTRALISED_HOOKS_PATH));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The other half of the vector, and the half a hooks-directory scan alone would miss: no hook
+    // FILE, but `core.hooksPath` aimed at a directory the job controls.
+    #[test]
+    fn a_planted_hooks_path_is_reported_and_overwritten() {
+        let (dir, repo) = hooks_repo("hookspath");
+        repo.config()
+            .and_then(|config| config.open_level(ConfigLevel::Local))
+            .expect("local config")
+            .set_str("core.hooksPath", "/work/.evil-hooks")
+            .expect("plant hooksPath");
+
+        let findings = neutralise_workdir_hooks(&repo).expect("neutralise");
+
+        assert_eq!(findings.hooks_path.as_deref(), Some("/work/.evil-hooks"));
+        assert_eq!(local_hooks_path(&repo).as_deref(), Some(NEUTRALISED_HOOKS_PATH));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Both post-agent legs run the pin (snapshot, then push), so the second one reads the pin the
+    // first one wrote. It must not report OUR OWN pin as a planted `hooksPath` — that false positive
+    // would fire on every normal contribution delivery, which is the shape that makes a warning
+    // worthless.
+    #[test]
+    fn our_own_pin_is_not_reported_as_planted() {
+        let (dir, repo) = hooks_repo("idempotent");
+        neutralise_workdir_hooks(&repo).expect("first leg");
+
+        let findings = neutralise_workdir_hooks(&repo).expect("second leg");
+
+        assert!(
+            findings.is_clean(),
+            "the pin we wrote ourselves is not a planted hook, got {findings:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
