@@ -564,7 +564,9 @@ pub fn compose_agent_prompt(
          never into the job directory, where it would become part of your deliverable. Prefer \
          `nix develop` when the project ships a flake and nix is present, otherwise a user-local \
          installer such as rustup, `pip install --user`, or `npm install -g` with a prefix under \
-         `$HOME`.\n\
+         `$HOME`. When `$HOME` is not writable, say so in your output and carry on with the \
+         rest of the task — a named obstacle is worth more to the buyer than a deadline spent \
+         hiding one.\n\
          ---\n\
          DELIVERY (required). Your deliverable is the FINAL STATE OF YOUR CURRENT WORKING \
          DIRECTORY:\n\
@@ -1980,6 +1982,8 @@ mod tests {
                 "your deliverable. Prefer `nix develop` when the project ships a flake",
                 "otherwise a user-local installer such as rustup",
                 "with a prefix under `$HOME`.",
+                "say so in your output and carry on with the rest of the task",
+                "worth more to the buyer than a deadline spent hiding one.",
             ] {
                 assert!(
                     prompt.contains(joined),
