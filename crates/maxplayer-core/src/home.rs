@@ -277,7 +277,11 @@ pub struct SellerConfig {
 /// Top-level on `MaxplayerConfig`, not nested under `[seller]`: `SellerConfig`'s literal is built in
 /// the money-path `seller.rs`, which this must not touch (same placement rationale as
 /// [`SellerAnnounceConfig`]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `Default` is derived so a caller naming the two or three fields it cares about can spread the
+/// rest. Every field is already `#[serde(default)]` — a config file has always been able to omit
+/// them — so the derive states in Rust what the deserializer already accepted, and adding a field
+/// stops being a mechanical edit at every construction site.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxConfig {
     /// Which executor runs the agent command. `launcher` (default) prepends a launcher argv;
@@ -325,6 +329,41 @@ pub struct SandboxConfig {
     /// Unused under `launcher` mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+    /// `docker` mode: the dedicated docker network a job's container joins (`docker run --network`).
+    /// Omitted ⇒ the daemon default (the shared `bridge` network).
+    ///
+    /// The network is what makes the #797 egress policy expressible AND enforceable, for two
+    /// separate reasons:
+    ///
+    /// * **A stable interface to scope rules to.** Firewall rules that deny the LAN must match only
+    ///   sandbox traffic. A named network has its own `br-*` interface, so every rule is
+    ///   interface-scoped and cannot match a service the seller runs.
+    /// * **DNS survives the host deny.** On a user-defined network a container resolves through
+    ///   docker's embedded resolver at `127.0.0.11`, inside its own netns — no packet crosses the
+    ///   bridge to a host or LAN resolver. On the shared default bridge docker instead copies the
+    ///   host's `resolv.conf`, so if that names a LAN or host resolver, denying the LAN also denies
+    ///   DNS and every job fails to resolve anything.
+    ///
+    /// A seat that sets this without installing the rules is NOT contained — see
+    /// `maxplayer sandbox-net`, and [`crate::sandbox_net`] for what the rules are and why there are
+    /// two chains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// `docker` mode: the TCP port range the per-job credential proxy (#647) binds inside, as
+    /// `"<start>-<end>"` or a single `"<port>"`. Omitted ⇒ the shipped behaviour, an ephemeral port
+    /// chosen by the kernel per job.
+    ///
+    /// This exists only so a static firewall rule can name the pinhole. The proxy's default bind is
+    /// port 0 — a fresh random high port every job — and no `iptables` rule can express "whatever
+    /// port the proxy happens to have got". Setting a range narrows the ports the proxy may use so
+    /// the host deny can carry one matching exception; leaving it unset changes nothing about how
+    /// the proxy binds today.
+    ///
+    /// The range must be at least as large as the number of jobs that can run concurrently: each
+    /// contained job holds its own listener for its lifetime, and a range that runs out fails the
+    /// job rather than falling back to a random port (the containment path has no fallbacks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_port_range: Option<String>,
 }
 
 /// Which executor the `[sandbox]` section selects.

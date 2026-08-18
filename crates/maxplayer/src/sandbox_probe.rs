@@ -810,6 +810,7 @@ mod tests {
             image: Some(image),
             forward_env: Vec::new(),
             runtime: None,
+            ..Default::default()
         }))
         .expect("mode=docker with an image resolves");
         let verdict = probe_containment(&policy, &root);
