@@ -739,6 +739,103 @@ mod checks {
         }
     }
 
+    const EGRESS_CHECK: &str = "sandbox egress";
+
+    /// Whether the #797 egress chains are installed on this host, as far as a non-root doctor can
+    /// tell.
+    ///
+    /// The states a container job can be in are: no dedicated network (nothing to enforce against),
+    /// network but no rules, or network with rules. **They are indistinguishable from inside a job**
+    /// — nothing about the job's behaviour differs until something reaches the seller's LAN, and by
+    /// then it has been reached. So the operator is the only one who can be told.
+    pub(super) fn check_sandbox_egress(sandbox: Option<SandboxConfig>) -> Check {
+        check_sandbox_egress_in(sandbox, read_egress_chain)
+    }
+
+    /// Whether our INPUT-side chain exists. `Ok(true)`/`Ok(false)` when we could look; `Err` when we
+    /// could not (a non-root doctor cannot read the filter table on most hosts).
+    ///
+    /// The `Err` arm is deliberately distinct from `Ok(false)`: "the rules are absent" and "I am not
+    /// allowed to look" are different facts, and reporting the second as the first would send an
+    /// operator to reinstall rules that are already there.
+    fn read_egress_chain() -> Result<bool, ()> {
+        match std::process::Command::new("iptables")
+            .args(["-S", maxplayer_core::sandbox_net::INPUT_CHAIN])
+            .output()
+        {
+            Ok(output) if output.status.success() => Ok(true),
+            // iptables exits 1 for "no such chain" and 3/4 for permission problems, but the codes are
+            // not portable across builds. The message is: a chain that does not exist says so.
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stderr.contains("No chain") || stderr.contains("does not exist") {
+                    Ok(false)
+                } else {
+                    Err(())
+                }
+            }
+            Err(_) => Err(()),
+        }
+    }
+
+    /// [`check_sandbox_egress`] over an injected chain reader, so every branch is testable on a host
+    /// where the doctor cannot run `iptables` at all.
+    pub(super) fn check_sandbox_egress_in(
+        sandbox: Option<SandboxConfig>,
+        chain_installed: impl Fn() -> Result<bool, ()>,
+    ) -> Check {
+        let policy = match SandboxPolicy::from_config(sandbox.as_ref()) {
+            // A config that does not resolve is already FAILed by the launcher check; do not double-report.
+            Err(_) => return Check::pass(EGRESS_CHECK, "no resolvable docker executor"),
+            Ok(policy) => policy,
+        };
+        // A host executor has no container to contain. Never a spurious warning.
+        if policy.docker_image().is_none() {
+            return Check::pass(EGRESS_CHECK, "not a docker executor; no container egress to contain");
+        }
+        let Some(network) = policy.sandbox_network() else {
+            return Check::warn(
+                EGRESS_CHECK,
+                "docker jobs run on the default bridge, so a job can reach this host's services \
+                 and the seller's LAN (#797)",
+                "set `[sandbox] network` to a dedicated docker network, then install the rules with \
+                 `maxplayer sandbox-net apply`",
+            );
+        };
+        // NOTE what this deliberately does NOT do: treat a configured network as containment. The
+        // network is a precondition — it gives the rules an interface to scope to and denies
+        // nothing on its own. `[sandbox]` being present says an operator wrote a config, not that
+        // it confines, and the only thing that reads the actual ruleset is `sandbox-net verify`.
+        match chain_installed() {
+            Ok(true) => Check::pass(
+                EGRESS_CHECK,
+                format!(
+                    "network '{network}' configured and the egress chains are installed; run \
+                     `maxplayer sandbox-net verify` to confirm they still MATCH the policy"
+                ),
+            ),
+            Ok(false) => Check::warn(
+                EGRESS_CHECK,
+                format!(
+                    "network '{network}' is configured but the egress chains are NOT installed, so \
+                     nothing denies the LAN or this host — the config says contained and the box \
+                     does not"
+                ),
+                "run `maxplayer sandbox-net apply`; a host reboot or a docker daemon restart that \
+                 recreates the bridge drops these rules silently",
+            ),
+            Err(()) => Check::warn(
+                EGRESS_CHECK,
+                format!(
+                    "network '{network}' is configured, but this process cannot read the firewall \
+                     to say whether the egress rules are in force"
+                ),
+                "run `sudo maxplayer sandbox-net verify` — a configured network denies nothing on \
+                 its own",
+            ),
+        }
+    }
+
     const CREDENTIAL_CONTAINMENT_CHECK: &str = "sandbox credential containment";
 
     /// The #647 credential proxy keeps every KNOWN model-credential variable out of a docker container.
@@ -1512,6 +1609,7 @@ fn build_checks(
     let sandbox_for_creds = sandbox.clone();
     let sandbox_for_image = sandbox.clone();
     let sandbox_for_engine = sandbox.clone();
+    let sandbox_for_egress = sandbox.clone();
     // The probe runs in the seat's OWN home, because that is where a launcher's config points.
     let home_root = home.root.clone();
     // Open-pool claiming is the exposure the containment gate is about: it is what makes this box
@@ -1551,6 +1649,11 @@ fn build_checks(
     checks.push(Box::new(move || {
         checks::check_sandbox_credential_containment(sandbox_for_creds)
     }));
+    // #797: a docker job's network containment is host-side firewall rules, and a seat with them
+    // missing is indistinguishable from a contained one FROM INSIDE A JOB. The operator is the only
+    // one who can be told, so this WARNs. Advisory — never blocks boot, because turning a working
+    // docker seat red on upgrade is a behaviour change, not a doctor's call.
+    checks.push(Box::new(move || checks::check_sandbox_egress(sandbox_for_egress)));
     // #792 phase 3: under mode=docker, the image the seat runs jobs in must be present or pullable,
     // or the first awarded job stalls. On absence this prints the exact `docker pull` command. A
     // non-docker policy is a no-op Pass. Placed after the launcher (docker-resolves) check.
@@ -2148,6 +2251,80 @@ mod tests {
             checks::check_sandbox_credential_containment_in(None, |_| Some("set".to_owned())).status,
             Status::Pass,
         );
+    }
+
+    // #797: the three states a docker seat can be in are indistinguishable from inside a job, so the
+    // operator is the only one who can be told. Every branch asserted, including the one that must
+    // NOT claim containment: a configured network denies nothing on its own.
+    #[test]
+    fn doctor_sandbox_egress_warns_until_the_rules_are_actually_installed() {
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
+        let docker = |network: Option<&str>| {
+            Some(SandboxConfig {
+                mode: SandboxMode::Docker,
+                image: Some("maxplayer-sandbox:latest".into()),
+                network: network.map(str::to_owned),
+                ..Default::default()
+            })
+        };
+
+        // No dedicated network ⇒ the job runs on the default bridge and reaches the LAN.
+        let bare = checks::check_sandbox_egress_in(docker(None), || Ok(true));
+        assert_eq!(bare.status, Status::Warn, "{}", bare.render());
+        assert!(
+            bare.detail.contains("LAN") && bare.render().contains("sandbox-net apply"),
+            "must name the exposure and the fix: {}",
+            bare.render()
+        );
+
+        // Network configured, rules ABSENT — the dangerous state: the config says contained and the
+        // box does not.
+        let unenforced = checks::check_sandbox_egress_in(docker(Some("sbx")), || Ok(false));
+        assert_eq!(unenforced.status, Status::Warn, "{}", unenforced.render());
+        assert!(
+            unenforced.detail.contains("NOT installed"),
+            "a configured network must never read as containment: {}",
+            unenforced.detail
+        );
+
+        // Cannot read the firewall — distinct from "absent". Reporting this as absent would send an
+        // operator to reinstall rules that are already there.
+        let unreadable = checks::check_sandbox_egress_in(docker(Some("sbx")), || Err(()));
+        assert_eq!(unreadable.status, Status::Warn, "{}", unreadable.render());
+        assert!(
+            unreadable.detail.contains("cannot read"),
+            "must say it could not look, not that nothing is there: {}",
+            unreadable.detail
+        );
+
+        // Installed ⇒ Pass, and it still refuses to claim the rules MATCH the policy — only
+        // `sandbox-net verify` reads that, and this check never did.
+        let installed = checks::check_sandbox_egress_in(docker(Some("sbx")), || Ok(true));
+        assert_eq!(installed.status, Status::Pass, "{}", installed.render());
+        assert!(
+            installed.detail.contains("verify"),
+            "a pass must still point at the check that reads the ruleset: {}",
+            installed.detail
+        );
+
+        // A host executor has no container to contain ⇒ no spurious warning, whatever the firewall
+        // says. Without this the check would nag every launcher-mode seat forever.
+        assert_eq!(
+            checks::check_sandbox_egress_in(None, || Ok(false)).status,
+            Status::Pass,
+        );
+        assert_eq!(
+            checks::check_sandbox_egress_in(Some(contained_probe_launcher()), || Ok(false)).status,
+            Status::Pass,
+        );
+        // Advisory, never blocking: turning a working docker seat red on upgrade is a behaviour
+        // change, not a doctor's call.
+        for state in [Ok(true), Ok(false), Err(())] {
+            assert_ne!(
+                checks::check_sandbox_egress_in(docker(Some("sbx")), || state).status,
+                Status::Fail,
+            );
+        }
     }
 
     // RED-PROVE (#792 phase 3): an absent docker sandbox image is flagged with the ACTIONABLE
