@@ -64,15 +64,40 @@ pub const HOST_INPUT_CHAIN: &str = "INPUT";
 /// instance credentials to anything that asks.
 pub const METADATA_ENDPOINT: &str = "169.254.169.254/32";
 
-/// Destinations a job may never reach: RFC1918 private space plus link-local.
+/// Destinations a job may never reach: RFC1918 private space, link-local, CGNAT, and the ranges no
+/// job has any business routing to.
 ///
 /// Link-local (`169.254.0.0/16`) is in the list for the metadata endpoint, but denying the whole /16
 /// is correct on its own terms — nothing a job legitimately fetches lives there.
+///
+/// CGNAT (`100.64.0.0/10`, RFC 6598) is the range this list most needed and least obviously covers.
+/// "The LAN" is not only RFC1918: a seller running Tailscale or Headscale — a plausible setup for
+/// someone already self-hosting a Lightning node — has its tailnet on `100.64.0.0/10`, reached over
+/// `tailscale0` rather than the LAN interface. Traffic to it still enters on the sandbox bridge, so
+/// the deny applies; without the range it routes out and matches nothing.
+///
+/// And it is not only an overlay concern. `crates/buzz/crates/buzz-core/src/network.rs` already
+/// denies this range in this repo, for a second reason stated there: some providers serve INSTANCE
+/// METADATA inside CGNAT space rather than at `169.254.169.254`. [`METADATA_ENDPOINT`] below is a
+/// deliberate, ordered-first drop of one spelling of that endpoint; a provider using the CGNAT
+/// spelling was reachable past it. Denying the range is what makes that drop provider-independent.
+///
+/// The remaining three carry no legitimate job traffic and are cheap to refuse: benchmarking
+/// (`198.18.0.0/15`, RFC 2544), multicast (`224.0.0.0/4`) and reserved (`240.0.0.0/4`).
+///
+/// IPv6 has no equivalent list here because these rules are `iptables` (v4). The v6 LAN-equivalents
+/// are ULA `fc00::/7` and link-local `fe80::/10` — see the `EnableIPv6` assertion in
+/// `maxplayer sandbox-net verify`, which refuses to call a v6-enabled network contained rather than
+/// leave a second address family silently unfiltered.
 pub const DENIED_DESTINATIONS: &[&str] = &[
     "10.0.0.0/8",
     "172.16.0.0/12",
     "192.168.0.0/16",
     "169.254.0.0/16",
+    "100.64.0.0/10",
+    "198.18.0.0/15",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
 ];
 
 /// Log lines are rate-limited so a job cannot fill the seller's disk by hammering a denied address.
@@ -555,6 +580,39 @@ mod tests {
                     && rule.args.last().map(String::as_str) == Some("DROP")
             });
             assert!(dropped, "{denied} is not denied on the routed path");
+        }
+    }
+
+    /// The loop above cannot catch a MISSING range: it iterates the same constant it checks, so
+    /// deleting an entry deletes the assertion with it and the suite stays green. This names the
+    /// ranges independently — the duplication IS the instrument, and it is the only thing here that
+    /// can go red when a range is removed.
+    ///
+    /// Red-proved by deletion, not by inspection: dropping `100.64.0.0/10` from
+    /// [`DENIED_DESTINATIONS`] fails this test and leaves the loop above passing.
+    #[test]
+    fn the_deny_list_names_every_lan_shaped_range_independently() {
+        for required in [
+            // RFC1918.
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            // Link-local, which carries the metadata endpoint.
+            "169.254.0.0/16",
+            // CGNAT (RFC 6598): Tailscale/Headscale tailnets, and instance metadata on providers
+            // that do not serve it at 169.254.169.254. Denied in this repo already, at
+            // crates/buzz/crates/buzz-core/src/network.rs, for both of those reasons.
+            "100.64.0.0/10",
+            // No legitimate job traffic: benchmarking (RFC 2544), multicast, reserved.
+            "198.18.0.0/15",
+            "224.0.0.0/4",
+            "240.0.0.0/4",
+        ] {
+            assert!(
+                DENIED_DESTINATIONS.contains(&required),
+                "{required} must stay in the deny list: removing one silently re-opens a \
+                 LAN-shaped range, and the rendering test cannot see the absence"
+            );
         }
     }
 
