@@ -91,12 +91,22 @@ RUN set -eux; \
 
 # nix reaches PATH through a shim, because nix discards a $HOME it does not own and then has no
 # passwd entry to fall back to — see nix-shim, and the HOME note below that makes it necessary.
+#
+# The loop asserts it linked something. An unmatched glob does not vanish in sh — it stays literal,
+# so the loop would run once on the pattern itself, `ln -s` would create a file named `*`, and
+# `set -e` sees nothing wrong. The build would then go green having produced an image with no nix on
+# PATH at all, and the first thing to notice would be a job that has already been awarded. Quoting
+# does not help here, because the expansion is what is wanted; the check is on the count.
 COPY nix-shim /usr/local/bin/nix-shim
 RUN set -eux; \
     chmod 0755 /usr/local/bin/nix-shim; \
+    shims=0; \
     for binary in /nix/nixbin/*; do \
+        [ -e "$binary" ] || { echo 'nix closure staged no binaries' >&2; exit 1; }; \
         ln -s nix-shim "/usr/local/bin/$(basename "$binary")"; \
-    done
+        shims=$((shims + 1)); \
+    done; \
+    [ "$shims" -ge 1 ]
 
 # HOME is a CONTAINER-ONLY path, deliberately NOT the mounted workdir.
 #
