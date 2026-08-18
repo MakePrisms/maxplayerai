@@ -35,6 +35,13 @@ config = { version = "0.15.25", default-features = false }
 # In-process seller push (libgit2, no system git). default-features off keeps the
 # `https`/`ssh` cargo features (and their openssl-sys / libssh2-sys) OUT — TLS is
 # supplied by our reqwest/rustls smart subtransport, so the build needs no openssl.
+# Swapping this for a `git` CLI would also make repo hooks live. libgit2 runs
+# none, so a hook a job planted in its own workdir `.git/` cannot execute — and
+# the delivery legs run on the HOST, beside the wallet and keys the sandbox
+# exists to protect. A leg that shells out must neutralise hook lookup itself.
+# The guard is `crates/maxplayer-core/tests/no_system_git.rs`: it puts a tripwire
+# `git` on PATH and fails if a production leg calls it. Its required-features are
+# `["git-delivery"]`, so it runs in the money-path CI job and nowhere else (#826).
 git2 = { version = "0.19", default-features = false }
 # Blocking HTTP for the git smart subtransport; rustls-tls bundles Mozilla CA roots
 # (webpki-roots) so the seller needs no ambient SSL_CERT_FILE at runtime.
