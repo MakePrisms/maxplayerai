@@ -65,6 +65,14 @@ COPY --from=nix /nixroot/nix /nix
 # `sandbox=false` — nix's build sandbox needs mount and user namespaces, which `--cap-drop ALL` and
 # `no-new-privileges` deny. Everything unlisted keeps nix's own defaults, cache.nixos.org included.
 #
+# `use-xdg-base-directories` — nix uses $HOME only when the calling uid OWNS it, and $HOME here is
+# root-owned by construction (see the HOME note below). This moves nix's state, cache and config to
+# $XDG_STATE_HOME/$XDG_CACHE_HOME/$XDG_CONFIG_HOME, which is what keeps it off that ownership check.
+# BOTH halves are required and neither is sufficient: the setting alone still derives its defaults
+# from $HOME, and the XDG variables alone are ignored without it. Measured in this image as a uid with
+# no passwd entry — either one on its own aborts with `cannot determine user's home directory`;
+# together, `nix eval`, `nix-store --add` and `nix store ping` all succeed.
+#
 # The store is world-writable for the same reason HOME below is: the job's uid is unknown at build
 # time, and a single-user store is written by whoever runs the build. The argument that makes it
 # safe is also the same one — a single-job container with one principal inside, discarded whole by
@@ -84,29 +92,28 @@ RUN set -eux; \
         echo 'experimental-features = nix-command flakes'; \
         echo 'build-users-group ='; \
         echo 'sandbox = false'; \
+        echo 'use-xdg-base-directories = true'; \
     } > /etc/nix/nix.conf; \
     chmod 1777 /nix/store; \
     chmod -R a+rwX /nix/var; \
     find /nix/var -type d -name per-user -prune -exec rm -rf {} +
 
-# nix reaches PATH through a shim, because nix discards a $HOME it does not own and then has no
-# passwd entry to fall back to — see nix-shim, and the HOME note below that makes it necessary.
+# nix reaches PATH as a direct symlink per entry point, so `nix`, `nix-build`, `nix-store` and the
+# rest all resolve to the staged closure's own binaries with nothing in between.
 #
 # The loop asserts it linked something. An unmatched glob does not vanish in sh — it stays literal,
-# so the loop would run once on the pattern itself, `ln -s` would create a file named `*`, and
-# `set -e` sees nothing wrong. The build would then go green having produced an image with no nix on
-# PATH at all, and the first thing to notice would be a job that has already been awarded. Quoting
+# so the loop would run once on the pattern itself, `ln -s` would create a dangling link named `*`,
+# and `set -e` sees nothing wrong. The build would then go green having produced an image with no nix
+# on PATH at all, and the first thing to notice would be a job that has already been awarded. Quoting
 # does not help here, because the expansion is what is wanted; the check is on the count.
-COPY nix-shim /usr/local/bin/nix-shim
 RUN set -eux; \
-    chmod 0755 /usr/local/bin/nix-shim; \
-    shims=0; \
+    links=0; \
     for binary in /nix/nixbin/*; do \
         [ -e "$binary" ] || { echo 'nix closure staged no binaries' >&2; exit 1; }; \
-        ln -s nix-shim "/usr/local/bin/$(basename "$binary")"; \
-        shims=$((shims + 1)); \
+        ln -s "$binary" "/usr/local/bin/$(basename "$binary")"; \
+        links=$((links + 1)); \
     done; \
-    [ "$shims" -ge 1 ]
+    [ "$links" -ge 1 ]
 
 # HOME is a CONTAINER-ONLY path, deliberately NOT the mounted workdir.
 #
@@ -118,15 +125,17 @@ RUN set -eux; \
 #
 # Writable is not the same as owned, and nix wants owned: it uses $HOME only when the calling uid
 # owns it, and otherwise falls back to a getpwuid() lookup this container cannot satisfy. A 0777
-# directory created at build time is owned by root, so nix cannot use this path at all — hence
-# nix-shim, which moves nix under a subdirectory the job creates and therefore owns. Anything else
-# added here that resolves its own home the way nix does will need the same treatment.
+# directory created at build time is owned by root, so an unconfigured nix aborts on every invocation
+# with `cannot determine user's home directory`. That is what the XDG settings above answer, and they
+# answer it for nix ALONE — anything else added here that resolves its own home the way nix does needs
+# its own answer.
 #
-# The job creates that subdirectory, so this path carries a run-time precondition: $HOME's parent
-# must still be writable by the job uid when the container starts. Mounting over /home/agent,
-# tightening the 0777, or pointing HOME at a read-only path breaks every nix call — and it surfaces
-# as ENV_UNPROVISIONABLE on a job that has already been awarded, not as a boot failure the operator
-# sees first. The same precondition carries anything told to install under $HOME.
+# The XDG directories do not exist in the image: nix creates them on first use, under this same 0777
+# parent, and therefore owns them. So this path carries a run-time precondition — /home/agent must
+# still be writable by the job uid when the container starts. Mounting over it, tightening the 0777,
+# or moving the XDG variables to a read-only path breaks every nix call, and it surfaces as
+# ENV_UNPROVISIONABLE on a job that has already been awarded, not as a boot failure the operator sees
+# first. The same precondition carries anything told to install under $HOME.
 #
 # It must NOT be /work: the workdir is the DELIVERABLE, staged wholesale by the delivery snapshot
 # (`seller_git`: `add_all(["*"])`, minus the one runtime-artifact exclusion) into a fresh repo that
@@ -137,7 +146,10 @@ RUN set -eux; \
 # Overlay, not --tmpfs: a toolchain install is GB-scale, and tmpfs would charge that to RAM on every
 # concurrent slot.
 RUN mkdir -p /home/agent && chmod 0777 /home/agent
-ENV HOME=/home/agent
+ENV HOME=/home/agent \
+    XDG_STATE_HOME=/home/agent/state \
+    XDG_CACHE_HOME=/home/agent/cache \
+    XDG_CONFIG_HOME=/home/agent/config
 
 # The agent works in the mounted workdir — the ACP session cwd is pinned to it independently
 # (`CONTAINER_WORKDIR`), and the delivery identity arrives as GIT_AUTHOR_*/GIT_COMMITTER_* env plus
