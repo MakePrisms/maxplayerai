@@ -1054,10 +1054,30 @@ async fn start_credential_containment(
     // `Policy::limited(10)`, and its cross-host scrub covers only AUTHORIZATION, COOKIE, cookie2,
     // PROXY_AUTHORIZATION and WWW_AUTHENTICATE — `x-api-key` is in none of them. So a 3xx from an
     // allowlisted host would carry the credential onward to a host the allowlist never approved:
-    // the destination is decided BEFORE the redirect moves it. Refusing to follow keeps the
-    // allowlist check and the destination the same decision.
+    // the destination is decided BEFORE the redirect moves it.
+    //
+    // So a redirect is followed only when its target is on the same allowlist the original request
+    // was checked against, which keeps the allowlist check and the destination one decision. The
+    // engine answers that question itself (`allows_redirect_target`) rather than a comparison built
+    // here: two notions of "allowlisted" would drift, and the drift stays invisible until something
+    // redirects to `host:443`. A refused attempt is `stop()`, which returns the 3xx for the proxy to
+    // relay to the container unchanged.
+    //
+    // EVERY HOP, not just the first: a first-hop-only check would be this same defect displaced by
+    // one redirect, since allowlisted -> allowlisted -> attacker would pass it and leak on the second.
+    // Verified in reqwest 0.12.28 rather than assumed — `TowerRedirectPolicy::redirect`
+    // (`src/redirect.rs:306`) is tower-http's per-redirect hook: it pushes the previous URL onto an
+    // accumulating chain (`:315`) and then calls this policy with THAT hop's target (`:317`). So the
+    // closure re-runs on each hop and `attempt.url()` is always the destination about to be requested.
+    let redirect_engine = Arc::clone(&engine);
     let forwarding_client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if redirect_engine.allows_redirect_target(attempt.url().as_str()) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
         .build()
         .map_err(|error| ExecError::Agent(format!("credential proxy client: {error}")))?;
     let running = proxy::start(Arc::clone(&engine), forwarding_client)
