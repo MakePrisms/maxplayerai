@@ -85,6 +85,66 @@ jobs:
       - name: Verify the seller surface (acp)
         run: ./scripts/verify-seller-surface.sh target/release/maxplayer
 
+  # `acp` and `wallet` are never both on in any `cargo test` in this file, so a test gated on BOTH is
+  # run by nothing. Every other row moves in ONE direction from that intersection: the acp job above
+  # has `acp` WITHOUT `wallet`, and money-path has `wallet` (which composes `gateway` and
+  # `git-delivery`) WITHOUT `acp`. build-acp already declares this exact combo as "the full shipped
+  # feature combo" — but as `cargo build`, and `cargo build` compiles no test target. So the combo was
+  # type-checked and never executed, and nothing in the check list could say so: a compiled-out test
+  # and a passing test produce the same green.
+  #
+  # The intersection is not an odd corner. `wallet` gates `seller_exec`, `acp` gates its
+  # agent-execution half, and what lives there is the credential-containment surface.
+  #
+  # MEASURED at 271186bd with `cargo test … -- --list`, which enumerates test names and executes no
+  # test body. This row lists 1053 names; the three existing maxplayer-core rows list 295 (acp), 276
+  # (default) and 1035 (money-path), 1054 together. FOUR names are in this row and in no existing row:
+  #   seller_exec::tests::contained_launch_keeps_every_real_credential_out_of_the_container_view
+  #   seller_exec::tests::todays_forwarding_leaks_every_real_credential_into_the_container_view
+  #   seller_exec::tests::docker_launch_without_containment_opens_no_pinhole
+  #   seller_exec::tests::response_timeout_is_classified_by_its_typed_timer_source
+  # The other rows cannot go RED on those four. The tests are ABSENT from their binaries, not passing
+  # in them — which is a stronger statement than "they happen to be green".
+  #
+  # RED-PROVED before this job was written, which is the only thing that makes it a guard rather than
+  # a row that has never failed. Invert the substitution guard in `seller_exec::contain_env_values` so
+  # a real credential is never replaced — a semantic defect, not a compile error, so no `#[cfg]` can
+  # mask it:
+  #   this row                          rc=101, 1041 passed / 1 failed
+  #                                     (contained_launch_keeps_every_real_credential_out_of_…)
+  #   money-path's features, same tree   rc=0,   1021 passed / 0 failed
+  # The control is the point: the broken function is `acp`-gated, so money-path does not compile it
+  # and cannot report it. One row red, one row green, same defect.
+  #
+  # This row is NOT a superset of money-path and must not replace it. FIVE names run today that this
+  # row does not carry: the four `live-mints` tests, and
+  # `seller_exec::tests::agent_run_fail_closed_without_acp_feature`, which exists only under
+  # `not(feature = "acp")`. The two rows are complementary by construction, in both directions.
+  #
+  # `live-mints` is deliberately absent here. It stays exclusive to money-path (#720), the only row
+  # permitted to reach a live third-party mint, so this row adds NO network money reach.
+  #
+  # Release, so the git-delivery suite runs the way money-path runs it: that job documents a
+  # debug-only transport-lifecycle bug (#152) as its reason for release-only, and this row inherits
+  # the constraint rather than re-litigating it.
+  #
+  # Its OWN job, for the reason money-path has its own: this row carries money teeth, because
+  # `wallet` composes `git-delivery`. A step queued behind a failed step is reported `skipped` inside
+  # a job whose conclusion is `failure`, which cannot distinguish a suite that failed from a suite
+  # that never ran — the one ambiguity a row like this must not have.
+  #
+  # build-acp's build step stays. It compiles this combo in DEBUG and this row is release, so neither
+  # covers the other's profile.
+  feature-union:
+    name: Test the full shipped feature combo (acp + wallet)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test maxplayer-core (acp + gateway + git-delivery + wallet)
+        run: cargo test -p maxplayer-core --release --features acp,gateway,git-delivery,wallet --locked
+
   # The bare feature set — `wallet` off, so `acp` and the seller surface are off with it. NO other
   # job compiles it: build-default builds `--workspace` with default features (wallet ON) and
   # build-acp turns MORE features on, never fewer. Every job in this file moves in one direction
