@@ -112,6 +112,12 @@ RUN set -eux; \
 # nix-shim, which moves nix under a subdirectory the job creates and therefore owns. Anything else
 # added here that resolves its own home the way nix does will need the same treatment.
 #
+# The job creates that subdirectory, so this path carries a run-time precondition: $HOME's parent
+# must still be writable by the job uid when the container starts. Mounting over /home/agent,
+# tightening the 0777, or pointing HOME at a read-only path breaks every nix call — and it surfaces
+# as ENV_UNPROVISIONABLE on a job that has already been awarded, not as a boot failure the operator
+# sees first. The same precondition carries anything told to install under $HOME.
+#
 # It must NOT be /work: the workdir is the DELIVERABLE, staged wholesale by the delivery snapshot
 # (`seller_git`: `add_all(["*"])`, minus the one runtime-artifact exclusion) into a fresh repo that
 # carries no .gitignore. Anything a tool caches under $HOME — rustup/cargo toolchains, the npm and
