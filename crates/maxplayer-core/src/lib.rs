@@ -63,6 +63,14 @@ pub mod receipt;
 #[cfg(feature = "gateway")]
 pub mod relay_auth;
 pub mod runtime_guard;
+/// Host-side network containment for a docker job (#797): which destinations a job may reach, and
+/// the `iptables` rules that enforce it on the two chains container traffic actually splits across.
+///
+/// Deliberately UNGATED, unlike [`seller_exec`] and [`credential_proxy`] which it serves. Those are
+/// `wallet`-only, so a default-features test run cannot execute a line of them — the policy is the
+/// part that decides what a stranger's job can reach, and it is compiled and tested on every build
+/// rather than only on the money-path one.
+pub mod sandbox_net;
 pub mod seller;
 /// The seller's harness registry: the agent harnesses one node enables, what it advertises for
 /// them, and which one a given job dispatches to.

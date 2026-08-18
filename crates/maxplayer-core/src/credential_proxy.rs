@@ -125,6 +125,15 @@ pub const OPENAI_DEFAULT_UPSTREAM: &str = "https://api.openai.com";
 /// are the same string.
 pub const PROXY_HOST_ALIAS: &str = "host.docker.internal";
 
+/// The address the per-job proxy listens on.
+///
+/// Every interface, because on Linux `host.docker.internal` maps to the bridge gateway and a
+/// loopback-bound service is unreachable from the container. Narrowing this to the bridge address is
+/// platform-split — Docker Desktop reaches a loopback-bound host service through the same alias — and
+/// is tracked as a follow-up rather than guessed at. Named here so the one place that binds and the
+/// comments that reason about the exposure cannot drift apart.
+const BIND_ADDRESS: &str = "0.0.0.0";
+
 /// Hop-by-hop headers that must not be copied verbatim onto the forwarded request/response. They
 /// describe the *connection* the proxy terminates, not the message, and reqwest/hyper regenerate the
 /// ones that still apply (`host`, `content-length`) from the outgoing request itself.
@@ -440,14 +449,57 @@ impl Drop for RunningProxy {
     }
 }
 
+/// Bind the proxy's listener: an ephemeral port, or the first free port in a configured range.
+///
+/// The scan walks the range in order and takes the first port that binds. `AddrInUse` is the
+/// expected result for a port another job already holds, so it moves on; any other error is a real
+/// failure to bind and is returned immediately rather than being retried against 99 more ports.
+async fn bind_listener(
+    ports: Option<crate::sandbox_net::PortRange>,
+) -> std::io::Result<tokio::net::TcpListener> {
+    let Some(range) = ports else {
+        return tokio::net::TcpListener::bind((BIND_ADDRESS, 0)).await;
+    };
+    for port in range.start()..=range.end() {
+        match tokio::net::TcpListener::bind((BIND_ADDRESS, port)).await {
+            Ok(listener) => return Ok(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        format!(
+            "[sandbox] proxy_port_range {range} is fully occupied ({} ports); a contained job needs \
+             one port for its lifetime, so widen the range or run fewer concurrent jobs",
+            range.capacity()
+        ),
+    ))
+}
+
 /// Bind a per-job proxy on the host and start its accept loop.
 ///
-/// Binds `0.0.0.0:0` so the container can reach it via the docker `host.docker.internal:host-gateway`
+/// Binds `0.0.0.0` so the container can reach it via the docker `host.docker.internal:host-gateway`
 /// alias (the launch adds `--add-host`). Exposure of the listener is bounded by the three invariants:
 /// a caller needs a registered placeholder to get *any* substitution, the destination must be on the
 /// allowlist, and the listener dies with the job. Tightening the bind to the docker bridge address is
 /// a follow-up that dovetails with the #797 egress work.
-pub async fn start(engine: Arc<ProxyEngine>, client: reqwest::Client) -> std::io::Result<RunningProxy> {
+///
+/// `ports` selects which port it lands on. `None` ⇒ port 0: the kernel picks an ephemeral one, fresh
+/// per job. `Some(range)` ⇒ the first free port in the range, which is what makes the listener
+/// nameable by a static firewall rule — `#797`'s host-services deny has to express one exception for
+/// this proxy, and "whatever port the kernel chose" is not expressible. The range narrows which port
+/// is chosen and nothing else; the address, the allowlist and the substitution are untouched by it.
+///
+/// A configured range that is fully occupied FAILS the job. It does not fall back to an ephemeral
+/// port: that would place the listener outside the range the firewall pinhole names, and the job
+/// would then fail to reach its model with no indication that the port was the reason. Same
+/// no-fallback rule the rest of this path follows.
+pub async fn start(
+    engine: Arc<ProxyEngine>,
+    client: reqwest::Client,
+    ports: Option<crate::sandbox_net::PortRange>,
+) -> std::io::Result<RunningProxy> {
     // KNOWN EXPOSURE, deliberately unchanged for now. `0.0.0.0` is every interface, so on a seller with
     // a public IP and no firewall this per-job listener is internet-reachable on a random high port.
     // The placeholder is the bearer — a caller without it gets `NoKnownPlaceholder` — so this is not an
@@ -460,7 +512,7 @@ pub async fn start(engine: Arc<ProxyEngine>, client: reqwest::Client) -> std::io
     // bridge gateway (`--add-host …:host-gateway`), where a `127.0.0.1` bind is unreachable and the
     // correct target is the bridge address. Changing this needs a Linux docker seat to verify against;
     // until then, seller-operators on a public box should firewall inbound ports.
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", 0)).await?;
+    let listener = bind_listener(ports).await?;
     let addr = listener.local_addr()?;
     let engine_for_task = Arc::clone(&engine);
     let connections = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
@@ -815,7 +867,7 @@ mod tests {
                 upstream: upstream.clone(),
             })
             .unwrap();
-        let proxy = start(Arc::clone(&engine), reqwest::Client::new()).await.unwrap();
+        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
         let port = proxy.local_addr().port();
 
         // The hostile shape: placeholder in the auth header (to authenticate) AND inside a prompt
@@ -1034,7 +1086,7 @@ mod tests {
                 upstream: upstream.clone(),
             })
             .unwrap();
-        let proxy = start(Arc::clone(&engine), reqwest::Client::new()).await.unwrap();
+        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
         let port = proxy.local_addr().port();
         let response = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}/v1/messages"))
@@ -1045,6 +1097,74 @@ mod tests {
             .unwrap();
         let headers = response.headers().clone();
         (headers, response.text().await.unwrap())
+    }
+
+    // #797: a configured range binds INSIDE it, so the host firewall's pinhole can name the port.
+    // Both legs matter — landing in the range is the property, and the unconfigured control is what
+    // proves the assertion is not vacuously true of an ephemeral port that happened to fall there.
+    #[tokio::test]
+    async fn a_configured_port_range_binds_inside_it_and_an_unset_one_stays_ephemeral() {
+        let engine = Arc::new(ProxyEngine::new(["api.anthropic.com".to_owned()]));
+        let range = crate::sandbox_net::PortRange::new(49200, 49299).unwrap();
+        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), Some(range))
+            .await
+            .expect("a free port in the range");
+        let port = proxy.local_addr().port();
+        assert!(
+            (range.start()..=range.end()).contains(&port),
+            "a configured range must bind inside itself, or the firewall pinhole names the wrong \
+             port and every contained job fails to reach its model: got {port}"
+        );
+
+        // A second proxy must take a DIFFERENT port in the range, not collide with the first: the
+        // range is walked until a free port is found, and concurrent jobs each hold one for their
+        // lifetime.
+        let second = start(Arc::clone(&engine), reqwest::Client::new(), Some(range))
+            .await
+            .expect("a second free port in the range");
+        assert_ne!(
+            second.local_addr().port(),
+            port,
+            "two live proxies must not claim the same port"
+        );
+
+        // Control: unset ⇒ the shipped ephemeral behaviour. Without this the range assertion above
+        // would also pass against a build that ignored the range entirely.
+        let ephemeral = start(Arc::clone(&engine), reqwest::Client::new(), None)
+            .await
+            .expect("an ephemeral port");
+        assert_ne!(ephemeral.local_addr().port(), 0, "the kernel must have chosen a real port");
+    }
+
+    // A fully-occupied range FAILS rather than falling back to an ephemeral port. A fallback would
+    // put the listener outside the range the firewall pinhole names, so the job would fail to reach
+    // its model with nothing naming the port as the cause.
+    #[tokio::test]
+    async fn an_exhausted_port_range_fails_instead_of_falling_back() {
+        let engine = Arc::new(ProxyEngine::new(["api.anthropic.com".to_owned()]));
+        // A single-port range, occupied by the first proxy.
+        let occupied = tokio::net::TcpListener::bind((BIND_ADDRESS, 0)).await.unwrap();
+        let taken = occupied.local_addr().unwrap().port();
+        let range = crate::sandbox_net::PortRange::new(taken, taken).unwrap();
+
+        // `expect_err` would need `Debug` on `RunningProxy`, which is merged #647 code this ticket
+        // does not touch. Matching says the same thing without widening that type.
+        let Err(error) = start(Arc::clone(&engine), reqwest::Client::new(), Some(range)).await
+        else {
+            panic!("an occupied single-port range must fail, not fall back to an ephemeral port");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(
+            error.to_string().contains("proxy_port_range"),
+            "the failure must name the config key an operator has to widen: {error}"
+        );
+
+        // Control: the same range binds once the port is free, so the failure above is about
+        // occupancy and not about the range being malformed.
+        drop(occupied);
+        start(Arc::clone(&engine), reqwest::Client::new(), Some(range))
+            .await
+            .expect("the same range binds once the port is released");
     }
 
     // DEFENCE IN DEPTH on the return leg: an upstream that reflects the real credential in its response
@@ -1131,7 +1251,7 @@ mod tests {
                 upstream: upstream.clone(),
             })
             .unwrap();
-        let proxy = start(Arc::clone(&engine), reqwest::Client::new()).await.unwrap();
+        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
         let port = proxy.local_addr().port();
 
         let response = reqwest::Client::new()
@@ -1168,7 +1288,7 @@ mod tests {
     async fn proxy_returns_403_for_a_non_allowlisted_destination() {
         let placeholder = mint_anthropic_placeholder();
         let engine = arc_engine_with_job(&placeholder, "https://attacker.example.com");
-        let proxy = start(Arc::clone(&engine), reqwest::Client::new()).await.unwrap();
+        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
         let port = proxy.local_addr().port();
         let response = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}/v1/messages"))
@@ -1185,7 +1305,7 @@ mod tests {
     #[tokio::test]
     async fn proxy_refuses_when_no_known_placeholder_is_present() {
         let engine = Arc::new(ProxyEngine::new([authority_of(UPSTREAM).unwrap()]));
-        let proxy = start(Arc::clone(&engine), reqwest::Client::new()).await.unwrap();
+        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
         let port = proxy.local_addr().port();
         let response = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}/v1/messages"))
@@ -1205,7 +1325,7 @@ mod tests {
     #[tokio::test]
     async fn proxy_rejects_an_over_cap_body_with_413() {
         let engine = Arc::new(ProxyEngine::new([authority_of(UPSTREAM).unwrap()]));
-        let proxy = start(Arc::clone(&engine), reqwest::Client::new()).await.unwrap();
+        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
         let port = proxy.local_addr().port();
         let over_cap = vec![b'a'; MAX_REQUEST_BODY_BYTES + 1];
         let response = reqwest::Client::new()

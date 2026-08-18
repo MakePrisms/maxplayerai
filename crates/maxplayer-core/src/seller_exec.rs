@@ -121,6 +121,16 @@ pub struct DockerPolicy {
     /// seat leaves it unset and leans on the platform VM plus the hardening flags. Resolved from
     /// [`crate::home::SandboxConfig::runtime`].
     runtime: Option<String>,
+    /// The dedicated docker network the container joins (`docker run --network <name>`), `None` ⇒
+    /// the daemon default bridge. Resolved from [`crate::home::SandboxConfig::network`]. The network
+    /// is what gives the #797 egress rules a stable interface to scope to — see
+    /// [`crate::sandbox_net`].
+    network: Option<String>,
+    /// The port range the per-job credential proxy binds inside, `None` ⇒ the shipped ephemeral-port
+    /// behaviour. Resolved from [`crate::home::SandboxConfig::proxy_port_range`]. Carried on the
+    /// policy because the proxy is started by the same launch path that builds the argv, and the
+    /// firewall pinhole and the bind must name the same ports or the job cannot reach its model.
+    proxy_ports: Option<crate::sandbox_net::PortRange>,
 }
 
 /// The agent-auth environment carried from the daemon into the container.
@@ -218,10 +228,30 @@ impl SandboxPolicy {
                     .runtime
                     .clone()
                     .filter(|runtime| !runtime.trim().is_empty());
+                let network = config
+                    .network
+                    .clone()
+                    .filter(|network| !network.trim().is_empty());
+                // A malformed range is refused HERE, at config resolution, not at job time. The
+                // alternative — falling back to an ephemeral port — would silently move the proxy
+                // outside the range the firewall pinhole names, and the seat would look contained
+                // while every job failed to reach its model for a reason no message explains.
+                let proxy_ports = config
+                    .proxy_port_range
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|range| !range.is_empty())
+                    .map(crate::sandbox_net::PortRange::parse)
+                    .transpose()
+                    .map_err(|error| {
+                        ExecError::Config(format!("[sandbox] proxy_port_range: {error}"))
+                    })?;
                 Ok(Self::docker(DockerPolicy {
                     image,
                     forward_env: config.forward_env.clone(),
                     runtime,
+                    network,
+                    proxy_ports,
                 }))
             }
         }
@@ -261,6 +291,26 @@ impl SandboxPolicy {
     pub fn docker_image(&self) -> Option<&str> {
         match &self.kind {
             PolicyKind::Docker(policy) => Some(policy.image.as_str()),
+            PolicyKind::Passthrough | PolicyKind::Launcher(_) => None,
+        }
+    }
+
+    /// The dedicated sandbox network a docker policy joins its containers to, `None` under a host
+    /// policy or when the operator has not configured one.
+    pub fn sandbox_network(&self) -> Option<&str> {
+        match &self.kind {
+            PolicyKind::Docker(policy) => policy.network.as_deref(),
+            PolicyKind::Passthrough | PolicyKind::Launcher(_) => None,
+        }
+    }
+
+    /// The port range the credential proxy must bind inside for this seat, `None` ⇒ an ephemeral
+    /// port. Read by the containment path so the proxy's bind and the firewall's pinhole name the
+    /// same ports — two artifacts that must agree, derived from one config value rather than
+    /// written down twice.
+    pub fn proxy_ports(&self) -> Option<crate::sandbox_net::PortRange> {
+        match &self.kind {
+            PolicyKind::Docker(policy) => policy.proxy_ports,
             PolicyKind::Passthrough | PolicyKind::Launcher(_) => None,
         }
     }
@@ -370,6 +420,19 @@ impl DockerPolicy {
             "-w".into(),
             CONTAINER_WORKDIR.into(),
         ]);
+        // Egress containment (#797): join the job to the seller's dedicated sandbox network rather
+        // than the shared default bridge. Unset ⇒ the daemon default, i.e. exactly the behaviour
+        // before this flag existed.
+        //
+        // The network is a PRECONDITION for the host-side rules, not the containment itself. It
+        // gives them one interface to scope to (so no rule can match a service the seller runs), and
+        // it moves DNS inside the container's own netns — docker's embedded resolver at 127.0.0.11 —
+        // so denying the LAN does not also deny name resolution. Installing the rules is
+        // `maxplayer sandbox-net`; a seat that sets this and skips that is NOT contained.
+        if let Some(network) = &self.network {
+            argv.push("--network".into());
+            argv.push(network.clone());
+        }
         // Credential containment (#647): when the env points the agent at the host-side proxy
         // (`…=http://host.docker.internal:<port>`), the container must be able to resolve that alias.
         // On Linux docker does not provide it by default; `--add-host …:host-gateway` maps it to the
@@ -839,7 +902,7 @@ pub async fn run_agent_job(
     // in the container.
     let _proxy;
     if policy.docker_image().is_some() {
-        match start_credential_containment(&forwarded).await? {
+        match start_credential_containment(&forwarded, policy.proxy_ports()).await? {
             Some((contained, proxy)) => {
                 env.extend(contained);
                 _proxy = Some(proxy);
@@ -1003,6 +1066,7 @@ struct MintedCredential {
 #[cfg(feature = "acp")]
 async fn start_credential_containment(
     forwarded: &[(String, String)],
+    proxy_ports: Option<crate::sandbox_net::PortRange>,
 ) -> Result<Option<(Vec<(String, String)>, crate::credential_proxy::RunningProxy)>, ExecError> {
     use crate::credential_proxy as proxy;
     use std::sync::Arc;
@@ -1080,7 +1144,7 @@ async fn start_credential_containment(
         }))
         .build()
         .map_err(|error| ExecError::Agent(format!("credential proxy client: {error}")))?;
-    let running = proxy::start(Arc::clone(&engine), forwarding_client)
+    let running = proxy::start(Arc::clone(&engine), forwarding_client, proxy_ports)
         .await
         .map_err(|error| ExecError::Agent(format!("credential proxy failed to start: {error}")))?;
 
@@ -1244,6 +1308,8 @@ mod tests {
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
             runtime: None,
+            network: None,
+            proxy_ports: None,
         });
         let env = vec![("GIT_AUTHOR_NAME".to_string(), "maxplayer-seller-abcd".to_string())];
         let workdir = Path::new("/home/seller/.maxplayer/seller-jobs/job1");
@@ -1290,6 +1356,8 @@ mod tests {
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
             runtime: None,
+            network: None,
+            proxy_ports: None,
         });
         let launch = policy
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -1340,6 +1408,8 @@ mod tests {
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
             runtime: None,
+            network: None,
+            proxy_ports: None,
         });
         let launch = default_rt
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -1355,6 +1425,8 @@ mod tests {
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
             runtime: Some("runsc".into()),
+            network: None,
+            proxy_ports: None,
         });
         let launch = gvisor
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -1378,6 +1450,113 @@ mod tests {
         );
     }
 
+    // The #797 sandbox network reaches the argv when configured, and is absent when not. The
+    // absent case is the one worth pinning: the flag must not appear at all, because an empty
+    // `--network ` is a docker error and a defaulted one would silently move every existing seat
+    // off the network its containers run on today.
+    #[test]
+    fn a_configured_sandbox_network_reaches_the_argv_and_an_unset_one_emits_no_flag() {
+        let unset = SandboxPolicy::docker(DockerPolicy {
+            image: "maxplayer-sandbox:latest".into(),
+            forward_env: Vec::new(),
+            runtime: None,
+            network: None,
+            proxy_ports: None,
+        });
+        let launch = unset
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
+            .expect("command");
+        assert!(
+            !launch.args.iter().any(|a| a == "--network"),
+            "an unset network must not emit a --network flag: {:?}",
+            launch.args
+        );
+
+        let joined = SandboxPolicy::docker(DockerPolicy {
+            image: "maxplayer-sandbox:latest".into(),
+            forward_env: Vec::new(),
+            runtime: None,
+            network: Some("maxplayer-sbx".into()),
+            proxy_ports: None,
+        });
+        let launch = joined
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
+            .expect("command");
+        assert!(
+            windowed(&launch.args, &["--network", "maxplayer-sbx"]),
+            "a configured network must reach the argv: {:?}",
+            launch.args
+        );
+        // Same ordering hazard as `--runtime`: a run flag after the image is read as the agent
+        // command, so the container would launch with `--network` as its argv0.
+        let network_at =
+            launch.args.iter().position(|a| a == "maxplayer-sbx").expect("network value in argv");
+        let image_at = launch
+            .args
+            .iter()
+            .position(|a| a == "maxplayer-sandbox:latest")
+            .expect("the image is in the argv");
+        assert!(
+            network_at < image_at,
+            "the network must precede the image, or docker reads it as the agent command: {:?}",
+            launch.args
+        );
+    }
+
+    // from_config threads the network and the proxy port range through, and refuses a malformed
+    // range at config-resolution time rather than at job time.
+    #[test]
+    fn from_config_resolves_the_network_and_the_proxy_port_range() {
+        use crate::home::{SandboxConfig, SandboxMode};
+        let configured = SandboxConfig {
+            mode: SandboxMode::Docker,
+            image: Some("img".into()),
+            network: Some("maxplayer-sbx".into()),
+            proxy_port_range: Some("49200-49299".into()),
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::from_config(Some(&configured)).expect("ok");
+        assert_eq!(policy.sandbox_network(), Some("maxplayer-sbx"));
+        assert_eq!(
+            policy.proxy_ports(),
+            Some(crate::sandbox_net::PortRange::new(49200, 49299).unwrap())
+        );
+
+        // Unset ⇒ both absent. This is the shipped behaviour and it must survive the new fields.
+        let bare =
+            SandboxConfig { mode: SandboxMode::Docker, image: Some("img".into()), ..Default::default() };
+        let policy = SandboxPolicy::from_config(Some(&bare)).expect("ok");
+        assert_eq!(policy.sandbox_network(), None);
+        assert_eq!(policy.proxy_ports(), None);
+
+        // Blank strings are unset, not an empty flag and not a parse error.
+        let blank = SandboxConfig {
+            mode: SandboxMode::Docker,
+            image: Some("img".into()),
+            network: Some("   ".into()),
+            proxy_port_range: Some("  ".into()),
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::from_config(Some(&blank)).expect("blank is unset, not invalid");
+        assert_eq!(policy.sandbox_network(), None);
+        assert_eq!(policy.proxy_ports(), None);
+
+        // A malformed range FAILS resolution. The alternative — falling back to an ephemeral port —
+        // would put the proxy outside the range the firewall pinhole names, so every job would fail
+        // to reach its model with nothing naming the port as the cause.
+        let bad = SandboxConfig {
+            mode: SandboxMode::Docker,
+            image: Some("img".into()),
+            proxy_port_range: Some("49300-49200".into()),
+            ..Default::default()
+        };
+        let error = SandboxPolicy::from_config(Some(&bad)).expect_err("an inverted range must fail");
+        assert!(
+            matches!(&error, ExecError::Config(message) if message.contains("proxy_port_range")),
+            "the refusal must name the config key an operator has to fix: {error:?}"
+        );
+    }
+
     // from_config threads the runtime through, and a blank string is treated as unset rather than
     // forwarded as an empty `--runtime ` that docker would reject.
     #[test]
@@ -1385,10 +1564,9 @@ mod tests {
         use crate::home::{SandboxConfig, SandboxMode};
         let with_runtime = SandboxConfig {
             mode: SandboxMode::Docker,
-            launcher: Vec::new(),
             image: Some("img".into()),
-            forward_env: Vec::new(),
             runtime: Some("runsc".into()),
+            ..Default::default()
         };
         let policy = SandboxPolicy::from_config(Some(&with_runtime)).expect("ok");
         let launch = policy
@@ -1430,6 +1608,8 @@ mod tests {
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
             runtime: None,
+            network: None,
+            proxy_ports: None,
         });
         let carried = forwarded_agent_env_from(&docker, daemon_env);
         let names: Vec<&str> = carried.iter().map(|(k, _)| k.as_str()).collect();
@@ -1475,6 +1655,8 @@ mod tests {
             image: "img".into(),
             forward_env: vec!["MY_AGENT_TOKEN".into(), "ANTHROPIC_API_KEY".into()],
             runtime: None,
+            network: None,
+            proxy_ports: None,
         });
         let carried = forwarded_agent_env_from(&policy, env);
         let names: Vec<&str> = carried.iter().map(|(k, _)| k.as_str()).collect();
@@ -1494,6 +1676,8 @@ mod tests {
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
             runtime: None,
+            network: None,
+            proxy_ports: None,
         });
         let env = vec![("ANTHROPIC_API_KEY".to_string(), "sk-ant-xxx".to_string())];
         let launch = policy
@@ -1539,6 +1723,8 @@ mod tests {
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
             runtime: None,
+            network: None,
+            proxy_ports: None,
         });
         let forwarded: Vec<(String, String)> =
             SYNTHETIC_REALS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
@@ -1566,6 +1752,8 @@ mod tests {
             image: "maxplayer-sandbox:latest".into(),
             forward_env: Vec::new(),
             runtime: None,
+            network: None,
+            proxy_ports: None,
         });
         // All four credentials, an operator var carrying one of the secrets (must be scrubbed too), and
         // both vendor base URLs (the overrides must replace, not append).
@@ -1653,6 +1841,8 @@ mod tests {
             image: "img".into(),
             forward_env: Vec::new(),
             runtime: None,
+            network: None,
+            proxy_ports: None,
         });
         let launch = policy
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -1670,7 +1860,13 @@ mod tests {
     #[test]
     fn uncontained_forwarded_credentials_flags_only_unrecognized_operator_vars() {
         let docker = |forward_env: Vec<String>| {
-            SandboxPolicy::docker(DockerPolicy { image: "img".into(), forward_env, runtime: None })
+            SandboxPolicy::docker(DockerPolicy {
+                image: "img".into(),
+                forward_env,
+                runtime: None,
+                network: None,
+                proxy_ports: None,
+            })
         };
         // Operator forwards an unknown var (set), a known credential (contained), and a blank one.
         let policy = docker(vec![
@@ -1705,10 +1901,7 @@ mod tests {
         use crate::home::{SandboxConfig, SandboxMode};
         let base = SandboxConfig {
             mode: SandboxMode::Docker,
-            launcher: Vec::new(),
-            image: None,
-            forward_env: Vec::new(),
-            runtime: None,
+            ..Default::default()
         };
         // docker with no image ⇒ resolves to the default, NOT an error.
         let policy = SandboxPolicy::from_config(Some(&base)).expect("defaults the image");
@@ -1778,7 +1971,13 @@ mod tests {
         );
         let agent_command = argv(&["sh", "-c", &probe]);
         let policy =
-            SandboxPolicy::docker(DockerPolicy { image, forward_env: Vec::new(), runtime: None });
+            SandboxPolicy::docker(DockerPolicy {
+                image,
+                forward_env: Vec::new(),
+                runtime: None,
+                network: None,
+                proxy_ports: None,
+            });
         let job = JobLaunch {
             workdir: &workdir,
             env: &[],

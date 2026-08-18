@@ -356,18 +356,13 @@ mod tests {
         assert_eq!(AdapterHost::for_sandbox(None), AdapterHost::Host);
         let docker = SandboxConfig {
             mode: SandboxMode::Docker,
-            launcher: Vec::new(),
             image: Some("img".into()),
-            forward_env: Vec::new(),
-            runtime: None,
+            ..Default::default()
         };
         assert_eq!(AdapterHost::for_sandbox(Some(&docker)), AdapterHost::Container);
         let launcher = SandboxConfig {
             mode: SandboxMode::Launcher,
-            launcher: Vec::new(),
-            image: None,
-            forward_env: Vec::new(),
-            runtime: None,
+            ..Default::default()
         };
         assert_eq!(AdapterHost::for_sandbox(Some(&launcher)), AdapterHost::Host);
     }

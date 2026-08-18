@@ -12494,9 +12494,7 @@ mod tests {
             config.sandbox = Some(SandboxConfig {
                 mode: crate::home::SandboxMode::Launcher,
                 launcher: vec!["definitely-not-a-real-binary-xyz".to_owned()],
-                image: None,
-                forward_env: Vec::new(),
-                runtime: None,
+                ..Default::default()
             });
         })
         .expect("persist config");

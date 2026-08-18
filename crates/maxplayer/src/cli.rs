@@ -55,6 +55,12 @@ where
         // gate runs rather than a description of it.
         #[cfg(feature = "wallet")]
         Some("sandbox-probe") => crate::sandbox_probe::run(&args[2..], out, err),
+        // Egress containment (#797). `sandbox-probe` answers "does the launcher contain the
+        // FILESYSTEM"; this answers "does the host contain the NETWORK", and `verify` is the half
+        // that matters — a seat with the network configured and no rules installed looks identical
+        // to a contained one from inside a job.
+        #[cfg(feature = "wallet")]
+        Some("sandbox-net") => crate::sandbox_net_cli::run(&args[2..], out, err),
         Some("wallet") => crate::wallet_cli::run(&args[2..], out, err),
         Some("profile") => crate::profile_cli::run(&args[2..], out, err),
         Some("whoami") => crate::whoami::run(&args[2..], out, err),

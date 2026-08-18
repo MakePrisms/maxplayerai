@@ -1889,6 +1889,7 @@ mod tests {
             image: None,
             forward_env: Vec::new(),
             runtime: None,
+            ..Default::default()
         }));
         assert_eq!(
             bogus.status,
@@ -1910,6 +1911,7 @@ mod tests {
                 image: None,
                 forward_env: Vec::new(),
                 runtime: None,
+                ..Default::default()
             }))
             .status,
             Status::Pass,
@@ -1935,6 +1937,7 @@ mod tests {
             image: None,
             forward_env: Vec::new(),
             runtime: None,
+            ..Default::default()
         }
     }
 
@@ -2074,6 +2077,7 @@ mod tests {
                 image: Some("maxplayer-sandbox:latest".into()),
                 forward_env: Vec::new(),
                 runtime: None,
+                ..Default::default()
             })
         };
 
@@ -2117,6 +2121,7 @@ mod tests {
                 image: Some("maxplayer-sandbox:latest".into()),
                 forward_env,
                 runtime: None,
+                ..Default::default()
             })
         };
         // An operator-added var that is set: named, advisory (never a boot-block).
@@ -2337,6 +2342,11 @@ mod tests {
             image: Some("maxplayer-sandbox:test".into()),
             forward_env: Vec::new(),
             runtime: None,
+            // This check is about the engine floor, not egress: no dedicated network and no proxy
+            // port range. Written out rather than `..Default::default()` so that adding another
+            // sandbox field breaks this test and makes someone decide what it should be here.
+            network: None,
+            proxy_port_range: None,
         });
         home.config.relay_url = "not-a-relay-url".into();
         home.config.accepted_mints = Vec::new();
@@ -2362,6 +2372,7 @@ mod tests {
             image: None,
             forward_env: Vec::new(),
             runtime: None,
+            ..Default::default()
         });
         assert_eq!(checks::check_sandbox_image(launcher).status, Status::Pass);
     }
@@ -2394,6 +2405,7 @@ mod tests {
             image: Some("no-such-registry.invalid/nope:v0".into()),
             forward_env: Vec::new(),
             runtime: None,
+            ..Default::default()
         });
         home.config.relay_url = "not-a-relay-url".into();
         home.config.accepted_mints = Vec::new();
@@ -2435,6 +2447,7 @@ mod tests {
             image: None,
             forward_env: Vec::new(),
             runtime: None,
+            ..Default::default()
         });
         home.config.relay_url = "not-a-relay-url".into();
         home.config.accepted_mints = Vec::new();
