@@ -288,11 +288,6 @@ pub fn snapshot_delivery_at(
 ) -> Result<String, SellerGitError> {
     let repo = Repository::open(workdir)
         .map_err(|error| SellerGitError::Io(format!("snapshot: open workdir: {error}")))?;
-    // #826: this is the FIRST git leg after the sandboxed job stopped, and the job had write access to
-    // `.git/`. Pin hook lookup off here as well as on the push, so the pin is in place before ANY git
-    // write in this workdir rather than only before the one that reaches the network.
-    git_transport::neutralise_and_report_hooks(&repo, "snapshot")
-        .map_err(|error| SellerGitError::Io(format!("snapshot: {error}")))?;
 
     let base = match base_oid {
         Some(hex) => {
