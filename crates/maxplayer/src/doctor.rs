@@ -875,6 +875,207 @@ mod checks {
             .unwrap_or(false)
     }
 
+    const SANDBOX_ENGINE_CHECK: &str = "sandbox engine floor";
+
+    /// The first Docker Engine whose default seccomp profile BLOCKS the `io_uring` family.
+    ///
+    /// Derived from moby itself rather than from a changelog summary, because the obvious reading is
+    /// wrong in the clearing direction. [moby/moby#46762] ("seccomp: block io_uring_* syscalls in
+    /// default profile", milestone 25.0.0, merged 2023-11-02) removes exactly three entries —
+    /// `io_uring_enter`, `io_uring_register`, `io_uring_setup` — from the allowlist in
+    /// `profiles/seccomp/default_linux.go`. The profile's `defaultAction` is `SCMP_ACT_ERRNO`, so
+    /// removal from the allowlist IS the block. The shipped `profiles/seccomp/default.json` carries
+    /// three `io_uring` occurrences at v20.10.24, v23.0.0, v24.0.0 and v24.0.9, and zero at v25.0.0
+    /// and v26.0.0; the commit is not on the v24 branch, so there is no 24.0.x backport to admit.
+    ///
+    /// The ADR calls this "a 2023 hardening". True of the COMMIT (2023-11-02), not of the release —
+    /// it first ships in 25.0.0 (January 2024). A seat reasoning "2023, so Docker 24 (May 2023) has
+    /// it" lands one major version too low, and that error CLEARS an exposed seat.
+    ///
+    /// Sharper than "older Engines merely lack the block": [moby/moby#39415] ADDED these three
+    /// syscalls to the allowlist in 2019 and the revert ([moby/moby#41223]) was closed UNMERGED, so
+    /// every Engine from 2019 through 24.x explicitly PERMITS io_uring. Below the floor the profile
+    /// is not silent about io_uring — it allows it.
+    const DOCKER_ENGINE_FLOOR: EngineVersion = EngineVersion { major: 25, minor: 0, patch: 0 };
+
+    /// A Docker Engine version, ordered by (major, minor, patch) — derived `Ord` over the fields in
+    /// declaration order is exactly that comparison.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub(super) struct EngineVersion {
+        major: u32,
+        minor: u32,
+        patch: u32,
+    }
+
+    impl EngineVersion {
+        /// Parse the leading `MAJOR[.MINOR[.PATCH]]` of a reported version.
+        ///
+        /// Lenient about what FOLLOWS the digits (`24.0.7-ce`, `25.0.3+dfsg1`, a vendor build suffix)
+        /// and strict about the digits themselves: a string with no leading integer is `None`, never a
+        /// silent `0.0.0`. A `0.0.0` would sort BELOW the floor and report an unreadable version as a
+        /// confident "too old" — a wrong answer where the honest one is "unknown".
+        pub(super) fn parse(reported: &str) -> Option<Self> {
+            let mut fields = reported.trim().trim_start_matches('v').split('.');
+            Some(Self {
+                major: leading_number(fields.next()?)?,
+                minor: fields.next().and_then(leading_number).unwrap_or(0),
+                patch: fields.next().and_then(leading_number).unwrap_or(0),
+            })
+        }
+    }
+
+    impl std::fmt::Display for EngineVersion {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+        }
+    }
+
+    /// The leading run of ASCII digits in `field`, so `7-ce` reads as 7. `None` when the field opens
+    /// with no digit — never 0, so "unparseable" stays distinguishable from "zero".
+    fn leading_number(field: &str) -> Option<u32> {
+        let digits: String =
+            field.trim().chars().take_while(|character| character.is_ascii_digit()).collect();
+        digits.parse().ok()
+    }
+
+    /// What `docker version` reported for the SERVER, or why no version could be read.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum EngineProbe {
+        /// The daemon answered with a version that parsed.
+        Reported(EngineVersion),
+        /// The daemon was unreachable, or answered something no version parses from. Carries the
+        /// operator-facing reason, so the WARN says which of the two happened.
+        Unreadable(String),
+    }
+
+    /// The Docker Engine must be new enough that its DEFAULT seccomp profile blocks `io_uring`.
+    ///
+    /// `docs/SANDBOXING.md` §4 declines to hand-write a seccomp profile on purpose — dev toolchains
+    /// touch a broad, shifting syscall surface — which leaves the Engine default as the ONLY filter
+    /// standing on a non-gVisor seat. That reasoning silently assumes an Engine at or above
+    /// [`DOCKER_ENGINE_FLOOR`]; below it the seat runs strangers' code with a recurring
+    /// kernel-exploit surface explicitly allowed, and until this check nothing said so.
+    ///
+    /// WARN for a targeted-only seat, FAIL for an open-pool one — the same exposure split
+    /// [`check_home_permissions`] and [`check_sandbox_containment`] already apply, for the same
+    /// reason: serving the open pool means executing code posted by strangers.
+    pub(super) fn check_sandbox_engine_floor(
+        sandbox: Option<SandboxConfig>,
+        claims_open_pool: bool,
+    ) -> Check {
+        let runtime = sandbox.as_ref().and_then(|sandbox| sandbox.runtime.clone());
+        let policy = match SandboxPolicy::from_config(sandbox.as_ref()) {
+            Ok(policy) => policy,
+            // An unresolvable [sandbox] is already FAILed by the launcher check; don't double-report.
+            Err(_) => {
+                return Check::pass(SANDBOX_ENGINE_CHECK, "no docker executor to version-check")
+            }
+        };
+        if policy.docker_image().is_none() {
+            return Check::pass(SANDBOX_ENGINE_CHECK, "no Engine floor to check (not mode=docker)");
+        }
+        // Same ordering rule as check_sandbox_image: probe only once docker itself resolves, or the
+        // spawn would ENOENT and be misreported as an unreadable Engine version. A missing docker is
+        // the launcher check's verdict, not this one's.
+        if !argv0_resolvable("docker") {
+            return Check::pass(
+                SANDBOX_ENGINE_CHECK,
+                "docker not resolvable; Engine version unchecked (see sandbox launcher)",
+            );
+        }
+        fold_sandbox_engine_floor(&probe_engine_version(), runtime.as_deref(), claims_open_pool)
+    }
+
+    /// Turn a probed Engine version into a Check. Pure, so every verdict — including the below-floor
+    /// wording an exposed operator actually has to read — is testable with no docker daemon present.
+    pub(super) fn fold_sandbox_engine_floor(
+        probe: &EngineProbe,
+        runtime: Option<&str>,
+        claims_open_pool: bool,
+    ) -> Check {
+        let floor = DOCKER_ENGINE_FLOOR;
+        // gVisor filters syscalls in the Sentry and does not apply the OCI seccomp profile at all
+        // unless `--oci-seccomp` is set, so on a runsc seat the Engine default governs nothing and no
+        // Engine version could change this verdict. Answered before the probe, not after it.
+        if runtime == Some("runsc") {
+            return Check::pass(
+                SANDBOX_ENGINE_CHECK,
+                format!(
+                    "runtime = \"runsc\" — gVisor filters syscalls itself and ignores the OCI seccomp \
+                     profile, so the Engine {floor} io_uring floor does not govern this seat"
+                ),
+            );
+        }
+        match probe {
+            // Unknown is reported, never assumed. A silent Pass here would make the check quietest
+            // exactly when it has learned least — and an operator whose daemon is down would read a
+            // clean gate as "my Engine is fine".
+            EngineProbe::Unreadable(reason) => Check::warn(
+                SANDBOX_ENGINE_CHECK,
+                format!(
+                    "could not read the Docker Engine version ({reason}) — cannot confirm this seat \
+                     has the io_uring seccomp block that first shipped in Engine {floor}"
+                ),
+                "start the docker daemon, then re-run `maxplayer doctor`; or read it by hand with \
+                 `docker version --format '{{.Server.Version}}'`",
+            ),
+            EngineProbe::Reported(version) if *version >= floor => Check::pass(
+                SANDBOX_ENGINE_CHECK,
+                format!(
+                    "Docker Engine {version} ≥ {floor} — the default seccomp profile blocks \
+                     io_uring_setup/io_uring_enter/io_uring_register"
+                ),
+            ),
+            EngineProbe::Reported(version) => {
+                let detail = format!(
+                    "Docker Engine {version} is BELOW the {floor} floor — its default seccomp profile \
+                     still ALLOWS io_uring_setup/io_uring_enter/io_uring_register (allowlisted since \
+                     2019, blocked only in {floor}), so a job reaches a recurring kernel-exploit \
+                     surface docs/SANDBOXING.md §4 assumes is closed"
+                );
+                let hint = format!(
+                    "upgrade the Docker Engine to {floor} or newer; on Linux, [sandbox] runtime = \
+                     \"runsc\" (gVisor) also removes the exposure"
+                );
+                if claims_open_pool {
+                    Check::fail(SANDBOX_ENGINE_CHECK, detail, hint)
+                } else {
+                    Check::warn(SANDBOX_ENGINE_CHECK, detail, hint)
+                }
+            }
+        }
+    }
+
+    /// Ask the daemon for the SERVER version — the Engine that applies the seccomp profile.
+    ///
+    /// `{{.Server.Version}}`, never `{{.Client.Version}}`: the client is a separate program that can
+    /// be a different version, and against a remote `DOCKER_HOST` it describes the wrong machine
+    /// entirely. The client version is a value sitting NEXT TO the property this check is about.
+    fn probe_engine_version() -> EngineProbe {
+        let probe = std::process::Command::new("docker")
+            .args(["version", "--format", "{{.Server.Version}}"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        let probe = match probe {
+            Ok(probe) => probe,
+            Err(error) => return EngineProbe::Unreadable(format!("could not run docker: {error}")),
+        };
+        // `docker version` prints the CLIENT block and then exits non-zero when the daemon does not
+        // answer, so a populated stdout is not evidence of a server reply. The status is the signal.
+        if !probe.status.success() {
+            return EngineProbe::Unreadable(
+                "docker daemon did not answer `docker version` (not running, or not permitted)"
+                    .to_owned(),
+            );
+        }
+        let reported = String::from_utf8_lossy(&probe.stdout).trim().to_owned();
+        match EngineVersion::parse(&reported) {
+            Some(version) => EngineProbe::Reported(version),
+            None => EngineProbe::Unreadable(format!("unrecognized version string '{reported}'")),
+        }
+    }
+
     /// Containment, for a seat that serves the OPEN POOL — which means executing code posted by
     /// strangers. `check_sandbox_launcher` above answers "does the launcher resolve", a property
     /// one layer out from this one: bubblewrap resolves on Ubuntu 24.04 and then fails at spawn on
@@ -1310,6 +1511,7 @@ fn build_checks(
     let sandbox_for_launcher = sandbox.clone();
     let sandbox_for_creds = sandbox.clone();
     let sandbox_for_image = sandbox.clone();
+    let sandbox_for_engine = sandbox.clone();
     // The probe runs in the seat's OWN home, because that is where a launcher's config points.
     let home_root = home.root.clone();
     // Open-pool claiming is the exposure the containment gate is about: it is what makes this box
@@ -1353,6 +1555,15 @@ fn build_checks(
     // or the first awarded job stalls. On absence this prints the exact `docker pull` command. A
     // non-docker policy is a no-op Pass. Placed after the launcher (docker-resolves) check.
     checks.push(Box::new(move || checks::check_sandbox_image(sandbox_for_image)));
+    // #796: under mode=docker the Engine's DEFAULT seccomp profile is the only syscall filter standing
+    // on a non-gVisor seat — docs/SANDBOXING.md §4 declines to hand-write one on purpose. The io_uring
+    // block first ships in Engine 25.0.0, and every Engine from 2019 through 24.x explicitly ALLOWS
+    // that family, so an older Engine is a materially weaker posture than the ADR assumes and nothing
+    // said so before this check. WARN for a targeted seat, FAIL for an open-pool one — the same
+    // exposure split check_home_permissions and check_sandbox_containment already use.
+    checks.push(Box::new(move || {
+        checks::check_sandbox_engine_floor(sandbox_for_engine, claims_open_pool)
+    }));
     // Blocking for an open-pool seat (#451). Placed after the resolve check so that a launcher which
     // is not there reports as the missing file it is, rather than as a containment failure.
     checks.push(Box::new(move || {
@@ -1961,6 +2172,183 @@ mod tests {
             "a pullable image must still offer the pre-pull command: {}",
             pullable.render()
         );
+    }
+
+    // RED-PROVE (#796): the below-floor path must SPEAK. A version check whose failure mode is silence
+    // is worse than no check at all, so this asserts the TEXT an exposed operator actually reads — the
+    // version, the floor, the syscalls and the fix — never merely a status enum.
+    #[test]
+    fn doctor_engine_floor_below_the_floor_names_the_exposure_and_the_fix() {
+        use checks::{EngineProbe, EngineVersion};
+        let below =
+            EngineProbe::Reported(EngineVersion::parse("24.0.9").expect("'24.0.9' must parse"));
+
+        // An open-pool seat executes code posted by strangers, so the finding blocks boot — the same
+        // exposure split check_home_permissions and check_sandbox_containment already apply.
+        let open_pool = checks::fold_sandbox_engine_floor(&below, None, true);
+        let rendered = open_pool.render();
+        assert_eq!(
+            open_pool.status,
+            Status::Fail,
+            "an open-pool seat below the floor must FAIL: {rendered}"
+        );
+        for needle in ["24.0.9", "25.0.0", "io_uring_setup", "BELOW"] {
+            assert!(rendered.contains(needle), "below-floor text must name '{needle}': {rendered}");
+        }
+        assert!(
+            rendered.contains("upgrade the Docker Engine to 25.0.0"),
+            "below-floor text must carry the actionable fix, not just the finding: {rendered}"
+        );
+
+        // A targeted-only seat chose its counterparties, so the same finding is advisory there.
+        let targeted = checks::fold_sandbox_engine_floor(&below, None, false);
+        assert_eq!(
+            targeted.status,
+            Status::Warn,
+            "a targeted seat below the floor WARNs: {}",
+            targeted.render()
+        );
+    }
+
+    // The comparison is `>=`, so the floor itself must PASS. An off-by-one here would flag every
+    // correctly-upgraded seat and teach operators to ignore this check — the failure mode that makes a
+    // real warning invisible later.
+    #[test]
+    fn doctor_engine_floor_passes_at_and_above_the_floor() {
+        use checks::{EngineProbe, EngineVersion};
+        for version in ["25.0.0", "25.0.3", "26.1.4", "28.0.1"] {
+            let probe =
+                EngineProbe::Reported(EngineVersion::parse(version).expect("version must parse"));
+            let check = checks::fold_sandbox_engine_floor(&probe, None, true);
+            assert_eq!(
+                check.status,
+                Status::Pass,
+                "Engine {version} is at or above the floor and must PASS: {}",
+                check.render()
+            );
+        }
+        // The nearest version below the floor still fails, so the boundary is exact in both directions.
+        let just_below =
+            EngineProbe::Reported(EngineVersion::parse("24.9.9").expect("'24.9.9' must parse"));
+        assert_eq!(
+            checks::fold_sandbox_engine_floor(&just_below, None, true).status,
+            Status::Fail,
+            "24.9.9 is below 25.0.0 and must still FAIL an open-pool seat"
+        );
+    }
+
+    // An unreadable version must produce a VISIBLE unknown, never a quiet Pass. A silent Pass would
+    // make this check quietest exactly when it has learned least, and an operator whose daemon is down
+    // would read a clean gate as "my Engine is fine". It still never BLOCKS: an unreachable daemon is
+    // the launcher and image checks' verdict, not this one's.
+    #[test]
+    fn doctor_engine_floor_reports_an_unreadable_version_instead_of_passing_silently() {
+        let unknown = checks::EngineProbe::Unreadable("docker daemon did not answer".to_owned());
+        let check = checks::fold_sandbox_engine_floor(&unknown, None, true);
+        let rendered = check.render();
+        assert_eq!(
+            check.status,
+            Status::Warn,
+            "an unknown Engine version must WARN, never Pass: {rendered}"
+        );
+        assert!(
+            rendered.contains("could not read the Docker Engine version"),
+            "the WARN must say the version is unknown: {rendered}"
+        );
+        assert!(
+            rendered.contains("docker daemon did not answer"),
+            "the WARN must carry WHY it is unknown, so the operator knows what to fix: {rendered}"
+        );
+    }
+
+    // Under gVisor the OCI seccomp profile is not applied at all, so the Engine default governs
+    // nothing on a runsc seat. A controlled comparison: the SAME below-floor probe that FAILs above,
+    // with the runtime as the only variable — so this proves the RUNTIME changed the verdict, not the
+    // version.
+    #[test]
+    fn doctor_engine_floor_is_moot_under_runsc() {
+        use checks::{EngineProbe, EngineVersion};
+        let below =
+            EngineProbe::Reported(EngineVersion::parse("24.0.9").expect("'24.0.9' must parse"));
+        assert_eq!(
+            checks::fold_sandbox_engine_floor(&below, None, true).status,
+            Status::Fail,
+            "control: the same Engine FAILs an open-pool seat under the default runtime"
+        );
+
+        let under_gvisor = checks::fold_sandbox_engine_floor(&below, Some("runsc"), true);
+        assert_eq!(
+            under_gvisor.status,
+            Status::Pass,
+            "runsc ignores the OCI seccomp profile, so the Engine floor does not govern: {}",
+            under_gvisor.render()
+        );
+
+        // Only gVisor replaces the syscall filter. Sysbox and friends still take the Engine's OCI
+        // profile, so naming any non-default runtime must NOT clear the finding.
+        assert_eq!(
+            checks::fold_sandbox_engine_floor(&below, Some("sysbox-runc"), true).status,
+            Status::Fail,
+            "a non-gVisor runtime still applies the OCI profile and stays exposed"
+        );
+    }
+
+    // `0.0.0` sorts BELOW the floor, so parsing an unrecognized string into it would report an
+    // unreadable version as a confident "too old" — a wrong answer where the honest one is "unknown".
+    #[test]
+    fn doctor_engine_version_parse_keeps_unknown_distinct_from_zero() {
+        use checks::EngineVersion;
+        assert!(EngineVersion::parse("not-a-version").is_none(), "garbage must be unknown, not 0.0.0");
+        assert!(EngineVersion::parse("").is_none(), "an empty report must be unknown");
+        assert!(EngineVersion::parse("   ").is_none(), "a blank report must be unknown");
+
+        // Vendor, distro and pre-release suffixes are common in the wild and must not defeat the
+        // comparison: `24.0.7-ce` is still 24.0.7.
+        assert_eq!(EngineVersion::parse("24.0.7-ce"), EngineVersion::parse("24.0.7"));
+        assert_eq!(EngineVersion::parse("v25.0.3"), EngineVersion::parse("25.0.3"));
+        assert_eq!(EngineVersion::parse("26.1.4+dfsg1"), EngineVersion::parse("26.1.4"));
+
+        // A truncated report still orders correctly rather than collapsing to unknown.
+        assert_eq!(EngineVersion::parse("25"), EngineVersion::parse("25.0.0"));
+        assert!(EngineVersion::parse("25") > EngineVersion::parse("24.0.9"));
+    }
+
+    // RED-PROVE (wiring, #796): the Engine floor check must sit in the ONE registry that both
+    // `maxplayer doctor` and the seller boot gate run — drop the `check_sandbox_engine_floor` push
+    // from `build_checks` and this goes red. It asserts on the check's NAME, which is present under
+    // every verdict (including "docker not resolvable"), so the test is deterministic on a box with no
+    // docker rather than depending on whatever Engine this host happens to run.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn sandbox_engine_floor_check_is_wired_into_the_boot_gate() {
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
+        let tmp = std::env::temp_dir().join(format!(
+            "maxplayer-doctor-engine-796-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut home = resolve_doctor_home(Some(tmp.clone())).expect("bootstrap the home");
+        home.config.sandbox = Some(SandboxConfig {
+            mode: SandboxMode::Docker,
+            launcher: Vec::new(),
+            image: Some("maxplayer-sandbox:test".into()),
+            forward_env: Vec::new(),
+            runtime: None,
+        });
+        home.config.relay_url = "not-a-relay-url".into();
+        home.config.accepted_mints = Vec::new();
+
+        let results = run_checks(build_checks(&home, false));
+        assert!(
+            results.iter().any(|check| check.name == "sandbox engine floor"),
+            "build_checks must run the sandbox engine floor check; got: {:?}",
+            results.iter().map(Check::render).collect::<Vec<_>>()
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     // A non-docker (or absent) [sandbox] has no image to check: a no-op Pass, never a spurious fault.
