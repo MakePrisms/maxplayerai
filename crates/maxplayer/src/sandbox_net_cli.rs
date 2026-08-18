@@ -88,8 +88,8 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             return USAGE_ERROR;
         }
     };
-    let policy = match resolve_policy(&parsed) {
-        Ok(policy) => policy,
+    let (policy, facts) = match resolve_policy(&parsed) {
+        Ok(resolved) => resolved,
         Err(message) => {
             let _ = writeln!(err, "{message}");
             return USAGE_ERROR;
@@ -97,8 +97,8 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     };
     match action {
         "plan" => plan(&policy, out),
-        "apply" => apply(&policy, out, err),
-        "verify" => verify(&policy, out, err),
+        "apply" => apply(&policy, facts.as_ref(), out, err),
+        "verify" => verify(&policy, facts.as_ref(), out, err),
         "revert" => revert(&policy, out, err),
         // Unreachable: the guard above accepts exactly these four.
         _ => USAGE_ERROR,
@@ -133,7 +133,7 @@ fn parse_flags(tokens: &[String]) -> Result<Args, String> {
 /// a seat running no contained credential needs no pinhole, and rendering one it does not need would
 /// open a host port for nothing. What it must never do is silently widen — an unset range yields no
 /// pinhole at all, never a permissive one.
-fn resolve_policy(args: &Args) -> Result<NetPolicy, String> {
+fn resolve_policy(args: &Args) -> Result<(NetPolicy, Option<NetworkFacts>), String> {
     // Same home resolution the doctor uses: `MAXPLAYER_HOME`, then `~/.maxplayer`. A seat with no
     // home yet is not an error here — the flags can supply everything, which is what lets an
     // operator plan the rules before the seat exists.
@@ -165,9 +165,15 @@ fn resolve_policy(args: &Args) -> Result<NetPolicy, String> {
         .map(|range| PortRange::parse(&range).map_err(|error| format!("--ports: {error}")))
         .transpose()?;
 
-    let (discovered_bridge, discovered_gateway) = match (&args.bridge, &args.gateway) {
-        (Some(_), Some(_)) => (None, None),
-        _ => inspect_network(&network)?,
+    // Both flags supplied ⇒ docker is never asked, so there are no network facts to check. That is a
+    // deliberate hole and `verify` NAMES it rather than passing quietly: a skipped check must not be
+    // reported as a satisfied one.
+    let (discovered_bridge, discovered_gateway, facts) = match (&args.bridge, &args.gateway) {
+        (Some(_), Some(_)) => (None, None, None),
+        _ => {
+            let (bridge, gateway, facts) = inspect_network(&network)?;
+            (bridge, gateway, Some(facts))
+        }
     };
     let bridge = args
         .bridge
@@ -180,28 +186,51 @@ fn resolve_policy(args: &Args) -> Result<NetPolicy, String> {
         .or(discovered_gateway)
         .ok_or_else(|| format!("could not determine the gateway address for network {network}"))?;
 
-    Ok(NetPolicy {
-        bridge,
-        gateway,
-        proxy_ports: ports,
-        log_connections: !args.no_log,
-    })
+    Ok((
+        NetPolicy {
+            bridge,
+            gateway,
+            proxy_ports: ports,
+            log_connections: !args.no_log,
+        },
+        facts,
+    ))
 }
 
-/// Ask docker for the network's host-side interface name and gateway address.
+/// What `docker network inspect` says about the NETWORK, as distinct from the ruleset.
+///
+/// The iptables policy cannot express either of these. `enable_icc` decides whether two containers
+/// on this bridge may talk to each other at all, and `EnableIPv6` decides whether there is a second
+/// address family that these v4 chains do not touch. Both are set when the network is CREATED, so
+/// they are properties to be checked, never installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NetworkFacts {
+    name: String,
+    /// Whether containers on this network may reach each other.
+    ///
+    /// Docker's default is ON, and in that case the key is ABSENT from `Options` entirely — so an
+    /// absent key reads as `true`. A missing setting must never read as the safe one.
+    inter_container: bool,
+    ipv6: bool,
+}
+
+/// Ask docker for the network's host-side interface, gateway, and the two properties the ruleset
+/// cannot cover.
 ///
 /// Docker names a user-defined bridge `br-<first 12 chars of the network id>` unless the operator
 /// pinned `com.docker.network.bridge.name`, so the pinned name is preferred and the derived one is
 /// the fallback. Getting this wrong is not a silent failure — a rule scoped to a non-existent
 /// interface matches nothing, and `verify` reports the mismatch.
-fn inspect_network(network: &str) -> Result<(Option<String>, Option<String>), String> {
+fn inspect_network(
+    network: &str,
+) -> Result<(Option<String>, Option<String>, NetworkFacts), String> {
     let output = Command::new("docker")
         .args([
             "network",
             "inspect",
             network,
             "--format",
-            "{{.Id}}\t{{index .Options \"com.docker.network.bridge.name\"}}\t{{range .IPAM.Config}}{{.Gateway}}{{end}}",
+            "{{.Id}}\t{{index .Options \"com.docker.network.bridge.name\"}}\t{{range .IPAM.Config}}{{.Gateway}}{{end}}\t{{.EnableIPv6}}\t{{index .Options \"com.docker.network.bridge.enable_icc\"}}",
         ])
         .output()
         .map_err(|error| format!("could not run `docker network inspect`: {error}"))?;
@@ -217,6 +246,8 @@ fn inspect_network(network: &str) -> Result<(Option<String>, Option<String>), St
     let id = fields.next().unwrap_or_default().to_owned();
     let pinned = fields.next().unwrap_or_default().trim().to_owned();
     let gateway = fields.next().unwrap_or_default().trim().to_owned();
+    let ipv6 = fields.next().unwrap_or_default().trim().to_owned();
+    let icc = fields.next().unwrap_or_default().trim().to_owned();
 
     let bridge = if !pinned.is_empty() && pinned != "<no value>" {
         Some(pinned)
@@ -225,7 +256,29 @@ fn inspect_network(network: &str) -> Result<(Option<String>, Option<String>), St
     } else {
         None
     };
-    Ok((bridge, (!gateway.is_empty()).then_some(gateway)))
+    Ok((
+        bridge,
+        (!gateway.is_empty()).then_some(gateway),
+        NetworkFacts {
+            name: network.to_owned(),
+            inter_container: parse_icc(&icc),
+            ipv6: parse_ipv6(&ipv6),
+        },
+    ))
+}
+
+/// Read docker's `enable_icc` option. ABSENT or unparseable ⇒ `true`, because docker's default is to
+/// allow inter-container traffic and the key only appears in `Options` when someone set it. Reading
+/// an absent key as `false` would report every default network as contained.
+fn parse_icc(raw: &str) -> bool {
+    !matches!(raw.trim().to_ascii_lowercase().as_str(), "false" | "0")
+}
+
+/// Read docker's `EnableIPv6`. Unlike `enable_icc` this is a real field and is `false` by default, so
+/// an EMPTY value means the template returned nothing — which is a broken read, not a safe network.
+/// Only an explicit `false` counts as off.
+fn parse_ipv6(raw: &str) -> bool {
+    !matches!(raw.trim().to_ascii_lowercase().as_str(), "false" | "0")
 }
 
 /// Print the rules and the reason for each, then the exact commands `apply` would run.
@@ -286,7 +339,48 @@ fn shell_join(argv: &[String]) -> String {
         .join(" ")
 }
 
-fn apply(policy: &NetPolicy, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+/// Install the rules, but only when they are not already installed.
+///
+/// `apply` used to append unconditionally. `-A` does not care that a rule is already there, so a
+/// second `apply` doubled every rule, and `verify`'s exact-sequence comparison then reported NOT
+/// CONTAINED on a box that was genuinely contained. Fail-loud rather than dangerous, but it made the
+/// obvious operator reflex — run apply again — produce a scary result.
+///
+/// So: compare first. Already in force ⇒ do nothing. Our chains present but DIFFERENT ⇒ refuse and
+/// send the operator through `revert`, because appending onto a mismatched chain is what produces the
+/// duplicates. Refusing is deliberate over reverting automatically: this command edits the firewall
+/// of a box running real services, and it should not remove rules the operator did not ask it to.
+/// An upgrade — this release adds ranges to the deny list — is therefore `revert` then `apply`.
+fn apply(
+    policy: &NetPolicy,
+    facts: Option<&NetworkFacts>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    let (mut quiet_out, mut quiet_err) = (Vec::new(), Vec::new());
+    if verify(policy, facts, &mut quiet_out, &mut quiet_err) == SUCCESS {
+        let _ = writeln!(
+            out,
+            "already in force: both chains match the policy, nothing to install"
+        );
+        return SUCCESS;
+    }
+    // A chain of ours that exists but does not match is the duplicate-producing case.
+    if [Chain::Forward, Chain::Input]
+        .iter()
+        .any(|chain| iptables_spec(chain.own_chain()).is_ok())
+    {
+        let _ = writeln!(
+            err,
+            "REFUSING to apply: our chains already exist and do not match the policy."
+        );
+        let _ = writeln!(
+            err,
+            "Appending onto them would duplicate every rule. Run `maxplayer sandbox-net revert` \
+             first, then apply."
+        );
+        return NOT_CONTAINED;
+    }
     for step in policy.install_plan() {
         // `-N` on an existing chain is an error, and it is the expected one on re-apply. Treat only
         // that as benign; everything else stops the run rather than pressing on with a half-built
@@ -304,7 +398,7 @@ fn apply(policy: &NetPolicy, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         }
     }
     let _ = writeln!(out, "installed. verifying:");
-    verify(policy, out, err)
+    verify(policy, facts, out, err)
 }
 
 /// Compare the live chains against the rendered policy.
@@ -312,7 +406,12 @@ fn apply(policy: &NetPolicy, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 /// Exact-sequence comparison, not a subset check: a rule present but in the wrong ORDER is a real
 /// defect here (a deny above the pinhole silently breaks every contained job; a pinhole above the
 /// metadata drop would be worse), and a subset check cannot see order at all.
-fn verify(policy: &NetPolicy, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+fn verify(
+    policy: &NetPolicy,
+    facts: Option<&NetworkFacts>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
     let mut mismatched = false;
     for chain in [Chain::Forward, Chain::Input] {
         let own = chain.own_chain();
@@ -367,14 +466,95 @@ fn verify(policy: &NetPolicy, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             }
         }
     }
+    if check_network_facts(facts, out, err) {
+        mismatched = true;
+    }
     if mismatched {
         return NOT_CONTAINED;
     }
-    let _ = writeln!(
-        out,
-        "contained: both chains match the policy and both parents jump to them"
-    );
+    let _ = match facts {
+        Some(_) => writeln!(
+            out,
+            "contained: both chains match the policy, both parents jump to them, \
+             inter-container is off and IPv6 is off"
+        ),
+        None => writeln!(
+            out,
+            "rules match: both chains match the policy and both parents jump to them \
+             (network properties unchecked, see the note above)"
+        ),
+    };
     SUCCESS
+}
+
+/// The two properties no iptables rule can express, checked against `docker network inspect`.
+///
+/// Both are decided when the network is CREATED, so a failure here is NOT fixed by re-applying the
+/// rules — it needs the network rebuilt, and the messages say so rather than leaving an operator to
+/// guess. Kept separate from [`verify`] so it is testable without root, iptables or a docker daemon.
+///
+/// Returns whether it found a containment problem.
+fn check_network_facts(
+    facts: Option<&NetworkFacts>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> bool {
+    let mut mismatched = false;
+    match facts {
+        Some(facts) => {
+            if facts.inter_container {
+                mismatched = true;
+                let _ = writeln!(
+                    err,
+                    "NOT CONTAINED: network {} allows inter-container traffic, so one job can reach \
+                     another on the same bridge",
+                    facts.name
+                );
+                let _ = writeln!(
+                    err,
+                    "  today a job→job packet is denied only INCIDENTALLY, by the RFC1918 rule plus \
+                     net.bridge.bridge-nf-call-iptables=1. Pick a non-RFC1918 subnet or lose that \
+                     sysctl and it is silently gone."
+                );
+                let _ = writeln!(
+                    err,
+                    "  fix (recreate — icc cannot be changed on an existing network, so stop jobs \
+                     first):\n    docker network rm {0}\n    docker network create \
+                     --opt com.docker.network.bridge.enable_icc=false {0}",
+                    facts.name
+                );
+            }
+            if facts.ipv6 {
+                mismatched = true;
+                let _ = writeln!(
+                    err,
+                    "NOT CONTAINED: network {} has IPv6 enabled, and these rules are iptables (v4) \
+                     only",
+                    facts.name
+                );
+                let _ = writeln!(
+                    err,
+                    "  a v6-enabled network gives the job a second address family that NONE of these \
+                     chains touch — v6 has its own INPUT and DOCKER-USER, and the LAN-equivalents \
+                     there are ULA fc00::/7 and link-local fe80::/10."
+                );
+                let _ = writeln!(
+                    err,
+                    "  fix: recreate the network without --ipv6, or render an ip6tables mirror of \
+                     this policy (not implemented)."
+                );
+            }
+        }
+        // Absence of a check is reported, never counted as a pass.
+        None => {
+            let _ = writeln!(
+                out,
+                "note: inter-container and IPv6 were NOT checked — --bridge and --gateway were both \
+                 supplied, so docker was never asked about the network."
+            );
+        }
+    }
+    mismatched
 }
 
 fn revert(policy: &NetPolicy, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
@@ -582,5 +762,84 @@ mod tests {
             !quiet.rules().iter().any(|rule| rule.args.contains(&"LOG".to_owned())),
             "--no-log must remove the LOG rules"
         );
+    }
+
+    /// The whole point of these two readers is which way they fail. `enable_icc` is ABSENT from
+    /// `Options` on a default network, so an absent value must read as ENABLED — read the other way
+    /// round, every default docker network would report itself contained.
+    #[test]
+    fn a_missing_docker_option_reads_as_the_unsafe_value() {
+        // Absent (`{{index}}` on a missing key), empty, and unparseable all mean "not turned off".
+        for raw in ["", "<no value>", "true", "1", "yes", "garbage"] {
+            assert!(
+                parse_icc(raw),
+                "icc {raw:?} must read as ENABLED: docker's default is on and the key is absent"
+            );
+        }
+        for raw in ["false", "FALSE", " false ", "0"] {
+            assert!(!parse_icc(raw), "icc {raw:?} is an explicit off");
+        }
+        // EnableIPv6 is a real field, so an empty read is a BROKEN read, not a safe network.
+        for raw in ["", "<no value>", "true", "1"] {
+            assert!(parse_ipv6(raw), "ipv6 {raw:?} must not read as off");
+        }
+        for raw in ["false", "FALSE", "0"] {
+            assert!(!parse_ipv6(raw), "ipv6 {raw:?} is an explicit off");
+        }
+    }
+
+    fn facts(inter_container: bool, ipv6: bool) -> NetworkFacts {
+        NetworkFacts {
+            name: "mp-sandbox".to_owned(),
+            inter_container,
+            ipv6,
+        }
+    }
+
+    #[test]
+    fn inter_container_and_ipv6_each_fail_containment_and_name_their_own_fix() {
+        for (given, needle) in [
+            (facts(true, false), "inter-container"),
+            (facts(false, true), "IPv6"),
+        ] {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert!(
+                check_network_facts(Some(&given), &mut out, &mut err),
+                "{needle} must fail containment"
+            );
+            let err = String::from_utf8(err).unwrap();
+            assert!(err.contains("NOT CONTAINED"), "{err}");
+            assert!(err.contains(needle), "the message must name the property: {err}");
+            // Re-applying rules cannot fix either one, so the message has to say what does.
+            assert!(
+                err.contains("docker network") || err.contains("recreate"),
+                "the fix must name recreating the network, not re-applying rules: {err}"
+            );
+        }
+    }
+
+    /// A skipped check must not read as a satisfied one. With both flags supplied docker is never
+    /// asked, and `verify` has to say so out loud.
+    #[test]
+    fn unchecked_network_properties_are_reported_rather_than_passed_quietly() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert!(!check_network_facts(None, &mut out, &mut err));
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("NOT checked"),
+            "an unevaluated check must be named: {out}"
+        );
+        assert!(String::from_utf8(err).unwrap().is_empty());
+    }
+
+    /// The positive control for the two tests above: a network with both properties off must pass
+    /// and print nothing on stderr. Without this, a `check_network_facts` that always returned true
+    /// would satisfy every other assertion here.
+    #[test]
+    fn a_contained_network_passes_with_no_complaint() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert!(!check_network_facts(Some(&facts(false, false)), &mut out, &mut err));
+        assert!(String::from_utf8(err).unwrap().is_empty());
+        assert!(String::from_utf8(out).unwrap().is_empty());
     }
 }
