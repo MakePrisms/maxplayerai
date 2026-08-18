@@ -218,27 +218,14 @@ impl ProxyEngine {
     }
 
     /// Whether `host` (an authority, `host` or `host:port`) is approved for substitution.
+    ///
+    /// The allowlist is the UNION of every present credential's upstream, so this answers "may *some*
+    /// registered credential be substituted for this destination". It is a belt on a destination
+    /// [`Self::authorize`] has already chosen from the credential itself — it is NOT the question a
+    /// redirect asks. See [`allows_paired_redirect`].
     pub fn allows(&self, host: &str) -> bool {
         let key = host_key(host);
-        // Match on host with and without an explicit port: an allowlist of `api.anthropic.com`
-        // approves `api.anthropic.com:443`, and vice versa, so a default-port request is not refused
-        // on a technicality.
-        self.allowlist
-            .iter()
-            .any(|allowed| allowed == &key || strip_default_port(allowed) == strip_default_port(&key))
-    }
-
-    /// Whether a redirect target is approved to receive the forwarded credential.
-    ///
-    /// The forwarding client follows a 3xx only when this returns `true`. Resolving the authority with
-    /// [`authority_of`] and deferring to [`Self::allows`] keeps a redirect and an original request
-    /// judged by ONE allowlist and ONE notion of "authority": a separate host comparison here would
-    /// drift from `allows` the first time something redirected to `host:443`.
-    ///
-    /// A target whose authority cannot be resolved is refused — the credential must not move to a
-    /// destination this proxy cannot name.
-    pub fn allows_redirect_target(&self, url: &str) -> bool {
-        authority_of(url).is_some_and(|host| self.allows(&host))
+        self.allowlist.iter().any(|allowed| same_authority(allowed, &key))
     }
 
     /// Register a job's credential. Refuses (returns `Err`) if the credential's upstream is not on the
@@ -366,6 +353,37 @@ fn strip_default_port(authority: &str) -> &str {
         .strip_suffix(":443")
         .or_else(|| authority.strip_suffix(":80"))
         .unwrap_or(authority)
+}
+
+/// Whether two authorities name the same service, treating an explicit default port as equivalent to
+/// none. The one comparison both the allowlist and a redirect decision go through, so neither can
+/// drift from the other on `host` versus `host:443`.
+fn same_authority(a: &str, b: &str) -> bool {
+    a == b || strip_default_port(a) == strip_default_port(b)
+}
+
+/// Whether a redirect may carry the credential minted for `original` on to `target`.
+///
+/// A job's credential is registered for exactly ONE upstream ([`JobCredential::upstream`]), and
+/// [`ProxyEngine::authorize`] forwards to that upstream and no other — the container never names its
+/// own destination. A redirect must not widen that: the credential moves only to the authority it was
+/// registered for.
+///
+/// `original` is the ORIGINAL request URL, never the previous hop. Judging each hop against its
+/// predecessor would let a chain walk one authority at a time to anywhere.
+///
+/// **Deliberately a free function, not a [`ProxyEngine`] method.** An engine-scoped check answers the
+/// weaker union question and would approve a redirect to a DIFFERENT vendor's registered upstream —
+/// handing, say, an Anthropic key to OpenAI's host. The union is a belt on an already-chosen
+/// destination; it is not an authorization to move a credential to a new one.
+///
+/// Either side unresolvable is refused: the credential must not move to a destination this proxy
+/// cannot name, and an empty redirect chain reaches here as an unresolvable `original`.
+pub fn allows_paired_redirect(original: &str, target: &str) -> bool {
+    match (authority_of(original), authority_of(target)) {
+        (Some(from), Some(to)) => same_authority(&from, &to),
+        _ => false,
+    }
 }
 
 /// The authority (`host` or `host:port`, lowercased) of a base URL like `https://api.anthropic.com`.
@@ -1217,37 +1235,34 @@ mod tests {
         assert_eq!(response.status(), 413, "an over-cap body must be refused, not buffered");
     }
 
-    // A redirect whose target is on the allowlist is approved, so the forwarding client may follow it
-    // and a provider's own cross-path or approved-host redirect keeps working. Default-port
-    // equivalence is asserted in BOTH directions: this is the drift that a host comparison written at
-    // the call site instead of here would introduce.
+    // A redirect that stays on the credential's own upstream is followed, so a provider's own
+    // cross-path redirect keeps working. Default-port equivalence is asserted in BOTH directions,
+    // because the allowlist and this check now share one comparison and must not diverge on it.
     #[test]
-    fn redirect_target_on_the_allowlist_is_approved() {
-        let engine = ProxyEngine::new([authority_of(UPSTREAM).unwrap()]);
-        for url in [
+    fn redirect_that_stays_on_the_paired_upstream_is_approved() {
+        for target in [
             "https://api.anthropic.com/v1/messages",
             "https://api.anthropic.com:443/v1/messages",
             "https://API.Anthropic.COM/v1/messages",
             "https://api.anthropic.com/v1/messages?next=%2Fother",
         ] {
-            assert!(engine.allows_redirect_target(url), "allowlisted target must be approved: {url}");
+            assert!(
+                allows_paired_redirect(UPSTREAM, target),
+                "a target on the paired upstream must be approved: {target}"
+            );
         }
-
-        let explicit_port = ProxyEngine::new(["api.anthropic.com:443".to_owned()]);
         assert!(
-            explicit_port.allows_redirect_target("https://api.anthropic.com/v1/messages"),
-            "an allowlist entry carrying the default port must still approve the bare host"
+            allows_paired_redirect("https://api.anthropic.com:443", "https://api.anthropic.com/v1/messages"),
+            "an upstream carrying the default port must still approve the bare host"
         );
     }
 
     // The attacker is the hired agent: it controls the full path and query of every proxied request,
-    // so it can attempt an open redirect on a host the seller genuinely trusts. A target off the
-    // allowlist is refused, which is what keeps the forwarded credential from reaching a destination
-    // the allowlist never approved. The substring case is the one a naive matcher gets wrong.
+    // so it can attempt an open redirect on a host the seller genuinely trusts. The substring case is
+    // the one a naive matcher gets wrong.
     #[test]
-    fn redirect_target_off_the_allowlist_is_refused() {
-        let engine = ProxyEngine::new([authority_of(UPSTREAM).unwrap()]);
-        for url in [
+    fn redirect_off_the_paired_upstream_is_refused() {
+        for target in [
             "https://evil.example.com/collect",
             "https://api.anthropic.com.evil.example/v1/messages",
             "https://evil.example.com/?next=https://api.anthropic.com",
@@ -1255,22 +1270,68 @@ mod tests {
             "http://169.254.169.254/latest/meta-data/",
         ] {
             assert!(
-                !engine.allows_redirect_target(url),
-                "off-allowlist target must be refused: {url}"
+                !allows_paired_redirect(UPSTREAM, target),
+                "a target off the paired upstream must be refused: {target}"
             );
         }
     }
 
-    // A target whose authority cannot be resolved is refused rather than parsed loosely: the
-    // credential must not move to a destination the proxy cannot name.
+    // THE CASE THIS FUNCTION EXISTS FOR, and the one an allowlist-membership check cannot see. Both
+    // hosts are registered upstreams, so BOTH are on the engine's allowlist, while the credential in
+    // flight belongs to exactly one of them. The first assertion is the positive control: it shows the
+    // union question genuinely answers YES here, so the refusal below is doing real work.
     #[test]
-    fn unnameable_redirect_target_is_refused() {
-        let engine = ProxyEngine::new([authority_of(UPSTREAM).unwrap()]);
-        for url in ["", "api.anthropic.com/v1/messages", "https://", "https:///v1/messages"] {
+    fn redirect_to_a_different_registered_upstream_is_refused() {
+        let engine = ProxyEngine::new([
+            authority_of(ANTHROPIC_DEFAULT_UPSTREAM).unwrap(),
+            authority_of(OPENAI_DEFAULT_UPSTREAM).unwrap(),
+        ]);
+        assert!(
+            engine.allows(&authority_of(OPENAI_DEFAULT_UPSTREAM).unwrap()),
+            "control: a union check approves the cross-vendor host, which is why it cannot gate a redirect"
+        );
+
+        assert!(
+            !allows_paired_redirect(ANTHROPIC_DEFAULT_UPSTREAM, "https://api.openai.com/v1/chat/completions"),
+            "a credential registered for Anthropic must not follow a redirect to another registered upstream"
+        );
+        assert!(
+            !allows_paired_redirect(OPENAI_DEFAULT_UPSTREAM, "https://api.anthropic.com/v1/messages"),
+            "and symmetrically, so the guard is not written from one vendor's shape"
+        );
+    }
+
+    // Every hop is judged against the ORIGINAL upstream, never its predecessor. reqwest pushes the
+    // previous URL onto an accumulating chain before calling the policy, so `previous()[0]` is the
+    // original request URL on every hop — which is what makes the pairing hold past hop one. The two
+    // assertions differ ONLY in which operand is treated as the original, so they show the choice of
+    // operand changing the answer: judging hop-against-predecessor would walk to any host in two steps.
+    #[test]
+    fn a_redirect_chain_is_judged_against_the_original_not_the_previous_hop() {
+        assert!(
+            allows_paired_redirect("https://mid.example.com/step", "https://mid.example.com/next"),
+            "control: measured against the PREVIOUS hop, a second hop on that hop's host is same-authority"
+        );
+        assert!(
+            !allows_paired_redirect(UPSTREAM, "https://mid.example.com/next"),
+            "measured against the ORIGINAL upstream, the same hop must be refused"
+        );
+    }
+
+    // An endpoint whose authority cannot be resolved is refused rather than parsed loosely: the
+    // credential must not move to a destination the proxy cannot name. Asserted on BOTH operands,
+    // because an empty redirect chain reaches the decision as an unresolvable `original`.
+    #[test]
+    fn an_unnameable_redirect_endpoint_is_refused() {
+        for target in ["", "api.anthropic.com/v1/messages", "https://", "https:///v1/messages"] {
             assert!(
-                !engine.allows_redirect_target(url),
-                "unresolvable target must be refused: {url:?}"
+                !allows_paired_redirect(UPSTREAM, target),
+                "an unresolvable target must be refused: {target:?}"
             );
         }
+        assert!(
+            !allows_paired_redirect("", "https://api.anthropic.com/v1/messages"),
+            "an unresolvable original must be refused, so an empty chain cannot fail open"
+        );
     }
 }
