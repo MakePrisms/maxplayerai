@@ -228,6 +228,19 @@ impl ProxyEngine {
             .any(|allowed| allowed == &key || strip_default_port(allowed) == strip_default_port(&key))
     }
 
+    /// Whether a redirect target is approved to receive the forwarded credential.
+    ///
+    /// The forwarding client follows a 3xx only when this returns `true`. Resolving the authority with
+    /// [`authority_of`] and deferring to [`Self::allows`] keeps a redirect and an original request
+    /// judged by ONE allowlist and ONE notion of "authority": a separate host comparison here would
+    /// drift from `allows` the first time something redirected to `host:443`.
+    ///
+    /// A target whose authority cannot be resolved is refused — the credential must not move to a
+    /// destination this proxy cannot name.
+    pub fn allows_redirect_target(&self, url: &str) -> bool {
+        authority_of(url).is_some_and(|host| self.allows(&host))
+    }
+
     /// Register a job's credential. Refuses (returns `Err`) if the credential's upstream is not on the
     /// allowlist — a belt that keeps an unapproved destination from ever entering the registry, so a
     /// registration bug cannot defeat the [`Self::authorize`] allowlist check downstream.
@@ -1202,5 +1215,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 413, "an over-cap body must be refused, not buffered");
+    }
+
+    // A redirect whose target is on the allowlist is approved, so the forwarding client may follow it
+    // and a provider's own cross-path or approved-host redirect keeps working. Default-port
+    // equivalence is asserted in BOTH directions: this is the drift that a host comparison written at
+    // the call site instead of here would introduce.
+    #[test]
+    fn redirect_target_on_the_allowlist_is_approved() {
+        let engine = ProxyEngine::new([authority_of(UPSTREAM).unwrap()]);
+        for url in [
+            "https://api.anthropic.com/v1/messages",
+            "https://api.anthropic.com:443/v1/messages",
+            "https://API.Anthropic.COM/v1/messages",
+            "https://api.anthropic.com/v1/messages?next=%2Fother",
+        ] {
+            assert!(engine.allows_redirect_target(url), "allowlisted target must be approved: {url}");
+        }
+
+        let explicit_port = ProxyEngine::new(["api.anthropic.com:443".to_owned()]);
+        assert!(
+            explicit_port.allows_redirect_target("https://api.anthropic.com/v1/messages"),
+            "an allowlist entry carrying the default port must still approve the bare host"
+        );
+    }
+
+    // The attacker is the hired agent: it controls the full path and query of every proxied request,
+    // so it can attempt an open redirect on a host the seller genuinely trusts. A target off the
+    // allowlist is refused, which is what keeps the forwarded credential from reaching a destination
+    // the allowlist never approved. The substring case is the one a naive matcher gets wrong.
+    #[test]
+    fn redirect_target_off_the_allowlist_is_refused() {
+        let engine = ProxyEngine::new([authority_of(UPSTREAM).unwrap()]);
+        for url in [
+            "https://evil.example.com/collect",
+            "https://api.anthropic.com.evil.example/v1/messages",
+            "https://evil.example.com/?next=https://api.anthropic.com",
+            "https://api.anthropic.com:8443/v1/messages",
+            "http://169.254.169.254/latest/meta-data/",
+        ] {
+            assert!(
+                !engine.allows_redirect_target(url),
+                "off-allowlist target must be refused: {url}"
+            );
+        }
+    }
+
+    // A target whose authority cannot be resolved is refused rather than parsed loosely: the
+    // credential must not move to a destination the proxy cannot name.
+    #[test]
+    fn unnameable_redirect_target_is_refused() {
+        let engine = ProxyEngine::new([authority_of(UPSTREAM).unwrap()]);
+        for url in ["", "api.anthropic.com/v1/messages", "https://", "https:///v1/messages"] {
+            assert!(
+                !engine.allows_redirect_target(url),
+                "unresolvable target must be refused: {url:?}"
+            );
+        }
     }
 }
