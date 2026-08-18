@@ -193,6 +193,32 @@ runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM
 - On macOS, leave `runtime` unset: Docker Desktop cannot load a custom runtime, and its containers
   already run inside a platform Linux VM that provides the hardware boundary.
 
+#### The credential proxy listens on every interface — firewall it on a public box
+
+The [#647](https://github.com/MakePrisms/maxplayerai/issues/647) credential proxy is a **host** listener
+that the job container reaches over the docker bridge. It binds `0.0.0.0`, so on a machine with a public
+IP it is reachable from outside that machine, not only from the job.
+
+**What actually protects it is the credential design, not the port.** Each job gets a fresh random
+placeholder, and the proxy substitutes the real value only for a request presenting that job's
+placeholder. An attacker who reaches the port still needs the placeholder, and it dies with the job.
+The port was never a control.
+
+**Two things nevertheless make an inbound rule worth adding:**
+
+- **The LAN/host denial does not cover this direction.** Every rule installed by
+  `maxplayer sandbox-net apply` is scoped to the sandbox bridge (`-i <bridge>`) and there is a test
+  asserting that of every rendered rule. Those rules govern what the **job** reaches. They are not
+  aimed at, and do not filter, traffic arriving on your public interface.
+- **Configuring `[sandbox] proxy_port_range` makes the port predictable.** That is deliberate — a
+  static firewall rule cannot name an ephemeral port, so containment needs a known range. The
+  side effect is that an attacker knocks on a small known range instead of scanning 65535 ports.
+
+**So: on any seller box with a public interface, deny inbound to your configured
+`proxy_port_range` (and to the ephemeral high ports if you have not configured one).** A host firewall
+default-denying inbound, or a cloud security group that exposes nothing but the ports you chose, both
+satisfy this. Sellers on a home NAT or a private network are already covered by the absence of a route.
+
 ### Working example: bubblewrap inside the container
 
 Install `bubblewrap` in your image (e.g. `apk add bubblewrap` / `apt-get install bubblewrap`), then add
