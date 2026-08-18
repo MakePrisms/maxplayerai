@@ -1,12 +1,28 @@
 # The sandbox image the seller runs an awarded job inside (`[sandbox] mode = "docker"`).
 #
 # It carries only what a job legitimately needs: the node runtime, the ACP agent adapters the
-# harness presets launch (claude/codex), git for the delivery commit, and CA certificates so the
-# adapter's HTTPS calls (model API, relay, git host) validate. The seller mounts the per-job workdir
-# at /work and runs the container as the seller's uid; NOTHING else of the host is present, so the
-# wallet/keys/journal under $MAXPLAYER_HOME cannot be read from here.
+# harness presets launch (claude/codex), git for the delivery commit, CA certificates so the
+# adapter's HTTPS calls (model API, relay, git host) validate, and nix so a nix-flake-provisioned job
+# has a provisioner. The seller mounts the per-job workdir at /work and runs the container as the
+# seller's uid; NOTHING else of the host is present, so the wallet/keys/journal under
+# $MAXPLAYER_HOME cannot be read from here.
 #
 # Build:  docker build -t maxplayer-sandbox:latest docker/maxplayer-sandbox
+
+# nix arrives as a copied store rather than through the installer: the installer wants root and sets
+# up a daemon, and the job container has neither — it runs as a host uid with `--cap-drop ALL` and
+# `no-new-privileges`. Pinned to an exact release for the same reason the adapters below are.
+FROM nixos/nix:2.31.2 AS nix
+# Only nix's OWN closure. The upstream image's default profile also carries git, curl, coreutils, man
+# and ssh — 702MB of store this image has no use for, against 114MB for nix alone. `local?root=`
+# writes a real store (paths plus the registration db), so the next stage can use it as-is instead of
+# importing a binary cache at run time.
+RUN set -eux; \
+    pkg="$(dirname "$(dirname "$(readlink -f "$(command -v nix)")")")"; \
+    nix --extra-experimental-features nix-command \
+        copy --no-check-sigs --to "local?root=/nixroot" "$pkg"; \
+    ln -s "$pkg/bin" /nixroot/nix/nixbin
+
 FROM node:22-bookworm-slim
 
 # git for the delivery commit; ca-certificates for TLS to the model API / relay / git host.
@@ -36,6 +52,52 @@ RUN npm install -g \
     @anthropic-ai/claude-code@2.1.223 \
     && npm cache clean --force
 
+# The nix a nix-flake-provisioned job needs. `EnvBackend::NixFlake` shells out to a bare `nix`
+# (crates/maxplayer-core/src/env_provision.rs), and under `[sandbox] mode = "docker"` that name
+# resolves HERE, not on the host — the host-side boot doctor's nix check cannot speak for the job's
+# toolchain. The provisioner runs on an awarded job, so a missing nix is not a cheap boot failure;
+# it is ENV_UNPROVISIONABLE on work the buyer is already committed to.
+COPY --from=nix /nixroot/nix /nix
+
+# `experimental-features` — `nix develop` and the rest of the `nix <subcommand>` surface are gated
+# behind these two, and the provisioner's argv is exactly `nix develop <dir>#<devshell> --command`.
+# `build-users-group=` — no daemon and no nixbld group here, so a build runs as the calling uid.
+# `sandbox=false` — nix's build sandbox needs mount and user namespaces, which `--cap-drop ALL` and
+# `no-new-privileges` deny. Everything unlisted keeps nix's own defaults, cache.nixos.org included.
+#
+# The store is world-writable for the same reason HOME below is: the job's uid is unknown at build
+# time, and a single-user store is written by whoever runs the build. The argument that makes it
+# safe is also the same one — a single-job container with one principal inside, discarded whole by
+# `--rm`. It stops holding the moment a store is shared BETWEEN jobs, which is why the store-integrity
+# question gates that optimization rather than following it.
+#
+# The `per-user` directories are REMOVED rather than made writable, and by shape rather than by
+# name: nix chmods each of them to 0755 when it opens the store, unconditionally, and chmod is
+# refused to anyone who does not own the path — so a copied-in per-user owned by root fails every
+# nix invocation with EPERM. Absent, the job's first nix call creates them and therefore owns them.
+# There are two (`profiles/` and `gcroots/`) and fixing only the one an error happens to name leaves
+# the other live. This is also the failure `nix --version` does not reach, because version reporting
+# never opens the store — so it reports success against a store nix cannot use.
+RUN set -eux; \
+    mkdir -p /etc/nix; \
+    { \
+        echo 'experimental-features = nix-command flakes'; \
+        echo 'build-users-group ='; \
+        echo 'sandbox = false'; \
+    } > /etc/nix/nix.conf; \
+    chmod 1777 /nix/store; \
+    chmod -R a+rwX /nix/var; \
+    find /nix/var -type d -name per-user -prune -exec rm -rf {} +
+
+# nix reaches PATH through a shim, because nix discards a $HOME it does not own and then has no
+# passwd entry to fall back to — see nix-shim, and the HOME note below that makes it necessary.
+COPY nix-shim /usr/local/bin/nix-shim
+RUN set -eux; \
+    chmod 0755 /usr/local/bin/nix-shim; \
+    for binary in /nix/nixbin/*; do \
+        ln -s nix-shim "/usr/local/bin/$(basename "$binary")"; \
+    done
+
 # HOME is a CONTAINER-ONLY path, deliberately NOT the mounted workdir.
 #
 # The job runs as the seller's uid (`docker run --user`), which is a host uid with no /etc/passwd
@@ -43,6 +105,12 @@ RUN npm install -g \
 # by a non-root user. That is the whole constraint: HOME must be writable by an uid unknown at build
 # time. Hence a 0777 directory rather than a per-user one. It is a single-job container with one
 # principal inside, so a world-writable home grants nothing to anyone who is not already the job.
+#
+# Writable is not the same as owned, and nix wants owned: it uses $HOME only when the calling uid
+# owns it, and otherwise falls back to a getpwuid() lookup this container cannot satisfy. A 0777
+# directory created at build time is owned by root, so nix cannot use this path at all — hence
+# nix-shim, which moves nix under a subdirectory the job creates and therefore owns. Anything else
+# added here that resolves its own home the way nix does will need the same treatment.
 #
 # It must NOT be /work: the workdir is the DELIVERABLE, staged wholesale by the delivery snapshot
 # (`seller_git`: `add_all(["*"])`, minus the one runtime-artifact exclusion) into a fresh repo that
