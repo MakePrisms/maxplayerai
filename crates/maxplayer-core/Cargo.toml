@@ -21,6 +21,10 @@ gateway = ["dep:nostr-sdk", "tokio/time"]
 # All git legs (seller push/fetch, buyer verify-fetch, ref-advertisement probes) run in-process
 # via libgit2 — NO system `git` on any product path (issue #55). Needs nostr-sdk (NIP-98 signing)
 # so it composes gateway; git2 (rustls-backed) + reqwest + base64 carry the smart-HTTP transport.
+# Running in-process is also what keeps repo hooks inert: libgit2 executes none, so a hook a job
+# planted in its own workdir cannot run on the host-side legs. A leg that ever shells out to a
+# `git` CLI must neutralise hook lookup itself. `tests/no_system_git.rs` is the guard — tripwire
+# `git` on PATH, required-features `git-delivery`, so it runs only in the money-path job (#826).
 git-delivery = ["gateway", "dep:git2", "dep:reqwest", "dep:base64"]
 # The `wallet` feature also brings up the persistent buyer daemon (crate::buyer): the
 # exclusive home lock (libc flock), the durable state DB (rusqlite, bundled sqlite so

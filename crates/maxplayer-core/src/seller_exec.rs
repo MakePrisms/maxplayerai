@@ -1039,7 +1039,18 @@ async fn start_credential_containment(
     }
 
     let engine = Arc::new(proxy::ProxyEngine::new(upstream_hosts));
-    let running = proxy::start(Arc::clone(&engine), reqwest::Client::new())
+    // The proxy is header-agnostic by design: it forwards whatever the container sent, and the
+    // forwarded agent credential rides `x-api-key`. reqwest's default redirect policy is
+    // `Policy::limited(10)`, and its cross-host scrub covers only AUTHORIZATION, COOKIE, cookie2,
+    // PROXY_AUTHORIZATION and WWW_AUTHENTICATE — `x-api-key` is in none of them. So a 3xx from an
+    // allowlisted host would carry the credential onward to a host the allowlist never approved:
+    // the destination is decided BEFORE the redirect moves it. Refusing to follow keeps the
+    // allowlist check and the destination the same decision.
+    let forwarding_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| ExecError::Agent(format!("credential proxy client: {error}")))?;
+    let running = proxy::start(Arc::clone(&engine), forwarding_client)
         .await
         .map_err(|error| ExecError::Agent(format!("credential proxy failed to start: {error}")))?;
 
