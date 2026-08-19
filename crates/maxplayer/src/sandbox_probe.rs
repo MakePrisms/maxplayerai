@@ -414,6 +414,9 @@ fn run_in_container(policy: &SandboxPolicy, canary: &Path, workdir: &Path) -> Co
         env: &[],
         uid,
         gid,
+        // The probe launches its payload with no containment established, so it must not claim one.
+        // The behavioural egress canary that DOES run inside a contained namespace is separate work.
+        netns: None,
     };
     let launch = match policy.launch(&payload, &job) {
         Ok(launch) => launch,

@@ -71,6 +71,11 @@ pub mod runtime_guard;
 /// part that decides what a stranger's job can reach, and it is compiled and tested on every build
 /// rather than only on the money-path one.
 pub mod sandbox_net;
+/// Putting `sandbox_net`'s policy in force: the holder container that owns the job's network
+/// namespace, and the sidecar that installs the rules into it before the job exists. Unconditional
+/// for the same reason as the renderer above — the argv that grants `NET_ADMIN` and the one that
+/// contains the job are decided here, so they are compiled and tested on every build.
+pub mod sandbox_netns;
 pub mod seller;
 /// The seller's harness registry: the agent harnesses one node enables, what it advertises for
 /// them, and which one a given job dispatches to.

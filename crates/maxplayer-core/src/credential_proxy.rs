@@ -447,10 +447,25 @@ impl RunningProxy {
         &self.engine
     }
 
-    /// The base URL a container uses as `ANTHROPIC_BASE_URL`. The container reaches the host over the
-    /// docker host-gateway alias, so the host part is `host.docker.internal` with this proxy's port.
+    /// The base URL a container uses as `ANTHROPIC_BASE_URL`, reaching this proxy at `host`.
+    ///
+    /// The host part is a parameter because a job contained in its own network namespace **cannot**
+    /// have the `host.docker.internal` alias: `--network=container:<holder>` and `--add-host` are
+    /// mutually exclusive (`conflicting options: custom host-to-IP mapping and the network mode`), and
+    /// `/etc/hosts` is per-mount-namespace so the holder's copy is invisible to the job. Such a job
+    /// gets a literal address, measured from docker itself — see `crate::sandbox_netns`.
+    ///
+    /// Whatever is passed here is also what the firewall pinhole names, so the two cannot drift: an
+    /// ACCEPT for one address and a base URL for another would leave every job unable to reach its
+    /// model, with every rule-rendering test still green.
+    pub fn container_base_url_via(&self, host: &str) -> String {
+        format!("http://{host}:{}", self.addr.port())
+    }
+
+    /// The base URL for a container that reaches the host over the docker host-gateway alias — the
+    /// shape for a job that is NOT namespace-contained.
     pub fn container_base_url(&self) -> String {
-        format!("http://{PROXY_HOST_ALIAS}:{}", self.addr.port())
+        self.container_base_url_via(PROXY_HOST_ALIAS)
     }
 
     /// The address the proxy is actually bound to on the host (for tests / diagnostics).
