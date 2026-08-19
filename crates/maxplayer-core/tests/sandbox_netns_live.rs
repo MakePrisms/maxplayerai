@@ -471,6 +471,128 @@ fn reaping_removes_an_unattached_holder_and_spares_a_busy_one() {
     assert_eq!(reaped.len(), 1, "exactly one holder was an orphan; reaped={reaped:?}");
 }
 
+/// **End to end: a job launched through the seller's own argv builder is contained.**
+///
+/// Everything else here contains a namespace and then joins a container to it by hand. That leaves the
+/// last link untested — whether `SandboxPolicy::launch` actually puts the *job* in the holder's
+/// namespace. It is the link where a `Some(holder)` that never reaches `--network` would leave every job
+/// uncontained while `establish` reported success and the readback verified a namespace nothing runs in.
+///
+/// So the policy builds the argv, the argv is executed verbatim, and the job's own process is asked to
+/// reach a denied address. The control is the same policy and the same argv with `netns: None`: that job
+/// must reach it. One difference between the two runs, and it is the field under test.
+#[test]
+#[ignore = "needs docker and the netfilter image"]
+fn a_job_launched_through_the_policy_is_contained_and_an_uncontained_one_is_not() {
+    use maxplayer_core::home::{SandboxConfig, SandboxMode};
+    use maxplayer_core::seller_exec::{JobLaunch, SandboxPolicy};
+    use std::path::Path;
+
+    let canary = Canary::new("203.0.113.0/24", "198.18.7.0/24");
+    let denied = canary.denied_ip.clone();
+
+    // Resolved from config through the same call a booting seat makes, rather than by assembling the
+    // policy directly — so this exercises the path an operator's `[sandbox]` section actually takes.
+    //
+    // The image carries `nc` and declares NO entrypoint, so the "agent" can be a single connection
+    // attempt. Deliberately not the netfilter image: its entrypoint is the applier, which would swallow
+    // the agent command as its own arguments and report "empty plan" while `nc` never ran — measured,
+    // and it is why this test's control existed to catch it.
+    let config = SandboxConfig {
+        mode: SandboxMode::Docker,
+        launcher: Vec::new(),
+        image: Some(holder_image()),
+        forward_env: Vec::new(),
+        runtime: None,
+        network: Some(canary.denied_net.clone()),
+        proxy_port_range: None,
+    };
+    let policy = SandboxPolicy::from_config(Some(&config)).expect("a docker policy");
+    let agent_command: Vec<String> = ["nc", "-w", "2", denied.as_str(), Canary::PORT]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+    // Control first, while the namespace has no rules: an UNCONTAINED job reaches the address. This also
+    // proves the argv itself works — image, mount, user and all — so a later failure is attributable to
+    // containment rather than to a malformed launch.
+    let uncontained = policy
+        .launch(
+            &agent_command,
+            &JobLaunch {
+                workdir: Path::new("/tmp"),
+                env: &[],
+                uid: 0,
+                gid: 0,
+                netns: None,
+            },
+        )
+        .expect("the policy must build a launch");
+    assert!(
+        run_launch(&uncontained),
+        "control: a job launched with netns: None must reach {denied} — if this fails the argv is \
+         broken and the contained case below would pass for the wrong reason"
+    );
+
+    // Now contain the namespace and launch the same job into it.
+    let (plan, expected) = plan_stdin(&policy_for(&denied));
+    let (ok, applied, err) = canary.fixture.apply(&plan);
+    assert!(ok, "the sidecar refused the plan: {err}");
+    assert_eq!(applied.parse::<usize>().expect("a count"), expected);
+
+    let contained = policy
+        .launch(
+            &agent_command,
+            &JobLaunch {
+                workdir: Path::new("/tmp"),
+                env: &[],
+                uid: 0,
+                gid: 0,
+                netns: Some(&canary.fixture.holder),
+            },
+        )
+        .expect("the policy must build a launch");
+    assert!(
+        contained.args.iter().any(|arg| arg == &format!("container:{}", canary.fixture.holder)),
+        "the launch must join the holder's namespace: {:?}",
+        contained.args
+    );
+    assert!(
+        !contained.args.iter().any(|arg| arg == &canary.denied_net),
+        "a contained launch must not also name a network — docker takes the last --network and the \
+         job would silently land outside the namespace the rules are in: {:?}",
+        contained.args
+    );
+    assert!(
+        !run_launch(&contained),
+        "a job launched into the contained namespace still reached {denied} — the policy built an \
+         argv that does not put the job where the rules are"
+    );
+}
+
+/// A policy whose pinhole names `gateway`, matching what the canary's listener answers on.
+fn policy_for(gateway: &str) -> NetPolicy {
+    let port: u16 = Canary::PORT.parse().expect("a port");
+    NetPolicy {
+        gateway: gateway.to_owned(),
+        // No pinhole: this test wants the denied address denied, not excepted.
+        proxy_ports: Some(PortRange::new(port + 1, port + 1).expect("valid range")),
+        log_connections: true,
+    }
+}
+
+/// Execute an `AgentLaunch` verbatim. `true` iff it exited zero.
+fn run_launch(launch: &maxplayer_core::seller_exec::AgentLaunch) -> bool {
+    Command::new(&launch.program)
+        .args(&launch.args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 /// Attempt one TCP connection from a container on `network`. `true` iff it connected.
 fn connect(network: &str, ip: &str, port: &str) -> bool {
     let (ok, _, _) = docker(
