@@ -43,6 +43,11 @@ jobs:
     env:
       REGISTRY: ghcr.io
       IMAGE_NAME: makeprisms/maxplayer-sandbox
+      # The containment sidecar (#797) ships on the SAME version as the sandbox image and from the
+      # same job, deliberately. A seat pins both by version, and a version that published one but not
+      # the other cannot start a contained job at all — the launch fails closed, which is correct but
+      # bricks the seat. Publishing them together is what makes that pair impossible to break.
+      NETFILTER_IMAGE_NAME: makeprisms/maxplayer-netfilter
     steps:
       # Check out the ref being released so the Dockerfile (and its pinned adapters) is exactly the one
       # that tag names — not whatever main happens to be at publish time.
@@ -69,14 +74,18 @@ jobs:
           [ -n "$version" ] || { echo "no version resolved to tag the image with" >&2; exit 1; }
 
           tags="${REGISTRY}/${IMAGE_NAME}:${version}"
+          netfilter_tags="${REGISTRY}/${NETFILTER_IMAGE_NAME}:${version}"
           if [ "$prerelease" != true ]; then
             tags="${tags},${REGISTRY}/${IMAGE_NAME}:latest"
+            netfilter_tags="${netfilter_tags},${REGISTRY}/${NETFILTER_IMAGE_NAME}:latest"
           fi
 
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tags=$tags"       >> "$GITHUB_OUTPUT"
+          echo "version=$version"               >> "$GITHUB_OUTPUT"
+          echo "tags=$tags"                     >> "$GITHUB_OUTPUT"
+          echo "netfilter_tags=$netfilter_tags" >> "$GITHUB_OUTPUT"
           echo "Building $version (prerelease=$prerelease)"
           echo "Tags: $tags"
+          echo "Netfilter tags: $netfilter_tags"
 
       # QEMU so the amd64 runner can also emit the linux/arm64 layer (Apple Silicon Macs run linux
       # containers). No native arm runner is configured for this job, so the cross-build needs it.
@@ -101,6 +110,19 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The containment sidecar. Same platforms as the sandbox image: it joins the job's namespace, so
+      # it runs wherever the job runs, including an arm64 Mac's linux VM.
+      - name: Build and push the containment sidecar
+        id: build_netfilter
+        uses: docker/build-push-action@v5
+        with:
+          context: docker/maxplayer-netfilter
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.netfilter_tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
