@@ -206,10 +206,10 @@ The port was never a control.
 
 **Two things nevertheless make an inbound rule worth adding:**
 
-- **The LAN/host denial does not cover this direction.** Every rule installed by
-  `maxplayer sandbox-net apply` is scoped to the sandbox bridge (`-i <bridge>`) and there is a test
-  asserting that of every rendered rule. Those rules govern what the **job** reaches. They are not
-  aimed at, and do not filter, traffic arriving on your public interface.
+- **The LAN/host denial does not cover this direction.** Every rendered rule lives in the job's own
+  network namespace, on its `OUTPUT` chain, and a test asserts that no rule names an interface at
+  all. Those rules govern what the **job** reaches. Nothing about them is on your host's filter
+  path, so they are not aimed at, and do not filter, traffic arriving on your public interface.
 - **Configuring `[sandbox] proxy_port_range` makes the port predictable.** That is deliberate — a
   static firewall rule cannot name an ephemeral port, so containment needs a known range. The
   side effect is that an attacker knocks on a small known range instead of scanning 65535 ports.

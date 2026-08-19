@@ -2650,6 +2650,29 @@ pub async fn probe_configured_harnesses(
              forward_env, or treat that credential as compromised and spend-cap it at the provider."
         );
     }
+    // Reap containment holders no job is attached to (#797 R6). A holder outlives its job by design —
+    // the guard removes it when the job ends — so any holder without a job belongs to a daemon that
+    // died before its guard could run. Best-effort and never a gate: a leaked holder owns a namespace
+    // and holds no policy, so it wastes a container rather than opening anything. Boot is the right
+    // moment because this daemon has no jobs of its own yet yet to confuse with someone else's.
+    // `#[cfg(acp)]` because `reap_orphans` needs the docker runner behind that feature, while this
+    // module only needs `wallet`. A `wallet`-without-`acp` build (the money-path row, and the workspace
+    // default build via the bin crate) compiles this function and would not find the call.
+    #[cfg(feature = "acp")]
+    if sandbox.sandbox_network().is_some() {
+        match crate::sandbox_netns::reap_orphans().await {
+            Ok(reaped) if !reaped.is_empty() => opline!(
+                "seller node: reaped {} orphaned containment holder(s) left by an earlier run",
+                reaped.len()
+            ),
+            Ok(_) => {}
+            Err(error) => opline!(
+                "seller node: could not reap orphaned containment holders ({error}) — harmless to \
+                 this boot, but stale holders will accumulate until it succeeds"
+            ),
+        }
+    }
+
     let identity = DeliveryAgentIdentity::for_seller(&home::public_key_hex(home)?);
     let mut verdicts = Vec::with_capacity(registry.entries().len());
     for (index, entry) in registry.entries().iter().enumerate() {

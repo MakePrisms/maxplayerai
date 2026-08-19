@@ -19,10 +19,6 @@ mod sell;
 // INSIDE the launcher, and a seat may reasonably run the probe from a binary it already trusts.
 #[cfg(feature = "wallet")]
 mod sandbox_probe;
-// The egress-rule surface (#797). Gated with the seller surfaces it serves: it reads `[sandbox]`
-// from the seller config, and a buyer-only build has no sandbox to contain.
-#[cfg(feature = "wallet")]
-mod sandbox_net_cli;
 #[cfg(feature = "stub-pay")]
 mod stub_pay_cli;
 mod wallet_cli;

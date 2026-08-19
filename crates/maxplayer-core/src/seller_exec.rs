@@ -169,6 +169,14 @@ pub struct JobLaunch<'a> {
     pub env: &'a [(String, String)],
     pub uid: u32,
     pub gid: u32,
+    /// The name of the holder container whose network namespace this job joins, when egress
+    /// containment has been established for it (#797, [`crate::sandbox_netns`]). `None` ⇒ the job gets
+    /// the configured network, i.e. the behaviour before containment existed.
+    ///
+    /// This is the difference between "a network was configured" and "the policy is in force": the
+    /// rules live in the namespace this names, and they were installed before this job's process
+    /// existed. A `Some` here is therefore a containment claim, not a networking preference.
+    pub netns: Option<&'a str>,
 }
 
 /// What the ACP driver spawns: the process `program` + `args`, and the `cwd` the ACP session runs
@@ -420,18 +428,26 @@ impl DockerPolicy {
             "-w".into(),
             CONTAINER_WORKDIR.into(),
         ]);
-        // Egress containment (#797): join the job to the seller's dedicated sandbox network rather
-        // than the shared default bridge. Unset ⇒ the daemon default, i.e. exactly the behaviour
-        // before this flag existed.
+        // Egress containment (#797): join the namespace a holder container already owns, where the
+        // rendered policy is in force BEFORE this process exists — the rules are not applied to the
+        // job, the job is started into them. `crate::sandbox_netns` establishes that; `None` here
+        // means it was not established, and the job falls back to the configured network (or, unset,
+        // to the daemon default — exactly the behaviour before any of this existed).
         //
-        // The network is a PRECONDITION for the host-side rules, not the containment itself. It
-        // gives them one interface to scope to (so no rule can match a service the seller runs), and
-        // it moves DNS inside the container's own netns — docker's embedded resolver at 127.0.0.11 —
-        // so denying the LAN does not also deny name resolution. Installing the rules is
-        // `maxplayer sandbox-net`; a seat that sets this and skips that is NOT contained.
-        if let Some(network) = &self.network {
-            argv.push("--network".into());
-            argv.push(network.clone());
+        // Name resolution survives the swap: a container joining a namespace still gets its own
+        // /etc/resolv.conf pointing at docker's embedded resolver on 127.0.0.11 (measured), which is
+        // why `sandbox_net` must never deny loopback.
+        match job.netns {
+            Some(holder) => {
+                argv.push("--network".into());
+                argv.push(format!("container:{holder}"));
+            }
+            None => {
+                if let Some(network) = &self.network {
+                    argv.push("--network".into());
+                    argv.push(network.clone());
+                }
+            }
         }
         // Credential containment (#647): when the env points the agent at the host-side proxy
         // (`…=http://host.docker.internal:<port>`), the container must be able to resolve that alias.
@@ -439,10 +455,17 @@ impl DockerPolicy {
         // host. This is the single pinhole to the proxy's host:port that #797's host-services deny must
         // preserve. Added only when something actually references the alias, so a docker run with no
         // containment carries no inert flag.
-        if job
-            .env
-            .iter()
-            .any(|(_, value)| value.contains(crate::credential_proxy::PROXY_HOST_ALIAS))
+        //
+        // ⛔ NEVER under namespace containment: the daemon REFUSES the combination outright —
+        // `conflicting options: custom host-to-IP mapping and the network mode` (measured, rc 125) —
+        // so adding it there does not weaken containment, it prevents the job from starting at all.
+        // Such a job needs no alias: `sandbox_netns` measures the address and puts the literal in the
+        // env, which is also what the firewall pinhole names.
+        if job.netns.is_none()
+            && job
+                .env
+                .iter()
+                .any(|(_, value)| value.contains(crate::credential_proxy::PROXY_HOST_ALIAS))
         {
             argv.push("--add-host".into());
             argv.push(format!("{}:host-gateway", crate::credential_proxy::PROXY_HOST_ALIAS));
@@ -508,6 +531,26 @@ fn split_argv(argv: Vec<String>, cwd: PathBuf) -> AgentLaunch {
 /// The per-job working directory under the home (`$MAXPLAYER_HOME/seller-jobs/<job_id>`).
 pub fn job_workdir(home: &MaxplayerHome, job_id: &str) -> PathBuf {
     home.root.join("seller-jobs").join(job_id)
+}
+
+/// The job id a workdir belongs to — the inverse of [`job_workdir`]'s last component.
+///
+/// Used to name per-job docker objects after the job that owns them, so a leaked one can be
+/// attributed instead of merely noticed. Sanitised to what docker accepts in a container name
+/// (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`), and never empty: a workdir with no usable final component would
+/// otherwise produce a name docker rejects at the moment containment is being established.
+fn job_id_of(workdir: &Path) -> String {
+    let raw = workdir.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' { c } else { '-' })
+        .collect();
+    let cleaned = cleaned.trim_start_matches(['.', '-', '_']).to_owned();
+    if cleaned.is_empty() {
+        "unattributed".to_owned()
+    } else {
+        cleaned
+    }
 }
 
 /// The ONE coherent job timeout. The ACP driver's idle/response timeout is derived from the job's
@@ -900,10 +943,75 @@ pub async fn run_agent_job(
     // for the run (dropping `_proxy` at fn end revokes the placeholder). If containment is required
     // but cannot be established, the job FAILS — there is no fallback to putting the real credential
     // in the container.
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    // Egress containment (#797), FIRST, because two things downstream depend on what it measures: the
+    // job's `--network` names the holder it creates, and the credential proxy's base URL must carry the
+    // address it resolved. Declared before `_proxy` so it is dropped LAST — the namespace has to
+    // outlive the job that runs in it.
+    //
+    // Established only for a docker policy with a configured network. No network ⇒ no containment,
+    // which is the behaviour a seat had before any of this existed; it is not silently claimed.
+    let _containment;
+    let holder = match (policy.docker_image(), policy.sandbox_network()) {
+        (Some(image), Some(network)) => {
+            let established = crate::sandbox_netns::establish(
+                network,
+                image,
+                crate::sandbox_netns::DEFAULT_NETFILTER_IMAGE,
+                crate::credential_proxy::PROXY_HOST_ALIAS,
+                &job_id_of(workdir),
+                uid,
+                gid,
+                policy.proxy_ports(),
+                true,
+            )
+            .await
+            // Fail the job rather than run it uncontained. The whole point of moving containment into
+            // the namespace is that "configured but not enforced" stops being representable, and a
+            // fallback here would put it straight back.
+            .map_err(|error| {
+                ExecError::Policy(format!("[sandbox] egress containment not established: {error}"))
+            })?;
+            let name = established.holder.name().to_owned();
+            let host = established.proxy_host.clone();
+            _containment = Some(established);
+            Some((name, host))
+        }
+        _ => {
+            _containment = None;
+            None
+        }
+    };
+    // Credential containment (#647). Under docker the real model credential must NOT enter the
+    // container: a stranger's job can read `-e ANTHROPIC_API_KEY` and exfiltrate a reusable secret.
+    // Start a per-job host proxy that holds the real credential, forward a format-plausible
+    // placeholder + a base-URL override pointing at the proxy in its place, and keep the proxy alive
+    // for the run (dropping `_proxy` at fn end revokes the placeholder). If containment is required
+    // but cannot be established, the job FAILS — there is no fallback to putting the real credential
+    // in the container.
     let _proxy;
     if policy.docker_image().is_some() {
-        match start_credential_containment(&forwarded, policy.proxy_ports()).await? {
+        // A namespace-contained job reaches the proxy at the measured address, not at the docker
+        // alias: `--add-host` and `--network=container:…` are mutually exclusive, so the alias would
+        // never resolve inside it. The same string is what the firewall pinhole names.
+        let proxy_host = holder
+            .as_ref()
+            .map(|(_, host)| host.as_str())
+            .unwrap_or(crate::credential_proxy::PROXY_HOST_ALIAS);
+        match start_credential_containment(&forwarded, policy.proxy_ports(), proxy_host).await? {
             Some((contained, proxy)) => {
+                // A contained credential the job cannot reach is worse than a loud failure: the run
+                // would burn its whole timeout on auth errors. The pinhole comes from `proxy_ports`,
+                // so without a range there is no hole for the proxy to be reached through.
+                if holder.is_some() && policy.proxy_ports().is_none() {
+                    return Err(ExecError::Config(
+                        "[sandbox] docker: a contained credential needs [sandbox] proxy_port_range \
+                         when egress containment is active — without it the firewall opens no pinhole \
+                         and the job cannot reach its model"
+                            .into(),
+                    ));
+                }
                 env.extend(contained);
                 _proxy = Some(proxy);
             }
@@ -915,8 +1023,9 @@ pub async fn run_agent_job(
     let job = JobLaunch {
         workdir,
         env: &env,
-        uid: unsafe { libc::getuid() },
-        gid: unsafe { libc::getgid() },
+        uid,
+        gid,
+        netns: holder.as_ref().map(|(name, _)| name.as_str()),
     };
     let launch = policy.launch(agent_command, &job)?;
     // The ACP idle/response timeout IS the unified job timeout — never a hardcoded 300s that could
@@ -1067,6 +1176,7 @@ struct MintedCredential {
 async fn start_credential_containment(
     forwarded: &[(String, String)],
     proxy_ports: Option<crate::sandbox_net::PortRange>,
+    proxy_host: &str,
 ) -> Result<Option<(Vec<(String, String)>, crate::credential_proxy::RunningProxy)>, ExecError> {
     use crate::credential_proxy as proxy;
     use std::sync::Arc;
@@ -1153,7 +1263,10 @@ async fn start_credential_containment(
         .await
         .map_err(|error| ExecError::Agent(format!("credential proxy failed to start: {error}")))?;
 
-    let base_url = running.container_base_url();
+    // `proxy_host` is the docker alias for an uncontained job and a measured literal address for a
+    // namespace-contained one, which cannot resolve the alias at all. Passed in rather than decided
+    // here so exactly one value reaches both this URL and the firewall's pinhole.
+    let base_url = running.container_base_url_via(proxy_host);
     let mut substitutions: Vec<(String, String)> = Vec::with_capacity(minted.len());
     let mut base_url_overrides: Vec<&'static str> = Vec::new();
     for (cred, m) in &minted {
@@ -1256,6 +1369,7 @@ mod tests {
             env,
             uid: 1000,
             gid: 1000,
+            netns: None,
         }
     }
 
@@ -1988,6 +2102,7 @@ mod tests {
             env: &[],
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
+            netns: None,
         };
         let launch = policy.launch(&agent_command, &job).expect("docker launch");
 

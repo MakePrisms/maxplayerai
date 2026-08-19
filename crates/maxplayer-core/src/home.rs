@@ -332,21 +332,24 @@ pub struct SandboxConfig {
     /// `docker` mode: the dedicated docker network a job's container joins (`docker run --network`).
     /// Omitted ⇒ the daemon default (the shared `bridge` network).
     ///
-    /// The network is what makes the #797 egress policy expressible AND enforceable, for two
-    /// separate reasons:
+    /// **Setting this is what turns #797 egress containment on for this seat.** A job launched under
+    /// it runs in a network namespace whose rules were installed before the job process existed, and
+    /// a job whose containment cannot be established FAILS rather than running exposed. There is no
+    /// second step: no root command, and nothing to reinstall after a reboot.
     ///
-    /// * **A stable interface to scope rules to.** Firewall rules that deny the LAN must match only
-    ///   sandbox traffic. A named network has its own `br-*` interface, so every rule is
-    ///   interface-scoped and cannot match a service the seller runs.
-    /// * **DNS survives the host deny.** On a user-defined network a container resolves through
-    ///   docker's embedded resolver at `127.0.0.11`, inside its own netns — no packet crosses the
-    ///   bridge to a host or LAN resolver. On the shared default bridge docker instead copies the
-    ///   host's `resolv.conf`, so if that names a LAN or host resolver, denying the LAN also denies
-    ///   DNS and every job fails to resolve anything.
+    /// Two reasons a *named* network rather than the default bridge:
     ///
-    /// A seat that sets this without installing the rules is NOT contained — see
-    /// `maxplayer sandbox-net`, and [`crate::sandbox_net`] for what the rules are and why there are
-    /// two chains.
+    /// * **The seller's own services are not on it.** The rules deny by destination, and the seat's
+    ///   LAN and host addresses fall inside those denies. A dedicated network keeps a job's traffic
+    ///   off the bridge every other container on the box shares.
+    /// * **DNS keeps working.** On a user-defined network a container resolves through docker's
+    ///   embedded resolver at `127.0.0.11` inside its own netns, so no packet crosses to a host or LAN
+    ///   resolver. On the shared default bridge docker copies the host's `resolv.conf` instead, and if
+    ///   that names a LAN or host resolver then denying the LAN also denies DNS — which presents as
+    ///   "the internet is broken" rather than as a firewall rule.
+    ///
+    /// See [`crate::sandbox_net`] for what the rules are and [`crate::sandbox_netns`] for how they are
+    /// put in force.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<String>,
     /// `docker` mode: the TCP port range the per-job credential proxy (#647) binds inside, as
