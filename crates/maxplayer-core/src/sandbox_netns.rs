@@ -32,7 +32,7 @@
 //! `/etc/resolv.conf` pointing at docker's embedded resolver on `127.0.0.11`, which is why
 //! `sandbox_net`'s "loopback is never denied" test is load-bearing rather than decorative.
 
-use crate::sandbox_net::NetPolicy;
+use crate::sandbox_net::{Family, NetPolicy};
 
 /// The containment sidecar image, pinned to this build's version exactly as
 /// [`crate::seller_exec::DEFAULT_SANDBOX_IMAGE`] is. Both images are published by the same workflow
@@ -67,8 +67,17 @@ impl NetnsHolder {
     }
 
     /// What to pass to `docker run --network` so a container joins this namespace.
+    /// The `--network` value that joins a container to the namespace `name` owns.
+    ///
+    /// An associated function as well as a method because the readback needs it for a holder it must
+    /// not own: taking a `&NetnsHolder` there would mean handing out a guard whose `Drop` destroys a
+    /// namespace the caller is only reading.
+    pub fn network_mode_for(name: &str) -> String {
+        format!("container:{name}")
+    }
+
     pub fn network_mode(&self) -> String {
-        format!("container:{}", self.name)
+        Self::network_mode_for(&self.name)
     }
 }
 
@@ -188,6 +197,41 @@ pub fn sidecar_argv(holder: &NetnsHolder, image: &str) -> Vec<String> {
         "--security-opt",
         "no-new-privileges",
         image,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// `docker run` argv that reads the installed rules back out of the holder's namespace, for one
+/// address family.
+///
+/// A **separate container** from the one that installed them, running a **different verb** (`-S`, not
+/// `-A`), because the question is what the kernel holds and not whether the installer believes it
+/// succeeded. `--entrypoint` replaces the applier, so this container is handed no plan and cannot
+/// modify anything even though it must carry `NET_ADMIN` to list rules at all.
+///
+/// The output is parsed and judged in Rust by [`crate::sandbox_net::NetPolicy::verify_readback`]. The
+/// sidecar image is reused rather than adding a third image: it already carries both binaries, and a
+/// separate image would grow the supply-chain surface to run one read-only command.
+pub fn readback_argv(holder_name: &str, image: &str, family: Family) -> Vec<String> {
+    [
+        "docker",
+        "run",
+        "--rm",
+        "--network",
+        &NetnsHolder::network_mode_for(holder_name),
+        "--cap-drop",
+        "ALL",
+        "--cap-add",
+        "NET_ADMIN",
+        "--security-opt",
+        "no-new-privileges",
+        "--entrypoint",
+        family.binary(),
+        image,
+        "-S",
+        crate::sandbox_net::OUTPUT_CHAIN,
     ]
     .into_iter()
     .map(String::from)
@@ -379,6 +423,24 @@ pub async fn establish(
         return Err(format!(
             "containment is incomplete: {applied} of {expected} rules applied (the plan was truncated in transit)"
         ));
+    }
+
+    // The readback (#797 R1). Everything above this point is the installer's own account of its work:
+    // an exit code and a number it chose to print. Neither can distinguish a namespace whose rules are
+    // in force from one where a runtime accepted `--cap-add NET_ADMIN` and quietly did nothing. So the
+    // kernel is asked directly, per family, and the job is refused unless the answer holds.
+    //
+    // Both families are checked, and a v6 failure is as fatal as a v4 one: an unfiltered address family
+    // is the cheapest bypass there is.
+    for family in [Family::V4, Family::V6] {
+        let (readback, _) = run_docker(readback_argv(holder.name(), sidecar_image, family), None)
+            .await
+            .map_err(|error| {
+                format!("could not read {} rules back from the namespace — {error}", family.binary())
+            })?;
+        policy.verify_readback(family, &readback).map_err(|error| {
+            format!("containment did not verify after installation — {error}")
+        })?;
     }
 
     Ok(Containment { holder, proxy_host })

@@ -116,6 +116,23 @@ pub const DENIED_DESTINATIONS_V6: &[&str] = &["fc00::/7", "fe80::/10", "ff00::/8
 const LOG_RATE: &str = "6/min";
 const LOG_BURST: &str = "12";
 
+/// The `--log-prefix` values, and the one hard constraint on them: **no whitespace**.
+///
+/// The install plan reaches the sidecar as one whitespace-delimited argv per line, and the applier
+/// word-splits that line — the fields *are* the argv, which is what keeps the applier from needing a
+/// quoting grammar or an `eval`. So an argument containing a space arrives as two arguments.
+///
+/// This is measured, not theoretical. A prefix of `"sbx-net conn: "` made iptables reject rule 1 of
+/// 24 with ``Bad argument `conn:'``; the applier then exited 3 and the namespace was left with **no
+/// rules at all**. Every rendering test still passed, because they assert the rendering and never
+/// execute it. Hyphens keep each prefix a single field, and each is inside iptables' 29-character
+/// limit. [`NetPolicy::rules`] is checked against this invariant by
+/// `no_rendered_argument_contains_whitespace`.
+const LOG_PREFIX_CONN: &str = "sbx-net-conn:";
+const LOG_PREFIX_DNS: &str = "sbx-net-dns:";
+const LOG_PREFIX_DENY_METADATA: &str = "sbx-net-deny-metadata:";
+const LOG_PREFIX_DENY: &str = "sbx-net-deny:";
+
 /// A contiguous TCP port range the credential proxy binds inside, so a static firewall rule can name
 /// the pinhole.
 ///
@@ -261,10 +278,74 @@ impl Rule {
         argv
     }
 
-    /// How this rule reads back from `iptables -S OUTPUT`, for verification against a live
-    /// namespace.
-    pub fn as_spec_line(&self) -> String {
-        format!("-A {} {}", OUTPUT_CHAIN, self.args.join(" "))
+    /// The `-j` target this rule jumps to, if it names one.
+    pub fn target(&self) -> Option<&str> {
+        arg_value(&self.args, "-j")
+    }
+
+    /// The `-d` destination this rule matches, if it names one.
+    pub fn destination(&self) -> Option<&str> {
+        arg_value(&self.args, "-d")
+    }
+}
+
+/// The value following `flag` in an argv, if present.
+fn arg_value<'a, S: AsRef<str>>(args: &'a [S], flag: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|arg| arg.as_ref() == flag)
+        .and_then(|at| args.get(at + 1))
+        .map(AsRef::as_ref)
+}
+
+/// An address as iptables prints it: a bare host address gains an explicit prefix length.
+///
+/// Measured, not assumed — `-d 172.17.0.1` reads back as `-d 172.17.0.1/32`. Comparing the two
+/// directly would report a missing pinhole on a namespace whose pinhole is present and correct.
+fn with_prefix_len(address: &str, family: Family) -> String {
+    if address.contains('/') {
+        return address.to_owned();
+    }
+    match family {
+        Family::V4 => format!("{address}/32"),
+        Family::V6 => format!("{address}/128"),
+    }
+}
+
+/// One appended rule as a live namespace reports it, reduced to the fields that decide whether
+/// containment holds.
+///
+/// iptables' cosmetic rewriting is discarded deliberately — see [`NetPolicy::verify_readback`] for
+/// what it does to a rule between being given one and printing it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadbackRule {
+    /// The `-d` value, exactly as printed (so already carrying its prefix length).
+    pub destination: Option<String>,
+    /// The `-j` target.
+    pub target: Option<String>,
+    /// The `--dport` value; a range for the pinhole.
+    pub dport: Option<String>,
+}
+
+impl ReadbackRule {
+    /// Parse the appended rules out of `iptables -S <chain>` output, in order.
+    ///
+    /// Only `-A` lines are rules. `-S` also prints the chain's default policy (`-P OUTPUT ACCEPT`),
+    /// which is not a rule: counting it would inflate the total by one and make a namespace missing
+    /// exactly one rule look complete.
+    pub fn parse_all(stdout: &str) -> Vec<Self> {
+        stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("-A "))
+            .map(|line| {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                Self {
+                    destination: arg_value(&fields, "-d").map(str::to_owned),
+                    target: arg_value(&fields, "-j").map(str::to_owned),
+                    dport: arg_value(&fields, "--dport").map(str::to_owned),
+                }
+            })
+            .collect()
     }
 }
 
@@ -297,7 +378,7 @@ impl NetPolicy {
                 Family::V4,
                 vec![
                     "-p", "tcp", "--syn", "-m", "limit", "--limit", LOG_RATE, "--limit-burst",
-                    LOG_BURST, "-j", "LOG", "--log-prefix", "sbx-net conn: ",
+                    LOG_BURST, "-j", "LOG", "--log-prefix", LOG_PREFIX_CONN,
                 ],
                 "log every new outbound TCP connection a job opens",
             ));
@@ -305,7 +386,7 @@ impl NetPolicy {
                 Family::V4,
                 vec![
                     "-p", "udp", "--dport", "53", "-m", "limit", "--limit", LOG_RATE,
-                    "--limit-burst", LOG_BURST, "-j", "LOG", "--log-prefix", "sbx-net dns: ",
+                    "--limit-burst", LOG_BURST, "-j", "LOG", "--log-prefix", LOG_PREFIX_DNS,
                 ],
                 "log DNS queries, including the ones the denies below then drop",
             ));
@@ -313,7 +394,7 @@ impl NetPolicy {
                 Family::V4,
                 vec![
                     "-d", METADATA_ENDPOINT, "-m", "limit", "--limit", LOG_RATE, "--limit-burst",
-                    LOG_BURST, "-j", "LOG", "--log-prefix", "sbx-net deny metadata: ",
+                    LOG_BURST, "-j", "LOG", "--log-prefix", LOG_PREFIX_DENY_METADATA,
                 ],
                 "a job reaching for instance credentials is worth its own log line",
             ));
@@ -352,7 +433,7 @@ impl NetPolicy {
                     Family::V4,
                     vec![
                         "-d", denied, "-m", "limit", "--limit", LOG_RATE, "--limit-burst",
-                        LOG_BURST, "-j", "LOG", "--log-prefix", "sbx-net deny: ",
+                        LOG_BURST, "-j", "LOG", "--log-prefix", LOG_PREFIX_DENY,
                     ],
                     "log the LAN probe before dropping it",
                 ));
@@ -389,19 +470,133 @@ impl NetPolicy {
             .collect()
     }
 
-    /// What a live namespace must read back for the policy to be in force, as `iptables -S` lines,
-    /// for one address family.
+    /// How many rules this policy installs for one address family.
+    pub fn rule_count(&self, family: Family) -> usize {
+        self.rules().iter().filter(|rule| rule.family == family).count()
+    }
+
+    /// Verify a live namespace against this policy, from that namespace's own `iptables -S OUTPUT`
+    /// output. `Ok(())` means containment is in force; an `Err` names what is missing and is a reason
+    /// to refuse the job.
     ///
-    /// This is the artifact the per-launch readback compares against. "The sidecar exited 0" is not
-    /// "the rules are in place": a partially applied policy leaves earlier rules behind, and a
-    /// runtime that ignored `--cap-add` would report success having installed nothing. The
-    /// comparison is exact and ordered, because order is load-bearing.
-    pub fn expected_spec_lines(&self, family: Family) -> Vec<String> {
-        self.rules()
-            .iter()
-            .filter(|rule| rule.family == family)
-            .map(Rule::as_spec_line)
-            .collect()
+    /// **This is deliberately not a string comparison, and that is a measured decision.** iptables
+    /// rewrites a rule between being given it and printing it back. Measured in a live namespace, on
+    /// 21 v4 rules, it: makes an implicit match module explicit (`-p tcp` ⇒ `-p tcp -m tcp`), expands
+    /// `--syn` to `--tcp-flags FIN,SYN,RST,ACK SYN`, gives a bare address its prefix length
+    /// (`172.17.0.1` ⇒ `172.17.0.1/32`), **reorders arguments** (`-d` moves ahead of `-p`), and quotes
+    /// `--log-prefix`. **12 of 21 lines came back textually different while the policy was perfectly
+    /// in force.** Comparing strings would refuse every single launch. Reproducing iptables' printer
+    /// in Rust to compare canonical forms would be a second, unverified implementation of it, and any
+    /// drift between the two versions fails jobs closed for no reason.
+    ///
+    /// So this checks the properties that make containment *true*, each one chosen because a specific
+    /// failure would otherwise pass:
+    ///
+    /// * **the rule count** — a partial application leaves earlier rules behind and exits non-zero,
+    ///   but a runtime that silently dropped `--cap-add` could report success having installed
+    ///   nothing;
+    /// * **every denied destination carries a DROP** — one missing range is one open route to the
+    ///   seller's LAN, and it is invisible in a count that happens to match;
+    /// * **exactly the expected number of ACCEPTs** — an extra ACCEPT is an egress hole, and it is the
+    ///   shape an injected rule would take;
+    /// * **the pinhole names the measured gateway and only the proxy's ports** — a widened pinhole
+    ///   still looks like one rule;
+    /// * **the metadata DROP precedes the pinhole** — order is load-bearing, and an ACCEPT above the
+    ///   metadata drop reopens the one destination the policy exists to close.
+    pub fn verify_readback(&self, family: Family, stdout: &str) -> Result<(), String> {
+        let found = ReadbackRule::parse_all(stdout);
+        let expected = self.rule_count(family);
+        if found.len() != expected {
+            return Err(format!(
+                "{} reports {} rules in {OUTPUT_CHAIN}, expected {expected} — the namespace is not \
+                 the one this policy was installed into, or the install was partial",
+                family.binary(),
+                found.len()
+            ));
+        }
+
+        let denied: &[&str] = match family {
+            Family::V4 => DENIED_DESTINATIONS,
+            Family::V6 => DENIED_DESTINATIONS_V6,
+        };
+        for destination in denied {
+            let dropped = found.iter().any(|rule| {
+                rule.target.as_deref() == Some("DROP")
+                    && rule.destination.as_deref() == Some(*destination)
+            });
+            if !dropped {
+                return Err(format!(
+                    "{destination} has no DROP in the live namespace — that range is reachable from \
+                     the job"
+                ));
+            }
+        }
+
+        if family == Family::V4 {
+            let metadata_dropped_at = found.iter().position(|rule| {
+                rule.target.as_deref() == Some("DROP")
+                    && rule.destination.as_deref() == Some(METADATA_ENDPOINT)
+            });
+            let Some(metadata_dropped_at) = metadata_dropped_at else {
+                return Err(format!(
+                    "{METADATA_ENDPOINT} has no DROP in the live namespace — instance credentials are \
+                     reachable from the job"
+                ));
+            };
+
+            let accepts: Vec<(usize, &ReadbackRule)> = found
+                .iter()
+                .enumerate()
+                .filter(|(_, rule)| rule.target.as_deref() == Some("ACCEPT"))
+                .collect();
+            let wanted = usize::from(self.proxy_ports.is_some());
+            if accepts.len() != wanted {
+                return Err(format!(
+                    "the live namespace has {} ACCEPT rules, expected {wanted} — an unexpected ACCEPT \
+                     is an egress hole",
+                    accepts.len()
+                ));
+            }
+
+            if let Some(ports) = self.proxy_ports {
+                let (accept_at, pinhole) = accepts[0];
+                let gateway = with_prefix_len(&self.gateway, Family::V4);
+                if pinhole.destination.as_deref() != Some(gateway.as_str()) {
+                    return Err(format!(
+                        "the pinhole points at {:?}, not the measured proxy address {gateway} — the \
+                         job cannot reach its model, or something else can",
+                        pinhole.destination
+                    ));
+                }
+                // iptables collapses a single-port range to a bare port, so both spellings of the
+                // same range must be accepted; anything wider is a hole. Derived from `to_match`
+                // rather than from `Display`, which spells a range `start-end` — a form iptables
+                // never prints, so matching against it would prove nothing.
+                let range = ports.to_match();
+                let mut acceptable = vec![range.clone()];
+                if let Some((start, end)) = range.split_once(':') {
+                    if start == end {
+                        acceptable.push(start.to_owned());
+                    }
+                }
+                let printed = pinhole.dport.as_deref().unwrap_or("");
+                if !acceptable.iter().any(|form| form == printed) {
+                    return Err(format!(
+                        "the pinhole opens ports {printed:?}, not the proxy's {} — a wider pinhole is \
+                         still one rule",
+                        ports.to_match()
+                    ));
+                }
+                if accept_at < metadata_dropped_at {
+                    return Err(format!(
+                        "the pinhole ACCEPT is at index {accept_at}, above the metadata DROP at \
+                         {metadata_dropped_at} — an ACCEPT above that drop reopens {METADATA_ENDPOINT}"
+                    ));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -665,24 +860,267 @@ mod tests {
         assert_eq!(PortRange::new(49200, 49299).unwrap().capacity(), 100);
     }
 
-    /// The spec lines are what the per-launch readback compares against a live namespace, so they
-    /// must read back in the shape `iptables -S` prints, and each family must be asked for
-    /// separately.
+    /// `iptables -S OUTPUT` as a live namespace actually printed it, captured from a real container
+    /// after this exact policy was applied through the real sidecar.
+    ///
+    /// Kept verbatim, because its whole value is being un-idealised: every difference from what we
+    /// sent — `-m tcp`, the expanded `--tcp-flags`, the `/32`, the reordered `-d`, the quoted
+    /// prefixes — is a way a string comparison would have failed a correctly contained job.
+    const MEASURED_V4: &str = "\
+-A OUTPUT -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix \"sbx-net-conn:\"
+-A OUTPUT -p udp -m udp --dport 53 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix \"sbx-net-dns:\"
+-A OUTPUT -d 169.254.169.254/32 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix \"sbx-net-deny-metadata:\"
+-A OUTPUT -d 169.254.169.254/32 -j DROP
+-A OUTPUT -d 172.17.0.1/32 -p tcp -m tcp --dport 49200:49299 -j ACCEPT
+-A OUTPUT -d 10.0.0.0/8 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix \"sbx-net-deny:\"
+-A OUTPUT -d 10.0.0.0/8 -j DROP
+-A OUTPUT -d 172.16.0.0/12 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix \"sbx-net-deny:\"
+-A OUTPUT -d 172.16.0.0/12 -j DROP
+-A OUTPUT -d 192.168.0.0/16 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix \"sbx-net-deny:\"
+-A OUTPUT -d 192.168.0.0/16 -j DROP
+-A OUTPUT -d 169.254.0.0/16 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix \"sbx-net-deny:\"
+-A OUTPUT -d 169.254.0.0/16 -j DROP
+-A OUTPUT -d 100.64.0.0/10 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix \"sbx-net-deny:\"
+-A OUTPUT -d 100.64.0.0/10 -j DROP
+-A OUTPUT -d 198.18.0.0/15 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix \"sbx-net-deny:\"
+-A OUTPUT -d 198.18.0.0/15 -j DROP
+-A OUTPUT -d 224.0.0.0/4 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix \"sbx-net-deny:\"
+-A OUTPUT -d 224.0.0.0/4 -j DROP
+-A OUTPUT -d 240.0.0.0/4 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix \"sbx-net-deny:\"
+-A OUTPUT -d 240.0.0.0/4 -j DROP";
+
+    /// The v6 readback, measured in the same run. Textually identical to what was sent — these rules
+    /// carry no match module and no bare address, so there is nothing for iptables to rewrite.
+    const MEASURED_V6: &str = "\
+-A OUTPUT -d fc00::/7 -j DROP
+-A OUTPUT -d fe80::/10 -j DROP
+-A OUTPUT -d ff00::/8 -j DROP";
+
+    /// The policy that produced [`MEASURED_V4`], so the fixture and the expectation cannot drift.
+    fn measured_policy() -> NetPolicy {
+        NetPolicy {
+            gateway: "172.17.0.1".to_owned(),
+            proxy_ports: Some(PortRange::new(49200, 49299).unwrap()),
+            log_connections: true,
+        }
+    }
+
+    /// The positive control for the whole readback: real iptables output, for a namespace that really
+    /// was contained, must verify.
     #[test]
-    fn spec_lines_read_back_in_iptables_save_shape() {
-        let v4_lines = policy().expected_spec_lines(Family::V4);
-        assert!(v4_lines.iter().all(|line| line.starts_with("-A OUTPUT ")));
-        assert!(v4_lines
+    fn the_measured_readback_of_a_contained_namespace_verifies() {
+        let policy = measured_policy();
+        assert_eq!(policy.verify_readback(Family::V4, MEASURED_V4), Ok(()));
+        assert_eq!(policy.verify_readback(Family::V6, MEASURED_V6), Ok(()));
+    }
+
+    /// Byte-comparing the same output against what we sent fails on 12 of 21 lines. This is the test
+    /// that documents *why* `verify_readback` is not a string comparison — if a future change makes
+    /// iptables echo argv verbatim, this test fails and the simpler design becomes available.
+    #[test]
+    fn an_exact_comparison_would_have_refused_this_contained_namespace() {
+        let sent: Vec<String> = measured_policy()
+            .rules()
             .iter()
-            .any(|line| line == "-A OUTPUT -d 10.0.0.0/8 -j DROP"));
-        assert!(
-            v4_lines.iter().all(|line| !line.contains("::")),
-            "a v6 rule leaked into the v4 readback, which would never match and would fail every \
-             launch"
+            .filter(|rule| rule.family == Family::V4)
+            .map(|rule| format!("-A {} {}", OUTPUT_CHAIN, rule.args.join(" ")))
+            .collect();
+        let read: Vec<&str> = MEASURED_V4.lines().collect();
+        assert_eq!(sent.len(), read.len(), "same rule count, different spelling");
+        let differing = sent.iter().zip(&read).filter(|(a, b)| a.as_str() != **b).count();
+        assert_eq!(
+            differing, 12,
+            "iptables' rewriting is what makes an exact comparison unusable; if this number moved, \
+             re-measure before trusting either design"
         );
-        let v6_lines = policy().expected_spec_lines(Family::V6);
-        assert!(v6_lines
+    }
+
+    /// `-S` prints the chain's default policy too, and it is not a rule.
+    #[test]
+    fn the_chain_policy_line_is_not_counted_as_a_rule() {
+        let with_policy_line = format!("-P OUTPUT ACCEPT\n{MEASURED_V4}");
+        assert_eq!(
+            ReadbackRule::parse_all(&with_policy_line).len(),
+            ReadbackRule::parse_all(MEASURED_V4).len(),
+            "counting `-P` as a rule would make a namespace missing one rule look complete"
+        );
+        assert_eq!(measured_policy().verify_readback(Family::V4, &with_policy_line), Ok(()));
+    }
+
+    /// Every refusal branch, each derived from the measured fixture by breaking exactly one thing —
+    /// so a branch that cannot fire is visible as a test that cannot fail.
+    #[test]
+    fn each_way_containment_can_be_absent_is_refused() {
+        let policy = measured_policy();
+
+        // A namespace with nothing in it at all — the shape a silently ignored `--cap-add` leaves.
+        let empty = policy.verify_readback(Family::V4, "-P OUTPUT ACCEPT\n").expect_err("empty");
+        assert!(empty.contains("reports 0 rules"), "{empty}");
+
+        // One denied range's DROP removed, count made up by a duplicate so the count check cannot be
+        // the thing that catches it.
+        let without_lan: Vec<&str> = MEASURED_V4
+            .lines()
+            .filter(|line| *line != "-A OUTPUT -d 10.0.0.0/8 -j DROP")
+            .collect();
+        let padded = format!("{}\n{}", without_lan.join("\n"), "-A OUTPUT -d 224.0.0.0/4 -j DROP");
+        let missing_drop = policy.verify_readback(Family::V4, &padded).expect_err("missing DROP");
+        assert!(missing_drop.contains("10.0.0.0/8"), "{missing_drop}");
+
+        // The metadata DROP removed, likewise padded so only the metadata check can catch it.
+        let without_metadata: Vec<&str> = MEASURED_V4
+            .lines()
+            .filter(|line| *line != "-A OUTPUT -d 169.254.169.254/32 -j DROP")
+            .collect();
+        let padded = format!("{}\n{}", without_metadata.join("\n"), "-A OUTPUT -d 224.0.0.0/4 -j DROP");
+        let no_metadata = policy.verify_readback(Family::V4, &padded).expect_err("metadata");
+        assert!(no_metadata.contains(METADATA_ENDPOINT), "{no_metadata}");
+
+        // An injected second ACCEPT — an egress hole that keeps every other property intact. It
+        // displaces a LOG rule, not a DROP: swapping out a DROP would also break a denied range, and
+        // the earlier check would then be the one that fired, leaving this branch never exercised.
+        let injected = MEASURED_V4.replace(
+            "-A OUTPUT -d 240.0.0.0/4 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix \"sbx-net-deny:\"",
+            "-A OUTPUT -j ACCEPT",
+        );
+        assert_eq!(
+            ReadbackRule::parse_all(&injected).len(),
+            ReadbackRule::parse_all(MEASURED_V4).len(),
+            "the injection must not change the rule count, or the count check fires instead"
+        );
+        let extra_accept = policy.verify_readback(Family::V4, &injected).expect_err("2 ACCEPTs");
+        assert!(extra_accept.contains("ACCEPT"), "{extra_accept}");
+
+        // The pinhole moved to another address: the job loses its model, or something else gains one.
+        let moved = MEASURED_V4.replace("-d 172.17.0.1/32 -p tcp", "-d 172.17.0.9/32 -p tcp");
+        let wrong_host = policy.verify_readback(Family::V4, &moved).expect_err("wrong host");
+        assert!(wrong_host.contains("172.17.0.1/32"), "{wrong_host}");
+
+        // The pinhole widened to every port while still being exactly one ACCEPT rule.
+        let widened = MEASURED_V4.replace("--dport 49200:49299", "--dport 1:65535");
+        let wide = policy.verify_readback(Family::V4, &widened).expect_err("widened");
+        assert!(wide.contains("1:65535"), "{wide}");
+
+        // The ACCEPT hoisted above the metadata DROP, which reopens the metadata endpoint.
+        let hoisted = format!(
+            "-A OUTPUT -d 172.17.0.1/32 -p tcp -m tcp --dport 49200:49299 -j ACCEPT\n{}",
+            MEASURED_V4.replace(
+                "-A OUTPUT -d 172.17.0.1/32 -p tcp -m tcp --dport 49200:49299 -j ACCEPT\n",
+                "",
+            )
+        );
+        let above = policy.verify_readback(Family::V4, &hoisted).expect_err("hoisted");
+        assert!(above.contains("above the metadata DROP"), "{above}");
+
+        // A v6 range missing.
+        let v6_short = "-A OUTPUT -d fc00::/7 -j DROP\n-A OUTPUT -d fe80::/10 -j DROP\n-A OUTPUT -d fc00::/7 -j DROP";
+        let v6_missing = policy.verify_readback(Family::V6, v6_short).expect_err("v6");
+        assert!(v6_missing.contains("ff00::/8"), "{v6_missing}");
+    }
+
+    /// A seat with no contained credential renders no pinhole, so any ACCEPT in its namespace is one
+    /// nobody asked for.
+    #[test]
+    fn a_policy_with_no_pinhole_refuses_any_accept() {
+        let policy = NetPolicy {
+            gateway: "172.17.0.1".to_owned(),
+            proxy_ports: None,
+            log_connections: true,
+        };
+        // Its own readback is the measured one minus the pinhole.
+        let without_pinhole = MEASURED_V4.replace(
+            "-A OUTPUT -d 172.17.0.1/32 -p tcp -m tcp --dport 49200:49299 -j ACCEPT\n",
+            "",
+        );
+        assert_eq!(policy.verify_readback(Family::V4, &without_pinhole), Ok(()));
+
+        // Now one ACCEPT appears where a LOG rule was, so the count still matches and every denied
+        // range still drops — the ACCEPT is the only thing wrong, which is what makes this a test of
+        // the ACCEPT check rather than of the count check.
+        let smuggled = without_pinhole.replace(
+            "-A OUTPUT -d 240.0.0.0/4 -m limit --limit 6/min --limit-burst 12 -j LOG --log-prefix \"sbx-net-deny:\"",
+            "-A OUTPUT -d 172.17.0.1/32 -p tcp -m tcp --dport 49200:49299 -j ACCEPT",
+        );
+        assert_eq!(
+            ReadbackRule::parse_all(&smuggled).len(),
+            policy.rule_count(Family::V4),
+            "the smuggled ACCEPT must keep the count correct, or the count check fires instead"
+        );
+        let refused = policy.verify_readback(Family::V4, &smuggled).expect_err("accept");
+        assert!(refused.contains("ACCEPT"), "{refused}");
+    }
+
+    /// iptables collapses a single-port range to a bare port, so the verifier must accept both.
+    #[test]
+    fn a_single_port_pinhole_is_accepted_in_either_spelling() {
+        let policy = NetPolicy {
+            gateway: "172.17.0.1".to_owned(),
+            proxy_ports: Some(PortRange::new(49200, 49200).unwrap()),
+            log_connections: false,
+        };
+        let bare = policy
+            .rules()
             .iter()
-            .any(|line| line == "-A OUTPUT -d fc00::/7 -j DROP"));
+            .filter(|rule| rule.family == Family::V4)
+            .map(|rule| {
+                let line = format!("-A {} {}", OUTPUT_CHAIN, rule.args.join(" "));
+                line.replace("-d 172.17.0.1 ", "-d 172.17.0.1/32 ")
+                    .replace("--dport 49200:49200", "--dport 49200")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(policy.verify_readback(Family::V4, &bare), Ok(()));
+    }
+
+    /// **No rendered argument may contain whitespace**, because the transport cannot carry one.
+    ///
+    /// The plan crosses into the sidecar as one whitespace-delimited argv per line and the applier
+    /// word-splits it, so a single space inside an argument silently becomes an argument boundary.
+    ///
+    /// This is a regression test for a measured, total failure: `--log-prefix "sbx-net conn: "`
+    /// reached iptables as `--log-prefix sbx-net` plus a stray `conn:`, which refused rule 1 of 24
+    /// and left the namespace with **no rules at all** — while every other test in this file passed,
+    /// because they assert what is *rendered* and never execute it.
+    ///
+    /// Every variant is enumerated deliberately. The bug existed only in the logging variant, so a
+    /// test that checked one policy shape would have reproduced exactly the blind spot that shipped
+    /// it.
+    #[test]
+    fn no_rendered_argument_contains_whitespace() {
+        for log_connections in [true, false] {
+            for proxy_ports in [Some(PortRange::new(49200, 49299).unwrap()), None] {
+                let policy = NetPolicy {
+                    gateway: "172.17.0.1".to_owned(),
+                    proxy_ports,
+                    log_connections,
+                };
+                for rule in policy.rules() {
+                    for arg in &rule.args {
+                        assert!(
+                            !arg.chars().any(char::is_whitespace),
+                            "argument {arg:?} contains whitespace, so the sidecar will split it into \
+                             two arguments and iptables will refuse the rule — leaving the namespace \
+                             uncontained (log_connections={log_connections})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A positive control for the test above: it must actually be able to see whitespace. A guard
+    /// that inspects the wrong field passes on every input, including a broken one.
+    #[test]
+    fn the_whitespace_guard_can_detect_a_bad_prefix() {
+        let bad = Rule::new(
+            Family::V4,
+            vec!["-j", "LOG", "--log-prefix", "sbx-net conn: "],
+            "the exact rule that failed in a live namespace",
+        );
+        assert!(
+            bad.args.iter().any(|arg| arg.chars().any(char::is_whitespace)),
+            "the predicate used by no_rendered_argument_contains_whitespace cannot see the very \
+             argument that broke containment"
+        );
     }
 }
