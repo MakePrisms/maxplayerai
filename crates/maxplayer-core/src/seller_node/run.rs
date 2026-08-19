@@ -2655,6 +2655,10 @@ pub async fn probe_configured_harnesses(
     // died before its guard could run. Best-effort and never a gate: a leaked holder owns a namespace
     // and holds no policy, so it wastes a container rather than opening anything. Boot is the right
     // moment because this daemon has no jobs of its own yet yet to confuse with someone else's.
+    // `#[cfg(acp)]` because `reap_orphans` needs the docker runner behind that feature, while this
+    // module only needs `wallet`. A `wallet`-without-`acp` build (the money-path row, and the workspace
+    // default build via the bin crate) compiles this function and would not find the call.
+    #[cfg(feature = "acp")]
     if sandbox.sandbox_network().is_some() {
         match crate::sandbox_netns::reap_orphans().await {
             Ok(reaped) if !reaped.is_empty() => opline!(

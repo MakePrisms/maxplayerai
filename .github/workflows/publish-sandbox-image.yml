@@ -130,23 +130,34 @@ jobs:
       # reference the image by version tag (above); this is the separate verification handle from ADR §4.
       # Kept in the run summary + job output rather than attached to the GitHub release, which would need
       # `contents: write` — a later phase can promote it to a durable release artifact if wanted.
-      - name: Record image digest
+      # BOTH digests, and the netfilter one is not optional: that image carries `NET_ADMIN` into the
+      # job's namespace, so it is the most privilege-bearing artifact we ship and the one a buyer has
+      # most reason to pin. Recording only the sandbox digest left the privileged image as the single
+      # artifact without an ADR §4 verifiable handle.
+      - name: Record image digests
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
+          NETFILTER_DIGEST: ${{ steps.build_netfilter.outputs.digest }}
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
           set -euo pipefail
-          [ -n "$DIGEST" ] || { echo "build produced no digest" >&2; exit 1; }
+          [ -n "$DIGEST" ] || { echo "the sandbox build produced no digest" >&2; exit 1; }
+          # Failing here rather than recording a blank is deliberate: a missing digest for the
+          # NET_ADMIN-carrying image is exactly the one that must not pass silently.
+          [ -n "$NETFILTER_DIGEST" ] || { echo "the netfilter build produced no digest" >&2; exit 1; }
           ref="${REGISTRY}/${IMAGE_NAME}:${VERSION}"
           pin="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+          netfilter_ref="${REGISTRY}/${NETFILTER_IMAGE_NAME}:${VERSION}"
+          netfilter_pin="${REGISTRY}/${NETFILTER_IMAGE_NAME}@${NETFILTER_DIGEST}"
           {
-            echo "## Sandbox image published"
+            echo "## Images published"
             echo
-            echo "| field | value |"
-            echo "| --- | --- |"
-            echo "| version tag (how a seat pulls) | \`${ref}\` |"
-            echo "| digest (verifiable delivery) | \`${DIGEST}\` |"
-            echo "| pin-by-digest reference | \`${pin}\` |"
+            echo "| image | version tag (how a seat pulls) | digest (verifiable delivery) | pin-by-digest |"
+            echo "| --- | --- | --- | --- |"
+            echo "| sandbox | \`${ref}\` | \`${DIGEST}\` | \`${pin}\` |"
+            echo "| netfilter (carries NET_ADMIN) | \`${netfilter_ref}\` | \`${NETFILTER_DIGEST}\` | \`${netfilter_pin}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "digest=$DIGEST"    >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST"                     >> "$GITHUB_OUTPUT"
+          echo "netfilter_digest=$NETFILTER_DIGEST" >> "$GITHUB_OUTPUT"
           echo "published ${ref} (${DIGEST})"
+          echo "published ${netfilter_ref} (${NETFILTER_DIGEST})"

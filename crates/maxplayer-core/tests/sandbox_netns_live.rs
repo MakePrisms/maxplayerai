@@ -19,7 +19,14 @@
 //! every unit test written against a captured fixture, so each case here breaks containment in a
 //! specific way against a live namespace and requires the refusal to name it.
 
-#![cfg(feature = "acp")]
+// Gated on BOTH features, because this file needs `establish` (behind `acp`) and `SandboxPolicy`
+// (behind `wallet`). Gating on `acp` alone breaks the acp-only CI row, which has no `wallet`.
+//
+// The row that runs it is "the full shipped feature combo (acp + wallet)" — added deliberately,
+// because `acp` and `wallet` are never both on in any other `cargo test` here and a test gated on both
+// would otherwise be compiled out everywhere. As ci.yml puts it: a compiled-out test and a passing
+// test produce the same green. Verify membership with `cargo test … -- --list`, never by a green tick.
+#![cfg(all(feature = "acp", feature = "wallet"))]
 
 use std::process::Command;
 
