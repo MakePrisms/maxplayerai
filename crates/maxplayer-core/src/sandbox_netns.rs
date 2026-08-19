@@ -90,7 +90,7 @@ impl Drop for NetnsHolder {
     /// will ever clean up, so the ~100 ms block is the cheaper end of that trade.
     ///
     /// Failure is logged, never propagated: `Drop` cannot return, and the reaper in
-    /// [`reap_orphans_argv`] is the backstop for the case where this did not work.
+    /// [`reap_orphans`] is the backstop for the case where this did not work.
     fn drop(&mut self) {
         let outcome = std::process::Command::new("docker")
             .args(["rm", "--force", "--volumes", &self.name])
@@ -301,12 +301,16 @@ pub fn parse_getent_ipv4(stdout: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// `docker` argv listing holder containers, for orphan reaping at seller start-up.
-pub fn reap_orphans_argv() -> Vec<String> {
+/// `docker` argv listing every holder container by **full** id.
+///
+/// Full ids rather than docker's truncated default, because a joined job's `NetworkMode` names its
+/// holder by full id and orphan detection compares the two directly.
+pub fn list_holders_argv() -> Vec<String> {
     [
         "docker",
         "ps",
         "--all",
+        "--no-trunc",
         "--quiet",
         "--filter",
         &format!("label={HOLDER_LABEL}"),
@@ -314,6 +318,101 @@ pub fn reap_orphans_argv() -> Vec<String> {
     .into_iter()
     .map(String::from)
     .collect()
+}
+
+/// `docker` argv listing every container on the host by full id.
+pub fn list_all_containers_argv() -> Vec<String> {
+    ["docker", "ps", "--all", "--no-trunc", "--quiet"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// `docker` argv printing one `<network-mode>` line per container in `ids`, in order.
+pub fn network_modes_argv(ids: &[String]) -> Vec<String> {
+    let mut argv: Vec<String> = ["docker", "inspect", "--format", "{{.HostConfig.NetworkMode}}"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    argv.extend(ids.iter().cloned());
+    argv
+}
+
+/// The holders in `holders` that no container is joined to, given every container's `modes`.
+///
+/// **Why this is a comparison and not a docker filter.** A live job joins its holder with
+/// `--network container:<id>`, which docker records as a `NetworkMode` of `container:<holder-full-id>`.
+/// Docker cannot select on that: measured on this host, `docker ps --filter network=<holder>` matches
+/// **nothing** for such a container, and `docker ps --format '{{.Networks}}'` prints an **empty** field
+/// for it. So the only way to see the join is to read the modes and compare.
+///
+/// This distinction is the whole safety property of reaping. "Every labelled holder" is the wrong set:
+/// two seller daemons can share a host, and a boot that reaped the other daemon's holders would strip
+/// the network namespace out from under its running jobs. An orphan is a holder with **no job
+/// attached**, which is what a crashed daemon leaves and what a healthy one never has.
+///
+/// **Residual race, stated rather than papered over.** Between `establish` creating a holder and the
+/// job joining it, that holder has no attachment and so looks like an orphan. A *second* daemon booting
+/// inside that window could reap it, and the first daemon's job would then fail to launch. It fails
+/// closed, and it needs two daemons on one host with boots seconds apart. Closing it properly wants a
+/// holder age or a per-daemon label, and neither is worth the complexity until a host actually runs two
+/// seller daemons.
+pub fn orphaned_holders(holders: &[String], modes: &str) -> Vec<String> {
+    let attached: Vec<&str> = modes
+        .lines()
+        .map(str::trim)
+        .filter_map(|mode| mode.strip_prefix("container:"))
+        .collect();
+    holders
+        .iter()
+        .filter(|holder| !attached.iter().any(|target| target == &holder.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Remove every holder no job is attached to, and return what was removed.
+///
+/// Best-effort by design: a leaked holder is a resource leak, not an open door — it owns a namespace and
+/// holds no policy, and the job that could have used it is already gone. So a failure here is reported
+/// and never blocks a boot, whereas a failure to *establish* containment refuses the job outright. The
+/// two are deliberately not symmetrical.
+#[cfg(feature = "acp")]
+pub async fn reap_orphans() -> Result<Vec<String>, String> {
+    let (holders, _) = run_docker(list_holders_argv(), None)
+        .await
+        .map_err(|error| format!("could not list containment holders — {error}"))?;
+    let holders: Vec<String> = holders.lines().map(str::trim).filter(|id| !id.is_empty()).map(str::to_owned).collect();
+    if holders.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (all, _) = run_docker(list_all_containers_argv(), None)
+        .await
+        .map_err(|error| format!("could not list containers — {error}"))?;
+    let all: Vec<String> = all.lines().map(str::trim).filter(|id| !id.is_empty()).map(str::to_owned).collect();
+    let (modes, _) = run_docker(network_modes_argv(&all), None)
+        .await
+        .map_err(|error| format!("could not read container network modes — {error}"))?;
+
+    let mut reaped = Vec::new();
+    for holder in orphaned_holders(&holders, &modes) {
+        match run_docker(
+            ["docker", "rm", "--force", "--volumes", holder.as_str()]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            None,
+        )
+        .await
+        {
+            Ok(_) => reaped.push(holder),
+            // One stuck holder must not stop the others being cleaned up.
+            Err(error) => {
+                eprintln!("sandbox: could not reap orphaned netns holder {holder}: {error}")
+            }
+        }
+    }
+    Ok(reaped)
 }
 
 /// Run a `docker` argv to completion, optionally feeding `stdin`, and return `(stdout, stderr)`.
@@ -482,7 +581,7 @@ mod tests {
         }
         assert!(argv.iter().any(|a| a == "ai.maxplayer.netns-holder=abc"), "{argv:?}");
         // The reaper must be able to find what the holder was labelled with.
-        let filter = reap_orphans_argv();
+        let filter = list_holders_argv();
         assert!(filter.iter().any(|a| a == "label=ai.maxplayer.netns-holder"), "{filter:?}");
     }
 
@@ -550,6 +649,62 @@ mod tests {
         assert_eq!(parse_getent_ipv4("1.2.3\n").as_deref(), None);
         assert_eq!(parse_getent_ipv4("1.2.3.4.5\n").as_deref(), None);
         assert_eq!(parse_getent_ipv4("999.1.1.1\n").as_deref(), None);
+    }
+
+    /// A holder with a job attached is in use; one without is what a crashed daemon leaves.
+    ///
+    /// The distinction is the safety property: reaping every labelled holder would strip the namespace
+    /// out from under another daemon's running jobs on a shared host.
+    #[test]
+    fn only_holders_with_no_job_attached_are_orphans() {
+        let busy = "a".repeat(64);
+        let idle = "b".repeat(64);
+        // One job joined to `busy`, plus containers on ordinary networks that name no holder.
+        let modes = format!("bridge\ncontainer:{busy}\nhost\nmx-sandbox-net\n");
+        assert_eq!(
+            orphaned_holders(&[busy.clone(), idle.clone()], &modes),
+            vec![idle],
+            "the holder with a job attached must survive"
+        );
+    }
+
+    /// The positive control: with nothing attached, every holder is an orphan. Without this a predicate
+    /// that never matches would look like a careful one.
+    #[test]
+    fn holders_are_reaped_when_nothing_is_attached() {
+        let one = "c".repeat(64);
+        let two = "d".repeat(64);
+        assert_eq!(
+            orphaned_holders(&[one.clone(), two.clone()], "bridge\nhost\n"),
+            vec![one, two]
+        );
+    }
+
+    /// A `container:` mode naming a *different* holder must not protect this one — the comparison is on
+    /// the id, and a prefix match or a contains() would confuse the two.
+    #[test]
+    fn an_attachment_to_another_holder_does_not_protect_this_one() {
+        let holder = "e".repeat(64);
+        let other = "f".repeat(64);
+        let modes = format!("container:{other}\n");
+        assert_eq!(orphaned_holders(&[holder.clone()], &modes), vec![holder]);
+    }
+
+    /// The reaper asks for full ids, because a job's network mode names its holder by full id. Comparing
+    /// a truncated id against that would never match and would reap every holder, including busy ones.
+    #[test]
+    fn the_holder_listing_asks_for_untruncated_ids() {
+        let argv = list_holders_argv();
+        assert!(argv.contains(&"--no-trunc".to_owned()), "{argv:?}");
+        assert!(argv.iter().any(|arg| arg == &format!("label={HOLDER_LABEL}")), "{argv:?}");
+    }
+
+    #[test]
+    fn the_mode_query_names_every_container_it_was_given() {
+        let ids = vec!["one".to_owned(), "two".to_owned()];
+        let argv = network_modes_argv(&ids);
+        assert_eq!(&argv[argv.len() - 2..], ["one", "two"]);
+        assert!(argv.contains(&"{{.HostConfig.NetworkMode}}".to_owned()), "{argv:?}");
     }
 
     #[test]

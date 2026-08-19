@@ -250,6 +250,393 @@ fn a_namespace_missing_only_the_metadata_drop_is_refused() {
     );
 }
 
+/// **Does containment actually contain?** Every other test here proves the rules are in the kernel.
+/// That is not the same claim: a ruleset can be present and ineffective, and "the rules are installed"
+/// standing in for "the packets stop" is exactly the substitution that hides a hole.
+///
+/// So this asks the namespace to open real TCP connections, and it is built to make the result
+/// attributable rather than merely negative:
+///
+/// * two docker networks, one with a subnet **inside** a denied range and one **outside** every denied
+///   range, both joined to the same namespace — so blocked-vs-reachable is decided by the policy and
+///   not by the environment, with no dependency on internet access;
+/// * a real listener on each, so a refusal cannot be confused with "nothing was listening" — the trap
+///   that makes naive egress canaries meaningless, since a connect to an address with no listener fails
+///   identically whether or not a DROP exists;
+/// * **both destinations probed before the rules are applied**, which is the positive control. Without
+///   it, a connect that fails for an environmental reason reads as proof of containment.
+#[test]
+#[ignore = "needs docker and the netfilter image"]
+fn a_contained_namespace_stops_a_denied_range_and_still_reaches_an_allowed_one() {
+    // 198.18.7/24 sits inside the denied 198.18.0.0/15 (RFC 2544 benchmarking space, which the policy
+    // denies and ordinary networks do not use). 203.0.113/24 (RFC 5737 documentation space) is in none
+    // of the denied ranges, so it is an "allowed" destination that needs no internet access.
+    //
+    // Both are chosen to be unlikely to collide with a real network on the host. A 172.16/12 subnet
+    // would have been the obvious denied choice and is the wrong one: docker's own default pools live
+    // there, so the test would fight whatever else the box is running.
+    let canary = Canary::new("203.0.113.0/24", "198.18.7.0/24");
+
+    // Positive control: with no rules installed, BOTH are reachable. If this fails the test proves
+    // nothing about the policy, so it must fail loudly here rather than pass later for the wrong
+    // reason.
+    assert!(
+        canary.can_reach(&canary.allowed_ip),
+        "control: the allowed listener at {} must be reachable before any rules exist",
+        canary.allowed_ip
+    );
+    assert!(
+        canary.can_reach(&canary.denied_ip),
+        "control: the denied-range listener at {} must be reachable before any rules exist — \
+         otherwise a later refusal is not attributable to the policy",
+        canary.denied_ip
+    );
+
+    let policy = policy("172.17.0.1");
+    let (plan, expected) = plan_stdin(&policy);
+    let (ok, applied, err) = canary.fixture.apply(&plan);
+    assert!(ok, "the sidecar refused the plan: {err}");
+    assert_eq!(applied.parse::<usize>().expect("a count"), expected);
+
+    // The measurement.
+    assert!(
+        !canary.can_reach(&canary.denied_ip),
+        "a denied range is still reachable at {} after containment was installed and verified — the \
+         rules are present and doing nothing",
+        canary.denied_ip
+    );
+    // …and the refusal above was the policy, not a listener that quietly died between the control and
+    // the measurement. Same address, same port, same moment, from outside the namespace.
+    assert!(
+        canary.can_reach_from_outside(&canary.denied_net.clone(), &canary.denied_ip),
+        "the listener at {} is unreachable from outside the namespace too, so the refusal inside \
+         proves nothing about the policy",
+        canary.denied_ip
+    );
+    assert!(
+        canary.can_reach(&canary.allowed_ip),
+        "containment also blocked {}, which is in none of the denied ranges — an over-broad policy \
+         breaks every job while looking like a working sandbox",
+        canary.allowed_ip
+    );
+}
+
+/// **The pinhole must actually open, and must open exactly one thing.**
+///
+/// This is the leg whose failure is silent and total: the proxy's address sits inside a denied range by
+/// construction, so the ACCEPT has to override a DROP that would otherwise cover it. If that ordering
+/// does not take effect, every job loses its model while every rule in the namespace reads correctly —
+/// and the readback cannot tell, because the rule is present either way.
+///
+/// Deliberately container-to-container. Pointing the policy's `gateway` at a *container* rather than at
+/// the host tests the property that can actually break — an ACCEPT winning over a range DROP at the
+/// same address — without depending on how the host's firewall is configured. Two live ports on one
+/// address, one inside the permitted range and one outside it, so the only thing separating reachable
+/// from blocked is the policy.
+///
+/// **What this does not cover, stated rather than implied:** that a job reaches the credential proxy on
+/// the *host*. That needs the host to accept container-to-host TCP on the proxy's port, which a host
+/// firewall may refuse — measured here on NixOS with the firewall active, `172.17.0.1:22` is reachable
+/// from a container and `:49250` is not, which is how the cause was identified as the firewall rather
+/// than the design. Two further measurements show the design is sound: the `host-gateway` address **is**
+/// reachable from a container on a *custom* network, and the probe run from there returns the
+/// daemon-wide `172.17.0.1` rather than that network's own gateway — the exact trap
+/// [`maxplayer_core::sandbox_netns::host_gateway_probe_argv`] exists to avoid. The final host hop is for
+/// an end-to-end contained job to prove, not this test.
+#[test]
+#[ignore = "needs docker and the netfilter image"]
+fn the_pinhole_opens_one_port_and_the_rest_of_that_range_stays_denied() {
+    let canary = Canary::new("203.0.113.0/24", "198.18.7.0/24");
+
+    // Control: both ports on the denied-range listener answer before any rule exists.
+    for port in [Canary::PORT, Canary::OTHER_PORT] {
+        assert!(
+            canary.can_reach_port(&canary.denied_ip, port),
+            "control: {}:{port} must answer before the rules exist, or nothing below is attributable",
+            canary.denied_ip
+        );
+    }
+
+    // The pinhole names the listener's address and only the range containing PORT, so OTHER_PORT — at
+    // the very same address — must stay covered by the range DROP.
+    let port: u16 = Canary::PORT.parse().expect("a port");
+    let policy = NetPolicy {
+        gateway: canary.denied_ip.clone(),
+        proxy_ports: Some(PortRange::new(port, port).expect("valid range")),
+        log_connections: true,
+    };
+    let (plan, expected) = plan_stdin(&policy);
+    let (ok, applied, err) = canary.fixture.apply(&plan);
+    assert!(ok, "the sidecar refused the plan: {err}");
+    assert_eq!(applied.parse::<usize>().expect("a count"), expected);
+    assert_eq!(
+        policy.verify_readback(Family::V4, &canary.fixture.readback(Family::V4)),
+        Ok(()),
+        "the namespace must verify before its behaviour means anything"
+    );
+
+    assert!(
+        canary.can_reach_port(&canary.denied_ip, Canary::PORT),
+        "the pinhole is closed: {}:{} is the one destination this policy permits and it is \
+         unreachable, so a job would lose its model while every rule looked right",
+        canary.denied_ip,
+        Canary::PORT
+    );
+    assert!(
+        !canary.can_reach_port(&canary.denied_ip, Canary::OTHER_PORT),
+        "the pinhole is not a pinhole: {}:{} is outside the permitted range and still reachable, so \
+         the ACCEPT opened the whole address instead of one port",
+        canary.denied_ip,
+        Canary::OTHER_PORT
+    );
+}
+/// Reaping removes a holder nothing is attached to and **leaves a busy one alone**.
+///
+/// The second half is the safety property and the reason this runs against real docker: two seller
+/// daemons can share a host, and a reaper that took every labelled holder would strip the network
+/// namespace out from under another daemon's running jobs. The unit tests check the predicate; only this
+/// checks that docker reports attachment the way the predicate expects.
+///
+/// This reaps every orphaned holder on the host, which is what the daemon does at boot. It is safe here
+/// because the label is maxplayer's own and no seller daemon runs on a dev box.
+#[test]
+#[ignore = "needs docker and the netfilter image"]
+fn reaping_removes_an_unattached_holder_and_spares_a_busy_one() {
+    let idle = "mx-reap-idle";
+    let busy = "mx-reap-busy";
+    let job = "mx-reap-job";
+    for name in [idle, busy, job] {
+        docker(&["rm", "--force", "--volumes", name], None);
+    }
+
+    // Two holders carrying the real label, and a job joined to exactly one of them.
+    for name in [idle, busy] {
+        let (ok, _, err) = docker(
+            &[
+                "run",
+                "--detach",
+                "--name",
+                name,
+                "--label",
+                &format!("{}=jobfor-{name}", maxplayer_core::sandbox_netns::HOLDER_LABEL),
+                "--entrypoint",
+                "sleep",
+                &holder_image(),
+                "infinity",
+            ],
+            None,
+        );
+        assert!(ok, "could not start holder {name}: {err}");
+    }
+    let (ok, _, err) = docker(
+        &[
+            "run",
+            "--detach",
+            "--name",
+            job,
+            "--network",
+            &format!("container:{busy}"),
+            "--entrypoint",
+            "sleep",
+            &holder_image(),
+            "infinity",
+        ],
+        None,
+    );
+    assert!(ok, "could not join a job to {busy}: {err}");
+
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let reaped = runtime
+        .block_on(maxplayer_core::sandbox_netns::reap_orphans())
+        .expect("reaping must not fail");
+
+    let still_there = |name: &str| {
+        let (_, out, _) = docker(&["ps", "--all", "--quiet", "--filter", &format!("name={name}")], None);
+        !out.is_empty()
+    };
+    let idle_survived = still_there(idle);
+    let busy_survived = still_there(busy);
+
+    // Clean up before asserting, so a failure does not leak containers.
+    for name in [idle, busy, job] {
+        docker(&["rm", "--force", "--volumes", name], None);
+    }
+
+    assert!(!idle_survived, "the unattached holder should have been reaped; reaped={reaped:?}");
+    assert!(
+        busy_survived,
+        "the holder with a job attached was reaped — on a shared host that strips the namespace out \
+         from under another daemon's running job; reaped={reaped:?}"
+    );
+    assert_eq!(reaped.len(), 1, "exactly one holder was an orphan; reaped={reaped:?}");
+}
+
+/// Attempt one TCP connection from a container on `network`. `true` iff it connected.
+fn connect(network: &str, ip: &str, port: &str) -> bool {
+    let (ok, _, _) = docker(
+        &[
+            "run",
+            "--rm",
+            "--network",
+            network,
+            "--entrypoint",
+            "nc",
+            &netfilter_image(),
+            "-w",
+            "2",
+            ip,
+            port,
+        ],
+        None,
+    );
+    ok
+}
+
+/// Two networks, two listeners, and a holder joined to both.
+struct Canary {
+    fixture: Fixture,
+    allowed_net: String,
+    denied_net: String,
+    allowed_listener: String,
+    denied_listener: String,
+    allowed_ip: String,
+    denied_ip: String,
+}
+
+impl Canary {
+    const PORT: &'static str = "9999";
+    /// A second live port on the same listeners, so the pinhole test can put one port inside the proxy
+    /// range and one outside it at the same address.
+    const OTHER_PORT: &'static str = "9998";
+
+    fn new(allowed_subnet: &str, denied_subnet: &str) -> Self {
+        let allowed_net = "mx-canary-allowed".to_owned();
+        let denied_net = "mx-canary-denied".to_owned();
+        // Setup can panic before the guard exists, which leaks whatever was created first. Clearing
+        // our own names up front makes a rerun idempotent instead of failing on the previous run's
+        // debris. Nothing here can touch a name we did not create.
+        for name in ["mx-canary-listener-allowed", "mx-canary-listener-denied", "mx-live-holder-canary"] {
+            docker(&["rm", "--force", "--volumes", name], None);
+        }
+        for net in [&allowed_net, &denied_net, &"mx-live-net-canary".to_owned()] {
+            docker(&["network", "rm", net], None);
+        }
+
+        let fixture = Fixture::new("canary");
+        for (net, subnet) in [(&allowed_net, allowed_subnet), (&denied_net, denied_subnet)] {
+            let (ok, _, err) = docker(&["network", "create", "--subnet", subnet, net], None);
+            assert!(
+                ok,
+                "could not create {net} on {subnet}: {err}\n\
+                 If this says the pool overlaps, another network on this host already holds that \
+                 subnet — pick a free one inside the same policy range rather than widening the test."
+            );
+        }
+
+        let allowed_listener = "mx-canary-listener-allowed".to_owned();
+        let denied_listener = "mx-canary-listener-denied".to_owned();
+        let mut ips = Vec::new();
+        for (name, net) in [(&allowed_listener, &allowed_net), (&denied_listener, &denied_net)] {
+            // Two ports, because the pinhole test needs one address that is reachable on one port and
+            // denied on another — that pair is what separates "a pinhole" from "an open host".
+            let (ok, _, err) = docker(
+                &[
+                    "run",
+                    "--detach",
+                    "--name",
+                    name,
+                    "--network",
+                    net,
+                    "--entrypoint",
+                    "sh",
+                    &netfilter_image(),
+                    "-c",
+                    &format!(
+                        "while :; do nc -l -p {} >/dev/null 2>&1; done & \
+                         while :; do nc -l -p {} >/dev/null 2>&1; done",
+                        Self::PORT,
+                        Self::OTHER_PORT
+                    ),
+                ],
+                None,
+            );
+            assert!(ok, "could not start listener {name}: {err}");
+            // Measured, never assumed: docker's IPAM picks the address inside the subnet.
+            // `index` rather than dot notation because a Go template cannot name a field containing
+            // hyphens, and every network here has them.
+            let (ok, ip, err) = docker(
+                &[
+                    "inspect",
+                    "--format",
+                    &format!("{{{{(index .NetworkSettings.Networks \"{net}\").IPAddress}}}}"),
+                    name,
+                ],
+                None,
+            );
+            assert!(ok && !ip.is_empty(), "could not read {name}'s address: {err}");
+            ips.push(ip);
+        }
+
+        // The holder joins BOTH networks, so the one namespace has a route to each listener. Without
+        // this the denied listener would be unroutable rather than blocked, and an unroutable
+        // destination fails exactly like a dropped one.
+        for net in [&allowed_net, &denied_net] {
+            let (ok, _, err) = docker(&["network", "connect", net, &fixture.holder], None);
+            assert!(ok, "could not attach {net} to the holder: {err}");
+        }
+
+        Self {
+            fixture,
+            allowed_net,
+            denied_net,
+            allowed_listener,
+            denied_listener,
+            allowed_ip: ips[0].clone(),
+            denied_ip: ips[1].clone(),
+        }
+    }
+
+    /// Open a real TCP connection from inside the contained namespace. `true` iff it connected.
+    fn can_reach(&self, ip: &str) -> bool {
+        self.connect_from(&format!("container:{}", self.fixture.holder), ip)
+    }
+
+    /// The same connection attempted from a container on the network directly, **outside** the
+    /// contained namespace.
+    ///
+    /// This is the discriminator for the one ambiguity the canary cannot resolve from inside: a failed
+    /// connect looks identical whether the policy dropped the packet or the listener had died. From out
+    /// here the policy does not apply, so a success proves the listener is alive and the refusal inside
+    /// was the rules doing their job.
+    fn can_reach_from_outside(&self, net: &str, ip: &str) -> bool {
+        self.connect_from(net, ip)
+    }
+
+    fn connect_from(&self, network: &str, ip: &str) -> bool {
+        connect(network, ip, Self::PORT)
+    }
+
+    /// Reach `ip` on an explicit port from inside the contained namespace.
+    fn can_reach_port(&self, ip: &str, port: &str) -> bool {
+        connect(&format!("container:{}", self.fixture.holder), ip, port)
+    }
+}
+
+impl Drop for Canary {
+    fn drop(&mut self) {
+        // A network cannot be removed while a container is attached, and the holder is attached to
+        // both. `Fixture`'s Drop runs after this one, so the holder has to go first here — its own
+        // removal then finds nothing, which is harmless.
+        docker(&["rm", "--force", "--volumes", &self.fixture.holder], None);
+        for name in [&self.allowed_listener, &self.denied_listener] {
+            docker(&["rm", "--force", "--volumes", name], None);
+        }
+        for net in [&self.allowed_net, &self.denied_net] {
+            docker(&["network", "rm", net], None);
+        }
+    }
+}
+
 /// `establish` end to end: it creates the holder, installs the policy, verifies it, and the holder it
 /// hands back really is contained. Then dropping the containment removes the holder.
 #[test]
