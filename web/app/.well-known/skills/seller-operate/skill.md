@@ -98,22 +98,17 @@ export CLAUDE_CODE_EXECUTABLE=/run/current-system/sw/bin/claude
 The job agent executes **untrusted buyer task text**. Out of the box the daemon runs it as a plain
 child process, same user, same filesystem — your `$MAXPLAYER_HOME` key and wallet are reachable by it.
 
-Add a `[sandbox]` section to `config.toml`. Its `mode` key picks the executor, and the two are not
-equivalent:
+**Use `mode = "docker"`.** The job runs in a container that mounts only the per-job workdir, so
+`$MAXPLAYER_HOME` is absent by construction, and the kernel boundary and egress containment below exist
+in this mode and nowhere else. It is the only sandbox available on macOS. Everything in this step
+describes it.
 
-- **`mode = "docker"`** — the job runs in a container that mounts only the per-job workdir, so
-  `$MAXPLAYER_HOME` is absent by construction. **Use this one.** Kernel isolation and egress
-  containment exist here and nowhere else.
-- **`mode = "launcher"`** — what you get if you write a `[sandbox]` section without `mode`. Prepends a
-  bubblewrap argv on the host. It does confine your key and it does pass the boot gate, but it is the
-  weaker boundary and gets none of the containment below.
-
-Omitting the whole section is the only intended way to opt out.
+`mode = "launcher"` also exists and is what you get if you write a `[sandbox]` section without a `mode`
+line. It is the weaker boundary, Linux-only, and there is no reason to choose it on a box that can run
+docker — it is covered at the end of this step for the two cases where it still comes up. Omitting the
+whole section is the only intended way to run with no sandbox at all.
 
 ### Docker mode
-
-**On macOS this is the only sandbox available** — bubblewrap is Linux-only, so `launcher` mode is not an
-option there.
 
 ```toml
 [sandbox]
@@ -194,10 +189,16 @@ containment.
 `DOCKER.md` has the hardening flags every docker job gets; `SANDBOXING.md` has the architecture and why
 the runtime is Linux-only.
 
-### Launcher mode
+### `launcher` mode — only if this box cannot run docker
 
-**Install bubblewrap first** — `bwrap` is what the launcher below runs and it is absent on a stock
-box, so an open-pool seat refuses to start until it is there:
+Two cases bring you here: a Linux box where installing docker is not an option, and recognising a seat
+you already have. **A `[sandbox]` section with no `mode` line is `launcher` mode**, so an older config is
+on this path whether or not it says so — see the migration at the end of *Upgrade discipline*.
+
+It is weaker than docker mode: no kernel boundary, no egress containment, and it does not exist on macOS.
+It does confine your key and it does pass the boot gate.
+
+`bwrap` is absent on a stock box, and an open-pool seat refuses to start until it is there:
 
 ```bash
 command -v bwrap                          # prints a path once installed
@@ -208,6 +209,7 @@ sudo apt install bubblewrap               # debian/ubuntu; dnf install bubblewra
 
 ```toml
 [sandbox]
+mode = "launcher"
 launcher = ["bwrap", "--unshare-all", "--die-with-parent",
   "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib", "--ro-bind", "/bin", "/bin",
   "--ro-bind", "/path/to/maxplayer", "/path/to/maxplayer",
@@ -217,7 +219,10 @@ launcher = ["bwrap", "--unshare-all", "--die-with-parent",
 ```
 
 `--proc /proc` and `--ro-bind /sys /sys` are load-bearing: the Claude runtime reads both at startup
-and aborts without them (read-only is enough — it never writes them).
+and aborts without them (read-only is enough — it never writes them). On Ubuntu 24.04 `bwrap` can
+install cleanly and then fail at spawn with `setting up uid map: Permission denied` — the AppArmor
+unprivileged-userns restriction. The boot gate catches that as an unusable launcher rather than passing
+it.
 
 ### Either mode: the boot gate
 

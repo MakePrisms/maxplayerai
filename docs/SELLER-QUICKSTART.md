@@ -363,13 +363,14 @@ default:** out of the box the daemon runs the agent as a plain child process —
 access — so your `MAXPLAYER_HOME` (key + wallet) is reachable by the agent. Configure a sandbox before
 serving jobs.
 
-The `[sandbox]` section's `mode` key picks the executor. `docker` runs the job in a container that mounts
-only the per-job workdir; `launcher` (what you get when `mode` is absent) prepends a launcher argv on the
-host. **Prefer `docker`** — kernel isolation and egress containment exist only there.
+**Use `mode = "docker"`.** The job runs in a container mounting only the per-job workdir, and the kernel
+boundary and egress containment exist in this mode and nowhere else. On macOS it is the only sandbox
+there is, since bubblewrap is Linux-only.
 
-### Recommended: `mode = "docker"`
+`mode = "launcher"` — which is what a `[sandbox]` section with no `mode` line gets — is the weaker,
+Linux-only path, kept below for a box that cannot run docker and for recognising a seat you already have.
 
-**On macOS it is the only option** — bubblewrap is Linux-only, so `launcher` mode does not exist there.
+### `mode = "docker"`
 
 ```toml
 [sandbox]
@@ -421,7 +422,7 @@ hardening flags every docker job gets and `SANDBOXING.md` for the architecture.
 An existing seat on `launcher` is never moved by an upgrade — see *Moving an existing seat from
 `launcher` to `docker`* at the end of this section.
 
-### Install bubblewrap first (`launcher` mode)
+### `launcher` mode — only if this box cannot run docker
 
 The launcher below is `bwrap` (bubblewrap), and it is not present on a stock box. Install it before
 you configure the section, or the boot gate refuses to start an open-pool seat:
@@ -436,7 +437,7 @@ nix profile install nixpkgs#bubblewrap   # nix
 
 Any launcher works — bubblewrap is what the examples use because it needs no daemon and no root.
 
-### How: `launcher` mode
+#### The `launcher` argv
 
 Under `mode = "launcher"` the `launcher` key is an argv array that the daemon prepends to the agent
 command, so the agent runs inside that launcher:

@@ -1492,14 +1492,12 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
 # directly as this daemon, with no isolation. A seat that claims open-pool
 # work is refused at the boot gate until a real sandbox is configured.
 #
-# Option A - launcher (an OS sandbox such as bubblewrap; also works inside a
-# container). Full bwrap example: docs/DOCKER.md
-#   [sandbox]
-#   mode = "launcher"
-#   launcher = ["bwrap", "--unshare-all", "--die-with-parent", "..."]
+# USE DOCKER. It is the only mode with a kernel boundary and egress
+# containment, and the only one that exists on macOS.
 #
-# Option B - docker on LINUX. gVisor (runsc) is the primary boundary. Install
+# Option A - docker on LINUX. gVisor (runsc) is the primary boundary. Install
 # it first (docs/SANDBOXING.md), then confirm:  docker info | grep -i runsc
+# One host step:  docker network create maxplayer-jobs
 # The image is supplied by this binary (a version-pinned GHCR ref); leave it
 # unset. `doctor` prints the exact `docker pull` command if it is not present.
 # LOCAL DEV: the default ref is `:v<this build's version>`, which is NOT
@@ -1507,16 +1505,32 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
 # "maxplayer-sandbox:latest") to override, or the default will fail to pull.
 #   [sandbox]
 #   mode = "docker"
+#   network = "maxplayer-jobs"         # turns egress containment on for this seat
+#   proxy_port_range = "9100-9199"     # REQUIRED once network is set; size it >= [seller] slots
 #   runtime = "runsc"                  # gVisor - LINUX ONLY
 #   # image = "ghcr.io/you/custom:tag" # ONLY to run a fully-custom image; NOT a version pin
 #   # image = "maxplayer-sandbox:latest" # LOCAL DEV: your locally-built tag (default GHCR ref is unpublished for dev)
 #   # forward_env = ["MY_AGENT_TOKEN"] # extra env names, atop the built-in auth allowlist
 #
-# Option C - docker on macOS. Docker Desktop cannot load runsc, so OMIT the
-# runtime line; the platform VM is the boundary. Otherwise identical to B.
+# Option B - docker on macOS. Docker Desktop cannot load runsc, so OMIT the
+# runtime line; the platform VM is the boundary. Otherwise identical to A.
 #   [sandbox]
 #   mode = "docker"
-#   # (no runtime line on macOS; image defaulted by the binary as in Option B)
+#   network = "maxplayer-jobs"
+#   proxy_port_range = "9100-9199"
+#   # (no runtime line on macOS; image defaulted by the binary as in Option A)
+#
+# THE CREDENTIAL DOES NOT CROSS INTO THE CONTAINER. A container inherits no
+# home directory and no macOS Keychain, so a `claude /login` credential is
+# unreachable and every job fails on auth while `doctor` and the pre-advertise
+# probe (which run on the HOST) both pass. Put a token in the DAEMON's own
+# environment - for claude, CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`.
+#
+# Option C - launcher, ONLY for a Linux box that cannot run docker. Weaker: no
+# kernel boundary, no egress containment. Full bwrap example: docs/DOCKER.md
+#   [sandbox]
+#   mode = "launcher"
+#   launcher = ["bwrap", "--unshare-all", "--die-with-parent", "..."]
 "#,
     );
     Ok(out)
