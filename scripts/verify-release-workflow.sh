@@ -134,7 +134,12 @@ const fail = (msg) => { console.error(msg); process.exit(1); };
 
 // Anything that writes to the outside world has to be gated on a tag PUSH. Both halves matter: a
 // workflow_dispatch can be aimed at a tag ref, so the ref type alone does not imply a push.
-for (const name of ["release", "publish"]) {
+//
+// `publish-images` is here because it pushes to GHCR: it is a third write to the outside world, and
+// it arrived after this list was written. A publish path the list does not name is a publish path
+// with no assertion that it is gated at all — which is the single edit this whole script exists to
+// catch. Add any future one here in the same commit that adds the job.
+for (const name of ["release", "publish", "publish-images"]) {
   const body = jobs.get(name);
   if (!body) fail(`expected a '${name}' job — this check is out of date with the workflow`);
   const text = body.join("\n");
@@ -293,7 +298,7 @@ if (!surface.join("\n").includes("verify-release-surface.sh")) {
 }
 
 console.log("ok: verify-surface runs in dry runs and gates release and publish (the #249 fix)");
-console.log("ok: release and publish are gated on a tag push");
+console.log("ok: release, publish and publish-images are gated on a tag push");
 console.log("ok: 'npm publish' appears only in the publish job and the fenced npm-probe job");
 console.log("ok: npm-probe is dispatch-only, needs a named package, and can publish 0.0.<n> of a payload package only");
 console.log("ok: no other workflow publishes to npm");

@@ -18,8 +18,26 @@ name: Publish sandbox image
 #
 # CREDENTIAL: the workflow's own GITHUB_TOKEN (no PAT, no org secret), scoped by the job-level
 # `packages: write`. Pattern copied from MakePrisms/cdk .github/workflows/docker-publish.yml.
+#
+# HOW THIS RUNS, and why `workflow_call` is the primary path:
+#   `release: published` alone does NOT work for a tagged release, and the failure is silent. A tag
+#   push runs release.yml, which creates the Release with `GH_TOKEN: ${{ github.token }}` — and
+#   GitHub does not start workflow runs from events raised by the default GITHUB_TOKEN. So the
+#   `published` event fires, no run is created, release.yml goes green, and the release ships with
+#   NO images. release.yml therefore calls this workflow directly, after its own build and Release
+#   jobs succeed, so the images cannot be published for a release whose binaries failed.
+#   The other two triggers stay for the cases where they do work: `release: published` covers a
+#   release a PERSON publishes (a human actor is not the GITHUB_TOKEN), and `workflow_dispatch` is
+#   the manual escape hatch.
 
 on:
+  # Called by release.yml on a tag push — the primary path (see above).
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Image version tag to build and publish, exactly as the git tag spells it (e.g. v0.4.2).'
+        required: true
+        type: string
   release:
     types: [published]
   workflow_dispatch:
@@ -63,15 +81,41 @@ jobs:
         id: meta
         run: |
           set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = release ]; then
-            version="${{ github.event.release.tag_name }}"
-            prerelease="${{ github.event.release.prerelease }}"
-          else
-            version="${{ github.event.inputs.tag }}"
-            # A manual build is not a release; never let it move the stable pointer.
-            prerelease=true
-          fi
+          # Three trigger shapes, and they do not agree on where the version lives or on whether
+          # `:latest` may move. Under `workflow_call` GITHUB_EVENT_NAME is the CALLER's event
+          # (`push`), not `workflow_call` — so the dispatch case is matched by name and the call case
+          # is the default, rather than the other way round.
+          case "$GITHUB_EVENT_NAME" in
+            release)
+              version="${{ github.event.release.tag_name }}"
+              prerelease="${{ github.event.release.prerelease }}"
+              ;;
+            workflow_dispatch)
+              version="${{ inputs.tag }}"
+              # A manual build is not a release; never let it move the stable pointer.
+              prerelease=true
+              ;;
+            *)
+              version="${{ inputs.tag }}"
+              # Called from release.yml for a real tag, so `:latest` moves for a stable version. The
+              # semver-suffix rule is release.yml's own (plan job): match the suffix rather than the
+              # literal "rc", so `-beta` is not published as latest either.
+              case "$version" in
+                *-*) prerelease=true ;;
+                *)   prerelease=false ;;
+              esac
+              ;;
+          esac
           [ -n "$version" ] || { echo "no version resolved to tag the image with" >&2; exit 1; }
+          # The seat pulls `:v<CARGO_PKG_VERSION>` — a ref compiled into the binary, not read from
+          # here. A tag missing its `v` would publish images no seller ever asks for, and the pull
+          # failure would surface much later, on the first contained job. release.yml's
+          # verify-release-version.sh already holds the tag to the crate version; this holds the
+          # image tag to the shape that ref is built from.
+          case "$version" in
+            v*) ;;
+            *) echo "image version '$version' does not start with 'v' — the binary asks for :v<version>, so these images would be unreachable" >&2; exit 1 ;;
+          esac
 
           tags="${REGISTRY}/${IMAGE_NAME}:${version}"
           netfilter_tags="${REGISTRY}/${NETFILTER_IMAGE_NAME}:${version}"
