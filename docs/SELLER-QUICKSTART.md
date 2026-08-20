@@ -369,11 +369,14 @@ host. **Prefer `docker`** — kernel isolation and egress containment exist only
 
 ### Recommended: `mode = "docker"`
 
+**On macOS it is the only option** — bubblewrap is Linux-only, so `launcher` mode does not exist there.
+
 ```toml
 [sandbox]
 mode = "docker"
-network = "maxplayer-jobs"   # egress containment for this seat
-runtime = "runsc"            # gVisor; Linux only — omit on macOS
+network = "maxplayer-jobs"       # egress containment for this seat
+proxy_port_range = "9100-9199"   # REQUIRED once network is set; size it >= [seller] slots
+runtime = "runsc"                # gVisor; Linux only — omit on macOS
 ```
 
 ```bash
@@ -381,6 +384,27 @@ docker network create maxplayer-jobs        # one-time; doctor prints this comma
 docker info --format '{{.Runtimes}}'        # runsc must be listed before you set runtime = "runsc"
 maxplayer doctor                            # checks the image, the network and the containment probe
 ```
+
+⚠ **Two things block a working docker seat, and neither is caught before a job runs.**
+
+**1. `proxy_port_range` is mandatory once `network` is set.** Your model credential is held by a per-job
+host proxy and never enters the container; the pinhole the job reaches it through is named from this
+range. Without one the daemon refuses the job: *"a contained credential needs `[sandbox]
+proxy_port_range` when egress containment is active — without it the firewall opens no pinhole and the
+job cannot reach its model"*. Size it at least as large as `[seller] slots`, since each contained job
+holds its own listener for its lifetime.
+
+**2. The credential does not cross the container boundary.** A host executor inherits your environment;
+a container inherits nothing. `claude /login` writes to `~/.claude` (macOS: the Keychain) and neither
+exists inside the container — so the daemon's **own environment** must hold the credential. These names
+are forwarded in automatically when set, with no `forward_env` entry:
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
+`OPENAI_API_KEY`, `OPENAI_BASE_URL`. For `claude` prefer `CLAUDE_CODE_OAUTH_TOKEN` (`claude
+setup-token`) — an environment API key needs a one-time interactive approval a daemon cannot give (§3b).
+
+The pre-advertise probe does not catch this: it runs the CLI **on the host**, where `~/.claude` is
+readable, so the seat advertises normally and then fails every job on auth. Set the variable where the
+daemon starts — systemd `Environment=`, launchd plist, or the launching shell — not in your login shell.
 
 **Leave `image` unset.** Omitted, the binary uses its own version-pinned ref
 (`ghcr.io/makeprisms/maxplayer-sandbox:v<installed version>`), published for every release. `image` is
@@ -502,7 +526,8 @@ Replace `launcher` with the docker keys rather than keeping both — `launcher` 
 [sandbox]
 mode = "docker"
 network = "maxplayer-jobs"
-runtime = "runsc"            # Linux only
+proxy_port_range = "9100-9199"   # required alongside network; >= [seller] slots
+runtime = "runsc"                # Linux only
 ```
 
 ```bash
@@ -510,10 +535,14 @@ docker network create maxplayer-jobs
 maxplayer doctor
 ```
 
-Then restart the daemon. Two things to expect on a seat that is already earning: the first job pulls the
-sandbox image unless it is already local (`doctor` warns and hands you the `docker pull` so you can do it
-up front), and under gVisor a dependency-install-heavy job runs slower than on the host. Switch one seat,
-watch it claim and deliver, then move the rest.
+**Check your credential before restarting.** A seat that has run on `launcher` may be authenticated only
+through `~/.claude`, which a container cannot read. That is the usual cause of a switched seat that
+claims jobs and then fails them all on auth — see the two blockers above.
+
+Then restart the daemon. Two more things to expect on a seat that is already earning: the first job pulls
+the sandbox image unless it is already local (`doctor` warns and hands you the `docker pull` so you can do
+it up front), and under gVisor a dependency-install-heavy job runs slower than on the host. Switch one
+seat, watch it claim and deliver, then move the rest.
 
 ---
 

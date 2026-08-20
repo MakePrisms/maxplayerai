@@ -112,11 +112,15 @@ Omitting the whole section is the only intended way to opt out.
 
 ### Docker mode
 
+**On macOS this is the only sandbox available** — bubblewrap is Linux-only, so `launcher` mode is not an
+option there.
+
 ```toml
 [sandbox]
 mode = "docker"
-network = "maxplayer-jobs"   # egress containment for this seat
-runtime = "runsc"            # gVisor; Linux only — omit on macOS
+network = "maxplayer-jobs"       # egress containment for this seat
+proxy_port_range = "9100-9199"   # REQUIRED once network is set — see below
+runtime = "runsc"                # gVisor; Linux only — omit on macOS
 ```
 
 **Leave `image` unset.** Omitted, the binary uses its own version-pinned ref —
@@ -136,7 +140,20 @@ namespace whose rules were installed **before the job process existed**: it cann
 host, or the other containers on the box, and a job whose containment cannot be established **fails
 rather than running exposed**. A *named* network rather than the default bridge is required for a second
 reason — on a user-defined network the container resolves DNS through docker's own resolver inside its
-namespace, so denying the LAN does not also break name resolution.
+namespace, so denying the LAN does not also break name resolution. **On the default bridge, denying the
+LAN also denies DNS, and that presents as "the internet is broken" rather than as a firewall rule.**
+
+**`proxy_port_range` stops being optional the moment `network` is set.** Your model credential is held
+by a per-job proxy on the host and never enters the container, and the pinhole the job reaches it
+through is named from this range. Without one the daemon refuses the job outright:
+
+```
+[sandbox] docker: a contained credential needs [sandbox] proxy_port_range when egress
+containment is active — without it the firewall opens no pinhole and the job cannot reach its model
+```
+
+Size the range **at least as large as `[seller] slots`** — each contained job holds its own listener for
+its lifetime, and a range that runs out fails the job rather than falling back to a random port.
 
 `runtime` maps straight to `docker run --runtime`. The name must be registered with the daemon or the
 job fails at spawn, and **nothing checks it before then** — confirm it with the `docker info` line
@@ -144,9 +161,35 @@ above. Install gVisor from its signed repo and keep it patched; it is part of th
 leave `runtime` unset: Docker Desktop cannot load a custom runtime, and its containers already run
 inside a platform VM.
 
-Set `forward_env = ["MY_TOKEN"]` only when your `[agents]` preset needs a variable the built-in auth
-set does not already carry. Unknown keys are refused at config load, so a misspelt key stops the daemon
-rather than silently disabling containment.
+#### The credential does not cross the container boundary
+
+**This is the one that costs the most debugging time.** A host executor inherits your whole environment;
+a container inherits **nothing**. `claude /login` writes its credential to `~/.claude` — and on macOS to
+the Keychain — and neither exists inside the container. **`/login` is what most sellers have, and it is
+exactly what does not work here.** Jobs fail with an auth error while `doctor` stays green, because
+nothing about the seat is misconfigured until a job actually runs.
+
+The daemon's **own environment** must hold the credential. These names are forwarded into the container
+automatically when they are set — you do not list them in `forward_env`:
+
+```
+ANTHROPIC_API_KEY   ANTHROPIC_AUTH_TOKEN   CLAUDE_CODE_OAUTH_TOKEN   ANTHROPIC_BASE_URL
+OPENAI_API_KEY      OPENAI_BASE_URL
+```
+
+For `claude`, use **`CLAUDE_CODE_OAUTH_TOKEN`** (`claude setup-token`) rather than
+`ANTHROPIC_API_KEY` — per step 2, Claude Code prompts once to approve an environment API key and a
+daemon has nobody to approve it. Set it wherever the daemon starts — the systemd `Environment=`, the
+launchd plist, or the shell that runs `maxplayer seller` — not just in your login shell.
+
+**The pre-advertise probe will not catch this.** It runs the agent CLI on the *host*, where your
+`~/.claude` credential is readable, so the seat advertises normally and then fails every job inside the
+container. Same requirement as the unattended-seat warning in step 2, with a harder edge: under
+`launcher` a logged-in `~/.claude` still works, and under `docker` it cannot.
+
+Only a variable **outside** that list needs `forward_env = ["MY_OTHER_TOKEN"]`. Unknown `[sandbox]` keys
+are refused at config load, so a misspelt key stops the daemon rather than silently disabling
+containment.
 
 `DOCKER.md` has the hardening flags every docker job gets; `SANDBOXING.md` has the architecture and why
 the runtime is Linux-only.
@@ -367,7 +410,8 @@ and leaving it there only misleads whoever reads the file next:
 [sandbox]
 mode = "docker"
 network = "maxplayer-jobs"
-runtime = "runsc"            # Linux only
+proxy_port_range = "9100-9199"   # required alongside network; size it ≥ [seller] slots
+runtime = "runsc"                # Linux only
 ```
 
 ```bash
@@ -375,7 +419,12 @@ docker network create maxplayer-jobs   # the one host step; doctor names it if y
 maxplayer doctor                       # image, network and containment all get checked here
 ```
 
-Then restart the daemon. Two things worth knowing before you do it on an earning seat: the first job
+**Check your credential before you restart.** A seat that has been running on `launcher` may be
+authenticated only through `~/.claude`, which a container cannot see — see *The credential does not cross
+the container boundary* in step 3. This is the usual cause of a switched seat that claims jobs and then
+fails them all on auth.
+
+Then restart the daemon. Two more things worth knowing before you do it on an earning seat: the first job
 pulls the sandbox image if it is not already local (`doctor` warns and gives you the `docker pull` to do
 it up front instead), and under gVisor a dependency-install-heavy job is slower than on the host — so
 switch one seat, watch it claim and deliver a job, and only then move the rest.
@@ -423,7 +472,11 @@ pasteable unit is in the [seller quickstart](https://github.com/MakePrisms/maxpl
 
 Go to **maxplayer-debug-selling**, indexed by symptom — `maxplayer seller` refuses to start, a fresh
 seller 404s at the relay-git seed, health checks show nothing on a healthy daemon, buyers cannot discover you,
-claiming stopped.
+claiming stopped, every job fails on an agent auth error.
+
+**Jobs claimed then failed on auth, under `mode = "docker"`, is the most likely first-run outcome** and it
+is not a discovery or delivery problem: the container has no access to a `/login` credential. See *The
+credential does not cross the container boundary* in step 3.
 
 Dead ends exit as an issue on **https://github.com/MakePrisms/maxplayerai** naming the exact log
 line or command output you saw, or a note on the Maxplayer market channel (buzz).

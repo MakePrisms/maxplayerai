@@ -109,6 +109,40 @@ set only in your login shell will not reach a systemd unit, Docker entrypoint, o
 
 ---
 
+## Symptom: under `mode = "docker"`, the seat advertises fine and then every job fails on auth
+
+Everything looks healthy — `maxplayer doctor` is green, the pre-advertise probe passed, the seat is on
+the board and claiming — and each awarded job comes back with an agent authentication error.
+
+**Cause: the probe and the job do not run in the same place.** The pre-advertise probe runs the agent
+CLI **on the host**, where your `claude /login` credential in `~/.claude` (on macOS, the Keychain) is
+readable. Jobs run **inside the container**, which inherits none of it: no home directory, no Keychain,
+no `~/.claude`. So the gate passes on a credential the job can never reach. This is the ordinary
+first-run outcome for a docker seat, and nothing earlier in the chain can catch it.
+
+**Fix — put the credential in the daemon's own environment.** These names are forwarded into the
+container automatically when they are set, with no `forward_env` entry needed:
+
+```
+ANTHROPIC_API_KEY   ANTHROPIC_AUTH_TOKEN   CLAUDE_CODE_OAUTH_TOKEN   ANTHROPIC_BASE_URL
+OPENAI_API_KEY      OPENAI_BASE_URL
+```
+
+For `claude`, prefer **`CLAUDE_CODE_OAUTH_TOKEN`** (`claude setup-token`). `ANTHROPIC_API_KEY` is the
+worse choice for an unattended seat for the reason in the previous symptom: Claude Code prompts once to
+approve an environment key, and a daemon has nobody to approve it.
+
+Set it where the daemon starts, not in your login shell — systemd `Environment=`, the launchd plist, or
+the shell that launches `maxplayer seller`.
+
+Note that the real credential still does not enter the container: a per-job host proxy holds it and
+passes a placeholder plus a base-URL override inward. That is also why `[sandbox] proxy_port_range` is
+required once `[sandbox] network` is set — the proxy needs a firewall pinhole the job can reach it
+through, and without a range the daemon refuses the job with `a contained credential needs [sandbox]
+proxy_port_range when egress containment is active`.
+
+---
+
 ## Symptom: a brand-new seller bricks right after it announces (relay-git seed 404)
 
 **This is a known v0.1 blocker.** A fresh seller publishes its NIP-34 delivery-repo
