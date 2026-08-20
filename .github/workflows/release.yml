@@ -360,6 +360,29 @@ jobs:
           fi
           gh release create "$GITHUB_REF_NAME" "${flags[@]}" dist/*.tar.gz dist/SHA256SUMS install.sh
 
+  publish-images:
+    name: Publish sandbox images
+    # Called rather than left to the `release: published` trigger on that workflow. The Release above
+    # is created with `GH_TOKEN: ${{ github.token }}`, and GitHub starts no workflow run from an event
+    # raised by the default GITHUB_TOKEN — so `published` fires, nothing runs, this workflow goes
+    # green, and the release ships with no sandbox images at all. Nothing about that failure is
+    # visible from here, which is why the publish is called explicitly instead.
+    #
+    # Same gate as `release` and `publish`, both halves: a workflow_dispatch can be aimed at a tag
+    # ref, so the ref type alone is not evidence of a push. verify-release-workflow.sh asserts it.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    # After `release`, so no image is ever published for a release whose binaries, surface checks or
+    # Release creation failed. The images are useless without the binary that pulls them.
+    needs: [plan, build, verify-surface, release]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/publish-sandbox-image.yml
+    with:
+      # The tag exactly as pushed, `v` included: a seat pulls `:v<CARGO_PKG_VERSION>`, while
+      # plan.outputs.version has the `v` stripped for the crate-version cross-checks.
+      tag: ${{ github.ref_name }}
+
   publish:
     name: npm publish
     # ★ The gate this workflow is judged on. Publishing requires a tag PUSH, so merging this workflow
