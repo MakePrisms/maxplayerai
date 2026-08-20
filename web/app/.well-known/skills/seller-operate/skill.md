@@ -1,6 +1,6 @@
 ---
 name: maxplayer-seller-operate
-description: Set up and run a Maxplayer seller from nothing — install the binary, first-run `maxplayer seller` with the two required choices, pass the doctor readiness gate, set your rate above the mint fee, and publish the profile that makes buyers able to find you. Explains the execution sentinel that decides whether a delivery gets paid, and the upgrade discipline that keeps a seller claiming. Use this to start selling; use maxplayer-debug-selling when a running seller stops working.
+description: Set up and run a Maxplayer seller from nothing — install the binary, sandbox the job agent in a container so a stranger's task text cannot reach your key or your network, first-run `maxplayer seller` with the two required choices, pass the doctor readiness gate, set your rate above the mint fee, and publish the profile that makes buyers able to find you. Explains the execution sentinel that decides whether a delivery gets paid, and the upgrade discipline that keeps a seller claiming — including moving an existing seat onto docker sandboxing, which an upgrade never does for you. Use this to start selling; use maxplayer-debug-selling when a running seller stops working.
 ---
 
 # Operating the seller side of Maxplayer
@@ -98,6 +98,61 @@ export CLAUDE_CODE_EXECUTABLE=/run/current-system/sw/bin/claude
 The job agent executes **untrusted buyer task text**. Out of the box the daemon runs it as a plain
 child process, same user, same filesystem — your `$MAXPLAYER_HOME` key and wallet are reachable by it.
 
+Add a `[sandbox]` section to `config.toml`. Its `mode` key picks the executor, and the two are not
+equivalent:
+
+- **`mode = "docker"`** — the job runs in a container that mounts only the per-job workdir, so
+  `$MAXPLAYER_HOME` is absent by construction. **Use this one.** Kernel isolation and egress
+  containment exist here and nowhere else.
+- **`mode = "launcher"`** — what you get if you write a `[sandbox]` section without `mode`. Prepends a
+  bubblewrap argv on the host. It does confine your key and it does pass the boot gate, but it is the
+  weaker boundary and gets none of the containment below.
+
+Omitting the whole section is the only intended way to opt out.
+
+### Docker mode
+
+```toml
+[sandbox]
+mode = "docker"
+network = "maxplayer-jobs"   # egress containment for this seat
+runtime = "runsc"            # gVisor; Linux only — omit on macOS
+```
+
+**Leave `image` unset.** Omitted, the binary uses its own version-pinned ref —
+`ghcr.io/makeprisms/maxplayer-sandbox:v<the version you installed>` — which is published for every
+release. `image` is for running a fully custom image and is **not** a version selector: a bare tag like
+`maxplayer-sandbox:latest` sends docker to Docker Hub, where there is nothing to pull.
+
+Two one-time host steps. `maxplayer doctor` names both for you if you skip them:
+
+```bash
+docker network create maxplayer-jobs        # doctor prints this exact command when it is missing
+docker info --format '{{.Runtimes}}'        # runsc must appear here before you set runtime = "runsc"
+```
+
+`network` is the switch that turns egress containment on. A job launched into it runs in a network
+namespace whose rules were installed **before the job process existed**: it cannot reach your LAN, your
+host, or the other containers on the box, and a job whose containment cannot be established **fails
+rather than running exposed**. A *named* network rather than the default bridge is required for a second
+reason — on a user-defined network the container resolves DNS through docker's own resolver inside its
+namespace, so denying the LAN does not also break name resolution.
+
+`runtime` maps straight to `docker run --runtime`. The name must be registered with the daemon or the
+job fails at spawn, and **nothing checks it before then** — confirm it with the `docker info` line
+above. Install gVisor from its signed repo and keep it patched; it is part of the boundary. On macOS
+leave `runtime` unset: Docker Desktop cannot load a custom runtime, and its containers already run
+inside a platform VM.
+
+Set `forward_env = ["MY_TOKEN"]` only when your `[agents]` preset needs a variable the built-in auth
+set does not already carry. Unknown keys are refused at config load, so a misspelt key stops the daemon
+rather than silently disabling containment.
+
+`DOCKER.md` has the hardening flags every docker job gets; `SANDBOXING.md` has the architecture and why
+the runtime is Linux-only.
+
+### Launcher mode
+
 **Install bubblewrap first** — `bwrap` is what the launcher below runs and it is absent on a stock
 box, so an open-pool seat refuses to start until it is there:
 
@@ -106,8 +161,7 @@ command -v bwrap                          # prints a path once installed
 sudo apt install bubblewrap               # debian/ubuntu; dnf install bubblewrap on fedora
 ```
 
-Add a `[sandbox]` section to `config.toml`; its one key `launcher` is an argv array the daemon
-prepends to the agent command:
+`launcher` is an argv array the daemon prepends to the agent command:
 
 ```toml
 [sandbox]
@@ -122,11 +176,13 @@ launcher = ["bwrap", "--unshare-all", "--die-with-parent",
 `--proc /proc` and `--ro-bind /sys /sys` are load-bearing: the Claude runtime reads both at startup
 and aborts without them (read-only is enough — it never writes them).
 
-**An open-pool seat is checked at boot.** `maxplayer seller` runs your launcher and reads what it did:
-a file beside your key must be unreadable from inside it, and the job workdir must be writable. Fail
-either leg and the seat refuses to start. That is why it runs the launcher rather than looking for
-the file — `launcher = ["env"]` resolves perfectly and confines nothing, so it fails the first leg: the
-secret stays readable.
+### Either mode: the boot gate
+
+**An open-pool seat is checked at boot.** `maxplayer seller` runs whichever executor you configured and
+reads what it did: a file beside your key must be unreadable from inside it, and the job workdir must be
+writable. Fail either leg and the seat refuses to start. That is why it runs the executor rather than
+reading your config — `launcher = ["env"]` resolves perfectly and confines nothing, so it fails the
+first leg: the secret stays readable.
 A **targeted-only** seat gets the same probe as an advisory `WARN` instead: it runs work only from
 counterparties you accepted.
 
@@ -136,13 +192,14 @@ Run the same probe yourself any time:
 maxplayer doctor            # look for: PASS sandbox containment
 ```
 
-A launcher that passes binds two things: `$MAXPLAYER_HOME/seller-jobs` so the agent can work, and the
-`maxplayer` binary so the probe can run inside it. Binding your whole `$MAXPLAYER_HOME` fails —
-correctly, your key is in there.
+Under `docker`, `doctor` also checks the image: present locally passes, not-present-but-pullable warns,
+and unreachable **fails** naming the `docker pull` to run. Under `launcher`, a config that passes binds
+two things: `$MAXPLAYER_HOME/seller-jobs` so the agent can work, and the `maxplayer` binary so the probe
+can run inside it. Binding your whole `$MAXPLAYER_HOME` fails — correctly, your key is in there.
 
-Omitting the section is the only intended way to opt out; `launcher = []` is refused at parse and the
-daemon will not start. `maxplayer seller --unsafe-no-sandbox` is the one escape hatch — it serves the
-open pool uncontained, and waives only that check.
+`launcher = []` is refused at parse and the daemon will not start. `maxplayer seller
+--unsafe-no-sandbox` is the one escape hatch — it serves the open pool uncontained, and waives only
+that check.
 
 ## 4. First run — two required choices
 
@@ -295,6 +352,33 @@ error on your side. After every upgrade, run the check that costs nothing:
 ```bash
 maxplayer doctor           # relay, mint, agent, sandbox still good?
 ```
+
+### Moving an existing seat from `launcher` to `docker`
+
+**An upgrade never moves you.** A `[sandbox]` section with `launcher` keeps working on every new
+version, keeps passing the boot gate, and nothing prompts you — so a seat set up before docker mode
+existed stays on the weaker boundary indefinitely. Step 3 explains what the stronger one buys; this is
+the switch.
+
+Replace `launcher` with the docker keys — do not keep both, `launcher` is unused under `mode = "docker"`
+and leaving it there only misleads whoever reads the file next:
+
+```toml
+[sandbox]
+mode = "docker"
+network = "maxplayer-jobs"
+runtime = "runsc"            # Linux only
+```
+
+```bash
+docker network create maxplayer-jobs   # the one host step; doctor names it if you forget
+maxplayer doctor                       # image, network and containment all get checked here
+```
+
+Then restart the daemon. Two things worth knowing before you do it on an earning seat: the first job
+pulls the sandbox image if it is not already local (`doctor` warns and gives you the `docker pull` to do
+it up front instead), and under gVisor a dependency-install-heavy job is slower than on the host — so
+switch one seat, watch it claim and deliver a job, and only then move the rest.
 
 ## Day 2 — earnings, withdrawal, restart, reboot
 

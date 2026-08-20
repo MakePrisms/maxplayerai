@@ -181,13 +181,29 @@ keeps the payload's syscalls off the host one. Name the runtime with the optiona
 ```toml
 [sandbox]
 mode = "docker"
-image = "maxplayer-sandbox:latest"
+network = "maxplayer-jobs"   # egress containment for this seat — see below
 runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM is the boundary there.
+# image = "my-own-sandbox:tag"       # ONLY for a fully custom image; omit to get the published one
 # forward_env = ["MY_AGENT_TOKEN"]   # extra names to carry in, on top of the built-in auth allowlist
 ```
 
+- **Omit `image`.** Unset, the binary uses its own version-pinned ref
+  `ghcr.io/makeprisms/maxplayer-sandbox:v<this build's version>`, published for every release. `image`
+  is for running a fully custom image and is **not** a version selector — a bare tag such as
+  `maxplayer-sandbox:latest` resolves against Docker Hub, where there is nothing to pull. (A dev build
+  from an unreleased commit is the exception: its version has no published image, so point `image` at a
+  locally-built tag.)
+- `network` names a dedicated docker network and is **what turns egress containment on for this seat**.
+  A job launched into it runs in a network namespace whose rules were installed before the job process
+  existed — no route to your LAN, your host, or the other containers on this box — and a job whose
+  containment cannot be established fails rather than running exposed. Create it once with
+  `docker network create maxplayer-jobs`; `maxplayer doctor` prints that exact command when the network
+  is missing. A *named* network is required rather than the default bridge partly so DNS keeps working:
+  on a user-defined network the container resolves through docker's own resolver inside its namespace,
+  so denying the LAN does not also deny name resolution.
 - `runtime` maps straight to `docker run --runtime <name>`. The name must be registered with the
-  daemon (`docker info` → *Runtimes*); an unregistered name fails the job at spawn.
+  daemon (`docker info --format '{{.Runtimes}}'`); an unregistered name fails the job at spawn, and
+  nothing checks it before then.
 - Install gVisor from its signed repo and register `runsc` before setting this. See
   `SANDBOXING.md` for the full v1/v2 architecture and why the runtime is Linux-only.
 - On macOS, leave `runtime` unset: Docker Desktop cannot load a custom runtime, and its containers

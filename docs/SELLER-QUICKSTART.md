@@ -363,7 +363,41 @@ default:** out of the box the daemon runs the agent as a plain child process —
 access — so your `MAXPLAYER_HOME` (key + wallet) is reachable by the agent. Configure a sandbox before
 serving jobs.
 
-### Install bubblewrap first
+The `[sandbox]` section's `mode` key picks the executor. `docker` runs the job in a container that mounts
+only the per-job workdir; `launcher` (what you get when `mode` is absent) prepends a launcher argv on the
+host. **Prefer `docker`** — kernel isolation and egress containment exist only there.
+
+### Recommended: `mode = "docker"`
+
+```toml
+[sandbox]
+mode = "docker"
+network = "maxplayer-jobs"   # egress containment for this seat
+runtime = "runsc"            # gVisor; Linux only — omit on macOS
+```
+
+```bash
+docker network create maxplayer-jobs        # one-time; doctor prints this command if it is missing
+docker info --format '{{.Runtimes}}'        # runsc must be listed before you set runtime = "runsc"
+maxplayer doctor                            # checks the image, the network and the containment probe
+```
+
+**Leave `image` unset.** Omitted, the binary uses its own version-pinned ref
+(`ghcr.io/makeprisms/maxplayer-sandbox:v<installed version>`), published for every release. `image` is
+for a fully custom image and is not a version selector — a bare tag like `maxplayer-sandbox:latest`
+sends docker to Docker Hub, where there is nothing to pull.
+
+`network` is the switch that turns egress containment on: the job runs in a network namespace whose rules
+were installed before the job process existed, so it cannot reach your LAN, your host, or the other
+containers on the box, and a job whose containment cannot be established fails rather than running
+exposed. `runtime` maps to `docker run --runtime` and must be registered with the daemon — nothing checks
+that before the job spawns, so confirm it with the `docker info` line above. See `DOCKER.md` for the
+hardening flags every docker job gets and `SANDBOXING.md` for the architecture.
+
+An existing seat on `launcher` is never moved by an upgrade — see *Moving an existing seat from
+`launcher` to `docker`* at the end of this section.
+
+### Install bubblewrap first (`launcher` mode)
 
 The launcher below is `bwrap` (bubblewrap), and it is not present on a stock box. Install it before
 you configure the section, or the boot gate refuses to start an open-pool seat:
@@ -378,10 +412,10 @@ nix profile install nixpkgs#bubblewrap   # nix
 
 Any launcher works — bubblewrap is what the examples use because it needs no daemon and no root.
 
-### How: the `[sandbox]` section
+### How: `launcher` mode
 
-Add a `[sandbox]` section to your seller config. Its one key, `launcher`, is an argv array that the daemon
-prepends to the agent command, so the agent runs inside that launcher:
+Under `mode = "launcher"` the `launcher` key is an argv array that the daemon prepends to the agent
+command, so the agent runs inside that launcher:
 
 ```toml
 [sandbox]
@@ -454,6 +488,32 @@ launcher = ["bwrap",
 denied`, the AppArmor unprivileged-userns restriction on Ubuntu 24.04. The launcher resolves; it
 confines nothing, because it never runs. The boot gate catches that as an unusable launcher rather
 than passing it, which is the reason it runs the launcher instead of looking for the file.
+
+### Moving an existing seat from `launcher` to `docker`
+
+**An upgrade never moves you.** A `[sandbox]` section with `launcher` keeps working on every new version
+and keeps passing the boot gate, so a seat configured before docker mode existed stays on the weaker
+boundary until you change it deliberately.
+
+Replace `launcher` with the docker keys rather than keeping both — `launcher` is unused under
+`mode = "docker"`, and leaving it in place only misleads the next person to read the file:
+
+```toml
+[sandbox]
+mode = "docker"
+network = "maxplayer-jobs"
+runtime = "runsc"            # Linux only
+```
+
+```bash
+docker network create maxplayer-jobs
+maxplayer doctor
+```
+
+Then restart the daemon. Two things to expect on a seat that is already earning: the first job pulls the
+sandbox image unless it is already local (`doctor` warns and hands you the `docker pull` so you can do it
+up front), and under gVisor a dependency-install-heavy job runs slower than on the host. Switch one seat,
+watch it claim and deliver, then move the rest.
 
 ---
 
