@@ -363,7 +363,66 @@ default:** out of the box the daemon runs the agent as a plain child process —
 access — so your `MAXPLAYER_HOME` (key + wallet) is reachable by the agent. Configure a sandbox before
 serving jobs.
 
-### Install bubblewrap first
+**Use `mode = "docker"`.** The job runs in a container mounting only the per-job workdir, and the kernel
+boundary and egress containment exist in this mode and nowhere else. On macOS it is the only sandbox
+there is, since bubblewrap is Linux-only.
+
+`mode = "launcher"` — which is what a `[sandbox]` section with no `mode` line gets — is the weaker,
+Linux-only path, kept below for a box that cannot run docker and for recognising a seat you already have.
+
+### `mode = "docker"`
+
+```toml
+[sandbox]
+mode = "docker"
+network = "maxplayer-jobs"       # egress containment for this seat
+proxy_port_range = "9100-9199"   # REQUIRED once network is set; size it >= [seller] slots
+runtime = "runsc"                # gVisor; Linux only — omit on macOS
+```
+
+```bash
+docker network create maxplayer-jobs        # one-time; doctor prints this command if it is missing
+docker info --format '{{.Runtimes}}'        # runsc must be listed before you set runtime = "runsc"
+maxplayer doctor                            # checks the image, the network and the containment probe
+```
+
+⚠ **Two things block a working docker seat, and neither is caught before a job runs.**
+
+**1. `proxy_port_range` is mandatory once `network` is set.** Your model credential is held by a per-job
+host proxy and never enters the container; the pinhole the job reaches it through is named from this
+range. Without one the daemon refuses the job: *"a contained credential needs `[sandbox]
+proxy_port_range` when egress containment is active — without it the firewall opens no pinhole and the
+job cannot reach its model"*. Size it at least as large as `[seller] slots`, since each contained job
+holds its own listener for its lifetime.
+
+**2. The credential does not cross the container boundary.** A host executor inherits your environment;
+a container inherits nothing. `claude /login` writes to `~/.claude` (macOS: the Keychain) and neither
+exists inside the container — so the daemon's **own environment** must hold the credential. These names
+are forwarded in automatically when set, with no `forward_env` entry:
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
+`OPENAI_API_KEY`, `OPENAI_BASE_URL`. For `claude` prefer `CLAUDE_CODE_OAUTH_TOKEN` (`claude
+setup-token`) — an environment API key needs a one-time interactive approval a daemon cannot give (§3b).
+
+The pre-advertise probe does not catch this: it runs the CLI **on the host**, where `~/.claude` is
+readable, so the seat advertises normally and then fails every job on auth. Set the variable where the
+daemon starts — systemd `Environment=`, launchd plist, or the launching shell — not in your login shell.
+
+**Leave `image` unset.** Omitted, the binary uses its own version-pinned ref
+(`ghcr.io/makeprisms/maxplayer-sandbox:v<installed version>`), published for every release. `image` is
+for a fully custom image and is not a version selector — a bare tag like `maxplayer-sandbox:latest`
+sends docker to Docker Hub, where there is nothing to pull.
+
+`network` is the switch that turns egress containment on: the job runs in a network namespace whose rules
+were installed before the job process existed, so it cannot reach your LAN, your host, or the other
+containers on the box, and a job whose containment cannot be established fails rather than running
+exposed. `runtime` maps to `docker run --runtime` and must be registered with the daemon — nothing checks
+that before the job spawns, so confirm it with the `docker info` line above. See `DOCKER.md` for the
+hardening flags every docker job gets and `SANDBOXING.md` for the architecture.
+
+An existing seat on `launcher` is never moved by an upgrade — see *Moving an existing seat from
+`launcher` to `docker`* at the end of this section.
+
+### `launcher` mode — only if this box cannot run docker
 
 The launcher below is `bwrap` (bubblewrap), and it is not present on a stock box. Install it before
 you configure the section, or the boot gate refuses to start an open-pool seat:
@@ -378,10 +437,10 @@ nix profile install nixpkgs#bubblewrap   # nix
 
 Any launcher works — bubblewrap is what the examples use because it needs no daemon and no root.
 
-### How: the `[sandbox]` section
+#### The `launcher` argv
 
-Add a `[sandbox]` section to your seller config. Its one key, `launcher`, is an argv array that the daemon
-prepends to the agent command, so the agent runs inside that launcher:
+Under `mode = "launcher"` the `launcher` key is an argv array that the daemon prepends to the agent
+command, so the agent runs inside that launcher:
 
 ```toml
 [sandbox]
@@ -454,6 +513,37 @@ launcher = ["bwrap",
 denied`, the AppArmor unprivileged-userns restriction on Ubuntu 24.04. The launcher resolves; it
 confines nothing, because it never runs. The boot gate catches that as an unusable launcher rather
 than passing it, which is the reason it runs the launcher instead of looking for the file.
+
+### Moving an existing seat from `launcher` to `docker`
+
+**An upgrade never moves you.** A `[sandbox]` section with `launcher` keeps working on every new version
+and keeps passing the boot gate, so a seat configured before docker mode existed stays on the weaker
+boundary until you change it deliberately.
+
+Replace `launcher` with the docker keys rather than keeping both — `launcher` is unused under
+`mode = "docker"`, and leaving it in place only misleads the next person to read the file:
+
+```toml
+[sandbox]
+mode = "docker"
+network = "maxplayer-jobs"
+proxy_port_range = "9100-9199"   # required alongside network; >= [seller] slots
+runtime = "runsc"                # Linux only
+```
+
+```bash
+docker network create maxplayer-jobs
+maxplayer doctor
+```
+
+**Check your credential before restarting.** A seat that has run on `launcher` may be authenticated only
+through `~/.claude`, which a container cannot read. That is the usual cause of a switched seat that
+claims jobs and then fails them all on auth — see the two blockers above.
+
+Then restart the daemon. Two more things to expect on a seat that is already earning: the first job pulls
+the sandbox image unless it is already local (`doctor` warns and hands you the `docker pull` so you can do
+it up front), and under gVisor a dependency-install-heavy job runs slower than on the host. Switch one
+seat, watch it claim and deliver, then move the rest.
 
 ---
 

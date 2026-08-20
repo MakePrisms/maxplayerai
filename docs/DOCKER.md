@@ -181,13 +181,46 @@ keeps the payload's syscalls off the host one. Name the runtime with the optiona
 ```toml
 [sandbox]
 mode = "docker"
-image = "maxplayer-sandbox:latest"
+network = "maxplayer-jobs"       # egress containment for this seat — see below
+proxy_port_range = "9100-9199"   # REQUIRED once network is set — see below
 runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM is the boundary there.
+# image = "my-own-sandbox:tag"       # ONLY for a fully custom image; omit to get the published one
 # forward_env = ["MY_AGENT_TOKEN"]   # extra names to carry in, on top of the built-in auth allowlist
 ```
 
+⚠ **A host seller needs both of these, and neither is caught before a job runs:**
+
+- **`proxy_port_range` is mandatory once `network` is set.** The per-job credential proxy is reached
+  through a firewall pinhole named from this range, so without one the daemon refuses the job:
+  *"a contained credential needs `[sandbox] proxy_port_range` when egress containment is active — without
+  it the firewall opens no pinhole and the job cannot reach its model"*. Size it at least as large as
+  `[seller] slots` — each contained job holds its own listener for its lifetime, and an exhausted range
+  fails the job rather than falling back to a random port.
+- **The agent credential must be in the daemon's environment, not in `~/.claude`.** A container inherits
+  nothing: no home directory, no macOS Keychain. The allowlist below is forwarded in automatically when
+  the variables are set — `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
+  `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_BASE_URL` — and `forward_env` is only for names outside
+  it. For `claude` prefer `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`); an environment API key needs
+  a one-time interactive approval a daemon cannot give. **The pre-advertise probe runs the CLI on the
+  host, so a `/login` credential passes the gate and then fails every job inside the container.**
+
+- **Omit `image`.** Unset, the binary uses its own version-pinned ref
+  `ghcr.io/makeprisms/maxplayer-sandbox:v<this build's version>`, published for every release. `image`
+  is for running a fully custom image and is **not** a version selector — a bare tag such as
+  `maxplayer-sandbox:latest` resolves against Docker Hub, where there is nothing to pull. (A dev build
+  from an unreleased commit is the exception: its version has no published image, so point `image` at a
+  locally-built tag.)
+- `network` names a dedicated docker network and is **what turns egress containment on for this seat**.
+  A job launched into it runs in a network namespace whose rules were installed before the job process
+  existed — no route to your LAN, your host, or the other containers on this box — and a job whose
+  containment cannot be established fails rather than running exposed. Create it once with
+  `docker network create maxplayer-jobs`; `maxplayer doctor` prints that exact command when the network
+  is missing. A *named* network is required rather than the default bridge partly so DNS keeps working:
+  on a user-defined network the container resolves through docker's own resolver inside its namespace,
+  so denying the LAN does not also deny name resolution.
 - `runtime` maps straight to `docker run --runtime <name>`. The name must be registered with the
-  daemon (`docker info` → *Runtimes*); an unregistered name fails the job at spawn.
+  daemon (`docker info --format '{{.Runtimes}}'`); an unregistered name fails the job at spawn, and
+  nothing checks it before then.
 - Install gVisor from its signed repo and register `runsc` before setting this. See
   `SANDBOXING.md` for the full v1/v2 architecture and why the runtime is Linux-only.
 - On macOS, leave `runtime` unset: Docker Desktop cannot load a custom runtime, and its containers
@@ -210,9 +243,11 @@ The port was never a control.
   network namespace, on its `OUTPUT` chain, and a test asserts that no rule names an interface at
   all. Those rules govern what the **job** reaches. Nothing about them is on your host's filter
   path, so they are not aimed at, and do not filter, traffic arriving on your public interface.
-- **Configuring `[sandbox] proxy_port_range` makes the port predictable.** That is deliberate — a
-  static firewall rule cannot name an ephemeral port, so containment needs a known range. The
-  side effect is that an attacker knocks on a small known range instead of scanning 65535 ports.
+- **`[sandbox] proxy_port_range` makes the port predictable.** That is deliberate — a static firewall
+  rule cannot name an ephemeral port, so containment needs a known range. The side effect is that an
+  attacker knocks on a small known range instead of scanning 65535 ports. Note this is not a
+  convenience: under `mode = "docker"` with `network` set, the range is **required**, and a job without
+  one is refused rather than run (see the host-seller warning above).
 
 **So: on any seller box with a public interface, deny inbound to your configured
 `proxy_port_range` (and to the ephemeral high ports if you have not configured one).** A host firewall
@@ -353,3 +388,11 @@ its wallet balance.
   container after editing it: `docker compose up -d --force-recreate seller`.
 - **Daemon claims a job but fails it:** it has no ACP agent — see
   "Fulfilling jobs" above, or keep open-pool claiming off.
+- **Under `mode = "docker"`: advertises fine, then every job fails on an agent auth error.** The
+  credential is in `~/.claude` (or the macOS Keychain), which the container cannot read, while the
+  pre-advertise probe runs the CLI on the *host* and therefore passes. Put the credential in the
+  daemon's environment instead — `CLAUDE_CODE_OAUTH_TOKEN` for `claude` — as described under
+  "Docker-mode hardening" above. This is the ordinary first-run outcome for a docker seat.
+- **Under `mode = "docker"`: job refused with `a contained credential needs [sandbox]
+  proxy_port_range`.** You set `[sandbox] network` without a port range; add one sized at least
+  `[seller] slots`.

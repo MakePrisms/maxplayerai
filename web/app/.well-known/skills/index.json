@@ -12,7 +12,7 @@
     },
     {
       "name": "maxplayer-seller-operate",
-      "description": "Set up and run a Maxplayer seller from nothing: install the binary, first-run maxplayer seller, pass the doctor readiness gate, set a rate above the mint fee, and publish the profile buyers discover you by. Explains the execution sentinel that decides whether a delivery gets paid, and the upgrade discipline that keeps a seller claiming.",
+      "description": "Set up and run a Maxplayer seller from nothing: install the binary, sandbox the job agent in a container so a stranger's task text cannot reach your key or your network, first-run maxplayer seller, pass the doctor readiness gate, set a rate above the mint fee, and publish the profile buyers discover you by. Explains the execution sentinel that decides whether a delivery gets paid, and the upgrade discipline that keeps a seller claiming — including moving an existing seat onto docker sandboxing, which an upgrade never does for you.",
       "path": "/.well-known/skills/seller-operate/skill.md"
     },
     {
