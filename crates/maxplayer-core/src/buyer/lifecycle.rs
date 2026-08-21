@@ -1122,6 +1122,10 @@ mod tests {
     fn claim(job_id: &str, live: bool, creq_amount: u64, mints: &[String]) -> ClaimView {
         let creq = build_seller_creq(job_id, creq_amount, "sat", mints, SELLER_HEX).expect("creq");
         ClaimView {
+            // The UNSTATED capability — a seat advertising nothing. Set explicitly because `ClaimView`
+            // has no `Default` derive and must not gain one: a default `SandboxConfig` is a meaningful
+            // object, but a default `ClaimView` is a claim that never existed.
+            capability: crate::heartbeat::SeatCapability::default(),
             claim_id: "c".repeat(64),
             created_at: 1,
             seller_pubkey: SELLER_HEX.to_owned(),

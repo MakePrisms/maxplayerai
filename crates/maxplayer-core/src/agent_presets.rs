@@ -38,6 +38,43 @@ impl AdapterHost {
     }
 }
 
+/// The harness FAMILY vocabulary advertised on the wire (#784), sorted.
+///
+/// ⚠ THIS IS A WIRE VOCABULARY AND IT IS DELIBERATELY NOT [`BUILTIN_PRESETS`]. The two overlap in
+/// spelling for two of three entries, which is exactly why they must stay separate objects: a
+/// preset name is load-bearing in THREE places at once — the `--agent` CLI vocabulary, the `agents`
+/// wire tag, and the dispatch key whose contract is "a named request is exact or nothing"
+/// ([`crate::seller_agents`]). Renaming `claude` to `claude-code` to make the two lists match would
+/// silently change what `--agent claude` dispatches to. [`harness_family_for_preset`] is the ONE
+/// seam between them, so the mapping is a lookup rather than an assumption that the names agree.
+///
+/// `goose` is in the vocabulary with no built-in preset. That is not an omission: the family list is
+/// what a buyer may FILTER on, and a buyer may legitimately ask for a family no seat of ours ships a
+/// preset for.
+pub const HARNESS_FAMILIES: [&str; 4] = ["claude-code", "codex", "cursor", "goose"];
+
+/// The wire harness family for a config/CLI preset name, or `None` when the preset names no family
+/// in the spec vocabulary.
+///
+/// `None` is a first-class outcome, not a failure: a custom `[agents]` entry or the unlabelled
+/// `--agent-argv` hatch has no family we can honestly publish, exactly as it has no `agents` name to
+/// publish. Absent means "unstated", and an unstated family never satisfies a buyer that named one —
+/// the same rule the `agents` tag already follows.
+///
+/// A custom preset spelled EXACTLY as a spec family maps to that family. That is exact equality
+/// against the closed vocabulary, never a nearest match, and it is how `goose` reaches the wire
+/// without a code change once someone configures a goose preset.
+pub fn harness_family_for_preset(preset: &str) -> Option<&'static str> {
+    let key = preset.trim().to_ascii_lowercase();
+    match key.as_str() {
+        "claude" => return Some("claude-code"),
+        "codex" => return Some("codex"),
+        "cursor" => return Some("cursor"),
+        _ => {}
+    }
+    HARNESS_FAMILIES.iter().copied().find(|family| *family == key)
+}
+
 /// Resolve a preset name to an argv for the seller ACP driver, for an adapter that runs on the HOST.
 /// The default for pass-through and launcher executors; docker mode calls [`resolve_agent_preset_in`]
 /// with [`AdapterHost::Container`].
@@ -397,5 +434,78 @@ mod tests {
         )]);
         let detected = detect_available_agents(&table);
         assert!(!detected.contains(&"ghost".to_owned()), "{detected:?}");
+    }
+
+    #[test]
+    fn every_builtin_preset_maps_to_a_family_in_the_vocabulary() {
+        // Enumerated from BUILTIN_PRESETS rather than hand-listed, so ADDING a preset without giving
+        // it a family fails here instead of shipping a seat that silently advertises no family. The
+        // family it maps to must itself be in HARNESS_FAMILIES — a mapping to an out-of-vocabulary
+        // string would be unmatchable by every buyer filter and is the exact drift #784 forbids.
+        for preset in BUILTIN_PRESETS {
+            let family = harness_family_for_preset(preset)
+                .unwrap_or_else(|| panic!("built-in preset {preset:?} maps to no harness family"));
+            assert!(
+                HARNESS_FAMILIES.contains(&family),
+                "preset {preset:?} maps to {family:?}, which is not in HARNESS_FAMILIES"
+            );
+        }
+    }
+
+    #[test]
+    fn the_preset_and_family_vocabularies_are_separate_objects() {
+        // The load-bearing distinction: `claude` the PRESET is `claude-code` the FAMILY, and the two
+        // spellings must not be assumed interchangeable. If someone ever "tidies" this by renaming
+        // the preset, this assertion is what says the dispatch key moved.
+        assert_eq!(harness_family_for_preset("claude"), Some("claude-code"));
+        assert!(
+            !BUILTIN_PRESETS.contains(&"claude-code"),
+            "claude-code is a WIRE family, never a preset/CLI name"
+        );
+        // The two that DO share a spelling still go through the mapping, not past it.
+        assert_eq!(harness_family_for_preset("codex"), Some("codex"));
+        assert_eq!(harness_family_for_preset("cursor"), Some("cursor"));
+    }
+
+    #[test]
+    fn casing_and_whitespace_reach_the_same_family() {
+        for spelling in ["claude", "Claude", "  CLAUDE  "] {
+            assert_eq!(
+                harness_family_for_preset(spelling),
+                Some("claude-code"),
+                "{spelling:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unlabelled_or_custom_preset_advertises_no_family() {
+        // Absent means "unstated", never "none" — the same rule the `agents` tag follows. A seat that
+        // cannot honestly name its family must publish nothing rather than a plausible guess.
+        for unknown in ["", "   ", "my-fork", "claude-ish", "claudecode"] {
+            assert_eq!(
+                harness_family_for_preset(unknown),
+                None,
+                "{unknown:?} must not resolve to a family"
+            );
+        }
+    }
+
+    #[test]
+    fn a_custom_preset_named_exactly_a_family_reaches_that_family() {
+        // How `goose` — a family with no built-in preset — gets on the wire: exact equality against
+        // the closed vocabulary. `goose` resolving here while `claudecode` does not (above) is the
+        // difference between exact-match and fuzzy-match.
+        assert_eq!(harness_family_for_preset("goose"), Some("goose"));
+        assert_eq!(harness_family_for_preset("  GOOSE "), Some("goose"));
+    }
+
+    #[test]
+    fn the_family_vocabulary_is_sorted_and_free_of_duplicates() {
+        let mut sorted = HARNESS_FAMILIES.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(HARNESS_FAMILIES.to_vec(), sorted, "HARNESS_FAMILIES must stay sorted");
+        sorted.dedup();
+        assert_eq!(sorted.len(), HARNESS_FAMILIES.len(), "HARNESS_FAMILIES must be duplicate-free");
     }
 }

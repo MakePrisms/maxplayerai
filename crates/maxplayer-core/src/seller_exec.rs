@@ -2355,6 +2355,30 @@ mod tests {
         }
     }
 
+    /// Mirror of the downstream DASHBOARD harness-family classifier: a family substring wins;
+    /// present-but-unrecognised (e.g. `npx`) falls through to `other`.
+    ///
+    /// ⚠ THIS IS NOT THE WIRE VOCABULARY. #784's `crate::agent_presets::HARNESS_FAMILIES` is a
+    /// closed enum matched EXACTLY, with no catch-all, and it spells the Claude family
+    /// `claude-code`. The two share a name and overlap in most tokens — see
+    /// [`the_dashboard_family_vocabulary_is_not_the_wire_family_vocabulary`], which asserts exactly
+    /// where they agree and where they diverge so the difference cannot be erased silently.
+    ///
+    /// ONE mirror, shared by both tests that need it. Two copies of a mirror can drift apart, and a
+    /// drifted mirror would quietly stop reflecting the thing it exists to track.
+    fn harness_family(id: &str) -> &'static str {
+        let s = id.to_ascii_lowercase();
+        if s.contains("claude") {
+            "claude"
+        } else if s.contains("cursor") {
+            "cursor"
+        } else if s.contains("codex") {
+            "codex"
+        } else {
+            "other"
+        }
+    }
+
     // The default (pass-through) policy launches the agent command exactly as configured: the
     // spawned `(program, args)` reconstruct the configured argv byte-for-byte, at the host workdir,
     // with no wrapper.
@@ -4427,20 +4451,6 @@ mod tests {
 
     #[test]
     fn claude_preset_resolves_harness_family_claude_despite_npx_argv0() {
-        // Mirror the downstream harness-family classifier: a family substring wins;
-        // present-but-unrecognized (e.g. "npx") → "other".
-        fn harness_family(id: &str) -> &'static str {
-            let s = id.to_ascii_lowercase();
-            if s.contains("claude") {
-                "claude"
-            } else if s.contains("cursor") {
-                "cursor"
-            } else if s.contains("codex") {
-                "codex"
-            } else {
-                "other"
-            }
-        }
         let value = |tags: &[TagSpec], name: &str| -> Option<String> {
             tags.iter()
                 .find(|tag| tag.first() == Some(name))
@@ -4483,6 +4493,57 @@ mod tests {
             harness_family(&value(&hatch, "harness").expect("harness")),
             "claude"
         );
+    }
+
+    #[test]
+    fn the_dashboard_family_vocabulary_is_not_the_wire_family_vocabulary() {
+        // TWO DIFFERENT THINGS SHARE THE NAME "harness family", and this test exists so that fact is
+        // EXECUTABLE rather than only written down:
+        //
+        // - The DASHBOARD classifier (mirrored in the test above): substring match over a receipt's
+        //   `harness` id, vocabulary {claude, cursor, codex} plus a catch-all "other".
+        // - The WIRE tag (#784, `crate::agent_presets::HARNESS_FAMILIES`): a closed enum matched
+        //   EXACTLY, no catch-all, and it spells the Claude family `claude-code`.
+        //
+        // The hazard is not the shared name — it is a shared name with a NEARLY shared vocabulary.
+        // Disjoint vocabularies would be caught on first use because everything would miss;
+        // identical ones would be harmless. Overlapping in 2 of 3 is the lethal middle: joining the
+        // two fields returns correct-looking results for codex and cursor seats and silently drops
+        // every claude one.
+        //
+        // So the assertion is on the RELATIONSHIP, and it is deliberately two-sided: it pins where
+        // they agree AND where they differ. Anyone who later "aligns" either side — renaming the
+        // wire enum to `claude`, or teaching the dashboard `claude-code` — trips this and is told
+        // what they are actually changing. Aligning them is not forbidden; doing it silently is.
+        use crate::agent_presets::{HARNESS_FAMILIES, harness_family_for_preset};
+
+        // Where they AGREE: same preset, same token, on both sides.
+        for shared in ["codex", "cursor"] {
+            assert_eq!(harness_family(shared), shared, "dashboard side of {shared:?}");
+            assert_eq!(
+                harness_family_for_preset(shared),
+                Some(shared),
+                "wire side of {shared:?}"
+            );
+        }
+
+        // Where they DIVERGE, and it is exactly one token.
+        assert_eq!(harness_family("claude"), "claude", "dashboard spells it claude");
+        assert_eq!(
+            harness_family_for_preset("claude"),
+            Some("claude-code"),
+            "the wire spells it claude-code — this is the ONE divergence, and #784 chose it"
+        );
+        assert!(
+            !HARNESS_FAMILIES.contains(&"claude"),
+            "the wire vocabulary must NOT also accept the dashboard spelling — two spellings of one \
+             family on the wire is exactly the canonicalisation failure #784 forbids"
+        );
+
+        // And the structural difference behind the divergence: the dashboard has a catch-all, the
+        // wire has none. An unknown id is classified by one and unmatchable by the other.
+        assert_eq!(harness_family("something-unknown"), "other");
+        assert_eq!(harness_family_for_preset("something-unknown"), None);
     }
 
     #[test]
