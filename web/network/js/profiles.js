@@ -38,20 +38,52 @@ export function resolveHeartbeats(events) {
 }
 
 /**
- * How recent a seat's announcement must be for that seat to be counted as existing.
+ * How long a seat may go unheard before the directory stops counting it.
  *
  * Kind-30340 is replaceable, so a relay hands back the last thing a seat said and nothing marks it
  * as over. Accumulating what the relay serves therefore builds a directory of seats that are gone.
- * Measured on relay.maxplayer.ai 2026-08-21: 27 announcements resolved to 9 seats inside this
- * window and 18 outside it, the excluded ones a median of ~11 days old and the oldest 16.6 days.
+ * Measured on relay.maxplayer.ai 2026-08-21: 27 announcements resolved to 9 live seats and 18
+ * fossils, the excluded ones a median of ~11 days old and the oldest 16.6 days.
  *
- * 300s rather than `LIVE_WINDOW_S` below: the two do not disagree on that measurement, because the
- * age distribution was bimodal with ZERO announcements between 300s and 1h, so the cut lands in an
- * empty region and both windows selected the same 9 seats. The tighter one is the charter's and is
- * the one stated in the UI. Two freshness constants in one app is how a page later contradicts
- * itself, so this is named here rather than left implicit — see #857's follow-up.
+ * DERIVED, not chosen: **three missed beats**. `default_heartbeat_interval_secs()` is 300 and the
+ * measured fleet cadence agrees with it — 18 inter-arrival gaps across 9 seats, 298s to 300s, total
+ * spread 2s. Three is the tolerance `default_heartbeat_stall_missed_intervals()` already applies,
+ * borrowed for its MAGNITUDE because the codebase has answered "how many intervals is too many".
+ *
+ * ⚠ Borrowed for magnitude and NOT for equivalence: `stall_missed_intervals` governs when the seller
+ * daemon declares its own subscription round-trip dead, which is a different event from a seat
+ * ceasing to announce, and either can happen without the other. This window does not mean the reader
+ * and the seat agree on when a seat has stopped. They are not measuring the same thing.
+ *
+ * ⛔ A window equal to the interval was the previous value and it was a knife edge BY CONSTRUCTION.
+ * A punctual seat's announcement age is uniform on [0, interval), so just before its next beat it
+ * approaches 300 and sits on the boundary. Any jitter, propagation, or clock skew then drops a live
+ * seat. (An observed maximum age of 226s across 9 seats does not contradict that — a maximum over 9
+ * draws is not the maximum of the distribution.)
+ *
+ * ★ THE MARGIN'S REAL JOB IS CLOCK SKEW, which is the argument that does not depend on the cadence
+ * at all. `created_at` is EMITTER-stamped, so reader-side age carries the offset between the seat's
+ * clock and ours. A seat whose clock runs slow reads permanently stale however punctually it beats.
+ * The 600s above one interval is not slack; it is what absorbs a quantity the reader cannot measure —
+ * and cannot measure ASYMMETRICALLY: a stamp in our future proves a fast clock, while a slow clock
+ * merely inflates an age and is indistinguishable from a late beat. Measured 2026-08-21: zero
+ * negative ages, which is a real reading of one direction and silence about the other, and the silent
+ * direction is the one that costs a live seat.
+ *
+ * RESIDUAL, unfixed: the window is one global constant while the cadence is PER-SEAT config, and no
+ * announcement states its own interval. A seat configured to beat slower than this is permanently
+ * excluded and reads identically to a dead one. Sampling the excluded addresses twice more than an
+ * interval apart WOULD separate them — a live seat's newest copy keeps advancing its `created_at`
+ * however offset its clock is, while a dead seat's stays frozen. Done once over ~11 minutes: none of
+ * the 12 excluded addresses changed, so none is live at ~300s; a slower-beating seat is still not
+ * ruled out. So the UI says "not seen in Ns" and never "gone" or "offline".
+ *
+ * `LIVE_WINDOW_S` above is 1800s — six intervals, answering a different question (is this pubkey
+ * alive at all, from any signal). Left alone deliberately rather than unified, because the two
+ * windows govern different subjects and collapsing them would be a semantic change wearing a
+ * cleanup's clothes.
  */
-export const SEAT_FRESH_WINDOW_S = 300;
+export const SEAT_FRESH_WINDOW_S = 900;
 
 /**
  * The live seat directory: seats that exist right now, with the fossils counted rather than dropped
