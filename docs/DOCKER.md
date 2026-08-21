@@ -203,6 +203,12 @@ runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM
   it. For `claude` prefer `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`); an environment API key needs
   a one-time interactive approval a daemon cannot give. **The pre-advertise probe runs the CLI on the
   host, so a `/login` credential passes the gate and then fails every job inside the container.**
+- ⛔ **`cursor` has no credential path under docker mode.** The allowlist is claude and codex only, and
+  `CURSOR_API_KEY` is also not one of the credentials the per-job proxy can hold — so
+  `forward_env = ["CURSOR_API_KEY"]` forwards the real reusable key into the container for a stranger's
+  job to read, which `doctor` flags as a WARN rather than refusing. Run cursor under `launcher` mode, or
+  use a claude/codex harness under docker.
+  See [#850](https://github.com/MakePrisms/maxplayerai/issues/850).
 
 - **Omit `image`.** Unset, the binary uses its own version-pinned ref
   `ghcr.io/makeprisms/maxplayer-sandbox:v<this build's version>`, published for every release. `image`
