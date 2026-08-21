@@ -285,7 +285,12 @@ export function createStore() {
           pubkey: ev.pubkey,
           created_at: ev.created_at,
           agents,
-          verified: verifyAdvertisedHarnesses(all, ev.pubkey, agents),
+          verified: verifyAdvertisedHarnesses(
+            all,
+            ev.pubkey,
+            agents,
+            ev.heartbeat?.capability?.filterable?.harness_family ?? [],
+          ),
           // #784. Carried under its own key, split into `filterable` and `displayOnly` exactly as
           // the emitter splits it, so nothing here can put a display-only field where a filter
           // predicate would read it.

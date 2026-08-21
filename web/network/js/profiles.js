@@ -7,7 +7,7 @@
  */
 import { groupEvents, jobFromGroup, JOB_STATUS } from "./jobs.js";
 import { SELLER_HEARTBEAT_D } from "./kinds.js";
-import { harnessFamilyFromId } from "./parse.js";
+import { harnessFamilyFromId, wireFamilyFromId } from "./parse.js";
 
 /** Liveness thresholds (seconds) from last-seen to now. */
 export const LIVE_WINDOW_S = 30 * 60;
@@ -166,8 +166,9 @@ export function resolveSeatDirectory(events, now = nowSeconds()) {
  * @param {any[]} events normalized events
  * @param {string} pubkey the seat
  * @param {string[]} advertised the seat's `agents` roster, verbatim
+ * @param {string[]} wireFamilies the seat's `harness_family` values — the roster the award reads
  */
-export function verifyAdvertisedHarnesses(events, pubkey, advertised = []) {
+export function verifyAdvertisedHarnesses(events, pubkey, advertised = [], wireFamilies = []) {
   /** @type {Map<string, number>} delivered harness id → receipt count */
   const delivered = new Map();
   for (const ev of events) {
@@ -177,16 +178,38 @@ export function verifyAdvertisedHarnesses(events, pubkey, advertised = []) {
   }
   const ids = [...delivered.keys()];
 
+  // The roster to verify against is `harness_family` when the seat sends it — that is the field the
+  // AWARD DECISION reads, so agreeing with it is the claim that matters. The emitter derives it from
+  // the same serving roster the `agents` tag comes from, so the two cannot describe different sets:
+  // "a harness dropped from service leaves both tags at once."
+  //
+  // ⚠ THE TWO TAGS DIVERGE IN EXACTLY ONE DIRECTION, and it is why `agents` is still read here. A
+  // preset with no family in the closed wire vocabulary contributes NOTHING to `harness_family`
+  // while still carrying its own name in `agents` — a custom `[agents]` entry is the case. Verifying
+  // only against `harness_family` would make that entry VANISH from the panel, which is worse than
+  // the `incomparable` it renders as today: a claim we cannot check must say so, not go quiet. The
+  // unlabelled `--agent-argv` hatch is absent from both tags and so from this list either way.
+  const rosterFamilies = wireFamilies.length ? wireFamilies : [];
+  const unmappedAgents = advertised.filter((label) => wireFamilyFromId(label) == null);
+  const roster = rosterFamilies.length || unmappedAgents.length
+    ? [...rosterFamilies, ...unmappedAgents]
+    : advertised;
+
   const matches = (label, id) => {
     // Exact first: an out-of-enum preset name IS the identity on both sides, so `deepseek-v4-flash`
     // advertised against `deepseek-v4-flash` delivered agrees on the string. A family comparison
     // alone would map both to null and read that as no information.
     if (id === label) return "id";
+    // Wire vocabulary on both sides — a `claude-code` claim against a `claude-agent-acp` receipt.
+    const wf = wireFamilyFromId(label);
+    if (wf && wireFamilyFromId(id) === wf) return "wire";
+    // Fall back to the display shorthand so a pre-capability seat, which advertises only `agents`,
+    // still pairs. Dropping this would un-verify every seat that has not upgraded.
     const lf = harnessFamilyFromId(label);
     return lf && harnessFamilyFromId(id) === lf ? "family" : null;
   };
 
-  const claims = advertised.map((label) => {
+  const claims = roster.map((label) => {
     for (const id of ids) {
       const how = matches(label, id);
       if (how) {
@@ -198,7 +221,7 @@ export function verifyAdvertisedHarnesses(events, pubkey, advertised = []) {
     // namespaces cannot be bridged at all and we have no basis for any conclusion. If it does name
     // one, the comparison genuinely ran and found nothing — which under exact-or-nothing dispatch
     // means no job asked for that harness, not that the seat cannot serve it.
-    const comparable = harnessFamilyFromId(label) != null;
+    const comparable = wireFamilyFromId(label) != null || harnessFamilyFromId(label) != null;
     return {
       advertised: label,
       verdict: comparable ? "unverified" : "incomparable",
@@ -223,8 +246,10 @@ export function verifyAdvertisedHarnesses(events, pubkey, advertised = []) {
     for (const id of ids) {
       if (advertised.some((label) => matches(label, id))) continue;
       const row = { deliveredId: id, receipts: delivered.get(id) };
-      const idFamily = harnessFamilyFromId(id);
-      const anyComparableLabel = advertised.some((label) => harnessFamilyFromId(label) != null);
+      const idFamily = wireFamilyFromId(id) ?? harnessFamilyFromId(id);
+      const anyComparableLabel = roster.some(
+        (label) => wireFamilyFromId(label) != null || harnessFamilyFromId(label) != null,
+      );
       if (idFamily != null && anyComparableLabel) contradictions.push(row);
       else incomparableDeliveries.push(row);
     }

@@ -772,7 +772,11 @@ test("advertised versus delivered: a claim paired with its falsifier", () => {
     {
       const v = verify(["claude"], [delivery(seat, "claude-agent-acp")]);
       assert.equal(v.claims[0].verdict, "agreed");
-      assert.equal(v.claims[0].on, "family", "bridged by family, not by string");
+      // `on` names WHICH vocabulary bridged it. `wire` and `family` are both family readings, as
+      // opposed to `id` which is an exact string match; they are reported separately so a test can
+      // tell which one did the work. Here the wire vocabulary reads both sides — a preset label and
+      // an adapter identity both resolve to `claude-code`.
+      assert.equal(v.claims[0].on, "wire", "bridged by family, not by string");
       assert.deepEqual(v.contradictedBy, []);
     }
 

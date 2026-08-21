@@ -233,6 +233,33 @@ export function harnessFamilyFromId(id) {
   return null;
 }
 
+/**
+ * The SPEC harness family for any harness id — the closed wire vocabulary, not this app's shorthand.
+ *
+ * Two vocabularies exist and they are not the same list. `harnessFamilyFromId` returns this app's
+ * display shorthand (`claude`), which the economics table has always shown. The wire family for that
+ * harness is `claude-code`, and the wire vocabulary is closed at four values, one of which — `goose`
+ * — the shorthand does not know at all. Verifying an advertised family against a delivered one has to
+ * happen in the wire vocabulary, because that is the one the award decision reads.
+ *
+ * Unreadable stays null, for the same reason as everywhere else: `sh` is an argv0 basename and could
+ * BE an advertised harness launched through a shell, so mapping it to a family would assert knowledge
+ * we do not have.
+ */
+export const WIRE_HARNESS_FAMILIES = Object.freeze(["claude-code", "codex", "cursor", "goose"]);
+
+export function wireFamilyFromId(id) {
+  if (!id) return null;
+  const s = String(id).toLowerCase();
+  // An id that IS a wire family (a seat's own `harness_family` value) passes through unchanged.
+  for (const family of WIRE_HARNESS_FAMILIES) if (s === family) return family;
+  if (s.includes("claude")) return "claude-code";
+  if (s.includes("cursor")) return "cursor";
+  if (s.includes("codex")) return "codex";
+  if (s.includes("goose")) return "goose";
+  return null;
+}
+
 /** The absent-usage shape. One definition: every consumer reads the same keys, all null. */
 export function emptyUsage() {
   return {
