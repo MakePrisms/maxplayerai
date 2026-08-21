@@ -474,6 +474,57 @@ function renderEconomics(eco) {
  * `agents` is the seat's own advertisement. It is rendered as a claim, because it is one: the
  * falsifier is the `harness` tag on that seat's own receipts, and nothing on this panel has read it.
  */
+/**
+ * The delivery evidence for one advertised roster, as its own cell beside the claim.
+ *
+ * FOUR states, and they must never look alike:
+ *   agreed       — a receipt from this seat names this harness. The claim is corroborated.
+ *   unverified   — the comparison ran and found nothing. That is NOT evidence against the claim:
+ *                  dispatch is exact-or-nothing, so no receipt means nobody asked.
+ *   incomparable — the comparison could not run. The advertised label names no family we can read,
+ *                  so the preset-label and adapter-identity namespaces cannot be bridged for it.
+ *   contradicted — the seat delivered a READABLE harness outside its stated roster. The only
+ *                  falsifier, and it stays rare on purpose.
+ *
+ * An unverified or incomparable seat must never render like a contradicted one. That is the whole
+ * rule this column exists to honour, and the colours carry it: only `contradicted` is alarming.
+ */
+const VERDICT_CLASS = Object.freeze({
+  agreed: "verdict-agreed",
+  unverified: "verdict-unverified",
+  incomparable: "verdict-incomparable",
+});
+
+function verifiedCell(v) {
+  if (!v || v.advertisesNothing) {
+    return el("td", { class: "unidentified" }, [text("nothing claimed")]);
+  }
+  const parts = [];
+  const label = (c) => {
+    if (c.verdict === "agreed") return `${c.advertised} ✓ ${c.receipts}`;
+    if (c.verdict === "incomparable") return `${c.advertised} · not comparable`;
+    return v.hasDeliveries ? `${c.advertised} · not exercised` : `${c.advertised} · no receipts`;
+  };
+  for (const c of v.claims) {
+    parts.push(el("span", { class: VERDICT_CLASS[c.verdict] }, [text(label(c))]));
+  }
+  for (const c of v.contradictedBy) {
+    parts.push(
+      el("span", { class: "verdict-contradicted" }, [
+        text(`delivered ${c.deliveredId} ✗ not advertised`),
+      ]),
+    );
+  }
+  for (const c of v.incomparableDeliveries) {
+    parts.push(
+      el("span", { class: "verdict-incomparable" }, [
+        text(`delivered ${c.deliveredId} · not comparable`),
+      ]),
+    );
+  }
+  return el("td", { class: "verdicts" }, parts);
+}
+
 function renderCensus(census) {
   const { seats = [], fossilsExcluded = 0, addressesSeen = 0, freshWindowS = 0 } = census || {};
   const body = seats.map((r) =>
@@ -482,8 +533,8 @@ function renderCensus(census) {
       r.agents.length
         ? el("td", { class: "claim" }, [text(r.agents.join(", "))])
         : el("td", { class: "unidentified" }, [text("advertises none")]),
+      verifiedCell(r.verified),
       td(r.version || "—"),
-      td(r.status || "—"),
       td(fmtTime(r.created_at)),
     ]),
   );
@@ -494,14 +545,21 @@ function renderCensus(census) {
           ` · ${fossilsExcluded} of ${addressesSeen} addresses excluded as stale`,
       ),
     ]),
+    el("p", { class: "lede" }, [
+      text(
+        "The middle column is what each seat SAYS about itself. The right column is what its own " +
+          "delivery receipts show. Unverified means no job asked for that harness — it is not a " +
+          "mark against the seat.",
+      ),
+    ]),
     el("div", { class: "table-wrap" }, [
       el("table", {}, [
         el("thead", {}, [
           el("tr", {}, [
             th("seat"),
             th("advertises (claimed)"),
+            th("delivered (verified)"),
             th("v"),
-            th("status"),
             th("announced"),
           ]),
         ]),

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createStore } from "../js/store.js";
+import { verifyAdvertisedHarnesses } from "../js/profiles.js";
 import {
   extractUsageAdjunct,
   parseEvent,
@@ -718,6 +719,128 @@ assert.equal(
   for (const [, g] of groups) {
     assert.equal(g.transport, "side-channel", "transport read from the value, never split off a key");
     assert.equal(g.family, null);
+  }
+}
+
+// ——— advertised versus delivered: a claim paired with its falsifier ———
+//
+// ⚠ EVERY BRANCH BELOW EXCEPT `agreed` IS UNREACHABLE ON LIVE DATA. Measured 2026-08-21: all 9 live
+// seats agreed, 9 of 9, and all 9 had receipts. So the live reading cannot show that `unverified`
+// and `contradicted` fire at all, let alone that they stay distinct. These assertions are the only
+// coverage those branches have.
+{
+  const seat = "1".repeat(64);
+  const other = "2".repeat(64);
+  let seq = 0;
+  const delivery = (pubkey, harnessId) => {
+    seq += 1;
+    return ok({
+      id: String(seq).padStart(2, "d").padEnd(64, "0"),
+      pubkey,
+      kind: RESULT,
+      created_at: 5000 + seq,
+      tags: [
+        ["e", String(seq).padStart(2, "c").padEnd(64, "0"), "", "root"],
+        ["harness", harnessId],
+      ],
+      content: "",
+    });
+  };
+  const verify = (advertised, deliveries) =>
+    verifyAdvertisedHarnesses(deliveries, seat, advertised);
+
+  // AGREED across the namespace gap: `agents` advertises a preset label, a receipt carries the
+  // adapter identity. A string comparison would call this a mismatch on every honest seat.
+  {
+    const v = verify(["claude"], [delivery(seat, "claude-agent-acp")]);
+    assert.equal(v.claims[0].verdict, "agreed");
+    assert.equal(v.claims[0].on, "family", "bridged by family, not by string");
+    assert.deepEqual(v.contradictedBy, []);
+  }
+
+  // AGREED on the exact id, for an out-of-enum preset name where the name IS the identity on both
+  // sides. A family comparison alone maps both sides to null and reads that as no information.
+  {
+    const v = verify(["deepseek-v4-flash"], [delivery(seat, "deepseek-v4-flash")]);
+    assert.equal(v.claims[0].verdict, "agreed");
+    assert.equal(v.claims[0].on, "id");
+  }
+
+  // UNVERIFIED, with no receipts at all. Must NOT be contradicted: a claim nobody tested is not a
+  // claim disproved, and an unverified seat must never render like a lying one.
+  {
+    const v = verify(["claude"], []);
+    assert.equal(v.claims[0].verdict, "unverified");
+    assert.equal(v.hasDeliveries, false);
+    assert.deepEqual(v.contradictedBy, [], "no receipts cannot contradict anything");
+  }
+
+  // UNVERIFIED PER ENTRY — the semantic that matters most. A seat advertising two harnesses and
+  // delivering on one has NOT been caught out on the other: dispatch is exact-or-nothing, so the
+  // absence of a codex receipt means no job asked for codex.
+  {
+    const v = verify(["claude", "codex"], [delivery(seat, "claude-agent-acp")]);
+    const byLabel = new Map(v.claims.map((c) => [c.advertised, c]));
+    assert.equal(byLabel.get("claude").verdict, "agreed");
+    assert.equal(byLabel.get("codex").verdict, "unverified");
+    assert.deepEqual(v.contradictedBy, [], "an unserved advertisement is not a contradiction");
+  }
+
+  // CONTRADICTED — the only real falsifier: a READABLE delivery outside a STATED roster.
+  {
+    const v = verify(["claude"], [delivery(seat, "codex-acp-ng")]);
+    assert.equal(v.claims[0].verdict, "unverified", "the claude claim is untested, not disproved");
+    assert.equal(v.contradictedBy.length, 1);
+    assert.equal(v.contradictedBy[0].deliveredId, "codex-acp-ng");
+    assert.deepEqual(v.incomparableDeliveries, []);
+  }
+
+  // INCOMPARABLE, and this is where a false accusation would hide. `sh` is the argv0 basename
+  // fallback, so it names the program that STARTED a harness — it could BE claude launched through
+  // a shell. Calling that an off-menu delivery asserts knowledge we do not have. Same principle as
+  // the family reading: an id whose family we cannot read carries no family.
+  {
+    const v = verify(["claude"], [delivery(seat, "sh")]);
+    assert.deepEqual(v.contradictedBy, [], "an unreadable id cannot contradict a roster");
+    assert.equal(v.incomparableDeliveries.length, 1);
+    assert.equal(v.incomparableDeliveries[0].deliveredId, "sh");
+  }
+
+  // INCOMPARABLE on the CLAIM side: an out-of-enum advertised label cannot be bridged to an adapter
+  // identity at all, so the verdict is "could not compare", never "unverified" and never a
+  // disagreement. Collapsing these is how a well-behaved seat wears the lying-seat costume.
+  {
+    const v = verify(["deepseek-v4-flash"], [delivery(seat, "claude-agent-acp")]);
+    assert.equal(v.claims[0].verdict, "incomparable");
+    assert.deepEqual(v.contradictedBy, [], "no readable label to compare against");
+  }
+
+  // …and the contrast that proves the two are distinguished: a READABLE label with no match is
+  // `unverified`, because the comparison actually ran.
+  {
+    const v = verify(["codex"], [delivery(seat, "claude-agent-acp")]);
+    assert.equal(v.claims[0].verdict, "unverified");
+    assert.notEqual(v.claims[0].verdict, "incomparable", "the comparison ran; it did not fail to run");
+    assert.equal(v.contradictedBy.length, 1, "claude is readable and codex is stated → off-menu");
+  }
+
+  // A seat advertising NOTHING cannot be contradicted, because it has made no claim. This is the
+  // case that produced 7 false positives when the detector asked "is this delivery declared?"
+  // instead of "does this delivery contradict a declaration?" — on the relay, every apparent
+  // off-menu delivery was a seat with an empty roster, and rendering those as a falsification is
+  // exactly the failure the one rule forbids.
+  {
+    const v = verify([], [delivery(seat, "sh")]);
+    assert.equal(v.advertisesNothing, true);
+    assert.deepEqual(v.claims, []);
+    assert.deepEqual(v.contradictedBy, [], "no roster, no claim, nothing to contradict");
+  }
+
+  // Only the seat's OWN receipts count. Another seat's delivery is not evidence about this one.
+  {
+    const v = verify(["claude"], [delivery(other, "claude-agent-acp")]);
+    assert.equal(v.claims[0].verdict, "unverified");
+    assert.deepEqual(v.deliveredIds, [], "a different author's receipt is not this seat's evidence");
   }
 }
 

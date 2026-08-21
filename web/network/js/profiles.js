@@ -7,6 +7,7 @@
  */
 import { groupEvents, jobFromGroup, JOB_STATUS } from "./jobs.js";
 import { SELLER_HEARTBEAT_D } from "./kinds.js";
+import { harnessFamilyFromId } from "./parse.js";
 
 /** Liveness thresholds (seconds) from last-seen to now. */
 export const LIVE_WINDOW_S = 30 * 60;
@@ -96,6 +97,114 @@ export function resolveSeatDirectory(events, now = nowSeconds()) {
     addressesSeen: byPubkey.size,
     freshWindowS: SEAT_FRESH_WINDOW_S,
     resolvedAt: now,
+  };
+}
+
+/**
+ * Verdicts for a seat's advertised harness roster, paired against what that seat has actually
+ * delivered. Advertising is discovery metadata; the falsifier is the `harness` tag on the seat's
+ * OWN kind-3403 results, which is a real falsifier because dispatch enforces the family
+ * exact-or-nothing — a job runs on the harness it asked for or it does not run.
+ *
+ * ⚠ ABSENCE OF A RECEIPT IS NOT EVIDENCE AGAINST A CLAIM, and getting this wrong is how the panel
+ * would end up calling honest seats liars. Because dispatch is exact-or-nothing, a seat that
+ * advertises `codex` and has only claude receipts has not been contradicted — it means nobody asked
+ * for codex. So a per-entry verdict is only ever `agreed` or `unverified`. There is no per-entry
+ * `disagreed`.
+ *
+ * What DOES contradict a roster is a delivery OUTSIDE it — a receipt naming a harness the seat does
+ * not advertise. That is a seat-level finding, `contradictedBy`, and it requires a NON-EMPTY roster:
+ * a seat advertising nothing has made no claim, so nothing it delivers can contradict it. Measured
+ * on the relay 2026-08-21, every seat that looked like an off-menu delivery advertised an empty
+ * roster — 0 real contradictions across the relay, 7 seats with no roster at all.
+ *
+ * FOUR outcomes, deliberately, because the two ways of reaching "no conclusion" are different facts:
+ *   agreed        the comparison ran and matched
+ *   unverified    the comparison ran and found nothing — no job asked for that harness
+ *   incomparable  the comparison could not run: the label names no family we can read, so the
+ *                 preset-label and adapter-identity namespaces cannot be bridged for it
+ *   (no receipts) `hasDeliveries` false — no evidence of any kind
+ * Collapsing `incomparable` into a disagreement is how a well-behaved seat ends up wearing the
+ * lying-seat costume, which defeats the one rule this panel exists to honour.
+ *
+ * ⚠ ONLY `agreed` HAS A POSITIVE CONTROL ON LIVE DATA. Measured 2026-08-21: 8 of 9 live seats agreed
+ * by family and 1 by exact id, 0 contradictions, 0 incomparable. The unit tests are the only thing
+ * proving the other branches fire at all; the live reading cannot show it.
+ *
+ * @param {any[]} events normalized events
+ * @param {string} pubkey the seat
+ * @param {string[]} advertised the seat's `agents` roster, verbatim
+ */
+export function verifyAdvertisedHarnesses(events, pubkey, advertised = []) {
+  /** @type {Map<string, number>} delivered harness id → receipt count */
+  const delivered = new Map();
+  for (const ev of events) {
+    if (!ev || ev.role !== "result" || ev.pubkey !== pubkey) continue;
+    const id = ev.result?.usage?.harness_id;
+    if (id) delivered.set(id, (delivered.get(id) || 0) + 1);
+  }
+  const ids = [...delivered.keys()];
+
+  const matches = (label, id) => {
+    // Exact first: an out-of-enum preset name IS the identity on both sides, so `deepseek-v4-flash`
+    // advertised against `deepseek-v4-flash` delivered agrees on the string. A family comparison
+    // alone would map both to null and read that as no information.
+    if (id === label) return "id";
+    const lf = harnessFamilyFromId(label);
+    return lf && harnessFamilyFromId(id) === lf ? "family" : null;
+  };
+
+  const claims = advertised.map((label) => {
+    for (const id of ids) {
+      const how = matches(label, id);
+      if (how) {
+        return { advertised: label, verdict: "agreed", on: how, deliveredId: id, receipts: delivered.get(id) };
+      }
+    }
+    // No match. WHY there is no match decides the verdict, and collapsing the two would let a
+    // well-behaved seat wear the lying-seat costume. If the label names no family we can read, the
+    // namespaces cannot be bridged at all and we have no basis for any conclusion. If it does name
+    // one, the comparison genuinely ran and found nothing — which under exact-or-nothing dispatch
+    // means no job asked for that harness, not that the seat cannot serve it.
+    const comparable = harnessFamilyFromId(label) != null;
+    return {
+      advertised: label,
+      verdict: comparable ? "unverified" : "incomparable",
+      on: null,
+      deliveredId: null,
+      receipts: 0,
+    };
+  });
+
+  // A delivery contradicts a STATED roster only when it is comparable to that roster and matches
+  // nothing in it. Comparability is the same question change 1 settled: an id whose family we cannot
+  // read carries no family, so `sh` — the argv0 basename fallback — could BE the advertised harness
+  // launched through a shell. Flagging it as off-menu would assert knowledge we do not have. Same
+  // for a delivered out-of-enum preset name, which is indistinguishable from that basename case.
+  //
+  // Measured 2026-08-21: asking the looser question "is this delivery declared?" produced 7 hits on
+  // the relay and every one was a seat with an EMPTY roster — no claim, so nothing to contradict.
+  // Real contradictions: 0.
+  const contradictions = [];
+  const incomparableDeliveries = [];
+  if (advertised.length) {
+    for (const id of ids) {
+      if (advertised.some((label) => matches(label, id))) continue;
+      const row = { deliveredId: id, receipts: delivered.get(id) };
+      const idFamily = harnessFamilyFromId(id);
+      const anyComparableLabel = advertised.some((label) => harnessFamilyFromId(label) != null);
+      if (idFamily != null && anyComparableLabel) contradictions.push(row);
+      else incomparableDeliveries.push(row);
+    }
+  }
+
+  return {
+    claims,
+    contradictedBy: contradictions,
+    incomparableDeliveries,
+    deliveredIds: ids,
+    hasDeliveries: ids.length > 0,
+    advertisesNothing: advertised.length === 0,
   };
 }
 
