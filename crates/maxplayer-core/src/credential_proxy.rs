@@ -424,6 +424,74 @@ pub fn mint_placeholder(prefix: &str, random_len: usize) -> String {
     format!("{prefix}{}", random_token(random_len))
 }
 
+/// Mint a per-job placeholder for a credential the client PARSES rather than carries as an opaque
+/// string. A vendor whose credential is a JWT reads its claims before sending it, so a
+/// prefix-plus-random placeholder is refused LOCALLY and never reaches the proxy — which presents as
+/// "containment broke the seat" rather than "the placeholder was malformed" (#850).
+///
+/// This is the OPPOSITE constraint to [`mint_placeholder`]'s vendors, whose clients do no local
+/// validation at all (three unrelated shapes produce byte-identical rejections there, so prefix and
+/// length are free). Do not carry that freedom across: the two carriers of one credential can impose
+/// opposite validation.
+///
+/// The signature segment is random and that is sound rather than lucky: a bearer token's signature is
+/// verified by its ISSUER, never by the client carrying it, so there is no local crypto check to
+/// satisfy. Measured — a placeholder with a random signature travelled verbatim onto the wire.
+///
+/// `exp` is minted PER JOB and must never be hardcoded. A fixed placeholder works for months and then
+/// begins failing, and the failure presents as an auth error that nobody traces back to a constant.
+pub fn mint_jwt_placeholder(claim_type: &str, valid_for: std::time::Duration) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    let exp = now.saturating_add(valid_for.as_secs());
+    let header = base64url(br#"{"alg":"HS256","typ":"JWT"}"#);
+    let payload =
+        base64url(format!(r#"{{"type":"{claim_type}","time":{now},"exp":{exp}}}"#).as_bytes());
+    // 32 bytes is the width of an HS256 MAC, so the segment is shaped like a signature without
+    // being one.
+    let signature = base64url(&random_bytes(32));
+    format!("{header}.{payload}.{signature}")
+}
+
+/// Unpadded base64url. JWT segments use this alphabet and carry no padding; a standard-alphabet or
+/// padded segment is not a well-formed JWT, and a client that parses before sending refuses it.
+///
+/// Hand-rolled to keep this off the feature graph: the crate's `base64` dependency is optional and
+/// gated behind `git-delivery`, while containment lives under `acp`.
+fn base64url(raw: &[u8]) -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(raw.len().div_ceil(3) * 4);
+    for chunk in raw.chunks(3) {
+        let bytes = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let packed =
+            ((bytes[0] as u32) << 16) | ((bytes[1] as u32) << 8) | (bytes[2] as u32);
+        let sextets = [
+            (packed >> 18) & 63,
+            (packed >> 12) & 63,
+            (packed >> 6) & 63,
+            packed & 63,
+        ];
+        // A 3-byte chunk emits 4 characters, 2 bytes emit 3, and 1 byte emits 2 — the unpadded form.
+        for sextet in sextets.iter().take(chunk.len() + 1) {
+            out.push(CHARSET[*sextet as usize] as char);
+        }
+    }
+    out
+}
+
+/// `len` bytes from the OS RNG.
+fn random_bytes(len: usize) -> Vec<u8> {
+    let mut raw = vec![0u8; len];
+    getrandom::fill(&mut raw).expect("OS RNG must be available to mint a per-job placeholder");
+    raw
+}
+
 /// `len` random characters from the url-safe base64 alphabet (the charset vendor keys use).
 fn random_token(len: usize) -> String {
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -1468,5 +1536,100 @@ mod tests {
             !allows_paired_redirect("", "https://api.anthropic.com/v1/messages"),
             "an unresolvable original must be refused, so an empty chain cannot fail open"
         );
+    }
+
+    /// RFC 4648 vectors, unpadded. The encoder is hand-rolled to keep the JWT placeholder off the
+    /// crate's optional `base64` feature, so it gets pinned against known values rather than trusted.
+    #[test]
+    fn base64url_matches_rfc4648_vectors_unpadded() {
+        for (raw, expected) in [
+            ("", ""),
+            ("f", "Zg"),
+            ("fo", "Zm8"),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg"),
+            ("fooba", "Zm9vYmE"),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64url(raw.as_bytes()), expected, "input {raw:?}");
+        }
+    }
+
+    /// The url-safe alphabet is the point: a `+` or `/` would make the segment standard base64, which
+    /// is not a well-formed JWT segment. These two bytes select exactly the last two code points.
+    #[test]
+    fn base64url_uses_the_url_safe_alphabet_not_standard() {
+        assert_eq!(base64url(&[0xFB, 0xFF]), "-_8");
+    }
+
+    #[test]
+    fn mint_jwt_placeholder_is_three_unpadded_base64url_segments() {
+        let token = mint_jwt_placeholder("session", std::time::Duration::from_secs(30 * 86_400));
+        let segments: Vec<&str> = token.split('.').collect();
+        assert_eq!(segments.len(), 3, "a JWT is three dot-separated segments: {token}");
+        for segment in &segments {
+            assert!(!segment.is_empty(), "no segment may be empty: {token}");
+            assert!(
+                segment.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                "segment {segment} must be unpadded base64url — a padded or standard-alphabet \
+                 segment is refused by a client that parses before sending"
+            );
+        }
+    }
+
+    /// Per-job, never a constant: a fixed placeholder carries a fixed `exp`, so it would work for
+    /// months and then start failing as an auth error nobody traces back to the placeholder.
+    #[test]
+    fn mint_jwt_placeholder_differs_per_call() {
+        let first = mint_jwt_placeholder("session", std::time::Duration::from_secs(3600));
+        let second = mint_jwt_placeholder("session", std::time::Duration::from_secs(3600));
+        assert_ne!(first, second, "each job must get its own placeholder");
+    }
+
+    #[test]
+    fn mint_jwt_placeholder_exp_is_in_the_future() {
+        let ttl = 30 * 86_400;
+        let token = mint_jwt_placeholder("session", std::time::Duration::from_secs(ttl));
+        let payload = token.split('.').nth(1).expect("three segments");
+        let claims = String::from_utf8(decode_base64url(payload)).expect("payload is utf-8 json");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs();
+        let exp: u64 = claims
+            .split("\"exp\":")
+            .nth(1)
+            .and_then(|tail| tail.trim_end_matches('}').trim().parse().ok())
+            .unwrap_or_else(|| panic!("payload must carry a numeric exp: {claims}"));
+        assert!(
+            exp > now,
+            "exp must be in the future or the client refuses it locally: exp={exp} now={now}"
+        );
+        assert!(
+            exp <= now + ttl + 5,
+            "exp must reflect the requested ttl, not an unbounded far future: exp={exp} now={now}"
+        );
+        assert!(claims.contains("\"type\":\"session\""), "claim shape is mirrored: {claims}");
+    }
+
+    /// Test-only decoder, so the exp assertion reads the real bytes rather than trusting the encoder.
+    fn decode_base64url(encoded: &str) -> Vec<u8> {
+        const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut bits = 0u32;
+        let mut width = 0u32;
+        let mut out = Vec::new();
+        for byte in encoded.bytes() {
+            let index = CHARSET
+                .iter()
+                .position(|candidate| *candidate == byte)
+                .unwrap_or_else(|| panic!("not base64url: {byte:?}")) as u32;
+            bits = (bits << 6) | index;
+            width += 6;
+            if width >= 8 {
+                width -= 8;
+                out.push(((bits >> width) & 0xFF) as u8);
+            }
+        }
+        out
     }
 }
