@@ -19,8 +19,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readFileSync } from "node:fs";
-import { harnessFamilyFromId, parseEvent, parseSeatCapability, wireFamilyFromId } from "../js/parse.js";
-import { SEAT_DISPLAY_ONLY_TAGS, SEAT_FILTERABLE_TAGS } from "../js/kinds.js";
+import { extractUsageAdjunct, harnessFamilyFromId, parseEvent, parseSeatCapability } from "../js/parse.js";
+import { HARNESS_FAMILIES, SEAT_DISPLAY_ONLY_TAGS, SEAT_FILTERABLE_TAGS } from "../js/kinds.js";
 import { verifyAdvertisedHarnesses } from "../js/profiles.js";
 
 const goldenRaw = readFileSync(new URL("./fixtures/golden-kind30340.json", import.meta.url), "utf8");
@@ -322,16 +322,43 @@ test("pairs a harness_family claim against a receipt in the same wire vocabulary
   // vocabulary and the display shorthand fallback — so a test that checked only the verdict would
   // stay green with the wire comparison broken. Found exactly that way: a mutation to the wire
   // mapping left the suite green until this line existed.
-  assert.equal(v.claims[0].on, "wire", "the wire vocabulary must be what matched, not the fallback");
+  // `on` names HOW it matched — `family` through the vocabulary, or `id` on an exact string. There
+  // is no longer a second family path to confuse it with: the shorthand fallback is gone, because a
+  // verdict with two producers cannot tell a test which one ran.
+  assert.equal(v.claims[0].on, "family");
 });
 
-test("goose is in the wire vocabulary and now reads as a family", () => {
-  // The display shorthand never knew `goose`, so before this it read null and every goose seat was
-  // incomparable. It reaches the wire without a code change once a goose preset is configured.
+// ⚠ SPLIT DELIBERATELY, one call site per test. Both assertions in one block would mean the first
+// failure silences the second, so a break in the shared function would be reported as covering only
+// the pairing — and "goose works in both places" is exactly the claim that must not rest on an
+// assertion that never ran.
+test("goose reads as a family in the PAIRING", () => {
   const v = verifyAdvertisedHarnesses([receipt(SEAT, "goose-acp")], SEAT, [], ["goose"]);
-  assert.equal(v.claims[0].verdict, "agreed", "a goose claim must be comparable, not incomparable");
-  assert.equal(wireFamilyFromId("goose-acp"), "goose");
-  assert.equal(harnessFamilyFromId("goose-acp"), null, "and the old shorthand still cannot read it");
+  assert.equal(v.claims[0].verdict, "agreed", "a goose claim must not read as incomparable");
+  assert.equal(v.claims[0].on, "family");
+});
+
+test("goose reads as a family in the ECONOMICS column", () => {
+  // The half-fix that made this necessary: the vocabulary was widened for the pairing and left short
+  // for this column, so a goose delivery rendered a blank family while the pairing read it fine.
+  assert.equal(extractUsageAdjunct(null, [["harness", "goose-acp"]]).harness_family, "goose");
+  assert.equal(extractUsageAdjunct(null, [["harness", "goose"]]).harness_family, "goose");
+});
+
+test("the family vocabulary is the closed set, not a list restated per call site", () => {
+  assert.ok(HARNESS_FAMILIES.includes("goose"));
+  assert.equal(HARNESS_FAMILIES.length, 4, "closed at four: claude-code, codex, cursor, goose");
+});
+
+test("the vocabulary holds no entry the wire never sends", () => {
+  // `other` was in the old list. Nothing emits it, and a value that can never arrive is a permanent
+  // no-match hiding inside something that reads like a permitted option.
+  assert.ok(!HARNESS_FAMILIES.includes("other"));
+  assert.equal(harnessFamilyFromId("other"), null);
+  // `claude` is a PRESET LABEL, not a family. The family is what a seat advertises.
+  assert.ok(!HARNESS_FAMILIES.includes("claude"));
+  assert.equal(harnessFamilyFromId("claude"), "claude-code", "the label resolves to the family");
+  assert.equal(extractUsageAdjunct(null, [["harness", "claude-agent-acp"]]).harness_family, "claude-code");
 });
 
 test("DIVERGENCE: a preset with no wire family stays visible instead of vanishing", () => {

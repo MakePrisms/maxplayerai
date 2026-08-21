@@ -63,6 +63,27 @@ export const MAXPLAYER_TAG = "maxplayer";
  * yields "a family plus a model" and drops every model past the first silently, so the two shapes
  * need different readers and never the same one.
  */
+/**
+ * The CLOSED harness-family vocabulary, and the reader's ONLY copy of it.
+ *
+ * Both places this reader names a family read this constant: the economics `harness_family` column
+ * and the advertised-versus-delivered pairing. Two copies of a vocabulary is the same drift problem
+ * as two copies of a fixture — a third call site cannot hold a stale list when there is no second
+ * list to be stale.
+ *
+ * These are WIRE families, which are not preset labels: the preset `claude` maps to the family
+ * `claude-code`, and `claude-code` is what a seat advertises. An earlier list here read
+ * ["codex","claude","cursor","other"] — short by `goose`, wrong on `claude`, and carrying `other`,
+ * which nothing emits.
+ *
+ * ⏳ UNPROTECTED, deliberately and temporarily. The durable guard asserts SET EQUALITY IN BOTH
+ * DIRECTIONS against Rust's `HARNESS_FAMILIES`, derived from that set rather than restated here —
+ * membership alone would miss a spurious entry like `other`. That const is not on `main`; it
+ * arrives with the emitter's own PR, and a test reading an absent const can only be red or
+ * conditionally green.
+ */
+export const HARNESS_FAMILIES = Object.freeze(["claude-code", "codex", "cursor", "goose"]);
+
 export const SEAT_FILTERABLE_TAGS = Object.freeze(["harness_family", "capabilities", "harness_model"]);
 
 /**

@@ -7,7 +7,7 @@
  */
 import { groupEvents, jobFromGroup, JOB_STATUS } from "./jobs.js";
 import { SELLER_HEARTBEAT_D } from "./kinds.js";
-import { harnessFamilyFromId, wireFamilyFromId } from "./parse.js";
+import { harnessFamilyFromId } from "./parse.js";
 
 /** Liveness thresholds (seconds) from last-seen to now. */
 export const LIVE_WINDOW_S = 30 * 60;
@@ -190,7 +190,7 @@ export function verifyAdvertisedHarnesses(events, pubkey, advertised = [], wireF
   // the `incomparable` it renders as today: a claim we cannot check must say so, not go quiet. The
   // unlabelled `--agent-argv` hatch is absent from both tags and so from this list either way.
   const rosterFamilies = wireFamilies.length ? wireFamilies : [];
-  const unmappedAgents = advertised.filter((label) => wireFamilyFromId(label) == null);
+  const unmappedAgents = advertised.filter((label) => harnessFamilyFromId(label) == null);
   const roster = rosterFamilies.length || unmappedAgents.length
     ? [...rosterFamilies, ...unmappedAgents]
     : advertised;
@@ -200,11 +200,10 @@ export function verifyAdvertisedHarnesses(events, pubkey, advertised = [], wireF
     // advertised against `deepseek-v4-flash` delivered agrees on the string. A family comparison
     // alone would map both to null and read that as no information.
     if (id === label) return "id";
-    // Wire vocabulary on both sides — a `claude-code` claim against a `claude-agent-acp` receipt.
-    const wf = wireFamilyFromId(label);
-    if (wf && wireFamilyFromId(id) === wf) return "wire";
-    // Fall back to the display shorthand so a pre-capability seat, which advertises only `agents`,
-    // still pairs. Dropping this would un-verify every seat that has not upgraded.
+    // ONE vocabulary, so ONE family path — a `claude-code` claim, a `claude` preset label and a
+    // `claude-agent-acp` receipt all resolve through the same function. There is deliberately no
+    // second comparison to fall back to: a verdict reachable by two producers cannot tell a test
+    // which one ran, and that is a defect removed by construction rather than guarded against.
     const lf = harnessFamilyFromId(label);
     return lf && harnessFamilyFromId(id) === lf ? "family" : null;
   };
@@ -221,7 +220,7 @@ export function verifyAdvertisedHarnesses(events, pubkey, advertised = [], wireF
     // namespaces cannot be bridged at all and we have no basis for any conclusion. If it does name
     // one, the comparison genuinely ran and found nothing — which under exact-or-nothing dispatch
     // means no job asked for that harness, not that the seat cannot serve it.
-    const comparable = wireFamilyFromId(label) != null || harnessFamilyFromId(label) != null;
+    const comparable = harnessFamilyFromId(label) != null;
     return {
       advertised: label,
       verdict: comparable ? "unverified" : "incomparable",
@@ -246,10 +245,8 @@ export function verifyAdvertisedHarnesses(events, pubkey, advertised = [], wireF
     for (const id of ids) {
       if (advertised.some((label) => matches(label, id))) continue;
       const row = { deliveredId: id, receipts: delivered.get(id) };
-      const idFamily = wireFamilyFromId(id) ?? harnessFamilyFromId(id);
-      const anyComparableLabel = roster.some(
-        (label) => wireFamilyFromId(label) != null || harnessFamilyFromId(label) != null,
-      );
+      const idFamily = harnessFamilyFromId(id);
+      const anyComparableLabel = roster.some((label) => harnessFamilyFromId(label) != null);
       if (idFamily != null && anyComparableLabel) contradictions.push(row);
       else incomparableDeliveries.push(row);
     }

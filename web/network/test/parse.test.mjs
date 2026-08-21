@@ -465,7 +465,7 @@ test("usage adjunct reads from result tags (spec wins)", () => {
     assert.equal(u.cost_usd, 0.0123);
     assert.equal(u.cost_basis, "harness-reported-usd");
     assert.equal(u.usage_transport, "acp-native");
-    assert.equal(u.harness_family, "claude"); // claude-agent-acp → claude
+    assert.equal(u.harness_family, "claude-code"); // claude-agent-acp → the family claude-code
     assert.equal(u.paid_price_sats, 21);
     // cache siblings must NOT be folded into total by the reader
     assert.notEqual(u.total_tokens, 100 + 40 + 4096);
@@ -500,7 +500,7 @@ test("usage adjunct reads from result tags (spec wins)", () => {
   uRow = e2rows.find((r) => r.id === untaggedResult.id);
   assert.ok(tRow, "tagged 6109 result fills an economics row");
   assert.equal(tRow.total_tokens, 140);
-  assert.equal(tRow.harness_family, "claude");
+  assert.equal(tRow.harness_family, "claude-code");
   assert.equal(tRow.usage_transport, "acp-native");
   // input / output columns fill from the ["tokens",N,"input"|"output"] tags.
   assert.equal(tRow.input_tokens, 100, "input column fills from the input tag");
@@ -576,7 +576,7 @@ test("row SOURCE: \"delivered\" (6109-only) must never read as \"paid\" (3400-ba
   assert.equal(bothPaid.total_tokens, 5, "paid row JOINS the result's tokens (offer fallback)");
   assert.equal(bothPaid.input_tokens, 3);
   assert.equal(bothPaid.output_tokens, 2);
-  assert.equal(bothPaid.harness_family, "claude");
+  assert.equal(bothPaid.harness_family, "claude-code");
   assert.equal(bothPaid.usage_transport, "acp-native");
 });
 
@@ -628,7 +628,7 @@ test("JOIN via the receipt's exact reply-tag binding → PAID row shows the resu
   assert.equal(jPaid.total_tokens, 140, "PAID row shows the bound RESULT's tokens, not dashes");
   assert.equal(jPaid.input_tokens, 100);
   assert.equal(jPaid.output_tokens, 40);
-  assert.equal(jPaid.harness_family, "claude");
+  assert.equal(jPaid.harness_family, "claude-code");
   assert.equal(jPaid.usage_transport, "acp-native");
 
   // receipt with NO visible result → PAID with usage dashes (honest, never fabricated).
@@ -670,7 +670,7 @@ test("harness family is a READING; the harness id is the seat's CLAIM", () => {
   }
 
   // POSITIVE CONTROLS — a classifier that matched nothing would pass every negative case below.
-  assert.equal(familyOf("claude-agent-acp").harness_family, "claude");
+  assert.equal(familyOf("claude-agent-acp").harness_family, "claude-code");
   assert.equal(familyOf("codex-acp-ng").harness_family, "codex");
   assert.equal(familyOf("cursor-agent").harness_family, "cursor");
   assert.equal(familyOf("claude-agent-acp").harness_id, "claude-agent-acp", "claim carried verbatim");
@@ -772,11 +772,10 @@ test("advertised versus delivered: a claim paired with its falsifier", () => {
     {
       const v = verify(["claude"], [delivery(seat, "claude-agent-acp")]);
       assert.equal(v.claims[0].verdict, "agreed");
-      // `on` names WHICH vocabulary bridged it. `wire` and `family` are both family readings, as
-      // opposed to `id` which is an exact string match; they are reported separately so a test can
-      // tell which one did the work. Here the wire vocabulary reads both sides — a preset label and
-      // an adapter identity both resolve to `claude-code`.
-      assert.equal(v.claims[0].on, "wire", "bridged by family, not by string");
+      // `on` names HOW it matched: `family` through the vocabulary, `id` on an exact string. Here
+      // the preset label `claude` and the adapter identity `claude-agent-acp` both resolve to the
+      // family `claude-code`.
+      assert.equal(v.claims[0].on, "family", "bridged by family, not by string");
       assert.deepEqual(v.contradictedBy, []);
     }
 
