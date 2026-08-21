@@ -132,8 +132,17 @@ For `claude`, prefer **`CLAUDE_CODE_OAUTH_TOKEN`** (`claude setup-token`). `ANTH
 worse choice for an unattended seat for the reason in the previous symptom: Claude Code prompts once to
 approve an environment key, and a daemon has nobody to approve it.
 
-Set it where the daemon starts, not in your login shell — systemd `Environment=`, the launchd plist, or
-the shell that launches `maxplayer seller`.
+Set it where the daemon **actually starts** — a systemd `Environment=`, a launchd plist, or the launcher
+script that `exec`s it. Not your login shell. And an `export` in an interactive shell cannot reach an
+already-running daemon, so this takes effect on the **restart**: seeing the variable in your own `env`
+verifies your shell, not the seat.
+
+⛔ **If your harness is `cursor`, there is no fix here — the seat cannot run contained.** The forwarded
+list is claude and codex only, and `CURSOR_API_KEY` is also not one of the credentials the per-job proxy
+can hold, so **`forward_env = ["CURSOR_API_KEY"]` puts your real reusable key inside the container where
+a stranger's job reads it.** A `doctor` WARN flags that; it does not refuse it, so the seat runs and
+leaks. Run cursor under `launcher` mode, or move the seat to a claude or codex harness.
+Tracked in [#850](https://github.com/MakePrisms/maxplayerai/issues/850).
 
 Note that the real credential still does not enter the container: a per-job host proxy holds it and
 passes a placeholder plus a base-URL override inward. That is also why `[sandbox] proxy_port_range` is

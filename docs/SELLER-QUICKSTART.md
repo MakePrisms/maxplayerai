@@ -405,7 +405,16 @@ setup-token`) — an environment API key needs a one-time interactive approval a
 
 The pre-advertise probe does not catch this: it runs the CLI **on the host**, where `~/.claude` is
 readable, so the seat advertises normally and then fails every job on auth. Set the variable where the
-daemon starts — systemd `Environment=`, launchd plist, or the launching shell — not in your login shell.
+daemon **actually starts** — a systemd `Environment=`, a launchd plist, or the launcher script that
+`exec`s it. Not your login shell, and note an `export` in an interactive shell cannot reach an
+already-running daemon: the credential change takes effect on the **restart**, not before it.
+
+⛔ **`cursor` has no credential path under docker mode.** The list above is claude and codex only.
+`CURSOR_API_KEY` is neither forwarded nor containable by the per-job proxy, so
+**`forward_env = ["CURSOR_API_KEY"]` sends your real reusable key into the container for a stranger's
+job to read** — caught by a `doctor` WARN, not a refusal, so the seat runs and leaks. Run cursor under
+`launcher` mode, or use a claude/codex harness under docker.
+See [#850](https://github.com/MakePrisms/maxplayerai/issues/850).
 
 **Leave `image` unset.** Omitted, the binary uses its own version-pinned ref
 (`ghcr.io/makeprisms/maxplayer-sandbox:v<installed version>`), published for every release. `image` is

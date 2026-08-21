@@ -182,9 +182,19 @@ launchd plist, or the shell that runs `maxplayer seller` — not just in your lo
 container. Same requirement as the unattended-seat warning in step 2, with a harder edge: under
 `launcher` a logged-in `~/.claude` still works, and under `docker` it cannot.
 
-Only a variable **outside** that list needs `forward_env = ["MY_OTHER_TOKEN"]`. Unknown `[sandbox]` keys
-are refused at config load, so a misspelt key stops the daemon rather than silently disabling
-containment.
+**`cursor` has no credential path under docker mode — do not try to make one.** The list above is
+claude and codex only. `CURSOR_API_KEY` is not on it, and it is also not one of the credentials the
+per-job proxy can hold, so **`forward_env = ["CURSOR_API_KEY"]` would send your real, reusable key
+into the container, where a stranger's job can read it.** That is caught by a `doctor` WARN rather than
+a refusal, so the seat will run and leak. A cursor seat under `mode = "docker"` passes `doctor` and the
+pre-advertise probe — both authenticate on the host — and then fails every claimed job. Run cursor
+under `launcher` mode, or run a claude or codex harness under docker. Tracked in
+[#850](https://github.com/MakePrisms/maxplayerai/issues/850).
+
+`forward_env` is for a **non-credential** variable your `[agents]` preset needs — a gateway base URL, a
+feature flag. Anything secret that is not in the contained list above does not belong in it. Unknown
+`[sandbox]` keys are refused at config load, so a misspelt key stops the daemon rather than silently
+disabling containment.
 
 `DOCKER.md` has the hardening flags every docker job gets; `SANDBOXING.md` has the architecture and why
 the runtime is Linux-only.
