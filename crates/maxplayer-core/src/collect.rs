@@ -543,7 +543,7 @@ mod tests {
             &seller_hex,
         )
         .expect("creq");
-        let claim_draft = crate::gateway::claim_draft(&offer_id, &buyer_hex, &seller_hex, &creq, &[]);
+        let claim_draft = crate::gateway::claim_draft(&offer_id, &buyer_hex, &seller_hex, &creq, &[], &Default::default());
         let claim_id = publish(&seller, &claim_draft).await.to_hex();
 
         // The buyer AWARDS the seller's claim (kind-3405). collect resolves the delivery against this
