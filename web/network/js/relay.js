@@ -1,5 +1,5 @@
 import { HISTORY_LIMIT, RELAY_URL } from "../config.js";
-import { MAXPLAYER_TAG, MAXPLAYER_TAGGED_KINDS, PROFILE, UNTAGGED_KINDS } from "./kinds.js";
+import { HEARTBEAT, MAXPLAYER_TAG, MAXPLAYER_TAGGED_KINDS, PROFILE, UNTAGGED_KINDS } from "./kinds.js";
 
 /**
  * Single-owner NIP-01 websocket client.
@@ -103,22 +103,39 @@ export function createRelayClient(hooks) {
   function openMarketSub(socket) {
     subSeq += 1;
     marketSubId = `maxplayer-net-m-${subSeq}`;
-    // Two filters in one REQ: the maxplayer-namespaced kinds are scoped to ["t","maxplayer"] so a
+    // Three filters in one REQ: the maxplayer-namespaced kinds are scoped to ["t","maxplayer"] so a
     // foreign event squatting a trade kind is filtered at the relay; the handler announce
     // carries no t-tag, so it rides an unscoped filter.
+    //
+    // The seat announcement gets its OWN filter, and that is not tidiness. `limit` is per-filter,
+    // and this relay caps a filter at 1000 events however large a limit you ask for. Sharing the
+    // busy trade filter therefore means heartbeats compete with trade volume for one budget and
+    // lose: measured 2026-08-21, the shared filter delivered 9 of the 21 seat announcements on the
+    // relay, while adding this filter to the same REQ delivered all 21. Seat resolution must not be
+    // a function of how much trading happened.
+    //
+    // ⚠ And the shared-filter answer was accidentally RIGHT, which is why this was easy to miss.
+    // Truncation is by recency, so the 9 that survived were exactly the 9 fresh seats — the census
+    // rendered correctly while the freshness cut had nothing left to exclude. A cut that never
+    // fires looks identical to one that works. The unit tests are what hold that property, not the
+    // live reading.
     /** @type {Record<string, unknown>} */
     const tagged = { kinds: [...MAXPLAYER_TAGGED_KINDS], "#t": [MAXPLAYER_TAG] };
+    /** @type {Record<string, unknown>} */
+    const seats = { kinds: [HEARTBEAT], "#t": [MAXPLAYER_TAG] };
     /** @type {Record<string, unknown>} */
     const untagged = { kinds: [...UNTAGGED_KINDS] };
     if (sinceCursor != null) {
       // Inclusive since — store dedupes by id; avoids gaps on same-second events.
       tagged.since = sinceCursor;
+      seats.since = sinceCursor;
       untagged.since = sinceCursor;
     } else {
       tagged.limit = HISTORY_LIMIT;
+      seats.limit = HISTORY_LIMIT;
       untagged.limit = HISTORY_LIMIT;
     }
-    safeSend(socket, ["REQ", marketSubId, tagged, untagged]);
+    safeSend(socket, ["REQ", marketSubId, tagged, seats, untagged]);
   }
 
   function openProfileSub(socket) {

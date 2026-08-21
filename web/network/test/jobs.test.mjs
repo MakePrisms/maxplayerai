@@ -5,7 +5,7 @@ import { test } from "node:test";
 
 import { parseEvent } from "../js/parse.js";
 import { aggregateJobs, computePulse, JOB_STATUS } from "../js/jobs.js";
-import { AWARD, OFFER } from "../js/kinds.js";
+import { AWARD, HEARTBEAT, OFFER, SELLER_HEARTBEAT_D } from "../js/kinds.js";
 
 /* Recorded from a live relay (wss://relay.example) — real event chains
  * covering each lifecycle stage. See test/fixtures/events.json. */
@@ -163,10 +163,57 @@ test("pulse: open offers count matches OPEN-status jobs", () => {
   assert.equal(pulse.openOffers, 1, "exactly the one future-deadline open offer");
 });
 
-test("pulse: active sellers counts distinct claim/result/handler authors in the last 24h", () => {
-  // Independently derived from the recording: 6 distinct sellers acted within 24h of `now`.
+test("pulse: active sellers counts distinct claim/result authors in the last 24h", () => {
+  // Composition, independently derived from the recording rather than taken from the total: inside
+  // 24h of `now` it holds 4 distinct claim-or-result authors and 3 handler authors, 2 of whom did
+  // nothing else. The old set was claim ∪ result ∪ handler = 6; handler authors are residue of the
+  // retired kind-31990 resolver and no longer count, so it is 4.
   const now = 1784595265;
   const jobs = aggregateJobs(market, profiles, now);
   const pulse = computePulse(market, jobs, now);
-  assert.equal(pulse.activeSellers, 6);
+  assert.equal(pulse.activeSellers, 4);
+});
+
+test("pulse: a seat that only ANNOUNCES counts as an active seller", () => {
+  // The under-count this fixes, and it needs synthetic events because the recording contains ZERO
+  // kind-30340 — so adjusting the number in the test above would have left the fix uncovered while
+  // the suite went green.
+  //
+  // Measured against the live relay on 2026-08-21 before the fix: active sellers read 1 while 9
+  // seats were live and announcing. A seat's first act is to announce, not to claim, so the metric
+  // was blind to every seat that had not yet taken a job — and got blinder as seats came up.
+  const now = 1784595265;
+  const seat = "a".repeat(64);
+  const announce = parseEvent({
+    id: "b".repeat(64),
+    pubkey: seat,
+    kind: HEARTBEAT,
+    created_at: now - 60,
+    tags: [
+      ["d", SELLER_HEARTBEAT_D],
+      ["t", "maxplayer"],
+      ["accepting", "y"],
+      ["queue_depth", "0"],
+    ],
+    content: "",
+  });
+  assert.ok(announce, "fixture must parse, else this asserts nothing");
+
+  const withSeat = [...market, announce];
+  const jobs = aggregateJobs(withSeat, profiles, now);
+  assert.equal(
+    computePulse(withSeat, jobs, now).activeSellers,
+    5,
+    "the announcing seat is the 5th active seller",
+  );
+
+  // Positive control on the WINDOW, not just the role: the same announcement outside 24h must not
+  // count. Without this, a role check that ignored `created_at` would pass the assertion above.
+  const stale = { ...announce, created_at: now - 25 * 60 * 60 };
+  const staleList = [...market, stale];
+  assert.equal(
+    computePulse(staleList, aggregateJobs(staleList, profiles, now), now).activeSellers,
+    4,
+    "an announcement older than the window is not activity",
+  );
 });

@@ -6,6 +6,7 @@
  * (reputation for a seller deciding whose offer to claim — the side nobody usually shows).
  */
 import { groupEvents, jobFromGroup, JOB_STATUS } from "./jobs.js";
+import { SELLER_HEARTBEAT_D } from "./kinds.js";
 
 /** Liveness thresholds (seconds) from last-seen to now. */
 export const LIVE_WINDOW_S = 30 * 60;
@@ -33,6 +34,69 @@ export function resolveHeartbeats(events) {
     if (!prev || prev.created_at < ev.created_at) byAuthor.set(ev.pubkey, ev);
   }
   return byAuthor;
+}
+
+/**
+ * How recent a seat's announcement must be for that seat to be counted as existing.
+ *
+ * Kind-30340 is replaceable, so a relay hands back the last thing a seat said and nothing marks it
+ * as over. Accumulating what the relay serves therefore builds a directory of seats that are gone.
+ * Measured on relay.maxplayer.ai 2026-08-21: 27 announcements resolved to 9 seats inside this
+ * window and 18 outside it, the excluded ones a median of ~11 days old and the oldest 16.6 days.
+ *
+ * 300s rather than `LIVE_WINDOW_S` below: the two do not disagree on that measurement, because the
+ * age distribution was bimodal with ZERO announcements between 300s and 1h, so the cut lands in an
+ * empty region and both windows selected the same 9 seats. The tighter one is the charter's and is
+ * the one stated in the UI. Two freshness constants in one app is how a page later contradicts
+ * itself, so this is named here rather than left implicit — see #857's follow-up.
+ */
+export const SEAT_FRESH_WINDOW_S = 300;
+
+/**
+ * The live seat directory: seats that exist right now, with the fossils counted rather than dropped
+ * silently.
+ *
+ * Resolved at the seat ADDRESS — (pubkey, kind, d) with `d = SELLER_HEARTBEAT_D` — not by pubkey
+ * alone. `resolveHeartbeats` above deliberately collapses to newest-per-author across every `d`,
+ * which is right for "is this pubkey alive" and wrong here: the pre-rename `mobee-seller` address is
+ * still live on the relay, so an author-wide collapse can answer with the retired address's event.
+ * Measured 2026-08-21, 4 pubkeys published under both values and the retired one won 0 of 4 — so
+ * that collapse is benign by coincidence of timestamps, not by construction.
+ *
+ * Returns the fossil count alongside the seats. A directory that silently drops rows cannot be
+ * told from a relay that served none, so the denominator is part of the answer, not a debug aid.
+ *
+ * @param {any[]} events normalized events
+ * @param {number} now unix-seconds
+ */
+export function resolveSeatDirectory(events, now = nowSeconds()) {
+  /** @type {Map<string, any>} */
+  const byPubkey = new Map();
+  for (const ev of events) {
+    if (!ev || ev.role !== "heartbeat") continue;
+    if (ev.heartbeat?.d !== SELLER_HEARTBEAT_D) continue;
+    const prev = byPubkey.get(ev.pubkey);
+    if (!prev || prev.created_at < ev.created_at) byPubkey.set(ev.pubkey, ev);
+  }
+
+  const seats = [];
+  let fossilsExcluded = 0;
+  for (const ev of byPubkey.values()) {
+    if (now - ev.created_at > SEAT_FRESH_WINDOW_S) {
+      fossilsExcluded += 1;
+      continue;
+    }
+    seats.push(ev);
+  }
+  seats.sort((a, b) => b.created_at - a.created_at);
+
+  return {
+    seats,
+    fossilsExcluded,
+    addressesSeen: byPubkey.size,
+    freshWindowS: SEAT_FRESH_WINDOW_S,
+    resolvedAt: now,
+  };
 }
 
 /**
