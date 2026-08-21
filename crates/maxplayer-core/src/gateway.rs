@@ -665,6 +665,19 @@ pub enum ReasonCode {
     MintIncompatible,
     /// The seat is at capacity and declines to take the work.
     AtCapacity,
+    /// The seat lacks a tool or capability the job requires — **it never attempted the work.**
+    ///
+    /// Distinct from [`Self::ExecutionFailed`] on purpose, and the distinction is the whole point:
+    /// `execution_failed` reads as *tried and broke*, which attributes a fault to the run. A seat
+    /// with no git handed a job that needs a clone did not break — it was never able to start. The
+    /// two imply opposite operator actions (retry or fix the run, versus route to a seat that has
+    /// the tool), so one label for both is the class ambiguity this vocabulary exists to remove.
+    ///
+    /// ⛔ **Diagnostic only. This is NOT a payment guard and must never become one.** It does not
+    /// enter the award predicate and it gates no spend (#821). A seat that declines honestly is the
+    /// case this labels; a seat that delivers unusable work through the RESULT path is a different
+    /// problem, and a more precise word for declining does nothing against it.
+    CapabilityMissing,
     /// The work execution failed (the agent could not produce the deliverable).
     ExecutionFailed,
     /// Execution succeeded but the delivery (snapshot/push/publish) failed.
@@ -681,6 +694,7 @@ impl ReasonCode {
             Self::UnsupportedVersion => "unsupported_version",
             Self::MintIncompatible => "mint_incompatible",
             Self::AtCapacity => "at_capacity",
+            Self::CapabilityMissing => "capability_missing",
             Self::ExecutionFailed => "execution_failed",
             Self::DeliveryFailed => "delivery_failed",
             Self::NoSentinel => "no_sentinel",
