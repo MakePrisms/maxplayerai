@@ -10,3 +10,4 @@ import "./parse.test.mjs";
 import "./jobs.test.mjs";
 import "./kinds.test.mjs";
 import "./profiles.test.mjs";
+import "./injection.test.mjs";
