@@ -92,7 +92,17 @@ RUN set -eu; \
     test -n "$found" && test "$(printf '%s\n' "$found" | wc -l)" -eq 1; \
     chmod +x "$found"; \
     ln -s "$found" /usr/local/bin/cursor-agent; \
-    cursor-agent --version | tee /usr/local/lib/cursor-agent/VERSION
+    cursor-agent --version > /usr/local/lib/cursor-agent/VERSION; \
+    cat /usr/local/lib/cursor-agent/VERSION
+# ⚠ The line above is a REDIRECT and must never become a pipe. This base image's `/bin/sh` is dash
+# and there is no SHELL directive, so RUN is POSIX sh: `set -e` takes a PIPELINE's status from its
+# LAST command, and `pipefail` does not exist there. `cursor-agent --version | tee VERSION` therefore
+# builds GREEN however `cursor-agent` exits, and leaves an empty VERSION on disk that looks like the
+# evidence the check ran. Measured in this exact image, both polarities: a deliberately bad node flag
+# piped to `tee` built green with a 0 B file; the same command redirected failed the build at exit 9.
+# It matters because it fails in the direction this gate exists for — a wrong-arch payload dies with
+# "Exec format error", which IS a non-zero `--version`, so the arch-mapping bug and a broken launcher
+# would be masked identically. `cat` is a separate statement, after the status has been enforced.
 
 # The nix a nix-flake-provisioned job needs. `EnvBackend::NixFlake` shells out to a bare `nix`
 # (crates/maxplayer-core/src/env_provision.rs), and under `[sandbox] mode = "docker"` that name
