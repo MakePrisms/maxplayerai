@@ -525,6 +525,60 @@ function verifiedCell(v) {
   return el("td", { class: "verdicts" }, parts);
 }
 
+/**
+ * The #784 capability claim: what the seat says it can serve. Every value here is the seat's own
+ * word and is rendered in the claim style, never beside a tick.
+ *
+ * A family that advertises no model renders "no model stated" in the muted style rather than an
+ * empty cell, because an empty cell and an unstated model look identical once formatted and only
+ * one of them is a fact about the seat.
+ */
+export function capabilityCell(cap) {
+  if (!cap) return el("td", { class: "unidentified" }, [text("no capability tags")]);
+  const parts = [];
+  for (const h of cap.harnesses) {
+    parts.push(
+      el("span", { class: "claim" }, [
+        text(h.models.length ? `${h.family} · ${h.models.join(", ")}` : h.family),
+        ...(h.models.length ? [] : [el("span", { class: "unidentified" }, [text(" · no model stated")])]),
+      ]),
+    );
+  }
+  for (const o of cap.orphanModels) {
+    // A model naming a family the seat did not advertise. Shown rather than dropped: hiding it
+    // would make this column disagree with the wire while looking complete.
+    parts.push(
+      el("span", { class: "verdict-incomparable" }, [
+        text(`${o.family} · ${o.model} · family not advertised`),
+      ]),
+    );
+  }
+  if (cap.filterable.capabilities.length) {
+    parts.push(el("span", { class: "claim" }, [text(cap.filterable.capabilities.join(", "))]));
+  }
+  if (!parts.length) return el("td", { class: "unidentified" }, [text("advertises none")]);
+  return el("td", { class: "verdicts" }, parts);
+}
+
+/**
+ * The display-only fields. These are BEAT-ONLY: the emitter never puts them on a claim, and the
+ * award decision reads the claim, so they are absent from the filter's input rather than merely
+ * unfiltered. The header says so, because a column of hardware strings beside a capability column
+ * otherwise reads as something a buyer can select on.
+ */
+export function displayOnlyCell(cap) {
+  if (!cap) return el("td", { class: "unidentified" }, [text("—")]);
+  const parts = [];
+  if (cap.displayOnly.hardware) {
+    parts.push(el("span", { class: "claim" }, [text(cap.displayOnly.hardware)]));
+  }
+  if (cap.displayOnly.harness_variant) {
+    parts.push(el("span", { class: "claim" }, [text(cap.displayOnly.harness_variant)]));
+  }
+  if (!parts.length) return el("td", { class: "unidentified" }, [text("not stated")]);
+  return el("td", { class: "verdicts" }, parts);
+}
+
 function renderCensus(census) {
   const { seats = [], fossilsExcluded = 0, addressesSeen = 0, freshWindowS = 0 } = census || {};
   const body = seats.map((r) =>
@@ -533,7 +587,9 @@ function renderCensus(census) {
       r.agents.length
         ? el("td", { class: "claim" }, [text(r.agents.join(", "))])
         : el("td", { class: "unidentified" }, [text("advertises none")]),
+      capabilityCell(r.capability),
       verifiedCell(r.verified),
+      displayOnlyCell(r.capability),
       td(r.version || "—"),
       td(fmtTime(r.created_at)),
     ]),
@@ -552,9 +608,10 @@ function renderCensus(census) {
     ]),
     el("p", { class: "lede" }, [
       text(
-        "The middle column is what each seat SAYS about itself. The right column is what its own " +
-          "delivery receipts show. Unverified means no job asked for that harness — it is not a " +
-          "mark against the seat.",
+        "Both claimed columns are what each seat SAYS about itself. The verified column is what its " +
+          "own delivery receipts show. Unverified means no job asked for that harness — it is not a " +
+          "mark against the seat. Hardware is display only: the seat sends it on the beat and never " +
+          "on a claim, so an award decision cannot read it.",
       ),
     ]),
     el("div", { class: "table-wrap" }, [
@@ -563,12 +620,14 @@ function renderCensus(census) {
           el("tr", {}, [
             th("seat"),
             th("advertises (claimed)"),
+            th("capability (claimed)"),
             th("delivered (verified)"),
+            th("hardware (never filtered)"),
             th("v"),
             th("announced"),
           ]),
         ]),
-        el("tbody", {}, body.length ? body : [emptyRow(5)]),
+        el("tbody", {}, body.length ? body : [emptyRow(7)]),
       ]),
     ]),
   ]);

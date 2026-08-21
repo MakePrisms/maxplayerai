@@ -54,6 +54,32 @@ export const SELLER_HEARTBEAT_D = "maxplayer-seller";
 /** The maxplayer namespace tag value. Every trade event and the heartbeat carry `["t","maxplayer"]`. */
 export const MAXPLAYER_TAG = "maxplayer";
 
+/**
+ * Seat capability tags the AWARD DECISION can read. The emitter puts exactly these on a claim.
+ *
+ * Two of the three carry a LIST IN ONE TAG — `["harness_family","claude-code","codex"]`,
+ * `["capabilities","rust","node"]`. The third REPEATS, one tag per model, each holding a PAIR:
+ * `["harness_model","claude-code","claude-opus-5"]`. Reading `harness_model` as a one-tag list
+ * yields "a family plus a model" and drops every model past the first silently, so the two shapes
+ * need different readers and never the same one.
+ */
+export const SEAT_FILTERABLE_TAGS = Object.freeze(["harness_family", "capabilities", "harness_model"]);
+
+/**
+ * Seat capability tags that exist for a human to read and NOTHING ELSE.
+ *
+ * These are beat-only: the emitter never puts them on a claim, and the award decision reads the
+ * claim, so they are not merely unfiltered — they are absent from the filter's input. Two
+ * consequences for a reader. Their absence on a claim is UNCONDITIONAL, so "not carried on claims"
+ * and "this seat did not set it" are indistinguishable there and must not be reported as the
+ * latter. And they are kept out of the filterable shape structurally rather than by convention, so
+ * a predicate written later against that shape cannot reach them.
+ *
+ * `hardware` values contain commas and spaces (`"mac studio, 64GB"`) and model values contain
+ * brackets (`"gpt-5.6-sol[low]"`). Split on the tag array. Never on the value text.
+ */
+export const SEAT_DISPLAY_ONLY_TAGS = Object.freeze(["harness_variant", "hardware"]);
+
 /** Plain-English labels for a kind, for any place a kind must surface to a human. */
 export const KIND_LABELS = Object.freeze({
   [PROFILE]: "profile",
