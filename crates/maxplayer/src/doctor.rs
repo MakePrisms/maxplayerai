@@ -877,11 +877,16 @@ mod checks {
 
     const CREDENTIAL_CONTAINMENT_CHECK: &str = "sandbox credential containment";
 
-    /// The #647 credential proxy keeps every KNOWN model-credential variable out of a docker container.
-    /// What it cannot contain is an operator-added `[sandbox] forward_env` variable the daemon does not
+    /// The #647 credential proxy keeps out of a docker container every model-credential variable named
+    /// in EITHER registry: the built-in table, and the operator's `[sandbox] file_credentials`. What it
+    /// cannot contain is an operator-added `[sandbox] forward_env` variable the daemon does not
     /// recognize — a `MY_AGENT_TOKEN` may be a credential, and the daemon has no way to know, so it
     /// still crosses raw. This surfaces that as a WARN. Advisory — it never blocks boot, because the
     /// operator chose to forward the variable; the fix is theirs.
+    ///
+    /// The pass string names those two registries rather than claiming "every known credential",
+    /// because the scope of this check is exactly what they list — a completeness claim wider than the
+    /// registries it enumerates would go quietly false the first time a third source is added.
     pub(super) fn check_sandbox_credential_containment(sandbox: Option<SandboxConfig>) -> Check {
         check_sandbox_credential_containment_in(sandbox, |key| std::env::var(key).ok())
     }
@@ -902,7 +907,8 @@ mod checks {
         if uncontained.is_empty() {
             return Check::pass(
                 CREDENTIAL_CONTAINMENT_CHECK,
-                "every known model credential is contained; no unrecognized forward_env var is set",
+                "every credential in the built-in table and in [sandbox] file_credentials is \
+                 contained; no unrecognized forward_env var is set",
             );
         }
         let names = uncontained.join(", ");
@@ -2629,6 +2635,10 @@ mod tests {
             // sandbox field breaks this test and makes someone decide what it should be here.
             network: None,
             proxy_port_range: None,
+            // Decision for this test, per the note above: none. It asserts the engine-version floor,
+            // and a file-sourced credential is a containment concern that would only add a second
+            // reason for the check to move.
+            file_credentials: Vec::new(),
         });
         home.config.relay_url = "not-a-relay-url".into();
         home.config.accepted_mints = Vec::new();

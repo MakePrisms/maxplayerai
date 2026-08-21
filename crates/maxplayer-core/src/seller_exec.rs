@@ -289,6 +289,22 @@ impl SandboxPolicy {
                             cred.upstream
                         )));
                     }
+                    // Forwarding the SAME variable the placeholder occupies is refused rather than
+                    // merged. Both would reach the launch as `-e NAME=…` and only one can win, so the
+                    // seat's behaviour would rest on argument order; and if the daemon's copy differs
+                    // from the file's (a stale export beside a re-logged-in file) it is not in the
+                    // substitution set and would cross RAW. A config error is the only outcome here
+                    // that cannot leak.
+                    let env_name = cred.env.trim();
+                    if config.forward_env.iter().any(|name| name.trim() == env_name)
+                        || FORWARDED_AGENT_ENV.contains(&env_name)
+                    {
+                        return Err(ExecError::Config(format!(
+                            "[sandbox] file_credentials: {env_name} is also forwarded as an \
+                             environment variable — remove it from forward_env, because the \
+                             placeholder and the daemon's own copy cannot both occupy it"
+                        )));
+                    }
                 }
                 Ok(Self::docker(DockerPolicy {
                     image,
@@ -1177,16 +1193,26 @@ const CONTAINED_CREDENTIALS: &[ContainedCred] = &[
     },
 ];
 
-/// Whether `name` is a credential variable the proxy contains.
-fn is_contained_credential(name: &str) -> bool {
+/// Whether `name` is a credential variable the proxy contains, across BOTH registries: the built-in
+/// [`CONTAINED_CREDENTIALS`] table and the operator's `[sandbox] file_credentials`.
+///
+/// Both, because containment is the property being audited and it has two sources. A predicate over
+/// only the table would report a file-sourced credential as uncontained, and — the direction that
+/// actually costs something — would let the doctor's completeness claim be emitted by a check that
+/// cannot see half of what it claims about.
+fn is_contained_credential(name: &str, file_creds: &[crate::home::FileCredential]) -> bool {
     CONTAINED_CREDENTIALS.iter().any(|cred| cred.env == name)
+        || file_creds.iter().any(|cred| cred.env.trim() == name)
 }
 
 /// Forwarded variables that would cross into a docker container UNCONTAINED: the operator-added
 /// `[sandbox] forward_env` names (beyond the built-in allowlist) that are SET and are NOT one of the
-/// contained credential variables. Every KNOWN credential variable is now contained, so what remains
-/// is operator-added names the daemon cannot recognize — a `MY_AGENT_TOKEN` may well be a credential,
-/// and the daemon has no way to know, so it is flagged rather than silently forwarded raw.
+/// contained credential variables — in EITHER registry (the built-in table or `[sandbox]
+/// file_credentials`). What remains is operator-added names the daemon cannot recognize: a
+/// `MY_AGENT_TOKEN` may well be a credential, and the daemon has no way to know, so it is flagged
+/// rather than silently forwarded raw.
+///
+/// The scope of that claim is exactly "the two registries", never "every credential that exists".
 ///
 /// Empty for a non-docker policy (a host executor inherits the daemon environment; there is no
 /// container to leak into). `lookup` injects the environment so the gap is testable. Drives the loud
@@ -1204,7 +1230,10 @@ pub fn uncontained_forwarded_credentials(
     let mut out = Vec::new();
     for name in extras {
         let name = name.trim();
-        if name.is_empty() || is_contained_credential(name) || seen.contains(&name) {
+        if name.is_empty()
+            || is_contained_credential(name, policy.file_credentials())
+            || seen.contains(&name)
+        {
             continue;
         }
         seen.push(name);
@@ -2126,6 +2155,69 @@ mod tests {
         );
     }
 
+    // Containment now has TWO registries, and the auditor must enumerate both. A predicate over only
+    // the built-in table would report a file-sourced credential as crossing UNCONTAINED — and, worse,
+    // would let the doctor emit a completeness claim covering a registry it cannot see.
+    //
+    // Constructed directly rather than through `from_config`, which refuses this combination outright
+    // (see below): the point here is the PREDICATE, so it is exercised where config validation cannot
+    // mask it.
+    #[test]
+    fn the_uncontained_audit_counts_both_registries_not_just_the_table() {
+        let cred = file_cred();
+        let policy = SandboxPolicy::docker(DockerPolicy {
+            image: "maxplayer-sandbox:latest".into(),
+            forward_env: vec!["CURSOR_AUTH_TOKEN".into(), "MY_AGENT_TOKEN".into()],
+            runtime: None,
+            network: None,
+            proxy_ports: None,
+            file_credentials: vec![cred],
+        });
+        let uncontained =
+            uncontained_forwarded_credentials(&policy, |_| Some("set-to-something".to_owned()));
+        assert!(
+            !uncontained.contains(&"CURSOR_AUTH_TOKEN".to_owned()),
+            "a file-sourced credential IS contained and must not be reported as leaking: \
+             {uncontained:?}"
+        );
+        assert!(
+            uncontained.contains(&"MY_AGENT_TOKEN".to_owned()),
+            "an unrecognized forwarded variable must still be flagged, or this check has stopped \
+             discriminating: {uncontained:?}"
+        );
+    }
+
+    // Forwarding the same variable the placeholder occupies is refused, not merged. Both would arrive
+    // as `-e NAME=…` and only one can win, so behaviour would rest on argument order; and a daemon
+    // copy that DIFFERS from the file's (a stale export beside a re-logged-in file) is not in the
+    // substitution set and would cross RAW.
+    #[test]
+    fn a_file_credential_variable_may_not_also_be_forwarded() {
+        let mut config = docker_with(vec![file_cred()]);
+        config.forward_env = vec!["CURSOR_AUTH_TOKEN".into()];
+        let error = SandboxPolicy::from_config(Some(&config))
+            .expect_err("the same variable from two sources must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("CURSOR_AUTH_TOKEN") && message.contains("also forwarded"),
+            "the error must name the collision: {message}"
+        );
+
+        // A built-in allowlist name collides too — the allowlist forwards it without the operator
+        // naming it, so the collision is invisible from `forward_env` alone.
+        let mut builtin = docker_with(vec![crate::home::FileCredential {
+            env: "ANTHROPIC_API_KEY".into(),
+            ..file_cred()
+        }]);
+        builtin.forward_env = Vec::new();
+        SandboxPolicy::from_config(Some(&builtin))
+            .expect_err("a built-in allowlist name must collide too");
+
+        // And the non-colliding case still resolves, so the guard is not refusing everything.
+        SandboxPolicy::from_config(Some(&docker_with(vec![file_cred()])))
+            .expect("a file credential with its own variable resolves");
+    }
+
     // A host executor is already a child of the daemon and inherits its whole environment, so
     // forwarding there would be a no-op that only lengthened the argv.
     #[test]
@@ -2383,7 +2475,7 @@ mod tests {
         };
         assert_eq!(uncontained_forwarded_credentials(&policy, env), vec!["MY_AGENT_TOKEN".to_owned()]);
         // No operator extras ⇒ nothing to warn about even with every known credential set.
-        let all_known = |key: &str| is_contained_credential(key).then(|| "real".to_owned());
+        let all_known = |key: &str| is_contained_credential(key, &[]).then(|| "real".to_owned());
         assert!(uncontained_forwarded_credentials(&docker(Vec::new()), all_known).is_empty());
         // A non-docker policy forwards nothing into a container ⇒ never flagged.
         assert!(uncontained_forwarded_credentials(
