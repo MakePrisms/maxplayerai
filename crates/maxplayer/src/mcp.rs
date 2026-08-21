@@ -588,6 +588,9 @@ mod tests {
             buyer_mint: DEFAULT_MINT_URL,
             allow_real_mints: false,
             requested_agent: Some("claude"),
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: &[],
         };
 
         assert_eq!(
