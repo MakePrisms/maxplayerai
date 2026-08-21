@@ -3361,6 +3361,44 @@ mod tests {
         );
     }
 
+    // The capability request is INERT, and this is the assertion that makes landing the offer-side
+    // plumbing impossible to do quietly.
+    //
+    // `post_job`'s schema tells callers that model is "not yet a hard filter"
+    // (`crates/maxplayer/src/mcp.rs`), and `post_job_award_filter_descriptions_match_enforcement`
+    // pins that STRING. But that test is a one-way ratchet pointing the safe way: it goes red when
+    // someone edits the DESCRIPTION and stays green when someone changes the BEHAVIOUR. The
+    // dangerous order — wire the offer, leave the description — would ship a false caller-facing
+    // claim on the money path under a passing test.
+    //
+    // So pin the behaviour at its source. Both award paths pass the request inertly today; when
+    // either starts reading it off the offer this goes red, and whoever does it has to come here and
+    // find the description they also owe.
+    #[test]
+    fn both_award_paths_pass_the_capability_request_inertly() {
+        let award_paths = include_str!("mod.rs");
+        let inert = award_paths.matches("requested_harness_family: None").count();
+        assert_eq!(
+            inert, 2,
+            "expected exactly 2 inert capability requests in buyer/mod.rs (manual award and \
+             drive_auto_award), found {inert}.\n\
+             IF THIS WENT RED BECAUSE YOU WIRED THE OFFER: that is the intended change, and it owes \
+             two edits IN THE SAME COMMIT — the `model` property description at \
+             crates/maxplayer/src/mcp.rs:219 (\"not yet a hard filter\") and the post_job tool \
+             description at :201 (\"model is a recorded auto-award preference\"). Both are \
+             caller-facing promises about a money path and both become false the moment a model \
+             request reaches this predicate. Editing THIS assertion instead is the cheap repair and \
+             the wrong one: it is the only thing standing between that change and a silently false \
+             schema."
+        );
+        assert_eq!(
+            award_paths.matches("required_capabilities: &[]").count(),
+            inert,
+            "every inert harness-family request must carry an inert capability list with it — a \
+             half-wired request filters on one axis while the schema disclaims both"
+        );
+    }
+
     // The wire-in, asserted separately from the predicate: `select_awardable_claim` must CONSULT it.
     // Bite for the red-prove: drop the `claim_meets_capability_request` arm from the `find` chain and
     // the second assertion below returns the claim id instead of `None`.
