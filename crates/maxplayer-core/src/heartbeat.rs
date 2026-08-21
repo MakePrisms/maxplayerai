@@ -1391,6 +1391,114 @@ mod tests {
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// The WIRE round-trip: emit → sign → publish to a real in-process relay over a websocket →
+    /// fetch by `(pubkey, kind, d)` → parse. Every other test in this file compares a draft to a
+    /// parser in memory, which cannot fail on anything the relay or the tag encoding does.
+    ///
+    /// ⚠ **WHAT THIS DOES NOT PROVE, and the real bound is sharper than "it is only a unit test".**
+    ///
+    /// `parse_heartbeat` has NO Rust production caller — all 17 call sites are in this test module.
+    /// **The readers that serve real users are JavaScript and TypeScript**: `web/network/js/parse.js`,
+    /// `web/network/js/kinds.js`, `web/app/src/model/kinds.ts`, and `web/app/scripts/bake-snapshot.mjs`
+    /// all read kind-30340 today.
+    ///
+    /// ⇒ **So this wire format has TWO INDEPENDENT PARSERS IN TWO LANGUAGES, and nothing tests them
+    /// against each other.** This test pins Rust emitter ↔ Rust parser — the parser nobody ships. The
+    /// JS suite pins JS parser ↔ a fixture a human typed, which is a CLAIM about what Rust emits
+    /// rather than a reading of it. Neither proves the shipped parser agrees with the real emission.
+    ///
+    /// The golden artifact below is what closes that: set `MAXPLAYER_WRITE_GOLDEN_30340` to a path and
+    /// this writes the exact signed JSON it published, for the JS suite to consume as a fixture. One
+    /// emitter, one artifact, two parsers asserting on the same bytes. Off by default so CI is
+    /// unaffected and no test writes outside its sandbox.
+    ///
+    /// The `Event` → [`EventDraft`] conversion below is TEST-ONLY scaffolding: production has none, so
+    /// it is not a path anything ships.
+    ///
+    /// ⛔ Built on a bare `LocalRelay`, deliberately NOT on the `post_job_async` fixture the other
+    /// relay tests in this crate use. Posting a job auto-awards, and that path resolves a fee floor
+    /// at the home's real mint under `live-mints`. **The two patterns look interchangeable and only
+    /// one of them spends money.**
+    #[cfg(feature = "gateway")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stated_capability_survives_a_real_relay_round_trip() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::{Client, Filter, Keys, Kind};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let url = relay.url().await.to_string();
+
+        let seat = Keys::generate();
+        let client = Client::new(seat.clone());
+        client.add_relay(&url).await.expect("add relay");
+        client.connect().await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let emitted = draft(true, 0, 7)
+            .with_agents(vec!["claude".to_owned()])
+            .with_capability(full_capability())
+            .to_event_draft();
+        let event = crate::gateway::nostr::event_builder(&emitted)
+            .expect("event builder")
+            .sign_with_keys(&seat)
+            .expect("sign");
+        client.send_event(&event).await.expect("publish the announcement");
+
+        // Resolve by (pubkey, kind, d) — never by event id. An addressable event is superseded in
+        // place, so a by-id lookup on a replaced beat reads as "seller gone".
+        let fetched = client
+            .fetch_events(
+                Filter::new()
+                    .author(seat.public_key())
+                    .kind(Kind::Custom(SELLER_HEARTBEAT_KIND))
+                    .identifier(SELLER_HEARTBEAT_D),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("fetch");
+        let back = fetched
+            .first()
+            .expect("the relay returns the announcement it stored");
+
+        let read_back = EventDraft::new(
+            back.kind.as_u16(),
+            back.tags
+                .iter()
+                .map(|tag| TagSpec(tag.clone().to_vec()))
+                .collect(),
+            back.content.clone(),
+        );
+        let parsed = parse_heartbeat(&read_back).expect("a buyer parses the beat off the wire");
+
+        // The whole capability compared as ONE value, not field by field: a per-field assertion
+        // silently stops covering any field added later, which is the fixture-scoping trap the two
+        // tag-set rows in this file exist to close.
+        assert_eq!(
+            parsed.capability,
+            full_capability(),
+            "every #784 field must survive sign → websocket → relay store → fetch → parse"
+        );
+        // The pre-#784 fields too, so a round-trip that silently dropped the base announcement while
+        // carrying the new tags cannot pass.
+        assert_eq!(parsed.agents, vec!["claude".to_owned()]);
+        assert_eq!(parsed.accepted_mints, mints());
+        assert_eq!(parsed.rate_sats, 7);
+        assert!(parsed.accepting);
+
+        // The cross-language artifact. Opt-in by env var: a test that wrote to a fixed path on every
+        // run would fail wherever that path does not exist, and CI is one such place.
+        //
+        // ⚠ `id`, `sig`, `pubkey` and `created_at` vary per run — the keys are generated and the
+        // timestamp is now. The TAGS are deterministic, and they are the whole subject: a consumer
+        // asserting on tag names and values gets a stable fixture, one asserting on the event id gets
+        // a test that fails every run.
+        if let Ok(path) = std::env::var("MAXPLAYER_WRITE_GOLDEN_30340") {
+            use nostr_sdk::JsonUtil as _;
+            std::fs::write(&path, back.as_json()).expect("write the golden kind-30340");
+        }
+    }
+
     /// A fully-stated #784 capability: both filterable list fields, two paired models, and both
     /// display-only fields. One fixture, so the beat/claim comparison below compares the same input
     /// through two emitters rather than two hand-written tag sets made to agree.
