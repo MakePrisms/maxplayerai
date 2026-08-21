@@ -110,8 +110,9 @@ function isSafePictureUrl(url) {
  * SPEC WINS: the seller emits exec-metadata as TAGS on the kind-3403 result (its content is a
  * non-JSON string like "delivery commit <oid>", so contentJson is null). We read tags first,
  * per the usage schema, and fall back to the legacy JSON vocabulary only for fields that
- * never had a tag form (measured_cost_tokens / paid_price_tokens). `harness` is mapped to the
- * spec enum {codex, claude, cursor, other} (e.g. claude-agent-acp → claude).
+ * never had a tag form (measured_cost_tokens / paid_price_tokens). `harness` is carried verbatim
+ * as `harness_id` — the seat's own claim — and separately READ for a family (claude-agent-acp →
+ * claude) into `harness_family`, which stays null when the id names no family we recognize.
  *
  * degrades-never-blanks: a missing field is `null` (renders a dash) — NEVER a fabricated
  * value, and totals are never invented by summing siblings.
@@ -161,6 +162,9 @@ export function extractUsageAdjunct(contentJson, tags = []) {
           "acp-native",
           "side-channel",
         ]),
+      // The seat's own claim, verbatim. Kept beside the family because the family is OUR reading
+      // of this string, and a reading and a claim are not the same fact.
+      harness_id: firstTagValue(tags, "harness"),
       harness_family:
         harnessFamilyFromId(firstTagValue(tags, "harness")) ??
         asEnumString(adjunct.harness_family ?? root.harness_family, [
@@ -198,17 +202,33 @@ function costFromTags(tags) {
   return { usd: null, basis: null };
 }
 
-/** Map a seller `harness` id to the spec enum. Present-but-unrecognized → "other"; absent → null. */
+/**
+ * Read a family off a seller's `harness` id. A recognized adapter identity → the family; absent
+ * or UNRECOGNIZED → null.
+ *
+ * Unrecognized must not become `"other"`. The seller emits this id from one of two paths it does
+ * not distinguish for us (`harness_and_transport`, `seller_exec.rs`): a config-defined preset
+ * name, where the name IS the harness identity and a family outside our enum is the truth; or the
+ * argv0 BASENAME fallback, which fires when nothing in the launch argv named a family — so the id
+ * is the program that STARTED a harness (`sh`; and `npx`, before the emitter preferred the preset
+ * label over argv0), not the harness itself. Both arrive here as the same unrecognized string and
+ * nothing else on the receipt separates them, so the family is unavailable and `"other"` would
+ * assert one we do not have. The caller renders `harness_id` verbatim, marked unidentified.
+ *
+ * `"other"` survives only where a seller states it OUTRIGHT in the legacy JSON field. There it is
+ * the seller's own claim rather than our inference.
+ */
 function harnessFamilyFromId(id) {
   if (!id) return null;
   const s = String(id).toLowerCase();
   if (s.includes("claude")) return "claude";
   if (s.includes("cursor")) return "cursor";
   if (s.includes("codex")) return "codex";
-  return "other";
+  return null;
 }
 
-function emptyUsage() {
+/** The absent-usage shape. One definition: every consumer reads the same keys, all null. */
+export function emptyUsage() {
   return {
     total_tokens: null,
     input_tokens: null,
@@ -222,6 +242,7 @@ function emptyUsage() {
     measured_cost_tokens: null,
     paid_price_tokens: null,
     usage_transport: null,
+    harness_id: null,
     harness_family: null,
     paid_price_sats: null,
   };

@@ -389,7 +389,8 @@ const taggedResult = ok({
   assert.notEqual(u.total_tokens, 100 + 40 + 4096);
 }
 
-// harness_family mapping across the spec enum; unknown → "other"; absent → null.
+// harness_family mapping across the spec enum; unreadable → null (see the reading-versus-claim
+// section at the end of this file for why it is not "other"); absent → null.
 assert.equal(
   extractUsageAdjunct(null, [["harness", "cursor-agent"]]).harness_family,
   "cursor",
@@ -400,7 +401,11 @@ assert.equal(
 );
 assert.equal(
   extractUsageAdjunct(null, [["harness", "some-tool"]]).harness_family,
-  "other",
+  null,
+);
+assert.equal(
+  extractUsageAdjunct(null, [["harness", "some-tool"]]).harness_id,
+  "some-tool",
 );
 assert.equal(extractUsageAdjunct(null, []).harness_family, null);
 
@@ -564,5 +569,90 @@ assert.equal(orphanRow.source, "paid");
 assert.equal(orphanRow.total_tokens, null, "receipt with no result → usage dashes, not fabricated");
 assert.equal(orphanRow.input_tokens, null);
 assert.equal(orphanRow.output_tokens, null);
+
+// ——— harness family is a READING; the harness id is the seat's CLAIM ———
+//
+// `harness_family` is what WE read off the seat's `harness` id. `"other"` asserts a family, so an
+// id we cannot place must not produce it. The emitter (`harness_and_transport`, `seller_exec.rs`)
+// reaches an unrecognized id by two paths it does not distinguish for us — a config-defined preset
+// name, where a family outside the enum is the truth, and the argv0 BASENAME fallback, where the id
+// names the program that STARTED a harness. Nothing on the receipt separates them, so the family is
+// unavailable and the id is rendered verbatim instead.
+
+/** The `harness` tag value as it reaches the reader, with no other usage tags to lean on. */
+function familyOf(harnessId) {
+  const tags = harnessId == null ? [] : [["harness", harnessId]];
+  return extractUsageAdjunct(null, tags);
+}
+
+// POSITIVE CONTROLS — a classifier that matched nothing would pass every negative case below.
+assert.equal(familyOf("claude-agent-acp").harness_family, "claude");
+assert.equal(familyOf("codex-acp-ng").harness_family, "codex");
+assert.equal(familyOf("cursor-agent").harness_family, "cursor");
+assert.equal(familyOf("claude-agent-acp").harness_id, "claude-agent-acp", "claim carried verbatim");
+
+// `sh` — the LIVE instance. The emitter's argv0 basename fallback produces it today; measured on
+// 2 of 441 kind-3403 results on relay.maxplayer.ai, 2026-08-21 (one read at one time).
+assert.equal(familyOf("sh").harness_family, null, "a launcher basename names no family");
+assert.equal(familyOf("sh").harness_id, "sh", "the unplaceable id survives for the UI to show");
+
+// `npx` — the instance this defect was REPORTED as. Measured 0 of 441 on the wire, because the
+// emitter now prefers the preset label and its hatch scans the full argv. Asserted anyway: the fix
+// must key on the SHAPE, so it has to hold where the bug is not, and this is the case a guard
+// written only for the reported string would have special-cased.
+assert.equal(familyOf("npx").harness_family, null);
+assert.equal(familyOf("npx").harness_id, "npx");
+
+// `deepseek-v4-flash` — a config-defined `[agents]` preset name, 26 of 441 on the wire. The preset
+// name IS the harness identity, so being outside the enum is the truth here, not a failure to read.
+// It shares `harness_family: null` with the two above; the id is what tells them apart, which is
+// exactly why the id must reach the renderer.
+assert.equal(familyOf("deepseek-v4-flash").harness_family, null);
+assert.equal(familyOf("deepseek-v4-flash").harness_id, "deepseek-v4-flash");
+
+// Absent stays absent — never an empty string, which would read as a value.
+assert.equal(familyOf(null).harness_family, null);
+assert.equal(familyOf(null).harness_id, null);
+
+// `"other"` is NEVER inferred from an id. It survives only where a seller states it outright in the
+// legacy JSON field, where it is the seller's own claim. This assertion is what fails if the
+// present-but-unrecognized → "other" mapping is ever restored.
+for (const id of ["sh", "npx", "deepseek-v4-flash", "mytool", "grok", "unknown", "bash", "uvx"]) {
+  assert.notEqual(familyOf(id).harness_family, "other", `inferred "other" from ${id}`);
+}
+assert.equal(
+  extractUsageAdjunct({ harness_family: "other" }, []).harness_family,
+  "other",
+  "a seller stating other outright is a claim we carry, not an inference we made",
+);
+
+// A seller-supplied id containing the old key separator must not merge or split economics groups.
+// The key was a "|" join over this very field, so the value could forge a group boundary.
+{
+  const sepStore = createStore();
+  const mk = (n, harnessId) =>
+    ok({
+      id: String(n).padStart(2, "f").padEnd(64, "0"),
+      pubkey: "fa".padEnd(64, "0"),
+      kind: RESULT,
+      created_at: 900 + n,
+      tags: [
+        ["e", String(n).padStart(2, "e").padEnd(64, "0"), "", "root"],
+        ["harness", harnessId],
+        ["usage_transport", "side-channel"],
+      ],
+      content: "",
+    });
+  sepStore.ingest(mk(1, "a|side-channel"));
+  sepStore.ingest(mk(2, "a"));
+  const groups = sepStore.economics().groups;
+  assert.equal(groups.length, 2, "a | inside the id must not collide two distinct harnesses");
+  const ids = groups.map(([, g]) => g.harness_id).sort();
+  assert.deepEqual(ids, ["a", "a|side-channel"]);
+  for (const [, g] of groups) {
+    assert.equal(g.transport, "side-channel", "transport read from the value, never split off a key");
+    assert.equal(g.family, null);
+  }
+}
 
 console.log("ok — parse/store suite passed");

@@ -749,6 +749,18 @@ code {
   font-size: 0.78rem;
 }
 
+/* A family we could not read off the seat's harness claim. Italic and muted so it cannot be
+   mistaken for one of the enum values sharing the column. */
+td.unidentified {
+  color: var(--muted);
+  font-style: italic;
+}
+/* The seat's own words, verbatim. Monospace marks it as a claim carried through, not a reading. */
+td.claim {
+  font-family: var(--mono);
+  font-size: 0.82rem;
+}
+
 @media (max-width: 720px) {
   .tail-row {
     grid-template-columns: 1fr 1fr;

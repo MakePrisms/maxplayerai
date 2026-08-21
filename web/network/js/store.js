@@ -1,4 +1,4 @@
-import { percentile } from "./parse.js";
+import { emptyUsage, percentile } from "./parse.js";
 import { aggregateJobs, computePulse } from "./jobs.js";
 import { buyerMetrics, sellerMetrics } from "./profiles.js";
 
@@ -198,6 +198,7 @@ export function createStore() {
           input_tokens: joined.input_tokens,
           output_tokens: joined.output_tokens,
           usage_transport: joined.usage_transport,
+          harness_id: joined.harness_id,
           harness_family: joined.harness_family,
         });
       }
@@ -224,19 +225,26 @@ export function createStore() {
           input_tokens: u.input_tokens,
           output_tokens: u.output_tokens,
           usage_transport: u.usage_transport,
+          harness_id: u.harness_id,
           harness_family: u.harness_family,
         });
       }
     }
     rows.sort((a, b) => b.created_at - a.created_at);
 
-    /** @type {Map<string, {n:number, withCost:number, sumCost:number, sumPaidTok:number, sumPaidSat:number}>} */
+    /** @type {Map<string, {family:string|null, harness_id:string|null, transport:string|null, n:number, withCost:number, sumCost:number, sumPaidTok:number, sumPaidSat:number}>} */
     const groups = new Map();
     for (const row of rows) {
-      const key = `${row.harness_family || "unknown"}|${row.usage_transport || "unknown"}`;
+      const family = row.harness_family ?? null;
+      const harness_id = row.harness_id ?? null;
+      const transport = row.usage_transport ?? null;
+      // JSON, never a "|" join: `harness_id` is seller-supplied text off the wire, so a separator
+      // occurring inside it would merge two groups or split one. The parts also ride on the VALUE,
+      // so no consumer has to parse the key back apart to render them.
+      const key = JSON.stringify([family, harness_id, transport]);
       let g = groups.get(key);
       if (!g) {
-        g = { n: 0, withCost: 0, sumCost: 0, sumPaidTok: 0, sumPaidSat: 0 };
+        g = { family, harness_id, transport, n: 0, withCost: 0, sumCost: 0, sumPaidTok: 0, sumPaidSat: 0 };
         groups.set(key, g);
       }
       g.n += 1;
@@ -356,17 +364,6 @@ function summarize(values) {
     p99: percentile(values, 99),
     min: values.length ? Math.min(...values) : null,
     max: values.length ? Math.max(...values) : null,
-  };
-}
-
-function emptyUsage() {
-  return {
-    total_tokens: null,
-    measured_cost_tokens: null,
-    paid_price_tokens: null,
-    usage_transport: null,
-    harness_family: null,
-    paid_price_sats: null,
   };
 }
 
