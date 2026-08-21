@@ -2261,22 +2261,30 @@ fn harness_probe_prompt(sentinel: &str) -> String {
 const HARNESS_PROBE_MAX_ATTEMPTS: usize = 3;
 
 /// One self-probe turn's outcome, keeping WHICH shape of failure occurred — the one bit a single
-/// `Result` throws away, and the bit the prove-before-advertise diagnostic needs (#472). The two
-/// failure shapes have OPPOSITE remedies:
+/// `Result` throws away, and the bit the prove-before-advertise diagnostic needs (#472).
 ///
-/// - [`Self::CompletedNoArtifact`] — the launcher ran the turn, the turn completed, the model just did
-///   not do the task. Flaky; the remedy is to retry (or swap the model). RETRIED.
+/// - [`Self::CompletedNoArtifact`] — the launcher ran the turn and the turn completed, but no artifact
+///   carries the sentinel. RETRIED, because a model that flakes on one turn often delivers on the next.
 /// - [`Self::Unrunnable`] — the turn never ran (a typed launcher/exec [`ExecError`], or our own workdir
 ///   could not be created). The remedy is to fix the launcher/containment, not the model. NOT retried:
 ///   re-asking a launcher that refused only delays a fail-closed boot.
 ///
-/// Collapsing the two — as a lone turn did — sends the operator hunting containment for a flaky model,
-/// or the reverse. Naming them apart is the whole point of the diagnostic.
+/// ⛔ THE SHAPE BOUNDS THE RETRY POLICY, NOT THE CAUSE, AND AN EARLIER VERSION OF THIS COMMENT CLAIMED
+/// OTHERWISE. It read "the turn completed, the model just did not do the task. Flaky" — an exhaustive
+/// dichotomy (turn-never-ran ⇒ containment, turn-ran ⇒ model) that the code does not have. A THIRD
+/// state exists and was measured on 2026-08-21: a contained cursor seat ran the turn to completion and
+/// the fault WAS containment — its model host would not resolve, cursor folded `getaddrinfo EAI_AGAIN`
+/// into ordinary assistant text, and returned `stopReason: end_turn`. Every egress gap produces this
+/// same completed-with-no-artifact shape.
+///
+/// ⇒ so `CompletedNoArtifact` carries the agent's own last message, which is the only thing in the turn
+/// that can name the cause. Retrying it is still right; asserting the model's mood is not.
 enum ProbeAttempt {
     /// The harness produced the sentinel artifact: a proven turn.
     Proven,
-    /// The ACP turn completed but left no artifact carrying the sentinel — a flaky model/harness.
-    CompletedNoArtifact,
+    /// The ACP turn completed but left no artifact carrying the sentinel. Carries the agent's own last
+    /// message when it said anything — the cause is in there or nowhere.
+    CompletedNoArtifact { agent_message: Option<String> },
     /// A failure retrying cannot fix. Carries the operator reason (which NAMES the launcher/containment
     /// remedy) and the fault to record.
     Unrunnable { reason: String, fault: Fault },
@@ -2292,16 +2300,54 @@ enum ProbeStep {
     Done(Result<(), (String, Fault)>),
 }
 
-/// The refusal reason for the FLAKY shape once every retry still produced no artifact.
+/// How much of an agent's message an operator line carries. Long enough for a vendor error string
+/// (`getaddrinfo EAI_AGAIN <host>` and friends), short enough to stay one readable line.
+const AGENT_MESSAGE_QUOTE_CHARS: usize = 400;
+
+/// One agent message, prepared for an operator line: trimmed, quoted, and truncated ONLY for length.
 ///
-/// Names the remedy that fits THIS shape and says which one it is NOT: the launcher ran every turn, so
-/// an operator must not go hunting containment for a fault that is upstream in the model.
-fn flaky_harness_reason(attempts: usize) -> String {
-    format!(
-        "completed {attempts} self-probe turn(s) but never produced the sentinel artifact — the \
-         launcher ran the turn each time, so this is a FLAKY harness/model, not a containment fault \
-         (remedy: retry later, or switch to a more reliable model/harness)"
-    )
+/// `None` when the agent said nothing usable, so every caller renders that case in its own words
+/// rather than printing empty quotes. Truncation counts CHARS, not bytes — a vendor error can carry any
+/// UTF-8 and slicing bytes would panic mid-codepoint.
+fn quoted_agent_message(message: Option<&str>) -> Option<String> {
+    let text = message.map(str::trim).filter(|text| !text.is_empty())?;
+    let head: String = text.chars().take(AGENT_MESSAGE_QUOTE_CHARS).collect();
+    let elided = if text.chars().count() > AGENT_MESSAGE_QUOTE_CHARS {
+        " […]"
+    } else {
+        ""
+    };
+    Some(format!("\"{head}\"{elided}"))
+}
+
+/// The refusal reason once every retry completed a turn and still produced no artifact.
+///
+/// ⛔ THIS FUNCTION USED TO NAME A CAUSE IT COULD NOT KNOW — "a FLAKY harness/model, not a containment
+/// fault" — and that sentence cost a full day on 2026-08-21: the fault WAS containment (a model host
+/// that would not resolve), and the string told the operator not to look there. It now reports what was
+/// observed and hands over the only evidence the turn contains: the agent's own words.
+///
+/// The agent's message is quoted rather than summarised, and truncated only for line length, because
+/// the useful part is a vendor error string nobody can predict.
+fn flaky_harness_reason(attempts: usize, agent_message: Option<&str>) -> String {
+    let head = format!(
+        "completed {attempts} self-probe turn(s), every turn ran but none produced the sentinel \
+         artifact — a completed turn does NOT establish the cause: an unreachable model host, an \
+         exhausted plan and an idle model all end a turn this way"
+    );
+    match quoted_agent_message(agent_message) {
+        Some(quoted) => {
+            format!(
+                "{head}. The agent's own last message was: {quoted} (remedy: read that message \
+                 first — it names the fault whenever the agent knew it)"
+            )
+        }
+        None => format!(
+            "{head}, and the agent produced NO message this turn, so nothing in the turn names the \
+             cause (remedy: check the launcher, the sandbox egress and the harness credential — none \
+             of them is ruled out by the turn completing)"
+        ),
+    }
 }
 
 /// The refusal reason for the UNRUNNABLE launcher/exec shape.
@@ -2374,11 +2420,14 @@ fn probe_step(attempt: usize, max_attempts: usize, outcome: ProbeAttempt) -> Pro
     match outcome {
         ProbeAttempt::Proven => ProbeStep::Done(Ok(())),
         ProbeAttempt::Unrunnable { reason, fault } => ProbeStep::Done(Err((reason, fault))),
-        ProbeAttempt::CompletedNoArtifact => {
+        ProbeAttempt::CompletedNoArtifact { agent_message } => {
             if attempt + 1 < max_attempts {
                 ProbeStep::Retry
             } else {
-                ProbeStep::Done(Err((flaky_harness_reason(max_attempts), Fault::Unproven)))
+                ProbeStep::Done(Err((
+                    flaky_harness_reason(max_attempts, agent_message.as_deref()),
+                    Fault::Unproven,
+                )))
             }
         }
     }
@@ -2418,7 +2467,7 @@ async fn run_harness_probe_once(
         };
     }
 
-    if let Err(error) = run_agent_job(
+    let report = match run_agent_job(
         argv,
         sandbox,
         &harness_probe_prompt(sentinel),
@@ -2428,25 +2477,30 @@ async fn run_harness_probe_once(
     )
     .await
     {
-        // The turn never ran: structural, so do not retry. The remedy STRING is routed by class —
-        // an auth failure needs a sign-in, not a containment fix (#555) — but the shape and fault
-        // are unchanged either way.
-        let fault = match harness_fault_for(&error) {
-            Some(ExecutionFailure::Harness(fault)) => fault,
-            Some(ExecutionFailure::DeadlineExceeded) | None => Fault::Unproven,
-        };
-        return ProbeAttempt::Unrunnable {
-            reason: unrunnable_reason(&error),
-            fault,
-        };
-    }
+        Ok(report) => report,
+        Err(error) => {
+            // The turn never ran: structural, so do not retry. The remedy STRING is routed by class —
+            // an auth failure needs a sign-in, not a containment fix (#555) — but the shape and fault
+            // are unchanged either way.
+            let fault = match harness_fault_for(&error) {
+                Some(ExecutionFailure::Harness(fault)) => fault,
+                Some(ExecutionFailure::DeadlineExceeded) | None => Fault::Unproven,
+            };
+            return ProbeAttempt::Unrunnable {
+                reason: unrunnable_reason(&error),
+                fault,
+            };
+        }
+    };
 
     // The turn "succeeded" — now ask the only question that separates a working harness from an
     // exhausted one: is the sentinel actually here?
     if probe_sentinel_present(workdir, sentinel) {
         ProbeAttempt::Proven
     } else {
-        ProbeAttempt::CompletedNoArtifact
+        ProbeAttempt::CompletedNoArtifact {
+            agent_message: report.last_agent_message,
+        }
     }
 }
 
@@ -2466,7 +2520,10 @@ async fn run_harness_probe(
     match run_harness_probe_once(argv, sandbox, identity, workdir, sentinel).await {
         ProbeAttempt::Proven => Ok(()),
         ProbeAttempt::Unrunnable { reason, fault } => Err((reason, fault)),
-        ProbeAttempt::CompletedNoArtifact => Err((flaky_harness_reason(1), Fault::Unproven)),
+        ProbeAttempt::CompletedNoArtifact { agent_message } => Err((
+            flaky_harness_reason(1, agent_message.as_deref()),
+            Fault::Unproven,
+        )),
     }
 }
 
@@ -2605,18 +2662,31 @@ async fn probe_one_harness(
         let outcome =
             run_harness_probe_once(argv, sandbox, identity, &workdir, &probe.sentinel).await;
         let _ = std::fs::remove_dir_all(&workdir);
+        // Kept before `probe_step` consumes the outcome, so a retry can print what the agent said on
+        // THIS turn instead of making the operator wait for the final verdict to learn it.
+        let said = match &outcome {
+            ProbeAttempt::CompletedNoArtifact { agent_message } => {
+                quoted_agent_message(agent_message.as_deref())
+            }
+            _ => None,
+        };
         match probe_step(attempt, HARNESS_PROBE_MAX_ATTEMPTS, outcome) {
             ProbeStep::Done(result) => return result,
             ProbeStep::Retry => opline!(
-                "seller node harness probe {label}: turn {} completed with NO artifact — flaky-model \
-                 shape, retrying",
-                attempt + 1
+                "seller node harness probe {label}: turn {} completed with NO artifact, retrying — \
+                 the agent said: {}",
+                attempt + 1,
+                said.as_deref().unwrap_or("<nothing>")
             ),
         }
     }
     // Unreachable: probe_step returns Done on the final attempt. Kept as a fail-closed verdict so a
-    // future change to the policy cannot fall through to a panic on a money path.
-    Err((flaky_harness_reason(HARNESS_PROBE_MAX_ATTEMPTS), Fault::Unproven))
+    // future change to the policy cannot fall through to a panic on a money path. No agent message is
+    // available here precisely because this path never runs a turn.
+    Err((
+        flaky_harness_reason(HARNESS_PROBE_MAX_ATTEMPTS, None),
+        Fault::Unproven,
+    ))
 }
 
 /// Probe EVERY configured harness before anything goes on the wire.
@@ -5594,8 +5664,8 @@ impl SellerNodeRunner {
         )
         .await;
         let wall_time_ms = run_started.elapsed().as_millis() as u64;
-        let usage = match run_result {
-            Ok(usage) => usage,
+        let report = match run_result {
+            Ok(report) => report,
             Err(error) => {
                 opline!("seller node execute fail job_id={job_id}: agent run failed ({error})");
                 self.drop_harness(harness, harness_fault_for(&error));
@@ -5603,6 +5673,14 @@ impl SellerNodeRunner {
                 return;
             }
         };
+        // The agent's own account of the run, on the REAL job path and not only the probe: it was
+        // discarded here too, so a job that delivered nothing left the operator the same guess the
+        // probe used to. Logged whenever the agent said anything — one line per job, and it is the
+        // line that names a blocked host or an exhausted plan.
+        if let Some(quoted) = quoted_agent_message(report.last_agent_message.as_deref()) {
+            opline!("seller node execute job_id={job_id} agent last message: {quoted}");
+        }
+        let usage = report.usage;
 
         // Snapshot the agent's final workdir tree into ONE delivery commit at the stored author date.
         // §19: the snapshot writes the execution sentinel into the delivered tree, seeded from this
@@ -12622,29 +12700,36 @@ mod tests {
     fn probe_step_retries_the_flaky_shape_up_to_the_cap_then_fails_closed() {
         // Completed-but-empty turns retry while turns remain...
         assert!(matches!(
-            probe_step(0, 3, ProbeAttempt::CompletedNoArtifact),
+            probe_step(0, 3, ProbeAttempt::CompletedNoArtifact { agent_message: None }),
             ProbeStep::Retry
         ));
         assert!(matches!(
-            probe_step(1, 3, ProbeAttempt::CompletedNoArtifact),
+            probe_step(1, 3, ProbeAttempt::CompletedNoArtifact { agent_message: None }),
             ProbeStep::Retry
         ));
         // ...and the FINAL empty turn fails closed with the flaky remedy, never another retry.
         let ProbeStep::Done(Err((reason, fault))) =
-            probe_step(2, 3, ProbeAttempt::CompletedNoArtifact)
+            probe_step(2, 3, ProbeAttempt::CompletedNoArtifact { agent_message: None })
         else {
             panic!("the last flaky attempt must be Done(Err), not a retry");
         };
         assert_eq!(fault, Fault::Unproven);
+        // The RETRY POLICY above is unchanged and is what this test is for. The WORDING assertions
+        // that used to sit here required the verdict to say "FLAKY", to prescribe "retry later /
+        // more reliable model", and to avoid mentioning the launcher at all. That premise was wrong:
+        // on 2026-08-21 this exact shape came from a containment fault, so the verdict must no longer
+        // name a cause — and must not steer the operator away from the launcher either.
         assert!(
-            reason.contains("FLAKY")
-                && reason.contains("retry later")
-                && reason.contains("more reliable model"),
-            "the flaky verdict must name the retry/replace-model remedy: {reason}"
+            reason.contains("does NOT establish the cause"),
+            "the verdict must state what a completed turn cannot tell us: {reason}"
         );
         assert!(
-            !reason.contains("fix the launcher"),
-            "the flaky verdict must NOT prescribe the launcher fix: {reason}"
+            !reason.contains("FLAKY") && !reason.contains("not a containment fault"),
+            "the verdict must not assert a cause it cannot know: {reason}"
+        );
+        assert!(
+            reason.contains("sandbox egress"),
+            "with no agent message, the verdict must leave containment ON the list: {reason}"
         );
     }
 
@@ -12735,15 +12820,71 @@ mod tests {
     }
 
     #[test]
-    fn the_two_probe_remedies_point_opposite_ways() {
-        let flaky = flaky_harness_reason(3);
+    fn the_completed_turn_reason_never_rules_containment_out() {
+        // This test's PREMISE changed, and that is the point. It used to require the completed-turn
+        // reason to say "a FLAKY harness/model, not a containment fault" and to avoid pointing at the
+        // launcher at all. On 2026-08-21 a contained cursor seat produced exactly this shape and the
+        // fault WAS containment — its model host would not resolve — so the old string argued against
+        // the correct hypothesis for a full day.
+        let completed = flaky_harness_reason(3, None);
         let launcher = launcher_unrunnable_reason(&ExecError::Agent("boom".to_owned()));
-        // Flaky ⇒ retry / replace the model; launcher ⇒ fix containment. Neither borrows the other's
-        // remedy — the whole point of splitting the shapes is that an operator is pointed the right way.
-        assert!(flaky.contains("retry later") && flaky.contains("more reliable model"));
-        assert!(!flaky.contains("fix the launcher"));
+        assert!(
+            !completed.contains("not a containment fault"),
+            "the completed-turn reason must not deny containment; it cannot know: {completed}"
+        );
+        assert!(
+            !completed.contains("FLAKY harness/model"),
+            "the completed-turn reason must not assert a cause it cannot know: {completed}"
+        );
+        assert!(
+            completed.contains("does NOT establish the cause"),
+            "it must say what it does not know: {completed}"
+        );
+        // The UNRUNNABLE shape still names its remedy — that one really is structural, and this half
+        // of the split is unchanged.
         assert!(launcher.contains("fix the launcher") && launcher.contains("containment"));
-        assert!(!launcher.contains("retry later") && !launcher.contains("more reliable model"));
+    }
+
+    #[test]
+    fn the_completed_turn_reason_carries_the_agents_own_words() {
+        // FIXTURE, measured 2026-08-21 on a contained cursor seat: the turn completed, produced no
+        // artifact, and the ONLY thing naming the cause was the agent's own message. It was already in
+        // the ACP stream on the first run; the seller's sink discarded it (`&mut |_| {}`), so the
+        // operator got a guess instead. Acceptance is that this text REACHES the operator reason.
+        const MEASURED: &str =
+            "Error: RetriableError: [unavailable] getaddrinfo EAI_AGAIN agentn.global.api5.cursor.sh";
+        let reason = flaky_harness_reason(3, Some(MEASURED));
+        assert!(
+            reason.contains("getaddrinfo EAI_AGAIN agentn.global.api5.cursor.sh"),
+            "the agent's own words must reach the operator verbatim: {reason}"
+        );
+        // And the no-message case must be rendered in words, never as empty quotes — "the agent said
+        // nothing" is itself a finding, and it must not look like a missing field.
+        let silent = flaky_harness_reason(3, None);
+        assert!(
+            silent.contains("NO message") && !silent.contains("\"\""),
+            "a silent turn must be stated, not printed as empty quotes: {silent}"
+        );
+        // A message that is only whitespace is silence, not a quote.
+        assert_eq!(
+            flaky_harness_reason(3, Some("   \n  ")),
+            silent,
+            "whitespace-only must be treated as no message at all"
+        );
+    }
+
+    #[test]
+    fn a_long_agent_message_is_truncated_on_a_char_boundary() {
+        // A vendor error can carry any UTF-8. Truncating by BYTES would panic mid-codepoint, so the
+        // quote counts chars — this is the red-prove for that choice: every char here is 4 bytes.
+        let long = "🙂".repeat(AGENT_MESSAGE_QUOTE_CHARS + 50);
+        let quoted = quoted_agent_message(Some(&long)).expect("a non-empty message must quote");
+        assert!(quoted.ends_with("[…]"), "an over-length message must be elided: {quoted}");
+        assert_eq!(
+            quoted.chars().filter(|c| *c == '🙂').count(),
+            AGENT_MESSAGE_QUOTE_CHARS,
+            "exactly the cap must survive, counted in chars"
+        );
     }
 
     #[test]
@@ -12752,8 +12893,8 @@ mod tests {
         // sequence: the first two retry, the third proves — so the harness ends PROVEN, not grounded.
         // This is the money-relevant direction: a merely flaky model still gets to advertise.
         let script = [
-            ProbeAttempt::CompletedNoArtifact,
-            ProbeAttempt::CompletedNoArtifact,
+            ProbeAttempt::CompletedNoArtifact { agent_message: None },
+            ProbeAttempt::CompletedNoArtifact { agent_message: None },
             ProbeAttempt::Proven,
         ];
         let mut verdict = None;
@@ -12778,7 +12919,7 @@ mod tests {
         // third element is never consumed, so a launcher fault surfacing on a retry still fails fast,
         // and the RECORDED fault is the launcher's, not the flaky Unproven.
         let script = [
-            ProbeAttempt::CompletedNoArtifact,
+            ProbeAttempt::CompletedNoArtifact { agent_message: None },
             ProbeAttempt::Unrunnable {
                 reason: launcher_unrunnable_reason(&ExecError::AcpRequired),
                 fault: Fault::Incapable(MissingCapability::AcpFeature),

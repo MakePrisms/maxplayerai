@@ -674,16 +674,16 @@ pub async fn run_agent_with_retry<F, Fut>(
     max_attempts: u32,
     now: impl Fn() -> u64,
     mut run: F,
-) -> Result<Option<UsageMetadata>, ExecError>
+) -> Result<AgentRunReport, ExecError>
 where
     F: FnMut(u32) -> Fut,
-    Fut: std::future::Future<Output = Result<Option<UsageMetadata>, ExecError>>,
+    Fut: std::future::Future<Output = Result<AgentRunReport, ExecError>>,
 {
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
         match run(attempt).await {
-            Ok(usage) => return Ok(usage),
+            Ok(report) => return Ok(report),
             // Retry only while BOTH an attempt and the deadline remain; otherwise surface the error
             // so the caller publishes feedback-kind exactly once (past deadline / exhausted).
             Err(_) if attempt < max_attempts && now() < deadline_unix => continue,
@@ -1010,11 +1010,28 @@ pub fn harness_and_transport(
     }
 }
 
+/// What one agent run reports back: the ACP usage the driver surfaced, and the agent's own last
+/// message.
+///
+/// The message is carried because a COMPLETED turn is not a successful one. An agent whose plan is
+/// exhausted, or whose model host is unreachable, ends its turn normally and explains itself in
+/// ordinary assistant text — so the turn's shape cannot tell that apart from a model that simply did
+/// nothing, and only the text can. Measured 2026-08-21: a contained cursor seat returned
+/// `getaddrinfo EAI_AGAIN` for its model host in exactly this field, on the first run, while the
+/// caller reported a flaky model.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentRunReport {
+    /// Usage the driver surfaced for this run. `None` when the harness exposed nothing.
+    pub usage: Option<UsageMetadata>,
+    /// The agent's last non-empty message this turn, verbatim. `None` when it said nothing at all —
+    /// which is itself informative, and distinct from an empty string.
+    pub last_agent_message: Option<String>,
+}
+
 /// Run the awarded agent under the ACP driver: one session in `workdir`, seeded with `prompt`, with
 /// the delivery `identity`'s git env, bounded by `timeout` (the unified job timeout). The agent
 /// command is launched through `policy` — directly under a pass-through policy, or inside the
-/// policy's launcher. Returns the ACP usage the driver surfaced (`None` when the harness exposed
-/// nothing).
+/// policy's launcher.
 #[cfg(feature = "acp")]
 pub async fn run_agent_job(
     agent_command: &[String],
@@ -1023,7 +1040,7 @@ pub async fn run_agent_job(
     workdir: &Path,
     identity: &DeliveryAgentIdentity,
     timeout: AgentRunTimeout,
-) -> Result<Option<UsageMetadata>, ExecError> {
+) -> Result<AgentRunReport, ExecError> {
     use crate::driver::{AcpDriver, AgentCommand, ContentBlock, PromptTurn, SessionConfig};
     use crate::engine::{run_job, RunParams};
     use crate::event::JobId;
@@ -1162,17 +1179,32 @@ pub async fn run_agent_job(
             }],
         },
     };
+    // The agent's own account of the turn, kept from the sink that was already called for every
+    // update. A turn can complete having done nothing and say WHY in its last message — a blocked
+    // host, an exhausted plan — and that text was previously dropped here, leaving the caller to
+    // guess a cause from the turn's shape alone.
+    let mut last_agent_message: Option<String> = None;
     let outcome = run_job(
         &mut driver,
         &mut log,
         &JobId(format!("seller-{}", short_hash(prompt))),
         params,
-        &mut |_| {},
+        &mut |event| {
+            if let crate::engine::RunEvent::Update(update) = event
+                && let Some(text) = crate::engine::update_text(update)
+                && !text.trim().is_empty()
+            {
+                last_agent_message = Some(text);
+            }
+        },
     )
     .await
     .map_err(|error| classify_run_error(error, timeout))?;
     match outcome.terminal {
-        crate::event::JobExecutionStatus::Completed => Ok(outcome.usage),
+        crate::event::JobExecutionStatus::Completed => Ok(AgentRunReport {
+            usage: outcome.usage,
+            last_agent_message,
+        }),
         other => Err(ExecError::Agent(format!("agent terminal {other:?}"))),
     }
 }
@@ -1631,7 +1663,7 @@ pub async fn run_agent_job(
     _workdir: &Path,
     _identity: &DeliveryAgentIdentity,
     _timeout: AgentRunTimeout,
-) -> Result<Option<UsageMetadata>, ExecError> {
+) -> Result<AgentRunReport, ExecError> {
     Err(ExecError::AcpRequired)
 }
 
@@ -2774,7 +2806,7 @@ mod tests {
                 if attempt < 2 {
                     Err(ExecError::Agent("transient".into()))
                 } else {
-                    Ok::<Option<UsageMetadata>, ExecError>(None)
+                    Ok::<AgentRunReport, ExecError>(AgentRunReport::default())
                 }
             }
         })
@@ -2790,7 +2822,7 @@ mod tests {
         // Deadline never the limiter (u64::MAX) — only the attempt budget stops the loop.
         let out = run_agent_with_retry(u64::MAX, 3, || 0, |attempt| {
             attempts.set(attempt);
-            async move { Err::<Option<UsageMetadata>, ExecError>(ExecError::Agent("always".into())) }
+            async move { Err::<AgentRunReport, ExecError>(ExecError::Agent("always".into())) }
         })
         .await;
         assert!(out.is_err(), "exhausted retries ⇒ error so caller publishes feedback-kind");
@@ -2805,7 +2837,7 @@ mod tests {
         // then the error surfaces so the caller publishes feedback-kind.
         let out = run_agent_with_retry(1_000, 3, || 5_000, |attempt| {
             attempts.set(attempt);
-            async move { Err::<Option<UsageMetadata>, ExecError>(ExecError::Agent("late".into())) }
+            async move { Err::<AgentRunReport, ExecError>(ExecError::Agent("late".into())) }
         })
         .await;
         assert!(out.is_err(), "past deadline ⇒ error (caller publishes feedback-kind)");

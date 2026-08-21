@@ -212,7 +212,7 @@ fn terminal_status(reason: StopReason) -> JobExecutionStatus {
     }
 }
 
-fn update_text(update: &SessionUpdate) -> Option<String> {
+pub(crate) fn update_text(update: &SessionUpdate) -> Option<String> {
     let text = match update {
         SessionUpdate::AgentMessage(blocks) => blocks
             .iter()
