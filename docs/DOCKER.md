@@ -203,12 +203,13 @@ runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM
   it. For `claude` prefer `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`); an environment API key needs
   a one-time interactive approval a daemon cannot give. **The pre-advertise probe runs the CLI on the
   host, so a `/login` credential passes the gate and then fails every job inside the container.**
-- ⛔ **`cursor` has no credential path under docker mode.** The allowlist is claude and codex only, and
-  `CURSOR_API_KEY` is also not one of the credentials the per-job proxy can hold — so
-  `forward_env = ["CURSOR_API_KEY"]` forwards the real reusable key into the container for a stranger's
-  job to read, which `doctor` flags as a WARN rather than refusing. Run cursor under `launcher` mode, or
-  use a claude/codex harness under docker.
-  See [#850](https://github.com/MakePrisms/maxplayerai/issues/850).
+- ⛔ **`cursor` has two credentials and only one of them has a contained path.** `CURSOR_API_KEY` is a
+  real reusable key and the allowlist is claude and codex only, so
+  `forward_env = ["CURSOR_API_KEY"]` forwards that key into the container for a stranger's job to
+  read — which `doctor` flags as a WARN rather than refusing. Never do that. The **browser-login
+  session** is different: `file_credentials` below carries it as a per-job placeholder and keeps the
+  real value on the host. That path has not yet been exercised from inside a running container, so
+  until it has, run cursor under `launcher` mode or use a claude/codex harness under docker.
 
 - **Omit `image`.** Unset, the binary uses its own version-pinned ref
   `ghcr.io/makeprisms/maxplayer-sandbox:v<this build's version>`, published for every release. `image`
@@ -231,6 +232,45 @@ runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM
   `SANDBOXING.md` for the full v1/v2 architecture and why the runtime is Linux-only.
 - On macOS, leave `runtime` unset: Docker Desktop cannot load a custom runtime, and its containers
   already run inside a platform Linux VM that provides the hardware boundary.
+
+#### A credential the agent keeps in a file (`file_credentials`)
+
+A harness that authenticates by browser login leaves its session in a file. There is nothing for
+`forward_env` to carry and nothing for the per-job proxy to substitute, so without this the real
+credential either crosses into the container intact or the harness cannot run contained at all.
+`[[sandbox.file_credentials]]` names what the proxy needs:
+
+```toml
+[[sandbox.file_credentials]]
+path         = "/home/you/.config/cursor/auth.json"  # absolute; a relative path is refused
+field        = "accessToken"                         # the only field ever read
+env          = "CURSOR_AUTH_TOKEN"                   # carries the PLACEHOLDER into the container
+upstream     = "https://api2.cursor.sh"              # the one destination the swap is allowed for
+endpoint_arg = "--endpoint"                          # the client's own flag; the proxy URL is appended
+```
+
+The daemon reads `field` out of `path` **on the host, once per job**, mints a placeholder, puts the
+placeholder in `env`, and appends `endpoint_arg <proxy-url>` to the agent's argv. The real value never
+enters the container, and nothing is written into the job workdir — so the buyer's delivery is
+untouched. Only `field` is read: a refresh token sitting beside it is never read, forwarded, or
+substituted, which bounds a leaked placeholder to one job.
+
+Four things to know before you need them:
+
+- **A variable may have one owner.** A name in both `forward_env` and `file_credentials`, or in two
+  `file_credentials` entries, is refused at startup. Docker keeps the last `-e NAME=…`, so otherwise
+  one of the two values would be discarded with nothing to show it.
+- **Expiry is not handled here.** The placeholder's own lifetime rolls per job, but the real session
+  expires on the vendor's schedule and nothing in maxplayer refreshes it. When it does, jobs fail with
+  the vendor's auth errors. Log in again and the **next** job picks up the new value, because the file
+  is read per job rather than cached at startup.
+- **`endpoint_arg` is per client and it is measured, not guessed.** That flag is what redirects
+  credential-bearing traffic for `cursor-agent 2026.07.09`; that client ignores its own base-URL
+  *environment* variables for those calls, which is the entire reason the redirect is an argv flag.
+  Another client needs its own measurement — do not assume the flag's name, or that a flag is needed.
+- **The container leg is unproven.** The host leg is verified end to end against the real vendor, with
+  a negative control. The placeholder has not been carried through a running container, and no seat
+  sets `mode = "docker"` today. Under `launcher` mode this key is inert.
 
 #### The credential proxy listens on every interface — firewall it on a public box
 

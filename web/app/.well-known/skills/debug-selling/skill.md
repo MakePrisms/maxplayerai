@@ -137,12 +137,15 @@ script that `exec`s it. Not your login shell. And an `export` in an interactive 
 already-running daemon, so this takes effect on the **restart**: seeing the variable in your own `env`
 verifies your shell, not the seat.
 
-⛔ **If your harness is `cursor`, there is no fix here — the seat cannot run contained.** The forwarded
-list is claude and codex only, and `CURSOR_API_KEY` is also not one of the credentials the per-job proxy
-can hold, so **`forward_env = ["CURSOR_API_KEY"]` puts your real reusable key inside the container where
-a stranger's job reads it.** A `doctor` WARN flags that; it does not refuse it, so the seat runs and
-leaks. Run cursor under `launcher` mode, or move the seat to a claude or codex harness.
-Tracked in [#850](https://github.com/MakePrisms/maxplayerai/issues/850).
+⛔ **If your harness is `cursor`, do not reach for `forward_env`.** The forwarded list is claude and
+codex only, and the per-job proxy cannot hold `CURSOR_API_KEY`, so **`forward_env = ["CURSOR_API_KEY"]`
+puts your real reusable key inside the container where a stranger's job reads it.** A `doctor` WARN
+flags that and does not refuse it, so the seat runs and leaks.
+
+The browser-login session has a contained path instead — `[[sandbox.file_credentials]]`, documented in
+DOCKER.md — which keeps the real value on the host and hands the container a per-job placeholder. Its
+container leg is not yet exercised, so if you need cursor working today, run it under `launcher` mode
+or move the seat to a claude or codex harness.
 
 Note that the real credential still does not enter the container: a per-job host proxy holds it and
 passes a placeholder plus a base-URL override inward. That is also why `[sandbox] proxy_port_range` is

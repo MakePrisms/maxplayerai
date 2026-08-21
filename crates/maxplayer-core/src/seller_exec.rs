@@ -131,6 +131,11 @@ pub struct DockerPolicy {
     /// policy because the proxy is started by the same launch path that builds the argv, and the
     /// firewall pinhole and the bind must name the same ports or the job cannot reach its model.
     proxy_ports: Option<crate::sandbox_net::PortRange>,
+    /// Credentials the proxy sources from a host FILE instead of the daemon's environment (#852).
+    /// Resolved from [`crate::home::SandboxConfig::file_credentials`]. Carried on the policy for the
+    /// same reason as `proxy_ports`: the containment path that reads them is the one that builds the
+    /// launch, so both come from one config value rather than being written down twice.
+    file_credentials: Vec<crate::home::FileCredential>,
 }
 
 /// The agent-auth environment carried from the daemon into the container.
@@ -254,12 +259,78 @@ impl SandboxPolicy {
                     .map_err(|error| {
                         ExecError::Config(format!("[sandbox] proxy_port_range: {error}"))
                     })?;
+                // Refused HERE, at config resolution, for the same reason as a malformed port range:
+                // a relative path would otherwise resolve against whatever cwd the daemon happens to
+                // have, and the job would fail to authenticate with nothing naming the path as the
+                // cause.
+                for cred in &config.file_credentials {
+                    if !cred.path.is_absolute() {
+                        return Err(ExecError::Config(format!(
+                            "[sandbox] file_credentials: path must be absolute, got {}",
+                            cred.path.display()
+                        )));
+                    }
+                    for (label, value) in [
+                        ("field", &cred.field),
+                        ("env", &cred.env),
+                        ("upstream", &cred.upstream),
+                        ("endpoint_arg", &cred.endpoint_arg),
+                    ] {
+                        if value.trim().is_empty() {
+                            return Err(ExecError::Config(format!(
+                                "[sandbox] file_credentials: {label} must not be empty (path {})",
+                                cred.path.display()
+                            )));
+                        }
+                    }
+                    if crate::credential_proxy::authority_of(&cred.upstream).is_none() {
+                        return Err(ExecError::Config(format!(
+                            "[sandbox] file_credentials: upstream {} is not a valid URL",
+                            cred.upstream
+                        )));
+                    }
+                    // Forwarding the SAME variable the placeholder occupies is refused rather than
+                    // merged. Both would reach the launch as `-e NAME=…` and only one can win, so the
+                    // seat's behaviour would rest on argument order; and if the daemon's copy differs
+                    // from the file's (a stale export beside a re-logged-in file) it is not in the
+                    // substitution set and would cross RAW. A config error is the only outcome here
+                    // that cannot leak.
+                    let env_name = cred.env.trim();
+                    if config.forward_env.iter().any(|name| name.trim() == env_name)
+                        || FORWARDED_AGENT_ENV.contains(&env_name)
+                    {
+                        return Err(ExecError::Config(format!(
+                            "[sandbox] file_credentials: {env_name} is also forwarded as an \
+                             environment variable — remove it from forward_env, because the \
+                             placeholder and the daemon's own copy cannot both occupy it"
+                        )));
+                    }
+                    // And the same name claimed by two entries. Docker keeps the LAST `-e NAME=…`,
+                    // so the shadowed entry's placeholder never reaches the container and its
+                    // upstream rejects every job — a per-job failure nobody can attribute to a
+                    // config typo. Neither value is real, so this is fail-visible rather than a
+                    // leak; it is refused here because boot is where the operator is still looking.
+                    if config
+                        .file_credentials
+                        .iter()
+                        .filter(|other| other.env.trim() == env_name)
+                        .count()
+                        > 1
+                    {
+                        return Err(ExecError::Config(format!(
+                            "[sandbox] file_credentials: {env_name} is claimed by two entries — \
+                             docker keeps the last one, so the other's placeholder never reaches \
+                             the container and its upstream rejects every job"
+                        )));
+                    }
+                }
                 Ok(Self::docker(DockerPolicy {
                     image,
                     forward_env: config.forward_env.clone(),
                     runtime,
                     network,
                     proxy_ports,
+                    file_credentials: config.file_credentials.clone(),
                 }))
             }
         }
@@ -323,6 +394,15 @@ impl SandboxPolicy {
         }
     }
 
+    /// The file-sourced credentials this policy contains (#852), empty under a host policy — which
+    /// needs no containment at all, having inherited the daemon's environment and filesystem.
+    pub fn file_credentials(&self) -> &[crate::home::FileCredential] {
+        match &self.kind {
+            PolicyKind::Docker(policy) => &policy.file_credentials,
+            PolicyKind::Passthrough | PolicyKind::Launcher(_) => &[],
+        }
+    }
+
     /// The host argv for `agent_command` under this policy — the command unchanged under
     /// pass-through, the launcher argv followed by the command under a launcher — or `None` under a
     /// docker policy, whose launch is not expressible as a bare host argv (it needs the per-job
@@ -361,6 +441,26 @@ impl SandboxPolicy {
                 argv
             }
             PolicyKind::Docker(policy) => {
+                // A placeholder shares the container environment with the delivery identity, the
+                // forwarded allowlist, and any base-URL override. Docker keeps the LAST
+                // `-e NAME=…`, so a name set twice silences one claimant: its placeholder never
+                // arrives and its upstream rejects every job. `contain_env_values` cannot cause
+                // this — it resolves an override by mutating the pair it finds — so the appended
+                // file-credential pairs are the only path that can produce a duplicate.
+                //
+                // Scoped to file-credential names deliberately. A seat with no `file_credentials`
+                // iterates nothing here, so this guard cannot change any launch that works today.
+                for cred in &policy.file_credentials {
+                    let name = cred.env.trim();
+                    if job.env.iter().filter(|(key, _)| key.trim() == name).count() > 1 {
+                        return Err(ExecError::Config(format!(
+                            "the container environment sets {name} twice — docker keeps the last \
+                             value, so the placeholder for {} would be dropped and every job to \
+                             it would fail to authenticate",
+                            cred.upstream
+                        )));
+                    }
+                }
                 let argv = policy.run_argv(agent_command, job);
                 // The ACP session runs at the in-container mount point, not the host path.
                 return Ok(split_argv(argv, PathBuf::from(CONTAINER_WORKDIR)));
@@ -935,6 +1035,9 @@ pub async fn run_agent_job(
     // The delivery identity, plus the agent-auth allowlist a container needs because it inherits
     // nothing from the daemon. Empty under a host executor, which already inherits it all.
     let mut env = identity.git_env();
+    // The argv actually spawned. Identical to `agent_command` unless containment adds a redirect flag
+    // for a file-sourced credential, whose proxy URL is not known until the proxy is bound.
+    let mut effective_command = agent_command.to_vec();
     let forwarded = forwarded_agent_env(policy);
     // Credential containment (#647). Under docker the real model credential must NOT enter the
     // container: a stranger's job can read `-e ANTHROPIC_API_KEY` and exfiltrate a reusable secret.
@@ -999,8 +1102,15 @@ pub async fn run_agent_job(
             .as_ref()
             .map(|(_, host)| host.as_str())
             .unwrap_or(crate::credential_proxy::PROXY_HOST_ALIAS);
-        match start_credential_containment(&forwarded, policy.proxy_ports(), proxy_host).await? {
-            Some((contained, proxy)) => {
+        match start_credential_containment(
+            &forwarded,
+            policy.file_credentials(),
+            policy.proxy_ports(),
+            proxy_host,
+        )
+        .await?
+        {
+            Some(containment) => {
                 // A contained credential the job cannot reach is worse than a loud failure: the run
                 // would burn its whole timeout on auth errors. The pinhole comes from `proxy_ports`,
                 // so without a range there is no hole for the proxy to be reached through.
@@ -1012,8 +1122,11 @@ pub async fn run_agent_job(
                             .into(),
                     ));
                 }
-                env.extend(contained);
-                _proxy = Some(proxy);
+                env.extend(containment.env);
+                // A file-sourced credential is reached through the client's own flag, not a base-URL
+                // variable, so the redirect has to land in the argv the driver spawns.
+                effective_command.extend(containment.argv_extra);
+                _proxy = Some(containment.proxy);
             }
             None => env.extend(forwarded),
         }
@@ -1027,7 +1140,7 @@ pub async fn run_agent_job(
         gid,
         netns: holder.as_ref().map(|(name, _)| name.as_str()),
     };
-    let launch = policy.launch(agent_command, &job)?;
+    let launch = policy.launch(&effective_command, &job)?;
     // The ACP idle/response timeout IS the unified job timeout — never a hardcoded 300s that could
     // override or conflict with `--job-timeout-secs`.
     let mut driver = AcpDriver::new(
@@ -1118,16 +1231,26 @@ const CONTAINED_CREDENTIALS: &[ContainedCred] = &[
     },
 ];
 
-/// Whether `name` is a credential variable the proxy contains.
-fn is_contained_credential(name: &str) -> bool {
+/// Whether `name` is a credential variable the proxy contains, across BOTH registries: the built-in
+/// [`CONTAINED_CREDENTIALS`] table and the operator's `[sandbox] file_credentials`.
+///
+/// Both, because containment is the property being audited and it has two sources. A predicate over
+/// only the table would report a file-sourced credential as uncontained, and — the direction that
+/// actually costs something — would let the doctor's completeness claim be emitted by a check that
+/// cannot see half of what it claims about.
+fn is_contained_credential(name: &str, file_creds: &[crate::home::FileCredential]) -> bool {
     CONTAINED_CREDENTIALS.iter().any(|cred| cred.env == name)
+        || file_creds.iter().any(|cred| cred.env.trim() == name)
 }
 
 /// Forwarded variables that would cross into a docker container UNCONTAINED: the operator-added
 /// `[sandbox] forward_env` names (beyond the built-in allowlist) that are SET and are NOT one of the
-/// contained credential variables. Every KNOWN credential variable is now contained, so what remains
-/// is operator-added names the daemon cannot recognize — a `MY_AGENT_TOKEN` may well be a credential,
-/// and the daemon has no way to know, so it is flagged rather than silently forwarded raw.
+/// contained credential variables — in EITHER registry (the built-in table or `[sandbox]
+/// file_credentials`). What remains is operator-added names the daemon cannot recognize: a
+/// `MY_AGENT_TOKEN` may well be a credential, and the daemon has no way to know, so it is flagged
+/// rather than silently forwarded raw.
+///
+/// The scope of that claim is exactly "the two registries", never "every credential that exists".
 ///
 /// Empty for a non-docker policy (a host executor inherits the daemon environment; there is no
 /// container to leak into). `lookup` injects the environment so the gap is testable. Drives the loud
@@ -1145,7 +1268,10 @@ pub fn uncontained_forwarded_credentials(
     let mut out = Vec::new();
     for name in extras {
         let name = name.trim();
-        if name.is_empty() || is_contained_credential(name) || seen.contains(&name) {
+        if name.is_empty()
+            || is_contained_credential(name, policy.file_credentials())
+            || seen.contains(&name)
+        {
             continue;
         }
         seen.push(name);
@@ -1164,10 +1290,87 @@ struct MintedCredential {
     upstream: String,
 }
 
+/// What containment hands back to the launch: the container-facing environment, any argv the client
+/// needs in order to reach the proxy, and the running proxy itself (dropped at job end, which revokes
+/// every placeholder).
+///
+/// `argv_extra` exists because redirection is not uniformly an environment variable. A file-sourced
+/// credential names the client's own flag instead — measured necessary for `cursor-agent`, whose env
+/// base-URL overrides are ignored for credential-bearing traffic.
+#[cfg(feature = "acp")]
+struct Containment {
+    env: Vec<(String, String)>,
+    argv_extra: Vec<String>,
+    proxy: crate::credential_proxy::RunningProxy,
+}
+
+/// The `type` claim minted into a file-credential placeholder.
+///
+/// A plausible value, NOT a measured requirement: nothing was observed reading it, and the signature
+/// cannot be checked by the bearer in any case. Recorded as a choice so a later reader does not treat
+/// it as a constraint discovered from the vendor.
+#[cfg(feature = "acp")]
+const FILE_CREDENTIAL_CLAIM_TYPE: &str = "session";
+
+/// How long a file-credential placeholder claims to be valid.
+///
+/// Only has to outlast one job — the placeholder is revoked when the proxy drops at job end — but it
+/// is generous because the failure is silent and one-sided: a client that refuses an
+/// already-expired-looking token never reaches the wire, and the job dies with an auth error that
+/// says nothing about `exp`. Rolling per job, never a fixed timestamp.
+#[cfg(feature = "acp")]
+const FILE_CREDENTIAL_PLACEHOLDER_LIFETIME: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Read one file-sourced credential's real value from the host (#852).
+///
+/// Called per job rather than cached at daemon start, and that is load-bearing: the operator's
+/// standing remediation for an expired session is to log in again, which REWRITES this file. A value
+/// cached at startup would survive that re-login and every job would fail to authenticate AFTER being
+/// awarded — the most expensive moment to discover a stale credential.
+///
+/// No error message can carry the file's content: a parse failure reports line and column only, and a
+/// missing field names the field, never a value.
+#[cfg(feature = "acp")]
+fn read_file_credential(cred: &crate::home::FileCredential) -> Result<String, ExecError> {
+    let raw = std::fs::read_to_string(&cred.path).map_err(|error| {
+        ExecError::Config(format!(
+            "[sandbox] file_credentials: cannot read {}: {error}",
+            cred.path.display()
+        ))
+    })?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+        ExecError::Config(format!(
+            "[sandbox] file_credentials: {} is not valid JSON (line {}, column {})",
+            cred.path.display(),
+            error.line(),
+            error.column()
+        ))
+    })?;
+    parsed
+        .get(&cred.field)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            ExecError::Config(format!(
+                "[sandbox] file_credentials: {} has no non-empty string field `{}`",
+                cred.path.display(),
+                cred.field
+            ))
+        })
+}
+
 /// Establish credential containment for a docker job, or `Ok(None)` when no contained credential is
 /// present (nothing to contain). For every contained credential the operator forwards, mint a per-job
 /// placeholder, register `(placeholder → real, upstream)` with the proxy, and route the vendor's
 /// base URL through the proxy.
+///
+/// File-sourced credentials (`[sandbox] file_credentials`) are handled alongside, differing in three
+/// ways: the real value comes from a file rather than an env pair, the placeholder is a parseable JWT
+/// rather than prefix-plus-random, and the client is redirected by an argv flag rather than a base-URL
+/// variable.
 ///
 /// `Err` on any failure to stand up the proxy or register a credential: the caller turns that into a
 /// failed job. This is the no-fallback invariant — the one failure mode that must never silently leave
@@ -1175,9 +1378,10 @@ struct MintedCredential {
 #[cfg(feature = "acp")]
 async fn start_credential_containment(
     forwarded: &[(String, String)],
+    file_creds: &[crate::home::FileCredential],
     proxy_ports: Option<crate::sandbox_net::PortRange>,
     proxy_host: &str,
-) -> Result<Option<(Vec<(String, String)>, crate::credential_proxy::RunningProxy)>, ExecError> {
+) -> Result<Option<Containment>, ExecError> {
     use crate::credential_proxy as proxy;
     use std::sync::Arc;
 
@@ -1218,7 +1422,40 @@ async fn start_credential_containment(
             },
         ));
     }
-    if minted.is_empty() {
+    // File-sourced credentials (#852). Read and validated BEFORE the proxy starts, same rule as the
+    // env-sourced ones above: an unreadable file or a missing field fails the job without leaving a
+    // half-started listener behind.
+    //
+    // The placeholder is a JWT, not prefix-plus-random: the client PARSES this value (a malformed one
+    // is refused locally and never reaches the wire, which presents as "containment broke the seat"
+    // rather than as a bad placeholder). `exp` is per-job and rolling for the same reason a fixed one
+    // would be wrong — it would start being refused at a date nothing in the config explains.
+    let mut minted_files: Vec<(&crate::home::FileCredential, MintedCredential)> = Vec::new();
+    for cred in file_creds {
+        let real = read_file_credential(cred)?;
+        let upstream = cred.upstream.trim().to_owned();
+        let host = proxy::authority_of(&upstream).ok_or_else(|| {
+            ExecError::Config(format!(
+                "[sandbox] file_credentials: upstream {upstream} is not a valid URL"
+            ))
+        })?;
+        if !upstream_hosts.contains(&host) {
+            upstream_hosts.push(host);
+        }
+        minted_files.push((
+            cred,
+            MintedCredential {
+                real,
+                placeholder: proxy::mint_jwt_placeholder(
+                    FILE_CREDENTIAL_CLAIM_TYPE,
+                    FILE_CREDENTIAL_PLACEHOLDER_LIFETIME,
+                ),
+                upstream,
+            },
+        ));
+    }
+
+    if minted.is_empty() && minted_files.is_empty() {
         return Ok(None);
     }
 
@@ -1285,8 +1522,36 @@ async fn start_credential_containment(
         }
     }
 
-    let contained = contain_env_values(forwarded, &substitutions, &base_url_overrides, &base_url);
-    Ok(Some((contained, running)))
+    // File-sourced credentials: register the swap, hand the container the PLACEHOLDER in the variable
+    // the operator named, and append the client's own redirect flag to the argv.
+    //
+    // The real values join `substitutions` BEFORE the env rewrite below, so a forwarded variable that
+    // happens to carry the same secret is scrubbed too — the same value-based defence the env-sourced
+    // entries get, not a weaker path for arriving from a file.
+    let mut placed: Vec<(&crate::home::FileCredential, String)> = Vec::new();
+    for (cred, m) in &minted_files {
+        engine
+            .register(proxy::JobCredential {
+                placeholder: m.placeholder.clone(),
+                real: m.real.clone(),
+                upstream: m.upstream.clone(),
+            })
+            .map_err(|refusal| {
+                ExecError::Agent(format!("credential proxy registration refused: {refusal}"))
+            })?;
+        substitutions.push((m.real.clone(), m.placeholder.clone()));
+        placed.push((cred, m.placeholder.clone()));
+    }
+    let (file_env, argv_extra) = file_credential_launch_additions(&placed, &base_url);
+
+    let mut contained = contain_env_values(forwarded, &substitutions, &base_url_overrides, &base_url);
+    // Appended AFTER the rewrite: these pairs carry placeholders, which have nothing to scrub.
+    contained.extend(file_env);
+    Ok(Some(Containment {
+        env: contained,
+        argv_extra,
+        proxy: running,
+    }))
 }
 
 /// Rewrite the forwarded env into what the container actually receives: every occurrence of each real
@@ -1323,6 +1588,27 @@ pub fn contain_env_values(
         }
     }
     out
+}
+
+/// What a set of placed file-credential placeholders adds to the launch: the container environment
+/// pairs carrying each placeholder, and the argv fragment redirecting the client at the proxy.
+///
+/// A pure transform, deliberately, so the red-prove can assert the real credential is absent and the
+/// redirect present without a container, a network, a proxy or a real key — the same reason
+/// [`contain_env_values`] is pure.
+#[cfg(feature = "acp")]
+fn file_credential_launch_additions(
+    placed: &[(&crate::home::FileCredential, String)],
+    base_url: &str,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut env = Vec::with_capacity(placed.len());
+    let mut argv = Vec::with_capacity(placed.len() * 2);
+    for (cred, placeholder) in placed {
+        env.push((cred.env.clone(), placeholder.clone()));
+        argv.push(cred.endpoint_arg.clone());
+        argv.push(base_url.to_owned());
+    }
+    (env, argv)
 }
 
 #[cfg(feature = "acp")]
@@ -1429,6 +1715,7 @@ mod tests {
             runtime: None,
             network: None,
             proxy_ports: None,
+            file_credentials: Vec::new(),
         });
         let env = vec![("GIT_AUTHOR_NAME".to_string(), "maxplayer-seller-abcd".to_string())];
         let workdir = Path::new("/home/seller/.maxplayer/seller-jobs/job1");
@@ -1477,6 +1764,7 @@ mod tests {
             runtime: None,
             network: None,
             proxy_ports: None,
+            file_credentials: Vec::new(),
         });
         let launch = policy
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -1529,6 +1817,7 @@ mod tests {
             runtime: None,
             network: None,
             proxy_ports: None,
+            file_credentials: Vec::new(),
         });
         let launch = default_rt
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -1546,6 +1835,7 @@ mod tests {
             runtime: Some("runsc".into()),
             network: None,
             proxy_ports: None,
+            file_credentials: Vec::new(),
         });
         let launch = gvisor
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -1581,6 +1871,7 @@ mod tests {
             runtime: None,
             network: None,
             proxy_ports: None,
+            file_credentials: Vec::new(),
         });
         let launch = unset
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -1597,6 +1888,7 @@ mod tests {
             runtime: None,
             network: Some("maxplayer-sbx".into()),
             proxy_ports: None,
+            file_credentials: Vec::new(),
         });
         let launch = joined
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -1729,6 +2021,7 @@ mod tests {
             runtime: None,
             network: None,
             proxy_ports: None,
+            file_credentials: Vec::new(),
         });
         let carried = forwarded_agent_env_from(&docker, daemon_env);
         let names: Vec<&str> = carried.iter().map(|(k, _)| k.as_str()).collect();
@@ -1748,6 +2041,285 @@ mod tests {
             !names.contains(&"ANTHROPIC_AUTH_TOKEN"),
             "an unset variable must not be forwarded empty: {carried:?}"
         );
+    }
+
+    fn file_cred() -> crate::home::FileCredential {
+        crate::home::FileCredential {
+            path: PathBuf::from("/home/seller/.config/cursor/auth.json"),
+            field: "accessToken".into(),
+            env: "CURSOR_AUTH_TOKEN".into(),
+            upstream: "https://api2.cursor.sh".into(),
+            endpoint_arg: "--endpoint".into(),
+        }
+    }
+
+    fn docker_with(file_credentials: Vec<crate::home::FileCredential>) -> crate::home::SandboxConfig {
+        crate::home::SandboxConfig {
+            mode: crate::home::SandboxMode::Docker,
+            file_credentials,
+            ..Default::default()
+        }
+    }
+
+    // A relative path is REFUSED at config resolution, not resolved against whatever cwd the daemon
+    // happens to have. A daemon started by systemd need not share the operator's `$HOME`, so silently
+    // resolving one would present as an auth failure inside the job with nothing naming the path.
+    #[test]
+    fn a_file_credential_path_must_be_absolute() {
+        let relative = crate::home::FileCredential {
+            path: PathBuf::from(".config/cursor/auth.json"),
+            ..file_cred()
+        };
+        let error = SandboxPolicy::from_config(Some(&docker_with(vec![relative])))
+            .expect_err("a relative path must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("must be absolute") && message.contains(".config/cursor/auth.json"),
+            "the error must name the offending path: {message}"
+        );
+        SandboxPolicy::from_config(Some(&docker_with(vec![file_cred()])))
+            .expect("an absolute path resolves");
+    }
+
+    // Every field is load-bearing, so a blank one is a config error rather than a silent no-op: a
+    // blank `endpoint_arg` would leave the client talking to the vendor, and a blank `env` would put
+    // the placeholder nowhere — both presenting as an unexplained auth failure per job.
+    #[test]
+    fn a_file_credential_refuses_blank_fields_and_a_malformed_upstream() {
+        for (label, cred) in [
+            ("field", crate::home::FileCredential { field: "  ".into(), ..file_cred() }),
+            ("env", crate::home::FileCredential { env: String::new(), ..file_cred() }),
+            ("upstream", crate::home::FileCredential { upstream: " ".into(), ..file_cred() }),
+            ("endpoint_arg", crate::home::FileCredential { endpoint_arg: "".into(), ..file_cred() }),
+        ] {
+            let error = SandboxPolicy::from_config(Some(&docker_with(vec![cred])))
+                .expect_err("a blank {label} must be refused");
+            assert!(
+                error.to_string().contains(label),
+                "the error must name which field was blank, got: {error}"
+            );
+        }
+        let bad_upstream = crate::home::FileCredential {
+            upstream: "api2.cursor.sh".into(), // no scheme
+            ..file_cred()
+        };
+        let error = SandboxPolicy::from_config(Some(&docker_with(vec![bad_upstream])))
+            .expect_err("an upstream with no scheme must be refused");
+        assert!(error.to_string().contains("not a valid URL"), "{error}");
+    }
+
+    // The value is read from the file at call time. The failure messages are asserted to name the
+    // FIELD and never a value: this file holds a live credential, so an error that quoted its content
+    // would write the secret into a log the operator never chose to expose.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn read_file_credential_takes_the_named_field_and_no_error_quotes_a_value() {
+        let dir = std::env::temp_dir().join(format!("mp852-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("auth.json");
+
+        std::fs::write(
+            &path,
+            br#"{"accessToken":"the-real-one","refreshToken":"the-refresh-one"}"#,
+        )
+        .expect("write");
+        let cred = crate::home::FileCredential { path: path.clone(), ..file_cred() };
+        assert_eq!(read_file_credential(&cred).expect("reads"), "the-real-one");
+
+        // The neighbouring refresh token is never read, which is what bounds a leaked placeholder to
+        // one job: only the named field is ever substituted.
+        let refresh_only =
+            crate::home::FileCredential { field: "nonexistent".into(), ..cred.clone() };
+        let error = read_file_credential(&refresh_only).expect_err("missing field");
+        let message = error.to_string();
+        assert!(message.contains("nonexistent"), "must name the field: {message}");
+        assert!(
+            !message.contains("the-real-one") && !message.contains("the-refresh-one"),
+            "an error must never quote a credential value: {message}"
+        );
+
+        std::fs::write(&path, b"{not json").expect("write");
+        let error = read_file_credential(&cred).expect_err("malformed json");
+        let message = error.to_string();
+        assert!(message.contains("not valid JSON"), "{message}");
+        assert!(
+            !message.contains("not json"),
+            "a parse error must report position only, never content: {message}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // RED-PROVE. The container sees a PLACEHOLDER and the redirect flag; the real credential appears
+    // in neither, including inside an unrelated forwarded variable that happens to carry the same
+    // secret. Pure transforms, so this needs no container, network, proxy or real key.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_file_credential_gives_the_container_a_placeholder_and_redirects_by_argv() {
+        const REAL: &str = "REAL-CURSOR-SESSION-SENTINEL";
+        let base_url = "http://host.docker.internal:41111";
+        let cred = file_cred();
+        let placeholder = crate::credential_proxy::mint_jwt_placeholder(
+            "session",
+            std::time::Duration::from_secs(600),
+        );
+
+        // The same value-based scrub the env-sourced entries get: a file-sourced secret that also
+        // appears in a forwarded variable is replaced there too.
+        let forwarded = vec![("SOME_OPERATOR_VAR".to_owned(), format!("prefix {REAL} suffix"))];
+        let substitutions = vec![(REAL.to_owned(), placeholder.clone())];
+        let mut view = contain_env_values(&forwarded, &substitutions, &[], base_url);
+        let (file_env, argv_extra) =
+            file_credential_launch_additions(&[(&cred, placeholder.clone())], base_url);
+        view.extend(file_env);
+
+        assert!(
+            view.iter().all(|(_, value)| !value.contains(REAL)),
+            "the real credential reached the container view: {view:?}"
+        );
+        assert!(
+            view.contains(&("CURSOR_AUTH_TOKEN".to_owned(), placeholder.clone())),
+            "the placeholder must arrive in the variable the operator named: {view:?}"
+        );
+        assert_eq!(
+            argv_extra,
+            vec!["--endpoint".to_owned(), base_url.to_owned()],
+            "the client is redirected by ITS OWN flag, because its base-URL env vars are ignored for \
+             credential traffic"
+        );
+        // The client PARSES this value, so a placeholder that is not a well-formed JWT would be
+        // refused locally and never reach the wire — presenting as "containment broke the seat".
+        assert_eq!(placeholder.split('.').count(), 3, "placeholder must be a JWT: {placeholder}");
+        assert!(
+            !placeholder.contains('=') && !placeholder.contains('+') && !placeholder.contains('/'),
+            "segments must be unpadded base64url: {placeholder}"
+        );
+    }
+
+    // Containment now has TWO registries, and the auditor must enumerate both. A predicate over only
+    // the built-in table would report a file-sourced credential as crossing UNCONTAINED — and, worse,
+    // would let the doctor emit a completeness claim covering a registry it cannot see.
+    //
+    // Constructed directly rather than through `from_config`, which refuses this combination outright
+    // (see below): the point here is the PREDICATE, so it is exercised where config validation cannot
+    // mask it.
+    #[test]
+    fn the_uncontained_audit_counts_both_registries_not_just_the_table() {
+        let cred = file_cred();
+        let policy = SandboxPolicy::docker(DockerPolicy {
+            image: "maxplayer-sandbox:latest".into(),
+            forward_env: vec!["CURSOR_AUTH_TOKEN".into(), "MY_AGENT_TOKEN".into()],
+            runtime: None,
+            network: None,
+            proxy_ports: None,
+            file_credentials: vec![cred],
+        });
+        let uncontained =
+            uncontained_forwarded_credentials(&policy, |_| Some("set-to-something".to_owned()));
+        assert!(
+            !uncontained.contains(&"CURSOR_AUTH_TOKEN".to_owned()),
+            "a file-sourced credential IS contained and must not be reported as leaking: \
+             {uncontained:?}"
+        );
+        assert!(
+            uncontained.contains(&"MY_AGENT_TOKEN".to_owned()),
+            "an unrecognized forwarded variable must still be flagged, or this check has stopped \
+             discriminating: {uncontained:?}"
+        );
+    }
+
+    // Forwarding the same variable the placeholder occupies is refused, not merged. Both would arrive
+    // as `-e NAME=…` and only one can win, so behaviour would rest on argument order; and a daemon
+    // copy that DIFFERS from the file's (a stale export beside a re-logged-in file) is not in the
+    // substitution set and would cross RAW.
+    #[test]
+    fn a_file_credential_variable_may_not_also_be_forwarded() {
+        let mut config = docker_with(vec![file_cred()]);
+        config.forward_env = vec!["CURSOR_AUTH_TOKEN".into()];
+        let error = SandboxPolicy::from_config(Some(&config))
+            .expect_err("the same variable from two sources must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("CURSOR_AUTH_TOKEN") && message.contains("also forwarded"),
+            "the error must name the collision: {message}"
+        );
+
+        // A built-in allowlist name collides too — the allowlist forwards it without the operator
+        // naming it, so the collision is invisible from `forward_env` alone.
+        let mut builtin = docker_with(vec![crate::home::FileCredential {
+            env: "ANTHROPIC_API_KEY".into(),
+            ..file_cred()
+        }]);
+        builtin.forward_env = Vec::new();
+        SandboxPolicy::from_config(Some(&builtin))
+            .expect_err("a built-in allowlist name must collide too");
+
+        // And the non-colliding case still resolves, so the guard is not refusing everything.
+        SandboxPolicy::from_config(Some(&docker_with(vec![file_cred()])))
+            .expect("a file credential with its own variable resolves");
+    }
+
+    // Two entries claiming one variable, refused at boot. Neither value is real, so this is
+    // fail-visible rather than a leak — but the visible failure is a per-job auth rejection whose
+    // cause is a config typo, and boot is where the operator is still looking at the config.
+    #[test]
+    fn two_file_credentials_may_not_claim_the_same_variable() {
+        let doubled = docker_with(vec![
+            file_cred(),
+            crate::home::FileCredential { upstream: "https://other.example".into(), ..file_cred() },
+        ]);
+        let error = SandboxPolicy::from_config(Some(&doubled))
+            .expect_err("one variable claimed twice must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("CURSOR_AUTH_TOKEN") && message.contains("two entries"),
+            "the error must name the variable and the cause: {message}"
+        );
+
+        // Distinct variables still resolve, so the guard counts NAMES and not entries.
+        SandboxPolicy::from_config(Some(&docker_with(vec![
+            file_cred(),
+            crate::home::FileCredential {
+                env: "OTHER_TOKEN".into(),
+                upstream: "https://other.example".into(),
+                ..file_cred()
+            },
+        ])))
+        .expect("two file credentials with distinct variables resolve");
+    }
+
+    // The launch-time half, for the sources config resolution cannot see: the delivery identity and
+    // any base-URL override are assembled per job. Docker keeps the last `-e NAME=…`, so a
+    // placeholder sharing a name with one of them is dropped and the vendor looks unreachable.
+    #[test]
+    fn a_docker_launch_refuses_a_placeholder_name_the_job_env_already_sets() {
+        let policy =
+            SandboxPolicy::from_config(Some(&docker_with(vec![file_cred()]))).expect("a policy");
+        let agent_command = vec!["cursor-agent".to_string()];
+        let workdir = Path::new("/home/seller/.maxplayer/seller-jobs/job1");
+        let collided = vec![
+            ("CURSOR_AUTH_TOKEN".to_string(), "from-another-source".to_string()),
+            ("CURSOR_AUTH_TOKEN".to_string(), "the-placeholder".to_string()),
+        ];
+
+        let error = policy
+            .launch(&agent_command, &job(workdir, &collided))
+            .expect_err("a name set twice must be refused");
+        assert!(
+            error.to_string().contains("CURSOR_AUTH_TOKEN"),
+            "the error must name the variable: {error}"
+        );
+
+        // One claimant launches, so the guard is not refusing every containment launch.
+        let clean = vec![("CURSOR_AUTH_TOKEN".to_string(), "the-placeholder".to_string())];
+        policy.launch(&agent_command, &job(workdir, &clean)).expect("one claimant launches");
+
+        // INERTNESS, asserted rather than argued: a seat with no `file_credentials` iterates
+        // nothing, so the identical duplicate launches exactly as it does today. This guard cannot
+        // change a launch that works now.
+        SandboxPolicy::from_config(Some(&docker_with(Vec::new())))
+            .expect("a policy with no file credentials")
+            .launch(&agent_command, &job(workdir, &collided))
+            .expect("no file credentials ⇒ the guard is inert");
     }
 
     // A host executor is already a child of the daemon and inherits its whole environment, so
@@ -1776,6 +2348,7 @@ mod tests {
             runtime: None,
             network: None,
             proxy_ports: None,
+            file_credentials: Vec::new(),
         });
         let carried = forwarded_agent_env_from(&policy, env);
         let names: Vec<&str> = carried.iter().map(|(k, _)| k.as_str()).collect();
@@ -1797,6 +2370,7 @@ mod tests {
             runtime: None,
             network: None,
             proxy_ports: None,
+            file_credentials: Vec::new(),
         });
         let env = vec![("ANTHROPIC_API_KEY".to_string(), "sk-ant-xxx".to_string())];
         let launch = policy
@@ -1844,6 +2418,7 @@ mod tests {
             runtime: None,
             network: None,
             proxy_ports: None,
+            file_credentials: Vec::new(),
         });
         let forwarded: Vec<(String, String)> =
             SYNTHETIC_REALS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
@@ -1873,6 +2448,7 @@ mod tests {
             runtime: None,
             network: None,
             proxy_ports: None,
+            file_credentials: Vec::new(),
         });
         // All four credentials, an operator var carrying one of the secrets (must be scrubbed too), and
         // both vendor base URLs (the overrides must replace, not append).
@@ -1962,6 +2538,7 @@ mod tests {
             runtime: None,
             network: None,
             proxy_ports: None,
+            file_credentials: Vec::new(),
         });
         let launch = policy
             .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
@@ -1985,6 +2562,7 @@ mod tests {
                 runtime: None,
                 network: None,
                 proxy_ports: None,
+                file_credentials: Vec::new(),
             })
         };
         // Operator forwards an unknown var (set), a known credential (contained), and a blank one.
@@ -2001,7 +2579,7 @@ mod tests {
         };
         assert_eq!(uncontained_forwarded_credentials(&policy, env), vec!["MY_AGENT_TOKEN".to_owned()]);
         // No operator extras ⇒ nothing to warn about even with every known credential set.
-        let all_known = |key: &str| is_contained_credential(key).then(|| "real".to_owned());
+        let all_known = |key: &str| is_contained_credential(key, &[]).then(|| "real".to_owned());
         assert!(uncontained_forwarded_credentials(&docker(Vec::new()), all_known).is_empty());
         // A non-docker policy forwards nothing into a container ⇒ never flagged.
         assert!(uncontained_forwarded_credentials(
@@ -2096,6 +2674,7 @@ mod tests {
                 runtime: None,
                 network: None,
                 proxy_ports: None,
+                file_credentials: Vec::new(),
             });
         let job = JobLaunch {
             workdir: &workdir,

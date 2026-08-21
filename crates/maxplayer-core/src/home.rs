@@ -367,6 +367,55 @@ pub struct SandboxConfig {
     /// job rather than falling back to a random port (the containment path has no fallbacks).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_port_range: Option<String>,
+    /// `docker` mode: credentials whose real value the #647 proxy sources from a FILE on the host
+    /// rather than from the daemon's environment. Empty ⇒ no file-sourced credential, which is the
+    /// shipped behaviour.
+    ///
+    /// The built-in [`crate::seller_exec::CONTAINED_CREDENTIALS`] table assumes the secret is already
+    /// an environment variable the operator forwards. A harness that authenticates by browser login
+    /// leaves its session in a file instead, so there is nothing to forward and the credential would
+    /// cross into the container raw or not at all. Naming the file here lets the same
+    /// placeholder-and-substitute mechanism cover it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_credentials: Vec<FileCredential>,
+}
+
+/// One credential the proxy reads from a host file (#852).
+///
+/// Every field is required and none is defaulted per-vendor: a wrong guess here sends a real
+/// credential to a host nobody chose, and the operator already has to name the path and the field, so
+/// naming the upstream and the redirect costs nothing extra.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileCredential {
+    /// ABSOLUTE host path to the file the harness wrote (e.g.
+    /// `/home/debian/.config/cursor/auth.json`).
+    ///
+    /// Absolute on purpose, and a relative path is refused rather than resolved: a daemon started by
+    /// systemd need not share the operator's `$HOME`, so a path resolved against the wrong home would
+    /// present as an auth failure inside the job rather than as a config error.
+    pub path: PathBuf,
+    /// The top-level JSON field holding the credential (e.g. `accessToken`).
+    ///
+    /// Only this field is ever read. A refresh token sitting beside it is neither read, forwarded, nor
+    /// substituted — which is what bounds the exposure of a leaked placeholder to one job.
+    pub field: String,
+    /// The container environment variable that carries the PLACEHOLDER (e.g. `CURSOR_AUTH_TOKEN`).
+    ///
+    /// The real value never appears here; the proxy swaps it in at egress.
+    pub env: String,
+    /// The one upstream this credential may be substituted for (e.g. `https://api2.cursor.sh`).
+    pub upstream: String,
+    /// The client's own argument for pointing it at a different API base (e.g. `--endpoint`). The
+    /// proxy's URL is appended immediately after it.
+    ///
+    /// An ARGV flag rather than a base-URL environment variable because, measured on
+    /// `cursor-agent 2026.07.09`, the env overrides are IGNORED for credential-bearing traffic: with
+    /// `CURSOR_API_BASE_URL` and `CURSOR_API_ENDPOINT` both pointed at a local listener, the client
+    /// still went to `api2.cursor.sh` and the listener received nothing. With this flag it received
+    /// the request, credential verbatim in an `authorization` header. A vendor whose base URL *is*
+    /// honoured through the environment belongs in `CONTAINED_CREDENTIALS` instead.
+    pub endpoint_arg: String,
 }
 
 /// Which executor the `[sandbox]` section selects.
