@@ -801,6 +801,13 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
                 buyer_mint: context.home.config.default_mint(),
                 allow_real_mints: context.home.config.allow_real_mints,
                 requested_agent: offer.requested_agent.as_deref(),
+                // #784 capability request — INERT until the offer carries these. The predicate is
+                // live and wired; an absent request passes every claim, so award behaviour here is
+                // byte-unchanged. The offer-side fields live in `job_lifecycle.rs`'s OfferView and
+                // its tag parse, and land in a follow-up (see this PR's body).
+                requested_harness_family: None,
+                requested_model: None,
+                required_capabilities: &[],
             };
 
             // Manual award names the claim but applies the SAME hard filters (max_sats, price,
@@ -1307,6 +1314,11 @@ async fn drive_auto_award(
             buyer_mint: context.home.config.default_mint(),
             allow_real_mints: context.home.config.allow_real_mints,
             requested_agent: offer.requested_agent.as_deref(),
+            // #784 capability request — INERT until the offer carries these, exactly as on the
+            // manual path above. One predicate serves both award paths so they cannot drift.
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: &[],
         };
         if let Some(claim_id) = lifecycle::select_awardable_claim(&view, &filters) {
             return finalize_auto_award(context, job_id, offer.amount_sats, claim_id).await;
