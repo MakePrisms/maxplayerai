@@ -52,6 +52,48 @@ RUN npm install -g \
     @anthropic-ai/claude-code@2.1.223 \
     && npm cache clean --force
 
+# cursor. Deliberately NOT on the line above: `npm i -g cursor-agent` installs an unrelated third
+# party's package that ships NO BINARY, so adding it there would build green and leave the image
+# without cursor (docs/SELLER-QUICKSTART.md says so explicitly). `resolve_cursor` in
+# crates/maxplayer-core/src/agent_presets.rs looks for `cursor-agent` on PATH and appends `acp`;
+# cursor speaks ACP natively, so it needs no adapter package the way claude and codex do.
+#
+# We take the vendor's versioned TARBALL rather than pipe its install script to a shell, for two
+# measured reasons:
+#   * The script HARDCODES its own version, so fetching the script is unpinnable while fetching the
+#     tarball is pinnable — which keeps the reproducibility property the paragraph above establishes.
+#   * The script derives every path from $HOME and exposes no override. Run as root in a build that
+#     is /root/.local, which the `agent` user this image runs as cannot read: a green build and an
+#     unusable cursor.
+# The tarball is also the right unit to digest. A digest over `cursor-agent` itself would cover a
+# 4 KB launcher script, not the bundled Node application it execs.
+#
+# `node` does the fetch and the hash because it is already here (it is this image's Cmd) and `curl`
+# is not — so this adds no package to an image that runs a stranger's code.
+#
+# ARG TARGETARCH is declared INSIDE this stage on purpose. Only a stage-scoped ARG varies per
+# platform; a global-scope one resolves ONCE for the whole build, which hands the arm64 image the
+# x64 tarball with a green build and a checksum that verifies. Measured, not theorised — and it is
+# why `ADD --checksum` cannot express this: it needs the arch before a stage exists.
+ARG TARGETARCH
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      amd64) arch=x64;   sha=bfff4bf6f4e9dd30c1d0ef0a70b6077b074015dd2948e4c50685d53afdcfce5a ;; \
+      arm64) arch=arm64; sha=ea13f92e295f523a99ce8d8f57d6894d21e5d1e2d030ffad718ccd5955ca2eed ;; \
+      *) echo "cursor: unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    node -e 'const fs=require("fs"),c=require("crypto");const[u,want,out]=process.argv.slice(1);(async()=>{const r=await fetch(u);if(!r.ok)throw new Error(`GET ${u} -> HTTP ${r.status}`);const b=Buffer.from(await r.arrayBuffer());const got=c.createHash("sha256").update(b).digest("hex");if(got!==want)throw new Error(`digest mismatch: got ${got} over ${b.length} B, want ${want}`);fs.writeFileSync(out,b);console.log(`cursor package: ${b.length} B sha256 ${got}`);})().catch(e=>{console.error(String(e));process.exit(1);});' \
+      "https://downloads.cursor.com/lab/2026.08.11-e8db854/linux/${arch}/agent-cli-package.tar.gz" \
+      "$sha" /tmp/cursor.tar.gz; \
+    mkdir -p /usr/local/lib/cursor-agent; \
+    tar -xzf /tmp/cursor.tar.gz -C /usr/local/lib/cursor-agent; \
+    rm /tmp/cursor.tar.gz; \
+    found="$(find /usr/local/lib/cursor-agent -type f -name cursor-agent)"; \
+    test -n "$found" && test "$(printf '%s\n' "$found" | wc -l)" -eq 1; \
+    chmod +x "$found"; \
+    ln -s "$found" /usr/local/bin/cursor-agent; \
+    cursor-agent --version | tee /usr/local/lib/cursor-agent/VERSION
+
 # The nix a nix-flake-provisioned job needs. `EnvBackend::NixFlake` shells out to a bare `nix`
 # (crates/maxplayer-core/src/env_provision.rs), and under `[sandbox] mode = "docker"` that name
 # resolves HERE, not on the host — the host-side boot doctor's nix check cannot speak for the job's
