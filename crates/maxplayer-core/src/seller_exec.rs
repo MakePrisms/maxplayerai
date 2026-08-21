@@ -2073,6 +2073,7 @@ mod tests {
     // The value is read from the file at call time. The failure messages are asserted to name the
     // FIELD and never a value: this file holds a live credential, so an error that quoted its content
     // would write the secret into a log the operator never chose to expose.
+    #[cfg(feature = "acp")]
     #[test]
     fn read_file_credential_takes_the_named_field_and_no_error_quotes_a_value() {
         let dir = std::env::temp_dir().join(format!("mp852-{}", std::process::id()));
@@ -2113,6 +2114,7 @@ mod tests {
     // RED-PROVE. The container sees a PLACEHOLDER and the redirect flag; the real credential appears
     // in neither, including inside an unrelated forwarded variable that happens to carry the same
     // secret. Pure transforms, so this needs no container, network, proxy or real key.
+    #[cfg(feature = "acp")]
     #[test]
     fn a_file_credential_gives_the_container_a_placeholder_and_redirects_by_argv() {
         const REAL: &str = "REAL-CURSOR-SESSION-SENTINEL";
