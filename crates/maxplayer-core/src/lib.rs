@@ -89,6 +89,13 @@ pub mod seller_exec;
 /// docker-mode job's container. A per-job placeholder is forwarded in its place and substituted for
 /// the real value at egress, only for an allowlisted upstream. Gated to `wallet` like its sole caller
 /// [`seller_exec`].
+///
+/// ⚠ **Building this crate with `--features acp` prints `Finished` WITHOUT COMPILING THIS MODULE.**
+/// The gate is `wallet`, so an `acp` build skips the file entirely and a syntax error in it stays
+/// invisible behind a green build. An exit status has no access to "did my code compile" — the
+/// **test count** does: this crate reports ~327 tests under `acp` and ~1062 under `wallet`. When you
+/// change anything here, build `--features wallet` and check the denominator, not the status. A test
+/// filter that matches 0 tests is a question, never "no tests for that yet".
 #[cfg(feature = "wallet")]
 pub mod credential_proxy;
 /// Which of a node's resolved harnesses are serving right now: the live availability layer over the
