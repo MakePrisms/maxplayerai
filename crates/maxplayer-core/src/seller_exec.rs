@@ -305,6 +305,24 @@ impl SandboxPolicy {
                              placeholder and the daemon's own copy cannot both occupy it"
                         )));
                     }
+                    // And the same name claimed by two entries. Docker keeps the LAST `-e NAME=…`,
+                    // so the shadowed entry's placeholder never reaches the container and its
+                    // upstream rejects every job — a per-job failure nobody can attribute to a
+                    // config typo. Neither value is real, so this is fail-visible rather than a
+                    // leak; it is refused here because boot is where the operator is still looking.
+                    if config
+                        .file_credentials
+                        .iter()
+                        .filter(|other| other.env.trim() == env_name)
+                        .count()
+                        > 1
+                    {
+                        return Err(ExecError::Config(format!(
+                            "[sandbox] file_credentials: {env_name} is claimed by two entries — \
+                             docker keeps the last one, so the other's placeholder never reaches \
+                             the container and its upstream rejects every job"
+                        )));
+                    }
                 }
                 Ok(Self::docker(DockerPolicy {
                     image,
@@ -423,6 +441,26 @@ impl SandboxPolicy {
                 argv
             }
             PolicyKind::Docker(policy) => {
+                // A placeholder shares the container environment with the delivery identity, the
+                // forwarded allowlist, and any base-URL override. Docker keeps the LAST
+                // `-e NAME=…`, so a name set twice silences one claimant: its placeholder never
+                // arrives and its upstream rejects every job. `contain_env_values` cannot cause
+                // this — it resolves an override by mutating the pair it finds — so the appended
+                // file-credential pairs are the only path that can produce a duplicate.
+                //
+                // Scoped to file-credential names deliberately. A seat with no `file_credentials`
+                // iterates nothing here, so this guard cannot change any launch that works today.
+                for cred in &policy.file_credentials {
+                    let name = cred.env.trim();
+                    if job.env.iter().filter(|(key, _)| key.trim() == name).count() > 1 {
+                        return Err(ExecError::Config(format!(
+                            "the container environment sets {name} twice — docker keeps the last \
+                             value, so the placeholder for {} would be dropped and every job to \
+                             it would fail to authenticate",
+                            cred.upstream
+                        )));
+                    }
+                }
                 let argv = policy.run_argv(agent_command, job);
                 // The ACP session runs at the in-container mount point, not the host path.
                 return Ok(split_argv(argv, PathBuf::from(CONTAINER_WORKDIR)));
@@ -2218,6 +2256,70 @@ mod tests {
         // And the non-colliding case still resolves, so the guard is not refusing everything.
         SandboxPolicy::from_config(Some(&docker_with(vec![file_cred()])))
             .expect("a file credential with its own variable resolves");
+    }
+
+    // Two entries claiming one variable, refused at boot. Neither value is real, so this is
+    // fail-visible rather than a leak — but the visible failure is a per-job auth rejection whose
+    // cause is a config typo, and boot is where the operator is still looking at the config.
+    #[test]
+    fn two_file_credentials_may_not_claim_the_same_variable() {
+        let doubled = docker_with(vec![
+            file_cred(),
+            crate::home::FileCredential { upstream: "https://other.example".into(), ..file_cred() },
+        ]);
+        let error = SandboxPolicy::from_config(Some(&doubled))
+            .expect_err("one variable claimed twice must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("CURSOR_AUTH_TOKEN") && message.contains("two entries"),
+            "the error must name the variable and the cause: {message}"
+        );
+
+        // Distinct variables still resolve, so the guard counts NAMES and not entries.
+        SandboxPolicy::from_config(Some(&docker_with(vec![
+            file_cred(),
+            crate::home::FileCredential {
+                env: "OTHER_TOKEN".into(),
+                upstream: "https://other.example".into(),
+                ..file_cred()
+            },
+        ])))
+        .expect("two file credentials with distinct variables resolve");
+    }
+
+    // The launch-time half, for the sources config resolution cannot see: the delivery identity and
+    // any base-URL override are assembled per job. Docker keeps the last `-e NAME=…`, so a
+    // placeholder sharing a name with one of them is dropped and the vendor looks unreachable.
+    #[test]
+    fn a_docker_launch_refuses_a_placeholder_name_the_job_env_already_sets() {
+        let policy =
+            SandboxPolicy::from_config(Some(&docker_with(vec![file_cred()]))).expect("a policy");
+        let agent_command = vec!["cursor-agent".to_string()];
+        let workdir = Path::new("/home/seller/.maxplayer/seller-jobs/job1");
+        let collided = vec![
+            ("CURSOR_AUTH_TOKEN".to_string(), "from-another-source".to_string()),
+            ("CURSOR_AUTH_TOKEN".to_string(), "the-placeholder".to_string()),
+        ];
+
+        let error = policy
+            .launch(&agent_command, &job(workdir, &collided))
+            .expect_err("a name set twice must be refused");
+        assert!(
+            error.to_string().contains("CURSOR_AUTH_TOKEN"),
+            "the error must name the variable: {error}"
+        );
+
+        // One claimant launches, so the guard is not refusing every containment launch.
+        let clean = vec![("CURSOR_AUTH_TOKEN".to_string(), "the-placeholder".to_string())];
+        policy.launch(&agent_command, &job(workdir, &clean)).expect("one claimant launches");
+
+        // INERTNESS, asserted rather than argued: a seat with no `file_credentials` iterates
+        // nothing, so the identical duplicate launches exactly as it does today. This guard cannot
+        // change a launch that works now.
+        SandboxPolicy::from_config(Some(&docker_with(Vec::new())))
+            .expect("a policy with no file credentials")
+            .launch(&agent_command, &job(workdir, &collided))
+            .expect("no file credentials ⇒ the guard is inert");
     }
 
     // A host executor is already a child of the daemon and inherits its whole environment, so

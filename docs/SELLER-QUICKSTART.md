@@ -409,12 +409,17 @@ daemon **actually starts** — a systemd `Environment=`, a launchd plist, or the
 `exec`s it. Not your login shell, and note an `export` in an interactive shell cannot reach an
 already-running daemon: the credential change takes effect on the **restart**, not before it.
 
-⛔ **`cursor` has no credential path under docker mode.** The list above is claude and codex only.
-`CURSOR_API_KEY` is neither forwarded nor containable by the per-job proxy, so
-**`forward_env = ["CURSOR_API_KEY"]` sends your real reusable key into the container for a stranger's
-job to read** — caught by a `doctor` WARN, not a refusal, so the seat runs and leaks. Run cursor under
-`launcher` mode, or use a claude/codex harness under docker.
-See [#850](https://github.com/MakePrisms/maxplayerai/issues/850).
+⛔ **`cursor` has two credentials and they are not interchangeable.** `CURSOR_API_KEY` is a real,
+reusable key; the list above is claude and codex only, and the per-job proxy cannot hold it. So
+**`forward_env = ["CURSOR_API_KEY"]` sends your real key into the container for a stranger's job to
+read** — caught by a `doctor` WARN, not a refusal, so the seat runs and leaks. Never do that.
+
+The browser-login **session** does have a contained path. `[[sandbox.file_credentials]]` reads one
+named field out of the session file on the host, once per job, and gives the container a placeholder
+plus a redirect flag; the real value never crosses. That path is verified against the real vendor on
+the host leg and **has not yet been exercised from inside a running container**, so until it has, run
+cursor under `launcher` mode or use a claude/codex harness under docker. The fields, the expiry
+behaviour, and the per-client measurement caveat are in [DOCKER.md](DOCKER.md).
 
 **Leave `image` unset.** Omitted, the binary uses its own version-pinned ref
 (`ghcr.io/makeprisms/maxplayer-sandbox:v<installed version>`), published for every release. `image` is
