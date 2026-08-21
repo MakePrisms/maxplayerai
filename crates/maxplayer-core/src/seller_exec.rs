@@ -1183,27 +1183,20 @@ pub async fn run_agent_job(
     // update. A turn can complete having done nothing and say WHY in its last message — a blocked
     // host, an exhausted plan — and that text was previously dropped here, leaving the caller to
     // guess a cause from the turn's shape alone.
-    let mut last_agent_message: Option<String> = None;
+    let mut capture = crate::engine::AgentMessageCapture::default();
     let outcome = run_job(
         &mut driver,
         &mut log,
         &JobId(format!("seller-{}", short_hash(prompt))),
         params,
-        &mut |event| {
-            if let crate::engine::RunEvent::Update(update) = event
-                && let Some(text) = crate::engine::update_text(update)
-                && !text.trim().is_empty()
-            {
-                last_agent_message = Some(text);
-            }
-        },
+        &mut |event| capture.observe(event),
     )
     .await
     .map_err(|error| classify_run_error(error, timeout))?;
     match outcome.terminal {
         crate::event::JobExecutionStatus::Completed => Ok(AgentRunReport {
             usage: outcome.usage,
-            last_agent_message,
+            last_agent_message: capture.into_last_message(),
         }),
         other => Err(ExecError::Agent(format!("agent terminal {other:?}"))),
     }
