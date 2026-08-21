@@ -166,8 +166,9 @@ export function resolveSeatDirectory(events, now = nowSeconds()) {
  * @param {any[]} events normalized events
  * @param {string} pubkey the seat
  * @param {string[]} advertised the seat's `agents` roster, verbatim
+ * @param {string[]} wireFamilies the seat's `harness_family` values — the roster the award reads
  */
-export function verifyAdvertisedHarnesses(events, pubkey, advertised = []) {
+export function verifyAdvertisedHarnesses(events, pubkey, advertised = [], wireFamilies = []) {
   /** @type {Map<string, number>} delivered harness id → receipt count */
   const delivered = new Map();
   for (const ev of events) {
@@ -177,16 +178,37 @@ export function verifyAdvertisedHarnesses(events, pubkey, advertised = []) {
   }
   const ids = [...delivered.keys()];
 
+  // The roster to verify against is `harness_family` when the seat sends it — that is the field the
+  // AWARD DECISION reads, so agreeing with it is the claim that matters. The emitter derives it from
+  // the same serving roster the `agents` tag comes from, so the two cannot describe different sets:
+  // "a harness dropped from service leaves both tags at once."
+  //
+  // ⚠ THE TWO TAGS DIVERGE IN EXACTLY ONE DIRECTION, and it is why `agents` is still read here. A
+  // preset with no family in the closed wire vocabulary contributes NOTHING to `harness_family`
+  // while still carrying its own name in `agents` — a custom `[agents]` entry is the case. Verifying
+  // only against `harness_family` would make that entry VANISH from the panel, which is worse than
+  // the `incomparable` it renders as today: a claim we cannot check must say so, not go quiet. The
+  // unlabelled `--agent-argv` hatch is absent from both tags and so from this list either way.
+  const rosterFamilies = wireFamilies.length ? wireFamilies : [];
+  const unmappedAgents = advertised.filter((label) => harnessFamilyFromId(label) == null);
+  const roster = rosterFamilies.length || unmappedAgents.length
+    ? [...rosterFamilies, ...unmappedAgents]
+    : advertised;
+
   const matches = (label, id) => {
     // Exact first: an out-of-enum preset name IS the identity on both sides, so `deepseek-v4-flash`
     // advertised against `deepseek-v4-flash` delivered agrees on the string. A family comparison
     // alone would map both to null and read that as no information.
     if (id === label) return "id";
+    // ONE vocabulary, so ONE family path — a `claude-code` claim, a `claude` preset label and a
+    // `claude-agent-acp` receipt all resolve through the same function. There is deliberately no
+    // second comparison to fall back to: a verdict reachable by two producers cannot tell a test
+    // which one ran, and that is a defect removed by construction rather than guarded against.
     const lf = harnessFamilyFromId(label);
     return lf && harnessFamilyFromId(id) === lf ? "family" : null;
   };
 
-  const claims = advertised.map((label) => {
+  const claims = roster.map((label) => {
     for (const id of ids) {
       const how = matches(label, id);
       if (how) {
@@ -224,7 +246,7 @@ export function verifyAdvertisedHarnesses(events, pubkey, advertised = []) {
       if (advertised.some((label) => matches(label, id))) continue;
       const row = { deliveredId: id, receipts: delivered.get(id) };
       const idFamily = harnessFamilyFromId(id);
-      const anyComparableLabel = advertised.some((label) => harnessFamilyFromId(label) != null);
+      const anyComparableLabel = roster.some((label) => harnessFamilyFromId(label) != null);
       if (idFamily != null && anyComparableLabel) contradictions.push(row);
       else incomparableDeliveries.push(row);
     }

@@ -3,7 +3,7 @@
  * One malformed / hostile event must never throw into the page.
  */
 
-import { ACCEPT, AWARD, CLAIM, FEEDBACK, HANDLER, HEARTBEAT, OFFER, PROFILE, RECEIPT, RESULT } from "./kinds.js";
+import { ACCEPT, AWARD, CLAIM, FEEDBACK, HANDLER, HEARTBEAT, OFFER, PROFILE, RECEIPT, RESULT, HARNESS_FAMILIES } from "./kinds.js";
 
 /**
  * @param {unknown} raw
@@ -167,12 +167,7 @@ export function extractUsageAdjunct(contentJson, tags = []) {
       harness_id: firstTagValue(tags, "harness"),
       harness_family:
         harnessFamilyFromId(firstTagValue(tags, "harness")) ??
-        asEnumString(adjunct.harness_family ?? root.harness_family, [
-          "codex",
-          "claude",
-          "cursor",
-          "other",
-        ]),
+        asEnumString(adjunct.harness_family ?? root.harness_family, HARNESS_FAMILIES),
       paid_price_sats: amountSatsFromTags(tags),
     };
   } catch {
@@ -227,9 +222,12 @@ function costFromTags(tags) {
 export function harnessFamilyFromId(id) {
   if (!id) return null;
   const s = String(id).toLowerCase();
-  if (s.includes("claude")) return "claude";
+  // An id that IS a family — a seat's own `harness_family` value — passes through unchanged.
+  for (const family of HARNESS_FAMILIES) if (s === family) return family;
+  if (s.includes("claude")) return "claude-code";
   if (s.includes("cursor")) return "cursor";
   if (s.includes("codex")) return "codex";
+  if (s.includes("goose")) return "goose";
   return null;
 }
 

@@ -19,8 +19,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readFileSync } from "node:fs";
-import { parseEvent, parseSeatCapability } from "../js/parse.js";
-import { SEAT_DISPLAY_ONLY_TAGS, SEAT_FILTERABLE_TAGS } from "../js/kinds.js";
+import { extractUsageAdjunct, harnessFamilyFromId, parseEvent, parseSeatCapability } from "../js/parse.js";
+import { HARNESS_FAMILIES, SEAT_DISPLAY_ONLY_TAGS, SEAT_FILTERABLE_TAGS } from "../js/kinds.js";
+import { verifyAdvertisedHarnesses } from "../js/profiles.js";
 
 const goldenRaw = readFileSync(new URL("./fixtures/golden-kind30340.json", import.meta.url), "utf8");
 const golden = JSON.parse(goldenRaw);
@@ -295,4 +296,108 @@ test("a beat with no capability tags reads as empty, never as null holes", () =>
   assert.deepEqual(cap.orphanModels, []);
   assert.equal(cap.displayOnly.hardware, null, "a single-value tag absent is null, not empty string");
   assert.equal(cap.displayOnly.harness_variant, null);
+});
+
+/* ═══════ verifying against harness_family: the roster the award decision reads ═══════ */
+
+/** A seat's delivery receipt, reduced to the two fields the pairing reads. */
+const receipt = (pubkey, harnessId) => ({
+  role: "result",
+  pubkey,
+  result: { usage: { harness_id: harnessId } },
+});
+
+const SEAT = "11".repeat(32);
+
+test("pairs a harness_family claim against a receipt in the same wire vocabulary", () => {
+  // `claude-code` advertised, `claude-agent-acp` delivered. Three spellings of one harness — wire
+  // family, adapter identity, and the `agents` preset label — and the comparison happens in the wire
+  // vocabulary because that is the one the award decision reads.
+  const v = verifyAdvertisedHarnesses([receipt(SEAT, "claude-agent-acp")], SEAT, ["claude"], ["claude-code"]);
+  assert.equal(v.claims.length, 1);
+  assert.equal(v.claims[0].advertised, "claude-code");
+  assert.equal(v.claims[0].verdict, "agreed");
+  assert.equal(v.claims[0].deliveredId, "claude-agent-acp");
+  // ⚠ Asserting the MECHANISM, not just the verdict. `agreed` is reachable by two paths — the wire
+  // vocabulary and the display shorthand fallback — so a test that checked only the verdict would
+  // stay green with the wire comparison broken. Found exactly that way: a mutation to the wire
+  // mapping left the suite green until this line existed.
+  // `on` names HOW it matched — `family` through the vocabulary, or `id` on an exact string. There
+  // is no longer a second family path to confuse it with: the shorthand fallback is gone, because a
+  // verdict with two producers cannot tell a test which one ran.
+  assert.equal(v.claims[0].on, "family");
+});
+
+// ⚠ SPLIT DELIBERATELY, one call site per test. Both assertions in one block would mean the first
+// failure silences the second, so a break in the shared function would be reported as covering only
+// the pairing — and "goose works in both places" is exactly the claim that must not rest on an
+// assertion that never ran.
+test("goose reads as a family in the PAIRING", () => {
+  const v = verifyAdvertisedHarnesses([receipt(SEAT, "goose-acp")], SEAT, [], ["goose"]);
+  assert.equal(v.claims[0].verdict, "agreed", "a goose claim must not read as incomparable");
+  assert.equal(v.claims[0].on, "family");
+});
+
+test("goose reads as a family in the ECONOMICS column", () => {
+  // The half-fix that made this necessary: the vocabulary was widened for the pairing and left short
+  // for this column, so a goose delivery rendered a blank family while the pairing read it fine.
+  assert.equal(extractUsageAdjunct(null, [["harness", "goose-acp"]]).harness_family, "goose");
+  assert.equal(extractUsageAdjunct(null, [["harness", "goose"]]).harness_family, "goose");
+});
+
+test("the family vocabulary is the closed set, not a list restated per call site", () => {
+  assert.ok(HARNESS_FAMILIES.includes("goose"));
+  assert.equal(HARNESS_FAMILIES.length, 4, "closed at four: claude-code, codex, cursor, goose");
+});
+
+test("the vocabulary holds no entry the wire never sends", () => {
+  // `other` was in the old list. Nothing emits it, and a value that can never arrive is a permanent
+  // no-match hiding inside something that reads like a permitted option.
+  assert.ok(!HARNESS_FAMILIES.includes("other"));
+  assert.equal(harnessFamilyFromId("other"), null);
+  // `claude` is a PRESET LABEL, not a family. The family is what a seat advertises.
+  assert.ok(!HARNESS_FAMILIES.includes("claude"));
+  assert.equal(harnessFamilyFromId("claude"), "claude-code", "the label resolves to the family");
+  assert.equal(extractUsageAdjunct(null, [["harness", "claude-agent-acp"]]).harness_family, "claude-code");
+});
+
+test("DIVERGENCE: a preset with no wire family stays visible instead of vanishing", () => {
+  // The one direction the two tags diverge. A custom [agents] entry carries its own NAME in `agents`
+  // and contributes NOTHING to `harness_family`, because it has no family in the closed vocabulary.
+  //
+  // ⛔ Verifying only against `harness_family` would drop it from the panel entirely — the seat would
+  // render as though it never advertised it. That is strictly worse than the `incomparable` it gets:
+  // a claim we cannot check has to SAY so. Silence is not a verdict.
+  const v = verifyAdvertisedHarnesses(
+    [receipt(SEAT, "claude-agent-acp")],
+    SEAT,
+    ["claude", "my-llm"],
+    ["claude-code"],
+  );
+  const labels = v.claims.map((c) => c.advertised);
+  assert.ok(labels.includes("claude-code"), "the wire family is verified");
+  assert.ok(labels.includes("my-llm"), "the unmappable preset MUST still appear");
+  assert.equal(v.claims.find((c) => c.advertised === "my-llm").verdict, "incomparable");
+  assert.equal(v.claims.find((c) => c.advertised === "claude-code").verdict, "agreed");
+  // And it is not turned into an accusation.
+  assert.deepEqual(v.contradictedBy, []);
+});
+
+test("DIVERGENCE, second case: the unlabelled hatch is absent from BOTH tags", () => {
+  // `advertised()` returns serving NAMES and the --agent-argv hatch has none, so it is missing from
+  // `agents` as well as `harness_family`. It therefore cannot appear here at all — and an empty
+  // roster is "no claim made", never a contradiction, however the seat delivers.
+  const v = verifyAdvertisedHarnesses([receipt(SEAT, "sh")], SEAT, [], []);
+  assert.equal(v.advertisesNothing, true);
+  assert.deepEqual(v.claims, []);
+  assert.deepEqual(v.contradictedBy, [], "a seat that claimed nothing cannot be contradicted");
+});
+
+test("a seat sending no harness_family still pairs off agents — no un-verify cliff", () => {
+  // A seat that has not upgraded sends `agents` and no capability tags. It must keep pairing exactly
+  // as before, or this change silently un-verifies the entire existing fleet.
+  const v = verifyAdvertisedHarnesses([receipt(SEAT, "claude-agent-acp")], SEAT, ["claude"], []);
+  assert.equal(v.claims.length, 1);
+  assert.equal(v.claims[0].advertised, "claude", "the agents label is what it advertised");
+  assert.equal(v.claims[0].verdict, "agreed");
 });
