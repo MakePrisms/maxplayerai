@@ -540,9 +540,14 @@ function renderCensus(census) {
   );
   return el("div", {}, [
     el("p", { class: "lede" }, [
+      // "not seen in Ns", never "gone" or "offline". An excluded address may be a live seat whose
+      // clock runs slow or whose configured beat is slower than this window — `created_at` is
+      // emitter-stamped and no announcement states its own interval, so the reader cannot tell that
+      // from a seat that stopped. Naming the observation instead of the conclusion is the only
+      // honest wording available.
       text(
-        `${seats.length} seat${seats.length === 1 ? "" : "s"} announcing within ${freshWindowS}s` +
-          ` · ${fossilsExcluded} of ${addressesSeen} addresses excluded as stale`,
+        `${seats.length} seat${seats.length === 1 ? "" : "s"} heard from in the last ${freshWindowS}s` +
+          ` · ${fossilsExcluded} of ${addressesSeen} addresses not seen in that window`,
       ),
     ]),
     el("p", { class: "lede" }, [

@@ -237,7 +237,10 @@ assert.equal(handler.handler.version, "2026.07.09");
   // The denominator ships with the number: 4 addresses at this d, 1 cut by the window.
   assert.equal(census.addressesSeen, 4);
   assert.equal(census.fossilsExcluded, 1);
-  assert.equal(census.freshWindowS, 300);
+  // Pinned as a LITERAL, not read from `SEAT_FRESH_WINDOW_S`. Asserting a constant against itself
+  // passes for any value and would let this window change silently; the window is derived from the
+  // measured beat cadence, so changing it must be a deliberate edit in two places.
+  assert.equal(census.freshWindowS, 900);
 
   // Many seats share d="maxplayer-seller", so the address must include the author. Carried over
   // from the kind-31990 census, where the same collapse would have been the bug.
