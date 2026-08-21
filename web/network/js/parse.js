@@ -382,8 +382,66 @@ function parseHeartbeat(base) {
     version: firstTagValue(base.tags, "v"),
     status: firstTagValue(base.tags, "status"),
     agents: firstTagRest(base.tags, "agents"),
+    capability: parseSeatCapability(base.tags),
     message: typeof base.content === "string" && base.content ? base.content.slice(0, 280) : null,
   };
+}
+
+/**
+ * The #784 seat capability advertisement, split exactly as the emitter splits it.
+ *
+ * `filterable` holds what the award decision can read; `displayOnly` holds what it structurally
+ * cannot. The split is a shape, not a comment: nothing in `filterable` can reach `hardware`, so a
+ * predicate written against it later cannot filter on hardware even by mistake.
+ *
+ * `harnesses` is the joined view a reader wants — one row per advertised family with its models.
+ * A family that advertises NO model gets an empty `models` array, which a view must render as an
+ * explicit absence. An empty array and a missing key look identical once formatted, so the
+ * distinction has to survive into the render rather than being resolved here.
+ *
+ * `orphanModels` carries any `harness_model` naming a family absent from `harness_family`. Dropping
+ * those would make the reader disagree with the wire while looking complete.
+ */
+export function parseSeatCapability(tags) {
+  const families = firstTagRest(tags, "harness_family");
+  const models = pairTagValues(tags, "harness_model");
+  const byFamily = new Map(families.map((f) => [f, []]));
+  const orphanModels = [];
+  for (const { family, model } of models) {
+    const bucket = byFamily.get(family);
+    if (bucket) bucket.push(model);
+    else orphanModels.push({ family, model });
+  }
+  return {
+    filterable: {
+      harness_family: families,
+      capabilities: firstTagRest(tags, "capabilities"),
+      harness_model: models,
+    },
+    displayOnly: {
+      harness_variant: firstTagValue(tags, "harness_variant"),
+      hardware: firstTagValue(tags, "hardware"),
+    },
+    harnesses: families.map((family) => ({ family, models: byFamily.get(family) })),
+    orphanModels,
+  };
+}
+
+/**
+ * Every `[name, a, b]` tag as `{family: a, model: b}` — for a tag that REPEATS and carries a pair,
+ * which is the opposite shape to `firstTagRest`'s one-tag list. `harness_model` is emitted once per
+ * model, so taking only the first tag loses every model after it.
+ *
+ * A tag missing its second value is skipped rather than admitted with `model: null`: a pair with
+ * one half absent states nothing, and a null model here would be indistinguishable in the joined
+ * view from a family that advertises no model at all.
+ */
+function pairTagValues(tags, name) {
+  const out = [];
+  for (const tag of tags) {
+    if (tag[0] === name && tag[1] && tag[2]) out.push({ family: tag[1], model: tag[2] });
+  }
+  return out;
 }
 
 /**
