@@ -237,7 +237,16 @@ export function computePulse(events, jobs, now = nowSeconds()) {
       satsSettledToday += ev.receipt?.amount_sats || 0;
     }
     if (ev.created_at >= activeWindow) {
-      if (ev.role === "result" || ev.role === "handler" || ev.role === "claim") {
+      // A seat that is up and ANNOUNCING is an active seller. Omitting the heartbeat here made
+      // this metric blind to any seat that had taken no job inside the window: measured against
+      // the wire on 2026-08-21 it read 1 while 9 seats were live and announcing, so 8 of 9 live
+      // seats did not exist to it. That is the same under-count as the retired-kind census, and
+      // it grows, because a seat's first act is to announce, not to claim.
+      //
+      // `handler` (kind-31990) is gone from this set. The seat resolver no longer uses that kind,
+      // so its authors are residue. Measured no-op at the time of the change: zero kind-31990
+      // announces existed inside the window, so nothing was double-counted by it either.
+      if (ev.role === "result" || ev.role === "claim" || ev.role === "heartbeat") {
         activeSellers.add(ev.pubkey);
       }
     }

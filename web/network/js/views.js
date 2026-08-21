@@ -1,4 +1,4 @@
-import { KIND_LABELS } from "./kinds.js";
+import { HEARTBEAT, KIND_LABELS } from "./kinds.js";
 import { STATUS_LABELS } from "./jobs.js";
 
 /* ═══════════════════════ connection banner ═══════════════════════ */
@@ -316,8 +316,11 @@ export function renderStats(root, snap) {
       renderEconomics(snap.economics),
     ]),
     el("section", { class: "view", id: "census" }, [
-      h2("Seller census"),
-      p("Seller handler announces (NIP-89) — harness_name + version."),
+      h2("Seat census"),
+      p(
+        `Seats resolved at their kind-${HEARTBEAT} address (pubkey, kind, d) and bounded by ` +
+          "freshness. Advertised capability is the seat's own claim; verification comes from delivery.",
+      ),
       renderCensus(snap.census),
     ]),
     el("section", { class: "view", id: "tail" }, [
@@ -463,22 +466,47 @@ function renderEconomics(eco) {
   ]);
 }
 
-function renderCensus(rows) {
-  const body = rows.map((r) =>
+/**
+ * The seat census. Two things must be visible on the surface, not left to a reader's inference:
+ * the freshness window the row count is bounded by, and how many addresses that window removed.
+ * "9 seats" reads the same whether 0 or 12 were cut, so the denominator ships with the number.
+ *
+ * `agents` is the seat's own advertisement. It is rendered as a claim, because it is one: the
+ * falsifier is the `harness` tag on that seat's own receipts, and nothing on this panel has read it.
+ */
+function renderCensus(census) {
+  const { seats = [], fossilsExcluded = 0, addressesSeen = 0, freshWindowS = 0 } = census || {};
+  const body = seats.map((r) =>
     el("tr", {}, [
-      td(r.harness_name),
-      td(r.version),
       el("td", {}, [authorCell(r.pubkey, r.profile)]),
-      td(r.k.join(", ") || "—"),
+      r.agents.length
+        ? el("td", { class: "claim" }, [text(r.agents.join(", "))])
+        : el("td", { class: "unidentified" }, [text("advertises none")]),
+      td(r.version || "—"),
+      td(r.status || "—"),
       td(fmtTime(r.created_at)),
     ]),
   );
-  return el("div", { class: "table-wrap" }, [
-    el("table", {}, [
-      el("thead", {}, [
-        el("tr", {}, [th("harness_name"), th("version"), th("seller"), th("k"), th("seen")]),
+  return el("div", {}, [
+    el("p", { class: "lede" }, [
+      text(
+        `${seats.length} seat${seats.length === 1 ? "" : "s"} announcing within ${freshWindowS}s` +
+          ` · ${fossilsExcluded} of ${addressesSeen} addresses excluded as stale`,
+      ),
+    ]),
+    el("div", { class: "table-wrap" }, [
+      el("table", {}, [
+        el("thead", {}, [
+          el("tr", {}, [
+            th("seat"),
+            th("advertises (claimed)"),
+            th("v"),
+            th("status"),
+            th("announced"),
+          ]),
+        ]),
+        el("tbody", {}, body.length ? body : [emptyRow(5)]),
       ]),
-      el("tbody", {}, body.length ? body : [emptyRow(5)]),
     ]),
   ]);
 }

@@ -356,16 +356,41 @@ function parseHandler(base) {
 }
 
 /**
- * Seller liveness heartbeat (kind 30340). Addressable — the `d` tag scopes it within
- * the author. Freshness is the event's own created_at (the caller resolves the newest
- * per author+d). `status` is an optional self-reported state; content is a free message.
+ * Seller seat announcement (kind 30340). Addressable — the `d` tag scopes it within the author.
+ * Freshness is the event's own created_at (the caller resolves the newest per author+d, and bounds
+ * it: see `resolveSeatDirectory`). `status` is an optional self-reported state; content is a free
+ * message.
+ *
+ * `agents` is the seat's ADVERTISED harness roster and is a CLAIM about itself — discovery
+ * metadata, never proof that a harness will serve. Verification comes from delivery, and the
+ * falsifier is the `harness` tag on that same seat's own receipts. Rendered as a claim.
+ *
+ * `version` is the announcement's `v`. It is absent on pre-`v` announcements, which are still on
+ * the relay, so absent here means "an older shape" and not "version zero". It does not follow from
+ * the `d`: a current-address announcement carrying the pre-rename tag set was measured on
+ * 2026-08-21, so shape is read from the tags and never inferred from the address.
  */
 function parseHeartbeat(base) {
   return {
     d: firstTagValue(base.tags, "d"),
+    version: firstTagValue(base.tags, "v"),
     status: firstTagValue(base.tags, "status"),
+    agents: firstTagRest(base.tags, "agents"),
     message: typeof base.content === "string" && base.content ? base.content.slice(0, 280) : null,
   };
+}
+
+/**
+ * Every value of the first `name` tag past its key — for tags that carry a LIST in one tag
+ * (`["agents","claude","codex"]`), which `allTagValues` cannot read because it takes index 1 of
+ * each matching tag. Absent tag → empty array, never null: an unstated roster and an empty one are
+ * both "advertises nothing", and the emitter omits the tag rather than sending it empty.
+ */
+function firstTagRest(tags, name) {
+  for (const tag of tags) {
+    if (tag[0] === name) return tag.slice(1).filter((v) => typeof v === "string" && v);
+  }
+  return [];
 }
 
 function normalizeTags(tags) {

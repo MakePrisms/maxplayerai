@@ -1,6 +1,6 @@
 import { emptyUsage, percentile } from "./parse.js";
 import { aggregateJobs, computePulse } from "./jobs.js";
-import { buyerMetrics, sellerMetrics } from "./profiles.js";
+import { buyerMetrics, resolveSeatDirectory, sellerMetrics } from "./profiles.js";
 
 /** In-memory aggregator for observatory views. */
 export function createStore() {
@@ -14,8 +14,6 @@ export function createStore() {
   const resultsByOffer = new Map();
   /** @type {Map<string, any[]>} */
   const receiptsByOffer = new Map();
-  /** @type {Map<string, any>} */
-  const handlers = new Map();
   /** @type {Map<string, {pubkey:string, name:string|null, display_name:string|null, picture:string|null, about:string|null, created_at:number}>} */
   const profiles = new Map();
   /** @type {any[]} */
@@ -81,17 +79,9 @@ export function createStore() {
         if (offerId) pushMap(receiptsByOffer, offerId, normalized);
         break;
       }
-      case "handler": {
-        // Addressable NIP-89 events are keyed by (kind, pubkey, d) — many sellers
-        // share d="maxplayer-seller", so pubkey must be part of the map key.
-        const d = normalized.handler?.d || normalized.id;
-        const key = `${normalized.pubkey}:${d}`;
-        const prev = handlers.get(key);
-        if (!prev || prev.created_at <= normalized.created_at) {
-          handlers.set(key, normalized);
-        }
-        break;
-      }
+      // No `handler` case. The NIP-89 kind-31990 announce is still parsed and still shows in the
+      // live tail and the kind counts, but nothing derives a seat from it: the seat resolver moved
+      // to kind-30340, so a per-author index of that kind only ever held residue.
       default:
         break;
     }
@@ -259,18 +249,37 @@ export function createStore() {
     return { rows: rows.slice(0, 100), groups: [...groups.entries()] };
   }
 
-  function census() {
-    const list = [...handlers.values()].sort((a, b) => b.created_at - a.created_at);
-    return list.map((ev) => ({
-      id: ev.id,
-      pubkey: ev.pubkey,
-      created_at: ev.created_at,
-      harness_name: ev.handler?.harness_name || "(unnamed)",
-      version: ev.handler?.version || "—",
-      d: ev.handler?.d,
-      k: ev.handler?.k || [],
-      profile: profiles.get(ev.pubkey) || null,
-    }));
+  /**
+   * The seat census: which seats exist right now.
+   *
+   * Sourced from the kind-30340 seat announcement at (pubkey, kind, `d`), bounded by freshness.
+   * It previously read the NIP-89 kind-31990 handler announce, which the seat resolver no longer
+   * uses, so that read answered from residue. Measured against the wire on 2026-08-21 it rendered
+   * 21 rows of which 8 were live seats, 13 were 10.1-to-16.7-day-old residue, and one live seat was
+   * missing entirely — a seat that came up after the resolver moved never publishes the retired
+   * kind, so the old source goes progressively blinder to exactly the seats that matter.
+   *
+   * The fossil count and the window travel WITH the seats. A caller handed a bare list cannot say
+   * how many rows the window removed, and "9 seats" reads identically whether 0 or 12 were cut.
+   */
+  function census(now) {
+    const dir = resolveSeatDirectory([...byId.values()], now);
+    return {
+      freshWindowS: dir.freshWindowS,
+      resolvedAt: dir.resolvedAt,
+      fossilsExcluded: dir.fossilsExcluded,
+      addressesSeen: dir.addressesSeen,
+      seats: dir.seats.map((ev) => ({
+        id: ev.id,
+        pubkey: ev.pubkey,
+        created_at: ev.created_at,
+        // Advertised: the seat's own claim about itself, never proof it will serve.
+        agents: ev.heartbeat?.agents ?? [],
+        version: ev.heartbeat?.version ?? null,
+        status: ev.heartbeat?.status ?? null,
+        profile: profiles.get(ev.pubkey) || null,
+      })),
+    };
   }
 
   function tail(n = 50) {
@@ -313,7 +322,7 @@ export function createStore() {
       funnel: funnel(),
       latency: latency(),
       economics: economics(),
-      census: census(),
+      census: census(now),
       tail: tail(50),
     };
   }

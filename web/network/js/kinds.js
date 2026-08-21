@@ -39,6 +39,18 @@ export const HANDLER = 31990;
  */
 export const HEARTBEAT = 30340;
 
+/**
+ * The `d` value scoping a seller's seat announcement within its author. A seat is addressed by
+ * (pubkey, kind, d) — the pubkey alone is not the address.
+ *
+ * The `d` does NOT imply the tag shape. Measured on relay.maxplayer.ai 2026-08-21: a
+ * `maxplayer-seller` announcement was carrying the pre-rename tag set (`mobee_agent`,
+ * `protocol_versions`, no `v`), so a reader must detect the shape from the tags rather than infer
+ * it from the address. The pre-rename `mobee-seller` address is also still live on the relay and is
+ * not this one.
+ */
+export const SELLER_HEARTBEAT_D = "maxplayer-seller";
+
 /** The maxplayer namespace tag value. Every trade event and the heartbeat carry `["t","maxplayer"]`. */
 export const MAXPLAYER_TAG = "maxplayer";
 

@@ -7,7 +7,15 @@ import {
   percentile,
   PROFILE_CONTENT_MAX,
 } from "../js/parse.js";
-import { CLAIM, HANDLER, OFFER, RECEIPT, RESULT } from "../js/kinds.js";
+import {
+  CLAIM,
+  HANDLER,
+  HEARTBEAT,
+  OFFER,
+  RECEIPT,
+  RESULT,
+  SELLER_HEARTBEAT_D,
+} from "../js/kinds.js";
 
 function ok(ev) {
   const n = parseEvent(ev);
@@ -141,7 +149,8 @@ const eco = store.economics();
 assert.ok(eco.rows.length >= 1);
 assert.equal(eco.rows[0].measured_cost_tokens, null);
 
-// ——— census harness_name + version ———
+// ——— kind-31990 handler announces still PARSE (they show in the live tail) ———
+// Nothing derives a seat from them any more; the seat census reads kind-30340 below.
 
 const handler = ok({
   id: "5".repeat(64),
@@ -160,33 +169,90 @@ const handler = ok({
 });
 assert.equal(handler.handler.harness_name, "cursor-agent");
 assert.equal(handler.handler.version, "2026.07.09");
-store.ingest(handler);
-assert.equal(store.census()[0].harness_name, "cursor-agent");
 
-// Same d-tag from distinct pubkeys must not collapse (NIP-89 addressable key includes author).
-store.ingest(
-  ok({
-    id: "f0".repeat(32),
-    pubkey: "f1".repeat(32),
-    kind: HANDLER,
-    created_at: 301,
-    tags: [
-      ["d", "seller-a"],
-      ["k", "5109"],
-    ],
-    content: JSON.stringify({
-      harness_name: "other-agent",
-      version: "1.0.0",
-    }),
-  }),
-);
+// ——— the seat census: resolved at the ADDRESS, bounded by freshness ———
+//
+// ⚠ THE COUNTS IN THIS FIXTURE ARE DELIBERATELY EQUAL. The retired kind-31990 source yields 3 rows
+// and the correct kind-30340 source yields 3 seats, and they are DIFFERENT SETS sharing one member.
+// This is a miniature of the live measurement on 2026-08-21, where the retired source rendered 21
+// rows against 21 distinct seat addresses on the wire — two totals that agree while the populations
+// differ by 13 residue rows plus one live seat missing entirely.
+//
+// So: DO NOT reduce this acceptance to a length comparison. A count that matches for the wrong
+// reason is the strongest form of a lying instrument, because it survives inspection. The check
+// that separates these populations is a SET JOIN and nothing else can be substituted for it.
 {
-  const census = store.census();
-  assert.equal(census.length, 2);
-  const pubkeys = new Set(census.map((r) => r.pubkey));
-  assert.equal(pubkeys.size, 2);
-  assert.ok(pubkeys.has("6".repeat(64)));
-  assert.ok(pubkeys.has("f1".repeat(32)));
+  const NOW = 10_000;
+  const pk = (n) => String(n).repeat(64).slice(0, 64);
+  const A = pk(1); // fresh, current address, ALSO has a 31990 → in both populations
+  const B = pk(2); // fresh, current address, NO 31990 → correct only (the live seat the old source could not see)
+  const E = pk(3); // fresh, current address, NO 31990 → correct only
+  const C = pk(4); // STALE, current address, has a 31990 → retired source only (a fossil)
+  const D = pk(5); // fresh but at the RETIRED address, has a 31990 → retired source only
+
+  const seatStore = createStore();
+  const beat = (pubkey, d, created_at, agents) =>
+    ok({
+      id: pubkey.slice(0, 2).repeat(32),
+      pubkey,
+      kind: HEARTBEAT,
+      created_at,
+      tags: [
+        ["d", d],
+        ["t", "maxplayer"],
+        ["v", "1"],
+        ["rate", "100"],
+        ["accepting", "y"],
+        ["queue_depth", "0"],
+        ...(agents ? [["agents", ...agents]] : []),
+      ],
+      content: "",
+    });
+  seatStore.ingest(beat(A, SELLER_HEARTBEAT_D, NOW - 10, ["claude"]));
+  seatStore.ingest(beat(B, SELLER_HEARTBEAT_D, NOW - 20, ["codex", "cursor"]));
+  seatStore.ingest(beat(E, SELLER_HEARTBEAT_D, NOW - 30, null));
+  seatStore.ingest(beat(C, SELLER_HEARTBEAT_D, NOW - 9000, ["claude"]));
+  seatStore.ingest(beat(D, "mobee-seller", NOW - 15, ["claude"]));
+
+  const census = seatStore.census(NOW);
+  const correct = new Set(census.seats.map((s) => s.pubkey));
+  const retired = new Set([A, C, D]); // what a kind-31990 index of this fixture would have held
+
+  // The set join FIRST — the only check with access to the property we want. Order matters here:
+  // an assertion that fails early silences every assertion below it, so putting the count check
+  // first made a broken resolver report "the totals disagree" while these never ran at all. The
+  // informative failure has to be the one that fires.
+  assert.deepEqual([...correct].sort(), [A, B, E].sort());
+  assert.ok(correct.has(B), "a live seat with no retired-kind announce must still appear");
+  assert.ok(correct.has(E), "…and so must the second one");
+  assert.ok(!correct.has(C), "a stale address must not render as a current seat");
+  assert.ok(!correct.has(D), "an announcement at the retired d is not this seat address");
+  assert.equal([...correct].filter((p) => retired.has(p)).length, 1, "the sets share ONE member");
+
+  // The coincidence LAST, asserted as a fact of the fixture so it cannot be read as incidental:
+  // these two totals agree and the populations above still differ. That is the whole point.
+  assert.equal(correct.size, retired.size, "fixture invariant: the two totals agree");
+
+  // The denominator ships with the number: 4 addresses at this d, 1 cut by the window.
+  assert.equal(census.addressesSeen, 4);
+  assert.equal(census.fossilsExcluded, 1);
+  assert.equal(census.freshWindowS, 300);
+
+  // Many seats share d="maxplayer-seller", so the address must include the author. Carried over
+  // from the kind-31990 census, where the same collapse would have been the bug.
+  assert.equal(correct.size, 3, "same d from distinct pubkeys must not collapse");
+
+  // The advertised roster is a CLAIM, carried verbatim; an unstated roster is empty, never invented.
+  const byPk = new Map(census.seats.map((s) => [s.pubkey, s]));
+  assert.deepEqual(byPk.get(B).agents, ["codex", "cursor"]);
+  assert.deepEqual(byPk.get(E).agents, [], "a seat advertising no harness advertises none");
+  assert.equal(byPk.get(A).version, "1");
+
+  // Newest first, so the panel's first row is the most recent announcement.
+  assert.deepEqual(
+    census.seats.map((s) => s.pubkey),
+    [A, B, E],
+  );
 }
 
 // ——— latency path ———

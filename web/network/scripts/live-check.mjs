@@ -30,8 +30,15 @@ function finish(code) {
     frames,
     kind_counts: Object.fromEntries([...kindCounts.entries()].sort()),
     funnel: snap.funnel,
+    // Carried to the same source as the UI panel deliberately. A probe left reading the retired
+    // kind-31990 resolver becomes the thing someone later cites as disagreeing with the page.
+    // `census_seats_n` counts what the freshness window kept; the excluded count rides alongside
+    // it, because a seat total without its denominator cannot be told from a quiet relay.
     census: snap.census,
-    census_n: snap.census.length,
+    census_seats_n: snap.census.seats.length,
+    census_fossils_excluded: snap.census.fossilsExcluded,
+    census_addresses_seen: snap.census.addressesSeen,
+    census_fresh_window_s: snap.census.freshWindowS,
     latency_samples: snap.latency.samples,
     economics_receipts: snap.economics.rows.length,
   };
