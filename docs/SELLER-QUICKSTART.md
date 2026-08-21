@@ -44,6 +44,13 @@ MAXPLAYER_BIN="$HOME/.local/bin/maxplayer"
 
 On npm: `npm install -g maxplayer` (needs Node 18+; see [npm global installs](#npm-global-installs-node-versions-and-eacces) if that fails with `EACCES`).
 
+⚠ **Neither route installs a prerelease.** `releases/latest` excludes prereleases by design — the
+installer resolves it deliberately rather than sorting tags, so it never hands you an `-rc` by accident
+— and npm's `latest` tag stays on the last stable. Both exit successfully having installed the older
+build. To take a prerelease, name it: `… install.sh | sh -s -- --version 0.5.0-rc2` (or
+`MAXPLAYER_VERSION=0.5.0-rc2`), or `npm i -g maxplayer@rc`. Check with `npm view maxplayer dist-tags`,
+and confirm with `maxplayer --version` — a zero exit from the installer is not the check.
+
 Building it yourself instead:
 
 ```bash

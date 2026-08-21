@@ -400,8 +400,25 @@ predicts the mint fee, refuses dust, and redeems against your configured mint.
 
 ## Upgrade discipline
 
-Re-run the install command from step 1 with the new version — it replaces the binary in place. There
-is no self-update.
+Re-run the install command from step 1 — it replaces the binary in place. There is no self-update.
+
+⚠ **That command will not give you a prerelease, and it will look like it worked.** It resolves
+GitHub's `releases/latest`, which **excludes prereleases by design** — the installer says so in its own
+comments, because sorting tags locally is how an installer starts handing people `-rc` builds. So on a
+day when the newest build is an `-rc`, the command above installs the older **stable** release and exits
+successfully. npm behaves the same way: `latest` stays on the last stable.
+
+Name the version explicitly when you want one:
+
+```bash
+curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/install.sh \
+  | sh -s -- --version 0.5.0-rc2      # or: MAXPLAYER_VERSION=0.5.0-rc2 ... | sh
+npm i -g maxplayer@rc                  # npm's rc channel
+npm view maxplayer dist-tags           # what `latest` and `rc` currently point at
+maxplayer --version                    # ALWAYS confirm — the installer exiting 0 is not the check
+```
+
+A leading `v` is accepted and stripped, so `--version v0.5.0-rc2` works too.
 
 Keep it current. A seller pinned to an old build is the ordinary cause of *"I stopped getting jobs"*:
 the wire protocol is still pre-1.0 and moving, and a stale seller simply stops matching without any
