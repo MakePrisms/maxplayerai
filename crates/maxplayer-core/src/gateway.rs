@@ -428,12 +428,23 @@ pub fn parse_bound_git_delivery(
 /// `agents` advertises the harnesses this seller can run (preference order) as `["agents", …]`
 /// (§6.2), so the buyer's award filter can hold the claim to the harness its job asked for.
 /// Empty ⇒ the tag is omitted rather than sent empty.
+///
+/// `capability` adds the #784 FILTERABLE fields. They are here and not only on the kind-30340 beat
+/// because the buyer's award filter reads the CLAIM — the claim is contemporaneous with the offer
+/// and needs no relay read inside the award decision, whereas the beat is periodic. The display-only
+/// fields are deliberately NOT carried: nothing in the award decision reads them, so they would be
+/// weight on every claim with no reader.
+///
+/// Both this and the beat take their filterable tags from
+/// [`crate::heartbeat::SeatCapability::filterable_tags`] — one function, so the two events cannot
+/// spell a shared field differently.
 pub fn claim_draft(
     offer_id: &str,
     buyer_pubkey: &str,
     seller_pubkey: &str,
     creq: &str,
     agents: &[String],
+    capability: &crate::heartbeat::SeatCapability,
 ) -> EventDraft {
     let mut tags = vec![
         TagSpec::new(["e", offer_id, "", "root"]),
@@ -444,6 +455,7 @@ pub fn claim_draft(
     if let Some(tag) = crate::heartbeat::agent_tag(agents) {
         tags.push(tag);
     }
+    tags.extend(capability.filterable_tags());
     status_draft(JOB_CLAIM_KIND, "processing", tags)
 }
 
@@ -1039,6 +1051,7 @@ mod tests {
             "seller",
             "creqAtest",
             &["claude".to_owned(), "codex".to_owned()],
+            &Default::default(),
         );
         let tag = advertised
             .tags
@@ -1051,7 +1064,7 @@ mod tests {
             vec!["claude", "codex"]
         );
 
-        let silent = claim_draft("job-1", "buyer", "seller", "creqAtest", &[]);
+        let silent = claim_draft("job-1", "buyer", "seller", "creqAtest", &[], &Default::default());
         assert!(silent.tags.iter().all(|tag| tag.first() != Some("agents")));
         assert!(crate::heartbeat::agents_from_tags(&silent.tags).is_empty());
     }
@@ -1197,7 +1210,7 @@ mod tests {
         // The claim (processing) is its own claim kind, and the buyer-authored award
         // is the award kind — each distinct from the seller's feedback kind.
         assert_eq!(
-            claim_draft("offer", BUYER, SELLER, "creqAtest", &[]),
+            claim_draft("offer", BUYER, SELLER, "creqAtest", &[], &Default::default()),
             EventDraft::new(
                 JOB_CLAIM_KIND,
                 vec![
@@ -1240,7 +1253,7 @@ mod tests {
         );
         // A non-award event yields no selection.
         assert_eq!(
-            parse_award(&claim_draft("offer", BUYER, SELLER, "creqAtest", &[])),
+            parse_award(&claim_draft("offer", BUYER, SELLER, "creqAtest", &[], &Default::default())),
             None
         );
     }
@@ -1259,7 +1272,7 @@ mod tests {
         // new one against. A new lifecycle builder needs a row added by hand.
         const OFFER: &str = "offer";
         let lifecycle = [
-            ("claim", claim_draft(OFFER, BUYER, SELLER, "creqAtest", &[])),
+            ("claim", claim_draft(OFFER, BUYER, SELLER, "creqAtest", &[], &Default::default())),
             ("award", award_draft(OFFER, "claim", BUYER, SELLER)),
             ("accept", accept_draft(OFFER, "claim", BUYER, SELLER)),
             (
@@ -1592,7 +1605,7 @@ mod creq_tests {
             build_seller_creq("job-1", 21, "sat", &[MINT_A.to_string()], &seller).expect("build creq");
         assert!(creq.starts_with("creqA"), "creq must start with creqA: {creq}");
 
-        let draft = claim_draft("job-1", "buyer-pubkey", &seller, &creq, &[]);
+        let draft = claim_draft("job-1", "buyer-pubkey", &seller, &creq, &[], &Default::default());
         let creq_tag = draft
             .tags
             .iter()
@@ -1646,7 +1659,7 @@ mod creq_tests {
         let seller = seller_hex();
         let creq =
             build_seller_creq("job-7", 5, "sat", &[MINT_A.to_string()], &seller).expect("build creq");
-        let draft = claim_draft("job-7", "buyer", &seller, &creq, &[]);
+        let draft = claim_draft("job-7", "buyer", &seller, &creq, &[], &Default::default());
         let tag: &TagSpec = draft
             .tags
             .iter()

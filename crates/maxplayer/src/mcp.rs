@@ -574,6 +574,7 @@ mod tests {
                 live: true,
                 creq: Some(creq),
                 agents: vec!["codex".to_owned()],
+                capability: maxplayer_core::heartbeat::SeatCapability::default(),
             }],
             results: Vec::new(),
             live_claim_id: None,

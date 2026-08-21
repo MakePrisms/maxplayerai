@@ -3,6 +3,11 @@ pub mod announce;
 #[cfg(all(feature = "wallet", feature = "gateway"))]
 pub mod authorize_pay;
 pub mod budget;
+// Unconditional on purpose: a build that emits or reads a filterable field must be able to name the
+// token set that field is bound to, so the vocabulary cannot sit behind a feature. The one item that
+// needs an executor — `probe_capabilities`, which takes a `wallet`-gated `SandboxPolicy` — carries
+// the gate itself rather than dragging the whole module behind it.
+pub mod capability;
 pub mod checks;
 #[cfg(feature = "wallet")]
 pub mod collect;
