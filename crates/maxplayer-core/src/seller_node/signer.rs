@@ -385,7 +385,7 @@ mod tests {
     }
 
     fn claim_draft() -> EventDraft {
-        gateway::claim_draft(&"e".repeat(64), &"b".repeat(64), &"s".repeat(64), "creqA-test", &[])
+        gateway::claim_draft(&"e".repeat(64), &"b".repeat(64), &"s".repeat(64), "creqA-test", &[], &Default::default())
     }
 
     // The fixed created_at makes the signed event id deterministic — the property the outbox relies

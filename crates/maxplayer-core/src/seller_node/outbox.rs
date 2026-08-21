@@ -79,7 +79,7 @@ mod tests {
     }
 
     fn claim_draft() -> crate::gateway::EventDraft {
-        crate::gateway::claim_draft(&"e".repeat(64), &"b".repeat(64), &"s".repeat(64), "creqA", &[])
+        crate::gateway::claim_draft(&"e".repeat(64), &"b".repeat(64), &"s".repeat(64), "creqA", &[], &Default::default())
     }
 
     /// Records every publish call; can be told to fail so the retry path is exercised.

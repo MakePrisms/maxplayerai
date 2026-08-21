@@ -4063,12 +4063,17 @@ impl SellerNodeRunner {
         // the pay path validates against, so what a buyer reads here is what this seat can settle
         // on — before #645 they were written once into a kind-31990 content at boot, which no
         // config change ever revisited.
+        // `names` is CLONED rather than moved because the capability comes off the SAME
+        // `advertisement()` snapshot: a second call could observe a different roster, and then the
+        // advertised names and the advertised models would describe two different moments. One
+        // snapshot, both reads.
         let draft = crate::heartbeat::heartbeat_for_state(
             in_flight,
             roster.serving,
             seller.rate_sats,
             self.node.home().config.accepted_mints.clone(),
-            roster.names,
+            roster.names.clone(),
+            roster.capability(),
         )
         .to_event_draft();
         self.publish_seat_announcement(draft, "heartbeat").await
@@ -4108,11 +4113,15 @@ impl SellerNodeRunner {
         // The roster still names what this seat can run: leaving the market is not a claim to have
         // forgotten how to work, and `accepting` is the field that carries "not taking work".
         let roster = self.agents.advertisement();
+        // The capability rides the terminal beat for the same reason the roster does: leaving the
+        // market is not a claim to have forgotten what this seat could run. `accepting=n` is what
+        // carries "not taking work", and it is passed as a literal by `retraction_for_state`.
         let draft = crate::heartbeat::retraction_for_state(
             self.live_in_flight("retraction"),
             seller.rate_sats,
             self.node.home().config.accepted_mints.clone(),
-            roster.names,
+            roster.names.clone(),
+            roster.capability(),
         )
         .to_event_draft();
 
@@ -4571,12 +4580,20 @@ impl SellerNodeRunner {
         };
         // The claim advertises what this node can run, so the buyer's award filter can hold it to
         // the harness its job asked for.
+        //
+        // ONE `advertisement()` snapshot feeds both the names and the capability, rather than two
+        // reads of the live roster. The award decides on what THIS claim carries, so a claim whose
+        // names came from one moment and whose models came from another would attribute a model to a
+        // harness the seat was not offering when it said so — and nothing downstream could detect it,
+        // because both halves parse.
+        let roster = self.agents.advertisement();
         let claim = claim_draft(
             job_id,
             buyer_pubkey,
             seller_pubkey,
             &creq,
-            &self.agents.advertised(),
+            &roster.names,
+            &roster.capability(),
         );
         // Reserve-at-claim: a fully loaded node has no free slot and simply does not claim, which is
         // how it stays invisible to the market. The gate is consulted only here on the event loop,
@@ -7659,7 +7676,7 @@ mod tests {
                     1,
                 )
                 .expect("record offer");
-            let draft = claim_draft(&job, &buyer, &seller, &creq, &["codex".to_owned()]);
+            let draft = claim_draft(&job, &buyer, &seller, &creq, &["codex".to_owned()], &Default::default());
             store
                 .claim_and_enqueue(&job, &job, &creq, &draft, 1, 9_999_999_999, 1)
                 .expect("claim");
@@ -9908,7 +9925,7 @@ mod tests {
                 now,
             )
             .expect("record offer");
-        let draft = claim_draft(job_id, buyer_hex, &"s".repeat(64), "creq", &[]);
+        let draft = claim_draft(job_id, buyer_hex, &"s".repeat(64), "creq", &[], &Default::default());
         store
             .claim_and_enqueue(job_id, job_id, "creq", &draft, now, now + 3_600, now)
             .expect("claim");
@@ -10234,7 +10251,7 @@ mod tests {
             "nothing delivered yet"
         );
 
-        let draft = claim_draft(&job, &buyer, &seller, &creq, &[]);
+        let draft = claim_draft(&job, &buyer, &seller, &creq, &[], &Default::default());
         let delivered_at = 6_000;
         assert!(store
             .deliver_and_enqueue(
@@ -10501,7 +10518,7 @@ mod tests {
         let job = "a".repeat(64);
         let buyer = "b".repeat(64);
         let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
-        let draft = claim_draft(&job, &buyer, &seller, &creq, &[]);
+        let draft = claim_draft(&job, &buyer, &seller, &creq, &[], &Default::default());
 
         // Deliver ⇒ state Delivered ⇒ NOT re-execute-eligible (the guard early-returns).
         assert!(store
@@ -10552,7 +10569,7 @@ mod tests {
         let buyer = "b".repeat(64);
         // The helper journals award event A (`w`×64) — that is execution #1's award.
         let (store, root) = store_with_awarded_job(&creq, &job, &buyer, 4242);
-        let draft = claim_draft(&job, &buyer, &seller, &creq, &[]);
+        let draft = claim_draft(&job, &buyer, &seller, &creq, &[], &Default::default());
 
         // Execution #1 finished and published ⇒ Delivered.
         assert!(
@@ -10908,7 +10925,7 @@ mod tests {
                 1,
             )
             .expect("record offer");
-        let draft = claim_draft(job, buyer, &"s".repeat(64), creq, &[]);
+        let draft = claim_draft(job, buyer, &"s".repeat(64), creq, &[], &Default::default());
         store
             .claim_and_enqueue(job, job, creq, &draft, 1, 9_999_999_999, 1)
             .expect("claim");
@@ -10945,7 +10962,7 @@ mod tests {
                 1,
             )
             .expect("record offer");
-        let draft = claim_draft(job, buyer, &"s".repeat(64), "creqL", &[]);
+        let draft = claim_draft(job, buyer, &"s".repeat(64), "creqL", &[], &Default::default());
         store
             .claim_and_enqueue(job, job, "creqL", &draft, 1, 9_999_999_999, 1)
             .expect("claim");
@@ -11062,7 +11079,7 @@ mod tests {
                     )
                     .expect("record offer");
                 // A per-job draft (distinct event id) — claim_and_enqueue dedups on `claim:{job}`.
-                let draft = claim_draft(job, &buyer, &seller, creq, &[]);
+                let draft = claim_draft(job, &buyer, &seller, creq, &[], &Default::default());
                 store
                     .claim_and_enqueue(job, job, creq, &draft, 1, 9_999_999_999, 1)
                     .expect("claim");
@@ -11075,7 +11092,7 @@ mod tests {
             seed(&pushed_lapsed, lapsed, &format!("{}4", "w".repeat(63)));
             store.mark_pushed(&pushed_lapsed, "commitX", 3).expect("mark pushed (lapsed)");
             seed(&delivered, live, &format!("{}5", "w".repeat(63)));
-            let ddraft = claim_draft(&delivered, &buyer, &seller, creq, &[]);
+            let ddraft = claim_draft(&delivered, &buyer, &seller, creq, &[], &Default::default());
             store
                 .deliver_and_enqueue(&delivered, &"c".repeat(40), &ddraft, 4, 4 + RESULT_PUBLISH_WINDOW_SECS, 4)
                 .expect("deliver");
@@ -11255,7 +11272,7 @@ mod tests {
         )
         .expect("creq");
         let (store, root) = store_with_awarded_job(&creq, &job, &buyer, author_date);
-        let draft = claim_draft(&job, &buyer, &seller, &creq, &[]);
+        let draft = claim_draft(&job, &buyer, &seller, &creq, &[], &Default::default());
         let now = 5000;
         assert!(
             store
@@ -11509,7 +11526,7 @@ mod tests {
         );
 
         // Re-execution delivers exactly once: deliver_and_enqueue is idempotent on the job.
-        let draft = claim_draft(&job, &buyer, &seller, &creq, &[]);
+        let draft = claim_draft(&job, &buyer, &seller, &creq, &[], &Default::default());
         let now = 5000;
         assert!(
             store

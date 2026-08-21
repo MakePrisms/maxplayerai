@@ -4959,6 +4959,10 @@ mod tests {
 
         fn claim_with(status: &str, seller_pubkey: String) -> job_lifecycle::ClaimView {
             job_lifecycle::ClaimView {
+                // The UNSTATED capability — a seat advertising nothing. Set explicitly because `ClaimView`
+                // has no `Default` derive and must not gain one: a default `SandboxConfig` is a meaningful
+                // object, but a default `ClaimView` is a claim that never existed.
+                capability: crate::heartbeat::SeatCapability::default(),
                 claim_id: "c".repeat(64),
                 created_at: 1,
                 seller_pubkey,
@@ -5630,7 +5634,7 @@ mod tests {
             &seller_hex,
         )
         .expect("creq");
-        let claim_draft = crate::gateway::claim_draft(&job_id, &buyer_hex, &seller_hex, &creq, &[]);
+        let claim_draft = crate::gateway::claim_draft(&job_id, &buyer_hex, &seller_hex, &creq, &[], &crate::heartbeat::SeatCapability::default());
         let claim_id = publish(&seller, &claim_draft).await.to_hex();
 
         // The buyer AWARDED this claim on the relay (kind-3405) — collect resolves the delivery
