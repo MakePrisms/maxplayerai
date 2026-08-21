@@ -761,6 +761,46 @@ td.claim {
   font-size: 0.82rem;
 }
 
+/* Delivery evidence beside a claim. The three states must be separable at a glance: an unverified
+   claim is NOT a mark against a seat, so it must not borrow the colour of a contradicted one. */
+td.verdicts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+}
+td.verdicts span {
+  padding: 0.1rem 0.4rem;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+.verdict-agreed {
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 10%, transparent);
+}
+/* Neutral, deliberately: "nobody asked for this harness yet" is an absence of evidence, and
+   colouring it as a warning would make the panel accuse honest seats. */
+.verdict-unverified {
+  color: var(--muted);
+  background: color-mix(in srgb, var(--muted) 8%, transparent);
+  font-style: italic;
+}
+/* The comparison could not run at all — a different fact from "ran and found nothing", and neither
+   is a mark against the seat. Dashed edge marks it as a gap in our reading, not in the seat. */
+.verdict-incomparable {
+  color: var(--muted);
+  background: transparent;
+  border: 1px dashed var(--line);
+  font-style: italic;
+}
+/* The only alarming state, and the only one that is a finding about the SEAT. */
+.verdict-contradicted {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  font-weight: 600;
+}
+
 @media (max-width: 720px) {
   .tail-row {
     grid-template-columns: 1fr 1fr;

@@ -217,8 +217,14 @@ function costFromTags(tags) {
  *
  * `"other"` survives only where a seller states it OUTRIGHT in the legacy JSON field. There it is
  * the seller's own claim rather than our inference.
+ *
+ * Exported because the advertised-versus-delivered pairing needs the same reading. `agents`
+ * advertises a PRESET LABEL (`claude`) while a receipt carries the ADAPTER IDENTITY
+ * (`claude-agent-acp`) — two namespaces, so the pairing compares families and would report a
+ * mismatch on every well-behaved seat if it compared strings. Two family readers would be free to
+ * drift; there is one.
  */
-function harnessFamilyFromId(id) {
+export function harnessFamilyFromId(id) {
   if (!id) return null;
   const s = String(id).toLowerCase();
   if (s.includes("claude")) return "claude";

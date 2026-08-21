@@ -1,6 +1,11 @@
 import { emptyUsage, percentile } from "./parse.js";
 import { aggregateJobs, computePulse } from "./jobs.js";
-import { buyerMetrics, resolveSeatDirectory, sellerMetrics } from "./profiles.js";
+import {
+  buyerMetrics,
+  resolveSeatDirectory,
+  sellerMetrics,
+  verifyAdvertisedHarnesses,
+} from "./profiles.js";
 
 /** In-memory aggregator for observatory views. */
 export function createStore() {
@@ -263,22 +268,29 @@ export function createStore() {
    * how many rows the window removed, and "9 seats" reads identically whether 0 or 12 were cut.
    */
   function census(now) {
-    const dir = resolveSeatDirectory([...byId.values()], now);
+    const all = [...byId.values()];
+    const dir = resolveSeatDirectory(all, now);
     return {
       freshWindowS: dir.freshWindowS,
       resolvedAt: dir.resolvedAt,
       fossilsExcluded: dir.fossilsExcluded,
       addressesSeen: dir.addressesSeen,
-      seats: dir.seats.map((ev) => ({
-        id: ev.id,
-        pubkey: ev.pubkey,
-        created_at: ev.created_at,
-        // Advertised: the seat's own claim about itself, never proof it will serve.
-        agents: ev.heartbeat?.agents ?? [],
-        version: ev.heartbeat?.version ?? null,
-        status: ev.heartbeat?.status ?? null,
-        profile: profiles.get(ev.pubkey) || null,
-      })),
+      seats: dir.seats.map((ev) => {
+        // Advertised: the seat's own claim about itself, never proof it will serve. `verified` is
+        // the separate reading of what it has actually delivered — carried as its own field so a
+        // renderer cannot present one as the other by accident.
+        const agents = ev.heartbeat?.agents ?? [];
+        return {
+          id: ev.id,
+          pubkey: ev.pubkey,
+          created_at: ev.created_at,
+          agents,
+          verified: verifyAdvertisedHarnesses(all, ev.pubkey, agents),
+          version: ev.heartbeat?.version ?? null,
+          status: ev.heartbeat?.status ?? null,
+          profile: profiles.get(ev.pubkey) || null,
+        };
+      }),
     };
   }
 
