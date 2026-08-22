@@ -509,6 +509,25 @@ impl DockerPolicy {
             argv.push("--runtime".into());
             argv.push(runtime.clone());
         }
+        // ⛔ `--rm` above is NOT the cleanup story, and removing this block to "simplify" rebuilds a
+        // bug that deletes the evidence of itself. `--rm` removes on container EXIT. The driver's
+        // shutdown signals `child.id()` — the outer `docker run` CLIENT, not the container
+        // (`driver/acp_driver.rs`, `shutdown`) — so on a timeout or an abort the client dies, the
+        // container keeps running, and `--rm` never fires. It then leaks until something tidies it,
+        // and the tidy-up is what destroys `docker logs`/`docker inspect`: the only record of WHY the
+        // job failed.
+        //
+        // A deterministic name is what makes the container addressable at all. This run is `-i`, not
+        // `-d`, so no id is printed on stdout to read back, and without `--name`/`--label`/`--cidfile`
+        // nothing downstream can inspect, log or remove THIS container rather than some container.
+        // Derived from the job id (never random) exactly as `sandbox_netns::holder_name` is, for the
+        // reason stated there: a stale container can then be attributed to the job that leaked it, and
+        // a second attempt for the same job collides loudly instead of quietly leaking the first.
+        let job_id = job_id_of(job.workdir);
+        argv.push("--name".into());
+        argv.push(job_container_name(&job_id));
+        argv.push("--label".into());
+        argv.push(format!("{JOB_LABEL}={job_id}"));
         argv.extend(
             [
                 "--init",
@@ -749,6 +768,427 @@ fn job_id_of(workdir: &Path) -> String {
         "unattributed".to_owned()
     } else {
         cleaned
+    }
+}
+
+/// The label a job container carries, so a leaked one can be attributed and listed.
+///
+/// Mirrors [`crate::sandbox_netns::HOLDER_LABEL`] deliberately: the holder and the job container are
+/// two per-job docker objects with ONE naming story, not two.
+pub const JOB_LABEL: &str = "ai.maxplayer.job";
+
+/// The job container's name for `job_id`.
+///
+/// Derived from the job id rather than random, for the reasons stated on
+/// [`crate::sandbox_netns::holder_name`]: a stale container can be attributed to the job that leaked
+/// it, and a second attempt for the same job collides loudly instead of quietly leaking the first.
+pub fn job_container_name(job_id: &str) -> String {
+    format!("maxplayer-job-{job_id}")
+}
+
+/// The directory a job's captured diagnostics are written to: `$MAXPLAYER_HOME/seller-diagnostics/<job_id>`.
+///
+/// ⛔ **Deliberately NOT inside the job workdir, and this is a containment property rather than
+/// tidiness.** The workdir is the ONE host path bind-mounted into the container
+/// (`-v <workdir>:<CONTAINER_WORKDIR>`, read-write), so a stranger's job can read and overwrite
+/// anything there. Evidence about a job must not be writable by that job — capture written into the
+/// mount could be edited by the very run it indicts.
+///
+/// ⚠ **And the file mode does NOT substitute for this.** The container runs `--user` with
+/// [`job_identity`] — the daemon's OWN uid — so inside the mount the job is the same uid that wrote
+/// the capture, and `0600` grants it full access. The owner-only mode below protects these files from
+/// OTHER users on a shared host; only being outside the mount protects them from the job itself. Two
+/// different threats, and only one of them is answered by a permission bit.
+///
+/// Derived by inverting [`job_workdir`] rather than taking a new parameter, and the inversion is
+/// CHECKED: the middle component must be `seller-jobs`, or this is not a path `job_workdir` built and
+/// `None` is returned instead of a guess. A wrong directory here would scatter diagnostics somewhere
+/// nobody looks, which reads exactly like the capture never ran.
+fn job_diagnostics_dir(workdir: &Path) -> Option<PathBuf> {
+    let jobs_dir = workdir.parent()?;
+    if jobs_dir.file_name()? != "seller-jobs" {
+        return None;
+    }
+    let job_id = job_id_of(workdir);
+    Some(jobs_dir.parent()?.join("seller-diagnostics").join(job_id))
+}
+
+/// `docker inspect` argv for the job container, **field-selected**.
+///
+/// ⛔ **Never a bare `docker inspect`.** Its JSON embeds `Config.Env`, and on a run WITHOUT credential
+/// containment that carries the real `ANTHROPIC_API_KEY` (the `-e` pairs this module builds). A
+/// capture file is written to disk and read later by a human, so a bare inspect would persist a live
+/// credential to a file forever. Naming the fields makes the credential absent BY CONSTRUCTION rather
+/// than scrubbed afterwards — the difference between a guarantee and a filter that has to be right.
+///
+/// The fields are the ones that answer *why did this job fail*: terminal state and exit code,
+/// OOM-kill (the failure that looks like a silent hang), docker's own error string, the start/finish
+/// instants, and the network mode (which names the holder it was joined to).
+pub fn inspect_argv(name: &str) -> Vec<String> {
+    [
+        "docker",
+        "inspect",
+        "--format",
+        "status={{.State.Status}} exit_code={{.State.ExitCode}} oom_killed={{.State.OOMKilled}} \
+         error={{printf \"%q\" .State.Error}} started_at={{.State.StartedAt}} \
+         finished_at={{.State.FinishedAt}} network_mode={{.HostConfig.NetworkMode}} \
+         image={{.Config.Image}}",
+        name,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// `docker logs` argv for the job container — the agent's own stdout/stderr.
+///
+/// `--timestamps` because the question a capture answers is usually *when did it stop*, and the
+/// container's clock is the only one that saw it.
+pub fn logs_argv(name: &str) -> Vec<String> {
+    ["docker", "logs", "--timestamps", name]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// `docker rm` argv that removes the job container by exact name.
+///
+/// `--force` because the container this exists for is one that is still RUNNING: the client died and
+/// `--rm` never fired, so a plain `rm` would refuse. `--volumes` matches the holder's teardown.
+pub fn force_remove_argv(name: &str) -> Vec<String> {
+    ["docker", "rm", "--force", "--volumes", name]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// Header names whose VALUE is a credential and must never reach a capture file.
+const SENSITIVE_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "cookie",
+    "set-cookie",
+];
+
+/// The marker a redacted span is replaced by. Matches the crate's existing `<redacted…>` convention
+/// (see `wallet_ops`), so one grep finds every redaction the daemon has ever written.
+const REDACTION_MARKER: &str = "<redacted>";
+
+/// Strip credentials out of captured text before it is written to disk.
+///
+/// Three passes, because a credential reaches a log by three different routes and each needs its own:
+///
+/// 1. **Exact values.** `secrets` holds the live credential values this run actually forwarded. Any
+///    verbatim occurrence is replaced. This is the only pass that can catch a token in a shape nobody
+///    anticipated, which is why the caller passes values rather than relying on patterns.
+/// 2. **Header lines.** Everything after the colon on a [`SENSITIVE_HEADERS`] line goes, so an agent
+///    that logs its own outgoing request does not persist the header value.
+/// 3. **Token shapes.** `sk-`-prefixed runs, which is what every vendor key in
+///    [`CONTAINED_CREDENTIALS`] looks like — the backstop for a credential this daemon never held and
+///    so could not list in `secrets` (one the job brought itself).
+///
+/// ⚠ Pass 1 is the load-bearing one and passes 2 and 3 are backstops. A redactor built only on
+/// patterns answers "I found no credential" identically whether the text is clean or merely
+/// unfamiliar — so the values are supplied, never inferred.
+///
+/// Short `secrets` entries are ignored: a 3-character "secret" would redact ordinary prose and the
+/// resulting file would be useless for the diagnosis it exists to serve.
+pub fn redact(text: &str, secrets: &[String]) -> String {
+    const MIN_SECRET_LEN: usize = 8;
+    let mut out = text.to_owned();
+    for secret in secrets {
+        let secret = secret.trim();
+        if secret.len() >= MIN_SECRET_LEN {
+            out = out.replace(secret, REDACTION_MARKER);
+        }
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for line in out.lines() {
+        match line.split_once(':') {
+            Some((head, _)) if SENSITIVE_HEADERS.contains(&head.trim().to_ascii_lowercase().as_str()) => {
+                lines.push(format!("{head}: {REDACTION_MARKER}"))
+            }
+            _ => lines.push(redact_token_shapes(line)),
+        }
+    }
+    lines.join("\n")
+}
+
+/// Replace `sk-…` runs in one line. Split out so [`redact`] reads as its three passes.
+fn redact_token_shapes(line: &str) -> String {
+    /// Shortest `sk-` run treated as a token. Vendor keys are far longer; this only has to be long
+    /// enough that a literal "sk-" in prose is left alone.
+    const MIN_TOKEN_LEN: usize = 16;
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = rest.find("sk-") {
+        let (before, from_token) = rest.split_at(at);
+        out.push_str(before);
+        let token_len = from_token
+            .char_indices()
+            .find(|(index, c)| *index > 0 && !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
+            .map_or(from_token.len(), |(index, _)| index);
+        if token_len >= MIN_TOKEN_LEN {
+            out.push_str(REDACTION_MARKER);
+        } else {
+            out.push_str(&from_token[..token_len]);
+        }
+        rest = &from_token[token_len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// One `docker` invocation, injected so the cleanup ORDER can be observed in a test.
+///
+/// The effectful implementation is [`RealDockerCli`]. This is a seam rather than a direct
+/// `Command::new("docker")` for one reason: the property that matters here is a SEQUENCE — capture
+/// strictly before removal — and a sequence cannot be checked by reading the source, only by
+/// recording what was called. See `sandbox_netns` for the sibling style where the argv builders are
+/// pure and unit-tested; this adds the one seam that style leaves untestable.
+pub trait DockerCli {
+    /// Run `argv`, returning combined output on success or a message on failure.
+    fn run(&mut self, argv: &[String]) -> Result<String, String>;
+}
+
+/// The real `docker` runner: a blocking `std::process::Command`.
+///
+/// Synchronous, like [`crate::sandbox_netns::NetnsHolder`]'s teardown and for the same reason — this
+/// runs on paths that include a panicking or aborted job, where a spawned task can be dropped by a
+/// shutting-down runtime.
+pub struct RealDockerCli;
+
+impl DockerCli for RealDockerCli {
+    fn run(&mut self, argv: &[String]) -> Result<String, String> {
+        let (program, args) = argv.split_first().ok_or("an empty docker argv")?;
+        let done = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|error| format!("could not run `{program}`: {error}"))?;
+        let stdout = String::from_utf8_lossy(&done.stdout).trim().to_owned();
+        let stderr = String::from_utf8_lossy(&done.stderr).trim().to_owned();
+        match done.status.code() {
+            Some(0) => Ok(stdout),
+            Some(code) => Err(format!(
+                "exit {code}: {}",
+                if stderr.is_empty() { &stdout } else { &stderr }
+            )),
+            None => Err("killed by a signal".to_string()),
+        }
+    }
+}
+
+/// What cleanup did, with capture and removal reported **independently**.
+///
+/// ⚠ Two `Result`s and not one, deliberately. A single status collapses "evidence saved but the
+/// container is still there" and "container gone, evidence lost" into one word — and those want
+/// opposite responses. A caller that only ever reads a combined verdict cannot tell an orphan from a
+/// blind spot.
+#[derive(Debug)]
+pub struct CleanupReport {
+    /// Where the diagnostics were written, or why they were not.
+    pub capture: Result<PathBuf, String>,
+    /// Whether the exact job container is gone, or why it is not.
+    pub removal: Result<(), String>,
+}
+
+impl CleanupReport {
+    /// The one state nothing else can recover from: the container is gone AND its evidence was not
+    /// saved. Named so a caller can act on it rather than re-deriving it from two fields.
+    pub fn evidence_lost(&self) -> bool {
+        self.capture.is_err() && self.removal.is_ok()
+    }
+}
+
+/// Capture the job container's diagnostics, THEN remove it.
+///
+/// **Evidence first, and the order is the whole point.** The tree already states this rule for the
+/// containment sidecar (`sandbox_netns::sidecar_argv`: *"`--rm` is safe here specifically because the
+/// caller captures stdout and stderr before the container is removed; the evidence is in hand before
+/// the container is gone"*). This is that rule applied to the job container, which is the one place it
+/// was missing.
+///
+/// Writes, owner-only, into `dir`:
+/// - `inspect.txt` — the field-selected state ([`inspect_argv`]);
+/// - `logs.txt` — the container's own stdout/stderr, redacted ([`logs_argv`], [`redact`]);
+/// - `event-log.jsonl` — a copy of the run's maxplayer event log, redacted, so the bundle is
+///   self-contained. The original stays in the workdir; this is a copy, not a move, because the
+///   workdir's own copy is what the delivery path already excludes and nothing here should change that.
+///
+/// **A capture failure never silently becomes a clean removal.** Every leg's outcome is recorded, and
+/// removal is attempted regardless — a container left running is a resource leak that also blocks the
+/// next attempt on the same job id, so refusing to remove it would trade one failure for two. What the
+/// caller must not be able to do is read "removed" and infer "captured", which is why
+/// [`CleanupReport`] keeps them apart and [`CleanupReport::evidence_lost`] names the bad pair.
+pub fn capture_then_remove<D: DockerCli>(
+    cli: &mut D,
+    name: &str,
+    dir: &Path,
+    event_log: Option<&Path>,
+    secrets: &[String],
+) -> CleanupReport {
+    let capture = capture_into(cli, name, dir, event_log, secrets);
+    // Attempted on BOTH branches. See the doc comment: not removing would leave a running container
+    // AND a name collision for the next attempt.
+    let removal = cli.run(&force_remove_argv(name)).map(|_| ());
+    CleanupReport { capture, removal }
+}
+
+/// The capture half of [`capture_then_remove`], split out so the `?` shorthand can be used without
+/// letting an early return skip the removal.
+fn capture_into<D: DockerCli>(
+    cli: &mut D,
+    name: &str,
+    dir: &Path,
+    event_log: Option<&Path>,
+    secrets: &[String],
+) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("could not create the diagnostics directory {}: {error}", dir.display()))?;
+    restrict_to_owner(dir, 0o700)?;
+
+    let inspect = cli.run(&inspect_argv(name))?;
+    write_owner_only(&dir.join("inspect.txt"), &redact(&inspect, secrets))?;
+    // `docker logs` on a container that produced nothing exits 0 with empty output; an error here is a
+    // real failure to READ the logs, which is exactly the case that must not be reported as captured.
+    let logs = cli.run(&logs_argv(name))?;
+    write_owner_only(&dir.join("logs.txt"), &redact(&logs, secrets))?;
+    if let Some(path) = event_log {
+        // Absent is normal — the run can fail before the driver writes its first event — so a missing
+        // event log is not a capture failure. An UNREADABLE one is.
+        match std::fs::read_to_string(path) {
+            Ok(events) => write_owner_only(&dir.join("event-log.jsonl"), &redact(&events, secrets))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!("could not read the event log {}: {error}", path.display()))
+            }
+        }
+    }
+    Ok(dir.to_path_buf())
+}
+
+/// Write `body` to `path` with mode `0600`, creating it.
+///
+/// Owner-only because the file holds a stranger's job output on a host that may run more than one
+/// seat, and because the redaction above is a backstop rather than a proof: a capture file should not
+/// be world-readable even when we believe it is clean.
+fn write_owner_only(path: &Path, body: &str) -> Result<(), String> {
+    std::fs::write(path, body)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    restrict_to_owner(path, 0o600)
+}
+
+/// Set `mode` on `path`. A no-op off unix, where the concept does not apply.
+fn restrict_to_owner(path: &Path, mode: u32) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(|error| format!("could not restrict {} to its owner: {error}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+    Ok(())
+}
+
+/// The structured marker the `Drop` fallback emits. A FIXED string, because it is what an operator
+/// greps for when a job has no diagnostics — a reworded marker is an unfindable record.
+pub const CAPTURE_SKIPPED_MARKER: &str = "capture_skipped=drop_fallback";
+
+/// What [`JobContainer`]'s `Drop` must do, as a VALUE.
+///
+/// Extracted from `Drop` so the decision is testable: `Drop` itself reaches a real docker daemon and
+/// cannot return a result, so a test can observe neither its outcome nor its ordering. The variants
+/// are the whole permitted vocabulary — note that **none of them captures**, which is the property
+/// this type exists to make structural rather than remembered.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DropFallback {
+    /// An explicit [`capture_then_remove`] already ran; the fallback issues nothing.
+    Nothing,
+    /// No explicit cleanup ran: emit [`CAPTURE_SKIPPED_MARKER`], THEN remove.
+    ReportSkippedThenRemove,
+}
+
+/// The fallback for a guard in state `settled`.
+///
+/// Reporting comes first and removal second, and never the reverse: the marker is the only record
+/// that will exist about this container, so it must be written while the claim is still true rather
+/// than after a step that can fail or abort.
+fn drop_fallback(settled: bool) -> DropFallback {
+    if settled {
+        DropFallback::Nothing
+    } else {
+        DropFallback::ReportSkippedThenRemove
+    }
+}
+
+/// An RAII handle on the job container, adopted the moment the container can exist.
+///
+/// Mirrors [`crate::sandbox_netns::NetnsHolder`]: the guard exists from the moment the container does,
+/// so a `?`, an early return or an unwind cannot leave one behind. The difference is what each guard
+/// does — the holder's `Drop` is the whole teardown story, whereas this one is a REMOVE-ONLY fallback
+/// for paths that never reached [`Self::settle`].
+pub struct JobContainer {
+    name: String,
+    /// Set by [`Self::settle`] once an explicit [`capture_then_remove`] has run, so `Drop` knows
+    /// whether it is the fallback or a no-op.
+    settled: bool,
+}
+
+impl JobContainer {
+    /// Adopt `name` under the guard. Call this where the container becomes possible, not where it
+    /// becomes certain — `docker run` can fail after creating it.
+    pub fn adopt(name: String) -> Self {
+        Self { name, settled: false }
+    }
+
+    /// The container's name, for the commands that address it.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Record that the explicit evidence-first path has run, so `Drop` does nothing.
+    pub fn settle(&mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for JobContainer {
+    /// Remove the container — and **only** remove it.
+    ///
+    /// ⛔ **Capture must never move into here, and the reason is in this crate already.**
+    /// [`crate::sandbox_netns::NetnsHolder`]'s own `Drop` states it: *"Failure is logged, never
+    /// propagated: `Drop` cannot return."* A capture placed in `Drop` is therefore a guard whose
+    /// failure mode is SILENCE, sitting directly over the evidence it is meant to save — a capture
+    /// that fails here, followed by a removal that succeeds, recreates the exact bug this work exists
+    /// to fix, and reports nothing.
+    ///
+    /// So this path is honest about being second-best: it emits a structured
+    /// `capture_skipped=drop_fallback` record BEFORE removing. Without that marker, "no diagnostics
+    /// for this job" is ambiguous between *capture ran and there was nothing to find* and *the
+    /// fallback removed the container before anything captured it* — two states that are
+    /// byte-identical in the record and want different investigations.
+    fn drop(&mut self) {
+        if drop_fallback(self.settled) == DropFallback::Nothing {
+            return;
+        }
+        // Emitted BEFORE the removal, not after: this line is the only evidence that will exist about
+        // this container, so it must be written while the claim is still true rather than depending on
+        // reaching the end of a path that is already the abnormal one.
+        eprintln!(
+            "sandbox: {CAPTURE_SKIPPED_MARKER} container={} reason=no_explicit_cleanup",
+            self.name
+        );
+        match RealDockerCli.run(&force_remove_argv(&self.name)) {
+            Ok(_) => {}
+            Err(error) => eprintln!(
+                "sandbox: {CAPTURE_SKIPPED_MARKER} container={} removal_failed={error}",
+                self.name
+            ),
+        }
     }
 }
 
@@ -1155,6 +1595,14 @@ pub async fn run_agent_job(
     // for a file-sourced credential, whose proxy URL is not known until the proxy is bound.
     let mut effective_command = agent_command.to_vec();
     let forwarded = forwarded_agent_env(policy);
+    // The credential VALUES this run forwards, held for the capture redactor's exact-value pass.
+    // Taken here because `forwarded` is consumed into `env` further down, and taken as values rather
+    // than trusting patterns because a pattern-only redactor reports "no credential found" identically
+    // for text that is clean and text whose token shape it does not recognise.
+    //
+    // ⛔ These are never printed, formatted into an error, or written anywhere but through
+    // [`redact`], which replaces them. A capture path is exactly where a secret must not leak.
+    let forwarded_secrets: Vec<String> = forwarded.iter().map(|(_, value)| value.clone()).collect();
     // Credential containment (#647). Under docker the real model credential must NOT enter the
     // container: a stranger's job can read `-e ANTHROPIC_API_KEY` and exfiltrate a reusable secret.
     // Start a per-job host proxy that holds the real credential, forward a format-plausible
@@ -1282,6 +1730,12 @@ pub async fn run_agent_job(
     // host, an exhausted plan — and that text was previously dropped here, leaving the caller to
     // guess a cause from the turn's shape alone.
     let mut capture = crate::engine::AgentMessageCapture::default();
+    // The job container is addressable by a name derived from the job, so adopt the guard BEFORE the
+    // run: from here on every exit — return, `?`, panic, runtime shutdown — has something that will
+    // remove it. Only a docker policy has a container at all; a host executor has nothing to guard.
+    let mut container = policy
+        .docker_image()
+        .map(|_| JobContainer::adopt(job_container_name(&job_id_of(workdir))));
     let outcome = run_job(
         &mut driver,
         &mut log,
@@ -1289,8 +1743,82 @@ pub async fn run_agent_job(
         params,
         &mut |event| capture.observe(event),
     )
-    .await
-    .map_err(|error| classify_run_error(error, timeout))?;
+    .await;
+    // ⛔ The cleanup sits HERE, above the `?`, and moving it below would restore the bug. A timeout or
+    // an agent failure returns `Err`, and the error exit is precisely the one that leaves a container
+    // running — `AcpDriver::shutdown` kills the `docker run` CLIENT, so `--rm` never fires. A cleanup
+    // placed after `map_err(…)?` would therefore run on every exit EXCEPT the ones that need it.
+    if let Some(mut container) = container.take() {
+        let name = container.name().to_owned();
+        let destination = job_diagnostics_dir(workdir);
+        let event_log = log_path.clone();
+        let secrets = forwarded_secrets;
+        // Owned: `spawn_blocking` needs `'static`, and this is only ever used in a message.
+        let workdir_shown = workdir.display().to_string();
+        // Off the runtime, for the reason `AcpDriver::shutdown` gives for its own blocking work: the
+        // seller node runs every awarded job as a `spawn_local` task on ONE LocalSet thread, so
+        // blocking docker calls here would stall every sibling job for the duration.
+        let reported = tokio::task::spawn_blocking(move || match destination {
+            Some(dir) => {
+                capture_then_remove(&mut RealDockerCli, &name, &dir, Some(&event_log), &secrets)
+            }
+            // The workdir is not one `job_workdir` built, so there is nowhere derivable to put the
+            // evidence. Still remove the container — a leak would also block the next attempt on this
+            // job id — but say plainly that nothing was captured rather than reporting a clean exit.
+            None => CleanupReport {
+                capture: Err(format!(
+                    "no diagnostics directory derivable from the workdir {workdir_shown}"
+                )),
+                removal: RealDockerCli.run(&force_remove_argv(&name)).map(|_| ()),
+            },
+        })
+        .await;
+        // The explicit path ran, so `Drop` must not also fire its fallback and report a
+        // `capture_skipped` that did not happen. `settle` records that it RAN, not that it SUCCEEDED —
+        // the two legs below carry the outcome.
+        container.settle();
+        match reported {
+            // Reported as two independent facts. A single verdict would collapse "evidence saved, the
+            // container is still there" and "container gone, evidence lost" — opposite problems.
+            Ok(report) => {
+                match &report.capture {
+                    Ok(dir) => eprintln!(
+                        "sandbox: job_capture=ok container={} dir={}",
+                        container.name(),
+                        dir.display()
+                    ),
+                    Err(error) => eprintln!(
+                        "sandbox: job_capture=failed container={} error={error}",
+                        container.name()
+                    ),
+                }
+                match &report.removal {
+                    Ok(()) => {
+                        eprintln!("sandbox: job_cleanup=ok container={}", container.name())
+                    }
+                    Err(error) => eprintln!(
+                        "sandbox: job_cleanup=failed container={} error={error}",
+                        container.name()
+                    ),
+                }
+                if report.evidence_lost() {
+                    eprintln!(
+                        "sandbox: job_capture=evidence_lost container={} — the container was removed \
+                         and its diagnostics were not saved",
+                        container.name()
+                    );
+                }
+            }
+            // The blocking task itself died, so neither leg has an answer and the container's state is
+            // unknown. Saying so is the point: an unreported orphan is the failure mode this work
+            // exists to remove.
+            Err(error) => eprintln!(
+                "sandbox: job_cleanup=unknown container={} error=cleanup task panicked: {error}",
+                container.name()
+            ),
+        }
+    }
+    let outcome = outcome.map_err(|error| classify_run_error(error, timeout))?;
     match outcome.terminal {
         crate::event::JobExecutionStatus::Completed => Ok(AgentRunReport {
             usage: outcome.usage,
@@ -1827,6 +2355,31 @@ mod tests {
         assert!(matches!(err, ExecError::Config(_)));
     }
 
+    /// Whether `arg` names the seller home DIRECTORY — `.maxplayer` occurring as a whole path
+    /// component, under either anchoring: absolute (`/home/seller/.maxplayer/…`) or relative
+    /// (`.maxplayer/…` at the start of the value).
+    ///
+    /// A component match and not a substring match, because the project's docker label namespace
+    /// (`ai.maxplayer.job`) contains the same letters while naming no path at all. Terminators are
+    /// `/`, `:` (a `-v src:dst` value ends the source there) and end-of-string.
+    fn names_home_dir(arg: &str) -> bool {
+        const HOME_COMPONENT: &str = ".maxplayer";
+        let bytes = arg.as_bytes();
+        let mut from = 0usize;
+        while let Some(offset) = arg[from..].find(HOME_COMPONENT) {
+            let at = from + offset;
+            let end = at + HOME_COMPONENT.len();
+            let starts_component = at == 0 || bytes[at - 1] == b'/';
+            let ends_component =
+                end == bytes.len() || bytes[end] == b'/' || bytes[end] == b':';
+            if starts_component && ends_component {
+                return true;
+            }
+            from = at + 1;
+        }
+        false
+    }
+
     // A docker policy mounts ONLY the per-job workdir at the container mount point, so no host path
     // outside the workdir — $MAXPLAYER_HOME included — is reachable in the container by construction.
     #[test]
@@ -1857,10 +2410,37 @@ mod tests {
             .collect();
         assert_eq!(mounts, vec![&format!("{}:{CONTAINER_WORKDIR}", workdir.display())]);
         // The seller's home path never appears anywhere in the argv — not as a mount, not elsewhere.
+        //
+        // The needle tests `.maxplayer` as a PATH COMPONENT rather than as a substring, because a
+        // path is the property and a substring is only a token that usually accompanies it. A bare
+        // `contains(".maxplayer")` also matches this project's docker LABEL namespace
+        // (`ai.maxplayer.…`, carried by both `JOB_LABEL` and `sandbox_netns::HOLDER_LABEL`), which
+        // reaches no host filesystem; and anchoring it to `/.maxplayer` instead would trade that
+        // false positive for a false NEGATIVE, silently dropping any leak that arrives as a relative
+        // path. Component-matching keeps both anchorings and excludes the label by structure.
+        let leaks = |args: &[String]| {
+            args.iter().any(|a: &String| names_home_dir(a) && !a.contains("seller-jobs/job1"))
+        };
         assert!(
-            !launch.args.iter().any(|a| a.contains(".maxplayer") && !a.contains("seller-jobs/job1")),
+            !leaks(&launch.args),
             "no host $MAXPLAYER_HOME path leaks into the container argv: {:?}",
             launch.args
+        );
+        // Controls in BOTH directions. The assertion above passes by matching nothing, which is also
+        // exactly what a broken needle does — so the same predicate is shown firing on real leaks and
+        // staying silent on the label that is not one.
+        assert!(
+            leaks(&[format!("/home/seller/.maxplayer:{CONTAINER_WORKDIR}")]),
+            "an absolute host-home mount must be detected"
+        );
+        assert!(
+            leaks(&[format!(".maxplayer/id_ed25519:{CONTAINER_WORKDIR}")]),
+            "a RELATIVE host-home path must be detected too — anchoring the needle to a leading \
+             slash would have missed this one"
+        );
+        assert!(
+            !leaks(&[format!("{JOB_LABEL}=job1")]),
+            "the docker label namespace is not a host path and must not be reported as a leak"
         );
         // Runs as the seller uid/gid and carries the delivery-identity env.
         assert!(windowed(&launch.args, &["--user", "1000:1000"]));
@@ -2163,6 +2743,315 @@ mod tests {
             "hardening flags after the image would be passed to the agent, not to docker: {:?}",
             launch.args
         );
+    }
+
+    // A job container that nothing can address is a job container nothing can capture. `docker run`
+    // without `--name`, `--label` or `--cidfile` yields a handle only on stdout of a `-d` run — and
+    // this run is `-i`, so there is no id to read. The launch must therefore carry a DETERMINISTIC
+    // name derived from the job, exactly as the netns holder does (`maxplayer-netns-{job_id}`), so a
+    // leaked container can be attributed to its job instead of merely noticed.
+    //
+    // Both must precede the image, or docker reads them as arguments to the agent command.
+    #[test]
+    fn job_container_carries_a_deterministic_name_and_label() {
+        let policy = SandboxPolicy::docker(DockerPolicy {
+            image: "maxplayer-sandbox:latest".into(),
+            forward_env: Vec::new(),
+            runtime: None,
+            network: None,
+            proxy_ports: None,
+            file_credentials: Vec::new(),
+        });
+        let launch = policy
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
+            .expect("command");
+
+        assert!(
+            windowed(&launch.args, &["--name", "maxplayer-job-w"]),
+            "the job container must be addressable by a deterministic name, or nothing can capture \
+             its diagnostics before removing it: {:?}",
+            launch.args
+        );
+        assert!(
+            windowed(&launch.args, &["--label", "ai.maxplayer.job=w"]),
+            "the job container must carry a job label, so a leaked one can be attributed: {:?}",
+            launch.args
+        );
+        let image_at = launch
+            .args
+            .iter()
+            .position(|a| a == "maxplayer-sandbox:latest")
+            .expect("the image is in the argv");
+        let name_at = launch.args.iter().position(|a| a == "--name").expect("--name");
+        let label_at = launch.args.iter().position(|a| a == "--label").expect("--label");
+        assert!(
+            name_at < image_at && label_at < image_at,
+            "an addressing flag after the image would be passed to the agent, not to docker: {:?}",
+            launch.args
+        );
+    }
+
+    // ---- failed-job cleanup and evidence capture ----
+
+    static NEXT_CAPTURE_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn capture_dir(label: &str) -> PathBuf {
+        let id = NEXT_CAPTURE_DIR.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "maxplayer-capture-{label}-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// A `docker` stand-in that RECORDS what it was asked to do, in order.
+    ///
+    /// The sequencing property here cannot be checked by reading the source: block order in a
+    /// function is not evidence that execution followed it. So the calls are recorded and the order
+    /// asserted on what actually ran. `fail_on` makes one verb fail, for the capture-failure case.
+    struct RecordingDocker {
+        /// The first word after `docker` for each call, in call order.
+        verbs: Vec<String>,
+        /// Whether the capture files existed on disk at the instant `rm` was requested. `None` until
+        /// `rm` is asked for. This is the real ordering evidence: argv order alone would not prove the
+        /// bytes had landed.
+        files_present_at_removal: Option<bool>,
+        /// The directory capture writes into, so the check above can look for the files.
+        dir: PathBuf,
+        /// A verb that returns an error instead of output.
+        fail_on: Option<&'static str>,
+        /// Output handed back for `logs`, so a test can plant a credential in it.
+        logs_output: String,
+    }
+
+    impl RecordingDocker {
+        fn new(dir: &Path) -> Self {
+            Self {
+                verbs: Vec::new(),
+                files_present_at_removal: None,
+                dir: dir.to_path_buf(),
+                fail_on: None,
+                logs_output: "job line one\njob line two".into(),
+            }
+        }
+    }
+
+    impl DockerCli for RecordingDocker {
+        fn run(&mut self, argv: &[String]) -> Result<String, String> {
+            let verb = argv.get(1).cloned().unwrap_or_default();
+            if verb == "rm" {
+                self.files_present_at_removal =
+                    Some(self.dir.join("inspect.txt").exists() && self.dir.join("logs.txt").exists());
+            }
+            self.verbs.push(verb.clone());
+            if self.fail_on == Some(verb.as_str()) {
+                return Err(format!("{verb} refused"));
+            }
+            match verb.as_str() {
+                "logs" => Ok(self.logs_output.clone()),
+                _ => Ok("status=exited exit_code=137 oom_killed=false".into()),
+            }
+        }
+    }
+
+    // THE ordering property, and the one the whole task exists for: the evidence must be on disk
+    // BEFORE the container is removed. A timeout is the case that matters — the driver kills the
+    // `docker run` client, `--rm` never fires, the container survives, and whatever removes it next
+    // takes `docker logs` and `docker inspect` with it.
+    //
+    // Asserted on RECORDED calls, not on block order: the fake reports whether the capture files
+    // existed at the instant `rm` was asked for, so a reordering that still "looks" evidence-first in
+    // source would fail here.
+    #[test]
+    fn capture_is_written_before_the_container_is_removed() {
+        let dir = capture_dir("order");
+        let mut cli = RecordingDocker::new(&dir);
+        let report = capture_then_remove(&mut cli, "maxplayer-job-j1", &dir, None, &[]);
+
+        assert!(report.capture.is_ok(), "capture: {:?}", report.capture);
+        assert!(report.removal.is_ok(), "removal: {:?}", report.removal);
+        let rm_at = cli.verbs.iter().position(|v| v == "rm").expect("rm was issued");
+        let inspect_at = cli.verbs.iter().position(|v| v == "inspect").expect("inspect was issued");
+        let logs_at = cli.verbs.iter().position(|v| v == "logs").expect("logs were read");
+        assert!(
+            inspect_at < rm_at && logs_at < rm_at,
+            "every capture call must precede the removal: {:?}",
+            cli.verbs
+        );
+        assert_eq!(
+            cli.files_present_at_removal,
+            Some(true),
+            "the capture files must already be on disk when removal is requested, not merely \
+             requested earlier: {:?}",
+            cli.verbs
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A capture that fails must not read as a clean cleanup. The container is still removed — leaving
+    // it would leak a running container AND collide with the next attempt on this job id — so the
+    // only protection against a silent orphan is that the two legs are reported separately and the bad
+    // pair is nameable.
+    #[test]
+    fn a_capture_failure_is_reported_and_never_a_silent_orphan() {
+        let dir = capture_dir("failed");
+        let mut cli = RecordingDocker::new(&dir);
+        cli.fail_on = Some("inspect");
+        let report = capture_then_remove(&mut cli, "maxplayer-job-j2", &dir, None, &[]);
+
+        assert!(
+            report.capture.is_err(),
+            "a failed inspect must be reported as a capture failure, not swallowed: {:?}",
+            report.capture
+        );
+        assert!(
+            report.removal.is_ok(),
+            "removal must still be attempted, or one failure becomes two: {:?}",
+            report.removal
+        );
+        assert!(
+            cli.verbs.iter().any(|v| v == "rm"),
+            "the container must still be removed: {:?}",
+            cli.verbs
+        );
+        assert!(
+            report.evidence_lost(),
+            "container removed with no evidence saved is the one state a caller must be able to \
+             SEE, rather than infer from two fields"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Nothing a capture writes may retain a credential. Three routes, three checks — because a
+    // redactor that only knows patterns answers "clean" identically for text it simply does not
+    // recognise.
+    //
+    // The structural half is the important one: `docker inspect` must never be asked for
+    // `Config.Env`. On a run without credential containment that field holds the real
+    // `ANTHROPIC_API_KEY` this module puts there with `-e`, so a bare inspect would persist a live
+    // credential to a file. Absent by construction beats scrubbed afterwards.
+    #[test]
+    fn capture_retains_no_credential_header_or_token() {
+        let format = inspect_argv("maxplayer-job-j3").join(" ");
+        assert!(
+            !format.contains("Config.Env") && !format.contains(".Env"),
+            "a field-selected inspect must never request the container environment: {format}"
+        );
+
+        let secret = "sk-ant-api03-REALKEYMATERIALREALKEYMATERIAL";
+        let text = format!(
+            "starting up\nAuthorization: Bearer {secret}\nx-api-key: {secret}\nbody: {{\"key\":\"{secret}\"}}\nplain sk-short line"
+        );
+        let clean = redact(&text, &[secret.to_string()]);
+
+        assert!(
+            !clean.contains(secret),
+            "the exact forwarded credential value must not survive redaction: {clean}"
+        );
+        assert!(
+            !clean.contains("Bearer"),
+            "a sensitive header's VALUE must go, not just the token inside it: {clean}"
+        );
+        assert!(
+            clean.contains("starting up"),
+            "redaction must leave the diagnostic text it exists to preserve: {clean}"
+        );
+        // A short `sk-` run in ordinary prose is not a token and must survive, or every capture file
+        // becomes unreadable noise.
+        assert!(
+            clean.contains("sk-short"),
+            "a short sk- run is prose, not a credential: {clean}"
+        );
+        // The pattern backstop, with NO value supplied — a credential the daemon never held.
+        let unlisted = redact("token=sk-ant-api03-UNLISTEDBUTSTILLSECRET", &[]);
+        assert!(
+            !unlisted.contains("UNLISTEDBUTSTILLSECRET"),
+            "a token shape must be caught even when its value was never forwarded: {unlisted}"
+        );
+    }
+
+    // The job container and its netns holder are TWO per-job docker objects, and each must be
+    // removable by its own exact name. One teardown story, two objects: the holder keeps the
+    // namespace (its own `Drop` owns that, and this change does not touch it), and the job container
+    // is this module's.
+    //
+    // ⚠ Bound, stated rather than implied: this asserts both removals are ISSUED against distinct
+    // exact names. It does not observe docker, so it is not evidence that either container actually
+    // disappeared — that needs a live run, which is gated until capture is active.
+    #[test]
+    fn job_and_holder_are_distinct_objects_removed_by_exact_name() {
+        let job = job_container_name("j4");
+        let holder = crate::sandbox_netns::holder_name("j4");
+        assert_ne!(
+            job, holder,
+            "one name for both objects would make removing either ambiguous"
+        );
+
+        let remove_job = force_remove_argv(&job);
+        assert_eq!(remove_job.last().map(String::as_str), Some(job.as_str()));
+        assert!(
+            remove_job.iter().any(|a| a == "--force"),
+            "the container this exists for is still RUNNING — a plain rm would refuse: {remove_job:?}"
+        );
+        assert!(
+            !remove_job.iter().any(|a| a == holder.as_str()),
+            "removing the job container must not name the holder: {remove_job:?}"
+        );
+    }
+
+    // `Drop` is the fallback for an unwind or an early return, and it is REMOVE-ONLY on purpose:
+    // `NetnsHolder`'s own `Drop` states that failure there is logged and never propagated, so a
+    // capture placed in a `Drop` is a guard whose failure mode is silence sitting over the evidence
+    // itself. What `Drop` must do instead is say it skipped capture — otherwise "no diagnostics" is
+    // ambiguous between *captured and found nothing* and *removed before anything captured it*.
+    #[test]
+    fn drop_fallback_is_remove_only_and_settling_disarms_it() {
+        // Unsettled: an unwind or an early return reached the guard with no explicit cleanup. It must
+        // SAY it skipped capture and then remove — never remove silently.
+        assert_eq!(
+            drop_fallback(false),
+            DropFallback::ReportSkippedThenRemove,
+            "an unsettled guard must report the skipped capture before removing, or 'no diagnostics' \
+             is ambiguous between captured-and-found-nothing and removed-before-capture"
+        );
+        // Settled: the explicit evidence-first path ran, so the fallback must issue nothing rather
+        // than report a skip that did not happen.
+        assert_eq!(
+            drop_fallback(true),
+            DropFallback::Nothing,
+            "a settled guard must not also run the fallback"
+        );
+        // The marker is an operator-facing interface — it is what gets grepped when a job has no
+        // diagnostics — so its exact text is pinned.
+        assert_eq!(CAPTURE_SKIPPED_MARKER, "capture_skipped=drop_fallback");
+
+        let mut container = JobContainer::adopt(job_container_name("j5"));
+        assert_eq!(container.name(), "maxplayer-job-j5");
+        container.settle();
+        drop(container);
+    }
+
+    // The evidence must not land where the job being diagnosed can rewrite it. The workdir is the ONE
+    // host path bind-mounted into the container, so diagnostics go to a sibling directory instead —
+    // and the inversion of `job_workdir` is checked rather than assumed, because a wrong directory
+    // scatters diagnostics somewhere nobody looks, which reads exactly like a capture that never ran.
+    #[test]
+    fn diagnostics_land_outside_the_bind_mounted_workdir() {
+        let home = Path::new("/home/seat/.maxplayer");
+        let workdir = home.join("seller-jobs").join("job-7");
+        let dir = job_diagnostics_dir(&workdir).expect("a job_workdir inverts");
+        // The containment property FIRST, and on its own line, so it can fail by itself. Asserted
+        // before the exact path because it is the load-bearing one: a capture written inside the
+        // bind mount could be rewritten by the very job it indicts.
+        assert!(
+            !dir.starts_with(&workdir),
+            "diagnostics inside the mount could be rewritten by the job they indict: {}",
+            dir.display()
+        );
+        assert_eq!(dir, home.join("seller-diagnostics").join("job-7"));
+        // Not a path `job_workdir` built ⇒ no guess.
+        assert_eq!(job_diagnostics_dir(Path::new("/tmp/elsewhere/job-7")), None);
     }
 
     // The v1 posture runs the job under gVisor on Linux by naming a container runtime. Unset ⇒ the
