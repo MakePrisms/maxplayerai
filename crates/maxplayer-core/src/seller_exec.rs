@@ -1179,6 +1179,9 @@ pub async fn run_agent_job(
                 crate::sandbox_netns::DEFAULT_NETFILTER_IMAGE,
                 crate::credential_proxy::PROXY_HOST_ALIAS,
                 &job_id_of(workdir),
+                // The holder is stamped with this seat's own key, so the boot reaper of a co-tenant
+                // daemon can tell it is not theirs to remove.
+                identity.seller_pubkey_hex(),
                 uid,
                 gid,
                 policy.proxy_ports(),

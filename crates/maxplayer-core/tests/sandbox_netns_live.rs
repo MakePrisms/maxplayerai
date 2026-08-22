@@ -397,27 +397,35 @@ fn the_pinhole_opens_one_port_and_the_rest_of_that_range_stays_denied() {
         Canary::OTHER_PORT
     );
 }
-/// Reaping removes a holder nothing is attached to and **leaves a busy one alone**.
+/// Reaping removes this seat's unattached holder, **spares a busy one**, and **spares another seat's**.
 ///
-/// The second half is the safety property and the reason this runs against real docker: two seller
-/// daemons can share a host, and a reaper that took every labelled holder would strip the network
-/// namespace out from under another daemon's running jobs. The unit tests check the predicate; only this
-/// checks that docker reports attachment the way the predicate expects.
+/// The last two are the safety property and the reason this runs against real docker. Two seller
+/// daemons share a host — VM1854 runs two earning seats, Server One runs three — and a boot that took
+/// every labelled holder would strip the network namespace out from under another daemon's job. The
+/// unit tests check the predicate; only this checks that docker reports labels and attachment the way
+/// the predicate expects, which is the half a fixture can never prove.
 ///
-/// This reaps every orphaned holder on the host, which is what the daemon does at boot. It is safe here
-/// because the label is maxplayer's own and no seller daemon runs on a dev box.
+/// Scoped to a synthetic seat key, so it reaps only what it planted. That is not politeness: it is the
+/// behaviour under test.
 #[test]
 #[ignore = "needs docker and the netfilter image"]
-fn reaping_removes_an_unattached_holder_and_spares_a_busy_one() {
+fn reaping_removes_an_unattached_holder_and_spares_a_busy_one_and_another_seats() {
+    // Two synthetic seats. `MINE` boots and reaps; `FOREIGN` is a co-tenant that must be left alone.
+    const MINE: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const FOREIGN: &str = "2222222222222222222222222222222222222222222222222222222222222222";
     let idle = "mx-reap-idle";
     let busy = "mx-reap-busy";
     let job = "mx-reap-job";
-    for name in [idle, busy, job] {
+    // Deliberately unattached, like a holder in its pre-attach window: the co-tenant case that the
+    // host-wide reaper destroyed and attachment state cannot distinguish.
+    let foreign = "mx-reap-cotenant";
+    for name in [idle, busy, job, foreign] {
         docker(&["rm", "--force", "--volumes", name], None);
     }
 
-    // Two holders carrying the real label, and a job joined to exactly one of them.
-    for name in [idle, busy] {
+    // Three holders carrying the real label — two mine, one another seat's — and a job joined to
+    // exactly one of mine.
+    for (name, seat) in [(idle, MINE), (busy, MINE), (foreign, FOREIGN)] {
         let (ok, _, err) = docker(
             &[
                 "run",
@@ -426,6 +434,8 @@ fn reaping_removes_an_unattached_holder_and_spares_a_busy_one() {
                 name,
                 "--label",
                 &format!("{}=jobfor-{name}", maxplayer_core::sandbox_netns::HOLDER_LABEL),
+                "--label",
+                &format!("{}={seat}", maxplayer_core::sandbox_netns::HOLDER_SEAT_LABEL),
                 "--entrypoint",
                 "sleep",
                 &holder_image(),
@@ -454,7 +464,7 @@ fn reaping_removes_an_unattached_holder_and_spares_a_busy_one() {
 
     let runtime = tokio::runtime::Runtime::new().expect("a runtime");
     let reaped = runtime
-        .block_on(maxplayer_core::sandbox_netns::reap_orphans())
+        .block_on(maxplayer_core::sandbox_netns::reap_orphans(MINE))
         .expect("reaping must not fail");
 
     let still_there = |name: &str| {
@@ -463,19 +473,25 @@ fn reaping_removes_an_unattached_holder_and_spares_a_busy_one() {
     };
     let idle_survived = still_there(idle);
     let busy_survived = still_there(busy);
+    let foreign_survived = still_there(foreign);
 
     // Clean up before asserting, so a failure does not leak containers.
-    for name in [idle, busy, job] {
+    for name in [idle, busy, job, foreign] {
         docker(&["rm", "--force", "--volumes", name], None);
     }
 
-    assert!(!idle_survived, "the unattached holder should have been reaped; reaped={reaped:?}");
+    assert!(!idle_survived, "my own unattached holder should have been reaped; reaped={reaped:?}");
     assert!(
         busy_survived,
         "the holder with a job attached was reaped — on a shared host that strips the namespace out \
          from under another daemon's running job; reaped={reaped:?}"
     );
-    assert_eq!(reaped.len(), 1, "exactly one holder was an orphan; reaped={reaped:?}");
+    assert!(
+        foreign_survived,
+        "another seat's unattached holder was reaped — that is the pre-attach window, and destroying \
+         it fails a stranger's job that was about to start; reaped={reaped:?}"
+    );
+    assert_eq!(reaped.len(), 1, "exactly one holder was mine and idle; reaped={reaped:?}");
 }
 
 /// **End to end: a job launched through the seller's own argv builder is contained.**
@@ -785,6 +801,7 @@ fn establish_contains_a_namespace_and_tears_it_down_on_drop() {
         &netfilter_image(),
         "host.docker.internal",
         "live-establish",
+        "3333333333333333333333333333333333333333333333333333333333333333",
         1000,
         1000,
         Some(PortRange::new(49200, 49299).expect("valid range")),
