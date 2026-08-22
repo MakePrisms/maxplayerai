@@ -212,7 +212,7 @@ fn terminal_status(reason: StopReason) -> JobExecutionStatus {
     }
 }
 
-fn update_text(update: &SessionUpdate) -> Option<String> {
+pub(crate) fn update_text(update: &SessionUpdate) -> Option<String> {
     let text = match update {
         SessionUpdate::AgentMessage(blocks) => blocks
             .iter()
@@ -232,6 +232,44 @@ fn content_block_text(block: &ContentBlock) -> Option<String> {
     }
 }
 
+/// The agent's own account of a turn, accumulated from the sink [`run_job`] already calls for every
+/// update.
+///
+/// A turn can complete having done nothing and say WHY in its last message — a blocked host, an
+/// exhausted plan, a refusal. A caller that discards the stream keeps only the turn's SHAPE, and a
+/// completed-but-empty turn has the same shape whatever the cause, so the cause must be guessed.
+///
+/// Named rather than written inline at the call site so the retention rule can be tested on its own.
+/// An inline closure is reachable only through the driver it is installed beside, which is why the
+/// rule went untested when it was one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AgentMessageCapture {
+    last: Option<String>,
+}
+
+impl AgentMessageCapture {
+    /// Retains `event`'s text when it carries any, so the LAST message the agent sent wins.
+    ///
+    /// Whitespace-only text is not an account of anything and must not displace a real message;
+    /// agents routinely close a turn with a bare newline chunk.
+    pub(crate) fn observe(&mut self, event: RunEvent<'_>) {
+        if let RunEvent::Update(update) = event
+            && let Some(text) = update_text(update)
+            && !text.trim().is_empty()
+        {
+            self.last = Some(text);
+        }
+    }
+
+    /// The retained message, or `None` when the agent sent no text at all.
+    ///
+    /// `None` is a positive claim — the agent said nothing — and a caller must not render it as an
+    /// unknown, because a capture that silently failed to fill would be indistinguishable from it.
+    pub(crate) fn into_last_message(self) -> Option<String> {
+        self.last
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::Future;
@@ -243,7 +281,9 @@ mod tests {
         Artifact, ContentBlock, DriverError, MockDriver, ScriptedSession, SessionUpdate,
         StopReason, UsageMetadata,
     };
-    use crate::engine::{EngineError, RunEvent, RunOutcome, RunParams, run_job};
+    use crate::engine::{
+        AgentMessageCapture, EngineError, RunEvent, RunOutcome, RunParams, run_job,
+    };
     use crate::event::{ArtifactId, Event, JobExecutionStatus, JobId, RuntimeId};
     use crate::log::EventLog;
 
@@ -546,6 +586,98 @@ mod tests {
                 } if value == "too late"
             )
         }));
+    }
+
+    /// The fixture is the message that cost a day: cursor folded a DNS failure for its model host
+    /// into ordinary assistant text and ended the turn normally, so the turn's shape said "flaky
+    /// model" while its text said "blocked egress".
+    const BLOCKED_HOST_MESSAGE: &str =
+        "Error: RetriableError: [unavailable] getaddrinfo EAI_AGAIN agentn.global.api5.cursor.sh";
+
+    #[test]
+    fn the_capture_keeps_the_agents_last_non_empty_message() {
+        let early = SessionUpdate::AgentMessage(vec![ContentBlock::Text {
+            text: "looking at the repo".into(),
+        }]);
+        let blank = SessionUpdate::AgentMessageChunk(ContentBlock::Text {
+            text: "  \n".into(),
+        });
+        let last = SessionUpdate::AgentMessage(vec![ContentBlock::Text {
+            text: BLOCKED_HOST_MESSAGE.into(),
+        }]);
+        let ended = SessionUpdate::TurnEnded(StopReason::Completed);
+        let mut capture = AgentMessageCapture::default();
+
+        for update in [&early, &blank, &last, &ended] {
+            capture.observe(RunEvent::Update(update));
+        }
+
+        assert_eq!(
+            capture.into_last_message().as_deref(),
+            Some(BLOCKED_HOST_MESSAGE),
+            "the last non-empty message must win: neither the trailing blank chunk nor the terminal \
+             update carries an account of the turn, so neither may displace one"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_said_nothing_captures_none() {
+        let blank = SessionUpdate::AgentMessageChunk(ContentBlock::Text { text: "   ".into() });
+        let ended = SessionUpdate::TurnEnded(StopReason::Completed);
+        let mut capture = AgentMessageCapture::default();
+
+        capture.observe(RunEvent::Update(&blank));
+        capture.observe(RunEvent::Update(&ended));
+
+        assert_eq!(
+            capture.into_last_message(),
+            None,
+            "`None` must mean the agent said nothing, which is only true if a real message would \
+             have been kept — the assertion above is what earns that reading"
+        );
+    }
+
+    #[test]
+    fn run_job_feeds_the_capture_the_agents_last_message() {
+        let script = ScriptedSession {
+            session_id: "session-1".into(),
+            updates: vec![
+                SessionUpdate::AgentMessage(vec![ContentBlock::Text {
+                    text: "looking at the repo".into(),
+                }]),
+                SessionUpdate::AgentMessage(vec![ContentBlock::Text {
+                    text: BLOCKED_HOST_MESSAGE.into(),
+                }]),
+                SessionUpdate::TurnEnded(StopReason::Completed),
+            ],
+            artifacts: Vec::new(),
+        };
+        let mut driver = MockDriver::new(RuntimeId("mock".into()), vec![script]);
+        let path = test_path("capture-through-run-job");
+        let mut log = EventLog::open(&path).expect("open log");
+        let mut capture = AgentMessageCapture::default();
+
+        let outcome = block_on(run_job(
+            &mut driver,
+            &mut log,
+            &JobId("job-1".into()),
+            RunParams::mock_defaults(),
+            &mut |event| capture.observe(event),
+        ))
+        .expect("run job");
+
+        assert_eq!(outcome.terminal, JobExecutionStatus::Completed);
+        assert!(
+            outcome.artifacts.is_empty(),
+            "the fixture is the completed-but-empty turn, so the artifact list must stay empty"
+        );
+        assert_eq!(
+            capture.into_last_message().as_deref(),
+            Some(BLOCKED_HOST_MESSAGE),
+            "a capture that stays empty across a talking turn renders as \"the agent said nothing\" \
+             — byte-identical to a genuinely silent turn, and the reason this seam went a day \
+             reporting the wrong cause"
+        );
     }
 
     fn replay_payloads(log: &EventLog) -> Vec<Event> {
