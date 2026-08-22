@@ -3377,7 +3377,18 @@ mod tests {
     #[test]
     fn both_award_paths_pass_the_capability_request_inertly() {
         let award_paths = include_str!("mod.rs");
-        let inert = award_paths.matches("requested_harness_family: None").count();
+        // Occurrences on LIVE lines only. A commented-out `requested_harness_family: None` holds a
+        // whole-file count at 2 while the live code is wired — a comment manufacturing the very
+        // occurrence that answers the probe. Line comments are the only comment form in this file.
+        let live = |needle: &str| {
+            award_paths
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .map(|line| line.matches(needle).count())
+                .sum::<usize>()
+        };
+
+        let inert = live("requested_harness_family: None");
         assert_eq!(
             inert, 2,
             "expected exactly 2 inert capability requests in buyer/mod.rs (manual award and \
@@ -3392,11 +3403,40 @@ mod tests {
              schema."
         );
         assert_eq!(
-            award_paths.matches("required_capabilities: &[]").count(),
+            live("required_capabilities: &[]"),
             inert,
             "every inert harness-family request must carry an inert capability list with it — a \
              half-wired request filters on one axis while the schema disclaims both"
         );
+        // The MODEL axis, which is what both descriptions named above are actually about. A wiring
+        // that touches model ALONE leaves the two counts above at 2, so only this assertion stands
+        // between that change and a green tripwire — and the consequence is worse than a missed
+        // filter: `a_model_request_without_a_harness_family_is_refused_not_ignored` pins that a
+        // model request carrying no family refuses EVERY claim, so model-only wiring stops awards
+        // entirely rather than narrowing them.
+        assert_eq!(
+            live("requested_model: None"),
+            inert,
+            "the model axis must be inert alongside the other two — a model request with no harness \
+             family is REFUSED, not ignored (see \
+             a_model_request_without_a_harness_family_is_refused_not_ignored), so wiring model alone \
+             stops every award instead of filtering one"
+        );
+        // Each axis is pinned by two counts: the inert form above, and the total here. The totals
+        // are what catch a wiring that ADDS a live line instead of editing one — a `Some(..)`
+        // sitting beside a surviving `None` satisfies the counts above and reads as inert.
+        for field in [
+            "requested_harness_family:",
+            "required_capabilities:",
+            "requested_model:",
+        ] {
+            let total = live(field);
+            assert_eq!(
+                total, inert,
+                "every live `{field}` in buyer/mod.rs must be the inert form; found {total} live \
+                 mentions against {inert} inert ones, so at least one carries a real request"
+            );
+        }
     }
 
     // The wire-in, asserted separately from the predicate: `select_awardable_claim` must CONSULT it.
