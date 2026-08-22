@@ -628,6 +628,105 @@ fn split_argv(argv: Vec<String>, cwd: PathBuf) -> AgentLaunch {
     }
 }
 
+/// The uid/gid an awarded job's process runs as: this daemon's own identity.
+///
+/// ONE expression, called by both the awarded-job path ([`run_agent_job`]) and the capability probe
+/// ([`probe_launch_argv`]), so "the probe runs as the uid a job gets" is a shared call rather than a
+/// comment claiming two separate reads agree. Under docker this is what reaches `docker run --user`;
+/// the host executors inherit the daemon's identity anyway and ignore it.
+///
+/// ⚠ Deliberately NOT the owner of any directory. A directory's gid is inherited from its parent
+/// when the parent is setgid, so a workdir's group can differ from the creating process's — and a
+/// probe run under a gid no job ever gets would answer for an identity that does not exist.
+pub fn job_identity() -> (u32, u32) {
+    // SAFETY: `getuid`/`getgid` take no arguments, cannot fail, and only read the calling process's
+    // own credentials.
+    unsafe { (libc::getuid(), libc::getgid()) }
+}
+
+/// The argv that runs `probe_command` in the JOB execution environment under `policy` (#802).
+///
+/// **This is [`SandboxPolicy::launch`], never [`SandboxPolicy::wrap`], and that is the whole point.**
+/// `wrap` yields no argv under docker, because a container launch is not expressible as a bare host
+/// argv — it needs the per-job mount, uid and env. A probe built on `wrap` therefore cannot reach a
+/// docker seat at all, and the ONLY safe reading of that absence is "not proven": running the bare
+/// command instead would execute it on the HOST while jobs run inside a container, advertising a
+/// capability the job will not have. `launch` is total over all three executors, so the probe reaches
+/// every one of them without a fallback existing to be taken.
+///
+/// ⚠ **This function constructs no argv of its own.** It supplies a [`JobLaunch`] and returns what
+/// the awarded-job path would be given for the same inputs. That is deliberate and load-bearing: a
+/// second container-argv builder is how the two drift, and a bad launcher argv does not fail one
+/// probe — it fails every job the seat is offered (#357). There is one builder, and the probe is
+/// merely another caller of it.
+///
+/// `workdir` is a throwaway directory the caller creates and removes, and a missing one is REFUSED
+/// rather than passed through. Measured: with a non-existent bind source, docker creates it as
+/// `uid=0 gid=0 mode=755`, and the container — running as the job's uid — then cannot write its own
+/// workdir. That failure is silent for the `--version` probes this renders, because a version check
+/// writes nothing and still exits 0, so the probe would answer correctly while standing in an
+/// environment no job would ever get. The guard costs one stat and removes the whole class.
+///
+/// The probe carries **no environment** — not the delivery identity, not the forwarded credential
+/// allowlist. It asks whether a binary resolves, which needs no secret, so none is put where a
+/// container could read it. It also claims **no egress containment** (`netns: None`), because none
+/// was established for it.
+///
+/// ⚠ What a proven token means is bounded by exactly this: the command resolved in this environment
+/// at this moment. It does not mean a build will succeed, and the environment can change before a
+/// job arrives — the advertisement is a claim bounded by the probe's cadence, never a guarantee.
+pub fn probe_launch_argv(
+    policy: &SandboxPolicy,
+    probe_command: &[String],
+    workdir: &Path,
+) -> Result<Vec<String>, ExecError> {
+    if !workdir.is_dir() {
+        return Err(ExecError::Config(format!(
+            "the probe workdir {} does not exist — docker would create the bind source as root and \
+             the probe would run in a workdir the job's uid cannot write",
+            workdir.display()
+        )));
+    }
+    let (uid, gid) = job_identity();
+    let job = JobLaunch {
+        workdir,
+        env: &[],
+        uid,
+        gid,
+        netns: None,
+    };
+    let launch = policy.launch(probe_command, &job)?;
+    let mut argv = Vec::with_capacity(launch.args.len() + 1);
+    argv.push(launch.program);
+    argv.extend(launch.args);
+    Ok(argv)
+}
+
+/// Run one already-rendered probe argv and report whether it succeeded (#784).
+///
+/// The spawn half of the capability probe, kept here with the rest of the process machinery. `argv`
+/// is ALREADY rendered for the job environment by [`probe_launch_argv`] — this function must never
+/// render, because doing it in two places is how one of them ends up not doing it.
+///
+/// Success is a clean exit, and NOTHING else. A binary that is absent fails to spawn; one that exists
+/// but errors exits non-zero; both mean the capability is not proven. Output is discarded
+/// (`--version` text is not the evidence, the exit status is) and never inherited, so a probe cannot
+/// scribble on the operator's console.
+///
+/// ⚠ This is a MEASUREMENT, not a gate: it answers only "did this command run cleanly HERE, NOW".
+pub fn probe_command_succeeds(argv: &[String]) -> bool {
+    let Some((program, args)) = argv.split_first() else {
+        return false;
+    };
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// The per-job working directory under the home (`$MAXPLAYER_HOME/seller-jobs/<job_id>`).
 pub fn job_workdir(home: &MaxplayerHome, job_id: &str) -> PathBuf {
     home.root.join("seller-jobs").join(job_id)
@@ -1063,8 +1162,7 @@ pub async fn run_agent_job(
     // for the run (dropping `_proxy` at fn end revokes the placeholder). If containment is required
     // but cannot be established, the job FAILS — there is no fallback to putting the real credential
     // in the container.
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
+    let (uid, gid) = job_identity();
     // Egress containment (#797), FIRST, because two things downstream depend on what it measures: the
     // job's `--network` names the holder it creates, and the credential proxy's base URL must carry the
     // address it resolved. Declared before `_proxy` so it is dropped LAST — the namespace has to
@@ -1769,6 +1867,244 @@ mod tests {
         assert!(windowed(&launch.args, &["-e", "GIT_AUTHOR_NAME=maxplayer-seller-abcd"]));
         // The image precedes the agent command, which is the final argv segment.
         assert_eq!(launch.args.last().map(String::as_str), Some("claude-agent-acp"));
+    }
+
+    fn docker_policy_for_probe() -> SandboxPolicy {
+        SandboxPolicy::docker(DockerPolicy {
+            image: "maxplayer-sandbox:probe".into(),
+            forward_env: Vec::new(),
+            runtime: None,
+            network: None,
+            proxy_ports: None,
+            file_credentials: Vec::new(),
+        })
+    }
+
+    /// A REAL throwaway directory, because `probe_launch_argv` refuses one that does not exist — and
+    /// it refuses it for a measured reason (docker would create the bind source root-owned). A test
+    /// passing a convenient `/w/probe` would be asserting against the refusal arm without noticing.
+    struct ProbeDir(PathBuf);
+
+    impl ProbeDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("maxplayer-probe-{}-{name}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("lay out the throwaway probe workdir");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ProbeDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // The guard on the workdir, both directions. Measured with a live daemon: a non-existent bind
+    // source is created by docker as `uid=0 gid=0 mode=755`, and the container — running as the job's
+    // uid — then cannot write its own workdir. A `--version` probe writes nothing and still exits 0,
+    // so that misconfiguration is INVISIBLE in the result: the probe answers correctly while standing
+    // in an environment no job would ever get.
+    //
+    // Both arms asserted, because a guard that only ever refuses is indistinguishable from a broken
+    // renderer.
+    #[test]
+    fn a_probe_workdir_that_does_not_exist_is_refused_and_a_real_one_renders() {
+        let policy = docker_policy_for_probe();
+        let probe_command = argv(&["cargo", "--version"]);
+
+        let missing = std::env::temp_dir()
+            .join(format!("maxplayer-probe-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let refused = probe_launch_argv(&policy, &probe_command, &missing);
+        assert!(
+            matches!(refused, Err(ExecError::Config(_))),
+            "a missing bind source must be refused, not passed to docker: {refused:?}"
+        );
+
+        // The positive control: the same call with a real directory renders.
+        let dir = ProbeDir::new("guard");
+        assert!(
+            probe_launch_argv(&policy, &probe_command, dir.path()).is_ok(),
+            "an existing workdir must render — otherwise the refusal above proves nothing"
+        );
+    }
+
+    // #802, and the reason this seam exists: the two renderers disagree about docker, and only one of
+    // them can reach a docker seat.
+    //
+    // TWO OPPOSING SIDES IN ONE TEST, deliberately. Asserting only that `probe_launch_argv` returns
+    // an argv would pass just as well if `wrap` had quietly started returning one too — and then the
+    // probe would have a host-argv fallback available again, which is the exact mistake this closes.
+    // So the refusal is asserted beside the reach: `wrap` still yields NOTHING under docker, and the
+    // probe path yields a real `docker run`.
+    #[test]
+    fn a_docker_policy_yields_no_host_argv_but_does_yield_a_probe_launch() {
+        let policy = docker_policy_for_probe();
+        let probe_command = argv(&["cargo", "--version"]);
+
+        // The old seam. `None` is correct here and must stay correct: a caller with no job to launch
+        // has no mount, uid or env to build a container from, so there is nothing safe to return.
+        assert!(
+            policy.wrap(&probe_command).is_none(),
+            "wrap must keep refusing docker — a host argv here is the wrong-environment probe"
+        );
+
+        // The new seam, total over the executor the primary one actually is.
+        let dir = ProbeDir::new("reach");
+        let rendered = probe_launch_argv(&policy, &probe_command, dir.path())
+            .expect("a docker policy renders a probe launch");
+        assert_eq!(rendered.first().map(String::as_str), Some("docker"));
+        assert!(windowed(
+            &rendered,
+            &["-v", &format!("{}:{CONTAINER_WORKDIR}", dir.path().display())]
+        ));
+        // The probe command is the trailing segment, after the image — so what runs inside the
+        // container is the probe, not something the renderer appended.
+        assert_eq!(
+            rendered[rendered.len() - 2..],
+            probe_command[..],
+            "the probe command is the final argv segment: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(&"maxplayer-sandbox:probe".to_owned()),
+            "the operator's real image, never a stand-in: {rendered:?}"
+        );
+    }
+
+    // The probe carries a `--user`, and it is the awarded-job path's OWN identity expression rather
+    // than a number written down twice.
+    //
+    // The sandbox image creates no user and sets no `USER`, so a `docker run` WITHOUT `--user` is
+    // root — and a root probe can see and execute what a job cannot, advertising a capability the job
+    // does not have. That failure passes every test someone would think to run and shows up only when
+    // a buyer's sats are on it, so the flag's presence is asserted directly, not inferred.
+    #[test]
+    fn the_probe_runs_as_the_identity_an_awarded_job_gets() {
+        let dir = ProbeDir::new("identity");
+        let rendered = probe_launch_argv(
+            &docker_policy_for_probe(),
+            &argv(&["cargo", "--version"]),
+            dir.path(),
+        )
+        .expect("renders");
+
+        let (uid, gid) = job_identity();
+        assert!(
+            windowed(&rendered, &["--user", &format!("{uid}:{gid}")]),
+            "the probe's --user must be job_identity() — the same call run_agent_job makes: {rendered:?}"
+        );
+        // Presence, separately from value: `job_identity()` legitimately returns (0, 0) when the
+        // daemon runs as root, and then `--user 0:0` is the honest answer. What must never happen is
+        // the flag being absent, because THAT is root-by-omission on any uid.
+        assert!(
+            rendered.iter().any(|part| part == "--user"),
+            "a docker probe without --user is root, because the image sets no USER: {rendered:?}"
+        );
+    }
+
+    // #357's blast radius, discharged structurally rather than promised.
+    //
+    // A second container-argv builder is how the job path and the probe path drift, and a bad
+    // launcher argv does not fail one probe — it fails EVERY job the seat is offered. So the probe
+    // constructs nothing: it calls the same `launch` the awarded-job path calls. This asserts that
+    // consequence directly — for one policy and one workdir, the probe argv and a job argv are
+    // identical up to the trailing command — which is only true if there is exactly one builder.
+    //
+    // The comparison is against a job with no env, because the probe deliberately carries none: it
+    // asks whether a binary resolves, which needs no secret, so no secret is put where a container
+    // could read it.
+    #[test]
+    fn the_probe_argv_and_a_job_argv_differ_only_in_the_trailing_command() {
+        let policy = docker_policy_for_probe();
+        let dir = ProbeDir::new("parity");
+        let workdir = dir.path();
+        let (uid, gid) = job_identity();
+
+        let job_command = argv(&["claude-agent-acp"]);
+        let job_launch = policy
+            .launch(
+                &job_command,
+                &JobLaunch { workdir, env: &[], uid, gid, netns: None },
+            )
+            .expect("a job renders");
+        let job_argv: Vec<String> =
+            std::iter::once(job_launch.program).chain(job_launch.args).collect();
+
+        let probe_command = argv(&["cargo", "--version"]);
+        let probe_argv = probe_launch_argv(&policy, &probe_command, workdir).expect("renders");
+
+        let job_prefix = &job_argv[..job_argv.len() - job_command.len()];
+        let probe_prefix = &probe_argv[..probe_argv.len() - probe_command.len()];
+        assert_eq!(
+            job_prefix, probe_prefix,
+            "every flag before the command must match the job path byte-for-byte — a difference here \
+             is a second argv builder, and #357 is what that costs"
+        );
+        // And the only difference really is the command, so the assertion above is not vacuous.
+        assert_ne!(job_argv, probe_argv);
+    }
+
+    // The honest false, measured in a REAL container rather than argued from a Dockerfile.
+    //
+    // `#[ignore]` rather than an env-var early-return: a test that returns early when its
+    // precondition is missing reports as PASSED, and a green that cannot go red is worth less than
+    // no test. Ignored reports as ignored. Run it with:
+    //
+    // ```text
+    // MAXPLAYER_PROBE_IMAGE=<image> cargo test -p maxplayer-core --features wallet \
+    //   seller_exec::tests::the_probe_answers_from_inside_the_container -- --ignored --nocapture
+    // ```
+    //
+    // TWO OPPOSING CONTROLS from one image, which is what makes either of them mean anything:
+    // `node` must be PROVEN and `cargo` must be REFUSED. Without the positive control a probe that
+    // always returned false would pass; without the negative one, a probe answering from the host —
+    // where cargo does resolve — would pass. Only the pair separates them.
+    #[test]
+    #[ignore = "runs a real container; needs a docker daemon and MAXPLAYER_PROBE_IMAGE"]
+    fn the_probe_answers_from_inside_the_container_not_from_the_host() {
+        let image = std::env::var("MAXPLAYER_PROBE_IMAGE").expect(
+            "set MAXPLAYER_PROBE_IMAGE to the sandbox image to probe — this test measures a real \
+             container and has nothing to say without one",
+        );
+        let policy = SandboxPolicy::docker(DockerPolicy {
+            image,
+            forward_env: Vec::new(),
+            runtime: None,
+            network: None,
+            proxy_ports: None,
+            file_credentials: Vec::new(),
+        });
+
+        // A REAL directory, for the reason `probe_launch_argv` refuses a missing one.
+        let dir = ProbeDir::new("live");
+
+        let proves = |command: &[&str]| {
+            let rendered = probe_launch_argv(&policy, &argv(command), dir.path())
+                .expect("a docker policy renders a probe launch");
+            probe_command_succeeds(&rendered)
+        };
+
+        let (uid, gid) = job_identity();
+        let node = proves(&["node", "--version"]);
+        let cargo = proves(&["cargo", "--version"]);
+
+        // Printed so the report can state WHICH identity answered, not merely that one did.
+        println!("probed as uid={uid} gid={gid}: node={node} cargo={cargo}");
+        assert!(
+            node,
+            "the positive control failed — a probe that proves nothing proves nothing about absence \
+             either, so the cargo leg below would be meaningless"
+        );
+        assert!(
+            !cargo,
+            "cargo resolved, which means this answered from the HOST: the runtime image carries no \
+             rust toolchain (#358), so a true here is the wrong-environment probe, not a capability"
+        );
     }
 
     // The container runs a STRANGER'S code, and two docker defaults are wrong for that. Measured
