@@ -374,24 +374,42 @@ function latBlock(title, s) {
   ]);
 }
 
+/**
+ * The family cell. `harness_family` is OUR READING of the seat's `harness` id, never the seat's
+ * own words — so an id we cannot place renders as `unidentified`, and never as `other`, which
+ * would assert a family we do not have. Absent id and unplaceable id are different facts and get
+ * different cells. The claimed id rides in its own column beside this one.
+ */
+function familyCell(family, harnessId) {
+  if (family) return td(family);
+  if (harnessId) return el("td", { class: "unidentified" }, [text("unidentified")]);
+  return td("—");
+}
+
+/** The seat's `harness` claim, verbatim. Seller-supplied text — escaped by `text()`, never markup. */
+function claimCell(harnessId) {
+  return harnessId ? el("td", { class: "claim" }, [text(harnessId)]) : td("—");
+}
+
 function renderEconomics(eco) {
-  const groupRows = eco.groups.map(([key, g]) => {
-    const [family, transport] = key.split("|");
-    return el("tr", {}, [
-      td(family),
-      td(transport),
+  const groupRows = eco.groups.map(([, g]) =>
+    el("tr", {}, [
+      familyCell(g.family, g.harness_id),
+      claimCell(g.harness_id),
+      td(g.transport || "—"),
       td(String(g.n)),
       td(g.withCost ? avg(g.sumCost, g.withCost) : "—"),
       td(g.sumPaidTok ? avg(g.sumPaidTok, g.n) : "—"),
       td(g.sumPaidSat ? avg(g.sumPaidSat, g.n) : "—"),
-    ]);
-  });
+    ]),
+  );
 
   const detailRows = eco.rows.slice(0, 40).map((r) =>
     el("tr", {}, [
       td(shortId(r.id)),
       td(r.source || "—"),
-      td(r.harness_family || "—"),
+      familyCell(r.harness_family, r.harness_id),
+      claimCell(r.harness_id),
       td(r.usage_transport || "—"),
       td(fmtNum(r.total_tokens)),
       td(fmtNum(r.input_tokens)),
@@ -403,12 +421,14 @@ function renderEconomics(eco) {
   );
 
   return el("div", { class: "economics" }, [
-    el("h3", {}, [text("by harness_family × usage_transport")]),
+    el("h3", {}, [text("by harness × usage_transport")]),
+    p("harness_family is our reading of the seat's harness claim; the claim itself is beside it."),
     el("div", { class: "table-wrap" }, [
       el("table", {}, [
         el("thead", {}, [
           el("tr", {}, [
             th("harness_family"),
+            th("harness (claimed)"),
             th("usage_transport"),
             th("n"),
             th("avg measured_cost_tokens"),
@@ -416,7 +436,7 @@ function renderEconomics(eco) {
             th("avg paid sats"),
           ]),
         ]),
-        el("tbody", {}, groupRows.length ? groupRows : [emptyRow(6)]),
+        el("tbody", {}, groupRows.length ? groupRows : [emptyRow(7)]),
       ]),
     ]),
     el("h3", {}, [text("recent settlements")]),
@@ -427,6 +447,7 @@ function renderEconomics(eco) {
             th("id"),
             th("source"),
             th("harness_family"),
+            th("harness (claimed)"),
             th("usage_transport"),
             th("total_tokens"),
             th("input_tokens"),
@@ -436,7 +457,7 @@ function renderEconomics(eco) {
             th("paid sats"),
           ]),
         ]),
-        el("tbody", {}, detailRows.length ? detailRows : [emptyRow(10)]),
+        el("tbody", {}, detailRows.length ? detailRows : [emptyRow(11)]),
       ]),
     ]),
   ]);
