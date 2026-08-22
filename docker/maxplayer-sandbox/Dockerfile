@@ -62,11 +62,18 @@ RUN npm install -g \
 # measured reasons:
 #   * The script HARDCODES its own version, so fetching the script is unpinnable while fetching the
 #     tarball is pinnable — which keeps the reproducibility property the paragraph above establishes.
-#   * The script derives every path from $HOME and exposes no override. Run as root in a build that
-#     is /root/.local, which the `agent` user this image runs as cannot read: a green build and an
-#     unusable cursor.
-# The tarball is also the right unit to digest. A digest over `cursor-agent` itself would cover a
-# 4 KB launcher script, not the bundled Node application it execs.
+#   * The script derives every path from $HOME and exposes no override, so a build — which runs as
+#     root — installs under /root/.local. A job cannot read that: jobs arrive as a host uid via
+#     `docker run --user` (see the HOME note further down), and only root can read /root. The trap
+#     is that it would look fine in testing, because this image sets no USER and a bare `docker run`
+#     is therefore root and CAN read it. It would fail only on real jobs, which is the worst
+#     available shape for a green build.
+# The tarball is also the right unit to digest, because `cursor-agent` is not the program. It is a
+# 1,074 B bash script that execs the package's OWN bundled node (`dist-package/node`, ~129 MB) —
+# this image's /usr/local/bin/node does not run cursor. A digest over the launcher would leave both
+# that interpreter and every .js beside it free to move under a passing check. The package also
+# ships `cursorsandbox` and `crepectl`, so what has to survive gVisor is the vendor's node and those
+# helpers, never the node measured on runsc elsewhere.
 #
 # `node` does the fetch and the hash because it is already here (it is this image's Cmd) and `curl`
 # is not — so this adds no package to an image that runs a stranger's code.
