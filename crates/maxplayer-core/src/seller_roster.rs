@@ -259,9 +259,24 @@ impl Advertisement {
     /// mistake is invisible on the wire — a seat that states no model is indistinguishable from a
     /// harness that reported none — and on the claim it is worse than cosmetic, because the award
     /// filter decides on the claim, so a forgotten model is a model no buyer can ever require.
-    pub fn capability(&self) -> crate::heartbeat::SeatCapability {
+    ///
+    /// `display` is the operator's declared colour ([`crate::home::SeatConfig`]) — the two fields a
+    /// roster read cannot supply, because no probe measures a fork name or a machine description.
+    /// It is a required argument for the same reason `models` is: a snapshot that could be turned
+    /// into a capability WITHOUT it gives every call site the chance to emit a seat whose declared
+    /// colour silently vanished, and an absent tag is indistinguishable on the wire from an operator
+    /// who declared nothing.
+    ///
+    /// ⚠ Passing it here does NOT put it on a claim. The two halves are separated at emit, not at
+    /// construction: the claim builder asks for [`crate::heartbeat::SeatCapability::filterable_tags`]
+    /// and the beat additionally asks for `display_tags`, so a claim carries these fields nowhere
+    /// even while holding them. That is the whole point of the split being structural — this
+    /// function does not have to remember which field is which, and neither does its caller.
+    pub fn capability(&self, display: &crate::home::SeatConfig) -> crate::heartbeat::SeatCapability {
         let mut capability = crate::heartbeat::SeatCapability::from_roster(&self.names, &self.models);
         capability.capabilities = self.capabilities.clone();
+        capability.harness_variant = display.harness_variant.clone();
+        capability.hardware = display.hardware.clone();
         capability
     }
 }
@@ -696,7 +711,10 @@ mod tests {
             "a dropped harness does not change what the ENVIRONMENT can run"
         );
         // And they reach the emittable capability through the one route both emitters use.
-        assert_eq!(ad.capability().capabilities, vec!["node", "rust"]);
+        assert_eq!(
+            ad.capability(&crate::home::SeatConfig::default()).capabilities,
+            vec!["node", "rust"]
+        );
     }
 
     #[test]
@@ -729,7 +747,9 @@ mod tests {
         roster.record_model(1, Some("gpt-5.6-terra[medium]".to_owned()));
         roster.fault(1, Fault::Unproven, Instant::now());
 
-        let capability = roster.advertisement().capability();
+        let capability = roster
+            .advertisement()
+            .capability(&crate::home::SeatConfig::default());
         assert_eq!(
             capability.harness_families,
             vec!["claude-code"],
@@ -753,6 +773,38 @@ mod tests {
             "claude-code",
             "claude-opus-5",
         ])));
+    }
+
+    #[test]
+    fn an_undeclared_seat_states_no_colour_at_all() {
+        // The two directions of the `[seat]` key, in one test because either alone is uninformative.
+        // Absent must mean the tag is OMITTED, not emitted empty: a reader cannot tell an empty
+        // string from a machine the operator declined to describe, and #784 makes absent the only
+        // spelling of unstated.
+        let roster = named(&["claude"]);
+        let undeclared = roster
+            .advertisement()
+            .capability(&crate::home::SeatConfig::default());
+        assert_eq!(undeclared.harness_variant, None);
+        assert_eq!(undeclared.hardware, None);
+        assert!(
+            undeclared.display_tags().is_empty(),
+            "an operator who declared nothing publishes no display tag"
+        );
+
+        // POSITIVE CONTROL: the same read must carry a DECLARED value, or the emptiness above proves
+        // only that the field is unreachable — which was the defect, not the fix.
+        let declared = roster.advertisement().capability(&crate::home::SeatConfig {
+            harness_variant: Some("my-fork".to_owned()),
+            hardware: Some("mac studio, 64GB".to_owned()),
+        });
+        assert_eq!(
+            declared.display_tags(),
+            vec![
+                crate::gateway::TagSpec::new(["harness_variant", "my-fork"]),
+                crate::gateway::TagSpec::new(["hardware", "mac studio, 64GB"]),
+            ]
+        );
     }
 
     #[test]

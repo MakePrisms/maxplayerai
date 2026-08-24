@@ -1076,6 +1076,51 @@ pub struct MaxplayerConfig {
     /// Optional `[sandbox]` executor config. Absent ⇒ the agent command runs pass-through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<SandboxConfig>,
+    /// `[seat]` operator-declared seat colour. Defaults (both fields unstated) when absent.
+    #[serde(default, skip_serializing_if = "SeatConfig::is_default")]
+    pub seat: SeatConfig,
+}
+
+/// `[seat]` — the operator-declared half of the seat's advertisement (#784).
+///
+/// These are the DISPLAY-ONLY fields of [`crate::heartbeat::SeatCapability`], and they are declared
+/// here precisely because they are the fields no probe can answer. A fork name and a machine
+/// description are facts about the operator's intent and hardware; nothing the daemon can run
+/// measures them.
+///
+/// ## Why a config key is safe here and forbidden for `capabilities`
+///
+/// The provenance rule is [`crate::heartbeat::SeatCapability`]'s: **filterable ⟺ machine-sourced**,
+/// because a buyer commits sats at award and an operator-typed claim has nothing to contradict it.
+/// These two are never filtered — they ride the kind-30340 beat alone and no award decision reads
+/// them — so an operator may state them freely. That is the same rule read from its other end, not
+/// an exception to it. Adding a FILTERABLE field to this struct would break it; see
+/// [`crate::seller_roster::Advertisement::capability`] for the seam that keeps the two halves apart.
+///
+/// Top-level rather than under `[seller]` for the money-path build boundary that already places
+/// [`SandboxConfig`] and [`SellerAnnounceConfig`] here: `SellerConfig`'s literal is built in
+/// `seller.rs`, which this must not touch.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeatConfig {
+    /// Free-text fork/config colour — e.g. `"my-fork"`. Absent ⇒ the seat states no variant and the
+    /// tag is omitted entirely, which is distinct from stating an empty one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_variant: Option<String>,
+    /// Free-text machine colour — e.g. `"mac studio, 64GB"`. Absent ⇒ the tag is omitted.
+    ///
+    /// EXPLICITLY UNVERIFIED. The daemon does not read the machine to check this, and
+    /// [`crate::heartbeat::HARDWARE_TAG`] documents why that is acceptable: nothing filters on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware: Option<String>,
+}
+
+impl SeatConfig {
+    /// True when the operator has declared nothing, so `config.toml` stays clean and the section
+    /// only serializes once a knob is set.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Buyer-side content policy for contribution verify (the content-policy hook). Maps 1:1
@@ -1172,6 +1217,7 @@ impl Default for MaxplayerConfig {
             buyer: BuyerConfig::default(),
             contribution: None,
             sandbox: None,
+            seat: SeatConfig::default(),
         }
     }
 }

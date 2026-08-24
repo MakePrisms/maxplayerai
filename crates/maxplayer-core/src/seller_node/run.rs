@@ -4207,7 +4207,7 @@ impl SellerNodeRunner {
             seller.rate_sats,
             self.node.home().config.accepted_mints.clone(),
             roster.names.clone(),
-            roster.capability(),
+            roster.capability(&self.node.home().config.seat),
         )
         .to_event_draft();
         self.publish_seat_announcement(draft, "heartbeat").await
@@ -4255,7 +4255,7 @@ impl SellerNodeRunner {
             seller.rate_sats,
             self.node.home().config.accepted_mints.clone(),
             roster.names.clone(),
-            roster.capability(),
+            roster.capability(&self.node.home().config.seat),
         )
         .to_event_draft();
 
@@ -4727,7 +4727,10 @@ impl SellerNodeRunner {
             seller_pubkey,
             &creq,
             &roster.names,
-            &roster.capability(),
+            // The claim holds the declared colour and emits none of it: `claim_draft` asks only for
+            // the filterable tags. Passing it is not a leak, and passing a stub here instead would
+            // make this the one site whose capability came from somewhere other than the config.
+            &roster.capability(&self.node.home().config.seat),
         );
         // Reserve-at-claim: a fully loaded node has no free slot and simply does not claim, which is
         // how it stays invisible to the market. The gate is consulted only here on the event loop,
@@ -12905,7 +12908,11 @@ mod tests {
         );
         // The claim emitter reads the SAME snapshot, so both wire events agree.
         assert_eq!(
-            runner.agents.advertisement().capability().capabilities,
+            runner
+                .agents
+                .advertisement()
+                .capability(&runner.node.home().config.seat)
+                .capabilities,
             expected,
             "the claim capability must carry the same probed set as the heartbeat"
         );
@@ -12977,7 +12984,7 @@ mod tests {
             runner
                 .agents
                 .advertisement()
-                .capability()
+                .capability(&runner.node.home().config.seat)
                 .models
                 .iter()
                 .map(|entry| (entry.family.as_str(), entry.model.as_str()))
@@ -12985,6 +12992,84 @@ mod tests {
             vec![("claude-code", "claude-opus-5")],
             "the claim capability must carry the same model as the heartbeat, in the wire family \
              vocabulary #866's filter matches on"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The operator-declared half of #784. `harness_variant` and `hardware` are the two fields no
+    // probe can answer — a fork name and a machine description are facts about the operator, and
+    // nothing the daemon runs measures them — so they come from `[seat]` in config.toml. Without
+    // that key they are emit helpers with no source, and a seat can never state either one.
+    //
+    // Asserted on the event the fixture relay actually RECEIVED, not on a capability built here: a
+    // test that reassembles the beat itself proves its own arithmetic and would stay green with the
+    // production emit path reading nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_operators_declared_colour_reaches_the_beat_and_never_the_claim() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("seat-colour");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        crate::home::save_config(&mut home, |config| {
+            config.seller = Some(seller_cfg(1, false));
+            config.seat = crate::home::SeatConfig {
+                harness_variant: Some("my-fork".to_owned()),
+                hardware: Some("mac studio, 64GB".to_owned()),
+            };
+            config.relay_url = fixture.url();
+        })
+        .expect("persist config");
+
+        let verdicts = vec![HarnessProbeVerdict {
+            index: 0,
+            name: Some("claude".to_owned()),
+            result: Ok(None),
+        }];
+        let runner = boot_advertising_only_proven(home, verdicts)
+            .await
+            .expect("a proven seat must boot");
+
+        assert!(
+            runner.publish_heartbeat().await,
+            "harness check: the relay must CONFIRM the beat, or the tag assertions below would be \
+             read off an event that never landed"
+        );
+
+        let events = fixture.events().await;
+        let beats = seat_announcements(&events);
+        let beat = beats.last().expect("the seat published an announcement");
+        assert_eq!(
+            beat.tag_value(crate::heartbeat::HARNESS_VARIANT_TAG),
+            Some("my-fork"),
+            "the beat must carry what the operator declared — an absent tag here is the defect \
+             this test exists for"
+        );
+        assert_eq!(
+            beat.tag_value(crate::heartbeat::HARDWARE_TAG),
+            Some("mac studio, 64GB")
+        );
+
+        // The other half of the contract, and the reason passing the config to the CLAIM's
+        // capability is not a leak: display fields are separated at EMIT. `claim_draft` asks for
+        // `filterable_tags` alone, so a claim built from this very capability carries neither field
+        // — asserted on that exact tag set, which is the one a claim publishes.
+        let filterable = runner
+            .agents
+            .advertisement()
+            .capability(&runner.node.home().config.seat)
+            .filterable_tags();
+        assert!(
+            !filterable.iter().any(|tag| {
+                tag.first() == Some(crate::heartbeat::HARNESS_VARIANT_TAG)
+                    || tag.first() == Some(crate::heartbeat::HARDWARE_TAG)
+            }),
+            "a display-only field on a claim would be weight no award decision reads: {filterable:?}"
+        );
+        assert!(
+            !filterable.is_empty(),
+            "POSITIVE CONTROL: the claim states SOMETHING, or the absence above is only an empty \
+             tag list and proves nothing about the split"
         );
 
         runner.client.disconnect().await;
