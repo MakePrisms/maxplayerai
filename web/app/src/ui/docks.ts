@@ -10,7 +10,7 @@ import { usd } from "./spot.js";
 import { statusDot } from "./indicators.js";
 import { feedLine } from "./board.js";
 import { KIND_LABELS, PROFILE } from "../model/kinds.js";
-import { parseEvent, type ParsedEvent } from "../model/events.js";
+import { parseEvent, type HarnessModel, type ParsedEvent } from "../model/events.js";
 import {
   JOB_OVERDUE, participantDetail, relatedActivity,
 } from "../market/participants.js";
@@ -227,6 +227,71 @@ function activityList(view: MarketView, events: ParsedEvent[], t: number, curren
 /* ---------------- participant sheet ---------------- */
 
 /**
+ * A Profile row: label, value, and an optional note. `title` explains what the
+ * value is worth; `mark` is the visible tag a row wears when it is weaker than
+ * it looks. A row with a title but no mark is annotated, not hedged.
+ */
+export type ProfileRow = [string, string | null, { title: string; mark?: string }?];
+
+/**
+ * One Profile row as markup. Exported so the marker rule is under test rather
+ * than asserted by reading this file as text: whether a value wears
+ * "operator-declared" is a claim about what a buyer sees, and a source grep
+ * cannot tell a rendered marker from one that is built and dropped.
+ *
+ * The value goes through `esc` like every other relay string — `hardware` and
+ * `harness_variant` are free text from an open relay, so they are an injection
+ * path in exactly the way an enum-bound token is not.
+ */
+export function profileRowHtml([label, value, note]: ProfileRow): string {
+  return `<div${note ? ` title="${esc(note.title)}"` : ""}><dt>${esc(label)}</dt><dd>${esc(String(value ?? ""))}${
+    note?.mark ? ` <span class="unverified">${esc(note.mark)}</span>` : ""}</dd></div>`;
+}
+
+/**
+ * Operator-typed, nothing measures it, no filter reads it. Every row carrying
+ * this marker is colour a human may find useful and a buyer must not price on.
+ */
+const OPERATOR_DECLARED = {
+  mark: "operator-declared",
+  title: "Typed by the operator. Nothing measures or contradicts this value, and no buyer filter reads it.",
+};
+
+/**
+ * What the runner says it can run, from the newest heartbeat.
+ *
+ * THE ROWS ARE NOT EQUAL, and the difference is provenance, not confidence.
+ * Families come from the dispatchable roster, models from the harness
+ * handshake, and each capability token from a probe run in the job execution
+ * environment before the beat went out. The last two rows are free text an
+ * operator typed. Both kinds are announcements — this reader sees the claim,
+ * never the probe — but only one kind has anything at the seat that could have
+ * made it false, so the weaker two are marked rather than blended in.
+ *
+ * A capability token means its probe command resolved in the job environment at
+ * beat time. That is necessary for the work, not sufficient for it, and the
+ * tooltip says so: a buyer commits sats on this row.
+ *
+ * An unstated field yields no row. A seat may state nothing — the Docker
+ * runtime image proves no tokens at all — and an empty row would read as a
+ * measured zero instead of a silence.
+ */
+export function capabilityRows(s: { harnessFamilies?: string[]; harnessModels?: HarnessModel[]; capabilities?: string[]; harnessVariant?: string | null; hardware?: string | null } | null): ProfileRow[] {
+  if (!s) return [];
+  return [
+    ["Harness family", s.harnessFamilies?.length ? s.harnessFamilies.join(" · ") : null],
+    ["Harness model", s.harnessModels?.length
+      ? s.harnessModels.map((m) => `${m.family} ${m.model}`).join(" · ") : null],
+    ["Capabilities", s.capabilities?.length ? s.capabilities.join(" · ") : null,
+      // No marker — this row is probed. It carries a title anyway, because the
+      // contract a token buys is narrower than the word "capability" suggests.
+      { title: "Probed in the job execution environment before this heartbeat: the token's command resolved there. Necessary for the work, not sufficient." }],
+    ["Harness variant", s.harnessVariant || null, OPERATOR_DECLARED],
+    ["Hardware", s.hardware || null, OPERATOR_DECLARED],
+  ];
+}
+
+/**
  * Racer and runner details share one structure on purpose: headline name,
  * Profile, Stats (six boxes), Recent activity. A field the participant never
  * published is simply not shown — only the public key is guaranteed.
@@ -274,9 +339,10 @@ function participantSheet(view: MarketView, role: "buyer" | "seller", pubkey: st
     ["Accepting work", acceptingText],
     ["Accepted mints", s?.acceptedMints?.length ? s.acceptedMints.join(" · ") : null],
     ["Agents", s?.advertisedAgents?.length ? s.advertisedAgents.join(" · ") : null],
-  ] as [string, string | null][])
+    ...capabilityRows(s),
+  ] as ProfileRow[])
     .filter(([, v]) => v != null && v !== "")
-    .map(([k, v]) => `<div><dt>${k}</dt><dd>${esc(v)}</dd></div>`).join("");
+    .map(profileRowHtml).join("");
   parts.push(`<h4>Profile</h4><dl class="kv profile-kv">
     <div><dt>Public key</dt><dd><button type="button" class="pk-copy" data-copy-text="${esc(pubkey)}" title="Click to copy the full public key" aria-label="Copy public key"><code>${short(pubkey)}…${esc(pubkey.slice(-8))}</code></button></dd></div>
     ${profileRowsHtml}</dl>`);

@@ -7,7 +7,7 @@
  * only the stages that fall inside it.
  */
 import { buildTrades } from "./trades.js";
-import { parseEvent, type ParsedEvent, type RawEvent, type AdvertisementTag } from "../model/events.js";
+import { parseEvent, type ParsedEvent, type RawEvent, type AdvertisementTag, type HarnessModel } from "../model/events.js";
 import { ACCEPT, AWARD, CLAIM, FEEDBACK, HEARTBEAT, OFFER, PROFILE, RECEIPT, RESULT } from "../model/kinds.js";
 
 /**
@@ -329,6 +329,23 @@ export interface SellerRow extends NamedRow {
   accepting: string | null;
   queueDepth: number | null;
   acceptedMints: string[];
+  /**
+   * What the seat says it can run, all from the SAME newest heartbeat as the
+   * rest of the advertisement. Machine-sourced at the seat: families from the
+   * dispatchable roster, models from the harness handshake, capability tokens
+   * from a probe of the job execution environment. Still a claim to this
+   * reader — we see the announcement, never the probe.
+   */
+  harnessFamilies: string[];
+  harnessModels: HarnessModel[];
+  capabilities: string[];
+  /**
+   * Operator-typed colour. Nothing measures or contradicts either one, and no
+   * filter reads them. Kept apart from the fields above so the detail view can
+   * show the difference instead of asking a reader to remember it.
+   */
+  harnessVariant: string | null;
+  hardware: string | null;
   advertisedAgents: string[];
   advertisementTags: AdvertisementTag[];
   advertisementContent: Record<string, unknown> | null;
@@ -366,7 +383,10 @@ export function sellerBoard(events: RawEvent[], now: number, activeEvents: RawEv
             // not measurements. Unknown tags stay intact for the detail view.
             name: null, about: null, profile: null, profileAt: 0,
             askSats: null, accepting: null, queueDepth: null,
-            acceptedMints: [], advertisedAgents: [], advertisementTags: [],
+            acceptedMints: [],
+            harnessFamilies: [], harnessModels: [], capabilities: [],
+            harnessVariant: null, hardware: null,
+            advertisedAgents: [], advertisementTags: [],
             advertisementContent: null, advertisedAt: 0,
             medianDeliverSeconds: null, completionRate: null, harness: null, harnesses: [] };
       rows.set(pk, r);
@@ -413,6 +433,15 @@ export function sellerBoard(events: RawEvent[], now: number, activeEvents: RawEv
         r.accepting = p.accepting ?? null;
         r.queueDepth = p.queueDepth ?? null;
         r.acceptedMints = p.acceptedMints ?? [];
+        // Assigned in this block with the rest of the advertisement, so every
+        // capability field on a row comes from ONE beat. Merged across beats
+        // they would describe a seat that never existed — yesterday's harness
+        // beside today's probe, with nothing on screen to say so.
+        r.harnessFamilies = p.harnessFamilies ?? [];
+        r.harnessModels = p.harnessModels ?? [];
+        r.capabilities = p.capabilities ?? [];
+        r.harnessVariant = p.harnessVariant ?? null;
+        r.hardware = p.hardware ?? null;
         r.advertisedAgents = p.agents ?? [];
         r.advertisementTags = p.advertisementTags ?? [];
         r.advertisementContent = p.advertisementContent ?? null;
