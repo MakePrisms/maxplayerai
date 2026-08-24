@@ -2803,6 +2803,14 @@ pub async fn boot_advertising_only_proven(
         )));
     }
 
+    // Take the home lock BEFORE anything reaches the relay. The publish below is the first thing this
+    // path puts on the wire, and a second seller started on the same home used to reach it, announce
+    // its identity, and only then fail the lock inside boot — leaving a kind-0 on the relay for a node
+    // that never served a single job. The lock is the claim on the home, so it has to precede the
+    // claim on the wire. It is threaded into boot rather than re-taken, which would deadlock.
+    let lock =
+        crate::seller_node::lock::HomeLock::acquire(home.root.join(crate::seller_node::LOCK_FILE))?;
+
     let disco = crate::profile::publish_seller_discoverability_async(&mut home)
         .await
         .map_err(|error| NodeError::Relay(format!("discoverability publish failed: {error}")))?;
@@ -2813,7 +2821,7 @@ pub async fn boot_advertising_only_proven(
         disco.pubkey
     );
 
-    let runner = SellerNodeRunner::boot(home).await?;
+    let runner = SellerNodeRunner::boot_with_lock(home, lock).await?;
     runner.narrow_roster_to(&verdicts);
     Ok(runner)
 }
@@ -2889,6 +2897,18 @@ impl SellerNodeRunner {
     /// authenticates the seller via NIP-42 (signing the challenge) before it will deliver the
     /// p-gated kind-1059 payment wraps.
     pub async fn boot(home: MaxplayerHome) -> Result<Self, NodeError> {
+        let lock = crate::seller_node::lock::HomeLock::acquire(
+            home.root.join(crate::seller_node::LOCK_FILE),
+        )?;
+        Self::boot_with_lock(home, lock).await
+    }
+
+    /// [`Self::boot`] for a caller that already holds the home lock, so the lock can be taken before
+    /// the caller publishes anything. See [`SellerNode::open_with_lock`].
+    pub async fn boot_with_lock(
+        home: MaxplayerHome,
+        lock: crate::seller_node::lock::HomeLock,
+    ) -> Result<Self, NodeError> {
         let relay_url = home.config.relay_url.clone();
 
         // Read the seller secret ONCE, here, to build the authenticated client (single construction
@@ -2898,7 +2918,7 @@ impl SellerNodeRunner {
             .map_err(|error| NodeError::Relay(format!("seller key parse: {error}")))?;
         drop(secret);
 
-        let node = SellerNode::open(home).await?;
+        let node = SellerNode::open_with_lock(home, lock).await?;
 
         // Resolve the harness registry BEFORE anything goes on the wire: a node that cannot launch
         // a single harness must refuse to boot rather than claim work it can never run. Boot can
@@ -6868,6 +6888,69 @@ mod tests {
         }
         // A from-scratch job (no pin) stays on the empty-workdir path — the pin never touches it.
         assert_eq!(plan_delivery_workdir(None, "job-99"), DeliveryWorkdirPlan::Empty);
+    }
+
+    // RED-PROVE: a seller that does not own the home must put NOTHING on the relay.
+    //
+    // `boot_advertising_only_proven` published kind-0 discoverability and only then took the home lock,
+    // inside boot. So a second seller started on a home another node already owns announced its
+    // identity to the relay and then exited at the lock — leaving a kind-0 for a node that never
+    // served a job. The lock is the claim on the home; it has to precede the claim on the wire.
+    //
+    // No relay is needed to observe the order. The publish path calls `home::save_config` to persist a
+    // generated display name BEFORE it contacts any relay (`profile.rs`), so "did the publish path
+    // run" is a question about the config file on disk. Restore the old order and the name appears
+    // there even though the relay is unreachable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_seller_that_loses_the_home_lock_reaches_no_wire() {
+        let root = temp_dir("lock-precedes-wire");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        // Deliberately unreachable: the config write under test happens before any relay contact, so
+        // a regression is still visible without a fixture relay.
+        home.config.relay_url = "ws://127.0.0.1:1".to_owned();
+        let seller = seller_cfg(1, false);
+        crate::home::save_config(&mut home, |config| {
+            config.seller = Some(seller);
+            // No display name, so the publish path would generate one and SAVE it.
+            config.profile = None;
+        })
+        .expect("persist seller config");
+
+        let config_path = root.join("config.toml");
+        let before = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(
+            !before.contains("maxplayer-seller-"),
+            "precondition: no generated display name yet, or this test proves nothing"
+        );
+
+        // Another node already owns this home.
+        let held = crate::seller_node::lock::HomeLock::acquire(
+            home.root.join(crate::seller_node::LOCK_FILE),
+        )
+        .expect("first holder takes the lock");
+
+        let verdicts = vec![HarnessProbeVerdict {
+            index: 0,
+            name: Some("claude".to_owned()),
+            result: Ok(()),
+        }];
+        let outcome = boot_advertising_only_proven(home, verdicts).await;
+
+        assert!(
+            matches!(outcome, Err(NodeError::Lock(_))),
+            "a seller that does not own the home must fail AT THE LOCK, before anything else"
+        );
+
+        let after = std::fs::read_to_string(&config_path).expect("read config after");
+        assert!(
+            !after.contains("maxplayer-seller-"),
+            "the discoverability publish path ran despite the home being owned by another node — \
+             its config write is the proof it got that far:\n{after}"
+        );
+
+        drop(held);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn seller_cfg(rate_sats: u64, claim_open_pool: bool) -> crate::home::SellerConfig {

@@ -156,7 +156,16 @@ impl SellerNode {
     /// Fails closed at the lock step if another node already owns this home.
     pub async fn open(home: MaxplayerHome) -> Result<Self, NodeError> {
         let lock = HomeLock::acquire(home.root.join(LOCK_FILE))?;
+        Self::open_with_lock(home, lock).await
+    }
 
+    /// [`Self::open`] for a caller that already holds the home lock.
+    ///
+    /// Exists so the lock can be taken EARLIER than node bring-up. A caller that publishes anything
+    /// — discoverability, an announcement — must hold the lock before it does, or a node that is
+    /// about to lose the lock still puts its identity on a relay it will never serve from. Taking a
+    /// second lock here instead would deadlock against the caller's own.
+    pub async fn open_with_lock(home: MaxplayerHome, lock: HomeLock) -> Result<Self, NodeError> {
         let store = SellerStore::open(home.root.join(STATE_DB_FILE))?;
         let started_at_unix = now_unix();
         store.record_start(started_at_unix)?;
