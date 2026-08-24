@@ -2279,6 +2279,11 @@ const HARNESS_PROBE_MAX_ATTEMPTS: usize = 3;
 ///
 /// ⇒ so `CompletedNoArtifact` carries the agent's own last message, which is the only thing in the turn
 /// that can name the cause. Retrying it is still right; asserting the model's mood is not.
+///
+/// `Debug` so a failing probe assertion names the shape it actually got. The three shapes are what
+/// the diagnostic is ABOUT, and a bare "assertion failed" cannot tell an unrunnable launcher from a
+/// harness that ran and wrote nothing.
+#[derive(Debug)]
 enum ProbeAttempt {
     /// The harness produced the sentinel artifact: a proven turn.
     ///
@@ -2648,6 +2653,7 @@ fn probe_sentinel_present(workdir: &std::path::Path, sentinel: &str) -> bool {
 /// logs), and whether it PROVED it can deliver. `Err` carries the operator reason and the `Fault` to
 /// record against the roster — the same `(reason, Fault)` a real job's failure produces, so a dead
 /// harness narrows the roster identically whether the fault is found here or at runtime.
+#[derive(Debug)]
 pub struct HarnessProbeVerdict {
     pub index: usize,
     pub name: Option<String>,
@@ -13070,6 +13076,219 @@ mod tests {
             !filterable.is_empty(),
             "POSITIVE CONTROL: the claim states SOMETHING, or the absence above is only an empty \
              tag list and proves nothing about the split"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `/bin/sh` agent that speaks just enough ACP to be probed: it answers `initialize` and
+    /// `session/new`, writes the sentinel, and ends the turn.
+    ///
+    /// It reads the workdir out of the `session/new` PARAMS rather than using its own cwd, because
+    /// that is where a real ACP agent reads it from — the driver carries `cwd` in the protocol and
+    /// does not set the child process's directory. (Distinct from the capability probe, which has no
+    /// protocol channel to carry it and therefore must set the child's cwd.) A stub that wrote to its
+    /// own directory would be testing a mechanism the ACP path does not use.
+    ///
+    /// `model` is the `models.currentModelId` the session start reports. `None` omits the block
+    /// entirely, which is what a harness exposing no model looks like on the wire.
+    ///
+    /// `write_sentinel` is the artifact leg. False makes a stub that answers every message
+    /// correctly and does no work — the shape a quota-exhausted harness has (#254).
+    #[cfg(feature = "acp")]
+    fn write_probe_stub(
+        dir: &std::path::Path,
+        label: &str,
+        model: Option<&str>,
+        write_sentinel: bool,
+    ) -> std::path::PathBuf {
+        let models = match model {
+            Some(id) => format!(r#","models":{{"currentModelId":"{id}"}}"#),
+            None => String::new(),
+        };
+        // One `sed` over the RAW request line, and never `grep`: `grep` on this box is `ugrep`, and
+        // a stub that depends on which grep is first on PATH fails for a reason having nothing to do
+        // with the code under test.
+        //
+        // The sentinel is read out of the JSON-escaped prompt, so it cannot be anchored to the start
+        // of a line. The prompt puts `\n\n` before it, which survives into the wire text as literal
+        // backslash-n — and `n` is a sentinel-legal character, so any tokenizer leaves `n` glued to
+        // the front of the value. Matching the PREFIX wherever it sits is the shape that holds.
+        let artifact = if write_sentinel {
+            "sentinel=$(printf '%s' \"$turn\" | \
+             sed -n 's/.*\\(maxplayer-probe-[0-9][0-9-]*[0-9]\\).*/\\1/p')\n\
+             printf '%s\\n' \"$sentinel\" > \"$cwd/probe.txt\"\n"
+        } else {
+            ""
+        };
+        let script = dir.join(format!("stub-acp-{label}.sh"));
+        let body = format!(
+            "#!/bin/sh\n\
+             read -r _init\n\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":2}}}}'\n\
+             read -r new\n\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"sessionId\":\"stub\"{models}}}}}'\n\
+             read -r turn\n\
+             cwd=$(printf '%s' \"$new\" | sed 's/.*\"cwd\": *\"\\([^\"]*\\)\".*/\\1/')\n\
+             {artifact}\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"stopReason\":\"end_turn\"}}}}'\n"
+        );
+        std::fs::write(&script, body).expect("write stub agent");
+        script
+    }
+
+    /// The argv that runs one stub under a pass-through policy — the same `argv` shape a configured
+    /// harness preset supplies.
+    #[cfg(feature = "acp")]
+    fn stub_argv(script: &std::path::Path) -> Vec<String> {
+        vec![
+            "/bin/sh".to_owned(),
+            script.to_string_lossy().into_owned(),
+        ]
+    }
+
+    // The model a seat advertises must come from the harness's OWN `session/new` result, and this
+    // asserts it across the real ACP driver rather than from an injected verdict: a stub agent
+    // reports `models.currentModelId`, the driver folds it into the run's usage, and the probe
+    // carries it out on the proven arm.
+    //
+    // THREE legs, because the first alone proves almost nothing:
+    //   · a session start that REPORTS a model puts that model on the verdict;
+    //   · one that reports NONE leaves it absent — absence stays absence, never a fabricated default;
+    //   · one that answers every message perfectly and writes NO artifact is NOT proven at all, and
+    //     therefore carries no model however confidently it named one.
+    //
+    // The third leg is also the control on this test's own vehicle. `run_agent_job` opens its event
+    // log INSIDE the probe workdir, and `probe_sentinel_present` scans every file there — so if the
+    // log ever recorded the prompt verbatim, the sentinel would be present without the harness
+    // having done anything, and legs one and two would pass on a probe that cannot fail.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_probe_carries_the_model_its_session_start_reported() {
+        let dir = std::env::temp_dir().join(format!("maxplayer-probe-acp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("stub dir");
+        let identity = DeliveryAgentIdentity::for_seller(&"aa".repeat(32));
+        let sandbox = SandboxPolicy::passthrough();
+
+        let run = |script: std::path::PathBuf, tag: &'static str| {
+            let identity = identity.clone();
+            let sandbox = sandbox.clone();
+            let dir = dir.clone();
+            async move {
+                let probe = mint_probe_identity(0, 0, now_unix() as u64);
+                let workdir = dir.join(format!("wd-{tag}"));
+                let outcome = run_harness_probe_once(
+                    &stub_argv(&script),
+                    &sandbox,
+                    &identity,
+                    &workdir,
+                    &probe.sentinel,
+                )
+                .await;
+                let _ = std::fs::remove_dir_all(&workdir);
+                outcome
+            }
+        };
+
+        let reported = run(
+            write_probe_stub(&dir, "with-model", Some("claude-opus-5"), true),
+            "with-model",
+        )
+        .await;
+        assert!(
+            matches!(&reported, ProbeAttempt::Proven { model } if model.as_deref() == Some("claude-opus-5")),
+            "the model the session start reported must reach the verdict: {reported:?}"
+        );
+
+        let silent = run(write_probe_stub(&dir, "no-model", None, true), "no-model").await;
+        assert!(
+            matches!(&silent, ProbeAttempt::Proven { model: None }),
+            "a harness that reports no model must state none — a default here would advertise a \
+             model no buyer could hold this seat to: {silent:?}"
+        );
+
+        let idle = run(
+            write_probe_stub(&dir, "no-artifact", Some("claude-opus-5"), false),
+            "no-artifact",
+        )
+        .await;
+        assert!(
+            matches!(&idle, ProbeAttempt::CompletedNoArtifact { .. }),
+            "CONTROL: a turn that completed and produced nothing is not proven, whatever model it \
+             named. A pass here would mean the sentinel is reachable without the harness writing \
+             it — and the two legs above would be asserting nothing: {idle:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The whole chain Rocky asked for, with nothing injected: a configured harness preset whose argv
+    // is the ACP stub → the real boot probe → the verdict → the roster → the tags on the event the
+    // relay received. No `SeatCapability` is constructed by this test and no verdict is handed to the
+    // boot; the only thing supplied is an agent that speaks the protocol.
+    //
+    // It is what separates "the pieces are each tested" from "the pieces are connected". Every seam
+    // here has a unit test already, and the seat still advertised no model at all.
+    #[cfg(feature = "acp")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_seat_advertises_the_model_its_acp_handshake_reported() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("acp-model-e2e");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        let script = write_probe_stub(&root, "boot", Some("claude-opus-5"), true);
+        crate::home::save_config(&mut home, |config| {
+            let mut seller = seller_cfg(1, false);
+            seller.agents = vec!["claude".to_owned()];
+            config.seller = Some(seller);
+            config.agents.insert(
+                "claude".to_owned(),
+                crate::home::AgentPresetConfig {
+                    argv: stub_argv(&script),
+                },
+            );
+            config.relay_url = fixture.url();
+        })
+        .expect("persist config");
+
+        // The REAL boot probe: it runs the harness, reads its handshake, and decides on the artifact.
+        let verdicts = probe_configured_harnesses(&home)
+            .await
+            .expect("the boot probe must run");
+        assert_eq!(
+            verdicts.len(),
+            1,
+            "harness check: exactly the configured preset was probed: {verdicts:?}"
+        );
+        assert_eq!(
+            verdicts[0].result.as_ref().map(Option::as_deref),
+            Ok(Some("claude-opus-5")),
+            "the boot probe must carry the handshake's model — everything below reads from this"
+        );
+
+        let runner = boot_advertising_only_proven(home, verdicts)
+            .await
+            .expect("a proven seat must boot");
+        assert!(
+            runner.publish_heartbeat().await,
+            "harness check: the relay must CONFIRM the beat"
+        );
+
+        let events = fixture.events().await;
+        let beat = seat_announcements(&events)
+            .last()
+            .copied()
+            .expect("the seat published an announcement");
+        assert!(
+            beat.tags.contains(&vec![
+                crate::heartbeat::HARNESS_MODEL_TAG.to_owned(),
+                "claude-code".to_owned(),
+                "claude-opus-5".to_owned(),
+            ]),
+            "the beat must pair the reported model with its wire FAMILY — the vocabulary #866's \
+             filter matches on, not the roster's preset name: {:?}",
+            beat.tags
         );
 
         runner.client.disconnect().await;
