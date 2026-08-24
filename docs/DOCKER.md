@@ -296,9 +296,13 @@ Six things to know before you need them:
   that preface and surfaces **no request at all**, so the symptom is "nothing connected" rather than a
   protocol error. Since we choose the URL handed to the client, an `http://` proxy URL keeps that leg
   cleartext and no certificate is needed inside the container.
-- **The container leg is unproven.** The host leg is verified end to end against the real vendor, with
-  a negative control. The placeholder has not been carried through a running container, and no seat
-  sets `mode = "docker"` today. Under `launcher` mode this key is inert.
+- **The container leg is measured now, and it splits in two.** The host leg was already verified end to
+  end against the real vendor, with a negative control. From inside a running container: the
+  placeholder **is** carried and substituted — the control plane reached the proxy and authenticated
+  over HTTP/1 across every probe turn on a live seat. The **agent** leg is where it stops, and the
+  reason is transport shape rather than credential handling: see the two bullets above. So the
+  credential mechanism is proven through a container and `mode = "docker"` with Cursor still does not
+  yield a working seat. Under `launcher` mode this key is inert.
 
 #### The credential proxy listens on every interface — firewall it on a public box
 
