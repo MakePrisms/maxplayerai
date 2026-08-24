@@ -2142,43 +2142,7 @@ async fn start_credential_containment(
     }
 
     let engine = Arc::new(proxy::ProxyEngine::new(upstream_hosts));
-    // The proxy is header-agnostic by design: it forwards whatever the container sent, and the
-    // forwarded agent credential rides `x-api-key`. reqwest's default redirect policy is
-    // `Policy::limited(10)`, and its cross-host scrub covers only AUTHORIZATION, COOKIE, cookie2,
-    // PROXY_AUTHORIZATION and WWW_AUTHENTICATE — `x-api-key` is in none of them. So a 3xx from an
-    // allowlisted host would carry the credential onward to a host the allowlist never approved:
-    // the destination is decided BEFORE the redirect moves it.
-    //
-    // So a redirect is followed only while it stays on the upstream the credential in flight was
-    // registered for. That upstream is not the allowlist: `authorize` picks the destination from the
-    // credential itself, and the allowlist is the UNION of every present credential's upstream. A
-    // union check would approve a 3xx from one registered vendor to ANOTHER — handing an Anthropic key
-    // to OpenAI's host — because both are on it. A refused attempt is `stop()`, which returns the 3xx
-    // for the proxy to relay to the container unchanged.
-    //
-    // The pairing is available without per-request state, which is why this stays one shared client:
-    // `Policy::custom` closes over the ENGINE and never a request, so the credential cannot be reached
-    // from here — but the attempt carries its own chain, and its FIRST entry is the original request
-    // URL, which `relay` built from that credential's upstream.
-    //
-    // EVERY HOP, not just the first, and each judged against the ORIGINAL rather than its predecessor:
-    // judging hop-against-predecessor would let a chain walk one authority at a time to anywhere.
-    // Verified in reqwest 0.12.28 rather than assumed — `TowerRedirectPolicy::redirect`
-    // (`src/redirect.rs:306`) pushes the previous URL onto an accumulating chain (`:315`) and then
-    // calls this policy with THAT hop's target (`:317`), so `previous()[0]` is the original request URL
-    // on every hop. An empty chain yields no original and is refused rather than followed.
-    let forwarding_client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            let original = attempt.previous().first().map(|url| url.as_str()).unwrap_or("");
-            if proxy::allows_paired_redirect(original, attempt.url().as_str()) {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        }))
-        .build()
-        .map_err(|error| ExecError::Agent(format!("credential proxy client: {error}")))?;
-    let running = proxy::start(Arc::clone(&engine), forwarding_client, proxy_ports)
+    let running = proxy::start(Arc::clone(&engine), proxy_ports)
         .await
         .map_err(|error| ExecError::Agent(format!("credential proxy failed to start: {error}")))?;
 
