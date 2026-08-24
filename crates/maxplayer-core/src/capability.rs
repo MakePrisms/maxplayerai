@@ -26,12 +26,10 @@
 //! the tool is present, not seats guaranteed to complete the work; that guarantee only ever comes from
 //! probe-and-delivery, never from the advertisement.
 //!
-//! ⚠ THE TOKEN LIST IS NOT YET RATIFIED. These three are the ones issue #784 names verbatim
-//! (`rust`, `node`, `python`). The spec (`docs/protocol-v1.md`) is the authority and does not carry
-//! a capability vocabulary yet. Adding a token is a one-line change HERE plus a spec update — which
-//! is the intended way new tokens land, per #784 ("new tokens land by a spec update"). Deliberately
-//! minimal: a token invented here and shipped to the wire is far harder to withdraw than one added
-//! later.
+//! The vocabulary is RATIFIED in `docs/protocol-v1.md` §4.5.2, which is the authority; this list and
+//! that section state the same three tokens, and §4.5.3 carries the probe commands. Adding a token
+//! is a one-line change HERE plus that spec update, and it lands in neither place alone. Deliberately
+//! minimal: a token shipped to the wire is far harder to withdraw than one added later.
 
 /// Every capability token a seat may advertise, sorted. A buyer's filter and a seller's emitter
 /// share this one list, so a token that cannot be emitted also cannot be asked for.
