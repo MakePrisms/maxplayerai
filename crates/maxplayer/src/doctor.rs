@@ -935,6 +935,10 @@ mod checks {
         /// Neither local nor reachable in the registry (not yet published, wrong ref, auth, or no
         /// network). The operator has to act before a job can run.
         Absent,
+        /// A probe did not finish inside [`DOCKER_PROBE_TIMEOUT`] and was killed. Carries the command
+        /// that hung. **This is not evidence about the image** — kept apart from `Absent` so the
+        /// verdict cannot claim the registry was unreachable when nothing was ever asked.
+        Indeterminate(&'static str),
     }
 
     /// The docker sandbox image the seat runs jobs in must be present locally or pullable, or the
@@ -988,33 +992,112 @@ mod checks {
                 ),
                 pull,
             ),
+            // WARN, not FAIL: we never learned anything about the image, and a FAIL here would
+            // report a registry problem the check never observed.
+            ImageAvailability::Indeterminate(command) => Check::warn(
+                SANDBOX_IMAGE_CHECK,
+                format!(
+                    "`{command}` did not return within {}s, so image '{image}' is unverified — on \
+                     macOS this is usually Docker Desktop's credential helper waiting for a keychain \
+                     prompt that a non-interactive run never answers",
+                    DOCKER_PROBE_TIMEOUT.as_secs()
+                ),
+                format!("run `{command} {image}` yourself to see what it waits on, then: {pull}"),
+            ),
         }
     }
 
-    /// Probe whether `image` is present locally or pullable, executing docker with every stdio stream
-    /// nulled (same discipline as [`nix_runs`]) so the gate's output is never polluted or blocked.
-    /// `docker image inspect` is a purely-local lookup; `docker manifest inspect` is a registry HEAD
-    /// that pulls no layers.
+    /// How long one `docker` probe gets before the check gives up on it.
+    ///
+    /// `docker image inspect` is a local lookup that returns in milliseconds and `docker manifest
+    /// inspect` is a single registry HEAD, so ten seconds is generous for both. The bound exists for
+    /// the case where neither returns at all: Docker Desktop's default `credsStore` shells out to a
+    /// credential helper, and that helper can wait indefinitely for a keychain or UI response that a
+    /// non-interactive `doctor` run will never supply.
+    const DOCKER_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// What one bounded `docker` probe did.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ProbeOutcome {
+        /// Exited 0.
+        Ok,
+        /// Ran to completion and exited non-zero, or could not be spawned.
+        Failed,
+        /// Still running at the deadline; killed. Says nothing about the image.
+        TimedOut,
+    }
+
+    /// Probe whether `image` is present locally or pullable.
+    ///
+    /// Every stdio stream is nulled so the gate's own output is never polluted, and each probe is
+    /// bounded by [`DOCKER_PROBE_TIMEOUT`] so a docker that never returns cannot hang the run.
+    /// Nulling stdio alone does not give that second property — it prevents a pipe-buffer stall, not
+    /// a child that simply never exits.
+    ///
+    /// A timeout is reported as [`ImageAvailability::Indeterminate`], never folded into `Absent`: a
+    /// probe that did not finish has learned nothing about the image, and saying "not reachable"
+    /// would send the operator after the wrong fault.
     fn probe_image_availability(image: &str) -> ImageAvailability {
-        if docker_probe_ok(&["image", "inspect", image]) {
-            ImageAvailability::Present
-        } else if docker_probe_ok(&["manifest", "inspect", image]) {
-            ImageAvailability::Pullable
-        } else {
-            ImageAvailability::Absent
+        match docker_probe(&["image", "inspect", image]) {
+            ProbeOutcome::Ok => return ImageAvailability::Present,
+            ProbeOutcome::TimedOut => {
+                return ImageAvailability::Indeterminate("docker image inspect")
+            }
+            ProbeOutcome::Failed => {}
+        }
+        match docker_probe(&["manifest", "inspect", image]) {
+            ProbeOutcome::Ok => ImageAvailability::Pullable,
+            ProbeOutcome::TimedOut => ImageAvailability::Indeterminate("docker manifest inspect"),
+            ProbeOutcome::Failed => ImageAvailability::Absent,
         }
     }
 
-    /// True when `docker <args>` spawns and exits 0, all stdio nulled.
-    fn docker_probe_ok(args: &[&str]) -> bool {
-        std::process::Command::new("docker")
-            .args(args)
+    /// Run `docker <args>` with all stdio nulled, bounded by [`DOCKER_PROBE_TIMEOUT`].
+    fn docker_probe(args: &[&str]) -> ProbeOutcome {
+        let mut command = std::process::Command::new("docker");
+        command.args(args);
+        run_bounded(&mut command, DOCKER_PROBE_TIMEOUT)
+    }
+
+    /// Spawn `command` with every stdio stream nulled and wait at most `timeout` for it.
+    ///
+    /// On expiry the child is killed and reaped, so a probe never leaves a process behind. Split out
+    /// from [`docker_probe`] and taking the `Command` so the bound itself is testable without docker.
+    pub(super) fn run_bounded(
+        command: &mut std::process::Command,
+        timeout: Duration,
+    ) -> ProbeOutcome {
+        let mut child = match command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return ProbeOutcome::Failed,
+        };
+
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return if status.success() {
+                        ProbeOutcome::Ok
+                    } else {
+                        ProbeOutcome::Failed
+                    }
+                }
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return ProbeOutcome::TimedOut;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => return ProbeOutcome::Failed,
+            }
+        }
     }
 
     const SANDBOX_ENGINE_CHECK: &str = "sandbox engine floor";
@@ -2464,6 +2547,92 @@ mod tests {
             pullable.render().contains(&pull),
             "a pullable image must still offer the pre-pull command: {}",
             pullable.render()
+        );
+    }
+
+    // RED-PROVE: the image probe must be BOUNDED. Before this, `docker_probe_ok` called
+    // `Command::status()`, which waits forever — so a docker CLI that never returns (Docker Desktop's
+    // default `credsStore` shelling out to a credential helper that waits on a keychain prompt)
+    // hung `doctor` with no output and no way out.
+    //
+    // The assertion is on ELAPSED TIME, not just the returned variant: a `TimedOut` that arrives after
+    // the caller has already waited forever is not a fix. Widen the timeout and this reddens.
+    #[test]
+    fn doctor_bounds_a_probe_that_never_returns() {
+        use std::time::{Duration, Instant};
+
+        let mut command = std::process::Command::new("sleep");
+        command.arg("60");
+
+        let started = Instant::now();
+        let outcome = checks::run_bounded(&mut command, Duration::from_millis(300));
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            outcome,
+            checks::ProbeOutcome::TimedOut,
+            "a child still running at the deadline must be reported as TimedOut, not as a failure \
+             that reads like an answer about the image"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the probe must RETURN at its deadline — waited {elapsed:?} for a 300ms bound"
+        );
+    }
+
+    // A bound is only useful if the ordinary answers still come back, so this is the positive control
+    // for the test above: without it, `run_bounded` could return TimedOut unconditionally and pass.
+    #[test]
+    fn doctor_bounded_probe_still_reports_success_and_failure() {
+        use std::time::Duration;
+
+        let mut ok = std::process::Command::new("true");
+        assert_eq!(
+            checks::run_bounded(&mut ok, Duration::from_secs(10)),
+            checks::ProbeOutcome::Ok,
+            "a command that exits 0 must report Ok"
+        );
+
+        let mut bad = std::process::Command::new("false");
+        assert_eq!(
+            checks::run_bounded(&mut bad, Duration::from_secs(10)),
+            checks::ProbeOutcome::Failed,
+            "a command that exits non-zero must report Failed"
+        );
+
+        let mut missing = std::process::Command::new("maxplayer-no-such-binary-exists");
+        assert_eq!(
+            checks::run_bounded(&mut missing, Duration::from_secs(10)),
+            checks::ProbeOutcome::Failed,
+            "a command that cannot be spawned must report Failed, never TimedOut"
+        );
+    }
+
+    // RED-PROVE: a timed-out probe must NOT be folded into `Absent`. `Absent` says the registry was
+    // reached and did not have the image, which sends the operator after a publish/auth problem that
+    // may not exist. A probe that never returned learned nothing, so it WARNs and names the command
+    // that hung.
+    #[test]
+    fn doctor_sandbox_image_timeout_is_not_reported_as_absent() {
+        use checks::ImageAvailability;
+        let image = "ghcr.io/makeprisms/maxplayer-sandbox:v9.9.9";
+
+        let stuck =
+            checks::fold_sandbox_image(image, ImageAvailability::Indeterminate("docker manifest inspect"));
+        let rendered = stuck.render();
+
+        assert_eq!(
+            stuck.status,
+            Status::Warn,
+            "an unfinished probe must WARN, never FAIL as though the registry answered: {rendered}"
+        );
+        assert!(
+            rendered.contains("docker manifest inspect"),
+            "the verdict must name the command that hung: {rendered}"
+        );
+        assert!(
+            !rendered.contains("could not be reached in the registry"),
+            "a timeout must not borrow the ABSENT wording — nothing was ever asked: {rendered}"
         );
     }
 
