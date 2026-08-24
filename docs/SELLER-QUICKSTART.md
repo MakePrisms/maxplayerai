@@ -417,9 +417,12 @@ read** — caught by a `doctor` WARN, not a refusal, so the seat runs and leaks.
 The browser-login **session** does have a contained path. `[[sandbox.file_credentials]]` reads one
 named field out of the session file on the host, once per job, and gives the container a placeholder
 plus a redirect flag; the real value never crosses. That path is verified against the real vendor on
-the host leg and **has not yet been exercised from inside a running container**, so until it has, run
-cursor under `launcher` mode or use a claude/codex harness under docker. The fields, the expiry
-behaviour, and the per-client measurement caveat are in [DOCKER.md](DOCKER.md).
+the host leg. **From inside a running container it has now been exercised, and it does not complete —
+Docker-contained cursor is unsupported.** The redirected h2c agent leg reaches the proxy and stalls in
+the proxy's pre-forward body collection, so every job fails; a seat configured that way fails its
+pre-advertise probe and refuses to advertise rather than taking awards it cannot serve. Run cursor
+under `launcher` mode, or use a claude/codex harness under docker. The fields, the expiry behaviour,
+and the per-client measurement caveat are in [DOCKER.md](DOCKER.md).
 
 **Leave `image` unset.** Omitted, the binary uses its own version-pinned ref
 (`ghcr.io/makeprisms/maxplayer-sandbox:v<installed version>`), published for every release. `image` is

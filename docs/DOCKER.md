@@ -208,8 +208,11 @@ runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM
   `forward_env = ["CURSOR_API_KEY"]` forwards that key into the container for a stranger's job to
   read — which `doctor` flags as a WARN rather than refusing. Never do that. The **browser-login
   session** is different: `file_credentials` below carries it as a per-job placeholder and keeps the
-  real value on the host. That path has not yet been exercised from inside a running container, so
-  until it has, run cursor under `launcher` mode or use a claude/codex harness under docker.
+  real value on the host. **That path has now been exercised from inside a running container, and it
+  does not complete: Docker-contained cursor is unsupported.** The redirected h2c agent leg reaches the
+  proxy and stalls in the proxy's pre-forward body collection, so every job fails and the seat's
+  pre-advertise probe refuses to advertise. Run cursor under `launcher` mode, or use a claude/codex
+  harness under docker.
 
 - **Omit `image`.** Unset, the binary uses its own version-pinned ref
   `ghcr.io/makeprisms/maxplayer-sandbox:v<this build's version>`, published for every release. `image`
