@@ -531,19 +531,26 @@ impl DockerPolicy {
     /// is the boundary there). The named runtime must be registered with the daemon, or the run fails
     /// at spawn — a fail-closed the seller boot doctor is meant to catch first.
     fn run_argv(&self, agent_command: &[String], job: &JobLaunch<'_>) -> Vec<String> {
-        let mut argv: Vec<String> = vec!["docker".into(), "run".into(), "--rm".into(), "-i".into()];
+        let mut argv: Vec<String> = vec!["docker".into(), "run".into(), "-i".into()];
         // Runtime first, so it is unambiguously a `docker run` flag and not read as the image.
         if let Some(runtime) = &self.runtime {
             argv.push("--runtime".into());
             argv.push(runtime.clone());
         }
-        // ⛔ `--rm` above is NOT the cleanup story, and removing this block to "simplify" rebuilds a
-        // bug that deletes the evidence of itself. `--rm` removes on container EXIT. The driver's
-        // shutdown signals `child.id()` — the outer `docker run` CLIENT, not the container
-        // (`driver/acp_driver.rs`, `shutdown`) — so on a timeout or an abort the client dies, the
-        // container keeps running, and `--rm` never fires. It then leaks until something tidies it,
-        // and the tidy-up is what destroys `docker logs`/`docker inspect`: the only record of WHY the
-        // job failed.
+        // ⛔ There is deliberately NO `--rm`, and adding one back deletes the evidence this path
+        // exists to keep. `--rm` removes on container EXIT — and a job that SUCCEEDS exits promptly,
+        // so the container is gone before `capture_then_remove` can read it. Capture then fails,
+        // removal reports success, and that pair is by definition `evidence_lost`: on the happy path,
+        // every time. `capture_then_remove` states that evidence comes first and the order is the
+        // whole point; `--rm` is the one flag that makes that order unenforceable.
+        //
+        // `--rm` was never the cleanup story either. The driver's shutdown signals `child.id()` — the
+        // outer `docker run` CLIENT, not the container (`driver/acp_driver.rs`, `shutdown`) — so on a
+        // timeout or an abort the client dies, the container keeps running, and `--rm` never fires
+        // anyway. Removal is owned by `capture_then_remove`, with `JobContainer`'s `Drop` as the
+        // fallback ([`DropFallback::ReportSkippedThenRemove`]). Both remove BY NAME, and both capture
+        // first. What survives is a hard kill of the seller between container exit and cleanup, which
+        // leaves a named container a later attempt collides on loudly rather than a silent leak.
         //
         // A deterministic name is what makes the container addressable at all. This run is `-i`, not
         // `-d`, so no id is printed on stdout to read back, and without `--name`/`--label`/`--cidfile`
@@ -2722,6 +2729,47 @@ mod tests {
             !cargo,
             "cargo resolved, which means this answered from the HOST: the runtime image carries no \
              rust toolchain (#358), so a true here is the wrong-environment probe, not a capability"
+        );
+    }
+
+    // RED-PROVE: the job container must NOT carry `--rm`.
+    //
+    // `--rm` removes on container EXIT, so on a job that SUCCEEDS docker deletes the container before
+    // `capture_then_remove` can read it. Capture fails, removal reports success, and `evidence_lost()`
+    // is true by definition — on the happy path, every run. `capture_then_remove` documents that
+    // evidence comes first and "the order is the whole point"; `--rm` is the single flag that makes
+    // that order unenforceable from outside the process.
+    //
+    // Removal is owned by `capture_then_remove` and by `JobContainer`'s `Drop` fallback, both of which
+    // remove BY NAME after capturing — so `--name` is asserted here too. Without it nothing downstream
+    // can address THIS container, and dropping `--rm` really would leak.
+    #[test]
+    fn docker_policy_keeps_the_container_alive_for_its_own_diagnostics() {
+        let policy = SandboxPolicy::docker(DockerPolicy {
+            image: "maxplayer-sandbox:latest".into(),
+            forward_env: Vec::new(),
+            runtime: None,
+            network: None,
+            proxy_ports: None,
+            file_credentials: Vec::new(),
+        });
+        let launch = policy
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
+            .expect("command");
+
+        assert!(
+            !launch.args.iter().any(|a| a == "--rm"),
+            "`--rm` deletes the container on exit, which on a PASSING job destroys the diagnostics \
+             `capture_then_remove` exists to save: {:?}",
+            launch.args
+        );
+        // Positive control: without a deterministic name, removing `--rm` would be a real leak rather
+        // than a deferred, attributable removal. An assertion that only forbids `--rm` cannot see that.
+        assert!(
+            launch.args.iter().any(|a| a == "--name"),
+            "the container must stay addressable by name so capture and removal can target THIS one: \
+             {:?}",
+            launch.args
         );
     }
 
