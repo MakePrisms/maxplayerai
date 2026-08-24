@@ -88,7 +88,8 @@ use http_body_util::{combinators::BoxBody, BodyExt, Full, Limited, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use tokio::sync::Semaphore;
 
 /// The proxy listener terminates INSIDE the seller daemon (a money-path process), and the caller is a
@@ -102,8 +103,38 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// modest ceiling is generous for legitimate use and caps a connection flood. Excess connections wait
 /// at the OS accept backlog rather than each spawning an unbounded task.
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+/// Concurrent HTTP/2 streams one connection may open.
+///
+/// [`MAX_CONCURRENT_CONNECTIONS`] bounds CONNECTIONS, and under HTTP/1 that is also the bound on
+/// requests in flight — one connection carries one request at a time. **HTTP/2 breaks that identity:**
+/// a single connection multiplexes, so without an explicit stream bound the connection ceiling stops
+/// being a ceiling on work. hyper's own default is 200 streams per connection
+/// (`hyper-1.10.1 proto/h2/server.rs:69`), which would turn a 64-connection cap into 12,800
+/// concurrent requests — a 200x widening of a limit nobody changed.
+///
+/// Set to mirror [`MAX_CONCURRENT_CONNECTIONS`], so the realistic shape — one agent on one
+/// multiplexed connection — gets the concurrency an HTTP/1 client would have had across the whole
+/// listener.
+///
+/// ⚠ **This is a PER-CONNECTION bound and it is not, on its own, a ceiling on work.** 64 connections
+/// each running 64 streams is 4096 requests in flight, and at [`MAX_REQUEST_BODY_BYTES`] each that is
+/// the very resource hazard the connection cap exists to prevent. The aggregate ceiling is
+/// [`MAX_IN_FLIGHT_REQUESTS`]; this constant only stops one connection from monopolising it.
+const MAX_CONCURRENT_H2_STREAMS: u32 = 64;
+/// Requests in flight across the whole listener, both protocols, whatever the connection count.
+///
+/// The real ceiling on concurrent work, and the only one of the three that does not change meaning
+/// with the protocol. [`MAX_CONCURRENT_CONNECTIONS`] bounds sockets and
+/// [`MAX_CONCURRENT_H2_STREAMS`] bounds streams within one socket; under HTTP/1 those coincide with
+/// requests, and under HTTP/2 they multiply. **Bounding the product is what keeps the buffered-body
+/// memory ceiling honest** — without it, adding h2c support would have silently widened a limit
+/// nobody edited, which is exactly the failure mode this module's other bounds exist to avoid.
+const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 /// How long the head (request line + headers) may take to arrive. hyper enforces this itself; without
 /// it a trickled header stream pins a connection open indefinitely.
+///
+/// HTTP/1 only: HTTP/2 has no equivalent head-read deadline to set, so the body deadline and the
+/// stream bound above are what bound a slow HTTP/2 peer.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the request BODY may take to arrive in full. Bounds a slow-loris body that dribbles bytes
 /// under the size cap forever. It bounds only the REQUEST read — the upstream RESPONSE (an SSE stream)
@@ -617,6 +648,8 @@ pub async fn start(
     let addr = listener.local_addr()?;
     let engine_for_task = Arc::clone(&engine);
     let connections = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    // Shared across every connection and both protocols, so multiplexing cannot widen it.
+    let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
     let task = tokio::spawn(async move {
         loop {
             let Ok((stream, _peer)) = listener.accept().await else {
@@ -630,19 +663,39 @@ pub async fn start(
             };
             let engine = Arc::clone(&engine_for_task);
             let client = client.clone();
+            let in_flight = Arc::clone(&in_flight);
             tokio::spawn(async move {
                 let _permit = permit; // released when the connection ends
                 let io = TokioIo::new(stream);
                 let service = service_fn(move |req| {
-                    handle_request(req, Arc::clone(&engine), client.clone())
+                    let engine = Arc::clone(&engine);
+                    let client = client.clone();
+                    let in_flight = Arc::clone(&in_flight);
+                    async move {
+                        // Held for the life of THIS request, so the ceiling counts requests rather
+                        // than sockets. Excess requests wait here instead of each buffering a body.
+                        let _in_flight = in_flight.acquire().await;
+                        handle_request(req, engine, client).await
+                    }
                 });
-                let _ = hyper::server::conn::http1::Builder::new()
+                // Auto-negotiating server: it sniffs the HTTP/2 prior-knowledge preface
+                // (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`) and otherwise falls through to HTTP/1 on the
+                // same listener. An http1-only server cannot parse that preface, and the failure is
+                // silent in the worst way — it surfaces NO request, so a client speaking h2c reads as
+                // "nothing ever connected" rather than as a protocol mismatch.
+                let mut builder = AutoBuilder::new(TokioExecutor::new());
+                builder
+                    .http1()
                     // A timer is required for hyper's own timeouts to arm.
                     .timer(TokioTimer::new())
                     // Bound the head read so a trickled header stream cannot pin a connection open.
-                    .header_read_timeout(HEADER_READ_TIMEOUT)
-                    .serve_connection(io, service)
-                    .await;
+                    .header_read_timeout(HEADER_READ_TIMEOUT);
+                builder
+                    .http2()
+                    .timer(TokioTimer::new())
+                    // Without this, one multiplexed connection escapes the connection ceiling.
+                    .max_concurrent_streams(MAX_CONCURRENT_H2_STREAMS);
+                let _ = builder.serve_connection(io, service).await;
             });
         }
     });
@@ -1631,5 +1684,254 @@ mod tests {
             }
         }
         out
+    }
+
+    // ---- h2c: a client may open its leg with the HTTP/2 preface, not an HTTP/1 request line ------
+    //
+    // Measured on `cursor-agent 2026.08.11-e8db854`: its agent/inference endpoint opens with the
+    // HTTP/2 prior-knowledge preface. An http1-only server cannot parse that and surfaces NO request,
+    // so the leg reads as "nothing ever connected" rather than as a protocol mismatch — which is
+    // exactly why this went undiagnosed: the proxy's own log stays clean, because traffic that never
+    // arrives leaves no trace in it.
+    //
+    // The assertion is on the WIRE, not on a client library, so it cannot pass by a client quietly
+    // falling back to HTTP/1. `PRI * HTTP/2.0` is itself a well-formed HTTP/1 request line with an
+    // unacceptable version, so an http1-only server answers `HTTP/1.1 400` — a reply, just the wrong
+    // protocol. Checking "did we get bytes back" would therefore pass on stock; only the frame type
+    // separates them.
+    #[tokio::test]
+    async fn the_proxy_accepts_an_h2c_prior_knowledge_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        // 9-byte frame header, zero-length payload: len=0, type=0x04 (SETTINGS), flags=0, stream=0.
+        const EMPTY_SETTINGS: &[u8] = &[0, 0, 0, 4, 0, 0, 0, 0, 0];
+        const FRAME_TYPE_SETTINGS: u8 = 0x04;
+
+        let engine = Arc::new(ProxyEngine::new([authority_of("http://127.0.0.1:1").unwrap()]));
+        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
+
+        let mut stream = tokio::net::TcpStream::connect(proxy.local_addr()).await.unwrap();
+        stream.write_all(H2_PREFACE).await.unwrap();
+        stream.write_all(EMPTY_SETTINGS).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut head = [0_u8; 9];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut head))
+            .await
+            .expect("an h2c server answers its own SETTINGS; a timeout means the preface was dropped")
+            .expect("connection closed instead of answering the preface");
+
+        assert!(
+            !head.starts_with(b"HTTP/1"),
+            "answered in HTTP/1, so the preface was parsed as an HTTP/1 request line: {:?}",
+            String::from_utf8_lossy(&head)
+        );
+        assert_eq!(
+            head[3], FRAME_TYPE_SETTINGS,
+            "expected an HTTP/2 SETTINGS frame (type 0x04) as the server preface, got {head:?}"
+        );
+    }
+
+    // The HTTP/1 providers must keep working on the SAME listener — an auto-negotiating server that
+    // silently stopped serving HTTP/1 would break every currently-working harness while making the
+    // h2c test above pass. Two protocols, one port, both asserted.
+    #[tokio::test]
+    async fn the_proxy_still_serves_http1_on_the_same_listener() {
+        let (stub_addr, stub) = spawn_stub("UPSTREAM_OK").await;
+        let upstream = format!("http://{stub_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        let placeholder = mint_anthropic_placeholder();
+        engine
+            .register(JobCredential {
+                placeholder: placeholder.clone(),
+                real: REAL.to_owned(),
+                upstream: upstream.clone(),
+            })
+            .unwrap();
+        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
+        let port = proxy.local_addr().port();
+
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("x-api-key", &placeholder)
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200, "HTTP/1 must still be served");
+        let seen = stub.await.unwrap();
+        assert_eq!(
+            seen.api_key.as_deref(),
+            Some(REAL),
+            "and substitution must still happen on the HTTP/1 path"
+        );
+    }
+
+
+    // An h2c connection that completes a SETTINGS exchange is not the same thing as an h2c REQUEST
+    // that gets served, forwarded and substituted. The preface test above proves only the former, and
+    // a proxy that negotiates h2 then fails every h2 request would pass it while contained jobs still
+    // failed — so the request path is asserted end to end, on the protocol the agent leg actually
+    // speaks, with the same substitution check the HTTP/1 test makes.
+    #[tokio::test]
+    async fn an_h2c_request_is_served_forwarded_and_substituted() {
+        let (stub_addr, stub) = spawn_stub("UPSTREAM_OK").await;
+        let upstream = format!("http://{stub_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        let placeholder = mint_anthropic_placeholder();
+        engine
+            .register(JobCredential {
+                placeholder: placeholder.clone(),
+                real: REAL.to_owned(),
+                upstream: upstream.clone(),
+            })
+            .unwrap();
+        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
+        let proxy_addr = proxy.local_addr();
+
+        let io = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let (send, connection) = h2::client::handshake(io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let mut send = send.ready().await.unwrap();
+        let request = hyper::Request::builder()
+            .method("POST")
+            .uri(format!("http://{proxy_addr}/v1/messages"))
+            .header("x-api-key", &placeholder)
+            .body(())
+            .unwrap();
+        let (response, mut body) = send.send_request(request, false).unwrap();
+        body.reserve_capacity(2);
+        body.send_data(bytes::Bytes::from_static(b"{}"), true).unwrap();
+
+        let response = tokio::time::timeout(Duration::from_secs(20), response)
+            .await
+            .expect("the proxy must answer an h2 request, not hang")
+            .expect("the h2 stream must not be reset");
+        assert!(
+            response.status().is_success(),
+            "an h2c request must be served, got {}",
+            response.status()
+        );
+
+        let seen = stub.await.unwrap();
+        assert_eq!(
+            seen.api_key.as_deref(),
+            Some(REAL),
+            "substitution must happen on the h2 path exactly as it does on HTTP/1"
+        );
+    }
+
+    // The aggregate ceiling must survive MULTIPLEXING. `MAX_CONCURRENT_CONNECTIONS` bounds sockets and
+    // `MAX_CONCURRENT_H2_STREAMS` bounds streams within one socket; under HTTP/1 those coincide with
+    // requests, under HTTP/2 they MULTIPLY. Two connections at the stream cap can attempt 128 requests
+    // against a limit of 64, and at `MAX_REQUEST_BODY_BYTES` each that is the resource hazard the
+    // connection cap exists to prevent.
+    //
+    // Deterministic, not timing-based: every request parks at a stub that answers nobody until told
+    // to, so the assertion is "exactly the ceiling arrives, the overflow does not, and releasing one
+    // admits exactly one more". A `sleep` never decides the outcome.
+    #[tokio::test]
+    async fn h2_multiplexing_cannot_exceed_the_aggregate_in_flight_ceiling() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::mpsc;
+
+        const OVERFLOW: usize = 4;
+        let attempts = MAX_IN_FLIGHT_REQUESTS + OVERFLOW;
+
+        let (arrived_tx, mut arrived_rx) = mpsc::unbounded_channel::<()>();
+        let (release_tx, release_rx) = mpsc::unbounded_channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(release_rx));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let arrived_tx = arrived_tx.clone();
+                let release_rx = Arc::clone(&release_rx);
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 2048];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = arrived_tx.send(());
+                    // Parked here, still holding the proxy's in-flight permit.
+                    let _ = release_rx.lock().await.recv().await;
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                        .await;
+                });
+            }
+        });
+
+        let upstream = format!("http://{upstream_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        let placeholder = mint_anthropic_placeholder();
+        engine
+            .register(JobCredential {
+                placeholder: placeholder.clone(),
+                real: REAL.to_owned(),
+                upstream: upstream.clone(),
+            })
+            .unwrap();
+        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
+        let proxy_addr = proxy.local_addr();
+
+        // TWO connections, so the per-connection stream cap cannot be what bounds the total.
+        let mut senders = Vec::new();
+        for _ in 0..2 {
+            let io = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+            let (send, connection) = h2::client::handshake(io).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            senders.push(send);
+        }
+
+        let mut responses = Vec::new();
+        for i in 0..attempts {
+            let mut send = senders[i % senders.len()].clone().ready().await.unwrap();
+            let request = hyper::Request::builder()
+                .method("POST")
+                .uri(format!("http://{proxy_addr}/v1/messages"))
+                .header("x-api-key", &placeholder)
+                .body(())
+                .unwrap();
+            let (response, mut body) = send.send_request(request, false).unwrap();
+            // Required before `send_data`, or h2 breaks the stream on a flow-control violation.
+            body.reserve_capacity(2);
+            body.send_data(bytes::Bytes::from_static(b"{}"), true).unwrap();
+            responses.push(response);
+        }
+
+        // Exactly the ceiling reaches the upstream.
+        for n in 0..MAX_IN_FLIGHT_REQUESTS {
+            tokio::time::timeout(Duration::from_secs(20), arrived_rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("only {n} of {MAX_IN_FLIGHT_REQUESTS} reached upstream"))
+                .expect("stub channel closed");
+        }
+        // The overflow does NOT, while those permits are held. This is the assertion that fails
+        // without a shared limiter: 68 multiplexed requests would all be in flight at once.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(750), arrived_rx.recv())
+                .await
+                .is_err(),
+            "a request beyond MAX_IN_FLIGHT_REQUESTS reached the upstream: {attempts} were \
+             multiplexed over 2 connections, so the ceiling is per-connection, not aggregate"
+        );
+
+        // Releasing one admits exactly one more — a queue, not a drop.
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(20), arrived_rx.recv())
+            .await
+            .expect("releasing one in-flight request must admit the next")
+            .expect("stub channel closed");
+
+        for _ in 0..attempts {
+            let _ = release_tx.send(());
+        }
     }
 }
