@@ -290,7 +290,10 @@ jobs:
     # A tag PUSH only. Both halves are needed: a dispatch can target a tag ref, so the ref type
     # alone does not establish that a tag was pushed.
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [plan, build, verify-surface]
+    # `publish-images` is a dependency because a GitHub Release is operator-visible guidance: an
+    # install line pointing at binaries whose compiled-in sandbox image does not exist sends people to
+    # a seat that refuses to boot. See the ordering note on `publish-images`.
+    needs: [plan, build, verify-surface, publish-images]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -371,9 +374,21 @@ jobs:
     # Same gate as `release` and `publish`, both halves: a workflow_dispatch can be aimed at a tag
     # ref, so the ref type alone is not evidence of a push. verify-release-workflow.sh asserts it.
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    # After `release`, so no image is ever published for a release whose binaries, surface checks or
-    # Release creation failed. The images are useless without the binary that pulls them.
-    needs: [plan, build, verify-surface, release]
+    # BEFORE `release` and before `publish`, and the ordering is load-bearing in the direction that
+    # cannot be undone.
+    #
+    # This used to run AFTER `release`, reasoned as "no image is ever published for a release whose
+    # binaries, surface checks or Release creation failed — the images are useless without the binary
+    # that pulls them". That reasoning is backwards on which failure is recoverable. An image published
+    # for a release that never shipped is inert: nothing references the tag, and it can be deleted. A
+    # release published without its images is PERMANENT — npm refuses to republish or reuse a version —
+    # and every seat that installs it asks for `maxplayer-sandbox:v<this version>`, an image that does
+    # not exist, so the readiness gate hard-fails and the seat will not boot.
+    #
+    # The version is compiled in (`seller_exec.rs`, `env!("CARGO_PKG_VERSION")`), so the binary cannot
+    # be pointed at an older image after the fact. The only orderings that cannot produce that state
+    # are the ones where the images exist first.
+    needs: [plan, build, verify-surface]
     permissions:
       contents: read
       packages: write
@@ -395,7 +410,11 @@ jobs:
     #   a trusted publisher for the package on npmjs.com. There is no silent-skip path — an
     #   unconfigured publisher fails the job loudly, exactly as a missing token used to.
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [plan, build, release, verify-surface]
+    # `publish-images` is named EXPLICITLY even though `release` already requires it. An npm publish is
+    # the one step in this workflow that can never be taken back, so the requirement that its images
+    # exist should be readable at this job rather than inherited from a neighbour — a later edit to
+    # `release`'s dependencies must not be able to silently un-gate this one.
+    needs: [plan, build, release, verify-surface, publish-images]
     runs-on: ubuntu-latest
     # `id-token: write` mints the OIDC token npm exchanges for a short-lived publish credential. It is
     # the whole of the job's write authority; `contents: read` restates the workflow default so that

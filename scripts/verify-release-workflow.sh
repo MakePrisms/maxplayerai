@@ -298,6 +298,31 @@ if (!surface.join("\n").includes("verify-release-surface.sh")) {
 }
 
 console.log("ok: verify-surface runs in dry runs and gates release and publish (the #249 fix)");
+
+// The images must exist BEFORE anything irreversible names the version that pulls them. A seat's
+// sandbox image ref is compiled in from CARGO_PKG_VERSION, so a published npm version whose image is
+// missing can never be repaired — npm refuses to republish or reuse a version, and the binary cannot
+// be pointed at an older image. The reverse failure is harmless: an image for a release that never
+// shipped is inert and deletable.
+//
+// Asserted here rather than left to the comments on the jobs, because the ordering is expressible in
+// two lines of `needs:` and a future edit that drops one would look like tidying.
+const images = jobs.get("publish-images");
+if (!images) {
+  fail("no 'publish-images' job — a release would ship binaries whose compiled-in sandbox image ref points at nothing");
+}
+const imagesNeeds = images.join("\n").match(/^ {4}needs:(.*)$/m);
+if (imagesNeeds && /\brelease\b/.test(imagesNeeds[1])) {
+  fail("job 'publish-images' depends on 'release' — that is the order that cannot be undone: the Release and npm publish would land before the images exist, and an npm version can never be republished");
+}
+for (const name of ["release", "publish"]) {
+  const needs = jobs.get(name).join("\n").match(/^ {4}needs:(.*)$/m);
+  if (!needs || !needs[1].includes("publish-images")) {
+    fail(`job '${name}' does not depend on publish-images (needs:) — a failed image publish would still ${name === "publish" ? "publish an npm version that can never be replaced" : "create a Release whose install line leads to a seat that refuses to boot"}`);
+  }
+}
+
+console.log("ok: sandbox images are published before the Release and before npm, and neither can proceed without them");
 console.log("ok: release, publish and publish-images are gated on a tag push");
 console.log("ok: 'npm publish' appears only in the publish job and the fenced npm-probe job");
 console.log("ok: npm-probe is dispatch-only, needs a named package, and can publish 0.0.<n> of a payload package only");
