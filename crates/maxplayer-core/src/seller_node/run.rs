@@ -2811,6 +2811,26 @@ pub async fn boot_advertising_only_proven(
     let lock =
         crate::seller_node::lock::HomeLock::acquire(home.root.join(crate::seller_node::LOCK_FILE))?;
 
+    // Prove seat CAPABILITY before anything reaches the wire (#784). The probe runs in the SAME
+    // executor a job runs in, in a throwaway workdir under the seller-jobs root, so it answers for the
+    // machine jobs land on rather than the seller host. A capability that cannot be MEASURED — a render
+    // failure, a launcher that will not spawn, a probe that times out — fails boot LOUDLY here, before
+    // the kind-0 publish, rather than advertising a silently shorter set: a buyer commits sats on this
+    // field, so "we could not check" must never look like "checked, and no". The proven set is recorded
+    // into the roster below, before the first heartbeat or claim can read it.
+    let sandbox = crate::seller_exec::SandboxPolicy::from_config(home.config.sandbox.as_ref())
+        .map_err(|error| NodeError::Sandbox(format!("capability probe policy: {error}")))?;
+    let probe_dir = crate::seller_exec::ProbeWorkdir::create(&home)
+        .map_err(|error| NodeError::Sandbox(format!("capability probe workdir: {error}")))?;
+    let capabilities = crate::capability::probe_seat_capabilities(&sandbox, probe_dir.path())
+        .map_err(|error| {
+            NodeError::Sandbox(format!(
+                "capability probe could not be measured; refusing to advertise: {error}"
+            ))
+        })?;
+    drop(probe_dir);
+    opline!("seller node capability probe proved: [{}]", capabilities.join(", "));
+
     let disco = crate::profile::publish_seller_discoverability_async(&mut home)
         .await
         .map_err(|error| NodeError::Relay(format!("discoverability publish failed: {error}")))?;
@@ -2823,6 +2843,10 @@ pub async fn boot_advertising_only_proven(
 
     let runner = SellerNodeRunner::boot_with_lock(home, lock).await?;
     runner.narrow_roster_to(&verdicts);
+    // Record the proven capability set into the live roster BEFORE the runner is handed back and can
+    // serve. The first heartbeat and the first claim both read the roster, so recording here — not on
+    // first use — is what makes the very first advertisement honest.
+    runner.agents.record_capabilities(capabilities);
     Ok(runner)
 }
 
@@ -12790,6 +12814,63 @@ mod tests {
         assert!(
             runner.agents.advertisement().serving,
             "the live roster must serve the proven harness"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Point ⑤ of #784: the FIRST advertisement carries the MEASURED capability set.
+    ///
+    /// `boot_advertising_only_proven` probes the environment and records the result into the roster
+    /// BEFORE it hands back the runner, so the roster the very first heartbeat and the first claim read
+    /// from already reflects the seat's real capability — never an empty set that fills in later.
+    ///
+    /// Deterministic regardless of which toolchains this host carries: it asserts the roster equals a
+    /// FRESH probe of the same pass-through environment taken moments after, so it holds whether the set
+    /// is empty or full. Delete the `record_capabilities` call in `boot_advertising_only_proven` and the
+    /// roster stays empty while a fresh probe finds this host's tools — reddening this test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_first_advertisement_carries_the_measured_capability_set() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("cap-wired");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        crate::home::save_config(&mut home, |config| {
+            config.seller = Some(seller_cfg(1, false));
+            config.relay_url = fixture.url();
+        })
+        .expect("persist config");
+
+        let verdicts = vec![HarnessProbeVerdict {
+            index: 0,
+            name: Some("claude".to_owned()),
+            result: Ok(()),
+        }];
+        let runner = boot_advertising_only_proven(home, verdicts)
+            .await
+            .expect("a proven seat must boot");
+
+        // Ground truth: a fresh probe of the SAME pass-through environment, taken now. The host does not
+        // change between boot and here, so the roster must equal this exactly.
+        let probe_dir = crate::seller_exec::ProbeWorkdir::create(runner.node.home())
+            .expect("probe workdir");
+        let expected = crate::capability::probe_seat_capabilities(
+            &crate::seller_exec::SandboxPolicy::passthrough(),
+            probe_dir.path(),
+        )
+        .expect("a pass-through probe is measurable");
+        drop(probe_dir);
+
+        assert_eq!(
+            runner.agents.advertisement().capabilities,
+            expected,
+            "the first heartbeat's roster must carry exactly the probed set — wired at boot, not later"
+        );
+        // The claim emitter reads the SAME snapshot, so both wire events agree.
+        assert_eq!(
+            runner.agents.advertisement().capability().capabilities,
+            expected,
+            "the claim capability must carry the same probed set as the heartbeat"
         );
 
         runner.client.disconnect().await;
