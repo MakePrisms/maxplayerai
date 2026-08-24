@@ -179,6 +179,7 @@ pub fn probe_seat_capabilities(
     probe_capabilities(policy, workdir, |argv| {
         crate::seller_exec::probe_command_outcome(
             argv,
+            workdir,
             crate::seller_exec::CAPABILITY_PROBE_TIMEOUT,
             container.as_deref(),
         )

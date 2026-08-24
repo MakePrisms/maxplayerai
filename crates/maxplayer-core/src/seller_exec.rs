@@ -819,6 +819,21 @@ const PROBE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Output is discarded (`--version` text is not the evidence, the exit status is) and never inherited,
 /// so a probe cannot scribble on the operator's console.
 ///
+/// `host_cwd` is the directory the spawned child runs in, and it is the HOST-side probe workdir —
+/// the same path [`probe_launch_argv`] validated and handed to the policy. A job's agent session
+/// starts in its own workdir, so a probe that runs from wherever the daemon happens to sit answers
+/// for a directory no job ever gets: a cwd-sensitive wrapper or a toolchain that reads a local
+/// config file resolves differently, and the token it produces describes the daemon's environment
+/// rather than the job's.
+///
+/// ⚠ **NOT [`AgentLaunch::cwd`], and the difference is not cosmetic.** For a docker policy that
+/// field is [`CONTAINER_WORKDIR`] — an IN-CONTAINER path that does not exist on this host, because
+/// the container reaches its workdir through the bind mount and `-w`. The child spawned here is
+/// `docker` ITSELF, running on the host, so giving it the container's path fails to spawn and every
+/// docker probe becomes an error. The host path is correct for all three executors at once: it is
+/// where a pass-through or launcher probe genuinely runs, and for docker it is the CLI's own cwd,
+/// which the container never sees.
+///
 /// `timeout` bounds the run; on expiry the child is killed and reaped. `docker_container` is
 /// `Some(name)` when the policy is docker — the deterministic container the render named — so that:
 ///   1. a launcher (`docker`) that cannot even spawn is an error, not a false "not proven"; and
@@ -829,6 +844,7 @@ const PROBE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// ⚠ This is a MEASUREMENT, not a gate: it answers only "did this command run cleanly HERE, NOW".
 pub fn probe_command_outcome(
     argv: &[String],
+    host_cwd: &Path,
     timeout: Duration,
     docker_container: Option<&str>,
 ) -> Result<bool, ProbeRunError> {
@@ -837,6 +853,7 @@ pub fn probe_command_outcome(
     };
     let spawned = std::process::Command::new(program)
         .args(args)
+        .current_dir(host_cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -2918,7 +2935,7 @@ mod tests {
         let proves = |command: &[&str]| {
             let rendered = probe_launch_argv(&policy, &argv(command), dir.path())
                 .expect("a docker policy renders a probe launch");
-            probe_command_outcome(&rendered, CAPABILITY_PROBE_TIMEOUT, container.as_deref())
+            probe_command_outcome(&rendered, dir.path(), CAPABILITY_PROBE_TIMEOUT, container.as_deref())
                 .expect("the probe must be measurable — a docker daemon is present for this test")
         };
 
@@ -2946,9 +2963,10 @@ mod tests {
     // returned variant: a `TimedOut` that arrives after the caller already waited forever is not a fix.
     #[test]
     fn a_capability_probe_that_never_returns_is_bounded_and_killed() {
+        let dir = ProbeDir::new("bounded");
         let argv = argv(&["sleep", "60"]);
         let started = Instant::now();
-        let outcome = probe_command_outcome(&argv, Duration::from_millis(300), None);
+        let outcome = probe_command_outcome(&argv, dir.path(), Duration::from_millis(300), None);
         let elapsed = started.elapsed();
 
         assert!(
@@ -2966,21 +2984,27 @@ mod tests {
     // `TimedOut`/`Ok(false)` unconditionally and the timeout test would still pass.
     #[test]
     fn a_bounded_probe_separates_success_absence_and_unmeasurable() {
+        let dir = ProbeDir::new("separates");
         assert_eq!(
-            probe_command_outcome(&argv(&["true"]), Duration::from_secs(10), None).ok(),
+            probe_command_outcome(&argv(&["true"]), dir.path(), Duration::from_secs(10), None).ok(),
             Some(true),
             "a command that exits 0 is proven"
         );
         assert_eq!(
-            probe_command_outcome(&argv(&["false"]), Duration::from_secs(10), None).ok(),
+            probe_command_outcome(&argv(&["false"]), dir.path(), Duration::from_secs(10), None).ok(),
             Some(false),
             "a command that exits non-zero ran and is not proven — omit, do not error"
         );
         // Under a pass-through policy the probe program IS the target, so its absence is a clean
         // 'not proven', never an unmeasurable error.
         assert_eq!(
-            probe_command_outcome(&argv(&["maxplayer-no-such-binary"]), Duration::from_secs(10), None)
-                .ok(),
+            probe_command_outcome(
+                &argv(&["maxplayer-no-such-binary"]),
+                dir.path(),
+                Duration::from_secs(10),
+                None,
+            )
+            .ok(),
             Some(false),
             "an absent bare probe binary is 'not proven' (Ok(false)), not a boot-failing error"
         );
@@ -2991,12 +3015,54 @@ mod tests {
             matches!(
                 probe_command_outcome(
                     &argv(&["maxplayer-no-such-launcher"]),
+                    dir.path(),
                     Duration::from_secs(10),
                     Some("maxplayer-job-probe-x"),
                 ),
                 Err(ProbeRunError::LauncherUnspawnable(_))
             ),
             "a docker launcher that cannot spawn is unmeasurable, never a silent 'no'"
+        );
+    }
+
+    // RED-PROVE for the probe cwd: a host or launcher probe must run in the JOB's workdir, not
+    // wherever the daemon happens to sit. Docker hides this — `-w` sets the container's cwd, so a
+    // docker probe answers correctly even when the host child inherits the daemon's directory — and
+    // that is exactly why the proof has to be built on a NON-docker policy.
+    //
+    // The probe command is a RELATIVE-path predicate, which is the only kind that can tell the two
+    // directories apart: `test -f probe-marker` resolves against the child's cwd and nothing else.
+    //
+    // TWO OPPOSING CONTROLS, for the same reason the real-docker pair has them: the marker must be
+    // FOUND in the directory we supply and MISSED in one we do not. Without the negative leg, a child
+    // that ignored our cwd entirely and inherited the daemon's would still pass whenever the daemon
+    // happened to sit somewhere with no marker — a green that cannot go red.
+    #[test]
+    fn a_probe_runs_in_the_supplied_workdir_not_the_daemon_cwd() {
+        let supplied = ProbeDir::new("cwd-supplied");
+        let other = ProbeDir::new("cwd-other");
+        std::fs::write(supplied.path().join("probe-marker"), b"x").expect("plant the marker");
+
+        let looks_for_marker = argv(&["test", "-f", "probe-marker"]);
+
+        assert_eq!(
+            probe_command_outcome(
+                &looks_for_marker,
+                supplied.path(),
+                Duration::from_secs(10),
+                None,
+            )
+            .ok(),
+            Some(true),
+            "the probe must run IN the supplied workdir — a relative path that exists there did not \
+             resolve, so the child ran somewhere else"
+        );
+        assert_eq!(
+            probe_command_outcome(&looks_for_marker, other.path(), Duration::from_secs(10), None)
+                .ok(),
+            Some(false),
+            "the negative control failed: the same argv answered true from a directory with NO \
+             marker, which means the cwd we pass is not the cwd the child gets"
         );
     }
 
