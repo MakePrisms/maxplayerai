@@ -16,6 +16,16 @@
 //! exactly, so an out-of-vocabulary spelling on the wire simply never matches. Out-of-enum is
 //! unmatchable by construction, which is fail-closed and needs no normaliser to enforce.
 //!
+//! ⚠ WHAT A PROVEN TOKEN MEANS, AND WHAT IT DOES NOT. A token proves exactly one thing: the token's
+//! probe binary RESOLVED and exited 0 inside the job execution policy, at probe time. It is a
+//! statement about BINARY PRESENCE and nothing more. It does NOT prove that a build or run using that
+//! binary will succeed (`cargo` resolving is necessary, not sufficient); it does NOT prove credential
+//! forwarding, since the probe carries none; and it does NOT prove network reachability or job-network
+//! parity — [`crate::seller_exec::probe_launch_argv`] renders with NO job netns, so the probe says
+//! nothing about what a job's network can reach. A buyer filtering on a token is selecting seats where
+//! the tool is present, not seats guaranteed to complete the work; that guarantee only ever comes from
+//! probe-and-delivery, never from the advertisement.
+//!
 //! ⚠ THE TOKEN LIST IS NOT YET RATIFIED. These three are the ones issue #784 names verbatim
 //! (`rust`, `node`, `python`). The spec (`docs/protocol-v1.md`) is the authority and does not carry
 //! a capability vocabulary yet. Adding a token is a one-line change HERE plus a spec update — which
@@ -93,33 +103,86 @@ pub fn capability_probe_command(token: &str) -> Option<[&'static str; 2]> {
 /// itself `wallet`-gated. The VOCABULARY above is deliberately not gated: a build that emits or reads
 /// a filterable field must be able to name the token set that field is bound to, and only the
 /// *probing* needs an executor.
+/// A capability could not be MEASURED, so boot has no honest answer and must refuse to advertise
+/// rather than publish a shorter set (#784).
+///
+/// This is the fail-closed direction that separates "checked, and the binary is not here" (an ordinary
+/// omitted token) from "could not check at all". Only the latter reaches this type. A buyer commits
+/// sats on this field, so an unmeasured capability must never be indistinguishable from an absent one.
+#[cfg(feature = "wallet")]
+#[derive(Debug)]
+pub enum CapabilityProbeError {
+    /// The probe argv could not be rendered for the job environment (missing workdir, launcher
+    /// misconfiguration). The measurement never started.
+    Render(crate::seller_exec::ExecError),
+    /// The probe was rendered but could not be run to a verdict (launcher unspawnable, timeout).
+    Run(crate::seller_exec::ProbeRunError),
+}
+
+#[cfg(feature = "wallet")]
+impl std::fmt::Display for CapabilityProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Render(error) => write!(f, "capability probe could not be rendered: {error}"),
+            Self::Run(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+#[cfg(feature = "wallet")]
+impl std::error::Error for CapabilityProbeError {}
+
+/// The capabilities this seat can PROVE, by running each token's probe command in the JOB execution
+/// environment. Returns the proven set, or refuses if any token could not be measured.
+///
+/// `resolves` runs one already-rendered argv and reports its outcome:
+/// - `Ok(true)` proven, `Ok(false)` ran and not present (omit the token),
+/// - `Err(_)` could not be measured — which aborts the whole probe with [`CapabilityProbeError::Run`].
+///
+/// A render failure is likewise fatal ([`CapabilityProbeError::Render`]), never a bare-argv fallback:
+/// running the bare command would execute it on the HOST while jobs run in the container, advertising a
+/// capability the job will not have. The only two honest outcomes for a token are "proven" and "ran and
+/// absent"; everything else fails boot.
 #[cfg(feature = "wallet")]
 pub fn probe_capabilities(
     policy: &crate::seller_exec::SandboxPolicy,
     workdir: &std::path::Path,
-    resolves: impl Fn(&[String]) -> bool,
-) -> Vec<String> {
-    CAPABILITIES
-        .iter()
-        .copied()
-        .filter(|token| {
-            // A token with no probe command cannot be proven, so it is never advertised. Unreachable
-            // while the vocabulary and the command table agree — and a test holds them to that —
-            // but fail-closed, because the failure of the other direction is an unprovable claim on
-            // a field buyers commit sats against.
-            let Some(argv) = capability_probe_command(token) else {
-                return false;
-            };
-            let argv: Vec<String> = argv.iter().map(|part| (*part).to_owned()).collect();
-            // A render that fails is NOT PROVEN. Never a bare-argv fallback: that is the one outcome
-            // that would advertise a host capability as a container's.
-            let Ok(rendered) = crate::seller_exec::probe_launch_argv(policy, &argv, workdir) else {
-                return false;
-            };
-            resolves(&rendered)
-        })
-        .map(str::to_owned)
-        .collect()
+    resolves: impl Fn(&[String]) -> Result<bool, crate::seller_exec::ProbeRunError>,
+) -> Result<Vec<String>, CapabilityProbeError> {
+    let mut proven = Vec::new();
+    for token in CAPABILITIES {
+        // A token with no probe command cannot be proven, so it is never advertised. Unreachable while
+        // the vocabulary and the command table agree — and a test holds them to that — but fail-closed.
+        let Some(argv) = capability_probe_command(token) else {
+            continue;
+        };
+        let argv: Vec<String> = argv.iter().map(|part| (*part).to_owned()).collect();
+        let rendered = crate::seller_exec::probe_launch_argv(policy, &argv, workdir)
+            .map_err(CapabilityProbeError::Render)?;
+        if resolves(&rendered).map_err(CapabilityProbeError::Run)? {
+            proven.push(token.to_owned());
+        }
+    }
+    Ok(proven)
+}
+
+/// Probe this seat's capabilities for real: render through `policy`, run each in `workdir` under the
+/// standard wall-clock bound, and force-remove any docker probe container afterward. The production
+/// entry point [`crate::seller_node`] boot calls; the injectable [`probe_capabilities`] is what tests
+/// drive.
+#[cfg(feature = "wallet")]
+pub fn probe_seat_capabilities(
+    policy: &crate::seller_exec::SandboxPolicy,
+    workdir: &std::path::Path,
+) -> Result<Vec<String>, CapabilityProbeError> {
+    let container = crate::seller_exec::probe_container_name(policy, workdir);
+    probe_capabilities(policy, workdir, |argv| {
+        crate::seller_exec::probe_command_outcome(
+            argv,
+            crate::seller_exec::CAPABILITY_PROBE_TIMEOUT,
+            container.as_deref(),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -191,8 +254,9 @@ mod tests {
         let seen = std::cell::RefCell::new(Vec::new());
         let proven = probe_capabilities(&policy, dir.path(), |argv| {
             seen.borrow_mut().push(argv.to_vec());
-            true
-        });
+            Ok(true)
+        })
+        .expect("an injected probe that always resolves cannot fail to be measured");
 
         let seen = seen.into_inner();
         assert_eq!(seen.len(), 3, "one spawn per token: {seen:?}");
@@ -214,8 +278,9 @@ mod tests {
         let seen = std::cell::RefCell::new(Vec::new());
         probe_capabilities(&crate::seller_exec::SandboxPolicy::passthrough(), dir.path(), |argv| {
             seen.borrow_mut().push(argv.to_vec());
-            false
-        });
+            Ok(false)
+        })
+        .expect("an injected probe that always resolves-false cannot fail to be measured");
         assert_eq!(
             seen.into_inner(),
             vec![
@@ -259,8 +324,9 @@ mod tests {
         let seen = std::cell::RefCell::new(Vec::new());
         let proven = probe_capabilities(&policy, dir.path(), |argv| {
             seen.borrow_mut().push(argv.to_vec());
-            true
-        });
+            Ok(true)
+        })
+        .expect("an injected probe that always resolves cannot fail to be measured");
 
         let seen = seen.into_inner();
         assert_eq!(seen.len(), 3, "one render per token on a docker seat: {seen:?}");
@@ -293,8 +359,9 @@ mod tests {
         let proven = probe_capabilities(
             &crate::seller_exec::SandboxPolicy::passthrough(),
             dir.path(),
-            |argv| argv.first().is_some_and(|program| program == "node"),
-        );
+            |argv| Ok(argv.first().is_some_and(|program| program == "node")),
+        )
+        .expect("an injected probe cannot fail to be measured");
         assert_eq!(proven, vec!["node"]);
     }
 
@@ -312,22 +379,65 @@ mod tests {
         let nothing_resolves = probe_capabilities(
             &crate::seller_exec::SandboxPolicy::passthrough(),
             dir.path(),
-            |_| false,
-        );
+            |_| Ok(false),
+        )
+        .expect("an injected probe cannot fail to be measured");
         assert_eq!(
             nothing_resolves.len(),
             0,
             "a seat with no toolchain must advertise no capabilities: {nothing_resolves:?}"
         );
 
-        let everything_resolves =
-            probe_capabilities(&crate::seller_exec::SandboxPolicy::passthrough(), dir.path(), |_| true);
+        let everything_resolves = probe_capabilities(
+            &crate::seller_exec::SandboxPolicy::passthrough(),
+            dir.path(),
+            |_| Ok(true),
+        )
+        .expect("an injected probe cannot fail to be measured");
         assert_eq!(
             everything_resolves,
             vec!["node", "python", "rust"],
             "POSITIVE CONTROL: the same probe must return the SPECIFIC tokens when they DO resolve. \
              A count alone would not separate a working probe from one returning the wrong set, and \
              without this direction the zero above is also exactly what a probe that never ran prints"
+        );
+    }
+
+    // Point ③ of #784's required shape: an UNMEASURABLE probe fails closed. A command that ran and was
+    // absent omits its token (tested above); a probe that could not be RUN AT ALL must abort the whole
+    // set with an error, never quietly shorten it — a buyer commits sats on this field, so "could not
+    // check" must not read as "checked, and no".
+    #[test]
+    fn a_probe_that_cannot_be_run_fails_the_whole_set() {
+        let dir = ProbeDir::new("unmeasurable");
+        let result = probe_capabilities(
+            &crate::seller_exec::SandboxPolicy::passthrough(),
+            dir.path(),
+            |_| Err(crate::seller_exec::ProbeRunError::TimedOut { after: std::time::Duration::from_secs(1) }),
+        );
+        assert!(
+            matches!(result, Err(CapabilityProbeError::Run(_))),
+            "a probe that timed out must fail the set, not return a silently shorter one: {result:?}"
+        );
+    }
+
+    // The other unmeasurable direction: a RENDER that fails is fatal too, never a bare-host fallback.
+    // A docker policy handed a workdir that does not exist cannot render a probe launch, and running
+    // the bare command instead would prove the HOST's capability and advertise it as the container's.
+    #[test]
+    fn a_probe_that_cannot_be_rendered_fails_the_whole_set() {
+        let policy = crate::seller_exec::SandboxPolicy::from_config(Some(&crate::home::SandboxConfig {
+            mode: crate::home::SandboxMode::Docker,
+            image: Some("maxplayer-sandbox:v1".to_owned()),
+            ..Default::default()
+        }))
+        .expect("a docker config naming an image resolves");
+        let missing = std::path::Path::new("/maxplayer/no/such/probe/workdir");
+
+        let result = probe_capabilities(&policy, missing, |_| Ok(true));
+        assert!(
+            matches!(result, Err(CapabilityProbeError::Render(_))),
+            "a render failure must fail the set, never fall back to the bare host command: {result:?}"
         );
     }
     }

@@ -8,7 +8,7 @@
 //! [`crate::relay_auth`].
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "acp")]
 use sha2::{Digest, Sha256};
@@ -53,6 +53,46 @@ impl std::fmt::Display for ExecError {
 }
 
 impl std::error::Error for ExecError {}
+
+/// A capability probe could not be MEASURED — as distinct from a probe that ran and found the binary
+/// absent (#784).
+///
+/// The two must never be conflated. An absent binary is the ordinary "this seat cannot do that" and
+/// simply omits the token; an unmeasurable probe means boot has no honest answer for that token and
+/// must fail LOUDLY rather than silently publish a shorter capability set. A buyer commits sats on
+/// this field, so "we could not check" is not allowed to look like "checked, and no".
+#[derive(Debug)]
+pub enum ProbeRunError {
+    /// The launcher process could not be spawned. Only raised under an executor whose launcher is a
+    /// separate program from the probe target (docker): a missing `docker` means the probe never ran.
+    /// Under a pass-through policy the probe program IS the target, so its absence is a clean "not
+    /// proven", not this error.
+    LauncherUnspawnable(std::io::Error),
+    /// The probe was still running at its wall-clock deadline and was killed. On the pre-advertise
+    /// path an unbounded probe (a stuck `--version`, a docker pull with no registry answer) would
+    /// hang the seller before it ever serves, so a timeout is a hard failure, not a "no".
+    TimedOut { after: Duration },
+    /// Waiting on the probe process itself failed, so its outcome is unknown.
+    Wait(std::io::Error),
+}
+
+impl std::fmt::Display for ProbeRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LauncherUnspawnable(error) => {
+                write!(f, "capability probe launcher could not be spawned: {error}")
+            }
+            Self::TimedOut { after } => write!(
+                f,
+                "capability probe exceeded its {}s bound and was killed",
+                after.as_secs()
+            ),
+            Self::Wait(error) => write!(f, "capability probe could not be waited on: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ProbeRunError {}
 
 /// What supplied the ACP response timer for an agent run.
 ///
@@ -756,34 +796,176 @@ pub fn probe_launch_argv(
     Ok(argv)
 }
 
-/// Run one already-rendered probe argv and report whether it succeeded (#784).
+/// A wall-clock bound generous enough for a `--version` or a cold container start, short enough that a
+/// stuck probe cannot hold the pre-advertise path open.
+pub const CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the best-effort container removal after a docker probe gets before it too is abandoned.
+const PROBE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run one already-rendered probe argv and report its outcome (#784).
 ///
 /// The spawn half of the capability probe, kept here with the rest of the process machinery. `argv`
 /// is ALREADY rendered for the job environment by [`probe_launch_argv`] — this function must never
 /// render, because doing it in two places is how one of them ends up not doing it.
 ///
-/// Success is a clean exit, and NOTHING else. A binary that is absent fails to spawn; one that exists
-/// but errors exits non-zero; both mean the capability is not proven. Output is discarded
-/// (`--version` text is not the evidence, the exit status is) and never inherited, so a probe cannot
-/// scribble on the operator's console.
+/// Return values carry the distinction the whole field rests on:
+/// - `Ok(true)` — the command ran and exited 0: the capability is proven.
+/// - `Ok(false)` — the command ran and exited non-zero, or (under a pass-through policy) the target
+///   binary was absent: the capability is simply not present. Omit the token.
+/// - `Err(_)` — the probe could not be measured at all (launcher missing, timeout). The caller must
+///   treat this as a boot failure, never as a silent "no", because a buyer commits sats on this field.
+///
+/// Output is discarded (`--version` text is not the evidence, the exit status is) and never inherited,
+/// so a probe cannot scribble on the operator's console.
+///
+/// `timeout` bounds the run; on expiry the child is killed and reaped. `docker_container` is
+/// `Some(name)` when the policy is docker — the deterministic container the render named — so that:
+///   1. a launcher (`docker`) that cannot even spawn is an error, not a false "not proven"; and
+///   2. the container is force-removed after the run, success or timeout alike. `--rm` is deliberately
+///      absent from the job container ([`SandboxPolicy::run_argv`]), so without this the probe would
+///      leak a container and the next token's identically-named run would collide.
 ///
 /// ⚠ This is a MEASUREMENT, not a gate: it answers only "did this command run cleanly HERE, NOW".
-pub fn probe_command_succeeds(argv: &[String]) -> bool {
+pub fn probe_command_outcome(
+    argv: &[String],
+    timeout: Duration,
+    docker_container: Option<&str>,
+) -> Result<bool, ProbeRunError> {
     let Some((program, args)) = argv.split_first() else {
-        return false;
+        return Ok(false);
     };
-    std::process::Command::new(program)
+    let spawned = std::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        // Under docker the program is `docker` itself; if it cannot spawn, the probe never ran and
+        // there is nothing to clean up. Under a pass-through policy the program IS the probe target,
+        // so its absence is the honest "not proven".
+        Err(error) => {
+            return match docker_container {
+                Some(_) => Err(ProbeRunError::LauncherUnspawnable(error)),
+                None => Ok(false),
+            };
+        }
+    };
+
+    let deadline = Instant::now() + timeout;
+    let outcome = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status.success()),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(ProbeRunError::TimedOut { after: timeout });
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => break Err(ProbeRunError::Wait(error)),
+        }
+    };
+
+    // The job container has no `--rm`, so a docker probe leaves a stopped (or, on timeout, running)
+    // container behind. Remove it by its deterministic name before returning, so the next token's run
+    // does not collide and no residue survives the probe. Best-effort and itself bounded.
+    if let Some(name) = docker_container {
+        let _ = run_bounded_nulled(&force_remove_argv(name), PROBE_CLEANUP_TIMEOUT);
+    }
+
+    outcome
+}
+
+/// Spawn `argv` with every stdio nulled and wait at most `timeout`, killing and reaping on expiry.
+/// Used for the probe's own container cleanup, so even teardown cannot hang the pre-advertise path.
+fn run_bounded_nulled(argv: &[String], timeout: Duration) -> Result<bool, ProbeRunError> {
+    let Some((program, args)) = argv.split_first() else {
+        return Ok(false);
+    };
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(ProbeRunError::LauncherUnspawnable)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status.success()),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(ProbeRunError::TimedOut { after: timeout });
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(ProbeRunError::Wait(error)),
+        }
+    }
+}
+
+/// The deterministic container name a docker probe in `workdir` will create, or `None` when the policy
+/// is not docker. The same value [`probe_launch_argv`] embeds as `--name`, exposed so a caller can
+/// force-remove that exact container after the probe. See [`probe_command_outcome`].
+pub fn probe_container_name(policy: &SandboxPolicy, workdir: &Path) -> Option<String> {
+    policy
+        .docker_image()
+        .map(|_| job_container_name(&job_id_of(workdir)))
 }
 
 /// The per-job working directory under the home (`$MAXPLAYER_HOME/seller-jobs/<job_id>`).
 pub fn job_workdir(home: &MaxplayerHome, job_id: &str) -> PathBuf {
     home.root.join("seller-jobs").join(job_id)
+}
+
+/// An owned throwaway workdir for the boot capability probe, removed when this value drops (#784).
+///
+/// It lives under the seller-jobs root — the same place a real job's workdir lives — so the probe runs
+/// where jobs run, not beside the seller process. The leaf is unique across SEATS and BOOTS
+/// (`capability-probe-<pid>-<nanos>`): two seats on one host differ by pid, and one seat across two
+/// boots differs by the nanosecond stamp. That uniqueness is load-bearing beyond tidiness, because the
+/// leaf also feeds docker's deterministic container name ([`probe_container_name`]) — two seats sharing
+/// a leaf would collide on that name, and a boot that reused a prior boot's leaf could adopt a stale
+/// container.
+///
+/// RAII rather than a caller-remembered cleanup: the probe runs on the pre-advertise path, which has
+/// several early-return and `?` points, and a leaked probe dir under seller-jobs is indistinguishable
+/// from a real job's. `Drop` removes the tree on every exit, including an unwind.
+pub struct ProbeWorkdir {
+    path: PathBuf,
+}
+
+impl ProbeWorkdir {
+    /// Create the unique probe workdir under `$MAXPLAYER_HOME/seller-jobs/`. Fails loudly: a workdir
+    /// that cannot be created means the probe cannot run in the environment a job would, and the caller
+    /// must refuse to advertise rather than probe somewhere a job never stands.
+    pub fn create(home: &MaxplayerHome) -> std::io::Result<Self> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let leaf = format!("capability-probe-{}-{}", std::process::id(), nanos);
+        let path = home.root.join("seller-jobs").join(leaf);
+        std::fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+
+    /// The directory to hand [`probe_launch_argv`] as the probe workdir.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ProbeWorkdir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 /// The job id a workdir belongs to — the inverse of [`job_workdir`]'s last component.
@@ -2732,10 +2914,12 @@ mod tests {
         // A REAL directory, for the reason `probe_launch_argv` refuses a missing one.
         let dir = ProbeDir::new("live");
 
+        let container = probe_container_name(&policy, dir.path());
         let proves = |command: &[&str]| {
             let rendered = probe_launch_argv(&policy, &argv(command), dir.path())
                 .expect("a docker policy renders a probe launch");
-            probe_command_succeeds(&rendered)
+            probe_command_outcome(&rendered, CAPABILITY_PROBE_TIMEOUT, container.as_deref())
+                .expect("the probe must be measurable — a docker daemon is present for this test")
         };
 
         let (uid, gid) = job_identity();
@@ -2754,6 +2938,105 @@ mod tests {
             "cargo resolved, which means this answered from the HOST: the runtime image carries no \
              rust toolchain (#358), so a true here is the wrong-environment probe, not a capability"
         );
+    }
+
+    // RED-PROVE: the capability probe must be BOUNDED. Before #784 the probe called an unbounded
+    // `.status()`, so a stuck `--version` or a docker launch with no answer would hang the seller on
+    // the pre-advertise path — before it ever serves. The assertion is on ELAPSED TIME, not only the
+    // returned variant: a `TimedOut` that arrives after the caller already waited forever is not a fix.
+    #[test]
+    fn a_capability_probe_that_never_returns_is_bounded_and_killed() {
+        let argv = argv(&["sleep", "60"]);
+        let started = Instant::now();
+        let outcome = probe_command_outcome(&argv, Duration::from_millis(300), None);
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(outcome, Err(ProbeRunError::TimedOut { .. })),
+            "a probe still running at its deadline must be a measurement FAILURE, never a silent \
+             'not proven': {outcome:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the probe must RETURN at its deadline — waited {elapsed:?} for a 300ms bound"
+        );
+    }
+
+    // The positive controls for the bound above: without them `probe_command_outcome` could return
+    // `TimedOut`/`Ok(false)` unconditionally and the timeout test would still pass.
+    #[test]
+    fn a_bounded_probe_separates_success_absence_and_unmeasurable() {
+        assert_eq!(
+            probe_command_outcome(&argv(&["true"]), Duration::from_secs(10), None).ok(),
+            Some(true),
+            "a command that exits 0 is proven"
+        );
+        assert_eq!(
+            probe_command_outcome(&argv(&["false"]), Duration::from_secs(10), None).ok(),
+            Some(false),
+            "a command that exits non-zero ran and is not proven — omit, do not error"
+        );
+        // Under a pass-through policy the probe program IS the target, so its absence is a clean
+        // 'not proven', never an unmeasurable error.
+        assert_eq!(
+            probe_command_outcome(&argv(&["maxplayer-no-such-binary"]), Duration::from_secs(10), None)
+                .ok(),
+            Some(false),
+            "an absent bare probe binary is 'not proven' (Ok(false)), not a boot-failing error"
+        );
+        // Under docker the program is `docker`; a launcher that cannot spawn means the probe never
+        // ran, which MUST be an error rather than a false 'not proven'. Simulated here with an absent
+        // launcher name and a docker cleanup target.
+        assert!(
+            matches!(
+                probe_command_outcome(
+                    &argv(&["maxplayer-no-such-launcher"]),
+                    Duration::from_secs(10),
+                    Some("maxplayer-job-probe-x"),
+                ),
+                Err(ProbeRunError::LauncherUnspawnable(_))
+            ),
+            "a docker launcher that cannot spawn is unmeasurable, never a silent 'no'"
+        );
+    }
+
+    // Point ② of #784's required shape: the probe workdir is under the seller-jobs root, UNIQUE across
+    // seats and boots, and removed on drop by RAII — not by a caller that must remember.
+    #[test]
+    fn the_probe_workdir_is_unique_under_seller_jobs_and_removed_on_drop() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("mp-probe-home-{}-{nanos}", std::process::id()));
+        let home = crate::home::bootstrap(&root).expect("bootstrap a test home");
+
+        let first_path;
+        let second_path;
+        {
+            let first = ProbeWorkdir::create(&home).expect("create the first probe workdir");
+            let second = ProbeWorkdir::create(&home).expect("create the second probe workdir");
+            first_path = first.path().to_path_buf();
+            second_path = second.path().to_path_buf();
+
+            assert!(first.path().is_dir(), "the probe workdir must exist while held");
+            assert!(second.path().is_dir(), "the probe workdir must exist while held");
+            assert_ne!(
+                first.path(),
+                second.path(),
+                "two probe workdirs must not collide — the leaf also names the docker container"
+            );
+            for path in [first.path(), second.path()] {
+                assert_eq!(
+                    path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()),
+                    Some("seller-jobs"),
+                    "the probe workdir must live under the seller-jobs root, where jobs run: {path:?}"
+                );
+            }
+        }
+        assert!(!first_path.exists(), "drop must remove the probe workdir: {first_path:?}");
+        assert!(!second_path.exists(), "drop must remove the probe workdir: {second_path:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // RED-PROVE: the job container must NOT carry `--rm`.
