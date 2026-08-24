@@ -357,7 +357,11 @@ jobs:
           PRERELEASE: ${{ needs.plan.outputs.prerelease }}
         run: |
           set -euo pipefail
-          flags=(--title "maxplayer $VERSION" --generate-notes)
+          # `--notes-file` PREPENDS to what `--generate-notes` produces, so the hand-written notes
+          # lead and the generated changelog follows. The path is hardcoded and unguarded on
+          # purpose: a `[ -f … ]` test would publish the release without the notes and say nothing,
+          # and a release cannot be un-published. Missing file ⇒ gh fails ⇒ the release fails closed.
+          flags=(--title "maxplayer $VERSION" --generate-notes --notes-file RELEASE_NOTES.md)
           if [ "$PRERELEASE" = true ]; then
             flags+=(--prerelease)
           fi
