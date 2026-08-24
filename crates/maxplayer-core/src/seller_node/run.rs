@@ -2533,9 +2533,9 @@ async fn run_harness_probe(
     identity: &DeliveryAgentIdentity,
     workdir: &std::path::Path,
     sentinel: &str,
-) -> Result<(), (String, Fault)> {
+) -> Result<Option<String>, (String, Fault)> {
     match run_harness_probe_once(argv, sandbox, identity, workdir, sentinel).await {
-        ProbeAttempt::Proven { .. } => Ok(()),
+        ProbeAttempt::Proven { model } => Ok(model),
         ProbeAttempt::Unrunnable { reason, fault } => Err((reason, fault)),
         ProbeAttempt::CompletedNoArtifact { agent_message } => Err((
             flaky_harness_reason(1, agent_message.as_deref()),
@@ -2596,7 +2596,7 @@ enum ProbeOutcome {
 async fn supervise_harness_probe(
     roster: Arc<LiveRoster>,
     harness: usize,
-    probe: impl std::future::Future<Output = Result<(), (String, Fault)>>,
+    probe: impl std::future::Future<Output = Result<Option<String>, (String, Fault)>>,
 ) -> ProbeOutcome {
     // Armed before the await: releases `probing` even if `probe` panics through it. Idempotent with the
     // verdict arms below, which clear the mark themselves on the paths that reach a verdict.
@@ -2605,7 +2605,18 @@ async fn supervise_harness_probe(
         harness,
     };
     match tokio::time::timeout(HARNESS_PROBE_WALL_TIMEOUT, probe).await {
-        Ok(Ok(())) => {
+        Ok(Ok(model)) => {
+            // RECORD BEFORE RESTORE, and the order is the property. `fault` leaves `model` untouched
+            // and `restore` clears only availability, so the model standing here is the one from
+            // BEFORE the harness was dropped — and a harness is dropped for exactly as long as an
+            // operator might re-point it at something else. Restoring first would publish that stale
+            // value on any beat landing between the two calls: the roster read takes its own lock, so
+            // the window is real, and what it emits is a filterable claim a buyer can be awarded on.
+            //
+            // `None` is written THROUGH rather than skipped, for the reason the setter takes an
+            // `Option` at all: a harness that has stopped reporting a model must come back stating
+            // none, not still advertising what it last said a fault ago.
+            roster.record_model(harness, model);
             roster.restore(harness);
             ProbeOutcome::Restored
         }
@@ -13622,6 +13633,71 @@ mod supervised_probe_tests {
         );
     }
 
+    /// The advertised model for the one harness in `claimed_probe`'s roster, as the wire would carry
+    /// it. `None` means the seat states no model for it.
+    fn advertised_model(roster: &LiveRoster) -> Option<String> {
+        roster
+            .advertisement()
+            .models
+            .into_iter()
+            .find(|entry| entry.harness == "claude")
+            .map(|entry| entry.model)
+    }
+
+    // A restore self-probe must publish the model IT observed, not the one standing from before the
+    // harness was dropped.
+    //
+    // The stale value is not hypothetical and neither half of the drop clears it: `fault` leaves
+    // `model` untouched and `restore` clears only availability. So a harness that faults, gets
+    // re-pointed at a different default while it is out of service, and is then proven by a self-probe
+    // comes back advertising what it ran BEFORE the fault — a filterable claim, on both the beat and
+    // the claim, that #866's model filter will match and award against.
+    //
+    // BOTH LEGS, because a replacement test alone cannot see the worse direction: a harness that has
+    // stopped reporting a model must come back UNSTATED, not merely un-updated. The `Option` in the
+    // setter exists for exactly that, and writing `None` through is what makes absence reachable.
+    #[tokio::test]
+    async fn a_restored_harness_advertises_the_model_its_probe_observed() {
+        let now = Instant::now();
+
+        // LEG 1 — REPLACEMENT. The pre-fault model must not survive the restore.
+        let (roster, _due) = claimed_probe(now);
+        roster.record_model(0, Some("claude-opus-4".to_owned()));
+        assert_eq!(
+            advertised_model(&roster),
+            None,
+            "harness check: a DROPPED harness advertises nothing at all, so the assertion after the \
+             restore below is about the restore and not about a model that was already visible"
+        );
+
+        let outcome = supervise_harness_probe(
+            Arc::clone(&roster),
+            0,
+            std::future::ready(Ok(Some("claude-opus-5".to_owned()))),
+        )
+        .await;
+        assert!(matches!(outcome, ProbeOutcome::Restored), "{outcome:?}");
+        assert_eq!(
+            advertised_model(&roster).as_deref(),
+            Some("claude-opus-5"),
+            "the restored harness must advertise the model its PROBE observed — `claude-opus-4` here \
+             is the pre-fault value, and advertising it is a claim this seat can no longer keep"
+        );
+
+        // LEG 2 — CLEARING. A harness that reports no model comes back stating none.
+        let (roster, _due) = claimed_probe(now);
+        roster.record_model(0, Some("claude-opus-4".to_owned()));
+        let outcome =
+            supervise_harness_probe(Arc::clone(&roster), 0, std::future::ready(Ok(None))).await;
+        assert!(matches!(outcome, ProbeOutcome::Restored), "{outcome:?}");
+        assert_eq!(
+            advertised_model(&roster),
+            None,
+            "a harness that has stopped reporting a model must come back UNSTATED — keeping the last \
+             value it ever gave outlives the truth, and absent is the only honest spelling"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_hung_probe_hits_the_wall_clock_ceiling_and_the_harness_is_re_probed() {
         // A probe the 120s ACP IDLE timeout can never bound: it never resolves (in the wild it holds
@@ -13633,7 +13709,7 @@ mod supervised_probe_tests {
         let outcome = supervise_harness_probe(
             Arc::clone(&roster),
             0,
-            std::future::pending::<Result<(), (String, Fault)>>(),
+            std::future::pending::<Result<Option<String>, (String, Fault)>>(),
         )
         .await;
         assert!(
