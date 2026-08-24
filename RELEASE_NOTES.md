@@ -1,6 +1,6 @@
 ### Known limitation: Docker-contained Cursor
 
-Docker-contained Cursor seats are not supported in this release. Such a seat cannot complete its
+Docker-contained Cursor seats are not supported in v0.5.0. Such a seat cannot complete its
 pre-advertise probe, so the seller refuses to advertise and the seat accepts no work. That refusal
 is deliberate and fail-closed: a seat that cannot prove its harness does not take jobs.
 

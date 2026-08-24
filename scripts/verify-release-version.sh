@@ -72,6 +72,30 @@ process.stdout.write(names.join(", "));
     || die "npm/maxplayer/package.json payload pins are not all $VERSION"
 echo "ok: payload pins at $VERSION -> $PIN_REPORT"
 
+# ── The release notes ───────────────────────────────────────────────────────────────────────────
+# RELEASE_NOTES.md is version-specific prose living at a permanent path, and the release job passes
+# it to `--notes-file` unconditionally. Absence already fails closed there — `gh` errors and no
+# Release is created — but staleness had no guard at all: an unrewritten file publishes the PREVIOUS
+# release's notes under this release's title, green and silent, and a Release cannot be un-published.
+#
+# The reason it survived unnoticed is that it does not misfire on the next release. A stale note
+# stays accidentally true for as long as the limitation it describes is unfixed, so every look at it
+# is reassuring. The first release the file is WRONG for is the release that FIXES the limitation —
+# which would ship "not supported" while announcing support.
+#
+# Checked here rather than beside `--notes-file` because CI runs this script on every pull request
+# with the crate version, so a version bump that forgets the notes fails on the bump PR, before a tag
+# exists. At `--notes-file` the earliest possible failure is after the tag has been pushed.
+#
+# Dots are escaped so they cannot match any character, and the digit boundaries keep 0.5.1 from being
+# satisfied by a file that only mentions 0.5.10.
+[ -f RELEASE_NOTES.md ] \
+    || die "RELEASE_NOTES.md is missing — the release job passes it to --notes-file and would fail after the tag exists"
+VERSION_RE="$(printf '%s' "$VERSION" | sed 's/\./\\./g')"
+grep -qE "(^|[^0-9.])${VERSION_RE}([^0-9]|$)" RELEASE_NOTES.md \
+    || die "RELEASE_NOTES.md does not name $VERSION — rewrite it for this release; it still describes the previous one"
+echo "ok: RELEASE_NOTES.md names $VERSION"
+
 # ── The built binary ────────────────────────────────────────────────────────────────────────────
 # The only check that looks at the artifact instead of the tree. It catches the case the others
 # structurally cannot: an asset carried over from an earlier build.
