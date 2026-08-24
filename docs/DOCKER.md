@@ -276,10 +276,18 @@ Six things to know before you need them:
 - **One flag is not always enough to contain one client, and the failure is silent.** Measured on
   `cursor-agent 2026.08.11-e8db854`: `--endpoint` moves the control plane, and a separate
   **undocumented `--agent-endpoint`** moves the agent/inference leg. With only the first set, the
-  control plane authenticates and the agent leg still leaves for `api2.cursor.sh` carrying the
-  placeholder — so every job fails while the proxy's own log looks perfectly healthy, because traffic
-  that never arrives leaves no trace in it. When adding a client, check the **egress denominator**: did
-  anything leave for an authority you did not redirect?
+  control plane authenticates and the agent leg leaves for **its own host** — measured as
+  `agentn.global.api5.cursor.sh`, which is not the `upstream` the credential names. On a contained seat
+  that host is not in the egress policy, so the leg dies at name resolution (`getaddrinfo EAI_AGAIN`)
+  and never reaches authentication. Every job fails while the proxy's own log looks perfectly healthy,
+  because traffic that never arrives leaves no trace in it. When adding a client, check the **egress
+  denominator**: did anything leave for an authority you did not redirect?
+- **Naming both flags is necessary and, for Cursor today, not sufficient.** Measured on a live
+  contained seat: the redirected agent leg reaches the proxy and completes an h2c handshake, and then
+  the request is never forwarded, because the proxy buffers a request body that this client does not
+  close. The client reports a stalled connection after about 37 seconds and the job fails. So
+  `file_credentials` for Cursor is not usable yet; a seat configured that way fails its pre-advertise
+  probe and correctly refuses to advertise. The flags fix the addressing, not this.
 - **The proxy accepts HTTP/1 and h2c on the same listener.** That client opens its agent leg with the
   HTTP/2 prior-knowledge preface rather than an HTTP/1 request line. An http1-only server cannot parse
   that preface and surfaces **no request at all**, so the symptom is "nothing connected" rather than a
