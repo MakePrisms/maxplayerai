@@ -637,8 +637,16 @@ impl RunningProxy {
 
 impl Drop for RunningProxy {
     fn drop(&mut self) {
-        // Job end = revocation: kill the listener so the placeholder stops working the instant the job
-        // is done, even if a caller forgets to deregister.
+        // JOB END IS A REVOCATION, and it has to reach connections that are ALREADY OPEN — not only
+        // the listener. Aborting this task drops the accept loop's `JoinSet`, and dropping a `JoinSet`
+        // aborts every task in it, so every accepted connection dies here too.
+        //
+        // Closing the listener alone would not be revocation. It stops the NEXT client and says
+        // nothing about the current one: an h2 or keep-alive connection accepted a moment earlier
+        // still holds `Arc<ProxyEngine>`, so its placeholder still resolves and it can keep a
+        // credential-bearing stream open, or start new requests, for as long as it likes. With a
+        // relayed body and no byte cap, "as long as it likes" is unbounded — see
+        // `dropping_the_proxy_revokes_connections_it_has_already_accepted`.
         self.task.abort();
     }
 }
@@ -717,9 +725,25 @@ pub async fn start(
     // Shared across every connection and both protocols, so multiplexing cannot widen it.
     let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
     let task = tokio::spawn(async move {
+        // EVERY CONNECTION IS OWNED BY THIS TASK, and that ownership is what makes job end a
+        // revocation rather than a request to stop.
+        //
+        // A detached `tokio::spawn` per connection would not be: tokio tasks are not scoped to their
+        // spawner, so aborting this accept loop would close the listener while every ALREADY-ACCEPTED
+        // connection kept running — each holding `Arc<ProxyEngine>` and so the live credential map.
+        // An h2 or keep-alive client could then hold a credential-bearing stream open past job end and
+        // start new requests on it, and the listener being shut would say nothing about any of it.
+        // Dropping a `JoinSet` aborts every task in it, so aborting this task now reaches them all.
+        let mut live: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         loop {
-            let Ok((stream, _peer)) = listener.accept().await else {
-                continue;
+            let (stream, _peer) = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok(accepted) => accepted,
+                    Err(_) => continue,
+                },
+                // Reap finished connections so a long-lived proxy does not accumulate their handles.
+                // Guarded, because `join_next` on an empty set is instantly `None` and would spin.
+                _ = live.join_next(), if !live.is_empty() => continue,
             };
             // Bound concurrent connections: acquire a permit before spawning, hold it for the life of
             // the connection. When all permits are out, this awaits — new connections queue at the OS
@@ -730,7 +754,7 @@ pub async fn start(
             let engine = Arc::clone(&engine_for_task);
             let client = client.clone();
             let in_flight = Arc::clone(&in_flight);
-            tokio::spawn(async move {
+            live.spawn(async move {
                 let _permit = permit; // released when the connection ends
                 let io = TokioIo::new(stream);
                 let service = service_fn(move |req| {
@@ -2597,6 +2621,154 @@ mod tests {
                 "an upstream that dies mid-relay must surface as 502 to the container"
             );
         }
+    }
+
+    /// A stub upstream that never answers and reports EVERY arrival, plus each socket close.
+    ///
+    /// Multi-arrival is the point: revocation is a claim about a SECOND request, and a stub that can
+    /// only witness one cannot tell "the second was refused" from "the stub stopped listening".
+    #[allow(clippy::type_complexity)]
+    async fn spawn_arrival_counting_stub() -> (
+        SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+        tokio::sync::mpsc::UnboundedReceiver<bool>,
+    ) {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (arrived_tx, arrived_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let arrived_tx = arrived_tx.clone();
+                let closed_tx = closed_tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0_u8; 4096];
+                    while find_subslice(&buf, b"\r\n\r\n").is_none() {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    let head_end = find_subslice(&buf, b"\r\n\r\n").unwrap() + 4;
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                    let key = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("x-api-key")
+                                .then(|| value.trim().to_owned())
+                        })
+                        .unwrap_or_else(|| "<absent>".to_owned());
+                    let _ = arrived_tx.send(key);
+                    // Answer nothing; wait to be torn down, then say whether the body ever finished.
+                    loop {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    let _ = closed_tx.send(decode_chunked(&buf[head_end..]).is_some());
+                });
+            }
+        });
+        (addr, arrived_rx, closed_rx)
+    }
+
+    // REVOCATION MUST REACH CONNECTIONS ALREADY ACCEPTED, not just the listener.
+    //
+    // Every connection used to be a detached `tokio::spawn`, and tokio tasks are not scoped to their
+    // spawner — so `RunningProxy::drop` aborting the accept loop closed the listener while every open
+    // connection kept running with `Arc<ProxyEngine>` in hand. The placeholder still resolved on such a
+    // connection, which makes "the placeholder stops working at job end" false for exactly the client
+    // that already has one. With a relayed body and no byte cap, that outlives the job indefinitely.
+    //
+    // Proving the listener refuses NEW connections would not test this at all: the whole failure lives
+    // on a socket accepted before the drop. So the client here is deliberately kept alive across it.
+    #[tokio::test]
+    async fn dropping_the_proxy_revokes_connections_it_has_already_accepted() {
+        const PREFIX: &str = r#"{"model":"claude","stream":true,"messages":["#;
+
+        let (stub_addr, mut arrived, mut closed) = spawn_arrival_counting_stub().await;
+        let upstream = format!("http://{stub_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        let placeholder = mint_anthropic_placeholder();
+        engine
+            .register(JobCredential {
+                placeholder: placeholder.clone(),
+                real: REAL.to_owned(),
+                upstream: upstream.clone(),
+            })
+            .unwrap();
+        let proxy = start(Arc::clone(&engine), None).await.unwrap();
+        let proxy_addr = proxy.local_addr();
+
+        let io = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let (send, connection) = h2::client::handshake(io).await.unwrap();
+        let connection = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let open_request = |send: &h2::client::SendRequest<Bytes>| {
+            let request = hyper::Request::builder()
+                .method("POST")
+                .uri(format!("http://{proxy_addr}/v1/messages"))
+                .header("x-api-key", &placeholder)
+                .body(())
+                .unwrap();
+            let mut send = send.clone();
+            let (response, mut body) = send.send_request(request, false).unwrap();
+            body.reserve_capacity(PREFIX.len());
+            body.send_data(Bytes::from_static(PREFIX.as_bytes()), false).unwrap();
+            (response, body)
+        };
+
+        // POSITIVE CONTROL: an authorized stream, credential-bearing, upstream, body still open.
+        let send = send.ready().await.unwrap();
+        let (_first_response, first_body) = open_request(&send);
+        let first_key = tokio::time::timeout(Duration::from_secs(10), arrived.recv())
+            .await
+            .expect("the first request must reach the upstream while its body is open")
+            .expect("the stub upstream closed");
+        assert_eq!(
+            first_key, REAL,
+            "the control stream must be the credential-bearing one, or nothing below is about \
+             revoking a credential"
+        );
+
+        // JOB END, with the client's socket deliberately still alive and still connected.
+        drop(proxy);
+
+        // (a) The credential-bearing upstream request is torn down, and torn down INCOMPLETE.
+        let completed = tokio::time::timeout(Duration::from_secs(10), closed.recv())
+            .await
+            .expect(
+                "the upstream request survived job end: an already-accepted connection is still \
+                 relaying under the real credential after the proxy was dropped",
+            )
+            .expect("the stub upstream closed");
+        assert!(
+            !completed,
+            "the revoked request was finished upstream rather than cut, so job end completed a \
+             credential-bearing request instead of revoking it"
+        );
+
+        // (b) A FURTHER stream on that same already-accepted connection reaches no upstream. The
+        // assertion is an absence, which is only worth anything because the identical call above
+        // produced an arrival on this very connection moments earlier.
+        let second = send.ready().await.map(|ready| open_request(&ready));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(750), arrived.recv()).await.is_err(),
+            "a new stream on a connection accepted BEFORE job end still reached the upstream, so the \
+             placeholder outlives the job on any connection that was already open"
+        );
+
+        drop(first_body);
+        drop(second);
+        connection.abort();
     }
 
     /// Serve requests on an already-bound listener, answering the first with `status` and a `Location`
