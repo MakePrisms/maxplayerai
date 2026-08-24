@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use cashu::nuts::nut18::PaymentRequestPayload;
 use cashu::{
-    Amount, CheckStateRequest, CurrencyUnit, MintUrl, PublicKey as CashuPublicKey, SecretKey,
-    SpendingConditions, State, Token,
+    Amount, CheckStateRequest, CurrencyUnit, MintUrl, Proofs, PublicKey as CashuPublicKey,
+    SecretKey, SpendingConditions, State, Token,
 };
 use cdk::wallet::{
     HttpClient, KeysetFilter, MintConnector, ReceiveOptions, SendOptions, Wallet,
@@ -39,6 +39,14 @@ pub const MINT_UNREACHABLE_POST: &str = "mint_unreachable";
 
 /// Reason code surfaced when a dead mint blocks the pay path.
 pub const MINT_UNREACHABLE_PAY: &str = "mint_unreachable_pay";
+
+/// Reason code surfaced when a dead mint blocks the keyset refresh that
+/// [`expand_token_proofs`] needs to expand a token naming a rotated keyset.
+///
+/// Distinct from the two above because that refresh is reached from three paths — buyer reconcile,
+/// buyer NUT-18 payload and seller receive — so neither the post nor the pay code would be true at
+/// all three call sites.
+pub const MINT_UNREACHABLE_KEYSETS: &str = "mint_unreachable_keysets";
 
 /// Last-resort ceiling on ONE buyer-worker round-trip across the synchronous bridge in
 /// [`CdkPaymentEffects::request`].
@@ -103,7 +111,8 @@ pub enum PaymentWalletError {
     ///
     /// The buyer money path fails fast with this instead of hanging past the MCP
     /// tool deadline. `reason` is a stable code (`mint_unreachable` for the
-    /// post-time dust guard, `mint_unreachable_pay` for the pay path) and `mint`
+    /// post-time dust guard, `mint_unreachable_pay` for the pay path,
+    /// `mint_unreachable_keysets` for the keyset refresh behind token expansion) and `mint`
     /// names the unreachable mint URL.
     MintUnreachable {
         reason: &'static str,
@@ -946,6 +955,94 @@ fn gate_effect(error: PaymentWalletError) -> LockedTokenGate {
     LockedTokenGate::Effect(EffectError::new(error.to_string()))
 }
 
+/// Is this expansion failure specifically "the token names a short keyset id absent from the set we
+/// passed"?
+///
+/// Matched on the typed variant, never on the message. A string match would start silently passing
+/// (or silently retrying an unrelated fault) the first time cashu edits its error text, and nothing
+/// in our suite would say so.
+fn is_unknown_short_keyset_id(error: &cashu::nuts::nut00::Error) -> bool {
+    matches!(
+        error,
+        cashu::nuts::nut00::Error::NUT02(cashu::nuts::nut02::Error::UnknownShortKeysetId)
+    )
+}
+
+/// Expand a token into proofs against the mint's keysets, refreshing once if the token names a
+/// keyset this wallet has not seen.
+///
+/// A `TokenV4` carries short keyset ids that only mean something against the mint's keyset set, and
+/// that set is served from a local cache. So a mint that rotated its keysets after the cache was
+/// populated leaves the expansion permanently unsatisfiable: `get_mint_keysets` filters by unit and
+/// cannot know which ids the token needs, so it answers `Ok` from the stale cache and the miss
+/// surfaces inside `Token::proofs`. cdk's own TTL does not rescue this — `MintMetadataCache::load`
+/// prefers any populated database row and re-stamps its timestamp, so the cache never ages into a
+/// mint fetch. [`Wallet::refresh_keysets`] is the only forced fetch, so on that one failure we call
+/// it, re-read the keysets and retry the expansion exactly once.
+///
+/// Three details this depends on, each load-bearing:
+///
+/// - The retry re-reads with [`KeysetFilter::All`] instead of using `refresh_keysets`' return value,
+///   which is filtered to *active* keysets. A token may legitimately carry proofs from a rotated,
+///   inactive keyset — mints still redeem those — so expanding against the active-only set would
+///   break exactly the tokens this path exists to recover.
+/// - `refresh_keysets` reports `Err` when the mint serves no *active* keyset for our unit, and it
+///   does so **after** writing the fetched data to the store. Its error therefore does not mean the
+///   refresh did not happen, so we reload and retry regardless and keep the error for the diagnosis
+///   only.
+/// - Only `UnknownShortKeysetId` refreshes. Any other expansion failure is a decode fault that a
+///   mint round-trip cannot repair, so it returns untouched rather than buying a pointless
+///   round-trip on every malformed token.
+///
+/// Exactly one retry: a second miss means the mint does not serve that keyset at all, and looping
+/// would turn a fail-closed refusal into an unbounded stall against a live mint.
+async fn expand_token_proofs(wallet: &Wallet, token: &Token) -> Result<Proofs, PaymentWalletError> {
+    let keysets = wallet
+        .get_mint_keysets(KeysetFilter::All)
+        .await
+        .map_err(wallet_error)?;
+    let first = match token.proofs(&keysets) {
+        Ok(proofs) => return Ok(proofs),
+        Err(error) => error,
+    };
+    if !is_unknown_short_keyset_id(&first) {
+        return Err(wallet_error(first));
+    }
+
+    // Bounded like every other mint touch: this is a live fetch against a mint that may be dead,
+    // and it sits on the buyer money path behind the MCP tool deadline.
+    let refresh_error = match tokio::time::timeout(MINT_TOUCH_TIMEOUT, wallet.refresh_keysets()).await
+    {
+        Ok(Ok(_)) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(_elapsed) => {
+            return Err(mint_unreachable(
+                wallet,
+                MINT_UNREACHABLE_KEYSETS,
+                format!("refresh_keysets exceeded {MINT_TOUCH_TIMEOUT:?} recovering from: {first}"),
+            ));
+        }
+    };
+
+    let keysets = wallet
+        .get_mint_keysets(KeysetFilter::All)
+        .await
+        .map_err(wallet_error)?;
+    token.proofs(&keysets).map_err(|second| {
+        // Keep the whole causal chain: collapsing this into `second` alone loses that a refresh was
+        // attempted, and collapsing it into `first` hides that the mint still does not serve the
+        // keyset after being asked directly.
+        let refreshed = match &refresh_error {
+            Some(error) => format!("; refresh reported: {error}"),
+            None => String::new(),
+        };
+        wallet_error(format!(
+            "token names a keyset the mint does not serve after refresh: {second} \
+             (first attempt: {first}{refreshed})"
+        ))
+    })
+}
+
 /// Compute the NUT-07 `Y` for every proof in a reconciled token. Expands the token into proofs
 /// using the wallet's mint keysets (a TokenV4 stores short keyset ids that must be expanded), then
 /// `proof.y()` each — the SAME decomposition [`build_nut18_payload`] performs and the same `y()`
@@ -954,11 +1051,7 @@ async fn token_proof_ys(
     wallet: &Wallet,
     token: &Token,
 ) -> Result<Vec<CashuPublicKey>, PaymentWalletError> {
-    let keysets = wallet
-        .get_mint_keysets(KeysetFilter::All)
-        .await
-        .map_err(wallet_error)?;
-    let proofs = token.proofs(&keysets).map_err(wallet_error)?;
+    let proofs = expand_token_proofs(wallet, token).await?;
     proofs
         .iter()
         .map(|proof| proof.y())
@@ -1719,11 +1812,7 @@ async fn build_nut18_payload(
     seller_pubkey: String,
     token: Token,
 ) -> Result<PaymentPayload, PaymentWalletError> {
-    let keysets = wallet
-        .get_mint_keysets(KeysetFilter::All)
-        .await
-        .map_err(wallet_error)?;
-    let proofs = token.proofs(&keysets).map_err(wallet_error)?;
+    let proofs = expand_token_proofs(wallet, &token).await?;
     let mint = token.mint_url().map_err(wallet_error)?;
     let unit = token
         .unit()
@@ -2100,12 +2189,7 @@ impl<'a> CdkSellerReceive<'a> {
         }
 
         // Fee must be predicted pre-swap: CDK receive returns net after fees.
-        let keysets = self
-            .wallet
-            .get_mint_keysets(KeysetFilter::All)
-            .await
-            .map_err(wallet_error)?;
-        let proofs = token.proofs(&keysets).map_err(wallet_error)?;
+        let proofs = expand_token_proofs(self.wallet, token).await?;
         let fee = self
             .wallet
             .get_proofs_fee(&proofs)
@@ -5574,5 +5658,342 @@ mod tests {
             .recover_unmapped_sagas()
             .await
             .expect("pay path must resume after dropping the orphan");
+    }
+
+    // ---- #873: token expansion must survive a mint keyset rotation ----------------------------
+    //
+    // Only v2 (`Version01`) keysets can reach this defect at all. `Id::from_short_keyset_id`
+    // returns a v1 short id straight back without ever consulting the keyset list, so a v1 token
+    // expands against any cache, stale or not. Every fixture here is therefore v2 — a v1 keyset
+    // would make these tests pass while testing nothing.
+
+    /// A v2 keyset seeded distinctly, so two of them never share a short-id prefix.
+    fn v2_keyset(seed: u8) -> KeySet {
+        let keys = [1_u64, 2, 4, 8]
+            .into_iter()
+            .map(|amount| {
+                (
+                    Amount::from(amount),
+                    secret_key(amount as u8 + seed).public_key(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let keys = Keys::new(keys);
+        KeySet {
+            id: Id::v2_from_data(&keys, &CurrencyUnit::Sat, 0, None),
+            unit: CurrencyUnit::Sat,
+            active: Some(true),
+            keys,
+            input_fee_ppk: 0,
+            final_expiry: None,
+        }
+    }
+
+    fn keyset_info_of(keyset: &KeySet) -> KeySetInfo {
+        KeySetInfo {
+            id: keyset.id,
+            unit: keyset.unit.clone(),
+            active: true,
+            input_fee_ppk: keyset.input_fee_ppk,
+            final_expiry: keyset.final_expiry,
+        }
+    }
+
+    /// Serves exactly the keysets it holds, and counts keyset-list fetches.
+    ///
+    /// The counter is the point: "expansion recovered" alone cannot distinguish a refresh from a
+    /// cache that was never stale, and "expansion failed" cannot distinguish one bounded retry from
+    /// a loop. Both questions are answered by how many times the mint was asked.
+    #[derive(Clone, Debug, Default)]
+    struct RotatingKeysetTransport {
+        served: Vec<KeySet>,
+        keyset_fetches: Arc<AtomicUsize>,
+    }
+
+    impl RotatingKeysetTransport {
+        fn new(served: Vec<KeySet>) -> Self {
+            Self {
+                served,
+                keyset_fetches: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn fetches(&self) -> usize {
+            self.keyset_fetches.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HttpTransport for RotatingKeysetTransport {
+        fn with_proxy(
+            &mut self,
+            _proxy: Url,
+            _host_matcher: Option<&str>,
+            _accept_invalid_certs: bool,
+        ) -> Result<(), cdk::Error> {
+            Ok(())
+        }
+
+        async fn http_get<R>(
+            &self,
+            url: Url,
+            _auth: Option<cashu::nuts::AuthToken>,
+        ) -> Result<R, cdk::Error>
+        where
+            R: DeserializeOwned,
+        {
+            let path = url.path().to_owned();
+            // `/v1/keysets` contains `/v1/keys` as a substring, so it must be matched first.
+            let value = if path.ends_with("/v1/keysets") {
+                self.keyset_fetches.fetch_add(1, Ordering::SeqCst);
+                serde_json::to_value(cashu::KeysetResponse {
+                    keysets: self.served.iter().map(keyset_info_of).collect(),
+                })
+            } else if path.contains("/v1/keys") {
+                let wanted = self
+                    .served
+                    .iter()
+                    .filter(|keyset| path.ends_with(&keyset.id.to_string()))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let keysets = if wanted.is_empty() && path.ends_with("/v1/keys") {
+                    self.served.clone()
+                } else {
+                    wanted
+                };
+                serde_json::to_value(cashu::KeysResponse { keysets })
+            } else if path.ends_with("/v1/info") {
+                serde_json::to_value(MintInfo::new())
+            } else {
+                return Err(cdk::Error::Custom(format!("unexpected GET {path}")));
+            };
+            serde_json::from_value(value.map_err(|error| cdk::Error::Custom(error.to_string()))?)
+                .map_err(|error| cdk::Error::Custom(error.to_string()))
+        }
+
+        async fn http_post<P, R>(
+            &self,
+            url: Url,
+            _auth: Option<cashu::nuts::AuthToken>,
+            _payload: &P,
+        ) -> Result<R, cdk::Error>
+        where
+            P: Serialize + ?Sized + Send + Sync,
+            R: DeserializeOwned,
+        {
+            Err(cdk::Error::Custom(format!(
+                "unexpected POST {}",
+                url.path()
+            )))
+        }
+    }
+
+    /// A wallet whose store is seeded with `cached` only, talking to a mint that serves `served`.
+    /// When `served` includes a keyset `cached` does not, the wallet is genuinely stale.
+    async fn rotated_keyset_wallet(
+        cached: &KeySet,
+        served: Vec<KeySet>,
+    ) -> (Wallet, RotatingKeysetTransport) {
+        let transport = RotatingKeysetTransport::new(served);
+        let wallet = seller_wallet_at(MINT, transport.clone(), cached.clone()).await;
+        (wallet, transport)
+    }
+
+    fn token_for_keyset(keyset: &KeySet, seller: PublicKey) -> Token {
+        Token::new(
+            mint(MINT),
+            vec![p2pk_proof_for_keyset(7, seller, keyset.id)],
+            None,
+            CurrencyUnit::Sat,
+        )
+    }
+
+    #[tokio::test]
+    async fn expansion_recovers_when_the_mint_rotated_its_keyset() {
+        let cached = v2_keyset(20);
+        let rotated = v2_keyset(60);
+        assert_ne!(cached.id, rotated.id, "fixture must model a real rotation");
+        let seller = secret_key(1).public_key();
+        let token = token_for_keyset(&rotated, seller);
+        let (wallet, transport) =
+            rotated_keyset_wallet(&cached, vec![cached.clone(), rotated.clone()]).await;
+
+        // Red-prove the premise: the unfixed shape — expand against the cached set, no refresh —
+        // must actually fail here, or this test would pass without exercising the fix.
+        let stale = wallet.get_mint_keysets(KeysetFilter::All).await.unwrap();
+        let unfixed = token.proofs(&stale).expect_err("stale cache must refuse");
+        assert!(
+            is_unknown_short_keyset_id(&unfixed),
+            "premise must fail with the keyset miss, not something else: {unfixed}"
+        );
+        assert_eq!(transport.fetches(), 0, "the stale read must not touch the mint");
+
+        let proofs = expand_token_proofs(&wallet, &token)
+            .await
+            .expect("expansion must recover after refreshing the rotated keyset");
+
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(
+            proofs[0].keyset_id, rotated.id,
+            "recovered proof must carry the ROTATED keyset's full id"
+        );
+        assert_eq!(
+            transport.fetches(),
+            1,
+            "recovery must cost exactly one keyset refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn expansion_does_not_touch_the_mint_when_the_cache_already_serves_the_token() {
+        let cached = v2_keyset(20);
+        let seller = secret_key(1).public_key();
+        let token = token_for_keyset(&cached, seller);
+        let (wallet, transport) = rotated_keyset_wallet(&cached, vec![cached.clone()]).await;
+
+        let proofs = expand_token_proofs(&wallet, &token)
+            .await
+            .expect("a token the cache can already expand must not need the mint");
+
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(
+            transport.fetches(),
+            0,
+            "the happy path must buy NO mint round-trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn expansion_retries_exactly_once_when_the_mint_still_lacks_the_keyset() {
+        let cached = v2_keyset(20);
+        let missing = v2_keyset(60);
+        let seller = secret_key(1).public_key();
+        let token = token_for_keyset(&missing, seller);
+        // The mint never serves `missing`, so the refresh cannot help. The retry must stop.
+        let (wallet, transport) = rotated_keyset_wallet(&cached, vec![cached.clone()]).await;
+
+        let error = expand_token_proofs(&wallet, &token)
+            .await
+            .expect_err("a keyset the mint does not serve must still refuse");
+
+        assert_eq!(
+            transport.fetches(),
+            1,
+            "a second miss must NOT loop: exactly one refresh, then refuse"
+        );
+        let text = error.to_string();
+        assert!(
+            text.contains("after refresh"),
+            "error must say a refresh was attempted: {text}"
+        );
+        assert!(
+            text.contains("first attempt"),
+            "error must preserve the original cause: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_proof_ys_recovers_when_the_mint_rotated_its_keyset() {
+        let cached = v2_keyset(20);
+        let rotated = v2_keyset(60);
+        let seller = secret_key(1).public_key();
+        let token = token_for_keyset(&rotated, seller);
+        let (wallet, transport) =
+            rotated_keyset_wallet(&cached, vec![cached.clone(), rotated.clone()]).await;
+
+        let ys = token_proof_ys(&wallet, &token)
+            .await
+            .expect("buyer reconcile must route through the refreshing expansion");
+
+        assert_eq!(ys.len(), 1);
+        assert_eq!(transport.fetches(), 1);
+    }
+
+    #[tokio::test]
+    async fn build_nut18_payload_recovers_when_the_mint_rotated_its_keyset() {
+        let cached = v2_keyset(20);
+        let rotated = v2_keyset(60);
+        let seller = secret_key(1).public_key();
+        let token = token_for_keyset(&rotated, seller);
+        let (wallet, transport) =
+            rotated_keyset_wallet(&cached, vec![cached.clone(), rotated.clone()]).await;
+
+        let payload = build_nut18_payload(
+            &wallet,
+            "job-873".into(),
+            seller.to_string(),
+            token.clone(),
+        )
+        .await
+        .expect("buyer NUT-18 payload must route through the refreshing expansion");
+
+        assert_eq!(payload.payload.proofs.len(), 1);
+        assert_eq!(payload.payload.proofs[0].keyset_id, rotated.id);
+        assert_eq!(transport.fetches(), 1);
+    }
+
+    /// The seller caller, which is the one the field failure came from: a correctly paid seller left
+    /// uncredited because fee prediction could not expand the wrap. Both fixtures carry
+    /// `input_fee_ppk` 0, so the predicted fee is 0 and the injected receive returns the full face.
+    #[tokio::test]
+    async fn seller_receive_recovers_when_the_mint_rotated_its_keyset() {
+        let cached = v2_keyset(20);
+        let rotated = v2_keyset(60);
+        let seller_key = secret_key(1);
+        let token = token_for_keyset(&rotated, seller_key.public_key());
+        let (wallet, transport) =
+            rotated_keyset_wallet(&cached, vec![cached.clone(), rotated.clone()]).await;
+        let terms = PaymentTerms::new(
+            mint(MINT),
+            Amount::from(7),
+            CurrencyUnit::Sat,
+            nostr_key_for_p2pk(seller_key.public_key()),
+            seller_key.public_key(),
+        );
+        let adapter = CdkSellerReceive::new(&wallet, seller_key);
+
+        let amount = adapter
+            .receive_with(&token, &terms, &accepted(&[MINT]), &mint(MINT), |_| async {
+                Ok(Amount::from(7))
+            })
+            .await
+            .expect("seller receive must route through the refreshing expansion");
+
+        assert_eq!(amount, Amount::from(7));
+        assert_eq!(
+            transport.fetches(),
+            1,
+            "the seller path must recover by refreshing exactly once"
+        );
+    }
+
+    /// The refresh is gated on ONE typed variant. A string match would silently start retrying
+    /// unrelated decode faults the first time cashu edits its error text, so the gate is asserted
+    /// against the neighbouring variants directly — the cases that must NOT buy a mint round-trip.
+    #[test]
+    fn only_the_unknown_short_keyset_id_variant_triggers_a_refresh() {
+        use cashu::nuts::{nut00, nut02};
+
+        assert!(is_unknown_short_keyset_id(&nut00::Error::NUT02(
+            nut02::Error::UnknownShortKeysetId
+        )));
+
+        for other in [
+            nut02::Error::MalformedShortKeysetId,
+            nut02::Error::IncorrectKeysetId,
+            nut02::Error::Length,
+            nut02::Error::UnknownVersion,
+        ] {
+            let wrapped = nut00::Error::NUT02(other);
+            assert!(
+                !is_unknown_short_keyset_id(&wrapped),
+                "must not refresh on: {wrapped}"
+            );
+        }
+
+        assert!(
+            !is_unknown_short_keyset_id(&nut00::Error::UnsupportedToken),
+            "a non-NUT02 expansion fault must not refresh"
+        );
     }
 }
