@@ -1016,25 +1016,83 @@ impl DockerCli for RealDockerCli {
     }
 }
 
+/// What became of a container's evidence.
+///
+/// ⚠ **Three states rather than two, because "this job has no diagnostics" is two different facts.**
+/// A capture that FAILED means evidence existed and was lost — an alarm worth waking someone for. A
+/// capture deliberately not attempted is a policy decision with nothing wrong in it. Collapsing the
+/// two makes [`CleanupReport::evidence_lost`] fire on every self-probe, and an alarm that fires on
+/// the common case is one nobody still reads by the time it means something.
+#[derive(Debug)]
+pub enum CaptureOutcome {
+    /// Diagnostics were written into this directory.
+    Written(PathBuf),
+    /// Capture was not attempted, by policy. Carries a FIXED marker ([`CAPTURE_SKIPPED_PROBE`])
+    /// rather than prose, because it is what an operator greps for when a run has no diagnostics.
+    SkippedByPolicy(&'static str),
+    /// Capture was attempted and failed, with the reason.
+    Failed(String),
+}
+
 /// What cleanup did, with capture and removal reported **independently**.
 ///
-/// ⚠ Two `Result`s and not one, deliberately. A single status collapses "evidence saved but the
+/// ⚠ Two fields and not one, deliberately. A single status collapses "evidence saved but the
 /// container is still there" and "container gone, evidence lost" into one word — and those want
 /// opposite responses. A caller that only ever reads a combined verdict cannot tell an orphan from a
 /// blind spot.
 #[derive(Debug)]
 pub struct CleanupReport {
     /// Where the diagnostics were written, or why they were not.
-    pub capture: Result<PathBuf, String>,
+    pub capture: CaptureOutcome,
     /// Whether the exact job container is gone, or why it is not.
     pub removal: Result<(), String>,
 }
 
 impl CleanupReport {
-    /// The one state nothing else can recover from: the container is gone AND its evidence was not
-    /// saved. Named so a caller can act on it rather than re-deriving it from two fields.
+    /// The one state nothing else can recover from: the container is gone AND evidence that was
+    /// meant to exist was not saved. Named so a caller can act on it rather than re-deriving it from
+    /// two fields.
+    ///
+    /// A [`CaptureOutcome::SkippedByPolicy`] is deliberately NOT this. Nothing was lost where
+    /// nothing was going to be captured, and counting it here would bury the one real signal under
+    /// the most frequent event on the node.
     pub fn evidence_lost(&self) -> bool {
-        self.capture.is_err() && self.removal.is_ok()
+        matches!(self.capture, CaptureOutcome::Failed(_)) && self.removal.is_ok()
+    }
+}
+
+/// Which cleanup a run's container gets.
+///
+/// The discriminator is [`AgentRunTimeout`], which the caller already has to pass — a run that
+/// carries a job deadline is an awarded job, and one that carries a probe limit is the node probing
+/// itself. No new parameter, and no way for a caller to hold the two apart incorrectly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CleanupPolicy {
+    /// Capture the diagnostics, then remove: an awarded job, whose failure someone must be able to
+    /// explain after the fact.
+    CaptureThenRemove,
+    /// Remove without capturing: a self-probe.
+    RemoveOnly,
+}
+
+/// The cleanup a run under `timeout` gets.
+///
+/// **Awarded jobs capture; self-probes do not, and the asymmetry is the point.** A probe runs on
+/// every harness at boot and again on every re-probe, minting a FRESH job id each time
+/// (`seller_node::run::mint_probe_identity` stamps the clock into its `dir_label`). Capturing each
+/// one writes a new directory under `seller-diagnostics/` that nothing ever prunes — the probe's own
+/// cleanup removes its WORKDIR, and diagnostics are a deliberate sibling of that, out of the
+/// container's reach ([`job_diagnostics_dir`]). Unbounded growth on the seller's own disk, in
+/// exchange for the diagnostics of a run whose verdict is already reported in full through
+/// `ProbeAttempt`.
+///
+/// What a probe keeps is REMOVAL. The leak this whole path exists to close — a driver shutdown kills
+/// the `docker run` client while the container keeps running — is not specific to awarded jobs, and
+/// an abandoned probe container leaks exactly the same way.
+pub fn cleanup_policy(timeout: AgentRunTimeout) -> CleanupPolicy {
+    match timeout {
+        AgentRunTimeout::JobDeadline(_) => CleanupPolicy::CaptureThenRemove,
+        AgentRunTimeout::HarnessProbe(_) => CleanupPolicy::RemoveOnly,
     }
 }
 
@@ -1065,7 +1123,10 @@ pub fn capture_then_remove<D: DockerCli>(
     event_log: Option<&Path>,
     secrets: &[String],
 ) -> CleanupReport {
-    let capture = capture_into(cli, name, dir, event_log, secrets);
+    let capture = match capture_into(cli, name, dir, event_log, secrets) {
+        Ok(at) => CaptureOutcome::Written(at),
+        Err(error) => CaptureOutcome::Failed(error),
+    };
     // Attempted on BOTH branches. See the doc comment: not removing would leave a running container
     // AND a name collision for the next attempt.
     let removal = cli.run(&force_remove_argv(name)).map(|_| ());
@@ -1105,6 +1166,22 @@ fn capture_into<D: DockerCli>(
     Ok(dir.to_path_buf())
 }
 
+/// Remove the container, capturing nothing, and say in the report that this was a CHOICE.
+///
+/// The counterpart to [`capture_then_remove`] under [`CleanupPolicy::RemoveOnly`]. It touches the
+/// filesystem not at all — no directory is created, which is the whole property: a path that creates
+/// an empty directory per run is the unbounded growth this policy exists to prevent, and
+/// [`capture_into`] creates its directory before it knows whether anything can be captured into it.
+///
+/// `reason` is recorded rather than dropped so that "this run has no diagnostics" stays
+/// distinguishable from "this run's diagnostics were lost" downstream, where only the report survives.
+pub fn remove_only<D: DockerCli>(cli: &mut D, name: &str, reason: &'static str) -> CleanupReport {
+    CleanupReport {
+        capture: CaptureOutcome::SkippedByPolicy(reason),
+        removal: cli.run(&force_remove_argv(name)).map(|_| ()),
+    }
+}
+
 /// Write `body` to `path` with mode `0600`, creating it.
 ///
 /// Owner-only because the file holds a stranger's job output on a host that may run more than one
@@ -1132,6 +1209,15 @@ fn restrict_to_owner(path: &Path, mode: u32) -> Result<(), String> {
 /// The structured marker the `Drop` fallback emits. A FIXED string, because it is what an operator
 /// greps for when a job has no diagnostics — a reworded marker is an unfindable record.
 pub const CAPTURE_SKIPPED_MARKER: &str = "capture_skipped=drop_fallback";
+
+/// The structured marker for a capture skipped under [`CleanupPolicy::RemoveOnly`].
+///
+/// ⚠ **A DIFFERENT string from [`CAPTURE_SKIPPED_MARKER`], and the two must never be merged.** They
+/// record opposite things. This one says a healthy path decided there was nothing worth keeping;
+/// that one says a guard fired because no explicit cleanup ever ran, which is a near-miss on the bug
+/// this module exists to fix. One marker for both would make the near-miss unfindable in exactly the
+/// logs where it matters, buried under one line per probe per boot.
+pub const CAPTURE_SKIPPED_PROBE: &str = "capture_skipped=probe";
 
 /// What [`JobContainer`]'s `Drop` must do, as a VALUE.
 ///
@@ -1793,18 +1879,26 @@ pub async fn run_agent_job(
         let secrets = forwarded_secrets;
         // Owned: `spawn_blocking` needs `'static`, and this is only ever used in a message.
         let workdir_shown = workdir.display().to_string();
+        // An awarded job's diagnostics are worth keeping; a self-probe's are not worth a directory
+        // per run in a tree nothing prunes. `cleanup_policy` carries the full reasoning, and the
+        // removal — the leak this path exists to close — happens either way.
+        let cleanup = cleanup_policy(timeout);
         // Off the runtime, for the reason `AcpDriver::shutdown` gives for its own blocking work: the
         // seller node runs every awarded job as a `spawn_local` task on ONE LocalSet thread, so
         // blocking docker calls here would stall every sibling job for the duration.
-        let reported = tokio::task::spawn_blocking(move || match destination {
-            Some(dir) => {
+        let reported = tokio::task::spawn_blocking(move || match (cleanup, destination) {
+            (CleanupPolicy::RemoveOnly, _) => {
+                remove_only(&mut RealDockerCli, &name, CAPTURE_SKIPPED_PROBE)
+            }
+            (CleanupPolicy::CaptureThenRemove, Some(dir)) => {
                 capture_then_remove(&mut RealDockerCli, &name, &dir, Some(&event_log), &secrets)
             }
             // The workdir is not one `job_workdir` built, so there is nowhere derivable to put the
             // evidence. Still remove the container — a leak would also block the next attempt on this
             // job id — but say plainly that nothing was captured rather than reporting a clean exit.
-            None => CleanupReport {
-                capture: Err(format!(
+            // A FAILURE and not a policy skip: this job was owed diagnostics and did not get them.
+            (CleanupPolicy::CaptureThenRemove, None) => CleanupReport {
+                capture: CaptureOutcome::Failed(format!(
                     "no diagnostics directory derivable from the workdir {workdir_shown}"
                 )),
                 removal: RealDockerCli.run(&force_remove_argv(&name)).map(|_| ()),
@@ -1820,12 +1914,19 @@ pub async fn run_agent_job(
             // container is still there" and "container gone, evidence lost" — opposite problems.
             Ok(report) => {
                 match &report.capture {
-                    Ok(dir) => eprintln!(
+                    CaptureOutcome::Written(dir) => eprintln!(
                         "sandbox: job_capture=ok container={} dir={}",
                         container.name(),
                         dir.display()
                     ),
-                    Err(error) => eprintln!(
+                    // Emitted rather than stayed silent about: a run with no diagnostics and no line
+                    // explaining why is the ambiguity `CAPTURE_SKIPPED_MARKER` exists to remove, and
+                    // a deliberate skip needs the same treatment as a fallback's.
+                    CaptureOutcome::SkippedByPolicy(reason) => eprintln!(
+                        "sandbox: {reason} container={}",
+                        container.name()
+                    ),
+                    CaptureOutcome::Failed(error) => eprintln!(
                         "sandbox: job_capture=failed container={} error={error}",
                         container.name()
                     ),
@@ -2909,6 +3010,24 @@ mod tests {
         fail_on: Option<&'static str>,
         /// Output handed back for `logs`, so a test can plant a credential in it.
         logs_output: String,
+        /// The state `inspect` reports, so a run that SUCCEEDED can be modelled and not just one
+        /// that was killed. A capture path that is only ever exercised on failures is a capture path
+        /// whose happy case nobody has looked at.
+        inspect_output: String,
+        /// Whether the container is already GONE: docker resolves the name to nothing, and every
+        /// command that addresses it fails the way docker fails for a name it cannot find.
+        ///
+        /// ⚠ **This is the state a fake must be able to reach, and the reason is a defect that
+        /// survived nine red-proven assertions.** Red-proving shows that an ASSERTION can fail. It
+        /// says nothing about whether the FAKE is faithful — and a fake whose `inspect` always
+        /// succeeds cannot fail any test about what happens when there is nothing left to inspect.
+        /// `--rm` on the job container was exactly that shape: it deleted every SUCCESSFUL job's
+        /// container before capture could read it, and no assertion here could express the state, so
+        /// they all passed. The flag is forbidden now
+        /// (`docker_policy_keeps_the_container_alive_for_its_own_diagnostics`), but a container can
+        /// still be gone for reasons this module does not control — an operator removed it, the
+        /// daemon restarted, `docker run` failed after the guard adopted the name.
+        container_absent: bool,
     }
 
     impl RecordingDocker {
@@ -2919,6 +3038,8 @@ mod tests {
                 dir: dir.to_path_buf(),
                 fail_on: None,
                 logs_output: "job line one\njob line two".into(),
+                inspect_output: "status=exited exit_code=137 oom_killed=false".into(),
+                container_absent: false,
             }
         }
     }
@@ -2934,9 +3055,24 @@ mod tests {
             if self.fail_on == Some(verb.as_str()) {
                 return Err(format!("{verb} refused"));
             }
+            if self.container_absent {
+                let target = argv.last().cloned().unwrap_or_default();
+                return match verb.as_str() {
+                    // `rm --force` against a name that resolves to nothing is modelled as SUCCESS,
+                    // and that is the PESSIMISTIC choice deliberately: a succeeding removal paired
+                    // with a failed capture is the definition of `evidence_lost`, so this fake
+                    // produces the alarm rather than swallowing it. ⚠ Not measured against a live
+                    // daemon — pinning docker's real exit code would mean running a destructive verb
+                    // for a claim nothing below rests on, so the tests assert their own precondition
+                    // (`removal.is_ok()`) instead of assuming this.
+                    "rm" => Ok(String::new()),
+                    _ => Err(format!("Error response from daemon: No such container: {target}")),
+                };
+            }
             match verb.as_str() {
                 "logs" => Ok(self.logs_output.clone()),
-                _ => Ok("status=exited exit_code=137 oom_killed=false".into()),
+                "inspect" => Ok(self.inspect_output.clone()),
+                _ => Ok(String::new()),
             }
         }
     }
@@ -2955,7 +3091,11 @@ mod tests {
         let mut cli = RecordingDocker::new(&dir);
         let report = capture_then_remove(&mut cli, "maxplayer-job-j1", &dir, None, &[]);
 
-        assert!(report.capture.is_ok(), "capture: {:?}", report.capture);
+        assert!(
+            matches!(report.capture, CaptureOutcome::Written(_)),
+            "capture: {:?}",
+            report.capture
+        );
         assert!(report.removal.is_ok(), "removal: {:?}", report.removal);
         let rm_at = cli.verbs.iter().position(|v| v == "rm").expect("rm was issued");
         let inspect_at = cli.verbs.iter().position(|v| v == "inspect").expect("inspect was issued");
@@ -2987,8 +3127,9 @@ mod tests {
         let report = capture_then_remove(&mut cli, "maxplayer-job-j2", &dir, None, &[]);
 
         assert!(
-            report.capture.is_err(),
-            "a failed inspect must be reported as a capture failure, not swallowed: {:?}",
+            matches!(report.capture, CaptureOutcome::Failed(_)),
+            "a failed inspect must be reported as a capture FAILURE — not swallowed, and not as the \
+             policy skip that means nothing was ever going to be captured: {:?}",
             report.capture
         );
         assert!(
@@ -3005,6 +3146,204 @@ mod tests {
             report.evidence_lost(),
             "container removed with no evidence saved is the one state a caller must be able to \
              SEE, rather than infer from two fields"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A self-probe's container is REMOVED, and nothing is written.
+    //
+    // The probe is the most frequent run on the node — every harness at boot, up to three attempts,
+    // and again on every re-probe — and `seller_node::run::mint_probe_identity` stamps the clock into
+    // its directory label, so every one of them is a NEW job id. Capturing each would add a directory
+    // under `seller-diagnostics/` that nothing ever prunes: the probe's own cleanup removes its
+    // WORKDIR, and the diagnostics directory is a deliberate sibling of that, out of the container's
+    // reach.
+    //
+    // What is NOT given up is the removal. The leak this module exists to close — a driver shutdown
+    // kills the `docker run` client while the container keeps running — is not specific to awarded
+    // jobs, and an abandoned probe container leaks in exactly the same way.
+    #[test]
+    fn a_probe_is_removed_without_capture_and_writes_nothing() {
+        assert_eq!(
+            cleanup_policy(AgentRunTimeout::HarnessProbe(Duration::from_secs(120))),
+            CleanupPolicy::RemoveOnly,
+            "a self-probe's diagnostics are not worth a directory per run in a tree nothing prunes"
+        );
+
+        let dir = capture_dir("probe");
+        let mut cli = RecordingDocker::new(&dir);
+        let report = remove_only(&mut cli, "maxplayer-job-probe-0-0-1700000000", CAPTURE_SKIPPED_PROBE);
+
+        assert!(
+            report.removal.is_ok(),
+            "the container must still be removed: {:?}",
+            report.removal
+        );
+        assert_eq!(
+            cli.verbs,
+            vec!["rm".to_string()],
+            "remove-only must issue the removal and NOTHING else — an inspect or a logs read here is \
+             the capture this policy exists to skip: {:?}",
+            cli.verbs
+        );
+        match &report.capture {
+            CaptureOutcome::SkippedByPolicy(reason) => assert_eq!(
+                *reason, CAPTURE_SKIPPED_PROBE,
+                "the skip must carry the probe marker — it is what an operator greps for when a run \
+                 has no diagnostics"
+            ),
+            other => panic!("a probe must report a deliberate skip, not {other:?}"),
+        }
+        assert!(
+            !report.evidence_lost(),
+            "a deliberate skip must not fire the one alarm that means real evidence was destroyed: \
+             an alarm that fires on every probe is one nobody still reads when it matters"
+        );
+        assert!(
+            !dir.exists(),
+            "remove-only must create no diagnostics directory at all, because an empty directory per \
+             probe accumulates exactly as fast as a full one: {}",
+            dir.display()
+        );
+        assert_ne!(
+            CAPTURE_SKIPPED_PROBE, CAPTURE_SKIPPED_MARKER,
+            "a policy skip and a Drop fallback firing are opposite findings and must stay greppable \
+             apart"
+        );
+    }
+
+    // An AWARDED job captures on both exits — the failing one and the passing one.
+    //
+    // The failing exit is the one everybody remembers to test. The passing one is where this path has
+    // been wrong before: a container that has exited is still inspectable and its logs are still
+    // readable, so a successful job's evidence IS available — unless something deletes the container
+    // the moment it exits, which is what `--rm` did and why
+    // `docker_policy_keeps_the_container_alive_for_its_own_diagnostics` now forbids it.
+    #[test]
+    fn an_awarded_job_captures_on_both_a_successful_and_a_failed_exit() {
+        assert_eq!(
+            cleanup_policy(AgentRunTimeout::JobDeadline(Duration::from_secs(60))),
+            CleanupPolicy::CaptureThenRemove,
+            "an awarded job's diagnostics are the ones a refund argument gets made from"
+        );
+
+        for (label, state) in [
+            ("passed", "status=exited exit_code=0 oom_killed=false"),
+            ("failed", "status=exited exit_code=137 oom_killed=true"),
+        ] {
+            let dir = capture_dir(&format!("awarded-{label}"));
+            let mut cli = RecordingDocker::new(&dir);
+            cli.inspect_output = state.into();
+            let report = capture_then_remove(&mut cli, "maxplayer-job-a1", &dir, None, &[]);
+
+            match &report.capture {
+                CaptureOutcome::Written(at) => assert_eq!(at, &dir),
+                other => panic!("an awarded job must capture on the {label} exit, got {other:?}"),
+            }
+            let inspect = std::fs::read_to_string(dir.join("inspect.txt")).expect("inspect.txt");
+            assert_eq!(
+                inspect, state,
+                "the captured state must be THIS run's, not a constant the fake returns whatever it \
+                 is asked"
+            );
+            assert!(
+                dir.join("logs.txt").exists(),
+                "the container's own output is the other half of the evidence"
+            );
+            assert!(report.removal.is_ok(), "removal: {:?}", report.removal);
+            assert!(
+                !report.evidence_lost(),
+                "captured and removed is the good pair, on the {label} exit as much as the other"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    // Repeated probes leave the diagnostics tree EMPTY — with a denominator.
+    //
+    // The test above proves one probe writes nothing. This proves the property that matters on a node
+    // that stays up for weeks: it does not ACCUMULATE. The denominator is stated because "no
+    // directories" produced by a loop that silently ran zero times reads identically to the real
+    // thing.
+    #[test]
+    fn repeated_probes_do_not_grow_the_diagnostics_tree() {
+        const PROBES: usize = 25;
+        let root = capture_dir("probe-tree");
+        std::fs::create_dir_all(&root).expect("a tree to watch");
+
+        let mut removed = 0usize;
+        for i in 0..PROBES {
+            // A FRESH job id per probe, exactly as `mint_probe_identity` mints one. Reusing a single
+            // id would collapse the growth mechanism this is here to catch.
+            let job_id = format!("probe-0-0-{}", 1_700_000_000u64 + i as u64);
+            let dir = root.join(&job_id);
+            let name = job_container_name(&job_id);
+            let mut cli = RecordingDocker::new(&dir);
+            // Routed through the POLICY, in the same shape as the production call site, so this
+            // measures the consequence of the decision rather than the behaviour of one branch of it.
+            // Calling `remove_only` directly here would still pass if probes were re-routed to
+            // capture tomorrow.
+            let report = match cleanup_policy(AgentRunTimeout::HarnessProbe(Duration::from_secs(120))) {
+                CleanupPolicy::RemoveOnly => remove_only(&mut cli, &name, CAPTURE_SKIPPED_PROBE),
+                CleanupPolicy::CaptureThenRemove => {
+                    capture_then_remove(&mut cli, &name, &dir, None, &[])
+                }
+            };
+            if report.removal.is_ok() {
+                removed += 1;
+            }
+        }
+
+        assert_eq!(
+            removed, PROBES,
+            "{removed} of {PROBES} probe containers were removed — dropping the capture must not \
+             drop the removal with it"
+        );
+        let left = std::fs::read_dir(&root).expect("the tree").count();
+        assert_eq!(
+            left, 0,
+            "{PROBES} probes left {left} directories behind; each probe mints a new job id, so any \
+             per-probe directory grows without bound on the seller's own disk"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The state a fake that always succeeds cannot reach: docker no longer knows this container.
+    //
+    // ⚠ **This test exists because red-proving does not check fixture fidelity.** An assertion shown
+    // to go red is proven LIVE; it is not proven to be asking about the real world. A capture suite
+    // whose `inspect` always succeeds passes identically whether the container survives to be
+    // inspected or is deleted the instant it exits — which is not hypothetical, it is precisely how
+    // `--rm` stayed invisible through a full red-prove of this module.
+    #[test]
+    fn an_already_gone_container_is_never_reported_as_a_clean_capture() {
+        let dir = capture_dir("gone");
+        let mut cli = RecordingDocker::new(&dir);
+        cli.container_absent = true;
+        let report = capture_then_remove(&mut cli, "maxplayer-job-g1", &dir, None, &[]);
+
+        match &report.capture {
+            CaptureOutcome::Failed(_) => {}
+            other => panic!(
+                "a container docker cannot resolve must report a capture FAILURE, not {other:?}"
+            ),
+        }
+        assert!(
+            !dir.join("inspect.txt").exists() && !dir.join("logs.txt").exists(),
+            "nothing may be written on behalf of a container that does not exist"
+        );
+        // Asserted rather than assumed, because the line after it depends on this: the fake models
+        // `rm --force` against a vanished name as succeeding. If that model ever changes, THIS fires
+        // and names the reason, instead of the next assertion failing without one.
+        assert!(
+            report.removal.is_ok(),
+            "precondition — the modelled removal succeeds: {:?}",
+            report.removal
+        );
+        assert!(
+            report.evidence_lost(),
+            "a gone container plus a failed capture is exactly the pair `evidence_lost` names, and \
+             it must never be reachable without the report saying so"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
