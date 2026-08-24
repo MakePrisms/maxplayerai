@@ -62,12 +62,19 @@ git2 = { workspace = true, optional = true }
 # `stream` adds `Response::bytes_stream`, so the credential proxy (#647) can relay an SSE upstream
 # response to the container without buffering it. Unions with the workspace feature set.
 reqwest = { workspace = true, optional = true, features = ["stream"] }
-# Credential-containment proxy transport (#647), all gated to `wallet`. hyper/1 terminates the
+# Credential-containment proxy transport (#647), all gated to `wallet`. hyper terminates the
 # container's plain-HTTP calls; http-body-util streams the upstream response back; bytes is the shared
 # body type; futures-util maps the reqwest byte stream into a hyper body.
+#
+# `http2` and `server-auto` are load-bearing, not future-proofing: a contained client may open its
+# second leg with the HTTP/2 prior-knowledge preface (`PRI * HTTP/2.0`) instead of an HTTP/1 request
+# line, and an http1-only server cannot parse that — it surfaces NO request at all, so the leg reads
+# as "nothing arrived" rather than as a protocol mismatch. `server-auto` sniffs the preface and serves
+# whichever the client speaks on the same listener. Measured on `cursor-agent 2026.08.11-e8db854`,
+# whose agent endpoint sent 3372 bytes opening with that preface.
 bytes = { version = "1", optional = true }
-hyper = { version = "1", optional = true, features = ["server", "http1"] }
-hyper-util = { version = "0.1", optional = true, features = ["tokio"] }
+hyper = { version = "1", optional = true, features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", optional = true, features = ["tokio", "server-auto"] }
 http-body-util = { version = "0.1", optional = true }
 futures-util = { version = "0.3", optional = true, default-features = false }
 cdk = { version = "=0.17.2", default-features = false, features = ["wallet"], optional = true }
@@ -106,6 +113,11 @@ required-features = ["git-delivery"]
 [dev-dependencies]
 async-trait = "0.1.89"
 cdk-sqlite = "=0.17.2"
+# An HTTP/2 CLIENT, for the credential proxy's aggregate in-flight test only. The proxy's own h2
+# support is server-side (hyper `http2`), and `reqwest` here is the UPSTREAM client — enabling h2 on
+# it would change how we talk to real vendors, which is not this test's business. Already in the lock
+# transitively via hyper/http2, so no new resolution. Test-only: never in the shipped binary.
+h2 = "0.4"
 # A5 (tests/no_system_git) builds git fixtures and reads commit graphs via libgit2 directly. Same
 # workspace pin as the optional [dependencies] git2, so it unifies to one crate instance.
 git2 = { workspace = true }

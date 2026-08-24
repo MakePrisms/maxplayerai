@@ -274,11 +274,39 @@ impl SandboxPolicy {
                         ("field", &cred.field),
                         ("env", &cred.env),
                         ("upstream", &cred.upstream),
-                        ("endpoint_arg", &cred.endpoint_arg),
                     ] {
                         if value.trim().is_empty() {
                             return Err(ExecError::Config(format!(
                                 "[sandbox] file_credentials: {label} must not be empty (path {})",
+                                cred.path.display()
+                            )));
+                        }
+                    }
+                    // Checked here as well as in the deserializer because `FileCredential` is also
+                    // constructed in code, which never goes through serde. An empty list would leave
+                    // the client talking to the vendor with the placeholder.
+                    if cred.endpoint_args.is_empty() {
+                        return Err(ExecError::Config(format!(
+                            "[sandbox] file_credentials: endpoint_args must name at least one flag \
+                             (path {})",
+                            cred.path.display()
+                        )));
+                    }
+                    for flag in &cred.endpoint_args {
+                        if flag.trim().is_empty() {
+                            return Err(ExecError::Config(format!(
+                                "[sandbox] file_credentials: endpoint_args must not contain an empty \
+                                 flag (path {})",
+                                cred.path.display()
+                            )));
+                        }
+                        // The same no-whitespace invariant the deserializer enforces. Repeated here
+                        // because a code-constructed `FileCredential` never passes through serde, so
+                        // the deserializer's guard is not a guard over this path.
+                        if flag.chars().any(char::is_whitespace) {
+                            return Err(ExecError::Config(format!(
+                                "[sandbox] file_credentials: endpoint_args flag {flag:?} contains \
+                                 whitespace; give one flag per entry, unpadded (path {})",
                                 cred.path.display()
                             )));
                         }
@@ -2250,17 +2278,24 @@ pub fn contain_env_values(
 /// A pure transform, deliberately, so the red-prove can assert the real credential is absent and the
 /// redirect present without a container, a network, a proxy or a real key — the same reason
 /// [`contain_env_values`] is pure.
+///
+/// **Every flag in `endpoint_args` gets its own `<flag> <base_url>` pair.** Emitting only the first
+/// would contain only the endpoints we happened to name first and leave the rest reaching the vendor
+/// with the placeholder — which authenticates nothing and fails the job while the proxy log stays
+/// clean, because traffic that never arrives leaves no trace in it.
 #[cfg(feature = "acp")]
 fn file_credential_launch_additions(
     placed: &[(&crate::home::FileCredential, String)],
     base_url: &str,
 ) -> (Vec<(String, String)>, Vec<String>) {
     let mut env = Vec::with_capacity(placed.len());
-    let mut argv = Vec::with_capacity(placed.len() * 2);
+    let mut argv = Vec::new();
     for (cred, placeholder) in placed {
         env.push((cred.env.clone(), placeholder.clone()));
-        argv.push(cred.endpoint_arg.clone());
-        argv.push(base_url.to_owned());
+        for flag in &cred.endpoint_args {
+            argv.push(flag.clone());
+            argv.push(base_url.to_owned());
+        }
     }
     (env, argv)
 }
@@ -3302,7 +3337,7 @@ mod tests {
             field: "accessToken".into(),
             env: "CURSOR_AUTH_TOKEN".into(),
             upstream: "https://api2.cursor.sh".into(),
-            endpoint_arg: "--endpoint".into(),
+            endpoint_args: vec!["--endpoint".into()],
         }
     }
 
@@ -3335,7 +3370,7 @@ mod tests {
     }
 
     // Every field is load-bearing, so a blank one is a config error rather than a silent no-op: a
-    // blank `endpoint_arg` would leave the client talking to the vendor, and a blank `env` would put
+    // blank endpoint flag would leave the client talking to the vendor, and a blank `env` would put
     // the placeholder nowhere — both presenting as an unexplained auth failure per job.
     #[test]
     fn a_file_credential_refuses_blank_fields_and_a_malformed_upstream() {
@@ -3343,7 +3378,14 @@ mod tests {
             ("field", crate::home::FileCredential { field: "  ".into(), ..file_cred() }),
             ("env", crate::home::FileCredential { env: String::new(), ..file_cred() }),
             ("upstream", crate::home::FileCredential { upstream: " ".into(), ..file_cred() }),
-            ("endpoint_arg", crate::home::FileCredential { endpoint_arg: "".into(), ..file_cred() }),
+            (
+                "endpoint_args",
+                crate::home::FileCredential { endpoint_args: vec!["".into()], ..file_cred() },
+            ),
+            (
+                "endpoint_args",
+                crate::home::FileCredential { endpoint_args: Vec::new(), ..file_cred() },
+            ),
         ] {
             let error = SandboxPolicy::from_config(Some(&docker_with(vec![cred])))
                 .expect_err("a blank {label} must be refused");
@@ -4676,5 +4718,74 @@ mod tests {
         .expect_err("acp required");
         assert!(matches!(err, ExecError::AcpRequired));
         assert!(err.to_string().contains("acp"));
+    }
+
+    // ---- every endpoint flag gets its own redirect pair ------------------------------------------
+    //
+    // Emitting only the first flag contains only the endpoints named first and leaves the rest
+    // reaching the vendor with the placeholder. That authenticates nothing, so the job fails — and it
+    // fails invisibly, because traffic that bypasses the proxy leaves no trace in the proxy's log.
+    // Measured on `cursor-agent 2026.08.11-e8db854`: `--endpoint` moves the control plane and a
+    // separate undocumented `--agent-endpoint` moves the agent leg.
+    //
+    // Gated to match the function it calls. A test must be gated at least as tightly as the tightest
+    // thing it references, or it fails to COMPILE in the narrower feature rows — which is a build
+    // break, not a test failure, and it takes the whole row down with it.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn every_endpoint_flag_gets_its_own_redirect_pair() {
+        let cred = crate::home::FileCredential {
+            endpoint_args: vec!["--endpoint".into(), "--agent-endpoint".into()],
+            ..file_cred()
+        };
+        let placeholder = "PLACEHOLDER-VALUE".to_owned();
+        let base_url = "http://127.0.0.1:9300";
+
+        let (env, argv) = file_credential_launch_additions(&[(&cred, placeholder.clone())], base_url);
+
+        assert_eq!(env, vec![("CURSOR_AUTH_TOKEN".to_owned(), placeholder)]);
+        assert_eq!(
+            argv,
+            vec![
+                "--endpoint".to_owned(),
+                base_url.to_owned(),
+                "--agent-endpoint".to_owned(),
+                base_url.to_owned(),
+            ],
+            "each flag must be followed by the proxy URL, and NO flag may be dropped"
+        );
+        // Stated as a count too, so a future edit that emits the flags without their URLs (or the
+        // URLs once) fails here rather than passing a looser shape.
+        assert_eq!(argv.len(), cred.endpoint_args.len() * 2);
+    }
+
+    // A one-flag client is the common case and must not gain a spurious second redirect.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn a_single_endpoint_flag_still_emits_exactly_one_pair() {
+        let (_, argv) = file_credential_launch_additions(&[(&file_cred(), "P".to_owned())], "http://u");
+        assert_eq!(argv, vec!["--endpoint".to_owned(), "http://u".to_owned()]);
+    }
+
+    // The same invariant for a CODE-constructed credential, which never passes through serde — so the
+    // deserializer's guard is not a guard over this path. Two enforcement points because there are two
+    // ways in, not because one is redundant.
+    #[test]
+    fn a_code_constructed_endpoint_flag_with_whitespace_is_refused() {
+        for padded in [" --endpoint", "--endpoint ", "--endpoint --agent-endpoint", "\t--endpoint"] {
+            let cred = crate::home::FileCredential {
+                endpoint_args: vec![padded.into()],
+                ..file_cred()
+            };
+            let error = SandboxPolicy::from_config(Some(&docker_with(vec![cred])))
+                .expect_err("a whitespace-bearing flag must be refused in code too");
+            assert!(
+                error.to_string().contains("whitespace"),
+                "the error must name whitespace as the cause for {padded:?}, got: {error}"
+            );
+        }
+        // And the clean form still resolves, so the guard is not refusing everything.
+        SandboxPolicy::from_config(Some(&docker_with(vec![file_cred()])))
+            .expect("an unpadded flag must still resolve");
     }
 }

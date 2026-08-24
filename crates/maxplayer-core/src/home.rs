@@ -406,8 +406,8 @@ pub struct FileCredential {
     pub env: String,
     /// The one upstream this credential may be substituted for (e.g. `https://api2.cursor.sh`).
     pub upstream: String,
-    /// The client's own argument for pointing it at a different API base (e.g. `--endpoint`). The
-    /// proxy's URL is appended immediately after it.
+    /// The client's own argument(s) for pointing it at a different API base (e.g. `--endpoint`). Each
+    /// is emitted followed immediately by the proxy's URL.
     ///
     /// An ARGV flag rather than a base-URL environment variable because, measured on
     /// `cursor-agent 2026.07.09`, the env overrides are IGNORED for credential-bearing traffic: with
@@ -415,7 +415,20 @@ pub struct FileCredential {
     /// still went to `api2.cursor.sh` and the listener received nothing. With this flag it received
     /// the request, credential verbatim in an `authorization` header. A vendor whose base URL *is*
     /// honoured through the environment belongs in `CONTAINED_CREDENTIALS` instead.
-    pub endpoint_arg: String,
+    ///
+    /// **A list, because one flag is not always enough to contain one client.** A client may reach its
+    /// API over more than one endpoint and redirect only the ones it was told about; the rest go
+    /// straight to the vendor, carrying the placeholder, and fail to authenticate. Measured on
+    /// `cursor-agent 2026.08.11-e8db854`: `--endpoint` moves the control plane, and a separate
+    /// undocumented `--agent-endpoint` moves the agent/inference leg. With only the first set, the
+    /// control plane authenticates and the agent leg still leaves for `api2.cursor.sh` — so every job
+    /// fails while the proxy log looks healthy.
+    ///
+    /// Accepts a bare string (one flag) or a list. A bare string is taken **verbatim as a single
+    /// flag** and is never split: an element containing whitespace is refused rather than shell-parsed,
+    /// for the same reason [`deserialize_agent_command_argv`] refuses a shell string outright.
+    #[serde(alias = "endpoint_arg", deserialize_with = "deserialize_endpoint_args")]
+    pub endpoint_args: Vec<String>,
 }
 
 /// Which executor the `[sandbox]` section selects.
@@ -818,6 +831,73 @@ pub fn relay_git_repo_id(remote_url: &str) -> Option<String> {
         return None;
     }
     Some(repo)
+}
+
+/// Endpoint-redirect flags: a bare string is ONE flag, a list is several.
+///
+/// Deliberately more permissive than [`deserialize_agent_command_argv`], and the difference is not an
+/// inconsistency. There, a string is refused because a whole argv given as a string can only mean
+/// "split this on spaces for me". Here a string is unambiguous — it is one flag — so accepting it
+/// keeps every `endpoint_arg = "--endpoint"` config working untouched. What is refused is the case
+/// where those two meanings collide: an element containing whitespace, which is a shell line wearing a
+/// flag's clothes. It is rejected rather than split, so no config can smuggle argv through this seam.
+fn deserialize_endpoint_args<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, SeqAccess, Visitor};
+    use std::fmt;
+
+    fn check(flag: String) -> Result<String, String> {
+        if flag.trim().is_empty() {
+            return Err("endpoint flag must not be empty".into());
+        }
+        // ANY whitespace, not "more than one whitespace-separated word". `split_whitespace().count()`
+        // reads as a check for shell strings and is not one: `" --endpoint "` and `"\t--endpoint"` both
+        // yield exactly one word and would pass, then be emitted as an argv element with the padding
+        // still attached — an element the client sees as a different flag than the one written.
+        if flag.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "endpoint flag {flag:?} contains whitespace; give one flag per list entry, with no \
+                 padding, rather than a shell string"
+            ));
+        }
+        Ok(flag)
+    }
+
+    struct EndpointArgsVisitor;
+
+    impl<'de> Visitor<'de> for EndpointArgsVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("an endpoint flag, or a list of them")
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            Ok(vec![check(value.to_owned()).map_err(E::custom)?])
+        }
+
+        fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+            Ok(vec![check(value).map_err(E::custom)?])
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(item) = seq.next_element::<String>()? {
+                out.push(check(item).map_err(de::Error::custom)?);
+            }
+            if out.is_empty() {
+                return Err(de::Error::custom(
+                    "endpoint_args must name at least one flag; an empty list would leave the \
+                     client talking to the vendor with the placeholder",
+                ));
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_any(EndpointArgsVisitor)
 }
 
 fn deserialize_agent_command_argv<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -2518,5 +2598,121 @@ mod tests {
         )
         .expect("nested env");
         assert_eq!(from_env.buyer.hop_fee_buffer_multiplier, 0);
+    }
+
+    // ---- endpoint_args config compatibility ------------------------------------------------------
+    //
+    // This field changed shape (one string -> a list). Every live seat's config still spells it
+    // `endpoint_arg = "--endpoint"`, and `FileCredential` is `deny_unknown_fields` with no defaults,
+    // so a rename that did not keep the old spelling parsing would refuse to load a config that
+    // worked yesterday — presenting as a seat that will not boot.
+    #[test]
+    fn the_old_single_string_endpoint_arg_spelling_still_parses() {
+        let old = r#"
+            path = "/home/seller/.config/cursor/auth.json"
+            field = "accessToken"
+            env = "CURSOR_AUTH_TOKEN"
+            upstream = "https://api2.cursor.sh"
+            endpoint_arg = "--endpoint"
+        "#;
+        let cred: super::FileCredential = toml::from_str(old).expect("the old spelling must parse");
+        assert_eq!(cred.endpoint_args, vec!["--endpoint".to_owned()]);
+    }
+
+    #[test]
+    fn a_list_of_endpoint_flags_parses_in_order() {
+        let new = r#"
+            path = "/home/seller/.config/cursor/auth.json"
+            field = "accessToken"
+            env = "CURSOR_AUTH_TOKEN"
+            upstream = "https://api2.cursor.sh"
+            endpoint_args = ["--endpoint", "--agent-endpoint"]
+        "#;
+        let cred: super::FileCredential = toml::from_str(new).expect("a list must parse");
+        assert_eq!(
+            cred.endpoint_args,
+            vec!["--endpoint".to_owned(), "--agent-endpoint".to_owned()]
+        );
+    }
+
+    // A string is taken as ONE flag, verbatim. Two flags crammed into one string is a shell line
+    // wearing a flag's clothes, and splitting it would make this seam an argv parser — the thing
+    // `deserialize_agent_command_argv` refuses outright. Refused, not split.
+    #[test]
+    fn an_endpoint_flag_containing_whitespace_is_refused_rather_than_split() {
+        for spelling in [
+            r#"endpoint_arg = "--endpoint --agent-endpoint""#,
+            r#"endpoint_args = ["--endpoint --agent-endpoint"]"#,
+        ] {
+            let config = format!(
+                r#"
+                path = "/home/seller/.config/cursor/auth.json"
+                field = "accessToken"
+                env = "CURSOR_AUTH_TOKEN"
+                upstream = "https://api2.cursor.sh"
+                {spelling}
+                "#
+            );
+            let error = toml::from_str::<super::FileCredential>(&config)
+                .expect_err("a whitespace-bearing flag must be refused");
+            assert!(
+                error.to_string().contains("whitespace"),
+                "the error must say why, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_endpoint_flag_list_is_refused() {
+        let config = r#"
+            path = "/home/seller/.config/cursor/auth.json"
+            field = "accessToken"
+            env = "CURSOR_AUTH_TOKEN"
+            upstream = "https://api2.cursor.sh"
+            endpoint_args = []
+        "#;
+        let error = toml::from_str::<super::FileCredential>(config)
+            .expect_err("an empty list leaves the client talking to the vendor");
+        assert!(
+            error.to_string().contains("at least one"),
+            "the error must name the requirement, got: {error}"
+        );
+    }
+
+    // Leading/trailing whitespace is the case a `split_whitespace().count() > 1` guard misses: those
+    // yield exactly ONE word and pass, then reach argv with the padding still attached — an element
+    // the client reads as a different flag than the one written. The guard is on ANY whitespace, and
+    // a padded flag is REFUSED rather than quietly trimmed, so a typo in config surfaces as a config
+    // error instead of as a client that mysteriously ignores its redirect.
+    #[test]
+    fn a_padded_endpoint_flag_is_refused_not_trimmed() {
+        for (label, spelling) in [
+            ("leading space", r#"endpoint_arg = " --endpoint""#),
+            ("trailing space", r#"endpoint_arg = "--endpoint ""#),
+            ("both", r#"endpoint_arg = " --endpoint ""#),
+            ("leading tab", r#"endpoint_arg = "\t--endpoint""#),
+            ("trailing newline", r#"endpoint_arg = "--endpoint\n""#),
+            ("padded list entry", r#"endpoint_args = ["--endpoint", " --agent-endpoint"]"#),
+        ] {
+            let config = format!(
+                r#"
+                path = "/home/seller/.config/cursor/auth.json"
+                field = "accessToken"
+                env = "CURSOR_AUTH_TOKEN"
+                upstream = "https://api2.cursor.sh"
+                {spelling}
+                "#
+            );
+            match toml::from_str::<super::FileCredential>(&config) {
+                Ok(parsed) => panic!(
+                    "{label} parsed as {:?}; a padded flag must be refused, not trimmed",
+                    parsed.endpoint_args
+                ),
+                Err(error) => assert!(
+                    error.to_string().contains("whitespace"),
+                    "{label}: the error must name whitespace as the cause, got: {error}"
+                ),
+            }
+        }
     }
 }

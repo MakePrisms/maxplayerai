@@ -242,20 +242,25 @@ credential either crosses into the container intact or the harness cannot run co
 
 ```toml
 [[sandbox.file_credentials]]
-path         = "/home/you/.config/cursor/auth.json"  # absolute; a relative path is refused
-field        = "accessToken"                         # the only field ever read
-env          = "CURSOR_AUTH_TOKEN"                   # carries the PLACEHOLDER into the container
-upstream     = "https://api2.cursor.sh"              # the one destination the swap is allowed for
-endpoint_arg = "--endpoint"                          # the client's own flag; the proxy URL is appended
+path          = "/home/you/.config/cursor/auth.json"  # absolute; a relative path is refused
+field         = "accessToken"                         # the only field ever read
+env           = "CURSOR_AUTH_TOKEN"                   # carries the PLACEHOLDER into the container
+upstream      = "https://api2.cursor.sh"              # the one destination the swap is allowed for
+endpoint_args = ["--endpoint", "--agent-endpoint"]    # every flag the client needs; proxy URL appended to each
 ```
 
+`endpoint_args` also accepts a bare string for a client that needs one flag, and the older
+`endpoint_arg = "--endpoint"` spelling still parses, so existing configs keep working. One flag per
+list entry: an entry containing whitespace is refused rather than split, so a shell string cannot
+become argv here.
+
 The daemon reads `field` out of `path` **on the host, once per job**, mints a placeholder, puts the
-placeholder in `env`, and appends `endpoint_arg <proxy-url>` to the agent's argv. The real value never
+placeholder in `env`, and appends `<flag> <proxy-url>` for each entry to the agent's argv. The real value never
 enters the container, and nothing is written into the job workdir — so the buyer's delivery is
 untouched. Only `field` is read: a refresh token sitting beside it is never read, forwarded, or
 substituted, which bounds a leaked placeholder to one job.
 
-Four things to know before you need them:
+Six things to know before you need them:
 
 - **A variable may have one owner.** A name in both `forward_env` and `file_credentials`, or in two
   `file_credentials` entries, is refused at startup. Docker keeps the last `-e NAME=…`, so otherwise
@@ -264,10 +269,22 @@ Four things to know before you need them:
   expires on the vendor's schedule and nothing in maxplayer refreshes it. When it does, jobs fail with
   the vendor's auth errors. Log in again and the **next** job picks up the new value, because the file
   is read per job rather than cached at startup.
-- **`endpoint_arg` is per client and it is measured, not guessed.** That flag is what redirects
+- **`endpoint_args` is per client and it is measured, not guessed.** Those flags are what redirect
   credential-bearing traffic for `cursor-agent 2026.07.09`; that client ignores its own base-URL
   *environment* variables for those calls, which is the entire reason the redirect is an argv flag.
   Another client needs its own measurement — do not assume the flag's name, or that a flag is needed.
+- **One flag is not always enough to contain one client, and the failure is silent.** Measured on
+  `cursor-agent 2026.08.11-e8db854`: `--endpoint` moves the control plane, and a separate
+  **undocumented `--agent-endpoint`** moves the agent/inference leg. With only the first set, the
+  control plane authenticates and the agent leg still leaves for `api2.cursor.sh` carrying the
+  placeholder — so every job fails while the proxy's own log looks perfectly healthy, because traffic
+  that never arrives leaves no trace in it. When adding a client, check the **egress denominator**: did
+  anything leave for an authority you did not redirect?
+- **The proxy accepts HTTP/1 and h2c on the same listener.** That client opens its agent leg with the
+  HTTP/2 prior-knowledge preface rather than an HTTP/1 request line. An http1-only server cannot parse
+  that preface and surfaces **no request at all**, so the symptom is "nothing connected" rather than a
+  protocol error. Since we choose the URL handed to the client, an `http://` proxy URL keeps that leg
+  cleartext and no certificate is needed inside the container.
 - **The container leg is unproven.** The host leg is verified end to end against the real vendor, with
   a negative control. The placeholder has not been carried through a running container, and no seat
   sets `mode = "docker"` today. Under `launcher` mode this key is inert.
