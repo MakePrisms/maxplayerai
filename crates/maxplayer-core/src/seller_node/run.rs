@@ -5773,6 +5773,16 @@ impl SellerNodeRunner {
             opline!("seller node execute job_id={job_id} agent last message: {quoted}");
         }
         let usage = report.usage;
+        // Refresh the advertised model from THIS run (#784). The boot probe answers for the moment
+        // the node started; an operator can re-point a harness at a different default while it runs,
+        // and an advertisement that sits behind the last restart is a claim the seat no longer keeps.
+        // A real run is the freshest evidence available, and it costs nothing to read here.
+        //
+        // A `None` observation CLEARS rather than preserves, which is the roster's documented
+        // contract: a harness that stops reporting a model must stop advertising one, or the last
+        // value it ever gave outlives the truth. That is the drift this field exists to bound.
+        self.agents
+            .record_model(harness, usage.as_ref().and_then(|u| u.model.clone()));
 
         // Snapshot the agent's final workdir tree into ONE delivery commit at the stored author date.
         // §19: the snapshot writes the execution sentinel into the delivered tree, seeded from this
