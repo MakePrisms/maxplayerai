@@ -4016,9 +4016,9 @@ mod tests {
     #[test]
     fn a_claims_capability_reaches_the_award_predicate_from_the_tags_the_seller_emitted() {
         // The seller→buyer join, end to end through both real functions: `claim_draft` writes the
-        // tags, `claim_view_from_tags` reads them. Before this, the seller had been emitting
-        // filterable tags for two slices and the buyer discarded every one at parse — a gap no test
-        // could see, because the award filter's "no match" and "nothing parsed" are the same false.
+        // tags, `claim_view_from_tags` reads them. The award filter's "no match" and "nothing
+        // parsed" are the same false, so this test pins the join itself rather than either side
+        // alone.
         let capability = crate::heartbeat::SeatCapability::from_roster(
             &["claude".to_owned()],
             &[crate::heartbeat::RosterModel {
