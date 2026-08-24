@@ -173,13 +173,15 @@ pub fn probe_seat_capabilities(
     policy: &crate::seller_exec::SandboxPolicy,
     workdir: &std::path::Path,
 ) -> Result<Vec<String>, CapabilityProbeError> {
-    let container = crate::seller_exec::probe_container_name(policy, workdir);
+    // Resolved ONCE, outside the loop: every token's probe runs under the same executor, and
+    // deriving it per token would be a second read of the policy that could disagree with the first.
+    let executor = crate::seller_exec::ProbeExecutor::for_policy(policy, workdir);
     probe_capabilities(policy, workdir, |argv| {
         crate::seller_exec::probe_command_outcome(
             argv,
             workdir,
             crate::seller_exec::CAPABILITY_PROBE_TIMEOUT,
-            container.as_deref(),
+            &executor,
         )
     })
 }

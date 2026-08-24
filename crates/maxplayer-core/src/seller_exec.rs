@@ -74,7 +74,31 @@ pub enum ProbeRunError {
     TimedOut { after: Duration },
     /// Waiting on the probe process itself failed, so its outcome is unknown.
     Wait(std::io::Error),
+    /// The container RUNTIME failed, so the probe target never ran. Docker reports this as exit
+    /// [`DOCKER_CLI_FAILURE`], which it uses for its own failures — an unreachable daemon, a missing
+    /// or unpullable image, a name collision with a container that outlived an earlier probe — and
+    /// NOT for anything the command inside the container did.
+    ///
+    /// That distinction is the whole reason this variant exists. Every one of those says "we could
+    /// not check", and every one of them was previously indistinguishable from `cargo` being absent
+    /// from the image.
+    RuntimeFailure { code: i32 },
+    /// The probe ran, but its container could not be removed afterwards.
+    ///
+    /// ⚠ THIS FAILS A PROBE THAT OTHERWISE SUCCEEDED, deliberately. The container name is
+    /// deterministic per workdir, so residue does not sit still: the NEXT token's run collides with
+    /// the survivor and docker refuses it with [`DOCKER_CLI_FAILURE`]. Reporting `Ok(true)` here and
+    /// moving on would prove one token and then silently lose every token after it — and the loss
+    /// would look exactly like a seat that genuinely has no python and no rust.
+    CleanupFailed { container: String, detail: String },
 }
+
+/// Docker's exit status for a failure of the CLI itself rather than of the containerized command.
+///
+/// Documented by docker: `docker run` exits 125 when the run cannot be started at all, 126 when the
+/// command is found but not executable, and 127 when it is not found. Only the last two describe the
+/// probe target, so only those two can honestly answer the capability question.
+const DOCKER_CLI_FAILURE: i32 = 125;
 
 impl std::fmt::Display for ProbeRunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -88,6 +112,18 @@ impl std::fmt::Display for ProbeRunError {
                 after.as_secs()
             ),
             Self::Wait(error) => write!(f, "capability probe could not be waited on: {error}"),
+            Self::RuntimeFailure { code } => write!(
+                f,
+                "capability probe container runtime failed (docker exit {code}) — the probe target \
+                 never ran, so this is NOT evidence the capability is absent: check the docker \
+                 daemon, the image, and for a container left by an earlier probe"
+            ),
+            Self::CleanupFailed { container, detail } => write!(
+                f,
+                "capability probe ran but its container {container} could not be removed ({detail}) \
+                 — the next token's run would collide with the survivor and report absent, so the \
+                 probe is failed here rather than after it has silently shortened the set"
+            ),
         }
     }
 }
@@ -834,19 +870,20 @@ const PROBE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// where a pass-through or launcher probe genuinely runs, and for docker it is the CLI's own cwd,
 /// which the container never sees.
 ///
-/// `timeout` bounds the run; on expiry the child is killed and reaped. `docker_container` is
-/// `Some(name)` when the policy is docker — the deterministic container the render named — so that:
-///   1. a launcher (`docker`) that cannot even spawn is an error, not a false "not proven"; and
-///   2. the container is force-removed after the run, success or timeout alike. `--rm` is deliberately
-///      absent from the job container ([`SandboxPolicy::run_argv`]), so without this the probe would
-///      leak a container and the next token's identically-named run would collide.
+/// `timeout` bounds the run; on expiry the child is killed and reaped. `executor` tells this function
+/// WHAT it just spawned, which is the one thing an argv cannot say for itself — see [`ProbeExecutor`].
 ///
 /// ⚠ This is a MEASUREMENT, not a gate: it answers only "did this command run cleanly HERE, NOW".
+///
+/// ⚠ KNOWN RESIDUAL, named rather than fixed here: a probe target killed by a SIGNAL — an OOM kill of
+/// `cargo`, say — reports as "not proven" rather than as unmeasured, under every executor. It is the
+/// same class as the failures above and it is deliberately out of scope: widening the boot-failing
+/// set is not a change to make inside a respin, and no evidence says this one fires.
 pub fn probe_command_outcome(
     argv: &[String],
     host_cwd: &Path,
     timeout: Duration,
-    docker_container: Option<&str>,
+    executor: &ProbeExecutor,
 ) -> Result<bool, ProbeRunError> {
     let Some((program, args)) = argv.split_first() else {
         return Ok(false);
@@ -860,13 +897,15 @@ pub fn probe_command_outcome(
         .spawn();
     let mut child = match spawned {
         Ok(child) => child,
-        // Under docker the program is `docker` itself; if it cannot spawn, the probe never ran and
-        // there is nothing to clean up. Under a pass-through policy the program IS the probe target,
-        // so its absence is the honest "not proven".
+        // Only a PASS-THROUGH policy spawns the probe target itself, so only there is a failure to
+        // spawn the honest "not proven". Under a launcher or docker the program is the WRAPPER, and
+        // its absence says nothing whatever about the target — the probe never ran.
         Err(error) => {
-            return match docker_container {
-                Some(_) => Err(ProbeRunError::LauncherUnspawnable(error)),
-                None => Ok(false),
+            return match executor {
+                ProbeExecutor::PassThrough => Ok(false),
+                ProbeExecutor::Launcher | ProbeExecutor::Docker { .. } => {
+                    Err(ProbeRunError::LauncherUnspawnable(error))
+                }
             };
         }
     };
@@ -874,7 +913,7 @@ pub fn probe_command_outcome(
     let deadline = Instant::now() + timeout;
     let outcome = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Ok(status.success()),
+            Ok(Some(status)) => break executor.classify(status),
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
@@ -888,13 +927,118 @@ pub fn probe_command_outcome(
     };
 
     // The job container has no `--rm`, so a docker probe leaves a stopped (or, on timeout, running)
-    // container behind. Remove it by its deterministic name before returning, so the next token's run
-    // does not collide and no residue survives the probe. Best-effort and itself bounded.
-    if let Some(name) = docker_container {
-        let _ = run_bounded_nulled(&force_remove_argv(name), PROBE_CLEANUP_TIMEOUT);
+    // container behind. Remove it by its deterministic name before returning. Bounded, so teardown
+    // cannot hang the pre-advertise path — but NOT best-effort: see `CleanupFailed`.
+    let cleanup = match executor {
+        ProbeExecutor::Docker { container } => {
+            match run_bounded_nulled(&force_remove_argv(container), PROBE_CLEANUP_TIMEOUT) {
+                Ok(true) => None,
+                Ok(false) => Some("`docker rm -f` exited non-zero".to_owned()),
+                Err(error) => Some(error.to_string()),
+            }
+        }
+        ProbeExecutor::PassThrough | ProbeExecutor::Launcher => None,
+    };
+
+    settle_probe(outcome, cleanup, executor.container())
+}
+
+/// Fold a finished probe's own outcome together with whatever its cleanup did.
+///
+/// Split out because the interesting cases are the ones that are awkward to stage for real: a
+/// removal that genuinely fails needs a container docker refuses to delete, and `docker rm -f` is
+/// idempotent — it exits 0 for a container that is simply not there, which is the easy case to
+/// simulate and the wrong one. This is the whole decision, and it is decided here so it can be
+/// asserted directly.
+///
+/// ⚠ **UNCOVERED, AND SAID SO RATHER THAN IMPLIED:** the tests reach this function directly, so no
+/// test proves that [`probe_command_outcome`] actually FEEDS it a cleanup failure. Measured on this
+/// host: `docker rm -f` exits 0 both for an absent container and for a syntactically invalid name,
+/// so the failing branch cannot be staged without a container docker refuses to delete. What guards
+/// the wiring is structural rather than tested — the cleanup result is a required argument here, so
+/// a caller cannot discard it without passing `None` on purpose, which the old `let _ =` did by
+/// default.
+fn settle_probe(
+    outcome: Result<bool, ProbeRunError>,
+    cleanup: Option<String>,
+    container: Option<&str>,
+) -> Result<bool, ProbeRunError> {
+    match (outcome, cleanup) {
+        // The probe's own failure is the more informative one, and it is also the likely CAUSE of
+        // the removal failing: a run that never started leaves no container to remove. An operator
+        // needs "check your daemon and your image", not "a container could not be removed".
+        (Err(error), _) => Err(error),
+        (Ok(_), Some(detail)) => Err(ProbeRunError::CleanupFailed {
+            container: container.unwrap_or_default().to_owned(),
+            detail,
+        }),
+        (Ok(proven), None) => Ok(proven),
+    }
+}
+
+/// What a rendered probe argv actually spawns — the fact the argv itself cannot carry.
+///
+/// It exists because the two questions a probe answers have DIFFERENT answers per executor, and both
+/// were previously inferred from one nullable container name:
+///
+/// - **A failure to spawn.** Under a pass-through policy the spawned program IS the probe target, so
+///   its absence is the honest "no". Under a launcher or docker it is the WRAPPER, and its absence
+///   says nothing about the target at all.
+/// - **A non-zero exit.** Under docker the exit status may belong to the RUNTIME rather than to the
+///   command — see [`DOCKER_CLI_FAILURE`].
+///
+/// `Some(container)`/`None` could answer neither honestly. A launcher policy has no container, so it
+/// was indistinguishable from pass-through, and an unspawnable launcher reported as a missing
+/// toolchain. Naming the executor makes both distinctions structural rather than inferred.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProbeExecutor {
+    /// The probe target runs directly: the spawned program IS the target.
+    PassThrough,
+    /// The target runs inside a launcher program that is not itself the target.
+    Launcher,
+    /// The target runs in a container the probe must remove afterwards, by this deterministic name.
+    Docker { container: String },
+}
+
+impl ProbeExecutor {
+    /// The executor `policy` will use for a probe in `workdir`.
+    ///
+    /// A `launcher` policy with an EMPTY launcher argv is pass-through and is reported as such: it
+    /// spawns the target directly, so a spawn failure there really is the target's absence. Reading
+    /// the mode rather than the argv would misclassify exactly the configuration an operator writes
+    /// when they turn a launcher off.
+    pub fn for_policy(policy: &SandboxPolicy, workdir: &Path) -> Self {
+        match probe_container_name(policy, workdir) {
+            Some(container) => Self::Docker { container },
+            None if policy.launcher().is_empty() => Self::PassThrough,
+            None => Self::Launcher,
+        }
     }
 
-    outcome
+    /// The container this executor must remove after a probe, if any.
+    pub fn container(&self) -> Option<&str> {
+        match self {
+            Self::Docker { container } => Some(container.as_str()),
+            Self::PassThrough | Self::Launcher => None,
+        }
+    }
+
+    /// Turn one finished probe's exit status into an answer about the CAPABILITY, or into the
+    /// refusal to answer.
+    ///
+    /// Only docker separates the two. A host executor's status belongs to the target by
+    /// construction, so a non-zero exit is the target's own and means the capability is absent.
+    fn classify(&self, status: std::process::ExitStatus) -> Result<bool, ProbeRunError> {
+        match self {
+            Self::PassThrough | Self::Launcher => Ok(status.success()),
+            Self::Docker { .. } => match status.code() {
+                Some(DOCKER_CLI_FAILURE) => Err(ProbeRunError::RuntimeFailure {
+                    code: DOCKER_CLI_FAILURE,
+                }),
+                _ => Ok(status.success()),
+            },
+        }
+    }
 }
 
 /// Spawn `argv` with every stdio nulled and wait at most `timeout`, killing and reaping on expiry.
@@ -2931,11 +3075,11 @@ mod tests {
         // A REAL directory, for the reason `probe_launch_argv` refuses a missing one.
         let dir = ProbeDir::new("live");
 
-        let container = probe_container_name(&policy, dir.path());
+        let executor = ProbeExecutor::for_policy(&policy, dir.path());
         let proves = |command: &[&str]| {
             let rendered = probe_launch_argv(&policy, &argv(command), dir.path())
                 .expect("a docker policy renders a probe launch");
-            probe_command_outcome(&rendered, dir.path(), CAPABILITY_PROBE_TIMEOUT, container.as_deref())
+            probe_command_outcome(&rendered, dir.path(), CAPABILITY_PROBE_TIMEOUT, &executor)
                 .expect("the probe must be measurable — a docker daemon is present for this test")
         };
 
@@ -2966,7 +3110,12 @@ mod tests {
         let dir = ProbeDir::new("bounded");
         let argv = argv(&["sleep", "60"]);
         let started = Instant::now();
-        let outcome = probe_command_outcome(&argv, dir.path(), Duration::from_millis(300), None);
+        let outcome = probe_command_outcome(
+            &argv,
+            dir.path(),
+            Duration::from_millis(300),
+            &ProbeExecutor::PassThrough,
+        );
         let elapsed = started.elapsed();
 
         assert!(
@@ -2986,12 +3135,24 @@ mod tests {
     fn a_bounded_probe_separates_success_absence_and_unmeasurable() {
         let dir = ProbeDir::new("separates");
         assert_eq!(
-            probe_command_outcome(&argv(&["true"]), dir.path(), Duration::from_secs(10), None).ok(),
+            probe_command_outcome(
+                &argv(&["true"]),
+                dir.path(),
+                Duration::from_secs(10),
+                &ProbeExecutor::PassThrough,
+            )
+            .ok(),
             Some(true),
             "a command that exits 0 is proven"
         );
         assert_eq!(
-            probe_command_outcome(&argv(&["false"]), dir.path(), Duration::from_secs(10), None).ok(),
+            probe_command_outcome(
+                &argv(&["false"]),
+                dir.path(),
+                Duration::from_secs(10),
+                &ProbeExecutor::PassThrough,
+            )
+            .ok(),
             Some(false),
             "a command that exits non-zero ran and is not proven — omit, do not error"
         );
@@ -3002,7 +3163,7 @@ mod tests {
                 &argv(&["maxplayer-no-such-binary"]),
                 dir.path(),
                 Duration::from_secs(10),
-                None,
+                &ProbeExecutor::PassThrough,
             )
             .ok(),
             Some(false),
@@ -3017,11 +3178,227 @@ mod tests {
                     &argv(&["maxplayer-no-such-launcher"]),
                     dir.path(),
                     Duration::from_secs(10),
-                    Some("maxplayer-job-probe-x"),
+                    &ProbeExecutor::Docker {
+                        container: "maxplayer-job-probe-x".to_owned(),
+                    },
                 ),
                 Err(ProbeRunError::LauncherUnspawnable(_))
             ),
             "a docker launcher that cannot spawn is unmeasurable, never a silent 'no'"
+        );
+        // And the same for a LAUNCHER policy, which has no container at all. This is the case the
+        // old nullable-container parameter could not represent: `None` meant pass-through, so an
+        // unspawnable launcher was reported as a missing toolchain.
+        assert!(
+            matches!(
+                probe_command_outcome(
+                    &argv(&["maxplayer-no-such-launcher"]),
+                    dir.path(),
+                    Duration::from_secs(10),
+                    &ProbeExecutor::Launcher,
+                ),
+                Err(ProbeRunError::LauncherUnspawnable(_))
+            ),
+            "a wrapped launcher that cannot spawn says NOTHING about the target it would have run"
+        );
+    }
+
+    /// One exit status, as a finished process reports it.
+    fn exited(code: i32) -> std::process::ExitStatus {
+        std::os::unix::process::ExitStatusExt::from_raw(code << 8)
+    }
+
+    // The classification Rocky's blocker 3 is about, asserted as the PAIR that makes it meaningful.
+    //
+    // Docker exit 125 is docker's own failure — an unreachable daemon, a missing image, a name
+    // collision with a container an earlier probe left behind. The target never ran, so 125 cannot
+    // answer the capability question and must refuse to. Every OTHER non-zero code belongs to the
+    // command inside the container and is a real "absent".
+    //
+    // The discriminator is the EXECUTOR, not the code, which is why one status is asserted under
+    // both. Under a host executor 125 is just a number a program chose to exit with, and reporting
+    // it as unmeasurable there would fail boot on a toolchain that merely said no.
+    #[test]
+    fn only_docker_reads_125_as_a_runtime_failure() {
+        let docker = ProbeExecutor::Docker {
+            container: "maxplayer-job-probe-x".to_owned(),
+        };
+
+        assert!(
+            matches!(
+                docker.classify(exited(DOCKER_CLI_FAILURE)),
+                Err(ProbeRunError::RuntimeFailure { code: 125 })
+            ),
+            "docker's own failure must refuse to answer, never report the capability absent"
+        );
+        assert_eq!(
+            docker.classify(exited(127)).ok(),
+            Some(false),
+            "127 is the command not found INSIDE the container — the probe ran, and the honest \
+             answer is absent"
+        );
+        assert_eq!(
+            docker.classify(exited(0)).ok(),
+            Some(true),
+            "POSITIVE CONTROL: a docker probe can still prove a capability, or the two legs above \
+             would hold for an executor that never answers true"
+        );
+
+        // The same status, the other executor. This is the whole claim: the number means nothing on
+        // its own.
+        assert_eq!(
+            ProbeExecutor::PassThrough.classify(exited(DOCKER_CLI_FAILURE)).ok(),
+            Some(false),
+            "125 from a host probe is the TARGET's exit code and means absent — treating it as \
+             unmeasurable would fail boot on a toolchain that simply said no"
+        );
+        assert_eq!(
+            ProbeExecutor::Launcher.classify(exited(DOCKER_CLI_FAILURE)).ok(),
+            Some(false)
+        );
+    }
+
+    // A probe that RAN and PROVED a capability must still fail if its container survives.
+    //
+    // This is the compounding Rocky named, and it is why the removal is not best-effort: the
+    // container name is deterministic per workdir, so residue does not sit still. The next token's
+    // run collides with the survivor, docker refuses it with 125, and — before the classification
+    // above — that read as "absent". One failed `rm` could therefore prove `node` and then silently
+    // lose `python` and `rust`, leaving a seat that looks like a stock image.
+    //
+    // ⚠ WHY THIS IS ASSERTED ON `settle_probe` AND NOT THROUGH A REAL RUN: `docker rm -f` is
+    // IDEMPOTENT — it exits 0 for a container that is not there. So the removal that is easy to
+    // stage is the one that SUCCEEDS, and a test built on an absent container would assert the
+    // failure branch while never entering it. A genuinely undeletable container is not something a
+    // unit test can arrange. The decision is therefore made in one place and driven directly.
+    #[test]
+    fn a_probe_whose_container_survives_is_not_reported_as_proven() {
+        let failed = settle_probe(
+            Ok(true),
+            Some("`docker rm -f` exited non-zero".to_owned()),
+            Some("maxplayer-job-probe-x"),
+        );
+        assert!(
+            matches!(
+                &failed,
+                Err(ProbeRunError::CleanupFailed { container, .. })
+                    if container == "maxplayer-job-probe-x"
+            ),
+            "a PROVEN probe whose container survived must be an ERROR — reporting Ok(true) hands \
+             back one token and poisons every token after it, because the next run collides with \
+             the survivor and reads as absent: {failed:?}"
+        );
+
+        // POSITIVE CONTROL: the same proven outcome with a clean removal is proven. Without it the
+        // assertion above would hold for a function that failed unconditionally.
+        assert_eq!(
+            settle_probe(Ok(true), None, Some("maxplayer-job-probe-x")).ok(),
+            Some(true),
+            "a probe that ran and cleaned up is proven"
+        );
+        assert_eq!(
+            settle_probe(Ok(false), None, None).ok(),
+            Some(false),
+            "and an honest absence still passes through as absence, not as an error"
+        );
+    }
+
+    // A probe that never ran reports THAT, not the cleanup that could not follow it.
+    //
+    // Both failures are live on this path at once — a docker that exits 125 created no container, so
+    // a removal may fail behind it — and the operator needs the cause, not the consequence. "check
+    // your daemon and your image" is actionable; "the container could not be removed" sends them
+    // looking for a container that never existed.
+    #[test]
+    fn the_probes_own_failure_outranks_the_cleanup_it_caused() {
+        let outcome = settle_probe(
+            Err(ProbeRunError::RuntimeFailure {
+                code: DOCKER_CLI_FAILURE,
+            }),
+            Some("`docker rm -f` exited non-zero".to_owned()),
+            Some("maxplayer-job-probe-y"),
+        );
+        assert!(
+            matches!(outcome, Err(ProbeRunError::RuntimeFailure { code: 125 })),
+            "the runtime failure is the CAUSE and the cleanup failure is its consequence: {outcome:?}"
+        );
+    }
+
+    // And the runtime-failure classification through the REAL spawn path, not only through
+    // `classify`: a command that exits 125 under a docker executor must come back unmeasurable.
+    //
+    // `sh -c 'exit 125'` stands in for `docker run` refusing to start. The cleanup that follows is
+    // the real `docker rm -f`, which succeeds or fails depending on this host — and either way the
+    // probe's own error is what surfaces, which is the precedence rule above holding end to end.
+    #[test]
+    fn a_runtime_failure_survives_the_whole_probe_path() {
+        let dir = ProbeDir::new("runtime-fail");
+        let outcome = probe_command_outcome(
+            &argv(&["sh", "-c", "exit 125"]),
+            dir.path(),
+            Duration::from_secs(10),
+            &ProbeExecutor::Docker {
+                container: "maxplayer-no-such-container-y".to_owned(),
+            },
+        );
+        assert!(
+            matches!(outcome, Err(ProbeRunError::RuntimeFailure { code: 125 })),
+            "125 under a docker executor is unmeasurable all the way out of the runner: {outcome:?}"
+        );
+
+        // POSITIVE CONTROL: the identical exit code under a host executor is a plain absence.
+        assert_eq!(
+            probe_command_outcome(
+                &argv(&["sh", "-c", "exit 125"]),
+                dir.path(),
+                Duration::from_secs(10),
+                &ProbeExecutor::PassThrough,
+            )
+            .ok(),
+            Some(false),
+            "the executor is the discriminator, not the number"
+        );
+    }
+
+    // A launcher policy resolves to the LAUNCHER executor, and an empty launcher argv to
+    // pass-through.
+    //
+    // The second half is the one worth a test. `[sandbox] mode = "launcher"` with no `launcher`
+    // array is documented pass-through, so reading the MODE rather than the argv would classify the
+    // exact configuration an operator writes when they turn a launcher off — and then report a
+    // missing toolchain as an unmeasurable probe, failing boot on a seat that is merely bare.
+    #[test]
+    fn an_empty_launcher_argv_is_pass_through_not_a_launcher() {
+        let dir = ProbeDir::new("executor-kind");
+
+        assert_eq!(
+            ProbeExecutor::for_policy(&SandboxPolicy::passthrough(), dir.path()),
+            ProbeExecutor::PassThrough
+        );
+
+        let empty = SandboxPolicy::from_config(Some(&crate::home::SandboxConfig {
+            mode: crate::home::SandboxMode::Launcher,
+            ..Default::default()
+        }))
+        .expect("a launcher policy with no launcher argv is pass-through, not an error");
+        assert_eq!(
+            ProbeExecutor::for_policy(&empty, dir.path()),
+            ProbeExecutor::PassThrough,
+            "launcher mode with an EMPTY argv spawns the target directly, so a spawn failure there \
+             really is the target's absence"
+        );
+
+        let wrapped = SandboxPolicy::from_config(Some(&crate::home::SandboxConfig {
+            mode: crate::home::SandboxMode::Launcher,
+            launcher: vec!["env".to_owned()],
+            ..Default::default()
+        }))
+        .expect("a launcher policy resolves");
+        assert_eq!(
+            ProbeExecutor::for_policy(&wrapped, dir.path()),
+            ProbeExecutor::Launcher,
+            "POSITIVE CONTROL: a real launcher argv must NOT read as pass-through, or the two \
+             assertions above would hold for a function that returns PassThrough unconditionally"
         );
     }
 
@@ -3050,7 +3427,7 @@ mod tests {
                 &looks_for_marker,
                 supplied.path(),
                 Duration::from_secs(10),
-                None,
+                &ProbeExecutor::PassThrough,
             )
             .ok(),
             Some(true),
@@ -3058,8 +3435,13 @@ mod tests {
              resolve, so the child ran somewhere else"
         );
         assert_eq!(
-            probe_command_outcome(&looks_for_marker, other.path(), Duration::from_secs(10), None)
-                .ok(),
+            probe_command_outcome(
+                &looks_for_marker,
+                other.path(),
+                Duration::from_secs(10),
+                &ProbeExecutor::PassThrough,
+            )
+            .ok(),
             Some(false),
             "the negative control failed: the same argv answered true from a directory with NO \
              marker, which means the cwd we pass is not the cwd the child gets"
