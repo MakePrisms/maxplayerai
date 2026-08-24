@@ -84,7 +84,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Full, Limited, StreamBody};
+use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -96,9 +96,8 @@ use tokio::sync::Semaphore;
 /// stranger's job. These bound what one job can make the daemon hold or spawn, so an unbounded or
 /// trickled request cannot OOM or exhaust it.
 ///
-/// The request body is buffered (it must be, to find and substitute the placeholder before egress);
-/// this caps that buffer. 32 MiB is far above any real model request and far below a memory hazard.
-pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// There is deliberately **no request-body size limit**. The body is relayed as it arrives and never
+/// accumulates, so its size is bounded by the network rather than by memory — see [`handle_request`].
 /// Concurrent connections the proxy will service at once. A per-job proxy serves ONE agent, so a
 /// modest ceiling is generous for legitimate use and caps a connection flood. Excess connections wait
 /// at the OS accept backlog rather than each spawning an unbounded task.
@@ -117,18 +116,22 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 /// listener.
 ///
 /// ⚠ **This is a PER-CONNECTION bound and it is not, on its own, a ceiling on work.** 64 connections
-/// each running 64 streams is 4096 requests in flight, and at [`MAX_REQUEST_BODY_BYTES`] each that is
-/// the very resource hazard the connection cap exists to prevent. The aggregate ceiling is
-/// [`MAX_IN_FLIGHT_REQUESTS`]; this constant only stops one connection from monopolising it.
+/// each running 64 streams is 4096 requests in flight, each holding an upstream connection and a
+/// credential — the very resource hazard the connection cap exists to prevent. The aggregate ceiling
+/// is [`MAX_IN_FLIGHT_REQUESTS`]; this constant only stops one connection from monopolising it.
 const MAX_CONCURRENT_H2_STREAMS: u32 = 64;
 /// Requests in flight across the whole listener, both protocols, whatever the connection count.
 ///
 /// The real ceiling on concurrent work, and the only one of the three that does not change meaning
 /// with the protocol. [`MAX_CONCURRENT_CONNECTIONS`] bounds sockets and
 /// [`MAX_CONCURRENT_H2_STREAMS`] bounds streams within one socket; under HTTP/1 those coincide with
-/// requests, and under HTTP/2 they multiply. **Bounding the product is what keeps the buffered-body
-/// memory ceiling honest** — without it, adding h2c support would have silently widened a limit
-/// nobody edited, which is exactly the failure mode this module's other bounds exist to avoid.
+/// requests, and under HTTP/2 they multiply. **Bounding the product is what keeps the count of
+/// simultaneously-live upstream connections honest** — without it, adding h2c support would have
+/// silently widened a limit nobody edited, which is exactly the failure mode this module's other
+/// bounds exist to avoid.
+///
+/// This is now the ONLY aggregate bound on concurrent work: with the body streamed rather than
+/// buffered, an in-flight request costs a socket pair and a credential in a header, not megabytes.
 const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 /// How long the head (request line + headers) may take to arrive. hyper enforces this itself; without
 /// it a trickled header stream pins a connection open indefinitely.
@@ -136,10 +139,17 @@ const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 /// HTTP/1 only: HTTP/2 has no equivalent head-read deadline to set, so the body deadline and the
 /// stream bound above are what bound a slow HTTP/2 peer.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long the request BODY may take to arrive in full. Bounds a slow-loris body that dribbles bytes
-/// under the size cap forever. It bounds only the REQUEST read — the upstream RESPONSE (an SSE stream)
-/// is relayed without any such deadline, so a long completion is never cut off.
-const BODY_READ_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the request body may go **silent** before the relay gives up on it.
+///
+/// This is an INACTIVITY deadline, not a total one, and the distinction is the whole point. A total
+/// deadline cannot tell a stalled client from a healthy long upload: both exceed it, so any value
+/// large enough to permit the second is too large to catch the first. Measuring the GAP between chunks
+/// separates them — a client that keeps sending is never cut off however long it takes, and one that
+/// stops is dropped `BODY_IDLE_TIMEOUT` later regardless of how much it already sent.
+///
+/// It bounds only the REQUEST read. The upstream RESPONSE (an SSE stream) is relayed with no deadline
+/// at all, so a long completion is never cut off.
+const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The default real upstream for the Anthropic API-key path when the operator has not pointed the
 /// daemon at a custom gateway. Any resolved destination must appear on the proxy's allowlist before
@@ -704,9 +714,13 @@ pub async fn start(
 
 type ProxyBody = BoxBody<Bytes, std::io::Error>;
 
-/// Serve one request: buffer it, run it through [`ProxyEngine::authorize`], and — only on a
-/// substituted forward — relay it to the real upstream and stream the response back. A refusal returns
-/// a `4xx`/`5xx` to the container with the real credential never in play.
+/// Serve one request: run its HEADERS through [`ProxyEngine::authorize`] and — only on a substituted
+/// forward — stream its body to the real upstream and stream the response back. A refusal returns a
+/// `4xx`/`5xx` to the container with the real credential never in play, and without reading the body.
+///
+/// Nothing here accumulates a request. The body is a stream from the container's socket to the
+/// upstream's, which is what lets a client that holds its request open — an agent streaming a turn —
+/// be served at all: waiting for such a body to END is waiting forever.
 async fn handle_request(
     req: Request<Incoming>,
     engine: Arc<ProxyEngine>,
@@ -726,39 +740,15 @@ async fn handle_request(
             value.to_str().ok().map(|v| (name.as_str().to_owned(), v.to_owned()))
         })
         .collect();
-    // Buffer the body under a size cap AND a read deadline: the listener lives in the seller daemon,
-    // so a stranger's job must not be able to OOM it with an unbounded body or pin memory by
-    // trickling one under the cap forever. `Limited` stops reading past the cap (413); the timeout
-    // bounds a slow-loris body (408). Neither touches the upstream RESPONSE stream.
-    let capped = Limited::new(req.into_body(), MAX_REQUEST_BODY_BYTES);
-    let body = match tokio::time::timeout(BODY_READ_TIMEOUT, capped.collect()).await {
-        Ok(Ok(collected)) => collected.to_bytes(),
-        Ok(Err(error)) => {
-            let over_cap = error
-                .downcast_ref::<http_body_util::LengthLimitError>()
-                .is_some();
-            return Ok(if over_cap {
-                refusal_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "request body exceeds the proxy limit",
-                )
-            } else {
-                refusal_response(StatusCode::BAD_GATEWAY, "failed to read request body")
-            });
-        }
-        Err(_) => {
-            return Ok(refusal_response(
-                StatusCode::REQUEST_TIMEOUT,
-                "request body read timed out",
-            ))
-        }
-    };
-
     // The reverse-substitution pair for the response leg, resolved from the SAME header match that
     // authorizes the request. Taken before `authorize` consumes nothing — both read the incoming
     // headers, so they agree on which job this is.
     let scrub = engine.scrub_pair_for(&headers);
 
+    // AUTHORIZE BEFORE READING A SINGLE BODY BYTE. `authorize` takes headers only, and the body is
+    // deliberately not a substitution surface (see "Why the BODY is never a substitution surface" in
+    // the module header), so the body was never an input to this decision. Deciding first means a
+    // request we refuse costs us nothing at all: we answer from the headers and drop the body unread.
     match engine.authorize(&headers) {
         Decision::Refuse(reason) => {
             let status = match reason {
@@ -767,9 +757,15 @@ async fn handle_request(
             };
             Ok(refusal_response(status, &reason.to_string()))
         }
-        // `body` is the ORIGINAL buffered request body, forwarded verbatim: the decision never
-        // carried it, so nothing substituted a credential into it.
         Decision::Forward { upstream, headers } => {
+            // The body is RELAYED, never accumulated: each chunk goes upstream as it arrives, so the
+            // daemon holds one chunk rather than a whole request, and a client that never closes its
+            // body is no longer a client we wait for forever. It is forwarded VERBATIM — the decision
+            // did not carry it, so nothing substituted a credential into it.
+            let body = reqwest::Body::wrap_stream(idle_bounded(
+                req.into_body().into_data_stream(),
+                BODY_IDLE_TIMEOUT,
+            ));
             match relay(&client, &method, &upstream, &path_and_query, headers, body, scrub).await {
                 Ok(response) => Ok(response),
                 // No-fallback: an upstream failure fails the request; it never resends without the
@@ -795,13 +791,13 @@ async fn relay(
     upstream: &str,
     path_and_query: &str,
     headers: Vec<(String, String)>,
-    body: Bytes,
+    body: reqwest::Body,
     scrub: Option<(String, String)>,
 ) -> Result<Response<ProxyBody>, String> {
     let url = format!("{}{}", upstream.trim_end_matches('/'), path_and_query);
     let method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|error| format!("bad method: {error}"))?;
-    let mut request = client.request(method, &url).body(body.to_vec());
+    let mut request = client.request(method, &url).body(body);
     for (name, value) in headers {
         request = request.header(name, value);
     }
@@ -837,6 +833,51 @@ async fn relay(
     builder
         .body(body)
         .map_err(|error| format!("building proxied response failed: {error}"))
+}
+
+/// Relay a request body chunk-by-chunk, dropping a client that goes SILENT without cutting off one
+/// that is merely slow.
+///
+/// The deadline is measured on the GAP between chunks, so it does not care how long a body takes or
+/// how large it is — only that it is still arriving. A client that keeps sending is never interrupted;
+/// one that stops errors the stream `idle` later, and that error aborts the upstream request, so a
+/// credential-bearing connection never outlives the client that justified it. Cancellation the other
+/// way is already covered: if the upstream dies, `relay`'s response stream errors and hyper closes the
+/// container's connection.
+///
+/// Trailers are dropped. This is a byte relay onto a fresh upstream request, whose framing is hyper's
+/// to generate; forwarding the container's trailers onto it would be forwarding metadata about a
+/// different HTTP exchange.
+/// Takes a chunk STREAM rather than the [`Incoming`] body it is used on, because `Incoming` cannot be
+/// constructed outside hyper — a synthetic one is the only way to test this at all, and an untested
+/// deadline is the one thing standing between a silent client and a pinned daemon connection.
+fn idle_bounded<S, E>(
+    chunks: S,
+    idle: Duration,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static
+where
+    S: futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    // `None` inner ⇒ the stream is finished (ended, errored, or timed out); stop yielding.
+    futures_util::stream::unfold(
+        Some(Box::pin(chunks)),
+        move |inner| async move {
+            let mut inner = inner?;
+            match tokio::time::timeout(idle, inner.next()).await {
+                Err(_) => Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "request body went silent",
+                    )),
+                    None,
+                )),
+                Ok(None) => None,
+                Ok(Some(Ok(chunk))) => Some((Ok(chunk), Some(inner))),
+                Ok(Some(Err(error))) => Some((Err(std::io::Error::other(error)), None)),
+            }
+        },
+    )
 }
 
 /// Rewrite `real` back to `placeholder` across a streamed response body, without buffering the stream.
@@ -1147,6 +1188,56 @@ mod tests {
         haystack.windows(needle.len()).position(|w| w == needle)
     }
 
+    /// Decode an HTTP/1.1 chunked body, or `None` while the terminal zero-length chunk is still to
+    /// come. `None` means "read more", never "empty" — collapsing those two is how a stub ends up
+    /// asserting against a body it merely has not finished receiving.
+    fn decode_chunked(raw: &[u8]) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut rest = raw;
+        loop {
+            let line_end = find_subslice(rest, b"\r\n")?;
+            // A chunk-size line may carry extensions after a `;`; the size is what precedes it.
+            let size_text = std::str::from_utf8(&rest[..line_end]).ok()?;
+            let size_text = size_text.split(';').next()?.trim();
+            let size = usize::from_str_radix(size_text, 16).ok()?;
+            rest = &rest[line_end + 2..];
+            if size == 0 {
+                return Some(out);
+            }
+            if rest.len() < size + 2 {
+                return None;
+            }
+            out.extend_from_slice(&rest[..size]);
+            rest = &rest[size + 2..];
+        }
+    }
+
+    /// Whatever decoded before the stream cut out. Only for the hung-up-mid-body path, so a test sees a
+    /// short body and can assert on the shortfall instead of the stub blocking forever.
+    fn decode_chunked_prefix(raw: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut rest = raw;
+        while let Some(line_end) = find_subslice(rest, b"\r\n") {
+            let Some(size) = std::str::from_utf8(&rest[..line_end])
+                .ok()
+                .and_then(|t| t.split(';').next().map(str::trim).map(str::to_owned))
+                .and_then(|t| usize::from_str_radix(&t, 16).ok())
+            else {
+                break;
+            };
+            rest = &rest[line_end + 2..];
+            if size == 0 || rest.len() < size {
+                break;
+            }
+            out.extend_from_slice(&rest[..size]);
+            if rest.len() < size + 2 {
+                break;
+            }
+            rest = &rest[size + 2..];
+        }
+        out
+    }
+
     /// A one-shot plain-HTTP stub upstream standing in for `api.anthropic.com`. It records the request
     /// line (to prove the path is forwarded verbatim) and the `x-api-key` it received (to prove the
     /// real credential was substituted), then answers `200` with `body_out`.
@@ -1178,26 +1269,51 @@ mod tests {
                     break;
                 }
             }
-            // Read the body too: `content-length` bytes past the header terminator. Without this the
-            // stub could not prove what the upstream actually received in the body.
+            // Read the body too — without this the stub could not prove what the upstream actually
+            // received in the body.
+            //
+            // BOTH FRAMINGS, because the proxy relays the request body as a stream and so cannot
+            // declare a length it does not know: reqwest frames such a body as `transfer-encoding:
+            // chunked`. A content-length-only stub reads ZERO body bytes from a chunked request, then
+            // answers and closes the socket while the sender is still writing — which surfaces as a
+            // truncated body on a small request and a broken pipe (502) on a large one. Neither is a
+            // fault in the thing under test.
             let head_end = find_subslice(&buf, b"\r\n\r\n").map(|i| i + 4).unwrap_or(buf.len());
             let head_text = String::from_utf8_lossy(&buf[..head_end]).to_string();
-            let content_length = head_text
-                .lines()
-                .find_map(|line| {
+            let header_value = |wanted: &str| -> Option<String> {
+                head_text.lines().find_map(|line| {
                     let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().ok())?
+                    name.eq_ignore_ascii_case(wanted).then(|| value.trim().to_owned())
                 })
-                .unwrap_or(0);
-            while buf.len() < head_end + content_length {
-                let n = sock.read(&mut tmp).await.unwrap();
-                if n == 0 {
-                    break;
+            };
+            let chunked = header_value("transfer-encoding")
+                .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
+            let raw_body = if chunked {
+                loop {
+                    if let Some(decoded) = decode_chunked(&buf[head_end..]) {
+                        break decoded;
+                    }
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        // Sender hung up mid-body: return what decoded so an assertion can see the
+                        // truncation rather than the stub hanging on it.
+                        break decode_chunked_prefix(&buf[head_end..]);
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
                 }
-                buf.extend_from_slice(&tmp[..n]);
-            }
-            let body = String::from_utf8_lossy(&buf[head_end..]).to_string();
+            } else {
+                let content_length =
+                    header_value("content-length").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+                while buf.len() < head_end + content_length {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                buf[head_end..].to_vec()
+            };
+            let body = String::from_utf8_lossy(&raw_body).to_string();
 
             let text = head_text;
             let request_line = text.lines().next().unwrap_or_default().to_owned();
@@ -1471,24 +1587,123 @@ mod tests {
         assert_eq!(response.status(), 502);
     }
 
-    // P1 regression (babu review): the listener lives in the money-path daemon, so a body over the cap
-    // must be REFUSED (413), not buffered. `Limited` stops reading past `MAX_REQUEST_BODY_BYTES`, so
-    // the proxy never holds more than the cap — the daemon stays under a fixed memory ceiling no matter
-    // how large the body a stranger's job sends. (Cap applies BEFORE authorize, so no registration is
-    // needed to reach it.)
+    // THE BUG THIS CHANGE EXISTS FOR, in miniature. A client that holds its request body OPEN — which
+    // is what a streaming agent turn looks like on the wire — used to be unanswerable: the proxy
+    // collected the body to completion before authorizing, so a body that never ends meant a decision
+    // that never came. The client gave up first and the request was never forwarded at all.
+    //
+    // Authorizing from the headers makes the refusal reachable while the body is still open. The
+    // outer timeout is the assertion: on the buffering code this test does not fail, it HANGS.
     #[tokio::test]
-    async fn proxy_rejects_an_over_cap_body_with_413() {
+    async fn a_request_is_refused_from_its_headers_while_its_body_is_still_open() {
         let engine = Arc::new(ProxyEngine::new([authority_of(UPSTREAM).unwrap()]));
         let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
         let port = proxy.local_addr().port();
-        let over_cap = vec![b'a'; MAX_REQUEST_BODY_BYTES + 1];
+
+        // One chunk, then never another and never an end — the shape of a client mid-turn.
+        let never_ends = futures_util::stream::once(async {
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"{\"messages\":["))
+        })
+        .chain(futures_util::stream::pending());
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{port}/v1/messages"))
+                .body(reqwest::Body::wrap_stream(never_ends))
+                .send(),
+        )
+        .await
+        .expect("the proxy must answer from the headers, not wait for the body to end")
+        .unwrap();
+
+        // No placeholder anywhere, so this is `NoKnownPlaceholder` — and crucially it is decided
+        // without a single body byte being required.
+        assert_eq!(response.status(), 502);
+    }
+
+    // A body larger than the old 32 MiB cap now relays in full. The cap existed to bound a BUFFER;
+    // with the body streamed there is no buffer to bound, so the limit was removed rather than raised
+    // — there is no size at which this now fails, which is why the assertion is on byte-for-byte
+    // arrival rather than on a status alone.
+    #[tokio::test]
+    async fn a_body_larger_than_the_old_cap_relays_in_full() {
+        let (stub_addr, stub) = spawn_stub("UPSTREAM_OK").await;
+        let upstream = format!("http://{stub_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        let placeholder = mint_anthropic_placeholder();
+        engine
+            .register(JobCredential {
+                placeholder: placeholder.clone(),
+                real: REAL.to_owned(),
+                upstream: upstream.clone(),
+            })
+            .unwrap();
+        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None).await.unwrap();
+        let port = proxy.local_addr().port();
+
+        // 33 MiB: one byte over the cap would prove the boundary moved; well over it proves there is
+        // no boundary. Distinctive bytes so a truncation cannot be mistaken for success.
+        let big = vec![b'z'; 33 * 1024 * 1024];
         let response = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}/v1/messages"))
-            .body(over_cap)
+            .header("x-api-key", &placeholder)
+            .body(big.clone())
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), 413, "an over-cap body must be refused, not buffered");
+        assert_eq!(response.status(), 200, "an over-old-cap body must be relayed, not refused");
+
+        let seen = stub.await.unwrap();
+        assert_eq!(
+            seen.body.len(),
+            big.len(),
+            "the upstream must receive every byte, not a capped prefix"
+        );
+        assert_eq!(seen.api_key.as_deref(), Some(REAL));
+    }
+
+    // The deadline is an INACTIVITY one, and this is the test that tells the two apart: five chunks
+    // spaced under the deadline run PAST it in total. A total-body deadline fails here; a gap deadline
+    // does not. Without this assertion, `BODY_IDLE_TIMEOUT` could be a total deadline under a new name
+    // and every other test would still pass.
+    #[tokio::test]
+    async fn a_slow_but_talking_body_is_not_cut_off_by_the_idle_deadline() {
+        let idle = Duration::from_millis(120);
+        let chunks = futures_util::stream::unfold(0u8, |n| async move {
+            if n == 5 {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            Some((Ok::<Bytes, std::io::Error>(Bytes::from(vec![b'a'; 4])), n + 1))
+        });
+
+        let relayed: Vec<Bytes> = idle_bounded(chunks, idle)
+            .map(|chunk| chunk.expect("a body that keeps arriving must never hit the idle deadline"))
+            .collect()
+            .await;
+
+        assert_eq!(relayed.len(), 5, "every chunk must be relayed");
+        assert_eq!(relayed.iter().map(Bytes::len).sum::<usize>(), 20);
+        // 5 x 40ms = 200ms elapsed against a 120ms deadline: a TOTAL deadline would have fired.
+    }
+
+    // The other half of the same guard: a body that goes SILENT is dropped, so a client cannot pin a
+    // credential-bearing upstream connection open by simply stopping. Errors rather than hanging.
+    #[tokio::test]
+    async fn a_body_that_goes_silent_is_dropped_at_the_idle_deadline() {
+        let one_then_silence = futures_util::stream::once(async {
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"partial"))
+        })
+        .chain(futures_util::stream::pending());
+
+        let outcome: Vec<Result<Bytes, std::io::Error>> =
+            idle_bounded(one_then_silence, Duration::from_millis(80)).collect().await;
+
+        assert_eq!(outcome.len(), 2, "the chunk that did arrive, then the failure");
+        assert_eq!(outcome[0].as_ref().unwrap(), &Bytes::from_static(b"partial"));
+        let error = outcome[1].as_ref().expect_err("silence must end the stream in an error");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 
     // A redirect that stays on the credential's own upstream is followed, so a provider's own
