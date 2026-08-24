@@ -417,12 +417,21 @@ pub struct FileCredential {
     /// honoured through the environment belongs in `CONTAINED_CREDENTIALS` instead.
     ///
     /// **A list, because one flag is not always enough to contain one client.** A client may reach its
-    /// API over more than one endpoint and redirect only the ones it was told about; the rest go
-    /// straight to the vendor, carrying the placeholder, and fail to authenticate. Measured on
-    /// `cursor-agent 2026.08.11-e8db854`: `--endpoint` moves the control plane, and a separate
-    /// undocumented `--agent-endpoint` moves the agent/inference leg. With only the first set, the
-    /// control plane authenticates and the agent leg still leaves for `api2.cursor.sh` — so every job
-    /// fails while the proxy log looks healthy.
+    /// API over more than one endpoint and redirect only the ones it was told about; the rest leave for
+    /// the vendor and never reach the proxy at all. Measured on `cursor-agent 2026.08.11-e8db854`:
+    /// `--endpoint` moves the control plane, and a separate undocumented `--agent-endpoint` moves the
+    /// agent/inference leg.
+    ///
+    /// With only the first set, the control plane authenticates and the agent leg leaves for **its own
+    /// host** — measured as `agentn.global.api5.cursor.sh`, which is not the `upstream` this credential
+    /// names. On a contained seat that host is not in the egress policy, so the leg dies at name
+    /// resolution (`getaddrinfo EAI_AGAIN`) without ever reaching authentication. Every job fails while
+    /// the proxy log looks healthy, because nothing about that leg was ever addressed to the proxy.
+    ///
+    /// Naming both flags is necessary and, for Cursor today, not sufficient: the redirected agent leg
+    /// reaches the proxy and speaks h2c, and [`crate::credential_proxy`] buffers a request body that
+    /// this client does not close, so the request is never forwarded. Measured on a live contained
+    /// seat. A second flag here fixes the addressing, not that.
     ///
     /// Accepts a bare string (one flag) or a list. A bare string is taken **verbatim as a single
     /// flag** and is never split: an element containing whitespace is refused rather than shell-parsed,
