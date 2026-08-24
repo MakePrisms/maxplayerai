@@ -45,6 +45,21 @@ pub const DEFAULT_NETFILTER_IMAGE: &str =
 /// reaped by something that never saw the job that created it.
 pub const HOLDER_LABEL: &str = "ai.maxplayer.netns-holder";
 
+/// The docker label carrying the **owning seat** of a holder — the seller public key hex, which is
+/// stable across restarts, unique per seat, and not secret.
+///
+/// **Why ownership is carried and not inferred.** A holder is unattached twice in every job's life:
+/// between [`establish`] creating it and the job joining it, and again after the job exits. So "no
+/// job attached" is a normal state, not evidence of abandonment, and no measurement of liveness or
+/// age can recover *whose* holder it is — age lowers the odds of a collision without ever
+/// establishing ownership. This label is the answer, and it is why the reaper can run on a host
+/// where several seller daemons share a docker socket.
+///
+/// A holder carrying no seat label belongs to nobody this build can name, so it is **never reaped**.
+/// That leaks a container rather than destroying another seat's running job, which is the direction
+/// this whole module chooses whenever it has to choose.
+pub const HOLDER_SEAT_LABEL: &str = "ai.maxplayer.netns-holder-seat";
+
 /// A running holder container, and the guarantee that it goes away.
 ///
 /// Constructed the instant the container exists, so that every `?` after that point tears it down on
@@ -137,6 +152,10 @@ pub fn holder_name(job_id: &str) -> String {
 ///
 /// `--read-only`, `--cap-drop ALL`, non-root and `no-new-privileges` because a container that exists
 /// to hold a namespace needs nothing else, and it shares that namespace with a stranger's job.
+///
+/// `seat` is the owning seller's public key hex and goes on as a second label. It is what lets the
+/// boot reaper tell this seat's holders from another daemon's on a shared host; see
+/// [`HOLDER_SEAT_LABEL`].
 pub fn holder_argv(
     name: &str,
     network: &str,
@@ -144,6 +163,7 @@ pub fn holder_argv(
     uid: u32,
     gid: u32,
     job_id: &str,
+    seat: &str,
 ) -> Vec<String> {
     [
         "docker",
@@ -155,6 +175,8 @@ pub fn holder_argv(
         network,
         "--label",
         &format!("{HOLDER_LABEL}={job_id}"),
+        "--label",
+        &format!("{HOLDER_SEAT_LABEL}={seat}"),
         "--read-only",
         "--cap-drop",
         "ALL",
@@ -301,23 +323,63 @@ pub fn parse_getent_ipv4(stdout: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// `docker` argv listing every holder container by **full** id.
+/// `docker` argv listing `seat`'s holder containers by **full** id and owning seat.
 ///
 /// Full ids rather than docker's truncated default, because a joined job's `NetworkMode` names its
 /// holder by full id and orphan detection compares the two directly.
-pub fn list_holders_argv() -> Vec<String> {
+///
+/// **Two barriers on purpose, and only one of them is load-bearing.** The `label=<seat>` filter asks
+/// docker to hand back this seat's holders alone, so a foreign id is never even a candidate for
+/// removal. But the decision is not left there: the seat label is also *printed*, and
+/// [`reapable_holders`] re-checks it in Rust with an exact string comparison. That comparison is the
+/// guard. The filter is narrowing — worth having because it shrinks what a later bug could reach,
+/// and safe to have because its only failure that matters is matching too little, which leaks a
+/// holder instead of destroying someone's job.
+pub fn list_holders_argv(seat: &str) -> Vec<String> {
     [
         "docker",
         "ps",
         "--all",
         "--no-trunc",
-        "--quiet",
         "--filter",
         &format!("label={HOLDER_LABEL}"),
+        "--filter",
+        &format!("label={HOLDER_SEAT_LABEL}={seat}"),
+        "--format",
+        &format!("{{{{.ID}}}}\t{{{{.Label \"{HOLDER_SEAT_LABEL}\"}}}}"),
     ]
     .into_iter()
     .map(String::from)
     .collect()
+}
+
+/// One holder as the reaper sees it: its full container id, and the seat that owns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HolderRecord {
+    pub id: String,
+    /// The owning seat from [`HOLDER_SEAT_LABEL`]. `None` for a holder created by a build older than
+    /// that label — unattributable, and so never a removal candidate.
+    pub seat: Option<String>,
+}
+
+/// Parse `docker ps --format '{{.ID}}\t{{.Label …}}'` output into one record per holder.
+///
+/// An absent label arrives as an **empty field**, not a missing one, so emptiness is what maps to
+/// `None`. Reading it as a seat named "" would make every legacy holder look like it belonged to a
+/// seat whose id is the empty string, and one caller passing an empty seat would then reap the lot.
+pub fn parse_holder_listing(stdout: &str) -> Vec<HolderRecord> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut fields = line.split('\t');
+            let id = fields.next().unwrap_or_default().trim().to_owned();
+            let seat = fields.next().map(str::trim).filter(|seat| !seat.is_empty()).map(str::to_owned);
+            HolderRecord { id, seat }
+        })
+        .filter(|holder| !holder.id.is_empty())
+        .collect()
 }
 
 /// `docker` argv listing every container on the host by full id.
@@ -338,26 +400,32 @@ pub fn network_modes_argv(ids: &[String]) -> Vec<String> {
     argv
 }
 
-/// The holders in `holders` that no container is joined to, given every container's `modes`.
+/// The holders `seat` may remove: **owned by `seat`** and with no container joined to them.
 ///
-/// **Why this is a comparison and not a docker filter.** A live job joins its holder with
+/// **Both legs are required, and neither is sufficient.** Ownership alone would remove a holder this
+/// seat is mid-way through attaching a job to. Attachment alone is the bug this function exists to
+/// forbid: a holder is unattached twice in every job's life, so "nothing attached" says nothing
+/// whatever about whether the holder is in use, let alone whose it is. A removal needs an explicit
+/// ownership match *and* an idle namespace.
+///
+/// **Why attachment is a comparison and not a docker filter.** A live job joins its holder with
 /// `--network container:<id>`, which docker records as a `NetworkMode` of `container:<holder-full-id>`.
 /// Docker cannot select on that: measured on this host, `docker ps --filter network=<holder>` matches
 /// **nothing** for such a container, and `docker ps --format '{{.Networks}}'` prints an **empty** field
 /// for it. So the only way to see the join is to read the modes and compare.
 ///
-/// This distinction is the whole safety property of reaping. "Every labelled holder" is the wrong set:
-/// two seller daemons can share a host, and a boot that reaped the other daemon's holders would strip
-/// the network namespace out from under its running jobs. An orphan is a holder with **no job
-/// attached**, which is what a crashed daemon leaves and what a healthy one never has.
+/// **What the ownership leg closed.** This function used to take every labelled holder on the host and
+/// keep the unattached ones, which made a boot on a shared host able to strip the namespace out from
+/// under another daemon's job — either one already running, or one in its pre-attach window. The
+/// comment here recorded that race and judged a per-daemon label not worth the complexity "until a
+/// host actually runs two seller daemons". That condition is now met: VM1854 runs two earning seats
+/// and Server One runs three. [`HOLDER_SEAT_LABEL`] is that label.
 ///
-/// **Residual race, stated rather than papered over.** Between `establish` creating a holder and the
-/// job joining it, that holder has no attachment and so looks like an orphan. A *second* daemon booting
-/// inside that window could reap it, and the first daemon's job would then fail to launch. It fails
-/// closed, and it needs two daemons on one host with boots seconds apart. Closing it properly wants a
-/// holder age or a per-daemon label, and neither is worth the complexity until a host actually runs two
-/// seller daemons.
-pub fn orphaned_holders(holders: &[String], modes: &str) -> Vec<String> {
+/// **What remains, stated rather than papered over.** A seat cannot clean up after a *different*
+/// seat, and a holder from a build predating the seat label has no owner to match, so both leak until
+/// something removes them by hand. A leaked holder costs a container and holds no policy; the job
+/// that could have used it is already gone. That is the trade this module takes every time.
+pub fn reapable_holders(holders: &[HolderRecord], seat: &str, modes: &str) -> Vec<String> {
     let attached: Vec<&str> = modes
         .lines()
         .map(str::trim)
@@ -365,23 +433,34 @@ pub fn orphaned_holders(holders: &[String], modes: &str) -> Vec<String> {
         .collect();
     holders
         .iter()
-        .filter(|holder| !attached.iter().any(|target| target == &holder.as_str()))
-        .cloned()
+        .filter(|holder| holder.seat.as_deref() == Some(seat))
+        .filter(|holder| !attached.iter().any(|target| target == &holder.id.as_str()))
+        .map(|holder| holder.id.clone())
         .collect()
 }
 
-/// Remove every holder no job is attached to, and return what was removed.
+/// Remove `seat`'s own holders that no job is attached to, and return what was removed.
+///
+/// `seat` is the caller's seller public key hex. It is the *only* thing that makes this safe to run on
+/// a host shared with other seller daemons: see [`reapable_holders`] for why ownership has to be
+/// carried and why attachment state cannot stand in for it.
 ///
 /// Best-effort by design: a leaked holder is a resource leak, not an open door — it owns a namespace and
 /// holds no policy, and the job that could have used it is already gone. So a failure here is reported
 /// and never blocks a boot, whereas a failure to *establish* containment refuses the job outright. The
 /// two are deliberately not symmetrical.
 #[cfg(feature = "acp")]
-pub async fn reap_orphans() -> Result<Vec<String>, String> {
-    let (holders, _) = run_docker(list_holders_argv(), None)
+pub async fn reap_orphans(seat: &str) -> Result<Vec<String>, String> {
+    // An empty seat would match every holder whose label failed to parse, so refuse to run at all
+    // rather than reap on an identity we do not have. A caller that cannot name itself has nothing to
+    // clean up.
+    if seat.trim().is_empty() {
+        return Err("refusing to reap: no owning seat was named".to_owned());
+    }
+    let (listing, _) = run_docker(list_holders_argv(seat), None)
         .await
         .map_err(|error| format!("could not list containment holders — {error}"))?;
-    let holders: Vec<String> = holders.lines().map(str::trim).filter(|id| !id.is_empty()).map(str::to_owned).collect();
+    let holders = parse_holder_listing(&listing);
     if holders.is_empty() {
         return Ok(Vec::new());
     }
@@ -395,7 +474,7 @@ pub async fn reap_orphans() -> Result<Vec<String>, String> {
         .map_err(|error| format!("could not read container network modes — {error}"))?;
 
     let mut reaped = Vec::new();
-    for holder in orphaned_holders(&holders, &modes) {
+    for holder in reapable_holders(&holders, seat, &modes) {
         match run_docker(
             ["docker", "rm", "--force", "--volumes", holder.as_str()]
                 .into_iter()
@@ -482,6 +561,7 @@ pub async fn establish(
     sidecar_image: &str,
     proxy_alias: &str,
     job_id: &str,
+    seat: &str,
     uid: u32,
     gid: u32,
     proxy_ports: Option<crate::sandbox_net::PortRange>,
@@ -496,7 +576,7 @@ pub async fn establish(
     })?;
 
     let name = holder_name(job_id);
-    run_docker(holder_argv(&name, network, holder_image, uid, gid, job_id), None)
+    run_docker(holder_argv(&name, network, holder_image, uid, gid, job_id, seat), None)
         .await
         .map_err(|error| format!("could not start the netns holder {name} — {error}"))?;
     // From here on the container exists, so every early return must tear it down. Adopting it into
@@ -558,6 +638,97 @@ mod tests {
         }
     }
 
+    /// Two seller daemons sharing one host. `SEAT_A` is a co-tenant; `SEAT_B` is the one booting.
+    fn seat_a() -> String {
+        "a1".repeat(32)
+    }
+    fn seat_b() -> String {
+        "b2".repeat(32)
+    }
+
+    /// Seat A's holder, in its **pre-attach window**: created, its job has not joined yet.
+    fn seat_a_holder() -> String {
+        "a".repeat(64)
+    }
+    /// Seat B's own holder, genuinely stale — left by a crash before its guard ran.
+    fn seat_b_holder() -> String {
+        "b".repeat(64)
+    }
+
+    /// The whole point of the pair below: **nothing is attached to either holder.** Attachment state
+    /// therefore cannot tell the two apart, and ownership is the only discriminator that exists.
+    const NOTHING_ATTACHED: &str = "bridge\nhost\nmx-sandbox-net\n";
+
+    fn two_seats_one_host() -> Vec<HolderRecord> {
+        vec![
+            HolderRecord { id: seat_a_holder(), seat: Some(seat_a()) },
+            HolderRecord { id: seat_b_holder(), seat: Some(seat_b()) },
+        ]
+    }
+
+    /// LEG 1 — seat B must not remove seat A's holder, which is unattached but very much in use.
+    ///
+    /// The pair with [`seat_b_does_select_its_own_stale_holder`] is deliberate and neither half stands
+    /// alone: this one passes for a reaper that removes nothing at all, and that one passes for the
+    /// host-wide reaper this replaced. They are separate `#[test]`s rather than two asserts in one
+    /// body so that a failure names which leg went red — an early assert would silence the other.
+    #[test]
+    fn seat_b_does_not_select_seat_as_live_but_unattached_holder() {
+        let selected = reapable_holders(&two_seats_one_host(), &seat_b(), NOTHING_ATTACHED);
+        assert!(
+            !selected.contains(&seat_a_holder()),
+            "LEG 1: seat B selected seat A's live-but-unattached holder for removal: {selected:?}"
+        );
+    }
+
+    /// LEG 2 — the anti-vacuity half: seat B must still remove its own stale holder.
+    #[test]
+    fn seat_b_does_select_its_own_stale_holder() {
+        let selected = reapable_holders(&two_seats_one_host(), &seat_b(), NOTHING_ATTACHED);
+        assert!(
+            selected.contains(&seat_b_holder()),
+            "LEG 2: seat B failed to select its OWN stale holder — a reaper that reaps nothing: {selected:?}"
+        );
+    }
+
+    /// A holder from a build older than the seat label has no owner to match, so nobody removes it.
+    /// Unattributable must mean left alone: the alternative is a seat destroying a stranger's job.
+    #[test]
+    fn an_unlabelled_holder_belongs_to_nobody_and_is_never_reaped() {
+        let legacy = vec![HolderRecord { id: seat_b_holder(), seat: None }];
+        assert!(
+            reapable_holders(&legacy, &seat_b(), NOTHING_ATTACHED).is_empty(),
+            "a holder with no seat label must never be selected"
+        );
+        // …and an empty seat must not become the key that matches it.
+        assert!(reapable_holders(&legacy, "", NOTHING_ATTACHED).is_empty());
+    }
+
+    /// An absent label arrives as an empty FIELD. Read as a seat named "", every legacy holder would
+    /// look owned, and one caller passing an empty seat would take the host.
+    #[test]
+    fn a_missing_seat_label_parses_as_no_owner_not_as_an_empty_owner() {
+        let listing = format!("{}\t{}\n{}\t\n{}\n", seat_a_holder(), seat_a(), seat_b_holder(), "c".repeat(64));
+        let parsed = parse_holder_listing(&listing);
+        assert_eq!(parsed.len(), 3, "{parsed:?}");
+        assert_eq!(parsed[0], HolderRecord { id: seat_a_holder(), seat: Some(seat_a()) });
+        assert_eq!(parsed[1], HolderRecord { id: seat_b_holder(), seat: None });
+        assert_eq!(parsed[2], HolderRecord { id: "c".repeat(64), seat: None });
+        // Blank lines are not a holder with no id.
+        assert!(parse_holder_listing("\n  \n").is_empty());
+    }
+
+    /// Ownership does not license removing a holder a job is attached to — the seat's own job, mid
+    /// pre-attach window, is the case that must survive its own daemon's boot.
+    #[test]
+    fn a_seats_own_holder_with_a_job_attached_survives() {
+        let modes = format!("bridge\ncontainer:{}\n", seat_b_holder());
+        assert!(
+            reapable_holders(&two_seats_one_host(), &seat_b(), &modes).is_empty(),
+            "an attached holder must survive even for the seat that owns it"
+        );
+    }
+
     #[test]
     fn the_job_joins_the_holders_namespace_and_never_names_a_network() {
         let holder = NetnsHolder::adopt("maxplayer-netns-abc".into());
@@ -566,7 +737,7 @@ mod tests {
 
     #[test]
     fn the_holder_runs_sleep_in_exec_form_with_no_shell() {
-        let argv = holder_argv("h", "net", "img", 1000, 1000, "abc");
+        let argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b());
         let tail = &argv[argv.len() - 4..];
         assert_eq!(tail, ["--entrypoint", "sleep", "img", "infinity"]);
         // A shell anywhere in the argv would mean the holder runs something that parses a string.
@@ -575,14 +746,31 @@ mod tests {
 
     #[test]
     fn the_holder_is_locked_down_and_labelled_for_reaping() {
-        let argv = holder_argv("h", "net", "img", 1000, 1000, "abc");
+        let argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b());
         for expected in ["--read-only", "--cap-drop", "ALL", "no-new-privileges"] {
             assert!(argv.iter().any(|a| a == expected), "missing {expected} in {argv:?}");
         }
         assert!(argv.iter().any(|a| a == "ai.maxplayer.netns-holder=abc"), "{argv:?}");
-        // The reaper must be able to find what the holder was labelled with.
-        let filter = list_holders_argv();
+        // The reaper must be able to find what the holder was labelled with, and to tell whose it is.
+        let filter = list_holders_argv(&seat_b());
         assert!(filter.iter().any(|a| a == "label=ai.maxplayer.netns-holder"), "{filter:?}");
+    }
+
+    /// The holder is stamped with its owning seat at creation. Without this the reap filter has
+    /// nothing to match and every holder is unattributable — a reaper that correctly reaps nothing.
+    #[test]
+    fn the_holder_carries_the_seat_that_created_it() {
+        let argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b());
+        assert!(
+            argv.iter().any(|a| a == &format!("{HOLDER_SEAT_LABEL}={}", seat_b())),
+            "{argv:?}"
+        );
+        // The value the creator stamps is the value the reaper filters on — one string, two sites.
+        let stamped = format!("{HOLDER_SEAT_LABEL}={}", seat_b());
+        assert!(
+            list_holders_argv(&seat_b()).iter().any(|a| a == &format!("label={stamped}")),
+            "creation label and reap filter must name the same seat"
+        );
     }
 
     #[test]
@@ -593,7 +781,7 @@ mod tests {
         // …and it still drops everything else first, so the grant is exactly one capability.
         assert!(sidecar.windows(2).any(|w| w == ["--cap-drop", "ALL"]), "{sidecar:?}");
         // The holder must never carry it: it shares its namespace with the job.
-        let holder_argv = holder_argv("h", "net", "img", 1000, 1000, "abc");
+        let holder_argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b());
         assert!(!holder_argv.iter().any(|a| a == "NET_ADMIN"), "{holder_argv:?}");
     }
 
@@ -651,33 +839,36 @@ mod tests {
         assert_eq!(parse_getent_ipv4("999.1.1.1\n").as_deref(), None);
     }
 
-    /// A holder with a job attached is in use; one without is what a crashed daemon leaves.
-    ///
-    /// The distinction is the safety property: reaping every labelled holder would strip the namespace
-    /// out from under another daemon's running jobs on a shared host.
+    /// A holder with a job attached is in use; one without may be stale. Within one seat's own
+    /// holders, attachment is what separates the two.
     #[test]
-    fn only_holders_with_no_job_attached_are_orphans() {
+    fn only_holders_with_no_job_attached_are_reapable() {
         let busy = "a".repeat(64);
         let idle = "b".repeat(64);
+        let mine = vec![
+            HolderRecord { id: busy.clone(), seat: Some(seat_b()) },
+            HolderRecord { id: idle.clone(), seat: Some(seat_b()) },
+        ];
         // One job joined to `busy`, plus containers on ordinary networks that name no holder.
         let modes = format!("bridge\ncontainer:{busy}\nhost\nmx-sandbox-net\n");
         assert_eq!(
-            orphaned_holders(&[busy.clone(), idle.clone()], &modes),
+            reapable_holders(&mine, &seat_b(), &modes),
             vec![idle],
             "the holder with a job attached must survive"
         );
     }
 
-    /// The positive control: with nothing attached, every holder is an orphan. Without this a predicate
-    /// that never matches would look like a careful one.
+    /// The positive control: this seat's own holders, nothing attached, all reapable. Without this a
+    /// predicate that never matches would look like a careful one.
     #[test]
     fn holders_are_reaped_when_nothing_is_attached() {
         let one = "c".repeat(64);
         let two = "d".repeat(64);
-        assert_eq!(
-            orphaned_holders(&[one.clone(), two.clone()], "bridge\nhost\n"),
-            vec![one, two]
-        );
+        let mine = vec![
+            HolderRecord { id: one.clone(), seat: Some(seat_b()) },
+            HolderRecord { id: two.clone(), seat: Some(seat_b()) },
+        ];
+        assert_eq!(reapable_holders(&mine, &seat_b(), "bridge\nhost\n"), vec![one, two]);
     }
 
     /// A `container:` mode naming a *different* holder must not protect this one — the comparison is on
@@ -686,17 +877,39 @@ mod tests {
     fn an_attachment_to_another_holder_does_not_protect_this_one() {
         let holder = "e".repeat(64);
         let other = "f".repeat(64);
+        let mine = vec![HolderRecord { id: holder.clone(), seat: Some(seat_b()) }];
         let modes = format!("container:{other}\n");
-        assert_eq!(orphaned_holders(&[holder.clone()], &modes), vec![holder]);
+        assert_eq!(reapable_holders(&mine, &seat_b(), &modes), vec![holder]);
     }
 
     /// The reaper asks for full ids, because a job's network mode names its holder by full id. Comparing
     /// a truncated id against that would never match and would reap every holder, including busy ones.
     #[test]
     fn the_holder_listing_asks_for_untruncated_ids() {
-        let argv = list_holders_argv();
+        let argv = list_holders_argv(&seat_b());
         assert!(argv.contains(&"--no-trunc".to_owned()), "{argv:?}");
         assert!(argv.iter().any(|arg| arg == &format!("label={HOLDER_LABEL}")), "{argv:?}");
+        // `--quiet` would suppress the seat column the ownership check reads.
+        assert!(!argv.contains(&"--quiet".to_owned()), "{argv:?}");
+    }
+
+    /// The listing must both narrow to this seat and print the seat back for the Rust-side check.
+    /// Asking docker without reading the answer would leave the guard resting on a filter alone.
+    #[test]
+    fn the_holder_listing_narrows_to_the_seat_and_prints_it_back() {
+        let argv = list_holders_argv(&seat_b());
+        assert!(
+            argv.iter().any(|arg| arg == &format!("label={HOLDER_SEAT_LABEL}={}", seat_b())),
+            "the listing must filter to the booting seat: {argv:?}"
+        );
+        // Written out by hand rather than rebuilt with the same `format!` escaping the code uses: an
+        // expectation that borrows the idiom under test agrees with it even when both are wrong. These
+        // are the bytes docker must receive as a Go template, read back off a failing run.
+        let format = argv.last().expect("a --format template");
+        assert_eq!(format, "{{.ID}}\t{{.Label \"ai.maxplayer.netns-holder-seat\"}}");
+        // Round-trip: what that template produces is what the parser reads.
+        let parsed = parse_holder_listing(&format!("{}\t{}\n", seat_b_holder(), seat_b()));
+        assert_eq!(parsed, vec![HolderRecord { id: seat_b_holder(), seat: Some(seat_b()) }]);
     }
 
     #[test]

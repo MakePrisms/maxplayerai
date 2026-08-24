@@ -90,19 +90,32 @@ impl From<TransportError> for SellerGitError {
 pub struct DeliveryAgentIdentity {
     pub name: String,
     pub email: String,
+    /// The seat's full public key hex. Private because it must stay the key `name` and `email` were
+    /// derived from: a caller free to set it independently could label a container as one seat while
+    /// committing as another.
+    seller_pubkey_hex: String,
 }
 
 impl DeliveryAgentIdentity {
     /// Derive a stable seller-run identity from the seller pubkey hex.
     pub fn for_seller(seller_pubkey_hex: &str) -> Self {
-        let short = seller_pubkey_hex
-            .get(..16)
-            .unwrap_or(seller_pubkey_hex)
-            .to_ascii_lowercase();
+        let full = seller_pubkey_hex.trim().to_ascii_lowercase();
+        let short = full.get(..16).unwrap_or(&full).to_owned();
         Self {
             name: format!("maxplayer-seller-{short}"),
             email: format!("{short}@seller.maxplayer.invalid"),
+            seller_pubkey_hex: full,
         }
+    }
+
+    /// The seat's full public key hex — the stable, non-secret identifier of *this* seller daemon.
+    ///
+    /// Exists because `name` and `email` carry only the first 16 hex characters, which is enough to
+    /// attribute a git commit and not enough to own a resource on a shared host. The egress-containment
+    /// holder label ([`crate::sandbox_netns::HOLDER_SEAT_LABEL`]) is stamped from this, and the boot
+    /// reaper matches on it, so both sides of that comparison come from one value.
+    pub fn seller_pubkey_hex(&self) -> &str {
+        &self.seller_pubkey_hex
     }
 
     /// Env that overrides ambient git identity for commits made during the agent run (the AGENT
