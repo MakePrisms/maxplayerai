@@ -2281,7 +2281,15 @@ const HARNESS_PROBE_MAX_ATTEMPTS: usize = 3;
 /// that can name the cause. Retrying it is still right; asserting the model's mood is not.
 enum ProbeAttempt {
     /// The harness produced the sentinel artifact: a proven turn.
-    Proven,
+    ///
+    /// Carries the model the harness reported for this turn, which is the ONLY moment it is
+    /// observable: the probe is the one place the node runs the harness and reads its usage back
+    /// before serving. Dropping it here is what leaves a production roster's `models` empty, and an
+    /// empty roster cannot emit `harness_model` on a heartbeat or a claim.
+    ///
+    /// `None` is a real answer, not a gap: a harness that exposes no usage has no model to
+    /// advertise, and absent-stays-absent all the way to the wire rather than being filled in.
+    Proven { model: Option<String> },
     /// The ACP turn completed but left no artifact carrying the sentinel. Carries the agent's own last
     /// message when it said anything — the cause is in there or nowhere.
     CompletedNoArtifact { agent_message: Option<String> },
@@ -2296,8 +2304,10 @@ enum ProbeAttempt {
 enum ProbeStep {
     /// The flaky shape, with turns still left: probe again.
     Retry,
-    /// Stop: this is the verdict the gate records (an `Err` is fail-closed).
-    Done(Result<(), (String, Fault)>),
+    /// Stop: this is the verdict the gate records (an `Err` is fail-closed). The `Ok` payload is the
+    /// model this turn reported, carried forward so the roster can record what the harness actually
+    /// ran rather than what a config guessed.
+    Done(Result<Option<String>, (String, Fault)>),
 }
 
 /// How much of an agent's message an operator line carries. Long enough for a vendor error string
@@ -2418,7 +2428,7 @@ fn unrunnable_reason(error: &ExecError) -> String {
 ///   shape that retries, and only up to `max_attempts`.
 fn probe_step(attempt: usize, max_attempts: usize, outcome: ProbeAttempt) -> ProbeStep {
     match outcome {
-        ProbeAttempt::Proven => ProbeStep::Done(Ok(())),
+        ProbeAttempt::Proven { model } => ProbeStep::Done(Ok(model)),
         ProbeAttempt::Unrunnable { reason, fault } => ProbeStep::Done(Err((reason, fault))),
         ProbeAttempt::CompletedNoArtifact { agent_message } => {
             if attempt + 1 < max_attempts {
@@ -2496,7 +2506,9 @@ async fn run_harness_probe_once(
     // The turn "succeeded" — now ask the only question that separates a working harness from an
     // exhausted one: is the sentinel actually here?
     if probe_sentinel_present(workdir, sentinel) {
-        ProbeAttempt::Proven
+        ProbeAttempt::Proven {
+            model: report.usage.and_then(|usage| usage.model),
+        }
     } else {
         ProbeAttempt::CompletedNoArtifact {
             agent_message: report.last_agent_message,
@@ -2518,7 +2530,7 @@ async fn run_harness_probe(
     sentinel: &str,
 ) -> Result<(), (String, Fault)> {
     match run_harness_probe_once(argv, sandbox, identity, workdir, sentinel).await {
-        ProbeAttempt::Proven => Ok(()),
+        ProbeAttempt::Proven { .. } => Ok(()),
         ProbeAttempt::Unrunnable { reason, fault } => Err((reason, fault)),
         ProbeAttempt::CompletedNoArtifact { agent_message } => Err((
             flaky_harness_reason(1, agent_message.as_deref()),
@@ -2639,7 +2651,11 @@ fn probe_sentinel_present(workdir: &std::path::Path, sentinel: &str) -> bool {
 pub struct HarnessProbeVerdict {
     pub index: usize,
     pub name: Option<String>,
-    pub result: Result<(), (String, Fault)>,
+    /// `Ok` carries the model the harness reported on its proving turn, or `None` when it exposed no
+    /// usage. This is the value the roster records, and it is sourced from the run itself rather than
+    /// from configuration — a config can state a model the harness is not actually serving, and a
+    /// buyer filtering on `harness_model` would then be matched against a claim the seat cannot keep.
+    pub result: Result<Option<String>, (String, Fault)>,
 }
 
 /// Probe ONE configured harness under the retry policy (#472), returning the verdict the gate records.
@@ -2655,7 +2671,7 @@ async fn probe_one_harness(
     sandbox: &SandboxPolicy,
     identity: &DeliveryAgentIdentity,
     home: &MaxplayerHome,
-) -> Result<(), (String, Fault)> {
+) -> Result<Option<String>, (String, Fault)> {
     for attempt in 0..HARNESS_PROBE_MAX_ATTEMPTS {
         let probe = mint_probe_identity(index, attempt, now_unix() as u64);
         let workdir = job_workdir(home, &probe.dir_label);
@@ -5301,16 +5317,27 @@ impl SellerNodeRunner {
     /// from the very first tick (#357). Provers are left untouched (boot already starts them serving).
     fn narrow_roster_to(&self, verdicts: &[HarnessProbeVerdict]) {
         for verdict in verdicts {
-            if let Err((reason, fault)) = &verdict.result {
-                let state = self.agents.fault(verdict.index, fault.clone(), Instant::now());
-                let label = self
-                    .agents
-                    .label(verdict.index)
-                    .unwrap_or_else(|| "<unlabelled>".to_owned());
-                opline!(
-                    "seller node pre-advertise DROPPED {label}: {reason} — {}",
-                    state.reason()
-                );
+            match &verdict.result {
+                // The proving turn is the one moment the node has run this harness and read its
+                // usage back, so it is the only honest source for the model. Recorded BEFORE the
+                // runner serves, which is what makes the first heartbeat and the first claim carry
+                // the same answer every later one does — an empty roster advertises no
+                // `harness_model` at all, and a buyer filtering on it never matches this seat.
+                //
+                // `None` is written through deliberately rather than skipped: a harness that stopped
+                // reporting usage must not keep advertising the model it reported last boot.
+                Ok(model) => self.agents.record_model(verdict.index, model.clone()),
+                Err((reason, fault)) => {
+                    let state = self.agents.fault(verdict.index, fault.clone(), Instant::now());
+                    let label = self
+                        .agents
+                        .label(verdict.index)
+                        .unwrap_or_else(|| "<unlabelled>".to_owned());
+                    opline!(
+                        "seller node pre-advertise DROPPED {label}: {reason} — {}",
+                        state.reason()
+                    );
+                }
             }
         }
     }
@@ -6974,7 +7001,7 @@ mod tests {
         let verdicts = vec![HarnessProbeVerdict {
             index: 0,
             name: Some("claude".to_owned()),
-            result: Ok(()),
+            result: Ok(None),
         }];
         let outcome = boot_advertising_only_proven(home, verdicts).await;
 
@@ -12792,7 +12819,7 @@ mod tests {
         let verdicts = vec![HarnessProbeVerdict {
             index: 0,
             name: Some("claude".to_owned()),
-            result: Ok(()),
+            result: Ok(None),
         }];
 
         let runner = boot_advertising_only_proven(home, verdicts)
@@ -12844,7 +12871,7 @@ mod tests {
         let verdicts = vec![HarnessProbeVerdict {
             index: 0,
             name: Some("claude".to_owned()),
-            result: Ok(()),
+            result: Ok(None),
         }];
         let runner = boot_advertising_only_proven(home, verdicts)
             .await
@@ -12871,6 +12898,83 @@ mod tests {
             runner.agents.advertisement().capability().capabilities,
             expected,
             "the claim capability must carry the same probed set as the heartbeat"
+        );
+
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The model the PROVING TURN reported must reach the roster before the runner serves, on both
+    // wire surfaces. Without it a production roster's `models` stays empty, no `harness_model` is
+    // emitted at all, and #866's model filter rejects every real seat — a seat that works perfectly
+    // and is unreachable to exactly the buyers who asked for what it runs.
+    //
+    // The model arrives here the only way it legitimately can: carried out of the probe on the `Ok`
+    // arm of the verdict. It is NOT read from config, because a config can name a model the harness
+    // is not serving, and a buyer filtering on that claim would match a seat that cannot keep it.
+    #[tokio::test]
+    async fn the_proving_turns_model_reaches_both_wire_surfaces_before_serving() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("model-wired");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        crate::home::save_config(&mut home, |config| {
+            // A NAMED roster entry, deliberately: a model tag is keyed by the harness it belongs to,
+            // so the unlabelled `--agent-argv` hatch drops an observed model as unattributable. The
+            // wiring this test is about is only observable on a named entry.
+            let mut seller = seller_cfg(1, false);
+            seller.agents = vec!["claude".to_owned()];
+            config.seller = Some(seller);
+            // A preset argv that resolves in any environment. The harness is never RUN here — the
+            // proving turn is supplied as a verdict — so the argv only has to exist; requiring the
+            // real ACP adapter would make this a test of the CI image rather than of the wiring.
+            config.agents.insert(
+                "claude".to_owned(),
+                crate::home::AgentPresetConfig {
+                    argv: vec!["true".to_owned()],
+                },
+            );
+            config.relay_url = fixture.url();
+        })
+        .expect("persist config");
+
+        let verdicts = vec![HarnessProbeVerdict {
+            index: 0,
+            name: Some("claude".to_owned()),
+            result: Ok(Some("claude-opus-5".to_owned())),
+        }];
+        let runner = boot_advertising_only_proven(home, verdicts)
+            .await
+            .expect("a proven seat must boot");
+
+        // The roster pairs the model with the entry's advertised NAME.
+        assert_eq!(
+            runner
+                .agents
+                .advertisement()
+                .models
+                .iter()
+                .map(|entry| (entry.harness.as_str(), entry.model.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("claude", "claude-opus-5")],
+            "the first heartbeat must carry the model the proving turn reported, paired to its \
+             roster entry — an empty `models` here is the defect this test exists for"
+        );
+        // The claim emitter reads the SAME snapshot and canonicalises the name to a wire FAMILY, so
+        // a buyer filtering on a claim and a buyer filtering on a heartbeat cannot get different
+        // answers about this seat. Asserted in the wire vocabulary, which is what a filter matches:
+        // the roster says `claude`, the wire says `claude-code`, and that difference is deliberate.
+        assert_eq!(
+            runner
+                .agents
+                .advertisement()
+                .capability()
+                .models
+                .iter()
+                .map(|entry| (entry.family.as_str(), entry.model.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("claude-code", "claude-opus-5")],
+            "the claim capability must carry the same model as the heartbeat, in the wire family \
+             vocabulary #866's filter matches on"
         );
 
         runner.client.disconnect().await;
@@ -12999,8 +13103,8 @@ mod tests {
     fn probe_step_stops_on_a_proven_turn() {
         // A proven turn ends the loop immediately — the gate's healthy direction is unchanged.
         assert!(matches!(
-            probe_step(0, 3, ProbeAttempt::Proven),
-            ProbeStep::Done(Ok(()))
+            probe_step(0, 3, ProbeAttempt::Proven { model: None }),
+            ProbeStep::Done(Ok(None))
         ));
     }
 
@@ -13080,7 +13184,7 @@ mod tests {
         let script = [
             ProbeAttempt::CompletedNoArtifact { agent_message: None },
             ProbeAttempt::CompletedNoArtifact { agent_message: None },
-            ProbeAttempt::Proven,
+            ProbeAttempt::Proven { model: None },
         ];
         let mut verdict = None;
         for (attempt, outcome) in script.into_iter().enumerate() {
@@ -13093,7 +13197,7 @@ mod tests {
             }
         }
         assert!(
-            matches!(verdict, Some(Ok(()))),
+            matches!(verdict, Some(Ok(None))),
             "a harness that delivers on its third turn must be proven, not grounded: {verdict:?}"
         );
     }
@@ -13109,7 +13213,7 @@ mod tests {
                 reason: launcher_unrunnable_reason(&ExecError::AcpRequired),
                 fault: Fault::Incapable(MissingCapability::AcpFeature),
             },
-            ProbeAttempt::Proven,
+            ProbeAttempt::Proven { model: None },
         ];
         let mut consumed = 0;
         let mut verdict = None;
