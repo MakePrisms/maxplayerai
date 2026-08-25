@@ -171,8 +171,13 @@ struct HarnessState {
     /// snapshot under one lock (#784):
     ///
     /// - the **setter** — a probe turn that PROVED this harness can serve (boot, or a restore).
-    /// - the **refresher** — a job that completed on this harness, carrying the model that job
-    ///   actually ran on.
+    /// - the **refresher** — a job that completed on this harness, carrying the model that job's
+    ///   `session/new` reported.
+    ///
+    /// ⚠ Both sources are SELF-REPORTS, not observations of execution. ACP surfaces the model only
+    /// on the `session/new` response, which the harness sends before it does any work; nothing here
+    /// pins the model or checks what actually ran. What makes the value worth advertising is its
+    /// PROVENANCE — machine-sourced rather than operator-typed.
     ///
     /// Written as an `Option` and overwritten UNCONDITIONALLY, including with `None`. A newer
     /// observation that saw no model must clear an older one: keeping the stale value would advertise
@@ -650,8 +655,8 @@ mod tests {
 
     #[test]
     fn a_later_observation_replaces_an_earlier_one() {
-        // The refresher's whole purpose: a job that ran on a newly-changed default must correct the
-        // model the boot probe recorded, not sit behind it.
+        // The refresher's whole purpose: a later `session/new` reporting a newly-changed default
+        // must correct the model the boot probe recorded, not sit behind it.
         let roster = named(&["claude"]);
         roster.record_model(0, Some("claude-opus-5".to_owned()));
         roster.record_model(0, Some("claude-opus-6".to_owned()));

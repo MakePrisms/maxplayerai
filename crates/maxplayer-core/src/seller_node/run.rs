@@ -2310,8 +2310,13 @@ enum ProbeStep {
     /// The flaky shape, with turns still left: probe again.
     Retry,
     /// Stop: this is the verdict the gate records (an `Err` is fail-closed). The `Ok` payload is the
-    /// model this turn reported, carried forward so the roster can record what the harness actually
-    /// ran rather than what a config guessed.
+    /// model this turn's `session/new` reported, carried forward so the roster records a
+    /// MACHINE-SOURCED value rather than an operator-typed one.
+    ///
+    /// ⚠ Reported, not executed. [`crate::driver::AcpDriver`] captures `models.currentModelId` off
+    /// the `session/new` response; it does not select, pin or verify what the harness runs. The
+    /// value's worth is its PROVENANCE — the harness said it about itself — never a record of
+    /// execution.
     Done(Result<Option<String>, (String, Fault)>),
 }
 
@@ -2668,10 +2673,15 @@ fn probe_sentinel_present(workdir: &std::path::Path, sentinel: &str) -> bool {
 pub struct HarnessProbeVerdict {
     pub index: usize,
     pub name: Option<String>,
-    /// `Ok` carries the model the harness reported on its proving turn, or `None` when it exposed no
-    /// usage. This is the value the roster records, and it is sourced from the run itself rather than
-    /// from configuration — a config can state a model the harness is not actually serving, and a
-    /// buyer filtering on `harness_model` would then be matched against a claim the seat cannot keep.
+    /// `Ok` carries the model the harness reported on its proving turn's `session/new`, or `None`
+    /// when it exposed no usage. This is the value the roster records, and it is sourced from the
+    /// harness itself rather than from configuration.
+    ///
+    /// ⚠ The reason is PROVENANCE, not enforcement. Reading it from config would destroy the one
+    /// property this value has — that the harness said it about itself — and substitute a number an
+    /// operator typed, which can drift from the harness with nothing to notice. Neither form is a
+    /// promise about execution: ACP reports the model before any work happens, and nothing here pins
+    /// it.
     pub result: Result<Option<String>, (String, Fault)>,
 }
 
@@ -12938,14 +12948,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // The model the PROVING TURN reported must reach the roster before the runner serves, on both
-    // wire surfaces. Without it a production roster's `models` stays empty, no `harness_model` is
-    // emitted at all, and #866's model filter rejects every real seat — a seat that works perfectly
-    // and is unreachable to exactly the buyers who asked for what it runs.
+    // The model the PROVING TURN's `session/new` reported must reach the roster before the runner
+    // serves, on both wire surfaces. Without it a production roster's `models` stays empty, no
+    // `harness_model` is emitted at all, and #866's model filter rejects every real seat — a seat
+    // that works perfectly and is unreachable to exactly the buyers who named the model it reports.
     //
     // The model arrives here the only way it legitimately can: carried out of the probe on the `Ok`
-    // arm of the verdict. It is NOT read from config, because a config can name a model the harness
-    // is not serving, and a buyer filtering on that claim would match a seat that cannot keep it.
+    // arm of the verdict. It is NOT read from config, because config would destroy the value's one
+    // property — machine-sourced provenance — and advertise an operator-typed id instead. Neither
+    // source promises what will execute; the advertised value is a self-report either way.
     #[tokio::test]
     async fn the_proving_turns_model_reaches_both_wire_surfaces_before_serving() {
         let fixture = PGateRelay::start(Duration::from_millis(0)).await;

@@ -81,6 +81,23 @@ pub const HARNESS_FAMILY_TAG: &str = "harness_family";
 ///
 /// ⚠ One namespace is not one value: the two are separate reads and CAN differ honestly — see below.
 ///
+/// ## The one thing this field must never be written as
+///
+/// ⚠ THE REFERENT IS NOT A TENSE. Every wording that upgrades this SELF-REPORT into an EXECUTION
+/// FACT is the same defect, and it has been written in all three tenses already — "the model it
+/// will use" (future), "the model it is serving" (present), "the model the job actually ran on"
+/// (past). Rewriting one tense leaves the others, because the tense was never the error.
+///
+/// The test to apply to any new wording: ACP reports `models.currentModelId` on the `session/new`
+/// RESPONSE, before the harness does any work, and nothing in this codebase pins the model or reads
+/// back what executed. So the field can carry only "what this harness said about itself, when it was
+/// last asked". Anything stronger — ran, runs, will run, is serving, guarantees — is a claim no code
+/// here supports.
+///
+/// What the value is worth is PROVENANCE: machine-sourced beats operator-typed, because an operator
+/// can type a model the harness has never reported and nothing would notice. That is the argument
+/// for reading it off the run rather than off config — never an argument that it binds execution.
+///
 /// ⚠ Comparable is not checked. Both ids are the seller's own report, and §6.4 states that nothing
 /// verifies the execution-metadata block and that a reader MUST NOT treat it as proof a given model
 /// ran. A divergence is an inconsistency a buyer can see in its own records — never a falsifier.
