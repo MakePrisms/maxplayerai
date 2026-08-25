@@ -3,8 +3,9 @@
 //! A running seller republishes an **addressable** (NIP-01 parameterized-replaceable) event,
 //! `d="maxplayer-seller"`, on a ~5-minute cadence. It carries every seat-level fact a buyer needs
 //! before it trades: whether the seat is `accepting` new work, its `queue_depth`, its `rate`, the
-//! `accepted_mints` it can be paid on, and the `agents` it can run. Every fact is current as of
-//! that beat.
+//! `accepted_mints` it can be paid on, and the `agents` it can run. Every fact is current as of that
+//! beat EXCEPT two: [`HARNESS_MODEL_TAG`] is last-observed and [`CAPABILITIES_TAG`] is bounded by
+//! the seat's uptime. `docs/protocol-v1.md` §4.5.4 is normative for both.
 //!
 //! **This is the seat's only capability surface.** Issue #645 retired the kind-31990 handler
 //! announce that used to carry the mints and the harness label; a reader must take capability from
@@ -68,8 +69,14 @@ pub const HARNESS_FAMILY_TAG: &str = "harness_family";
 /// `["harness_model", "<family>", "<currentModelId>"]`, REPEATED once per serving harness.
 ///
 /// The value is whatever that harness's own ACP `session/new` reports as `models.currentModelId`,
-/// verbatim — never operator-typed, and the same field that fills `model_used` on the receipt. That
-/// puts advertised and delivered ids in ONE NAMESPACE, so they are directly comparable.
+/// verbatim — never operator-typed, and the same value the seller later reports as `["model", name]`
+/// on the RESULT event (`docs/protocol-v1.md` §6.4), which a buyer records as its own `model_used`
+/// attribution. That puts advertised and delivered ids in ONE NAMESPACE, so they are directly
+/// COMPARABLE.
+///
+/// ⚠ Comparable is not checked. Both ids are the seller's own report, and §6.4 states that nothing
+/// verifies the execution-metadata block and that a reader MUST NOT treat it as proof a given model
+/// ran. A divergence is an inconsistency a buyer can see in its own records — never a falsifier.
 ///
 /// ## Why paired, and why not a flat list
 ///
@@ -90,7 +97,7 @@ pub const HARNESS_FAMILY_TAG: &str = "harness_family";
 ///
 /// ## One namespace is not one value
 ///
-/// The advertisement and the receipt are two SEPARATE `session/new` invocations, minutes apart, and
+/// The advertisement and the RESULT are two SEPARATE `session/new` invocations, minutes apart, and
 /// `reasoning_effort` — which composes into the bracket suffix of the very id being filtered on — is
 /// a settable harness control. So an advertised id CAN differ from the delivered one with no liar
 /// involved: two honest reads at two times. This design does not eliminate that drift; it reduces it
@@ -155,8 +162,11 @@ pub const HARNESS_VARIANT_TAG: &str = "harness_variant";
 ///
 /// The probe runs ONCE, at seat start, and every beat for the life of the process republishes that
 /// same snapshot. So the staleness bound is how long the seat has been running, and a recent beat is
-/// no evidence of a recent measurement. This is the only field that takes that narrowing; see
-/// `docs/protocol-v1.md` §4.5.4, which is normative for it.
+/// no evidence of a recent measurement.
+///
+/// TWO fields narrow §4.2's general rule, not one: this one is uptime-bounded and
+/// [`HARNESS_MODEL_TAG`] is last-observed. [`HARNESS_FAMILY_TAG`] is the only filterable field that
+/// is genuinely current as of the beat carrying it. See `docs/protocol-v1.md` §4.5.4, normative.
 ///
 /// Drift runs in BOTH directions and they are not symmetric. A toolchain INSTALLED into a running
 /// seat's environment is not advertised until restart — the seat under-claims and loses awards it
@@ -209,7 +219,7 @@ pub struct SeatCapability {
     pub harness_families: Vec<String>,
     /// One machine-sourced `currentModelId` per serving harness, PAIRED to that harness. Empty ⇒
     /// unstated. See [`HARNESS_MODEL_TAG`] for why it is paired, and for why one namespace with the
-    /// receipt is not one value.
+    /// RESULT's `model` tag is not one value.
     pub models: Vec<HarnessModel>,
     /// Capability tokens this seat PROVED it can run, from
     /// [`crate::capability::probe_capabilities`]. Canonical by PROVENANCE — the only emitter yields

@@ -850,8 +850,13 @@ pub fn job_identity() -> (u32, u32) {
 /// was established for it.
 ///
 /// ⚠ What a proven token means is bounded by exactly this: the command resolved in this environment
-/// at this moment. It does not mean a build will succeed, and the environment can change before a
-/// job arrives — the advertisement is a claim bounded by the probe's cadence, never a guarantee.
+/// at the moment of the probe. It does not mean a build will succeed, and the environment can change
+/// before a job arrives.
+///
+/// ⚠ That moment is ONCE, AT SEAT START. The probe does not repeat, so the advertisement is bounded
+/// by the seat's UPTIME, not by any cadence — every beat for the life of the process republishes
+/// this one measurement. `docs/protocol-v1.md` §4.5.4 is normative; giving the probe a bounded
+/// cadence is #891.
 pub fn probe_launch_argv(
     policy: &SandboxPolicy,
     probe_command: &[String],

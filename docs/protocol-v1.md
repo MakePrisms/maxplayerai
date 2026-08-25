@@ -257,8 +257,11 @@ That bound drifts in BOTH directions, and the two are not equally safe:
   seat OVER-claims: it can be awarded work it can no longer do. Nothing on the filter path catches
   this — the advertisement is what a buyer matches on — so it surfaces at delivery.
 
-A reader MUST NOT infer from a recent beat that its `capabilities` were measured recently. This is a
-narrowing of section 4.2's general rule, and it is the only field that takes it.
+A reader MUST NOT infer from a recent beat that its `capabilities` were measured recently.
+
+Two fields narrow section 4.2's general rule, not one: `harness_model` is last-observed and
+`capabilities` is uptime-bounded. `harness_family` is the only filterable field that is genuinely
+current as of the beat carrying it.
 
 #### 4.5.5 Rollout
 
