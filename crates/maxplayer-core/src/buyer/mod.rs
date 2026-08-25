@@ -815,25 +815,16 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
             };
             let offer_amount = offer.amount_sats;
             let max_sats = params.max_sats.unwrap_or(offer_amount);
-            let filters = AwardFilters {
-                offer_amount_sats: offer_amount,
+            // ONE constructor, shared with `drive_auto_award` — the capability request (#897) and
+            // every other filter come from the SIGNED OFFER, never from award params, so the request
+            // cannot be changed after the fact. Sharing the constructor is what makes "both paths
+            // filter identically" structural instead of a convention someone has to keep noticing.
+            let filters = lifecycle::award_filters_for_offer(
+                offer,
                 max_sats,
-                buyer_mint: context.home.config.default_mint(),
-                allow_real_mints: context.home.config.allow_real_mints,
-                requested_agent: offer.requested_agent.as_deref(),
-                // #897 capability request, read from the SIGNED OFFER on the relay — never from award
-                // params, so the request cannot be changed after the fact. Absent ⇒ passes every
-                // claim, so a buyer that asks for nothing sees the behaviour it saw before.
-                //
-                // Every axis below must stay identical to the auto path in `drive_auto_award` — a
-                // property `both_award_paths_read_the_capability_request_off_the_offer` holds, rather
-                // than a convention to remember. A request honoured on one path and dropped on the
-                // other is the bypass #866 was filed to close, and naming a claim chooses WHICH claim
-                // is judged, never WHETHER it is.
-                requested_harness_family: offer.requested_harness_family.as_deref(),
-                requested_model: offer.requested_model.as_deref(),
-                required_capabilities: &offer.required_capabilities,
-            };
+                context.home.config.default_mint(),
+                context.home.config.allow_real_mints,
+            );
 
             // Manual award names the claim but applies the SAME hard filters as auto-award —
             // max_sats, price, mint AND the #784 capability request. Naming a claim chooses which
@@ -1315,21 +1306,15 @@ async fn drive_auto_award(
             return Ok(());
         };
         unconfirmed_reads = 0;
-        let filters = AwardFilters {
-            offer_amount_sats: offer.amount_sats,
+        // THE SAME constructor the manual award path uses, so the two cannot apply different filters.
+        // Both selection entry points then consult `claim_meets_capability_request`:
+        // `select_awardable_claim` here, `named_claim_awardable` on the manual path.
+        let filters = lifecycle::award_filters_for_offer(
+            offer,
             max_sats,
-            buyer_mint: context.home.config.default_mint(),
-            allow_real_mints: context.home.config.allow_real_mints,
-            requested_agent: offer.requested_agent.as_deref(),
-            // #897 capability request, read from the SIGNED OFFER — the SAME two fields the manual
-            // path reads above, in the same order. Both selection paths call
-            // `claim_meets_capability_request`: `select_awardable_claim` here,
-            // `named_claim_awardable` on the manual path, and a test holds the refusal property from
-            // BOTH entry points so this cannot quietly become false the way its predecessor did.
-            requested_harness_family: offer.requested_harness_family.as_deref(),
-            requested_model: offer.requested_model.as_deref(),
-            required_capabilities: &offer.required_capabilities,
-        };
+            context.home.config.default_mint(),
+            context.home.config.allow_real_mints,
+        );
 
         // Built AFTER `filters` so the deadline park can name the capability request that refused
         // everything, instead of only reporting that time ran out. The order of these two blocks is
