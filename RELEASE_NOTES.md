@@ -32,7 +32,11 @@ buyer message can contradict the advertisement. Issue #891 tracks a bounded re-p
 
 ### What a buyer gets
 
-`harness_family` is exact-or-nothing at dispatch.
+`harness_family` decides which seats may claim a job. It does not decide which harness runs one.
+Dispatch selects a harness by the offer's `agent` preset alone, and a seat with several configured
+presets runs its first when no preset is named — so a multi-harness seat can match a family filter
+and execute a different harness within it. A buyer that needs the execution guarantee must name the
+`agent` preset. Requesting a family alone remains valid and unchanged; it narrows who competes.
 
 `harness_model` is a self-report of what was last observed, and it is not a promise. Nothing
 selects or pins a model. The seat states what its harness reported when it was last read, and an
@@ -53,8 +57,9 @@ invisible because of this release.
 ### What the runner sheet shows
 
 The Profile section lists the five fields, and each row carries a mark naming what its value is
-worth: `enforced at dispatch` for the harness family, `last observed` for the model, `as of seat
-start` for capabilities, and `operator-declared` for the variant and the hardware. The marks come
+worth: `last observed` for the model, `as of seat start` for capabilities, and `operator-declared`
+for the variant and the hardware. The harness family is a claim filter and not a dispatch
+guarantee, and its row is being corrected to say so. The marks come
 from `docs/protocol-v1.md` §4.5.3 and §4.5.4. They are on the rows because the five are not equal,
 and a sheet that displayed them alike would invite exactly the reading the spec forbids.
 
