@@ -65,14 +65,21 @@ pub const ACCEPTED_MINTS_TAG: &str = "accepted_mints";
 /// [`crate::agent_presets::HARNESS_FAMILIES`]; a preset with no family contributes nothing.
 pub const HARNESS_FAMILY_TAG: &str = "harness_family";
 
-/// Wire tag pairing ONE serving harness to the model it will actually use (#784):
+/// Wire tag pairing ONE serving harness to the model it LAST REPORTED (#784):
 /// `["harness_model", "<family>", "<currentModelId>"]`, REPEATED once per serving harness.
 ///
+/// ⚠ Last-observed, NOT a promise about the next job. Nothing here selects or pins a model: the seat
+/// states what a harness reported when it was last read, and the job that arrives later starts its
+/// own session. §4.5.4 is normative; #785 carries the model-SELECTION work that would make this a
+/// commitment rather than an observation.
+///
 /// The value is whatever that harness's own ACP `session/new` reports as `models.currentModelId`,
-/// verbatim — never operator-typed, and the same value the seller later reports as `["model", name]`
+/// verbatim — never operator-typed. The SAME ACP FIELD later supplies the seller's `["model", name]`
 /// on the RESULT event (`docs/protocol-v1.md` §6.4), which a buyer records as its own `model_used`
-/// attribution. That puts advertised and delivered ids in ONE NAMESPACE, so they are directly
+/// attribution. One field, one namespace — so the advertised and delivered ids are directly
 /// COMPARABLE.
+///
+/// ⚠ One namespace is not one value: the two are separate reads and CAN differ honestly — see below.
 ///
 /// ⚠ Comparable is not checked. Both ids are the seller's own report, and §6.4 states that nothing
 /// verifies the execution-metadata block and that a reader MUST NOT treat it as proof a given model
@@ -486,7 +493,9 @@ fn stated_values(values: Vec<String>) -> Vec<String> {
     values.iter().filter_map(|value| stated(value)).collect()
 }
 
-/// One serving harness and the model it will use — the decoded form of [`HARNESS_MODEL_TAG`].
+/// One serving harness and the model it LAST REPORTED — the decoded form of [`HARNESS_MODEL_TAG`].
+///
+/// Last-observed, never a commitment about the next job: see [`HARNESS_MODEL_TAG`].
 ///
 /// The pair is the unit on purpose. Splitting it into two parallel lists is what reintroduces the
 /// positional-desync failure the tag shape exists to prevent, so there is deliberately no API here
