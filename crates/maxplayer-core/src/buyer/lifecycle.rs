@@ -19,8 +19,8 @@ use cashu::{Amount, CurrencyUnit};
 
 use crate::crossmint::plan_payment;
 use crate::job_lifecycle::{
-    AwardClaimOutcome, AwardPresence, JobLifecycleError, JobView, PreparedAward, PresenceRead,
-    SendOutcome,
+    AwardClaimOutcome, AwardPresence, JobLifecycleError, JobView, OfferView, PreparedAward,
+    PresenceRead, SendOutcome,
 };
 
 use super::reservations::{Converted, JobDisposition, ReservationState, ReserveRefused};
@@ -57,6 +57,41 @@ pub struct AwardFilters<'a> {
     /// Capability tokens the offer requires (#784). Empty ⇒ no requirement. Every token is validated
     /// against [`crate::capability::CAPABILITIES`] before any claim is judged.
     pub required_capabilities: &'a [String],
+}
+
+/// Build the award filters for a job from its SIGNED OFFER — the ONE constructor both award paths
+/// use (#897).
+///
+/// ★ THIS EXISTS SO THE TWO PATHS CANNOT DIVERGE, rather than so a test can detect that they have.
+/// The manual RPC and `drive_auto_award` must apply identical filters — a request honoured on one and
+/// dropped on the other is the bypass #866 was filed to close — and two hand-written literals make
+/// that a property somebody has to keep noticing. One constructor makes it structural: a new request
+/// axis is added here once and both paths have it.
+///
+/// It also removes a subtler hazard that had already bitten: while the two literals existed, the
+/// tests needed a THIRD copy to build filters the way production does, and that copy silently drifted
+/// from production for a revision — tests kept passing while asserting behaviour production did not
+/// have. There is now nothing to drift from, which is why this is a constructor rather than a
+/// stronger test.
+///
+/// Everything filterable comes from the OFFER; only the money context is passed in, because the
+/// buyer's mint and its real-mint policy are properties of the buyer rather than of the job.
+pub fn award_filters_for_offer<'a>(
+    offer: &'a OfferView,
+    max_sats: u64,
+    buyer_mint: &'a str,
+    allow_real_mints: bool,
+) -> AwardFilters<'a> {
+    AwardFilters {
+        offer_amount_sats: offer.amount_sats,
+        max_sats,
+        buyer_mint,
+        allow_real_mints,
+        requested_agent: offer.requested_agent.as_deref(),
+        requested_harness_family: offer.requested_harness_family.as_deref(),
+        requested_model: offer.requested_model.as_deref(),
+        required_capabilities: &offer.required_capabilities,
+    }
 }
 
 /// Select the claim to auto-award: the first LIVE claim whose seller-authored `creq` passes every
@@ -3623,21 +3658,17 @@ mod tests {
         }
     }
 
-    /// Mirror of the `AwardFilters` both award sites construct. Kept in one place here so a test
-    /// cannot accidentally exercise a request shape production never builds — and
-    /// `both_award_paths_read_the_capability_request_off_the_offer` is what holds this mirror honest,
-    /// by pinning the form the real sites use.
+    /// The filters production would build for this offer — THE PRODUCTION CONSTRUCTOR ITSELF, not a
+    /// copy of it.
+    ///
+    /// This was briefly a hand-written mirror, and the mirror drifted: it carried
+    /// `requested_model: None` for a revision while production read the offer, so two model tests
+    /// passed while asserting the opposite of the intended behaviour. A test that restates production
+    /// wiring is a second copy subject to exactly the same drift rule as a gate that restates a
+    /// predicate, and the fix in both cases is to call the real thing rather than to test the copy
+    /// harder.
     fn filters_from_offer<'a>(offer: &'a OfferView, max_sats: u64) -> AwardFilters<'a> {
-        AwardFilters {
-            offer_amount_sats: offer.amount_sats,
-            max_sats,
-            buyer_mint: DEFAULT_MINT_URL,
-            allow_real_mints: false,
-            requested_agent: offer.requested_agent.as_deref(),
-            requested_harness_family: offer.requested_harness_family.as_deref(),
-            requested_model: offer.requested_model.as_deref(),
-            required_capabilities: &offer.required_capabilities,
-        }
+        award_filters_for_offer(offer, max_sats, DEFAULT_MINT_URL, false)
     }
 
     // THE ACCEPTANCE TEST FOR #897, both axes through BOTH selection entry points.
@@ -4036,78 +4067,30 @@ mod tests {
         // hand-written assertions so that adding a fourth request field to `AwardFilters` and wiring
         // it is the only way to satisfy this — a new axis left inert has to be added here to pass,
         // which is the moment its author reads what that costs.
-        // `filters_from_offer` in THIS file is a hand-written mirror of the production wiring, and
-        // every offer-sourced test below is built on it. A mirror that drifts makes those tests prove
-        // less than they appear to while still passing — which is not hypothetical: this mirror
-        // shipped with `requested_model: None` for one revision, and two model tests silently
-        // asserted that a model request awards the claim it should have refused. They went red only
-        // because the model cases were written; nothing structural would have caught it.
-        let mirror = include_str!("lifecycle.rs");
-
-        for (axis, wired_form) in [
-            ("harness family", "requested_harness_family: offer.requested_harness_family.as_deref()"),
-            ("model", "requested_model: offer.requested_model.as_deref()"),
-            ("capabilities", "required_capabilities: &offer.required_capabilities"),
-        ] {
-            let wired = live(wired_form);
-            assert_eq!(
-                wired, AWARD_SITES,
-                "expected both award sites in buyer/mod.rs to read the {axis} request off the \
-                 SIGNED OFFER, found {wired}.\n\
-                 A request honoured on one path and dropped on the other is exactly the bypass #866 \
-                 was filed to close, and naming a claim chooses WHICH claim is judged, never WHETHER \
-                 it is."
-            );
-            assert!(
-                mirror.contains(wired_form),
-                "the test mirror `filters_from_offer` does not spell the {axis} axis the way both \
-                 production award sites do (`{wired_form}`). Every offer-sourced test is built on \
-                 that mirror, so a drifted mirror means those tests exercise a request shape \
-                 production never builds — and they keep passing while doing it."
-            );
-        }
-
-        // No axis may be inert. Kept because it fails on the OPPOSITE mistake from the table above:
-        // the table catches an axis that was never wired, this catches one that was wired and then
-        // quietly turned off.
-        //
-        // Scoped to the axis names — NOT a bare `: None` search. `buyer/mod.rs` is full of unrelated
-        // `Option` fields set to None, so a bare search reports a number that has nothing to do with
-        // this property, and a needle that answers a question you did not ask is worse than none.
-        for axis in [
-            "requested_harness_family: None",
-            "requested_model: None",
-            "required_capabilities: &[]",
-        ] {
-            let inert = live(axis);
-            assert_eq!(
-                inert, 0,
-                "found {inert} inert `{axis}` in buyer/mod.rs. An axis passed inertly is a filter \
-                 the caller was told exists and that refuses nothing — the exact state #897 was \
-                 filed to end. If an axis genuinely must be disabled, the caller-facing description \
-                 in crates/maxplayer/src/mcp.rs owes the same edit IN THE SAME COMMIT, because it \
-                 promises callers a hard filter on a money path."
-            );
-        }
-
-        // The counts above say the two sites we know about are wired. This says there are only two.
-        // Without it, a THIRD award site could construct its own filters — inertly, or from award
-        // params — and every assertion above would still pass, because they count occurrences of the
-        // correct form rather than bounding the total.
-        //
-        // Counted on `AwardFilters {` rather than on the field names, deliberately. The field names
-        // are NOT a usable denominator here: `requested_harness_family:` legitimately appears a third
-        // time in `post_job`, where it fills a `PostJobRequest` on the POSTING path. A total over the
-        // field name conflates the two concerns and goes red for a change that is none of this test's
-        // business — and a duplicate field inside one literal is already a compile error, so the
-        // field-name total was never buying anything the specific forms above do not.
-        let award_sites = live("AwardFilters {");
+        // Both award sites must go through `award_filters_for_offer`, the ONE constructor. That
+        // function reads every axis off the offer, so this single property replaces the per-axis
+        // string-scraping this test used to do — and it replaces it with something stronger, because
+        // a new request axis added to the constructor reaches both paths with no edit here.
+        let shared = live("lifecycle::award_filters_for_offer(");
         assert_eq!(
-            award_sites, AWARD_SITES,
-            "expected exactly {AWARD_SITES} AwardFilters constructions in buyer/mod.rs (the manual \
-             award RPC and drive_auto_award), found {award_sites}. A new award site must read the \
-             capability request off the offer exactly as those two do — a request honoured on some \
-             paths and dropped on others is the bypass #866 was filed to close."
+            shared, AWARD_SITES,
+            "expected both award sites in buyer/mod.rs to build filters through \
+             `lifecycle::award_filters_for_offer`, found {shared}. That constructor is what makes \
+             'both paths filter identically' structural rather than a convention: a site building \
+             its own AwardFilters can silently drop a request axis, which is exactly the bypass #866 \
+             was filed to close."
+        );
+
+        // AND NO SITE MAY HAND-ROLL ITS OWN. Without this the assertion above passes while a third
+        // site quietly constructs a literal beside the two that behave — the counts would confirm the
+        // good paths and say nothing about the bad one.
+        let hand_rolled = live("AwardFilters {");
+        assert_eq!(
+            hand_rolled, 0,
+            "found {hand_rolled} hand-written `AwardFilters` literal(s) in buyer/mod.rs. Every award \
+             site must use `award_filters_for_offer` so a new request axis cannot reach one path and \
+             miss the other. If a site genuinely needs different filters, that is a money-path \
+             decision and belongs in the constructor with a reason, not in a local literal."
         );
     }
 
