@@ -3762,6 +3762,8 @@ mod tests {
     #[test]
     fn the_post_time_gate_refuses_exactly_what_the_predicate_can_never_pass() {
         let rust = vec!["rust".to_owned()];
+        let bogus = vec!["kubernetes".to_owned()];
+        let mixed = vec!["rust".to_owned(), "kubernetes".to_owned()];
         let shapes: Vec<(Option<&str>, Option<&str>, &[String])> = vec![
             // Satisfiable: absent, single-axis, and fully-specified requests.
             (None, None, &[]),
@@ -3772,6 +3774,13 @@ mod tests {
             // Unsatisfiable by construction: a model with no family to pair it to (#788).
             (None, Some("opus"), &[]),
             (None, Some("opus"), &rust),
+            // Out-of-vocabulary capability token. Included because the token rule is the ONE rule
+            // both post-time gates can see: the vocabulary gate checks it directly, and the
+            // predicate checks it too, so the satisfiability gate surfaces it as well. Both read the
+            // same `CAPABILITIES` constant, so adding a token cannot make them disagree — but the
+            // rule being stated twice is worth a row here rather than an argument in a comment.
+            (None, None, &bogus),
+            (Some("codex"), None, &mixed),
         ];
 
         for (family, model, capabilities) in shapes {
@@ -3950,35 +3959,53 @@ mod tests {
     // which is the one place a filter can actually read.
     #[test]
     fn display_only_fields_never_reach_the_award_filter() {
-        let filter_surface = include_str!("lifecycle.rs");
-        let declaration = filter_surface
-            .split_once("pub struct AwardFilters<'a> {")
-            .expect("AwardFilters declaration")
-            .1
-            .split_once("\n}")
-            .expect("end of AwardFilters declaration")
-            .0;
-
-        for display_only in [
-            crate::heartbeat::HARNESS_VARIANT_TAG,
-            crate::heartbeat::HARDWARE_TAG,
-        ] {
-            assert!(
-                !declaration.contains(display_only),
-                "{display_only} is display-only and must NEVER be filterable \
-                 (docs/protocol-v1.md 4.5.1) — it is operator-declared free text that nothing can \
-                 contradict, so filtering on it would award money on an unfalsifiable claim. It \
-                 appears in the AwardFilters declaration."
-            );
+        // FIELD NAMES, not raw text. Searching the declaration's text would fire on a doc comment
+        // that merely MENTIONS hardware — and the natural comment to write beside these fields is
+        // exactly "hardware is never filterable", so the obvious implementation is a false-alarm
+        // generator aimed at the one sentence a careful author would add.
+        fn filter_field_names(source: &str) -> Vec<&str> {
+            source
+                .split_once("pub struct AwardFilters<'a> {")
+                .expect("AwardFilters declaration")
+                .1
+                .split_once("\n}")
+                .expect("end of AwardFilters declaration")
+                .0
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("pub "))
+                .filter_map(|field| field.split(':').next())
+                .collect()
         }
 
-        // Positive control: the assertion above can only mean something if this substring search
-        // finds a field that IS there. Without it, a mis-derived `declaration` slice would pass
-        // every assertion above while proving nothing.
-        assert!(
-            declaration.contains("required_capabilities"),
-            "control: the filterable capability field must be found in the slice being searched"
+        let display_only = [crate::heartbeat::HARNESS_VARIANT_TAG, crate::heartbeat::HARDWARE_TAG];
+
+        // POSITIVE CONTROL ON THE DETECTOR ITSELF, against a synthetic declaration that IS bad.
+        // Without it, a `filter_field_names` that returned an empty list — a renamed struct, a
+        // changed brace style, a `pub(crate)` field — would pass the real assertion below while
+        // inspecting nothing, and the pass would look identical to a correct one.
+        let planted = filter_field_names(
+            "pub struct AwardFilters<'a> {\n    pub max_sats: u64,\n    pub hardware: Option<&'a str>,\n}",
         );
+        assert!(
+            planted.contains(&"hardware"),
+            "control: the detector must FIND a display-only field when one is present, else its \
+             verdict on the real declaration means nothing. Found: {planted:?}"
+        );
+
+        let fields = filter_field_names(include_str!("lifecycle.rs"));
+        assert!(
+            fields.contains(&"required_capabilities"),
+            "control: the real declaration must parse into recognizable fields. Found: {fields:?}"
+        );
+        for banned in display_only {
+            assert!(
+                !fields.contains(&banned),
+                "{banned} is display-only and must NEVER be filterable \
+                 (docs/protocol-v1.md 4.5.1) — it is operator-declared free text that nothing can \
+                 contradict, so filtering on it would decide money on an unfalsifiable claim. It is \
+                 a field of AwardFilters. Fields: {fields:?}"
+            );
+        }
     }
 
     // ALL THREE axes of the capability request are read OFF THE SIGNED OFFER, at BOTH award sites
