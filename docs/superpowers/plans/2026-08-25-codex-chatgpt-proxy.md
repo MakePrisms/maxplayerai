@@ -364,15 +364,17 @@ git commit -m "docs: add the Codex ChatGPT Docker setup"
 
 ### Steps
 
-- [ ] Run the formatter.
+- [x] Run the formatter check.
 
 ```bash
 cargo fmt --all --check
 ```
 
-Expected result: exit code zero.
+Actual result: the current formatter reports repository-wide baseline differences. It changes no files.
 
-- [ ] Run the default core tests.
+The standalone new module passes `rustfmt --edition 2024 --check`.
+
+- [x] Run the default core tests.
 
 ```bash
 cargo test -p maxplayer-core
@@ -380,7 +382,7 @@ cargo test -p maxplayer-core
 
 Expected result: all tests pass.
 
-- [ ] Run the offline money tests.
+- [x] Run the offline money tests.
 
 ```bash
 cargo test -p maxplayer-core --features wallet
@@ -388,7 +390,7 @@ cargo test -p maxplayer-core --features wallet
 
 Expected result: all tests pass.
 
-- [ ] Run the feature-union tests.
+- [x] Run the feature-union tests.
 
 ```bash
 cargo test -p maxplayer-core --features acp,gateway,git-delivery,wallet
@@ -396,7 +398,7 @@ cargo test -p maxplayer-core --features acp,gateway,git-delivery,wallet
 
 Expected result: all tests pass and the Codex tests run.
 
-- [ ] Build the release feature set.
+- [x] Build the release feature set.
 
 ```bash
 cargo build -p maxplayer --release --no-default-features --features wallet,acp
@@ -404,7 +406,7 @@ cargo build -p maxplayer --release --no-default-features --features wallet,acp
 
 Expected result: exit code zero.
 
-- [ ] Inspect the diff for a token, auth file, seller key, or wallet file.
+- [x] Inspect the diff for a token, auth file, seller key, or wallet file.
 
 ```bash
 git status --short
@@ -414,7 +416,7 @@ git diff --stat HEAD~4..HEAD
 
 Expected result: only source and documentation files appear.
 
-- [ ] Confirm the source worktree still has no new tracked change.
+- [x] Confirm the source worktree still has no new tracked change.
 
 ```bash
 git -C "$SOURCE_WORKTREE" status --short
@@ -424,12 +426,12 @@ Expected result: only the user files that existed before this work appear.
 
 ## Plan Review
 
-- [ ] Confirm each production behavior has a failing test step.
+- [x] Confirm each production behavior has a failing test step.
 
-- [ ] Confirm every task has complete steps and exact values.
+- [x] Confirm every task has complete steps and exact values.
 
-- [ ] Confirm all interface names agree across tasks.
+- [x] Confirm all interface names agree across tasks.
 
-- [ ] Confirm the later host refresh stays outside this version.
+- [x] Confirm the later host refresh stays outside this version.
 
-- [ ] Confirm the existing Claude path stays outside all new branches.
+- [x] Confirm the existing Claude path stays outside all new branches.
