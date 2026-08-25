@@ -430,8 +430,37 @@ pub fn harness_family_tag(families: &[String]) -> Option<TagSpec> {
 
 /// Read the `["harness_family", …]` list off any event's tags. Absent ⇒ empty, which never
 /// satisfies a buyer that named a family — silence is not a capability.
+///
+/// Whitespace-normalized: see [`stated`].
 pub fn harness_families_from_tags(tags: &[TagSpec]) -> Vec<String> {
-    tag_values(tags, HARNESS_FAMILY_TAG)
+    stated_values(tag_values(tags, HARNESS_FAMILY_TAG))
+}
+
+/// One wire value, normalized to the "stated or absent" contract: trimmed, and `None` when nothing
+/// survives. Blank and all-whitespace are ABSENT, exactly as §4.5.2 defines them.
+///
+/// ⚠ THE EMITTERS ALREADY HONOUR THIS AND THE READERS DID NOT, which is a narrower hole than it
+/// looks: [`single_value_tag`] trims and drops empty, so every tag THIS code writes is already
+/// clean. The gap only opens for tags written by someone else — which is every tag a reader ever
+/// sees. An all-whitespace value read raw becomes a `Some("   ")` that no operator typed and no
+/// buyer can match, and for the filterable fields it decides awards.
+///
+/// Trimming rather than only rejecting is deliberate, and it is what makes the reader agree with the
+/// emitter: a padded `" claude "` that stayed padded would never equal the `"claude"` a buyer names,
+/// so a seat would advertise a family it could never be matched on.
+///
+/// ⚠ Applied at the FIVE #784 readers individually, NOT inside [`tag_values`]/[`first_tag_value`].
+/// Those helpers are shared with `agents` and `accepted_mints`, and changing how MINT LISTS parse is
+/// not something to do as a side effect of a capability change. Unifying at the helper is a coherent
+/// proposal; it is a separate one.
+fn stated(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// [`stated`] across a list, dropping the values that state nothing.
+fn stated_values(values: Vec<String>) -> Vec<String> {
+    values.iter().filter_map(|value| stated(value)).collect()
 }
 
 /// One serving harness and the model it will use — the decoded form of [`HARNESS_MODEL_TAG`].
@@ -483,19 +512,17 @@ pub fn harness_model_tags(models: &[HarnessModel]) -> Vec<TagSpec> {
 /// A malformed tag — one missing either element — is SKIPPED rather than half-decoded. A pair with
 /// an empty family would be a model no buyer could attach to a harness, which is exactly the
 /// unpairable state this shape exists to rule out.
+///
+/// Both halves are whitespace-normalized by [`stated`], and an all-whitespace half is as unpairable
+/// as an empty one: the pair is the unit, so a stated model under a blank family is not a partial
+/// answer to salvage.
 pub fn harness_models_from_tags(tags: &[TagSpec]) -> Vec<HarnessModel> {
     tags.iter()
         .filter(|tag| tag.0.first().map(String::as_str) == Some(HARNESS_MODEL_TAG))
         .filter_map(|tag| {
-            let family = tag.0.get(1)?;
-            let model = tag.0.get(2)?;
-            if family.is_empty() || model.is_empty() {
-                return None;
-            }
-            Some(HarnessModel {
-                family: family.clone(),
-                model: model.clone(),
-            })
+            let family = stated(tag.0.get(1)?)?;
+            let model = stated(tag.0.get(2)?)?;
+            Some(HarnessModel { family, model })
         })
         .collect()
 }
@@ -510,8 +537,11 @@ pub fn capabilities_tag(capabilities: &[String]) -> Option<TagSpec> {
 }
 
 /// Read the `["capabilities", …]` list off any event's tags. Absent ⇒ empty.
+///
+/// Whitespace-normalized: see [`stated`]. This one is filterable and a buyer commits sats on it, so
+/// a blank token that survived into the set would be a capability no seat can be held to.
 pub fn capabilities_from_tags(tags: &[TagSpec]) -> Vec<String> {
-    tag_values(tags, CAPABILITIES_TAG)
+    stated_values(tag_values(tags, CAPABILITIES_TAG))
 }
 
 /// The `["harness_variant", …]` tag, or `None` for a seat that states no variant (#784).
@@ -524,8 +554,11 @@ pub fn harness_variant_tag(variant: Option<&str>) -> Option<TagSpec> {
 }
 
 /// Read the `["harness_variant", …]` value off a seat announcement's tags. Absent ⇒ `None`.
+///
+/// Whitespace-normalized: see [`stated`]. Display-only, so this is the mildest of the five — but a
+/// `Some("   ")` renders as a variant that is present and blank, which is not a state the field has.
 pub fn harness_variant_from_tags(tags: &[TagSpec]) -> Option<String> {
-    first_tag_value(tags, HARNESS_VARIANT_TAG).map(str::to_owned)
+    first_tag_value(tags, HARNESS_VARIANT_TAG).and_then(stated)
 }
 
 /// The `["hardware", …]` tag, or `None` for a seat that states none (#784). Beat-only and never
@@ -535,8 +568,12 @@ pub fn hardware_tag(hardware: Option<&str>) -> Option<TagSpec> {
 }
 
 /// Read the `["hardware", …]` value off a seat announcement's tags. Absent ⇒ `None`.
+///
+/// Whitespace-normalized: see [`stated`]. Never filtered, so this one is cosmetic — normalized with
+/// the others because a reader that treats one of the five differently is the thing a later change
+/// reasons from.
 pub fn hardware_from_tags(tags: &[TagSpec]) -> Option<String> {
-    first_tag_value(tags, HARDWARE_TAG).map(str::to_owned)
+    first_tag_value(tags, HARDWARE_TAG).and_then(stated)
 }
 
 /// `["<name>", value]` for the single-value free-text tags, or `None` when there is nothing honest
@@ -1693,6 +1730,87 @@ mod tests {
         // The POSITIVE CONTROL for the assertion above: the same event still carries the family, so
         // the empty read is a real absence and not a beat that emitted no capability at all.
         assert_eq!(harness_families_from_tags(&event.tags), vec!["claude-code"]);
+    }
+
+    // ── Rocky blocker 4: the readers must enforce the whitespace contract the emitters already do ──
+    //
+    // §4.5.2 says a whitespace-only value is ABSENT. `single_value_tag` has always honoured that on
+    // the way out, so every tag WE write is clean — and that is exactly why the readers could stay
+    // wrong without any test noticing: a round-trip through our own emitter can never produce the
+    // input that breaks them.
+    //
+    // So these tags are built by hand, as a hostile or merely sloppy third-party seat would put them
+    // on the wire. All five #784 readers, three shapes each: whitespace-only, padded, and mixed.
+    #[test]
+    fn a_reader_treats_a_whitespace_only_wire_value_as_unstated() {
+        let hostile = vec![
+            TagSpec::new([HARNESS_FAMILY_TAG, "   ", " claude-code ", "\t\n"]),
+            TagSpec::new([CAPABILITIES_TAG, " ", " rust ", "\t"]),
+            TagSpec::new([HARNESS_VARIANT_TAG, "   "]),
+            TagSpec::new([HARDWARE_TAG, " \t "]),
+            TagSpec::new([HARNESS_MODEL_TAG, "  ", "claude-opus-5"]),
+            TagSpec::new([HARNESS_MODEL_TAG, "claude-code", "   "]),
+            TagSpec::new([HARNESS_MODEL_TAG, " codex ", " gpt-5 "]),
+        ];
+
+        // The list readers: blanks are dropped, padded values are TRIMMED rather than kept as-is.
+        // Trimming is the half that matters for awards — a padded family that stayed padded would
+        // never equal the family a buyer names, so the seat would advertise something unmatchable.
+        assert_eq!(
+            harness_families_from_tags(&hostile),
+            vec!["claude-code"],
+            "a blank family states nothing and a padded one must normalize to what a buyer names"
+        );
+        assert_eq!(
+            capabilities_from_tags(&hostile),
+            vec!["rust"],
+            "capabilities are filterable and a buyer commits sats on them — a blank token would be \
+             a capability no seat can be held to"
+        );
+
+        // The single-value readers: whitespace-only is `None`, never `Some("   ")`.
+        assert_eq!(
+            harness_variant_from_tags(&hostile),
+            None,
+            "a present-but-blank variant is not a state this field has"
+        );
+        assert_eq!(
+            hardware_from_tags(&hostile),
+            None,
+            "never filtered, but a blank hardware string still renders as stated-and-empty"
+        );
+
+        // The PAIR reader. Either half blank makes the pair unpairable, and a stated model under a
+        // blank family is not a partial answer worth salvaging.
+        assert_eq!(
+            harness_models_from_tags(&hostile),
+            vec![HarnessModel {
+                family: "codex".to_owned(),
+                model: "gpt-5".to_owned(),
+            }],
+            "a blank family or a blank model drops the whole pair; the padded pair normalizes"
+        );
+    }
+
+    #[test]
+    fn a_whitespace_padded_advertisement_still_matches_the_buyer_that_names_it() {
+        // The POSITIVE CONTROL for the test above, and the reason trimming is not cosmetic. Without
+        // it every assertion above is satisfied by a reader that returns nothing at all, which would
+        // refuse every award instead of just the blank ones.
+        let padded = vec![
+            TagSpec::new([HARNESS_FAMILY_TAG, " claude-code "]),
+            TagSpec::new([CAPABILITIES_TAG, "  rust  ", " node "]),
+            TagSpec::new([HARNESS_VARIANT_TAG, "  pro  "]),
+            TagSpec::new([HARDWARE_TAG, " mac studio, 64GB "]),
+        ];
+        assert_eq!(harness_families_from_tags(&padded), vec!["claude-code"]);
+        assert_eq!(capabilities_from_tags(&padded), vec!["rust", "node"]);
+        assert_eq!(harness_variant_from_tags(&padded), Some("pro".to_owned()));
+        assert_eq!(
+            hardware_from_tags(&padded),
+            Some("mac studio, 64GB".to_owned()),
+            "interior whitespace is CONTENT and must survive — only the edges are noise"
+        );
     }
 
     #[test]
