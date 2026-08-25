@@ -4042,10 +4042,24 @@ mod tests {
             );
         }
 
-        // Positive controls on BOTH sides, one per rule the table exercises. Without these, a gate
-        // stuck at `None` and a predicate stuck at `None` would agree on every row and pass — and
-        // the controls pin the actual verdicts, so an oracle that is wrong the same way the gate is
-        // wrong still fails here.
+        // ⛔ THESE CONTROLS ARE THE ONLY REAL COVERAGE THIS TEST HAS AGAINST A FAULT IN THE
+        // PREDICATE. THE LOOP ABOVE IS NOT. Do not read that loop as protecting the predicate, and
+        // do not weaken these on the grounds that the loop already compares the two sides.
+        //
+        // The oracle is COMPUTED FROM THE SUBJECT: both sides of that comparison end in
+        // `claim_meets_capability_request`. So when the PREDICATE is what breaks, both sides move
+        // together, the comparison still holds, and the loop reports a pass THROUGH the exact fault
+        // it looks like it is watching for. That is measured, not feared — deleting the
+        // family-contradicts-preset check, and separately the model-requires-preset check, each left
+        // the loop GREEN, and only these controls went red.
+        //
+        // The general form, because it is not special to this test: whenever an oracle is derived
+        // from the thing under test, the controls carry the whole of the coverage. Agreement between
+        // two things computed from one broken source is not evidence about the source.
+        //
+        // ⇒ ADDING A RULE TO THE PREDICATE MEANS ADDING A CONTROL HERE. The loop will not notice.
+        // One control per rule the table exercises; they pin actual verdicts rather than agreement,
+        // so an oracle wrong in the same way as the gate still fails here.
         assert!(
             unsatisfiable_capability_request(None, None, Some("opus"), &[]).is_some(),
             "control: a model with no harness preset must be refused by the gate"
