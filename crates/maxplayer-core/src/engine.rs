@@ -1,6 +1,6 @@
 use crate::driver::{
     Artifact, ContentBlock, Driver, DriverError, PermissionOutcome, PermissionRequest, PromptTurn,
-    SessionConfig, SessionUpdate, StopReason, UsageMetadata,
+    SessionConfig, SessionId, SessionUpdate, StopReason, UsageMetadata,
 };
 use crate::event::{ArtifactId, Envelope, Event, JobExecutionStatus, JobId};
 use crate::log::{EventLog, LogError};
@@ -29,6 +29,18 @@ pub struct RunOutcome {
 pub struct RunParams {
     pub session_config: SessionConfig,
     pub prompt: PromptTurn,
+    /// The model this job NAMED, if it named one, verbatim as the buyer signed it.
+    ///
+    /// `None` means no model was requested and the run takes whatever the harness defaults to —
+    /// today's behaviour for every caller, unchanged. `Some` means the run is only allowed to
+    /// proceed on that exact model: [`bind_session_model`] asks the harness to bind it and refuses
+    /// the job if the harness reports anything else.
+    ///
+    /// Carried verbatim on purpose. Normalising it anywhere en route would hide the substitution
+    /// the comparison exists to catch — `claude-agent-acp` resolves `opus` onto a canonical id and
+    /// reports success, so the requested string and the bound string must stay separately
+    /// observable all the way to the comparison.
+    pub requested_model: Option<String>,
 }
 
 impl RunParams {
@@ -39,6 +51,8 @@ impl RunParams {
                 mcp_servers: Vec::new(),
                 env: Vec::new(),
             },
+            // No model requested: the default path, and the one every caller takes today.
+            requested_model: None,
             prompt: PromptTurn {
                 input: vec![ContentBlock::Text {
                     text: "do the work".into(),
@@ -53,6 +67,16 @@ pub enum EngineError {
     Driver(DriverError),
     Log(LogError),
     MissingTerminal,
+    /// The job named a model and the harness bound something else. The run is refused.
+    ///
+    /// Carries BOTH strings because the pair is the evidence: a report saying only "model mismatch"
+    /// cannot distinguish an alias the harness canonicalised from a value it ignored outright, and
+    /// those want different follow-ups. `bound: None` means the harness reported no usable model at
+    /// all after the write.
+    ModelBindMismatch {
+        requested: String,
+        bound: Option<String>,
+    },
 }
 
 impl Display for EngineError {
@@ -61,6 +85,16 @@ impl Display for EngineError {
             Self::Driver(error) => write!(f, "{error}"),
             Self::Log(error) => write!(f, "{error}"),
             Self::MissingTerminal => write!(f, "mock update stream ended without turn_ended"),
+            Self::ModelBindMismatch { requested, bound } => match bound {
+                Some(bound) => write!(
+                    f,
+                    "job requested model {requested} but the harness bound {bound}"
+                ),
+                None => write!(
+                    f,
+                    "job requested model {requested} but the harness reported no bound model"
+                ),
+            },
         }
     }
 }
@@ -70,7 +104,9 @@ impl Error for EngineError {
         match self {
             Self::Driver(error) => Some(error),
             Self::Log(error) => Some(error),
-            Self::MissingTerminal => None,
+            // No source: the mismatch IS the fault, not a wrapper around a lower-level one. The
+            // harness succeeded at everything it was asked; the refusal is ours.
+            Self::MissingTerminal | Self::ModelBindMismatch { .. } => None,
         }
     }
 }
@@ -122,6 +158,46 @@ pub async fn run_job<D: Driver>(
     }
 }
 
+/// Bind `requested` as the session's model and PROVE the harness took it, or refuse the run.
+///
+/// ⛔ The setter's success is not the check. Measured by reading both adapters' sources: `codex-acp`
+/// accepts an unrecognised model verbatim and forwards it to Codex, rejecting only the empty string;
+/// `claude-agent-acp` fuzzy-resolves aliases like `opus` onto a canonical id, then deliberately
+/// substitutes "the canonical option value so downstream code always receives the model ID rather
+/// than the caller-supplied alias". Both return OK having bound something other than what was named,
+/// so a caller that trusted the return would run a job on a model the buyer did not ask for.
+///
+/// The comparison is EXACT and lives here rather than in the driver — one place, so a driver cannot
+/// bypass it, and testable without a harness. No aliasing forgiveness on our side: this crate's own
+/// rule is that a named request is exact or nothing, with no nearest-match fallback, because
+/// silently running a job on something the buyer did not ask for is the failure the registry exists
+/// to prevent. A harness that canonicalises `opus` to `claude-opus-4-6` has bound a DIFFERENT STRING
+/// than the one signed, and the buyer filtered and paid on the string.
+///
+/// Returns the bound model on success, for callers that want to log what was proven.
+async fn bind_session_model<D: Driver>(
+    driver: &mut D,
+    session_id: &SessionId,
+    requested: &str,
+) -> Result<String, EngineError> {
+    verify_bound_model(requested, driver.select_model(session_id, requested).await?)
+}
+
+/// The comparison itself: EXACT, or refuse.
+///
+/// Split out from [`bind_session_model`] so the policy is a pure function — no driver, no runtime,
+/// no session. The whole value of this change is which pairs it accepts, and that is worth testing
+/// directly rather than through a stub whose own behaviour would need trusting.
+fn verify_bound_model(requested: &str, bound: Option<String>) -> Result<String, EngineError> {
+    match bound {
+        Some(bound) if bound == requested => Ok(bound),
+        bound => Err(EngineError::ModelBindMismatch {
+            requested: requested.to_owned(),
+            bound,
+        }),
+    }
+}
+
 /// The fallible body of [`run_job`]: readiness through usage capture, shutdown excluded.
 async fn run_turn<D: Driver>(
     driver: &mut D,
@@ -139,6 +215,12 @@ async fn run_turn<D: Driver>(
     append_execution(log, job_id, JobExecutionStatus::Running)?;
 
     let session_id = driver.start_session(params.session_config).await?;
+    // A named model is bound and PROVEN bound before any work happens. Refusing here costs nothing:
+    // the session exists but no prompt has been sent, so nothing has been spent on compute and the
+    // job fails without a delivery. Ordering matters — this sits before `prompt`, never after.
+    if let Some(requested) = params.requested_model.as_deref() {
+        bind_session_model(driver, &session_id, requested).await?;
+    }
     let mut stream = match driver.prompt(&session_id, params.prompt).await {
         Ok(stream) => stream,
         Err(error) => {
@@ -267,6 +349,87 @@ impl AgentMessageCapture {
     /// unknown, because a capture that silently failed to fill would be indistinguishable from it.
     pub(crate) fn into_last_message(self) -> Option<String> {
         self.last
+    }
+}
+
+#[cfg(test)]
+mod model_binding_tests {
+    use super::{EngineError, verify_bound_model};
+
+    #[test]
+    fn an_exactly_matching_bound_model_is_accepted() {
+        // The only accepting case, and the control for every refusal below: if this were not Ok the
+        // rest of the module would pass for the wrong reason.
+        assert_eq!(
+            verify_bound_model("claude-opus-4-8", Some("claude-opus-4-8".into())).unwrap(),
+            "claude-opus-4-8"
+        );
+    }
+
+    #[test]
+    fn a_fuzzily_resolved_alias_is_refused() {
+        // THE case #785 names. `claude-agent-acp` resolves `opus` onto a canonical id and returns
+        // SUCCESS, deliberately substituting "the canonical option value so downstream code always
+        // receives the model ID rather than the caller-supplied alias". The set succeeded; a
+        // different model is bound. The buyer named `opus`, filtered on `opus` and paid on `opus`,
+        // so a run on `claude-opus-4-6` is a different product and this must refuse.
+        let error = verify_bound_model("opus", Some("claude-opus-4-6".into())).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                EngineError::ModelBindMismatch { requested, bound }
+                    if requested == "opus" && bound.as_deref() == Some("claude-opus-4-6")
+            ),
+            "both strings must survive into the error, or a reader cannot tell a canonicalised \
+             alias from an ignored value: {error}"
+        );
+    }
+
+    #[test]
+    fn a_harness_reporting_no_model_is_refused() {
+        // Absence is not agreement. A harness that wrote something and then reported nothing usable
+        // has not shown us the requested model is bound, so the run does not proceed.
+        let error = verify_bound_model("claude-opus-4-8", None).unwrap_err();
+        assert!(matches!(
+            error,
+            EngineError::ModelBindMismatch { bound: None, .. }
+        ));
+    }
+
+    #[test]
+    fn the_comparison_is_exact_and_forgives_nothing() {
+        // No trimming, no case-folding, no prefix or suffix tolerance. Each of these is a real
+        // near-miss shape and every one of them is a DIFFERENT model id than the one requested.
+        // Forgiving any of them re-introduces nearest-match dispatch through the back door.
+        for bound in [
+            "claude-opus-4-8 ",       // trailing space
+            " claude-opus-4-8",       // leading space
+            "Claude-Opus-4-8",        // case
+            "claude-opus-4-8[medium]", // composed: the effort axis appended
+            "claude-opus-4",          // prefix
+            "claude-opus-4-80",       // the requested id is a prefix of this one
+        ] {
+            assert!(
+                verify_bound_model("claude-opus-4-8", Some(bound.into())).is_err(),
+                "bound {bound:?} differs from the request and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_echoed_unknown_model_is_not_caught_here_and_that_is_deliberate() {
+        // ⛔ THE LIMIT OF THIS CHECK, pinned so nobody later reads it as total coverage.
+        // `codex-acp` accepts an unrecognised id VERBATIM and forwards it, so the read-back echoes
+        // the nonsense and request == bound. This comparison therefore ACCEPTS it — correctly, on
+        // its own terms, because the harness did report exactly what was asked for.
+        //
+        // The guard for that direction is membership, checked pre-write in the driver
+        // (`DriverError::ModelNotOffered`). Two different failures need two different guards, and
+        // this test exists so a future reader cannot mistake the exact comparison for both.
+        assert_eq!(
+            verify_bound_model("gpt-9-does-not-exist", Some("gpt-9-does-not-exist".into())).unwrap(),
+            "gpt-9-does-not-exist"
+        );
     }
 }
 

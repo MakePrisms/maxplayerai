@@ -56,6 +56,24 @@ pub struct AcpDriver {
     /// either wire shape by [`session_model_from_result`]. Folded into [`Self::usage`] so a run's
     /// exec-metadata carries the resolved model (#455). `None` when the harness reported no model.
     session_model: Option<String>,
+    /// The `id` of this session's model selector, captured from the `session/new` `configOptions`
+    /// so [`Driver::select_model`] can address `session/set_config_option`.
+    ///
+    /// Captured rather than assumed: ACP leaves the option `id` to the agent, so the only way to
+    /// write to the selector we also READ is to remember the id off the same entry. `None` when the
+    /// harness published no model selector — which makes a model request unservable rather than a
+    /// fault, hence [`DriverError::ModelSelectorAbsent`].
+    model_config_id: Option<String>,
+    /// Every model id this session's selector says it can be set to, captured at `session/new`.
+    ///
+    /// Checked BEFORE writing, because the post-write read-back cannot see one of the two
+    /// substitution directions: `codex-acp` accepts an unrecognised id verbatim and echoes it back,
+    /// so request == bound and an exact comparison passes on a model the harness never had. See
+    /// [`model_option_offered_values`].
+    ///
+    /// `None` when no selector was published; `Some(empty)` is a selector offering nothing, which is
+    /// a different fact and refuses every request rather than accepting any.
+    model_offered_values: Option<Vec<String>>,
 }
 
 impl AcpDriver {
@@ -76,6 +94,8 @@ impl AcpDriver {
             next_request_id: AtomicU64::new(1),
             last_usage: None,
             session_model: None,
+            model_config_id: None,
+            model_offered_values: None,
         }
     }
 
@@ -251,7 +271,59 @@ impl Driver for AcpDriver {
         // `session_model_from_result` reads (#896). Absent-stays-absent: a harness that reports no
         // model leaves this `None`, and nothing downstream fabricates one.
         self.session_model = session_model_from_result(&result);
+        // Capture the model selector's id from the same response, so a later `select_model` writes
+        // to the selector this session actually published rather than a hardcoded name (#785).
+        self.model_config_id = model_config_option_id(&result);
+        self.model_offered_values = model_option_offered_values(&result);
         session_id_from_result(&result)
+    }
+
+    async fn select_model(
+        &mut self,
+        session_id: &SessionId,
+        model: &str,
+    ) -> Result<Option<String>, DriverError> {
+        // No selector in this session's `configOptions` ⇒ there is no id to address, and guessing
+        // one would be the hardcoded-name defect `model_config_option_id` exists to avoid. A harness
+        // that published no model selector cannot serve a model request; say that, do not retry it.
+        let config_id = self
+            .model_config_id
+            .clone()
+            .ok_or(DriverError::ModelSelectorAbsent)?;
+        // FIRST GUARD, and it catches the direction the read-back structurally cannot: refuse a
+        // model the selector does not offer, BEFORE writing anything. `codex-acp` accepts an
+        // unrecognised id verbatim and echoes it back, so request == bound and the exact comparison
+        // downstream would PASS on a model the harness never had. Refusing pre-write also means a
+        // rejected request leaves the session's model untouched.
+        if let Some(offered) = &self.model_offered_values
+            && !offered.iter().any(|value| value == model)
+        {
+            return Err(DriverError::ModelNotOffered {
+                requested: model.to_owned(),
+            });
+        }
+        let id = self.send_request(
+            "session/set_config_option",
+            json!({
+                "sessionId": session_id,
+                "configId": config_id,
+                "value": model,
+            }),
+        )?;
+        let result = self.wait_response(id).await?;
+        // The setter returns the FULL updated `configOptions`, so its own response is the read-back
+        // channel — same array shape as `session/new`, so the same first-entry fail-closed rule
+        // applies unchanged. Returning the harness's REPORT, not a verdict: the caller compares it
+        // against what was requested, because a successful set is not evidence the requested model
+        // was bound (see `Driver::select_model`).
+        let bound = config_option_session_model(&result);
+        // Keep the advertised model consistent with what is now bound. Without this, a successful
+        // rebind would leave `usage()` reporting the model captured at session start — an
+        // exec-metadata attribution that names a model the run did not use.
+        if let Some(bound) = bound.clone() {
+            self.session_model = Some(bound);
+        }
+        Ok(bound)
     }
 
     async fn prompt(
@@ -568,7 +640,7 @@ fn session_model_from_result(result: &Value) -> Option<String> {
 
 /// Shape 1: the legacy top-level `models.currentModelId` (camelCase on the wire).
 fn legacy_session_model(result: &Value) -> Option<String> {
-    non_blank_model(result.get("models")?.get("currentModelId")?)
+    non_blank_str(result.get("models")?.get("currentModelId")?)
 }
 
 /// Shape 2: the FIRST model-category `configOptions` entry, value in its `currentValue`.
@@ -589,25 +661,85 @@ fn legacy_session_model(result: &Value) -> Option<String> {
 /// A `configOptions` that is not an array, entries that are not objects, and entries of any other
 /// category never yield a value.
 fn config_option_session_model(result: &Value) -> Option<String> {
-    let first_model_option = result
+    non_blank_str(first_model_config_option(result)?.get("currentValue")?)
+}
+
+/// The FIRST `configOptions` entry declaring the model category, or `None`.
+///
+/// Shared by the read path and the write path deliberately. The value we ADVERTISE and the option
+/// we WRITE TO must be the same selector: two independent "find the model option" implementations
+/// could drift, and the failure that produces is setting one selector while reporting another — a
+/// silent success with the wrong model bound, which is the exact class this module exists to refuse.
+fn first_model_config_option(result: &Value) -> Option<&Value> {
+    result
         .get("configOptions")?
         .as_array()?
         .iter()
         .find(|option| {
             option.get("category").and_then(Value::as_str) == Some(MODEL_CONFIG_CATEGORY)
-        })?;
-    non_blank_model(first_model_option.get("currentValue")?)
+        })
 }
 
-/// A model id is a non-blank JSON string, taken verbatim.
+/// The `id` of the model selector this session published, for addressing `session/set_config_option`.
 ///
-/// Anything else — a blank or whitespace-only string, a number, bool, null, array or object — is not
-/// a model id and yields `None` rather than a coerced, trimmed or fabricated value. This also
-/// applies to the legacy shape: a present-but-blank `currentModelId` is not a model, so it falls
-/// through to the config-option shape rather than advertising an empty string.
-fn non_blank_model(value: &Value) -> Option<String> {
-    let model = value.as_str()?;
-    (!model.trim().is_empty()).then(|| model.to_owned())
+/// The read path keys on `category`; the write path must address the option by `id`, because that is
+/// what the setter takes. Those are different fields, and the id is NOT hardcodable: ACP documents
+/// `id` as the agent's own identifier and does not standardise it, so writing a literal `"model"`
+/// would bind this to one adapter's naming — precisely the defect [`MODEL_CONFIG_CATEGORY`]
+/// documents avoiding on the read side. Taking the id from the SAME entry the read path uses is also
+/// what guarantees we write to the selector we subsequently read back.
+fn model_config_option_id(result: &Value) -> Option<String> {
+    non_blank_str(first_model_config_option(result)?.get("id")?)
+}
+
+/// Every model id this session's selector says it can be set to.
+///
+/// ⛔ This exists because the post-write read-back CANNOT catch one of the two substitution
+/// directions, and it is worth being exact about which. `claude-agent-acp` resolves an alias onto a
+/// canonical id, so the value it reports back DIFFERS from the request and an exact comparison
+/// catches it. `codex-acp` does the opposite: an unrecognised id is accepted verbatim
+/// (`unwrap_or_else(|| model_id.to_string())`, rejecting only the empty string) and forwarded to
+/// Codex, so the read-back faithfully ECHOES the nonsense and request == bound. The comparison
+/// passes and the job proceeds on a model the harness never had.
+///
+/// So membership is a SECOND guard against a different failure, not a cheaper version of the first:
+/// refuse a model the selector does not offer, before writing anything.
+///
+/// The set is `options[].value` PLUS the current `currentValue`. The current value belongs even when
+/// absent from `options`: `claude-agent-acp` treats it as always-settable, because a session resumed
+/// onto an allowlist-excluded model reports a `currentValue` that is not in its own picker, and a
+/// client round-tripping it must not be refused. So `options` alone is NOT the settable set.
+///
+/// `None` when the session published no model selector — distinct from `Some(empty)`, which is a
+/// selector offering nothing.
+fn model_option_offered_values(result: &Value) -> Option<Vec<String>> {
+    let option = first_model_config_option(result)?;
+    let mut offered: Vec<String> = option
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|entry| non_blank_str(entry.get("value")?))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(current) = option.get("currentValue").and_then(non_blank_str)
+        && !offered.contains(&current)
+    {
+        offered.push(current);
+    }
+    Some(offered)
+}
+
+/// A usable wire string: non-blank, taken verbatim.
+///
+/// Anything else — a blank or whitespace-only string, a number, bool, null, array or object — yields
+/// `None` rather than a coerced, trimmed or fabricated value. Used for both the model id and the
+/// selector id, because the rule is identical: a blank string is not an identifier.
+fn non_blank_str(value: &Value) -> Option<String> {
+    let text = value.as_str()?;
+    (!text.trim().is_empty()).then(|| text.to_owned())
 }
 
 /// Fold the `session/new` model into a run's captured usage. The `session/prompt` result never
@@ -1049,6 +1181,112 @@ mod tests {
             ]
         });
         assert_eq!(session_model_from_result(&unknown_category), None);
+    }
+
+    #[test]
+    fn the_model_selector_id_is_read_from_the_model_category_entry() {
+        // #785: the WRITE addresses an option by `id`, and the id must come from the same entry the
+        // read path keys on by `category` — never a hardcoded "model". Here the selector deliberately
+        // calls itself something else, so a hardcoded literal would find nothing.
+        let result = json!({
+            "sessionId": "abc",
+            "configOptions": [
+                {"id": "session-mode", "category": "mode", "currentValue": "default"},
+                {"id": "vendor.model.picker", "category": "model", "currentValue": "m-1"}
+            ]
+        });
+        assert_eq!(
+            model_config_option_id(&result).as_deref(),
+            Some("vendor.model.picker")
+        );
+    }
+
+    #[test]
+    fn the_model_selector_id_follows_the_same_first_entry_and_absence_rules() {
+        // Same conservatism as the read path, for the same reason: writing to a LATER model-category
+        // selector than the one we report from would set one option and advertise another.
+        let two = json!({
+            "sessionId": "abc",
+            "configOptions": [
+                {"id": "first", "category": "model", "currentValue": "m-1"},
+                {"id": "second", "category": "model", "currentValue": "m-2"}
+            ]
+        });
+        assert_eq!(model_config_option_id(&two).as_deref(), Some("first"));
+
+        // No category ⇒ we decline to infer, exactly as on the read side. No selector, no write.
+        let no_category = json!({
+            "sessionId": "abc",
+            "configOptions": [{"id": "model", "currentValue": "m-1"}]
+        });
+        assert_eq!(model_config_option_id(&no_category), None);
+
+        // A blank or non-string id is not an id.
+        for bad in [json!(""), json!("  "), json!(7), json!(null)] {
+            let result = json!({
+                "sessionId": "abc",
+                "configOptions": [{"id": bad, "category": "model", "currentValue": "m-1"}]
+            });
+            assert_eq!(model_config_option_id(&result), None);
+        }
+    }
+
+    #[test]
+    fn offered_values_include_the_options_list_and_the_current_value() {
+        // The current value belongs even when absent from `options`: claude-agent-acp treats it as
+        // always-settable, because a session resumed onto an allowlist-excluded model reports a
+        // currentValue outside its own picker and a client round-tripping it must not be refused.
+        // So `options` alone is NOT the settable set.
+        let result = json!({
+            "sessionId": "abc",
+            "configOptions": [{
+                "id": "model",
+                "category": "model",
+                "currentValue": "out-of-picker-model",
+                "options": [{"value": "m-1"}, {"value": "m-2"}]
+            }]
+        });
+        let offered = model_option_offered_values(&result).expect("selector present");
+        assert!(offered.contains(&"m-1".to_string()));
+        assert!(offered.contains(&"m-2".to_string()));
+        assert!(
+            offered.contains(&"out-of-picker-model".to_string()),
+            "the current value must be settable even when the picker omits it"
+        );
+        assert_eq!(offered.len(), 3, "no duplicates, nothing invented: {offered:?}");
+    }
+
+    #[test]
+    fn offered_values_distinguish_no_selector_from_a_selector_offering_nothing() {
+        // Two different facts that a bare `Vec` would flatten. `None` = nothing published, so a
+        // model request is unservable. `Some(empty)` = a selector that offers nothing, which refuses
+        // every request rather than accepting any — and must never be read as "unconstrained".
+        assert_eq!(
+            model_option_offered_values(&json!({"sessionId": "abc"})),
+            None
+        );
+        let empty = json!({
+            "sessionId": "abc",
+            "configOptions": [{"id": "model", "category": "model"}]
+        });
+        assert_eq!(model_option_offered_values(&empty), Some(Vec::new()));
+    }
+
+    #[test]
+    fn offered_values_skip_malformed_entries_without_inventing_any() {
+        // A non-array `options`, entries that are not objects, and blank or non-string values all
+        // contribute nothing. An invented offer would let an unofferable model through the guard.
+        let result = json!({
+            "sessionId": "abc",
+            "configOptions": [{
+                "id": "model",
+                "category": "model",
+                "currentValue": "m-real",
+                "options": [{"value": ""}, {"value": 7}, {"value": null}, "m-bare", {"value": "m-ok"}]
+            }]
+        });
+        let offered = model_option_offered_values(&result).expect("selector present");
+        assert_eq!(offered, vec!["m-ok".to_string(), "m-real".to_string()]);
     }
 
     #[test]

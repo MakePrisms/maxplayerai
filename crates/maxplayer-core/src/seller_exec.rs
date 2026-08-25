@@ -2227,6 +2227,14 @@ pub async fn run_agent_job(
             mcp_servers: Vec::new(),
             env: identity.git_env(),
         },
+        // NOT WIRED YET, deliberately, and this is the seam where it lands (#785). The mechanism
+        // that binds and proves a model exists in `engine::bind_session_model`; what is missing is
+        // the model itself, which must arrive from the STORED SIGNED OFFER — never from award
+        // params, or the value a seat runs on would not be the value the buyer signed and filtered
+        // against. That plumbing waits on #900's contract (a requested model rides the signed
+        // preset), so passing `None` here keeps today's behaviour byte-for-byte: no request, no
+        // binding, no refusal.
+        requested_model: None,
         prompt: PromptTurn {
             input: vec![ContentBlock::Text {
                 text: prompt.to_owned(),
