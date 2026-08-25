@@ -340,12 +340,50 @@ reject a lifecycle event that lacks it.
 | `["v","1"]` | 1 | yes | Protocol major |
 | `["p", seller_pubkey]` | 0..1 | no | Targets one seat |
 | `["param","agent", agent_id]` | 0..1 | no | Requests one harness |
+| `["param","harness_family", family]` | 0..1 | no | Requires one harness family |
+| `["param","harness_model", model]` | 0..1 | no | Requires one model; needs `harness_family` |
+| `["param","capability", token, ...]` | 0..1 | no | Requires every listed capability token |
 | `["delivery","git"]` | 0..1 | no | Delivery binding mode |
 | `["repo", locator]` | 0..1 | no | Bound delivery remote |
 | `["branch", name]` | 0..1 | no | Bound delivery branch |
 
 The `delivery`, `repo`, and `branch` tags bind delivery as one group. If the offer uses any of them,
 it MUST carry all three. A reader MUST reject a partial group.
+
+#### 6.1.1 The capability request
+
+The three `harness_family` / `harness_model` / `capability` params are the offer's CAPABILITY REQUEST.
+They name what a seat must advertise to be awarded this job, and they are matched against the
+filterable claim tags of §6.2 — the same words on both sides, compared by exact equality.
+
+Every param is optional and an ABSENT request passes every claim. An offer that requests nothing is
+byte-identical to one posted before this existed, so filtering is opt-in per offer rather than a
+change in how offers are read.
+
+A buyer MUST decide the award on the request carried by the SIGNED OFFER, never on a request supplied
+at award time. Both award paths — automatic selection and a manually named claim — MUST apply it
+identically. Naming a claim selects WHICH claim is judged, never WHETHER it is judged.
+
+`harness_model` is meaningful only ALONGSIDE `harness_family`. A model alone does not say which
+harness would run it, so a reader MUST refuse such an offer rather than ignore the model: the harness
+request is what binds dispatch, and a model phrased as a refinement of it inherits that binding where
+a bare model inherits none. A refusal is the fail-closed outcome; silently dropping the model would
+award a job on terms the buyer did not ask for.
+
+`capability` is ONE multi-value tag, not one tag per token. A reader takes the first matching tag, so
+a second would be silently dropped and the buyer filtered on a subset of its own request.
+
+Values follow the same "stated or absent" rule as §4.5.2: a reader MUST trim, and a value that states
+nothing is absent. A request naming a family outside §4.5 or a token outside §4.5.2 can never match
+and SHOULD be refused before the offer is published.
+
+Matching decides who is CONSIDERED; it never guarantees what executes. `harness_model` is a
+last-observed self-report (§4.5.4) and a capability token proves binary presence at probe time
+(§4.5.3). The award is the payment decision, so nothing downstream revises it.
+
+The display-only fields of §4.5.1 — `harness_variant` and `hardware` — MUST NOT be requestable. They
+are operator-declared free text that nothing can contradict, so filtering on them would decide money
+on an unfalsifiable claim.
 
 ### 6.2 Claim, kind `3402`
 
