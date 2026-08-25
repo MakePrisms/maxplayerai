@@ -228,16 +228,16 @@ function activityList(view: MarketView, events: ParsedEvent[], t: number, curren
 
 /**
  * A Profile row: label, value, and an optional note. `title` explains what the
- * value is worth; `mark` is the visible tag a row wears when it is weaker than
- * it looks. A row with a title but no mark is annotated, not hedged.
+ * value is worth; `mark` is the visible tag the row wears, and `markClass`
+ * selects its weight. A row with a title but no mark is annotated, not marked.
  */
-export type ProfileRow = [string, string | null, { title: string; mark?: string }?];
+export type ProfileRow = [string, string | null, { title: string; mark?: string; markClass?: string }?];
 
 /**
  * One Profile row as markup. Exported so the marker rule is under test rather
- * than asserted by reading this file as text: whether a value wears
- * "operator-declared" is a claim about what a buyer sees, and a source grep
- * cannot tell a rendered marker from one that is built and dropped.
+ * than asserted by reading this file as text: which mark a value wears is a
+ * claim about what a buyer sees, and a source grep cannot tell a rendered
+ * marker from one that is built and dropped.
  *
  * The value goes through `esc` like every other relay string — `hardware` and
  * `harness_variant` are free text from an open relay, so they are an injection
@@ -245,7 +245,7 @@ export type ProfileRow = [string, string | null, { title: string; mark?: string 
  */
 export function profileRowHtml([label, value, note]: ProfileRow): string {
   return `<div${note ? ` title="${esc(note.title)}"` : ""}><dt>${esc(label)}</dt><dd>${esc(String(value ?? ""))}${
-    note?.mark ? ` <span class="unverified">${esc(note.mark)}</span>` : ""}</dd></div>`;
+    note?.mark ? ` <span class="${esc(note.markClass ?? "unverified")}">${esc(note.mark)}</span>` : ""}</dd></div>`;
 }
 
 /**
@@ -254,38 +254,78 @@ export function profileRowHtml([label, value, note]: ProfileRow): string {
  */
 const OPERATOR_DECLARED = {
   mark: "operator-declared",
+  markClass: "unverified",
   title: "Typed by the operator. Nothing measures or contradicts this value, and no buyer filter reads it.",
+};
+
+/**
+ * The one capability field backed by a mechanism, and the only one current as
+ * of the beat that carries it (protocol v1 §4.5.3, §4.5.4).
+ */
+const ENFORCED_AT_DISPATCH = {
+  mark: "enforced at dispatch",
+  markClass: "provenance",
+  title: "Read from the live roster each time a beat is drafted, so it is current as of this beat. Dispatch binds to the named family exactly or not at all — the only one of the three filterable fields backed by a mechanism.",
+};
+
+/**
+ * Last-observed, and never a promise about the next job.
+ *
+ * The wording here is constrained on purpose. This field carries what a harness
+ * reported when it was last asked; nothing in the stack pins a model or reads
+ * back what executed. Any stronger verb — ran, runs, will run, is serving,
+ * guarantees — states a fact no code supports, and the tense is not what makes
+ * it wrong. See `HARNESS_MODEL_TAG` beside the emitter.
+ */
+const LAST_OBSERVED = {
+  mark: "last observed",
+  markClass: "provenance",
+  title: "What this harness said about itself when it was last asked, republished on every beat since. Not a promise about the next job. A result echoes a model id, so a divergence is visible in a buyer's own records — an inconsistency signal, never proof of what ran.",
+};
+
+/**
+ * The stalest of the three, and the one a buyer commits sats on. Bounded by the
+ * seat's UPTIME rather than by the beat cadence, and it drifts in both
+ * directions — only one of which is safe (protocol v1 §4.5.4).
+ */
+const AS_OF_SEAT_START = {
+  mark: "as of seat start",
+  markClass: "provenance",
+  title: "Probed once when the seat started and republished on every beat since, so a recent beat is NOT evidence of a recent measurement. A token means its probe command resolved in the job execution environment then: necessary for the work, not sufficient. A toolchain removed since start is still advertised, so this row can over-claim, and nothing on the filter path catches it.",
 };
 
 /**
  * What the runner says it can run, from the newest heartbeat.
  *
  * THE ROWS ARE NOT EQUAL, and the difference is provenance, not confidence.
- * Families come from the dispatchable roster, models from the harness
- * handshake, and each capability token from a probe run in the job execution
- * environment before the beat went out. The last two rows are free text an
- * operator typed. Both kinds are announcements — this reader sees the claim,
- * never the probe — but only one kind has anything at the seat that could have
- * made it false, so the weaker two are marked rather than blended in.
+ * Protocol v1 §4.5.3 is explicit that a reader MUST NOT read the three
+ * filterable fields as three grades of proof: `harness_family` is an
+ * ENFORCEMENT, `harness_model` is an ECHO a buyer can notice a divergence
+ * against, and `capabilities` is a SILENCE — no event carries a capability back
+ * at all. §4.5.4 then gives the three different freshness guarantees, and only
+ * `harness_family` is current as of the beat carrying it.
  *
- * A capability token means its probe command resolved in the job environment at
- * beat time. That is necessary for the work, not sufficient for it, and the
- * tooltip says so: a buyer commits sats on this row.
+ * So every row wears its own mark and the marks differ where the proof differs.
+ * Flush and unmarked, the weakest row reads as solidly as the enforced one, and
+ * a buyer commits sats on the weakest of the three. The last two rows are free
+ * text an operator typed; they stay marked apart from all three, because
+ * nothing pays out on them.
  *
- * An unstated field yields no row. A seat may state nothing — the Docker
+ * Every row is an ANNOUNCEMENT either way. This reader sees the claim, never
+ * the probe. A mark says what a claim is worth, not that anything verified it
+ * here.
+ *
+ * An unstated field yields no row. A seat may state nothing — the stock Docker
  * runtime image proves no tokens at all — and an empty row would read as a
  * measured zero instead of a silence.
  */
 export function capabilityRows(s: { harnessFamilies?: string[]; harnessModels?: HarnessModel[]; capabilities?: string[]; harnessVariant?: string | null; hardware?: string | null } | null): ProfileRow[] {
   if (!s) return [];
   return [
-    ["Harness family", s.harnessFamilies?.length ? s.harnessFamilies.join(" · ") : null],
+    ["Harness family", s.harnessFamilies?.length ? s.harnessFamilies.join(" · ") : null, ENFORCED_AT_DISPATCH],
     ["Harness model", s.harnessModels?.length
-      ? s.harnessModels.map((m) => `${m.family} ${m.model}`).join(" · ") : null],
-    ["Capabilities", s.capabilities?.length ? s.capabilities.join(" · ") : null,
-      // No marker — this row is probed. It carries a title anyway, because the
-      // contract a token buys is narrower than the word "capability" suggests.
-      { title: "Probed in the job execution environment before this heartbeat: the token's command resolved there. Necessary for the work, not sufficient." }],
+      ? s.harnessModels.map((m) => `${m.family} ${m.model}`).join(" · ") : null, LAST_OBSERVED],
+    ["Capabilities", s.capabilities?.length ? s.capabilities.join(" · ") : null, AS_OF_SEAT_START],
     ["Harness variant", s.harnessVariant || null, OPERATOR_DECLARED],
     ["Hardware", s.hardware || null, OPERATOR_DECLARED],
   ];

@@ -5,15 +5,14 @@
  * contract with the publisher: the tag names below are typed as raw literals,
  * never imported, so a change to what `events.ts` looks for goes red here
  * rather than silently rendering an empty Profile. The DISPLAY is a claim about
- * what a buyer sees — which values wear "operator-declared" — and that is
- * asserted against rendered markup, because a source-text grep cannot tell a
- * marker that reaches the page from one that is built and dropped.
+ * what a buyer sees — which mark each value wears — and that is asserted
+ * against rendered markup, because a source-text grep cannot tell a marker that
+ * reaches the page from one that is built and dropped.
  *
- * ⚠ SCOPE OF THE SPELLING PIN. It pins THIS side only. Nothing in web/app can
- * go red on a rename in `crates/maxplayer-core/src/heartbeat.rs`, so a
- * publisher-side rename still lands as blank rows and a green suite. That
- * cross-check belongs beside the emitter and cannot be written until the
- * emitter is on main — see the PR.
+ * ⚠ SCOPE OF THE SPELLING PIN. It pins THIS side only. Nothing in web/app goes
+ * red on a rename in `crates/maxplayer-core/src/heartbeat.rs`, so a
+ * publisher-side rename lands as blank rows over a green suite. That
+ * cross-check belongs beside the emitter and is tracked as #888.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -115,7 +114,7 @@ test("an older beat arriving late never overwrites the current advertisement", (
   assert.deepEqual(rows.find((r) => r.pubkey === SELLER)?.capabilities, ["node"]);
 });
 
-test("operator-typed rows are marked and probed rows are not", () => {
+test("every capability row wears the mark its provenance earns", () => {
   const rows = capabilityRows({
     harnessFamilies: ["codex"],
     harnessModels: [{ family: "codex", model: "gpt-5" }],
@@ -124,17 +123,67 @@ test("operator-typed rows are marked and probed rows are not", () => {
     hardware: "mac studio",
   });
 
+  // Operator-typed: nothing measured these and no filter reads them.
   for (const label of ["Harness variant", "Hardware"]) {
     const row = rowOf(rows, label);
     assert.equal(row?.[2]?.mark, "operator-declared", `${label} is operator-typed and must say so`);
     assert.match(profileRowHtml(row!), /class="unverified">operator-declared</);
   }
 
-  for (const label of ["Capabilities", "Harness family", "Harness model"]) {
+  // Machine-sourced, and NOT interchangeable. Protocol §4.5.3: one enforcement,
+  // one echo, one silence. A reader must not read three grades of one proof.
+  // Tuple-typed, not inferred: destructuring a `string[][]` yields
+  // `string | undefined` under noUncheckedIndexedAccess.
+  const filterable: [string, string][] = [
+    ["Harness family", "enforced at dispatch"],
+    ["Harness model", "last observed"],
+    ["Capabilities", "as of seat start"],
+  ];
+  for (const [label, mark] of filterable) {
     const row = rowOf(rows, label);
-    assert.equal(row?.[2]?.mark, undefined, `${label} is machine-sourced — marking it would say the opposite`);
+    assert.equal(row?.[2]?.mark, mark, `${label} must state its own provenance`);
+    assert.match(profileRowHtml(row!), new RegExp(`class="provenance">${mark}<`));
+    // The operator marker on a measured value would say the opposite.
     assert.doesNotMatch(profileRowHtml(row!), /unverified/);
   }
+
+  // The trichotomy is the point: the three must DIFFER. One mark shared across
+  // them satisfies every assertion above and still presents the equal-grades
+  // reading the protocol forbids, so the distinctness is asserted separately.
+  const marks = filterable.map(([label]) => rowOf(rows, label)?.[2]?.mark);
+  assert.equal(new Set(marks).size, 3, "the three filterable rows must not share a mark");
+});
+
+test("the capability row states its staleness bound and its over-claim direction", () => {
+  // §4.5.4: probed ONCE at seat start and republished on every beat since, so
+  // the bound is the seat's uptime and a recent beat proves nothing about when
+  // it was measured. The drift is not symmetric — a REMOVED toolchain keeps
+  // being advertised, nothing on the filter path catches it, and a buyer
+  // commits sats on this row.
+  const html = profileRowHtml(rowOf(capabilityRows({ capabilities: ["rust"] }), "Capabilities")!);
+  assert.match(html, /seat started/);
+  assert.match(html, /NOT evidence of a recent measurement/);
+  assert.match(html, /over-claim/);
+  assert.match(html, /not sufficient/);
+});
+
+test("the model row never states an execution fact", () => {
+  // The emitter names this defect family: any wording that upgrades this
+  // SELF-REPORT into an EXECUTION FACT is the same error, and it has been
+  // written in all three tenses already. The tense was never the error.
+  //
+  // ⚠ The forbidden list below is an INCLUSION filter. It pins the three shapes
+  // the emitter enumerated and CANNOT prove a new wording is safe — a novel
+  // overclaim passes it. The load-bearing assertion is the positive one: the
+  // title must say what the value actually is.
+  const row = rowOf(capabilityRows({ harnessModels: [{ family: "codex", model: "gpt-5" }] }), "Harness model");
+  const title = row?.[2]?.title ?? "";
+  assert.notEqual(title, "", "positive control: an empty title would pass every doesNotMatch below");
+
+  for (const shape of [/will use/, /is serving/, /actually ran/, /guarantees/]) {
+    assert.doesNotMatch(title, shape, `states an execution fact no code here supports: ${shape}`);
+  }
+  assert.match(title, /last asked/, "it must say what the value actually is");
 });
 
 test("a capability token carries the contract it actually buys", () => {
