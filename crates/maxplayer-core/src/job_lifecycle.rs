@@ -717,6 +717,7 @@ fn build_offer_draft(
     )
     .map_err(|defect| JobLifecycleError::Input(format!("post_job refused: {defect}")))?;
     if let Some(refusal) = crate::buyer::lifecycle::unsatisfiable_capability_request(
+        offer.requested_agent.as_deref(),
         offer.requested_harness_family.as_deref(),
         offer.requested_model.as_deref(),
         &offer.required_capabilities,
@@ -2067,7 +2068,7 @@ fn delivery_pay_deadline(results: &[ResultView], seller_pubkey: &str) -> Option<
 ///
 /// `offer_deadline_unix == None` (offer not yet on the relay) means expiry cannot be derived,
 /// so status-based liveness is preserved unchanged.
-fn derive_claim_liveness(
+pub(crate) fn derive_claim_liveness(
     claims: &mut [ClaimView],
     results: &[ResultView],
     offer_deadline_unix: Option<u64>,
@@ -2091,6 +2092,42 @@ fn derive_claim_liveness(
         claim.live = live_claim_id.as_deref() == Some(claim.claim_id.as_str());
     }
     live_claim_id
+}
+
+/// The claims that were award CANDIDATES at the instant the offer's deadline struck (#897).
+///
+/// Diagnosing a park means reasoning about the claims that were in the running, and a job parks for
+/// a passed deadline only once [`derive_claim_liveness`] has already demoted every `processing`
+/// claim to expired. At that point `live` is false on all of them, so a diagnosis that reads `live`
+/// sees an empty field in exactly the case where a seat did claim — and reports nothing, which reads
+/// as "capability was not the problem" rather than as "this question was never asked".
+///
+/// Re-derives with the SAME function at `now = deadline` instead of restating which statuses count
+/// as candidates. At that instant the demotion branch (`now > deadline`) is inert and
+/// `delivery_pay_deadline` is never reached, so this reproduces the liveness any pre-deadline
+/// evaluation would have produced. It owns no rule of its own and so cannot drift from the one it
+/// is asking about.
+pub(crate) fn claims_at_deadline(view: &JobView) -> Vec<ClaimView> {
+    let mut claims = view.claims.clone();
+    // The demotion is DESTRUCTIVE — it overwrites `status` — so re-deriving at the deadline is not
+    // enough on its own: the information the diagnosis needs was already spent. Reverse the marker
+    // first.
+    //
+    // [`CLAIM_STATUS_EXPIRED`] is never a relay value. `derive_claim_liveness` is the only thing that
+    // writes it, and only for a claim that was `processing` when the deadline passed, so restoring it
+    // reads that function's own marker rather than guessing at a status. The round trip is asserted
+    // by `the_capability_clause_survives_the_real_deadline_demotion`, which demotes at `deadline + 1`
+    // and requires the claim to be a candidate again here — so if the demotion ever writes a
+    // different status, that test fails rather than this quietly seeing nothing.
+    for claim in claims.iter_mut() {
+        if claim.status == CLAIM_STATUS_EXPIRED {
+            claim.status = "processing".to_owned();
+        }
+    }
+    if let Some(deadline) = view.offer.as_ref().map(|offer| offer.deadline_unix) {
+        derive_claim_liveness(&mut claims, &view.results, Some(deadline), deadline);
+    }
+    claims
 }
 
 /// A buyer AWARD found on the relay, parsed into exactly the fields an `awards` row needs and
@@ -5170,6 +5207,7 @@ mod tests {
 
     /// A from-scratch post request carrying a capability request, for the gate tests below.
     fn post_request_requesting(
+        agent: Option<&str>,
         family: Option<&str>,
         model: Option<&str>,
         capabilities: &[&str],
@@ -5184,7 +5222,7 @@ mod tests {
             repo: None,
             branch: None,
             job: JobKind::FromScratch,
-            requested_agent: None,
+            requested_agent: agent.map(str::to_owned),
             requested_harness_family: family.map(str::to_owned),
             requested_model: model.map(str::to_owned),
             required_capabilities: capabilities.iter().map(|t| (*t).to_owned()).collect(),
@@ -5203,7 +5241,7 @@ mod tests {
     fn post_job_refuses_a_request_no_seat_could_satisfy() {
         // Out-of-vocabulary family: no seat can advertise it, because families reach the wire only
         // through `harness_family_for_preset`.
-        let error = build_offer_draft(&post_request_requesting(Some("gpt-cli"), None, &[]), 10, None)
+        let error = build_offer_draft(&post_request_requesting(None, Some("gpt-cli"), None, &[]), 10, None)
             .expect_err("an unknown harness family must be refused");
         assert!(
             error.to_string().contains("gpt-cli") && error.to_string().contains("not a known family"),
@@ -5217,17 +5255,30 @@ mod tests {
         );
 
         // Out-of-vocabulary capability token.
-        let error = build_offer_draft(&post_request_requesting(None, None, &["kubernetes"]), 10, None)
+        let error =
+            build_offer_draft(&post_request_requesting(None, None, None, &["kubernetes"]), 10, None)
             .expect_err("an unknown capability token must be refused");
         assert!(
             error.to_string().contains("kubernetes") && error.to_string().contains("node"),
             "the error must name the bad token and the known ones: {error}"
         );
 
-        // A model with no family — refused by the SATISFIABILITY gate, which asks the award predicate
-        // rather than restating #788's rule.
-        let error = build_offer_draft(&post_request_requesting(None, Some("opus"), &[]), 10, None)
-            .expect_err("a model with no harness family must be refused");
+        // A model with no PRESET — refused by the SATISFIABILITY gate, which asks the award predicate
+        // rather than restating the rule. A family does not rescue it: dispatch never reads one, so
+        // the second row here is the one that would silently execute on the wrong harness.
+        for (agent, family) in [(None, None), (None, Some("claude-code"))] {
+            let error =
+                build_offer_draft(&post_request_requesting(agent, family, Some("opus"), &[]), 10, None)
+                    .expect_err("a model with no harness preset must be refused");
+            assert!(
+                error.to_string().contains("no seat could ever satisfy"),
+                "family={family:?}: unsatisfiable by construction, and the error should say so \
+                 rather than reading as a vocabulary complaint: {error}"
+            );
+        }
+        let error =
+            build_offer_draft(&post_request_requesting(None, None, Some("opus"), &[]), 10, None)
+                .expect_err("a model with no harness preset must be refused");
         assert!(
             error.to_string().contains("no seat could ever satisfy"),
             "a model-only request is unsatisfiable by construction and the error should say so \
@@ -5238,19 +5289,38 @@ mod tests {
             "the error must name the model the caller asked for: {error}"
         );
 
+        // A preset and a family naming DIFFERENT harnesses. Dispatch honours the preset, so this
+        // offer would ask for codex and run Claude — and because a multi-harness seat advertises
+        // both families, no claim-level check can see it. Refused before the offer is signed.
+        let error = build_offer_draft(
+            &post_request_requesting(Some("claude"), Some("codex"), None, &[]),
+            10,
+            None,
+        )
+        .expect_err("a family contradicting the preset must be refused");
+        assert!(
+            error.to_string().contains("claude") && error.to_string().contains("codex"),
+            "the error must name BOTH sides of the contradiction so the caller knows which to \
+             change: {error}"
+        );
+
         // CONTROLS: every satisfiable shape must still post. Without these the assertions above are
         // equally explained by a gate that refuses everything with a capability request on it.
-        for (family, model, capabilities) in [
-            (None, None, Vec::new()),
-            (Some("codex"), None, Vec::new()),
-            (Some("codex"), Some("gpt-5.6-sol[low]"), Vec::new()),
-            (None, None, vec!["rust"]),
-            (Some("claude-code"), None, vec!["rust", "node"]),
+        for (agent, family, model, capabilities) in [
+            (None, None, None, Vec::new()),
+            (None, Some("codex"), None, Vec::new()),
+            (Some("codex"), None, None, Vec::new()),
+            (Some("codex"), Some("codex"), Some("gpt-5.6-sol[low]"), Vec::new()),
+            // The family DERIVED from the preset rather than stated — the shape a caller reaches
+            // for first, and the one a stricter rule would have broken.
+            (Some("codex"), None, Some("gpt-5.6-sol[low]"), Vec::new()),
+            (None, None, None, vec!["rust"]),
+            (None, Some("claude-code"), None, vec!["rust", "node"]),
         ] {
-            let request = post_request_requesting(family, model, &capabilities);
+            let request = post_request_requesting(agent, family, model, &capabilities);
             assert!(
                 build_offer_draft(&request, 10, None).is_ok(),
-                "control: {family:?}/{model:?}/{capabilities:?} is satisfiable and must post"
+                "control: {agent:?}/{family:?}/{model:?}/{capabilities:?} is satisfiable and must post"
             );
         }
     }
@@ -5263,7 +5333,12 @@ mod tests {
     #[test]
     fn post_job_emits_the_capability_request_it_was_given() {
         let draft = build_offer_draft(
-            &post_request_requesting(Some("codex"), Some("gpt-5.6-sol[low]"), &["rust"]),
+            &post_request_requesting(
+                Some("codex"),
+                Some("codex"),
+                Some("gpt-5.6-sol[low]"),
+                &["rust"],
+            ),
             10,
             None,
         )
@@ -5284,7 +5359,7 @@ mod tests {
 
         // And a post with no request is byte-identical to one built before any of this existed —
         // the property that makes filtering opt-in on the wire, not just in the predicate.
-        let plain = build_offer_draft(&post_request_requesting(None, None, &[]), 10, None)
+        let plain = build_offer_draft(&post_request_requesting(None, None, None, &[]), 10, None)
             .expect("draft");
         assert_eq!(
             plain,

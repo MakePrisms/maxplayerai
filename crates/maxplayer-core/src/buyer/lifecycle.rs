@@ -46,13 +46,18 @@ pub struct AwardFilters<'a> {
     /// signed offer is the authority for what the job requested). `None` ⇒ no preference and every
     /// claim passes this filter unchanged.
     pub requested_agent: Option<&'a str>,
-    /// The harness FAMILY the offer asked for (#784). `None` ⇒ no preference. Distinct from
-    /// `requested_agent`, which names a preset: a family spans the presets that share a harness, so
-    /// a family request binds dispatch where a preset name binds a configuration.
+    /// The harness FAMILY the offer asked for. `None` ⇒ no preference.
+    ///
+    /// Selects WHICH SEATS MAY CLAIM, and nothing more: a seat that does not advertise the family is
+    /// refused, but a multi-harness seat that does advertise it still dispatches on its own preset.
+    /// Only `requested_agent` reaches execution. A stated family must therefore AGREE with the
+    /// preset when both are present — see
+    /// [`CapabilityRefusal::HarnessFamilyContradictsPreset`].
     pub requested_harness_family: Option<&'a str>,
-    /// The model the offer asked for (#784). Only meaningful PAIRED with a family, and refused
-    /// rather than ignored when it arrives without one — see
-    /// [`CapabilityRefusal::ModelWithoutHarnessFamily`].
+    /// The model the offer asked for. Only meaningful PAIRED with a preset, and refused rather than
+    /// ignored when it arrives without one — see
+    /// [`CapabilityRefusal::ModelWithoutHarnessPreset`]. When the family is absent it is DERIVED
+    /// from the preset, so `agent` + `model` is a complete request.
     pub requested_model: Option<&'a str>,
     /// Capability tokens the offer requires (#784). Empty ⇒ no requirement. Every token is validated
     /// against [`crate::capability::CAPABILITIES`] before any claim is judged.
@@ -124,9 +129,24 @@ pub enum CapabilityRefusal {
     /// the claim advertises no model at all and when it advertises that model for a DIFFERENT
     /// family — a model is only meaningful paired to the harness that would run it.
     Model { family: String, requested: String },
-    /// The job named a model but no harness family. A buyer-side request defect, refused here as the
+    /// The job named a model but no harness PRESET. A buyer-side request defect, refused here as the
     /// fail-closed backstop so it can never be silently ignored on the money path.
-    ModelWithoutHarnessFamily { requested: String },
+    ///
+    /// The preset is the anchor because it is the only requested axis the seller persists and
+    /// dispatches on: `offer_row` stores `requested_agent` alone, `classify_offer` gates on it, and
+    /// `execute_job` hands it to `SellerAgents::dispatch`. Family and model reach neither, so a model
+    /// hung off a family would name a harness nothing selects — and `dispatch(None)` runs the seat's
+    /// FIRST configured preset, which is how a multi-harness seat could accept a codex request and
+    /// deterministically run Claude.
+    ModelWithoutHarnessPreset { requested: String },
+    /// The job named both a preset and a harness family, and they disagree. Dispatch honours the
+    /// preset, so the family names a harness this job would not run on — the offer would be asking
+    /// for one thing and executing another.
+    HarnessFamilyContradictsPreset { preset: String, preset_family: String, requested: String },
+    /// The job constrained the harness (a family or a model) while naming a preset with no family in
+    /// [`crate::agent_presets::HARNESS_FAMILIES`] — a custom preset. Nothing can establish that what
+    /// dispatch will run matches what the job asked for, so it refuses rather than assuming.
+    PresetHasNoKnownFamily { preset: String },
     /// The job required capability tokens the claim does not advertise. Names the MISSING tokens
     /// rather than the whole request, so the refusal says what to fix.
     Capabilities { missing: Vec<String> },
@@ -147,8 +167,15 @@ impl std::fmt::Display for CapabilityRefusal {
             Self::Model { family, requested } => {
                 write!(f, "claim does not advertise model {requested} for family {family}")
             }
-            Self::ModelWithoutHarnessFamily { requested } => {
-                write!(f, "model {requested} requested without a harness family")
+            Self::ModelWithoutHarnessPreset { requested } => {
+                write!(f, "model {requested} requested without a harness preset (`agent`)")
+            }
+            Self::HarnessFamilyContradictsPreset { preset, preset_family, requested } => write!(
+                f,
+                "harness family {requested} contradicts preset {preset}, which dispatches {preset_family}"
+            ),
+            Self::PresetHasNoKnownFamily { preset } => {
+                write!(f, "preset {preset} has no known harness family to check the request against")
             }
             Self::Capabilities { missing } => {
                 write!(f, "claim is missing required capabilities: {}", missing.join(", "))
@@ -197,16 +224,64 @@ pub fn claim_meets_capability_request(
     {
         return Err(CapabilityRefusal::UnknownCapabilityToken { token: unknown.clone() });
     }
+    // The request must be one DISPATCH can honour, before any of it is matched against a claim.
+    //
+    // Only `requested_agent` reaches execution: `offer_row` persists it alone, `classify_offer`
+    // gates on it, and `execute_job` passes it to `SellerAgents::dispatch`, which runs the seat's
+    // FIRST configured preset when it is absent. A family or model that disagrees with the preset
+    // therefore describes a harness this job will not run on, and a multi-harness seat would satisfy
+    // the filter and then execute something else. Refusing here is what keeps the offer's request and
+    // the seat's dispatch the same statement.
+    let preset = crate::seller_agents::normalize_request(filters.requested_agent);
+    if let Some(requested_model) = filters.requested_model {
+        if preset.is_none() {
+            return Err(CapabilityRefusal::ModelWithoutHarnessPreset {
+                requested: requested_model.to_owned(),
+            });
+        }
+    }
+    let preset_family =
+        preset.as_deref().and_then(crate::agent_presets::harness_family_for_preset);
+    if let Some(preset_name) = preset.as_deref() {
+        // A bare preset constrains nothing about the family — `claim_serves_requested_agent` already
+        // enforces it, and a seat naming that preset is by definition able to run it.
+        if filters.requested_harness_family.is_some() || filters.requested_model.is_some() {
+            let Some(preset_family) = preset_family else {
+                return Err(CapabilityRefusal::PresetHasNoKnownFamily {
+                    preset: preset_name.to_owned(),
+                });
+            };
+            if let Some(requested) = filters.requested_harness_family {
+                if requested != preset_family {
+                    return Err(CapabilityRefusal::HarnessFamilyContradictsPreset {
+                        preset: preset_name.to_owned(),
+                        preset_family: preset_family.to_owned(),
+                        requested: requested.to_owned(),
+                    });
+                }
+            }
+        }
+    }
+    // The family this request actually binds to: stated outright, or DERIVED from the preset when a
+    // model needs one to pair against. Deriving rather than demanding both keeps `agent` + `model`
+    // — the shape a buyer reaches for first — a valid request instead of a refusal.
+    let effective_family: Option<&str> = match filters.requested_harness_family {
+        Some(stated) => Some(stated),
+        None if filters.requested_model.is_some() => preset_family,
+        None => None,
+    };
     // Family first: when a claim fails both, the family refusal is the actionable one — a model
     // refusal would send the operator chasing a model on a harness the seat never offered.
-    if let Some(requested) = filters.requested_harness_family {
+    if let Some(requested) = effective_family {
         if !advertised.harness_families.iter().any(|family| family == requested) {
             return Err(CapabilityRefusal::HarnessFamily { requested: requested.to_owned() });
         }
     }
     if let Some(requested_model) = filters.requested_model {
-        let Some(family) = filters.requested_harness_family else {
-            return Err(CapabilityRefusal::ModelWithoutHarnessFamily {
+        // Some by construction: a model requires a preset, and a preset that constrains the harness
+        // must map to a family or it was refused above.
+        let Some(family) = effective_family else {
+            return Err(CapabilityRefusal::ModelWithoutHarnessPreset {
                 requested: requested_model.to_owned(),
             });
         };
@@ -254,36 +329,56 @@ pub fn claim_meets_capability_request(
 /// offer the award-time refusal and its park row are the wire-level truth. Both layers are tested and
 /// neither makes the other unnecessary.
 pub fn unsatisfiable_capability_request(
+    requested_agent: Option<&str>,
     requested_harness_family: Option<&str>,
     requested_model: Option<&str>,
     required_capabilities: &[String],
 ) -> Option<CapabilityRefusal> {
-    // The seat that advertises exactly what was asked for. A model is only representable PAIRED with
-    // a family, so a request naming a model and no family cannot be advertised by any seat — which is
-    // the unsatisfiability this probe detects rather than asserts.
+    // The seat that advertises exactly what was asked for, along EVERY axis that could be asked
+    // about. It advertises the stated family AND the preset's own family, and pairs the model to
+    // both, so it satisfies whichever one the predicate decides is effective.
+    //
+    // Advertising both rather than working out which one applies is deliberate: computing the
+    // effective family here would be a second copy of the derive rule, and the two would rot apart
+    // exactly as a restated predicate would. A maximally-capable seat needs to know only which axes
+    // were REQUESTED, never how they resolve — so what survives is a request no seat could satisfy,
+    // which is the question this asks.
+    let mut harness_families: Vec<String> = Vec::new();
+    for family in [
+        requested_harness_family,
+        requested_agent.and_then(crate::agent_presets::harness_family_for_preset),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !harness_families.iter().any(|held| held == family) {
+            harness_families.push(family.to_owned());
+        }
+    }
     let advertised = crate::heartbeat::SeatCapability {
-        harness_families: requested_harness_family
-            .map(|family| vec![family.to_owned()])
-            .unwrap_or_default(),
-        models: match (requested_harness_family, requested_model) {
-            (Some(family), Some(model)) => vec![crate::heartbeat::HarnessModel {
-                family: family.to_owned(),
-                model: model.to_owned(),
-            }],
-            _ => Vec::new(),
+        models: match requested_model {
+            Some(model) => harness_families
+                .iter()
+                .map(|family| crate::heartbeat::HarnessModel {
+                    family: family.clone(),
+                    model: model.to_owned(),
+                })
+                .collect(),
+            None => Vec::new(),
         },
+        harness_families,
         capabilities: required_capabilities.to_vec(),
         ..crate::heartbeat::SeatCapability::default()
     };
     // Money fields are placeholders and are never read: `claim_meets_capability_request` consults
-    // only the three request axes. Zeroes rather than plausible amounts, so nothing here can be
-    // mistaken for a price this function decides anything about.
+    // only the request axes. Zeroes rather than plausible amounts, so nothing here can be mistaken
+    // for a price this function decides anything about.
     let filters = AwardFilters {
         offer_amount_sats: 0,
         max_sats: 0,
         buyer_mint: "",
         allow_real_mints: false,
-        requested_agent: None,
+        requested_agent,
         requested_harness_family,
         requested_model,
         required_capabilities,
@@ -316,8 +411,14 @@ pub fn capability_park_reason(view: &JobView, filters: &AwardFilters) -> Option<
     {
         return None;
     }
+    // Judged on the claims that were candidates AT THE DEADLINE, not on `view.claims` as they stand
+    // now. A job reaches this diagnosis only after its deadline passed, and by then liveness has
+    // been re-derived against the current clock and every ordinary claim is expired — so reading
+    // `view.claims` here would find nothing live and stay silent in precisely the case this exists
+    // to explain.
+    let candidates = crate::job_lifecycle::claims_at_deadline(view);
     let mut refusals: Vec<String> = Vec::new();
-    for claim in view.claims.iter().filter(|claim| claim.live) {
+    for claim in candidates.iter().filter(|claim| claim.live) {
         match claim_meets_capability_request(&claim.capability, filters) {
             // A live claim that passes means the request was satisfiable and something else refused
             // this job. Bail rather than report: a partial list reads as the whole reason.
@@ -1563,6 +1664,10 @@ mod tests {
             harness_variant: None,
             hardware: None,
         };
+        // The seat serves the `codex` PRESET as well as the family. A model axis now has to name a
+        // preset, because dispatch reads nothing else — so without this the model case would be
+        // refused for an unserved preset and would stop exercising the model rule at all.
+        named.agents = vec!["codex".to_owned()];
         let view = view_with(&job, 10, vec![named]);
         let id = "c".repeat(64);
 
@@ -1584,6 +1689,7 @@ mod tests {
 
         // Axis 2 — right family, model the seat does not advertise. The PAIR is the unit.
         let mut wants_model = filters(10, 100);
+        wants_model.requested_agent = Some("codex");
         wants_model.requested_harness_family = Some("codex");
         wants_model.requested_model = Some("opus");
         if select_awardable_claim(&view, &wants_model).is_some() {
@@ -1610,6 +1716,7 @@ mod tests {
         // above. That is a different bug wearing the same green, and only this catches it.
         let conforming_caps = vec!["python".to_owned()];
         let mut conforming = filters(10, 100);
+        conforming.requested_agent = Some("codex");
         conforming.requested_harness_family = Some("codex");
         conforming.requested_model = Some("sonnet");
         conforming.required_capabilities = &conforming_caps;
@@ -3542,6 +3649,9 @@ mod tests {
     #[test]
     fn a_model_matches_only_when_paired_with_its_own_family() {
         let mut wants = filters(10, 10);
+        // A model request names the PRESET too — dispatch reads nothing else. `claude` maps to the
+        // requested family, so the two agree and this stays a test about model pairing.
+        wants.requested_agent = Some("claude");
         wants.requested_harness_family = Some("claude-code");
         wants.requested_model = Some("opus");
         assert_eq!(
@@ -3572,19 +3682,74 @@ mod tests {
         );
     }
 
-    // A model without a family is a defect in the REQUEST. Refused rather than ignored: ignoring it
+    // A model without a PRESET is a defect in the REQUEST. Refused rather than ignored: ignoring it
     // would award on a weaker filter than the buyer asked for, silently, on the money path.
+    //
+    // The preset is the anchor because it is the only axis dispatch reads. A model hung off a family
+    // alone would pass this filter and then run on whatever preset the seat happens to list first.
     #[test]
-    fn a_model_request_without_a_harness_family_is_refused_not_ignored() {
+    fn a_model_request_without_a_harness_preset_is_refused_not_ignored() {
         let mut wants = filters(10, 10);
+        wants.requested_model = Some("opus");
+        wants.requested_harness_family = Some("claude-code");
+        assert_eq!(
+            claim_meets_capability_request(
+                &seat(&["claude-code"], &[("claude-code", "opus")], &[]),
+                &wants,
+            ),
+            Err(CapabilityRefusal::ModelWithoutHarnessPreset { requested: "opus".into() }),
+            "a seat that DOES advertise the model, for the requested family, must STILL be refused: \
+             without a preset nothing binds which harness dispatch would actually start"
+        );
+    }
+
+    // The counterexample from review: a preset and a family that name different harnesses. Dispatch
+    // honours the preset, so awarding this would run Claude on a job that asked for codex — and a
+    // multi-harness seat advertises BOTH families, so every other filter passes.
+    #[test]
+    fn a_family_that_contradicts_the_preset_is_refused_on_a_seat_that_advertises_both() {
+        let mut wants = filters(10, 10);
+        wants.requested_agent = Some("claude");
+        wants.requested_harness_family = Some("codex");
+        let multi_harness =
+            seat(&["claude-code", "codex"], &[("claude-code", "opus"), ("codex", "gpt-5.6")], &[]);
+        assert_eq!(
+            claim_meets_capability_request(&multi_harness, &wants),
+            Err(CapabilityRefusal::HarnessFamilyContradictsPreset {
+                preset: "claude".into(),
+                preset_family: "claude-code".into(),
+                requested: "codex".into(),
+            }),
+            "the seat can genuinely serve both, so nothing about the CLAIM refuses this — the \
+             request itself is unrunnable and only a request-level check can see it"
+        );
+    }
+
+    // The shape a buyer reaches for first: name the preset, name the model, say nothing about the
+    // family. The family is DERIVED from the preset rather than demanded, so this is a valid request.
+    #[test]
+    fn a_preset_and_a_model_derive_the_family_instead_of_refusing() {
+        let mut wants = filters(10, 10);
+        wants.requested_agent = Some("claude");
         wants.requested_model = Some("opus");
         assert_eq!(
             claim_meets_capability_request(
                 &seat(&["claude-code"], &[("claude-code", "opus")], &[]),
                 &wants,
             ),
-            Err(CapabilityRefusal::ModelWithoutHarnessFamily { requested: "opus".into() }),
-            "a seat that DOES advertise the model must still be refused — the request is the defect"
+            Ok(()),
+            "agent=claude implies family=claude-code, so the model has a family to pair against"
+        );
+        assert_eq!(
+            claim_meets_capability_request(
+                &seat(&["claude-code"], &[("claude-code", "sonnet")], &[]),
+                &wants,
+            ),
+            Err(CapabilityRefusal::Model {
+                family: "claude-code".into(),
+                requested: "opus".into()
+            }),
+            "and the derived family is a real filter, not a formality"
         );
     }
 
@@ -3630,6 +3795,7 @@ mod tests {
     #[test]
     fn a_claim_failing_both_reports_the_family_refusal() {
         let mut wants = filters(10, 10);
+        wants.requested_agent = Some("claude");
         wants.requested_harness_family = Some("claude-code");
         wants.requested_model = Some("opus");
         assert_eq!(
@@ -3687,6 +3853,10 @@ mod tests {
         let claim_id = "c".repeat(64);
         let mut payable = claim(&job, true, 10, &mints);
         payable.capability = seat(&["codex"], &[], &["rust"]);
+        // The seat also serves the `codex` PRESET, so the model case below can name one. A model
+        // request without a preset is refused as a request defect and would never reach the model
+        // comparison this test exists to make.
+        payable.agents = vec!["codex".to_owned()];
 
         // Control FIRST: the same claim, the same paths, no request. A refusal below means nothing
         // unless this passes — otherwise the test proves only that the claim was unawardable.
@@ -3741,6 +3911,7 @@ mod tests {
         // MODEL the claim does not advertise, paired with a family it DOES. The pair is the unit, so
         // this is the case that separates a real model filter from one that matches on family alone.
         let wants_model = OfferView {
+            requested_agent: Some("codex".to_owned()),
             requested_model: Some("opus".to_owned()),
             ..offer_requesting(&job, 10, Some("codex"), &[])
         };
@@ -3795,39 +3966,68 @@ mod tests {
         let rust = vec!["rust".to_owned()];
         let bogus = vec!["kubernetes".to_owned()];
         let mixed = vec!["rust".to_owned(), "kubernetes".to_owned()];
-        let shapes: Vec<(Option<&str>, Option<&str>, &[String])> = vec![
+        let shapes: Vec<(Option<&str>, Option<&str>, Option<&str>, &[String])> = vec![
             // Satisfiable: absent, single-axis, and fully-specified requests.
-            (None, None, &[]),
-            (Some("codex"), None, &[]),
-            (Some("codex"), Some("gpt-5.6-sol[low]"), &[]),
-            (None, None, &rust),
-            (Some("codex"), Some("gpt-5.6-sol[low]"), &rust),
-            // Unsatisfiable by construction: a model with no family to pair it to (#788).
-            (None, Some("opus"), &[]),
-            (None, Some("opus"), &rust),
+            (None, None, None, &[]),
+            (None, Some("codex"), None, &[]),
+            (Some("codex"), None, None, &[]),
+            (Some("codex"), Some("codex"), Some("gpt-5.6-sol[low]"), &[]),
+            // The family DERIVED from the preset rather than stated.
+            (Some("codex"), None, Some("gpt-5.6-sol[low]"), &[]),
+            (None, None, None, &rust),
+            (Some("codex"), Some("codex"), Some("gpt-5.6-sol[low]"), &rust),
+            // Unsatisfiable: a model with no preset, so nothing binds the harness that would run it.
+            // A family does not rescue it — dispatch never reads one.
+            (None, None, Some("opus"), &[]),
+            (None, Some("claude-code"), Some("opus"), &[]),
+            (None, Some("claude-code"), Some("opus"), &rust),
+            // Unsatisfiable: a family naming a harness the preset would not dispatch.
+            (Some("claude"), Some("codex"), None, &[]),
+            (Some("claude"), Some("codex"), Some("opus"), &[]),
+            // Unsatisfiable: a custom preset has no family, so nothing can establish that what
+            // dispatch runs is what was asked for.
+            (Some("my-custom-harness"), Some("codex"), None, &[]),
+            (Some("my-custom-harness"), None, Some("opus"), &[]),
+            // But a custom preset ALONE constrains no harness and stays satisfiable — the preset
+            // filter already binds dispatch exactly.
+            (Some("my-custom-harness"), None, None, &[]),
             // Out-of-vocabulary capability token. Included because the token rule is the ONE rule
             // both post-time gates can see: the vocabulary gate checks it directly, and the
             // predicate checks it too, so the satisfiability gate surfaces it as well. Both read the
             // same `CAPABILITIES` constant, so adding a token cannot make them disagree — but the
             // rule being stated twice is worth a row here rather than an argument in a comment.
-            (None, None, &bogus),
-            (Some("codex"), None, &mixed),
+            (None, None, None, &bogus),
+            (None, Some("codex"), None, &mixed),
         ];
 
-        for (family, model, capabilities) in shapes {
-            let gate = unsatisfiable_capability_request(family, model, capabilities);
+        for (agent, family, model, capabilities) in shapes {
+            let gate = unsatisfiable_capability_request(agent, family, model, capabilities);
 
             // What the predicate says about the claim that advertises EXACTLY this request. If even
             // that claim is refused, no publishable claim can pass.
-            let perfect = seat(
-                &family.map(|f| vec![f]).unwrap_or_default(),
-                &match (family, model) {
-                    (Some(f), Some(m)) => vec![(f, m)],
-                    _ => Vec::new(),
-                },
-                &capabilities.iter().map(String::as_str).collect::<Vec<_>>(),
-            );
+            //
+            // Built here rather than reused from the gate, so the two are a CROSS-CHECK instead of
+            // one artifact agreeing with itself. It advertises the stated family and the preset's
+            // family both, because either can be the one the predicate binds to and this oracle
+            // must not have to know which — knowing would make it a copy of the rule under test.
+            let mut families: Vec<&str> = Vec::new();
+            for candidate in
+                [family, agent.and_then(crate::agent_presets::harness_family_for_preset)]
+                    .into_iter()
+                    .flatten()
+            {
+                if !families.contains(&candidate) {
+                    families.push(candidate);
+                }
+            }
+            let pairs: Vec<(&str, &str)> = match model {
+                Some(model) => families.iter().map(|family| (*family, model)).collect(),
+                None => Vec::new(),
+            };
+            let perfect =
+                seat(&families, &pairs, &capabilities.iter().map(String::as_str).collect::<Vec<_>>());
             let mut filters = filters(10, 10);
+            filters.requested_agent = agent;
             filters.requested_harness_family = family;
             filters.requested_model = model;
             filters.required_capabilities = capabilities;
@@ -3835,23 +4035,41 @@ mod tests {
 
             assert_eq!(
                 gate, predicate,
-                "gate and predicate disagree on {family:?}/{model:?}/{capabilities:?}. The gate must \
-                 refuse exactly what the predicate can never pass: refusing more blocks posts that \
-                 would have been awarded, refusing less restores the silent park the gate exists to \
-                 prevent."
+                "gate and predicate disagree on {agent:?}/{family:?}/{model:?}/{capabilities:?}. The \
+                 gate must refuse exactly what the predicate can never pass: refusing more blocks \
+                 posts that would have been awarded, refusing less restores the silent park the gate \
+                 exists to prevent."
             );
         }
 
-        // Positive control on BOTH sides: the table above is only meaningful if it contains a shape
-        // that is refused and a shape that is not. Without this, a gate stuck at `None` and a
-        // predicate stuck at `None` would agree on every row and pass.
+        // Positive controls on BOTH sides, one per rule the table exercises. Without these, a gate
+        // stuck at `None` and a predicate stuck at `None` would agree on every row and pass — and
+        // the controls pin the actual verdicts, so an oracle that is wrong the same way the gate is
+        // wrong still fails here.
         assert!(
-            unsatisfiable_capability_request(None, Some("opus"), &[]).is_some(),
-            "control: a model with no harness family must be refused by the gate"
+            unsatisfiable_capability_request(None, None, Some("opus"), &[]).is_some(),
+            "control: a model with no harness preset must be refused by the gate"
         );
         assert!(
-            unsatisfiable_capability_request(Some("codex"), Some("opus"), &[]).is_none(),
-            "control: a fully-specified request must NOT be refused by the gate"
+            unsatisfiable_capability_request(None, Some("claude-code"), Some("opus"), &[]).is_some(),
+            "control: a family does NOT substitute for the preset — dispatch never reads one"
+        );
+        assert!(
+            unsatisfiable_capability_request(Some("claude"), Some("codex"), None, &[]).is_some(),
+            "control: a family contradicting the preset must be refused by the gate"
+        );
+        assert!(
+            unsatisfiable_capability_request(Some("codex"), Some("codex"), Some("opus"), &[])
+                .is_none(),
+            "control: a fully-specified, self-consistent request must NOT be refused by the gate"
+        );
+        assert!(
+            unsatisfiable_capability_request(Some("codex"), None, Some("opus"), &[]).is_none(),
+            "control: the family may be DERIVED from the preset rather than stated"
+        );
+        assert!(
+            unsatisfiable_capability_request(None, Some("codex"), None, &[]).is_none(),
+            "control: a family-only request stays valid as a SEAT filter"
         );
     }
 
@@ -3920,13 +4138,13 @@ mod tests {
         assert_eq!(
             select_awardable_claim(&view, &filters),
             None,
-            "auto path: a model with no family must refuse, not be ignored (#788)"
+            "auto path: a model with no preset must refuse, not be ignored"
         );
         assert_eq!(
             named_claim_awardable(&view, &claim_id, &filters),
             Err(NamedAwardRefused::Capability {
                 claim_id: claim_id.clone(),
-                refusal: CapabilityRefusal::ModelWithoutHarnessFamily { requested: "opus".into() },
+                refusal: CapabilityRefusal::ModelWithoutHarnessPreset { requested: "opus".into() },
             }),
             "manual path: naming the claim must not bypass the malformed request either"
         );
@@ -3934,7 +4152,7 @@ mod tests {
         let reason = capability_park_reason(&view, &filters)
             .expect("a model-only request must produce a park reason");
         assert!(
-            reason.contains("without a harness family"),
+            reason.contains("without a harness preset"),
             "the row must name the REQUEST defect, not blame the claim — an operator reading it has \
              to know to add a family rather than to go find another seat: {reason}"
         );
@@ -3972,10 +4190,94 @@ mod tests {
         // No LIVE claims ⇒ nothing was refused. "No seat advertises X" would be false where the truth
         // is that nobody claimed, and it would send an operator to fix a request that is fine.
         let wants = offer_requesting(&job, 10, Some("claude-code"), &[]);
-        let dead = claim(&job, false, 10, &mints);
-        let view = JobView { offer: Some(wants.clone()), ..view_with(&job, 10, vec![dead]) };
+        // NO CLAIMS AT ALL, which is what "an empty relay" means. A claim carrying `live: false`
+        // would NOT do: the diagnosis re-derives liveness from status, so a claim still saying
+        // "processing" is a candidate however the flag was set, and an `expired` one was a
+        // candidate at the deadline by definition — that status is written only by the demotion.
+        // Hand-setting the flag would assert against a state production cannot hold.
+        let view = JobView { offer: Some(wants.clone()), ..view_with(&job, 10, Vec::new()) };
         assert_eq!(
             capability_park_reason(&view, &filters_from_offer(&wants, 10)),
+            None,
+            "an empty relay is not a capability failure"
+        );
+    }
+
+    // THE PRODUCTION SHAPE OF THE DEADLINE PARK — the state `drive_auto_award` actually holds when
+    // it writes the row, rather than one assembled to suit the diagnosis.
+    //
+    // The earlier park tests hand-built `live: true` and called the helpers directly. That is a state
+    // the real branch CANNOT receive: a job parks for a passed deadline only after liveness has been
+    // re-derived against the current clock, and `derive_claim_liveness` demotes every `processing`
+    // claim to expired the moment `now > deadline`. Reading `live` at that point finds nothing, so
+    // the diagnosis returned `None` and the generic deadline row stood — a green test over a code
+    // path production could never reach.
+    //
+    // So this drives PRODUCTION'S OWN liveness step at `now = deadline + 1` BEFORE forming the row.
+    #[test]
+    fn the_capability_clause_survives_the_real_deadline_demotion() {
+        let job = "a".repeat(64);
+        let mints = vec![DEFAULT_MINT_URL.to_owned()];
+        let deadline = 1_000_u64;
+
+        let park_row_for = |capability: crate::heartbeat::SeatCapability, requested| {
+            let mut claimed = claim(&job, true, 10, &mints);
+            claimed.capability = capability;
+            let offer = OfferView {
+                deadline_unix: deadline,
+                ..offer_requesting(&job, 10, requested, &[])
+            };
+            let mut claims = vec![claimed];
+            // PRODUCTION'S OWN STEP, at the clock the park branch runs on.
+            crate::job_lifecycle::derive_claim_liveness(
+                &mut claims,
+                &[],
+                Some(deadline),
+                deadline + 1,
+            );
+            assert!(
+                claims.iter().all(|claim| !claim.live),
+                "precondition: past the deadline production holds NO live claim — if this ever \
+                 stops being true the regression has stopped reproducing the bug it guards"
+            );
+            let view = JobView {
+                offer: Some(offer.clone()),
+                claims,
+                ..view_with(&job, 10, Vec::new())
+            };
+            park_reason_deadline_passed(
+                capability_park_reason(&view, &filters_from_offer(&offer, 10)).as_deref(),
+            )
+        };
+
+        let refused = park_row_for(seat(&["codex"], &[], &[]), Some("claude-code"));
+        assert!(
+            refused.contains("claude-code"),
+            "the row an operator reads must name the request that refused every claim, not only \
+             that time ran out: {refused}"
+        );
+
+        // SILENT when capability was not the obstacle — the case where a capability-shaped reason is
+        // most plausible and most wrong.
+        let satisfied = park_row_for(seat(&["claude-code"], &[], &[]), Some("claude-code"));
+        assert_eq!(
+            satisfied,
+            park_reason_deadline_passed(None),
+            "a claim that SATISFIED the request means price, mint or budget stopped the award; \
+             blaming capability would send the operator to fix a request that is fine"
+        );
+
+        // SILENT with no claims at all — nothing was refused, so there is nothing to explain.
+        let wants = OfferView {
+            deadline_unix: deadline,
+            ..offer_requesting(&job, 10, Some("claude-code"), &[])
+        };
+        let empty = JobView {
+            offer: Some(wants.clone()),
+            ..view_with(&job, 10, Vec::new())
+        };
+        assert_eq!(
+            capability_park_reason(&empty, &filters_from_offer(&wants, 10)),
             None,
             "an empty relay is not a capability failure"
         );
