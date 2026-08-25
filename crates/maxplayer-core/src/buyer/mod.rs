@@ -801,11 +801,19 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
                 buyer_mint: context.home.config.default_mint(),
                 allow_real_mints: context.home.config.allow_real_mints,
                 requested_agent: offer.requested_agent.as_deref(),
+                // #784 capability request — INERT until the offer carries these. The predicate is
+                // live and wired; an absent request passes every claim, so award behaviour here is
+                // byte-unchanged. The offer-side fields live in `job_lifecycle.rs`'s OfferView and
+                // its tag parse, and land in a follow-up (see this PR's body).
+                requested_harness_family: None,
+                requested_model: None,
+                required_capabilities: &[],
             };
 
-            // Manual award names the claim but applies the SAME hard filters (max_sats, price,
-            // mint) as auto-award — max_sats is enforced, not ignored, on the manual path.
-            // Auto-award selects the first live payable claim.
+            // Manual award names the claim but applies the SAME hard filters as auto-award —
+            // max_sats, price, mint AND the #784 capability request. Naming a claim chooses which
+            // claim is judged, never whether it is. Auto-award selects the first live payable
+            // claim that passes those same filters.
             let claim_id = match params.claim_id.clone() {
                 Some(claim_id) => {
                     if let Err(refused) = lifecycle::named_claim_awardable(&view, &claim_id, &filters) {
@@ -1307,6 +1315,14 @@ async fn drive_auto_award(
             buyer_mint: context.home.config.default_mint(),
             allow_real_mints: context.home.config.allow_real_mints,
             requested_agent: offer.requested_agent.as_deref(),
+            // #784 capability request — INERT until the offer carries these, exactly as on the
+            // manual path above. Both selection paths call `claim_meets_capability_request`:
+            // `select_awardable_claim` here, `named_claim_awardable` on the manual path. A test
+            // holds that property from BOTH entry points, so this sentence cannot quietly become
+            // false the way its predecessor did.
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: &[],
         };
         if let Some(claim_id) = lifecycle::select_awardable_claim(&view, &filters) {
             return finalize_auto_award(context, job_id, offer.amount_sats, claim_id).await;
