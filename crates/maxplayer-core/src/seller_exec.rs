@@ -6016,7 +6016,9 @@ mod tests {
         let placeholder = "PLACEHOLDER-VALUE".to_owned();
         let base_url = "http://127.0.0.1:9300";
 
-        let (env, argv) = file_credential_launch_additions(&[(&cred, placeholder.clone())], base_url);
+        let (env, argv) =
+            file_credential_launch_additions(&[(&cred, placeholder.clone())], base_url, |_| None)
+                .expect("a credential without legs never consults the leg lookup");
 
         assert_eq!(env, vec![("CURSOR_AUTH_TOKEN".to_owned(), placeholder)]);
         assert_eq!(
@@ -6038,7 +6040,9 @@ mod tests {
     #[cfg(feature = "acp")]
     #[test]
     fn a_single_endpoint_flag_still_emits_exactly_one_pair() {
-        let (_, argv) = file_credential_launch_additions(&[(&file_cred(), "P".to_owned())], "http://u");
+        let (_, argv) =
+            file_credential_launch_additions(&[(&file_cred(), "P".to_owned())], "http://u", |_| None)
+                .expect("a credential without legs never consults the leg lookup");
         assert_eq!(argv, vec!["--endpoint".to_owned(), "http://u".to_owned()]);
     }
 

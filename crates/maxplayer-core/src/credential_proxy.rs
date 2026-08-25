@@ -910,9 +910,10 @@ fn spawn_accept_loop(
             let Ok(permit) = Arc::clone(&connections).acquire_owned().await else {
                 continue; // semaphore closed — proxy shutting down
             };
-            let engine = Arc::clone(&engine_for_task);
+            let engine = Arc::clone(&engine);
             let client = client.clone();
             let in_flight = Arc::clone(&in_flight);
+            let via_authority = via_authority.clone();
             live.spawn(async move {
                 let _permit = permit; // released when the connection ends
                 let io = TokioIo::new(stream);
@@ -920,11 +921,12 @@ fn spawn_accept_loop(
                     let engine = Arc::clone(&engine);
                     let client = client.clone();
                     let in_flight = Arc::clone(&in_flight);
+                    let via_authority = via_authority.clone();
                     async move {
                         // Held for the life of THIS request, so the ceiling counts requests rather
                         // than sockets. Excess requests wait here instead of each buffering a body.
                         let _in_flight = in_flight.acquire().await;
-                        handle_request(req, engine, client).await
+                        handle_request(req, engine, client, via_authority).await
                     }
                 });
                 // Auto-negotiating server: it sniffs the HTTP/2 prior-knowledge preface
@@ -947,8 +949,7 @@ fn spawn_accept_loop(
                 let _ = builder.serve_connection(io, service).await;
             });
         }
-    });
-    Ok(RunningProxy { addr, engine, task })
+    })
 }
 
 type ProxyBody = BoxBody<Bytes, std::io::Error>;
@@ -1221,7 +1222,7 @@ mod tests {
             JobCredential {
                 placeholder: placeholder.to_owned(),
                 real: REAL.to_owned(),
-                upstream: upstream.to_owned(),
+                upstreams: vec![upstream.to_owned()],
             },
         );
         engine
@@ -1455,7 +1456,7 @@ mod tests {
         let client = reqwest::Client::new();
         let primary_answer = client
             .get(format!("http://127.0.0.1:{}/v1/messages", running.local_addr().port()))
-            .header("authorization", &placeholder)
+            .header("x-api-key", &placeholder)
             .send()
             .await
             .expect("the primary listener must answer");
@@ -1467,20 +1468,17 @@ mod tests {
             .port();
         let leg_answer = client
             .get(format!("http://127.0.0.1:{leg_port}/v1/agent"))
-            .header("authorization", &placeholder)
+            .header("x-api-key", &placeholder)
             .send()
             .await
             .expect("the leg listener must answer");
         assert_eq!(leg_answer.text().await.unwrap(), "LEG_OK");
 
         let seen_by_leg = leg_stub.await.expect("the leg stub must have been reached");
-        assert!(
-            seen_by_leg.contains(REAL),
+        assert_eq!(
+            seen_by_leg.api_key.as_deref(),
+            Some(REAL),
             "the leg upstream must see the REAL credential, substituted from the placeholder"
-        );
-        assert!(
-            !seen_by_leg.contains(&placeholder),
-            "the placeholder must not travel past the proxy"
         );
     }
 
@@ -1500,7 +1498,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -1587,13 +1585,13 @@ mod tests {
         let bad = JobCredential {
             placeholder: mint_anthropic_placeholder(),
             real: REAL.to_owned(),
-            upstream: "https://evil.example.com".to_owned(),
+            upstreams: vec!["https://evil.example.com".to_owned()],
         };
         assert!(matches!(engine.register(bad), Err(Refusal::DestinationNotAllowed { .. })));
         let good = JobCredential {
             placeholder: mint_anthropic_placeholder(),
             real: REAL.to_owned(),
-            upstream: UPSTREAM.to_owned(),
+            upstreams: vec![UPSTREAM.to_owned()],
         };
         assert!(engine.register(good).is_ok());
     }
@@ -1794,7 +1792,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -1959,7 +1957,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -2077,7 +2075,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -2402,7 +2400,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -2441,7 +2439,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -2533,7 +2531,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -2699,7 +2697,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -2850,7 +2848,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -2942,7 +2940,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -3061,7 +3059,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -3240,7 +3238,7 @@ mod tests {
                     .register(JobCredential {
                         placeholder: placeholder.clone(),
                         real: REAL.to_owned(),
-                        upstream: upstream.clone(),
+                        upstreams: vec![upstream.clone()],
                     })
                     .unwrap();
                 let proxy = start(Arc::clone(&engine), None).await.unwrap();
