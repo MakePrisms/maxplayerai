@@ -83,7 +83,8 @@ pub struct OfferDraft {
     /// `["param", "harness_family", …]`. `None` ⇒ no preference.
     pub requested_harness_family: Option<String>,
     /// The model this job asks for (#897), as `["param", "harness_model", …]`. `None` ⇒ no
-    /// preference. Only meaningful paired with a family; a model alone refuses every claim (#788).
+    /// preference. Only meaningful paired with `requested_agent` — the preset is the only axis
+    /// dispatch reads — and a model without one refuses every claim.
     pub requested_model: Option<String>,
     /// Capability tokens this job REQUIRES (#897), as `["param", "capability", …]`. Empty ⇒ no
     /// requirement, and no tag is emitted, so an offer that requires nothing stays byte-identical to
@@ -140,21 +141,28 @@ impl OfferDraft {
 
     /// Request a harness family, a model, and/or a set of capability tokens for this job (#897).
     ///
-    /// All three axes take ONE builder because they are ONE request: the model is only meaningful
-    /// paired with a family (#788), so an API that let a caller set them independently would make the
-    /// invalid pairing the easy thing to write. They travel together and are judged together.
+    /// All three axes take ONE builder because they are ONE request: they travel together and are
+    /// judged together.
+    ///
+    /// ⚠ The PRESET is not one of them — it is set by [`Self::requesting_agent`]. A model needs the
+    /// preset, so a caller requesting a model through this builder alone builds an offer no claim can
+    /// satisfy. That is the fail-closed direction and the posting path refuses it before signing, but
+    /// it is the one pairing this signature cannot make obvious.
     ///
     /// Blank and all-whitespace values state nothing and are dropped, so "no requirement" has one
     /// representation on the wire — the same "stated or absent" contract the seat-side readers apply
     /// (`docs/protocol-v1.md` §4.5.2). Tokens are de-duplicated for the same reason: two spellings of
     /// one requirement would put a set on the wire that no seat's advertisement is shaped like.
     ///
-    /// Vocabulary is NOT checked here, and the family/model PAIRING is not enforced here either. This
+    /// Vocabulary is NOT checked here, and the PAIRING rules are not enforced here either. This
     /// builds what it is told to build; the vocabulary gate is
     /// [`crate::capability::validate_capability_request`], run by the posting path before an event is
-    /// signed, and the pairing rule is the award predicate's — it refuses a model with no family
-    /// rather than ignoring it, which is the fail-closed backstop that also covers offers this code
-    /// never built.
+    /// signed, and the pairing rules are the award predicate's — it refuses a model with no preset,
+    /// and a family contradicting the preset, rather than ignoring either. That is the fail-closed
+    /// backstop, and it also covers offers this code never built.
+    ///
+    /// Owning no copy of those rules is why this builder needed no change when the model's anchor
+    /// moved from the family to the preset (#897 review).
     pub fn requiring_capability(
         mut self,
         requested_harness_family: Option<&str>,
@@ -244,7 +252,7 @@ pub struct ParsedOffer {
     /// The harness FAMILY this job requested (#897). `None` ⇒ no preference (absent or blank).
     pub requested_harness_family: Option<String>,
     /// The model this job requested (#897). `None` ⇒ no preference. Refused rather than ignored when
-    /// it arrives without a family (#788).
+    /// it arrives without `requested_agent`.
     pub requested_model: Option<String>,
     /// Capability tokens this job requires (#897). Empty ⇒ no requirement.
     pub required_capabilities: Vec<String>,

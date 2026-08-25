@@ -217,8 +217,10 @@ probe inside that container: a host-side check proves a capability the job will 
 The three filterable fields are NOT equally checkable, and none of the three is verified by the
 protocol:
 
-- `harness_family` is ENFORCED, at the seat, when the job is dispatched: dispatch binds to the named
-  family exactly or not at all. This is the only one of the three backed by a mechanism.
+- `harness_family` is NEITHER ENFORCED NOR ECHOED. Nothing at the seat reads it: dispatch selects a
+  harness by the offer's `agent` preset alone, and runs the seat's first configured preset when no
+  preset is named. A family filter therefore decides who may be CONSIDERED and never what executes,
+  so a seat serving several families can satisfy the filter and then dispatch a different one.
 - `harness_model` is ECHOED. The result event carries `["model", name]` — the model the seller says
   it used. A buyer can compare that against the model it was awarded on, so a divergence is at least
   VISIBLE in the buyer's own records. It is not a falsifier: both values are the seller's word, and
@@ -227,8 +229,9 @@ protocol:
 - `capabilities` is neither enforced nor echoed. No event carries a capability back, so nothing a
   buyer receives can disagree with the advertisement at all.
 
-A reader MUST NOT read these as three grades of proof. One is an enforcement, one is an
-inconsistency signal, and one is silence.
+A reader MUST NOT read these as grades of proof. NONE of the three is an enforcement: one is an
+inconsistency signal and two are silence. The only part of an offer that binds what executes is the
+`agent` preset, which is why §6.1.1 requires a model request to name one.
 
 #### 4.5.4 Freshness
 
@@ -340,8 +343,8 @@ reject a lifecycle event that lacks it.
 | `["v","1"]` | 1 | yes | Protocol major |
 | `["p", seller_pubkey]` | 0..1 | no | Targets one seat |
 | `["param","agent", agent_id]` | 0..1 | no | Requests one harness |
-| `["param","harness_family", family]` | 0..1 | no | Requires one harness family |
-| `["param","harness_model", model]` | 0..1 | no | Requires one model; needs `harness_family` |
+| `["param","harness_family", family]` | 0..1 | no | Requires one harness family; must agree with `agent` |
+| `["param","harness_model", model]` | 0..1 | no | Requires one model; needs `agent` |
 | `["param","capability", token, ...]` | 0..1 | no | Requires every listed capability token |
 | `["delivery","git"]` | 0..1 | no | Delivery binding mode |
 | `["repo", locator]` | 0..1 | no | Bound delivery remote |
@@ -364,11 +367,22 @@ A buyer MUST decide the award on the request carried by the SIGNED OFFER, never 
 at award time. Both award paths — automatic selection and a manually named claim — MUST apply it
 identically. Naming a claim selects WHICH claim is judged, never WHETHER it is judged.
 
-`harness_model` is meaningful only ALONGSIDE `harness_family`. A model alone does not say which
-harness would run it, so a reader MUST refuse such an offer rather than ignore the model: the harness
-request is what binds dispatch, and a model phrased as a refinement of it inherits that binding where
-a bare model inherits none. A refusal is the fail-closed outcome; silently dropping the model would
-award a job on terms the buyer did not ask for.
+`harness_model` is meaningful only ALONGSIDE the `agent` preset, and a reader MUST refuse an offer
+naming a model without one rather than ignore the model. The preset is the anchor because it is the
+only part of the request that reaches execution: dispatch selects on it alone (§4.5.3). A model hung
+off a family instead would pass the filter and then run on whatever preset the seat happens to list
+first — the divergence this request exists to prevent. A refusal is the fail-closed outcome;
+silently dropping the model would award a job on terms the buyer did not ask for.
+
+`harness_family` and `agent` MUST NOT contradict each other. When both are present the family MUST
+equal the preset's own family, and a reader MUST refuse an offer where they disagree: dispatch
+honours the preset, so awarding one would run a harness the offer did not ask for. When a model is
+requested with a preset but no family, the family is DERIVED from the preset rather than demanded —
+naming the preset and the model is a complete request.
+
+A family named ALONE — no preset, no model — stays valid and none of the above narrows it. It binds
+which seats may CLAIM the job. It does NOT bind which harness a multi-harness seat dispatches, and a
+buyer needing that second guarantee MUST name the `agent` preset.
 
 `capability` is ONE multi-value tag, not one tag per token. A reader takes the first matching tag, so
 a second would be silently dropped and the buyer filtered on a subset of its own request.

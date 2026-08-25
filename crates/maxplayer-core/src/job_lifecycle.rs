@@ -76,13 +76,17 @@ pub struct PostJobRequest {
     /// A requested harness narrows the market: only sellers advertising it may be awarded.
     pub requested_agent: Option<String>,
     /// Ask for a harness FAMILY (#897). `None` ⇒ no preference. Enforced as a hard award filter on
-    /// both award paths, so only a seller advertising that family may be awarded.
+    /// both award paths, so only a seller advertising that family may be awarded. It selects who may
+    /// CLAIM and does not bind which harness a multi-harness seat dispatches — only `requested_agent`
+    /// does that — so when both are present the family must AGREE with the preset's own family.
     pub requested_harness_family: Option<String>,
     /// Ask for a MODEL (#897). `None` ⇒ no preference. Enforced as a hard award filter on both award
     /// paths, matched against the family/model PAIR a seat advertises.
     ///
-    /// ⚠ Requires `requested_harness_family`: a model with no family refuses every claim (#788), so
-    /// posting one alone stops awards rather than narrowing them.
+    /// ⚠ Requires `requested_agent`: the preset is the only axis dispatch reads, so it is the only
+    /// one that binds the model to the harness that will actually run. The family is DERIVED from
+    /// the preset when it is not stated. Posting a model alone stops awards rather than narrowing
+    /// them.
     pub requested_model: Option<String>,
     /// Capability tokens the job REQUIRES (#897). Empty ⇒ no requirement, and the offer is
     /// byte-identical to one posted before capability requests existed. Every token must be in
@@ -237,9 +241,11 @@ pub struct OfferView {
     pub requested_harness_family: Option<String>,
     /// The model this job requested (`["param", "harness_model", …]`), #897. `None` ⇒ any.
     ///
-    /// ⚠ Only meaningful PAIRED with `requested_harness_family`: a model with no family is REFUSED
-    /// rather than ignored (#788), so it stops awards instead of narrowing them. And it matches a
-    /// seat's LAST-OBSERVED self-report, so it narrows who is considered without pinning what runs.
+    /// ⚠ Only meaningful PAIRED with `requested_agent`: a model with no preset is REFUSED rather
+    /// than ignored, so it stops awards instead of narrowing them. The preset is the anchor because
+    /// it is the only axis dispatch reads; the family is DERIVED from it when unstated. And the
+    /// model matches a seat's LAST-OBSERVED self-report, so it narrows who is considered without
+    /// pinning what runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_model: Option<String>,
     /// Capability tokens this job requires (`["param", "capability", …]`), #897. Empty ⇒ none, and
