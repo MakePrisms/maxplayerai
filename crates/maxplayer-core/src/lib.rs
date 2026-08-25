@@ -111,6 +111,9 @@ pub mod seller_exec;
 /// that yet".
 #[cfg(feature = "wallet")]
 pub mod credential_proxy;
+/// Host-only ChatGPT session parsing for the Docker Codex credential proxy.
+#[cfg(feature = "wallet")]
+pub mod codex_subscription;
 /// Which of a node's resolved harnesses are serving right now: the live availability layer over the
 /// boot registry, so a harness that cannot deliver stops being advertised and stops attracting awards.
 pub mod seller_roster;

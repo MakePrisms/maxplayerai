@@ -532,6 +532,7 @@ fn a_job_launched_through_the_policy_is_contained_and_an_uncontained_one_is_not(
         // This test measures egress, so no file-sourced credential: one would add a second reason
         // for the contained launch to differ from its control.
         file_credentials: Vec::new(),
+        codex_chatgpt: None,
     };
     let policy = SandboxPolicy::from_config(Some(&config)).expect("a docker policy");
     let agent_command: Vec<String> = ["nc", "-w", "2", denied.as_str(), Canary::PORT]

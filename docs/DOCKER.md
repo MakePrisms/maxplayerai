@@ -196,13 +196,14 @@ runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM
   it the firewall opens no pinhole and the job cannot reach its model"*. Size it at least as large as
   `[seller] slots` — each contained job holds its own listener for its lifetime, and an exhausted range
   fails the job rather than falling back to a random port.
-- **The agent credential must be in the daemon's environment, not in `~/.claude`.** A container inherits
+- **An environment credential must be in the daemon's environment, not in `~/.claude`.** A container inherits
   nothing: no home directory, no macOS Keychain. The allowlist below is forwarded in automatically when
   the variables are set — `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
   `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_BASE_URL` — and `forward_env` is only for names outside
   it. For `claude` prefer `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`); an environment API key needs
   a one-time interactive approval a daemon cannot give. **The pre-advertise probe runs the CLI on the
-  host, so a `/login` credential passes the gate and then fails every job inside the container.**
+  host, so a `/login` credential passes the gate and then fails every job inside the container.** The
+  Codex ChatGPT file route below is the exception. It reads the host session for each Docker job.
 - ⛔ **`cursor` has two credentials and only one of them has a contained path.** `CURSOR_API_KEY` is a
   real reusable key and the allowlist is claude and codex only, so
   `forward_env = ["CURSOR_API_KEY"]` forwards that key into the container for a stranger's job to
@@ -235,6 +236,56 @@ runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM
   `SANDBOXING.md` for the full v1/v2 architecture and why the runtime is Linux-only.
 - On macOS, leave `runtime` unset: Docker Desktop cannot load a custom runtime, and its containers
   already run inside a platform Linux VM that provides the hardware boundary.
+
+#### A Codex ChatGPT subscription session (`codex_chatgpt`)
+
+Use this route when a Docker `codex-acp` seller must use a ChatGPT subscription instead of an API key.
+Create a separate Codex home so its login and later refresh do not change another Codex process:
+
+```bash
+export MAXPLAYER_CODEX_AUTH="$HOME/.codex-maxplayer-seller"
+install -d -m 700 "$MAXPLAYER_CODEX_AUTH"
+CODEX_HOME="$MAXPLAYER_CODEX_AUTH" codex login
+chmod 600 "$MAXPLAYER_CODEX_AUTH/auth.json"
+test -f "$MAXPLAYER_CODEX_AUTH/auth.json"
+```
+
+Codex normally stores login data in `CODEX_HOME/auth.json`. If it uses a keyring, set
+`cli_auth_credentials_store = "file"` in that Codex home's `config.toml`. Then run `codex login` again.
+See the [OpenAI Codex authentication guide](https://developers.openai.com/codex/auth/) for login options.
+
+Add the absolute auth path to the seller config. TOML does not expand `$HOME` or `~` here:
+
+```toml
+[sandbox]
+mode = "docker"
+network = "maxplayer-codex-jobs"
+proxy_port_range = "9200-9200"   # one port for one seller slot
+# runtime = "runsc"              # Linux only; omit on macOS
+
+[sandbox.codex_chatgpt]
+auth_file = "/absolute/path/to/.codex-maxplayer-seller/auth.json"
+```
+
+The table activates only when the Docker command basename is `codex-acp`. It does not change Claude,
+Cursor, API-key Codex, host, or launcher runs.
+
+Before each matching run, the host reads only `tokens.access_token` and `tokens.account_id`. It does
+not parse the refresh token. The auth file is never mounted into Docker.
+
+The access token must remain valid for the job timeout plus 15 minutes. The daemon reads the JWT `exp`
+claim, so it does not assume a fixed token lifetime. A short or expired token stops the run before any
+Docker container starts.
+
+The container receives two random per-job placeholders in a default gateway auth request. The proxy
+replaces the placeholders only for the fixed ChatGPT Codex backend. It permits `POST /responses`,
+`POST /responses/compact`, and `GET /models`. The proxy stops at job end.
+
+Version one does not refresh a token. Run `codex login` again in the dedicated `CODEX_HOME` when the
+remaining lifetime is too short. The next job reads the updated file without a seller restart.
+
+A later version will run a host refresh step before each job. That step will stay outside Docker, and
+Docker will continue to receive placeholders only.
 
 #### A credential the agent keeps in a file (`file_credentials`)
 

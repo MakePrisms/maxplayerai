@@ -378,6 +378,22 @@ pub struct SandboxConfig {
     /// placeholder-and-substitute mechanism cover it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_credentials: Vec<FileCredential>,
+    /// `docker` mode: use a host Codex ChatGPT session through the per-job proxy.
+    ///
+    /// The auth file stays on the host. The container receives only per-job placeholders through the
+    /// default gateway auth request. Absent means the existing API-key or harness auth behavior
+    /// remains unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_chatgpt: Option<CodexChatgptConfig>,
+}
+
+/// Host ChatGPT session source for a contained Docker Codex run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexChatgptConfig {
+    /// Absolute path to the Codex `auth.json` file. The file is read before each run and is never
+    /// mounted into the job container.
+    pub auth_file: PathBuf,
 }
 
 /// One credential the proxy reads from a host file (#852).
@@ -2540,6 +2556,30 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("config.toml"), "names the layer: {message}");
         assert!(message.contains("bogus_field"), "names the key: {message}");
+    }
+
+    #[test]
+    fn codex_subscription_config_parses_under_the_docker_sandbox() {
+        let config = parse_config_toml(
+            r#"
+            relay_url = "wss://relay.example"
+            per_job_budget_sats = 1
+
+            [sandbox]
+            mode = "docker"
+
+            [sandbox.codex_chatgpt]
+            auth_file = "/srv/maxplayer-codex/auth.json"
+            "#,
+        )
+        .expect("the Codex ChatGPT table must parse");
+
+        let codex = config
+            .sandbox
+            .expect("sandbox")
+            .codex_chatgpt
+            .expect("Codex ChatGPT config");
+        assert_eq!(codex.auth_file, PathBuf::from("/srv/maxplayer-codex/auth.json"));
     }
 
     #[test]

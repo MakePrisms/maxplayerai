@@ -210,6 +210,8 @@ const CONTAINER_WORKDIR: &str = "/work";
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxPolicy {
     kind: PolicyKind,
+    /// Host ChatGPT auth for a Docker `codex-acp` command. All other commands ignore this value.
+    codex_chatgpt: Option<crate::home::CodexChatgptConfig>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -322,6 +324,7 @@ impl SandboxPolicy {
     pub fn passthrough() -> Self {
         Self {
             kind: PolicyKind::Passthrough,
+            codex_chatgpt: None,
         }
     }
 
@@ -333,13 +336,17 @@ impl SandboxPolicy {
         } else {
             PolicyKind::Launcher(launcher)
         };
-        Self { kind }
+        Self {
+            kind,
+            codex_chatgpt: None,
+        }
     }
 
     /// A policy that runs the agent command inside a container.
     pub fn docker(policy: DockerPolicy) -> Self {
         Self {
             kind: PolicyKind::Docker(policy),
+            codex_chatgpt: None,
         }
     }
 
@@ -382,6 +389,14 @@ impl SandboxPolicy {
                     .map_err(|error| {
                         ExecError::Config(format!("[sandbox] proxy_port_range: {error}"))
                     })?;
+                if let Some(codex) = &config.codex_chatgpt {
+                    if !codex.auth_file.is_absolute() {
+                        return Err(ExecError::Config(format!(
+                            "[sandbox] codex_chatgpt: auth_file must be absolute, got {}",
+                            codex.auth_file.display()
+                        )));
+                    }
+                }
                 // Refused HERE, at config resolution, for the same reason as a malformed port range:
                 // a relative path would otherwise resolve against whatever cwd the daemon happens to
                 // have, and the job would fail to authenticate with nothing naming the path as the
@@ -475,14 +490,16 @@ impl SandboxPolicy {
                         )));
                     }
                 }
-                Ok(Self::docker(DockerPolicy {
+                let mut policy = Self::docker(DockerPolicy {
                     image,
                     forward_env: config.forward_env.clone(),
                     runtime,
                     network,
                     proxy_ports,
                     file_credentials: config.file_credentials.clone(),
-                }))
+                });
+                policy.codex_chatgpt = config.codex_chatgpt.clone();
+                Ok(policy)
             }
         }
     }
@@ -551,6 +568,14 @@ impl SandboxPolicy {
         match &self.kind {
             PolicyKind::Docker(policy) => &policy.file_credentials,
             PolicyKind::Passthrough | PolicyKind::Launcher(_) => &[],
+        }
+    }
+
+    /// The host ChatGPT auth source for Docker Codex, absent for all other policy modes.
+    pub fn codex_chatgpt(&self) -> Option<&crate::home::CodexChatgptConfig> {
+        match &self.kind {
+            PolicyKind::Docker(_) => self.codex_chatgpt.as_ref(),
+            PolicyKind::Passthrough | PolicyKind::Launcher(_) => None,
         }
     }
 
@@ -2072,6 +2097,46 @@ pub struct AgentRunReport {
     pub last_agent_message: Option<String>,
 }
 
+/// Environment values that must not compete with the fixed subscription provider.
+#[cfg(feature = "acp")]
+const CODEX_CHATGPT_REMOVED_ENV: &[&str] = &[
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "CODEX_API_KEY",
+    "CODEX_ACCESS_TOKEN",
+    "CODEX_CONFIG",
+    "MODEL_PROVIDER",
+    "DEFAULT_AUTH_REQUEST",
+];
+
+/// Read a host ChatGPT session only for a Docker command whose argv0 basename is `codex-acp`.
+#[cfg(feature = "acp")]
+fn codex_chatgpt_session_for_command(
+    policy: &SandboxPolicy,
+    agent_command: &[String],
+    required_lifetime: Duration,
+) -> Result<Option<crate::codex_subscription::ChatgptSession>, ExecError> {
+    let is_codex_acp = agent_command
+        .first()
+        .and_then(|program| Path::new(program).file_name())
+        .and_then(|name| name.to_str())
+        == Some("codex-acp");
+    if !is_codex_acp {
+        return Ok(None);
+    }
+    let Some(config) = policy.codex_chatgpt() else {
+        return Ok(None);
+    };
+    crate::codex_subscription::read_chatgpt_session(
+        &config.auth_file,
+        required_lifetime,
+        std::time::SystemTime::now(),
+    )
+    .map(Some)
+    .map_err(|error| ExecError::Config(format!("[sandbox] codex_chatgpt: {error}")))
+}
+
 /// Run the awarded agent under the ACP driver: one session in `workdir`, seeded with `prompt`, with
 /// the delivery `identity`'s git env, bounded by `timeout` (the unified job timeout). The agent
 /// command is launched through `policy` — directly under a pass-through policy, or inside the
@@ -2096,6 +2161,10 @@ pub async fn run_agent_job(
     // The delivery identity, plus the agent-auth allowlist a container needs because it inherits
     // nothing from the daemon. Empty under a host executor, which already inherits it all.
     let mut env = identity.git_env();
+    // Read and validate the host session before any docker holder or job container starts. The
+    // session reader binds no refresh token and requires the token to outlive this job.
+    let codex_chatgpt_session =
+        codex_chatgpt_session_for_command(policy, agent_command, timeout.duration())?;
     // The argv actually spawned. Identical to `agent_command` unless containment adds a redirect flag
     // for a file-sourced credential, whose proxy URL is not known until the proxy is bound.
     let mut effective_command = agent_command.to_vec();
@@ -2176,6 +2245,8 @@ pub async fn run_agent_job(
         match start_credential_containment(
             &forwarded,
             policy.file_credentials(),
+            codex_chatgpt_session,
+            timeout.duration(),
             policy.proxy_ports(),
             proxy_host,
         )
@@ -2449,6 +2520,15 @@ struct MintedCredential {
     upstream: String,
 }
 
+/// One host ChatGPT session and its two container-facing placeholders.
+#[cfg(feature = "acp")]
+struct MintedCodexSession {
+    access_token: String,
+    access_placeholder: String,
+    account_id: String,
+    account_placeholder: String,
+}
+
 /// What containment hands back to the launch: the container-facing environment, any argv the client
 /// needs in order to reach the proxy, and the running proxy itself (dropped at job end, which revokes
 /// every placeholder).
@@ -2538,11 +2618,23 @@ fn read_file_credential(cred: &crate::home::FileCredential) -> Result<String, Ex
 async fn start_credential_containment(
     forwarded: &[(String, String)],
     file_creds: &[crate::home::FileCredential],
+    codex_session: Option<crate::codex_subscription::ChatgptSession>,
+    job_lifetime: Duration,
     proxy_ports: Option<crate::sandbox_net::PortRange>,
     proxy_host: &str,
 ) -> Result<Option<Containment>, ExecError> {
     use crate::credential_proxy as proxy;
     use std::sync::Arc;
+
+    // The fixed subscription provider must be the only Codex auth source inside the container.
+    // Remove ambient API keys, endpoints, and provider controls before generic containment sees them.
+    let forwarded: Vec<(String, String)> = forwarded
+        .iter()
+        .filter(|(name, _)| {
+            codex_session.is_none() || !CODEX_CHATGPT_REMOVED_ENV.contains(&name.trim())
+        })
+        .cloned()
+        .collect();
 
     let lookup = |key: &str| {
         forwarded
@@ -2614,7 +2706,26 @@ async fn start_credential_containment(
         ));
     }
 
-    if minted.is_empty() && minted_files.is_empty() {
+    let minted_codex = codex_session.map(|session| MintedCodexSession {
+        access_token: session.access_token().to_owned(),
+        access_placeholder: proxy::mint_jwt_placeholder(
+            "access",
+            job_lifetime
+                .checked_add(crate::codex_subscription::ACCESS_TOKEN_MARGIN)
+                .unwrap_or(Duration::MAX),
+        ),
+        account_id: session.account_id().to_owned(),
+        account_placeholder: proxy::mint_placeholder("account-", 32),
+    });
+    if minted_codex.is_some() {
+        let host = proxy::authority_of(crate::codex_subscription::CHATGPT_CODEX_UPSTREAM)
+            .expect("the fixed ChatGPT Codex upstream is a valid URL");
+        if !upstream_hosts.contains(&host) {
+            upstream_hosts.push(host);
+        }
+    }
+
+    if minted.is_empty() && minted_files.is_empty() && minted_codex.is_none() {
         return Ok(None);
     }
 
@@ -2633,10 +2744,9 @@ async fn start_credential_containment(
     // to OpenAI's host — because both are on it. A refused attempt is `stop()`, which returns the 3xx
     // for the proxy to relay to the container unchanged.
     //
-    // The pairing is available without per-request state, which is why this stays one shared client:
-    // `Policy::custom` closes over the ENGINE and never a request, so the credential cannot be reached
-    // from here — but the attempt carries its own chain, and its FIRST entry is the original request
-    // URL, which `relay` built from that credential's upstream.
+    // The pairing is available without per-request state, so the generic client can use one shared
+    // policy. `Policy::custom` never receives a credential. The typed Codex route selects a second,
+    // no-redirect client inside the proxy because its credential is valid for fixed paths only.
     //
     // EVERY HOP, not just the first, and each judged against the ORIGINAL rather than its predecessor:
     // judging hop-against-predecessor would let a chain walk one authority at a time to anywhere.
@@ -2663,7 +2773,8 @@ async fn start_credential_containment(
     // namespace-contained one, which cannot resolve the alias at all. Passed in rather than decided
     // here so exactly one value reaches both this URL and the firewall's pinhole.
     let base_url = running.container_base_url_via(proxy_host);
-    let mut substitutions: Vec<(String, String)> = Vec::with_capacity(minted.len());
+    let mut substitutions: Vec<(String, String)> =
+        Vec::with_capacity(minted.len() + minted_files.len() + 2);
     let mut base_url_overrides: Vec<&'static str> = Vec::new();
     for (cred, m) in &minted {
         engine
@@ -2703,9 +2814,38 @@ async fn start_credential_containment(
     }
     let (file_env, argv_extra) = file_credential_launch_additions(&placed, &base_url);
 
-    let mut contained = contain_env_values(forwarded, &substitutions, &base_url_overrides, &base_url);
+    let mut codex_env = Vec::new();
+    if let Some(m) = minted_codex {
+        engine
+            .register_codex_session(proxy::CodexSessionCredential {
+                access_placeholder: m.access_placeholder.clone(),
+                access_token: m.access_token.clone(),
+                account_placeholder: m.account_placeholder.clone(),
+                account_id: m.account_id.clone(),
+                upstream: crate::codex_subscription::CHATGPT_CODEX_UPSTREAM.to_owned(),
+            })
+            .map_err(|refusal| {
+                ExecError::Agent(format!(
+                    "Codex session proxy registration refused: {refusal}"
+                ))
+            })?;
+        substitutions.push((m.access_token, m.access_placeholder.clone()));
+        substitutions.push((m.account_id, m.account_placeholder.clone()));
+        codex_env.push((
+            "DEFAULT_AUTH_REQUEST".to_owned(),
+            crate::codex_subscription::gateway_auth_request_json(
+                &base_url,
+                &m.access_placeholder,
+                &m.account_placeholder,
+            ),
+        ));
+    }
+
+    let mut contained =
+        contain_env_values(&forwarded, &substitutions, &base_url_overrides, &base_url);
     // Appended AFTER the rewrite: these pairs carry placeholders, which have nothing to scrub.
     contained.extend(file_env);
+    contained.extend(codex_env);
     Ok(Some(Containment {
         env: contained,
         argv_extra,
@@ -4435,6 +4575,241 @@ mod tests {
             matches!(&error, ExecError::Config(message) if message.contains("proxy_port_range")),
             "the refusal must name the config key an operator has to fix: {error:?}"
         );
+    }
+
+    #[test]
+    fn codex_chatgpt_auth_path_must_be_absolute() {
+        let config = crate::home::SandboxConfig {
+            mode: crate::home::SandboxMode::Docker,
+            codex_chatgpt: Some(crate::home::CodexChatgptConfig {
+                auth_file: PathBuf::from(".codex/auth.json"),
+            }),
+            ..Default::default()
+        };
+
+        let error = SandboxPolicy::from_config(Some(&config))
+            .expect_err("a relative Codex auth path must fail at config resolution");
+        assert!(
+            error.to_string().contains("codex_chatgpt")
+                && error.to_string().contains("must be absolute"),
+            "the error must name the setting and the problem: {error}"
+        );
+    }
+
+    #[cfg(feature = "acp")]
+    #[test]
+    fn codex_chatgpt_does_not_activate_for_a_claude_command() {
+        let config = crate::home::SandboxConfig {
+            mode: crate::home::SandboxMode::Docker,
+            codex_chatgpt: Some(crate::home::CodexChatgptConfig {
+                auth_file: PathBuf::from("/does/not/exist/auth.json"),
+            }),
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::from_config(Some(&config)).expect("valid policy");
+
+        let session = codex_chatgpt_session_for_command(
+            &policy,
+            &argv(&["claude-agent-acp"]),
+            Duration::from_secs(60),
+        )
+        .expect("a non-Codex command must not read the absent auth file");
+        assert!(session.is_none());
+    }
+
+    #[cfg(feature = "acp")]
+    #[tokio::test]
+    async fn codex_chatgpt_docker_containment_exposes_only_placeholders() {
+        const ACCOUNT_ID: &str = "synthetic-chatgpt-account";
+        const REFRESH_TOKEN: &str = "synthetic-refresh-token-must-stay-on-host";
+        const OPENAI_KEY: &str = "sk-host-api-key-must-not-cross";
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("time after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "maxplayer-codex-chatgpt-launch-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create auth directory");
+        let auth_file = dir.join("auth.json");
+        let access_token = crate::credential_proxy::mint_jwt_placeholder(
+            "access",
+            Duration::from_secs(2 * 60 * 60),
+        );
+        let auth = serde_json::json!({
+            "tokens": {
+                "access_token": access_token,
+                "account_id": ACCOUNT_ID,
+                "refresh_token": REFRESH_TOKEN,
+            }
+        });
+        std::fs::write(
+            &auth_file,
+            serde_json::to_vec(&auth).expect("serialize auth"),
+        )
+        .expect("write auth");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&auth_file, std::fs::Permissions::from_mode(0o600))
+                .expect("set auth permissions");
+        }
+        let config = crate::home::SandboxConfig {
+            mode: crate::home::SandboxMode::Docker,
+            image: Some("maxplayer-sandbox:test".into()),
+            codex_chatgpt: Some(crate::home::CodexChatgptConfig {
+                auth_file: auth_file.clone(),
+            }),
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::from_config(Some(&config)).expect("valid policy");
+        let command = argv(&["/usr/local/bin/codex-acp"]);
+        let job_lifetime = Duration::from_secs(60);
+        let session = codex_chatgpt_session_for_command(&policy, &command, job_lifetime)
+            .expect("read the synthetic session");
+        assert!(
+            session.is_some(),
+            "a codex-acp basename must activate the mode"
+        );
+
+        let forwarded = vec![
+            ("OPENAI_API_KEY".to_owned(), OPENAI_KEY.to_owned()),
+            (
+                "OPENAI_BASE_URL".to_owned(),
+                "https://api.openai.com".to_owned(),
+            ),
+            (
+                "CODEX_ACCESS_TOKEN".to_owned(),
+                "ambient-codex-token".to_owned(),
+            ),
+            ("CODEX_CONFIG".to_owned(), "ambient-codex-config".to_owned()),
+            ("MODEL_PROVIDER".to_owned(), "ambient-provider".to_owned()),
+            (
+                "DEFAULT_AUTH_REQUEST".to_owned(),
+                "ambient-default-auth-request".to_owned(),
+            ),
+            (
+                "MY_COPIED_SESSION".to_owned(),
+                format!("prefix {access_token} account {ACCOUNT_ID}"),
+            ),
+        ];
+        let containment = start_credential_containment(
+            &forwarded,
+            policy.file_credentials(),
+            session,
+            job_lifetime,
+            None,
+            crate::credential_proxy::PROXY_HOST_ALIAS,
+        )
+        .await
+        .expect("start the local proxy")
+        .expect("the Codex session needs containment");
+
+        for (_, value) in &containment.env {
+            for real in [
+                access_token.as_str(),
+                ACCOUNT_ID,
+                REFRESH_TOKEN,
+                OPENAI_KEY,
+                "ambient-codex-token",
+                "ambient-codex-config",
+                "ambient-provider",
+                "ambient-default-auth-request",
+            ] {
+                assert!(
+                    !value.contains(real),
+                    "a host value reached the container environment"
+                );
+            }
+        }
+        for name in [
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "CODEX_ACCESS_TOKEN",
+            "CODEX_CONFIG",
+            "MODEL_PROVIDER",
+        ] {
+            assert!(
+                !containment.env.iter().any(|(key, _)| key == name),
+                "the subscription mode must remove {name}"
+            );
+        }
+        let auth_request_json = containment
+            .env
+            .iter()
+            .find(|(key, _)| key == "DEFAULT_AUTH_REQUEST")
+            .map(|(_, value)| value)
+            .expect("the container receives the default gateway auth request");
+        let auth_request: serde_json::Value =
+            serde_json::from_str(auth_request_json).expect("valid JSON");
+        assert_eq!(auth_request["methodId"], "gateway");
+        let gateway = &auth_request["_meta"]["gateway"];
+        assert_eq!(gateway["providerName"], "Maxplayer ChatGPT");
+        assert!(
+            gateway["baseUrl"]
+                .as_str()
+                .expect("proxy base URL")
+                .starts_with("http://host.docker.internal:"),
+            "the adapter gateway must point at the per-job proxy"
+        );
+        let headers = &gateway["headers"];
+        let authorization = headers["Authorization"]
+            .as_str()
+            .expect("placeholder authorization header");
+        let access_placeholder = authorization
+            .strip_prefix("Bearer ")
+            .expect("bearer placeholder");
+        let account_placeholder = headers["ChatGPT-Account-ID"]
+            .as_str()
+            .expect("account placeholder");
+        assert_ne!(access_placeholder, access_token);
+        assert_ne!(account_placeholder, ACCOUNT_ID);
+
+        let request_headers = vec![
+            ("Authorization".to_owned(), authorization.to_owned()),
+            (
+                "ChatGPT-Account-ID".to_owned(),
+                account_placeholder.to_owned(),
+            ),
+        ];
+        match containment
+            .proxy
+            .engine()
+            .authorize_request("POST", "/responses", &request_headers)
+        {
+            crate::credential_proxy::Decision::Forward { headers, .. } => {
+                assert!(headers.iter().any(|(name, value)| {
+                    name.eq_ignore_ascii_case("authorization")
+                        && value == &format!("Bearer {access_token}")
+                }));
+                assert!(headers.iter().any(|(name, value)| {
+                    name.eq_ignore_ascii_case("chatgpt-account-id") && value == ACCOUNT_ID
+                }));
+            }
+            other => panic!("the typed session was not registered: {other:?}"),
+        }
+
+        let launch = policy
+            .launch(
+                &command,
+                &job(Path::new("/tmp/maxplayer-job"), &containment.env),
+            )
+            .expect("build Docker argv");
+        let container_view = std::iter::once(&launch.program)
+            .chain(launch.args.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        for real in [access_token.as_str(), ACCOUNT_ID, REFRESH_TOKEN, OPENAI_KEY] {
+            assert!(
+                !container_view.contains(real),
+                "a real value reached Docker argv"
+            );
+        }
+
+        drop(containment);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     // from_config threads the runtime through, and a blank string is treated as unset rather than
