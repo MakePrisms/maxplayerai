@@ -198,7 +198,7 @@ fn tools() -> Value {
     json!([
         {
             "name": "post_job",
-            "description": "Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness, harness_family, model and capabilities are ALL hard award filters (only a seller advertising them can be awarded), enforced identically on the manual and automatic award paths; model requires harness_family. Omit them all and every claim passes exactly as before. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. Never echoes secrets.",
+            "description": "Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness, harness_family, model and capabilities are ALL hard award filters (only a seller advertising them can be awarded), enforced identically on the manual and automatic award paths; model requires harness (the preset), and a harness_family given alongside harness must name the same harness it does. Omit them all and every claim passes exactly as before. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -216,11 +216,11 @@ fn tools() -> Value {
                     },
                     "model": {
                         "type": "string",
-                        "description": "Request a specific seller model. Posted on the offer as [\"param\",\"harness_model\",<model>] and enforced as a HARD award filter: only a seller advertising that model FOR the requested harness family can be awarded. REQUIRES harness_family — a model without one is refused at post time, because a bare model does not say which harness would run it. Matched by exact equality against the model id the seat advertises (e.g. gpt-5.6-sol[low]), which is whatever its harness reported, so this is a LAST-OBSERVED self-report: it narrows who is considered, it does not pin what executes. Claude seats advertise no model yet, so a model request currently matches only non-Claude families."
+                        "description": "Request a specific seller model. Posted on the offer as [\"param\",\"harness_model\",<model>] and enforced as a HARD award filter: only a seller advertising that model FOR the harness the job will dispatch on can be awarded. REQUIRES harness (the preset) — a model without one is refused at post time, because only the preset reaches execution, so a model hung off anything else names a harness the job would not actually run. The family is DERIVED from the preset when you do not state one, so harness+model is a complete request. Matched by exact equality against the model id the seat advertises (e.g. gpt-5.6-sol[low]), which is whatever its harness reported, so this is a LAST-OBSERVED self-report: it narrows who is considered, it does not pin what executes. A seat advertises a model only for harnesses whose ACP session reports one, so a model request matches nothing on a seat whose harness reports none."
                     },
                     "harness_family": {
                         "type": "string",
-                        "description": "Request a harness FAMILY (claude-code|codex|cursor|goose). Posted on the offer as [\"param\",\"harness_family\",<family>] and enforced as a HARD award filter: only a seller advertising that family can be awarded. Distinct from harness, which names a preset — a family spans the presets sharing a harness, so a family request binds dispatch where a preset binds a configuration. Both may be given and both are then enforced. An unknown family is refused at post time."
+                        "description": "Request a harness FAMILY (claude-code|codex|cursor|goose). Posted on the offer as [\"param\",\"harness_family\",<family>] and enforced as a HARD award filter: only a seller advertising that family can be awarded. Distinct from harness, which names a preset, and the difference is what each one BINDS: a family selects WHICH SEATS MAY CLAIM, while only the preset decides which harness a winning seat then runs — so a multi-harness seat can satisfy a family request and dispatch a different harness. Give harness when the request must bind execution. If you give both, the family must name the same harness the preset does, or the offer is refused at post time. An unknown family is refused at post time."
                     },
                     "capabilities": {
                         "type": "array",
@@ -574,12 +574,12 @@ mod tests {
         }
 
         // The model axis carries two extra caller-facing facts that are load-bearing and easy to
-        // drop: it needs a family (#788), and it matches a self-report rather than pinning execution.
+        // drop: it needs the PRESET, and it matches a self-report rather than pinning execution.
         let model_description = description("model");
         assert!(
-            model_description.contains("requires harness_family"),
-            "a model without a family is REFUSED, so the schema must say it requires one — a caller \
-             that omits it gets no awards at all: {model_description}"
+            model_description.contains("requires harness"),
+            "a model without a harness preset is REFUSED, so the schema must say it requires one — \
+             a caller that omits it gets no awards at all: {model_description}"
         );
         assert!(
             model_description.contains("does not pin what executes"),
@@ -648,7 +648,10 @@ mod tests {
             ),
             (
                 "model",
+                // The preset is named too: a model request without one is a REQUEST defect and
+                // would refuse before the claim's model was ever compared.
                 AwardFilters {
+                    requested_agent: Some("codex"),
                     requested_harness_family: Some("codex"),
                     requested_model: Some("opus"),
                     ..neutral
