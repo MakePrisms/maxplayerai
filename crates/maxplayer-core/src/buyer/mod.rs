@@ -431,16 +431,19 @@ struct PostJobParams {
     /// therefore hard award filters: only a seller advertising them can be awarded.
     ///
     /// `harness` names a PRESET and is matched against the claim's `agents`. `model` (#897) is matched
-    /// against the family/model PAIR a seat advertises, and so REQUIRES `harness_family` — a model
-    /// with no family refuses every claim rather than being ignored (#788).
+    /// against the family/model PAIR a seat advertises, and so REQUIRES `harness` — the preset is the
+    /// only axis dispatch reads, so it is the only one that can bind the model to the harness that
+    /// will actually run. The family is DERIVED from the preset when it is not stated. A model with
+    /// no preset refuses every claim rather than being ignored.
     #[serde(default)]
     harness: Option<String>,
     #[serde(default)]
     model: Option<String>,
     /// Harness FAMILY the job requires (#897). Posted on the offer and enforced as a hard award
     /// filter on BOTH award paths. Distinct from `harness`, which names a preset: a family spans the
-    /// presets sharing a harness, so a family request binds dispatch where a preset binds a
-    /// configuration. Both may be given and both are then enforced.
+    /// presets sharing a harness, so a family request selects which seats may CLAIM the job and does
+    /// NOT bind which harness a multi-harness seat dispatches — only `harness` does that. When both
+    /// are given they must AGREE: a family naming a harness the preset would not run is refused.
     #[serde(default)]
     harness_family: Option<String>,
     /// Capability tokens the job requires (#897) — a subset of

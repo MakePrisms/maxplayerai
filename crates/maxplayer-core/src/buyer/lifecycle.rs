@@ -318,7 +318,7 @@ pub fn claim_meets_capability_request(
 /// [`claim_meets_capability_request`] against it. A request the perfect claim cannot pass is one no
 /// claim can pass.
 ///
-/// That construction is the whole point. A gate that restated "a model needs a family" in its own
+/// That construction is the whole point. A gate that restated "a model needs a preset" in its own
 /// words would be a second copy of a rule owned elsewhere, and the two would rot apart silently:
 /// #788 may later make a bare model valid, and on that day this gate must stop refusing WITHOUT
 /// anyone remembering it exists. Because the verdict comes from the predicate, it will.
