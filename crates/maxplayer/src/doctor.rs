@@ -2808,6 +2808,9 @@ mod tests {
             // and a file-sourced credential is a containment concern that would only add a second
             // reason for the check to move.
             file_credentials: Vec::new(),
+            // Same decision and the same reason: a host ChatGPT session is a containment concern,
+            // and reading one here would give the check a second reason to move.
+            codex_chatgpt: None,
         });
         home.config.relay_url = "not-a-relay-url".into();
         home.config.accepted_mints = Vec::new();
