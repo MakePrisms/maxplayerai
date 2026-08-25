@@ -54,7 +54,7 @@ use crate::job_lifecycle::{
 };
 use crate::payment::{PaymentMachine, PaymentRecord, PaymentState};
 use lifecycle::{
-    AwardError, AwardFilters, AwardOutcome, MissingOfferAction, PaymentProgress, RearmAction,
+    AwardError, AwardOutcome, MissingOfferAction, PaymentProgress, RearmAction,
     SettleError,
 };
 use lock::{HomeLock, LockError};
