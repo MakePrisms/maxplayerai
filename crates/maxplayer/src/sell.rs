@@ -50,6 +50,9 @@ struct SellOptions {
     job_timeout_secs: Option<u64>,
     /// Opt-in to claim untargeted/open offers (default OFF).
     claim_open_pool: Option<bool>,
+    /// Opt-in to accept targeted offers from buyers this seat has not named (default OFF).
+    /// A separate surface from `claim_open_pool` — see `SellerConfig::accept_open_targeted`.
+    accept_open_targeted: Option<bool>,
     /// Open-pool offer-backfill window in seconds (default 1200 / 20 min; 0 = live-only).
     /// Targeted offers are unaffected (they always backfill in full).
     offer_backfill_secs: Option<u64>,
@@ -265,11 +268,18 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
         })?;
     let _ = writeln!(
         err,
-        "seller node starting pubkey={} agent={} rate_sats={} claim_open_pool={} git_remote={} (never-echo: key omitted)",
+        // Both open surfaces AND the size of the allowlist, because the seat's reachability is now a
+        // three-knob answer and any one of them alone reads as the whole posture. The allowlist is
+        // reported as a COUNT, never its contents: a private seller's buyer list is not boot-log
+        // material, and the count is what an operator needs to tell "I named someone" from "I did
+        // not" — the distinction that decides whether an empty list leaves them reachable.
+        "seller node starting pubkey={} agent={} rate_sats={} claim_open_pool={} accept_open_targeted={} accept_offers_only_from={} git_remote={} (never-echo: key omitted)",
         runner.seller_pubkey(),
         seller.agents.first().map(String::as_str).unwrap_or("custom"),
         seller.rate_sats,
         seller.claim_open_pool,
+        seller.accept_open_targeted,
+        seller.accept_offers_only_from.len(),
         seller.git_remote
     );
     // #747: SIGTERM/SIGINT must reach the run loop rather than the kernel's default disposition. A
@@ -334,6 +344,12 @@ fn ensure_seller_config(
     let claim_open_pool = options
         .claim_open_pool
         .unwrap_or_else(|| existing.as_ref().map(|s| s.claim_open_pool).unwrap_or(false));
+    // Same precedence as the pool flag: explicit flag > existing config > CLOSED. Carrying the
+    // existing value is what stops a plain relaunch from silently closing a seat its operator had
+    // opened — the #369-class clobber, in the direction that takes a working seller off the market.
+    let accept_open_targeted = options
+        .accept_open_targeted
+        .unwrap_or_else(|| existing.as_ref().map(|s| s.accept_open_targeted).unwrap_or(false));
     // Offer backfill window: flag > existing config > serde default (1200s / 20 min).
     let offer_backfill_secs = options.offer_backfill_secs.unwrap_or_else(|| {
         existing
@@ -481,9 +497,11 @@ fn ensure_seller_config(
         job_timeout_secs,
         agents,
         claim_open_pool,
+        accept_open_targeted,
         // Buyer allowlist (#482): carried from an existing config so a relaunch never clobbers an
-        // operator's private-seller fence back to accept-all (#369-class); a fresh config defaults
-        // empty (accept-all). Operators edit it via `[seller] accept_offers_only_from`.
+        // operator's private-seller fence (#369-class); a fresh config defaults empty, which now
+        // means "no buyer named" rather than accept-all — reachability is decided by the two
+        // surface flags. Operators edit it via `[seller] accept_offers_only_from`.
         accept_offers_only_from: existing
             .as_ref()
             .map(|s| s.accept_offers_only_from.clone())
@@ -659,6 +677,12 @@ impl SellOptions {
                 "--unsafe-no-sandbox" => options.unsafe_no_sandbox = true,
                 "--claim-open-pool" => options.claim_open_pool = Some(true),
                 "--no-claim-open-pool" => options.claim_open_pool = Some(false),
+                // Both open surfaces are opt-IN, so the bare flag TURNS ON and the `--no-` form is
+                // the explicit restatement of the default. A `--no-accept-open-targeted` that had to
+                // be passed to get the safe posture would put the flag set out of step with the
+                // defaults, which is how an operator ends up believing they closed something.
+                "--accept-open-targeted" => options.accept_open_targeted = Some(true),
+                "--no-accept-open-targeted" => options.accept_open_targeted = Some(false),
                 "--key" | "--secret-key" | "--private-key" => {
                     return Err(
                         "refused: --key / secret key argv is not allowed (key stays in home file)"
@@ -748,7 +772,7 @@ impl SellOptions {
 fn sell_usage(w: &mut dyn Write) {
     let _ = writeln!(
         w,
-        "Usage:\n  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>] [--skip-doctor]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n  maxplayer seller --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (no working nix, agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint\n  - --skip-doctor: bypass the startup readiness checks (default: checks-on; not recommended). The nix check still runs — it is an environment requirement (#745) with no bypass\n  - --unsafe-no-sandbox: serve the OPEN POOL with no working sandbox — this box then runs code written by strangers with no containment (waives only that one check)\n  - open-pool claiming is OFF by default; pass --claim-open-pool to opt in\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)"
+        "Usage:\n  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted] [--name <display>] [--home <dir>] [--skip-doctor]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n  maxplayer seller --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (no working nix, agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint\n  - --skip-doctor: bypass the startup readiness checks (default: checks-on; not recommended). The nix check still runs — it is an environment requirement (#745) with no bypass\n  - --unsafe-no-sandbox: serve the OPEN POOL with no working sandbox — this box then runs code written by strangers with no containment (waives only that one check)\n  - BOTH open surfaces are OFF by default, and they are separate: --claim-open-pool opts in to untargeted pool offers, --accept-open-targeted opts in to targeted offers from buyers you have not named\n  - with neither set and no [seller] accept_offers_only_from, this seat claims NOTHING and says so at boot\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)"
     );
 }
 
@@ -1008,6 +1032,7 @@ mod tests {
                 job_timeout_secs: None,
                 agents: vec!["claude".to_owned(), "codex".to_owned()],
                 claim_open_pool: false,
+                accept_open_targeted: false,
                 accept_offers_only_from: Vec::new(),
                 offer_backfill_secs: home::default_offer_backfill_secs(),
                 contribution_enabled: true,
@@ -1060,6 +1085,7 @@ mod tests {
                 job_timeout_secs: None,
                 agents: vec!["claude".to_owned()],
                 claim_open_pool: false,
+                accept_open_targeted: false,
                 accept_offers_only_from: Vec::new(),
                 offer_backfill_secs: home::default_offer_backfill_secs(),
                 contribution_enabled: false,
@@ -1116,6 +1142,7 @@ mod tests {
                 job_timeout_secs: None,
                 agents: vec!["claude".to_owned()],
                 claim_open_pool: false,
+                accept_open_targeted: false,
                 accept_offers_only_from: vec!["buyer-abc".to_owned(), "buyer-def".to_owned()],
                 offer_backfill_secs: home::default_offer_backfill_secs(),
                 contribution_enabled: true,
@@ -1146,6 +1173,86 @@ mod tests {
     }
 
     #[test]
+    fn sell_writeback_preserves_operator_accept_open_targeted() {
+        // The #369-class clobber in the direction that COSTS AN OPERATOR MONEY. The allowlist test
+        // above guards a relaunch silently OPENING a private seller; this guards the mirror — a bare
+        // relaunch silently CLOSING a seat the operator had opened, which takes a working seller off
+        // the market with no error and no output. The flag defaults false, so a write-back that
+        // forgets to carry it reconstructs the default and looks entirely correct.
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-open-targeted-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = home::bootstrap(&root).expect("bootstrap temp home");
+        home::save_config(&mut home, |config| {
+            config.seller = Some(SellerConfig {
+                agent_command: vec!["claude".to_owned()],
+                rate_sats: 5,
+                git_remote: "https://example.invalid/seller.git".to_owned(),
+                job_timeout_secs: None,
+                agents: vec!["claude".to_owned()],
+                claim_open_pool: false,
+                accept_open_targeted: true,
+                accept_offers_only_from: Vec::new(),
+                offer_backfill_secs: home::default_offer_backfill_secs(),
+                contribution_enabled: true,
+                slots: 3,
+                claim_award_timeout_secs: None,
+            });
+        })
+        .expect("seed [seller] with an opened targeted surface");
+
+        let options = SellOptions::default();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        ensure_seller_config(&mut home, &options, &mut out, &mut err).unwrap_or_else(|code| {
+            panic!(
+                "ensure_seller_config failed code={code} err={}",
+                String::from_utf8_lossy(&err)
+            )
+        });
+
+        let reloaded = home::bootstrap(&root).expect("reload persisted config");
+        let seller = reloaded.config.seller.expect("[seller] persisted");
+        assert!(
+            seller.accept_open_targeted,
+            "operator accept_open_targeted must survive a bare relaunch (a relaunch must never close an open seat)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The flag set matches the defaults: the bare flag OPENS, and its `--no-` form restates the
+    // default. Both are asserted because an opt-in whose parser silently ignored it would leave the
+    // seat closed and give the operator no signal at all — the same silence this change exists to end.
+    #[test]
+    fn accept_open_targeted_flags_are_opt_in_shaped() {
+        assert_eq!(
+            SellOptions::parse(&["--accept-open-targeted".to_owned()])
+                .expect("flag parses")
+                .accept_open_targeted,
+            Some(true),
+            "the bare flag must OPEN the targeted surface"
+        );
+        assert_eq!(
+            SellOptions::parse(&["--no-accept-open-targeted".to_owned()])
+                .expect("flag parses")
+                .accept_open_targeted,
+            Some(false),
+            "the --no- form must explicitly close it"
+        );
+        assert_eq!(
+            SellOptions::default().accept_open_targeted,
+            None,
+            "absent from argv must stay None so the existing config decides, not the flag"
+        );
+    }
+
+    #[test]
     fn sell_writeback_preserves_operator_slots_and_claim_timeout() {
         let root = std::env::temp_dir().join(format!(
             "maxplayer-369-slots-{}-{}",
@@ -1168,6 +1275,7 @@ mod tests {
                 job_timeout_secs: None,
                 agents: Vec::new(),
                 claim_open_pool: false,
+                accept_open_targeted: false,
                 accept_offers_only_from: Vec::new(),
                 offer_backfill_secs: home::default_offer_backfill_secs(),
                 contribution_enabled: true,

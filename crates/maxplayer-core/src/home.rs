@@ -223,12 +223,40 @@ pub struct SellerConfig {
     /// (#626). Any handler added to that subscription inherits the same obligation.
     #[serde(default)]
     pub claim_open_pool: bool,
-    /// Allowlist of buyer pubkeys (64-hex) whose offers this seller will claim. **Empty/absent =
-    /// accept-all** — every buyer is eligible, subject to the usual targeting/rate/harness gates
-    /// (the pre-#482 behavior; existing sellers are unaffected). **Populated = a hard fence**: an
-    /// offer whose author (the buyer) is not on the list is skipped with a named `NotAllowlisted`
-    /// skip reason and NO buyer feedback — a private seller does not advertise why it declined a
-    /// stranger. Consulted right after the lapsed-offer refusal, before the rate/harness gates.
+    /// Opt-in to let a buyer this seat has NOT named target it directly. Default **false**.
+    ///
+    /// This is the TARGETED half of the seat's exposure, and it is a separate surface from
+    /// [`SellerConfig::claim_open_pool`]: that flag governs UNTARGETED (open-pool) offers, this one
+    /// governs offers whose `p` tag is this seat. A seat can be reachable on either, both, or
+    /// neither, so the two are independent knobs rather than one "openness" setting.
+    ///
+    /// The three buyer-facing knobs are deliberately independent and NOTHING is inferred from a
+    /// field being empty:
+    /// - [`SellerConfig::accept_offers_only_from`] — the buyers this operator named.
+    /// - `accept_open_targeted` — may a buyer it did NOT name target this seat.
+    /// - [`SellerConfig::claim_open_pool`] — may it claim untargeted pool offers.
+    ///
+    /// A default seat therefore claims only from the buyers its operator listed, and a seat with no
+    /// list claims nothing until the operator opts in to one of the open surfaces.
+    ///
+    /// **PRECEDENCE — a populated allowlist WINS.** `accept_offers_only_from` stays the hard fence
+    /// it has been since #482: while it is populated, an unlisted buyer is refused on BOTH surfaces
+    /// and this flag has no effect. The flag is what an operator with no list uses to stay reachable.
+    /// The combination (populated list AND this flag) is inert rather than wrong, so `doctor` reports
+    /// it — an inert setting that looks like it opened something is the failure worth naming.
+    #[serde(default)]
+    pub accept_open_targeted: bool,
+    /// Allowlist of buyer pubkeys (64-hex) whose offers this seller will claim. **Populated = a hard
+    /// fence** (#482): an offer whose author (the buyer) is not on the list is skipped with a named
+    /// `NotAllowlisted` skip reason and NO buyer feedback — a private seller does not advertise why
+    /// it declined a stranger. Consulted right after the lapsed-offer refusal, before the
+    /// rate/harness gates.
+    ///
+    /// **Empty/absent means the operator named no buyers — it does NOT mean accept-all.** Which
+    /// strangers may reach a seat with no list is decided by the two surface flags above, never
+    /// inferred from this field's emptiness. Before the three-knob change an empty list DID mean
+    /// accept-all on the targeted surface; see [`SellerConfig::accept_open_targeted`] for the
+    /// migration a seat with no list now needs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accept_offers_only_from: Vec<String>,
     /// Backfill window (seconds) for the seller's UNTARGETED (open-pool) offer-kind offer

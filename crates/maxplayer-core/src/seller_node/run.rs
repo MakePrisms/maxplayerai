@@ -357,6 +357,19 @@ enum SkipReason {
     /// buyer) is not on it — a hard fence (#482). Named (not silent) so the operator log records the
     /// declined pubkey; no buyer feedback is emitted (a private seller does not advertise the fence).
     NotAllowlisted,
+    /// A buyer this seat has not named targeted it directly, and the seat has not opted in to the
+    /// targeted-open surface (`accept_open_targeted = false`, the default).
+    ///
+    /// DELIBERATELY NOT FOLDED INTO [`Self::NotAllowlisted`], for the reason
+    /// [`Self::TakenElsewhere`] is not folded into [`Self::Settled`]: the two answer different
+    /// operator questions. `NotAllowlisted` means "this buyer is not on the list you wrote" and the
+    /// fix is to edit the list. This means "you named no buyers and you are not open to strangers"
+    /// — the operator has NO list to edit, so the same string would send them looking for one that
+    /// does not exist. It is also the line that makes the silent migration audible: a seat upgraded
+    /// past the three-knob change stops accepting targeted work with no config error, and this
+    /// reason is what tells its operator which knob restores it. Like the fence, it emits no buyer
+    /// feedback — a seat that is not open does not advertise why.
+    OpenTargetedRefused,
     /// Rate-gate refused: untargeted without open-pool opt-in, or below the seller's rate floor.
     RateGate,
     /// The offer asked for a harness this node does not run.
@@ -391,6 +404,11 @@ impl SkipReason {
             Self::Lapsed => "offer deadline already passed (lapsed; never resurrected)",
             Self::TooOld => "offer authored too long ago (aged historical; not re-admitted from backfill)",
             Self::NotAllowlisted => "buyer not in accept_offers_only_from allowlist",
+            Self::OpenTargetedRefused => {
+                "targeted by a buyer this seat has not named, and accept_open_targeted=false \
+                 (set accept_open_targeted=true to accept strangers, or list the buyer in \
+                 accept_offers_only_from)"
+            }
             Self::RateGate => "rate-gate refused (untargeted without opt-in / below rate)",
             Self::AgentUnavailable => "requested agent harness not available on this node",
             Self::SlotsBusy => "all execution slots busy (node fully loaded; not claiming)",
@@ -2057,9 +2075,17 @@ async fn contribution_result_envelope_tags(
 /// Decide whether to claim `offer`, applying the always-on money-safety gates in the legacy order:
 /// a lapsed offer is refused BEFORE its deadline is re-derived (never resurrect a stale offer with a
 /// fresh `now + timeout`), then the #604 offer-age gate (a long-aged historical the backfill keeps
-/// re-surfacing is refused so it cannot park a slot on work that will not be awarded), then the
-/// buyer-allowlist fence (#482), then the targeting/rate gate, then the harness the offer asked for.
+/// re-surfacing is refused so it cannot park a slot on work that will not be awarded), then buyer
+/// eligibility, then the targeting/rate gate, then the harness the offer asked for.
 /// Pure over (offer, config, registry, buyer, now, offer_created_at).
+///
+/// Buyer eligibility is TWO clauses over three independent knobs, and no knob is inferred from
+/// another being empty. The allowlist fence (#482) refuses an unlisted buyer whenever the operator
+/// populated a list, on either surface. The targeted-surface opt-in then refuses a buyer the
+/// operator did NOT name when the offer targets this seat and `accept_open_targeted` is false — the
+/// clause that stops an empty allowlist meaning accept-all. The untargeted (open-pool) surface is
+/// left wholly to `claim_open_pool` in the rate gate, so the two open surfaces stay separable.
+/// A populated allowlist wins: while one is set, `accept_open_targeted` cannot re-open the seat.
 ///
 /// The harness gate is a CLAIM-time decision, not a delivery-time one: a node that cannot run the
 /// requested harness never parks a claim at all, so the buyer's offer stays visible to a seller
@@ -2088,14 +2114,28 @@ fn classify_offer(
     if now_unix.saturating_sub(offer_created_at) > MAX_OFFER_ADMIT_AGE_SECS {
         return ClaimDecision::Skip(SkipReason::TooOld);
     }
-    // Private-seller fence (#482): a populated `accept_offers_only_from` claims ONLY from a named
-    // buyer. Empty/absent ⇒ accept-all (unchanged). Consulted after the lapsed refusal but before
-    // the rate/harness gates, so a stranger's offer is declined outright; the caller names the
-    // declined pubkey in the skip log (this pure fn cannot, and stays silent to the buyer).
-    if !seller.accept_offers_only_from.is_empty()
-        && !seller.accept_offers_only_from.iter().any(|allowed| allowed == buyer_pubkey)
-    {
+    // Buyer-eligibility, in two independent clauses. Consulted after the lapsed refusal but before
+    // the rate/harness gates, so an ineligible buyer's offer is declined outright; the caller names
+    // the declined pubkey in the skip log (this pure fn cannot, and stays silent to the buyer).
+    let buyer_is_named = seller.accept_offers_only_from.iter().any(|allowed| allowed == buyer_pubkey);
+    // (1) Private-seller fence (#482), UNCHANGED: a POPULATED `accept_offers_only_from` claims ONLY
+    // from a named buyer, on both the targeted and the open-pool surface. `is_empty()` is kept here
+    // deliberately — it is what scopes the fence to operators who set one, and deleting it would
+    // turn an empty list into deny-all by a second route, which is exactly what the separate flag
+    // below exists to avoid.
+    if !seller.accept_offers_only_from.is_empty() && !buyer_is_named {
         return ClaimDecision::Skip(SkipReason::NotAllowlisted);
+    }
+    // (2) Targeted-surface opt-in: a buyer this seat did not name may target it only with
+    // `accept_open_targeted`. This is the clause that stops an empty allowlist from meaning
+    // accept-all. It is scoped to offers whose `p` tag is THIS seat, so it leaves the untargeted
+    // (open-pool) surface entirely to `claim_open_pool` in the rate gate below — the two open
+    // surfaces are independent knobs, and neither is inferred from the allowlist being empty.
+    if !buyer_is_named
+        && !seller.accept_open_targeted
+        && offer.seller_pubkey.as_deref() == Some(seller_pubkey)
+    {
+        return ClaimDecision::Skip(SkipReason::OpenTargetedRefused);
     }
     if rate_gate_allows(offer, seller_pubkey, seller.rate_sats, seller.claim_open_pool).is_err() {
         return ClaimDecision::Skip(SkipReason::RateGate);
@@ -2106,6 +2146,36 @@ fn classify_offer(
     ClaimDecision::Claim {
         deadline_unix: crate::seller::job_deadline_unix(offer, seller, now_unix),
     }
+}
+
+/// The boot siren for a seat whose config can claim NOTHING: no buyer named, and neither open
+/// surface opted in to. Returns the operator line, or `None` when at least one route in exists.
+///
+/// ⛔ THIS EXISTS BECAUSE THE THREE-KNOB MIGRATION IS SILENT, AND THE SILENCE IS THE HAZARD, NOT THE
+/// STRICTNESS. Before the split, an empty `accept_offers_only_from` meant accept-all on the targeted
+/// surface; after it, that same config accepts no one. Every already-deployed seller with no
+/// allowlist — including outside operators running our releases — stops accepting targeted work the
+/// moment it upgrades, and nothing about it is an error: the config still parses, the node still
+/// boots, the relay subscription is still live, and the seat still advertises. It simply never
+/// claims again. The strict default is intended and stays; a seat going quiet without saying so is
+/// not, so this is REQUIRED rather than advisory.
+///
+/// Pure over the config so it is testable without a relay, a home lock or a boot. The caller emits.
+fn unreachable_seat_warning(seller: &crate::home::SellerConfig) -> Option<String> {
+    let no_buyer_named = seller.accept_offers_only_from.is_empty();
+    if !(no_buyer_named && !seller.accept_open_targeted && !seller.claim_open_pool) {
+        return None;
+    }
+    Some(
+        "seller node WARNING: this seat can claim NOTHING as configured — it names no buyers \
+         (accept_offers_only_from is empty), does not accept targeted offers from buyers it has not \
+         named (accept_open_targeted=false), and does not claim the open pool \
+         (claim_open_pool=false). It will advertise and stay connected, but never claim a job. If \
+         this seat used to serve, an upgrade closed the targeted surface that an empty allowlist \
+         used to leave open: list your buyers in [seller] accept_offers_only_from, or set \
+         accept_open_targeted=true to accept strangers again."
+            .to_owned(),
+    )
 }
 
 /// Resolve + report the harness registry at boot: one PASS/FAIL line per configured preset, then
@@ -2845,6 +2915,19 @@ pub async fn boot_advertising_only_proven(
              (fix the harness/launcher, then restart)",
             verdicts.len()
         )));
+    }
+
+    // Say it BEFORE the wire work, so an operator watching a boot scroll past sees it whether or not
+    // the relay legs succeed — a seat that will never claim is worth knowing about even if boot then
+    // fails for an unrelated reason. Emitted every boot, not once: the condition is a standing state
+    // of the config, not an event, and a seat can be restarted long after the upgrade that closed it.
+    if let Some(warning) = home
+        .config
+        .seller
+        .as_ref()
+        .and_then(unreachable_seat_warning)
+    {
+        opline!("{warning}");
     }
 
     // Take the home lock BEFORE anything reaches the relay. The publish below is the first thing this
@@ -4567,10 +4650,12 @@ impl SellerNodeRunner {
         {
             ClaimDecision::Claim { deadline_unix } => deadline_unix,
             ClaimDecision::Skip(skip) => {
-                // Every skip is named, never silent. The allowlist fence additionally names the
-                // declined buyer (the other reasons are offer-intrinsic and need no identity).
+                // Every skip is named, never silent. The two buyer-eligibility refusals additionally
+                // name the declined buyer (the other reasons are offer-intrinsic and need no
+                // identity). Both are spelled out rather than left to the catch-all: a refusal the
+                // operator can only fix by knowing WHICH buyer was turned away is useless without it.
                 match skip {
-                    SkipReason::NotAllowlisted => opline!(
+                    SkipReason::NotAllowlisted | SkipReason::OpenTargetedRefused => opline!(
                         "seller node offer skip id={}: {} (buyer={})",
                         event.id,
                         skip.reason(),
@@ -7062,6 +7147,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A seat that is REACHABLE by an unnamed buyer, which is deliberately NOT the product default.
+    ///
+    /// `accept_open_targeted` is forced true here so the gate a given test is actually about — rate,
+    /// lapse, age, harness, slots — is the one that decides its outcome. Leave it at the product
+    /// default and every such test would skip on buyer eligibility instead, passing or failing for a
+    /// reason it never meant to exercise.
+    ///
+    /// ⛔ This fixture is therefore NOT evidence about the shipped default, and no test may cite it
+    /// as such. The default that ships is pinned by `open_targeted_is_off_by_default_on_the_wire`
+    /// (deserialization, the only thing an operator's `config.toml` actually goes through) and its
+    /// behavioural twin `default_seat_refuses_a_targeted_offer_from_an_unnamed_buyer`.
     fn seller_cfg(rate_sats: u64, claim_open_pool: bool) -> crate::home::SellerConfig {
         crate::home::SellerConfig {
             agent_command: vec!["claude".to_owned()],
@@ -7070,6 +7166,7 @@ mod tests {
             job_timeout_secs: None,
             agents: Vec::new(),
             claim_open_pool,
+            accept_open_targeted: true,
             accept_offers_only_from: Vec::new(),
             offer_backfill_secs: 0,
             contribution_enabled: true,
@@ -7208,18 +7305,188 @@ mod tests {
         );
     }
 
-    // #482 BACKCOMPAT (the accept leg) — an empty/absent allowlist is accept-all: any buyer's in-rate
-    // offer still claims, exactly as before the fence existed. Bite: fire the fence on an empty list
-    // and this claim turns into a NotAllowlisted skip.
+    // THE DEFAULT SEAT IS CLOSED ON THE TARGETED SURFACE. This test replaces the #482-era
+    // `empty_allowlist_accepts_any_buyer`, which asserted the OPPOSITE — that an empty allowlist is
+    // accept-all — and whose precondition line ("default allowlist is empty") read the emptiness as
+    // if it carried the policy. It does not any more: emptiness means the operator named no buyers,
+    // and who else may reach the seat is decided by the two surface flags alone.
+    //
+    // The foil is the same offer from the same buyer at the same instant, with the ONE new flag
+    // flipped — so a gate that stopped consulting `accept_open_targeted` cannot pass this.
     #[test]
-    fn empty_allowlist_accepts_any_buyer() {
-        let cfg = seller_cfg(2, false);
-        assert!(cfg.accept_offers_only_from.is_empty(), "precondition: default allowlist is empty");
+    fn default_seat_refuses_a_targeted_offer_from_an_unnamed_buyer() {
+        let mut cfg = seller_cfg(2, false);
+        cfg.accept_open_targeted = false; // the SHIPPED default; the fixture deliberately differs
+        assert!(cfg.accept_offers_only_from.is_empty(), "precondition: no buyer is named");
+
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, "anybody99", NOW, NOW),
+            ClaimDecision::Skip(SkipReason::OpenTargetedRefused),
+            "a seat that named no buyers and did not open the targeted surface must refuse a stranger"
+        );
+        cfg.accept_open_targeted = true;
         assert_eq!(
             classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, "anybody99", NOW, NOW),
             ClaimDecision::Claim { deadline_unix: NOW + 600 },
-            "with no allowlist, any buyer's in-rate offer claims"
+            "opting in to the targeted surface must let exactly that same offer through"
         );
+    }
+
+    // The refusal reports its OWN reason, not the allowlist fence's. An operator with no allowlist
+    // told "buyer not in accept_offers_only_from allowlist" goes looking for a list that does not
+    // exist; the two skips answer different questions and must stay distinguishable. Also pins that
+    // the line names the knob that restores service — this is the migration's only audible signal.
+    #[test]
+    fn the_closed_targeted_refusal_names_its_own_knob_not_the_allowlist() {
+        let refusal = SkipReason::OpenTargetedRefused.reason();
+        assert!(
+            refusal.contains("accept_open_targeted"),
+            "the refusal must name the knob that reopens the seat, got: {refusal}"
+        );
+        assert_ne!(
+            refusal,
+            SkipReason::NotAllowlisted.reason(),
+            "a closed seat and a fenced-out buyer must not share one string — they need different fixes"
+        );
+    }
+
+    // THE SHIPPED DEFAULT, read through the path an operator's `config.toml` actually takes. The
+    // fixture above forces this flag TRUE for test reachability, so nothing in this module's
+    // behavioural tests can attest the default; deserialization is the only thing that can.
+    #[test]
+    fn open_targeted_is_off_by_default_on_the_wire() {
+        let cfg: crate::home::SellerConfig = toml::from_str(
+            r#"
+            agent_command = ["claude"]
+            rate_sats = 2
+            git_remote = "https://example.invalid/repo.git"
+            "#,
+        )
+        .expect("a [seller] block with no open-surface keys must still parse");
+
+        assert!(
+            !cfg.accept_open_targeted,
+            "a config that never mentions accept_open_targeted must default to CLOSED"
+        );
+        // The foil: the field is genuinely wired to serde, not merely absent-and-false by accident.
+        let opted_in: crate::home::SellerConfig = toml::from_str(
+            r#"
+            agent_command = ["claude"]
+            rate_sats = 2
+            git_remote = "https://example.invalid/repo.git"
+            accept_open_targeted = true
+            "#,
+        )
+        .expect("an explicit opt-in must parse");
+        assert!(opted_in.accept_open_targeted, "an explicit true must survive deserialization");
+    }
+
+    // KNOB INDEPENDENCE, both directions. The whole point of three knobs is that no one of them is
+    // inferred from another, so each surface must be openable WITHOUT opening the other.
+    #[test]
+    fn the_two_open_surfaces_are_independent() {
+        // Targeted opt-in alone must NOT open the pool — the untargeted offer still needs
+        // `claim_open_pool`, and it is the rate gate (not the buyer gate) that says so.
+        let mut targeted_only = seller_cfg(2, false);
+        targeted_only.accept_open_targeted = true;
+        assert_eq!(
+            classify_offer(&offer(5, None, NOW + 600), &targeted_only, &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::RateGate),
+            "accept_open_targeted must not silently enrol the seat in the open pool"
+        );
+
+        // Pool opt-in alone must NOT open the targeted surface, and must still claim the pool —
+        // `claim_open_pool` is UNCHANGED by the three-knob split.
+        let mut pool_only = seller_cfg(2, true);
+        pool_only.accept_open_targeted = false;
+        assert_eq!(
+            classify_offer(&offer(5, None, NOW + 600), &pool_only, &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "claim_open_pool must still claim an untargeted offer from an unnamed buyer, exactly as before"
+        );
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &pool_only, &claude_only(), SELLER, BUYER, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::OpenTargetedRefused),
+            "claiming the open pool must not also invite strangers to target the seat directly"
+        );
+    }
+
+    // PRECEDENCE — a populated allowlist WINS over the targeted opt-in, and this test FAILS IF THE
+    // ORDER FLIPS. Run the buyer-eligibility clauses the other way round (targeted opt-in first) and
+    // the stranger below would be admitted, silently dissolving the #482 fence for every operator who
+    // ever sets both. That is the whole reason the order is asserted rather than left to reading.
+    #[test]
+    fn a_populated_allowlist_wins_over_the_targeted_opt_in() {
+        const ALLOWED: &str = "cafe01";
+        const STRANGER: &str = "dead02";
+        let mut cfg = seller_cfg(2, false);
+        cfg.accept_offers_only_from = vec![ALLOWED.to_owned()];
+        cfg.accept_open_targeted = true; // set, and deliberately INERT while a list exists
+
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, STRANGER, NOW, NOW),
+            ClaimDecision::Skip(SkipReason::NotAllowlisted),
+            "the #482 fence must still fence: accept_open_targeted may not reopen a seat that named its buyers"
+        );
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, ALLOWED, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "the named buyer is unaffected"
+        );
+    }
+
+    // A NAMED BUYER REACHES A CLOSED SEAT — the migration path an operator is told to take. Without
+    // this, every assertion above is satisfied by a gate that simply refuses everything.
+    #[test]
+    fn a_named_buyer_reaches_a_seat_with_the_targeted_surface_closed() {
+        const ALLOWED: &str = "cafe01";
+        let mut cfg = seller_cfg(2, false);
+        cfg.accept_offers_only_from = vec![ALLOWED.to_owned()];
+        cfg.accept_open_targeted = false;
+        assert_eq!(
+            classify_offer(&offer(5, Some(SELLER), NOW + 600), &cfg, &claude_only(), SELLER, ALLOWED, NOW, NOW),
+            ClaimDecision::Claim { deadline_unix: NOW + 600 },
+            "listing a buyer must be sufficient to keep working with the targeted surface closed"
+        );
+    }
+
+    // THE MIGRATION SIREN. The condition is exactly the config an already-deployed seller upgrades
+    // INTO: it had no allowlist (which used to mean accept-all) and never opted in to either surface,
+    // so after the split it claims nothing while looking entirely healthy. Fires there and nowhere
+    // else — each of the three routes in is checked to SILENCE it, so a warning that simply always
+    // fired (or a predicate that lost a clause) fails here rather than training operators to ignore it.
+    #[test]
+    fn the_unreachable_seat_warning_fires_on_exactly_the_closed_config() {
+        let closed = seller_cfg_closed();
+        let warning = unreachable_seat_warning(&closed).expect("a seat with no way in must warn");
+        assert!(
+            warning.contains("accept_open_targeted") && warning.contains("accept_offers_only_from"),
+            "the warning must name the knobs that restore service, got: {warning}"
+        );
+
+        // Route 1 — name a buyer.
+        let mut listed = seller_cfg_closed();
+        listed.accept_offers_only_from = vec!["cafe01".to_owned()];
+        assert_eq!(unreachable_seat_warning(&listed), None, "a named buyer is a way in");
+
+        // Route 2 — open the targeted surface.
+        let mut open_targeted = seller_cfg_closed();
+        open_targeted.accept_open_targeted = true;
+        assert_eq!(unreachable_seat_warning(&open_targeted), None, "the targeted surface is a way in");
+
+        // Route 3 — claim the open pool.
+        let mut open_pool = seller_cfg_closed();
+        open_pool.claim_open_pool = true;
+        assert_eq!(unreachable_seat_warning(&open_pool), None, "the open pool is a way in");
+    }
+
+    /// The fully-closed seat: the config an upgrading seller with no allowlist lands on. Written out
+    /// rather than derived from `seller_cfg`, which deliberately ships an OPEN targeted surface.
+    fn seller_cfg_closed() -> crate::home::SellerConfig {
+        let mut cfg = seller_cfg(2, false);
+        cfg.accept_open_targeted = false;
+        cfg.accept_offers_only_from = Vec::new();
+        cfg
     }
 
     // #482 ORDER — the fence is consulted AFTER the lapsed refusal: a dead offer from an unlisted

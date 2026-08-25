@@ -136,8 +136,9 @@ the boot gate refuses to start when argv0 is neither on `PATH` nor an existing f
 would then die at spawn with ENOENT (#357). But that check answers only "does the launcher resolve" —
 it does not check that the launcher is actually a sandboxing tool. `launcher = ["env"]` resolves and
 isolates nothing. A separate containment probe (#451) does run the launcher once against a canary file
-in `/data` and the job workdir, but it blocks boot only for a seat claiming open-pool jobs; on a
-targeted-only seat — the default for this image — it is advisory (a WARN), and either way it samples
+in `/data` and the job workdir, but it blocks boot only for a seat strangers can reach — one that
+claims the open pool OR accepts targeted offers from buyers it has not named. On a seat reachable
+only by the buyers it named — the default for this image — it is advisory (a WARN), and either way it samples
 one canary read and one workdir write, not your other secret paths. Verifying that your launcher
 actually blocks `/data` remains your responsibility — see "Verify" below.
 
@@ -432,8 +433,9 @@ Key points about this example:
 
 ### Verify the sandbox actually works
 
-Don't lean on the boot gate's containment probe for this: on the default targeted-only seat it only
-warns, and it samples a single canary path. After configuring, run your launcher by hand with a probe in
+Don't lean on the boot gate's containment probe for this: on a default seat — reachable only by the
+buyers it named, both open surfaces off — it only warns, and it samples a single canary path. After
+configuring, run your launcher by hand with a probe in
 place of the agent command and confirm `/data` is gone:
 
 ```sh
