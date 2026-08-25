@@ -395,13 +395,16 @@ proxy_port_range` when egress containment is active — without it the firewall 
 job cannot reach its model"*. Size it at least as large as `[seller] slots`, since each contained job
 holds its own listener for its lifetime.
 
-**2. The credential does not cross the container boundary.** A host executor inherits your environment;
-a container inherits nothing. `claude /login` writes to `~/.claude` (macOS: the Keychain) and neither
-exists inside the container — so the daemon's **own environment** must hold the credential. These names
-are forwarded in automatically when set, with no `forward_env` entry:
+**2. An environment credential does not cross the container boundary.** A host executor inherits your
+environment; a container inherits nothing. `claude /login` writes to `~/.claude` (macOS: the Keychain)
+and neither exists inside the container. The daemon's **own environment** must hold that credential.
+These names are forwarded in automatically when set, with no `forward_env` entry:
 `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
 `OPENAI_API_KEY`, `OPENAI_BASE_URL`. For `claude` prefer `CLAUDE_CODE_OAUTH_TOKEN` (`claude
 setup-token`) — an environment API key needs a one-time interactive approval a daemon cannot give (§3b).
+
+Docker Codex has a separate ChatGPT session route. `[sandbox.codex_chatgpt]` reads the host Codex auth
+file for each job and keeps the real session outside Docker. See the controlled setup below.
 
 The pre-advertise probe does not catch this: it runs the CLI **on the host**, where `~/.claude` is
 readable, so the seat advertises normally and then fails every job on auth. Set the variable where the
@@ -423,6 +426,78 @@ the proxy's pre-forward body collection, so every job fails; a seat configured t
 pre-advertise probe and refuses to advertise rather than taking awards it cannot serve. Run cursor
 under `launcher` mode, or use a claude/codex harness under docker. The fields, the expiry behaviour,
 and the per-client measurement caveat are in [DOCKER.md](DOCKER.md).
+
+#### Controlled Docker Codex seller with ChatGPT auth
+
+Use a separate seller home, Codex home, Docker network, and proxy port. This keeps the current Claude
+seller home and process unchanged.
+
+First, create a dedicated Codex login for the same ChatGPT account:
+
+```bash
+export MAXPLAYER_CODEX_AUTH="$HOME/.codex-maxplayer-test"
+install -d -m 700 "$MAXPLAYER_CODEX_AUTH"
+CODEX_HOME="$MAXPLAYER_CODEX_AUTH" codex login
+chmod 600 "$MAXPLAYER_CODEX_AUTH/auth.json"
+```
+
+Next, build the source-test sandbox image and create its network. A released binary can omit `image`
+and use its versioned image instead.
+
+```bash
+docker build -t maxplayer-sandbox:codex-test docker/maxplayer-sandbox
+docker network create maxplayer-codex-test
+```
+
+Create a new seller identity. `whoami` writes a new key inside only this home and prints public values:
+
+```bash
+export MAXPLAYER_CODEX_SELLER_HOME="$HOME/.maxplayer-codex-test"
+"$MAXPLAYER_BIN" whoami --home "$MAXPLAYER_CODEX_SELLER_HOME"
+```
+
+Edit `$MAXPLAYER_CODEX_SELLER_HOME/config.toml`. Keep its existing root settings. Add these sections
+after you replace all angle-bracket values:
+
+```toml
+[seller]
+agent_command = ["codex-acp"]
+agents = ["codex"]
+rate_sats = 100
+git_remote = "https://relay.maxplayer.ai/git/<SELLER_HEX>/m<FIRST_16_SELLER_HEX>.git"
+claim_open_pool = false
+accept_offers_only_from = ["<TEST_BUYER_HEX>"]
+slots = 1
+
+[sandbox]
+mode = "docker"
+image = "maxplayer-sandbox:codex-test"  # source test only; omit for a released binary
+network = "maxplayer-codex-test"
+proxy_port_range = "9200-9200"
+# runtime = "runsc"                    # Linux only; omit on macOS
+
+[sandbox.codex_chatgpt]
+auth_file = "/absolute/path/to/.codex-maxplayer-test/auth.json"
+```
+
+`<TEST_BUYER_HEX>` is the 64-character buyer public key. The buyer must also target the new seller
+public key. These two checks limit the seller to controlled test jobs.
+
+Run the checks and start only the new home:
+
+```bash
+MAXPLAYER_HOME="$MAXPLAYER_CODEX_SELLER_HOME" "$MAXPLAYER_BIN" doctor
+MAXPLAYER_HOME="$MAXPLAYER_CODEX_SELLER_HOME" "$MAXPLAYER_BIN" seller
+```
+
+The host reads the current access token and account ID before each Codex run. The auth file and refresh
+token never enter Docker. Docker receives only two per-job placeholders.
+
+The token must outlive the job timeout plus 15 minutes. Version one does not refresh it. Run the same
+dedicated Codex login again when the lifetime check fails.
+
+The planned refresh step will run on the host before each job. It will update the same auth file before
+this reader runs. It will never put a refresh token in Docker.
 
 **Leave `image` unset.** Omitted, the binary uses its own version-pinned ref
 (`ghcr.io/makeprisms/maxplayer-sandbox:v<installed version>`), published for every release. `image` is
