@@ -74,9 +74,16 @@ pub const HARNESS_FAMILY_TAG: &str = "harness_family";
 /// vocabulary. A request param that drifted from the advertisement tag would filter on a word no
 /// seat can say, and nothing would flag it.
 ///
-/// Distinct from [`crate::seller_agents::AGENT_PARAM`], which names a PRESET: a family spans the
-/// presets sharing a harness, so a family request binds dispatch where a preset name binds a
-/// configuration. Both may be present and both are then enforced.
+/// Distinct from [`crate::seller_agents::AGENT_PARAM`], which names a PRESET, and the difference is
+/// what each one BINDS. A family request selects WHICH SEATS MAY CLAIM: it is matched against
+/// [`HARNESS_FAMILY_TAG`] at award time and refuses a seat that does not advertise it. It does NOT
+/// choose which harness a winning seat then dispatches — only the preset reaches execution
+/// (`offer_row` persists `requested_agent` alone, `classify_offer` gates on it, and `execute_job`
+/// hands it to `SellerAgents::dispatch`, which runs the seat's FIRST configured preset when it is
+/// absent). So a multi-harness seat can satisfy a family request and run a different harness.
+///
+/// A request that must bind execution therefore names the preset, and a model request REQUIRES one
+/// — see [`crate::buyer::lifecycle::CapabilityRefusal::ModelWithoutHarnessPreset`].
 pub const HARNESS_FAMILY_PARAM: &str = "harness_family";
 
 /// Wire tag pairing ONE serving harness to the model it LAST REPORTED (#784):
@@ -567,7 +574,11 @@ fn stated_values(values: Vec<String>) -> Vec<String> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct HarnessModel {
     /// The harness family this model belongs to — a value from
-    /// [`crate::agent_presets::HARNESS_FAMILIES`]. This is what a buyer names to make dispatch bind.
+    /// [`crate::agent_presets::HARNESS_FAMILIES`].
+    ///
+    /// ⚠ Naming this in a request does NOT make dispatch bind — that claim was here before the
+    /// request side existed and it is false. A family narrows which seats may claim; the PRESET is
+    /// the only requested axis execution reads.
     pub family: String,
     /// The harness-resolved session model id, verbatim.
     pub model: String,
