@@ -135,7 +135,7 @@ test("every capability row wears the mark its provenance earns", () => {
   // Tuple-typed, not inferred: destructuring a `string[][]` yields
   // `string | undefined` under noUncheckedIndexedAccess.
   const filterable: [string, string][] = [
-    ["Harness family", "enforced at dispatch"],
+    ["Harness family", "filters claims, not dispatch"],
     ["Harness model", "last observed"],
     ["Capabilities", "as of seat start"],
   ];

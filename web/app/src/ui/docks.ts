@@ -259,13 +259,20 @@ const OPERATOR_DECLARED = {
 };
 
 /**
- * The one capability field backed by a mechanism, and the only one current as
- * of the beat that carries it (protocol v1 §4.5.3, §4.5.4).
+ * The only capability field current as of the beat that carries it, and a
+ * claim filter rather than a dispatch guarantee (protocol v1 §4.5.3, §4.5.4).
+ *
+ * The wording here is constrained for the same reason `LAST_OBSERVED`'s is.
+ * Nothing at the seat reads `harness_family`: dispatch selects a harness by the
+ * offer's `agent` preset alone. Any verb implying it binds execution — enforced,
+ * pinned, guaranteed, exact-or-nothing at dispatch — states a fact no code
+ * supports, and a multi-harness seat matching the filter can run a different
+ * harness within the family.
  */
-const ENFORCED_AT_DISPATCH = {
-  mark: "enforced at dispatch",
+const FILTERS_CLAIMS_NOT_DISPATCH = {
+  mark: "filters claims, not dispatch",
   markClass: "provenance",
-  title: "Read from the live roster each time a beat is drafted, so it is current as of this beat. Dispatch binds to the named family exactly or not at all — the only one of the three filterable fields backed by a mechanism.",
+  title: "Read from the live roster each time a beat is drafted, so it is current as of this beat. It decides which seats may claim a job, never which harness runs one — dispatch selects by the offer's `agent` preset alone, so a seat configured with several presets in this family can match and run a different one. A buyer that needs the execution guarantee must name the preset.",
 };
 
 /**
@@ -322,7 +329,7 @@ const AS_OF_SEAT_START = {
 export function capabilityRows(s: { harnessFamilies?: string[]; harnessModels?: HarnessModel[]; capabilities?: string[]; harnessVariant?: string | null; hardware?: string | null } | null): ProfileRow[] {
   if (!s) return [];
   return [
-    ["Harness family", s.harnessFamilies?.length ? s.harnessFamilies.join(" · ") : null, ENFORCED_AT_DISPATCH],
+    ["Harness family", s.harnessFamilies?.length ? s.harnessFamilies.join(" · ") : null, FILTERS_CLAIMS_NOT_DISPATCH],
     ["Harness model", s.harnessModels?.length
       ? s.harnessModels.map((m) => `${m.family} ${m.model}`).join(" · ") : null, LAST_OBSERVED],
     ["Capabilities", s.capabilities?.length ? s.capabilities.join(" · ") : null, AS_OF_SEAT_START],
