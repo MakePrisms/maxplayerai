@@ -87,7 +87,8 @@ or delivery decisions.
 ### 4.2 Seat announcement, kind `30340`
 
 Kind `30340` is the seat's capability and liveness announcement. It is addressable, so a seat
-replaces it on every beat. Every fact below is current as of that beat.
+replaces it on every beat. Every fact below is current as of that beat, EXCEPT `harness_model` and
+`capabilities` — those two carry weaker guarantees and §4.5.4 is normative for them.
 
 | Tag | Card. | Req. | Meaning |
 |---|---|---:|---|
@@ -213,33 +214,72 @@ satoshis on the token, so the limit is stated here rather than left to inference
 The probe runs where jobs run, never on the seat host. A seat whose jobs run in a container MUST
 probe inside that container: a host-side check proves a capability the job will not have.
 
-A capability token has neither dispatch enforcement nor a receipt-side contradiction. This is unlike
-the other two filterable fields — `harness_family` is enforced when the job is dispatched, and
-`harness_model` is contradicted by `model_used` on the result. Nothing on a receipt contradicts a
-capability claim. A reader MUST NOT read the three as equally falsifiable.
+The three filterable fields are NOT equally checkable, and none of the three is verified by the
+protocol:
+
+- `harness_family` is ENFORCED, at the seat, when the job is dispatched: dispatch binds to the named
+  family exactly or not at all. This is the only one of the three backed by a mechanism.
+- `harness_model` is ECHOED. The result event carries `["model", name]` — the model the seller says
+  it used. A buyer can compare that against the model it was awarded on, so a divergence is at least
+  VISIBLE in the buyer's own records. It is not a falsifier: both values are the seller's word, and
+  §6.4 states that nothing verifies the execution-metadata block and a reader MUST NOT treat it as
+  proof that a given model ran.
+- `capabilities` is neither enforced nor echoed. No event carries a capability back, so nothing a
+  buyer receives can disagree with the advertisement at all.
+
+A reader MUST NOT read these as three grades of proof. One is an enforcement, one is an
+inconsistency signal, and one is silence.
 
 #### 4.5.4 Freshness
 
-`harness_family` and `harness_model` are current as of the beat that carries them:
-`harness_family` is read from live roster state, and `harness_model` is refreshed from every
-completed job.
+The three filterable fields have three different freshness guarantees, and only one of them is
+"current as of the beat".
 
-`capabilities` is NOT. A seat probes its execution environment once, at start, and republishes that
-snapshot on every beat for the life of the process. The bound on its staleness is the seat's
-UPTIME, not the beat cadence. An operator who installs a toolchain into a running seat's environment
-does not change what the seat advertises until it restarts.
+`harness_family` IS current as of the beat that carries it: it is read from live roster state each
+time a beat is drafted.
+
+`harness_model` is the LAST OBSERVED value, not a current one. A seat records a model at three
+moments — when a harness is probed at boot, when a dropped harness is restored by its self-probe,
+and when a job completes — and republishes that value on every beat in between. Those three are the
+whole set. Between them the seat states what it last saw, which is why the field is a claim about an
+advertisement and never a promise about the next job. §4.5.3 states what can and cannot contradict
+it.
+
+`capabilities` is the stalest of the three. A seat probes its execution environment once, at start,
+and republishes that snapshot on every beat for the life of the process. The bound on its staleness
+is the seat's UPTIME, not the beat cadence.
+
+That bound drifts in BOTH directions, and the two are not equally safe:
+
+- A toolchain INSTALLED into a running seat's environment is not advertised until the seat restarts.
+  The seat UNDER-claims and loses awards it could have won.
+- A toolchain REMOVED from a running seat continues to be advertised until the seat restarts. The
+  seat OVER-claims: it can be awarded work it can no longer do. Nothing on the filter path catches
+  this — the advertisement is what a buyer matches on — so it surfaces at delivery.
 
 A reader MUST NOT infer from a recent beat that its `capabilities` were measured recently. This is a
 narrowing of section 4.2's general rule, and it is the only field that takes it.
 
 #### 4.5.5 Rollout
 
-Every capability filter is optional, and an absent field satisfies every filter. A buyer that names
-no capability matches seats that advertise none, so seats that predate this section keep receiving
-awards unchanged.
+Two different things can be absent, and they have OPPOSITE effects. Conflating them is the error this
+paragraph exists to prevent.
 
-The moment a buyer DOES name one, a seat advertising no capability tag is refused. **Seats advertise
-before buyers filter.** Deploy the seat side first; publish filter-bearing offers after.
+- **An absent BUYER requirement imposes no filter.** Every capability filter is optional. A job that
+  names no family, no model and no capability is matched against nothing and is awarded exactly as it
+  was before this section existed.
+- **An absent SELLER field satisfies no NAMED requirement.** Silence is not a capability. Once a
+  buyer names one, a seat that advertises nothing for it cannot match — there is no value to compare,
+  and an absent advertisement is never read as a wildcard.
+
+Both follow directly from the matcher: a requirement the buyer left unset skips its check entirely,
+and a requirement the buyer set is tested against the seat's advertised list, which an empty list can
+never satisfy.
+
+The consequence for deployment is one-directional. Seats that predate this section keep receiving
+awards from buyers that filter on nothing, and stop receiving them from any buyer that filters on
+something. **Seats advertise before buyers filter.** Deploy the seat side first; publish
+filter-bearing offers after.
 
 ⚠ The failure mode on the seller side is SILENCE. A seat refused by a capability filter looks exactly
 like an idle market: the process is alive, the beats are publishing, the logs are clean, and the

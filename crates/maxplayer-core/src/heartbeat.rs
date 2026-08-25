@@ -140,16 +140,29 @@ pub const HARNESS_VARIANT_TAG: &str = "harness_variant";
 ///
 /// ## Known asymmetry — probing buys provenance, not detectability
 ///
-/// This remains the only filterable field with NEITHER dispatch enforcement NOR a receipt-side
-/// falsifier. `harness_family` is enforced by dispatch (exact-or-nothing); `harness_model` is
-/// contradicted by `model_used`. Nothing on a receipt contradicts a capability. The residual is
-/// accepted because the probe makes the claim true at the SOURCE, and because presence is honestly
-/// necessary-not-sufficient for any capability signal — but it is a real difference from
-/// `harness_model` and must not be read as symmetry.
+/// This remains the only filterable field with NEITHER dispatch enforcement NOR any echo a buyer
+/// could compare against. `harness_family` is enforced by dispatch (exact-or-nothing) — a real
+/// mechanism. `harness_model` is merely ECHOED: the result carries `["model", name]`, so a buyer can
+/// notice a divergence from what it awarded on, but both values are the SELLER'S OWN WORD and
+/// `docs/protocol-v1.md` §6.4 states that nothing verifies that block. It is an inconsistency
+/// signal, not a falsifier. No event carries a capability back at all.
 ///
-/// Same two-reads-in-time residual as the model tag: the probe runs at beat time and the job runs
-/// later, so an environment change between them drifts the advertisement. That reduces drift to the
-/// probe cadence; it does not eliminate it.
+/// The residual is accepted because the probe makes the claim true at the SOURCE, and because
+/// presence is honestly necessary-not-sufficient for any capability signal — but the three are one
+/// enforcement, one echo and one silence, and must not be read as three grades of the same proof.
+///
+/// ## Freshness — bounded by UPTIME, not by the beat
+///
+/// The probe runs ONCE, at seat start, and every beat for the life of the process republishes that
+/// same snapshot. So the staleness bound is how long the seat has been running, and a recent beat is
+/// no evidence of a recent measurement. This is the only field that takes that narrowing; see
+/// `docs/protocol-v1.md` §4.5.4, which is normative for it.
+///
+/// Drift runs in BOTH directions and they are not symmetric. A toolchain INSTALLED into a running
+/// seat's environment is not advertised until restart — the seat under-claims and loses awards it
+/// could have won. A toolchain REMOVED from a running seat keeps being advertised until restart, so
+/// the seat OVER-claims: it can be awarded work it can no longer do, and that is caught at delivery
+/// rather than at the filter. Bounding the probe on a cadence is #891.
 pub const CAPABILITIES_TAG: &str = "capabilities";
 
 /// Wire tag carrying operator colour about the machine (#784) — e.g. "mac studio, 64GB". Free text,
