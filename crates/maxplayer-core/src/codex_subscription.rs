@@ -7,8 +7,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The only ChatGPT backend a subscription session may reach.
 pub const CHATGPT_CODEX_UPSTREAM: &str = "https://chatgpt.com/backend-api/codex";
-/// The custom provider id handed to `codex-acp` inside the container.
-pub const MODEL_PROVIDER_ID: &str = "maxplayer-chatgpt";
 /// Extra token lifetime required after the job timeout.
 pub const ACCESS_TOKEN_MARGIN: Duration = Duration::from_secs(15 * 60);
 
@@ -243,24 +241,24 @@ pub fn read_chatgpt_session(
     })
 }
 
-/// Build the container-facing Codex configuration. Every credential value is a per-job placeholder.
-pub fn provider_config_json(
+/// Build the container-facing `codex-acp` gateway request. Every credential value is a per-job
+/// placeholder. `DEFAULT_AUTH_REQUEST` makes the adapter install this gateway before its own auth
+/// gate runs; a custom `MODEL_PROVIDER` alone reaches that gate too late.
+pub fn gateway_auth_request_json(
     proxy_url: &str,
     access_placeholder: &str,
     account_placeholder: &str,
 ) -> String {
     serde_json::json!({
-        "model_provider": MODEL_PROVIDER_ID,
-        "model_providers": {
-            MODEL_PROVIDER_ID: {
-                "name": "Maxplayer ChatGPT",
-                "base_url": proxy_url,
-                "wire_api": "responses",
-                "requires_openai_auth": false,
-                "http_headers": {
+        "methodId": "gateway",
+        "_meta": {
+            "gateway": {
+                "baseUrl": proxy_url,
+                "headers": {
                     "Authorization": format!("Bearer {access_placeholder}"),
                     "ChatGPT-Account-ID": account_placeholder,
-                }
+                },
+                "providerName": "Maxplayer ChatGPT",
             }
         }
     })
@@ -427,26 +425,25 @@ mod tests {
     }
 
     #[test]
-    fn codex_subscription_provider_config_contains_placeholders_only() {
-        let json = super::provider_config_json(
+    fn codex_subscription_gateway_auth_request_contains_placeholders_only() {
+        let json = super::gateway_auth_request_json(
             "http://maxplayer-proxy:9123",
             "access-placeholder",
             "account-placeholder",
         );
-        let config: serde_json::Value = serde_json::from_str(&json).expect("provider config JSON");
-        let provider = &config["model_providers"]["maxplayer-chatgpt"];
+        let request: serde_json::Value =
+            serde_json::from_str(&json).expect("gateway auth request JSON");
+        let gateway = &request["_meta"]["gateway"];
 
-        assert_eq!(config["model_provider"], "maxplayer-chatgpt");
-        assert_eq!(provider["name"], "Maxplayer ChatGPT");
-        assert_eq!(provider["base_url"], "http://maxplayer-proxy:9123");
-        assert_eq!(provider["wire_api"], "responses");
-        assert_eq!(provider["requires_openai_auth"], false);
+        assert_eq!(request["methodId"], "gateway");
+        assert_eq!(gateway["providerName"], "Maxplayer ChatGPT");
+        assert_eq!(gateway["baseUrl"], "http://maxplayer-proxy:9123");
         assert_eq!(
-            provider["http_headers"]["Authorization"],
+            gateway["headers"]["Authorization"],
             "Bearer access-placeholder"
         );
         assert_eq!(
-            provider["http_headers"]["ChatGPT-Account-ID"],
+            gateway["headers"]["ChatGPT-Account-ID"],
             "account-placeholder"
         );
         assert!(!json.contains("real-access"));

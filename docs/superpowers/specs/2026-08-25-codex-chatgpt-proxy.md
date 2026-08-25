@@ -71,21 +71,25 @@ Use one placeholder for the bearer token.
 
 Use one placeholder for the ChatGPT account ID.
 
-Configure Codex with a custom model provider.
+Configure `codex-acp` with its default gateway auth request.
 
-Use these provider values:
+Use these gateway values:
 
 ```text
-base_url = the per-job proxy URL
-wire_api = responses
-requires_openai_auth = false
+methodId = gateway
+baseUrl = the per-job proxy URL
 Authorization = Bearer <access placeholder>
 ChatGPT-Account-ID = <account placeholder>
+providerName = Maxplayer ChatGPT
 ```
 
-Set `MODEL_PROVIDER=maxplayer-chatgpt` for `codex-acp`.
+Put this JSON in `DEFAULT_AUTH_REQUEST`.
 
-Put the same provider name in `CODEX_CONFIG`.
+Do not set `CODEX_CONFIG` or `MODEL_PROVIDER` in this mode.
+
+`codex-acp` checks its own auth state before it uses `MODEL_PROVIDER`.
+
+The default gateway request installs the placeholder route before that check.
 
 The configuration contains placeholders only.
 

@@ -63,7 +63,7 @@ pub fn read_chatgpt_session(
     now: SystemTime,
 ) -> Result<ChatgptSession, SessionError>;
 
-pub fn provider_config_json(
+pub fn gateway_auth_request_json(
     proxy_url: &str,
     access_placeholder: &str,
     account_placeholder: &str,
@@ -78,7 +78,7 @@ pub fn provider_config_json(
 
 - [x] Add a Unix test that refuses group or world access.
 
-- [x] Add a test that confirms the provider JSON contains placeholders only.
+- [x] Add a test that confirms the gateway auth JSON contains placeholders only.
 
 - [x] Run the new tests before implementation.
 
@@ -102,7 +102,7 @@ Expected result: compilation fails because the module and fields do not exist.
 
 - [x] Check the auth file mode on Unix.
 
-- [x] Build the custom provider JSON with `serde_json`.
+- [x] Build the default gateway auth JSON with `serde_json`.
 
 - [x] Run the new tests again.
 
@@ -248,7 +248,9 @@ impl SandboxPolicy {
 
 - [x] Add a launch test for the built-in `codex-acp` command.
 
-- [x] Assert that Docker gets `CODEX_CONFIG` and `MODEL_PROVIDER`.
+- [x] Assert that Docker gets `DEFAULT_AUTH_REQUEST`.
+
+- [x] Assert that Docker gets no `CODEX_CONFIG` or `MODEL_PROVIDER`.
 
 - [x] Assert that Docker gets no host access token.
 
@@ -280,7 +282,7 @@ Expected result: compilation fails because the policy field and launch path do n
 
 - [x] Register the typed session route.
 
-- [x] Add placeholder provider data to the container environment.
+- [x] Add the placeholder gateway request to the container environment.
 
 - [x] Keep the proxy guard alive until the run ends.
 
@@ -435,3 +437,25 @@ Expected result: only the user files that existed before this work appear.
 - [x] Confirm the later host refresh stays outside this version.
 
 - [x] Confirm the existing Claude path stays outside all new branches.
+
+---
+
+## Task 6: Correct the `codex-acp` Auth Gate After the Live Probe
+
+### Steps
+
+- [x] Run the controlled seller pre-advertise probe against the real ChatGPT backend.
+
+- [x] Confirm that `CODEX_CONFIG` and `MODEL_PROVIDER` reach the adapter auth gate too late.
+
+- [x] Reproduce the adapter path with a placeholder-only `DEFAULT_AUTH_REQUEST`.
+
+- [x] Add a failing regression test for the adapter gateway request.
+
+- [x] Replace the old provider variables with `DEFAULT_AUTH_REQUEST`.
+
+- [x] Rebuild the release binary.
+
+- [x] Run the controlled seller pre-advertise probe again.
+
+Actual result: the capability probe passed, and the targeted seller advertised one Codex slot.

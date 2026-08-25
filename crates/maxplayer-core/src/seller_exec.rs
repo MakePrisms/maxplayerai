@@ -2107,6 +2107,7 @@ const CODEX_CHATGPT_REMOVED_ENV: &[&str] = &[
     "CODEX_ACCESS_TOKEN",
     "CODEX_CONFIG",
     "MODEL_PROVIDER",
+    "DEFAULT_AUTH_REQUEST",
 ];
 
 /// Read a host ChatGPT session only for a Docker command whose argv0 basename is `codex-acp`.
@@ -2832,16 +2833,12 @@ async fn start_credential_containment(
         substitutions.push((m.access_token, m.access_placeholder.clone()));
         substitutions.push((m.account_id, m.account_placeholder.clone()));
         codex_env.push((
-            "CODEX_CONFIG".to_owned(),
-            crate::codex_subscription::provider_config_json(
+            "DEFAULT_AUTH_REQUEST".to_owned(),
+            crate::codex_subscription::gateway_auth_request_json(
                 &base_url,
                 &m.access_placeholder,
                 &m.account_placeholder,
             ),
-        ));
-        codex_env.push((
-            "MODEL_PROVIDER".to_owned(),
-            crate::codex_subscription::MODEL_PROVIDER_ID.to_owned(),
         ));
     }
 
@@ -4690,6 +4687,10 @@ mod tests {
             ("CODEX_CONFIG".to_owned(), "ambient-codex-config".to_owned()),
             ("MODEL_PROVIDER".to_owned(), "ambient-provider".to_owned()),
             (
+                "DEFAULT_AUTH_REQUEST".to_owned(),
+                "ambient-default-auth-request".to_owned(),
+            ),
+            (
                 "MY_COPIED_SESSION".to_owned(),
                 format!("prefix {access_token} account {ACCOUNT_ID}"),
             ),
@@ -4715,6 +4716,7 @@ mod tests {
                 "ambient-codex-token",
                 "ambient-codex-config",
                 "ambient-provider",
+                "ambient-default-auth-request",
             ] {
                 assert!(
                     !value.contains(real),
@@ -4722,29 +4724,37 @@ mod tests {
                 );
             }
         }
-        for name in ["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_ACCESS_TOKEN"] {
+        for name in [
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "CODEX_ACCESS_TOKEN",
+            "CODEX_CONFIG",
+            "MODEL_PROVIDER",
+        ] {
             assert!(
                 !containment.env.iter().any(|(key, _)| key == name),
                 "the subscription mode must remove {name}"
             );
         }
-        assert_eq!(
-            containment
-                .env
-                .iter()
-                .find(|(key, _)| key == "MODEL_PROVIDER")
-                .map(|(_, value)| value.as_str()),
-            Some(crate::codex_subscription::MODEL_PROVIDER_ID)
-        );
-        let provider_json = containment
+        let auth_request_json = containment
             .env
             .iter()
-            .find(|(key, _)| key == "CODEX_CONFIG")
+            .find(|(key, _)| key == "DEFAULT_AUTH_REQUEST")
             .map(|(_, value)| value)
-            .expect("the container receives provider JSON");
-        let provider: serde_json::Value = serde_json::from_str(provider_json).expect("valid JSON");
-        let headers = &provider["model_providers"]
-            [crate::codex_subscription::MODEL_PROVIDER_ID]["http_headers"];
+            .expect("the container receives the default gateway auth request");
+        let auth_request: serde_json::Value =
+            serde_json::from_str(auth_request_json).expect("valid JSON");
+        assert_eq!(auth_request["methodId"], "gateway");
+        let gateway = &auth_request["_meta"]["gateway"];
+        assert_eq!(gateway["providerName"], "Maxplayer ChatGPT");
+        assert!(
+            gateway["baseUrl"]
+                .as_str()
+                .expect("proxy base URL")
+                .starts_with("http://host.docker.internal:"),
+            "the adapter gateway must point at the per-job proxy"
+        );
+        let headers = &gateway["headers"];
         let authorization = headers["Authorization"]
             .as_str()
             .expect("placeholder authorization header");
