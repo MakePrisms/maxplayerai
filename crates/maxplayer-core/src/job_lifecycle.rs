@@ -4668,6 +4668,9 @@ mod tests {
                 branch: None,
                 job: JobKind::FromScratch,
                 requested_agent: None,
+                requested_harness_family: None,
+                requested_model: None,
+                required_capabilities: Vec::new(),
             },
         )
         .await
@@ -4758,6 +4761,9 @@ mod tests {
                 branch: None,
                 job: JobKind::FromScratch,
                 requested_agent: None,
+                requested_harness_family: None,
+                requested_model: None,
+                required_capabilities: Vec::new(),
             },
         )
         .await
