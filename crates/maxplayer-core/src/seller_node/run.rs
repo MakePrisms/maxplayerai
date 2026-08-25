@@ -2313,8 +2313,9 @@ enum ProbeStep {
     /// model this turn's `session/new` reported, carried forward so the roster records a
     /// MACHINE-SOURCED value rather than an operator-typed one.
     ///
-    /// ⚠ Reported, not executed. [`crate::driver::AcpDriver`] captures `models.currentModelId` off
-    /// the `session/new` response; it does not select, pin or verify what the harness runs. The
+    /// ⚠ Reported, not executed. [`crate::driver::AcpDriver`] captures the resolved session model off
+    /// the `session/new` response, from either wire shape it carries (#896); it does not select, pin
+    /// or verify what the harness runs. The
     /// value's worth is its PROVENANCE — the harness said it about itself — never a record of
     /// execution.
     Done(Result<Option<String>, (String, Fault)>),
@@ -13113,8 +13114,13 @@ mod tests {
     /// protocol channel to carry it and therefore must set the child's cwd.) A stub that wrote to its
     /// own directory would be testing a mechanism the ACP path does not use.
     ///
-    /// `model` is the `models.currentModelId` the session start reports. `None` omits the block
-    /// entirely, which is what a harness exposing no model looks like on the wire.
+    /// `model` is the model id the session start reports, emitted in the LEGACY
+    /// `models.currentModelId` shape. `None` omits the block entirely, which is what a harness
+    /// exposing no model looks like on the wire.
+    ///
+    /// ⚠ Coverage bound: this stub speaks the legacy shape only. The Session Config Options shape
+    /// current Claude adapters use (#896) is covered by unit tests over
+    /// `driver::acp_driver::session_model_from_result`, NOT by this end-to-end probe.
     ///
     /// `write_sentinel` is the artifact leg. False makes a stub that answers every message
     /// correctly and does no work — the shape a quota-exhausted harness has (#254).
@@ -13172,8 +13178,8 @@ mod tests {
 
     // The model a seat advertises must come from the harness's OWN `session/new` result, and this
     // asserts it across the real ACP driver rather than from an injected verdict: a stub agent
-    // reports `models.currentModelId`, the driver folds it into the run's usage, and the probe
-    // carries it out on the proven arm.
+    // reports a model id in the legacy `models.currentModelId` shape, the driver folds it into the
+    // run's usage, and the probe carries it out on the proven arm.
     //
     // THREE legs, because the first alone proves almost nothing:
     //   · a session start that REPORTS a model puts that model on the verdict;

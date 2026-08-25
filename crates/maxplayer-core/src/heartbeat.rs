@@ -66,18 +66,22 @@ pub const ACCEPTED_MINTS_TAG: &str = "accepted_mints";
 pub const HARNESS_FAMILY_TAG: &str = "harness_family";
 
 /// Wire tag pairing ONE serving harness to the model it LAST REPORTED (#784):
-/// `["harness_model", "<family>", "<currentModelId>"]`, REPEATED once per serving harness.
+/// `["harness_model", "<family>", "<model-id>"]`, REPEATED once per serving harness.
 ///
 /// ⚠ Last-observed, NOT a promise about the next job. Nothing here selects or pins a model: the seat
 /// states what a harness reported when it was last read, and the job that arrives later starts its
 /// own session. §4.5.4 is normative; #785 carries the model-SELECTION work that would make this a
 /// commitment rather than an observation.
 ///
-/// The value is whatever that harness's own ACP `session/new` reports as `models.currentModelId`,
-/// verbatim — never operator-typed. The SAME ACP FIELD later supplies the seller's `["model", name]`
-/// on the RESULT event (`docs/protocol-v1.md` §6.4), which a buyer records as its own `model_used`
-/// attribution. One field, one namespace — so the advertised and delivered ids are directly
-/// COMPARABLE.
+/// The value is whatever that harness's own ACP `session/new` reports as its resolved session model,
+/// verbatim — never operator-typed. TWO wire shapes carry it and the driver reads both: legacy
+/// `models.currentModelId`, or the first model-category Session Config Option's `currentValue` for
+/// adapters that publish it there instead (see `driver::acp_driver::session_model_from_result`).
+///
+/// The SAME MODEL-ID NAMESPACE later supplies the seller's `["model", name]` on the RESULT event
+/// (`docs/protocol-v1.md` §6.4), which a buyer records as its own `model_used` attribution. Not one
+/// FIELD — an adapter may advertise from one shape — but one namespace of ids, which is the property
+/// that makes advertised and delivered directly COMPARABLE.
 ///
 /// ⚠ One namespace is not one value: the two are separate reads and CAN differ honestly — see below.
 ///
@@ -88,9 +92,10 @@ pub const HARNESS_FAMILY_TAG: &str = "harness_family";
 /// will use" (future), "the model it is serving" (present), "the model the job actually ran on"
 /// (past). Rewriting one tense leaves the others, because the tense was never the error.
 ///
-/// The test to apply to any new wording: ACP reports `models.currentModelId` on the `session/new`
+/// The test to apply to any new wording: ACP reports the resolved session model on the `session/new`
 /// RESPONSE, before the harness does any work, and nothing in this codebase pins the model or reads
-/// back what executed. So the field can carry only "what this harness said about itself, when it was
+/// back what executed. Reading a second wire shape (#896) changed WHERE the value is found and
+/// nothing about WHEN — it is still a pre-work self-report, so every wording rule below is untouched. So the field can carry only "what this harness said about itself, when it was
 /// last asked". Anything stronger — ran, runs, will run, is serving, guarantees — is a claim no code
 /// here supports.
 ///
@@ -241,7 +246,7 @@ pub struct SeatCapability {
     /// Enum-bound harness families this seat serves, from
     /// [`crate::agent_presets::harness_family_for_preset`]. Empty ⇒ unstated.
     pub harness_families: Vec<String>,
-    /// One machine-sourced `currentModelId` per serving harness, PAIRED to that harness. Empty ⇒
+    /// One machine-sourced resolved model id per serving harness, PAIRED to that harness. Empty ⇒
     /// unstated. See [`HARNESS_MODEL_TAG`] for why it is paired, and for why one namespace with the
     /// RESULT's `model` tag is not one value.
     pub models: Vec<HarnessModel>,
@@ -522,7 +527,7 @@ pub struct HarnessModel {
     /// The harness family this model belongs to — a value from
     /// [`crate::agent_presets::HARNESS_FAMILIES`]. This is what a buyer names to make dispatch bind.
     pub family: String,
-    /// The harness-resolved `currentModelId`, verbatim.
+    /// The harness-resolved session model id, verbatim.
     pub model: String,
 }
 
@@ -539,14 +544,15 @@ pub struct HarnessModel {
 pub struct RosterModel {
     /// The roster entry's advertised NAME, as it appears in the `agents` tag.
     pub harness: String,
-    /// The harness-resolved `currentModelId` last observed for that entry, verbatim.
+    /// The harness-resolved session model id last observed for that entry, verbatim.
     pub model: String,
 }
 
 /// The `["harness_model", family, model]` tags, one per serving harness that named a model (#784).
 /// Both emitters, for the same reason as [`harness_family_tag`].
 ///
-/// A harness that reported no `currentModelId` contributes NO tag — absent means unstated, and an
+/// A harness that reported no model id in EITHER wire shape contributes NO tag — absent means
+/// unstated, and an
 /// unstated model never satisfies a buyer that named one. Because each pair is its own tag, that
 /// absence shifts nothing else.
 pub fn harness_model_tags(models: &[HarnessModel]) -> Vec<TagSpec> {

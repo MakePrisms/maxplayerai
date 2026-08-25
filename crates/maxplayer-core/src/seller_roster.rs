@@ -165,7 +165,8 @@ pub enum ExecutionFailure {
 struct HarnessState {
     /// `None` ⇒ serving.
     unavailable: Option<Unavailable>,
-    /// The harness-resolved model id (ACP `models.currentModelId`) last observed for THIS harness, or
+    /// The harness-resolved session model id last observed for THIS harness — read from either ACP
+    /// wire shape by `driver::acp_driver::session_model_from_result` (#896) — or
     /// `None` when nothing has observed one. Written by two sources and read only through
     /// [`LiveRoster::advertisement`], so the advertised model and the advertised name are one
     /// snapshot under one lock (#784):

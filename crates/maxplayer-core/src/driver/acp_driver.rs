@@ -51,10 +51,10 @@ pub struct AcpDriver {
     /// ACP-native usage captured from the most recent `session/prompt` result.
     /// `None` when the harness surfaced nothing (absent-stays-absent).
     last_usage: Option<UsageMetadata>,
-    /// The harness-resolved model id (`models.currentModelId`) captured from the `session/new`
-    /// response — the only ACP surface that carries it (the prompt result does not; see
-    /// [`super::acp::parse_acp_usage`]). Folded into [`Self::usage`] so a run's exec-metadata carries
-    /// the resolved model (#455). `None` when the harness reported no model.
+    /// The harness-resolved model id captured from the `session/new` response — the only ACP surface
+    /// that carries it (the prompt result does not; see [`super::acp::parse_acp_usage`]). Read from
+    /// either wire shape by [`session_model_from_result`]. Folded into [`Self::usage`] so a run's
+    /// exec-metadata carries the resolved model (#455). `None` when the harness reported no model.
     session_model: Option<String>,
 }
 
@@ -246,9 +246,10 @@ impl Driver for AcpDriver {
             })?,
         )?;
         let result = self.wait_response(id).await?;
-        // Capture the harness-resolved model (`models.currentModelId`) before the response is reduced
-        // to a session id — this is the only ACP surface that carries it (#455). Absent-stays-absent:
-        // a harness that reports no model leaves this `None`, and nothing downstream fabricates one.
+        // Capture the harness-resolved model before the response is reduced to a session id — this is
+        // the only ACP surface that carries it (#455), in either of the two shapes
+        // `session_model_from_result` reads (#896). Absent-stays-absent: a harness that reports no
+        // model leaves this `None`, and nothing downstream fabricates one.
         self.session_model = session_model_from_result(&result);
         session_id_from_result(&result)
     }
@@ -519,16 +520,94 @@ fn session_id_from_result(result: &Value) -> Result<SessionId, DriverError> {
         })
 }
 
-/// The harness-resolved model id from a `session/new` result: ACP `models.currentModelId`
-/// (camelCase on the wire). This is the resolved identity INCLUDING the harness's reasoning-effort
-/// suffix, e.g. `gpt-5.6-terra[medium]`. `None` when the response carries no model block — the field
-/// is optional, so absence stays absence and is never fabricated.
+/// The ACP Session Config Options `category` this crate treats as the session's model selector.
+///
+/// This is a Maxplayer POLICY, not an ACP wire contract, and the distinction is load-bearing. ACP
+/// defines `category` as optional semantic metadata that MUST NOT be required for correctness, and
+/// requires clients to handle a missing or unknown category gracefully. So an option carrying no
+/// category is VALID ACP — not malformed — and an adapter is entitled to publish its model selector
+/// without one.
+///
+/// The policy: we read a model only from an option that declares `category == "model"`, and where
+/// the category is absent we DECLINE TO INFER model semantics rather than guess from `id` or
+/// position. Returning no model is the graceful handling ACP asks for, because in this crate an
+/// absent `harness_model` is honest while a wrong one is a false advertisement a buyer can be
+/// awarded against.
+///
+/// Deliberately not keyed on `id == "model"`: ACP documents `id` as the agent's own identifier and
+/// does not standardise it — the spec's own example names the model selector `models`, not `model` —
+/// so an id match would bind this to one adapter's naming while also matching a selector that is
+/// semantically something else. One of the two, never both loosely.
+const MODEL_CONFIG_CATEGORY: &str = "model";
+
+/// The harness-resolved model id from a `session/new` result, as the resolved identity INCLUDING any
+/// reasoning-effort suffix (e.g. `gpt-5.6-terra[medium]`).
+///
+/// Two wire shapes carry it, tried in this order:
+///
+/// 1. `models.currentModelId` — a top-level `models` object (codex-acp, and any adapter still
+///    returning that shape).
+/// 2. The FIRST `configOptions` entry whose `category` is [`MODEL_CONFIG_CATEGORY`], with the
+///    resolved id in that entry's `currentValue`. Current Claude ACP adapters return only
+///    `sessionId`, `modes` and `configOptions`, publishing the model here (#896). Only that first
+///    entry is consulted, and an unusable value there yields `None` rather than promoting a later
+///    model-category entry — see [`config_option_session_model`].
+///
+/// Legacy is preferred when it carries a usable value: an adapter still returning the top-level
+/// object has not changed what it means, so reading it first keeps every already-working harness
+/// byte-identical. The test `session_model_prefers_legacy_over_config_option` fails if that order
+/// flips.
+///
+/// `None` when neither shape yields a non-blank string. Absence stays absence — a missing, blank,
+/// non-string or malformed value is never repaired into a fabricated model, and no value is borrowed
+/// from a neighbouring option: the sibling `thought_level` selector carries values like `medium`,
+/// which is an effort level and not a model.
 fn session_model_from_result(result: &Value) -> Option<String> {
-    result
-        .get("models")?
-        .get("currentModelId")?
-        .as_str()
-        .map(str::to_owned)
+    legacy_session_model(result).or_else(|| config_option_session_model(result))
+}
+
+/// Shape 1: the legacy top-level `models.currentModelId` (camelCase on the wire).
+fn legacy_session_model(result: &Value) -> Option<String> {
+    non_blank_model(result.get("models")?.get("currentModelId")?)
+}
+
+/// Shape 2: the FIRST model-category `configOptions` entry, value in its `currentValue`.
+///
+/// Takes the first entry declaring the model category, validates ONLY that entry, and FAILS CLOSED
+/// to `None` when its value is unusable — it does not scan past it for a later entry that happens to
+/// carry a usable string.
+///
+/// That choice is the conservative one and it is the point of this function. A later model-category
+/// entry is a DIFFERENT selector; promoting its value because the first one was blank would advertise
+/// a model the session's primary selector does not report, which is the same
+/// read-an-adjacent-value defect as reading the neighbouring `thought_level` option, just one level
+/// in. An absent `harness_model` is honest; a wrong one is a false advertisement a buyer can be
+/// awarded against. It also matches ACP, which asks clients to use `configOptions` order as the
+/// primary way to establish priority and resolve ties — but the conservatism above is the reason,
+/// and it would stand on its own if that guidance changed.
+///
+/// A `configOptions` that is not an array, entries that are not objects, and entries of any other
+/// category never yield a value.
+fn config_option_session_model(result: &Value) -> Option<String> {
+    let first_model_option = result
+        .get("configOptions")?
+        .as_array()?
+        .iter()
+        .find(|option| {
+            option.get("category").and_then(Value::as_str) == Some(MODEL_CONFIG_CATEGORY)
+        })?;
+    non_blank_model(first_model_option.get("currentValue")?)
+}
+
+/// A model id is a non-blank JSON string, taken verbatim.
+///
+/// Anything else — a blank or whitespace-only string, a number, bool, null, array or object — is not
+/// a model id and yields `None` rather than a coerced, trimmed or fabricated value. This also
+/// applies to the legacy shape: a present-but-blank `currentModelId` is not a model, so it falls
+/// through to the config-option shape rather than advertising an empty string.
+fn non_blank_model(value: &Value) -> Option<String> {
+    let model = value.as_str()?;
+    (!model.trim().is_empty()).then(|| model.to_owned())
 }
 
 /// Fold the `session/new` model into a run's captured usage. The `session/prompt` result never
@@ -730,6 +809,246 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// A `session/new` result shaped like a current Claude ACP adapter's: NO top-level `models`
+    /// object, the resolved model published as the model-category Session Config Option, and the
+    /// sibling `mode` and `thought_level` selectors present exactly as they are on the real wire.
+    ///
+    /// Ground-truthed by reading `claude-agent-acp` v0.62.0 (the version reported in the field on
+    /// #896): `buildConfigOptions` emits the model entry as `{id: "model", name: "Model",
+    /// description, category: "model", type: "select", currentValue: models.currentModelId,
+    /// options: [...]}`, and `createSession` returns exactly `{sessionId, modes, configOptions}`.
+    ///
+    /// The `thought_level` sibling is load-bearing, not decoration: its `currentValue` is an effort
+    /// level (`medium`), so any matcher loose enough to read a neighbouring option advertises an
+    /// effort level as a model.
+    fn claude_session_new_result(current_value: Value) -> Value {
+        json!({
+            "sessionId": "019f61bd-89be-7230-b67b-717871387cea",
+            "modes": {
+                "currentModeId": "default",
+                "availableModes": [{"id": "default", "name": "Always Ask"}]
+            },
+            "configOptions": [
+                {
+                    "id": "mode",
+                    "name": "Session Mode",
+                    "category": "mode",
+                    "type": "select",
+                    "currentValue": "default",
+                    "options": [{"value": "default", "name": "Always Ask"}]
+                },
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "description": "AI model to use",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": current_value,
+                    "options": [{"value": "claude-opus-4-8", "name": "Opus 4.8"}]
+                },
+                {
+                    "id": "effort",
+                    "name": "Effort",
+                    "description": "Available effort levels for this model",
+                    "category": "thought_level",
+                    "type": "select",
+                    "currentValue": "medium",
+                    "options": [{"value": "medium", "name": "Medium"}]
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn session_model_read_from_a_claude_session_config_option() {
+        // #896: the Claude shape carries no legacy object at all — the resolved model is the
+        // model-category config option's `currentValue`.
+        let result = claude_session_new_result(json!("claude-opus-4-8"));
+        assert!(
+            result.get("models").is_none(),
+            "fixture must not carry the legacy shape, or it proves nothing about the new one"
+        );
+        assert_eq!(
+            session_model_from_result(&result).as_deref(),
+            Some("claude-opus-4-8")
+        );
+    }
+
+    #[test]
+    fn session_model_from_a_config_option_is_verbatim() {
+        // The value is the resolved identity as the harness stated it, suffix and all — not parsed,
+        // trimmed or normalised.
+        let result = claude_session_new_result(json!("claude-opus-4-8[medium]"));
+        assert_eq!(
+            session_model_from_result(&result).as_deref(),
+            Some("claude-opus-4-8[medium]")
+        );
+    }
+
+    #[test]
+    fn session_model_never_reads_a_neighbouring_config_option() {
+        // Remove ONLY the model entry. The `mode` and `thought_level` siblings survive, both with
+        // perfectly usable string values — and the answer must be None, not a neighbour's value.
+        let mut result = claude_session_new_result(json!("claude-opus-4-8"));
+        let options = result["configOptions"].as_array_mut().expect("array");
+        options.retain(|option| {
+            option.get("category").and_then(Value::as_str) != Some(MODEL_CONFIG_CATEGORY)
+        });
+        assert_eq!(
+            options.len(),
+            2,
+            "both non-model selectors must remain, or this proves nothing"
+        );
+        assert_eq!(session_model_from_result(&result), None);
+    }
+
+    #[test]
+    fn session_model_prefers_legacy_over_config_option() {
+        // Both shapes present, both usable → legacy wins. Named in `session_model_from_result`'s
+        // docs as the test that fails if that precedence flips.
+        let mut result = claude_session_new_result(json!("config-option-model"));
+        result["models"] = json!({"currentModelId": "legacy-model"});
+        assert_eq!(
+            session_model_from_result(&result).as_deref(),
+            Some("legacy-model"),
+            "legacy models.currentModelId must win when both shapes carry a usable value"
+        );
+    }
+
+    #[test]
+    fn session_model_falls_through_when_legacy_is_present_but_unusable() {
+        // A legacy key that is not a usable model id must not shadow a good config option, and must
+        // not be advertised as an empty or coerced model either.
+        for unusable in [json!(""), json!("   "), json!(7), json!(null), json!({})] {
+            let mut result = claude_session_new_result(json!("claude-opus-4-8"));
+            result["models"] = json!({"currentModelId": unusable.clone()});
+            assert_eq!(
+                session_model_from_result(&result).as_deref(),
+                Some("claude-opus-4-8"),
+                "unusable legacy value {unusable} must fall through to the config option"
+            );
+        }
+    }
+
+    #[test]
+    fn session_model_rejects_hostile_config_option_values_without_fabricating() {
+        // Each of these means "no model". None may become a coerced, stringified or invented one —
+        // and with the `thought_level` sibling still in the fixture, none may borrow its value.
+        for hostile in [
+            json!(""),
+            json!("   "),
+            json!("\t\n"),
+            json!(0),
+            json!(4.8),
+            json!(true),
+            json!(null),
+            json!(["claude-opus-4-8"]),
+            json!({"currentModelId": "claude-opus-4-8"}),
+        ] {
+            let result = claude_session_new_result(hostile.clone());
+            assert_eq!(
+                session_model_from_result(&result),
+                None,
+                "hostile currentValue {hostile} must yield None"
+            );
+        }
+    }
+
+    #[test]
+    fn session_model_rejects_malformed_config_options_without_fabricating() {
+        for malformed in [
+            // `configOptions` itself the wrong type, or empty.
+            json!({"sessionId": "abc", "configOptions": "model"}),
+            json!({"sessionId": "abc", "configOptions": {}}),
+            json!({"sessionId": "abc", "configOptions": null}),
+            json!({"sessionId": "abc", "configOptions": []}),
+            // Entries that are not objects.
+            json!({"sessionId": "abc", "configOptions": ["model", 7, null]}),
+            // Right category, no value key at all.
+            json!({"sessionId": "abc", "configOptions": [{"id": "model", "category": "model"}]}),
+            // A usable value under the WRONG category — an `id` of "model" is not a match, because
+            // this reads the category and never the id.
+            json!({"sessionId": "abc", "configOptions": [
+                {"id": "model", "category": "mode", "currentValue": "claude-opus-4-8"}
+            ]}),
+            // A non-string category is malformed rather than merely absent: the field is present and
+            // the wrong type. Absent and unknown categories are VALID ACP and are covered by
+            // `session_model_declines_to_infer_when_the_optional_category_is_absent`, deliberately
+            // not filed here.
+            json!({"sessionId": "abc", "configOptions": [
+                {"id": "model", "category": 7, "currentValue": "claude-opus-4-8"}
+            ]}),
+        ] {
+            assert_eq!(
+                session_model_from_result(&malformed),
+                None,
+                "malformed input {malformed} must yield None"
+            );
+        }
+    }
+
+    #[test]
+    fn session_model_fails_closed_when_the_first_model_option_is_unusable() {
+        // ORDER IS THE CONTRACT. The first model-category entry is the session's model selector; a
+        // later one is a DIFFERENT selector. When the first carries no usable value the answer is
+        // None — we do NOT scan ahead and advertise the second entry's model, because that would
+        // report a model the primary selector does not, which is the same read-an-adjacent-value
+        // defect as reading the neighbouring `thought_level` option one level in.
+        //
+        // A usable value sits behind the blank one deliberately: skip-ahead behaviour returns
+        // Some("claude-opus-4-8") here, so this test goes red the moment the fail-closed rule
+        // regresses.
+        let result = json!({
+            "sessionId": "abc",
+            "configOptions": [
+                {"id": "model", "category": "model", "currentValue": ""},
+                {"id": "model-fallback", "category": "model", "currentValue": "claude-opus-4-8"}
+            ]
+        });
+        assert_eq!(session_model_from_result(&result), None);
+    }
+
+    #[test]
+    fn session_model_reads_the_first_model_option_not_a_later_one() {
+        // The positive direction of the same rule: with BOTH entries usable, the first wins. Without
+        // this, a fail-closed implementation that read the LAST entry would pass the test above.
+        let result = json!({
+            "sessionId": "abc",
+            "configOptions": [
+                {"id": "model", "category": "model", "currentValue": "first-selector-model"},
+                {"id": "model-fallback", "category": "model", "currentValue": "second-selector-model"}
+            ]
+        });
+        assert_eq!(
+            session_model_from_result(&result).as_deref(),
+            Some("first-selector-model")
+        );
+    }
+
+    #[test]
+    fn session_model_declines_to_infer_when_the_optional_category_is_absent() {
+        // NOT a malformed-input test. ACP makes `category` optional semantic metadata that MUST NOT
+        // be required for correctness, and requires clients to handle its absence gracefully — so an
+        // option with no category is VALID ACP. This pins a Maxplayer POLICY choice: we decline to
+        // infer model semantics from `id` or position, and returning no model IS the graceful
+        // handling, because an absent harness_model is honest where a guessed one is a false
+        // advertisement.
+        let no_category = json!({
+            "sessionId": "abc",
+            "configOptions": [{"id": "model", "currentValue": "claude-opus-4-8"}]
+        });
+        assert_eq!(session_model_from_result(&no_category), None);
+
+        // Same for a category we do not recognise: handled gracefully, never guessed at.
+        let unknown_category = json!({
+            "sessionId": "abc",
+            "configOptions": [
+                {"id": "model", "category": "_vendor_model", "currentValue": "claude-opus-4-8"}
+            ]
+        });
+        assert_eq!(session_model_from_result(&unknown_category), None);
     }
 
     #[test]
