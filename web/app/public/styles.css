@@ -713,6 +713,20 @@ ol .row:hover .dot.working i, ol .row:focus-visible .dot.working i {
 .kv dd { margin: 0; font-size: 12px; color: var(--ink-2); overflow-wrap: anywhere; }
 .kv.identity-kv dd { color: var(--muted); font-size: 11px; }
 .kv.advertisement dd { color: var(--ink-2); }
+/* Provenance marks on the capability rows. EVERY row wears one, because the
+   three filterable fields are an enforcement, an echo and a silence, and a
+   reader must not read them as three grades of one proof (protocol v1 §4.5.3).
+   Quiet on purpose: legible beside the value each qualifies, never competing
+   with it. The two weights differ because the warnings differ. `.provenance`
+   qualifies a value the seat MEASURED, so it reads as sourcing. `.unverified`
+   flags one nothing measured at all, and is the brighter of the two on purpose:
+   it is the only mark naming a value with nothing anywhere to contradict it. */
+.unverified, .provenance {
+  font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase;
+  white-space: nowrap;
+}
+.unverified { color: var(--muted); }
+.provenance { color: var(--faint); }
 
 /* six boxes, three per row — racer and runner docks line up box for box */
 .stats-in { margin: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); }
