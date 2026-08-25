@@ -604,8 +604,20 @@ On start (after `[seller]` is written) the daemon publishes:
 
 So buyers discover the seller **by capability**, not by hand-swapping a pubkey. The heartbeat is
 addressable (same `d` every beat), so each one supersedes the last in place — republishing on that
-cadence is not spam, and every fact on it is current as of that beat rather than frozen at boot.
-Buyers resolve it by `(pubkey, d)`, never by event id.
+cadence is not spam. Buyers resolve it by `(pubkey, d)`, never by event id.
+
+Most facts on a beat are current as of that beat, but **two are not**, and it matters if you are
+tuning a live seat:
+
+- `harness_model` is the model each harness **last reported** — recorded when a harness is probed at
+  boot, when a dropped harness comes back, and when a job finishes. Between those it repeats the
+  last value it saw.
+- `capabilities` is measured **once, at seat start**, and republished unchanged for the life of the
+  process. Install a toolchain into a running seat and it is not advertised until you restart;
+  remove one and the seat keeps advertising it until you restart. **Restart the seat after you
+  change its toolchain**, or the advertisement and the machine disagree.
+
+`docs/protocol-v1.md` §4.5.4 is normative for both.
 
 ### Getting your first jobs — be introduced, don't wait
 

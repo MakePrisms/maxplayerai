@@ -257,6 +257,18 @@ pub struct ClaimView {
     /// Empty ⇒ the claim stated none, which never satisfies a job that asked for one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<String>,
+    /// The #784 capability this seller advertised ON THIS CLAIM, read through the one
+    /// [`crate::heartbeat::SeatCapability::from_tags`] path.
+    ///
+    /// ⚠ The award filter decides on the CLAIM and never reads the seat announcement, so this is
+    /// the ONLY place a capability filter can get its facts. A claim carries filterable fields only;
+    /// the display fields parse to `None` and are never filtered on.
+    ///
+    /// All-default ⇒ the claim stated nothing — which is NOT the same as stating a non-matching
+    /// value, even though both refuse an award. Any test over this field has to separate the two,
+    /// or it stays green against a parser that reads nothing at all.
+    #[serde(default, skip_serializing_if = "crate::heartbeat::SeatCapability::is_unstated")]
+    pub capability: crate::heartbeat::SeatCapability,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -2386,6 +2398,33 @@ fn parse_relayed_award(
 /// session is alive but says nothing about whether the offer subscription was served, so it can
 /// never certify offer-absence. #602 was exactly that substitution. Feedback/result are deliberately
 /// NOT parameters here so the blend cannot even type-check.
+/// Everything a claim event's TAGS say, as the view the award path reads. Pure, so what a buyer
+/// takes off a seller's claim is testable without a relay.
+///
+/// Extracted for exactly that reason: the caller is an async relay fetch, and a parse that can only
+/// be exercised through one has no test that could notice it silently reading nothing. Every
+/// tag-derived field lands here; `live` is decided later against the offer, not by the tags.
+fn claim_view_from_tags(
+    claim_id: String,
+    created_at: u64,
+    seller_pubkey: String,
+    status: String,
+    tags: &[crate::gateway::TagSpec],
+) -> ClaimView {
+    ClaimView {
+        claim_id,
+        created_at,
+        seller_pubkey,
+        display_name: None,
+        status,
+        live: false,
+        // Capture the seller-authored creq tag; absent on claims with no creq.
+        creq: first_tag_value(tags, "creq").map(str::to_owned),
+        agents: crate::heartbeat::agents_from_tags(tags),
+        capability: crate::heartbeat::SeatCapability::from_tags(tags),
+    }
+}
+
 fn offer_read_answered(offer_present: bool, offer_probe_confirmed: bool) -> bool {
     offer_present || offer_probe_confirmed
 }
@@ -2551,17 +2590,13 @@ pub(crate) async fn fetch_job_view_async(
             // accepts are buyer-authored; skip for claim list
             continue;
         }
-        claims.push(ClaimView {
-            claim_id: event.id.to_hex(),
-            created_at: event.created_at.as_secs(),
-            seller_pubkey: event.pubkey.to_hex(),
-            display_name: None,
+        claims.push(claim_view_from_tags(
+            event.id.to_hex(),
+            event.created_at.as_secs(),
+            event.pubkey.to_hex(),
             status,
-            live: false,
-            // Capture the seller-authored creq tag; absent on claims with no creq.
-            creq: first_tag_value(&draft.tags, "creq").map(str::to_owned),
-            agents: crate::heartbeat::agents_from_tags(&draft.tags),
-        });
+            &draft.tags,
+        ));
     }
     claims.sort_by_key(|c| std::cmp::Reverse(c.created_at));
 
@@ -3978,6 +4013,82 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_claims_capability_reaches_the_award_predicate_from_the_tags_the_seller_emitted() {
+        // The seller→buyer join, end to end through both real functions: `claim_draft` writes the
+        // tags, `claim_view_from_tags` reads them. The award filter's "no match" and "nothing
+        // parsed" are the same false, so this test pins the join itself rather than either side
+        // alone.
+        let capability = crate::heartbeat::SeatCapability::from_roster(
+            &["claude".to_owned()],
+            &[crate::heartbeat::RosterModel {
+                harness: "claude".to_owned(),
+                model: "claude-opus-5".to_owned(),
+            }],
+        );
+        let draft = crate::gateway::claim_draft(
+            "offer-id",
+            "buyer-pubkey",
+            "seller-pubkey",
+            "creqA-test",
+            &["claude".to_owned()],
+            &capability,
+        );
+
+        let view = claim_view_from_tags(
+            "claim-id".to_owned(),
+            7,
+            "seller-pubkey".to_owned(),
+            "processing".to_owned(),
+            &draft.tags,
+        );
+        assert_eq!(view.capability.harness_families, vec!["claude-code"]);
+        assert_eq!(
+            view.capability.models,
+            vec![crate::heartbeat::HarnessModel {
+                family: "claude-code".to_owned(),
+                model: "claude-opus-5".to_owned(),
+            }],
+            "the buyer must recover the model the seller advertised, keyed by family"
+        );
+        assert!(!view.capability.is_unstated(), "a stated claim must not read as unstated");
+
+        // THE DISCRIMINATOR, in the same test so it cannot be skipped separately: a claim carrying
+        // NO capability tags must read as UNSTATED. Without this leg, the assertions above would
+        // also pass a parser that fabricated a value, and without the leg above, a parser that read
+        // nothing at all would look correct here.
+        let bare = crate::gateway::claim_draft(
+            "offer-id",
+            "buyer-pubkey",
+            "seller-pubkey",
+            "creqA-test",
+            &[],
+            &Default::default(),
+        );
+        let bare_view = claim_view_from_tags(
+            "claim-id".to_owned(),
+            7,
+            "seller-pubkey".to_owned(),
+            "processing".to_owned(),
+            &bare.tags,
+        );
+        assert!(
+            bare_view.capability.is_unstated(),
+            "a claim with no capability tags must read as unstated, not as a default that matches: \
+             {:?}",
+            bare_view.capability
+        );
+
+        // The predicate link of this chain — `filterable_tags` writes → `from_tags` reads → the
+        // AWARD PREDICATE decides — lands with the award leg, which owns
+        // `claim_meets_capability_request`. What this test proves is the first two links and the join
+        // between them: the tags a seller emitted are what a buyer's reader produces, and an absent
+        // capability reads as UNSTATED rather than as a default that matches.
+        //
+        // ⚠ Two passing links say nothing about a third. Do not read this test as covering the award
+        // decision; it stops one link short by design.
+    }
+
     // ── #540: collect resolves the DURABLE AWARD, not the exclusive live claim ────────────────
     // A claim with a chosen status + live flag; `award_for` is the buyer's parsed kind-3405 naming
     // the winning claim + its seller. These drive the resolver purely, no relay.
@@ -3991,6 +4102,7 @@ mod tests {
             live,
             creq: None,
             agents: Vec::new(),
+            capability: Default::default(),
         }
     }
     fn award_for(claim_id: &str, seller: &str) -> RelayedAward {
@@ -4127,6 +4239,7 @@ mod tests {
             live: false,
             creq: None,
             agents: Vec::new(),
+            capability: Default::default(),
         }
     }
 

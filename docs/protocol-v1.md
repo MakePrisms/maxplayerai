@@ -87,7 +87,8 @@ or delivery decisions.
 ### 4.2 Seat announcement, kind `30340`
 
 Kind `30340` is the seat's capability and liveness announcement. It is addressable, so a seat
-replaces it on every beat. Every fact below is current as of that beat.
+replaces it on every beat. Every fact below is current as of that beat, EXCEPT `harness_model` and
+`capabilities` — those two carry weaker guarantees and §4.5.4 is normative for them.
 
 | Tag | Card. | Req. | Meaning |
 |---|---|---:|---|
@@ -99,6 +100,14 @@ replaces it on every beat. Every fact below is current as of that beat.
 | `["queue_depth", n]` | 1 | yes | Jobs the seat currently holds in a non-terminal state |
 | `["accepted_mints", url, ...]` | 1 | yes | Every mint the seat accepts payment on |
 | `["agents", id, ...]` | 0..1 | no | Harnesses the seat can run |
+| `["harness_family", family, ...]` | 0..1 | no | Harness families the seat serves |
+| `["harness_model", family, model]` | 0..N | no | One resolved model, paired to its family |
+| `["capabilities", token, ...]` | 0..1 | no | Capability tokens the seat proved |
+| `["harness_variant", text]` | 0..1 | no | Fork or configuration colour |
+| `["hardware", text]` | 0..1 | no | Machine description |
+
+The last five are the seat's capability. Section 4.5 defines them. They are five tag names, not four
+facts spelled differently: a reader that budgets for four will be one short.
 
 `accepted_mints` carries one or more mint URLs. A buyer can pay a seat only on a mint in this list.
 
@@ -142,6 +151,143 @@ seat still exists, however recently the seat published it, and an old one is evi
 all. This requirement stands whether or not seats publish the terminal announcement of section 4.2 —
 a seat that dies abruptly publishes no terminal announcement, so age is the only signal a reader has
 for that case.
+
+### 4.5 Seat capability
+
+A seat's capability is five tags across two classes. The class decides where a tag may appear and
+what a reader may do with it.
+
+**Filterable** — `harness_family`, `harness_model`, `capabilities`. A buyer's award filter reads
+these. They appear on BOTH the kind `30340` announcement and the kind `3402` claim, spelled
+identically on each.
+
+**Display** — `harness_variant`, `hardware`. These appear on the announcement ONLY. A reader MUST
+NOT filter on them, and a seller MUST NOT put them on a claim.
+
+#### 4.5.1 The line between the classes is provenance
+
+A field may be filterable only if the seat MEASURED it. A buyer commits satoshis at award, and an
+operator-typed value has nothing that could contradict it. Each filterable field earns its place:
+
+- `harness_family` comes from the dispatchable roster — the same list that fills `agents`.
+- `harness_model` comes from the harness's own handshake.
+- `capabilities` comes from probing the job execution environment.
+
+The display fields are operator-declared, which is exactly why they are harmless: nothing pays out
+on them, so free text costs nothing. A new tag joins one class or the other. A field that is
+operator-declared MUST NOT be filterable.
+
+A closed vocabulary does not substitute for provenance. Binding `capabilities` to an enumeration
+makes `rust` and `Rust` one spelling; it says nothing about whether the seat can build Rust.
+
+#### 4.5.2 Cardinality and shape
+
+`harness_family` is one tag carrying one or more family values, from the closed vocabulary
+`claude-code`, `codex`, `cursor`, `goose`. Values are distinct: two presets may alias one family,
+and a repeated value states nothing further.
+
+`harness_model` is `["harness_model", family, model]` and MAY repeat — once per serving harness that
+named a model. It is PAIRED rather than positional. A reader MUST NOT correlate a list of models
+against `harness_family` by position: the family list collapses duplicates and drops unknowns, so the
+two lists have no reliable index correspondence. A reader MUST skip a `harness_model` tag whose
+family or model is empty rather than half-decode it.
+
+`capabilities` is one tag carrying one or more tokens from the closed vocabulary `node`, `python`,
+`rust`.
+
+`harness_variant` and `hardware` each carry exactly one free-text value.
+
+Every capability tag is optional. Absent means UNSTATED. Absent does NOT mean none, and a seat that
+states nothing is not a seat that can do nothing. An all-whitespace value is unstated: a seller emits
+no tag rather than an empty one, and a reader MUST treat the two identically.
+
+#### 4.5.3 What a capability token guarantees
+
+A token's probe command IS its definition. `node` is `node --version`, `python` is
+`python3 --version`, `rust` is `cargo --version`. A new token ships with its probe command and a
+change to this section.
+
+Filtering `rust` guarantees that `cargo` resolved in the JOB execution environment at probe time. It
+does NOT guarantee that a build succeeds. Presence is necessary, not sufficient. A buyer commits
+satoshis on the token, so the limit is stated here rather than left to inference.
+
+The probe runs where jobs run, never on the seat host. A seat whose jobs run in a container MUST
+probe inside that container: a host-side check proves a capability the job will not have.
+
+The three filterable fields are NOT equally checkable, and none of the three is verified by the
+protocol:
+
+- `harness_family` is ENFORCED, at the seat, when the job is dispatched: dispatch binds to the named
+  family exactly or not at all. This is the only one of the three backed by a mechanism.
+- `harness_model` is ECHOED. The result event carries `["model", name]` — the model the seller says
+  it used. A buyer can compare that against the model it was awarded on, so a divergence is at least
+  VISIBLE in the buyer's own records. It is not a falsifier: both values are the seller's word, and
+  §6.4 states that nothing verifies the execution-metadata block and a reader MUST NOT treat it as
+  proof that a given model ran.
+- `capabilities` is neither enforced nor echoed. No event carries a capability back, so nothing a
+  buyer receives can disagree with the advertisement at all.
+
+A reader MUST NOT read these as three grades of proof. One is an enforcement, one is an
+inconsistency signal, and one is silence.
+
+#### 4.5.4 Freshness
+
+The three filterable fields have three different freshness guarantees, and only one of them is
+"current as of the beat".
+
+`harness_family` IS current as of the beat that carries it: it is read from live roster state each
+time a beat is drafted.
+
+`harness_model` is the LAST OBSERVED value, not a current one. A seat records a model at three
+moments — when a harness is probed at boot, when a dropped harness is restored by its self-probe,
+and when a job completes — and republishes that value on every beat in between. Those three are the
+whole set. Between them the seat states what it last saw, which is why the field is a claim about an
+advertisement and never a promise about the next job. §4.5.3 states what can and cannot contradict
+it.
+
+`capabilities` is the stalest of the three. A seat probes its execution environment once, at start,
+and republishes that snapshot on every beat for the life of the process. The bound on its staleness
+is the seat's UPTIME, not the beat cadence.
+
+That bound drifts in BOTH directions, and the two are not equally safe:
+
+- A toolchain INSTALLED into a running seat's environment is not advertised until the seat restarts.
+  The seat UNDER-claims and loses awards it could have won.
+- A toolchain REMOVED from a running seat continues to be advertised until the seat restarts. The
+  seat OVER-claims: it can be awarded work it can no longer do. Nothing on the filter path catches
+  this — the advertisement is what a buyer matches on — so it surfaces at delivery.
+
+A reader MUST NOT infer from a recent beat that its `capabilities` were measured recently.
+
+Two fields narrow section 4.2's general rule, not one: `harness_model` is last-observed and
+`capabilities` is uptime-bounded. `harness_family` is the only filterable field that is genuinely
+current as of the beat carrying it.
+
+#### 4.5.5 Rollout
+
+Two different things can be absent, and they have OPPOSITE effects. Conflating them is the error this
+paragraph exists to prevent.
+
+- **An absent BUYER requirement imposes no filter.** Every capability filter is optional. A job that
+  names no family, no model and no capability is matched against nothing and is awarded exactly as it
+  was before this section existed.
+- **An absent SELLER field satisfies no NAMED requirement.** Silence is not a capability. Once a
+  buyer names one, a seat that advertises nothing for it cannot match — there is no value to compare,
+  and an absent advertisement is never read as a wildcard.
+
+Both follow directly from the matcher: a requirement the buyer left unset skips its check entirely,
+and a requirement the buyer set is tested against the seat's advertised list, which an empty list can
+never satisfy.
+
+The consequence for deployment is one-directional. Seats that predate this section keep receiving
+awards from buyers that filter on nothing, and stop receiving them from any buyer that filters on
+something. **Seats advertise before buyers filter.** Deploy the seat side first; publish
+filter-bearing offers after.
+
+⚠ The failure mode on the seller side is SILENCE. A seat refused by a capability filter looks exactly
+like an idle market: the process is alive, the beats are publishing, the logs are clean, and the
+revenue is zero. Nothing anywhere reads as broken. An operator who upgrades buyers first has no
+signal that would tell them why.
 
 ## 5. Job Lifecycle
 
@@ -213,6 +359,13 @@ it MUST carry all three. A reader MUST reject a partial group.
 | `["v","1"]` | 1 | yes | Protocol major |
 | `["p", seller_pubkey]` | 0..1 | no | Seller mirror |
 | `["agents", id, ...]` | 0..1 | no | Harnesses this seat can run |
+| `["harness_family", family, ...]` | 0..1 | no | Harness families the seat serves |
+| `["harness_model", family, model]` | 0..N | no | One resolved model, paired to its family |
+| `["capabilities", token, ...]` | 0..1 | no | Capability tokens the seat proved |
+
+A claim carries the three FILTERABLE capability tags and no others. `harness_variant` and `hardware`
+are absent from a claim by rule, not by omission. Section 4.5 defines the split and the reason for
+it. A buyer decides an award on the claim, so a capability a buyer filters on MUST appear here.
 
 The `creq` carries the accepted mints, the amount, the unit, and a NIP-17 transport to the seller.
 
