@@ -232,6 +232,11 @@ pub enum NamedAwardRefused {
     /// The job asked for a harness the named claim does not advertise — awarding it would buy work
     /// from a seller that never said it could do it this way.
     AgentMismatch { claim_id: String, requested: String },
+    /// The named claim's advertised capability does not satisfy the job's request (#784). Carries
+    /// the underlying [`CapabilityRefusal`] rather than flattening it: the auto path can already
+    /// tell an operator WHICH axis refused, and collapsing that here would make the manual path the
+    /// less informative of two paths that must decide identically.
+    Capability { claim_id: String, refusal: CapabilityRefusal },
 }
 
 impl std::fmt::Display for NamedAwardRefused {
@@ -251,6 +256,9 @@ impl std::fmt::Display for NamedAwardRefused {
                 formatter,
                 "award refused: job requested agent {requested:?}, which claim {claim_id} does not advertise"
             ),
+            Self::Capability { claim_id, refusal } => {
+                write!(formatter, "award refused: claim {claim_id}: {refusal}")
+            }
         }
     }
 }
@@ -258,8 +266,14 @@ impl std::fmt::Display for NamedAwardRefused {
 impl std::error::Error for NamedAwardRefused {}
 
 /// Verify a specifically-named claim is awardable under the hard filters — the manual-award
-/// counterpart of [`select_awardable_claim`], so `max_sats` and mint/price compatibility are applied
-/// on the manual path rather than ignored. Pure: relay truth + filters in, verdict out.
+/// counterpart of [`select_awardable_claim`], so `max_sats`, mint/price compatibility AND the
+/// capability request are applied on the manual path rather than ignored. Pure: relay truth +
+/// filters in, verdict out.
+///
+/// Every filter `select_awardable_claim` applies is applied here, in the same order. That is a
+/// property the tests hold, not a convention: naming a claim selects WHICH claim is judged, never
+/// WHETHER it is judged, and the award IS the payment decision, so a filter skipped here is a
+/// filter that never runs at all.
 pub fn named_claim_awardable(
     view: &JobView,
     claim_id: &str,
@@ -284,6 +298,11 @@ pub fn named_claim_awardable(
             claim_id: claim_id.to_owned(),
             requested: filters.requested_agent.unwrap_or_default().to_owned(),
         });
+    }
+    // Same position the capability arm holds in `select_awardable_claim`, so the two chains stay
+    // readable as mirrors: naming a claim chooses WHICH claim is judged, never WHETHER it is.
+    if let Err(refusal) = claim_meets_capability_request(&claim.capability, filters) {
+        return Err(NamedAwardRefused::Capability { claim_id: claim_id.to_owned(), refusal });
     }
     if !claim_is_payable(&view.job_id, claim.creq.as_deref(), filters) {
         return Err(NamedAwardRefused::Unpayable { claim_id: claim_id.to_owned() });
@@ -1352,6 +1371,93 @@ mod tests {
             Some("c".repeat(64).as_str())
         );
         assert!(named_claim_awardable(&view, &"c".repeat(64), &wants_codex).is_ok());
+    }
+
+    // TOOTH — the capability predicate governs EVERY award-selection entry point, not just the one
+    // that happens to call it. This is the tripwire for a BYPASS, so its red condition is the
+    // PROPERTY (a violating claim is refused via both entry points), never the shape of a struct
+    // literal: an inert-field counter passes happily while a whole path skips the predicate.
+    //
+    // Bite, per path: delete the `claim_meets_capability_request` arm from `named_claim_awardable`
+    // and every `manual …` assertion below goes red; delete it from `select_awardable_claim` and
+    // every `auto …` assertion goes red. Each axis is asserted on BOTH paths before the next axis
+    // begins, so the failure names the axis AND the path rather than stopping at the first one.
+    #[test]
+    fn every_award_entry_point_applies_the_capability_predicate() {
+        let job = "a".repeat(64);
+        let mut named = claim(&job, true, 10, &[DEFAULT_MINT_URL.into()]);
+        named.capability = crate::heartbeat::SeatCapability {
+            harness_families: vec!["codex".to_owned()],
+            models: vec![crate::heartbeat::HarnessModel {
+                family: "codex".to_owned(),
+                model: "sonnet".to_owned(),
+            }],
+            capabilities: vec!["python".to_owned()],
+            harness_variant: None,
+            hardware: None,
+        };
+        let view = view_with(&job, 10, vec![named]);
+        let id = "c".repeat(64);
+
+        // Every axis is COLLECTED, not asserted in place, and the verdict is taken once at the end.
+        // An assert fires on the first axis and silences the rest, so a bite that breaks all three
+        // would look identical to one that breaks only the first — and the reader would fix one.
+        let mut failures: Vec<String> = Vec::new();
+
+        // Axis 1 — harness family the seat does not advertise.
+        let mut wants_family = filters(10, 100);
+        wants_family.requested_harness_family = Some("claude-code");
+        if select_awardable_claim(&view, &wants_family).is_some() {
+            failures.push("auto family: a codex-only seat won a claude-code job".to_owned());
+        }
+        match named_claim_awardable(&view, &id, &wants_family) {
+            Err(NamedAwardRefused::Capability { refusal: CapabilityRefusal::HarnessFamily { .. }, .. }) => {}
+            other => failures.push(format!("manual family: expected a family refusal, got {other:?}")),
+        }
+
+        // Axis 2 — right family, model the seat does not advertise. The PAIR is the unit.
+        let mut wants_model = filters(10, 100);
+        wants_model.requested_harness_family = Some("codex");
+        wants_model.requested_model = Some("opus");
+        if select_awardable_claim(&view, &wants_model).is_some() {
+            failures.push("auto model: a family match alone won a job naming a model".to_owned());
+        }
+        match named_claim_awardable(&view, &id, &wants_model) {
+            Err(NamedAwardRefused::Capability { refusal: CapabilityRefusal::Model { .. }, .. }) => {}
+            other => failures.push(format!("manual model: expected a model refusal, got {other:?}")),
+        }
+
+        // Axis 3 — capability token the seat does not advertise.
+        let needs_rust = vec!["rust".to_owned()];
+        let mut wants_caps = filters(10, 100);
+        wants_caps.required_capabilities = &needs_rust;
+        if select_awardable_claim(&view, &wants_caps).is_some() {
+            failures.push("auto capabilities: a python-only seat won a rust job".to_owned());
+        }
+        match named_claim_awardable(&view, &id, &wants_caps) {
+            Err(NamedAwardRefused::Capability { refusal: CapabilityRefusal::Capabilities { .. }, .. }) => {}
+            other => failures.push(format!("manual capabilities: expected a token refusal, got {other:?}")),
+        }
+
+        // POSITIVE CONTROL — a predicate that refused EVERYTHING would satisfy all six checks
+        // above. That is a different bug wearing the same green, and only this catches it.
+        let conforming_caps = vec!["python".to_owned()];
+        let mut conforming = filters(10, 100);
+        conforming.requested_harness_family = Some("codex");
+        conforming.requested_model = Some("sonnet");
+        conforming.required_capabilities = &conforming_caps;
+        if select_awardable_claim(&view, &conforming).as_deref() != Some(id.as_str()) {
+            failures.push("auto control: a claim meeting all three axes was NOT awarded".to_owned());
+        }
+        if named_claim_awardable(&view, &id, &conforming) != Ok(()) {
+            failures.push("manual control: a claim meeting all three axes was NOT awarded".to_owned());
+        }
+
+        assert!(
+            failures.is_empty(),
+            "the capability predicate is not applied at every award entry point:\n  {}",
+            failures.join("\n  ")
+        );
     }
 
     // Compat: with no harness requested the award path behaves exactly as before — a claim that
