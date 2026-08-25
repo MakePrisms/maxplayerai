@@ -142,9 +142,13 @@ impl std::fmt::Display for CapabilityRefusal {
 /// they are different states and the tests separate them.
 ///
 /// ⚠ Matching is a decision about an ADVERTISEMENT, and an advertisement is a claim, not a proof. A
-/// matched model may still differ from the `model_used` on the receipt (two honest reads at two
-/// times), and a matched capability token promises the tool resolved at probe time, never that the
-/// work succeeds. The award IS the payment decision, so nothing downstream can revise it.
+/// matched model may still differ from the `["model", name]` the seller stamps on the result — two
+/// honest reads of the same ACP field at two times. Nothing on the pay path can catch that: the buyer
+/// records that tag as its own `model_used`, which is a seller-claimed attribution outside the
+/// receipt preimage and gates nothing (`docs/protocol-v1.md` §6.4). It can corroborate a divergence
+/// afterwards; it can never have prevented one. A matched capability token promises the tool resolved
+/// at probe time, never that the work succeeds. The award IS the payment decision, so nothing
+/// downstream can revise it.
 pub fn claim_meets_capability_request(
     advertised: &crate::heartbeat::SeatCapability,
     filters: &AwardFilters,
