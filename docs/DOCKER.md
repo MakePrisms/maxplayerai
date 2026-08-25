@@ -277,8 +277,8 @@ The access token must remain valid for the job timeout plus 15 minutes. The daem
 claim, so it does not assume a fixed token lifetime. A short or expired token stops the run before any
 Docker container starts.
 
-The container receives two random per-job placeholders and a custom Codex provider. The proxy replaces
-the placeholders only for the fixed ChatGPT Codex backend. It permits `POST /responses`,
+The container receives two random per-job placeholders in a default gateway auth request. The proxy
+replaces the placeholders only for the fixed ChatGPT Codex backend. It permits `POST /responses`,
 `POST /responses/compact`, and `GET /models`. The proxy stops at job end.
 
 Version one does not refresh a token. Run `codex login` again in the dedicated `CODEX_HOME` when the

@@ -257,8 +257,19 @@ pub enum Decision {
         headers: Vec<(String, String)>,
         /// Real-to-placeholder substitutions for the response leg only.
         scrub: Vec<(String, String)>,
+        /// The redirect rule for this credential type.
+        redirects: RedirectMode,
     },
     Refuse(Refusal),
+}
+
+/// The redirect rule for one authorized request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectMode {
+    /// Follow redirects only while they stay on the credential's paired authority.
+    PairedAuthority,
+    /// Return the redirect response without another upstream request.
+    Disabled,
 }
 
 impl std::fmt::Debug for Decision {
@@ -268,11 +279,13 @@ impl std::fmt::Debug for Decision {
                 upstream,
                 headers,
                 scrub,
+                redirects,
             } => f
                 .debug_struct("Forward")
                 .field("upstream", upstream)
                 .field("header_count", &headers.len())
                 .field("scrub_count", &scrub.len())
+                .field("redirects", redirects)
                 .finish(),
             Self::Refuse(reason) => f.debug_tuple("Refuse").field(reason).finish(),
         }
@@ -408,6 +421,7 @@ impl ProxyEngine {
             upstream: cred.upstream,
             headers,
             scrub: vec![(cred.real, cred.placeholder)],
+            redirects: RedirectMode::PairedAuthority,
         }
     }
 
@@ -487,6 +501,7 @@ impl ProxyEngine {
                 (session.access_token, session.access_placeholder),
                 (session.account_id, session.account_placeholder),
             ],
+            redirects: RedirectMode::Disabled,
         }
     }
 }
@@ -506,47 +521,52 @@ fn placeholder_present(placeholder: &str, headers: &[(String, String)]) -> bool 
     headers.iter().any(|(_, v)| v.contains(placeholder))
 }
 
-/// Replace every occurrence of `needle` with `replacement` in a byte buffer. Bodies are not required to
-/// be UTF-8, so this works on raw bytes rather than going through `String`.
+fn replace_bytes_many(haystack: &[u8], substitutions: &[(String, String)]) -> Vec<u8> {
+    let mut buffer = haystack.to_vec();
+    scrub_buffer(&mut buffer, substitutions, true)
+}
+
+/// Scrub the safe prefix of an ORIGINAL byte buffer.
 ///
-/// Used on the RESPONSE leg only (real ⇒ placeholder). The request leg deliberately has no body
-/// substitution at all.
-fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
-    if needle.is_empty() {
-        return haystack.to_vec();
+/// When `finish` is false, the function retains enough original bytes to match a value across the
+/// next stream chunk. It never puts replacement bytes back into `buffer`, so a replacement length
+/// cannot change the next input boundary.
+fn scrub_buffer(
+    buffer: &mut Vec<u8>,
+    substitutions: &[(String, String)],
+    finish: bool,
+) -> Vec<u8> {
+    let max_real_len = substitutions
+        .iter()
+        .map(|(real, _)| real.len())
+        .max()
+        .unwrap_or(0);
+    if max_real_len == 0 {
+        return std::mem::take(buffer);
     }
-    let mut out = Vec::with_capacity(haystack.len());
-    let mut i = 0;
-    while i < haystack.len() {
-        if haystack[i..].starts_with(needle) {
-            out.extend_from_slice(replacement);
-            i += needle.len();
+
+    let safe_start_limit = if finish {
+        buffer.len()
+    } else {
+        buffer.len().saturating_sub(max_real_len.saturating_sub(1))
+    };
+    let mut output = Vec::with_capacity(buffer.len());
+    let mut cursor = 0;
+    while cursor < safe_start_limit {
+        let matched = substitutions
+            .iter()
+            .filter(|(real, _)| !real.is_empty() && buffer[cursor..].starts_with(real.as_bytes()))
+            .max_by_key(|(real, _)| real.len());
+        if let Some((real, placeholder)) = matched {
+            output.extend_from_slice(placeholder.as_bytes());
+            cursor += real.len();
         } else {
-            out.push(haystack[i]);
-            i += 1;
+            output.push(buffer[cursor]);
+            cursor += 1;
         }
     }
-    out
-}
-
-fn replace_bytes_many(haystack: &[u8], substitutions: &[(String, String)]) -> Vec<u8> {
-    substitutions
-        .iter()
-        .fold(haystack.to_vec(), |current, (real, placeholder)| {
-            replace_bytes(&current, real.as_bytes(), placeholder.as_bytes())
-        })
-}
-
-fn scrub_text(text: &str, substitutions: &[(String, String)]) -> String {
-    substitutions
-        .iter()
-        .fold(text.to_owned(), |current, (real, placeholder)| {
-            if real.is_empty() {
-                current
-            } else {
-                current.replace(real, placeholder)
-            }
-        })
+    buffer.drain(..cursor);
+    output
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -804,6 +824,13 @@ pub async fn start(
     client: reqwest::Client,
     ports: Option<crate::sandbox_net::PortRange>,
 ) -> std::io::Result<RunningProxy> {
+    let clients = ForwardClients {
+        paired_redirects: client,
+        no_redirects: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(std::io::Error::other)?,
+    };
     // KNOWN EXPOSURE, deliberately unchanged for now. `0.0.0.0` is every interface, so on a seller with
     // a public IP and no firewall this per-job listener is internet-reachable on a random high port.
     // The placeholder is the bearer — a caller without it gets `NoKnownPlaceholder` — so this is not an
@@ -834,20 +861,20 @@ pub async fn start(
                 continue; // semaphore closed — proxy shutting down
             };
             let engine = Arc::clone(&engine_for_task);
-            let client = client.clone();
+            let clients = clients.clone();
             let in_flight = Arc::clone(&in_flight);
             tokio::spawn(async move {
                 let _permit = permit; // released when the connection ends
                 let io = TokioIo::new(stream);
                 let service = service_fn(move |req| {
                     let engine = Arc::clone(&engine);
-                    let client = client.clone();
+                    let clients = clients.clone();
                     let in_flight = Arc::clone(&in_flight);
                     async move {
                         // Held for the life of THIS request, so the ceiling counts requests rather
                         // than sockets. Excess requests wait here instead of each buffering a body.
                         let _in_flight = in_flight.acquire().await;
-                        handle_request(req, engine, client).await
+                        handle_request(req, engine, clients).await
                     }
                 });
                 // Auto-negotiating server: it sniffs the HTTP/2 prior-knowledge preface
@@ -876,13 +903,19 @@ pub async fn start(
 
 type ProxyBody = BoxBody<Bytes, std::io::Error>;
 
+#[derive(Clone)]
+struct ForwardClients {
+    paired_redirects: reqwest::Client,
+    no_redirects: reqwest::Client,
+}
+
 /// Serve one request: buffer it, run it through [`ProxyEngine::authorize`], and — only on a
 /// substituted forward — relay it to the real upstream and stream the response back. A refusal returns
 /// a `4xx`/`5xx` to the container with the real credential never in play.
 async fn handle_request(
     req: Request<Incoming>,
     engine: Arc<ProxyEngine>,
-    client: reqwest::Client,
+    clients: ForwardClients,
 ) -> Result<Response<ProxyBody>, std::convert::Infallible> {
     let method = req.method().clone();
     // The path+query is forwarded verbatim; it is never a substitution input.
@@ -940,8 +973,17 @@ async fn handle_request(
         }
         // `body` is the ORIGINAL buffered request body, forwarded verbatim: the decision never
         // carried it, so nothing substituted a credential into it.
-        Decision::Forward { upstream, headers, scrub } => {
-            match relay(&client, &method, &upstream, &path_and_query, headers, body, scrub).await {
+        Decision::Forward {
+            upstream,
+            headers,
+            scrub,
+            redirects,
+        } => {
+            let client = match redirects {
+                RedirectMode::PairedAuthority => &clients.paired_redirects,
+                RedirectMode::Disabled => &clients.no_redirects,
+            };
+            match relay(client, &method, &upstream, &path_and_query, headers, body, scrub).await {
                 Ok(response) => Ok(response),
                 // No-fallback: an upstream failure fails the request; it never resends without the
                 // proxy or with the real credential in the container.
@@ -974,12 +1016,32 @@ async fn relay(
         .map_err(|error| format!("bad method: {error}"))?;
     let mut request = client.request(method, &url).body(body.to_vec());
     for (name, value) in headers {
+        if name.eq_ignore_ascii_case("accept-encoding") {
+            continue;
+        }
         request = request.header(name, value);
     }
+    request = request.header(reqwest::header::ACCEPT_ENCODING, "identity");
     let upstream_response = request
         .send()
         .await
         .map_err(|error| format!("upstream request failed: {error}"))?;
+
+    let supported_encoding = upstream_response
+        .headers()
+        .get_all(reqwest::header::CONTENT_ENCODING)
+        .iter()
+        .all(|value| {
+            value.to_str().is_ok_and(|text| {
+                let mut encodings = text.split(',').map(str::trim);
+                let first = encodings.next();
+                first.is_some_and(|encoding| encoding.eq_ignore_ascii_case("identity"))
+                    && encodings.all(|encoding| encoding.eq_ignore_ascii_case("identity"))
+            })
+        });
+    if !supported_encoding {
+        return Err("upstream response uses an unsupported Content-Encoding".to_owned());
+    }
 
     let status = upstream_response.status();
     let mut builder = Response::builder().status(status.as_u16());
@@ -987,12 +1049,12 @@ async fn relay(
         if is_hop_by_hop(name.as_str()) {
             continue;
         }
-        // Response headers are scrubbed too: an upstream that reflects the credential in a header
-        // (`www-authenticate`, a debug echo) must not hand it to the container.
-        match value.to_str() {
-            Ok(text) => builder = builder.header(name, scrub_text(text, &scrub)),
-            Err(_) => builder = builder.header(name, value),
-        }
+        // Scrub raw bytes. A valid HTTP header can contain non-UTF-8 `obs-text`, so a text-only branch
+        // would pass the real credential unchanged when any neighboring byte was non-UTF-8.
+        let scrubbed = replace_bytes_many(value.as_bytes(), &scrub);
+        let scrubbed = hyper::header::HeaderValue::from_bytes(&scrubbed)
+            .map_err(|_| "upstream response has an unsafe header value".to_owned())?;
+        builder = builder.header(name, scrubbed);
     }
     let upstream_body = Box::pin(upstream_response.bytes_stream());
     let body = if scrub.is_empty() {
@@ -1021,11 +1083,6 @@ fn scrub_stream<S>(
 where
     S: futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin,
 {
-    let max_real_len = substitutions
-        .iter()
-        .map(|(real, _)| real.len())
-        .max()
-        .unwrap_or(0);
     // `None` inner ⇒ the stream is finished (ended or errored); stop yielding.
     futures_util::stream::unfold(
         (Some(inner), Vec::<u8>::new()),
@@ -1038,24 +1095,21 @@ where
                     match inner.next().await {
                         Some(Ok(chunk)) => {
                             carry.extend_from_slice(&chunk);
-                            let replaced = replace_bytes_many(&carry, &substitutions);
-                            // Everything but a possible split match at the tail is safe to emit.
-                            let hold = max_real_len.saturating_sub(1).min(replaced.len());
-                            let split = replaced.len() - hold;
-                            if split == 0 {
+                            let emit = scrub_buffer(&mut carry, &substitutions, false);
+                            if emit.is_empty() {
                                 // Nothing emittable yet — keep pulling rather than yielding empty.
-                                carry = replaced;
                                 continue;
                             }
-                            let emit = Bytes::copy_from_slice(&replaced[..split]);
-                            let rest = replaced[split..].to_vec();
-                            return Some((Ok(Frame::data(emit)), (Some(inner), rest)));
+                            return Some((
+                                Ok(Frame::data(Bytes::from(emit))),
+                                (Some(inner), carry),
+                            ));
                         }
                         Some(Err(error)) => {
                             return Some((Err(std::io::Error::other(error)), (None, Vec::new())));
                         }
                         None => {
-                            let tail = replace_bytes_many(&carry, &substitutions);
+                            let tail = scrub_buffer(&mut carry, &substitutions, true);
                             if tail.is_empty() {
                                 return None;
                             }
@@ -1137,8 +1191,14 @@ mod tests {
         ]);
 
         match engine.authorize_request("POST", "/responses", &headers) {
-            Decision::Forward { upstream, headers, scrub } => {
+            Decision::Forward {
+                upstream,
+                headers,
+                scrub,
+                redirects,
+            } => {
                 assert_eq!(upstream, "https://chatgpt.com/backend-api/codex");
+                assert_eq!(redirects, RedirectMode::Disabled);
                 assert_eq!(
                     headers
                         .iter()
@@ -1416,6 +1476,78 @@ mod tests {
         assert!(seen.request_line.contains("/responses?test=1"));
     }
 
+    #[tokio::test]
+    async fn codex_session_proxy_does_not_follow_a_same_host_redirect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind redirect stub");
+        let stub_addr = listener.local_addr().expect("redirect stub address");
+        let stub = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.expect("first request");
+            let mut request = [0_u8; 8192];
+            let first_len = first.read(&mut request).await.expect("read first request");
+            assert!(
+                String::from_utf8_lossy(&request[..first_len]).contains("/responses"),
+                "the first request must use the approved Codex route"
+            );
+            first
+                .write_all(
+                    b"HTTP/1.1 307 Temporary Redirect\r\nlocation: /outside\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write redirect");
+            first.flush().await.expect("flush redirect");
+
+            match tokio::time::timeout(Duration::from_millis(500), listener.accept()).await {
+                Ok(Ok((mut second, _))) => {
+                    let second_len = second.read(&mut request).await.expect("read redirect target");
+                    second
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        )
+                        .await
+                        .expect("write redirect target response");
+                    Some(String::from_utf8_lossy(&request[..second_len]).into_owned())
+                }
+                _ => None,
+            }
+        });
+
+        let upstream = format!("http://{stub_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        register_codex_session(&engine, &upstream);
+        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None)
+            .await
+            .expect("start the local proxy");
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build no-redirect test client");
+        let response = client
+            .post(format!("http://{}/responses", proxy.local_addr()))
+            .header(
+                "authorization",
+                format!("Bearer {CODEX_ACCESS_PLACEHOLDER}"),
+            )
+            .header("chatgpt-account-id", CODEX_ACCOUNT_PLACEHOLDER)
+            .body("{}")
+            .send()
+            .await
+            .expect("send through the local proxy");
+
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::TEMPORARY_REDIRECT,
+            "the proxy must return the redirect without another upstream request"
+        );
+        assert!(
+            stub.await.expect("redirect stub result").is_none(),
+            "the real Codex headers must not reach a redirected path"
+        );
+    }
+
     // A placeholder ONLY in the body identifies nothing: it cannot authenticate upstream (the vendor
     // reads a header), so treating it as identification widened the attack surface for no gain.
     #[test]
@@ -1501,6 +1633,7 @@ mod tests {
         api_key: Option<String>,
         authorization: Option<String>,
         account_id: Option<String>,
+        accept_encoding: Option<String>,
         /// The request BODY as the upstream received it — the ground truth for "no credential was
         /// written into a job-authored body".
         body: String,
@@ -1578,6 +1711,11 @@ mod tests {
                 name.eq_ignore_ascii_case("chatgpt-account-id")
                     .then(|| value.trim().to_owned())
             });
+            let accept_encoding = text.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("accept-encoding")
+                    .then(|| value.trim().to_owned())
+            });
             let extra = extra_header.map(|h| format!("{h}\r\n")).unwrap_or_default();
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/plain\r\n{}\r\n{}",
@@ -1587,7 +1725,14 @@ mod tests {
             );
             sock.write_all(response.as_bytes()).await.unwrap();
             sock.flush().await.unwrap();
-            StubSeen { request_line, api_key, authorization, account_id, body }
+            StubSeen {
+                request_line,
+                api_key,
+                authorization,
+                account_id,
+                accept_encoding,
+                body,
+            }
         });
         (addr, handle)
     }
@@ -1725,6 +1870,98 @@ mod tests {
         assert!(seen.contains("sk-ant-api03-"), "rewritten to the placeholder: {seen}");
     }
 
+    #[tokio::test]
+    async fn an_encoded_upstream_response_is_refused_and_identity_is_requested() {
+        let (stub_addr, stub) = spawn_stub_with(
+            format!("encoded credential echo: {REAL}"),
+            Some("content-encoding: x-maxplayer-test".to_owned()),
+        )
+        .await;
+        let upstream = format!("http://{stub_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        let placeholder = mint_anthropic_placeholder();
+        engine
+            .register(JobCredential {
+                placeholder: placeholder.clone(),
+                real: REAL.to_owned(),
+                upstream,
+            })
+            .unwrap();
+        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None)
+            .await
+            .expect("start the local proxy");
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/messages", proxy.local_addr()))
+            .header("x-api-key", placeholder)
+            .header("accept-encoding", "gzip")
+            .body("{}")
+            .send()
+            .await
+            .expect("send through the local proxy");
+        let status = response.status();
+        let body = response.bytes().await.expect("read refusal body");
+        let seen = stub.await.expect("encoded stub result");
+
+        assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY);
+        assert!(!contains(&body, REAL), "the refusal must not contain the credential");
+        assert_eq!(
+            seen.accept_encoding.as_deref(),
+            Some("identity"),
+            "the proxy must replace a caller-selected encoding"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_utf8_response_header_is_scrubbed_as_raw_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind raw-header stub");
+        let stub_addr = listener.local_addr().expect("raw-header stub address");
+        let stub = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("raw-header request");
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.expect("read raw-header request");
+            let mut response = b"HTTP/1.1 200 OK\r\nx-raw-echo: prefix-\x80-".to_vec();
+            response.extend_from_slice(REAL.as_bytes());
+            response.extend_from_slice(
+                b"-suffix\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+            );
+            socket
+                .write_all(&response)
+                .await
+                .expect("write raw response header");
+            socket.flush().await.expect("flush raw response header");
+        });
+
+        let upstream = format!("http://{stub_addr}");
+        let response = relay(
+            &reqwest::Client::new(),
+            &hyper::Method::POST,
+            &upstream,
+            "/v1/messages",
+            vec![("x-api-key".to_owned(), REAL.to_owned())],
+            Bytes::from_static(b"{}"),
+            vec![(REAL.to_owned(), "safe-placeholder".to_owned())],
+        )
+        .await
+        .expect("relay the raw response header");
+        let raw = response
+            .headers()
+            .get("x-raw-echo")
+            .expect("raw response header")
+            .as_bytes();
+
+        assert!(!contains(raw, REAL), "the raw response header must not contain the credential");
+        assert!(
+            contains(raw, "safe-placeholder"),
+            "the raw response header must contain the placeholder"
+        );
+        stub.await.expect("raw-header stub result");
+    }
+
     // The scrub must survive CHUNK BOUNDARIES. A credential split across two stream frames would slip
     // past a naive per-chunk replace, so `scrub_stream` holds back `len(real) - 1` bytes and re-checks.
     // Driven directly with hand-split frames, since a stub cannot reliably force the split.
@@ -1794,6 +2031,32 @@ mod tests {
                 "start-{CODEX_ACCESS_PLACEHOLDER}-middle-{CODEX_ACCOUNT_PLACEHOLDER}-end"
             )
         );
+    }
+
+    #[tokio::test]
+    async fn the_response_scrub_handles_adjacent_values_without_reprocessing_output() {
+        use futures_util::TryStreamExt as _;
+
+        let frames: Vec<reqwest::Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"bb")),
+            Ok(Bytes::from_static(b"bb")),
+        ];
+        let scrubbed = scrub_stream(
+            futures_util::stream::iter(frames),
+            vec![("bb".to_owned(), "ab".to_owned())],
+        );
+        let collected: Vec<u8> = scrubbed
+            .try_fold(Vec::new(), |mut acc, frame| async move {
+                if let Ok(data) = frame.into_data() {
+                    acc.extend_from_slice(&data);
+                }
+                Ok(acc)
+            })
+            .await
+            .expect("collect adjacent scrub result");
+
+        assert_eq!(collected, b"abab");
+        assert!(!contains(&collected, "bb"));
     }
 
     // #647 acceptance #1 (plumbing): a request carrying the placeholder is forwarded to the approved

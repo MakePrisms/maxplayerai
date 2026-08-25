@@ -499,7 +499,7 @@ dedicated Codex login again when the lifetime check fails.
 The planned refresh step will run on the host before each job. It will update the same auth file before
 this reader runs. It will never put a refresh token in Docker.
 
-**Leave `image` unset.** Omitted, the binary uses its own version-pinned ref
+**Leave `image` unset for a released binary.** Omitted, the binary uses its own version-pinned ref
 (`ghcr.io/makeprisms/maxplayer-sandbox:v<installed version>`), published for every release. `image` is
 for a fully custom image and is not a version selector — a bare tag like `maxplayer-sandbox:latest`
 sends docker to Docker Hub, where there is nothing to pull.

@@ -2,6 +2,7 @@
 
 use base64::Engine as _;
 use serde::Deserialize;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -150,7 +151,21 @@ pub fn read_chatgpt_session(
     required_lifetime: Duration,
     now: SystemTime,
 ) -> Result<ChatgptSession, SessionError> {
-    let metadata = std::fs::metadata(auth_file).map_err(|error| SessionError::Metadata {
+    let file = std::fs::File::open(auth_file).map_err(|error| SessionError::Metadata {
+        path: auth_file.to_path_buf(),
+        detail: error.to_string(),
+    })?;
+    read_chatgpt_session_from_open_file(file, auth_file, required_lifetime, now)
+}
+
+/// Check and read one already-open auth file, so a path replacement cannot change the checked file.
+fn read_chatgpt_session_from_open_file(
+    mut file: std::fs::File,
+    auth_file: &Path,
+    required_lifetime: Duration,
+    now: SystemTime,
+) -> Result<ChatgptSession, SessionError> {
+    let metadata = file.metadata().map_err(|error| SessionError::Metadata {
         path: auth_file.to_path_buf(),
         detail: error.to_string(),
     })?;
@@ -171,10 +186,12 @@ pub fn read_chatgpt_session(
         }
     }
 
-    let raw = std::fs::read_to_string(auth_file).map_err(|error| SessionError::Read {
-        path: auth_file.to_path_buf(),
-        detail: error.to_string(),
-    })?;
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)
+        .map_err(|error| SessionError::Read {
+            path: auth_file.to_path_buf(),
+            detail: error.to_string(),
+        })?;
     let parsed: AuthFile = serde_json::from_str(&raw).map_err(|error| SessionError::Json {
         path: auth_file.to_path_buf(),
         line: error.line(),
@@ -421,6 +438,36 @@ mod tests {
             message.contains("0o640"),
             "the current mode must be named: {message}"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_subscription_checks_and_reads_the_same_open_file() {
+        let dir = test_dir("open-file");
+        let auth_file = dir.join("auth.json");
+        let first_token = synthetic_jwt(NOW_SECS + 10_000);
+        write_auth(&auth_file, &first_token, "first-account");
+        let opened = std::fs::File::open(&auth_file).expect("open the first auth file");
+
+        let replacement = dir.join("replacement.json");
+        write_auth(
+            &replacement,
+            &synthetic_jwt(NOW_SECS + 20_000),
+            "replacement-account",
+        );
+        std::fs::rename(&replacement, &auth_file).expect("replace the auth directory entry");
+
+        let session = super::read_chatgpt_session_from_open_file(
+            opened,
+            &auth_file,
+            Duration::from_secs(1),
+            UNIX_EPOCH + Duration::from_secs(NOW_SECS),
+        )
+        .expect("read the already-open first file");
+
+        assert_eq!(session.access_token(), first_token);
+        assert_eq!(session.account_id(), "first-account");
         let _ = std::fs::remove_dir_all(dir);
     }
 

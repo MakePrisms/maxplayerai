@@ -380,9 +380,9 @@ pub struct SandboxConfig {
     pub file_credentials: Vec<FileCredential>,
     /// `docker` mode: use a host Codex ChatGPT session through the per-job proxy.
     ///
-    /// The auth file stays on the host. The container receives only per-job placeholders through a
-    /// custom Codex model-provider configuration. Absent means the existing API-key or harness auth
-    /// behavior remains unchanged.
+    /// The auth file stays on the host. The container receives only per-job placeholders through the
+    /// default gateway auth request. Absent means the existing API-key or harness auth behavior
+    /// remains unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_chatgpt: Option<CodexChatgptConfig>,
 }

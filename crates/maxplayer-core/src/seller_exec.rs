@@ -2744,10 +2744,9 @@ async fn start_credential_containment(
     // to OpenAI's host — because both are on it. A refused attempt is `stop()`, which returns the 3xx
     // for the proxy to relay to the container unchanged.
     //
-    // The pairing is available without per-request state, which is why this stays one shared client:
-    // `Policy::custom` closes over the ENGINE and never a request, so the credential cannot be reached
-    // from here — but the attempt carries its own chain, and its FIRST entry is the original request
-    // URL, which `relay` built from that credential's upstream.
+    // The pairing is available without per-request state, so the generic client can use one shared
+    // policy. `Policy::custom` never receives a credential. The typed Codex route selects a second,
+    // no-redirect client inside the proxy because its credential is valid for fixed paths only.
     //
     // EVERY HOP, not just the first, and each judged against the ORIGINAL rather than its predecessor:
     // judging hop-against-predecessor would let a chain walk one authority at a time to anywhere.
