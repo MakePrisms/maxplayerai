@@ -825,9 +825,11 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
                 // params, so the request cannot be changed after the fact. Absent ⇒ passes every
                 // claim, so a buyer that asks for nothing sees the behaviour it saw before.
                 //
-                // These two lines must stay identical to the auto path in `drive_auto_award`. A
-                // request honoured on one path and dropped on the other is the bypass #866 was filed
-                // to close, and naming a claim chooses WHICH claim is judged, never WHETHER it is.
+                // Every axis below must stay identical to the auto path in `drive_auto_award` — a
+                // property `both_award_paths_read_the_capability_request_off_the_offer` holds, rather
+                // than a convention to remember. A request honoured on one path and dropped on the
+                // other is the bypass #866 was filed to close, and naming a claim chooses WHICH claim
+                // is judged, never WHETHER it is.
                 requested_harness_family: offer.requested_harness_family.as_deref(),
                 requested_model: offer.requested_model.as_deref(),
                 required_capabilities: &offer.required_capabilities,
