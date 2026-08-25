@@ -50,7 +50,6 @@ pub enum SessionError {
         path: PathBuf,
         line: usize,
         column: usize,
-        detail: String,
     },
     EmptyField {
         path: PathBuf,
@@ -95,14 +94,9 @@ impl std::fmt::Display for SessionError {
                     path.display()
                 )
             }
-            Self::Json {
-                path,
-                line,
-                column,
-                detail,
-            } => write!(
+            Self::Json { path, line, column } => write!(
                 f,
-                "Codex auth file {} is not valid auth JSON at line {line}, column {column}: {detail}",
+                "Codex auth file {} is not valid auth JSON at line {line}, column {column}",
                 path.display()
             ),
             Self::EmptyField { path, field } => write!(
@@ -196,7 +190,6 @@ fn read_chatgpt_session_from_open_file(
         path: auth_file.to_path_buf(),
         line: error.line(),
         column: error.column(),
-        detail: error.to_string(),
     })?;
     let access_token = parsed.tokens.access_token.trim().to_owned();
     if access_token.is_empty() {
@@ -403,7 +396,27 @@ mod tests {
         )
         .err()
         .expect("a missing access token must be refused");
-        assert!(error.to_string().contains("access_token"), "{error}");
+        assert!(error.to_string().contains("auth JSON"), "{error}");
+
+        let malformed_secret = "sensitive-auth-file-value-that-must-not-reach-a-log";
+        std::fs::write(&auth_file, format!(r#"{{"tokens":"{malformed_secret}"}}"#))
+            .expect("replace auth with a secret in an incorrect field type");
+        let error = super::read_chatgpt_session(
+            &auth_file,
+            Duration::from_secs(1),
+            UNIX_EPOCH + Duration::from_secs(NOW_SECS),
+        )
+        .err()
+        .expect("an incorrect tokens type must be refused");
+        assert!(error.to_string().contains("auth JSON"), "{error}");
+        assert!(
+            !error.to_string().contains(malformed_secret),
+            "the display error must not echo malformed auth content: {error}"
+        );
+        assert!(
+            !format!("{error:?}").contains(malformed_secret),
+            "the debug error must not retain malformed auth content"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
