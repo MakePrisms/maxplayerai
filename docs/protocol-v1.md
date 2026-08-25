@@ -388,8 +388,17 @@ buyer needing that second guarantee MUST name the `agent` preset.
 a second would be silently dropped and the buyer filtered on a subset of its own request.
 
 Values follow the same "stated or absent" rule as §4.5.2: a reader MUST trim, and a value that states
-nothing is absent. A request naming a family outside §4.5 or a token outside §4.5.2 can never match
-and SHOULD be refused before the offer is published.
+nothing is absent. A request naming a family outside §4.5 or a token outside §4.5.2 can never be
+satisfied. A publisher SHOULD refuse it before the offer is published, and a buyer MUST refuse it at
+AWARD time, judging the REQUEST before any claim is consulted.
+
+Both are required, and the award-time half is the load-bearing one. Refusing before publication only
+covers offers that publisher built; anyone may sign an offer carrying any string. Neither the offer
+reader nor the claim reader filters vocabulary — both only trim and drop blanks — so a claim
+advertising the SAME out-of-vocabulary family as the request will match it on every other axis. A
+buyer that checked only claim-against-request would find agreement and award. The request is
+therefore judged against the vocabulary first, so that two parties agreeing about a harness that does
+not exist cannot produce an award.
 
 Matching decides who is CONSIDERED; it never guarantees what executes. `harness_model` is a
 last-observed self-report (§4.5.4) and a capability token proves binary presence at probe time

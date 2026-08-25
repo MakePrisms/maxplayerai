@@ -156,6 +156,21 @@ pub enum CapabilityRefusal {
     /// real token" means the request is wrong and no seat can ever satisfy it. Collapsing them would
     /// tell an operator to wait for a seat that cannot exist.
     UnknownCapabilityToken { token: String },
+    /// The job requested a harness family outside [`crate::agent_presets::HARNESS_FAMILIES`].
+    ///
+    /// Distinct from `HarnessFamily` for the same reason `UnknownCapabilityToken` is distinct from
+    /// `Capabilities`: the two imply OPPOSITE operator actions. "No seat advertises this family"
+    /// means wait or add a seat; "that is not a real family" means the request is wrong and no seat
+    /// can ever satisfy it.
+    ///
+    /// ⚠ THIS IS A WIRE-LEVEL GUARD, NOT A CONVENIENCE. The post-time vocabulary gate only sees
+    /// offers built by OUR client. A foreign client can publish any string it likes, and neither
+    /// reader filters vocabulary — `harness_families_from_tags` and the offer's param reader both
+    /// only trim and drop blanks. So without this check a foreign offer requesting a bogus family,
+    /// matched by a claim advertising THAT SAME bogus family, satisfied the predicate and both award
+    /// paths could select it. Judged on the REQUEST, before the claim is consulted, so a nonsense
+    /// request can never be laundered into a match by a claim that agrees with it.
+    UnknownHarnessFamily { requested: String },
 }
 
 impl std::fmt::Display for CapabilityRefusal {
@@ -182,6 +197,9 @@ impl std::fmt::Display for CapabilityRefusal {
             }
             Self::UnknownCapabilityToken { token } => {
                 write!(f, "{token} is not a known capability token")
+            }
+            Self::UnknownHarnessFamily { requested } => {
+                write!(f, "{requested} is not a known harness family")
             }
         }
     }
@@ -223,6 +241,20 @@ pub fn claim_meets_capability_request(
         .find(|token| !crate::capability::CAPABILITIES.contains(&token.as_str()))
     {
         return Err(CapabilityRefusal::UnknownCapabilityToken { token: unknown.clone() });
+    }
+    // The STATED family must be a real one. Judged against the vocabulary, never against the claim:
+    // a claim advertising the same bogus string would otherwise satisfy the filter, and the offer
+    // and the seat would agree with each other about a harness that does not exist.
+    //
+    // Only the stated family needs this. A DERIVED one comes from `harness_family_for_preset`, whose
+    // range is `HARNESS_FAMILIES` by construction — asserted in `agent_presets` — so validating it
+    // here would be checking a value this crate produced rather than one the wire supplied.
+    if let Some(requested) = filters.requested_harness_family {
+        if !crate::agent_presets::HARNESS_FAMILIES.contains(&requested) {
+            return Err(CapabilityRefusal::UnknownHarnessFamily {
+                requested: requested.to_owned(),
+            });
+        }
     }
     // The request must be one DISPATCH can honour, before any of it is matched against a claim.
     //
@@ -3789,6 +3821,95 @@ mod tests {
         );
     }
 
+    // The same rule for the FAMILY axis, which had the token axis's guard and not its own.
+    //
+    // Neither reader filters vocabulary — `harness_families_from_tags` and the offer's param reader
+    // both only trim and drop blanks — so a foreign offer can carry any string, and a claim can
+    // advertise the same one.
+    #[test]
+    fn an_unknown_harness_family_is_refused_even_when_the_claim_advertises_it() {
+        let mut wants = filters(10, 10);
+        wants.requested_harness_family = Some("not-a-family");
+
+        // ⛔ THE ADVERSARIAL CASE IS THE ONLY ONE THAT PROVES ANYTHING, AND IT IS EASY TO GET WRONG.
+        // The claim advertises THE SAME unknown value. Test this against an ORDINARY claim instead
+        // and it goes red on a plain family mismatch — which it would do with the vocabulary check
+        // deleted entirely. Such a test passes without the guard and certifies nothing.
+        assert_eq!(
+            claim_meets_capability_request(&seat(&["not-a-family"], &[], &[]), &wants),
+            Err(CapabilityRefusal::UnknownHarnessFamily { requested: "not-a-family".into() }),
+            "a claim that AGREES with a nonsense request must not launder it into a match"
+        );
+
+        // Judged on the REQUEST, before the claim: a seat advertising every real family is refused
+        // identically, so the refusal can never be read as a property of the seat.
+        assert_eq!(
+            claim_meets_capability_request(
+                &seat(&["claude-code", "codex", "cursor", "goose"], &[], &[]),
+                &wants,
+            ),
+            Err(CapabilityRefusal::UnknownHarnessFamily { requested: "not-a-family".into() }),
+        );
+
+        // And it narrows nothing real: every family in the vocabulary still passes on a seat that
+        // serves it. Without this the guard could be a blanket refusal and the cases above would not
+        // notice.
+        for family in crate::agent_presets::HARNESS_FAMILIES {
+            wants.requested_harness_family = Some(family);
+            assert_eq!(
+                claim_meets_capability_request(&seat(&[family], &[], &[]), &wants),
+                Ok(()),
+                "{family} is a real family and must still pass"
+            );
+        }
+    }
+
+    // The wire-level case this exists for: an offer we did not build, matched by a claim that agrees
+    // with it. The post-time vocabulary gate never sees this offer, so if the predicate does not
+    // refuse it, nothing does — and the comment on `unsatisfiable_capability_request` promises that
+    // the award-time refusal IS the backstop for foreign offers.
+    #[test]
+    fn a_foreign_offer_naming_a_bogus_family_is_refused_on_both_paths_and_parks_blaming_the_request()
+    {
+        let job = "a".repeat(64);
+        let mints = vec![DEFAULT_MINT_URL.to_owned()];
+        let claim_id = "c".repeat(64);
+
+        // A claim that is payable, live, and advertises exactly the bogus family requested. Every
+        // other filter passes; only the vocabulary check stands between this and an award.
+        let mut colluding = claim(&job, true, 10, &mints);
+        colluding.capability = seat(&["not-a-family"], &[], &[]);
+
+        let bogus = offer_requesting(&job, 10, Some("not-a-family"), &[]);
+        let view =
+            JobView { offer: Some(bogus.clone()), ..view_with(&job, 10, vec![colluding]) };
+        let filters = filters_from_offer(&bogus, 10);
+
+        assert_eq!(
+            select_awardable_claim(&view, &filters),
+            None,
+            "auto path: a family outside the vocabulary must never award, however well it matches"
+        );
+        assert_eq!(
+            named_claim_awardable(&view, &claim_id, &filters),
+            Err(NamedAwardRefused::Capability {
+                claim_id: claim_id.clone(),
+                refusal: CapabilityRefusal::UnknownHarnessFamily {
+                    requested: "not-a-family".into()
+                },
+            }),
+            "manual path: naming the claim must not bypass the vocabulary check either"
+        );
+
+        let reason = capability_park_reason(&view, &filters)
+            .expect("a bogus family must produce a park reason");
+        assert!(
+            reason.contains("not a known harness family"),
+            "the row must blame the REQUEST. Blaming the claim would send an operator to find \
+             another seat for a family that does not exist: {reason}"
+        );
+    }
+
     // A family refusal beats a model refusal when a claim fails both, because the family one is the
     // actionable half — a model refusal would send an operator chasing a model on a harness the seat
     // never offered.
@@ -3998,6 +4119,13 @@ mod tests {
             // rule being stated twice is worth a row here rather than an argument in a comment.
             (None, None, None, &bogus),
             (None, Some("codex"), None, &mixed),
+            // Out-of-vocabulary FAMILY, the axis that had no vocabulary rule until review found it.
+            // Alone, and paired with each other axis, because the check runs on the REQUEST and must
+            // not be reachable only on some paths through the predicate.
+            (None, Some("not-a-family"), None, &[]),
+            (None, Some("not-a-family"), Some("opus"), &[]),
+            (Some("codex"), Some("not-a-family"), None, &[]),
+            (None, Some("not-a-family"), None, &rust),
         ];
 
         for (agent, family, model, capabilities) in shapes {
@@ -4085,6 +4213,12 @@ mod tests {
             unsatisfiable_capability_request(None, Some("codex"), None, &[]).is_none(),
             "control: a family-only request stays valid as a SEAT filter"
         );
+        assert!(
+            unsatisfiable_capability_request(None, Some("not-a-family"), None, &[]).is_some(),
+            "control: a family outside the vocabulary must be refused by the gate — the synthesized \
+             claim advertises exactly that family, so this passes only if the REQUEST is judged \
+             before the claim"
+        );
     }
 
     // A request that matches no live claim PARKS with a reason naming what to fix, rather than
@@ -4168,7 +4302,7 @@ mod tests {
         assert!(
             reason.contains("without a harness preset"),
             "the row must name the REQUEST defect, not blame the claim — an operator reading it has \
-             to know to add a family rather than to go find another seat: {reason}"
+             to know to add the `agent` preset rather than to go find another seat: {reason}"
         );
     }
 
