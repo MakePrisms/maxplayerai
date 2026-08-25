@@ -192,6 +192,18 @@ pub struct JobCredential {
     pub upstream: String,
 }
 
+/// One Codex ChatGPT session whose two required headers must move as one unit.
+///
+/// This type has no `Debug` implementation. Both real fields must stay out of logs and errors.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CodexSessionCredential {
+    pub access_placeholder: String,
+    pub access_token: String,
+    pub account_placeholder: String,
+    pub account_id: String,
+    pub upstream: String,
+}
+
 /// Why a request was refused. Each variant means the real credential was NOT substituted — the
 /// request either failed outright or was forwarded with the (worthless) placeholder untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +215,10 @@ pub enum Refusal {
     /// credential is withheld and the request is refused — the load-bearing invariant that keeps this
     /// from being worse than the status quo.
     DestinationNotAllowed { host: String },
+    /// A request carried a known Codex access placeholder but did not carry both exact auth headers.
+    InvalidCodexHeaders,
+    /// A known Codex session tried a method or path outside its narrow backend route.
+    RequestNotAllowed { method: String, path: String },
 }
 
 impl std::fmt::Display for Refusal {
@@ -214,13 +230,20 @@ impl std::fmt::Display for Refusal {
             Self::DestinationNotAllowed { host } => {
                 write!(f, "destination {host} not on the credential-substitution allowlist")
             }
+            Self::InvalidCodexHeaders => write!(
+                f,
+                "Codex session request did not carry both exact per-job placeholder headers"
+            ),
+            Self::RequestNotAllowed { method, path } => {
+                write!(f, "Codex session request {method} {path} is not allowed")
+            }
         }
     }
 }
 
 /// The outcome of authorizing one request against the engine: either a forward plan whose HEADERS
 /// carry the real credential (destination approved) or a typed [`Refusal`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Decision {
     /// Forward to `upstream` (base URL) with these substituted headers.
     ///
@@ -232,20 +255,42 @@ pub enum Decision {
     Forward {
         upstream: String,
         headers: Vec<(String, String)>,
+        /// Real-to-placeholder substitutions for the response leg only.
+        scrub: Vec<(String, String)>,
     },
     Refuse(Refusal),
+}
+
+impl std::fmt::Debug for Decision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Forward {
+                upstream,
+                headers,
+                scrub,
+            } => f
+                .debug_struct("Forward")
+                .field("upstream", upstream)
+                .field("header_count", &headers.len())
+                .field("scrub_count", &scrub.len())
+                .finish(),
+            Self::Refuse(reason) => f.debug_tuple("Refuse").field(reason).finish(),
+        }
+    }
 }
 
 /// The credential-substitution core: the destination allowlist plus the live per-job registry. Pure
 /// decision logic ([`Self::authorize`]) is separated from all socket I/O so the invariants are
 /// unit-testable without a container, a network, or a real credential.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ProxyEngine {
     /// Approved upstream hosts (lowercased, `host` or `host:port`). The real credential is substituted
     /// only when the resolved destination's host is in this set.
     allowlist: Vec<String>,
     /// Registered per-job credentials, keyed by placeholder value for O(1) identification.
     creds: Mutex<HashMap<String, JobCredential>>,
+    /// Typed Codex sessions, keyed by the access placeholder that identifies the job.
+    codex_sessions: Mutex<HashMap<String, CodexSessionCredential>>,
 }
 
 impl ProxyEngine {
@@ -254,6 +299,7 @@ impl ProxyEngine {
         Self {
             allowlist: hosts.into_iter().map(|h| host_key(&h)).collect(),
             creds: Mutex::new(HashMap::new()),
+            codex_sessions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -284,6 +330,40 @@ impl ProxyEngine {
     /// Drop a job's credential (job end = revocation point). Returns whether one was present.
     pub fn deregister(&self, placeholder: &str) -> bool {
         self.creds.lock().unwrap().remove(placeholder).is_some()
+    }
+
+    /// Register one two-header Codex session. The access placeholder is the sole route identifier.
+    pub fn register_codex_session(&self, cred: CodexSessionCredential) -> Result<(), Refusal> {
+        let host = authority_of(&cred.upstream).ok_or_else(|| Refusal::DestinationNotAllowed {
+            host: cred.upstream.clone(),
+        })?;
+        if !self.allows(&host) {
+            return Err(Refusal::DestinationNotAllowed { host });
+        }
+        if [
+            cred.access_placeholder.as_str(),
+            cred.access_token.as_str(),
+            cred.account_placeholder.as_str(),
+            cred.account_id.as_str(),
+        ]
+        .iter()
+        .any(|value| value.trim().is_empty())
+        {
+            return Err(Refusal::InvalidCodexHeaders);
+        }
+        let placeholders = [&cred.access_placeholder, &cred.account_placeholder];
+        let real_values = [&cred.access_token, &cred.account_id];
+        if placeholders
+            .iter()
+            .any(|placeholder| real_values.contains(placeholder))
+        {
+            return Err(Refusal::InvalidCodexHeaders);
+        }
+        self.codex_sessions
+            .lock()
+            .unwrap()
+            .insert(cred.access_placeholder.clone(), cred);
+        Ok(())
     }
 
     /// The decision for one request, from its headers alone.
@@ -327,21 +407,93 @@ impl ProxyEngine {
         Decision::Forward {
             upstream: cred.upstream,
             headers,
+            scrub: vec![(cred.real, cred.placeholder)],
         }
     }
 
-    /// The real credential registered under `placeholder`, for the response scrub in [`relay`].
-    ///
-    /// Returned as `(real, placeholder)` so the caller can run the substitution in REVERSE on the way
-    /// back. Not a leak of anything the caller does not already hold: [`Self::authorize`] just put this
-    /// same value into the outgoing headers.
-    fn scrub_pair_for(&self, headers: &[(String, String)]) -> Option<(String, String)> {
-        let creds = self.creds.lock().unwrap();
-        creds
+    /// Authorize a transport request. A typed Codex session takes the narrow route; all other
+    /// requests use the existing generic credential behavior.
+    pub fn authorize_request(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+    ) -> Decision {
+        let sessions = self.codex_sessions.lock().unwrap();
+        let matched = sessions
             .values()
-            .find(|c| placeholder_present(&c.placeholder, headers))
-            .map(|c| (c.real.clone(), c.placeholder.clone()))
+            .find(|session| {
+                headers.iter().any(|(name, value)| {
+                    name.eq_ignore_ascii_case("authorization")
+                        && value == &format!("Bearer {}", session.access_placeholder)
+                })
+            })
+            .cloned();
+        drop(sessions);
+        let Some(session) = matched else {
+            return self.authorize(headers);
+        };
+
+        if !codex_request_allowed(method, path) {
+            return Decision::Refuse(Refusal::RequestNotAllowed {
+                method: method.to_owned(),
+                path: path.to_owned(),
+            });
+        }
+        let authorization = format!("Bearer {}", session.access_placeholder);
+        let auth_values: Vec<&str> = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        let account_values: Vec<&str> = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("chatgpt-account-id"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        if auth_values.as_slice() != [authorization.as_str()]
+            || account_values.as_slice() != [session.account_placeholder.as_str()]
+        {
+            return Decision::Refuse(Refusal::InvalidCodexHeaders);
+        }
+
+        let Some(host) = authority_of(&session.upstream) else {
+            return Decision::Refuse(Refusal::DestinationNotAllowed {
+                host: session.upstream.clone(),
+            });
+        };
+        if !self.allows(&host) {
+            return Decision::Refuse(Refusal::DestinationNotAllowed { host });
+        }
+
+        let mut outgoing: Vec<(String, String)> = headers
+            .iter()
+            .filter(|(name, _)| {
+                !is_hop_by_hop(name)
+                    && !name.eq_ignore_ascii_case("authorization")
+                    && !name.eq_ignore_ascii_case("chatgpt-account-id")
+            })
+            .cloned()
+            .collect();
+        outgoing.push((
+            "authorization".to_owned(),
+            format!("Bearer {}", session.access_token),
+        ));
+        outgoing.push(("chatgpt-account-id".to_owned(), session.account_id.clone()));
+        Decision::Forward {
+            upstream: session.upstream,
+            headers: outgoing,
+            scrub: vec![
+                (session.access_token, session.access_placeholder),
+                (session.account_id, session.account_placeholder),
+            ],
+        }
     }
+}
+
+fn codex_request_allowed(method: &str, path: &str) -> bool {
+    (method.eq_ignore_ascii_case("POST") && matches!(path, "/responses" | "/responses/compact"))
+        || (method.eq_ignore_ascii_case("GET") && path == "/models")
 }
 
 /// Whether `placeholder` appears in any header value. Header *names* are not searched: the placeholder
@@ -375,6 +527,26 @@ fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> 
         }
     }
     out
+}
+
+fn replace_bytes_many(haystack: &[u8], substitutions: &[(String, String)]) -> Vec<u8> {
+    substitutions
+        .iter()
+        .fold(haystack.to_vec(), |current, (real, placeholder)| {
+            replace_bytes(&current, real.as_bytes(), placeholder.as_bytes())
+        })
+}
+
+fn scrub_text(text: &str, substitutions: &[(String, String)]) -> String {
+    substitutions
+        .iter()
+        .fold(text.to_owned(), |current, (real, placeholder)| {
+            if real.is_empty() {
+                current
+            } else {
+                current.replace(real, placeholder)
+            }
+        })
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -719,6 +891,7 @@ async fn handle_request(
         .path_and_query()
         .map(|pq| pq.as_str().to_owned())
         .unwrap_or_else(|| "/".to_owned());
+    let request_path = req.uri().path().to_owned();
     let headers: Vec<(String, String)> = req
         .headers()
         .iter()
@@ -754,22 +927,20 @@ async fn handle_request(
         }
     };
 
-    // The reverse-substitution pair for the response leg, resolved from the SAME header match that
-    // authorizes the request. Taken before `authorize` consumes nothing — both read the incoming
-    // headers, so they agree on which job this is.
-    let scrub = engine.scrub_pair_for(&headers);
-
-    match engine.authorize(&headers) {
+    match engine.authorize_request(method.as_str(), &request_path, &headers) {
         Decision::Refuse(reason) => {
             let status = match reason {
                 Refusal::DestinationNotAllowed { .. } => StatusCode::FORBIDDEN,
                 Refusal::NoKnownPlaceholder => StatusCode::BAD_GATEWAY,
+                Refusal::InvalidCodexHeaders | Refusal::RequestNotAllowed { .. } => {
+                    StatusCode::FORBIDDEN
+                }
             };
             Ok(refusal_response(status, &reason.to_string()))
         }
         // `body` is the ORIGINAL buffered request body, forwarded verbatim: the decision never
         // carried it, so nothing substituted a credential into it.
-        Decision::Forward { upstream, headers } => {
+        Decision::Forward { upstream, headers, scrub } => {
             match relay(&client, &method, &upstream, &path_and_query, headers, body, scrub).await {
                 Ok(response) => Ok(response),
                 // No-fallback: an upstream failure fails the request; it never resends without the
@@ -796,7 +967,7 @@ async fn relay(
     path_and_query: &str,
     headers: Vec<(String, String)>,
     body: Bytes,
-    scrub: Option<(String, String)>,
+    scrub: Vec<(String, String)>,
 ) -> Result<Response<ProxyBody>, String> {
     let url = format!("{}{}", upstream.trim_end_matches('/'), path_and_query);
     let method = reqwest::Method::from_bytes(method.as_str().as_bytes())
@@ -818,48 +989,48 @@ async fn relay(
         }
         // Response headers are scrubbed too: an upstream that reflects the credential in a header
         // (`www-authenticate`, a debug echo) must not hand it to the container.
-        match (&scrub, value.to_str()) {
-            (Some((real, placeholder)), Ok(text)) if text.contains(real.as_str()) => {
-                builder = builder.header(name, text.replace(real.as_str(), placeholder));
-            }
-            _ => builder = builder.header(name, value),
+        match value.to_str() {
+            Ok(text) => builder = builder.header(name, scrub_text(text, &scrub)),
+            Err(_) => builder = builder.header(name, value),
         }
     }
     let upstream_body = Box::pin(upstream_response.bytes_stream());
-    let body = match scrub {
-        Some((real, placeholder)) => {
-            BodyExt::boxed(StreamBody::new(scrub_stream(upstream_body, real, placeholder)))
-        }
-        None => BodyExt::boxed(StreamBody::new(
+    let body = if scrub.is_empty() {
+        BodyExt::boxed(StreamBody::new(
             upstream_body.map(|chunk| chunk.map(Frame::data).map_err(std::io::Error::other)),
-        )),
+        ))
+    } else {
+        BodyExt::boxed(StreamBody::new(scrub_stream(upstream_body, scrub)))
     };
     builder
         .body(body)
         .map_err(|error| format!("building proxied response failed: {error}"))
 }
 
-/// Rewrite `real` back to `placeholder` across a streamed response body, without buffering the stream.
+/// Rewrite all real values to placeholders across a response stream without buffering the stream.
 ///
-/// A credential can straddle a chunk boundary, so a naive per-chunk replace would miss it. This holds
-/// back the last `real.len() - 1` bytes of what it would otherwise emit — the longest possible partial
-/// match — and re-examines them once the next chunk arrives. The held-back tail is flushed when the
-/// upstream stream ends.
+/// A credential can straddle a chunk boundary, so a per-chunk replace would miss it. This holds back
+/// enough bytes for the longest possible partial match. It re-examines those bytes with the next
+/// chunk. It flushes the held-back tail when the upstream stream ends.
 ///
 /// SSE responses stay streaming: each chunk is forwarded as it arrives, minus that small carry-over.
 fn scrub_stream<S>(
     inner: S,
-    real: String,
-    placeholder: String,
+    substitutions: Vec<(String, String)>,
 ) -> impl futures_util::Stream<Item = Result<Frame<Bytes>, std::io::Error>>
 where
     S: futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin,
 {
+    let max_real_len = substitutions
+        .iter()
+        .map(|(real, _)| real.len())
+        .max()
+        .unwrap_or(0);
     // `None` inner ⇒ the stream is finished (ended or errored); stop yielding.
     futures_util::stream::unfold(
         (Some(inner), Vec::<u8>::new()),
         move |(inner, carry)| {
-            let (real, placeholder) = (real.clone(), placeholder.clone());
+            let substitutions = substitutions.clone();
             async move {
                 let mut inner = inner?;
                 let mut carry = carry;
@@ -867,10 +1038,9 @@ where
                     match inner.next().await {
                         Some(Ok(chunk)) => {
                             carry.extend_from_slice(&chunk);
-                            let replaced =
-                                replace_bytes(&carry, real.as_bytes(), placeholder.as_bytes());
+                            let replaced = replace_bytes_many(&carry, &substitutions);
                             // Everything but a possible split match at the tail is safe to emit.
-                            let hold = real.len().saturating_sub(1).min(replaced.len());
+                            let hold = max_real_len.saturating_sub(1).min(replaced.len());
                             let split = replaced.len() - hold;
                             if split == 0 {
                                 // Nothing emittable yet — keep pulling rather than yielding empty.
@@ -885,8 +1055,7 @@ where
                             return Some((Err(std::io::Error::other(error)), (None, Vec::new())));
                         }
                         None => {
-                            let tail =
-                                replace_bytes(&carry, real.as_bytes(), placeholder.as_bytes());
+                            let tail = replace_bytes_many(&carry, &substitutions);
                             if tail.is_empty() {
                                 return None;
                             }
@@ -920,6 +1089,10 @@ mod tests {
 
     const REAL: &str = "sk-ant-api03-REALaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const UPSTREAM: &str = ANTHROPIC_DEFAULT_UPSTREAM;
+    const CODEX_ACCESS_PLACEHOLDER: &str = "synthetic.header.access-placeholder";
+    const CODEX_ACCOUNT_PLACEHOLDER: &str = "account-placeholder";
+    const CODEX_REAL_ACCESS: &str = "real-access-token-sentinel";
+    const CODEX_REAL_ACCOUNT: &str = "real-account-sentinel";
 
     fn engine_with_job(placeholder: &str, upstream: &str) -> ProxyEngine {
         let engine = ProxyEngine::new([authority_of(UPSTREAM).unwrap()]);
@@ -938,6 +1111,140 @@ mod tests {
 
     fn hdr(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    fn register_codex_session(engine: &ProxyEngine, upstream: &str) {
+        engine
+            .register_codex_session(CodexSessionCredential {
+                access_placeholder: CODEX_ACCESS_PLACEHOLDER.to_owned(),
+                access_token: CODEX_REAL_ACCESS.to_owned(),
+                account_placeholder: CODEX_ACCOUNT_PLACEHOLDER.to_owned(),
+                account_id: CODEX_REAL_ACCOUNT.to_owned(),
+                upstream: upstream.to_owned(),
+            })
+            .expect("register the synthetic Codex session");
+    }
+
+    #[test]
+    fn codex_session_rewrites_both_exact_headers_for_an_approved_request() {
+        let engine = ProxyEngine::new(["chatgpt.com".to_owned()]);
+        register_codex_session(&engine, "https://chatgpt.com/backend-api/codex");
+        let headers = hdr(&[
+            ("Authorization", &format!("Bearer {CODEX_ACCESS_PLACEHOLDER}")),
+            ("ChatGPT-Account-ID", CODEX_ACCOUNT_PLACEHOLDER),
+            ("content-type", "application/json"),
+            ("connection", "keep-alive"),
+        ]);
+
+        match engine.authorize_request("POST", "/responses", &headers) {
+            Decision::Forward { upstream, headers, scrub } => {
+                assert_eq!(upstream, "https://chatgpt.com/backend-api/codex");
+                assert_eq!(
+                    headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                        .map(|(_, value)| value.as_str()),
+                    Some("Bearer real-access-token-sentinel")
+                );
+                assert_eq!(
+                    headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("chatgpt-account-id"))
+                        .map(|(_, value)| value.as_str()),
+                    Some(CODEX_REAL_ACCOUNT)
+                );
+                assert!(
+                    !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("connection")),
+                    "the typed route must still remove hop-by-hop headers"
+                );
+                assert_eq!(
+                    scrub,
+                    vec![
+                        (CODEX_REAL_ACCESS.to_owned(), CODEX_ACCESS_PLACEHOLDER.to_owned()),
+                        (CODEX_REAL_ACCOUNT.to_owned(), CODEX_ACCOUNT_PLACEHOLDER.to_owned()),
+                    ]
+                );
+            }
+            other => panic!("expected the Codex session to forward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_session_refuses_unapproved_methods_paths_and_headers() {
+        let engine = ProxyEngine::new(["chatgpt.com".to_owned()]);
+        register_codex_session(&engine, "https://chatgpt.com/backend-api/codex");
+        let valid = hdr(&[
+            ("authorization", &format!("Bearer {CODEX_ACCESS_PLACEHOLDER}")),
+            ("chatgpt-account-id", CODEX_ACCOUNT_PLACEHOLDER),
+        ]);
+
+        for (method, path) in [("DELETE", "/responses"), ("POST", "/other")] {
+            assert_eq!(
+                engine.authorize_request(method, path, &valid),
+                Decision::Refuse(Refusal::RequestNotAllowed {
+                    method: method.to_owned(),
+                    path: path.to_owned(),
+                })
+            );
+        }
+
+        for headers in [
+            hdr(&[(
+                "authorization",
+                &format!("Bearer {CODEX_ACCESS_PLACEHOLDER}"),
+            )]),
+            hdr(&[
+                ("authorization", &format!("Bearer {CODEX_ACCESS_PLACEHOLDER}")),
+                ("chatgpt-account-id", "wrong-account-placeholder"),
+            ]),
+            hdr(&[
+                ("authorization", &format!("Bearer {CODEX_ACCESS_PLACEHOLDER}")),
+                ("authorization", "Bearer second-value"),
+                ("chatgpt-account-id", CODEX_ACCOUNT_PLACEHOLDER),
+            ]),
+            hdr(&[
+                ("authorization", &format!("Bearer {CODEX_ACCESS_PLACEHOLDER}")),
+                ("chatgpt-account-id", CODEX_ACCOUNT_PLACEHOLDER),
+                ("chatgpt-account-id", "second-account"),
+            ]),
+        ] {
+            assert_eq!(
+                engine.authorize_request("POST", "/responses", &headers),
+                Decision::Refuse(Refusal::InvalidCodexHeaders)
+            );
+        }
+
+        assert!(matches!(
+            engine.authorize_request("GET", "/models", &valid),
+            Decision::Forward { .. }
+        ));
+
+        let unsafe_placeholder = CodexSessionCredential {
+            access_placeholder: CODEX_REAL_ACCESS.to_owned(),
+            access_token: CODEX_REAL_ACCESS.to_owned(),
+            account_placeholder: CODEX_ACCOUNT_PLACEHOLDER.to_owned(),
+            account_id: CODEX_REAL_ACCOUNT.to_owned(),
+            upstream: "https://chatgpt.com/backend-api/codex".to_owned(),
+        };
+        assert_eq!(
+            engine.register_codex_session(unsafe_placeholder),
+            Err(Refusal::InvalidCodexHeaders),
+            "a placeholder must never equal a real session value"
+        );
+    }
+
+    #[test]
+    fn codex_session_decision_debug_text_redacts_real_values() {
+        let engine = ProxyEngine::new(["chatgpt.com".to_owned()]);
+        register_codex_session(&engine, "https://chatgpt.com/backend-api/codex");
+        let headers = hdr(&[
+            ("authorization", &format!("Bearer {CODEX_ACCESS_PLACEHOLDER}")),
+            ("chatgpt-account-id", CODEX_ACCOUNT_PLACEHOLDER),
+        ]);
+
+        let debug = format!("{:?}", engine.authorize_request("POST", "/responses", &headers));
+        assert!(!debug.contains(CODEX_REAL_ACCESS));
+        assert!(!debug.contains(CODEX_REAL_ACCOUNT));
     }
 
     /// Substring search over raw bytes, for asserting a credential is (or is not) present.
@@ -1055,6 +1362,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn codex_session_proxy_keeps_the_body_and_scrubs_both_response_values() {
+        let response_body = format!("access={CODEX_REAL_ACCESS};account={CODEX_REAL_ACCOUNT}");
+        let response_header = format!(
+            "x-session-echo: Bearer {CODEX_REAL_ACCESS}; account={CODEX_REAL_ACCOUNT}"
+        );
+        let (stub_addr, stub) = spawn_stub_with(response_body, Some(response_header)).await;
+        let upstream = format!("http://{stub_addr}");
+        let engine = Arc::new(ProxyEngine::new([authority_of(&upstream).unwrap()]));
+        register_codex_session(&engine, &upstream);
+        let proxy = start(Arc::clone(&engine), reqwest::Client::new(), None)
+            .await
+            .expect("start the local proxy");
+        let hostile_body = format!(
+            "{{\"input\":\"{CODEX_ACCESS_PLACEHOLDER}:{CODEX_ACCOUNT_PLACEHOLDER}\"}}"
+        );
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/responses?test=1", proxy.local_addr()))
+            .header(
+                "authorization",
+                format!("Bearer {CODEX_ACCESS_PLACEHOLDER}"),
+            )
+            .header("chatgpt-account-id", CODEX_ACCOUNT_PLACEHOLDER)
+            .body(hostile_body.clone())
+            .send()
+            .await
+            .expect("send through the local proxy");
+
+        assert_eq!(response.status(), 200);
+        let echoed_header = response
+            .headers()
+            .get("x-session-echo")
+            .expect("the upstream response header")
+            .to_str()
+            .expect("text response header")
+            .to_owned();
+        let returned_body = response.text().await.expect("response body");
+        assert!(!echoed_header.contains(CODEX_REAL_ACCESS));
+        assert!(!echoed_header.contains(CODEX_REAL_ACCOUNT));
+        assert!(echoed_header.contains(CODEX_ACCESS_PLACEHOLDER));
+        assert!(echoed_header.contains(CODEX_ACCOUNT_PLACEHOLDER));
+        assert_eq!(
+            returned_body,
+            format!("access={CODEX_ACCESS_PLACEHOLDER};account={CODEX_ACCOUNT_PLACEHOLDER}")
+        );
+
+        let seen = stub.await.expect("stub result");
+        assert_eq!(seen.authorization.as_deref(), Some("Bearer real-access-token-sentinel"));
+        assert_eq!(seen.account_id.as_deref(), Some(CODEX_REAL_ACCOUNT));
+        assert_eq!(seen.body, hostile_body, "the request body must stay byte-identical");
+        assert!(seen.request_line.contains("/responses?test=1"));
+    }
+
     // A placeholder ONLY in the body identifies nothing: it cannot authenticate upstream (the vendor
     // reads a header), so treating it as identification widened the attack surface for no gain.
     #[test]
@@ -1138,6 +1499,8 @@ mod tests {
     struct StubSeen {
         request_line: String,
         api_key: Option<String>,
+        authorization: Option<String>,
+        account_id: Option<String>,
         /// The request BODY as the upstream received it — the ground truth for "no credential was
         /// written into a job-authored body".
         body: String,
@@ -1205,6 +1568,16 @@ mod tests {
                 let (name, value) = line.split_once(':')?;
                 name.eq_ignore_ascii_case("x-api-key").then(|| value.trim().to_owned())
             });
+            let authorization = text.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim().to_owned())
+            });
+            let account_id = text.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("chatgpt-account-id")
+                    .then(|| value.trim().to_owned())
+            });
             let extra = extra_header.map(|h| format!("{h}\r\n")).unwrap_or_default();
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/plain\r\n{}\r\n{}",
@@ -1214,7 +1587,7 @@ mod tests {
             );
             sock.write_all(response.as_bytes()).await.unwrap();
             sock.flush().await.unwrap();
-            StubSeen { request_line, api_key, body }
+            StubSeen { request_line, api_key, authorization, account_id, body }
         });
         (addr, handle)
     }
@@ -1368,8 +1741,7 @@ mod tests {
         ];
         let scrubbed = scrub_stream(
             futures_util::stream::iter(frames),
-            REAL.to_owned(),
-            placeholder.clone(),
+            vec![(REAL.to_owned(), placeholder.clone())],
         );
         let collected: Vec<u8> = scrubbed
             .try_fold(Vec::new(), |mut acc, frame| async move {
@@ -1387,6 +1759,41 @@ mod tests {
             "a split credential must still be rewritten, and nothing else may be lost"
         );
         assert!(!text.contains(REAL), "no fragment of the real credential survives");
+    }
+
+    #[tokio::test]
+    async fn codex_session_response_scrub_catches_both_values_across_chunks() {
+        use futures_util::TryStreamExt as _;
+
+        let (access_head, access_tail) = CODEX_REAL_ACCESS.split_at(8);
+        let (account_head, account_tail) = CODEX_REAL_ACCOUNT.split_at(7);
+        let frames: Vec<reqwest::Result<Bytes>> = vec![
+            Ok(Bytes::from(format!("start-{access_head}"))),
+            Ok(Bytes::from(format!("{access_tail}-middle-{account_head}"))),
+            Ok(Bytes::from(format!("{account_tail}-end"))),
+        ];
+        let scrubbed = scrub_stream(
+            futures_util::stream::iter(frames),
+            vec![
+                (CODEX_REAL_ACCESS.to_owned(), CODEX_ACCESS_PLACEHOLDER.to_owned()),
+                (CODEX_REAL_ACCOUNT.to_owned(), CODEX_ACCOUNT_PLACEHOLDER.to_owned()),
+            ],
+        );
+        let collected: Vec<u8> = scrubbed
+            .try_fold(Vec::new(), |mut acc, frame| async move {
+                if let Ok(data) = frame.into_data() {
+                    acc.extend_from_slice(&data);
+                }
+                Ok(acc)
+            })
+            .await
+            .expect("collect scrubbed frames");
+        assert_eq!(
+            String::from_utf8(collected).expect("UTF-8 result"),
+            format!(
+                "start-{CODEX_ACCESS_PLACEHOLDER}-middle-{CODEX_ACCOUNT_PLACEHOLDER}-end"
+            )
+        );
     }
 
     // #647 acceptance #1 (plumbing): a request carrying the placeholder is forwarded to the approved
