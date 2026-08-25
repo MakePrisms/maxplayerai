@@ -869,6 +869,11 @@ pub async fn start_with_legs(
         ));
     }
 
+    eprintln!("proxy: listener kind=primary port={}", addr.port());
+    for (authority, leg_addr) in &leg_addrs {
+        eprintln!("proxy: listener kind=leg authority={authority} port={}", leg_addr.port());
+    }
+
     Ok(RunningProxy { addr, leg_addrs, engine, tasks })
 }
 
@@ -954,6 +959,60 @@ fn spawn_accept_loop(
 
 type ProxyBody = BoxBody<Bytes, std::io::Error>;
 
+// --- Per-request diagnostic logging (leg-level observability) --------------------------------------
+//
+// Emitted to stderr as `proxy: key=value` lines, matching the daemon's existing `sandbox:` convention:
+// no logging dependency, no subscriber, so a line always reaches the seat's captured stderr. A line
+// NEVER carries a credential value, a placeholder, or any header/body byte — only authorities, hosts,
+// ports, protocols, phases, wall-clock timings and outcomes.
+//
+// The question this exists to answer is WHO ended a stalled await — the container that gave up, or the
+// upstream that dropped the request. A log recording only "no response" cannot tell those apart: they
+// are byte-identical downstream. `terminated_by=` is that field.
+static PROXY_REQ_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Milliseconds since the Unix epoch. The FORWARD line's stamp is the anchor every wait is measured
+/// from: the container's outbound send time is not otherwise observable, so a duration differenced
+/// against the nearest visible ACP event (a title notification, say) is anchored to the wrong instant.
+fn proxy_log_now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0)
+}
+
+/// Records `terminated_by=downstream` if dropped before the upstream terminated the await.
+///
+/// A forwarded request holds one of these across [`relay`]. [`AwaitGuard::settle`] is called the instant
+/// the upstream returns a response header OR an error, disarming it. If instead the container closes its
+/// connection while the proxy is still awaiting the upstream, hyper drops the request future, this value
+/// is dropped un-settled, and the drop records that the CONTAINER (downstream) ended the wait. That is
+/// the single field separating a client-side timeout from an upstream-side one.
+struct AwaitGuard {
+    req: u64,
+    host: String,
+    settled: bool,
+}
+
+impl AwaitGuard {
+    fn settle(&mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for AwaitGuard {
+    fn drop(&mut self) {
+        if !self.settled {
+            eprintln!(
+                "proxy: req#{} ts={} phase=await_response terminated_by=downstream host={}",
+                self.req,
+                proxy_log_now_ms(),
+                self.host,
+            );
+        }
+    }
+}
+
 /// Serve one request: run its HEADERS through [`ProxyEngine::authorize`] and — only on a substituted
 /// forward — stream its body to the real upstream and stream the response back. A refusal returns a
 /// `4xx`/`5xx` to the container with the real credential never in play, and without reading the body.
@@ -968,6 +1027,15 @@ async fn handle_request(
     via_authority: Option<String>,
 ) -> Result<Response<ProxyBody>, std::convert::Infallible> {
     let method = req.method().clone();
+    let proxy_req = PROXY_REQ_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // `req.version()` is the NEGOTIATED protocol (HTTP/2.0 for the h2c legs, HTTP/1.1 otherwise) — it
+    // decides whether an http1-only timeout like `header_read_timeout` is even in scope for this leg.
+    let listener_label = via_authority.as_deref().unwrap_or("primary").to_owned();
+    eprintln!(
+        "proxy: req#{proxy_req} ts={} phase=arrived listener={listener_label} proto={:?} method={method}",
+        proxy_log_now_ms(),
+        req.version(),
+    );
     // The path+query is forwarded verbatim; it is never a substitution input.
     let path_and_query = req
         .uri()
@@ -999,6 +1067,10 @@ async fn handle_request(
     };
     match decision {
         Decision::Refuse(reason) => {
+            eprintln!(
+                "proxy: req#{proxy_req} ts={} phase=authorize outcome=refuse reason={reason}",
+                proxy_log_now_ms(),
+            );
             let status = match reason {
                 Refusal::DestinationNotAllowed { .. } => StatusCode::FORBIDDEN,
                 Refusal::NoKnownPlaceholder => StatusCode::BAD_GATEWAY,
@@ -1009,6 +1081,11 @@ async fn handle_request(
             Ok(refusal_response(status, &reason.to_string()))
         }
         Decision::Forward { upstream, headers } => {
+            let host = authority_of(&upstream).unwrap_or_else(|| upstream.clone());
+            eprintln!(
+                "proxy: req#{proxy_req} ts={} phase=forward host={host}",
+                proxy_log_now_ms(),
+            );
             // The body is RELAYED, never accumulated: each chunk goes upstream as it arrives, so the
             // daemon holds one chunk rather than a whole request, and a client that never closes its
             // body is no longer a client we wait for forever. It is forwarded VERBATIM — the decision
@@ -1017,11 +1094,35 @@ async fn handle_request(
                 req.into_body().into_data_stream(),
                 BODY_IDLE_TIMEOUT,
             ));
-            match relay(&client, &method, &upstream, &path_and_query, headers, body, scrub).await {
+            // Held across the await. `settle` disarms it the instant the upstream terminates the await
+            // (a response header or an error); if the CONTAINER closes first, this drops un-settled and
+            // records `terminated_by=downstream` — the field that tells a client timeout from an
+            // upstream drop, which are otherwise byte-identical as "no response".
+            let mut await_guard = AwaitGuard { req: proxy_req, host: host.clone(), settled: false };
+            let outcome = relay(
+                &client,
+                &method,
+                &upstream,
+                &path_and_query,
+                headers,
+                body,
+                scrub,
+                proxy_req,
+                &host,
+            )
+            .await;
+            await_guard.settle();
+            match outcome {
                 Ok(response) => Ok(response),
                 // No-fallback: an upstream failure fails the request; it never resends without the
                 // proxy or with the real credential in the container.
-                Err(message) => Ok(refusal_response(StatusCode::BAD_GATEWAY, &message)),
+                Err(message) => {
+                    eprintln!(
+                        "proxy: req#{proxy_req} ts={} phase=await_response terminated_by=upstream kind=error host={host} msg={message}",
+                        proxy_log_now_ms(),
+                    );
+                    Ok(refusal_response(StatusCode::BAD_GATEWAY, &message))
+                }
             }
         }
     }
@@ -1044,6 +1145,8 @@ async fn relay(
     headers: Vec<(String, String)>,
     body: reqwest::Body,
     scrub: Option<(String, String)>,
+    req: u64,
+    host: &str,
 ) -> Result<Response<ProxyBody>, String> {
     let url = format!("{}{}", upstream.trim_end_matches('/'), path_and_query);
     let method = reqwest::Method::from_bytes(method.as_str().as_bytes())
@@ -1052,12 +1155,25 @@ async fn relay(
     for (name, value) in headers {
         request = request.header(name, value);
     }
+    // The anchor for this request's wait: the outbound send, otherwise unobservable. Every duration
+    // derived downstream is measured from THIS `ts`, never from the nearest visible event.
+    eprintln!(
+        "proxy: req#{req} ts={} phase=await_send host={host}",
+        proxy_log_now_ms(),
+    );
     let upstream_response = request
         .send()
         .await
         .map_err(|error| format!("upstream request failed: {error}"))?;
 
     let status = upstream_response.status();
+    // The upstream terminated the await by answering. Pairs with `await_send` above: the interval
+    // between these two `ts` values IS the send->response-header wait for this request.
+    eprintln!(
+        "proxy: req#{req} ts={} phase=await_response terminated_by=upstream kind=response_header host={host} status={}",
+        proxy_log_now_ms(),
+        status.as_u16(),
+    );
     let mut builder = Response::builder().status(status.as_u16());
     for (name, value) in upstream_response.headers() {
         if is_hop_by_hop(name.as_str()) {
