@@ -1355,7 +1355,7 @@ mod checks {
                 other => Check::warn(
                     CONTAINMENT_CHECK,
                     format!("targeted-only seat, so advisory — {}", other.detail()),
-                    "this seat only runs work from counterparties it accepts; configure a working [sandbox] launcher before serving the open pool",
+                    "advisory because this seat does not claim open-pool offers, NOT because the exposure is lower: any buyer can target this pubkey, so a targeted job runs the same stranger-written task text. Configure a working [sandbox] launcher; restrict WHICH buyers you claim from with `accept_offers_only_from`",
                 ),
             };
         }
@@ -1385,7 +1385,7 @@ mod checks {
             Err(detail) => Check::fail(
                 CONTAINMENT_CHECK,
                 format!("this seat claims OPEN-POOL jobs — arbitrary code from strangers — and {detail}"),
-                "configure a [sandbox] launcher that passes `maxplayer sandbox-probe`, or drop open-pool claiming (--no-claim-open-pool), or accept the exposure deliberately with --unsafe-no-sandbox",
+                "configure a [sandbox] launcher that passes `maxplayer sandbox-probe` — the only one of these that adds containment. `--no-claim-open-pool` silences this check without reducing exposure (a targeted job runs the same stranger-written task text); `--unsafe-no-sandbox` accepts the exposure deliberately",
             ),
         }
     }

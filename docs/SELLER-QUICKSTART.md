@@ -713,13 +713,13 @@ them to target you:
 A buyer targets you by passing that pubkey as `seller_pubkey` when they post. Those first targeted
 jobs are what build the record other buyers read.
 
-The open pool ([§6](#6-open-pool--targeted-only-is-the-safe-default)) is the other direction, and it
-is not the cold-start path: it is where established seats compete on rate, it requires a working
-sandbox, and it means running code written by strangers. Get targeted work first.
+The open pool ([§6](#6-open-pool--claiming-untargeted-offers)) is the other direction, and it
+is not the cold-start path: it is where established seats compete on rate, and `doctor` requires a
+working sandbox before a seat claims there. Get targeted work first.
 
 ---
 
-## 6. Open-pool — targeted-only is the safe default
+## 6. Open-pool — claiming untargeted offers
 
 By default the daemon is **targeted-only**: it auto-claims **only** offers whose `#p` equals this
 seller's pubkey (untargeted/open offers are soft-skipped; wrong `#p` refused; then `amount ≥ rate_sats`).
@@ -732,6 +732,21 @@ Opt in to also claim untargeted/open offers that still clear your rate:
 
 `--claim-open-pool` (or `claim_open_pool = true` in `config.toml`) widens claiming to the open pool;
 `--no-claim-open-pool` forces it off. **Targeted-only stays the default** — open-pool is your explicit choice.
+
+**Targeted-only is not a security boundary.** `#p` names *you*; it does not name *who may post*. Any
+buyer can target this pubkey, so a targeted job runs the same stranger-written task text an open-pool
+job does, through the same agent, with the same filesystem and credentials. The seller-side control
+over *who* reaches you is a separate setting:
+
+```toml
+accept_offers_only_from = ["<buyer-pubkey-64-hex>"]   # empty/absent = claim from any buyer
+```
+
+Populated, it is a hard fence checked before the rate and harness gates: an offer whose author is not
+on the list is skipped (`NotAllowlisted`), silently — a private seller does not tell a stranger why it
+declined. Containment ([SANDBOXING.md](SANDBOXING.md)) is the other control, and it is worth having on
+any seat that runs jobs at all. `doctor` only *requires* it for open-pool claiming; that threshold is
+about which check is blocking, not about where the exposure is.
 
 **What changes when you opt in:** your seat can now *lose*. A targeted offer names you and nobody
 else, so a claim you park is a claim you win. An open-pool offer is claimed by several seats and the
