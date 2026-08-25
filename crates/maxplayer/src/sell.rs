@@ -1121,9 +1121,12 @@ mod tests {
 
     #[test]
     fn sell_writeback_preserves_operator_accept_offers_only_from() {
-        // #482 / #369-class: a steady-state relaunch must NOT clobber an operator's buyer allowlist
-        // back to accept-all — a private seller must stay private across a bare `sell` relaunch. Seed
-        // a populated allowlist, relaunch, and assert it survives the write-back.
+        // #482 / #369-class: a steady-state relaunch must NOT clobber an operator's buyer allowlist —
+        // a private seller must stay private across a bare `sell` relaunch. Seed a populated
+        // allowlist, relaunch, and assert it survives the write-back. (Clobbering it no longer means
+        // "back to accept-all": since the three-knob change an empty list means no buyer named, so the
+        // damage is a seat that claims NOTHING rather than one that claims from everyone. Still a
+        // clobber, opposite direction — see the accept_open_targeted twin below.)
         let root = std::env::temp_dir().join(format!(
             "maxplayer-482-allowlist-{}-{}",
             std::process::id(),

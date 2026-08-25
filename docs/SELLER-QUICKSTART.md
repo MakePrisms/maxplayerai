@@ -125,7 +125,8 @@ All four are overridable in `config.toml`.
 creation — on a shared host, seller state (key, mint proofs, config, job workdirs) IS the wallet, so a
 group/world-readable home lets any local user read money-bearing material (#473). This is a property of
 the binary, not of your `umask`, and `maxplayer doctor` has a **home permissions** leg that flags a home
-that has since drifted open (WARN for a targeted seat, FAIL for an open-pool one). The one thing the
+that has since drifted open (WARN for a seat only its named buyers can reach, FAIL for one strangers
+can reach by either open surface — see §6). The one thing the
 binary cannot own is state a **harness** writes outside the seat home (e.g. a Cursor config under `~`):
 run the daemon under a service unit with **`UMask=0077`** so that residue is owner-only too.
 
@@ -518,7 +519,8 @@ An existing seat on `launcher` is never moved by an upgrade — see *Moving an e
 ### `launcher` mode — only if this box cannot run docker
 
 The launcher below is `bwrap` (bubblewrap), and it is not present on a stock box. Install it before
-you configure the section, or the boot gate refuses to start an open-pool seat:
+you configure the section, or the boot gate refuses to start a seat strangers can reach — one that
+claims the open pool OR accepts targeted offers from buyers it has not named:
 
 ```bash
 command -v bwrap            # prints a path once installed

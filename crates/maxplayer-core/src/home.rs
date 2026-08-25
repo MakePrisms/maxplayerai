@@ -1717,8 +1717,10 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
     out.push_str(
         r#"# --- [sandbox]: how an awarded job runs. Uncomment ONE option below. ---
 # With no [sandbox] section (the default here) the agent runs PASS-THROUGH:
-# directly as this daemon, with no isolation. A seat that claims open-pool
-# work is refused at the boot gate until a real sandbox is configured.
+# directly as this daemon, with no isolation. A seat that strangers can reach
+# — one that claims open-pool work OR accepts targeted offers from buyers it
+# has not named — is refused at the boot gate until a real sandbox is
+# configured.
 #
 # USE DOCKER. It is the only mode with a kernel boundary and egress
 # containment, and the only one that exists on macOS.

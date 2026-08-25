@@ -2883,14 +2883,15 @@ mod tests {
         let below =
             EngineProbe::Reported(EngineVersion::parse("24.0.9").expect("'24.0.9' must parse"));
 
-        // An open-pool seat executes code posted by strangers, so the finding blocks boot — the same
-        // exposure split check_home_permissions and check_sandbox_containment already apply.
-        let open_pool = checks::fold_sandbox_engine_floor(&below, None, true);
-        let rendered = open_pool.render();
+        // A seat strangers can reach executes code they posted, so the finding blocks boot — the same
+        // exposure split check_home_permissions and check_sandbox_containment apply. The bool is
+        // `serves_strangers`: EITHER open surface sets it, not open-pool claiming alone.
+        let serves_strangers = checks::fold_sandbox_engine_floor(&below, None, true);
+        let rendered = serves_strangers.render();
         assert_eq!(
-            open_pool.status,
+            serves_strangers.status,
             Status::Fail,
-            "an open-pool seat below the floor must FAIL: {rendered}"
+            "a seat strangers can reach, below the floor, must FAIL: {rendered}"
         );
         for needle in ["24.0.9", "25.0.0", "io_uring_setup", "BELOW"] {
             assert!(rendered.contains(needle), "below-floor text must name '{needle}': {rendered}");
@@ -2900,13 +2901,15 @@ mod tests {
             "below-floor text must carry the actionable fix, not just the finding: {rendered}"
         );
 
-        // A targeted-only seat chose its counterparties, so the same finding is advisory there.
-        let targeted = checks::fold_sandbox_engine_floor(&below, None, false);
+        // A seat reachable only by the buyers its operator NAMED chose its counterparties, so the same
+        // finding is advisory there. ⛔Not "targeted-only": a seat with `accept_open_targeted` takes
+        // targeted offers from buyers it never named and is escalated with the open-pool case.
+        let named_buyers_only = checks::fold_sandbox_engine_floor(&below, None, false);
         assert_eq!(
-            targeted.status,
+            named_buyers_only.status,
             Status::Warn,
-            "a targeted seat below the floor WARNs: {}",
-            targeted.render()
+            "a seat only its named buyers can reach, below the floor, WARNs: {}",
+            named_buyers_only.render()
         );
     }
 
@@ -2933,7 +2936,7 @@ mod tests {
         assert_eq!(
             checks::fold_sandbox_engine_floor(&just_below, None, true).status,
             Status::Fail,
-            "24.9.9 is below 25.0.0 and must still FAIL an open-pool seat"
+            "24.9.9 is below 25.0.0 and must still FAIL a seat strangers can reach"
         );
     }
 
@@ -2973,7 +2976,7 @@ mod tests {
         assert_eq!(
             checks::fold_sandbox_engine_floor(&below, None, true).status,
             Status::Fail,
-            "control: the same Engine FAILs an open-pool seat under the default runtime"
+            "control: the same Engine FAILs a seat strangers can reach under the default runtime"
         );
 
         let under_gvisor = checks::fold_sandbox_engine_floor(&below, Some("runsc"), true);
@@ -3370,7 +3373,8 @@ mod tests {
     }
 
     // #473: the perms leg VERIFIES the owner-only invariant bootstrap enforces — PASS when owner-only,
-    // WARN for a targeted seat that drifted open, FAIL for an open-pool one. Pure over two real dirs,
+    // WARN for a seat only its named buyers can reach, FAIL for one strangers can reach by EITHER open
+    // surface (the bool is `serves_strangers`, not `claim_open_pool`). Pure over two real dirs,
     // so no agent or network. Access-exposure is orthogonal to the mint (testnut vs real is irrelevant).
     #[cfg(all(unix, feature = "wallet"))]
     #[test]
@@ -3395,12 +3399,12 @@ mod tests {
         assert_eq!(
             checks::check_home_permissions(home.clone(), wallet.clone(), false).status,
             Status::Warn,
-            "a group/world-accessible home is a WARN for a targeted seat"
+            "a group/world-accessible home is a WARN for a seat only its named buyers can reach"
         );
         assert_eq!(
             checks::check_home_permissions(home.clone(), wallet.clone(), true).status,
             Status::Fail,
-            "…and a FAIL for an open-pool seat"
+            "…and a FAIL for a seat strangers can reach — by EITHER open surface, not open-pool alone"
         );
 
         let _ = std::fs::remove_dir_all(&base);
