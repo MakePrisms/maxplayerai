@@ -65,6 +65,27 @@ pub const ACCEPTED_MINTS_TAG: &str = "accepted_mints";
 /// [`crate::agent_presets::HARNESS_FAMILIES`]; a preset with no family contributes nothing.
 pub const HARNESS_FAMILY_TAG: &str = "harness_family";
 
+/// Offer param naming the harness family a job REQUESTS (#897):
+/// `["param", "harness_family", "<family>"]`, single-value, matched against
+/// [`HARNESS_FAMILY_TAG`].
+///
+/// Same word as the advertisement deliberately: the buyer's request and the seat's claim are
+/// compared by exact equality, so spelling them from one constant is what keeps the two sides in one
+/// vocabulary. A request param that drifted from the advertisement tag would filter on a word no
+/// seat can say, and nothing would flag it.
+///
+/// Distinct from [`crate::seller_agents::AGENT_PARAM`], which names a PRESET, and the difference is
+/// what each one BINDS. A family request selects WHICH SEATS MAY CLAIM: it is matched against
+/// [`HARNESS_FAMILY_TAG`] at award time and refuses a seat that does not advertise it. It does NOT
+/// choose which harness a winning seat then dispatches — only the preset reaches execution
+/// (`offer_row` persists `requested_agent` alone, `classify_offer` gates on it, and `execute_job`
+/// hands it to `SellerAgents::dispatch`, which runs the seat's FIRST configured preset when it is
+/// absent). So a multi-harness seat can satisfy a family request and run a different harness.
+///
+/// A request that must bind execution therefore names the preset, and a model request REQUIRES one
+/// — see [`crate::buyer::lifecycle::CapabilityRefusal::ModelWithoutHarnessPreset`].
+pub const HARNESS_FAMILY_PARAM: &str = "harness_family";
+
 /// Wire tag pairing ONE serving harness to the model it LAST REPORTED (#784):
 /// `["harness_model", "<family>", "<model-id>"]`, REPEATED once per serving harness.
 ///
@@ -110,10 +131,15 @@ pub const HARNESS_FAMILY_TAG: &str = "harness_family";
 /// ## Why paired, and why not a flat list
 ///
 /// A model belongs to a harness; it is not an independent axis. On a multi-harness seat a bare model
-/// does not say which harness would run, and the harness is what dispatch enforces
-/// ([`crate::seller_agents::AgentRegistry::dispatch`] is exact-or-nothing). So a buyer filtering on a
-/// model must be able to name the harness that carries it — then the model request is a REFINEMENT
-/// of a harness request and inherits the guarantee that already exists, with no new seller logic.
+/// does not say which harness would run, so the ADVERTISEMENT pairs each model to the family that
+/// carries it — a flat list could not say which is which.
+///
+/// ⚠ Pairing the advertisement is not the same as binding execution, and the two must not be run
+/// together. What dispatch selects on is the PRESET
+/// ([`crate::seller_agents::AgentRegistry::dispatch`] is exact-or-nothing on the preset NAME, and
+/// falls back to the seat's first preset when none is named). A family is not read there at all. So
+/// a model request inherits no guarantee from a family request; it is the `agent` preset that a
+/// model must be paired with on the REQUEST side, and only that pairing reaches execution.
 ///
 /// The flat `["models", id, …]` this replaces cannot express that pairing. Pairing by POSITION
 /// against the family list was rejected for a sharper reason: a harness that reports no model
@@ -135,6 +161,22 @@ pub const HARNESS_FAMILY_TAG: &str = "harness_family";
 /// and a detector that always fires is not a detector. Issue #785 carries the model-selection work
 /// that would close the gap properly.
 pub const HARNESS_MODEL_TAG: &str = "harness_model";
+
+/// Offer param naming the model a job REQUESTS (#897):
+/// `["param", "harness_model", "<model>"]`, single-value, matched against [`HARNESS_MODEL_TAG`].
+///
+/// ⚠ ONLY MEANINGFUL PAIRED WITH THE `agent` PRESET, and a model arriving without one refuses every
+/// claim rather than being ignored — the PAIR is the unit, because a bare model on a multi-harness
+/// seat does not say which harness would run it. The PRESET is the anchor rather than
+/// [`HARNESS_FAMILY_PARAM`] because it is the only part of a request that reaches execution: the
+/// seat dispatches on the preset alone and runs its first configured preset when none is named, so
+/// a model hung off a family would pass the filter and then run on whichever preset the seat happens
+/// to list first. The family is DERIVED from the preset when it is not stated.
+///
+/// ⚠ And it filters on a LAST-OBSERVED self-report, never a promise: see [`HARNESS_MODEL_TAG`]. A
+/// model request narrows who is CONSIDERED; it does not pin what executes. #785 carries the
+/// selection work that would make it a commitment.
+pub const HARNESS_MODEL_PARAM: &str = "harness_model";
 
 /// Wire tag carrying the seat's harness VARIANT (#784) — fork/config colour, free text, single value.
 ///
@@ -176,16 +218,17 @@ pub const HARNESS_VARIANT_TAG: &str = "harness_variant";
 ///
 /// ## Known asymmetry — probing buys provenance, not detectability
 ///
-/// This remains the only filterable field with NEITHER dispatch enforcement NOR any echo a buyer
-/// could compare against. `harness_family` is enforced by dispatch (exact-or-nothing) — a real
-/// mechanism. `harness_model` is merely ECHOED: the result carries `["model", name]`, so a buyer can
-/// notice a divergence from what it awarded on, but both values are the SELLER'S OWN WORD and
-/// `docs/protocol-v1.md` §6.4 states that nothing verifies that block. It is an inconsistency
-/// signal, not a falsifier. No event carries a capability back at all.
+/// No filterable field has dispatch enforcement, and this one also has no echo a buyer could
+/// compare against. `harness_family` is NOT enforced by dispatch: dispatch selects on the offer's
+/// `agent` preset alone and runs the seat's first preset when none is named, so a family decides who
+/// may be CONSIDERED and never what executes. `harness_model` is merely ECHOED: the result carries
+/// `["model", name]`, so a buyer can notice a divergence from what it awarded on, but both values
+/// are the SELLER'S OWN WORD and `docs/protocol-v1.md` §6.4 states that nothing verifies that block.
+/// It is an inconsistency signal, not a falsifier. No event carries a capability back at all.
 ///
 /// The residual is accepted because the probe makes the claim true at the SOURCE, and because
 /// presence is honestly necessary-not-sufficient for any capability signal — but the three are one
-/// enforcement, one echo and one silence, and must not be read as three grades of the same proof.
+/// echo and two silences, and must not be read as grades of the same proof.
 ///
 /// ## Freshness — bounded by UPTIME, not by the beat
 ///
@@ -203,6 +246,19 @@ pub const HARNESS_VARIANT_TAG: &str = "harness_variant";
 /// the seat OVER-claims: it can be awarded work it can no longer do, and that is caught at delivery
 /// rather than at the filter. Bounding the probe on a cadence is #891.
 pub const CAPABILITIES_TAG: &str = "capabilities";
+
+/// Offer param naming the capability tokens a job REQUIRES (#897):
+/// `["param", "capability", "<token>", …]`, multi-value, matched against [`CAPABILITIES_TAG`].
+///
+/// Singular against the plural advertisement, exactly as [`crate::seller_agents::AGENT_PARAM`] is
+/// singular against [`crate::seller_agents::AGENT_TAG`] — the request names one requirement at a
+/// time, the advertisement names a set.
+///
+/// ONE multi-value tag, never repeated single-value tags. The readers here take the FIRST matching
+/// tag, so a second `["param", "capability", …]` would be silently dropped and a buyer would be
+/// filtered on a subset of what it asked for — the failure direction that awards work nobody
+/// verified was requestable.
+pub const CAPABILITY_PARAM: &str = "capability";
 
 /// Wire tag carrying operator colour about the machine (#784) — e.g. "mac studio, 64GB". Free text,
 /// single value.
@@ -525,7 +581,11 @@ fn stated_values(values: Vec<String>) -> Vec<String> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct HarnessModel {
     /// The harness family this model belongs to — a value from
-    /// [`crate::agent_presets::HARNESS_FAMILIES`]. This is what a buyer names to make dispatch bind.
+    /// [`crate::agent_presets::HARNESS_FAMILIES`].
+    ///
+    /// ⚠ Naming this in a request does NOT make dispatch bind — that claim was here before the
+    /// request side existed and it is false. A family narrows which seats may claim; the PRESET is
+    /// the only requested axis execution reads.
     pub family: String,
     /// The harness-resolved session model id, verbatim.
     pub model: String,
