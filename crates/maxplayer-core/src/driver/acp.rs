@@ -263,9 +263,10 @@ pub fn parse_acp_usage(result: &Value) -> Option<UsageMetadata> {
     let meta = UsageMetadata {
         // No maintained ACP harness (claude-code-acp, codex, cursor) and no ACP spec field carries a
         // model id or a monetary cost in the `session/prompt` result, so neither is read here. The
-        // resolved model IS on the wire — but in the `session/new` response (`models.currentModelId`),
-        // captured separately and OR-filled into usage by the driver (see `AcpDriver::start_session` /
-        // `merge_session_model`, #455). Cost stays absent (no harness surfaces one).
+        // resolved model IS on the wire — but in the `session/new` response, in either of the two
+        // shapes `session_model_from_result` reads (#896), captured separately and OR-filled into
+        // usage by the driver (see `AcpDriver::start_session` / `merge_session_model`, #455). Cost
+        // stays absent (no harness surfaces one).
         model: None,
         input_tokens,
         output_tokens,
