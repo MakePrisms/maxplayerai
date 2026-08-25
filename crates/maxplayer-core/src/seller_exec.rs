@@ -63,11 +63,37 @@ impl std::error::Error for ExecError {}
 /// this field, so "we could not check" is not allowed to look like "checked, and no".
 #[derive(Debug)]
 pub enum ProbeRunError {
+    /// The probe argv was empty, so there was no command to run and nothing was measured.
+    ///
+    /// An argv this code failed to BUILD says nothing about the seat's environment. Reporting it as
+    /// "not proven" would answer the capability question from a defect in the caller.
+    EmptyArgv,
     /// The launcher process could not be spawned. Only raised under an executor whose launcher is a
     /// separate program from the probe target (docker): a missing `docker` means the probe never ran.
     /// Under a pass-through policy the probe program IS the target, so its absence is a clean "not
     /// proven", not this error.
     LauncherUnspawnable(std::io::Error),
+    /// A pass-through probe target could not be spawned for a reason that does NOT establish the
+    /// target is missing — resource exhaustion, an I/O failure, a target that exists but is not
+    /// executable.
+    ///
+    /// See [`spawn_error_proves_absence`] for why only `NotFound` is allowed to mean "absent", and
+    /// why `PermissionDenied` in particular is not.
+    TargetUnspawnable(std::io::Error),
+    /// The probe workdir was not a usable directory when the spawn failed, so the failure describes
+    /// the WORKDIR and not the probe target.
+    ///
+    /// ⚠ This variant is why [`spawn_error_proves_absence`] is not the whole guard. Measured on this
+    /// host: a target that resolves fine, spawned with a `current_dir` that does not exist, fails
+    /// with `NotFound` — the SAME kind as a genuinely missing binary. Without this check the one kind
+    /// we trust to mean "absent" would silently shorten the capability set whenever the probe workdir
+    /// went missing, which is the exact defect this error type exists to prevent.
+    WorkdirUnusable { path: PathBuf },
+    /// The probe process was killed by a SIGNAL, so it never reported an exit status of its own.
+    ///
+    /// An OOM-killed `cargo` is the motivating case. The process was terminated by the environment
+    /// rather than by finishing, so its non-success says nothing about whether the tool is installed.
+    KilledBySignal { signal: i32 },
     /// The probe was still running at its wall-clock deadline and was killed. On the pre-advertise
     /// path an unbounded probe (a stuck `--version`, a docker pull with no registry answer) would
     /// hang the seller before it ever serves, so a timeout is a hard failure, not a "no".
@@ -103,9 +129,30 @@ const DOCKER_CLI_FAILURE: i32 = 125;
 impl std::fmt::Display for ProbeRunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::EmptyArgv => write!(
+                f,
+                "capability probe had an empty command, so nothing was measured — this is a defect \
+                 in the probe definition, NOT evidence the capability is absent"
+            ),
             Self::LauncherUnspawnable(error) => {
                 write!(f, "capability probe launcher could not be spawned: {error}")
             }
+            Self::TargetUnspawnable(error) => write!(
+                f,
+                "capability probe target could not be spawned ({error}) — this does not establish \
+                 that the tool is missing, so the probe is unmeasured rather than negative"
+            ),
+            Self::WorkdirUnusable { path } => write!(
+                f,
+                "capability probe workdir {} was not a usable directory, so the spawn failure \
+                 describes the workdir and not the probe target — the capability is unmeasured",
+                path.display()
+            ),
+            Self::KilledBySignal { signal } => write!(
+                f,
+                "capability probe was killed by signal {signal} before it could report — an \
+                 environment kill (OOM, for one) is NOT evidence the capability is absent"
+            ),
             Self::TimedOut { after } => write!(
                 f,
                 "capability probe exceeded its {}s bound and was killed",
@@ -875,18 +922,36 @@ const PROBE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// ⚠ This is a MEASUREMENT, not a gate: it answers only "did this command run cleanly HERE, NOW".
 ///
-/// ⚠ KNOWN RESIDUAL, named rather than fixed here: a probe target killed by a SIGNAL — an OOM kill of
-/// `cargo`, say — reports as "not proven" rather than as unmeasured, under every executor. It is the
-/// same class as the failures above and it is deliberately out of scope: widening the boot-failing
-/// set is not a change to make inside a respin, and no evidence says this one fires.
+/// ⚠ Only ONE outcome is allowed to answer "absent": a pass-through spawn that failed with
+/// `NotFound`, against a workdir confirmed usable. Everything else that is not a clean run is an
+/// error. See [`spawn_error_proves_absence`] — the kinds do not partition the way they read.
 pub fn probe_command_outcome(
     argv: &[String],
     host_cwd: &Path,
     timeout: Duration,
     executor: &ProbeExecutor,
 ) -> Result<bool, ProbeRunError> {
+    probe_command_outcome_with(argv, host_cwd, timeout, executor, force_remove_argv)
+}
+
+/// [`probe_command_outcome`] with the container-removal argv supplied by the caller.
+///
+/// The seam exists because the cleanup FAILURE path cannot be staged against real docker: `docker
+/// rm -f` is idempotent and exits 0 for a container that is not there, and (measured on this host)
+/// even for a syntactically invalid name. Pointing this at a stub CLI is what lets a test drive a
+/// removal that genuinely fails and prove the error travels, rather than asserting the decision
+/// function in isolation and leaving the wiring to inspection.
+///
+/// Production has exactly one caller and it passes [`force_remove_argv`].
+fn probe_command_outcome_with(
+    argv: &[String],
+    host_cwd: &Path,
+    timeout: Duration,
+    executor: &ProbeExecutor,
+    cleanup_argv: impl Fn(&str) -> Vec<String>,
+) -> Result<bool, ProbeRunError> {
     let Some((program, args)) = argv.split_first() else {
-        return Ok(false);
+        return Err(ProbeRunError::EmptyArgv);
     };
     let spawned = std::process::Command::new(program)
         .args(args)
@@ -897,12 +962,28 @@ pub fn probe_command_outcome(
         .spawn();
     let mut child = match spawned {
         Ok(child) => child,
-        // Only a PASS-THROUGH policy spawns the probe target itself, so only there is a failure to
-        // spawn the honest "not proven". Under a launcher or docker the program is the WRAPPER, and
-        // its absence says nothing whatever about the target — the probe never ran.
+        // The workdir is checked BEFORE the error kind is read, for every executor, because a bad
+        // workdir counterfeits both interesting kinds: a missing one fails with `NotFound` and a
+        // non-directory with `NotADirectory`, whatever the target is. Diagnosing that as a missing
+        // launcher would send an operator to check docker for a directory problem.
+        //
+        // This runs only on the error path, so a healthy probe pays nothing for it — and it races the
+        // right way. Checking AFTER the spawn error means a workdir that vanishes in between
+        // classifies as a loud `WorkdirUnusable` rather than a silent absence; the opposite race, a
+        // broken workdir repairing itself mid-error-path, has no author in a directory the probe owns.
         Err(error) => {
+            if !host_cwd.is_dir() {
+                return Err(ProbeRunError::WorkdirUnusable {
+                    path: host_cwd.to_path_buf(),
+                });
+            }
+            // Only a PASS-THROUGH policy spawns the probe target itself, so only there CAN a failure
+            // to spawn be the honest "not proven" — and only for the one kind that establishes it.
+            // Under a launcher or docker the program is the WRAPPER, and its absence says nothing
+            // whatever about the target: the probe never ran.
             return match executor {
-                ProbeExecutor::PassThrough => Ok(false),
+                ProbeExecutor::PassThrough if spawn_error_proves_absence(&error) => Ok(false),
+                ProbeExecutor::PassThrough => Err(ProbeRunError::TargetUnspawnable(error)),
                 ProbeExecutor::Launcher | ProbeExecutor::Docker { .. } => {
                     Err(ProbeRunError::LauncherUnspawnable(error))
                 }
@@ -931,7 +1012,7 @@ pub fn probe_command_outcome(
     // cannot hang the pre-advertise path — but NOT best-effort: see `CleanupFailed`.
     let cleanup = match executor {
         ProbeExecutor::Docker { container } => {
-            match run_bounded_nulled(&force_remove_argv(container), PROBE_CLEANUP_TIMEOUT) {
+            match run_bounded_nulled(&cleanup_argv(container), PROBE_CLEANUP_TIMEOUT) {
                 Ok(true) => None,
                 Ok(false) => Some("`docker rm -f` exited non-zero".to_owned()),
                 Err(error) => Some(error.to_string()),
@@ -951,13 +1032,10 @@ pub fn probe_command_outcome(
 /// simulate and the wrong one. This is the whole decision, and it is decided here so it can be
 /// asserted directly.
 ///
-/// ⚠ **UNCOVERED, AND SAID SO RATHER THAN IMPLIED:** the tests reach this function directly, so no
-/// test proves that [`probe_command_outcome`] actually FEEDS it a cleanup failure. Measured on this
-/// host: `docker rm -f` exits 0 both for an absent container and for a syntactically invalid name,
-/// so the failing branch cannot be staged without a container docker refuses to delete. What guards
-/// the wiring is structural rather than tested — the cleanup result is a required argument here, so
-/// a caller cannot discard it without passing `None` on purpose, which the old `let _ =` did by
-/// default.
+/// The wiring into it is covered too, through [`probe_command_outcome_with`]: real docker cannot
+/// stage a failing removal (`docker rm -f` is idempotent — measured on this host, it exits 0 both for
+/// an absent container and for a syntactically invalid name), so the tests point the cleanup argv at
+/// a stub CLI instead and drive both directions through the actual runner.
 fn settle_probe(
     outcome: Result<bool, ProbeRunError>,
     cleanup: Option<String>,
@@ -1026,9 +1104,19 @@ impl ProbeExecutor {
     /// Turn one finished probe's exit status into an answer about the CAPABILITY, or into the
     /// refusal to answer.
     ///
-    /// Only docker separates the two. A host executor's status belongs to the target by
-    /// construction, so a non-zero exit is the target's own and means the capability is absent.
+    /// A SIGNAL kill is checked first and under every executor. A signalled process has no exit code
+    /// of its own, so `success()` is false and the old reading made an OOM-killed `cargo` say "rust
+    /// is not installed" — a measurement the process never got far enough to make. This is where that
+    /// happens, NOT in the spawn arm: the child spawned fine and then died, so no amount of care
+    /// about spawn errors reaches it.
+    ///
+    /// Past that, only docker separates the remaining two. A host executor's status belongs to the
+    /// target by construction, so a non-zero exit is the target's own and means the capability is
+    /// absent.
     fn classify(&self, status: std::process::ExitStatus) -> Result<bool, ProbeRunError> {
+        if let Some(signal) = terminating_signal(status) {
+            return Err(ProbeRunError::KilledBySignal { signal });
+        }
         match self {
             Self::PassThrough | Self::Launcher => Ok(status.success()),
             Self::Docker { .. } => match status.code() {
@@ -1039,6 +1127,40 @@ impl ProbeExecutor {
             },
         }
     }
+}
+
+/// The signal that terminated `status`, or `None` if it exited on its own.
+///
+/// Note this is deliberately NOT `status.code().is_none()`. A timed-out probe is killed by this code
+/// and would look identical, but that path never reaches [`ProbeExecutor::classify`] — it breaks with
+/// `TimedOut` before classification, which is the more specific diagnosis and must stay that way.
+#[cfg(unix)]
+fn terminating_signal(status: std::process::ExitStatus) -> Option<i32> {
+    std::os::unix::process::ExitStatusExt::signal(&status)
+}
+
+#[cfg(not(unix))]
+fn terminating_signal(_status: std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
+/// Whether a spawn failure ESTABLISHES that the probe target is not installed.
+///
+/// ⚠ The kinds do not partition the way they read, and the difference decides whether a seat
+/// under-advertises silently or fails loudly. Measured on this host with `Command::spawn`, each case
+/// run against a positive control:
+///
+/// - target absent, workdir fine ⇒ `NotFound`
+/// - target present and executable, workdir UNSEARCHABLE ⇒ `PermissionDenied`
+/// - target present but NOT executable, workdir fine ⇒ `PermissionDenied`
+/// - target present, workdir MISSING ⇒ `NotFound`
+/// - target present, workdir is a FILE ⇒ `NotADirectory`
+///
+/// So `PermissionDenied` cannot mean "absent": a fine target behind an unsearchable directory
+/// produces the identical kind. `NotFound` only means "absent" once the workdir has been eliminated
+/// as its cause, which is why the caller checks the workdir BEFORE calling this.
+fn spawn_error_proves_absence(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
 }
 
 /// Spawn `argv` with every stdio nulled and wait at most `timeout`, killing and reaping on expiry.
@@ -3206,6 +3328,257 @@ mod tests {
     /// One exit status, as a finished process reports it.
     fn exited(code: i32) -> std::process::ExitStatus {
         std::os::unix::process::ExitStatusExt::from_raw(code << 8)
+    }
+
+    /// A status for a process KILLED BY `signal`, in the raw wait-status encoding: the signal number
+    /// lives in the low seven bits, and `code()` on such a status is `None`.
+    fn signalled(signal: i32) -> std::process::ExitStatus {
+        std::os::unix::process::ExitStatusExt::from_raw(signal)
+    }
+
+    /// Write an executable shell stub at `path` and return its path.
+    fn write_stub(path: PathBuf, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("write the stub");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stub executable");
+        path
+    }
+
+    // ── Rocky blocker 2: an UNMEASURED failure must never be reported as an absent capability ──
+    //
+    // The old code turned EVERY pass-through spawn error into `Ok(false)`, so a seat that could not
+    // spawn at all advertised the same shorter capability set as a seat that genuinely lacked the
+    // tool. A buyer commits sats on that field and nothing downstream contradicts it.
+    //
+    // Each leg is a DIFFERENT cause with the same old symptom, and the last leg is the positive
+    // control: without it, "never report absent" would be satisfied by never reporting absent at all.
+    #[test]
+    fn an_unmeasured_spawn_failure_is_never_reported_as_absent() {
+        let dir = ProbeDir::new("unmeasured-spawn");
+
+        assert!(
+            matches!(
+                probe_command_outcome(
+                    &[],
+                    dir.path(),
+                    Duration::from_secs(10),
+                    &ProbeExecutor::PassThrough,
+                ),
+                Err(ProbeRunError::EmptyArgv)
+            ),
+            "an argv we failed to BUILD measures nothing about the seat — it must not answer the \
+             capability question"
+        );
+
+        // A target that EXISTS but is not executable. This is the case that makes `PermissionDenied`
+        // unusable as an absence proof: an unsearchable workdir produces the identical error kind
+        // with a perfectly good target, so the kind cannot tell the two apart.
+        let not_executable = dir.path().join("not-executable");
+        std::fs::write(&not_executable, "#!/bin/sh\ntrue\n").expect("write the target");
+        assert!(
+            matches!(
+                probe_command_outcome(
+                    &argv(&[not_executable.to_str().expect("utf8 path")]),
+                    dir.path(),
+                    Duration::from_secs(10),
+                    &ProbeExecutor::PassThrough,
+                ),
+                Err(ProbeRunError::TargetUnspawnable(_))
+            ),
+            "a target that exists but cannot be executed is UNMEASURED — reporting it absent would \
+             hide a misconfiguration behind a plausible capability set"
+        );
+
+        assert_eq!(
+            probe_command_outcome(
+                &argv(&["maxplayer-no-such-binary"]),
+                dir.path(),
+                Duration::from_secs(10),
+                &ProbeExecutor::PassThrough,
+            )
+            .ok(),
+            Some(false),
+            "POSITIVE CONTROL: a genuinely absent target against a good workdir is still the honest \
+             Ok(false). Without this leg the two assertions above would pass on a function that \
+             errored unconditionally, and boot would fail on every seat."
+        );
+    }
+
+    // The workdir confound, which is why `NotFound ⇒ absent` is not sufficient on its own.
+    //
+    // Measured with `Command::spawn` on this host, each against a positive control: a target that
+    // resolves fine, spawned with a `current_dir` that does NOT EXIST, fails with `NotFound` — the
+    // same kind as a genuinely missing binary. A workdir that is a FILE fails with `NotADirectory`.
+    // So the one kind trusted to mean "absent" is counterfeited by a broken workdir, and would
+    // silently shorten the capability set every time the probe workdir went missing.
+    //
+    // `probe_launch_argv` already refuses a missing workdir up front; this closes the window between
+    // that check and the spawn, and it is the reason the check here runs BEFORE the kind is read.
+    #[test]
+    fn a_broken_probe_workdir_is_unmeasured_rather_than_absent() {
+        let dir = ProbeDir::new("broken-workdir");
+
+        let missing = dir.path().join("no-such-subdir");
+        assert!(
+            matches!(
+                probe_command_outcome(
+                    &argv(&["true"]),
+                    &missing,
+                    Duration::from_secs(10),
+                    &ProbeExecutor::PassThrough,
+                ),
+                Err(ProbeRunError::WorkdirUnusable { .. })
+            ),
+            "a MISSING workdir fails with the same NotFound kind as an absent binary — it must be \
+             diagnosed as the workdir, not as the capability"
+        );
+
+        let file_workdir = write_stub(dir.path().join("a-file"), "true");
+        assert!(
+            matches!(
+                probe_command_outcome(
+                    &argv(&["true"]),
+                    &file_workdir,
+                    Duration::from_secs(10),
+                    &ProbeExecutor::PassThrough,
+                ),
+                Err(ProbeRunError::WorkdirUnusable { .. })
+            ),
+            "a workdir that is a FILE is equally unmeasured"
+        );
+
+        // The guard is checked for every executor, so a broken workdir under docker is diagnosed as
+        // the workdir rather than as a missing `docker` — an operator sent to check their daemon for
+        // a directory problem looks in the wrong place entirely.
+        assert!(
+            matches!(
+                probe_command_outcome(
+                    &argv(&["maxplayer-no-such-launcher"]),
+                    &missing,
+                    Duration::from_secs(10),
+                    &ProbeExecutor::Docker {
+                        container: "maxplayer-job-probe-x".to_owned(),
+                    },
+                ),
+                Err(ProbeRunError::WorkdirUnusable { .. })
+            ),
+            "the workdir is the more specific diagnosis, and it is checked first under every executor"
+        );
+
+        assert_eq!(
+            probe_command_outcome(
+                &argv(&["true"]),
+                dir.path(),
+                Duration::from_secs(10),
+                &ProbeExecutor::PassThrough,
+            )
+            .ok(),
+            Some(true),
+            "POSITIVE CONTROL: the same probe against a GOOD workdir still proves the capability"
+        );
+    }
+
+    // A signal kill is where the old code turned an environment failure into "absent", and it is NOT
+    // in the spawn arm: the child spawns fine and then dies, so the status is what has to carry it.
+    // An OOM-killed `cargo` is the motivating case — the seat drops `rust` and looks like a stock
+    // image, with nothing in the result to say a measurement never completed.
+    //
+    // Asserted under all three executors because the old reading was shared by all three.
+    #[test]
+    fn a_signal_killed_probe_is_unmeasured_under_every_executor() {
+        for executor in [
+            ProbeExecutor::PassThrough,
+            ProbeExecutor::Launcher,
+            ProbeExecutor::Docker {
+                container: "maxplayer-job-probe-x".to_owned(),
+            },
+        ] {
+            assert!(
+                matches!(
+                    executor.classify(signalled(9)),
+                    Err(ProbeRunError::KilledBySignal { signal: 9 })
+                ),
+                "a probe killed by a signal never reported for itself, so {executor:?} must refuse \
+                 to answer rather than call the capability absent"
+            );
+            assert_eq!(
+                executor.classify(exited(0)).ok(),
+                Some(true),
+                "POSITIVE CONTROL for {executor:?}: it can still prove a capability, so the leg \
+                 above is not passing on an executor that errors unconditionally"
+            );
+            assert_eq!(
+                executor.classify(exited(1)).ok(),
+                Some(false),
+                "and an ordinary non-zero exit is still the honest absent for {executor:?} — the \
+                 signal check must not have swallowed the real negative"
+            );
+        }
+    }
+
+    // Rocky's cleanup FEED-PATH proof. `settle_probe` decides correctly in isolation, but nothing
+    // proved `probe_command_outcome` actually HANDS it a cleanup failure — and real docker cannot
+    // stage one, because `docker rm -f` is idempotent (measured here: exit 0 for an absent container
+    // and for a syntactically invalid name alike). So the removal argv is pointed at a stub CLI and
+    // both directions are driven through the real runner.
+    #[test]
+    fn a_cleanup_failure_travels_out_of_the_probe_runner() {
+        let dir = ProbeDir::new("cleanup-feed");
+        let container = "maxplayer-job-probe-feed";
+        let receipt = dir.path().join("removed.txt");
+        let failing_rm = write_stub(dir.path().join("rm-fails"), "exit 1");
+        let working_rm = write_stub(
+            dir.path().join("rm-works"),
+            &format!("printf '%s' \"$1\" > {}", receipt.display()),
+        );
+        let executor = ProbeExecutor::Docker {
+            container: container.to_owned(),
+        };
+        let stub_cleanup = |program: &PathBuf| {
+            let program = program.clone();
+            move |name: &str| vec![program.to_string_lossy().into_owned(), name.to_owned()]
+        };
+
+        // The probe itself SUCCEEDS here. That is the whole point: a cleanup failure has to be able
+        // to fail a probe that otherwise passed, or residue silently poisons every token after it.
+        let failed = probe_command_outcome_with(
+            &argv(&["true"]),
+            dir.path(),
+            Duration::from_secs(10),
+            &executor,
+            stub_cleanup(&failing_rm),
+        );
+        assert!(
+            matches!(
+                &failed,
+                Err(ProbeRunError::CleanupFailed { container: named, .. }) if named == container
+            ),
+            "a removal that genuinely fails must travel out of the runner as CleanupFailed naming \
+             the survivor, not be discarded on the way: {failed:?}"
+        );
+
+        // The other direction, and it is BEHAVIOURAL rather than a bare `Ok(true)`: the stub records
+        // the argument it was handed, so this proves the runner asked for the RIGHT container to be
+        // removed. A cleanup that silently removed nothing would leave the same zero-residue result.
+        let cleaned = probe_command_outcome_with(
+            &argv(&["true"]),
+            dir.path(),
+            Duration::from_secs(10),
+            &executor,
+            stub_cleanup(&working_rm),
+        );
+        assert_eq!(
+            cleaned.ok(),
+            Some(true),
+            "POSITIVE CONTROL: a probe whose cleanup succeeds still proves the capability"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&receipt).ok().as_deref(),
+            Some(container),
+            "the runner must have asked for THIS container by name — a zero-residue result with no \
+             removal attempted is indistinguishable from a correct one without this assertion"
+        );
     }
 
     // The classification Rocky's blocker 3 is about, asserted as the PAIR that makes it meaningful.
