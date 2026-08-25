@@ -200,6 +200,110 @@ pub fn claim_meets_capability_request(
     Ok(())
 }
 
+/// Whether a capability request is UNSATISFIABLE BY CONSTRUCTION — no claim that could ever be
+/// published can pass it — and if so, why (#897).
+///
+/// ★ DERIVED FROM THE PREDICATE, NOT A SECOND COPY OF ITS RULES. It synthesizes the claim that would
+/// satisfy the request exactly — a seat advertising precisely what was asked for — and runs the REAL
+/// [`claim_meets_capability_request`] against it. A request the perfect claim cannot pass is one no
+/// claim can pass.
+///
+/// That construction is the whole point. A gate that restated "a model needs a family" in its own
+/// words would be a second copy of a rule owned elsewhere, and the two would rot apart silently:
+/// #788 may later make a bare model valid, and on that day this gate must stop refusing WITHOUT
+/// anyone remembering it exists. Because the verdict comes from the predicate, it will.
+///
+/// SCOPE, and it is a real limit rather than a caveat: this is a fail-fast for OUR posting surface,
+/// where refusing costs the caller nothing and posting commits an offer. It is NOT the enforcement
+/// boundary. A foreign client can publish a model-only offer straight to the relay, and for that
+/// offer the award-time refusal and its park row are the wire-level truth. Both layers are tested and
+/// neither makes the other unnecessary.
+pub fn unsatisfiable_capability_request(
+    requested_harness_family: Option<&str>,
+    requested_model: Option<&str>,
+    required_capabilities: &[String],
+) -> Option<CapabilityRefusal> {
+    // The seat that advertises exactly what was asked for. A model is only representable PAIRED with
+    // a family, so a request naming a model and no family cannot be advertised by any seat — which is
+    // the unsatisfiability this probe detects rather than asserts.
+    let advertised = crate::heartbeat::SeatCapability {
+        harness_families: requested_harness_family
+            .map(|family| vec![family.to_owned()])
+            .unwrap_or_default(),
+        models: match (requested_harness_family, requested_model) {
+            (Some(family), Some(model)) => vec![crate::heartbeat::HarnessModel {
+                family: family.to_owned(),
+                model: model.to_owned(),
+            }],
+            _ => Vec::new(),
+        },
+        capabilities: required_capabilities.to_vec(),
+        ..crate::heartbeat::SeatCapability::default()
+    };
+    // Money fields are placeholders and are never read: `claim_meets_capability_request` consults
+    // only the three request axes. Zeroes rather than plausible amounts, so nothing here can be
+    // mistaken for a price this function decides anything about.
+    let filters = AwardFilters {
+        offer_amount_sats: 0,
+        max_sats: 0,
+        buyer_mint: "",
+        allow_real_mints: false,
+        requested_agent: None,
+        requested_harness_family,
+        requested_model,
+        required_capabilities,
+    };
+    claim_meets_capability_request(&advertised, &filters).err()
+}
+
+/// Why the job's capability request left nothing awardable, as an operator-facing clause — or `None`
+/// when the capability request is not what stood in the way (#897).
+///
+/// DIAGNOSTICS ONLY. Nothing here decides an award; it explains one that already did not happen, so a
+/// job that parks says what to fix instead of only that it parked.
+///
+/// `None` in three distinct cases, and each would otherwise produce a misleading line:
+/// - No request ⇒ nothing to explain; the obstacle was price, mint, agent or an empty relay.
+/// - No live claims ⇒ nothing was refused. "No seat advertises X" would be false where the truth is
+///   that nobody claimed at all, and it would send an operator to fix a request that is fine.
+/// - Some live claim SATISFIED the request ⇒ capability was not the obstacle. Naming it here would
+///   blame the request for a price or mint failure and hide the real one. This is the case worth
+///   being strict about: it is the one where a capability-shaped reason is most plausible and most
+///   wrong.
+///
+/// Deliberately NOT a wire reason code. #821 adds `capability_missing` to the protocol and #859 makes
+/// an undispatchable job carry that label; this is the local operator string that can land first
+/// without pre-empting either, and it is what those two replace on the wire.
+pub fn capability_park_reason(view: &JobView, filters: &AwardFilters) -> Option<String> {
+    if filters.requested_harness_family.is_none()
+        && filters.requested_model.is_none()
+        && filters.required_capabilities.is_empty()
+    {
+        return None;
+    }
+    let mut refusals: Vec<String> = Vec::new();
+    for claim in view.claims.iter().filter(|claim| claim.live) {
+        match claim_meets_capability_request(&claim.capability, filters) {
+            // A live claim that passes means the request was satisfiable and something else refused
+            // this job. Bail rather than report: a partial list reads as the whole reason.
+            Ok(()) => return None,
+            Err(refusal) => {
+                let rendered = refusal.to_string();
+                if !refusals.contains(&rendered) {
+                    refusals.push(rendered);
+                }
+            }
+        }
+    }
+    if refusals.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "no live claim satisfied the job's capability request ({})",
+        refusals.join("; ")
+    ))
+}
+
 /// Whether a claim may be awarded a job that asked for a specific harness.
 ///
 /// No request ⇒ every claim passes. A request ⇒ the claim must ADVERTISE that harness. A claim
@@ -1160,6 +1264,28 @@ pub fn park_reason_unreadable(unanswered_reads: u32) -> String {
     )
 }
 
+/// Park reason for an auto-award whose offer deadline passed with nothing awardable.
+///
+/// `capability` is the clause from [`capability_park_reason`], or `None` when the capability request
+/// was not the obstacle. With `None` the wording is exactly what it was before capability requests
+/// existed, so a job that asked for nothing parks with an unchanged row.
+///
+/// The wording lives beside the decision rather than at the call site, matching
+/// [`park_reason_unreadable`] — the reason a row carries and the evidence that produced it cannot
+/// drift, and it was previously the one park reason spelled as a duplicated literal at its call site.
+///
+/// The deadline is still stated when a capability clause is present, because both facts are true and
+/// they imply different actions: the deadline says this job is over, the clause says what would have
+/// to change for the next one to succeed.
+pub fn park_reason_deadline_passed(capability: Option<&str>) -> String {
+    match capability {
+        Some(clause) => {
+            format!("offer deadline passed before an awardable claim appeared — {clause}")
+        }
+        None => "offer deadline passed before an awardable claim appeared".to_owned(),
+    }
+}
+
 /// Classify a reserved job for [`BuyerStore::reconcile`] from its payment progress + relay
 /// liveness. The payment journal is authoritative over relay liveness: a `Closed` payment is
 /// `Paid` regardless of whether the claim still looks live, and an ambiguous payment is KEPT
@@ -1269,7 +1395,13 @@ mod tests {
             branch: None,
             job_class: None,
             contribution: None,
+            // The NEUTRAL request — a job that asks for nothing. The default on purpose: every test
+            // built on this fixture asserts today's award behaviour, and that behaviour must be
+            // byte-unchanged by #897. Tests that exercise a request set these fields explicitly.
             requested_agent: None,
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: Vec::new(),
         }
     }
 
@@ -3471,24 +3603,396 @@ mod tests {
         );
     }
 
-    // The capability request is INERT, and this is the assertion that makes landing the offer-side
-    // plumbing impossible to do quietly.
+    /// An offer carrying a capability request, and the filters built from it EXACTLY as both
+    /// production award sites build them (`buyer/mod.rs`).
+    ///
+    /// The existing predicate tests set these fields on hand-built filters, which proves the
+    /// predicate decides correctly. It cannot prove the OFFER reaches the predicate — the gap #897
+    /// exists to close. This builds the request the way production does, so the two tests together
+    /// cover the predicate and the wiring rather than the predicate twice.
+    fn offer_requesting(
+        job_id: &str,
+        amount: u64,
+        family: Option<&str>,
+        capabilities: &[&str],
+    ) -> OfferView {
+        OfferView {
+            requested_harness_family: family.map(str::to_owned),
+            required_capabilities: capabilities.iter().map(|token| (*token).to_owned()).collect(),
+            ..offer_view(job_id, amount)
+        }
+    }
+
+    /// Mirror of the `AwardFilters` both award sites construct. Kept in one place here so a test
+    /// cannot accidentally exercise a request shape production never builds — and
+    /// `both_award_paths_read_the_capability_request_off_the_offer` is what holds this mirror honest,
+    /// by pinning the form the real sites use.
+    fn filters_from_offer<'a>(offer: &'a OfferView, max_sats: u64) -> AwardFilters<'a> {
+        AwardFilters {
+            offer_amount_sats: offer.amount_sats,
+            max_sats,
+            buyer_mint: DEFAULT_MINT_URL,
+            allow_real_mints: false,
+            requested_agent: offer.requested_agent.as_deref(),
+            requested_harness_family: offer.requested_harness_family.as_deref(),
+            requested_model: offer.requested_model.as_deref(),
+            required_capabilities: &offer.required_capabilities,
+        }
+    }
+
+    // THE ACCEPTANCE TEST FOR #897, both axes through BOTH selection entry points.
     //
-    // `post_job`'s schema tells callers that model is "not yet a hard filter"
-    // (`crates/maxplayer/src/mcp.rs`), and `post_job_award_filter_descriptions_match_enforcement`
-    // pins that STRING. But that test is a one-way ratchet pointing the safe way: it goes red when
-    // someone edits the DESCRIPTION and stays green when someone changes the BEHAVIOUR. The
-    // dangerous order — wire the offer, leave the description — would ship a false caller-facing
-    // claim on the money path under a passing test.
+    // A request honoured on one path and dropped on the other is precisely the bypass #866 was filed
+    // to close, so a test that checked only `select_awardable_claim` would leave the manual path — the
+    // one an operator drives by hand, naming a claim — free to award what the auto path refuses.
     //
-    // So pin the behaviour at its source. Both award paths pass the request inertly today; when
-    // either starts reading it off the offer this goes red, and whoever does it has to come here and
-    // find the description they also owe.
+    // The payable claim is deliberately otherwise-perfect: live, priced at the offer amount, quoting
+    // the buyer's mint. Only capability separates award from refusal, so a green here cannot be a
+    // price or mint failure wearing a capability costume.
     #[test]
-    fn both_award_paths_pass_the_capability_request_inertly() {
+    fn an_offer_sourced_request_refuses_a_non_matching_claim_on_both_paths() {
+        let job = "a".repeat(64);
+        let mints = vec![DEFAULT_MINT_URL.to_owned()];
+        let claim_id = "c".repeat(64);
+        let mut payable = claim(&job, true, 10, &mints);
+        payable.capability = seat(&["codex"], &[], &["rust"]);
+
+        // Control FIRST: the same claim, the same paths, no request. A refusal below means nothing
+        // unless this passes — otherwise the test proves only that the claim was unawardable.
+        let indifferent = offer_requesting(&job, 10, None, &[]);
+        let view = JobView { offer: Some(indifferent.clone()), ..view_with(&job, 10, vec![payable]) };
+        assert_eq!(
+            select_awardable_claim(&view, &filters_from_offer(&indifferent, 10)),
+            Some(claim_id.clone()),
+            "control: with no request on the offer the claim must be awarded as before"
+        );
+        assert_eq!(
+            named_claim_awardable(&view, &claim_id, &filters_from_offer(&indifferent, 10)),
+            Ok(()),
+            "control: the manual path must also award it with no request"
+        );
+
+        // FAMILY the claim does not advertise.
+        let wants_family = offer_requesting(&job, 10, Some("claude-code"), &[]);
+        let view = JobView { offer: Some(wants_family.clone()), ..view.clone() };
+        assert_eq!(
+            select_awardable_claim(&view, &filters_from_offer(&wants_family, 10)),
+            None,
+            "auto path: a claim failing the offer's family request must not be selected"
+        );
+        assert_eq!(
+            named_claim_awardable(&view, &claim_id, &filters_from_offer(&wants_family, 10)),
+            Err(NamedAwardRefused::Capability {
+                claim_id: claim_id.clone(),
+                refusal: CapabilityRefusal::HarnessFamily { requested: "claude-code".into() },
+            }),
+            "manual path: naming the claim must NOT bypass the offer's family request"
+        );
+
+        // CAPABILITY the claim does not advertise. Asserted separately because a wiring that carried
+        // only the family would leave this axis silently inert while the family assertions pass.
+        let wants_python = offer_requesting(&job, 10, None, &["python"]);
+        let view = JobView { offer: Some(wants_python.clone()), ..view.clone() };
+        assert_eq!(
+            select_awardable_claim(&view, &filters_from_offer(&wants_python, 10)),
+            None,
+            "auto path: a claim missing a required capability must not be selected"
+        );
+        assert_eq!(
+            named_claim_awardable(&view, &claim_id, &filters_from_offer(&wants_python, 10)),
+            Err(NamedAwardRefused::Capability {
+                claim_id: claim_id.clone(),
+                refusal: CapabilityRefusal::Capabilities { missing: vec!["python".to_owned()] },
+            }),
+            "manual path: naming the claim must NOT bypass the offer's capability request"
+        );
+
+        // MODEL the claim does not advertise, paired with a family it DOES. The pair is the unit, so
+        // this is the case that separates a real model filter from one that matches on family alone.
+        let wants_model = OfferView {
+            requested_model: Some("opus".to_owned()),
+            ..offer_requesting(&job, 10, Some("codex"), &[])
+        };
+        let view = JobView { offer: Some(wants_model.clone()), ..view.clone() };
+        assert_eq!(
+            select_awardable_claim(&view, &filters_from_offer(&wants_model, 10)),
+            None,
+            "auto path: a claim advertising the family but not the model must not be selected"
+        );
+        assert_eq!(
+            named_claim_awardable(&view, &claim_id, &filters_from_offer(&wants_model, 10)),
+            Err(NamedAwardRefused::Capability {
+                claim_id: claim_id.clone(),
+                refusal: CapabilityRefusal::Model {
+                    family: "codex".into(),
+                    requested: "opus".into(),
+                },
+            }),
+            "manual path: naming the claim must NOT bypass the offer's model request"
+        );
+
+        // And a request the claim DOES satisfy still awards — otherwise the refusals above are
+        // equally explained by a filter that refuses everything.
+        let satisfied = offer_requesting(&job, 10, Some("codex"), &["rust"]);
+        let view = JobView { offer: Some(satisfied.clone()), ..view.clone() };
+        assert_eq!(
+            select_awardable_claim(&view, &filters_from_offer(&satisfied, 10)),
+            Some(claim_id.clone()),
+            "a matching request must still award — the filter narrows, it does not block"
+        );
+        assert_eq!(
+            named_claim_awardable(&view, &claim_id, &filters_from_offer(&satisfied, 10)),
+            Ok(()),
+            "the manual path must award a claim that satisfies the request"
+        );
+    }
+
+    // THE COUPLING TEST: the post-time gate refuses EXACTLY the requests the award predicate can
+    // never pass — no more, no less.
+    //
+    // This is the assertion that keeps the two from rotting apart. The gate exists only to surface a
+    // predicate consequence earlier, so any request where the two disagree is a bug in one of them:
+    // a gate that refuses MORE blocks posts that would have been awarded, and a gate that refuses
+    // LESS is the silent park the gate was added to prevent.
+    //
+    // Both sides are computed here rather than asserted against a hand-written expectation. A table
+    // of "these shapes must be refused" would be a third copy of the rule and would need editing on
+    // the day #788 makes a bare model valid; this needs none — on that day the predicate changes and
+    // both sides of the comparison move together.
+    #[test]
+    fn the_post_time_gate_refuses_exactly_what_the_predicate_can_never_pass() {
+        let rust = vec!["rust".to_owned()];
+        let shapes: Vec<(Option<&str>, Option<&str>, &[String])> = vec![
+            // Satisfiable: absent, single-axis, and fully-specified requests.
+            (None, None, &[]),
+            (Some("codex"), None, &[]),
+            (Some("codex"), Some("gpt-5.6-sol[low]"), &[]),
+            (None, None, &rust),
+            (Some("codex"), Some("gpt-5.6-sol[low]"), &rust),
+            // Unsatisfiable by construction: a model with no family to pair it to (#788).
+            (None, Some("opus"), &[]),
+            (None, Some("opus"), &rust),
+        ];
+
+        for (family, model, capabilities) in shapes {
+            let gate = unsatisfiable_capability_request(family, model, capabilities);
+
+            // What the predicate says about the claim that advertises EXACTLY this request. If even
+            // that claim is refused, no publishable claim can pass.
+            let perfect = seat(
+                &family.map(|f| vec![f]).unwrap_or_default(),
+                &match (family, model) {
+                    (Some(f), Some(m)) => vec![(f, m)],
+                    _ => Vec::new(),
+                },
+                &capabilities.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
+            let mut filters = filters(10, 10);
+            filters.requested_harness_family = family;
+            filters.requested_model = model;
+            filters.required_capabilities = capabilities;
+            let predicate = claim_meets_capability_request(&perfect, &filters).err();
+
+            assert_eq!(
+                gate, predicate,
+                "gate and predicate disagree on {family:?}/{model:?}/{capabilities:?}. The gate must \
+                 refuse exactly what the predicate can never pass: refusing more blocks posts that \
+                 would have been awarded, refusing less restores the silent park the gate exists to \
+                 prevent."
+            );
+        }
+
+        // Positive control on BOTH sides: the table above is only meaningful if it contains a shape
+        // that is refused and a shape that is not. Without this, a gate stuck at `None` and a
+        // predicate stuck at `None` would agree on every row and pass.
+        assert!(
+            unsatisfiable_capability_request(None, Some("opus"), &[]).is_some(),
+            "control: a model with no harness family must be refused by the gate"
+        );
+        assert!(
+            unsatisfiable_capability_request(Some("codex"), Some("opus"), &[]).is_none(),
+            "control: a fully-specified request must NOT be refused by the gate"
+        );
+    }
+
+    // A request that matches no live claim PARKS with a reason naming what to fix, rather than
+    // awarding anyway or failing silently (#897 acceptance).
+    #[test]
+    fn a_request_matching_no_claim_parks_with_an_actionable_reason() {
+        let job = "a".repeat(64);
+        let mints = vec![DEFAULT_MINT_URL.to_owned()];
+        let mut payable = claim(&job, true, 10, &mints);
+        payable.capability = seat(&["codex"], &[], &[]);
+
+        let wants = offer_requesting(&job, 10, Some("claude-code"), &[]);
+        let view = JobView { offer: Some(wants.clone()), ..view_with(&job, 10, vec![payable]) };
+        let reason = capability_park_reason(&view, &filters_from_offer(&wants, 10))
+            .expect("an unsatisfiable request must produce a reason");
+        assert!(
+            reason.contains("claude-code"),
+            "the reason must name the REQUEST that refused, so an operator knows what to change: \
+             {reason}"
+        );
+
+        // The park row an operator actually reads states BOTH facts: the job is over, and this is
+        // what would have to change. Neither alone is actionable.
+        let row = park_reason_deadline_passed(Some(&reason));
+        assert!(row.contains("offer deadline passed"), "{row}");
+        assert!(row.contains("claude-code"), "{row}");
+
+        // And with no capability obstacle the row is EXACTLY what it was before #897 — a job that
+        // asked for nothing must not acquire new wording.
+        assert_eq!(
+            park_reason_deadline_passed(None),
+            "offer deadline passed before an awardable claim appeared"
+        );
+    }
+
+    // THE WIRE-LEVEL LAYER, and the reason the post-time gate is not the whole answer.
+    //
+    // Our posting surface refuses a model-only request before signing. A FOREIGN client is under no
+    // such obligation: it can publish a model-only offer straight to the relay, and our buyer will
+    // read it. For that offer the award-time refusal and this park row are the only truth there is.
+    //
+    // So this is deliberately NOT reachable through `post_job` — it constructs the offer the way the
+    // relay would hand it to us. A test that went through our own posting path could not express this
+    // case at all, because the gate would refuse it first, and the layer would look tested when the
+    // only tested thing was the gate.
+    #[test]
+    fn a_foreign_model_only_offer_is_refused_at_award_and_parks_saying_why() {
+        let job = "a".repeat(64);
+        let mints = vec![DEFAULT_MINT_URL.to_owned()];
+        let claim_id = "c".repeat(64);
+        // A seat that genuinely advertises the model, under a family. Even this claim must be refused:
+        // the defect is in the REQUEST, and a claim-blaming refusal would send an operator to fix a
+        // seat that is doing everything right.
+        let mut advertising = claim(&job, true, 10, &mints);
+        advertising.capability = seat(&["codex"], &[("codex", "opus")], &[]);
+
+        let model_only = offer_requesting(&job, 10, None, &[]);
+        let model_only = OfferView { requested_model: Some("opus".to_owned()), ..model_only };
+        let view = JobView {
+            offer: Some(model_only.clone()),
+            ..view_with(&job, 10, vec![advertising])
+        };
+        let filters = filters_from_offer(&model_only, 10);
+
+        assert_eq!(
+            select_awardable_claim(&view, &filters),
+            None,
+            "auto path: a model with no family must refuse, not be ignored (#788)"
+        );
+        assert_eq!(
+            named_claim_awardable(&view, &claim_id, &filters),
+            Err(NamedAwardRefused::Capability {
+                claim_id: claim_id.clone(),
+                refusal: CapabilityRefusal::ModelWithoutHarnessFamily { requested: "opus".into() },
+            }),
+            "manual path: naming the claim must not bypass the malformed request either"
+        );
+
+        let reason = capability_park_reason(&view, &filters)
+            .expect("a model-only request must produce a park reason");
+        assert!(
+            reason.contains("without a harness family"),
+            "the row must name the REQUEST defect, not blame the claim — an operator reading it has \
+             to know to add a family rather than to go find another seat: {reason}"
+        );
+    }
+
+    // The park reason must stay SILENT unless the capability request is genuinely the obstacle.
+    // This is the half that makes the reason worth trusting: a clause that appears whenever a request
+    // is present would blame the request for every price and mint failure, and it would be most
+    // convincing exactly when it was wrong.
+    #[test]
+    fn the_park_reason_declines_to_blame_capability_when_it_was_not_the_obstacle() {
+        let job = "a".repeat(64);
+        let mints = vec![DEFAULT_MINT_URL.to_owned()];
+        let mut matching = claim(&job, true, 10, &mints);
+        matching.capability = seat(&["codex"], &[], &[]);
+
+        // No request ⇒ nothing to explain.
+        let indifferent = offer_requesting(&job, 10, None, &[]);
+        let view = JobView {
+            offer: Some(indifferent.clone()),
+            ..view_with(&job, 10, vec![matching.clone()])
+        };
+        assert_eq!(capability_park_reason(&view, &filters_from_offer(&indifferent, 10)), None);
+
+        // A request that SOME live claim satisfies ⇒ capability was not the obstacle. The claim here
+        // matches the request, so whatever stopped the award was price, mint or budget.
+        let satisfied = offer_requesting(&job, 10, Some("codex"), &[]);
+        let view = JobView { offer: Some(satisfied.clone()), ..view.clone() };
+        assert_eq!(
+            capability_park_reason(&view, &filters_from_offer(&satisfied, 10)),
+            None,
+            "a satisfied request must never appear in a park reason"
+        );
+
+        // No LIVE claims ⇒ nothing was refused. "No seat advertises X" would be false where the truth
+        // is that nobody claimed, and it would send an operator to fix a request that is fine.
+        let wants = offer_requesting(&job, 10, Some("claude-code"), &[]);
+        let dead = claim(&job, false, 10, &mints);
+        let view = JobView { offer: Some(wants.clone()), ..view_with(&job, 10, vec![dead]) };
+        assert_eq!(
+            capability_park_reason(&view, &filters_from_offer(&wants, 10)),
+            None,
+            "an empty relay is not a capability failure"
+        );
+    }
+
+    // #897 opens a NEW filter surface — the offer's request params — and the display-only fields must
+    // not reach it. `hardware_is_unreachable_from_the_filterable_surface` guards the seat's
+    // ADVERTISEMENT; nothing guarded the REQUEST side, because until now there was no request.
+    //
+    // Asserted against the filter struct itself rather than against a list of param names: a test
+    // naming params would keep passing if a display-only axis were added straight to `AwardFilters`,
+    // which is the one place a filter can actually read.
+    #[test]
+    fn display_only_fields_never_reach_the_award_filter() {
+        let filter_surface = include_str!("lifecycle.rs");
+        let declaration = filter_surface
+            .split_once("pub struct AwardFilters<'a> {")
+            .expect("AwardFilters declaration")
+            .1
+            .split_once("\n}")
+            .expect("end of AwardFilters declaration")
+            .0;
+
+        for display_only in [
+            crate::heartbeat::HARNESS_VARIANT_TAG,
+            crate::heartbeat::HARDWARE_TAG,
+        ] {
+            assert!(
+                !declaration.contains(display_only),
+                "{display_only} is display-only and must NEVER be filterable \
+                 (docs/protocol-v1.md 4.5.1) — it is operator-declared free text that nothing can \
+                 contradict, so filtering on it would award money on an unfalsifiable claim. It \
+                 appears in the AwardFilters declaration."
+            );
+        }
+
+        // Positive control: the assertion above can only mean something if this substring search
+        // finds a field that IS there. Without it, a mis-derived `declaration` slice would pass
+        // every assertion above while proving nothing.
+        assert!(
+            declaration.contains("required_capabilities"),
+            "control: the filterable capability field must be found in the slice being searched"
+        );
+    }
+
+    // ALL THREE axes of the capability request are read OFF THE SIGNED OFFER, at BOTH award sites
+    // (#897, replacing the all-inert tripwire #866 left behind).
+    //
+    // The property is not "the fields are populated" but "they come from the OFFER". A site reading
+    // any of them from award params, config, or a local would let the request a buyer is held to
+    // differ from the one it signed and published — and that is the whole reason the filter reads the
+    // relay rather than its own inputs.
+    #[test]
+    fn both_award_paths_read_the_capability_request_off_the_offer() {
         let award_paths = include_str!("mod.rs");
-        // Occurrences on LIVE lines only. A commented-out `requested_harness_family: None` holds a
-        // whole-file count at 2 while the live code is wired — a comment manufacturing the very
+        // Occurrences on LIVE lines only. A commented-out field name holds a whole-file count at the
+        // expected value while the live code says something else — a comment manufacturing the very
         // occurrence that answers the probe. Line comments are the only comment form in this file.
         let live = |needle: &str| {
             award_paths
@@ -3498,55 +4002,86 @@ mod tests {
                 .sum::<usize>()
         };
 
-        let inert = live("requested_harness_family: None");
-        assert_eq!(
-            inert, 2,
-            "expected exactly 2 inert capability requests in buyer/mod.rs (manual award and \
-             drive_auto_award), found {inert}.\n\
-             IF THIS WENT RED BECAUSE YOU WIRED THE OFFER: that is the intended change, and it owes \
-             two edits IN THE SAME COMMIT — the `model` property description at \
-             crates/maxplayer/src/mcp.rs:219 (\"not yet a hard filter\") and the post_job tool \
-             description at :201 (\"model is a recorded auto-award preference\"). Both are \
-             caller-facing promises about a money path and both become false the moment a model \
-             request reaches this predicate. Editing THIS assertion instead is the cheap repair and \
-             the wrong one: it is the only thing standing between that change and a silently false \
-             schema."
-        );
-        assert_eq!(
-            live("required_capabilities: &[]"),
-            inert,
-            "every inert harness-family request must carry an inert capability list with it — a \
-             half-wired request filters on one axis while the schema disclaims both"
-        );
-        // The MODEL axis, which is what both descriptions named above are actually about. A wiring
-        // that touches model ALONE leaves the two counts above at 2, so only this assertion stands
-        // between that change and a green tripwire — and the consequence is worse than a missed
-        // filter: `a_model_request_without_a_harness_family_is_refused_not_ignored` pins that a
-        // model request carrying no family refuses EVERY claim, so model-only wiring stops awards
-        // entirely rather than narrowing them.
-        assert_eq!(
-            live("requested_model: None"),
-            inert,
-            "the model axis must be inert alongside the other two — a model request with no harness \
-             family is REFUSED, not ignored (see \
-             a_model_request_without_a_harness_family_is_refused_not_ignored), so wiring model alone \
-             stops every award instead of filtering one"
-        );
-        // Each axis is pinned by two counts: the inert form above, and the total here. The totals
-        // are what catch a wiring that ADDS a live line instead of editing one — a `Some(..)`
-        // sitting beside a surviving `None` satisfies the counts above and reads as inert.
-        for field in [
-            "requested_harness_family:",
-            "required_capabilities:",
-            "requested_model:",
+        // The two production award sites: the manual `award_claim` RPC and `drive_auto_award`.
+        const AWARD_SITES: usize = 2;
+
+        // Every axis, spelled as the offer-sourced form. Enumerated as a table rather than as three
+        // hand-written assertions so that adding a fourth request field to `AwardFilters` and wiring
+        // it is the only way to satisfy this — a new axis left inert has to be added here to pass,
+        // which is the moment its author reads what that costs.
+        // `filters_from_offer` in THIS file is a hand-written mirror of the production wiring, and
+        // every offer-sourced test below is built on it. A mirror that drifts makes those tests prove
+        // less than they appear to while still passing — which is not hypothetical: this mirror
+        // shipped with `requested_model: None` for one revision, and two model tests silently
+        // asserted that a model request awards the claim it should have refused. They went red only
+        // because the model cases were written; nothing structural would have caught it.
+        let mirror = include_str!("lifecycle.rs");
+
+        for (axis, wired_form) in [
+            ("harness family", "requested_harness_family: offer.requested_harness_family.as_deref()"),
+            ("model", "requested_model: offer.requested_model.as_deref()"),
+            ("capabilities", "required_capabilities: &offer.required_capabilities"),
         ] {
-            let total = live(field);
+            let wired = live(wired_form);
             assert_eq!(
-                total, inert,
-                "every live `{field}` in buyer/mod.rs must be the inert form; found {total} live \
-                 mentions against {inert} inert ones, so at least one carries a real request"
+                wired, AWARD_SITES,
+                "expected both award sites in buyer/mod.rs to read the {axis} request off the \
+                 SIGNED OFFER, found {wired}.\n\
+                 A request honoured on one path and dropped on the other is exactly the bypass #866 \
+                 was filed to close, and naming a claim chooses WHICH claim is judged, never WHETHER \
+                 it is."
+            );
+            assert!(
+                mirror.contains(wired_form),
+                "the test mirror `filters_from_offer` does not spell the {axis} axis the way both \
+                 production award sites do (`{wired_form}`). Every offer-sourced test is built on \
+                 that mirror, so a drifted mirror means those tests exercise a request shape \
+                 production never builds — and they keep passing while doing it."
             );
         }
+
+        // No axis may be inert. Kept because it fails on the OPPOSITE mistake from the table above:
+        // the table catches an axis that was never wired, this catches one that was wired and then
+        // quietly turned off.
+        //
+        // Scoped to the axis names — NOT a bare `: None` search. `buyer/mod.rs` is full of unrelated
+        // `Option` fields set to None, so a bare search reports a number that has nothing to do with
+        // this property, and a needle that answers a question you did not ask is worse than none.
+        for axis in [
+            "requested_harness_family: None",
+            "requested_model: None",
+            "required_capabilities: &[]",
+        ] {
+            let inert = live(axis);
+            assert_eq!(
+                inert, 0,
+                "found {inert} inert `{axis}` in buyer/mod.rs. An axis passed inertly is a filter \
+                 the caller was told exists and that refuses nothing — the exact state #897 was \
+                 filed to end. If an axis genuinely must be disabled, the caller-facing description \
+                 in crates/maxplayer/src/mcp.rs owes the same edit IN THE SAME COMMIT, because it \
+                 promises callers a hard filter on a money path."
+            );
+        }
+
+        // The counts above say the two sites we know about are wired. This says there are only two.
+        // Without it, a THIRD award site could construct its own filters — inertly, or from award
+        // params — and every assertion above would still pass, because they count occurrences of the
+        // correct form rather than bounding the total.
+        //
+        // Counted on `AwardFilters {` rather than on the field names, deliberately. The field names
+        // are NOT a usable denominator here: `requested_harness_family:` legitimately appears a third
+        // time in `post_job`, where it fills a `PostJobRequest` on the POSTING path. A total over the
+        // field name conflates the two concerns and goes red for a change that is none of this test's
+        // business — and a duplicate field inside one literal is already a compile error, so the
+        // field-name total was never buying anything the specific forms above do not.
+        let award_sites = live("AwardFilters {");
+        assert_eq!(
+            award_sites, AWARD_SITES,
+            "expected exactly {AWARD_SITES} AwardFilters constructions in buyer/mod.rs (the manual \
+             award RPC and drive_auto_award), found {award_sites}. A new award site must read the \
+             capability request off the offer exactly as those two do — a request honoured on some \
+             paths and dropped on others is the bypass #866 was filed to close."
+        );
     }
 
     // The wire-in, asserted separately from the predicate: `select_awardable_claim` must CONSULT it.
