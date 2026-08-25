@@ -130,8 +130,11 @@ test("every capability row wears the mark its provenance earns", () => {
     assert.match(profileRowHtml(row!), /class="unverified">operator-declared</);
   }
 
-  // Machine-sourced, and NOT interchangeable. Protocol §4.5.3: one enforcement,
-  // one echo, one silence. A reader must not read three grades of one proof.
+  // Machine-sourced, and NOT interchangeable. Protocol §4.5.3: NONE of the
+  // three is an enforcement — one inconsistency signal (`harness_model` is
+  // echoed) and two silences. They differ in freshness and in what they gate,
+  // not in how true they are, and a reader must not read three grades of one
+  // proof.
   // Tuple-typed, not inferred: destructuring a `string[][]` yields
   // `string | undefined` under noUncheckedIndexedAccess.
   const filterable: [string, string][] = [
@@ -165,6 +168,37 @@ test("the capability row states its staleness bound and its over-claim direction
   assert.match(html, /NOT evidence of a recent measurement/);
   assert.match(html, /over-claim/);
   assert.match(html, /not sufficient/);
+});
+
+test("the harness-family row never promises which harness runs", () => {
+  // This is the row a buyer reads before paying for a family, and the title is
+  // where the contract is stated — the mark beside it is a chip with no room
+  // for one. §4.5.3: the family is neither enforced nor echoed. It decides who
+  // may be CONSIDERED and never what executes, because dispatch selects on the
+  // offer's `agent` preset alone.
+  //
+  // ⚠ The forbidden list below is an INCLUSION filter, exactly as in the model
+  // row's test: it pins the spellings this claim has already worn here and
+  // CANNOT prove a new one is safe. The load-bearing assertions are the three
+  // positive ones.
+  const row = rowOf(capabilityRows({ harnessFamilies: ["codex"] }), "Harness family");
+  const title = row?.[2]?.title ?? "";
+  assert.notEqual(title, "", "positive control: an empty title would pass every doesNotMatch below");
+
+  for (const shape of [/enforced/i, /enforcement/i, /backed by a mechanism/i, /exactly or not at all/i, /binds dispatch/i]) {
+    assert.doesNotMatch(title, shape, `claims the family binds execution, which no code supports: ${shape}`);
+  }
+
+  // The three a buyer needs, asserted separately so that satisfying one cannot
+  // stand in for another: what the field DOES, what it does NOT do, and what to
+  // name instead when the execution guarantee is the thing being bought.
+  assert.match(title, /decides which seats may claim a job/, "must say the family filters claimant eligibility");
+  assert.match(title, /never which harness runs one/, "must say the family does not select what executes");
+  assert.match(title, /must name the preset/, "must say the `agent` preset is what buys the execution guarantee");
+
+  // Assert on the RENDERED attribute too. The object field and the string a
+  // buyer actually hovers are different artifacts, and only the second one ships.
+  assert.match(profileRowHtml(row!), /title="[^"]*never which harness runs one/);
 });
 
 test("the model row never states an execution fact", () => {

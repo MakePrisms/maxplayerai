@@ -306,17 +306,21 @@ const AS_OF_SEAT_START = {
  *
  * THE ROWS ARE NOT EQUAL, and the difference is provenance, not confidence.
  * Protocol v1 §4.5.3 is explicit that a reader MUST NOT read the three
- * filterable fields as three grades of proof: `harness_family` is an
- * ENFORCEMENT, `harness_model` is an ECHO a buyer can notice a divergence
- * against, and `capabilities` is a SILENCE — no event carries a capability back
- * at all. §4.5.4 then gives the three different freshness guarantees, and only
+ * filterable fields as three grades of proof, and that NONE of the three is an
+ * enforcement: `harness_model` is ECHOED, so a divergence is at least visible
+ * in a buyer's own records, while `harness_family` and `capabilities` are both
+ * SILENCE — nothing at the seat reads the family, and no event carries a
+ * capability back at all. One inconsistency signal and two silences. §4.5.4
+ * then gives the three different freshness guarantees, and only
  * `harness_family` is current as of the beat carrying it.
  *
- * So every row wears its own mark and the marks differ where the proof differs.
- * Flush and unmarked, the weakest row reads as solidly as the enforced one, and
- * a buyer commits sats on the weakest of the three. The last two rows are free
- * text an operator typed; they stay marked apart from all three, because
- * nothing pays out on them.
+ * So every row wears its own mark, and the marks differ on what a reader can
+ * DO with the value, not on how true it is. Two rows being equally unenforced
+ * does not make them interchangeable: they differ in freshness and in what
+ * they gate, and that is what the marks carry. Flush and unmarked, the stalest
+ * row would read as solidly as the freshest, and a buyer commits sats on the
+ * stalest of the three. The last two rows are free text an operator typed;
+ * they stay marked apart from all three, because nothing pays out on them.
  *
  * Every row is an ANNOUNCEMENT either way. This reader sees the claim, never
  * the probe. A mark says what a claim is worth, not that anything verified it
