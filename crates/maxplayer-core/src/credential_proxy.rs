@@ -191,15 +191,26 @@ const HOP_BY_HOP: &[&str] = &[
 ];
 
 /// One job's containment secret: the placeholder the container was handed, the real credential it
-/// stands in for, and the single approved upstream that credential may be substituted for.
+/// stands in for, and the approved upstream base URLs that credential may be substituted for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobCredential {
     /// The format-plausible value inside the container (`sk-ant-…`). Worthless if it leaks.
     pub placeholder: String,
     /// The real credential. Never enters the container; held only in this host process.
     pub real: String,
-    /// The approved real upstream base URL (scheme + host[:port]) this credential is valid for.
-    pub upstream: String,
+    /// The approved real upstream base URLs (scheme + host[:port]) this credential is valid for.
+    ///
+    /// The FIRST entry is the primary: it is where [`ProxyEngine::authorize`] — the primary
+    /// listener's path — forwards, exactly as a single-upstream credential always has. Every entry
+    /// past the first exists for a client whose separate legs go to separate hosts (measured on
+    /// cursor-agent: `--endpoint` moves the control plane and `--agent-endpoint` moves the agent
+    /// leg, and the two legs' true destinations differ). Each such entry is reachable only through
+    /// [`ProxyEngine::authorize_via`] from the leg listener bound for its authority.
+    ///
+    /// [`ProxyEngine::register`] refuses an empty list and refuses two entries naming the same
+    /// authority, so order inside the list never has to break a tie: at most one entry can match
+    /// any listener.
+    pub upstreams: Vec<String>,
 }
 
 /// Why a request was refused. Each variant means the real credential was NOT substituted — the
@@ -209,10 +220,18 @@ pub enum Refusal {
     /// No registered placeholder was found anywhere in the request. The proxy cannot identify a job,
     /// so it will not substitute any credential (no-fallback): the request fails.
     NoKnownPlaceholder,
-    /// A placeholder was found, but the resolved destination host is not on the allowlist. The real
-    /// credential is withheld and the request is refused — the load-bearing invariant that keeps this
-    /// from being worse than the status quo.
+    /// A placeholder was found, but the resolved destination host is not on the allowlist — or, on a
+    /// leg listener, not on the identified credential's own upstream list. The real credential is
+    /// withheld and the request is refused — the load-bearing invariant that keeps this from being
+    /// worse than the status quo.
     DestinationNotAllowed { host: String },
+    /// A credential was offered for registration with no upstream at all. Refused at registration so
+    /// the registry can never hold a credential with nowhere approved to go.
+    NoUpstream,
+    /// Two entries of one credential's upstream list resolve to the same authority. Refused rather
+    /// than tie-broken: a duplicate is a config error, and any tie-break rule would silently pick a
+    /// base URL the operator may not have meant (`https://a` vs `https://a:443/v2`).
+    DuplicateUpstream { host: String },
 }
 
 impl std::fmt::Display for Refusal {
@@ -223,6 +242,12 @@ impl std::fmt::Display for Refusal {
             }
             Self::DestinationNotAllowed { host } => {
                 write!(f, "destination {host} not on the credential-substitution allowlist")
+            }
+            Self::NoUpstream => {
+                write!(f, "credential lists no upstream; refusing registration")
+            }
+            Self::DuplicateUpstream { host } => {
+                write!(f, "credential lists {host} more than once; refusing registration")
             }
         }
     }
@@ -278,14 +303,26 @@ impl ProxyEngine {
         self.allowlist.iter().any(|allowed| same_authority(allowed, &key))
     }
 
-    /// Register a job's credential. Refuses (returns `Err`) if the credential's upstream is not on the
-    /// allowlist — a belt that keeps an unapproved destination from ever entering the registry, so a
-    /// registration bug cannot defeat the [`Self::authorize`] allowlist check downstream.
+    /// Register a job's credential. Refuses (returns `Err`) unless EVERY listed upstream is a
+    /// parseable base URL on the allowlist — a belt that keeps an unapproved destination from ever
+    /// entering the registry, so a registration bug cannot defeat the [`Self::authorize`] allowlist
+    /// check downstream. An empty list and two entries naming the same authority are refused here
+    /// too, which is what lets every later lookup treat the list as non-empty and tie-free.
     pub fn register(&self, cred: JobCredential) -> Result<(), Refusal> {
-        let host = authority_of(&cred.upstream)
-            .ok_or_else(|| Refusal::DestinationNotAllowed { host: cred.upstream.clone() })?;
-        if !self.allows(&host) {
-            return Err(Refusal::DestinationNotAllowed { host });
+        if cred.upstreams.is_empty() {
+            return Err(Refusal::NoUpstream);
+        }
+        let mut authorities: Vec<String> = Vec::with_capacity(cred.upstreams.len());
+        for upstream in &cred.upstreams {
+            let host = authority_of(upstream)
+                .ok_or_else(|| Refusal::DestinationNotAllowed { host: upstream.clone() })?;
+            if !self.allows(&host) {
+                return Err(Refusal::DestinationNotAllowed { host });
+            }
+            if authorities.iter().any(|seen| same_authority(seen, &host)) {
+                return Err(Refusal::DuplicateUpstream { host });
+            }
+            authorities.push(host);
         }
         self.creds.lock().unwrap().insert(cred.placeholder.clone(), cred);
         Ok(())
@@ -310,6 +347,41 @@ impl ProxyEngine {
     ///    [`Refusal::DestinationNotAllowed`] with NO substitution.
     /// 3. **Substitute** — replace the placeholder with the real credential in every header value.
     pub fn authorize(&self, headers: &[(String, String)]) -> Decision {
+        self.decide(headers, |cred| match cred.upstreams.first() {
+            Some(upstream) => Ok(upstream.clone()),
+            // Unreachable through `register`, which refuses an empty list. Refused rather than
+            // panicked so a future construction path turns a config error into a 4xx, not a crash.
+            None => Err(Refusal::NoUpstream),
+        })
+    }
+
+    /// The decision for one request arriving on the LEG listener bound for `via_authority`.
+    ///
+    /// Same steps as [`Self::authorize`], one difference: the destination is the identified
+    /// credential's OWN entry whose authority matches `via_authority`. The listener the request
+    /// physically arrived on is the selector — the container picks a destination only by which of
+    /// the base URLs it was handed it dials, every one of which this host chose. A credential that
+    /// never listed this authority is refused: a leg listener serves exactly the credentials that
+    /// named its leg, so one job's extra leg never widens where another job's credential may go.
+    pub fn authorize_via(&self, headers: &[(String, String)], via_authority: &str) -> Decision {
+        let via = host_key(via_authority);
+        self.decide(headers, move |cred| {
+            cred.upstreams
+                .iter()
+                .find(|u| authority_of(u).is_some_and(|a| same_authority(&a, &via)))
+                .cloned()
+                .ok_or(Refusal::DestinationNotAllowed { host: via })
+        })
+    }
+
+    /// Shared spine of [`Self::authorize`] and [`Self::authorize_via`]: identify the job by its
+    /// placeholder, let `select` pick the destination from the credential itself, hold that
+    /// destination to the allowlist, then substitute in header values only.
+    fn decide(
+        &self,
+        headers: &[(String, String)],
+        select: impl FnOnce(&JobCredential) -> Result<String, Refusal>,
+    ) -> Decision {
         let creds = self.creds.lock().unwrap();
         let Some(cred) = creds
             .values()
@@ -320,10 +392,12 @@ impl ProxyEngine {
         };
         drop(creds);
 
-        let Some(host) = authority_of(&cred.upstream) else {
-            return Decision::Refuse(Refusal::DestinationNotAllowed {
-                host: cred.upstream.clone(),
-            });
+        let upstream = match select(&cred) {
+            Ok(upstream) => upstream,
+            Err(refusal) => return Decision::Refuse(refusal),
+        };
+        let Some(host) = authority_of(&upstream) else {
+            return Decision::Refuse(Refusal::DestinationNotAllowed { host: upstream });
         };
         if !self.allows(&host) {
             return Decision::Refuse(Refusal::DestinationNotAllowed { host });
@@ -334,10 +408,7 @@ impl ProxyEngine {
             .filter(|(name, _)| !is_hop_by_hop(name))
             .map(|(name, value)| (name.clone(), value.replace(&cred.placeholder, &cred.real)))
             .collect();
-        Decision::Forward {
-            upstream: cred.upstream,
-            headers,
-        }
+        Decision::Forward { upstream, headers }
     }
 
     /// The real credential registered under `placeholder`, for the response scrub in [`relay`].
@@ -598,8 +669,11 @@ fn random_token(len: usize) -> String {
 /// revocation point.
 pub struct RunningProxy {
     addr: SocketAddr,
+    /// `(authority, bound address)` for each leg listener, in the order handed to
+    /// [`start_with_legs`]. Empty for a proxy started without legs.
+    leg_addrs: Vec<(String, SocketAddr)>,
     engine: Arc<ProxyEngine>,
-    task: tokio::task::JoinHandle<()>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl RunningProxy {
@@ -633,12 +707,33 @@ impl RunningProxy {
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }
+
+    /// The base URL a container uses to reach the LEG listener bound for `authority`, reaching this
+    /// proxy at `host` — or `None` when no such leg was started. The same host/pinhole reasoning as
+    /// [`Self::container_base_url_via`] applies: every leg listener sits on the same address, only
+    /// the port differs, so the one pinholed address covers them all.
+    pub fn leg_base_url_via(&self, host: &str, authority: &str) -> Option<String> {
+        let want = host_key(authority);
+        self.leg_addrs
+            .iter()
+            .find(|(a, _)| same_authority(&host_key(a), &want))
+            .map(|(_, addr)| format!("http://{host}:{}", addr.port()))
+    }
+
+    /// The bound address of the leg listener for `authority` (for tests / diagnostics).
+    pub fn leg_addr(&self, authority: &str) -> Option<SocketAddr> {
+        let want = host_key(authority);
+        self.leg_addrs
+            .iter()
+            .find(|(a, _)| same_authority(&host_key(a), &want))
+            .map(|(_, addr)| *addr)
+    }
 }
 
 impl Drop for RunningProxy {
     fn drop(&mut self) {
         // JOB END IS A REVOCATION, and it has to reach connections that are ALREADY OPEN — not only
-        // the listener. Aborting this task drops the accept loop's `JoinSet`, and dropping a `JoinSet`
+        // the listener. Aborting each task drops that accept loop's `JoinSet`, and dropping a `JoinSet`
         // aborts every task in it, so every accepted connection dies here too.
         //
         // Closing the listener alone would not be revocation. It stops the NEXT client and says
@@ -647,7 +742,12 @@ impl Drop for RunningProxy {
         // credential-bearing stream open, or start new requests, for as long as it likes. With a
         // relayed body and no byte cap, "as long as it likes" is unbounded — see
         // `dropping_the_proxy_revokes_connections_it_has_already_accepted`.
-        self.task.abort();
+        //
+        // The legs die with the primary: a leg outliving the job would be a credential-bearing
+        // listener nobody owns.
+        for task in &self.tasks {
+            task.abort();
+        }
     }
 }
 
@@ -705,9 +805,29 @@ pub async fn start(
     engine: Arc<ProxyEngine>,
     ports: Option<crate::sandbox_net::PortRange>,
 ) -> std::io::Result<RunningProxy> {
+    start_with_legs(engine, ports, &[]).await
+}
+
+/// [`start`], plus one LEG listener per entry of `leg_authorities`.
+///
+/// A leg listener is the routing selector for a multi-upstream credential: a request arriving on it
+/// is authorized via [`ProxyEngine::authorize_via`] with that leg's authority, so it forwards to the
+/// identified credential's own entry for that authority — see [`JobCredential::upstreams`]. The
+/// primary listener keeps the exact semantics [`start`] always had.
+///
+/// Every listener binds from the SAME `ports` range, so a namespace-contained job's firewall
+/// pinhole — rendered from the range, never from a bound port — covers the legs with no new rules.
+/// One job therefore consumes `1 + leg_authorities.len()` ports from the range for its lifetime.
+/// All listeners share one connection ceiling and one in-flight ceiling: the bounds stay job-global,
+/// so an extra leg never widens what one job may hold open.
+pub async fn start_with_legs(
+    engine: Arc<ProxyEngine>,
+    ports: Option<crate::sandbox_net::PortRange>,
+    leg_authorities: &[String],
+) -> std::io::Result<RunningProxy> {
     let client = forwarding_client().map_err(std::io::Error::other)?;
     // KNOWN EXPOSURE, deliberately unchanged for now. `0.0.0.0` is every interface, so on a seller with
-    // a public IP and no firewall this per-job listener is internet-reachable on a random high port.
+    // a public IP and no firewall each per-job listener is internet-reachable on a random high port.
     // The placeholder is the bearer — a caller without it gets `NoKnownPlaceholder` — so this is not an
     // open relay. But the job HOLDS the placeholder by construction, so it can hand placeholder+port to
     // an outside accomplice, who can then burn the seller's model quota for the job's lifetime. Quota
@@ -718,13 +838,52 @@ pub async fn start(
     // bridge gateway (`--add-host …:host-gateway`), where a `127.0.0.1` bind is unreachable and the
     // correct target is the bridge address. Changing this needs a Linux docker seat to verify against;
     // until then, seller-operators on a public box should firewall inbound ports.
+    let connections = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    // Shared across every connection, every listener, and both protocols, so neither multiplexing nor
+    // an extra leg can widen it.
+    let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
+
     let listener = bind_listener(ports).await?;
     let addr = listener.local_addr()?;
-    let engine_for_task = Arc::clone(&engine);
-    let connections = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
-    // Shared across every connection and both protocols, so multiplexing cannot widen it.
-    let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
-    let task = tokio::spawn(async move {
+    let mut tasks = Vec::with_capacity(1 + leg_authorities.len());
+    tasks.push(spawn_accept_loop(
+        listener,
+        Arc::clone(&engine),
+        client.clone(),
+        Arc::clone(&connections),
+        Arc::clone(&in_flight),
+        None,
+    ));
+
+    let mut leg_addrs = Vec::with_capacity(leg_authorities.len());
+    for authority in leg_authorities {
+        let listener = bind_listener(ports).await?;
+        leg_addrs.push((authority.clone(), listener.local_addr()?));
+        tasks.push(spawn_accept_loop(
+            listener,
+            Arc::clone(&engine),
+            client.clone(),
+            Arc::clone(&connections),
+            Arc::clone(&in_flight),
+            Some(authority.clone()),
+        ));
+    }
+
+    Ok(RunningProxy { addr, leg_addrs, engine, tasks })
+}
+
+/// One listener's accept loop. `via_authority` is `None` for the primary listener and the leg's
+/// authority for a leg listener — it decides which authorize entry point every request on this
+/// listener goes through, and nothing else about the connection handling differs.
+fn spawn_accept_loop(
+    listener: tokio::net::TcpListener,
+    engine: Arc<ProxyEngine>,
+    client: reqwest::Client,
+    connections: Arc<Semaphore>,
+    in_flight: Arc<Semaphore>,
+    via_authority: Option<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         // EVERY CONNECTION IS OWNED BY THIS TASK, and that ownership is what makes job end a
         // revocation rather than a request to stop.
         //
@@ -805,6 +964,7 @@ async fn handle_request(
     req: Request<Incoming>,
     engine: Arc<ProxyEngine>,
     client: reqwest::Client,
+    via_authority: Option<String>,
 ) -> Result<Response<ProxyBody>, std::convert::Infallible> {
     let method = req.method().clone();
     // The path+query is forwarded verbatim; it is never a substitution input.
@@ -829,11 +989,21 @@ async fn handle_request(
     // deliberately not a substitution surface (see "Why the BODY is never a substitution surface" in
     // the module header), so the body was never an input to this decision. Deciding first means a
     // request we refuse costs us nothing at all: we answer from the headers and drop the body unread.
-    match engine.authorize(&headers) {
+    // Which entry point decides is a property of the LISTENER the request arrived on: the primary
+    // listener forwards to the credential's primary upstream, a leg listener to the credential's own
+    // entry for that leg's authority. Same steps, same refusals — only the selector differs.
+    let decision = match via_authority.as_deref() {
+        None => engine.authorize(&headers),
+        Some(authority) => engine.authorize_via(&headers, authority),
+    };
+    match decision {
         Decision::Refuse(reason) => {
             let status = match reason {
                 Refusal::DestinationNotAllowed { .. } => StatusCode::FORBIDDEN,
                 Refusal::NoKnownPlaceholder => StatusCode::BAD_GATEWAY,
+                // Registration-time refusals; reachable here only through `authorize`'s defensive
+                // empty-list arm, never through a credential `register` accepted.
+                Refusal::NoUpstream | Refusal::DuplicateUpstream { .. } => StatusCode::FORBIDDEN,
             };
             Ok(refusal_response(status, &reason.to_string()))
         }
@@ -1121,6 +1291,197 @@ mod tests {
             }
             other => panic!("expected Forward, got {other:?}"),
         }
+    }
+
+    // BACK-COMPAT IS THE ACCEPTANCE: a credential listing ONE upstream is decided exactly as it
+    // always was — same Forward, same substitution target, same refusal shapes. The claude/codex
+    // path IS this case (every env-sourced credential registers a one-entry list), so this test is
+    // the direct answer to "does multi-upstream change anything for the existing seats".
+    #[test]
+    fn a_single_upstream_credential_is_decided_exactly_as_before() {
+        let upstream = "https://api.anthropic.com".to_owned();
+        let engine = ProxyEngine::new([authority_of(&upstream).unwrap()]);
+        engine
+            .register(JobCredential {
+                placeholder: "PLACEHOLDER".into(),
+                real: "REAL_VALUE".into(),
+                upstreams: vec![upstream.clone()],
+            })
+            .expect("a single-upstream credential must register exactly as before");
+        let headers = vec![("authorization".to_owned(), "Bearer PLACEHOLDER".to_owned())];
+        match engine.authorize(&headers) {
+            Decision::Forward { upstream: chosen, headers } => {
+                assert_eq!(chosen, upstream, "the primary path must forward to the one upstream");
+                assert_eq!(
+                    headers,
+                    vec![("authorization".to_owned(), "Bearer REAL_VALUE".to_owned())],
+                    "substitution must be unchanged"
+                );
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    // The primary path never looks past the first entry: extra legs change nothing for traffic on
+    // the primary listener.
+    #[test]
+    fn the_primary_path_ignores_extra_legs() {
+        let a = "https://api2.cursor.sh".to_owned();
+        let b = "https://agent.cursor.example".to_owned();
+        let engine =
+            ProxyEngine::new([authority_of(&a).unwrap(), authority_of(&b).unwrap()]);
+        engine
+            .register(JobCredential {
+                placeholder: "PLACEHOLDER".into(),
+                real: "REAL_VALUE".into(),
+                upstreams: vec![a.clone(), b],
+            })
+            .expect("a two-upstream credential must register");
+        let headers = vec![("authorization".to_owned(), "PLACEHOLDER".to_owned())];
+        match engine.authorize(&headers) {
+            Decision::Forward { upstream, .. } => {
+                assert_eq!(upstream, a, "authorize must pick the FIRST entry, always");
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    // A leg listener serves exactly the credentials that listed its authority: one job's extra leg
+    // never widens where another job's credential may go, even with both authorities allowlisted.
+    #[test]
+    fn a_leg_listener_serves_only_credentials_that_listed_its_authority() {
+        let a = "https://api2.cursor.sh".to_owned();
+        let b = "https://agent.cursor.example".to_owned();
+        let b_authority = authority_of(&b).unwrap();
+        let engine =
+            ProxyEngine::new([authority_of(&a).unwrap(), b_authority.clone()]);
+        engine
+            .register(JobCredential {
+                placeholder: "LISTS_BOTH".into(),
+                real: "REAL_BOTH".into(),
+                upstreams: vec![a.clone(), b.clone()],
+            })
+            .expect("the two-upstream credential must register");
+        engine
+            .register(JobCredential {
+                placeholder: "LISTS_A_ONLY".into(),
+                real: "REAL_A".into(),
+                upstreams: vec![a],
+            })
+            .expect("the one-upstream credential must register");
+
+        let both = vec![("authorization".to_owned(), "LISTS_BOTH".to_owned())];
+        match engine.authorize_via(&both, &b_authority) {
+            Decision::Forward { upstream, .. } => {
+                assert_eq!(upstream, b, "the leg must forward to the credential's OWN entry for it");
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
+
+        let a_only = vec![("authorization".to_owned(), "LISTS_A_ONLY".to_owned())];
+        match engine.authorize_via(&a_only, &b_authority) {
+            Decision::Refuse(Refusal::DestinationNotAllowed { host }) => {
+                assert_eq!(host, b_authority, "the refusal must name the leg it refused");
+            }
+            other => panic!(
+                "a credential that never listed this leg must be refused on it, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn register_refuses_an_empty_upstream_list() {
+        let engine = ProxyEngine::new(["api.anthropic.com".to_owned()]);
+        let refusal = engine
+            .register(JobCredential {
+                placeholder: "PLACEHOLDER".into(),
+                real: "REAL_VALUE".into(),
+                upstreams: vec![],
+            })
+            .expect_err("an upstream-less credential must be refused");
+        assert_eq!(refusal, Refusal::NoUpstream);
+    }
+
+    // Two entries naming one authority are refused rather than tie-broken — including the shape
+    // where they differ only by an explicit default port and a path, which is how a real config
+    // would most plausibly produce the duplicate.
+    #[test]
+    fn register_refuses_two_entries_naming_one_authority() {
+        let engine = ProxyEngine::new(["api2.cursor.sh".to_owned()]);
+        let refusal = engine
+            .register(JobCredential {
+                placeholder: "PLACEHOLDER".into(),
+                real: "REAL_VALUE".into(),
+                upstreams: vec![
+                    "https://api2.cursor.sh".to_owned(),
+                    "https://api2.cursor.sh:443/v2".to_owned(),
+                ],
+            })
+            .expect_err("two entries for one authority must be refused");
+        assert_eq!(
+            refusal,
+            Refusal::DuplicateUpstream { host: "api2.cursor.sh:443".to_owned() }
+        );
+    }
+
+    // MULTI-UPSTREAM END TO END: WHICH LISTENER A REQUEST ARRIVES ON IS THE SELECTOR. One
+    // credential lists two upstreams; the SAME placeholder sent to the primary listener reaches the
+    // primary stub and sent to the leg listener reaches the leg stub, each with the REAL credential
+    // substituted. The container-side story in one test: the base URL a leg was handed is the only
+    // thing that routes it, and it can reach nothing the credential did not list.
+    #[tokio::test]
+    async fn the_listener_a_request_arrives_on_selects_the_upstream() {
+        let (primary_addr, _primary_stub) = spawn_stub("PRIMARY_OK").await;
+        let (leg_addr, leg_stub) = spawn_stub("LEG_OK").await;
+        let primary = format!("http://{primary_addr}");
+        let leg = format!("http://{leg_addr}");
+        let leg_authority = authority_of(&leg).unwrap();
+        let engine = Arc::new(ProxyEngine::new([
+            authority_of(&primary).unwrap(),
+            leg_authority.clone(),
+        ]));
+        let placeholder = mint_anthropic_placeholder();
+        engine
+            .register(JobCredential {
+                placeholder: placeholder.clone(),
+                real: REAL.to_owned(),
+                upstreams: vec![primary, leg],
+            })
+            .expect("a two-upstream credential must register");
+        let running = start_with_legs(Arc::clone(&engine), None, &[leg_authority.clone()])
+            .await
+            .expect("a proxy with one leg must start");
+
+        let client = reqwest::Client::new();
+        let primary_answer = client
+            .get(format!("http://127.0.0.1:{}/v1/messages", running.local_addr().port()))
+            .header("authorization", &placeholder)
+            .send()
+            .await
+            .expect("the primary listener must answer");
+        assert_eq!(primary_answer.text().await.unwrap(), "PRIMARY_OK");
+
+        let leg_port = running
+            .leg_addr(&leg_authority)
+            .expect("the leg listener must exist")
+            .port();
+        let leg_answer = client
+            .get(format!("http://127.0.0.1:{leg_port}/v1/agent"))
+            .header("authorization", &placeholder)
+            .send()
+            .await
+            .expect("the leg listener must answer");
+        assert_eq!(leg_answer.text().await.unwrap(), "LEG_OK");
+
+        let seen_by_leg = leg_stub.await.expect("the leg stub must have been reached");
+        assert!(
+            seen_by_leg.contains(REAL),
+            "the leg upstream must see the REAL credential, substituted from the placeholder"
+        );
+        assert!(
+            !seen_by_leg.contains(&placeholder),
+            "the placeholder must not travel past the proxy"
+        );
     }
 
     // THE ATTACK THIS MODULE'S BODY EXCLUSION EXISTS FOR, end to end through a live proxy.
