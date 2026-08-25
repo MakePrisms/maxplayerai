@@ -186,6 +186,77 @@ pub fn probe_seat_capabilities(
     })
 }
 
+/// Why a job's capability REQUEST is itself malformed (#897).
+///
+/// Distinct from [`crate::buyer::lifecycle::CapabilityRefusal`], which judges a well-formed request
+/// against a seat's ADVERTISEMENT. The two reach different people and imply opposite actions: a
+/// refusal tells an operator to wait or add a seat, which is a useful answer; a defect tells the
+/// CALLER its own arguments name something no seat can ever advertise, which no amount of waiting
+/// fixes. Collapsing them would tell a buyer to wait for a seat that cannot exist.
+///
+/// They are also caught at different times, and that is the point of having this type at all: this
+/// one is caught BEFORE an offer is signed and published, where refusing costs nothing. The refusal
+/// is caught at award, by which time the offer is on the relay and the deadline is already running.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestDefect {
+    /// The request named a harness family outside [`crate::agent_presets::HARNESS_FAMILIES`]. No
+    /// seat can advertise it, because families reach the wire only via
+    /// [`crate::agent_presets::harness_family_for_preset`].
+    UnknownHarnessFamily { requested: String },
+    /// The request named a capability token outside [`CAPABILITIES`]. Unmatchable by construction —
+    /// the only emitter of these tokens is [`probe_capabilities`], which yields entries of that list.
+    UnknownCapabilityToken { token: String },
+}
+
+impl std::fmt::Display for RequestDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownHarnessFamily { requested } => write!(
+                f,
+                "harness_family {requested:?} is not a known family (known: {})",
+                crate::agent_presets::HARNESS_FAMILIES.join(", ")
+            ),
+            Self::UnknownCapabilityToken { token } => write!(
+                f,
+                "capability {token:?} is not a known capability token (known: {})",
+                CAPABILITIES.join(", ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RequestDefect {}
+
+/// Validate a job's capability request against the closed vocabularies, BEFORE an offer carrying it
+/// is signed (#897).
+///
+/// Posting an offer commits the buyer: the daemon drives the award from it and the deadline starts
+/// running. An out-of-vocabulary request is unmatchable by construction, so an offer carrying one
+/// can only ever park at its deadline having refused every claim — a spend of time and attention for
+/// a defect that was visible before the event was built. Refusing here converts that into an
+/// immediate, actionable error to the caller.
+///
+/// The award-side predicate keeps its own equivalent check and this does NOT replace it: offers
+/// arrive from clients this code never ran, so the fail-closed backstop at judge time is what makes
+/// the property hold on the wire rather than only in our own posting path.
+pub fn validate_capability_request(
+    requested_harness_family: Option<&str>,
+    required_capabilities: &[String],
+) -> Result<(), RequestDefect> {
+    if let Some(family) = requested_harness_family {
+        if !crate::agent_presets::HARNESS_FAMILIES.contains(&family) {
+            return Err(RequestDefect::UnknownHarnessFamily { requested: family.to_owned() });
+        }
+    }
+    if let Some(token) = required_capabilities
+        .iter()
+        .find(|token| !CAPABILITIES.contains(&token.as_str()))
+    {
+        return Err(RequestDefect::UnknownCapabilityToken { token: token.clone() });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

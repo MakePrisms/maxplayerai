@@ -65,6 +65,20 @@ pub const ACCEPTED_MINTS_TAG: &str = "accepted_mints";
 /// [`crate::agent_presets::HARNESS_FAMILIES`]; a preset with no family contributes nothing.
 pub const HARNESS_FAMILY_TAG: &str = "harness_family";
 
+/// Offer param naming the harness family a job REQUESTS (#897):
+/// `["param", "harness_family", "<family>"]`, single-value, matched against
+/// [`HARNESS_FAMILY_TAG`].
+///
+/// Same word as the advertisement deliberately: the buyer's request and the seat's claim are
+/// compared by exact equality, so spelling them from one constant is what keeps the two sides in one
+/// vocabulary. A request param that drifted from the advertisement tag would filter on a word no
+/// seat can say, and nothing would flag it.
+///
+/// Distinct from [`crate::seller_agents::AGENT_PARAM`], which names a PRESET: a family spans the
+/// presets sharing a harness, so a family request binds dispatch where a preset name binds a
+/// configuration. Both may be present and both are then enforced.
+pub const HARNESS_FAMILY_PARAM: &str = "harness_family";
+
 /// Wire tag pairing ONE serving harness to the model it LAST REPORTED (#784):
 /// `["harness_model", "<family>", "<currentModelId>"]`, REPEATED once per serving harness.
 ///
@@ -130,6 +144,21 @@ pub const HARNESS_FAMILY_TAG: &str = "harness_family";
 /// and a detector that always fires is not a detector. Issue #785 carries the model-selection work
 /// that would close the gap properly.
 pub const HARNESS_MODEL_TAG: &str = "harness_model";
+
+/// Offer param naming the model a job REQUESTS (#897):
+/// `["param", "harness_model", "<model>"]`, single-value, matched against [`HARNESS_MODEL_TAG`].
+///
+/// ⚠ ONLY MEANINGFUL PAIRED WITH [`HARNESS_FAMILY_PARAM`], and a model arriving without one refuses
+/// every claim rather than being ignored — the PAIR is the unit, because a bare model on a
+/// multi-harness seat does not say which harness would run it (#788). That is a v1 restriction with a
+/// mechanism behind it: the harness filter binds delivery because the seller enforces it
+/// exact-or-nothing at dispatch, and a model phrased as a refinement of a harness request inherits
+/// that chain where a model-only request would inherit none of it.
+///
+/// ⚠ And it filters on a LAST-OBSERVED self-report, never a promise: see [`HARNESS_MODEL_TAG`]. A
+/// model request narrows who is CONSIDERED; it does not pin what executes. #785 carries the
+/// selection work that would make it a commitment.
+pub const HARNESS_MODEL_PARAM: &str = "harness_model";
 
 /// Wire tag carrying the seat's harness VARIANT (#784) — fork/config colour, free text, single value.
 ///
@@ -198,6 +227,19 @@ pub const HARNESS_VARIANT_TAG: &str = "harness_variant";
 /// the seat OVER-claims: it can be awarded work it can no longer do, and that is caught at delivery
 /// rather than at the filter. Bounding the probe on a cadence is #891.
 pub const CAPABILITIES_TAG: &str = "capabilities";
+
+/// Offer param naming the capability tokens a job REQUIRES (#897):
+/// `["param", "capability", "<token>", …]`, multi-value, matched against [`CAPABILITIES_TAG`].
+///
+/// Singular against the plural advertisement, exactly as [`crate::seller_agents::AGENT_PARAM`] is
+/// singular against [`crate::seller_agents::AGENT_TAG`] — the request names one requirement at a
+/// time, the advertisement names a set.
+///
+/// ONE multi-value tag, never repeated single-value tags. The readers here take the FIRST matching
+/// tag, so a second `["param", "capability", …]` would be silently dropped and a buyer would be
+/// filtered on a subset of what it asked for — the failure direction that awards work nobody
+/// verified was requestable.
+pub const CAPABILITY_PARAM: &str = "capability";
 
 /// Wire tag carrying operator colour about the machine (#784) — e.g. "mac studio, 64GB". Free text,
 /// single value.
