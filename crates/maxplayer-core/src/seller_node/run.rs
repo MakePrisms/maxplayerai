@@ -3231,6 +3231,13 @@ impl SellerNodeRunner {
                 deadline_unix: row.deadline_unix as u64,
                 seller_pubkey: row.targeted.then(|| seller_pubkey.clone()),
                 requested_agent: row.requested_agent.clone(),
+                // The seller's own claim decision is capability-blind: the buyer's request filters
+                // which claims may be AWARDED, and it is judged buyer-side against what this seat
+                // advertises. Reconstructing it here would be a second reading of the request that
+                // could disagree with the one that decides.
+                requested_harness_family: None,
+                requested_model: None,
+                required_capabilities: Vec::new(),
             };
             match classify_offer(
                 &offer,
@@ -6289,8 +6296,13 @@ impl SellerNodeRunner {
             unit: offer.unit.clone(),
             deadline_unix: offer.deadline_unix.max(0) as u64,
             seller_pubkey: offer.targeted.then(|| seller_pubkey.clone()),
-            // The pay path is harness-blind: which harness ran the job never changes the terms.
+            // The pay path is harness-blind: which harness ran the job never changes the terms. It is
+            // capability-blind for the same reason — the request decided WHO could be awarded, and
+            // that decision is upstream of and independent from what the agreed terms are.
             requested_agent: None,
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: Vec::new(),
         };
         let accepted_mints: std::collections::HashSet<cashu::MintUrl> =
             request.mints.iter().cloned().collect();
@@ -7097,6 +7109,9 @@ mod tests {
             deadline_unix,
             seller_pubkey: targeted_to.map(str::to_owned),
             requested_agent: None,
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: Vec::new(),
         }
     }
 

@@ -4301,6 +4301,9 @@ mod tests {
             deadline_unix: 1,
             seller_pubkey: Some(seller.into()),
             requested_agent: None,
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: Vec::new(),
         }
     }
 
