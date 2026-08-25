@@ -106,6 +106,33 @@ const tagValues = (event: RawEvent, name: string): string[] => {
 };
 
 /**
+ * One wire value under the "stated or absent" contract of `docs/protocol-v1.md`
+ * §4.5.2: trimmed, and null when nothing survives. Blank and all-whitespace are
+ * ABSENT, and a reader must treat them identically to a missing tag.
+ *
+ * Trimming rather than merely rejecting is what makes this reader agree with the
+ * emitter. A padded `" claude-code "` kept as-is would never equal the
+ * `claude-code` a buyer names, so a seat would advertise a family it could never
+ * be matched on. Interior whitespace is CONTENT and survives — only the edges
+ * are noise.
+ *
+ * ⚠ APPLIED AT THE FIVE #784 READERS INDIVIDUALLY, NEVER INSIDE `tagValues` OR
+ * `firstTag`. Those two are shared with `agents` and `accepted_mints`, and
+ * changing how a mint list parses is not something to do as a side effect of a
+ * capability change. Unifying at the helper is a coherent proposal; it is a
+ * separate one. This mirrors `stated` in `crates/maxplayer-core/src/heartbeat.rs`,
+ * which carries the same restriction for the same reason.
+ */
+const stated = (value: string | null | undefined): string | null => {
+  const trimmed = (value ?? "").trim();
+  return trimmed.length > 0 ? trimmed : null;
+};
+
+/** `stated` across a list, dropping the values that state nothing. */
+const statedValues = (values: string[]): string[] =>
+  values.map(stated).filter((v): v is string => v !== null);
+
+/**
  * Every `["harness_model", family, model]` tag on the event.
  *
  * Deliberately NOT `tagValues`, which returns the cells of the FIRST tag with a
@@ -115,12 +142,16 @@ const tagValues = (event: RawEvent, name: string): string[] => {
  *
  * A pair missing either cell is dropped: a family with no model states nothing,
  * and a model with no family cannot say which harness reported it.
+ *
+ * Both halves go through `stated`, so an all-whitespace half is as unpairable as
+ * an empty one. The pair is the unit — a stated model under a blank family is
+ * not a partial answer worth salvaging.
  */
 function harnessModels(event: RawEvent): HarnessModel[] {
   const pairs: HarnessModel[] = [];
   for (const t of tagsNamed(event, "harness_model")) {
-    const family = t[1];
-    const model = t[2];
+    const family = stated(t[1]);
+    const model = stated(t[2]);
     if (!family || !model) continue;
     if (!pairs.some((p) => p.family === family && p.model === model)) pairs.push({ family, model });
   }
@@ -382,11 +413,14 @@ function parseEventUncached(event: RawEvent): ParsedEvent | null {
                // job execution environment. `harness_variant` and `hardware`
                // are operator-typed and nothing verifies them; the renderer
                // keeps that split visible rather than showing five equal rows.
-               harnessFamilies: tagValues(event, "harness_family"),
+               // Each of the five normalized at its OWN reader (§4.5.2), never
+               // in the shared helpers those two lines call — `agents` and
+               // `accepted_mints` ride the same helpers and must not shift.
+               harnessFamilies: statedValues(tagValues(event, "harness_family")),
                harnessModels: harnessModels(event),
-               capabilities: tagValues(event, "capabilities"),
-               harnessVariant: firstTag(event, "harness_variant"),
-               hardware: firstTag(event, "hardware"),
+               capabilities: statedValues(tagValues(event, "capabilities")),
+               harnessVariant: stated(firstTag(event, "harness_variant")),
+               hardware: stated(firstTag(event, "hardware")),
                advertisementTags: advertisementTags(event),
                advertisementContent: String(event.content || "").trim() ? parseJsonContent(event) : null };
     case PROFILE: {

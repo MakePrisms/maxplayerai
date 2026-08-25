@@ -206,3 +206,79 @@ test("hostile free text in an unverified field cannot escape its row", () => {
   assert.doesNotMatch(html, /<img/);
   assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
 });
+
+test("a hostile beat normalizes all five fields to stated-or-absent", () => {
+  // §4.5.2: an all-whitespace value is UNSTATED, and a reader must treat it
+  // exactly like a missing tag. Read raw, a `"   "` renders as a stated-but-blank
+  // claim no operator typed, and for the three filterable fields it is what a
+  // buyer's award filter consumes — so the display would show tokens the award
+  // path does not. Matches `heartbeat.rs`'s own hostile-tag test.
+  const p = parseEvent(beat(T0, [
+    ["harness_family", "   ", " codex "],
+    ["capabilities", "\t", " rust "],
+    ["harness_model", " ", "gpt-x"],
+    ["harness_model", "claude-code", "   "],
+    ["harness_model", " claude-code ", "  opus  "],
+    ["harness_variant", "  "],
+    ["hardware", " \t "],
+  ]));
+
+  assert.deepEqual(p?.harnessFamilies, ["codex"], "a blank family states nothing; a padded one must match what a buyer names");
+  assert.deepEqual(p?.capabilities, ["rust"], "a blank token would be a capability no seat can be held to");
+  assert.deepEqual(p?.harnessModels, [{ family: "claude-code", model: "opus" }],
+    "either half blank drops the WHOLE pair — a stated model under a blank family is not a partial answer");
+  assert.equal(p?.harnessVariant, null, "present-but-blank is not a state this field has");
+  assert.equal(p?.hardware, null, "a tab padded with spaces states nothing either");
+});
+
+test("padded values normalize but INTERIOR whitespace is content and survives", () => {
+  // The positive control for the test above. Without it every assertion there is
+  // satisfied by a reader that returns nothing at all — which would hide every
+  // seat instead of only the blank fields.
+  const p = parseEvent(beat(T0, [
+    ["harness_family", " claude-code "],
+    ["capabilities", "  rust  ", " node "],
+    ["harness_variant", "  pro fork  "],
+    ["hardware", " mac studio, 64GB "],
+  ]));
+
+  assert.deepEqual(p?.harnessFamilies, ["claude-code"]);
+  assert.deepEqual(p?.capabilities, ["rust", "node"]);
+  assert.equal(p?.harnessVariant, "pro fork", "the space between words is content");
+  assert.equal(p?.hardware, "mac studio, 64GB", "only the edges are noise");
+});
+
+test("a beat stating only blanks produces no capability rows at all", () => {
+  // End to end, because the row is what a buyer reads. An unstated field must
+  // render as silence, not as a row containing a space.
+  const rows = sellerBoard([beat(T0, [
+    ["harness_family", "   "],
+    ["capabilities", " "],
+    ["harness_model", "  ", " "],
+    ["harness_variant", "\t"],
+    ["hardware", "  "],
+  ])], T0 + 60);
+
+  const seat = rows.find((r) => r.pubkey === SELLER);
+  const shown = capabilityRows(seat ?? null).filter(([, v]) => v != null && v !== "");
+  assert.deepEqual(shown, [], "every field is unstated, so the Profile shows no capability rows");
+});
+
+test("normalization is capability-scoped — agents and accepted_mints are untouched", () => {
+  // ⛔ THE CONSTRAINT, not a nicety. `tagValues` and `firstTag` are shared with
+  // the mint list, and a mint string is matched elsewhere; changing how it parses
+  // as a side effect of a capability fix is a different change with a different
+  // blast radius. `stated` is applied at the five #784 readers ONLY, and this
+  // test fails if someone later "tidies" it into the shared helper.
+  const p = parseEvent(beat(T0, [
+    ["accepted_mints", "  https://mint.a  ", "", "https://mint.b"],
+    ["agents", " claude ", "  "],
+    ["capabilities", " rust "],
+  ]));
+
+  assert.deepEqual(p?.acceptedMints, ["  https://mint.a  ", "https://mint.b"],
+    "mint values keep their padding — only the zero-length cell drops, as before");
+  assert.deepEqual(p?.agents, [" claude ", "  "],
+    "agents keeps both padding AND its whitespace-only cell, exactly as before");
+  assert.deepEqual(p?.capabilities, ["rust"], "positive control: the capability reader IS normalizing in the same parse");
+});
