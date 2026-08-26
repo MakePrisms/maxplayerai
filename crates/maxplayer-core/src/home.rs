@@ -1639,6 +1639,7 @@ pub(crate) fn parse_config_toml(raw: &str) -> Result<MaxplayerConfig, HomeError>
 /// `MAXPLAYER_*` spelling, so excluding them costs no config coverage.
 const RESERVED_ENV_VARS: &[&str] = &[
     "MAXPLAYER_HOME",
+    "MAXPLAYER_VERBOSE",
     "MAXPLAYER_HEARTBEAT_INTERVAL_SECS",
     "MAXPLAYER_HEARTBEAT_ENABLED",
     "MAXPLAYER_HEARTBEAT_STALL_MISSED_INTERVALS",
@@ -2789,6 +2790,7 @@ mod tests {
         // resolution from refusing when they are set. The filtered map must drop them.
         let raw = env(&[
             ("MAXPLAYER_HOME", "/tmp/x"),
+            ("MAXPLAYER_VERBOSE", "1"),
             ("MAXPLAYER_HEARTBEAT_INTERVAL_SECS", "9"),
             ("MAXPLAYER_RELAY_URL", "wss://kept"),
         ]);
