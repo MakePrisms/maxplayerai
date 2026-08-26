@@ -1036,6 +1036,21 @@ impl std::fmt::Display for OptTs {
     }
 }
 
+/// Formats an optional byte length as the number or `none`, so a `forward_end` line for a leg with no
+/// credential to scrub still carries the `real_len` field. A missing field would read as a logging bug,
+/// and a `0` would read as "an empty credential" rather than "no credential on this leg". This is a
+/// LENGTH only — never the credential value; a length is not a secret, a prefix is.
+struct OptLen(Option<usize>);
+
+impl std::fmt::Display for OptLen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(len) => write!(f, "{len}"),
+            None => f.write_str("none"),
+        }
+    }
+}
+
 /// Observes the RESPONSE BODY — the region after the response header that [`AwaitGuard`] and the
 /// `await_response` line structurally cannot see. Wraps the raw upstream byte stream and is PASSIVE: it
 /// forwards every chunk unchanged and records only timings and the terminator.
@@ -1161,6 +1176,143 @@ impl Drop for BodyMeter {
                 self.bytes,
                 OptTs(self.first_byte_ts),
                 OptTs(self.last_byte_ts),
+            );
+        }
+    }
+}
+
+/// Observes the DOWNSTREAM-FORWARDED body — the frames that actually leave the proxy for the container,
+/// AFTER [`scrub_stream`] (or the no-scrub `map`) has run. [`BodyMeter`] sits BEFORE scrub and counts
+/// bytes RECEIVED from the upstream; this counts bytes FORWARDED to hyper. Reading `body_*` beside
+/// `forward_*` for one request separates "the upstream sent little" from "the proxy forwarded little of
+/// what the upstream sent".
+///
+/// The gap between the two meters is the credential-scrub holdback: [`scrub_stream`] withholds the last
+/// `real.len() - 1` bytes of the stream — the longest possible partial credential match — and flushes it
+/// only when the upstream ENDS. On an upstream STALL (bytes then no EOF), bytes that BodyMeter has
+/// already counted may not yet be forwarded here. This meter only MEASURES that gap; it changes nothing
+/// about when the carry flushes, because that is a containment boundary, not a streaming knob.
+///
+/// PASSIVE, exactly like [`BodyMeter`]: forwards every frame unchanged, records only counts, timings and
+/// the terminator, and its heartbeat only EMITS — it never cancels, so it cannot manufacture the
+/// terminator it observes. LOGS NO CREDENTIAL MATERIAL: `real_len` is the LENGTH of the credential
+/// string only, never its value, never the carry buffer, never a matched region or offset.
+struct ForwardMeter {
+    inner: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<Frame<Bytes>, std::io::Error>> + Send + Sync>,
+    >,
+    req: u64,
+    host: String,
+    // The same observed response-header instant [`BodyMeter`] measures from, so `forward_*` gaps and
+    // `body_*` gaps share one origin and read directly against each other.
+    header_ts: u128,
+    // Bytes ACTUALLY forwarded downstream: the running sum of forwarded `Frame::data` payload lengths.
+    bytes: u64,
+    first_ts: Option<u128>,
+    last_ts: Option<u128>,
+    // LENGTH of the credential scrubbed on this leg (`None` on a leg with no scrub). The holdback is
+    // `real_len - 1` bytes, so this is the parameter that predicts how much a stalled stream withholds.
+    real_len: Option<usize>,
+    // Log-only clock, same discipline as [`BodyMeter`]'s heartbeat: emits `forward_idle` while nothing is
+    // forwarded, so "the upstream trickled bytes but the proxy forwarded none" is a POSITIVE reading with
+    // a denominator rather than an absence. Polled but NEVER used to cancel.
+    heartbeat: tokio::time::Interval,
+    // Set once the forwarded stream terminates (its own EOF or error) so Drop does not then record a
+    // spurious `terminated_by=downstream`.
+    ended: bool,
+}
+
+impl futures_util::Stream for ForwardMeter {
+    type Item = Result<Frame<Bytes>, std::io::Error>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // `Self: Unpin` (every field is), so unwrapping the pin needs no projection crate.
+        let this = self.get_mut();
+        match futures_util::Stream::poll_next(this.inner.as_mut(), cx) {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                let now = proxy_log_now_ms();
+                if this.first_ts.is_none() {
+                    this.first_ts = Some(now);
+                    eprintln!(
+                        "proxy: req#{} ts={now} phase=forward_first host={} gap_from_header_ms={}",
+                        this.req,
+                        this.host,
+                        now.saturating_sub(this.header_ts),
+                    );
+                }
+                // Only DATA frames carry body bytes; a trailers frame contributes zero.
+                this.bytes += frame.data_ref().map_or(0, Bytes::len) as u64;
+                this.last_ts = Some(now);
+                std::task::Poll::Ready(Some(Ok(frame)))
+            }
+            std::task::Poll::Ready(Some(Err(error))) => {
+                this.ended = true;
+                eprintln!(
+                    "proxy: req#{} ts={} phase=forward_end terminated_by=upstream kind=error host={} bytes={} real_len={} first_ts={} last_ts={} msg={error}",
+                    this.req,
+                    proxy_log_now_ms(),
+                    this.host,
+                    this.bytes,
+                    OptLen(this.real_len),
+                    OptTs(this.first_ts),
+                    OptTs(this.last_ts),
+                );
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            std::task::Poll::Ready(None) => {
+                this.ended = true;
+                let now = proxy_log_now_ms();
+                eprintln!(
+                    "proxy: req#{} ts={now} phase=forward_end terminated_by=upstream kind=eof host={} bytes={} real_len={} first_ts={} last_ts={}",
+                    this.req,
+                    this.host,
+                    this.bytes,
+                    OptLen(this.real_len),
+                    OptTs(this.first_ts),
+                    OptTs(this.last_ts),
+                );
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => {
+                // The forwarded stream has nothing right now — either the upstream is parked or scrub is
+                // holding its carry back. Drive the heartbeat so the withheld case is an explicit line
+                // rather than an absence. Same waker mechanics as [`BodyMeter`]: polling the interval
+                // registers its waker, and the inner stream's waker is already registered from the poll
+                // above, so a real frame still wakes us immediately.
+                while this.heartbeat.poll_tick(cx).is_ready() {
+                    let now = proxy_log_now_ms();
+                    eprintln!(
+                        "proxy: req#{} ts={now} phase=forward_idle host={} bytes={} gap_from_header_ms={}",
+                        this.req,
+                        this.host,
+                        this.bytes,
+                        now.saturating_sub(this.header_ts),
+                    );
+                }
+                std::task::Poll::Pending
+            }
+        }
+    }
+}
+
+impl Drop for ForwardMeter {
+    fn drop(&mut self) {
+        // Un-ended at drop ⇒ the forwarded stream was torn down before it finished, i.e. hyper dropped
+        // the body because the container closed its connection mid-stream. `bytes` is then the total the
+        // proxy managed to forward before the client gave up — the number the holdback hypothesis predicts.
+        if !self.ended {
+            eprintln!(
+                "proxy: req#{} ts={} phase=forward_end terminated_by=downstream host={} bytes={} real_len={} first_ts={} last_ts={}",
+                self.req,
+                proxy_log_now_ms(),
+                self.host,
+                self.bytes,
+                OptLen(self.real_len),
+                OptTs(self.first_ts),
+                OptTs(self.last_ts),
             );
         }
     }
@@ -1364,14 +1516,35 @@ async fn relay(
         heartbeat,
         ended: false,
     };
-    let body = match scrub {
-        Some((real, placeholder)) => {
-            BodyExt::boxed(StreamBody::new(scrub_stream(metered, real, placeholder)))
-        }
-        None => BodyExt::boxed(StreamBody::new(
-            metered.map(|chunk| chunk.map(Frame::data).map_err(std::io::Error::other)),
-        )),
+    // Second meter, DOWNSTREAM of scrub: `metered` (BodyMeter) counted what the upstream SENT; this
+    // counts what the proxy FORWARDS after scrub. The credential length is captured before `scrub` is
+    // consumed by the match. Same heartbeat discipline as the upstream meter so "received bytes, forwarded
+    // none" is a positive `forward_idle` reading rather than silence.
+    let real_len = scrub.as_ref().map(|(real, _)| real.len());
+    let forwarded: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<Frame<Bytes>, std::io::Error>> + Send + Sync>,
+    > = match scrub {
+        Some((real, placeholder)) => Box::pin(scrub_stream(metered, real, placeholder)),
+        None => Box::pin(metered.map(|chunk| chunk.map(Frame::data).map_err(std::io::Error::other))),
     };
+    let mut forward_heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + BODY_HEARTBEAT_PERIOD,
+        BODY_HEARTBEAT_PERIOD,
+    );
+    forward_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let forward_metered = ForwardMeter {
+        inner: forwarded,
+        req,
+        host: host.to_owned(),
+        header_ts,
+        bytes: 0,
+        first_ts: None,
+        last_ts: None,
+        real_len,
+        heartbeat: forward_heartbeat,
+        ended: false,
+    };
+    let body = BodyExt::boxed(StreamBody::new(forward_metered));
     builder
         .body(body)
         .map_err(|error| format!("building proxied response failed: {error}"))
