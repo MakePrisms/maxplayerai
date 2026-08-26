@@ -2169,7 +2169,7 @@ fn unreachable_seat_warning(seller: &crate::home::SellerConfig) -> Option<String
     let usable_buyers = seller
         .accept_offers_only_from
         .iter()
-        .filter(|entry| crate::home::buyer_pubkey_is_matchable(entry))
+        .filter(|entry| crate::home::buyer_pubkey_is_reachable(entry))
         .count();
     if usable_buyers > 0 {
         return None;
@@ -2188,24 +2188,20 @@ fn unreachable_seat_warning(seller: &crate::home::SellerConfig) -> Option<String
              everyone else on BOTH surfaces, so no offer can reach this seat at all. A buyer pubkey \
              is 64 lowercase hex characters; an npub1..., a shortened id or a capitalised one is \
              compared literally and matches nobody. Correct the entries, or remove them. THREE \
-             ROUTES BACK IN: list your buyers in [seller] accept_offers_only_from, or set \
-             accept_open_targeted=true to accept targeted offers from buyers you have not named, or \
-             set claim_open_pool=true to claim untargeted jobs from the open pool.",
-            seller.accept_offers_only_from.len()
+             ROUTES BACK IN: {}.",
+            seller.accept_offers_only_from.len(),
+            crate::home::ROUTES_BACK_IN
         ));
     }
-    Some(
+    Some(format!(
         "seller node WARNING: this seat can claim NOTHING as configured — it names no buyers \
          (accept_offers_only_from is empty), does not accept targeted offers from buyers it has not \
          named (accept_open_targeted=false), and does not claim the open pool \
          (claim_open_pool=false). It will advertise and stay connected, but never claim a job. If \
          this seat used to serve, an upgrade closed the targeted surface that an empty allowlist \
-         used to leave open. THREE ROUTES BACK IN: list your buyers in [seller] \
-         accept_offers_only_from, or set accept_open_targeted=true to accept targeted offers from \
-         buyers you have not named, or set claim_open_pool=true to claim untargeted jobs from the \
-         open pool."
-            .to_owned(),
-    )
+         used to leave open. THREE ROUTES BACK IN: {}.",
+        crate::home::ROUTES_BACK_IN
+    ))
 }
 
 /// Resolve + report the harness registry at boot: one PASS/FAIL line per configured preset, then
@@ -7532,17 +7528,66 @@ mod tests {
     /// satisfied by text that tells the operator nothing about how to fix it. The needle is present
     /// in the WRONG ROLE, and splitting on the marker is what gives this test access to the claim
     /// it is actually making.
+    /// Extraction only — deliberately NOT an assertion helper. Each branch keeps its own `#[test]`
+    /// and its own assertions, because the runner stops at the first failing assertion: folding the
+    /// two branches into one test would let whichever ran second go unexercised while the suite
+    /// still reported a failure for the right-looking reason.
+    fn remedy_clause_of(warning: &str) -> String {
+        warning
+            .split_once("THREE ROUTES BACK IN:")
+            .expect(
+                "the remedy must be delimited so it can be read apart from the diagnosis, which \
+                 names the same knobs as the settings that are OFF",
+            )
+            .1
+            .to_owned()
+    }
+
+    /// ⛔ ASSERTED ON THE REMEDY CLAUSE ALONE, NEVER THE WHOLE STRING. The diagnosis already names
+    /// all three knobs — as the settings that are OFF — so `warning.contains("claim_open_pool")` is
+    /// satisfied by text that tells the operator nothing about how to fix it. The needle is present
+    /// in the WRONG ROLE.
     #[test]
-    fn the_unreachable_warning_offers_all_three_routes_back_in() {
+    fn the_empty_list_warning_offers_all_three_routes_back_in() {
         let warning =
             unreachable_seat_warning(&seller_cfg_closed()).expect("a closed seat must warn");
-        let (_diagnosis, remedy) = warning.split_once("THREE ROUTES BACK IN:").expect(
-            "the remedy must be delimited so it can be read apart from the diagnosis that names \
-             the same knobs",
-        );
+        let remedy = remedy_clause_of(&warning);
         for route in ["accept_offers_only_from", "accept_open_targeted", "claim_open_pool"] {
             assert!(remedy.contains(route), "the remedy must offer `{route}`, got: {remedy}");
         }
+    }
+
+    /// ⛔ THE BRANCH THAT WAS UNCOVERED, AND THE REASON THIS IS A SEPARATE TEST. The remedy used to
+    /// be spelled literally in each branch, and the only test that read one read the EMPTY branch:
+    /// deleting a route from the junk-list copy alone left the suite green. A mutation proves the
+    /// line it touched, never the claim it was chosen to represent — so each branch is asserted
+    /// where it lives, and both now read the one shared constant.
+    #[test]
+    fn the_junk_list_warning_offers_all_three_routes_back_in() {
+        let mut junk = seller_cfg_closed();
+        junk.accept_offers_only_from = vec!["cafe01".to_owned()];
+        let warning =
+            unreachable_seat_warning(&junk).expect("an all-unusable allowlist must warn");
+        let remedy = remedy_clause_of(&warning);
+        for route in ["accept_offers_only_from", "accept_open_targeted", "claim_open_pool"] {
+            assert!(remedy.contains(route), "the remedy must offer `{route}`, got: {remedy}");
+        }
+    }
+
+    /// The two branches must not drift apart again: whatever the diagnosis says, the remedy is the
+    /// SAME text in both. This is the assertion a shared constant makes cheap and two literals make
+    /// impossible — it fails the moment someone re-inlines either copy.
+    #[test]
+    fn both_unreachable_branches_share_one_remedy_text() {
+        let mut junk = seller_cfg_closed();
+        junk.accept_offers_only_from = vec!["cafe01".to_owned()];
+        let empty = remedy_clause_of(
+            &unreachable_seat_warning(&seller_cfg_closed()).expect("closed seat warns"),
+        );
+        let unusable =
+            remedy_clause_of(&unreachable_seat_warning(&junk).expect("junk allowlist warns"));
+        assert_eq!(empty, unusable, "both branches must offer the identical remedy");
+        assert!(!empty.is_empty(), "and it must not be vacuously equal by both being empty");
     }
 
     /// ⛔ THE FENCE OPENS ON `is_empty()`, SO A LIST OF TYPOS ADMITS NOBODY AND SHUTS BOTH SURFACES.

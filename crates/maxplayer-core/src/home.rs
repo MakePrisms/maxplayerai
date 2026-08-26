@@ -298,6 +298,26 @@ pub struct SellerConfig {
     pub claim_award_timeout_secs: Option<u64>,
 }
 
+/// Every route back to reachable, named once for the whole workspace.
+///
+/// ⛔ THIS LIVES HERE FOR A STRUCTURAL REASON, NOT A TIDINESS ONE. The dependency runs ONE WAY —
+/// `maxplayer` depends on `maxplayer-core` and never the reverse — so a constant in the CLI crate
+/// is unreachable from `seller_node::run`, which is why that file ended up with its own copies.
+/// `home` is also UNGATED, where `seller_node` is `#[cfg(feature = "wallet")]`: putting the
+/// operator's remedy text there would gate it behind `wallet` for no reason.
+///
+/// ⛔ AND THE DRIFT WAS NOT HYPOTHETICAL — IT HAD ALREADY HAPPENED. Three spellings existed: the two
+/// in `run.rs` were byte-identical to each other, and both differed from the doctor's. **The two
+/// agreeing is exactly why it looked consolidated** — within one file the duplication is visible,
+/// and the divergence lived across the crate boundary where nobody greps.
+///
+/// The doctor's wording won on merit rather than seniority: backticked and spaced, it reads as the
+/// TOML an operator must actually type. Callers add their own framing and terminal punctuation.
+pub const ROUTES_BACK_IN: &str = "list the buyers you work with in `[seller] \
+     accept_offers_only_from`, or set `accept_open_targeted = true` to accept targeted offers from \
+     buyers you have not named, or set `claim_open_pool = true` to claim untargeted jobs from the \
+     open pool";
+
 /// Can this `accept_offers_only_from` entry ever match a real buyer?
 ///
 /// ⛔ THE FENCE IS AN EXACT STRING COMPARE, SO AN ENTRY IN ANY OTHER FORM IS NOT A NARROW ROUTE —
@@ -310,8 +330,33 @@ pub struct SellerConfig {
 /// would make some of these match — which means admitting a counterparty the seat is currently
 /// refusing. Widening who can reach a seat is the opposite of what the opt-in surfaces are for,
 /// so an unusable entry stays unusable and the operator is told. Matching semantics are unchanged.
-pub fn buyer_pubkey_is_matchable(entry: &str) -> bool {
+pub fn buyer_pubkey_is_wire_shaped(entry: &str) -> bool {
     entry.len() == 64 && entry.chars().all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch))
+}
+
+/// Can this entry match a buyer that can actually EXIST? Shape, plus a real x-only public key.
+///
+/// ⛔ SHAPE IS NECESSARY AND NOT SUFFICIENT, AND THE GAP IS HALF OF ALL TYPOS. A buyer pubkey is a
+/// secp256k1 x-coordinate, and roughly half of all 64-hex values have no curve point at all — so a
+/// mistyped key is far more likely to be *unusable* than merely *wrong*. Counting a shape-valid
+/// entry as a route in is what produced `PASS reachable: 1 named buyer` for a seat no offer can
+/// ever reach.
+///
+/// ⛔ `PublicKey::from_hex` IS NOT THE VALIDATOR, THOUGH IT LOOKS LIKE ONE. Read in the pinned
+/// nostr 0.44.4: `PublicKey` is `{ buf: [u8; 32] }` and `from_hex` is `hex::decode_to_slice` with
+/// no secp256k1 call, while `hex` accepts `A-F` as well as `a-f`. A `from_hex` -> `to_hex`
+/// round-trip therefore proves exactly *64 hex characters, lowercase* — verbatim the contract
+/// [`buyer_pubkey_is_wire_shaped`] already has, so it would change nothing. **`.xonly()` is the
+/// call that parses**: it reaches `XOnlyPublicKey::from_slice`, which rejects an x with no point.
+///
+/// ⚠ `gateway` is the MINIMAL feature supplying nostr-sdk; `wallet` composes it, and every
+/// production caller of this is already `wallet`-gated. This deliberately does NOT change the
+/// admission gate, which stays an exact string compare — see [`buyer_pubkey_is_wire_shaped`].
+#[cfg(feature = "gateway")]
+pub fn buyer_pubkey_is_reachable(entry: &str) -> bool {
+    use nostr_sdk::prelude::PublicKey;
+    buyer_pubkey_is_wire_shaped(entry)
+        && PublicKey::from_hex(entry).is_ok_and(|key| key.xonly().is_ok())
 }
 
 /// Executor sandbox config (`[sandbox]` section): which executor the awarded agent command runs
@@ -1975,10 +2020,55 @@ mod tests {
 
     /// The positive control. Without it every rejection below would be satisfied by a predicate
     /// that simply answered `false`.
+    /// The positive control for the SHAPE predicate. Without it every rejection below would be
+    /// satisfied by a predicate that simply answered `false`.
+    ///
+    /// ⚠ `0123456789abcdef…` is asserted here DELIBERATELY and it is correct: it IS wire-shaped.
+    /// It is also unreachable, because it has no curve point — and that gap is the whole reason
+    /// [`buyer_pubkey_is_reachable`] exists. Asserting it here is not a bug being pinned; the bug
+    /// was the CALLERS binding a reachability question to this shape-only answer.
     #[test]
-    fn a_wire_form_buyer_pubkey_is_matchable() {
-        assert!(buyer_pubkey_is_matchable(&"a1".repeat(32)));
-        assert!(buyer_pubkey_is_matchable(&"0123456789abcdef".repeat(4)));
+    fn a_wire_form_buyer_pubkey_is_wire_shaped() {
+        assert!(buyer_pubkey_is_wire_shaped(&"a1".repeat(32)));
+        assert!(buyer_pubkey_is_wire_shaped(&"0123456789abcdef".repeat(4)));
+    }
+
+    /// x-coordinate of the secp256k1 generator: a key that provably exists, used as the positive
+    /// control so a strict predicate that always answered `false` cannot pass the rejections below.
+    #[cfg(feature = "gateway")]
+    const GENERATOR_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn a_real_curve_point_is_reachable() {
+        assert!(
+            buyer_pubkey_is_reachable(GENERATOR_X),
+            "the generator's x-coordinate is a valid x-only key and must count as a route in"
+        );
+    }
+
+    /// ⛔ SHAPE IS NOT SUFFICIENT, AND THESE FIXTURES ARE COMPUTED RATHER THAN EYEBALLED. Roughly
+    /// half of all 64-hex values have no curve point, so "looks like a key" is a coin flip.
+    /// ⚠ TWO OBVIOUS-LOOKING NEGATIVE CONTROLS ARE ACTUALLY VALID KEYS and must NOT be used here:
+    /// x = 1, and `cafe01` zero-padded to 64 — both land ON the curve. A negative control chosen by
+    /// eye is how a strict predicate gets a test that cannot fail.
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn a_wire_shaped_entry_with_no_curve_point_is_not_reachable() {
+        for (entry, why) in [
+            ("0123456789abcdef".repeat(4), "x is a quadratic non-residue: no y exists"),
+            ("ff".repeat(32), "x is above the field modulus: not a field element at all"),
+        ] {
+            assert!(
+                buyer_pubkey_is_wire_shaped(&entry),
+                "precondition: `{entry}` must be SHAPE-valid, or this proves nothing about the \
+                 curve check ({why})"
+            );
+            assert!(
+                !buyer_pubkey_is_reachable(&entry),
+                "{why}: `{entry}` can never be a buyer, so it is not a route in"
+            );
+        }
     }
 
     /// ⛔ EACH OF THESE FENCES EVERYONE AND MATCHES NOBODY. The allowlist is compared byte-for-byte
@@ -1986,7 +2076,7 @@ mod tests {
     /// is not a narrow route in — it is no route at all, while reading to an operator like a seat
     /// that named a buyer. The capitalised case is the dangerous one: it is the right key.
     #[test]
-    fn an_entry_that_can_never_match_a_wire_pubkey_is_not_matchable() {
+    fn an_entry_that_can_never_match_a_wire_pubkey_is_not_wire_shaped() {
         for (entry, why) in [
             ("A1".repeat(32), "capitalised hex — the right key, and it still matches nobody"),
             ("a1".repeat(31), "too short"),
@@ -1997,7 +2087,7 @@ mod tests {
             ("g".repeat(64), "right length, not hex"),
         ] {
             assert!(
-                !buyer_pubkey_is_matchable(&entry),
+                !buyer_pubkey_is_wire_shaped(&entry),
                 "{why}: `{entry}` cannot match a wire pubkey and must not be counted as a route in"
             );
         }
