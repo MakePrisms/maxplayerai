@@ -2185,11 +2185,10 @@ fn unreachable_seat_warning(seller: &crate::home::SellerConfig) -> Option<String
         return Some(format!(
             "seller node WARNING: this seat can claim NOTHING as configured — all {} entr(y/ies) in \
              [seller] accept_offers_only_from are unusable, and a populated allowlist fences out \
-             everyone else on BOTH surfaces, so no offer can reach this seat at all. A buyer pubkey \
-             is 64 lowercase hex characters; an npub1..., a shortened id or a capitalised one is \
-             compared literally and matches nobody. Correct the entries, or remove them. THREE \
-             ROUTES BACK IN: {}.",
+             everyone else on BOTH surfaces, so no offer can reach this seat at all. {}. Correct \
+             the entries, or remove them. THREE ROUTES BACK IN: {}.",
             seller.accept_offers_only_from.len(),
+            crate::home::USABLE_BUYER_ENTRY,
             crate::home::ROUTES_BACK_IN
         ));
     }
@@ -7588,6 +7587,50 @@ mod tests {
             remedy_clause_of(&unreachable_seat_warning(&junk).expect("junk allowlist warns"));
         assert_eq!(empty, unusable, "both branches must offer the identical remedy");
         assert!(!empty.is_empty(), "and it must not be vacuously equal by both being empty");
+    }
+
+    /// ⛔ THE EXPLANATION MUST NAME THE RULE THAT ACTUALLY REFUSED THE ENTRY. Every other test here
+    /// uses a fixture rejected for its SHAPE — `cafe01` is too short, `A1…` is capitalised — so none
+    /// of them can tell a shape-only message from a correct one. This one is rejected for its CURVE
+    /// and nothing else, which is the only fixture that puts the wording under test.
+    ///
+    /// ⛔ WHY IT MATTERS MORE THAN A WORDING NIT: an operator whose entries are all curve-invalid is
+    /// told every entry is unusable and handed a rule their entries already pass. A right diagnosis
+    /// with an unusable correction is worse than a vague one — they have a stated rule that
+    /// demonstrably fails on their input and no way to see why, because this string is their only
+    /// interface to the predicate.
+    ///
+    /// ⛔ THE PRECONDITION ASSERTS ARE THE TEST. Without them this passes on any junk fixture and
+    /// proves nothing about the curve wording — the same trap as picking a negative control by eye.
+    #[test]
+    fn the_unusable_list_explanation_names_the_curve_not_only_the_shape() {
+        let curve_rejected = "0123456789abcdef".repeat(4);
+        assert!(
+            crate::home::buyer_pubkey_is_wire_shaped(&curve_rejected),
+            "precondition: `{curve_rejected}` must be SHAPE-valid, or a shape-only message would be \
+             a correct explanation for it and this test asserts nothing"
+        );
+        assert!(
+            !crate::home::buyer_pubkey_is_reachable(&curve_rejected),
+            "precondition: `{curve_rejected}` must be refused for its CURVE, not its shape"
+        );
+
+        let mut junk = seller_cfg_closed();
+        junk.accept_offers_only_from = vec![curve_rejected.clone()];
+        let warning =
+            unreachable_seat_warning(&junk).expect("a curve-rejected allowlist must warn");
+
+        // Pinned twice, and both are needed: the first fails if this site re-inlines its own copy,
+        // the second fails if the shared constant is weakened back to shape-only. Either alone
+        // leaves one of the two ways this regressed still open.
+        assert!(
+            warning.contains(crate::home::USABLE_BUYER_ENTRY),
+            "the warning must read the SHARED criterion, not a local copy of it, got: {warning}"
+        );
+        assert!(
+            warning.contains("secp256k1"),
+            "the criterion must still name what rejected `{curve_rejected}`, got: {warning}"
+        );
     }
 
     /// ⛔ THE FENCE OPENS ON `is_empty()`, SO A LIST OF TYPOS ADMITS NOBODY AND SHUTS BOTH SURFACES.

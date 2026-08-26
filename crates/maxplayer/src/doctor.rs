@@ -1322,7 +1322,13 @@ mod checks {
         /// Part of the exposure rather than context carried beside it, because a populated
         /// allowlist decides who reaches the seat just as directly as either flag does.
         pub(super) named_buyers: usize,
-        /// Entries that can never match anything — wrong length, wrong charset, or capitalised.
+        /// Entries that can never match anything — wrong length, wrong charset, capitalised, or 64
+        /// lowercase hex characters that are not a secp256k1 x-only key.
+        ///
+        /// ⛔ THE LAST CASE IS THE ONE A SHAPE-ONLY DESCRIPTION MISSES, AND IT IS NOT AN EDGE CASE:
+        /// roughly half of all 64-hex values have no curve point, so a hand-typed key is more likely
+        /// to land here than in any of the first three. `buyer_pubkey_is_reachable` is what counts
+        /// this field, so a description that stops at shape under-describes what it counts.
         ///
         /// ⛔ THESE STILL FENCE. `classify_offer` opens the fence on `is_empty()`, so an entry that
         /// matches nobody is not a dead letter: it shuts both surfaces and admits no one, which is
@@ -1392,6 +1398,7 @@ mod checks {
     /// that drifts is undetectable. It lives in `home` because the dependency runs one way
     /// (`maxplayer` -> `maxplayer-core`), so a constant here can never be reached from `run.rs`.
     use maxplayer_core::home::ROUTES_BACK_IN as ROUTES_IN;
+    use maxplayer_core::home::USABLE_BUYER_ENTRY;
 
     /// Can ANY offer reach this seat, and does every knob the operator set still do something?
     ///
@@ -1429,9 +1436,9 @@ mod checks {
                          out everyone else on both surfaces — so no offer can reach this seat at all",
                         exposure.unusable_buyers
                     ),
-                    "a buyer pubkey is 64 lowercase hex characters; an `npub1…`, a shortened id or \
-                     a capitalised one is matched literally and therefore matches nobody. Correct \
-                     the entries, or remove them and instead ".to_owned() + ROUTES_IN,
+                    USABLE_BUYER_ENTRY.to_owned()
+                        + ". Correct the entries, or remove them and instead "
+                        + ROUTES_IN,
                 );
             }
             return Check::warn(
@@ -2917,9 +2924,32 @@ mod tests {
             "a list of entries that match nobody is a seat that can claim nothing:\n{}",
             check.render()
         );
+        // ⛔ THE DISCRIMINATOR, AND THE REASON THE OLD ASSERTION COULD NOT BE ONE. This entry
+        // satisfies every rule the previous message stated — 64 characters, lowercase, hex — and is
+        // refused anyway, so `contains("64 lowercase hex")` stayed green on a message that hands
+        // this operator a correction their own input already passes.
+        let curve_rejected = "0123456789abcdef".repeat(4);
         assert!(
-            check.render().contains("64 lowercase hex"),
-            "the operator must be told what a usable entry looks like:\n{}",
+            maxplayer_core::home::buyer_pubkey_is_wire_shaped(&curve_rejected),
+            "precondition: `{curve_rejected}` must be SHAPE-valid, or a shape-only message would be \
+             a correct explanation for it and this asserts nothing"
+        );
+        assert!(
+            !maxplayer_core::home::buyer_pubkey_is_reachable(&curve_rejected),
+            "precondition: `{curve_rejected}` must be refused for its CURVE, not its shape"
+        );
+        // Pinned twice on purpose: the first fails if this site re-inlines its own copy, the second
+        // fails if the shared constant is weakened back to shape-only. Either alone leaves one of
+        // the two ways this regressed still open.
+        assert!(
+            check.render().contains(maxplayer_core::home::USABLE_BUYER_ENTRY),
+            "the guidance must read the SHARED criterion, not a local copy:\n{}",
+            check.render()
+        );
+        assert!(
+            check.render().contains("secp256k1"),
+            "the guidance must name the criterion that actually rejects `{curve_rejected}`, not \
+             only the shape it satisfies:\n{}",
             check.render()
         );
     }

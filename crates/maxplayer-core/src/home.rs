@@ -318,6 +318,26 @@ pub const ROUTES_BACK_IN: &str = "list the buyers you work with in `[seller] \
      buyers you have not named, or set `claim_open_pool = true` to claim untargeted jobs from the \
      open pool";
 
+/// What makes an `accept_offers_only_from` entry a route in, stated to the operator.
+///
+/// ⛔ SHAPE IS NOT THE RULE, AND A MESSAGE THAT SAYS IT IS HANDS THE OPERATOR A CORRECTION THEIR
+/// INPUT ALREADY PASSES. `buyer_pubkey_is_reachable` parses the x-only key as well as the shape, so
+/// `"0123456789abcdef".repeat(4)` — 64 lowercase hex characters, no curve point — satisfies every
+/// syllable of a shape-only explanation and is still refused.
+///
+/// ⛔ A RIGHT DIAGNOSIS WITH A WRONG CORRECTION IS WORSE THAN A VAGUE ONE. The operator is told every
+/// entry is unusable, handed a rule their entries demonstrably pass, and left with no way to see the
+/// difference — this text is their ONLY interface to the predicate, because they cannot read
+/// `home.rs`. The classifier learning curve validity while its explanations kept the old rule is the
+/// same failure as the remedy text above: the fix reached the site under the cursor and stopped.
+///
+/// ⛔ REPORTING ONLY. The admission gate stays an exact byte compare — this explains a refusal and
+/// never widens one. Callers add their own framing and terminal punctuation.
+pub const USABLE_BUYER_ENTRY: &str = "Copy the canonical public key the buyer gives you: 64 \
+     lowercase hex characters that are ALSO a valid secp256k1 x-only key (the hex pubkey a Nostr \
+     client shows). An `npub1…`, a shortened id, a capitalised key, or hex invented by hand is \
+     compared literally and matches nobody";
+
 /// Can this `accept_offers_only_from` entry ever match a real buyer?
 ///
 /// ⛔ THE FENCE IS AN EXACT STRING COMPARE, SO AN ENTRY IN ANY OTHER FORM IS NOT A NARROW ROUTE —
