@@ -333,10 +333,19 @@ pub const ROUTES_BACK_IN: &str = "list the buyers you work with in `[seller] \
 ///
 /// ⛔ REPORTING ONLY. The admission gate stays an exact byte compare — this explains a refusal and
 /// never widens one. Callers add their own framing and terminal punctuation.
+/// ⛔ AND THE CLAUSE THIS SENTENCE MUST NOT MAKE, BECAUSE THIS FILE REFUTES IT ON LINE 2065: THE
+/// PREDICATE HAS NO PROVENANCE SIGNAL. It cannot know whether bytes were copied or typed, and
+/// `GENERATOR_X` — hand-entered hex in this very file — is asserted REACHABLE. Grouping hand entry
+/// with the forms that match NOBODY was false by this tree's own positive control, and it is the
+/// exact defect this constant exists to fix: an operator-facing rule the code does not hold.
+/// ⇒ the honest claim is narrower — typed hex may be curve-invalid, or valid and name someone else,
+/// so it is no EVIDENCE the intended buyer was listed. Copying is what carries that evidence.
 pub const USABLE_BUYER_ENTRY: &str = "Copy the canonical public key the buyer gives you: 64 \
      lowercase hex characters that are ALSO a valid secp256k1 x-only key (the hex pubkey a Nostr \
-     client shows). An `npub1…`, a shortened id, a capitalised key, or hex invented by hand is \
-     compared literally and matches nobody";
+     client shows). An `npub1…`, a shortened id or a capitalised key is compared literally and \
+     matches nobody. Hex you typed rather than copied is not refused for being typed — but it may \
+     be curve-invalid, or valid and name a different buyer, so it is no evidence you listed the \
+     one you meant";
 
 /// Can this `accept_offers_only_from` entry ever match a real buyer?
 ///
@@ -2065,6 +2074,36 @@ mod tests {
             buyer_pubkey_is_reachable(GENERATOR_X),
             "the generator's x-coordinate is a valid x-only key and must count as a route in"
         );
+    }
+
+    /// ⛔ THE OPERATOR-FACING RULE MUST NOT CLAIM SOMETHING THIS FILE REFUTES. The predicate has no
+    /// provenance signal — it cannot tell copied bytes from typed ones — and `GENERATOR_X` is
+    /// hand-entered right here and reachable. So any wording that groups hand entry with the forms
+    /// that match NOBODY is false, and false in the direction that matters: it hands an operator a
+    /// correction that does not explain their refusal.
+    ///
+    /// ⛔ ASSERTED ON THE NEVER-MATCH CLAUSE ALONE, NOT THE WHOLE STRING. The sentence is ALLOWED to
+    /// discuss typed hex — it must simply not do so inside the claim about what matches nobody, so
+    /// splitting on the marker is what gives this test access to the claim it is actually making.
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn the_criterion_never_groups_typed_hex_with_the_forms_that_match_nobody() {
+        assert!(
+            buyer_pubkey_is_reachable(GENERATOR_X),
+            "precondition: a HAND-ENTERED VALID key must be reachable, or the wording under test \
+             would be true and this test asserts nothing"
+        );
+        let never_match_claim = USABLE_BUYER_ENTRY
+            .split_once("matches nobody")
+            .expect("the criterion must keep a never-match clause for this to assert against")
+            .0;
+        for token in ["hand", "typed", "invented"] {
+            assert!(
+                !never_match_claim.contains(token),
+                "`{token}` appears inside the never-match claim, but `{GENERATOR_X}` is entered by \
+                 hand in this file and IS reachable:\n{USABLE_BUYER_ENTRY}"
+            );
+        }
     }
 
     /// ⛔ SHAPE IS NOT SUFFICIENT, AND THESE FIXTURES ARE COMPUTED RATHER THAN EYEBALLED. Roughly
