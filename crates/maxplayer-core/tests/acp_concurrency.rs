@@ -77,6 +77,9 @@ async fn run_stub_job(
             mcp_servers: Vec::new(),
             env: Vec::new(),
         },
+        // This test is about concurrency, not model selection: no request, so no binding step runs
+        // and the harness default applies exactly as before.
+        requested_model: None,
         prompt: PromptTurn {
             input: vec![ContentBlock::Text {
                 text: "do the work".into(),

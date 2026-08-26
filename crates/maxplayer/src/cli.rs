@@ -166,6 +166,10 @@ fn run_agent(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             mcp_servers: Vec::new(),
             env: Vec::new(),
         },
+        // The local run path takes no model flag, so there is nothing to bind and the harness
+        // default applies — today's behaviour, unchanged. A `--model` here would be a separate
+        // change with its own argument surface, not a side effect of #785.
+        requested_model: None,
         prompt: PromptTurn {
             input: vec![ContentBlock::Text { text: options.task }],
         },
