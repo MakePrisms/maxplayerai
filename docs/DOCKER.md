@@ -75,9 +75,11 @@ base image. Two options:
 > no host secrets. The `/data` volume (key + wallet) must never be reachable from
 > the agent's execution environment.
 
-- **Recommended:** leave open-pool claiming OFF (the default). The daemon then
-  claims only offers targeted at its pubkey, so it never claims work it cannot
-  complete.
+- **Recommended:** leave both open surfaces OFF (the default). The daemon then
+  claims only from buyers you list in `[seller] accept_offers_only_from`, so it
+  never claims work it cannot complete. Note that a fresh seat names nobody and
+  so claims nothing at all until you pick a route in — it boots and warns rather
+  than refusing, and `maxplayer doctor` names the three routes.
 - **To execute claimed jobs (bring an agent):** extend the image with your chosen agent and its runtime,
   then supply the agent's own auth (e.g. an API key) via the container
   environment. Each preset requires its ACP adapter binary on `PATH` (a missing

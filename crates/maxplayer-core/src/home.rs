@@ -209,7 +209,9 @@ pub struct SellerConfig {
     /// plain list of harness names, and the top-level `slots` is the only concurrency knob.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<String>,
-    /// Opt-in to claim untargeted/open offers. Default **false** (targeted-only).
+    /// Opt-in to claim untargeted/open offers. Default **false**. ⛔ That default is NOT
+    /// "targeted-only": the targeted surface is its own opt-in ([`SellerConfig::accept_open_targeted`]),
+    /// so a seat with both flags false and no allowlist claims NOTHING.
     ///
     /// This flag decides whether the seat can LOSE a race, and that is what makes it more than a
     /// throughput knob. A targeted offer has exactly one eligible claimant — `rate_gate_allows`
@@ -294,6 +296,22 @@ pub struct SellerConfig {
     /// default (see `DEFAULT_CLAIM_AWARD_TIMEOUT_SECS`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_award_timeout_secs: Option<u64>,
+}
+
+/// Can this `accept_offers_only_from` entry ever match a real buyer?
+///
+/// ⛔ THE FENCE IS AN EXACT STRING COMPARE, SO AN ENTRY IN ANY OTHER FORM IS NOT A NARROW ROUTE —
+/// IT IS NO ROUTE. A buyer pubkey arrives off the wire as 64 lowercase hex characters, and the
+/// allowlist is matched against that byte-for-byte. An `npub1…`, a truncated id, a capitalised
+/// hex string or a typo therefore fences out *everyone* while reading, to an operator and to
+/// `doctor` alike, as a seat that named a buyer.
+///
+/// **This deliberately reports rather than repairs.** Trimming and lower-casing the entry here
+/// would make some of these match — which means admitting a counterparty the seat is currently
+/// refusing. Widening who can reach a seat is the opposite of what the opt-in surfaces are for,
+/// so an unusable entry stays unusable and the operator is told. Matching semantics are unchanged.
+pub fn buyer_pubkey_is_matchable(entry: &str) -> bool {
+    entry.len() == 64 && entry.chars().all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch))
 }
 
 /// Executor sandbox config (`[sandbox]` section): which executor the awarded agent command runs
@@ -1953,6 +1971,36 @@ mod tests {
     #[test]
     fn default_rate_sats_is_the_market_floor() {
         assert_eq!(DEFAULT_RATE_SATS, 100);
+    }
+
+    /// The positive control. Without it every rejection below would be satisfied by a predicate
+    /// that simply answered `false`.
+    #[test]
+    fn a_wire_form_buyer_pubkey_is_matchable() {
+        assert!(buyer_pubkey_is_matchable(&"a1".repeat(32)));
+        assert!(buyer_pubkey_is_matchable(&"0123456789abcdef".repeat(4)));
+    }
+
+    /// ⛔ EACH OF THESE FENCES EVERYONE AND MATCHES NOBODY. The allowlist is compared byte-for-byte
+    /// against a pubkey that arrives as 64 lowercase hex characters, so an entry in any other form
+    /// is not a narrow route in — it is no route at all, while reading to an operator like a seat
+    /// that named a buyer. The capitalised case is the dangerous one: it is the right key.
+    #[test]
+    fn an_entry_that_can_never_match_a_wire_pubkey_is_not_matchable() {
+        for (entry, why) in [
+            ("A1".repeat(32), "capitalised hex — the right key, and it still matches nobody"),
+            ("a1".repeat(31), "too short"),
+            ("a1".repeat(33), "too long"),
+            (String::new(), "empty"),
+            (format!("npub1{}", "q".repeat(58)), "bech32 npub rather than hex"),
+            (format!(" {}", "a1".repeat(32)), "leading space, not trimmed at the match site"),
+            ("g".repeat(64), "right length, not hex"),
+        ] {
+            assert!(
+                !buyer_pubkey_is_matchable(&entry),
+                "{why}: `{entry}` cannot match a wire pubkey and must not be counted as a route in"
+            );
+        }
     }
 
     #[test]

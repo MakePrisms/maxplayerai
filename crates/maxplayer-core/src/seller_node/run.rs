@@ -2162,9 +2162,37 @@ fn classify_offer(
 ///
 /// Pure over the config so it is testable without a relay, a home lock or a boot. The caller emits.
 fn unreachable_seat_warning(seller: &crate::home::SellerConfig) -> Option<String> {
-    let no_buyer_named = seller.accept_offers_only_from.is_empty();
-    if !(no_buyer_named && !seller.accept_open_targeted && !seller.claim_open_pool) {
+    // Counted, never `is_empty()`. An entry is matched byte-for-byte against a wire pubkey, so one
+    // that cannot be a wire pubkey is not a narrow route in — it is no route, while still fencing
+    // everyone else out. Keying this on emptiness silenced the siren for exactly the seat it exists
+    // to catch: a list of typos claims nothing and looked configured.
+    let usable_buyers = seller
+        .accept_offers_only_from
+        .iter()
+        .filter(|entry| crate::home::buyer_pubkey_is_matchable(entry))
+        .count();
+    if usable_buyers > 0 {
         return None;
+    }
+    // With NO list, either open flag is a way in. With a populated one the fence shuts both
+    // surfaces, so the flags cannot rescue a list that matches nobody.
+    if seller.accept_offers_only_from.is_empty()
+        && (seller.accept_open_targeted || seller.claim_open_pool)
+    {
+        return None;
+    }
+    if !seller.accept_offers_only_from.is_empty() {
+        return Some(format!(
+            "seller node WARNING: this seat can claim NOTHING as configured — all {} entr(y/ies) in \
+             [seller] accept_offers_only_from are unusable, and a populated allowlist fences out \
+             everyone else on BOTH surfaces, so no offer can reach this seat at all. A buyer pubkey \
+             is 64 lowercase hex characters; an npub1..., a shortened id or a capitalised one is \
+             compared literally and matches nobody. Correct the entries, or remove them. THREE \
+             ROUTES BACK IN: list your buyers in [seller] accept_offers_only_from, or set \
+             accept_open_targeted=true to accept targeted offers from buyers you have not named, or \
+             set claim_open_pool=true to claim untargeted jobs from the open pool.",
+            seller.accept_offers_only_from.len()
+        ));
     }
     Some(
         "seller node WARNING: this seat can claim NOTHING as configured — it names no buyers \
@@ -2172,8 +2200,10 @@ fn unreachable_seat_warning(seller: &crate::home::SellerConfig) -> Option<String
          named (accept_open_targeted=false), and does not claim the open pool \
          (claim_open_pool=false). It will advertise and stay connected, but never claim a job. If \
          this seat used to serve, an upgrade closed the targeted surface that an empty allowlist \
-         used to leave open: list your buyers in [seller] accept_offers_only_from, or set \
-         accept_open_targeted=true to accept strangers again."
+         used to leave open. THREE ROUTES BACK IN: list your buyers in [seller] \
+         accept_offers_only_from, or set accept_open_targeted=true to accept targeted offers from \
+         buyers you have not named, or set claim_open_pool=true to claim untargeted jobs from the \
+         open pool."
             .to_owned(),
     )
 }
@@ -7479,9 +7509,11 @@ mod tests {
             "the warning must name the knobs that restore service, got: {warning}"
         );
 
-        // Route 1 — name a buyer.
+        // Route 1 — name a buyer. ⛔ A WIRE-FORM pubkey: the fixture here used to be `cafe01`,
+        // which is fenced-but-unmatchable and therefore NOT a way in. Asserting `None` against it
+        // pinned the bug as the specification.
         let mut listed = seller_cfg_closed();
-        listed.accept_offers_only_from = vec!["cafe01".to_owned()];
+        listed.accept_offers_only_from = vec!["a1".repeat(32)];
         assert_eq!(unreachable_seat_warning(&listed), None, "a named buyer is a way in");
 
         // Route 2 — open the targeted surface.
@@ -7493,6 +7525,56 @@ mod tests {
         let mut open_pool = seller_cfg_closed();
         open_pool.claim_open_pool = true;
         assert_eq!(unreachable_seat_warning(&open_pool), None, "the open pool is a way in");
+    }
+
+    /// ⛔ ASSERTED ON THE REMEDY CLAUSE ALONE, NEVER THE WHOLE STRING. The diagnosis already names
+    /// all three knobs — as the settings that are OFF — so `warning.contains("claim_open_pool")` is
+    /// satisfied by text that tells the operator nothing about how to fix it. The needle is present
+    /// in the WRONG ROLE, and splitting on the marker is what gives this test access to the claim
+    /// it is actually making.
+    #[test]
+    fn the_unreachable_warning_offers_all_three_routes_back_in() {
+        let warning =
+            unreachable_seat_warning(&seller_cfg_closed()).expect("a closed seat must warn");
+        let (_diagnosis, remedy) = warning.split_once("THREE ROUTES BACK IN:").expect(
+            "the remedy must be delimited so it can be read apart from the diagnosis that names \
+             the same knobs",
+        );
+        for route in ["accept_offers_only_from", "accept_open_targeted", "claim_open_pool"] {
+            assert!(remedy.contains(route), "the remedy must offer `{route}`, got: {remedy}");
+        }
+    }
+
+    /// ⛔ THE FENCE OPENS ON `is_empty()`, SO A LIST OF TYPOS ADMITS NOBODY AND SHUTS BOTH SURFACES.
+    /// The siren keyed on emptiness and therefore stayed silent for precisely the seat it exists to
+    /// catch. Asserted separately from the mixed case below: they are opposite outcomes, and the
+    /// runner stops at the first failing assertion.
+    #[test]
+    fn the_siren_fires_for_an_allowlist_that_can_never_match() {
+        let mut junk = seller_cfg_closed();
+        junk.accept_offers_only_from = vec!["cafe01".to_owned(), "A1".repeat(32)];
+        // Both open flags ON: the fence shuts them anyway, so they must not rescue the seat.
+        junk.accept_open_targeted = true;
+        junk.claim_open_pool = true;
+        let warning = unreachable_seat_warning(&junk)
+            .expect("a seat whose every allowlist entry is unusable can claim nothing");
+        assert!(
+            warning.contains("unusable"),
+            "the operator must be told the entries are the problem, got: {warning}"
+        );
+    }
+
+    /// The foil for the test above: ONE usable entry among unusable ones is a real route in, so the
+    /// siren must stay silent. Without this, a predicate that always fired would pass.
+    #[test]
+    fn the_siren_stays_silent_when_one_allowlist_entry_is_usable() {
+        let mut mixed = seller_cfg_closed();
+        mixed.accept_offers_only_from = vec!["cafe01".to_owned(), "a1".repeat(32)];
+        assert_eq!(
+            unreachable_seat_warning(&mixed),
+            None,
+            "one buyer that can actually match is a way in, whatever else is listed"
+        );
     }
 
     /// The fully-closed seat: the config an upgrading seller with no allowlist lands on. Written out

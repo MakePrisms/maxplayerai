@@ -6,7 +6,8 @@
 services:
   # -----------------------------------------------------------------------
   # Seller daemon — comes online, authenticates (NIP-42), publishes a
-  # heartbeat, and (by default) claims only offers targeted at its pubkey.
+  # heartbeat. BOTH open surfaces are off by default, so a fresh seat claims
+  # nothing until you name buyers in accept_offers_only_from or opt one in.
   # -----------------------------------------------------------------------
   seller:
     build: .
