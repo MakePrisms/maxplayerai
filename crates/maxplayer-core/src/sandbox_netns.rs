@@ -477,19 +477,61 @@ pub async fn reapable_holders_live(seat: &str) -> Result<Vec<String>, String> {
     Ok(reapable_holders(&holders, seat, &modes))
 }
 
-/// Remove `seat`'s own holders that no job is attached to, and return what was removed.
+/// What one reap did: the holders it removed, and the selected holders it could not remove.
+///
+/// Two lists rather than one, because the two callers need opposite answers from the same run and
+/// either list folded into the other destroys one of them:
+///
+///   * The boot reaper in `seller_node::run` must never be blocked by a stuck holder. It reads
+///     `removed` for its log line and treats `failed` as information, not as a gate.
+///   * `maxplayer sandbox-reap` is an operator asking whether a retired seat's leak is gone. For it,
+///     "selected three, removed none" is a runtime error. Reporting that as an empty result would
+///     print "there were none" — a false statement about the host, on the line a script reads.
+///
+/// Carrying the failures back rather than printing them is what lets both hold at once. An earlier
+/// version wrote them with `eprintln!` from this crate and returned only the removals: the boot path
+/// could not route them through its own operator log, the CLI's injected error writer never saw them
+/// at all, and — because they were not returned — a TOTAL failure arrived at the caller as an empty
+/// list, indistinguishable from nothing to do. Whether a failure is fatal is the caller's decision,
+/// and a caller cannot make it without being told.
+#[cfg(feature = "acp")]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReapReport {
+    /// The holders `docker rm` accepted. Only these were actually removed.
+    pub removed: Vec<String>,
+    /// The holders the selection chose and `docker rm` refused, each with docker's own reason.
+    pub failed: Vec<(String, String)>,
+}
+
+#[cfg(feature = "acp")]
+impl ReapReport {
+    /// How many holders the selection chose, removed or not.
+    ///
+    /// `removed.len()` alone understates a failing run: the leak the operator asked about is the
+    /// selected count, not the successful one.
+    #[must_use]
+    pub fn selected(&self) -> usize {
+        self.removed.len() + self.failed.len()
+    }
+}
+
+/// Remove `seat`'s own holders that no job is attached to, and report what happened to each.
 ///
 /// `seat` is the caller's seller public key hex. It is the *only* thing that makes this safe to run on
 /// a host shared with other seller daemons: see [`reapable_holders`] for why ownership has to be
 /// carried and why attachment state cannot stand in for it.
 ///
-/// Best-effort by design: a leaked holder is a resource leak, not an open door — it owns a namespace and
-/// holds no policy, and the job that could have used it is already gone. So a failure here is reported
-/// and never blocks a boot, whereas a failure to *establish* containment refuses the job outright. The
-/// two are deliberately not symmetrical.
+/// Best-effort **at the boot call site**, and that is a property of the caller, not of this function.
+/// A leaked holder is a resource leak, not an open door — it owns a namespace and holds no policy, and
+/// the job that could have used it is already gone — so a failure must never block a boot, whereas a
+/// failure to *establish* containment refuses the job outright. The two are deliberately not
+/// symmetrical. What changed with #905 is only WHERE that decision is taken: this function reports
+/// every failure in [`ReapReport::failed`] and gates on nothing, and each caller chooses. Swallowing
+/// the failure here would have forced best-effort on the operator command too, which needs the
+/// opposite.
 #[cfg(feature = "acp")]
-pub async fn reap_orphans(seat: &str) -> Result<Vec<String>, String> {
-    let mut reaped = Vec::new();
+pub async fn reap_orphans(seat: &str) -> Result<ReapReport, String> {
+    let mut report = ReapReport::default();
     for holder in reapable_holders_live(seat).await? {
         match run_docker(
             ["docker", "rm", "--force", "--volumes", holder.as_str()]
@@ -500,14 +542,14 @@ pub async fn reap_orphans(seat: &str) -> Result<Vec<String>, String> {
         )
         .await
         {
-            Ok(_) => reaped.push(holder),
-            // One stuck holder must not stop the others being cleaned up.
-            Err(error) => {
-                eprintln!("sandbox: could not reap orphaned netns holder {holder}: {error}")
-            }
+            Ok(_) => report.removed.push(holder),
+            // One stuck holder must not stop the others being cleaned up, so this collects and
+            // carries on. What it must not do is DROP the failure: the loop continuing is a
+            // scheduling decision, not a verdict that the removal was unimportant.
+            Err(error) => report.failed.push((holder, error)),
         }
     }
-    Ok(reaped)
+    Ok(report)
 }
 
 /// Run a `docker` argv to completion, optionally feeding `stdin`, and return `(stdout, stderr)`.

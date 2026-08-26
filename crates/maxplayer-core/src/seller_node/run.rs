@@ -2875,11 +2875,25 @@ pub async fn probe_configured_harnesses(
     #[cfg(feature = "acp")]
     if sandbox.sandbox_network().is_some() {
         match crate::sandbox_netns::reap_orphans(identity.seller_pubkey_hex()).await {
-            Ok(reaped) if !reaped.is_empty() => opline!(
-                "seller node: reaped {} containment holder(s) left by an earlier run of this seat",
-                reaped.len()
-            ),
-            Ok(_) => {}
+            Ok(report) => {
+                if !report.removed.is_empty() {
+                    opline!(
+                        "seller node: reaped {} containment holder(s) left by an earlier run of this seat",
+                        report.removed.len()
+                    );
+                }
+                // Still never a gate — see above. `reap_orphans` returns its per-holder failures
+                // (#905) instead of printing them, so they now reach the operator log this daemon
+                // already writes rather than raw process stderr. Reporting them, not acting on them,
+                // is the whole difference from the operator command, which exits nonzero on the same
+                // input.
+                for (holder, error) in &report.failed {
+                    opline!(
+                        "seller node: could not reap this seat's stale containment holder {holder} \
+                         ({error}) — harmless to this boot, but it will accumulate until it succeeds"
+                    );
+                }
+            }
             Err(error) => opline!(
                 "seller node: could not reap this seat's stale containment holders ({error}) — \
                  harmless to this boot, but they will accumulate until it succeeds"

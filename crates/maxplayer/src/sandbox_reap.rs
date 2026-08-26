@@ -56,7 +56,7 @@ pub(crate) struct ReapOptions {
 fn write_usage(out: &mut dyn Write) {
     let _ = writeln!(
         out,
-        "Usage:\n  maxplayer sandbox-reap --seat <64-hex> [--dry-run]\n\nRemove the containment holders left behind by a RETIRED seat, which that seat can no longer reap\nfor itself because it never boots again. You name the seat: only you can know it is retired, and\nthe host cannot tell a retired seat from one that is merely slow to start.\n\n  --seat <64-hex>   the retired seat's public key hex. Required; there is no default.\n  --dry-run         print what would be removed and remove nothing.\n\nA holder is removed only when it is BOTH labelled with that seat AND has no container joined to its\nnamespace. Exit codes: 0 success, 1 usage error, 2 runtime error."
+        "Usage:\n  maxplayer sandbox-reap --seat <64-hex> [--dry-run]\n\nRemove the containment holders left behind by a RETIRED seat, which that seat can no longer reap\nfor itself because it never boots again. You name the seat: only you can know it is retired, and\nthe host cannot tell a retired seat from one that is merely slow to start.\n\n  --seat <64-hex>   the retired seat's public key hex. Required; there is no default.\n  --dry-run         print what would be removed and remove nothing.\n\nA holder is removed only when it is BOTH labelled with that seat AND has no container joined to its\nnamespace. A holder that was selected and could not be removed is named on stderr and exits 2, even\nif others were removed: a reap that reported success while holders survived would be read as proof\nthe leak is gone.\n\nExit codes: 0 success, 1 usage error, 2 runtime error."
     );
 }
 
@@ -191,26 +191,49 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             }
         }
     } else {
+        // A holder that was SELECTED and could not be removed is a runtime error, and the whole
+        // reason `reap_orphans` returns its failures rather than logging them. The operator ran this
+        // to learn whether a retired seat's leak is gone; "selected one, removed none" answered as
+        // an empty result would print "no reapable containment holders for seat <hex>" and exit 0 —
+        // a false statement about the host, on the one line a script reads. The boot reaper keeps
+        // ignoring the same failures, because a leaked holder must never refuse a boot.
         match runtime.block_on(maxplayer_core::sandbox_netns::reap_orphans(&options.seat)) {
-            Ok(reaped) if reaped.is_empty() => {
-                let _ = writeln!(
-                    out,
-                    "no reapable containment holders for seat {}",
-                    options.seat
-                );
-                SUCCESS
-            }
-            Ok(reaped) => {
-                for holder in &reaped {
+            Ok(report) => {
+                // Facts only, and only on stdout: a holder is named here when docker accepted its
+                // removal, never merely because it was chosen.
+                for holder in &report.removed {
                     let _ = writeln!(out, "reaped {holder}");
                 }
-                let _ = writeln!(
-                    out,
-                    "reaped {} containment holder(s) left by seat {}",
-                    reaped.len(),
-                    options.seat
-                );
-                SUCCESS
+                for (holder, why) in &report.failed {
+                    let _ = writeln!(err, "could not reap containment holder {holder}: {why}");
+                }
+                if report.failed.is_empty() {
+                    let _ = if report.removed.is_empty() {
+                        writeln!(out, "no reapable containment holders for seat {}", options.seat)
+                    } else {
+                        writeln!(
+                            out,
+                            "reaped {} containment holder(s) left by seat {}",
+                            report.removed.len(),
+                            options.seat
+                        )
+                    };
+                    SUCCESS
+                } else {
+                    // The count that matters is what the selection FOUND. A partial run that says
+                    // only "reaped 2" hides the third, which is the same false-clean report in a
+                    // quieter shape.
+                    let _ = writeln!(
+                        err,
+                        "reaped {} of the {} containment holder(s) selected for seat {}; {} could \
+                         not be removed and are still on this host",
+                        report.removed.len(),
+                        report.selected(),
+                        options.seat,
+                        report.failed.len()
+                    );
+                    RUNTIME_ERROR
+                }
             }
             Err(error) => {
                 let _ = writeln!(err, "{error}");
