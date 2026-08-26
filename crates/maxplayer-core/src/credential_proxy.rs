@@ -173,13 +173,6 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// denominator. That is the exact failure under investigation: a response header, then silence.
 const BODY_HEARTBEAT_PERIOD: Duration = Duration::from_secs(5);
 
-/// Inactivity after which [`scrub_stream`] flushes the provably-safe part of its holdback instead of
-/// waiting for an upstream EOF that a stalled response never sends. Unlike [`BODY_IDLE_TIMEOUT`] this
-/// CANCELS nothing: it releases only bytes that cannot begin a split credential (see
-/// [`straddle_prefix_len`]) and keeps holding the trailing bytes that could. So the value bounds how long
-/// a stalled body is withheld; it is never a containment knob — any value is equally safe.
-const RESPONSE_HOLDBACK_FLUSH_IDLE: Duration = Duration::from_secs(15);
-
 /// The default real upstream for the Anthropic API-key path when the operator has not pointed the
 /// daemon at a custom gateway. Any resolved destination must appear on the proxy's allowlist before
 /// the real credential is substituted, so this constant also seeds the default allowlist entry.
@@ -1879,7 +1872,7 @@ async fn relay(
     > = if scrub.is_empty() {
         Box::pin(metered.map(|chunk| chunk.map(Frame::data).map_err(std::io::Error::other)))
     } else {
-        Box::pin(scrub_stream(metered, scrub, RESPONSE_HOLDBACK_FLUSH_IDLE))
+        Box::pin(scrub_stream(metered, scrub))
     };
     let mut forward_heartbeat = tokio::time::interval_at(
         tokio::time::Instant::now() + BODY_HEARTBEAT_PERIOD,
@@ -2003,25 +1996,23 @@ where
 /// otherwise forward NOTHING and the client would time the connection out mid-body; here each
 /// keepalive passes straight through.
 ///
-/// A stalled upstream — bytes received, then silence with NO EOF — is handled by the same release on
-/// an `idle` timer, a backstop for the case where a partial arrived and then nothing did. That
-/// release never forwards a byte the EOF flush would withhold, for any value of `idle`.
+/// No idle timer, on purpose. The per-chunk release already forwards every provably-safe byte the
+/// instant its chunk arrives, so the only bytes ever held are a straddling credential prefix — which
+/// no timer may release, because a later chunk could still complete it into the real value. An earlier
+/// design flushed the holdback on an inactivity timer; once the release runs per chunk that timer can
+/// only ever re-hold the same prefix, so it is gone. A genuinely silent upstream (no bytes, no EOF) is
+/// bounded upstream of here by [`BODY_IDLE_TIMEOUT`] on the request leg and by the client's own read
+/// deadline; the scrub itself just waits for the next chunk or the EOF.
 ///
 /// SSE responses stay streaming: each chunk is forwarded as it arrives, minus that small carry-over.
 fn scrub_stream<S>(
     inner: S,
     substitutions: Vec<(String, String)>,
-    idle: Duration,
 ) -> impl futures_util::Stream<Item = Result<Frame<Bytes>, std::io::Error>>
 where
     S: futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin,
 {
     // `None` inner ⇒ the stream is finished (ended or errored); stop yielding.
-    // One turn of the loop: the upstream yielded (or ended), or the idle timer fired first.
-    enum Step {
-        Upstream(Option<reqwest::Result<Bytes>>),
-        Idle,
-    }
     futures_util::stream::unfold(
         (Some(inner), Vec::<u8>::new()),
         move |(inner, carry)| {
@@ -2030,16 +2021,8 @@ where
                 let mut inner = inner?;
                 let mut carry = carry;
                 loop {
-                    // Race the upstream against an inactivity timer. `biased` prefers real progress, so
-                    // only a genuine gap of `idle` with nothing ready reaches `Idle`; a fresh sleep each
-                    // iteration measures inactivity since the last chunk, not elapsed total.
-                    let step = tokio::select! {
-                        biased;
-                        item = inner.next() => Step::Upstream(item),
-                        _ = tokio::time::sleep(idle) => Step::Idle,
-                    };
-                    match step {
-                        Step::Upstream(Some(Ok(chunk))) => {
+                    match inner.next().await {
+                        Some(Ok(chunk)) => {
                             carry.extend_from_slice(&chunk);
                             // Release everything provably safe on THIS chunk, holding only a genuine
                             // straddling prefix (normally nothing) — not the flat `max_real_len - 1`
@@ -2054,31 +2037,15 @@ where
                                 (Some(inner), carry),
                             ));
                         }
-                        Step::Upstream(Some(Err(error))) => {
+                        Some(Err(error)) => {
                             return Some((Err(std::io::Error::other(error)), (None, Vec::new())));
                         }
-                        Step::Upstream(None) => {
+                        None => {
                             let tail = scrub_buffer(&mut carry, &substitutions, true);
                             if tail.is_empty() {
                                 return None;
                             }
                             return Some((Ok(Frame::data(Bytes::from(tail))), (None, Vec::new())));
-                        }
-                        Step::Idle => {
-                            // Backstop for a stall with NO EOF: flush whatever became provably safe
-                            // since the last chunk, instead of waiting for an EOF that never comes.
-                            // Same release the chunk arm runs, so it can only ever hold a genuine
-                            // straddling prefix; a body received in full has already been forwarded.
-                            let emit = scrub_release_safe(&mut carry, &substitutions);
-                            if emit.is_empty() {
-                                // Carry empty or entirely a credential prefix — nothing provably safe to
-                                // release. Keep holding; forwarding here would leak a partial credential.
-                                continue;
-                            }
-                            return Some((
-                                Ok(Frame::data(Bytes::from(emit))),
-                                (Some(inner), carry),
-                            ));
                         }
                     }
                 }
@@ -3209,7 +3176,6 @@ mod tests {
         let scrubbed = scrub_stream(
             futures_util::stream::iter(frames),
             vec![(REAL.to_owned(), placeholder.clone())],
-            RESPONSE_HOLDBACK_FLUSH_IDLE,
         );
         let collected: Vec<u8> = scrubbed
             .try_fold(Vec::new(), |mut acc, frame| async move {
@@ -3244,12 +3210,13 @@ mod tests {
         let count = 3usize;
         let frames: Vec<reqwest::Result<Bytes>> =
             (0..count).map(|_| Ok(keepalive.clone())).collect();
-        // Keepalives, then a stream that never ends — the exact shape of a stalled SSE body.
+        // Keepalives, then a stream that never ends — the exact shape of a stalled SSE body. The
+        // stream never EOFs and there is no idle timer, so only the per-chunk release can forward
+        // these bytes.
         let stream = futures_util::stream::iter(frames).chain(futures_util::stream::pending());
         let mut scrubbed = Box::pin(scrub_stream(
             stream,
             vec![(REAL.to_owned(), placeholder.clone())],
-            Duration::from_secs(3600), // idle backstop must NOT be what releases these bytes
         ));
 
         let want = keepalive.len() * count;
@@ -3293,7 +3260,6 @@ mod tests {
                 (CODEX_REAL_ACCESS.to_owned(), CODEX_ACCESS_PLACEHOLDER.to_owned()),
                 (CODEX_REAL_ACCOUNT.to_owned(), CODEX_ACCOUNT_PLACEHOLDER.to_owned()),
             ],
-            RESPONSE_HOLDBACK_FLUSH_IDLE,
         );
         let collected: Vec<u8> = scrubbed
             .try_fold(Vec::new(), |mut acc, frame| async move {
@@ -3323,7 +3289,6 @@ mod tests {
         let scrubbed = scrub_stream(
             futures_util::stream::iter(frames),
             vec![("bb".to_owned(), "ab".to_owned())],
-            RESPONSE_HOLDBACK_FLUSH_IDLE,
         );
         let collected: Vec<u8> = scrubbed
             .try_fold(Vec::new(), |mut acc, frame| async move {
@@ -3344,26 +3309,24 @@ mod tests {
     // reaches, so the container got `received - (real.len() - 1)` bytes and no more — the credential-
     // scrub half of the "200 header, short-or-empty body, client gives up" symptom. Now the per-chunk
     // release forwards every provably-safe byte the instant the chunk arrives, so an ordinary body of
-    // any size reaches the container IN FULL on arrival — no EOF, and without waiting for the idle
-    // deadline at all. Driven with a large idle to prove the idle timer is NOT what delivers it.
+    // any size reaches the container IN FULL on arrival — no EOF, and no idle timer involved.
     #[tokio::test]
-    async fn a_stalled_ordinary_body_is_forwarded_in_full_on_arrival_without_eof_or_idle() {
+    async fn a_stalled_ordinary_body_is_forwarded_in_full_on_arrival_without_eof() {
         use futures_util::StreamExt as _;
         let placeholder = mint_anthropic_placeholder();
-        let idle = Duration::from_secs(3600); // must NOT be what releases these bytes
         let hold = REAL.len() - 1; // the old fixed holdback width — deliberately exceeded
         // Ordinary bytes — no suffix of them can begin the credential, so the whole body is safe now.
         let body = vec![b'x'; hold + 27];
         let stalled = futures_util::stream::iter(vec![Ok(Bytes::from(body.clone()))])
             .chain(futures_util::stream::pending::<reqwest::Result<Bytes>>());
         let mut scrubbed =
-            Box::pin(scrub_stream(stalled, vec![(REAL.to_owned(), placeholder.clone())], idle));
+            Box::pin(scrub_stream(stalled, vec![(REAL.to_owned(), placeholder.clone())]));
 
         // The entire body is forwarded on the chunk itself — the old code held `real.len() - 1` bytes
-        // here until an EOF or idle flush that a stalled stream never reaches.
+        // here until an EOF a stalled stream never reaches.
         let first = tokio::time::timeout(Duration::from_millis(500), scrubbed.next())
             .await
-            .expect("the safe body must be forwarded on arrival, not on the idle deadline")
+            .expect("the safe body must be forwarded on arrival")
             .unwrap()
             .unwrap()
             .into_data()
@@ -3371,20 +3334,19 @@ mod tests {
         assert_eq!(
             first.len(),
             body.len(),
-            "a stalled ordinary body reaches the container in full on arrival, with no EOF and no idle wait"
+            "a stalled ordinary body reaches the container in full on arrival, with no EOF"
         );
     }
 
-    // CONTAINMENT — the idle flush must never release a byte that could still begin a credential. A
-    // stalled body ending in a proper PREFIX of the real credential is the exact straddle the holdback
-    // guards: the flush releases only the bytes AHEAD of that prefix, and the prefix stays held even
+    // CONTAINMENT — the per-chunk release must never forward a byte that could still begin a credential.
+    // A stalled body ending in a proper PREFIX of the real credential is the exact straddle the holdback
+    // guards: the release forwards only the bytes AHEAD of that prefix, and the prefix stays held even
     // though the stream never EOFs. The prefix leaves the boundary only by being completed into a full
-    // credential (then replaced — see the split-across-chunks test) or on a real EOF; never on idle.
+    // credential (then replaced — see the split-across-chunks test) or on a real EOF.
     #[tokio::test]
-    async fn a_stalled_credential_prefix_is_never_released_by_the_idle_flush() {
+    async fn a_stalled_credential_prefix_is_never_released() {
         use futures_util::StreamExt as _;
         let placeholder = mint_anthropic_placeholder();
-        let idle = Duration::from_millis(50);
         let k = 12; // "sk-ant-api03" — a proper, non-empty prefix of REAL
         let prefix = &REAL.as_bytes()[..k];
         let mut body = vec![b'x'; 40];
@@ -3392,15 +3354,15 @@ mod tests {
         let stalled = futures_util::stream::iter(vec![Ok(Bytes::from(body.clone()))])
             .chain(futures_util::stream::pending::<reqwest::Result<Bytes>>());
         let mut scrubbed =
-            Box::pin(scrub_stream(stalled, vec![(REAL.to_owned(), placeholder.clone())], idle));
+            Box::pin(scrub_stream(stalled, vec![(REAL.to_owned(), placeholder.clone())]));
 
-        // The only frame the idle flush will release: exactly the 40 bytes ahead of the prefix. The k
-        // prefix bytes are withheld, so no fragment of the credential is ever forwarded.
+        // The only frame released: exactly the 40 bytes ahead of the prefix. The k prefix bytes are
+        // withheld, so no fragment of the credential is ever forwarded.
         let flushed = scrubbed.next().await.unwrap().unwrap().into_data().unwrap();
         assert_eq!(
             flushed.as_ref(),
             vec![b'x'; 40].as_slice(),
-            "the idle flush releases only the bytes that cannot begin a credential; the prefix stays held"
+            "the release forwards only the bytes that cannot begin a credential; the prefix stays held"
         );
         // A further await is intentionally omitted: with the prefix held and no more data and no EOF,
         // the stream never yields again — that permanent hold on the prefix IS the containment property.
