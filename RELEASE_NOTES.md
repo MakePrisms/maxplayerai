@@ -1,7 +1,7 @@
-## v0.5.1-rc1
+## v0.5.2
 
-A seat now advertises what it can actually do, a buyer can filter awards on it, and the runner sheet
-shows it. This is a release candidate.
+A seat advertises what it can actually do, a buyer can require it when posting a job, and the award
+refuses a claim that does not match. Docker-contained Cursor now works end to end.
 
 ### What a seat operator gets
 
@@ -48,11 +48,11 @@ they are directly comparable. They are separate reads and can differ without any
 
 An absent field satisfies no named requirement. A seat that declares nothing matches nothing.
 
-**Award filtering is present and inert in this release.** The machinery that selects a claim on
-advertised capability ships here, but no offer carries a capability request yet: both production
-award sites pass an empty request, so every job selects the same claim it would have selected
-before. Award behaviour is unchanged. Nothing you run today starts filtering, and no seat becomes
-invisible because of this release.
+**Award filtering is live in this release.** A job can carry a capability request, and both
+production award sites — the automatic award and the manual one — judge every claim against it
+through one shared constructor, so a request honoured on one path cannot be dropped on the other.
+A job that names nothing filters nothing: omit the request and every claim competes exactly as it
+did before, so no seat becomes invisible because of this release.
 
 ### What the runner sheet shows
 
@@ -69,23 +69,26 @@ Of the five fields, only `capabilities` is bounded by seat uptime. `harness_fami
 each beat, and `harness_model` refreshes from every completed job, including when a harness stops
 reporting one. A recent beat does not mean the capabilities on it were measured recently.
 
-### Known limitation: Docker-contained Cursor
+### Docker-contained Cursor now works
 
-Docker-contained Cursor seats are not supported in v0.5.1-rc1. Such a seat cannot complete its
-pre-advertise probe, so the seller refuses to advertise and the seat accepts no work. That refusal
-is deliberate and fail-closed: a seat that cannot prove its harness does not take jobs.
+A Docker-contained Cursor seat completes, delivers and settles a real job, proven from inside a
+running container. The previous notes listed this as unsupported.
 
-Three causes are identified:
+It needs the two-leg configuration, because Cursor's control plane and its agent traffic go to
+separate hosts. Use the browser-login session through `file_credentials`, which keeps the real value
+on the host and carries a per-job placeholder into the container. Do not forward `CURSOR_API_KEY`:
+it is a real reusable key, and forwarding it puts it inside the container for a stranger's job to
+read. `docs/DOCKER.md` carries the configuration, including the macOS step for a session that lives
+in the Keychain.
 
-- The credential proxy's upstream leg cannot negotiate HTTP/2. Cursor's agent endpoint serves
-  HTTP/2 only and returns no HTTP/1 response at all, so the upstream connection is never
-  established.
-- The proxy buffers a request body before forwarding it. An agent stream does not close its body,
-  so the request is never forwarded.
-- The proxy forwards every request to the single upstream a credential names, while Cursor's
-  control plane and agent leg use different hosts.
+### The response scrub no longer stalls a slow stream
 
-None of the three is fixed in this release.
+The credential proxy rewrites real values back to placeholders as a response streams, so it has to
+hold back any trailing bytes that might begin a credential split across two chunks. It used to hold
+a fixed-width tail on every chunk. A stream that sent fewer bytes than that between reads therefore
+forwarded nothing at all and the client timed the connection out mid-body — which is exactly what a
+contained Cursor agent leg does, sending small keepalives against a much larger credential.
 
-Uncontained Cursor seats and other harnesses are outside the scope of this limitation; it describes
-Docker-contained Cursor only.
+It now holds back only the tail that is genuinely the start of a real value, which is normally
+nothing, so each chunk passes straight through as it arrives. A partial credential is still never
+forwarded, and the held tail is released when the stream ends.
