@@ -75,6 +75,24 @@ pub struct PostJobRequest {
     /// preference, and the offer is byte-identical to one posted before harness selection existed.
     /// A requested harness narrows the market: only sellers advertising it may be awarded.
     pub requested_agent: Option<String>,
+    /// Ask for a harness FAMILY (#897). `None` ⇒ no preference. Enforced as a hard award filter on
+    /// both award paths, so only a seller advertising that family may be awarded. It selects who may
+    /// CLAIM and does not bind which harness a multi-harness seat dispatches — only `requested_agent`
+    /// does that — so when both are present the family must AGREE with the preset's own family.
+    pub requested_harness_family: Option<String>,
+    /// Ask for a MODEL (#897). `None` ⇒ no preference. Enforced as a hard award filter on both award
+    /// paths, matched against the family/model PAIR a seat advertises.
+    ///
+    /// ⚠ Requires `requested_agent`: the preset is the only axis dispatch reads, so it is the only
+    /// one that binds the model to the harness that will actually run. The family is DERIVED from
+    /// the preset when it is not stated. Posting a model alone stops awards rather than narrowing
+    /// them.
+    pub requested_model: Option<String>,
+    /// Capability tokens the job REQUIRES (#897). Empty ⇒ no requirement, and the offer is
+    /// byte-identical to one posted before capability requests existed. Every token must be in
+    /// [`crate::capability::CAPABILITIES`]; the posting path refuses the request otherwise, before
+    /// any event is signed.
+    pub required_capabilities: Vec<String>,
 }
 
 /// Job class of a posted offer. Making this an enum (rather than an all-or-nothing cluster of
@@ -216,6 +234,24 @@ pub struct OfferView {
     /// parameters, so the request cannot be changed after the fact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_agent: Option<String>,
+    /// The harness FAMILY this job requested (`["param", "harness_family", …]`), #897. `None` ⇒ any.
+    /// Read from the signed offer for the same reason `requested_agent` is: the request a buyer is
+    /// held to must be the one it published, not one supplied at award time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_harness_family: Option<String>,
+    /// The model this job requested (`["param", "harness_model", …]`), #897. `None` ⇒ any.
+    ///
+    /// ⚠ Only meaningful PAIRED with `requested_agent`: a model with no preset is REFUSED rather
+    /// than ignored, so it stops awards instead of narrowing them. The preset is the anchor because
+    /// it is the only axis dispatch reads; the family is DERIVED from it when unstated. And the
+    /// model matches a seat's LAST-OBSERVED self-report, so it narrows who is considered without
+    /// pinning what runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    /// Capability tokens this job requires (`["param", "capability", …]`), #897. Empty ⇒ none, and
+    /// every claim passes this filter unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_capabilities: Vec<String>,
 }
 
 /// Serializable view of a well-formed contribution offer's pins.
@@ -656,7 +692,46 @@ fn build_offer_draft(
             })?,
         )
     }
-    .requesting_agent(request.requested_agent.as_deref());
+    .requesting_agent(request.requested_agent.as_deref())
+    .requiring_capability(
+        request.requested_harness_family.as_deref(),
+        request.requested_model.as_deref(),
+        &request.required_capabilities,
+    );
+
+    // #897 — TWO GATES, on the NORMALIZED request rather than the raw one. Validating what was handed
+    // in would refuse a padded `" rust "` for a defect the builder just fixed, and would pass a value
+    // the builder had dropped. What reaches the wire is what must be judged.
+    //
+    // WHY GATE AT POST AT ALL: posting commits. `post_job` arms the auto-award and puts a signed offer
+    // on the relay with its deadline running, so a request nothing can satisfy converts a caller's
+    // mistake into a committed offer plus a guaranteed park. Post time is the cheapest moment the
+    // mistake can surface, and refusing here costs the caller nothing.
+    //
+    // The division of labour matters and is not a duplication:
+    //   · The VOCABULARY gate knows the closed lists — a family or token no seat can ever advertise.
+    //     That is a fact about the vocabularies, not about matching.
+    //   · The SATISFIABILITY gate owns nothing: it asks the AWARD PREDICATE whether the perfect claim
+    //     would pass. The predicate keeps sole ownership of matching semantics; this only surfaces a
+    //     consequence of them earlier.
+    //
+    // Neither is the enforcement boundary — a foreign client can publish either shape straight to the
+    // relay, where the award-time refusal is what holds. These make our own surface fail fast.
+    crate::capability::validate_capability_request(
+        offer.requested_harness_family.as_deref(),
+        &offer.required_capabilities,
+    )
+    .map_err(|defect| JobLifecycleError::Input(format!("post_job refused: {defect}")))?;
+    if let Some(refusal) = crate::buyer::lifecycle::unsatisfiable_capability_request(
+        offer.requested_agent.as_deref(),
+        offer.requested_harness_family.as_deref(),
+        offer.requested_model.as_deref(),
+        &offer.required_capabilities,
+    ) {
+        return Err(JobLifecycleError::Input(format!(
+            "post_job refused: no seat could ever satisfy this request — {refusal}"
+        )));
+    }
 
     let mut draft = offer.to_event_draft();
     if let (Some(repo), Some(branch)) = (&request.repo, &request.branch) {
@@ -1999,7 +2074,7 @@ fn delivery_pay_deadline(results: &[ResultView], seller_pubkey: &str) -> Option<
 ///
 /// `offer_deadline_unix == None` (offer not yet on the relay) means expiry cannot be derived,
 /// so status-based liveness is preserved unchanged.
-fn derive_claim_liveness(
+pub(crate) fn derive_claim_liveness(
     claims: &mut [ClaimView],
     results: &[ResultView],
     offer_deadline_unix: Option<u64>,
@@ -2023,6 +2098,42 @@ fn derive_claim_liveness(
         claim.live = live_claim_id.as_deref() == Some(claim.claim_id.as_str());
     }
     live_claim_id
+}
+
+/// The claims that were award CANDIDATES at the instant the offer's deadline struck (#897).
+///
+/// Diagnosing a park means reasoning about the claims that were in the running, and a job parks for
+/// a passed deadline only once [`derive_claim_liveness`] has already demoted every `processing`
+/// claim to expired. At that point `live` is false on all of them, so a diagnosis that reads `live`
+/// sees an empty field in exactly the case where a seat did claim — and reports nothing, which reads
+/// as "capability was not the problem" rather than as "this question was never asked".
+///
+/// Re-derives with the SAME function at `now = deadline` instead of restating which statuses count
+/// as candidates. At that instant the demotion branch (`now > deadline`) is inert and
+/// `delivery_pay_deadline` is never reached, so this reproduces the liveness any pre-deadline
+/// evaluation would have produced. It owns no rule of its own and so cannot drift from the one it
+/// is asking about.
+pub(crate) fn claims_at_deadline(view: &JobView) -> Vec<ClaimView> {
+    let mut claims = view.claims.clone();
+    // The demotion is DESTRUCTIVE — it overwrites `status` — so re-deriving at the deadline is not
+    // enough on its own: the information the diagnosis needs was already spent. Reverse the marker
+    // first.
+    //
+    // [`CLAIM_STATUS_EXPIRED`] is never a relay value. `derive_claim_liveness` is the only thing that
+    // writes it, and only for a claim that was `processing` when the deadline passed, so restoring it
+    // reads that function's own marker rather than guessing at a status. The round trip is asserted
+    // by `the_capability_clause_survives_the_real_deadline_demotion`, which demotes at `deadline + 1`
+    // and requires the claim to be a candidate again here — so if the demotion ever writes a
+    // different status, that test fails rather than this quietly seeing nothing.
+    for claim in claims.iter_mut() {
+        if claim.status == CLAIM_STATUS_EXPIRED {
+            claim.status = "processing".to_owned();
+        }
+    }
+    if let Some(deadline) = view.offer.as_ref().map(|offer| offer.deadline_unix) {
+        derive_claim_liveness(&mut claims, &view.results, Some(deadline), deadline);
+    }
+    claims
 }
 
 /// A buyer AWARD found on the relay, parsed into exactly the fields an `awards` row needs and
@@ -2577,6 +2688,14 @@ pub(crate) async fn fetch_job_view_async(
                 .map(str::to_owned),
             contribution: contribution_offer_view(&draft.tags),
             requested_agent: parsed.as_ref().and_then(|p| p.requested_agent.clone()),
+            requested_harness_family: parsed
+                .as_ref()
+                .and_then(|p| p.requested_harness_family.clone()),
+            requested_model: parsed.as_ref().and_then(|p| p.requested_model.clone()),
+            required_capabilities: parsed
+                .as_ref()
+                .map(|p| p.required_capabilities.clone())
+                .unwrap_or_default(),
         }
     });
 
@@ -4401,6 +4520,9 @@ mod tests {
                 branch: None,
                 job: JobKind::FromScratch,
                 requested_agent: None,
+                requested_harness_family: None,
+                requested_model: None,
+                required_capabilities: Vec::new(),
             },
         )
         .expect_err("seller required");
@@ -4589,6 +4711,9 @@ mod tests {
                 branch: None,
                 job: JobKind::FromScratch,
                 requested_agent: None,
+                requested_harness_family: None,
+                requested_model: None,
+                required_capabilities: Vec::new(),
             },
         )
         .await
@@ -4679,6 +4804,9 @@ mod tests {
                 branch: None,
                 job: JobKind::FromScratch,
                 requested_agent: None,
+                requested_harness_family: None,
+                requested_model: None,
+                required_capabilities: Vec::new(),
             },
         )
         .await
@@ -4738,6 +4866,9 @@ mod tests {
                 branch: None,
                 job: JobKind::FromScratch,
                 requested_agent: None,
+                requested_harness_family: None,
+                requested_model: None,
+                required_capabilities: Vec::new(),
             },
         )
         .expect_err("must refuse nested block_on");
@@ -4829,6 +4960,9 @@ mod tests {
                 accepts: vec!["fork".into()],
             }),
             requested_agent: None,
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: Vec::new(),
         }
     }
 
@@ -5022,6 +5156,9 @@ mod tests {
             branch: None,
             job: JobKind::Contribution(contribution_spec(owner, url, branch, oid, accepts)),
             requested_agent: None,
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: Vec::new(),
         }
     }
 
@@ -5074,6 +5211,169 @@ mod tests {
         assert_eq!(bind.base_oid, base_oid);
     }
 
+    /// A from-scratch post request carrying a capability request, for the gate tests below.
+    fn post_request_requesting(
+        agent: Option<&str>,
+        family: Option<&str>,
+        model: Option<&str>,
+        capabilities: &[&str],
+    ) -> PostJobRequest {
+        PostJobRequest {
+            task: "t".into(),
+            output: "text/plain".into(),
+            amount_sats: 3,
+            seller_pubkey: Some("bb".repeat(32)),
+            untargeted: false,
+            deadline_unix: Some(10),
+            repo: None,
+            branch: None,
+            job: JobKind::FromScratch,
+            requested_agent: agent.map(str::to_owned),
+            requested_harness_family: family.map(str::to_owned),
+            requested_model: model.map(str::to_owned),
+            required_capabilities: capabilities.iter().map(|t| (*t).to_owned()).collect(),
+        }
+    }
+
+    // #897 — the post path REFUSES a request no seat could ever satisfy, before any event is built.
+    //
+    // Posting commits: it arms the auto-award and puts a signed offer on the relay with its deadline
+    // running. So an unsatisfiable request is not merely useless, it converts a caller's typo into a
+    // committed offer and a guaranteed park. Post time is the cheapest moment it can surface.
+    //
+    // Asserted on the ERROR, and separately on the draft NOT being built: a gate that returned the
+    // error after emitting the event would satisfy an error-only assertion.
+    #[test]
+    fn post_job_refuses_a_request_no_seat_could_satisfy() {
+        // Out-of-vocabulary family: no seat can advertise it, because families reach the wire only
+        // through `harness_family_for_preset`.
+        let error = build_offer_draft(&post_request_requesting(None, Some("gpt-cli"), None, &[]), 10, None)
+            .expect_err("an unknown harness family must be refused");
+        assert!(
+            error.to_string().contains("gpt-cli") && error.to_string().contains("not a known family"),
+            "the error must name the value AND the vocabulary, so a caller can fix it without \
+             reading our source: {error}"
+        );
+        assert!(
+            error.to_string().contains("codex"),
+            "the error must list the known families — naming the defect without the alternatives \
+             makes the caller guess: {error}"
+        );
+
+        // Out-of-vocabulary capability token.
+        let error =
+            build_offer_draft(&post_request_requesting(None, None, None, &["kubernetes"]), 10, None)
+            .expect_err("an unknown capability token must be refused");
+        assert!(
+            error.to_string().contains("kubernetes") && error.to_string().contains("node"),
+            "the error must name the bad token and the known ones: {error}"
+        );
+
+        // A model with no PRESET — refused by the SATISFIABILITY gate, which asks the award predicate
+        // rather than restating the rule. A family does not rescue it: dispatch never reads one, so
+        // the second row here is the one that would silently execute on the wrong harness.
+        for (agent, family) in [(None, None), (None, Some("claude-code"))] {
+            let error =
+                build_offer_draft(&post_request_requesting(agent, family, Some("opus"), &[]), 10, None)
+                    .expect_err("a model with no harness preset must be refused");
+            assert!(
+                error.to_string().contains("no seat could ever satisfy"),
+                "family={family:?}: unsatisfiable by construction, and the error should say so \
+                 rather than reading as a vocabulary complaint: {error}"
+            );
+        }
+        let error =
+            build_offer_draft(&post_request_requesting(None, None, Some("opus"), &[]), 10, None)
+                .expect_err("a model with no harness preset must be refused");
+        assert!(
+            error.to_string().contains("no seat could ever satisfy"),
+            "a model-only request is unsatisfiable by construction and the error should say so \
+             rather than reading as a vocabulary complaint: {error}"
+        );
+        assert!(
+            error.to_string().contains("opus"),
+            "the error must name the model the caller asked for: {error}"
+        );
+
+        // A preset and a family naming DIFFERENT harnesses. Dispatch honours the preset, so this
+        // offer would ask for codex and run Claude — and because a multi-harness seat advertises
+        // both families, no claim-level check can see it. Refused before the offer is signed.
+        let error = build_offer_draft(
+            &post_request_requesting(Some("claude"), Some("codex"), None, &[]),
+            10,
+            None,
+        )
+        .expect_err("a family contradicting the preset must be refused");
+        assert!(
+            error.to_string().contains("claude") && error.to_string().contains("codex"),
+            "the error must name BOTH sides of the contradiction so the caller knows which to \
+             change: {error}"
+        );
+
+        // CONTROLS: every satisfiable shape must still post. Without these the assertions above are
+        // equally explained by a gate that refuses everything with a capability request on it.
+        for (agent, family, model, capabilities) in [
+            (None, None, None, Vec::new()),
+            (None, Some("codex"), None, Vec::new()),
+            (Some("codex"), None, None, Vec::new()),
+            (Some("codex"), Some("codex"), Some("gpt-5.6-sol[low]"), Vec::new()),
+            // The family DERIVED from the preset rather than stated — the shape a caller reaches
+            // for first, and the one a stricter rule would have broken.
+            (Some("codex"), None, Some("gpt-5.6-sol[low]"), Vec::new()),
+            (None, None, None, vec!["rust"]),
+            (None, Some("claude-code"), None, vec!["rust", "node"]),
+        ] {
+            let request = post_request_requesting(agent, family, model, &capabilities);
+            assert!(
+                build_offer_draft(&request, 10, None).is_ok(),
+                "control: {agent:?}/{family:?}/{model:?}/{capabilities:?} is satisfiable and must post"
+            );
+        }
+    }
+
+    // The request reaches the EMITTED TAGS, and an absent request emits nothing (#897).
+    //
+    // The gateway tests cover the draft→tags→parse round trip. This covers the seam ABOVE it: that
+    // `post_job`'s own request object is what feeds that round trip, rather than the fields being
+    // carried on the type and dropped on the way to the event.
+    #[test]
+    fn post_job_emits_the_capability_request_it_was_given() {
+        let draft = build_offer_draft(
+            &post_request_requesting(
+                Some("codex"),
+                Some("codex"),
+                Some("gpt-5.6-sol[low]"),
+                &["rust"],
+            ),
+            10,
+            None,
+        )
+        .expect("draft");
+
+        let param = |name: &str| {
+            draft
+                .tags
+                .iter()
+                .find(|tag| {
+                    tag.first() == Some("param") && tag.0.get(1).map(String::as_str) == Some(name)
+                })
+                .map(|tag| tag.0[2..].to_vec())
+        };
+        assert_eq!(param("harness_family"), Some(vec!["codex".to_owned()]));
+        assert_eq!(param("harness_model"), Some(vec!["gpt-5.6-sol[low]".to_owned()]));
+        assert_eq!(param("capability"), Some(vec!["rust".to_owned()]));
+
+        // And a post with no request is byte-identical to one built before any of this existed —
+        // the property that makes filtering opt-in on the wire, not just in the predicate.
+        let plain = build_offer_draft(&post_request_requesting(None, None, None, &[]), 10, None)
+            .expect("draft");
+        assert_eq!(
+            plain,
+            OfferDraft::new("t", "text/plain", 3, 10, "bb".repeat(32)).to_event_draft(),
+            "a post with no capability request must emit the pre-#897 offer exactly"
+        );
+    }
+
     #[test]
     fn post_job_from_scratch_emits_byte_identical_tags() {
         // No contribution params ⇒ Ok(None) ⇒ built tags are byte-identical to the bare offer.
@@ -5088,6 +5388,9 @@ mod tests {
             branch: None,
             job: JobKind::FromScratch,
             requested_agent: None,
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: Vec::new(),
         };
         let contribution: Option<crate::contribution::ContributionOffer> = match &request.job {
             JobKind::FromScratch => None,
@@ -5292,6 +5595,9 @@ mod tests {
                 branch: None,
                 job: JobKind::FromScratch,
                 requested_agent: None,
+                requested_harness_family: None,
+                requested_model: None,
+                required_capabilities: Vec::new(),
             },
         )
         .await

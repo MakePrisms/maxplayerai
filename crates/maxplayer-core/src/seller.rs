@@ -740,6 +740,9 @@ mod tests {
             deadline_unix: 2_000_000_000,
             seller_pubkey: seller.map(str::to_owned),
             requested_agent: None,
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: Vec::new(),
         }
     }
 

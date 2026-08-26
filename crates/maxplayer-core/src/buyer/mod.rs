@@ -54,7 +54,7 @@ use crate::job_lifecycle::{
 };
 use crate::payment::{PaymentMachine, PaymentRecord, PaymentState};
 use lifecycle::{
-    AwardError, AwardFilters, AwardOutcome, MissingOfferAction, PaymentProgress, RearmAction,
+    AwardError, AwardOutcome, MissingOfferAction, PaymentProgress, RearmAction,
     SettleError,
 };
 use lock::{HomeLock, LockError};
@@ -427,13 +427,30 @@ struct PostJobParams {
     /// never auto-awards a claim it cannot pay or priced above this.
     #[serde(default)]
     max_sats: Option<u64>,
-    /// Auto-award preferences recorded with the intent. `harness` is ALSO posted on the offer as
-    /// its requested agent, so it is a hard award filter: only a seller advertising that harness
-    /// can be awarded. `model` has no wire field yet and stays a recorded preference.
+    /// Auto-award preferences recorded with the intent. BOTH are also posted on the offer and are
+    /// therefore hard award filters: only a seller advertising them can be awarded.
+    ///
+    /// `harness` names a PRESET and is matched against the claim's `agents`. `model` (#897) is matched
+    /// against the family/model PAIR a seat advertises, and so REQUIRES `harness` — the preset is the
+    /// only axis dispatch reads, so it is the only one that can bind the model to the harness that
+    /// will actually run. The family is DERIVED from the preset when it is not stated. A model with
+    /// no preset refuses every claim rather than being ignored.
     #[serde(default)]
     harness: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    /// Harness FAMILY the job requires (#897). Posted on the offer and enforced as a hard award
+    /// filter on BOTH award paths. Distinct from `harness`, which names a preset: a family spans the
+    /// presets sharing a harness, so a family request selects which seats may CLAIM the job and does
+    /// NOT bind which harness a multi-harness seat dispatches — only `harness` does that. When both
+    /// are given they must AGREE: a family naming a harness the preset would not run is refused.
+    #[serde(default)]
+    harness_family: Option<String>,
+    /// Capability tokens the job requires (#897) — a subset of
+    /// [`maxplayer_core::capability::CAPABILITIES`]. Posted on the offer and enforced as a hard
+    /// award filter on BOTH award paths. Omitted or empty ⇒ no requirement.
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
 }
 
 /// Resolve the offer kind from the contribution pins: all four present ⇒ contribution; none ⇒
@@ -490,6 +507,12 @@ async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Resp
         branch: params.branch,
         job,
         requested_agent: harness.clone(),
+        requested_harness_family: params.harness_family,
+        // #897: `model` now reaches the WIRE as well as the intent. It stays recorded on the intent
+        // because that is a separate fact — what the buyer asked for locally — from what the signed
+        // offer says, and the award filter reads only the offer.
+        requested_model: model.clone(),
+        required_capabilities: params.capabilities.unwrap_or_default(),
     };
     match job_lifecycle::post_job_async(&context.home, request).await {
         Ok(outcome) => {
@@ -795,20 +818,16 @@ async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
             };
             let offer_amount = offer.amount_sats;
             let max_sats = params.max_sats.unwrap_or(offer_amount);
-            let filters = AwardFilters {
-                offer_amount_sats: offer_amount,
+            // ONE constructor, shared with `drive_auto_award` — the capability request (#897) and
+            // every other filter come from the SIGNED OFFER, never from award params, so the request
+            // cannot be changed after the fact. Sharing the constructor is what makes "both paths
+            // filter identically" structural instead of a convention someone has to keep noticing.
+            let filters = lifecycle::award_filters_for_offer(
+                offer,
                 max_sats,
-                buyer_mint: context.home.config.default_mint(),
-                allow_real_mints: context.home.config.allow_real_mints,
-                requested_agent: offer.requested_agent.as_deref(),
-                // #784 capability request — INERT until the offer carries these. The predicate is
-                // live and wired; an absent request passes every claim, so award behaviour here is
-                // byte-unchanged. The offer-side fields live in `job_lifecycle.rs`'s OfferView and
-                // its tag parse, and land in a follow-up (see this PR's body).
-                requested_harness_family: None,
-                requested_model: None,
-                required_capabilities: &[],
-            };
+                context.home.config.default_mint(),
+                context.home.config.allow_real_mints,
+            );
 
             // Manual award names the claim but applies the SAME hard filters as auto-award —
             // max_sats, price, mint AND the #784 capability request. Naming a claim chooses which
@@ -1290,6 +1309,20 @@ async fn drive_auto_award(
             return Ok(());
         };
         unconfirmed_reads = 0;
+        // THE SAME constructor the manual award path uses, so the two cannot apply different filters.
+        // Both selection entry points then consult `claim_meets_capability_request`:
+        // `select_awardable_claim` here, `named_claim_awardable` on the manual path.
+        let filters = lifecycle::award_filters_for_offer(
+            offer,
+            max_sats,
+            context.home.config.default_mint(),
+            context.home.config.allow_real_mints,
+        );
+
+        // Built AFTER `filters` so the deadline park can name the capability request that refused
+        // everything, instead of only reporting that time ran out. The order of these two blocks is
+        // the only thing that makes an actionable reason available here; the decision itself is
+        // unchanged, and a job with no request parks with the wording it always did.
         if now_unix() as u64 > offer.deadline_unix {
             // A pinned attempt past its deadline is NOT "no awardable claim appeared" — a claim
             // was selected and signed for. Reflect the ATTEMPT's truth on the intent instead of
@@ -1297,33 +1330,14 @@ async fn drive_auto_award(
             if settle_intent_from_attempt(context, &keys, job_id).await {
                 return Ok(());
             }
-            crate::opline!(
-                "{}",
-                auto_award_park_line(job_id, "offer deadline passed before an awardable claim appeared")
+            let reason = lifecycle::park_reason_deadline_passed(
+                lifecycle::capability_park_reason(&view, &filters).as_deref(),
             );
-            let _ = context.store.mark_award_parked(
-                job_id,
-                "offer deadline passed before an awardable claim appeared",
-                now_unix(),
-            );
+            crate::opline!("{}", auto_award_park_line(job_id, &reason));
+            let _ = context.store.mark_award_parked(job_id, &reason, now_unix());
             return Ok(());
         }
 
-        let filters = AwardFilters {
-            offer_amount_sats: offer.amount_sats,
-            max_sats,
-            buyer_mint: context.home.config.default_mint(),
-            allow_real_mints: context.home.config.allow_real_mints,
-            requested_agent: offer.requested_agent.as_deref(),
-            // #784 capability request — INERT until the offer carries these, exactly as on the
-            // manual path above. Both selection paths call `claim_meets_capability_request`:
-            // `select_awardable_claim` here, `named_claim_awardable` on the manual path. A test
-            // holds that property from BOTH entry points, so this sentence cannot quietly become
-            // false the way its predecessor did.
-            requested_harness_family: None,
-            requested_model: None,
-            required_capabilities: &[],
-        };
         if let Some(claim_id) = lifecycle::select_awardable_claim(&view, &filters) {
             return finalize_auto_award(context, job_id, offer.amount_sats, claim_id).await;
         }
