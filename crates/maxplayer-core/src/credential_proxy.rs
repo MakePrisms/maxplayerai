@@ -163,7 +163,7 @@ const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// request.
 pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
-/// Period of the response-body heartbeat: [`BodyMeter`] emits a log-only `body_idle` line this often
+/// Period of the response-body heartbeat: [`StreamMeter`] emits a log-only `*_idle` line this often
 /// while the upstream response body is producing no bytes.
 ///
 /// It is a CLOCK, not a deadline — contrast [`BODY_IDLE_TIMEOUT`], which cancels the request body. The
@@ -1333,179 +1333,134 @@ impl std::fmt::Display for OptLen {
     }
 }
 
-/// Observes the RESPONSE BODY — the region after the response header that [`AwaitGuard`] and the
-/// `await_response` line structurally cannot see. Wraps the raw upstream byte stream and is PASSIVE: it
-/// forwards every chunk unchanged and records only timings and the terminator.
-///
-/// It answers the body-phase form of the WHO-ended question:
-/// - `terminated_by=upstream kind=eof completed=true` — the upstream body ended naturally.
-/// - `terminated_by=upstream kind=error` — the upstream body errored (reset / GOAWAY / decode).
-/// - `terminated_by=downstream` — dropped before either terminal, i.e. hyper dropped the body because
-///   the container closed its connection mid-stream. This is the body-phase analogue of [`AwaitGuard`],
-///   and the ONLY way to observe a client that gives up AFTER the header.
-///
-/// `last_byte_ts` is the discriminator for a mid-stream stall: the gap from it to the `body_end` line is
-/// the stall interval, both ends real events in this same log. And while the body produces no bytes at
-/// all, a [`BODY_HEARTBEAT_PERIOD`] clock emits `body_idle` lines — so "a header then N seconds of
-/// nothing" (the failure under investigation) is a POSITIVE reading with a denominator, not the absence
-/// of a `body_end` line, which is indistinguishable from a request that never reached the body phase.
-/// The clock only EMITS; it never cancels, so it cannot manufacture the terminator this meter finds.
-struct BodyMeter {
-    // `+ Sync` as well as `+ Send`: the boxed response body (`BoxBody` via `BodyExt::boxed`) requires
-    // `Send + Sync`, and the concrete upstream stream satisfies both — erasing to `dyn … + Send` alone
-    // would drop `Sync` and fail the bound.
-    inner: std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send + Sync>>,
-    req: u64,
-    host: String,
-    // The observed response-header instant: the anchor `body_first_byte` and every `body_idle` gap are
-    // measured from it, both ends real events in this log rather than a value differenced against the
-    // nearest ACP notification.
-    header_ts: u128,
-    bytes: u64,
-    first_byte_ts: Option<u128>,
-    last_byte_ts: Option<u128>,
-    // Log-only clock: fires while the upstream body yields nothing, so an idle stall is an explicit line
-    // rather than silence. Polled but NEVER used to cancel — see [`BODY_HEARTBEAT_PERIOD`].
-    heartbeat: tokio::time::Interval,
-    // Set once the UPSTREAM terminates (EOF or error) so Drop does not then record a spurious
-    // `terminated_by=downstream` — the upstream terminal and the eventual drop are the same stream's end.
-    ended: bool,
+/// One frame's forwardable byte length, so [`StreamMeter`] counts bytes without knowing whether it
+/// wraps a raw upstream `Bytes` stream or a scrubbed `Frame<Bytes>` stream.
+trait MeteredItem {
+    fn payload_len(&self) -> usize;
+}
+impl MeteredItem for Bytes {
+    fn payload_len(&self) -> usize {
+        self.len()
+    }
+}
+impl MeteredItem for Frame<Bytes> {
+    // Only DATA frames carry body bytes; a trailers frame contributes zero.
+    fn payload_len(&self) -> usize {
+        self.data_ref().map_or(0, Bytes::len)
+    }
 }
 
-impl futures_util::Stream for BodyMeter {
-    type Item = reqwest::Result<Bytes>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        // `Self: Unpin` (every field is), so unwrapping the pin needs no projection crate.
-        let this = self.get_mut();
-        match futures_util::Stream::poll_next(this.inner.as_mut(), cx) {
-            std::task::Poll::Ready(Some(Ok(chunk))) => {
-                let now = proxy_log_now_ms();
-                if this.first_byte_ts.is_none() {
-                    this.first_byte_ts = Some(now);
-                    eprintln!(
-                        "proxy: req#{} ts={now} phase=body_first_byte host={} gap_from_header_ms={}",
-                        this.req,
-                        this.host,
-                        now.saturating_sub(this.header_ts),
-                    );
-                }
-                this.bytes += chunk.len() as u64;
-                this.last_byte_ts = Some(now);
-                std::task::Poll::Ready(Some(Ok(chunk)))
-            }
-            std::task::Poll::Ready(Some(Err(error))) => {
-                this.ended = true;
-                eprintln!(
-                    "proxy: req#{} ts={} phase=body_end terminated_by=upstream kind=error host={} bytes={} completed=false first_byte_ts={} last_byte_ts={} msg={error}",
-                    this.req,
-                    proxy_log_now_ms(),
-                    this.host,
-                    this.bytes,
-                    OptTs(this.first_byte_ts),
-                    OptTs(this.last_byte_ts),
-                );
-                std::task::Poll::Ready(Some(Err(error)))
-            }
-            std::task::Poll::Ready(None) => {
-                this.ended = true;
-                let now = proxy_log_now_ms();
-                eprintln!(
-                    "proxy: req#{} ts={now} phase=body_end terminated_by=upstream kind=eof host={} bytes={} completed=true first_byte_ts={} last_byte_ts={}",
-                    this.req,
-                    this.host,
-                    this.bytes,
-                    OptTs(this.first_byte_ts),
-                    OptTs(this.last_byte_ts),
-                );
-                std::task::Poll::Ready(None)
-            }
-            std::task::Poll::Pending => {
-                // Upstream has nothing right now. Drive the heartbeat so a silent body is an explicit
-                // reading rather than an absence. Polling the interval registers its waker on `cx`, so
-                // the task is re-polled each period even while the upstream stays parked; the upstream's
-                // own waker is already registered from the `poll_next` above, so a real byte still wakes
-                // us. Draining every ready tick keeps it to one line per elapsed period.
-                while this.heartbeat.poll_tick(cx).is_ready() {
-                    let now = proxy_log_now_ms();
-                    eprintln!(
-                        "proxy: req#{} ts={now} phase=body_idle host={} bytes={} gap_from_header_ms={}",
-                        this.req,
-                        this.host,
-                        this.bytes,
-                        now.saturating_sub(this.header_ts),
-                    );
-                }
-                std::task::Poll::Pending
-            }
+/// Which leg a [`StreamMeter`] observes. Selects the `phase=` label so `body_*` and `forward_*` lines
+/// for one request read directly against each other.
+#[derive(Clone, Copy)]
+enum MeterLeg {
+    /// Bytes RECEIVED from the upstream, before the scrub.
+    Upstream,
+    /// Bytes FORWARDED downstream to the container, after the scrub.
+    Forward,
+}
+impl MeterLeg {
+    fn first(self) -> &'static str {
+        match self {
+            Self::Upstream => "body_first_byte",
+            Self::Forward => "forward_first",
+        }
+    }
+    fn idle(self) -> &'static str {
+        match self {
+            Self::Upstream => "body_idle",
+            Self::Forward => "forward_idle",
+        }
+    }
+    fn end(self) -> &'static str {
+        match self {
+            Self::Upstream => "body_end",
+            Self::Forward => "forward_end",
         }
     }
 }
 
-impl Drop for BodyMeter {
-    fn drop(&mut self) {
-        // Un-ended at drop ⇒ the body pipeline was torn down before the upstream itself finished, which
-        // happens when hyper drops the response because the container closed its connection mid-stream.
-        if !self.ended {
-            eprintln!(
-                "proxy: req#{} ts={} phase=body_end terminated_by=downstream host={} bytes={} completed=false first_byte_ts={} last_byte_ts={}",
-                self.req,
-                proxy_log_now_ms(),
-                self.host,
-                self.bytes,
-                OptTs(self.first_byte_ts),
-                OptTs(self.last_byte_ts),
-            );
-        }
-    }
-}
-
-/// Observes the DOWNSTREAM-FORWARDED body — the frames that actually leave the proxy for the container,
-/// AFTER [`scrub_stream`] (or the no-scrub `map`) has run. [`BodyMeter`] sits BEFORE scrub and counts
-/// bytes RECEIVED from the upstream; this counts bytes FORWARDED to hyper. Reading `body_*` beside
-/// `forward_*` for one request separates "the upstream sent little" from "the proxy forwarded little of
-/// what the upstream sent".
+/// Observes ONE leg of the response body — the region after the response header that [`AwaitGuard`] and
+/// the `await_response` line structurally cannot see. One meter wraps the raw upstream stream
+/// ([`MeterLeg::Upstream`]); a second wraps the scrubbed forwarded stream ([`MeterLeg::Forward`]).
+/// Reading the two together separates "the upstream sent little" from "the proxy forwarded little of
+/// what it received" — the gap between them is the credential-scrub holdback.
 ///
-/// The gap between the two meters is the credential-scrub holdback: [`scrub_stream`] withholds the last
-/// `real.len() - 1` bytes of the stream — the longest possible partial credential match — and flushes it
-/// only when the upstream ENDS. On an upstream STALL (bytes then no EOF), bytes that BodyMeter has
-/// already counted may not yet be forwarded here. This meter only MEASURES that gap; it changes nothing
-/// about when the carry flushes, because that is a containment boundary, not a streaming knob.
+/// PASSIVE: it forwards every item unchanged and records only counts, timings and the terminator. It
+/// answers the body-phase form of the WHO-ended question:
+/// - `terminated_by=upstream kind=eof completed=true` — the leg ended naturally.
+/// - `terminated_by=upstream kind=error completed=false` — the leg errored (reset / GOAWAY / decode).
+/// - `terminated_by=downstream completed=false` — dropped before either terminal, i.e. hyper dropped
+///   the body because the container closed its connection mid-stream. This is the body-phase analogue
+///   of [`AwaitGuard`], and the ONLY way to observe a client that gives up AFTER the header.
 ///
-/// PASSIVE, exactly like [`BodyMeter`]: forwards every frame unchanged, records only counts, timings and
-/// the terminator, and its heartbeat only EMITS — it never cancels, so it cannot manufacture the
-/// terminator it observes. LOGS NO CREDENTIAL MATERIAL: `real_len` is the LENGTH of the credential
+/// `last_ts` is the discriminator for a mid-stream stall: the gap from it to the `*_end` line is the
+/// stall interval. While the leg produces nothing, a [`BODY_HEARTBEAT_PERIOD`] clock emits `*_idle`
+/// lines, so "a header then N seconds of nothing" is a POSITIVE reading with a denominator, not the
+/// absence of an end line. The clock only EMITS; it never cancels, so it cannot manufacture the
+/// terminator this meter finds. LOGS NO CREDENTIAL MATERIAL: `real_len` is the LENGTH of the credential
 /// string only, never its value, never the carry buffer, never a matched region or offset.
-struct ForwardMeter {
-    inner: std::pin::Pin<
-        Box<dyn futures_util::Stream<Item = Result<Frame<Bytes>, std::io::Error>> + Send + Sync>,
-    >,
+struct StreamMeter<T, E> {
+    // `+ Sync` as well as `+ Send`: the boxed response body (`BoxBody` via `BodyExt::boxed`) requires
+    // `Send + Sync`, and the concrete streams satisfy both — erasing to `dyn … + Send` alone would drop
+    // `Sync` and fail the bound.
+    inner: std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<T, E>> + Send + Sync>>,
+    leg: MeterLeg,
     req: u64,
     host: String,
-    // The same observed response-header instant [`BodyMeter`] measures from, so `forward_*` gaps and
-    // `body_*` gaps share one origin and read directly against each other.
+    // The observed response-header instant: the anchor `*_first` and every `*_idle` gap are measured
+    // from it, both ends real events in this log rather than a value differenced against the nearest
+    // ACP notification.
     header_ts: u128,
-    // Bytes ACTUALLY forwarded downstream: the running sum of forwarded `Frame::data` payload lengths.
     bytes: u64,
     first_ts: Option<u128>,
     last_ts: Option<u128>,
-    // LENGTH of the credential scrubbed on this leg (`None` on a leg with no scrub). The holdback is
-    // `real_len - 1` bytes, so this is the parameter that predicts how much a stalled stream withholds.
+    // LENGTH of the credential scrubbed on this leg (`None` when there is no scrub, e.g. the upstream
+    // leg). The holdback is `real_len - 1` bytes, so this is the parameter that predicts how much a
+    // stalled stream withholds. Printed as `none` when absent.
     real_len: Option<usize>,
-    // Log-only clock, same discipline as [`BodyMeter`]'s heartbeat: emits `forward_idle` while nothing is
-    // forwarded, so "the upstream trickled bytes but the proxy forwarded none" is a POSITIVE reading with
-    // a denominator rather than an absence. Polled but NEVER used to cancel.
+    // Log-only clock: fires while the leg yields nothing, so an idle stall is an explicit line rather
+    // than silence. Polled but NEVER used to cancel — see [`BODY_HEARTBEAT_PERIOD`].
     heartbeat: tokio::time::Interval,
-    // Set once the forwarded stream terminates (its own EOF or error) so Drop does not then record a
-    // spurious `terminated_by=downstream`.
+    // Set once the inner stream terminates (EOF or error) so Drop does not then record a spurious
+    // `terminated_by=downstream` — the inner terminal and the eventual drop are the same stream's end.
     ended: bool,
 }
 
-impl futures_util::Stream for ForwardMeter {
-    type Item = Result<Frame<Bytes>, std::io::Error>;
+impl<T, E> StreamMeter<T, E> {
+    fn new(
+        inner: std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<T, E>> + Send + Sync>>,
+        leg: MeterLeg,
+        req: u64,
+        host: String,
+        header_ts: u128,
+        real_len: Option<usize>,
+    ) -> Self {
+        // First tick one full period out, not immediately; `Skip` so a delayed poll collapses missed
+        // ticks to a single line rather than a catch-up burst.
+        let mut heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + BODY_HEARTBEAT_PERIOD,
+            BODY_HEARTBEAT_PERIOD,
+        );
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Self {
+            inner,
+            leg,
+            req,
+            host,
+            header_ts,
+            bytes: 0,
+            first_ts: None,
+            last_ts: None,
+            real_len,
+            heartbeat,
+            ended: false,
+        }
+    }
+}
+
+impl<T: MeteredItem, E: std::fmt::Display> futures_util::Stream for StreamMeter<T, E> {
+    type Item = Result<T, E>;
 
     fn poll_next(
         self: std::pin::Pin<&mut Self>,
@@ -1514,28 +1469,29 @@ impl futures_util::Stream for ForwardMeter {
         // `Self: Unpin` (every field is), so unwrapping the pin needs no projection crate.
         let this = self.get_mut();
         match futures_util::Stream::poll_next(this.inner.as_mut(), cx) {
-            std::task::Poll::Ready(Some(Ok(frame))) => {
+            std::task::Poll::Ready(Some(Ok(item))) => {
                 let now = proxy_log_now_ms();
                 if this.first_ts.is_none() {
                     this.first_ts = Some(now);
                     eprintln!(
-                        "proxy: req#{} ts={now} phase=forward_first host={} gap_from_header_ms={}",
+                        "proxy: req#{} ts={now} phase={} host={} gap_from_header_ms={}",
                         this.req,
+                        this.leg.first(),
                         this.host,
                         now.saturating_sub(this.header_ts),
                     );
                 }
-                // Only DATA frames carry body bytes; a trailers frame contributes zero.
-                this.bytes += frame.data_ref().map_or(0, Bytes::len) as u64;
+                this.bytes += item.payload_len() as u64;
                 this.last_ts = Some(now);
-                std::task::Poll::Ready(Some(Ok(frame)))
+                std::task::Poll::Ready(Some(Ok(item)))
             }
             std::task::Poll::Ready(Some(Err(error))) => {
                 this.ended = true;
                 eprintln!(
-                    "proxy: req#{} ts={} phase=forward_end terminated_by=upstream kind=error host={} bytes={} real_len={} first_ts={} last_ts={} msg={error}",
+                    "proxy: req#{} ts={} phase={} terminated_by=upstream kind=error host={} bytes={} real_len={} completed=false first_ts={} last_ts={} msg={error}",
                     this.req,
                     proxy_log_now_ms(),
+                    this.leg.end(),
                     this.host,
                     this.bytes,
                     OptLen(this.real_len),
@@ -1548,8 +1504,9 @@ impl futures_util::Stream for ForwardMeter {
                 this.ended = true;
                 let now = proxy_log_now_ms();
                 eprintln!(
-                    "proxy: req#{} ts={now} phase=forward_end terminated_by=upstream kind=eof host={} bytes={} real_len={} first_ts={} last_ts={}",
+                    "proxy: req#{} ts={now} phase={} terminated_by=upstream kind=eof host={} bytes={} real_len={} completed=true first_ts={} last_ts={}",
                     this.req,
+                    this.leg.end(),
                     this.host,
                     this.bytes,
                     OptLen(this.real_len),
@@ -1559,16 +1516,18 @@ impl futures_util::Stream for ForwardMeter {
                 std::task::Poll::Ready(None)
             }
             std::task::Poll::Pending => {
-                // The forwarded stream has nothing right now — either the upstream is parked or scrub is
-                // holding its carry back. Drive the heartbeat so the withheld case is an explicit line
-                // rather than an absence. Same waker mechanics as [`BodyMeter`]: polling the interval
-                // registers its waker, and the inner stream's waker is already registered from the poll
-                // above, so a real frame still wakes us immediately.
+                // The leg has nothing right now — the inner stream is parked (or scrub is holding its
+                // carry). Drive the heartbeat so the withheld case is an explicit line rather than an
+                // absence. Polling the interval registers its waker on `cx`, so the task is re-polled
+                // each period even while the inner stays parked; the inner's own waker is already
+                // registered from the `poll_next` above, so a real item still wakes us. Draining every
+                // ready tick keeps it to one line per elapsed period.
                 while this.heartbeat.poll_tick(cx).is_ready() {
                     let now = proxy_log_now_ms();
                     eprintln!(
-                        "proxy: req#{} ts={now} phase=forward_idle host={} bytes={} gap_from_header_ms={}",
+                        "proxy: req#{} ts={now} phase={} host={} bytes={} gap_from_header_ms={}",
                         this.req,
+                        this.leg.idle(),
                         this.host,
                         this.bytes,
                         now.saturating_sub(this.header_ts),
@@ -1580,16 +1539,17 @@ impl futures_util::Stream for ForwardMeter {
     }
 }
 
-impl Drop for ForwardMeter {
+impl<T, E> Drop for StreamMeter<T, E> {
     fn drop(&mut self) {
-        // Un-ended at drop ⇒ the forwarded stream was torn down before it finished, i.e. hyper dropped
+        // Un-ended at drop ⇒ the leg was torn down before the inner stream finished, i.e. hyper dropped
         // the body because the container closed its connection mid-stream. `bytes` is then the total the
-        // proxy managed to forward before the client gave up — the number the holdback hypothesis predicts.
+        // proxy managed to move before the client gave up.
         if !self.ended {
             eprintln!(
-                "proxy: req#{} ts={} phase=forward_end terminated_by=downstream host={} bytes={} real_len={} first_ts={} last_ts={}",
+                "proxy: req#{} ts={} phase={} terminated_by=downstream host={} bytes={} real_len={} completed=false first_ts={} last_ts={}",
                 self.req,
                 proxy_log_now_ms(),
+                self.leg.end(),
                 self.host,
                 self.bytes,
                 OptLen(self.real_len),
@@ -1820,7 +1780,7 @@ async fn relay(
     let status = upstream_response.status();
     // The upstream terminated the await by answering. Pairs with `await_send` above: the interval
     // between these two `ts` values IS the send->response-header wait for this request. Held as the
-    // anchor `BodyMeter` measures time-to-first-byte from — the same event, not a nearby proxy for it.
+    // anchor `StreamMeter` measures time-to-first-byte from — the same event, not a nearby proxy for it.
     let header_ts = proxy_log_now_ms();
     eprintln!(
         "proxy: req#{req} ts={header_ts} phase=await_response terminated_by=upstream kind=response_header host={host} status={}",
@@ -1839,33 +1799,21 @@ async fn relay(
         builder = builder.header(name, scrubbed);
     }
     // Instrument the response body — the region after the header that `await_response` cannot see.
-    // Passive: it forwards every chunk unchanged and records only timings and the terminator; on Drop
-    // (hyper dropping the body because the container closed mid-stream) it records
-    // `terminated_by=downstream`, the body-phase analogue of `AwaitGuard`.
-    // First tick one full period out, not immediately; `Skip` so a delayed poll collapses missed ticks
-    // to a single line rather than a catch-up burst.
-    let mut heartbeat = tokio::time::interval_at(
-        tokio::time::Instant::now() + BODY_HEARTBEAT_PERIOD,
-        BODY_HEARTBEAT_PERIOD,
-    );
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let metered = BodyMeter {
-        inner: Box::pin(upstream_response.bytes_stream()),
+    // Two meters wrap the same body: the UPSTREAM leg counts what the upstream sent (before scrub), the
+    // FORWARD leg counts what the proxy forwards downstream (after scrub). Both are passive — they
+    // forward every item unchanged and record only timings and the terminator; on Drop (hyper dropping
+    // the body because the container closed mid-stream) each records `terminated_by=downstream`, the
+    // body-phase analogue of `AwaitGuard`.
+    let metered = StreamMeter::new(
+        Box::pin(upstream_response.bytes_stream()),
+        MeterLeg::Upstream,
         req,
-        host: host.to_owned(),
+        host.to_owned(),
         header_ts,
-        bytes: 0,
-        first_byte_ts: None,
-        last_byte_ts: None,
-        heartbeat,
-        ended: false,
-    };
-    // Second meter, DOWNSTREAM of scrub: `metered` (BodyMeter) counted what the upstream SENT; this
-    // counts what the proxy FORWARDS after scrub. The credential length is captured before `scrub` is
-    // consumed by the match. Same heartbeat discipline as the upstream meter so "received bytes, forwarded
-    // none" is a positive `forward_idle` reading rather than silence.
-    // The WIDEST real value in play, not the only one: it is what sets `scrub_stream`'s holdback, so
-    // it is the number that explains a short forward. Captured before `scrub` is consumed below.
+        None, // the upstream leg is not scrubbed, so it has no holdback width to report
+    );
+    // The WIDEST real value in play, not the only one: it is what sets `scrub_stream`'s holdback, so it
+    // is the number that explains a short forward. Captured before `scrub` is consumed below.
     let real_len = scrub.iter().map(|(real, _)| real.len()).max();
     let forwarded: std::pin::Pin<
         Box<dyn futures_util::Stream<Item = Result<Frame<Bytes>, std::io::Error>> + Send + Sync>,
@@ -1874,23 +1822,8 @@ async fn relay(
     } else {
         Box::pin(scrub_stream(metered, scrub))
     };
-    let mut forward_heartbeat = tokio::time::interval_at(
-        tokio::time::Instant::now() + BODY_HEARTBEAT_PERIOD,
-        BODY_HEARTBEAT_PERIOD,
-    );
-    forward_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let forward_metered = ForwardMeter {
-        inner: forwarded,
-        req,
-        host: host.to_owned(),
-        header_ts,
-        bytes: 0,
-        first_ts: None,
-        last_ts: None,
-        real_len,
-        heartbeat: forward_heartbeat,
-        ended: false,
-    };
+    let forward_metered =
+        StreamMeter::new(forwarded, MeterLeg::Forward, req, host.to_owned(), header_ts, real_len);
     let body = BodyExt::boxed(StreamBody::new(forward_metered));
     builder
         .body(body)
