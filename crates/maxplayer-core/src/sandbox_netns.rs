@@ -439,18 +439,19 @@ pub fn reapable_holders(holders: &[HolderRecord], seat: &str, modes: &str) -> Ve
         .collect()
 }
 
-/// Remove `seat`'s own holders that no job is attached to, and return what was removed.
+/// Ask docker which of `seat`'s holders are reapable right now: the three reads, then
+/// [`reapable_holders`] on what came back. Selects; removes nothing.
 ///
-/// `seat` is the caller's seller public key hex. It is the *only* thing that makes this safe to run on
-/// a host shared with other seller daemons: see [`reapable_holders`] for why ownership has to be
-/// carried and why attachment state cannot stand in for it.
+/// Split out of [`reap_orphans`] so that a caller which wants to SHOW an operator what a reap would
+/// touch — `maxplayer sandbox-reap --seat <hex> --dry-run` (#905) — shares this selection instead of
+/// carrying a second copy of it. A second copy is exactly how the host-wide predicate #876 removed
+/// would come back: it would start as a listing, and nothing would hold it to both legs. There is one
+/// reap predicate and this is the one place it is measured.
 ///
-/// Best-effort by design: a leaked holder is a resource leak, not an open door — it owns a namespace and
-/// holds no policy, and the job that could have used it is already gone. So a failure here is reported
-/// and never blocks a boot, whereas a failure to *establish* containment refuses the job outright. The
-/// two are deliberately not symmetrical.
+/// The empty-seat refusal lives here rather than in `reap_orphans` for the same reason: it guards the
+/// SELECTION, so it guards every caller of it, including one that only intends to print.
 #[cfg(feature = "acp")]
-pub async fn reap_orphans(seat: &str) -> Result<Vec<String>, String> {
+pub async fn reapable_holders_live(seat: &str) -> Result<Vec<String>, String> {
     // An empty seat would match every holder whose label failed to parse, so refuse to run at all
     // rather than reap on an identity we do not have. A caller that cannot name itself has nothing to
     // clean up.
@@ -473,8 +474,23 @@ pub async fn reap_orphans(seat: &str) -> Result<Vec<String>, String> {
         .await
         .map_err(|error| format!("could not read container network modes — {error}"))?;
 
+    Ok(reapable_holders(&holders, seat, &modes))
+}
+
+/// Remove `seat`'s own holders that no job is attached to, and return what was removed.
+///
+/// `seat` is the caller's seller public key hex. It is the *only* thing that makes this safe to run on
+/// a host shared with other seller daemons: see [`reapable_holders`] for why ownership has to be
+/// carried and why attachment state cannot stand in for it.
+///
+/// Best-effort by design: a leaked holder is a resource leak, not an open door — it owns a namespace and
+/// holds no policy, and the job that could have used it is already gone. So a failure here is reported
+/// and never blocks a boot, whereas a failure to *establish* containment refuses the job outright. The
+/// two are deliberately not symmetrical.
+#[cfg(feature = "acp")]
+pub async fn reap_orphans(seat: &str) -> Result<Vec<String>, String> {
     let mut reaped = Vec::new();
-    for holder in reapable_holders(&holders, seat, &modes) {
+    for holder in reapable_holders_live(seat).await? {
         match run_docker(
             ["docker", "rm", "--force", "--volumes", holder.as_str()]
                 .into_iter()

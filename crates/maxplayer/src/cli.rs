@@ -55,6 +55,12 @@ where
         // gate runs rather than a description of it.
         #[cfg(feature = "wallet")]
         Some("sandbox-probe") => crate::sandbox_probe::run(&args[2..], out, err),
+        // Operator-only, and deliberately NOT on the boot path: it reaps the holders of a seat the
+        // OPERATOR names as retired. The host cannot make that call — a retired seat and a slow-
+        // starting one leave identical evidence — so the seat id arrives from a human or not at all
+        // (#905). `--all` is refused inside, by name, rather than being merely unrecognised here.
+        #[cfg(feature = "acp")]
+        Some("sandbox-reap") => crate::sandbox_reap::run(&args[2..], out, err),
         Some("wallet") => crate::wallet_cli::run(&args[2..], out, err),
         Some("profile") => crate::profile_cli::run(&args[2..], out, err),
         Some("whoami") => crate::whoami::run(&args[2..], out, err),
@@ -327,7 +333,7 @@ fn write_usage(out: &mut dyn Write) {
     #[cfg(feature = "acp")]
     let _ = write!(
         out,
-        "  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n"
+        "  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n  maxplayer sandbox-reap --seat <64-hex> [--dry-run]   # remove a RETIRED seat's leftover containment holders\n"
     );
     let _ = writeln!(
         out,
@@ -639,6 +645,8 @@ mod tests {
         // dispatch arms in `run`), so this tracks the surface a given build actually ships.
         #[cfg(feature = "acp")]
         cases.push(("seller --help", "maxplayer seller"));
+        #[cfg(feature = "acp")]
+        cases.push(("sandbox-reap --help", "maxplayer sandbox-reap"));
         #[cfg(feature = "wallet")]
         cases.push(("sandbox-probe --help", "maxplayer sandbox-probe"));
         #[cfg(feature = "stub-pay")]
@@ -661,6 +669,29 @@ mod tests {
                 "`maxplayer {line}` must have no side-effect output on stderr:\nstderr={err}"
             );
         }
+    }
+
+    // #905: `sandbox-reap --all` must be REFUSED, not merely unrecognised. The seat id is the
+    // operator's EVIDENCE that a seat is retired, not a parameter to be defaulted or widened.
+    // Nobody is in a position to know "every seat but mine is retired" — that claim is false the
+    // instant a co-tenant is booting, and the host cannot check it. So the flag gets a deliberate
+    // refusal arm that names itself: a maintainer who wants host-wide selection has to DELETE a
+    // refusal rather than fill a gap, and the operator is taught at the moment of the mistake.
+    // Falling through to the generic usage would exit 1 too, which is why this asserts on the TEXT.
+    #[cfg(feature = "acp")]
+    #[test]
+    fn sandbox_reap_refuses_all_seats_rather_than_leaving_the_flag_unrecognised() {
+        let (code, out, err) = run_captured(["maxplayer", "sandbox-reap", "--all"]);
+        assert_eq!(code, 1, "`--all` must be a usage error:\nstdout={out}\nstderr={err}");
+        assert!(out.is_empty(), "a refusal prints nothing to stdout:\nstdout={out}");
+        assert!(
+            err.contains("--all"),
+            "the refusal must NAME the flag it refuses, not print generic usage:\nstderr={err}"
+        );
+        assert!(
+            err.contains("retired"),
+            "the refusal must say why: only an operator can name a RETIRED seat:\nstderr={err}"
+        );
     }
 
     // #570, the worst instance: `buyer status --help` must answer from usage WITHOUT opening the
