@@ -92,6 +92,18 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use tokio::sync::Semaphore;
 
+/// Emit a `proxy: …` diagnostic line to stderr, but only under `MAXPLAYER_VERBOSE`. These per-request
+/// lines are how a stalled leg gets diagnosed; unconditional they flood the operator console on every
+/// job, so they are gated exactly like [`crate::oplog::opline_verbose`] — but WITHOUT its `HH:MM:SSZ`
+/// prefix, because each line already carries its own `ts=<ms>` field.
+macro_rules! plog {
+    ($($arg:tt)*) => {
+        if $crate::oplog::verbose_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 /// The proxy listener terminates INSIDE the seller daemon (a money-path process), and the caller is a
 /// stranger's job. These bound what one job can make the daemon hold or spawn, so an unbounded or
 /// trickled request cannot OOM or exhaust it.
@@ -1154,9 +1166,9 @@ pub async fn start_with_legs(
         ));
     }
 
-    eprintln!("proxy: listener kind=primary port={}", addr.port());
+    plog!("proxy: listener kind=primary port={}", addr.port());
     for (authority, leg_addr) in &leg_addrs {
-        eprintln!("proxy: listener kind=leg authority={authority} port={}", leg_addr.port());
+        plog!("proxy: listener kind=leg authority={authority} port={}", leg_addr.port());
     }
 
     Ok(RunningProxy { addr, leg_addrs, engine, tasks })
@@ -1295,7 +1307,7 @@ impl AwaitGuard {
 impl Drop for AwaitGuard {
     fn drop(&mut self) {
         if !self.settled {
-            eprintln!(
+            plog!(
                 "proxy: req#{} ts={} phase=await_response terminated_by=downstream host={}",
                 self.req,
                 proxy_log_now_ms(),
@@ -1473,7 +1485,7 @@ impl<T: MeteredItem, E: std::fmt::Display> futures_util::Stream for StreamMeter<
                 let now = proxy_log_now_ms();
                 if this.first_ts.is_none() {
                     this.first_ts = Some(now);
-                    eprintln!(
+                    plog!(
                         "proxy: req#{} ts={now} phase={} host={} gap_from_header_ms={}",
                         this.req,
                         this.leg.first(),
@@ -1487,7 +1499,7 @@ impl<T: MeteredItem, E: std::fmt::Display> futures_util::Stream for StreamMeter<
             }
             std::task::Poll::Ready(Some(Err(error))) => {
                 this.ended = true;
-                eprintln!(
+                plog!(
                     "proxy: req#{} ts={} phase={} terminated_by=upstream kind=error host={} bytes={} real_len={} completed=false first_ts={} last_ts={} msg={error}",
                     this.req,
                     proxy_log_now_ms(),
@@ -1503,7 +1515,7 @@ impl<T: MeteredItem, E: std::fmt::Display> futures_util::Stream for StreamMeter<
             std::task::Poll::Ready(None) => {
                 this.ended = true;
                 let now = proxy_log_now_ms();
-                eprintln!(
+                plog!(
                     "proxy: req#{} ts={now} phase={} terminated_by=upstream kind=eof host={} bytes={} real_len={} completed=true first_ts={} last_ts={}",
                     this.req,
                     this.leg.end(),
@@ -1524,7 +1536,7 @@ impl<T: MeteredItem, E: std::fmt::Display> futures_util::Stream for StreamMeter<
                 // ready tick keeps it to one line per elapsed period.
                 while this.heartbeat.poll_tick(cx).is_ready() {
                     let now = proxy_log_now_ms();
-                    eprintln!(
+                    plog!(
                         "proxy: req#{} ts={now} phase={} host={} bytes={} gap_from_header_ms={}",
                         this.req,
                         this.leg.idle(),
@@ -1545,7 +1557,7 @@ impl<T, E> Drop for StreamMeter<T, E> {
         // the body because the container closed its connection mid-stream. `bytes` is then the total the
         // proxy managed to move before the client gave up.
         if !self.ended {
-            eprintln!(
+            plog!(
                 "proxy: req#{} ts={} phase={} terminated_by=downstream host={} bytes={} real_len={} completed=false first_ts={} last_ts={}",
                 self.req,
                 proxy_log_now_ms(),
@@ -1578,7 +1590,7 @@ async fn handle_request(
     // `req.version()` is the NEGOTIATED protocol (HTTP/2.0 for the h2c legs, HTTP/1.1 otherwise) — it
     // decides whether an http1-only timeout like `header_read_timeout` is even in scope for this leg.
     let listener_label = via_authority.as_deref().unwrap_or("primary").to_owned();
-    eprintln!(
+    plog!(
         "proxy: req#{proxy_req} ts={} phase=arrived listener={listener_label} proto={:?} method={method}",
         proxy_log_now_ms(),
         req.version(),
@@ -1615,7 +1627,7 @@ async fn handle_request(
     );
     match decision {
         Decision::Refuse(reason) => {
-            eprintln!(
+            plog!(
                 "proxy: req#{proxy_req} ts={} phase=authorize outcome=refuse reason={reason}",
                 proxy_log_now_ms(),
             );
@@ -1638,7 +1650,7 @@ async fn handle_request(
             redirects,
         } => {
             let host = authority_of(&upstream).unwrap_or_else(|| upstream.clone());
-            eprintln!(
+            plog!(
                 "proxy: req#{proxy_req} ts={} phase=forward host={host}",
                 proxy_log_now_ms(),
             );
@@ -1672,7 +1684,7 @@ async fn handle_request(
                 .and_then(|value| value.to_str().ok())
                 .and_then(|text| text.parse::<u64>().ok());
             if declared.is_some_and(|length| length > MAX_REQUEST_BODY_BYTES as u64) {
-                eprintln!(
+                plog!(
                     "proxy: req#{proxy_req} ts={} phase=forward outcome=refuse reason=body_over_cap host={host}",
                     proxy_log_now_ms(),
                 );
@@ -1708,7 +1720,7 @@ async fn handle_request(
                 // No-fallback: an upstream failure fails the request; it never resends without the
                 // proxy or with the real credential in the container.
                 Err(message) => {
-                    eprintln!(
+                    plog!(
                         "proxy: req#{proxy_req} ts={} phase=await_response terminated_by=upstream kind=error host={host} msg={message}",
                         proxy_log_now_ms(),
                     );
@@ -1752,7 +1764,7 @@ async fn relay(
     request = request.header(reqwest::header::ACCEPT_ENCODING, "identity");
     // The anchor for this request's wait: the outbound send, otherwise unobservable. Every duration
     // derived downstream is measured from THIS `ts`, never from the nearest visible event.
-    eprintln!(
+    plog!(
         "proxy: req#{req} ts={} phase=await_send host={host}",
         proxy_log_now_ms(),
     );
@@ -1782,7 +1794,7 @@ async fn relay(
     // between these two `ts` values IS the send->response-header wait for this request. Held as the
     // anchor `StreamMeter` measures time-to-first-byte from — the same event, not a nearby proxy for it.
     let header_ts = proxy_log_now_ms();
-    eprintln!(
+    plog!(
         "proxy: req#{req} ts={header_ts} phase=await_response terminated_by=upstream kind=response_header host={host} status={}",
         status.as_u16(),
     );
