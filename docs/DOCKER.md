@@ -75,9 +75,11 @@ base image. Two options:
 > no host secrets. The `/data` volume (key + wallet) must never be reachable from
 > the agent's execution environment.
 
-- **Recommended:** leave open-pool claiming OFF (the default). The daemon then
-  claims only offers targeted at its pubkey, so it never claims work it cannot
-  complete.
+- **Recommended:** leave both open surfaces OFF (the default). The daemon then
+  claims only from buyers you list in `[seller] accept_offers_only_from`, so it
+  never claims work it cannot complete. Note that a fresh seat names nobody and
+  so claims nothing at all until you pick a route in — it boots and warns rather
+  than refusing, and `maxplayer doctor` names the three routes.
 - **To execute claimed jobs (bring an agent):** extend the image with your chosen agent and its runtime,
   then supply the agent's own auth (e.g. an API key) via the container
   environment. Each preset requires its ACP adapter binary on `PATH` (a missing
@@ -136,8 +138,9 @@ the boot gate refuses to start when argv0 is neither on `PATH` nor an existing f
 would then die at spawn with ENOENT (#357). But that check answers only "does the launcher resolve" —
 it does not check that the launcher is actually a sandboxing tool. `launcher = ["env"]` resolves and
 isolates nothing. A separate containment probe (#451) does run the launcher once against a canary file
-in `/data` and the job workdir, but it blocks boot only for a seat claiming open-pool jobs; on a
-targeted-only seat — the default for this image — it is advisory (a WARN), and either way it samples
+in `/data` and the job workdir, but it blocks boot only for a seat strangers can reach — one that
+claims the open pool OR accepts targeted offers from buyers it has not named. On a seat reachable
+only by the buyers it named — the default for this image — it is advisory (a WARN), and either way it samples
 one canary read and one workdir write, not your other secret paths. Verifying that your launcher
 actually blocks `/data` remains your responsibility — see "Verify" below.
 
@@ -432,8 +435,9 @@ Key points about this example:
 
 ### Verify the sandbox actually works
 
-Don't lean on the boot gate's containment probe for this: on the default targeted-only seat it only
-warns, and it samples a single canary path. After configuring, run your launcher by hand with a probe in
+Don't lean on the boot gate's containment probe for this: on a default seat — reachable only by the
+buyers it named, both open surfaces off — it only warns, and it samples a single canary path. After
+configuring, run your launcher by hand with a probe in
 place of the agent command and confirm `/data` is gone:
 
 ```sh
@@ -516,7 +520,10 @@ its wallet balance.
 - **Config change ignored:** `config.toml` is read once at startup. Recreate the
   container after editing it: `docker compose up -d --force-recreate seller`.
 - **Daemon claims a job but fails it:** it has no ACP agent — see
-  "Fulfilling jobs" above, or keep open-pool claiming off.
+  "Fulfilling jobs" above. Until one is in the image, leave every route in closed:
+  that means `claim_open_pool` **and** `accept_open_targeted` off, and no buyers
+  listed in `accept_offers_only_from`. Any one of the three is enough to be
+  claimed against; a fresh seat has none of them and so claims nothing.
 - **Under `mode = "docker"`: advertises fine, then every job fails on an agent auth error.** The
   credential is in `~/.claude` (or the macOS Keychain), which the container cannot read, while the
   pre-advertise probe runs the CLI on the *host* and therefore passes. Put the credential in the

@@ -125,7 +125,8 @@ All four are overridable in `config.toml`.
 creation — on a shared host, seller state (key, mint proofs, config, job workdirs) IS the wallet, so a
 group/world-readable home lets any local user read money-bearing material (#473). This is a property of
 the binary, not of your `umask`, and `maxplayer doctor` has a **home permissions** leg that flags a home
-that has since drifted open (WARN for a targeted seat, FAIL for an open-pool one). The one thing the
+that has since drifted open (WARN for a seat only its named buyers can reach, FAIL for one strangers
+can reach by either open surface — see §6). The one thing the
 binary cannot own is state a **harness** writes outside the seat home (e.g. a Cursor config under `~`):
 run the daemon under a service unit with **`UMask=0077`** so that residue is owner-only too.
 
@@ -159,7 +160,7 @@ Notes:
   - no --key (packaged key file only)
   - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (no working nix, agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint
   - --skip-doctor: bypass the startup readiness checks (default: checks-on; not recommended). The nix check still runs — it is an environment requirement (#745) with no bypass
-  - --unsafe-no-sandbox: serve the OPEN POOL with no working sandbox — this box then runs code written by strangers with no containment (waives only that one check)
+  - --unsafe-no-sandbox: serve a STRANGER-FACING surface with no working sandbox (either open surface) — this box then runs code written by strangers with no containment (waives only that one check)
   - open-pool claiming is OFF by default; pass --claim-open-pool to opt in
   - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)
 ```
@@ -170,12 +171,13 @@ Notes:
 | `--agent-argv <part>` | yes* (repeatable) | Build `agent_command` as an **argv array** (first entry = program). Shell strings refused. Pass either `--agent` **or** `--agent-argv`, not both. |
 | `--rate-sats <n>` | yes (first run) | Claim floor in sats + your net-positive floor. The setup default is `100` (see [§7](#7-fees--rate--set---rate-sats-to-net-positive)). |
 | `--git-remote <url>` | no | Public https delivery remote (BYO). Omit → the hosted relay-git default. |
-| `--claim-open-pool` | no | Opt in to also claim untargeted/open offers (default **off** = targeted-only). `--no-claim-open-pool` forces off. |
+| `--claim-open-pool` | no | Opt in to claim untargeted/open-pool offers (default **off**). `--no-claim-open-pool` forces off. |
+| `--accept-open-targeted` | no | Opt in to accept targeted offers from buyers you have NOT named (default **off**). `--no-accept-open-targeted` forces off. See §6 — with neither this nor an allowlist, the seat claims nothing. |
 | `--name <display>` | no | Optional kind-0 display name published for discoverability. |
 | `--job-timeout-secs <n>` | no | Per-job timeout (seconds). |
 | `--offer-backfill-secs <n>` | no | See OPEN-POOL offers posted up to `n` seconds before startup (default `1200`; `0` = live-only; targeted offers always backfill). |
 | `--skip-doctor` | no | Bypass the startup readiness checks (checks-on by default; not recommended). Does **not** bypass the nix check — that is an environment requirement (#745: "can this box EVER do the work"), so it survives every flag. |
-| `--unsafe-no-sandbox` | no | Serve the open pool with no working sandbox — this box then runs strangers' code uncontained. Waives that one check only. |
+| `--unsafe-no-sandbox` | no | Serve a stranger-facing surface (either open surface) with no working sandbox — this box then runs strangers' code uncontained. Waives that one check only. |
 | `--home <dir>` | no | Home root (else `MAXPLAYER_HOME` / `~/.maxplayer`). |
 
 \* Exactly one of `--agent` / `--agent-argv` is required on the **first** run. After that they are
@@ -517,7 +519,8 @@ An existing seat on `launcher` is never moved by an upgrade — see *Moving an e
 ### `launcher` mode — only if this box cannot run docker
 
 The launcher below is `bwrap` (bubblewrap), and it is not present on a stock box. Install it before
-you configure the section, or the boot gate refuses to start an open-pool seat:
+you configure the section, or the boot gate refuses to start a seat strangers can reach — one that
+claims the open pool OR accepts targeted offers from buyers it has not named:
 
 ```bash
 command -v bwrap            # prints a path once installed
@@ -570,10 +573,13 @@ and aborts the boot probe without them (read-only is enough — it never writes 
   and the job workdir must be writable. Fail either leg and the seat refuses to start (#451).
   `launcher = ["env"]` resolves perfectly and confines nothing — it is refused on the second leg,
   not the first.
-- **Targeted-only seats stay advisory.** Without `claim_open_pool`, the same probe reports as a WARN:
-  you run work from counterparties you accepted, rather than whatever the market posts.
+- **Seats only their named buyers can reach stay advisory.** With BOTH open surfaces off
+  (`claim_open_pool` and `accept_open_targeted`), the same probe reports as a WARN: every job comes
+  from a buyer you listed, rather than from whoever the market sends. That softening is bought by the
+  allowlist — opening **either** surface makes this a blocking FAIL, because a targeted job from an
+  unnamed buyer is the same stranger-written task text an open-pool job is.
 - **The escape hatch is one flag, and it is narrow on purpose.** `maxplayer seller --unsafe-no-sandbox`
-  serves the open pool uncontained. It waives THIS check only — the relay, mint, key and agent gates
+  serves strangers uncontained. It waives THIS check only — the relay, mint, key and agent gates
   stay blocking, so accepting the code-execution exposure never means switching the rest off.
 
 ### Verify before going live
@@ -719,34 +725,51 @@ working sandbox before a seat claims there. Get targeted work first.
 
 ---
 
-## 6. Open-pool — claiming untargeted offers
+## 6. Who can reach you — three independent knobs
 
-By default the daemon is **targeted-only**: it auto-claims **only** offers whose `#p` equals this
-seller's pubkey (untargeted/open offers are soft-skipped; wrong `#p` refused; then `amount ≥ rate_sats`).
-
-Opt in to also claim untargeted/open offers that still clear your rate:
-
-```bash
-"$MAXPLAYER_BIN" seller --agent claude --rate-sats 100 --claim-open-pool
-```
-
-`--claim-open-pool` (or `claim_open_pool = true` in `config.toml`) widens claiming to the open pool;
-`--no-claim-open-pool` forces it off. **Targeted-only stays the default** — open-pool is your explicit choice.
-
-**Targeted-only is not a security boundary.** `#p` names *you*; it does not name *who may post*. Any
-buyer can target this pubkey, so a targeted job runs the same stranger-written task text an open-pool
-job does, through the same agent, with the same filesystem and credentials. The seller-side control
-over *who* reaches you is a separate setting:
+**A fresh seat claims nothing until you say who may reach it.** Both ways a stranger can hand this
+box work are opt-in, and neither is inferred from the other or from a field being empty:
 
 ```toml
-accept_offers_only_from = ["<buyer-pubkey-64-hex>"]   # empty/absent = claim from any buyer
+[seller]
+accept_offers_only_from = []       # the buyers you name. Default: none named.
+accept_open_targeted    = false    # may a buyer you did NOT name target you directly?
+claim_open_pool         = false    # may you claim untargeted offers from the open pool?
 ```
 
-Populated, it is a hard fence checked before the rate and harness gates: an offer whose author is not
-on the list is skipped (`NotAllowlisted`), silently — a private seller does not tell a stranger why it
-declined. Containment ([SANDBOXING.md](SANDBOXING.md)) is the other control, and it is worth having on
-any seat that runs jobs at all. `doctor` only *requires* it for open-pool claiming; that threshold is
-about which check is blocking, not about where the exposure is.
+| You want | Set |
+| --- | --- |
+| Work only with buyers you know | `accept_offers_only_from = ["<buyer-hex>", …]` |
+| Take targeted offers from anyone | `accept_open_targeted = true` |
+| Compete for untargeted pool offers | `claim_open_pool = true` |
+
+The CLI flags mirror the defaults — both are opt-INs, so the safe posture needs no flag at all:
+
+```bash
+"$MAXPLAYER_BIN" seller --agent claude --rate-sats 100 --accept-open-targeted   # accept strangers
+"$MAXPLAYER_BIN" seller --agent claude --rate-sats 100 --claim-open-pool        # claim the pool
+```
+
+**A populated allowlist wins.** While `accept_offers_only_from` has entries it is a hard fence on
+*both* surfaces, checked before the rate and harness gates: an offer whose author is not on the list
+is skipped (`NotAllowlisted`), silently — a private seller does not tell a stranger why it declined.
+`accept_open_targeted` then has no effect, and `doctor` reports it as INERT rather than letting you
+believe you opened something.
+
+> ⚠ **Upgrading an existing seat? Read this.** An empty `accept_offers_only_from` used to mean
+> *accept from any buyer* on the targeted surface. It no longer does — it means *no buyer named*. A
+> seat with no allowlist and neither flag set will **stop claiming targeted work after the upgrade**:
+> it still boots, connects and advertises, it just never claims. There is no config error, because the
+> config is valid. The daemon says so loudly at boot and `maxplayer doctor` fails the **seat
+> reachability** check. To restore the old behaviour, either list your buyers or set
+> `accept_open_targeted = true`.
+
+**Neither flag is a security boundary, and `#p` never was one.** `#p` names *you*; it does not name
+*who may post*. A targeted job from an unnamed buyer runs the same stranger-written task text an
+open-pool job does, through the same agent, with the same filesystem and credentials — which is why
+opening *either* surface makes containment ([SANDBOXING.md](SANDBOXING.md)) a blocking `doctor` check
+rather than an advisory one. The allowlist is the control over *who* reaches you; containment is the
+control over what they can do once they have.
 
 **What changes when you opt in:** your seat can now *lose*. A targeted offer names you and nobody
 else, so a claim you park is a claim you win. An open-pool offer is claimed by several seats and the
@@ -790,7 +813,7 @@ offer (3401)  →  claim (3402 status=processing)
 ```
 
 1. **Offer** — buyer posts kind-3401. Offers may be targeted (`#p=<seller>`) or untargeted (open).
-2. **Claim (targeted-only by default)** — the daemon auto-claims only offers `#p`-tagged to this seller and `amount ≥ rate_sats`; untargeted offers are soft-skipped unless `--claim-open-pool`. (Unattended claim-to-collect over a live offer used a harness in testing — see the autonomy caveat above.)
+2. **Claim (nothing, until you say who may reach you)** — the daemon auto-claims an offer only if its author is a buyer you named, or the offer is `#p`-tagged to you and `accept_open_targeted = true`, or it is untargeted and `claim_open_pool = true`; then `amount ≥ rate_sats`. See §6. (Unattended claim-to-collect over a live offer used a harness in testing — see the autonomy caveat above.)
 3. **Execute** — the ACP agent runs the task in the job workdir (real files / commit).
 4. **Deliver** — push to the delivery remote (relay-git default or BYO); publish kind-3403 with the commit OID.
 5. **Collect (working, fee-aware)** — when the buyer pays, a NIP-17 gift-wrapped cashu token (kind-1059) arrives for the seller pubkey. The daemon AUTH-then-reads `#p=seller` on the relay (p-gated), unwraps, predicts the mint fee, refuses dust up front, and redeems against your configured mint. Your wallet nets `face − fee`.
@@ -824,7 +847,7 @@ wrote [seller] to …/config.toml
 relay-git NIP-34 announce ok id=… remote=…
 relay-git seed probe ok (info/refs reachable)
 discoverable kind0=… name=… pubkey=…
-seller node starting pubkey=… agent=claude rate_sats=100 claim_open_pool=false git_remote=… (never-echo: key omitted)
+seller node starting pubkey=… agent=claude rate_sats=100 claim_open_pool=false accept_open_targeted=false accept_offers_only_from=0 git_remote=… (never-echo: key omitted)
 ```
 
 It must **not** print the secret key. Leave it running: on a matching offer the daemon claims,
@@ -999,6 +1022,6 @@ signed in for you is not signed in for the service unless its config lives under
 → gotcha 2 (NixOS): CLAUDE_CODE_EXECUTABLE points at a NixOS-runnable claude; a PATH shim alone leaves the ACP/agent path dead (§3b)
 → delivery defaults to relay-git (NIP-34 announce → in-process NIP-98 push, no external git/helper); --git-remote for BYO https
 → discoverability: kind-0 profile on start; capability on the kind-30340 seat heartbeat, republished every ~5 min
-→ targeted-only by default; --claim-open-pool to opt into the open pool
+→ both open surfaces off by default; --accept-open-targeted for targeted offers from unnamed buyers, --claim-open-pool for the open pool
 → --rate-sats defaults to 100, the rate buyers post at: wallet nets face − fee; receipt records FACE, not net; dust refused up front
 ```

@@ -969,6 +969,7 @@ offer_backfill_secs = {backfill}
                 job_timeout_secs: None,
                 agents: Vec::new(),
                 claim_open_pool: false,
+                accept_open_targeted: false,
                 accept_offers_only_from: Vec::new(),
                 offer_backfill_secs: 0,
                 contribution_enabled: true,

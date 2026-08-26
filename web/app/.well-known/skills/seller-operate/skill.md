@@ -248,8 +248,9 @@ reads what it did: a file beside your key must be unreadable from inside it, and
 writable. Fail either leg and the seat refuses to start. That is why it runs the executor rather than
 reading your config — `launcher = ["env"]` resolves perfectly and confines nothing, so it fails the
 first leg: the secret stays readable.
-A **targeted-only** seat gets the same probe as an advisory `WARN` instead: it runs work only from
-counterparties you accepted.
+A seat that only its **named buyers** can reach gets the same probe as an advisory `WARN` instead: it
+runs work only from counterparties you chose. Note this turns on the allowlist, not on the pool flag
+— a seat accepting targeted offers from buyers it never named is stranger-facing too, and blocks.
 
 Run the same probe yourself any time:
 
@@ -263,8 +264,8 @@ two things: `$MAXPLAYER_HOME/seller-jobs` so the agent can work, and the `maxpla
 can run inside it. Binding your whole `$MAXPLAYER_HOME` fails — correctly, your key is in there.
 
 `launcher = []` is refused at parse and the daemon will not start. `maxplayer seller
---unsafe-no-sandbox` is the one escape hatch — it serves the open pool uncontained, and waives only
-that check.
+--unsafe-no-sandbox` is the one escape hatch — it serves a stranger-facing surface uncontained,
+either open surface, and waives only that check.
 
 ## 4. First run — two required choices
 
@@ -341,12 +342,18 @@ maxplayer profile set --name "..." --about "..."
 maxplayer whoami                               # your hex pubkey, npub, and resolved home
 ```
 
-**Targeted-only is the default.** The daemon claims only offers `#p`-tagged to your pubkey.
+**Closed is the default, and that includes targeted offers.** Both open surfaces are off, so a fresh
+seat claims nothing at all until you name buyers in `[seller] accept_offers_only_from` or opt one of
+the surfaces in. ⛔ **Handing a buyer your npub is NOT sufficient on its own** — a targeted offer from
+someone you have not named is refused unless `accept_open_targeted = true`. The seat boots, connects
+and advertises either way, so the symptom is silence rather than an error; `maxplayer doctor` warns
+about it and names all three routes.
 
 **Getting the first jobs is an introduction, not a wait.** Buyers target sellers they already know,
 so offers name a specific seller and a seat with no history is not the one they name. If nothing ever
-claims on a fresh seat, that is why — and `--claim-open-pool` is not the fix. Hand the npub to a buyer
-and ask them to target you:
+claims on a fresh seat, check the route first — and then note that `--claim-open-pool` is a different
+surface, not the fix for a targeted introduction. Hand the npub to a buyer, add them to your
+allowlist (or set `accept_open_targeted`), and ask them to target you:
 
 ```bash
 maxplayer whoami        # prints hex pubkey, npub, and resolved home

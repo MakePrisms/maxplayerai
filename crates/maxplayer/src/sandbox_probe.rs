@@ -545,8 +545,13 @@ fn cleanup(workdir: &Path, canary: &Path) {
 /// operator asked for the unsafe path. Pure, because this is the decision the whole check exists to
 /// make and it must be testable without a sandbox.
 ///
-/// Targeted-only seats are advisory: they run work from counterparties they chose, which is a
-/// different risk than executing whatever the open market posts.
+/// ⚠ The advisory softening belongs to a seat reachable ONLY by the buyers its operator named —
+/// those run work from counterparties they chose, a different risk from executing whatever the
+/// market posts. It does NOT belong to "targeted-only": since the three-knob change a seat with
+/// `accept_open_targeted` takes targeted offers from buyers it never named, which is the same
+/// stranger-written code. This function still decides the OPEN-POOL half alone; its caller
+/// (`doctor::checks::check_sandbox_containment`) is what weighs both surfaces and only reaches
+/// here once it has established the seat serves strangers.
 pub fn open_pool_admission(
     claims_open_pool: bool,
     containment: &Containment,

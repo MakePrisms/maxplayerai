@@ -209,7 +209,9 @@ pub struct SellerConfig {
     /// plain list of harness names, and the top-level `slots` is the only concurrency knob.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<String>,
-    /// Opt-in to claim untargeted/open offers. Default **false** (targeted-only).
+    /// Opt-in to claim untargeted/open offers. Default **false**. ⛔ That default is NOT
+    /// "targeted-only": the targeted surface is its own opt-in ([`SellerConfig::accept_open_targeted`]),
+    /// so a seat with both flags false and no allowlist claims NOTHING.
     ///
     /// This flag decides whether the seat can LOSE a race, and that is what makes it more than a
     /// throughput knob. A targeted offer has exactly one eligible claimant — `rate_gate_allows`
@@ -223,12 +225,40 @@ pub struct SellerConfig {
     /// (#626). Any handler added to that subscription inherits the same obligation.
     #[serde(default)]
     pub claim_open_pool: bool,
-    /// Allowlist of buyer pubkeys (64-hex) whose offers this seller will claim. **Empty/absent =
-    /// accept-all** — every buyer is eligible, subject to the usual targeting/rate/harness gates
-    /// (the pre-#482 behavior; existing sellers are unaffected). **Populated = a hard fence**: an
-    /// offer whose author (the buyer) is not on the list is skipped with a named `NotAllowlisted`
-    /// skip reason and NO buyer feedback — a private seller does not advertise why it declined a
-    /// stranger. Consulted right after the lapsed-offer refusal, before the rate/harness gates.
+    /// Opt-in to let a buyer this seat has NOT named target it directly. Default **false**.
+    ///
+    /// This is the TARGETED half of the seat's exposure, and it is a separate surface from
+    /// [`SellerConfig::claim_open_pool`]: that flag governs UNTARGETED (open-pool) offers, this one
+    /// governs offers whose `p` tag is this seat. A seat can be reachable on either, both, or
+    /// neither, so the two are independent knobs rather than one "openness" setting.
+    ///
+    /// The three buyer-facing knobs are deliberately independent and NOTHING is inferred from a
+    /// field being empty:
+    /// - [`SellerConfig::accept_offers_only_from`] — the buyers this operator named.
+    /// - `accept_open_targeted` — may a buyer it did NOT name target this seat.
+    /// - [`SellerConfig::claim_open_pool`] — may it claim untargeted pool offers.
+    ///
+    /// A default seat therefore claims only from the buyers its operator listed, and a seat with no
+    /// list claims nothing until the operator opts in to one of the open surfaces.
+    ///
+    /// **PRECEDENCE — a populated allowlist WINS.** `accept_offers_only_from` stays the hard fence
+    /// it has been since #482: while it is populated, an unlisted buyer is refused on BOTH surfaces
+    /// and this flag has no effect. The flag is what an operator with no list uses to stay reachable.
+    /// The combination (populated list AND this flag) is inert rather than wrong, so `doctor` reports
+    /// it — an inert setting that looks like it opened something is the failure worth naming.
+    #[serde(default)]
+    pub accept_open_targeted: bool,
+    /// Allowlist of buyer pubkeys (64-hex) whose offers this seller will claim. **Populated = a hard
+    /// fence** (#482): an offer whose author (the buyer) is not on the list is skipped with a named
+    /// `NotAllowlisted` skip reason and NO buyer feedback — a private seller does not advertise why
+    /// it declined a stranger. Consulted right after the lapsed-offer refusal, before the
+    /// rate/harness gates.
+    ///
+    /// **Empty/absent means the operator named no buyers — it does NOT mean accept-all.** Which
+    /// strangers may reach a seat with no list is decided by the two surface flags above, never
+    /// inferred from this field's emptiness. Before the three-knob change an empty list DID mean
+    /// accept-all on the targeted surface; see [`SellerConfig::accept_open_targeted`] for the
+    /// migration a seat with no list now needs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accept_offers_only_from: Vec<String>,
     /// Backfill window (seconds) for the seller's UNTARGETED (open-pool) offer-kind offer
@@ -266,6 +296,96 @@ pub struct SellerConfig {
     /// default (see `DEFAULT_CLAIM_AWARD_TIMEOUT_SECS`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_award_timeout_secs: Option<u64>,
+}
+
+/// Every route back to reachable, named once for the whole workspace.
+///
+/// ⛔ THIS LIVES HERE FOR A STRUCTURAL REASON, NOT A TIDINESS ONE. The dependency runs ONE WAY —
+/// `maxplayer` depends on `maxplayer-core` and never the reverse — so a constant in the CLI crate
+/// is unreachable from `seller_node::run`, which is why that file ended up with its own copies.
+/// `home` is also UNGATED, where `seller_node` is `#[cfg(feature = "wallet")]`: putting the
+/// operator's remedy text there would gate it behind `wallet` for no reason.
+///
+/// ⛔ AND THE DRIFT WAS NOT HYPOTHETICAL — IT HAD ALREADY HAPPENED. Three spellings existed: the two
+/// in `run.rs` were byte-identical to each other, and both differed from the doctor's. **The two
+/// agreeing is exactly why it looked consolidated** — within one file the duplication is visible,
+/// and the divergence lived across the crate boundary where nobody greps.
+///
+/// The doctor's wording won on merit rather than seniority: backticked and spaced, it reads as the
+/// TOML an operator must actually type. Callers add their own framing and terminal punctuation.
+pub const ROUTES_BACK_IN: &str = "list the buyers you work with in `[seller] \
+     accept_offers_only_from`, or set `accept_open_targeted = true` to accept targeted offers from \
+     buyers you have not named, or set `claim_open_pool = true` to claim untargeted jobs from the \
+     open pool";
+
+/// What makes an `accept_offers_only_from` entry a route in, stated to the operator.
+///
+/// ⛔ SHAPE IS NOT THE RULE, AND A MESSAGE THAT SAYS IT IS HANDS THE OPERATOR A CORRECTION THEIR
+/// INPUT ALREADY PASSES. `buyer_pubkey_is_reachable` parses the x-only key as well as the shape, so
+/// `"0123456789abcdef".repeat(4)` — 64 lowercase hex characters, no curve point — satisfies every
+/// syllable of a shape-only explanation and is still refused.
+///
+/// ⛔ A RIGHT DIAGNOSIS WITH A WRONG CORRECTION IS WORSE THAN A VAGUE ONE. The operator is told every
+/// entry is unusable, handed a rule their entries demonstrably pass, and left with no way to see the
+/// difference — this text is their ONLY interface to the predicate, because they cannot read
+/// `home.rs`. The classifier learning curve validity while its explanations kept the old rule is the
+/// same failure as the remedy text above: the fix reached the site under the cursor and stopped.
+///
+/// ⛔ REPORTING ONLY. The admission gate stays an exact byte compare — this explains a refusal and
+/// never widens one. Callers add their own framing and terminal punctuation.
+/// ⛔ AND THE CLAUSE THIS SENTENCE MUST NOT MAKE, BECAUSE THIS FILE REFUTES IT ON LINE 2065: THE
+/// PREDICATE HAS NO PROVENANCE SIGNAL. It cannot know whether bytes were copied or typed, and
+/// `GENERATOR_X` — hand-entered hex in this very file — is asserted REACHABLE. Grouping hand entry
+/// with the forms that match NOBODY was false by this tree's own positive control, and it is the
+/// exact defect this constant exists to fix: an operator-facing rule the code does not hold.
+/// ⇒ the honest claim is narrower — typed hex may be curve-invalid, or valid and name someone else,
+/// so it is no EVIDENCE the intended buyer was listed. Copying is what carries that evidence.
+pub const USABLE_BUYER_ENTRY: &str = "Copy the canonical public key the buyer gives you: 64 \
+     lowercase hex characters that are ALSO a valid secp256k1 x-only key (the hex pubkey a Nostr \
+     client shows). An `npub1…`, a shortened id or a capitalised key is compared literally and \
+     matches nobody. Hex you typed rather than copied is not refused for being typed — but it may \
+     be curve-invalid, or valid and name a different buyer, so it is no evidence you listed the \
+     one you meant";
+
+/// Can this `accept_offers_only_from` entry ever match a real buyer?
+///
+/// ⛔ THE FENCE IS AN EXACT STRING COMPARE, SO AN ENTRY IN ANY OTHER FORM IS NOT A NARROW ROUTE —
+/// IT IS NO ROUTE. A buyer pubkey arrives off the wire as 64 lowercase hex characters, and the
+/// allowlist is matched against that byte-for-byte. An `npub1…`, a truncated id, a capitalised
+/// hex string or a typo therefore fences out *everyone* while reading, to an operator and to
+/// `doctor` alike, as a seat that named a buyer.
+///
+/// **This deliberately reports rather than repairs.** Trimming and lower-casing the entry here
+/// would make some of these match — which means admitting a counterparty the seat is currently
+/// refusing. Widening who can reach a seat is the opposite of what the opt-in surfaces are for,
+/// so an unusable entry stays unusable and the operator is told. Matching semantics are unchanged.
+pub fn buyer_pubkey_is_wire_shaped(entry: &str) -> bool {
+    entry.len() == 64 && entry.chars().all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch))
+}
+
+/// Can this entry match a buyer that can actually EXIST? Shape, plus a real x-only public key.
+///
+/// ⛔ SHAPE IS NECESSARY AND NOT SUFFICIENT, AND THE GAP IS HALF OF ALL TYPOS. A buyer pubkey is a
+/// secp256k1 x-coordinate, and roughly half of all 64-hex values have no curve point at all — so a
+/// mistyped key is far more likely to be *unusable* than merely *wrong*. Counting a shape-valid
+/// entry as a route in is what produced `PASS reachable: 1 named buyer` for a seat no offer can
+/// ever reach.
+///
+/// ⛔ `PublicKey::from_hex` IS NOT THE VALIDATOR, THOUGH IT LOOKS LIKE ONE. Read in the pinned
+/// nostr 0.44.4: `PublicKey` is `{ buf: [u8; 32] }` and `from_hex` is `hex::decode_to_slice` with
+/// no secp256k1 call, while `hex` accepts `A-F` as well as `a-f`. A `from_hex` -> `to_hex`
+/// round-trip therefore proves exactly *64 hex characters, lowercase* — verbatim the contract
+/// [`buyer_pubkey_is_wire_shaped`] already has, so it would change nothing. **`.xonly()` is the
+/// call that parses**: it reaches `XOnlyPublicKey::from_slice`, which rejects an x with no point.
+///
+/// ⚠ `gateway` is the MINIMAL feature supplying nostr-sdk; `wallet` composes it, and every
+/// production caller of this is already `wallet`-gated. This deliberately does NOT change the
+/// admission gate, which stays an exact string compare — see [`buyer_pubkey_is_wire_shaped`].
+#[cfg(feature = "gateway")]
+pub fn buyer_pubkey_is_reachable(entry: &str) -> bool {
+    use nostr_sdk::prelude::PublicKey;
+    buyer_pubkey_is_wire_shaped(entry)
+        && PublicKey::from_hex(entry).is_ok_and(|key| key.xonly().is_ok())
 }
 
 /// Executor sandbox config (`[sandbox]` section): which executor the awarded agent command runs
@@ -1689,8 +1809,10 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
     out.push_str(
         r#"# --- [sandbox]: how an awarded job runs. Uncomment ONE option below. ---
 # With no [sandbox] section (the default here) the agent runs PASS-THROUGH:
-# directly as this daemon, with no isolation. A seat that claims open-pool
-# work is refused at the boot gate until a real sandbox is configured.
+# directly as this daemon, with no isolation. A seat that strangers can reach
+# — one that claims open-pool work OR accepts targeted offers from buyers it
+# has not named — is refused at the boot gate until a real sandbox is
+# configured.
 #
 # USE DOCKER. It is the only mode with a kernel boundary and egress
 # containment, and the only one that exists on macOS.
@@ -1923,6 +2045,111 @@ mod tests {
     #[test]
     fn default_rate_sats_is_the_market_floor() {
         assert_eq!(DEFAULT_RATE_SATS, 100);
+    }
+
+    /// The positive control. Without it every rejection below would be satisfied by a predicate
+    /// that simply answered `false`.
+    /// The positive control for the SHAPE predicate. Without it every rejection below would be
+    /// satisfied by a predicate that simply answered `false`.
+    ///
+    /// ⚠ `0123456789abcdef…` is asserted here DELIBERATELY and it is correct: it IS wire-shaped.
+    /// It is also unreachable, because it has no curve point — and that gap is the whole reason
+    /// [`buyer_pubkey_is_reachable`] exists. Asserting it here is not a bug being pinned; the bug
+    /// was the CALLERS binding a reachability question to this shape-only answer.
+    #[test]
+    fn a_wire_form_buyer_pubkey_is_wire_shaped() {
+        assert!(buyer_pubkey_is_wire_shaped(&"a1".repeat(32)));
+        assert!(buyer_pubkey_is_wire_shaped(&"0123456789abcdef".repeat(4)));
+    }
+
+    /// x-coordinate of the secp256k1 generator: a key that provably exists, used as the positive
+    /// control so a strict predicate that always answered `false` cannot pass the rejections below.
+    #[cfg(feature = "gateway")]
+    const GENERATOR_X: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn a_real_curve_point_is_reachable() {
+        assert!(
+            buyer_pubkey_is_reachable(GENERATOR_X),
+            "the generator's x-coordinate is a valid x-only key and must count as a route in"
+        );
+    }
+
+    /// ⛔ THE OPERATOR-FACING RULE MUST NOT CLAIM SOMETHING THIS FILE REFUTES. The predicate has no
+    /// provenance signal — it cannot tell copied bytes from typed ones — and `GENERATOR_X` is
+    /// hand-entered right here and reachable. So any wording that groups hand entry with the forms
+    /// that match NOBODY is false, and false in the direction that matters: it hands an operator a
+    /// correction that does not explain their refusal.
+    ///
+    /// ⛔ ASSERTED ON THE NEVER-MATCH CLAUSE ALONE, NOT THE WHOLE STRING. The sentence is ALLOWED to
+    /// discuss typed hex — it must simply not do so inside the claim about what matches nobody, so
+    /// splitting on the marker is what gives this test access to the claim it is actually making.
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn the_criterion_never_groups_typed_hex_with_the_forms_that_match_nobody() {
+        assert!(
+            buyer_pubkey_is_reachable(GENERATOR_X),
+            "precondition: a HAND-ENTERED VALID key must be reachable, or the wording under test \
+             would be true and this test asserts nothing"
+        );
+        let never_match_claim = USABLE_BUYER_ENTRY
+            .split_once("matches nobody")
+            .expect("the criterion must keep a never-match clause for this to assert against")
+            .0;
+        for token in ["hand", "typed", "invented"] {
+            assert!(
+                !never_match_claim.contains(token),
+                "`{token}` appears inside the never-match claim, but `{GENERATOR_X}` is entered by \
+                 hand in this file and IS reachable:\n{USABLE_BUYER_ENTRY}"
+            );
+        }
+    }
+
+    /// ⛔ SHAPE IS NOT SUFFICIENT, AND THESE FIXTURES ARE COMPUTED RATHER THAN EYEBALLED. Roughly
+    /// half of all 64-hex values have no curve point, so "looks like a key" is a coin flip.
+    /// ⚠ TWO OBVIOUS-LOOKING NEGATIVE CONTROLS ARE ACTUALLY VALID KEYS and must NOT be used here:
+    /// x = 1, and `cafe01` zero-padded to 64 — both land ON the curve. A negative control chosen by
+    /// eye is how a strict predicate gets a test that cannot fail.
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn a_wire_shaped_entry_with_no_curve_point_is_not_reachable() {
+        for (entry, why) in [
+            ("0123456789abcdef".repeat(4), "x is a quadratic non-residue: no y exists"),
+            ("ff".repeat(32), "x is above the field modulus: not a field element at all"),
+        ] {
+            assert!(
+                buyer_pubkey_is_wire_shaped(&entry),
+                "precondition: `{entry}` must be SHAPE-valid, or this proves nothing about the \
+                 curve check ({why})"
+            );
+            assert!(
+                !buyer_pubkey_is_reachable(&entry),
+                "{why}: `{entry}` can never be a buyer, so it is not a route in"
+            );
+        }
+    }
+
+    /// ⛔ EACH OF THESE FENCES EVERYONE AND MATCHES NOBODY. The allowlist is compared byte-for-byte
+    /// against a pubkey that arrives as 64 lowercase hex characters, so an entry in any other form
+    /// is not a narrow route in — it is no route at all, while reading to an operator like a seat
+    /// that named a buyer. The capitalised case is the dangerous one: it is the right key.
+    #[test]
+    fn an_entry_that_can_never_match_a_wire_pubkey_is_not_wire_shaped() {
+        for (entry, why) in [
+            ("A1".repeat(32), "capitalised hex — the right key, and it still matches nobody"),
+            ("a1".repeat(31), "too short"),
+            ("a1".repeat(33), "too long"),
+            (String::new(), "empty"),
+            (format!("npub1{}", "q".repeat(58)), "bech32 npub rather than hex"),
+            (format!(" {}", "a1".repeat(32)), "leading space, not trimmed at the match site"),
+            ("g".repeat(64), "right length, not hex"),
+        ] {
+            assert!(
+                !buyer_pubkey_is_wire_shaped(&entry),
+                "{why}: `{entry}` cannot match a wire pubkey and must not be counted as a route in"
+            );
+        }
     }
 
     #[test]

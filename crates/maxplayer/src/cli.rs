@@ -327,7 +327,7 @@ fn write_usage(out: &mut dyn Write) {
     #[cfg(feature = "acp")]
     let _ = write!(
         out,
-        "  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n"
+        "  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n"
     );
     let _ = writeln!(
         out,
