@@ -207,16 +207,15 @@ runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM
   a one-time interactive approval a daemon cannot give. **The pre-advertise probe runs the CLI on the
   host, so a `/login` credential passes the gate and then fails every job inside the container.** The
   Codex ChatGPT file route below is the exception. It reads the host session for each Docker job.
-- ⛔ **`cursor` has two credentials and only one of them has a contained path.** `CURSOR_API_KEY` is a
-  real reusable key and the allowlist is claude and codex only, so
+- ⛔ **`cursor` has two credentials and only one of them belongs in the container.** `CURSOR_API_KEY`
+  is a real reusable key and the allowlist is claude and codex only, so
   `forward_env = ["CURSOR_API_KEY"]` forwards that key into the container for a stranger's job to
-  read — which `doctor` flags as a WARN rather than refusing. Never do that. The **browser-login
-  session** is different: `file_credentials` below carries it as a per-job placeholder and keeps the
-  real value on the host. **That path has now been exercised from inside a running container, and it
-  does not complete: Docker-contained cursor is unsupported.** The redirected h2c agent leg reaches the
-  proxy and stalls in the proxy's pre-forward body collection, so every job fails and the seat's
-  pre-advertise probe refuses to advertise. Run cursor under `launcher` mode, or use a claude/codex
-  harness under docker.
+  read — which `doctor` flags as a WARN rather than refusing. Never do that. Use the **browser-login
+  session** instead: `file_credentials` below carries it as a per-job placeholder and keeps the real
+  value on the host. **That path is now proven end to end from inside a running container — a
+  Docker-contained cursor seat completes, delivers, and settles a real job.** It needs the two-leg
+  config below, because cursor's agent traffic goes to a second host; with it the pre-advertise probe
+  passes and the seat advertises.
 
 - **Omit `image`.** Unset, the binary uses its own version-pinned ref
   `ghcr.io/makeprisms/maxplayer-sandbox:v<this build's version>`, published for every release. `image`
@@ -302,9 +301,21 @@ credential either crosses into the container intact or the harness cannot run co
 path          = "/home/you/.config/cursor/auth.json"  # absolute; a relative path is refused
 field         = "accessToken"                         # the only field ever read
 env           = "CURSOR_AUTH_TOKEN"                   # carries the PLACEHOLDER into the container
-upstream      = "https://api2.cursor.sh"              # the one destination the swap is allowed for
-endpoint_args = ["--endpoint", "--agent-endpoint"]    # every flag the client needs; proxy URL appended to each
+upstream      = "https://api2.cursor.sh"              # the control-plane host the swap is allowed for
+endpoint_args = ["--endpoint"]                        # points the control plane at the proxy
+
+# Cursor's agent/inference leg goes to a SEPARATE host, so it needs its own leg: one more proxy
+# listener, bound for that authority, with the client's second flag pointed at it. Without this the
+# agent leg leaves for its own host, which is not in the egress policy, and the job fails at DNS.
+[[sandbox.file_credentials.legs]]
+endpoint_args = ["--agent-endpoint"]
+upstream      = "https://agentn.global.api5.cursor.sh"
 ```
+
+On macOS the cursor session lives in the login Keychain, which the daemon cannot read, so the file
+`path` points at does not exist yet. Create it once with `AGENT_CLI_CREDENTIAL_STORE=file cursor-agent
+login`; that writes `~/.cursor/auth.json` with the `accessToken` field this reads. The Keychain login
+stays valid alongside it.
 
 `endpoint_args` also accepts a bare string for a client that needs one flag, and the older
 `endpoint_arg = "--endpoint"` spelling still parses, so existing configs keep working. One flag per
@@ -339,24 +350,22 @@ Six things to know before you need them:
   and never reaches authentication. Every job fails while the proxy's own log looks perfectly healthy,
   because traffic that never arrives leaves no trace in it. When adding a client, check the **egress
   denominator**: did anything leave for an authority you did not redirect?
-- **Naming both flags is necessary and, for Cursor today, not sufficient.** Measured on a live
-  contained seat: the redirected agent leg reaches the proxy and completes an h2c handshake, and then
-  the request is never forwarded, because the proxy buffers a request body that this client does not
-  close. The client reports a stalled connection after about 37 seconds and the job fails. So
-  `file_credentials` for Cursor is not usable yet; a seat configured that way fails its pre-advertise
-  probe and correctly refuses to advertise. The flags fix the addressing, not this.
+- **Both flags are necessary, and each leg's true host must be named.** `--endpoint` moves the control
+  plane; the separate `--agent-endpoint` moves the agent leg, and the two go to DIFFERENT hosts, so one
+  `upstream` cannot cover both. Name the second host as a `[[sandbox.file_credentials.legs]]` entry (see
+  the example above): each leg gets its own proxy listener bound for that authority, and the client can
+  then reach only the hosts the config names — the primary `upstream` and every `legs` upstream.
 - **The proxy accepts HTTP/1 and h2c on the same listener.** That client opens its agent leg with the
   HTTP/2 prior-knowledge preface rather than an HTTP/1 request line. An http1-only server cannot parse
   that preface and surfaces **no request at all**, so the symptom is "nothing connected" rather than a
   protocol error. Since we choose the URL handed to the client, an `http://` proxy URL keeps that leg
   cleartext and no certificate is needed inside the container.
-- **The container leg is measured now, and it splits in two.** The host leg was already verified end to
-  end against the real vendor, with a negative control. From inside a running container: the
-  placeholder **is** carried and substituted — the control plane reached the proxy and authenticated
-  over HTTP/1 across every probe turn on a live seat. The **agent** leg is where it stops, and the
-  reason is transport shape rather than credential handling: see the two bullets above. So the
-  credential mechanism is proven through a container and `mode = "docker"` with Cursor still does not
-  yield a working seat. Under `launcher` mode this key is inert.
+- **The container leg is proven end to end.** From inside a running container the placeholder is carried
+  and substituted on BOTH legs: the control plane authenticates over HTTP/1, and the agent leg connects
+  over h2c to its own host and streams its turn. An earlier build stalled here — the response scrub held
+  the agent leg's keepalives until an idle flush those same keepalives kept resetting — but the scrub
+  now releases each chunk as it arrives, so a long streaming turn flows, and a real job completes,
+  delivers, and settles. Under `launcher` mode this key is inert.
 
 #### The credential proxy listens on every interface — firewall it on a public box
 

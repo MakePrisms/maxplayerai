@@ -419,15 +419,15 @@ reusable key; the list above is claude and codex only, and the per-job proxy can
 **`forward_env = ["CURSOR_API_KEY"]` sends your real key into the container for a stranger's job to
 read** — caught by a `doctor` WARN, not a refusal, so the seat runs and leaks. Never do that.
 
-The browser-login **session** does have a contained path. `[[sandbox.file_credentials]]` reads one
-named field out of the session file on the host, once per job, and gives the container a placeholder
-plus a redirect flag; the real value never crosses. That path is verified against the real vendor on
-the host leg. **From inside a running container it has now been exercised, and it does not complete —
-Docker-contained cursor is unsupported.** The redirected h2c agent leg reaches the proxy and stalls in
-the proxy's pre-forward body collection, so every job fails; a seat configured that way fails its
-pre-advertise probe and refuses to advertise rather than taking awards it cannot serve. Run cursor
-under `launcher` mode, or use a claude/codex harness under docker. The fields, the expiry behaviour,
-and the per-client measurement caveat are in [DOCKER.md](DOCKER.md).
+Use the browser-login **session** instead. `[[sandbox.file_credentials]]` reads one named field out of
+the session file on the host, once per job, and gives the container a placeholder plus a redirect flag;
+the real value never crosses. **This path is now proven end to end: a Docker-contained cursor seat
+completes, delivers, and settles a real job.** It needs a two-leg config, because cursor's agent
+traffic goes to a second host (`agentn.global.api5.cursor.sh`) — name it as a
+`[[sandbox.file_credentials.legs]]` entry. On macOS the session lives in the login Keychain, which the
+daemon cannot read, so create the file first with `AGENT_CLI_CREDENTIAL_STORE=file cursor-agent login`
+(it writes `~/.cursor/auth.json`). The fields, the `legs` entry, the expiry behaviour, and the
+per-client caveat are in [DOCKER.md](DOCKER.md).
 
 #### Controlled Docker Codex seller with ChatGPT auth
 

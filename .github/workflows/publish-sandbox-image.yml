@@ -24,8 +24,11 @@ name: Publish sandbox image
 #   push runs release.yml, which creates the Release with `GH_TOKEN: ${{ github.token }}` — and
 #   GitHub does not start workflow runs from events raised by the default GITHUB_TOKEN. So the
 #   `published` event fires, no run is created, release.yml goes green, and the release ships with
-#   NO images. release.yml therefore calls this workflow directly, after its own build and Release
-#   jobs succeed, so the images cannot be published for a release whose binaries failed.
+#   NO images. release.yml therefore calls this workflow directly, after its own build and surface
+#   checks succeed and BEFORE it creates the Release or publishes to npm — so an image can never be
+#   missing for a release that names it. An image published for a release that then fails is
+#   discardable; a release published without its images is not, because npm refuses to reuse a
+#   version. The ordering follows the failure that cannot be undone.
 #   The other two triggers stay for the cases where they do work: `release: published` covers a
 #   release a PERSON publishes (a human actor is not the GITHUB_TOKEN), and `workflow_dispatch` is
 #   the manual escape hatch.

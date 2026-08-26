@@ -574,6 +574,35 @@ pub struct FileCredential {
     /// for the same reason [`deserialize_agent_command_argv`] refuses a shell string outright.
     #[serde(alias = "endpoint_arg", deserialize_with = "deserialize_endpoint_args")]
     pub endpoint_args: Vec<String>,
+    /// Additional (flags, upstream) legs, for a client whose separate connections go to separate
+    /// hosts. Measured on cursor-agent: `--endpoint` moves the control plane and `--agent-endpoint`
+    /// moves the agent/inference leg, and the two legs' true destinations differ — one `upstream`
+    /// cannot name both. Each leg gets its own proxy listener bound for that leg's authority, and
+    /// the leg's flags are emitted pointing at that listener, so which base URL the client dials is
+    /// what routes each leg to its true host — the client still cannot reach anything this list
+    /// does not name.
+    ///
+    /// Optional and empty by default, so every existing config parses unchanged. NOTE FOR
+    /// DOWNGRADES: a config that has adopted `legs` is refused by any binary predating this field
+    /// (`deny_unknown_fields`), so rolling a seat back means restoring the pre-adoption config
+    /// snapshot alongside the older binary — the binary alone is not a rollback.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legs: Vec<CredentialLeg>,
+}
+
+/// One additional leg of a [`FileCredential`]: the client flag(s) that redirect this leg to the
+/// proxy, and the true upstream this leg's traffic belongs to. Field semantics match the parent
+/// credential's `endpoint_args`/`upstream` pair exactly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialLeg {
+    /// The client's argument(s) for pointing THIS leg at the proxy (e.g. `--agent-endpoint`). Same
+    /// shape and refusals as [`FileCredential::endpoint_args`].
+    #[serde(alias = "endpoint_arg", deserialize_with = "deserialize_endpoint_args")]
+    pub endpoint_args: Vec<String>,
+    /// The upstream base URL this leg's traffic is actually for (e.g.
+    /// `https://agentn.global.api5.cursor.sh`).
+    pub upstream: String,
 }
 
 /// Which executor the `[sandbox]` section selects.
@@ -1610,6 +1639,7 @@ pub(crate) fn parse_config_toml(raw: &str) -> Result<MaxplayerConfig, HomeError>
 /// `MAXPLAYER_*` spelling, so excluding them costs no config coverage.
 const RESERVED_ENV_VARS: &[&str] = &[
     "MAXPLAYER_HOME",
+    "MAXPLAYER_VERBOSE",
     "MAXPLAYER_HEARTBEAT_INTERVAL_SECS",
     "MAXPLAYER_HEARTBEAT_ENABLED",
     "MAXPLAYER_HEARTBEAT_STALL_MISSED_INTERVALS",
@@ -2760,6 +2790,7 @@ mod tests {
         // resolution from refusing when they are set. The filtered map must drop them.
         let raw = env(&[
             ("MAXPLAYER_HOME", "/tmp/x"),
+            ("MAXPLAYER_VERBOSE", "1"),
             ("MAXPLAYER_HEARTBEAT_INTERVAL_SECS", "9"),
             ("MAXPLAYER_RELAY_URL", "wss://kept"),
         ]);
@@ -2939,6 +2970,43 @@ mod tests {
         "#;
         let cred: super::FileCredential = toml::from_str(old).expect("the old spelling must parse");
         assert_eq!(cred.endpoint_args, vec!["--endpoint".to_owned()]);
+    }
+
+    // BACK-COMPAT FOR PERSISTED CONFIG: a credential block written before `legs` existed parses
+    // unchanged — the field is optional and defaults empty, and no existing field changed shape.
+    // This is the config half of "the length-1 case behaves exactly as before".
+    #[test]
+    fn a_file_credential_without_legs_parses_unchanged() {
+        let old = r#"
+            path = "/home/seller/.config/cursor/auth.json"
+            field = "accessToken"
+            env = "CURSOR_AUTH_TOKEN"
+            upstream = "https://api2.cursor.sh"
+            endpoint_args = ["--endpoint"]
+        "#;
+        let cred: super::FileCredential =
+            toml::from_str(old).expect("a pre-legs credential block must parse unchanged");
+        assert!(cred.legs.is_empty(), "absent legs must default to empty, never error");
+    }
+
+    #[test]
+    fn a_credential_leg_parses_with_its_own_flags_and_upstream() {
+        let with_leg = r#"
+            path = "/home/seller/.config/cursor/auth.json"
+            field = "accessToken"
+            env = "CURSOR_AUTH_TOKEN"
+            upstream = "https://api2.cursor.sh"
+            endpoint_args = ["--endpoint"]
+
+            [[legs]]
+            endpoint_args = ["--agent-endpoint"]
+            upstream = "https://agentn.global.api5.cursor.sh"
+        "#;
+        let cred: super::FileCredential =
+            toml::from_str(with_leg).expect("a credential with one leg must parse");
+        assert_eq!(cred.legs.len(), 1);
+        assert_eq!(cred.legs[0].endpoint_args, vec!["--agent-endpoint".to_owned()]);
+        assert_eq!(cred.legs[0].upstream, "https://agentn.global.api5.cursor.sh");
     }
 
     #[test]
