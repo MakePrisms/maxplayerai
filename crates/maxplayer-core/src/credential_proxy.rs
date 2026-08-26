@@ -151,6 +151,23 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// at all, so a long completion is never cut off.
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Period of the response-body heartbeat: [`BodyMeter`] emits a log-only `body_idle` line this often
+/// while the upstream response body is producing no bytes.
+///
+/// It is a CLOCK, not a deadline — contrast [`BODY_IDLE_TIMEOUT`], which cancels the request body. The
+/// heartbeat has no power to cancel anything; it only EMITS, so it cannot manufacture the terminator it
+/// exists to observe. Its whole purpose is to turn "nothing arrived for N seconds" from an ABSENCE — a
+/// reading indistinguishable from an instrument that was never reached — into an explicit line with a
+/// denominator. That is the exact failure under investigation: a response header, then silence.
+const BODY_HEARTBEAT_PERIOD: Duration = Duration::from_secs(5);
+
+/// Inactivity after which [`scrub_stream`] flushes the provably-safe part of its holdback instead of
+/// waiting for an upstream EOF that a stalled response never sends. Unlike [`BODY_IDLE_TIMEOUT`] this
+/// CANCELS nothing: it releases only bytes that cannot begin a split credential (see
+/// [`straddle_prefix_len`]) and keeps holding the trailing bytes that could. So the value bounds how long
+/// a stalled body is withheld; it is never a containment knob — any value is equally safe.
+const RESPONSE_HOLDBACK_FLUSH_IDLE: Duration = Duration::from_secs(15);
+
 /// The default real upstream for the Anthropic API-key path when the operator has not pointed the
 /// daemon at a custom gateway. Any resolved destination must appear on the proxy's allowlist before
 /// the real credential is substituted, so this constant also seeds the default allowlist entry.
@@ -456,6 +473,16 @@ fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> 
         }
     }
     out
+}
+
+/// Length of the longest suffix of `buf` that is a proper prefix of `needle` — the only trailing bytes
+/// that a not-yet-arrived chunk could complete into a `needle` occurrence. [`replace_bytes`] has already
+/// removed every COMPLETE occurrence, so a split match can hold at most `needle.len() - 1` bytes here;
+/// everything before this suffix is provably not part of any `needle`, whole or split, whatever arrives
+/// next. [`scrub_stream`] uses it to flush a stalled holdback without ever releasing a partial credential.
+fn straddle_prefix_len(buf: &[u8], needle: &[u8]) -> usize {
+    let max = buf.len().min(needle.len().saturating_sub(1));
+    (1..=max).rev().find(|&j| buf[buf.len() - j..] == needle[..j]).unwrap_or(0)
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -1013,6 +1040,301 @@ impl Drop for AwaitGuard {
     }
 }
 
+/// Formats an optional timestamp as the number or `none`, so a `body_end` line for a stream that never
+/// yielded a byte still carries both fields — a missing field would read as a logging bug, not as "zero".
+struct OptTs(Option<u128>);
+
+impl std::fmt::Display for OptTs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(ts) => write!(f, "{ts}"),
+            None => f.write_str("none"),
+        }
+    }
+}
+
+/// Formats an optional byte length as the number or `none`, so a `forward_end` line for a leg with no
+/// credential to scrub still carries the `real_len` field. A missing field would read as a logging bug,
+/// and a `0` would read as "an empty credential" rather than "no credential on this leg". This is a
+/// LENGTH only — never the credential value; a length is not a secret, a prefix is.
+struct OptLen(Option<usize>);
+
+impl std::fmt::Display for OptLen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(len) => write!(f, "{len}"),
+            None => f.write_str("none"),
+        }
+    }
+}
+
+/// Observes the RESPONSE BODY — the region after the response header that [`AwaitGuard`] and the
+/// `await_response` line structurally cannot see. Wraps the raw upstream byte stream and is PASSIVE: it
+/// forwards every chunk unchanged and records only timings and the terminator.
+///
+/// It answers the body-phase form of the WHO-ended question:
+/// - `terminated_by=upstream kind=eof completed=true` — the upstream body ended naturally.
+/// - `terminated_by=upstream kind=error` — the upstream body errored (reset / GOAWAY / decode).
+/// - `terminated_by=downstream` — dropped before either terminal, i.e. hyper dropped the body because
+///   the container closed its connection mid-stream. This is the body-phase analogue of [`AwaitGuard`],
+///   and the ONLY way to observe a client that gives up AFTER the header.
+///
+/// `last_byte_ts` is the discriminator for a mid-stream stall: the gap from it to the `body_end` line is
+/// the stall interval, both ends real events in this same log. And while the body produces no bytes at
+/// all, a [`BODY_HEARTBEAT_PERIOD`] clock emits `body_idle` lines — so "a header then N seconds of
+/// nothing" (the failure under investigation) is a POSITIVE reading with a denominator, not the absence
+/// of a `body_end` line, which is indistinguishable from a request that never reached the body phase.
+/// The clock only EMITS; it never cancels, so it cannot manufacture the terminator this meter finds.
+struct BodyMeter {
+    // `+ Sync` as well as `+ Send`: the boxed response body (`BoxBody` via `BodyExt::boxed`) requires
+    // `Send + Sync`, and the concrete upstream stream satisfies both — erasing to `dyn … + Send` alone
+    // would drop `Sync` and fail the bound.
+    inner: std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send + Sync>>,
+    req: u64,
+    host: String,
+    // The observed response-header instant: the anchor `body_first_byte` and every `body_idle` gap are
+    // measured from it, both ends real events in this log rather than a value differenced against the
+    // nearest ACP notification.
+    header_ts: u128,
+    bytes: u64,
+    first_byte_ts: Option<u128>,
+    last_byte_ts: Option<u128>,
+    // Log-only clock: fires while the upstream body yields nothing, so an idle stall is an explicit line
+    // rather than silence. Polled but NEVER used to cancel — see [`BODY_HEARTBEAT_PERIOD`].
+    heartbeat: tokio::time::Interval,
+    // Set once the UPSTREAM terminates (EOF or error) so Drop does not then record a spurious
+    // `terminated_by=downstream` — the upstream terminal and the eventual drop are the same stream's end.
+    ended: bool,
+}
+
+impl futures_util::Stream for BodyMeter {
+    type Item = reqwest::Result<Bytes>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // `Self: Unpin` (every field is), so unwrapping the pin needs no projection crate.
+        let this = self.get_mut();
+        match futures_util::Stream::poll_next(this.inner.as_mut(), cx) {
+            std::task::Poll::Ready(Some(Ok(chunk))) => {
+                let now = proxy_log_now_ms();
+                if this.first_byte_ts.is_none() {
+                    this.first_byte_ts = Some(now);
+                    eprintln!(
+                        "proxy: req#{} ts={now} phase=body_first_byte host={} gap_from_header_ms={}",
+                        this.req,
+                        this.host,
+                        now.saturating_sub(this.header_ts),
+                    );
+                }
+                this.bytes += chunk.len() as u64;
+                this.last_byte_ts = Some(now);
+                std::task::Poll::Ready(Some(Ok(chunk)))
+            }
+            std::task::Poll::Ready(Some(Err(error))) => {
+                this.ended = true;
+                eprintln!(
+                    "proxy: req#{} ts={} phase=body_end terminated_by=upstream kind=error host={} bytes={} completed=false first_byte_ts={} last_byte_ts={} msg={error}",
+                    this.req,
+                    proxy_log_now_ms(),
+                    this.host,
+                    this.bytes,
+                    OptTs(this.first_byte_ts),
+                    OptTs(this.last_byte_ts),
+                );
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            std::task::Poll::Ready(None) => {
+                this.ended = true;
+                let now = proxy_log_now_ms();
+                eprintln!(
+                    "proxy: req#{} ts={now} phase=body_end terminated_by=upstream kind=eof host={} bytes={} completed=true first_byte_ts={} last_byte_ts={}",
+                    this.req,
+                    this.host,
+                    this.bytes,
+                    OptTs(this.first_byte_ts),
+                    OptTs(this.last_byte_ts),
+                );
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => {
+                // Upstream has nothing right now. Drive the heartbeat so a silent body is an explicit
+                // reading rather than an absence. Polling the interval registers its waker on `cx`, so
+                // the task is re-polled each period even while the upstream stays parked; the upstream's
+                // own waker is already registered from the `poll_next` above, so a real byte still wakes
+                // us. Draining every ready tick keeps it to one line per elapsed period.
+                while this.heartbeat.poll_tick(cx).is_ready() {
+                    let now = proxy_log_now_ms();
+                    eprintln!(
+                        "proxy: req#{} ts={now} phase=body_idle host={} bytes={} gap_from_header_ms={}",
+                        this.req,
+                        this.host,
+                        this.bytes,
+                        now.saturating_sub(this.header_ts),
+                    );
+                }
+                std::task::Poll::Pending
+            }
+        }
+    }
+}
+
+impl Drop for BodyMeter {
+    fn drop(&mut self) {
+        // Un-ended at drop ⇒ the body pipeline was torn down before the upstream itself finished, which
+        // happens when hyper drops the response because the container closed its connection mid-stream.
+        if !self.ended {
+            eprintln!(
+                "proxy: req#{} ts={} phase=body_end terminated_by=downstream host={} bytes={} completed=false first_byte_ts={} last_byte_ts={}",
+                self.req,
+                proxy_log_now_ms(),
+                self.host,
+                self.bytes,
+                OptTs(self.first_byte_ts),
+                OptTs(self.last_byte_ts),
+            );
+        }
+    }
+}
+
+/// Observes the DOWNSTREAM-FORWARDED body — the frames that actually leave the proxy for the container,
+/// AFTER [`scrub_stream`] (or the no-scrub `map`) has run. [`BodyMeter`] sits BEFORE scrub and counts
+/// bytes RECEIVED from the upstream; this counts bytes FORWARDED to hyper. Reading `body_*` beside
+/// `forward_*` for one request separates "the upstream sent little" from "the proxy forwarded little of
+/// what the upstream sent".
+///
+/// The gap between the two meters is the credential-scrub holdback: [`scrub_stream`] withholds the last
+/// `real.len() - 1` bytes of the stream — the longest possible partial credential match — and flushes it
+/// only when the upstream ENDS. On an upstream STALL (bytes then no EOF), bytes that BodyMeter has
+/// already counted may not yet be forwarded here. This meter only MEASURES that gap; it changes nothing
+/// about when the carry flushes, because that is a containment boundary, not a streaming knob.
+///
+/// PASSIVE, exactly like [`BodyMeter`]: forwards every frame unchanged, records only counts, timings and
+/// the terminator, and its heartbeat only EMITS — it never cancels, so it cannot manufacture the
+/// terminator it observes. LOGS NO CREDENTIAL MATERIAL: `real_len` is the LENGTH of the credential
+/// string only, never its value, never the carry buffer, never a matched region or offset.
+struct ForwardMeter {
+    inner: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<Frame<Bytes>, std::io::Error>> + Send + Sync>,
+    >,
+    req: u64,
+    host: String,
+    // The same observed response-header instant [`BodyMeter`] measures from, so `forward_*` gaps and
+    // `body_*` gaps share one origin and read directly against each other.
+    header_ts: u128,
+    // Bytes ACTUALLY forwarded downstream: the running sum of forwarded `Frame::data` payload lengths.
+    bytes: u64,
+    first_ts: Option<u128>,
+    last_ts: Option<u128>,
+    // LENGTH of the credential scrubbed on this leg (`None` on a leg with no scrub). The holdback is
+    // `real_len - 1` bytes, so this is the parameter that predicts how much a stalled stream withholds.
+    real_len: Option<usize>,
+    // Log-only clock, same discipline as [`BodyMeter`]'s heartbeat: emits `forward_idle` while nothing is
+    // forwarded, so "the upstream trickled bytes but the proxy forwarded none" is a POSITIVE reading with
+    // a denominator rather than an absence. Polled but NEVER used to cancel.
+    heartbeat: tokio::time::Interval,
+    // Set once the forwarded stream terminates (its own EOF or error) so Drop does not then record a
+    // spurious `terminated_by=downstream`.
+    ended: bool,
+}
+
+impl futures_util::Stream for ForwardMeter {
+    type Item = Result<Frame<Bytes>, std::io::Error>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // `Self: Unpin` (every field is), so unwrapping the pin needs no projection crate.
+        let this = self.get_mut();
+        match futures_util::Stream::poll_next(this.inner.as_mut(), cx) {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                let now = proxy_log_now_ms();
+                if this.first_ts.is_none() {
+                    this.first_ts = Some(now);
+                    eprintln!(
+                        "proxy: req#{} ts={now} phase=forward_first host={} gap_from_header_ms={}",
+                        this.req,
+                        this.host,
+                        now.saturating_sub(this.header_ts),
+                    );
+                }
+                // Only DATA frames carry body bytes; a trailers frame contributes zero.
+                this.bytes += frame.data_ref().map_or(0, Bytes::len) as u64;
+                this.last_ts = Some(now);
+                std::task::Poll::Ready(Some(Ok(frame)))
+            }
+            std::task::Poll::Ready(Some(Err(error))) => {
+                this.ended = true;
+                eprintln!(
+                    "proxy: req#{} ts={} phase=forward_end terminated_by=upstream kind=error host={} bytes={} real_len={} first_ts={} last_ts={} msg={error}",
+                    this.req,
+                    proxy_log_now_ms(),
+                    this.host,
+                    this.bytes,
+                    OptLen(this.real_len),
+                    OptTs(this.first_ts),
+                    OptTs(this.last_ts),
+                );
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            std::task::Poll::Ready(None) => {
+                this.ended = true;
+                let now = proxy_log_now_ms();
+                eprintln!(
+                    "proxy: req#{} ts={now} phase=forward_end terminated_by=upstream kind=eof host={} bytes={} real_len={} first_ts={} last_ts={}",
+                    this.req,
+                    this.host,
+                    this.bytes,
+                    OptLen(this.real_len),
+                    OptTs(this.first_ts),
+                    OptTs(this.last_ts),
+                );
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => {
+                // The forwarded stream has nothing right now — either the upstream is parked or scrub is
+                // holding its carry back. Drive the heartbeat so the withheld case is an explicit line
+                // rather than an absence. Same waker mechanics as [`BodyMeter`]: polling the interval
+                // registers its waker, and the inner stream's waker is already registered from the poll
+                // above, so a real frame still wakes us immediately.
+                while this.heartbeat.poll_tick(cx).is_ready() {
+                    let now = proxy_log_now_ms();
+                    eprintln!(
+                        "proxy: req#{} ts={now} phase=forward_idle host={} bytes={} gap_from_header_ms={}",
+                        this.req,
+                        this.host,
+                        this.bytes,
+                        now.saturating_sub(this.header_ts),
+                    );
+                }
+                std::task::Poll::Pending
+            }
+        }
+    }
+}
+
+impl Drop for ForwardMeter {
+    fn drop(&mut self) {
+        // Un-ended at drop ⇒ the forwarded stream was torn down before it finished, i.e. hyper dropped
+        // the body because the container closed its connection mid-stream. `bytes` is then the total the
+        // proxy managed to forward before the client gave up — the number the holdback hypothesis predicts.
+        if !self.ended {
+            eprintln!(
+                "proxy: req#{} ts={} phase=forward_end terminated_by=downstream host={} bytes={} real_len={} first_ts={} last_ts={}",
+                self.req,
+                proxy_log_now_ms(),
+                self.host,
+                self.bytes,
+                OptLen(self.real_len),
+                OptTs(self.first_ts),
+                OptTs(self.last_ts),
+            );
+        }
+    }
+}
+
 /// Serve one request: run its HEADERS through [`ProxyEngine::authorize`] and — only on a substituted
 /// forward — stream its body to the real upstream and stream the response back. A refusal returns a
 /// `4xx`/`5xx` to the container with the real credential never in play, and without reading the body.
@@ -1168,10 +1490,11 @@ async fn relay(
 
     let status = upstream_response.status();
     // The upstream terminated the await by answering. Pairs with `await_send` above: the interval
-    // between these two `ts` values IS the send->response-header wait for this request.
+    // between these two `ts` values IS the send->response-header wait for this request. Held as the
+    // anchor `BodyMeter` measures time-to-first-byte from — the same event, not a nearby proxy for it.
+    let header_ts = proxy_log_now_ms();
     eprintln!(
-        "proxy: req#{req} ts={} phase=await_response terminated_by=upstream kind=response_header host={host} status={}",
-        proxy_log_now_ms(),
+        "proxy: req#{req} ts={header_ts} phase=await_response terminated_by=upstream kind=response_header host={host} status={}",
         status.as_u16(),
     );
     let mut builder = Response::builder().status(status.as_u16());
@@ -1188,15 +1511,59 @@ async fn relay(
             _ => builder = builder.header(name, value),
         }
     }
-    let upstream_body = Box::pin(upstream_response.bytes_stream());
-    let body = match scrub {
-        Some((real, placeholder)) => {
-            BodyExt::boxed(StreamBody::new(scrub_stream(upstream_body, real, placeholder)))
-        }
-        None => BodyExt::boxed(StreamBody::new(
-            upstream_body.map(|chunk| chunk.map(Frame::data).map_err(std::io::Error::other)),
-        )),
+    // Instrument the response body — the region after the header that `await_response` cannot see.
+    // Passive: it forwards every chunk unchanged and records only timings and the terminator; on Drop
+    // (hyper dropping the body because the container closed mid-stream) it records
+    // `terminated_by=downstream`, the body-phase analogue of `AwaitGuard`.
+    // First tick one full period out, not immediately; `Skip` so a delayed poll collapses missed ticks
+    // to a single line rather than a catch-up burst.
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + BODY_HEARTBEAT_PERIOD,
+        BODY_HEARTBEAT_PERIOD,
+    );
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let metered = BodyMeter {
+        inner: Box::pin(upstream_response.bytes_stream()),
+        req,
+        host: host.to_owned(),
+        header_ts,
+        bytes: 0,
+        first_byte_ts: None,
+        last_byte_ts: None,
+        heartbeat,
+        ended: false,
     };
+    // Second meter, DOWNSTREAM of scrub: `metered` (BodyMeter) counted what the upstream SENT; this
+    // counts what the proxy FORWARDS after scrub. The credential length is captured before `scrub` is
+    // consumed by the match. Same heartbeat discipline as the upstream meter so "received bytes, forwarded
+    // none" is a positive `forward_idle` reading rather than silence.
+    let real_len = scrub.as_ref().map(|(real, _)| real.len());
+    let forwarded: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<Frame<Bytes>, std::io::Error>> + Send + Sync>,
+    > = match scrub {
+        Some((real, placeholder)) => {
+            Box::pin(scrub_stream(metered, real, placeholder, RESPONSE_HOLDBACK_FLUSH_IDLE))
+        }
+        None => Box::pin(metered.map(|chunk| chunk.map(Frame::data).map_err(std::io::Error::other))),
+    };
+    let mut forward_heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + BODY_HEARTBEAT_PERIOD,
+        BODY_HEARTBEAT_PERIOD,
+    );
+    forward_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let forward_metered = ForwardMeter {
+        inner: forwarded,
+        req,
+        host: host.to_owned(),
+        header_ts,
+        bytes: 0,
+        first_ts: None,
+        last_ts: None,
+        real_len,
+        heartbeat: forward_heartbeat,
+        ended: false,
+    };
+    let body = BodyExt::boxed(StreamBody::new(forward_metered));
     builder
         .body(body)
         .map_err(|error| format!("building proxied response failed: {error}"))
@@ -1251,19 +1618,31 @@ where
 ///
 /// A credential can straddle a chunk boundary, so a naive per-chunk replace would miss it. This holds
 /// back the last `real.len() - 1` bytes of what it would otherwise emit — the longest possible partial
-/// match — and re-examines them once the next chunk arrives. The held-back tail is flushed when the
-/// upstream stream ends.
+/// match — and re-examines them once the next chunk arrives. The held-back tail is flushed in full when
+/// the upstream stream ends, because no later chunk can then straddle into it.
+///
+/// A stalled upstream — bytes received, then silence with NO EOF — would otherwise hold that tail
+/// forever, starving the container of a body it already sent. So after `idle` of inactivity this flushes
+/// the part of the carry that [`straddle_prefix_len`] proves cannot begin a split credential, and keeps
+/// holding only the trailing bytes that still could. That release is a strict subset of the EOF flush:
+/// it never forwards a byte the containment boundary would withhold, for any value of `idle`.
 ///
 /// SSE responses stay streaming: each chunk is forwarded as it arrives, minus that small carry-over.
 fn scrub_stream<S>(
     inner: S,
     real: String,
     placeholder: String,
+    idle: Duration,
 ) -> impl futures_util::Stream<Item = Result<Frame<Bytes>, std::io::Error>>
 where
     S: futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin,
 {
     // `None` inner ⇒ the stream is finished (ended or errored); stop yielding.
+    // One turn of the loop: the upstream yielded (or ended), or the idle timer fired first.
+    enum Step {
+        Upstream(Option<reqwest::Result<Bytes>>),
+        Idle,
+    }
     futures_util::stream::unfold(
         (Some(inner), Vec::<u8>::new()),
         move |(inner, carry)| {
@@ -1272,8 +1651,16 @@ where
                 let mut inner = inner?;
                 let mut carry = carry;
                 loop {
-                    match inner.next().await {
-                        Some(Ok(chunk)) => {
+                    // Race the upstream against an inactivity timer. `biased` prefers real progress, so
+                    // only a genuine gap of `idle` with nothing ready reaches `Idle`; a fresh sleep each
+                    // iteration measures inactivity since the last chunk, not elapsed total.
+                    let step = tokio::select! {
+                        biased;
+                        item = inner.next() => Step::Upstream(item),
+                        _ = tokio::time::sleep(idle) => Step::Idle,
+                    };
+                    match step {
+                        Step::Upstream(Some(Ok(chunk))) => {
                             carry.extend_from_slice(&chunk);
                             let replaced =
                                 replace_bytes(&carry, real.as_bytes(), placeholder.as_bytes());
@@ -1289,16 +1676,33 @@ where
                             let rest = replaced[split..].to_vec();
                             return Some((Ok(Frame::data(emit)), (Some(inner), rest)));
                         }
-                        Some(Err(error)) => {
+                        Step::Upstream(Some(Err(error))) => {
                             return Some((Err(std::io::Error::other(error)), (None, Vec::new())));
                         }
-                        None => {
+                        Step::Upstream(None) => {
                             let tail =
                                 replace_bytes(&carry, real.as_bytes(), placeholder.as_bytes());
                             if tail.is_empty() {
                                 return None;
                             }
                             return Some((Ok(Frame::data(Bytes::from(tail))), (None, Vec::new())));
+                        }
+                        Step::Idle => {
+                            // Release the carry MINUS its longest suffix that could still begin a
+                            // credential, instead of waiting for an EOF a stalled stream never sends.
+                            let replaced =
+                                replace_bytes(&carry, real.as_bytes(), placeholder.as_bytes());
+                            let held = straddle_prefix_len(&replaced, real.as_bytes());
+                            let safe = replaced.len() - held;
+                            if safe == 0 {
+                                // Carry empty or entirely a credential prefix — nothing provably safe to
+                                // release. Keep holding; forwarding here would leak a partial credential.
+                                carry = replaced;
+                                continue;
+                            }
+                            let emit = Bytes::copy_from_slice(&replaced[..safe]);
+                            let rest = replaced[safe..].to_vec();
+                            return Some((Ok(Frame::data(emit)), (Some(inner), rest)));
                         }
                     }
                 }
@@ -2041,6 +2445,7 @@ mod tests {
             futures_util::stream::iter(frames),
             REAL.to_owned(),
             placeholder.clone(),
+            RESPONSE_HOLDBACK_FLUSH_IDLE,
         );
         let collected: Vec<u8> = scrubbed
             .try_fold(Vec::new(), |mut acc, frame| async move {
@@ -2058,6 +2463,85 @@ mod tests {
             "a split credential must still be rewritten, and nothing else may be lost"
         );
         assert!(!text.contains(REAL), "no fragment of the real credential survives");
+    }
+
+    // A STALLED upstream — bytes received, then silence with NO EOF — once left scrub_stream's holdback
+    // withheld forever: the tail flushed ONLY on the `None`/EOF arm, which a stalled stream never
+    // reaches, so the container got `received - (real.len() - 1)` bytes and no more — the credential-
+    // scrub half of the "200 header, short-or-empty body, client gives up" symptom. The idle deadline
+    // now flushes the provably-safe part of the holdback, so a fully-received body still arrives in full
+    // without an EOF. Driven with a short real idle so the deadline actually elapses.
+    #[tokio::test]
+    async fn a_stalled_upstream_flushes_the_safe_body_tail_on_the_idle_deadline() {
+        use futures_util::StreamExt as _;
+        let placeholder = mint_anthropic_placeholder();
+        let idle = Duration::from_millis(50);
+        let hold = REAL.len() - 1; // scrub_stream's fixed holdback width
+        // Ordinary bytes — no suffix of them can begin the credential, so the whole tail is safe to flush.
+        let body = vec![b'x'; hold + 27];
+        let stalled = futures_util::stream::iter(vec![Ok(Bytes::from(body.clone()))])
+            .chain(futures_util::stream::pending::<reqwest::Result<Bytes>>());
+        let mut scrubbed =
+            Box::pin(scrub_stream(stalled, REAL.to_owned(), placeholder.clone(), idle));
+
+        // The non-held part is forwarded at once — `received - (real.len() - 1)`.
+        let first = scrubbed.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(first.len(), 27, "the immediately-emittable prefix is forwarded before any idle");
+
+        // The held tail would stay held forever without an EOF. After the idle deadline it flushes in
+        // full, because ordinary bytes cannot begin a split credential.
+        let second = scrubbed.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(
+            first.len() + second.len(),
+            body.len(),
+            "a stalled body reaches the container in full after the idle deadline, with no EOF"
+        );
+    }
+
+    // CONTAINMENT — the idle flush must never release a byte that could still begin a credential. A
+    // stalled body ending in a proper PREFIX of the real credential is the exact straddle the holdback
+    // guards: the flush releases only the bytes AHEAD of that prefix, and the prefix stays held even
+    // though the stream never EOFs. The prefix leaves the boundary only by being completed into a full
+    // credential (then replaced — see the split-across-chunks test) or on a real EOF; never on idle.
+    #[tokio::test]
+    async fn a_stalled_credential_prefix_is_never_released_by_the_idle_flush() {
+        use futures_util::StreamExt as _;
+        let placeholder = mint_anthropic_placeholder();
+        let idle = Duration::from_millis(50);
+        let k = 12; // "sk-ant-api03" — a proper, non-empty prefix of REAL
+        let prefix = &REAL.as_bytes()[..k];
+        let mut body = vec![b'x'; 40];
+        body.extend_from_slice(prefix);
+        let stalled = futures_util::stream::iter(vec![Ok(Bytes::from(body.clone()))])
+            .chain(futures_util::stream::pending::<reqwest::Result<Bytes>>());
+        let mut scrubbed =
+            Box::pin(scrub_stream(stalled, REAL.to_owned(), placeholder.clone(), idle));
+
+        // The only frame the idle flush will release: exactly the 40 bytes ahead of the prefix. The k
+        // prefix bytes are withheld, so no fragment of the credential is ever forwarded.
+        let flushed = scrubbed.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(
+            flushed.as_ref(),
+            vec![b'x'; 40].as_slice(),
+            "the idle flush releases only the bytes that cannot begin a credential; the prefix stays held"
+        );
+        // A further await is intentionally omitted: with the prefix held and no more data and no EOF,
+        // the stream never yields again — that permanent hold on the prefix IS the containment property.
+    }
+
+    #[test]
+    fn straddle_prefix_len_finds_the_longest_suffix_that_is_a_credential_prefix() {
+        let needle = b"sk-ant-api03-xyz";
+        // Nothing at the tail could begin the needle ⇒ 0 (the whole buffer is safe to flush).
+        assert_eq!(straddle_prefix_len(b"hello world", needle), 0);
+        assert_eq!(straddle_prefix_len(b"", needle), 0);
+        // A trailing partial prefix is detected at exactly its length.
+        assert_eq!(straddle_prefix_len(b"xxxxsk-ant", needle), 6);
+        // The LONGEST qualifying suffix wins, not a shorter coincidence earlier in the buffer.
+        assert_eq!(straddle_prefix_len(b"sk-sk-ant", needle), 6);
+        // The full proper prefix reports its own length — the cap is needle.len() - 1, so a complete
+        // occurrence (which replace_bytes strips first) is never reported as an unbreakable hold.
+        assert_eq!(straddle_prefix_len(&needle[..needle.len() - 1], needle), needle.len() - 1);
     }
 
     // #647 acceptance #1 (plumbing): a request carrying the placeholder is forwarded to the approved
