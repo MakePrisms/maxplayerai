@@ -151,6 +151,23 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// at all, so a long completion is never cut off.
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Period of the response-body heartbeat: [`BodyMeter`] emits a log-only `body_idle` line this often
+/// while the upstream response body is producing no bytes.
+///
+/// It is a CLOCK, not a deadline — contrast [`BODY_IDLE_TIMEOUT`], which cancels the request body. The
+/// heartbeat has no power to cancel anything; it only EMITS, so it cannot manufacture the terminator it
+/// exists to observe. Its whole purpose is to turn "nothing arrived for N seconds" from an ABSENCE — a
+/// reading indistinguishable from an instrument that was never reached — into an explicit line with a
+/// denominator. That is the exact failure under investigation: a response header, then silence.
+const BODY_HEARTBEAT_PERIOD: Duration = Duration::from_secs(5);
+
+/// Inactivity after which [`scrub_stream`] flushes the provably-safe part of its holdback instead of
+/// waiting for an upstream EOF that a stalled response never sends. Unlike [`BODY_IDLE_TIMEOUT`] this
+/// CANCELS nothing: it releases only bytes that cannot begin a split credential (see
+/// [`straddle_prefix_len`]) and keeps holding the trailing bytes that could. So the value bounds how long
+/// a stalled body is withheld; it is never a containment knob — any value is equally safe.
+const RESPONSE_HOLDBACK_FLUSH_IDLE: Duration = Duration::from_secs(15);
+
 /// The default real upstream for the Anthropic API-key path when the operator has not pointed the
 /// daemon at a custom gateway. Any resolved destination must appear on the proxy's allowlist before
 /// the real credential is substituted, so this constant also seeds the default allowlist entry.
@@ -191,15 +208,26 @@ const HOP_BY_HOP: &[&str] = &[
 ];
 
 /// One job's containment secret: the placeholder the container was handed, the real credential it
-/// stands in for, and the single approved upstream that credential may be substituted for.
+/// stands in for, and the approved upstream base URLs that credential may be substituted for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobCredential {
     /// The format-plausible value inside the container (`sk-ant-…`). Worthless if it leaks.
     pub placeholder: String,
     /// The real credential. Never enters the container; held only in this host process.
     pub real: String,
-    /// The approved real upstream base URL (scheme + host[:port]) this credential is valid for.
-    pub upstream: String,
+    /// The approved real upstream base URLs (scheme + host[:port]) this credential is valid for.
+    ///
+    /// The FIRST entry is the primary: it is where [`ProxyEngine::authorize`] — the primary
+    /// listener's path — forwards, exactly as a single-upstream credential always has. Every entry
+    /// past the first exists for a client whose separate legs go to separate hosts (measured on
+    /// cursor-agent: `--endpoint` moves the control plane and `--agent-endpoint` moves the agent
+    /// leg, and the two legs' true destinations differ). Each such entry is reachable only through
+    /// [`ProxyEngine::authorize_via`] from the leg listener bound for its authority.
+    ///
+    /// [`ProxyEngine::register`] refuses an empty list and refuses two entries naming the same
+    /// authority, so order inside the list never has to break a tie: at most one entry can match
+    /// any listener.
+    pub upstreams: Vec<String>,
 }
 
 /// Why a request was refused. Each variant means the real credential was NOT substituted — the
@@ -209,10 +237,18 @@ pub enum Refusal {
     /// No registered placeholder was found anywhere in the request. The proxy cannot identify a job,
     /// so it will not substitute any credential (no-fallback): the request fails.
     NoKnownPlaceholder,
-    /// A placeholder was found, but the resolved destination host is not on the allowlist. The real
-    /// credential is withheld and the request is refused — the load-bearing invariant that keeps this
-    /// from being worse than the status quo.
+    /// A placeholder was found, but the resolved destination host is not on the allowlist — or, on a
+    /// leg listener, not on the identified credential's own upstream list. The real credential is
+    /// withheld and the request is refused — the load-bearing invariant that keeps this from being
+    /// worse than the status quo.
     DestinationNotAllowed { host: String },
+    /// A credential was offered for registration with no upstream at all. Refused at registration so
+    /// the registry can never hold a credential with nowhere approved to go.
+    NoUpstream,
+    /// Two entries of one credential's upstream list resolve to the same authority. Refused rather
+    /// than tie-broken: a duplicate is a config error, and any tie-break rule would silently pick a
+    /// base URL the operator may not have meant (`https://a` vs `https://a:443/v2`).
+    DuplicateUpstream { host: String },
 }
 
 impl std::fmt::Display for Refusal {
@@ -223,6 +259,12 @@ impl std::fmt::Display for Refusal {
             }
             Self::DestinationNotAllowed { host } => {
                 write!(f, "destination {host} not on the credential-substitution allowlist")
+            }
+            Self::NoUpstream => {
+                write!(f, "credential lists no upstream; refusing registration")
+            }
+            Self::DuplicateUpstream { host } => {
+                write!(f, "credential lists {host} more than once; refusing registration")
             }
         }
     }
@@ -278,14 +320,26 @@ impl ProxyEngine {
         self.allowlist.iter().any(|allowed| same_authority(allowed, &key))
     }
 
-    /// Register a job's credential. Refuses (returns `Err`) if the credential's upstream is not on the
-    /// allowlist — a belt that keeps an unapproved destination from ever entering the registry, so a
-    /// registration bug cannot defeat the [`Self::authorize`] allowlist check downstream.
+    /// Register a job's credential. Refuses (returns `Err`) unless EVERY listed upstream is a
+    /// parseable base URL on the allowlist — a belt that keeps an unapproved destination from ever
+    /// entering the registry, so a registration bug cannot defeat the [`Self::authorize`] allowlist
+    /// check downstream. An empty list and two entries naming the same authority are refused here
+    /// too, which is what lets every later lookup treat the list as non-empty and tie-free.
     pub fn register(&self, cred: JobCredential) -> Result<(), Refusal> {
-        let host = authority_of(&cred.upstream)
-            .ok_or_else(|| Refusal::DestinationNotAllowed { host: cred.upstream.clone() })?;
-        if !self.allows(&host) {
-            return Err(Refusal::DestinationNotAllowed { host });
+        if cred.upstreams.is_empty() {
+            return Err(Refusal::NoUpstream);
+        }
+        let mut authorities: Vec<String> = Vec::with_capacity(cred.upstreams.len());
+        for upstream in &cred.upstreams {
+            let host = authority_of(upstream)
+                .ok_or_else(|| Refusal::DestinationNotAllowed { host: upstream.clone() })?;
+            if !self.allows(&host) {
+                return Err(Refusal::DestinationNotAllowed { host });
+            }
+            if authorities.iter().any(|seen| same_authority(seen, &host)) {
+                return Err(Refusal::DuplicateUpstream { host });
+            }
+            authorities.push(host);
         }
         self.creds.lock().unwrap().insert(cred.placeholder.clone(), cred);
         Ok(())
@@ -310,6 +364,41 @@ impl ProxyEngine {
     ///    [`Refusal::DestinationNotAllowed`] with NO substitution.
     /// 3. **Substitute** — replace the placeholder with the real credential in every header value.
     pub fn authorize(&self, headers: &[(String, String)]) -> Decision {
+        self.decide(headers, |cred| match cred.upstreams.first() {
+            Some(upstream) => Ok(upstream.clone()),
+            // Unreachable through `register`, which refuses an empty list. Refused rather than
+            // panicked so a future construction path turns a config error into a 4xx, not a crash.
+            None => Err(Refusal::NoUpstream),
+        })
+    }
+
+    /// The decision for one request arriving on the LEG listener bound for `via_authority`.
+    ///
+    /// Same steps as [`Self::authorize`], one difference: the destination is the identified
+    /// credential's OWN entry whose authority matches `via_authority`. The listener the request
+    /// physically arrived on is the selector — the container picks a destination only by which of
+    /// the base URLs it was handed it dials, every one of which this host chose. A credential that
+    /// never listed this authority is refused: a leg listener serves exactly the credentials that
+    /// named its leg, so one job's extra leg never widens where another job's credential may go.
+    pub fn authorize_via(&self, headers: &[(String, String)], via_authority: &str) -> Decision {
+        let via = host_key(via_authority);
+        self.decide(headers, move |cred| {
+            cred.upstreams
+                .iter()
+                .find(|u| authority_of(u).is_some_and(|a| same_authority(&a, &via)))
+                .cloned()
+                .ok_or(Refusal::DestinationNotAllowed { host: via })
+        })
+    }
+
+    /// Shared spine of [`Self::authorize`] and [`Self::authorize_via`]: identify the job by its
+    /// placeholder, let `select` pick the destination from the credential itself, hold that
+    /// destination to the allowlist, then substitute in header values only.
+    fn decide(
+        &self,
+        headers: &[(String, String)],
+        select: impl FnOnce(&JobCredential) -> Result<String, Refusal>,
+    ) -> Decision {
         let creds = self.creds.lock().unwrap();
         let Some(cred) = creds
             .values()
@@ -320,10 +409,12 @@ impl ProxyEngine {
         };
         drop(creds);
 
-        let Some(host) = authority_of(&cred.upstream) else {
-            return Decision::Refuse(Refusal::DestinationNotAllowed {
-                host: cred.upstream.clone(),
-            });
+        let upstream = match select(&cred) {
+            Ok(upstream) => upstream,
+            Err(refusal) => return Decision::Refuse(refusal),
+        };
+        let Some(host) = authority_of(&upstream) else {
+            return Decision::Refuse(Refusal::DestinationNotAllowed { host: upstream });
         };
         if !self.allows(&host) {
             return Decision::Refuse(Refusal::DestinationNotAllowed { host });
@@ -334,10 +425,7 @@ impl ProxyEngine {
             .filter(|(name, _)| !is_hop_by_hop(name))
             .map(|(name, value)| (name.clone(), value.replace(&cred.placeholder, &cred.real)))
             .collect();
-        Decision::Forward {
-            upstream: cred.upstream,
-            headers,
-        }
+        Decision::Forward { upstream, headers }
     }
 
     /// The real credential registered under `placeholder`, for the response scrub in [`relay`].
@@ -385,6 +473,16 @@ fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> 
         }
     }
     out
+}
+
+/// Length of the longest suffix of `buf` that is a proper prefix of `needle` — the only trailing bytes
+/// that a not-yet-arrived chunk could complete into a `needle` occurrence. [`replace_bytes`] has already
+/// removed every COMPLETE occurrence, so a split match can hold at most `needle.len() - 1` bytes here;
+/// everything before this suffix is provably not part of any `needle`, whole or split, whatever arrives
+/// next. [`scrub_stream`] uses it to flush a stalled holdback without ever releasing a partial credential.
+fn straddle_prefix_len(buf: &[u8], needle: &[u8]) -> usize {
+    let max = buf.len().min(needle.len().saturating_sub(1));
+    (1..=max).rev().find(|&j| buf[buf.len() - j..] == needle[..j]).unwrap_or(0)
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -598,8 +696,11 @@ fn random_token(len: usize) -> String {
 /// revocation point.
 pub struct RunningProxy {
     addr: SocketAddr,
+    /// `(authority, bound address)` for each leg listener, in the order handed to
+    /// [`start_with_legs`]. Empty for a proxy started without legs.
+    leg_addrs: Vec<(String, SocketAddr)>,
     engine: Arc<ProxyEngine>,
-    task: tokio::task::JoinHandle<()>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl RunningProxy {
@@ -633,12 +734,33 @@ impl RunningProxy {
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }
+
+    /// The base URL a container uses to reach the LEG listener bound for `authority`, reaching this
+    /// proxy at `host` — or `None` when no such leg was started. The same host/pinhole reasoning as
+    /// [`Self::container_base_url_via`] applies: every leg listener sits on the same address, only
+    /// the port differs, so the one pinholed address covers them all.
+    pub fn leg_base_url_via(&self, host: &str, authority: &str) -> Option<String> {
+        let want = host_key(authority);
+        self.leg_addrs
+            .iter()
+            .find(|(a, _)| same_authority(&host_key(a), &want))
+            .map(|(_, addr)| format!("http://{host}:{}", addr.port()))
+    }
+
+    /// The bound address of the leg listener for `authority` (for tests / diagnostics).
+    pub fn leg_addr(&self, authority: &str) -> Option<SocketAddr> {
+        let want = host_key(authority);
+        self.leg_addrs
+            .iter()
+            .find(|(a, _)| same_authority(&host_key(a), &want))
+            .map(|(_, addr)| *addr)
+    }
 }
 
 impl Drop for RunningProxy {
     fn drop(&mut self) {
         // JOB END IS A REVOCATION, and it has to reach connections that are ALREADY OPEN — not only
-        // the listener. Aborting this task drops the accept loop's `JoinSet`, and dropping a `JoinSet`
+        // the listener. Aborting each task drops that accept loop's `JoinSet`, and dropping a `JoinSet`
         // aborts every task in it, so every accepted connection dies here too.
         //
         // Closing the listener alone would not be revocation. It stops the NEXT client and says
@@ -647,7 +769,12 @@ impl Drop for RunningProxy {
         // credential-bearing stream open, or start new requests, for as long as it likes. With a
         // relayed body and no byte cap, "as long as it likes" is unbounded — see
         // `dropping_the_proxy_revokes_connections_it_has_already_accepted`.
-        self.task.abort();
+        //
+        // The legs die with the primary: a leg outliving the job would be a credential-bearing
+        // listener nobody owns.
+        for task in &self.tasks {
+            task.abort();
+        }
     }
 }
 
@@ -705,9 +832,29 @@ pub async fn start(
     engine: Arc<ProxyEngine>,
     ports: Option<crate::sandbox_net::PortRange>,
 ) -> std::io::Result<RunningProxy> {
+    start_with_legs(engine, ports, &[]).await
+}
+
+/// [`start`], plus one LEG listener per entry of `leg_authorities`.
+///
+/// A leg listener is the routing selector for a multi-upstream credential: a request arriving on it
+/// is authorized via [`ProxyEngine::authorize_via`] with that leg's authority, so it forwards to the
+/// identified credential's own entry for that authority — see [`JobCredential::upstreams`]. The
+/// primary listener keeps the exact semantics [`start`] always had.
+///
+/// Every listener binds from the SAME `ports` range, so a namespace-contained job's firewall
+/// pinhole — rendered from the range, never from a bound port — covers the legs with no new rules.
+/// One job therefore consumes `1 + leg_authorities.len()` ports from the range for its lifetime.
+/// All listeners share one connection ceiling and one in-flight ceiling: the bounds stay job-global,
+/// so an extra leg never widens what one job may hold open.
+pub async fn start_with_legs(
+    engine: Arc<ProxyEngine>,
+    ports: Option<crate::sandbox_net::PortRange>,
+    leg_authorities: &[String],
+) -> std::io::Result<RunningProxy> {
     let client = forwarding_client().map_err(std::io::Error::other)?;
     // KNOWN EXPOSURE, deliberately unchanged for now. `0.0.0.0` is every interface, so on a seller with
-    // a public IP and no firewall this per-job listener is internet-reachable on a random high port.
+    // a public IP and no firewall each per-job listener is internet-reachable on a random high port.
     // The placeholder is the bearer — a caller without it gets `NoKnownPlaceholder` — so this is not an
     // open relay. But the job HOLDS the placeholder by construction, so it can hand placeholder+port to
     // an outside accomplice, who can then burn the seller's model quota for the job's lifetime. Quota
@@ -718,13 +865,57 @@ pub async fn start(
     // bridge gateway (`--add-host …:host-gateway`), where a `127.0.0.1` bind is unreachable and the
     // correct target is the bridge address. Changing this needs a Linux docker seat to verify against;
     // until then, seller-operators on a public box should firewall inbound ports.
+    let connections = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    // Shared across every connection, every listener, and both protocols, so neither multiplexing nor
+    // an extra leg can widen it.
+    let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
+
     let listener = bind_listener(ports).await?;
     let addr = listener.local_addr()?;
-    let engine_for_task = Arc::clone(&engine);
-    let connections = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
-    // Shared across every connection and both protocols, so multiplexing cannot widen it.
-    let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
-    let task = tokio::spawn(async move {
+    let mut tasks = Vec::with_capacity(1 + leg_authorities.len());
+    tasks.push(spawn_accept_loop(
+        listener,
+        Arc::clone(&engine),
+        client.clone(),
+        Arc::clone(&connections),
+        Arc::clone(&in_flight),
+        None,
+    ));
+
+    let mut leg_addrs = Vec::with_capacity(leg_authorities.len());
+    for authority in leg_authorities {
+        let listener = bind_listener(ports).await?;
+        leg_addrs.push((authority.clone(), listener.local_addr()?));
+        tasks.push(spawn_accept_loop(
+            listener,
+            Arc::clone(&engine),
+            client.clone(),
+            Arc::clone(&connections),
+            Arc::clone(&in_flight),
+            Some(authority.clone()),
+        ));
+    }
+
+    eprintln!("proxy: listener kind=primary port={}", addr.port());
+    for (authority, leg_addr) in &leg_addrs {
+        eprintln!("proxy: listener kind=leg authority={authority} port={}", leg_addr.port());
+    }
+
+    Ok(RunningProxy { addr, leg_addrs, engine, tasks })
+}
+
+/// One listener's accept loop. `via_authority` is `None` for the primary listener and the leg's
+/// authority for a leg listener — it decides which authorize entry point every request on this
+/// listener goes through, and nothing else about the connection handling differs.
+fn spawn_accept_loop(
+    listener: tokio::net::TcpListener,
+    engine: Arc<ProxyEngine>,
+    client: reqwest::Client,
+    connections: Arc<Semaphore>,
+    in_flight: Arc<Semaphore>,
+    via_authority: Option<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         // EVERY CONNECTION IS OWNED BY THIS TASK, and that ownership is what makes job end a
         // revocation rather than a request to stop.
         //
@@ -751,9 +942,10 @@ pub async fn start(
             let Ok(permit) = Arc::clone(&connections).acquire_owned().await else {
                 continue; // semaphore closed — proxy shutting down
             };
-            let engine = Arc::clone(&engine_for_task);
+            let engine = Arc::clone(&engine);
             let client = client.clone();
             let in_flight = Arc::clone(&in_flight);
+            let via_authority = via_authority.clone();
             live.spawn(async move {
                 let _permit = permit; // released when the connection ends
                 let io = TokioIo::new(stream);
@@ -761,11 +953,12 @@ pub async fn start(
                     let engine = Arc::clone(&engine);
                     let client = client.clone();
                     let in_flight = Arc::clone(&in_flight);
+                    let via_authority = via_authority.clone();
                     async move {
                         // Held for the life of THIS request, so the ceiling counts requests rather
                         // than sockets. Excess requests wait here instead of each buffering a body.
                         let _in_flight = in_flight.acquire().await;
-                        handle_request(req, engine, client).await
+                        handle_request(req, engine, client, via_authority).await
                     }
                 });
                 // Auto-negotiating server: it sniffs the HTTP/2 prior-knowledge preface
@@ -788,11 +981,359 @@ pub async fn start(
                 let _ = builder.serve_connection(io, service).await;
             });
         }
-    });
-    Ok(RunningProxy { addr, engine, task })
+    })
 }
 
 type ProxyBody = BoxBody<Bytes, std::io::Error>;
+
+// --- Per-request diagnostic logging (leg-level observability) --------------------------------------
+//
+// Emitted to stderr as `proxy: key=value` lines, matching the daemon's existing `sandbox:` convention:
+// no logging dependency, no subscriber, so a line always reaches the seat's captured stderr. A line
+// NEVER carries a credential value, a placeholder, or any header/body byte — only authorities, hosts,
+// ports, protocols, phases, wall-clock timings and outcomes.
+//
+// The question this exists to answer is WHO ended a stalled await — the container that gave up, or the
+// upstream that dropped the request. A log recording only "no response" cannot tell those apart: they
+// are byte-identical downstream. `terminated_by=` is that field.
+static PROXY_REQ_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Milliseconds since the Unix epoch. The FORWARD line's stamp is the anchor every wait is measured
+/// from: the container's outbound send time is not otherwise observable, so a duration differenced
+/// against the nearest visible ACP event (a title notification, say) is anchored to the wrong instant.
+fn proxy_log_now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0)
+}
+
+/// Records `terminated_by=downstream` if dropped before the upstream terminated the await.
+///
+/// A forwarded request holds one of these across [`relay`]. [`AwaitGuard::settle`] is called the instant
+/// the upstream returns a response header OR an error, disarming it. If instead the container closes its
+/// connection while the proxy is still awaiting the upstream, hyper drops the request future, this value
+/// is dropped un-settled, and the drop records that the CONTAINER (downstream) ended the wait. That is
+/// the single field separating a client-side timeout from an upstream-side one.
+struct AwaitGuard {
+    req: u64,
+    host: String,
+    settled: bool,
+}
+
+impl AwaitGuard {
+    fn settle(&mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for AwaitGuard {
+    fn drop(&mut self) {
+        if !self.settled {
+            eprintln!(
+                "proxy: req#{} ts={} phase=await_response terminated_by=downstream host={}",
+                self.req,
+                proxy_log_now_ms(),
+                self.host,
+            );
+        }
+    }
+}
+
+/// Formats an optional timestamp as the number or `none`, so a `body_end` line for a stream that never
+/// yielded a byte still carries both fields — a missing field would read as a logging bug, not as "zero".
+struct OptTs(Option<u128>);
+
+impl std::fmt::Display for OptTs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(ts) => write!(f, "{ts}"),
+            None => f.write_str("none"),
+        }
+    }
+}
+
+/// Formats an optional byte length as the number or `none`, so a `forward_end` line for a leg with no
+/// credential to scrub still carries the `real_len` field. A missing field would read as a logging bug,
+/// and a `0` would read as "an empty credential" rather than "no credential on this leg". This is a
+/// LENGTH only — never the credential value; a length is not a secret, a prefix is.
+struct OptLen(Option<usize>);
+
+impl std::fmt::Display for OptLen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(len) => write!(f, "{len}"),
+            None => f.write_str("none"),
+        }
+    }
+}
+
+/// Observes the RESPONSE BODY — the region after the response header that [`AwaitGuard`] and the
+/// `await_response` line structurally cannot see. Wraps the raw upstream byte stream and is PASSIVE: it
+/// forwards every chunk unchanged and records only timings and the terminator.
+///
+/// It answers the body-phase form of the WHO-ended question:
+/// - `terminated_by=upstream kind=eof completed=true` — the upstream body ended naturally.
+/// - `terminated_by=upstream kind=error` — the upstream body errored (reset / GOAWAY / decode).
+/// - `terminated_by=downstream` — dropped before either terminal, i.e. hyper dropped the body because
+///   the container closed its connection mid-stream. This is the body-phase analogue of [`AwaitGuard`],
+///   and the ONLY way to observe a client that gives up AFTER the header.
+///
+/// `last_byte_ts` is the discriminator for a mid-stream stall: the gap from it to the `body_end` line is
+/// the stall interval, both ends real events in this same log. And while the body produces no bytes at
+/// all, a [`BODY_HEARTBEAT_PERIOD`] clock emits `body_idle` lines — so "a header then N seconds of
+/// nothing" (the failure under investigation) is a POSITIVE reading with a denominator, not the absence
+/// of a `body_end` line, which is indistinguishable from a request that never reached the body phase.
+/// The clock only EMITS; it never cancels, so it cannot manufacture the terminator this meter finds.
+struct BodyMeter {
+    // `+ Sync` as well as `+ Send`: the boxed response body (`BoxBody` via `BodyExt::boxed`) requires
+    // `Send + Sync`, and the concrete upstream stream satisfies both — erasing to `dyn … + Send` alone
+    // would drop `Sync` and fail the bound.
+    inner: std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send + Sync>>,
+    req: u64,
+    host: String,
+    // The observed response-header instant: the anchor `body_first_byte` and every `body_idle` gap are
+    // measured from it, both ends real events in this log rather than a value differenced against the
+    // nearest ACP notification.
+    header_ts: u128,
+    bytes: u64,
+    first_byte_ts: Option<u128>,
+    last_byte_ts: Option<u128>,
+    // Log-only clock: fires while the upstream body yields nothing, so an idle stall is an explicit line
+    // rather than silence. Polled but NEVER used to cancel — see [`BODY_HEARTBEAT_PERIOD`].
+    heartbeat: tokio::time::Interval,
+    // Set once the UPSTREAM terminates (EOF or error) so Drop does not then record a spurious
+    // `terminated_by=downstream` — the upstream terminal and the eventual drop are the same stream's end.
+    ended: bool,
+}
+
+impl futures_util::Stream for BodyMeter {
+    type Item = reqwest::Result<Bytes>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // `Self: Unpin` (every field is), so unwrapping the pin needs no projection crate.
+        let this = self.get_mut();
+        match futures_util::Stream::poll_next(this.inner.as_mut(), cx) {
+            std::task::Poll::Ready(Some(Ok(chunk))) => {
+                let now = proxy_log_now_ms();
+                if this.first_byte_ts.is_none() {
+                    this.first_byte_ts = Some(now);
+                    eprintln!(
+                        "proxy: req#{} ts={now} phase=body_first_byte host={} gap_from_header_ms={}",
+                        this.req,
+                        this.host,
+                        now.saturating_sub(this.header_ts),
+                    );
+                }
+                this.bytes += chunk.len() as u64;
+                this.last_byte_ts = Some(now);
+                std::task::Poll::Ready(Some(Ok(chunk)))
+            }
+            std::task::Poll::Ready(Some(Err(error))) => {
+                this.ended = true;
+                eprintln!(
+                    "proxy: req#{} ts={} phase=body_end terminated_by=upstream kind=error host={} bytes={} completed=false first_byte_ts={} last_byte_ts={} msg={error}",
+                    this.req,
+                    proxy_log_now_ms(),
+                    this.host,
+                    this.bytes,
+                    OptTs(this.first_byte_ts),
+                    OptTs(this.last_byte_ts),
+                );
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            std::task::Poll::Ready(None) => {
+                this.ended = true;
+                let now = proxy_log_now_ms();
+                eprintln!(
+                    "proxy: req#{} ts={now} phase=body_end terminated_by=upstream kind=eof host={} bytes={} completed=true first_byte_ts={} last_byte_ts={}",
+                    this.req,
+                    this.host,
+                    this.bytes,
+                    OptTs(this.first_byte_ts),
+                    OptTs(this.last_byte_ts),
+                );
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => {
+                // Upstream has nothing right now. Drive the heartbeat so a silent body is an explicit
+                // reading rather than an absence. Polling the interval registers its waker on `cx`, so
+                // the task is re-polled each period even while the upstream stays parked; the upstream's
+                // own waker is already registered from the `poll_next` above, so a real byte still wakes
+                // us. Draining every ready tick keeps it to one line per elapsed period.
+                while this.heartbeat.poll_tick(cx).is_ready() {
+                    let now = proxy_log_now_ms();
+                    eprintln!(
+                        "proxy: req#{} ts={now} phase=body_idle host={} bytes={} gap_from_header_ms={}",
+                        this.req,
+                        this.host,
+                        this.bytes,
+                        now.saturating_sub(this.header_ts),
+                    );
+                }
+                std::task::Poll::Pending
+            }
+        }
+    }
+}
+
+impl Drop for BodyMeter {
+    fn drop(&mut self) {
+        // Un-ended at drop ⇒ the body pipeline was torn down before the upstream itself finished, which
+        // happens when hyper drops the response because the container closed its connection mid-stream.
+        if !self.ended {
+            eprintln!(
+                "proxy: req#{} ts={} phase=body_end terminated_by=downstream host={} bytes={} completed=false first_byte_ts={} last_byte_ts={}",
+                self.req,
+                proxy_log_now_ms(),
+                self.host,
+                self.bytes,
+                OptTs(self.first_byte_ts),
+                OptTs(self.last_byte_ts),
+            );
+        }
+    }
+}
+
+/// Observes the DOWNSTREAM-FORWARDED body — the frames that actually leave the proxy for the container,
+/// AFTER [`scrub_stream`] (or the no-scrub `map`) has run. [`BodyMeter`] sits BEFORE scrub and counts
+/// bytes RECEIVED from the upstream; this counts bytes FORWARDED to hyper. Reading `body_*` beside
+/// `forward_*` for one request separates "the upstream sent little" from "the proxy forwarded little of
+/// what the upstream sent".
+///
+/// The gap between the two meters is the credential-scrub holdback: [`scrub_stream`] withholds the last
+/// `real.len() - 1` bytes of the stream — the longest possible partial credential match — and flushes it
+/// only when the upstream ENDS. On an upstream STALL (bytes then no EOF), bytes that BodyMeter has
+/// already counted may not yet be forwarded here. This meter only MEASURES that gap; it changes nothing
+/// about when the carry flushes, because that is a containment boundary, not a streaming knob.
+///
+/// PASSIVE, exactly like [`BodyMeter`]: forwards every frame unchanged, records only counts, timings and
+/// the terminator, and its heartbeat only EMITS — it never cancels, so it cannot manufacture the
+/// terminator it observes. LOGS NO CREDENTIAL MATERIAL: `real_len` is the LENGTH of the credential
+/// string only, never its value, never the carry buffer, never a matched region or offset.
+struct ForwardMeter {
+    inner: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<Frame<Bytes>, std::io::Error>> + Send + Sync>,
+    >,
+    req: u64,
+    host: String,
+    // The same observed response-header instant [`BodyMeter`] measures from, so `forward_*` gaps and
+    // `body_*` gaps share one origin and read directly against each other.
+    header_ts: u128,
+    // Bytes ACTUALLY forwarded downstream: the running sum of forwarded `Frame::data` payload lengths.
+    bytes: u64,
+    first_ts: Option<u128>,
+    last_ts: Option<u128>,
+    // LENGTH of the credential scrubbed on this leg (`None` on a leg with no scrub). The holdback is
+    // `real_len - 1` bytes, so this is the parameter that predicts how much a stalled stream withholds.
+    real_len: Option<usize>,
+    // Log-only clock, same discipline as [`BodyMeter`]'s heartbeat: emits `forward_idle` while nothing is
+    // forwarded, so "the upstream trickled bytes but the proxy forwarded none" is a POSITIVE reading with
+    // a denominator rather than an absence. Polled but NEVER used to cancel.
+    heartbeat: tokio::time::Interval,
+    // Set once the forwarded stream terminates (its own EOF or error) so Drop does not then record a
+    // spurious `terminated_by=downstream`.
+    ended: bool,
+}
+
+impl futures_util::Stream for ForwardMeter {
+    type Item = Result<Frame<Bytes>, std::io::Error>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // `Self: Unpin` (every field is), so unwrapping the pin needs no projection crate.
+        let this = self.get_mut();
+        match futures_util::Stream::poll_next(this.inner.as_mut(), cx) {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                let now = proxy_log_now_ms();
+                if this.first_ts.is_none() {
+                    this.first_ts = Some(now);
+                    eprintln!(
+                        "proxy: req#{} ts={now} phase=forward_first host={} gap_from_header_ms={}",
+                        this.req,
+                        this.host,
+                        now.saturating_sub(this.header_ts),
+                    );
+                }
+                // Only DATA frames carry body bytes; a trailers frame contributes zero.
+                this.bytes += frame.data_ref().map_or(0, Bytes::len) as u64;
+                this.last_ts = Some(now);
+                std::task::Poll::Ready(Some(Ok(frame)))
+            }
+            std::task::Poll::Ready(Some(Err(error))) => {
+                this.ended = true;
+                eprintln!(
+                    "proxy: req#{} ts={} phase=forward_end terminated_by=upstream kind=error host={} bytes={} real_len={} first_ts={} last_ts={} msg={error}",
+                    this.req,
+                    proxy_log_now_ms(),
+                    this.host,
+                    this.bytes,
+                    OptLen(this.real_len),
+                    OptTs(this.first_ts),
+                    OptTs(this.last_ts),
+                );
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            std::task::Poll::Ready(None) => {
+                this.ended = true;
+                let now = proxy_log_now_ms();
+                eprintln!(
+                    "proxy: req#{} ts={now} phase=forward_end terminated_by=upstream kind=eof host={} bytes={} real_len={} first_ts={} last_ts={}",
+                    this.req,
+                    this.host,
+                    this.bytes,
+                    OptLen(this.real_len),
+                    OptTs(this.first_ts),
+                    OptTs(this.last_ts),
+                );
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => {
+                // The forwarded stream has nothing right now — either the upstream is parked or scrub is
+                // holding its carry back. Drive the heartbeat so the withheld case is an explicit line
+                // rather than an absence. Same waker mechanics as [`BodyMeter`]: polling the interval
+                // registers its waker, and the inner stream's waker is already registered from the poll
+                // above, so a real frame still wakes us immediately.
+                while this.heartbeat.poll_tick(cx).is_ready() {
+                    let now = proxy_log_now_ms();
+                    eprintln!(
+                        "proxy: req#{} ts={now} phase=forward_idle host={} bytes={} gap_from_header_ms={}",
+                        this.req,
+                        this.host,
+                        this.bytes,
+                        now.saturating_sub(this.header_ts),
+                    );
+                }
+                std::task::Poll::Pending
+            }
+        }
+    }
+}
+
+impl Drop for ForwardMeter {
+    fn drop(&mut self) {
+        // Un-ended at drop ⇒ the forwarded stream was torn down before it finished, i.e. hyper dropped
+        // the body because the container closed its connection mid-stream. `bytes` is then the total the
+        // proxy managed to forward before the client gave up — the number the holdback hypothesis predicts.
+        if !self.ended {
+            eprintln!(
+                "proxy: req#{} ts={} phase=forward_end terminated_by=downstream host={} bytes={} real_len={} first_ts={} last_ts={}",
+                self.req,
+                proxy_log_now_ms(),
+                self.host,
+                self.bytes,
+                OptLen(self.real_len),
+                OptTs(self.first_ts),
+                OptTs(self.last_ts),
+            );
+        }
+    }
+}
 
 /// Serve one request: run its HEADERS through [`ProxyEngine::authorize`] and — only on a substituted
 /// forward — stream its body to the real upstream and stream the response back. A refusal returns a
@@ -805,8 +1346,18 @@ async fn handle_request(
     req: Request<Incoming>,
     engine: Arc<ProxyEngine>,
     client: reqwest::Client,
+    via_authority: Option<String>,
 ) -> Result<Response<ProxyBody>, std::convert::Infallible> {
     let method = req.method().clone();
+    let proxy_req = PROXY_REQ_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // `req.version()` is the NEGOTIATED protocol (HTTP/2.0 for the h2c legs, HTTP/1.1 otherwise) — it
+    // decides whether an http1-only timeout like `header_read_timeout` is even in scope for this leg.
+    let listener_label = via_authority.as_deref().unwrap_or("primary").to_owned();
+    eprintln!(
+        "proxy: req#{proxy_req} ts={} phase=arrived listener={listener_label} proto={:?} method={method}",
+        proxy_log_now_ms(),
+        req.version(),
+    );
     // The path+query is forwarded verbatim; it is never a substitution input.
     let path_and_query = req
         .uri()
@@ -829,15 +1380,34 @@ async fn handle_request(
     // deliberately not a substitution surface (see "Why the BODY is never a substitution surface" in
     // the module header), so the body was never an input to this decision. Deciding first means a
     // request we refuse costs us nothing at all: we answer from the headers and drop the body unread.
-    match engine.authorize(&headers) {
+    // Which entry point decides is a property of the LISTENER the request arrived on: the primary
+    // listener forwards to the credential's primary upstream, a leg listener to the credential's own
+    // entry for that leg's authority. Same steps, same refusals — only the selector differs.
+    let decision = match via_authority.as_deref() {
+        None => engine.authorize(&headers),
+        Some(authority) => engine.authorize_via(&headers, authority),
+    };
+    match decision {
         Decision::Refuse(reason) => {
+            eprintln!(
+                "proxy: req#{proxy_req} ts={} phase=authorize outcome=refuse reason={reason}",
+                proxy_log_now_ms(),
+            );
             let status = match reason {
                 Refusal::DestinationNotAllowed { .. } => StatusCode::FORBIDDEN,
                 Refusal::NoKnownPlaceholder => StatusCode::BAD_GATEWAY,
+                // Registration-time refusals; reachable here only through `authorize`'s defensive
+                // empty-list arm, never through a credential `register` accepted.
+                Refusal::NoUpstream | Refusal::DuplicateUpstream { .. } => StatusCode::FORBIDDEN,
             };
             Ok(refusal_response(status, &reason.to_string()))
         }
         Decision::Forward { upstream, headers } => {
+            let host = authority_of(&upstream).unwrap_or_else(|| upstream.clone());
+            eprintln!(
+                "proxy: req#{proxy_req} ts={} phase=forward host={host}",
+                proxy_log_now_ms(),
+            );
             // The body is RELAYED, never accumulated: each chunk goes upstream as it arrives, so the
             // daemon holds one chunk rather than a whole request, and a client that never closes its
             // body is no longer a client we wait for forever. It is forwarded VERBATIM — the decision
@@ -846,11 +1416,35 @@ async fn handle_request(
                 req.into_body().into_data_stream(),
                 BODY_IDLE_TIMEOUT,
             ));
-            match relay(&client, &method, &upstream, &path_and_query, headers, body, scrub).await {
+            // Held across the await. `settle` disarms it the instant the upstream terminates the await
+            // (a response header or an error); if the CONTAINER closes first, this drops un-settled and
+            // records `terminated_by=downstream` — the field that tells a client timeout from an
+            // upstream drop, which are otherwise byte-identical as "no response".
+            let mut await_guard = AwaitGuard { req: proxy_req, host: host.clone(), settled: false };
+            let outcome = relay(
+                &client,
+                &method,
+                &upstream,
+                &path_and_query,
+                headers,
+                body,
+                scrub,
+                proxy_req,
+                &host,
+            )
+            .await;
+            await_guard.settle();
+            match outcome {
                 Ok(response) => Ok(response),
                 // No-fallback: an upstream failure fails the request; it never resends without the
                 // proxy or with the real credential in the container.
-                Err(message) => Ok(refusal_response(StatusCode::BAD_GATEWAY, &message)),
+                Err(message) => {
+                    eprintln!(
+                        "proxy: req#{proxy_req} ts={} phase=await_response terminated_by=upstream kind=error host={host} msg={message}",
+                        proxy_log_now_ms(),
+                    );
+                    Ok(refusal_response(StatusCode::BAD_GATEWAY, &message))
+                }
             }
         }
     }
@@ -873,6 +1467,8 @@ async fn relay(
     headers: Vec<(String, String)>,
     body: reqwest::Body,
     scrub: Option<(String, String)>,
+    req: u64,
+    host: &str,
 ) -> Result<Response<ProxyBody>, String> {
     let url = format!("{}{}", upstream.trim_end_matches('/'), path_and_query);
     let method = reqwest::Method::from_bytes(method.as_str().as_bytes())
@@ -881,12 +1477,26 @@ async fn relay(
     for (name, value) in headers {
         request = request.header(name, value);
     }
+    // The anchor for this request's wait: the outbound send, otherwise unobservable. Every duration
+    // derived downstream is measured from THIS `ts`, never from the nearest visible event.
+    eprintln!(
+        "proxy: req#{req} ts={} phase=await_send host={host}",
+        proxy_log_now_ms(),
+    );
     let upstream_response = request
         .send()
         .await
         .map_err(|error| format!("upstream request failed: {error}"))?;
 
     let status = upstream_response.status();
+    // The upstream terminated the await by answering. Pairs with `await_send` above: the interval
+    // between these two `ts` values IS the send->response-header wait for this request. Held as the
+    // anchor `BodyMeter` measures time-to-first-byte from — the same event, not a nearby proxy for it.
+    let header_ts = proxy_log_now_ms();
+    eprintln!(
+        "proxy: req#{req} ts={header_ts} phase=await_response terminated_by=upstream kind=response_header host={host} status={}",
+        status.as_u16(),
+    );
     let mut builder = Response::builder().status(status.as_u16());
     for (name, value) in upstream_response.headers() {
         if is_hop_by_hop(name.as_str()) {
@@ -901,15 +1511,59 @@ async fn relay(
             _ => builder = builder.header(name, value),
         }
     }
-    let upstream_body = Box::pin(upstream_response.bytes_stream());
-    let body = match scrub {
-        Some((real, placeholder)) => {
-            BodyExt::boxed(StreamBody::new(scrub_stream(upstream_body, real, placeholder)))
-        }
-        None => BodyExt::boxed(StreamBody::new(
-            upstream_body.map(|chunk| chunk.map(Frame::data).map_err(std::io::Error::other)),
-        )),
+    // Instrument the response body — the region after the header that `await_response` cannot see.
+    // Passive: it forwards every chunk unchanged and records only timings and the terminator; on Drop
+    // (hyper dropping the body because the container closed mid-stream) it records
+    // `terminated_by=downstream`, the body-phase analogue of `AwaitGuard`.
+    // First tick one full period out, not immediately; `Skip` so a delayed poll collapses missed ticks
+    // to a single line rather than a catch-up burst.
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + BODY_HEARTBEAT_PERIOD,
+        BODY_HEARTBEAT_PERIOD,
+    );
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let metered = BodyMeter {
+        inner: Box::pin(upstream_response.bytes_stream()),
+        req,
+        host: host.to_owned(),
+        header_ts,
+        bytes: 0,
+        first_byte_ts: None,
+        last_byte_ts: None,
+        heartbeat,
+        ended: false,
     };
+    // Second meter, DOWNSTREAM of scrub: `metered` (BodyMeter) counted what the upstream SENT; this
+    // counts what the proxy FORWARDS after scrub. The credential length is captured before `scrub` is
+    // consumed by the match. Same heartbeat discipline as the upstream meter so "received bytes, forwarded
+    // none" is a positive `forward_idle` reading rather than silence.
+    let real_len = scrub.as_ref().map(|(real, _)| real.len());
+    let forwarded: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<Frame<Bytes>, std::io::Error>> + Send + Sync>,
+    > = match scrub {
+        Some((real, placeholder)) => {
+            Box::pin(scrub_stream(metered, real, placeholder, RESPONSE_HOLDBACK_FLUSH_IDLE))
+        }
+        None => Box::pin(metered.map(|chunk| chunk.map(Frame::data).map_err(std::io::Error::other))),
+    };
+    let mut forward_heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + BODY_HEARTBEAT_PERIOD,
+        BODY_HEARTBEAT_PERIOD,
+    );
+    forward_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let forward_metered = ForwardMeter {
+        inner: forwarded,
+        req,
+        host: host.to_owned(),
+        header_ts,
+        bytes: 0,
+        first_ts: None,
+        last_ts: None,
+        real_len,
+        heartbeat: forward_heartbeat,
+        ended: false,
+    };
+    let body = BodyExt::boxed(StreamBody::new(forward_metered));
     builder
         .body(body)
         .map_err(|error| format!("building proxied response failed: {error}"))
@@ -964,19 +1618,31 @@ where
 ///
 /// A credential can straddle a chunk boundary, so a naive per-chunk replace would miss it. This holds
 /// back the last `real.len() - 1` bytes of what it would otherwise emit — the longest possible partial
-/// match — and re-examines them once the next chunk arrives. The held-back tail is flushed when the
-/// upstream stream ends.
+/// match — and re-examines them once the next chunk arrives. The held-back tail is flushed in full when
+/// the upstream stream ends, because no later chunk can then straddle into it.
+///
+/// A stalled upstream — bytes received, then silence with NO EOF — would otherwise hold that tail
+/// forever, starving the container of a body it already sent. So after `idle` of inactivity this flushes
+/// the part of the carry that [`straddle_prefix_len`] proves cannot begin a split credential, and keeps
+/// holding only the trailing bytes that still could. That release is a strict subset of the EOF flush:
+/// it never forwards a byte the containment boundary would withhold, for any value of `idle`.
 ///
 /// SSE responses stay streaming: each chunk is forwarded as it arrives, minus that small carry-over.
 fn scrub_stream<S>(
     inner: S,
     real: String,
     placeholder: String,
+    idle: Duration,
 ) -> impl futures_util::Stream<Item = Result<Frame<Bytes>, std::io::Error>>
 where
     S: futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin,
 {
     // `None` inner ⇒ the stream is finished (ended or errored); stop yielding.
+    // One turn of the loop: the upstream yielded (or ended), or the idle timer fired first.
+    enum Step {
+        Upstream(Option<reqwest::Result<Bytes>>),
+        Idle,
+    }
     futures_util::stream::unfold(
         (Some(inner), Vec::<u8>::new()),
         move |(inner, carry)| {
@@ -985,8 +1651,16 @@ where
                 let mut inner = inner?;
                 let mut carry = carry;
                 loop {
-                    match inner.next().await {
-                        Some(Ok(chunk)) => {
+                    // Race the upstream against an inactivity timer. `biased` prefers real progress, so
+                    // only a genuine gap of `idle` with nothing ready reaches `Idle`; a fresh sleep each
+                    // iteration measures inactivity since the last chunk, not elapsed total.
+                    let step = tokio::select! {
+                        biased;
+                        item = inner.next() => Step::Upstream(item),
+                        _ = tokio::time::sleep(idle) => Step::Idle,
+                    };
+                    match step {
+                        Step::Upstream(Some(Ok(chunk))) => {
                             carry.extend_from_slice(&chunk);
                             let replaced =
                                 replace_bytes(&carry, real.as_bytes(), placeholder.as_bytes());
@@ -1002,16 +1676,33 @@ where
                             let rest = replaced[split..].to_vec();
                             return Some((Ok(Frame::data(emit)), (Some(inner), rest)));
                         }
-                        Some(Err(error)) => {
+                        Step::Upstream(Some(Err(error))) => {
                             return Some((Err(std::io::Error::other(error)), (None, Vec::new())));
                         }
-                        None => {
+                        Step::Upstream(None) => {
                             let tail =
                                 replace_bytes(&carry, real.as_bytes(), placeholder.as_bytes());
                             if tail.is_empty() {
                                 return None;
                             }
                             return Some((Ok(Frame::data(Bytes::from(tail))), (None, Vec::new())));
+                        }
+                        Step::Idle => {
+                            // Release the carry MINUS its longest suffix that could still begin a
+                            // credential, instead of waiting for an EOF a stalled stream never sends.
+                            let replaced =
+                                replace_bytes(&carry, real.as_bytes(), placeholder.as_bytes());
+                            let held = straddle_prefix_len(&replaced, real.as_bytes());
+                            let safe = replaced.len() - held;
+                            if safe == 0 {
+                                // Carry empty or entirely a credential prefix — nothing provably safe to
+                                // release. Keep holding; forwarding here would leak a partial credential.
+                                carry = replaced;
+                                continue;
+                            }
+                            let emit = Bytes::copy_from_slice(&replaced[..safe]);
+                            let rest = replaced[safe..].to_vec();
+                            return Some((Ok(Frame::data(emit)), (Some(inner), rest)));
                         }
                     }
                 }
@@ -1051,7 +1742,7 @@ mod tests {
             JobCredential {
                 placeholder: placeholder.to_owned(),
                 real: REAL.to_owned(),
-                upstream: upstream.to_owned(),
+                upstreams: vec![upstream.to_owned()],
             },
         );
         engine
@@ -1123,6 +1814,194 @@ mod tests {
         }
     }
 
+    // BACK-COMPAT IS THE ACCEPTANCE: a credential listing ONE upstream is decided exactly as it
+    // always was — same Forward, same substitution target, same refusal shapes. The claude/codex
+    // path IS this case (every env-sourced credential registers a one-entry list), so this test is
+    // the direct answer to "does multi-upstream change anything for the existing seats".
+    #[test]
+    fn a_single_upstream_credential_is_decided_exactly_as_before() {
+        let upstream = "https://api.anthropic.com".to_owned();
+        let engine = ProxyEngine::new([authority_of(&upstream).unwrap()]);
+        engine
+            .register(JobCredential {
+                placeholder: "PLACEHOLDER".into(),
+                real: "REAL_VALUE".into(),
+                upstreams: vec![upstream.clone()],
+            })
+            .expect("a single-upstream credential must register exactly as before");
+        let headers = vec![("authorization".to_owned(), "Bearer PLACEHOLDER".to_owned())];
+        match engine.authorize(&headers) {
+            Decision::Forward { upstream: chosen, headers } => {
+                assert_eq!(chosen, upstream, "the primary path must forward to the one upstream");
+                assert_eq!(
+                    headers,
+                    vec![("authorization".to_owned(), "Bearer REAL_VALUE".to_owned())],
+                    "substitution must be unchanged"
+                );
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    // The primary path never looks past the first entry: extra legs change nothing for traffic on
+    // the primary listener.
+    #[test]
+    fn the_primary_path_ignores_extra_legs() {
+        let a = "https://api2.cursor.sh".to_owned();
+        let b = "https://agent.cursor.example".to_owned();
+        let engine =
+            ProxyEngine::new([authority_of(&a).unwrap(), authority_of(&b).unwrap()]);
+        engine
+            .register(JobCredential {
+                placeholder: "PLACEHOLDER".into(),
+                real: "REAL_VALUE".into(),
+                upstreams: vec![a.clone(), b],
+            })
+            .expect("a two-upstream credential must register");
+        let headers = vec![("authorization".to_owned(), "PLACEHOLDER".to_owned())];
+        match engine.authorize(&headers) {
+            Decision::Forward { upstream, .. } => {
+                assert_eq!(upstream, a, "authorize must pick the FIRST entry, always");
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    // A leg listener serves exactly the credentials that listed its authority: one job's extra leg
+    // never widens where another job's credential may go, even with both authorities allowlisted.
+    #[test]
+    fn a_leg_listener_serves_only_credentials_that_listed_its_authority() {
+        let a = "https://api2.cursor.sh".to_owned();
+        let b = "https://agent.cursor.example".to_owned();
+        let b_authority = authority_of(&b).unwrap();
+        let engine =
+            ProxyEngine::new([authority_of(&a).unwrap(), b_authority.clone()]);
+        engine
+            .register(JobCredential {
+                placeholder: "LISTS_BOTH".into(),
+                real: "REAL_BOTH".into(),
+                upstreams: vec![a.clone(), b.clone()],
+            })
+            .expect("the two-upstream credential must register");
+        engine
+            .register(JobCredential {
+                placeholder: "LISTS_A_ONLY".into(),
+                real: "REAL_A".into(),
+                upstreams: vec![a],
+            })
+            .expect("the one-upstream credential must register");
+
+        let both = vec![("authorization".to_owned(), "LISTS_BOTH".to_owned())];
+        match engine.authorize_via(&both, &b_authority) {
+            Decision::Forward { upstream, .. } => {
+                assert_eq!(upstream, b, "the leg must forward to the credential's OWN entry for it");
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
+
+        let a_only = vec![("authorization".to_owned(), "LISTS_A_ONLY".to_owned())];
+        match engine.authorize_via(&a_only, &b_authority) {
+            Decision::Refuse(Refusal::DestinationNotAllowed { host }) => {
+                assert_eq!(host, b_authority, "the refusal must name the leg it refused");
+            }
+            other => panic!(
+                "a credential that never listed this leg must be refused on it, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn register_refuses_an_empty_upstream_list() {
+        let engine = ProxyEngine::new(["api.anthropic.com".to_owned()]);
+        let refusal = engine
+            .register(JobCredential {
+                placeholder: "PLACEHOLDER".into(),
+                real: "REAL_VALUE".into(),
+                upstreams: vec![],
+            })
+            .expect_err("an upstream-less credential must be refused");
+        assert_eq!(refusal, Refusal::NoUpstream);
+    }
+
+    // Two entries naming one authority are refused rather than tie-broken — including the shape
+    // where they differ only by an explicit default port and a path, which is how a real config
+    // would most plausibly produce the duplicate.
+    #[test]
+    fn register_refuses_two_entries_naming_one_authority() {
+        let engine = ProxyEngine::new(["api2.cursor.sh".to_owned()]);
+        let refusal = engine
+            .register(JobCredential {
+                placeholder: "PLACEHOLDER".into(),
+                real: "REAL_VALUE".into(),
+                upstreams: vec![
+                    "https://api2.cursor.sh".to_owned(),
+                    "https://api2.cursor.sh:443/v2".to_owned(),
+                ],
+            })
+            .expect_err("two entries for one authority must be refused");
+        assert_eq!(
+            refusal,
+            Refusal::DuplicateUpstream { host: "api2.cursor.sh:443".to_owned() }
+        );
+    }
+
+    // MULTI-UPSTREAM END TO END: WHICH LISTENER A REQUEST ARRIVES ON IS THE SELECTOR. One
+    // credential lists two upstreams; the SAME placeholder sent to the primary listener reaches the
+    // primary stub and sent to the leg listener reaches the leg stub, each with the REAL credential
+    // substituted. The container-side story in one test: the base URL a leg was handed is the only
+    // thing that routes it, and it can reach nothing the credential did not list.
+    #[tokio::test]
+    async fn the_listener_a_request_arrives_on_selects_the_upstream() {
+        let (primary_addr, _primary_stub) = spawn_stub("PRIMARY_OK").await;
+        let (leg_addr, leg_stub) = spawn_stub("LEG_OK").await;
+        let primary = format!("http://{primary_addr}");
+        let leg = format!("http://{leg_addr}");
+        let leg_authority = authority_of(&leg).unwrap();
+        let engine = Arc::new(ProxyEngine::new([
+            authority_of(&primary).unwrap(),
+            leg_authority.clone(),
+        ]));
+        let placeholder = mint_anthropic_placeholder();
+        engine
+            .register(JobCredential {
+                placeholder: placeholder.clone(),
+                real: REAL.to_owned(),
+                upstreams: vec![primary, leg],
+            })
+            .expect("a two-upstream credential must register");
+        let running = start_with_legs(Arc::clone(&engine), None, &[leg_authority.clone()])
+            .await
+            .expect("a proxy with one leg must start");
+
+        let client = reqwest::Client::new();
+        let primary_answer = client
+            .get(format!("http://127.0.0.1:{}/v1/messages", running.local_addr().port()))
+            .header("x-api-key", &placeholder)
+            .send()
+            .await
+            .expect("the primary listener must answer");
+        assert_eq!(primary_answer.text().await.unwrap(), "PRIMARY_OK");
+
+        let leg_port = running
+            .leg_addr(&leg_authority)
+            .expect("the leg listener must exist")
+            .port();
+        let leg_answer = client
+            .get(format!("http://127.0.0.1:{leg_port}/v1/agent"))
+            .header("x-api-key", &placeholder)
+            .send()
+            .await
+            .expect("the leg listener must answer");
+        assert_eq!(leg_answer.text().await.unwrap(), "LEG_OK");
+
+        let seen_by_leg = leg_stub.await.expect("the leg stub must have been reached");
+        assert_eq!(
+            seen_by_leg.api_key.as_deref(),
+            Some(REAL),
+            "the leg upstream must see the REAL credential, substituted from the placeholder"
+        );
+    }
+
     // THE ATTACK THIS MODULE'S BODY EXCLUSION EXISTS FOR, end to end through a live proxy.
     //
     // A job authors its own request body. When the proxy substituted there, a job could plant its
@@ -1139,7 +2018,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -1226,13 +2105,13 @@ mod tests {
         let bad = JobCredential {
             placeholder: mint_anthropic_placeholder(),
             real: REAL.to_owned(),
-            upstream: "https://evil.example.com".to_owned(),
+            upstreams: vec!["https://evil.example.com".to_owned()],
         };
         assert!(matches!(engine.register(bad), Err(Refusal::DestinationNotAllowed { .. })));
         let good = JobCredential {
             placeholder: mint_anthropic_placeholder(),
             real: REAL.to_owned(),
-            upstream: UPSTREAM.to_owned(),
+            upstreams: vec![UPSTREAM.to_owned()],
         };
         assert!(engine.register(good).is_ok());
     }
@@ -1433,7 +2312,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -1566,6 +2445,7 @@ mod tests {
             futures_util::stream::iter(frames),
             REAL.to_owned(),
             placeholder.clone(),
+            RESPONSE_HOLDBACK_FLUSH_IDLE,
         );
         let collected: Vec<u8> = scrubbed
             .try_fold(Vec::new(), |mut acc, frame| async move {
@@ -1585,6 +2465,85 @@ mod tests {
         assert!(!text.contains(REAL), "no fragment of the real credential survives");
     }
 
+    // A STALLED upstream — bytes received, then silence with NO EOF — once left scrub_stream's holdback
+    // withheld forever: the tail flushed ONLY on the `None`/EOF arm, which a stalled stream never
+    // reaches, so the container got `received - (real.len() - 1)` bytes and no more — the credential-
+    // scrub half of the "200 header, short-or-empty body, client gives up" symptom. The idle deadline
+    // now flushes the provably-safe part of the holdback, so a fully-received body still arrives in full
+    // without an EOF. Driven with a short real idle so the deadline actually elapses.
+    #[tokio::test]
+    async fn a_stalled_upstream_flushes_the_safe_body_tail_on_the_idle_deadline() {
+        use futures_util::StreamExt as _;
+        let placeholder = mint_anthropic_placeholder();
+        let idle = Duration::from_millis(50);
+        let hold = REAL.len() - 1; // scrub_stream's fixed holdback width
+        // Ordinary bytes — no suffix of them can begin the credential, so the whole tail is safe to flush.
+        let body = vec![b'x'; hold + 27];
+        let stalled = futures_util::stream::iter(vec![Ok(Bytes::from(body.clone()))])
+            .chain(futures_util::stream::pending::<reqwest::Result<Bytes>>());
+        let mut scrubbed =
+            Box::pin(scrub_stream(stalled, REAL.to_owned(), placeholder.clone(), idle));
+
+        // The non-held part is forwarded at once — `received - (real.len() - 1)`.
+        let first = scrubbed.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(first.len(), 27, "the immediately-emittable prefix is forwarded before any idle");
+
+        // The held tail would stay held forever without an EOF. After the idle deadline it flushes in
+        // full, because ordinary bytes cannot begin a split credential.
+        let second = scrubbed.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(
+            first.len() + second.len(),
+            body.len(),
+            "a stalled body reaches the container in full after the idle deadline, with no EOF"
+        );
+    }
+
+    // CONTAINMENT — the idle flush must never release a byte that could still begin a credential. A
+    // stalled body ending in a proper PREFIX of the real credential is the exact straddle the holdback
+    // guards: the flush releases only the bytes AHEAD of that prefix, and the prefix stays held even
+    // though the stream never EOFs. The prefix leaves the boundary only by being completed into a full
+    // credential (then replaced — see the split-across-chunks test) or on a real EOF; never on idle.
+    #[tokio::test]
+    async fn a_stalled_credential_prefix_is_never_released_by_the_idle_flush() {
+        use futures_util::StreamExt as _;
+        let placeholder = mint_anthropic_placeholder();
+        let idle = Duration::from_millis(50);
+        let k = 12; // "sk-ant-api03" — a proper, non-empty prefix of REAL
+        let prefix = &REAL.as_bytes()[..k];
+        let mut body = vec![b'x'; 40];
+        body.extend_from_slice(prefix);
+        let stalled = futures_util::stream::iter(vec![Ok(Bytes::from(body.clone()))])
+            .chain(futures_util::stream::pending::<reqwest::Result<Bytes>>());
+        let mut scrubbed =
+            Box::pin(scrub_stream(stalled, REAL.to_owned(), placeholder.clone(), idle));
+
+        // The only frame the idle flush will release: exactly the 40 bytes ahead of the prefix. The k
+        // prefix bytes are withheld, so no fragment of the credential is ever forwarded.
+        let flushed = scrubbed.next().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(
+            flushed.as_ref(),
+            vec![b'x'; 40].as_slice(),
+            "the idle flush releases only the bytes that cannot begin a credential; the prefix stays held"
+        );
+        // A further await is intentionally omitted: with the prefix held and no more data and no EOF,
+        // the stream never yields again — that permanent hold on the prefix IS the containment property.
+    }
+
+    #[test]
+    fn straddle_prefix_len_finds_the_longest_suffix_that_is_a_credential_prefix() {
+        let needle = b"sk-ant-api03-xyz";
+        // Nothing at the tail could begin the needle ⇒ 0 (the whole buffer is safe to flush).
+        assert_eq!(straddle_prefix_len(b"hello world", needle), 0);
+        assert_eq!(straddle_prefix_len(b"", needle), 0);
+        // A trailing partial prefix is detected at exactly its length.
+        assert_eq!(straddle_prefix_len(b"xxxxsk-ant", needle), 6);
+        // The LONGEST qualifying suffix wins, not a shorter coincidence earlier in the buffer.
+        assert_eq!(straddle_prefix_len(b"sk-sk-ant", needle), 6);
+        // The full proper prefix reports its own length — the cap is needle.len() - 1, so a complete
+        // occurrence (which replace_bytes strips first) is never reported as an unbreakable hold.
+        assert_eq!(straddle_prefix_len(&needle[..needle.len() - 1], needle), needle.len() - 1);
+    }
+
     // #647 acceptance #1 (plumbing): a request carrying the placeholder is forwarded to the approved
     // upstream with the REAL credential substituted, the path unchanged, and the upstream's response
     // streamed back to the caller.
@@ -1598,7 +2557,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -1716,7 +2675,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -2041,7 +3000,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -2080,7 +3039,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -2172,7 +3131,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -2338,7 +3297,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -2489,7 +3448,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -2581,7 +3540,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -2700,7 +3659,7 @@ mod tests {
             .register(JobCredential {
                 placeholder: placeholder.clone(),
                 real: REAL.to_owned(),
-                upstream: upstream.clone(),
+                upstreams: vec![upstream.clone()],
             })
             .unwrap();
         let proxy = start(Arc::clone(&engine), None).await.unwrap();
@@ -2879,7 +3838,7 @@ mod tests {
                     .register(JobCredential {
                         placeholder: placeholder.clone(),
                         real: REAL.to_owned(),
-                        upstream: upstream.clone(),
+                        upstreams: vec![upstream.clone()],
                     })
                     .unwrap();
                 let proxy = start(Arc::clone(&engine), None).await.unwrap();

@@ -2446,7 +2446,9 @@ pub fn uncontained_forwarded_credentials(
 struct MintedCredential {
     real: String,
     placeholder: String,
-    upstream: String,
+    /// Approved upstream base URLs, primary first — the shape
+    /// [`crate::credential_proxy::JobCredential::upstreams`] takes.
+    upstreams: Vec<String>,
 }
 
 /// What containment hands back to the launch: the container-facing environment, any argv the client
@@ -2577,7 +2579,7 @@ async fn start_credential_containment(
             MintedCredential {
                 real,
                 placeholder: proxy::mint_placeholder(cred.placeholder_prefix, cred.placeholder_random_len),
-                upstream,
+                upstreams: vec![upstream],
             },
         ));
     }
@@ -2590,16 +2592,37 @@ async fn start_credential_containment(
     // rather than as a bad placeholder). `exp` is per-job and rolling for the same reason a fixed one
     // would be wrong — it would start being refused at a date nothing in the config explains.
     let mut minted_files: Vec<(&crate::home::FileCredential, MintedCredential)> = Vec::new();
+    // Every leg authority across every file credential, deduped — each becomes one extra proxy
+    // listener, and which listener a request arrives on is what routes it (see
+    // [`proxy::start_with_legs`]).
+    let mut leg_authorities: Vec<String> = Vec::new();
     for cred in file_creds {
         let real = read_file_credential(cred)?;
-        let upstream = cred.upstream.trim().to_owned();
-        let host = proxy::authority_of(&upstream).ok_or_else(|| {
+        let mut upstreams = Vec::with_capacity(1 + cred.legs.len());
+        let primary = cred.upstream.trim().to_owned();
+        let host = proxy::authority_of(&primary).ok_or_else(|| {
             ExecError::Config(format!(
-                "[sandbox] file_credentials: upstream {upstream} is not a valid URL"
+                "[sandbox] file_credentials: upstream {primary} is not a valid URL"
             ))
         })?;
         if !upstream_hosts.contains(&host) {
             upstream_hosts.push(host);
+        }
+        upstreams.push(primary);
+        for leg in &cred.legs {
+            let upstream = leg.upstream.trim().to_owned();
+            let host = proxy::authority_of(&upstream).ok_or_else(|| {
+                ExecError::Config(format!(
+                    "[sandbox] file_credentials: legs upstream {upstream} is not a valid URL"
+                ))
+            })?;
+            if !upstream_hosts.contains(&host) {
+                upstream_hosts.push(host.clone());
+            }
+            if !leg_authorities.contains(&host) {
+                leg_authorities.push(host);
+            }
+            upstreams.push(upstream);
         }
         minted_files.push((
             cred,
@@ -2609,7 +2632,7 @@ async fn start_credential_containment(
                     FILE_CREDENTIAL_CLAIM_TYPE,
                     FILE_CREDENTIAL_PLACEHOLDER_LIFETIME,
                 ),
-                upstream,
+                upstreams,
             },
         ));
     }
@@ -2619,7 +2642,7 @@ async fn start_credential_containment(
     }
 
     let engine = Arc::new(proxy::ProxyEngine::new(upstream_hosts));
-    let running = proxy::start(Arc::clone(&engine), proxy_ports)
+    let running = proxy::start_with_legs(Arc::clone(&engine), proxy_ports, &leg_authorities)
         .await
         .map_err(|error| ExecError::Agent(format!("credential proxy failed to start: {error}")))?;
 
@@ -2634,7 +2657,7 @@ async fn start_credential_containment(
             .register(proxy::JobCredential {
                 placeholder: m.placeholder.clone(),
                 real: m.real.clone(),
-                upstream: m.upstream.clone(),
+                upstreams: m.upstreams.clone(),
             })
             .map_err(|refusal| {
                 ExecError::Agent(format!("credential proxy registration refused: {refusal}"))
@@ -2657,7 +2680,7 @@ async fn start_credential_containment(
             .register(proxy::JobCredential {
                 placeholder: m.placeholder.clone(),
                 real: m.real.clone(),
-                upstream: m.upstream.clone(),
+                upstreams: m.upstreams.clone(),
             })
             .map_err(|refusal| {
                 ExecError::Agent(format!("credential proxy registration refused: {refusal}"))
@@ -2665,7 +2688,10 @@ async fn start_credential_containment(
         substitutions.push((m.real.clone(), m.placeholder.clone()));
         placed.push((cred, m.placeholder.clone()));
     }
-    let (file_env, argv_extra) = file_credential_launch_additions(&placed, &base_url);
+    let (file_env, argv_extra) = file_credential_launch_additions(&placed, &base_url, |upstream| {
+        proxy::authority_of(upstream)
+            .and_then(|authority| running.leg_base_url_via(proxy_host, &authority))
+    })?;
 
     let mut contained = contain_env_values(forwarded, &substitutions, &base_url_overrides, &base_url);
     // Appended AFTER the rewrite: these pairs carry placeholders, which have nothing to scrub.
@@ -2728,7 +2754,8 @@ pub fn contain_env_values(
 fn file_credential_launch_additions(
     placed: &[(&crate::home::FileCredential, String)],
     base_url: &str,
-) -> (Vec<(String, String)>, Vec<String>) {
+    leg_base_url: impl Fn(&str) -> Option<String>,
+) -> Result<(Vec<(String, String)>, Vec<String>), ExecError> {
     let mut env = Vec::with_capacity(placed.len());
     let mut argv = Vec::new();
     for (cred, placeholder) in placed {
@@ -2737,8 +2764,23 @@ fn file_credential_launch_additions(
             argv.push(flag.clone());
             argv.push(base_url.to_owned());
         }
+        for leg in &cred.legs {
+            // The leg listeners were started from this same config, so a missing URL here is a
+            // programmer error — refused rather than silently pointing the leg at the primary,
+            // which would recreate the exact wrong-host failure legs exist to fix.
+            let url = leg_base_url(&leg.upstream).ok_or_else(|| {
+                ExecError::Agent(format!(
+                    "no leg listener for {} — the proxy was started without it",
+                    leg.upstream
+                ))
+            })?;
+            for flag in &leg.endpoint_args {
+                argv.push(flag.clone());
+                argv.push(url.clone());
+            }
+        }
     }
-    (env, argv)
+    Ok((env, argv))
 }
 
 #[cfg(feature = "acp")]
@@ -4483,6 +4525,7 @@ mod tests {
             env: "CURSOR_AUTH_TOKEN".into(),
             upstream: "https://api2.cursor.sh".into(),
             endpoint_args: vec!["--endpoint".into()],
+            legs: Vec::new(),
         }
     }
 
@@ -4609,7 +4652,8 @@ mod tests {
         let substitutions = vec![(REAL.to_owned(), placeholder.clone())];
         let mut view = contain_env_values(&forwarded, &substitutions, &[], base_url);
         let (file_env, argv_extra) =
-            file_credential_launch_additions(&[(&cred, placeholder.clone())], base_url);
+            file_credential_launch_additions(&[(&cred, placeholder.clone())], base_url, |_| None)
+                .expect("a credential without legs never consults the leg lookup");
         view.extend(file_env);
 
         assert!(
@@ -4665,6 +4709,55 @@ mod tests {
             "an unrecognized forwarded variable must still be flagged, or this check has stopped \
              discriminating: {uncontained:?}"
         );
+    }
+
+    // Each leg's flags are emitted pointing at THAT leg's listener URL, never the primary's — the
+    // addressing IS the routing, so getting this pairing wrong recreates the exact wrong-host
+    // failure legs exist to fix.
+    #[test]
+    fn a_credential_leg_redirects_by_its_own_flags_to_its_own_listener() {
+        let base_url = "http://host.docker.internal:41111";
+        let leg_url = "http://host.docker.internal:41112";
+        let mut cred = file_cred();
+        cred.legs = vec![crate::home::CredentialLeg {
+            endpoint_args: vec!["--agent-endpoint".into()],
+            upstream: "https://agentn.global.api5.cursor.sh".into(),
+        }];
+        let (_, argv_extra) = file_credential_launch_additions(
+            &[(&cred, "PLACEHOLDER".to_owned())],
+            base_url,
+            |upstream| {
+                assert_eq!(upstream, "https://agentn.global.api5.cursor.sh");
+                Some(leg_url.to_owned())
+            },
+        )
+        .expect("a known leg must resolve");
+        assert_eq!(
+            argv_extra,
+            vec![
+                "--endpoint".to_owned(),
+                base_url.to_owned(),
+                "--agent-endpoint".to_owned(),
+                leg_url.to_owned(),
+            ],
+            "the leg's flag must carry the leg's URL, the primary's flag the primary's"
+        );
+    }
+
+    // A leg whose listener is missing is refused loudly, never silently pointed at the primary.
+    #[test]
+    fn a_leg_without_a_listener_is_refused_not_defaulted() {
+        let mut cred = file_cred();
+        cred.legs = vec![crate::home::CredentialLeg {
+            endpoint_args: vec!["--agent-endpoint".into()],
+            upstream: "https://agentn.global.api5.cursor.sh".into(),
+        }];
+        let refused = file_credential_launch_additions(
+            &[(&cred, "PLACEHOLDER".to_owned())],
+            "http://host.docker.internal:41111",
+            |_| None,
+        );
+        assert!(refused.is_err(), "a missing leg listener must refuse the launch");
     }
 
     // Forwarding the same variable the placeholder occupies is refused, not merged. Both would arrive
@@ -5923,7 +6016,9 @@ mod tests {
         let placeholder = "PLACEHOLDER-VALUE".to_owned();
         let base_url = "http://127.0.0.1:9300";
 
-        let (env, argv) = file_credential_launch_additions(&[(&cred, placeholder.clone())], base_url);
+        let (env, argv) =
+            file_credential_launch_additions(&[(&cred, placeholder.clone())], base_url, |_| None)
+                .expect("a credential without legs never consults the leg lookup");
 
         assert_eq!(env, vec![("CURSOR_AUTH_TOKEN".to_owned(), placeholder)]);
         assert_eq!(
@@ -5945,7 +6040,9 @@ mod tests {
     #[cfg(feature = "acp")]
     #[test]
     fn a_single_endpoint_flag_still_emits_exactly_one_pair() {
-        let (_, argv) = file_credential_launch_additions(&[(&file_cred(), "P".to_owned())], "http://u");
+        let (_, argv) =
+            file_credential_launch_additions(&[(&file_cred(), "P".to_owned())], "http://u", |_| None)
+                .expect("a credential without legs never consults the leg lookup");
         assert_eq!(argv, vec!["--endpoint".to_owned(), "http://u".to_owned()]);
     }
 
