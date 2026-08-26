@@ -21,8 +21,11 @@ services:
     #
     # NOTE: fulfilling a claimed job requires an ACP agent (claude/cursor/codex)
     # available INSIDE the container — see docs/DOCKER.md "Fulfilling jobs".
-    # Without one the daemon still runs, authenticates, and heartbeats; leave
-    # open-pool claiming OFF (the default) so it never claims work it can't do.
+    # Without one the daemon still runs, authenticates, and heartbeats — and it
+    # claims nothing at all, because BOTH open surfaces are off by default and no
+    # buyer is named. Three separate things would open a route: naming buyers in
+    # accept_offers_only_from, accept_open_targeted, or claim_open_pool. Leave all
+    # three alone until an agent is in the image.
     command: ["seller", "--non-interactive", "--agent", "claude", "--rate-sats", "2"]
     volumes:
       # Named volume holds the seller home: key (0600, auto-generated on first

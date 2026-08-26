@@ -520,7 +520,10 @@ its wallet balance.
 - **Config change ignored:** `config.toml` is read once at startup. Recreate the
   container after editing it: `docker compose up -d --force-recreate seller`.
 - **Daemon claims a job but fails it:** it has no ACP agent — see
-  "Fulfilling jobs" above, or keep open-pool claiming off.
+  "Fulfilling jobs" above. Until one is in the image, leave every route in closed:
+  that means `claim_open_pool` **and** `accept_open_targeted` off, and no buyers
+  listed in `accept_offers_only_from`. Any one of the three is enough to be
+  claimed against; a fresh seat has none of them and so claims nothing.
 - **Under `mode = "docker"`: advertises fine, then every job fails on an agent auth error.** The
   credential is in `~/.claude` (or the macOS Keychain), which the container cannot read, while the
   pre-advertise probe runs the CLI on the *host* and therefore passes. Put the credential in the
