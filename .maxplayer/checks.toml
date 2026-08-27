@@ -44,7 +44,15 @@ kind = "nix-flake"
 # requires. The environment reference is the SHA-256 of the flake.lock bytes.
 
 [checks]
-prepare = [["cargo", "fetch", "--locked"]]
+# web/app's suite runs its TypeScript through `tsx`, a lockfile-pinned devDependency, so its
+# node_modules must exist before any command runs. This is the one step here that legitimately needs
+# the network, which is why it is `prepare` and not a command. Measured on this tree: with an empty
+# npm cache and the network denied, `npm ci --prefix web/app` fails ENOTFOUND (rc=1) — so it could
+# never have been a command. web/network declares zero npm dependencies and needs no counterpart.
+prepare = [
+    ["cargo", "fetch", "--locked"],
+    ["npm", "ci", "--prefix", "web/app"],
+]
 
 # `--offline` on the test commands is not redundant with `net: denied`: it makes cargo fail fast and
 # legibly instead of attempting a fetch it cannot complete. `cargo build` is declared without it
@@ -59,6 +67,33 @@ commands = [
     # Its fixtures are loopback-only; it needs `lo`, never a route off the box.
     ["cargo", "test", "-p", "maxplayer-core", "--features", "wallet", "--locked", "--offline"],
     ["cargo", "test", "-p", "maxplayer", "--locked", "--offline"],
+    # WEB COVERAGE (#709). Until these two rows, this file declared five cargo rows and no Node row,
+    # so every test in web/app and web/network ran ZERO times under the declared set. A delivery
+    # could regress the market terminal and attest GREEN. CI catches that break on a pull request to
+    # main (the `web-tests` job in .github/workflows/ci.yml); the gate a delivery is PAID against did
+    # not. Same shape as the WALLET COVERAGE gap above, and a money defect for the same reason.
+    #
+    # `npm --prefix <dir> test` rather than a bare `node --test <dir>`: every command here runs from
+    # the repo root with no shell, and each package's own `test` script is the thing CI proves. npm
+    # runs that script through a shell, which is what expands web/app's `test/*.test.ts` glob and
+    # honours its `&&`. Declaring the node argv directly would freeze a glob that no shell expands —
+    # measured here, `node --test "web/app/test/*.test.ts"` from the root fails 8/8 (rc=1) because
+    # nothing loads tsx, and `node --test web/app/test/` fails 1/1 (rc=1). Both are loud, not
+    # silently green, but neither runs the suite. Delegating keeps this file and CI naming ONE
+    # definition of each suite, so they cannot drift apart.
+    #
+    # Both directories, not one. They are separate npm packages with separate runners: web/app is
+    # TypeScript through tsx, web/network is plain ESM with no dependencies whose test/package.json
+    # sets `main = run-all.mjs` so the directory form reaches all four of its suites. Declaring only
+    # one would leave the other exactly as uncovered as before. `crate::checks` holds that as a
+    # test, across the spellings that reach a directory.
+    #
+    # Offline-safe, measured on this tree with the network denied at the socket layer (control: the
+    # same TCP probe connects outside the sandbox and gets EPERM inside): web/app 72/72 and
+    # web/network 18/18, both rc=0, neither needing even loopback. With node_modules absent the
+    # web/app row fails rc=127 `tsc: command not found` — it cannot report green without its deps.
+    ["npm", "--prefix", "web/app", "test"],
+    ["npm", "--prefix", "web/network", "test"],
 ]
 
 # A cold run is dominated by compilation, not by the tests: four distinct feature configurations are
@@ -67,4 +102,9 @@ commands = [
 # test time for the other three. The example declaration's 1200s would be a false failure on a cold
 # machine; 3600s was already comfortable for three configurations and is not for four, so it is
 # raised rather than left to time out on a slow runner. This bounds the run — it weakens no check.
+#
+# #709 did NOT move this. The two Node rows are measured, not assumed: web/app runs in 1.7s wall and
+# web/network in 0.05s, against the ~9min the wallet configuration alone spends compiling and
+# testing. They are noise against this bound, and raising a timeout without a measurement behind it
+# is how a real timeout stops being a signal.
 timeout_secs = 5400
