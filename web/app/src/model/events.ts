@@ -25,6 +25,13 @@ export interface RawEvent {
 export interface AdvertisementTag { name: string; values: string[] }
 
 /**
+ * One serving harness and the model it reported, from a `["harness_model",
+ * family, model]` tag. Paired on the wire, so paired here: a flat list of
+ * models could not say which harness runs which.
+ */
+export interface HarnessModel { family: string; model: string }
+
+/**
  * One parsed record. A single shape with optional fields, not a union: nearly
  * every consumer branches on `stage`/`kind` at runtime and reads a handful of
  * fields — the optional shape keeps that direct, and `parseEvent` is the only
@@ -69,6 +76,11 @@ export interface ParsedEvent {
   queueDepth?: number | null;
   rateSats?: number | null;
   acceptedMints?: string[];
+  harnessFamilies?: string[];
+  harnessModels?: HarnessModel[];
+  capabilities?: string[];
+  harnessVariant?: string | null;
+  hardware?: string | null;
   advertisementTags?: AdvertisementTag[];
   advertisementContent?: Record<string, unknown> | null;
   name?: string | null;
@@ -92,6 +104,59 @@ const tagValues = (event: RawEvent, name: string): string[] => {
   const t = tagsNamed(event, name)[0];
   return t ? t.slice(1).filter((v) => typeof v === "string" && v.length > 0) : [];
 };
+
+/**
+ * One wire value under the "stated or absent" contract of `docs/protocol-v1.md`
+ * §4.5.2: trimmed, and null when nothing survives. Blank and all-whitespace are
+ * ABSENT, and a reader must treat them identically to a missing tag.
+ *
+ * Trimming rather than merely rejecting is what makes this reader agree with the
+ * emitter. A padded `" claude-code "` kept as-is would never equal the
+ * `claude-code` a buyer names, so a seat would advertise a family it could never
+ * be matched on. Interior whitespace is CONTENT and survives — only the edges
+ * are noise.
+ *
+ * ⚠ APPLIED AT THE FIVE #784 READERS INDIVIDUALLY, NEVER INSIDE `tagValues` OR
+ * `firstTag`. Those two are shared with `agents` and `accepted_mints`, and
+ * changing how a mint list parses is not something to do as a side effect of a
+ * capability change. Unifying at the helper is a coherent proposal; it is a
+ * separate one. This mirrors `stated` in `crates/maxplayer-core/src/heartbeat.rs`,
+ * which carries the same restriction for the same reason.
+ */
+const stated = (value: string | null | undefined): string | null => {
+  const trimmed = (value ?? "").trim();
+  return trimmed.length > 0 ? trimmed : null;
+};
+
+/** `stated` across a list, dropping the values that state nothing. */
+const statedValues = (values: string[]): string[] =>
+  values.map(stated).filter((v): v is string => v !== null);
+
+/**
+ * Every `["harness_model", family, model]` tag on the event.
+ *
+ * Deliberately NOT `tagValues`, which returns the cells of the FIRST tag with a
+ * name. A seat serving two harnesses emits two `harness_model` tags, so reading
+ * only the first would show one model and silently drop the rest — an absence
+ * indistinguishable from a seat that runs a single harness.
+ *
+ * A pair missing either cell is dropped: a family with no model states nothing,
+ * and a model with no family cannot say which harness reported it.
+ *
+ * Both halves go through `stated`, so an all-whitespace half is as unpairable as
+ * an empty one. The pair is the unit — a stated model under a blank family is
+ * not a partial answer worth salvaging.
+ */
+function harnessModels(event: RawEvent): HarnessModel[] {
+  const pairs: HarnessModel[] = [];
+  for (const t of tagsNamed(event, "harness_model")) {
+    const family = stated(t[1]);
+    const model = stated(t[2]);
+    if (!family || !model) continue;
+    if (!pairs.some((p) => p.family === family && p.model === model)) pairs.push({ family, model });
+  }
+  return pairs;
+}
 
 /**
  * Preserve the complete public advertisement, including fields introduced by
@@ -342,6 +407,20 @@ function parseEventUncached(event: RawEvent): ParsedEvent | null {
                rateSats: firstNumber(event, "rate"),
                acceptedMints: tagValues(event, "accepted_mints"),
                agents: tagValues(event, "agents"),
+               // The seat's advertised capability. `harness_family`,
+               // `harness_model` and `capabilities` are machine-sourced at the
+               // seat — the roster, the harness handshake, and a probe of the
+               // job execution environment. `harness_variant` and `hardware`
+               // are operator-typed and nothing verifies them; the renderer
+               // keeps that split visible rather than showing five equal rows.
+               // Each of the five normalized at its OWN reader (§4.5.2), never
+               // in the shared helpers those two lines call — `agents` and
+               // `accepted_mints` ride the same helpers and must not shift.
+               harnessFamilies: statedValues(tagValues(event, "harness_family")),
+               harnessModels: harnessModels(event),
+               capabilities: statedValues(tagValues(event, "capabilities")),
+               harnessVariant: stated(firstTag(event, "harness_variant")),
+               hardware: stated(firstTag(event, "hardware")),
                advertisementTags: advertisementTags(event),
                advertisementContent: String(event.content || "").trim() ? parseJsonContent(event) : null };
     case PROFILE: {

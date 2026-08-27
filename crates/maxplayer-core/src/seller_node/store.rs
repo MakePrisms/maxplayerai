@@ -1495,7 +1495,7 @@ mod tests {
         );
 
         // release_claim: only a still-`claimed` row releases; an awarded one reports 0.
-        let draft = crate::gateway::claim_draft("job-c", &"b".repeat(64), &"s".repeat(64), "creq", &[]);
+        let draft = crate::gateway::claim_draft("job-c", &"b".repeat(64), &"s".repeat(64), "creq", &[], &Default::default());
         store
             .claim_and_enqueue("job-c", "job-c", "creq", &draft, 1, 9_999_999_999, 1)
             .expect("claim");

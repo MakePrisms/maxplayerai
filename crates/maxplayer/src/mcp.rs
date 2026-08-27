@@ -198,7 +198,7 @@ fn tools() -> Value {
     json!([
         {
             "name": "post_job",
-            "description": "Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness is a hard award filter (only a seller advertising it can be awarded); model is a recorded auto-award preference. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. Never echoes secrets.",
+            "description": "Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness, harness_family, model and capabilities are ALL hard award filters (only a seller advertising them can be awarded), enforced identically on the manual and automatic award paths; model requires harness (the preset), and a harness_family given alongside harness must name the same harness it does. Omit them all and every claim passes exactly as before. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -216,7 +216,16 @@ fn tools() -> Value {
                     },
                     "model": {
                         "type": "string",
-                        "description": "Preferred seller model. Recorded as an auto-award preference; not yet a hard filter."
+                        "description": "Request a specific seller model. Posted on the offer as [\"param\",\"harness_model\",<model>] and enforced as a HARD award filter: only a seller advertising that model FOR the harness the job will dispatch on can be awarded. REQUIRES harness (the preset) — a model without one is refused at post time, because only the preset reaches execution, so a model hung off anything else names a harness the job would not actually run. The family is DERIVED from the preset when you do not state one, so harness+model is a complete request. Matched by exact equality against the model id the seat advertises (e.g. gpt-5.6-sol[low]), which is whatever its harness reported, so this is a LAST-OBSERVED self-report: it narrows who is considered, it does not pin what executes. A seat advertises a model only for harnesses whose ACP session reports one, so a model request matches nothing on a seat whose harness reports none."
+                    },
+                    "harness_family": {
+                        "type": "string",
+                        "description": "Request a harness FAMILY (claude-code|codex|cursor|goose). Posted on the offer as [\"param\",\"harness_family\",<family>] and enforced as a HARD award filter: only a seller advertising that family can be awarded. Distinct from harness, which names a preset, and the difference is what each one BINDS: a family selects WHICH SEATS MAY CLAIM, while only the preset decides which harness a winning seat then runs — so a multi-harness seat can satisfy a family request and dispatch a different harness. Give harness when the request must bind execution. If you give both, the family must name the same harness the preset does, or the offer is refused at post time. An unknown family is refused at post time."
+                    },
+                    "capabilities": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Capability tokens this job REQUIRES (node|python|rust). Posted on the offer as [\"param\",\"capability\",<token>,…] and enforced as a HARD award filter: only a seller advertising every token can be awarded. An unknown token is refused at post time. NOTE what a token proves: the tool's probe binary resolved at SEAT START, nothing more — not that a build using it succeeds, and not that it is still installed now. Omit for no requirement."
                     },
                     "seller_pubkey": {
                         "type": "string",
@@ -518,10 +527,14 @@ mod tests {
     use std::io::Cursor;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    // The post_job schema promises that harness constrains award selection while model does not.
-    // Keep those caller-facing claims tied to the real award predicate: removing the harness
-    // predicate or weakening either description makes this test fail. If AwardFilters grows a
-    // model filter, update both the model description and this test together.
+    // The post_job schema promises that EVERY request axis constrains award selection (#897 wired
+    // the last of them). Keep those caller-facing claims tied to the real award predicate: removing
+    // a predicate or weakening a description makes this test fail.
+    //
+    // These are promises about a MONEY path — a caller told "hard award filter" may reasonably post a
+    // job it would not have posted otherwise — so the descriptions are asserted per axis rather than
+    // in aggregate. An axis whose description silently reverts to a weaker claim is the failure this
+    // guards, and aggregate wording would not see it.
     #[cfg(feature = "wallet")]
     #[test]
     fn post_job_award_filter_descriptions_match_enforcement() {
@@ -538,19 +551,41 @@ mod tests {
             .find(|tool| tool["name"] == "post_job")
             .expect("post_job tool");
         let properties = &post_job["inputSchema"]["properties"];
-        let harness_description = properties["harness"]["description"]
-            .as_str()
-            .expect("harness description")
-            .to_ascii_lowercase();
-        let model_description = properties["model"]["description"]
-            .as_str()
-            .expect("model description")
-            .to_ascii_lowercase();
+        let description = |axis: &str| {
+            properties[axis]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{axis} description"))
+                .to_ascii_lowercase()
+        };
 
-        assert!(harness_description.contains("hard award filter"));
-        assert!(harness_description.contains("only a seller advertising"));
-        assert!(model_description.contains("recorded as an auto-award preference"));
-        assert!(model_description.contains("not yet a hard filter"));
+        // Every axis that reaches `AwardFilters` must SAY it is a hard filter. `harness_family`,
+        // `model` and `capabilities` all became hard filters in #897; `harness` already was.
+        for axis in ["harness", "harness_family", "model", "capabilities"] {
+            let text = description(axis);
+            assert!(
+                text.contains("hard award filter"),
+                "{axis} reaches the award predicate, so its description must tell callers it is a \
+                 hard award filter — this is a promise about a money path: {text}"
+            );
+            assert!(
+                text.contains("only a seller advertising"),
+                "{axis} description must say only an advertising seller can be awarded: {text}"
+            );
+        }
+
+        // The model axis carries two extra caller-facing facts that are load-bearing and easy to
+        // drop: it needs the PRESET, and it matches a self-report rather than pinning execution.
+        let model_description = description("model");
+        assert!(
+            model_description.contains("requires harness"),
+            "a model without a harness preset is REFUSED, so the schema must say it requires one — \
+             a caller that omits it gets no awards at all: {model_description}"
+        );
+        assert!(
+            model_description.contains("does not pin what executes"),
+            "a matched model is a last-observed self-report, never a guarantee about the next job; \
+             the schema must not let a caller read it as a commitment: {model_description}"
+        );
 
         let job_id = "a".repeat(64);
         let seller_pubkey = "aa1e5f8c9d3b6a2f4e7c1d0b8a5f3e2c1d0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f";
@@ -574,6 +609,7 @@ mod tests {
                 live: true,
                 creq: Some(creq),
                 agents: vec!["codex".to_owned()],
+                capability: maxplayer_core::heartbeat::SeatCapability::default(),
             }],
             results: Vec::new(),
             live_claim_id: None,
@@ -581,19 +617,55 @@ mod tests {
             pending: false,
             read_confirmed: true,
         };
-        let filters = AwardFilters {
+        let neutral = AwardFilters {
             offer_amount_sats: 10,
             max_sats: 10,
             buyer_mint: DEFAULT_MINT_URL,
             allow_real_mints: false,
-            requested_agent: Some("claude"),
+            requested_agent: None,
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: &[],
         };
 
+        // CONTROL FIRST: this claim IS awardable with no request. Every refusal below is meaningless
+        // without it — an unawardable claim refuses for every request and proves no filter works.
         assert_eq!(
-            select_awardable_claim(&view, &filters),
-            None,
-            "a payable codex-only claim must not win a job requesting claude"
+            select_awardable_claim(&view, &neutral),
+            Some("c".repeat(64)),
+            "control: the claim must be awardable when nothing is requested"
         );
+
+        // Each axis, enforced. The claim advertises the `codex` PRESET and a default (empty)
+        // capability, so it fails a claude preset request, any family request, any model request, and
+        // any capability requirement.
+        let rust = vec!["rust".to_owned()];
+        for (axis, filters) in [
+            ("harness", AwardFilters { requested_agent: Some("claude"), ..neutral }),
+            (
+                "harness_family",
+                AwardFilters { requested_harness_family: Some("claude-code"), ..neutral },
+            ),
+            (
+                "model",
+                // The preset is named too: a model request without one is a REQUEST defect and
+                // would refuse before the claim's model was ever compared.
+                AwardFilters {
+                    requested_agent: Some("codex"),
+                    requested_harness_family: Some("codex"),
+                    requested_model: Some("opus"),
+                    ..neutral
+                },
+            ),
+            ("capabilities", AwardFilters { required_capabilities: &rust, ..neutral }),
+        ] {
+            assert_eq!(
+                select_awardable_claim(&view, &filters),
+                None,
+                "the schema calls {axis} a hard award filter, so a payable claim that does not \
+                 advertise it must not be awarded"
+            );
+        }
     }
 
     static NEXT: AtomicU64 = AtomicU64::new(0);

@@ -1,0 +1,281 @@
+{
+  "initialize": {
+    "protocolVersion": 1,
+    "agentCapabilities": {
+      "_meta": {
+        "claudeCode": {
+          "promptQueueing": true
+        }
+      },
+      "promptCapabilities": {
+        "image": true,
+        "embeddedContext": true
+      },
+      "mcpCapabilities": {
+        "http": true,
+        "sse": true
+      },
+      "auth": {
+        "logout": {}
+      },
+      "providers": {},
+      "loadSession": true,
+      "sessionCapabilities": {
+        "additionalDirectories": {},
+        "close": {},
+        "delete": {},
+        "fork": {},
+        "list": {},
+        "resume": {}
+      }
+    },
+    "agentInfo": {
+      "name": "@agentclientprotocol/claude-agent-acp",
+      "title": "Claude Agent",
+      "version": "0.70.0"
+    },
+    "authMethods": [],
+    "_meta": {
+      "jetbrains": {
+        "air": {
+          "version": 1,
+          "capabilities": [
+            "sessionFailure",
+            "agentFileChangeReport"
+          ]
+        }
+      },
+      "steering": {
+        "supported": true
+      },
+      "goal": {
+        "version": 1,
+        "controlMethod": "_session/goal",
+        "actions": [
+          "set",
+          "clear"
+        ]
+      }
+    }
+  },
+  "sessionNew": {
+    "sessionId": "7fab6006-49d6-4429-ae97-2f85a8649364",
+    "modes": {
+      "currentModeId": "default",
+      "availableModes": [
+        {
+          "id": "auto",
+          "name": "Auto",
+          "description": "Use a model classifier to approve/deny permission prompts"
+        },
+        {
+          "id": "default",
+          "name": "Manual",
+          "description": "Standard behavior, prompts for dangerous operations"
+        },
+        {
+          "id": "acceptEdits",
+          "name": "Accept Edits",
+          "description": "Auto-accept file edit operations"
+        },
+        {
+          "id": "plan",
+          "name": "Plan Mode",
+          "description": "Planning mode, no actual tool execution"
+        },
+        {
+          "id": "dontAsk",
+          "name": "Don't Ask",
+          "description": "Don't prompt for permissions, deny if not pre-approved"
+        },
+        {
+          "id": "bypassPermissions",
+          "name": "Bypass Permissions",
+          "description": "Bypass all permission checks"
+        }
+      ]
+    },
+    "configOptions": [
+      {
+        "id": "mode",
+        "name": "Mode",
+        "description": "Session permission mode",
+        "category": "mode",
+        "type": "select",
+        "currentValue": "default",
+        "options": [
+          {
+            "value": "auto",
+            "name": "Auto",
+            "description": "Use a model classifier to approve/deny permission prompts"
+          },
+          {
+            "value": "default",
+            "name": "Manual",
+            "description": "Standard behavior, prompts for dangerous operations"
+          },
+          {
+            "value": "acceptEdits",
+            "name": "Accept Edits",
+            "description": "Auto-accept file edit operations"
+          },
+          {
+            "value": "plan",
+            "name": "Plan Mode",
+            "description": "Planning mode, no actual tool execution"
+          },
+          {
+            "value": "dontAsk",
+            "name": "Don't Ask",
+            "description": "Don't prompt for permissions, deny if not pre-approved"
+          },
+          {
+            "value": "bypassPermissions",
+            "name": "Bypass Permissions",
+            "description": "Bypass all permission checks"
+          }
+        ]
+      },
+      {
+        "id": "model",
+        "name": "Model",
+        "description": "AI model to use",
+        "category": "model",
+        "type": "select",
+        "currentValue": "default",
+        "options": [
+          {
+            "value": "default",
+            "name": "Default (recommended)",
+            "description": "Opus (1M context)"
+          },
+          {
+            "value": "opus[1m]",
+            "name": "Opus (1M context)",
+            "description": "Opus 5 with 1M context · Best for everyday, complex tasks"
+          },
+          {
+            "value": "claude-fable-5[1m]",
+            "name": "Fable",
+            "description": "Fable 5 · Most capable for your hardest and longest-running tasks"
+          },
+          {
+            "value": "sonnet",
+            "name": "Sonnet",
+            "description": "Sonnet 5 · Efficient for routine tasks"
+          },
+          {
+            "value": "haiku",
+            "name": "Haiku",
+            "description": "Haiku 4.5 · Fastest for quick answers"
+          }
+        ]
+      },
+      {
+        "id": "effort",
+        "name": "Effort",
+        "description": "Available effort levels for this model",
+        "category": "thought_level",
+        "type": "select",
+        "currentValue": "default",
+        "options": [
+          {
+            "value": "default",
+            "name": "Default"
+          },
+          {
+            "value": "low",
+            "name": "Low"
+          },
+          {
+            "value": "medium",
+            "name": "Medium"
+          },
+          {
+            "value": "high",
+            "name": "High"
+          },
+          {
+            "value": "xhigh",
+            "name": "Xhigh"
+          },
+          {
+            "value": "max",
+            "name": "Max"
+          }
+        ]
+      },
+      {
+        "id": "fast",
+        "name": "Fast mode",
+        "description": "Faster responses on supported models",
+        "category": "model_config",
+        "type": "select",
+        "currentValue": "off",
+        "options": [
+          {
+            "value": "on",
+            "name": "On"
+          },
+          {
+            "value": "off",
+            "name": "Off"
+          }
+        ]
+      }
+    ]
+  },
+  "prompt": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "result": {
+      "stopReason": "end_turn",
+      "usage": {
+        "inputTokens": 2,
+        "outputTokens": 4,
+        "cachedReadTokens": 16486,
+        "cachedWriteTokens": 13905,
+        "totalTokens": 30397
+      }
+    }
+  },
+  "bin": "/Users/forge/forge/npm/bin/claude-agent-acp",
+  "notificationKinds": {
+    "session/update": 5,
+    "_claude/sdkMessage": 1
+  },
+  "modelStringsSeen": [
+    "system/init -> claude-opus-5[1m]"
+  ],
+  "rawSdkNotifications": [
+    {
+      "jsonrpc": "2.0",
+      "method": "_claude/sdkMessage",
+      "params": {
+        "sessionId": "7fab6006-49d6-4429-ae97-2f85a8649364",
+        "message": {
+          "type": "system",
+          "subtype": "init",
+          "session_id": "7fab6006-49d6-4429-ae97-2f85a8649364",
+          "mcp_servers": [],
+          "model": "claude-opus-5[1m]",
+          "permissionMode": "default",
+          "apiKeySource": "none",
+          "claude_code_version": "2.1.232",
+          "output_style": "Concise",
+          "plugins": [],
+          "capabilities": [
+            "interrupt_receipt_v1",
+            "interrupt_cancel_queued_v1",
+            "msg_lifecycle_v1"
+          ],
+          "analytics_disabled": false,
+          "product_feedback_disabled": false,
+          "uuid": "f16a1adc-aeea-4c30-89fd-007a807d7561",
+          "fast_mode_state": "off",
+          "fast_mode_disabled_reason": "sdk_opt_in_required"
+        }
+      }
+    }
+  ]
+}

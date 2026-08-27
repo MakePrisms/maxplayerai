@@ -17,7 +17,7 @@ default-members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.3"
 edition = "2024"
 description = "Maxplayer"
 repository = "https://github.com/MakePrisms/maxplayerai"
@@ -45,7 +45,13 @@ config = { version = "0.15.25", default-features = false }
 git2 = { version = "0.19", default-features = false }
 # Blocking HTTP for the git smart subtransport; rustls-tls bundles Mozilla CA roots
 # (webpki-roots) so the seller needs no ambient SSL_CERT_FILE at runtime.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# `http2` is what lets the credential proxy's upstream leg offer h2 in ALPN. Cursor's
+# agent endpoint serves HTTP/2 only — it answers an HTTP/1.1 request with no HTTP/1
+# response at all — so without this feature reqwest cannot offer h2, and the upstream
+# connection fails before a request is sent. Measured with this feature as the only
+# variable: off, the agent host is unreachable; on, it answers 200 over HTTP/2. The
+# control host `api2.cursor.sh` answers either way, so the constraint is that endpoint's.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "http2"] }
 base64 = "0.22"
 
 [profile.release]

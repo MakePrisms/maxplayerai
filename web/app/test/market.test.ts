@@ -320,6 +320,24 @@ test("the boards COUNT self-trades, and no copy claims the page excludes them", 
   );
 });
 
+test("the runner sheet no longer carries an Agents row", () => {
+  // bob, 2026-08-27 01:41:30Z: the row is redundant on that sheet. `:392` read
+  // `advertisedAgents`, and it was that field's ONLY reader in docks.ts, so its
+  // absence from the source is the deletion.
+  //
+  // ⚠ A source-text assertion, and its limit is the point. It cannot prove
+  // nothing renders the word "Agents" — two other things still must, and the
+  // positive controls below pin them. `participantSheet` is not exported, so
+  // there is no rendering seam for this row; exporting one to test a deletion
+  // would be a wider change than the deletion.
+  const docks = readFileSync(join(SRC, "ui", "docks.ts"), "utf8");
+  assert.ok(!/advertisedAgents/.test(docks), "the runner sheet's Agents row is gone");
+
+  // Positive controls. Both survive on purpose and are NOT in bob's scope.
+  assert.ok(/e\?\.agents\?\.length/.test(docks), "the event sheet's own Agents row must survive");
+  assert.ok(/agents: "Agents"/.test(docks), "the advertisement label map still renders an `agents` tag");
+});
+
 test("profiles enrich rows but never create them", () => {
   const profile = ev(PROFILE, hex("d"), T0, [], JSON.stringify({ name: "lurker" }));
   const board = sellerBoard([profile], T0 + 10);

@@ -94,6 +94,13 @@ git2 = { workspace = true, optional = true }
 # it encodes comes from `maxplayer-core::home::public_key_hex`, itself `wallet`-gated.
 nostr-sdk = { version = "0.44.1", optional = true }
 
+# #905: the retired-seat reaper's `--dry-run` must remove nothing. Drives the shipped binary against
+# a recording stand-in `docker` on PATH, so it needs the subcommand compiled in (`acp`); a buyer-only
+# `cargo test -p maxplayer` compiles it out rather than failing to resolve the command.
+[[test]]
+name = "sandbox_reap_dry_run"
+required-features = ["acp"]
+
 [dev-dependencies]
 cashu = "=0.17.2"
 cdk = { version = "=0.17.2", default-features = false, features = ["wallet"] }

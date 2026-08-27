@@ -10,7 +10,7 @@ import { usd } from "./spot.js";
 import { statusDot } from "./indicators.js";
 import { feedLine } from "./board.js";
 import { KIND_LABELS, PROFILE } from "../model/kinds.js";
-import { parseEvent, type ParsedEvent } from "../model/events.js";
+import { parseEvent, type HarnessModel, type ParsedEvent } from "../model/events.js";
 import {
   JOB_OVERDUE, participantDetail, relatedActivity,
 } from "../market/participants.js";
@@ -227,6 +227,85 @@ function activityList(view: MarketView, events: ParsedEvent[], t: number, curren
 /* ---------------- participant sheet ---------------- */
 
 /**
+ * A Profile row: label, value, and an optional note. `title` explains what the
+ * value is worth; `mark` is the visible tag the row wears, and `markClass`
+ * selects its weight. A row with a title but no mark is annotated, not marked.
+ */
+export type ProfileRow = [string, string | null, { title: string; mark?: string; markClass?: string }?];
+
+/**
+ * One Profile row as markup. Exported so the marker rule is under test rather
+ * than asserted by reading this file as text: which mark a value wears is a
+ * claim about what a buyer sees, and a source grep cannot tell a rendered
+ * marker from one that is built and dropped.
+ *
+ * The value goes through `esc` like every other relay string — `hardware` and
+ * `harness_variant` are free text from an open relay, so they are an injection
+ * path in exactly the way an enum-bound token is not.
+ */
+export function profileRowHtml([label, value, note]: ProfileRow): string {
+  return `<div${note ? ` title="${esc(note.title)}"` : ""}><dt>${esc(label)}</dt><dd>${esc(String(value ?? ""))}${
+    note?.mark ? ` <span class="${esc(note.markClass ?? "unverified")}">${esc(note.mark)}</span>` : ""}</dd></div>`;
+}
+
+/**
+ * Operator-typed, nothing measures it, no filter reads it. Every row carrying
+ * this marker is colour a human may find useful and a buyer must not price on.
+ */
+const OPERATOR_DECLARED = {
+  mark: "operator-declared",
+  markClass: "unverified",
+  title: "Typed by the operator. Nothing measures or contradicts this value, and no buyer filter reads it.",
+};
+
+/**
+ * What the runner says it can run, from the newest heartbeat.
+ *
+ * ⚠ WHAT THIS FUNCTION NO LONGER TELLS A BUYER. Until 2026-08-27 the three
+ * machine-sourced rows each carried a provenance mark and a hover title, and
+ * the comment here argued at length that they MUST: protocol v1 §4.5.3 says a
+ * reader must not read `harness_family`, `harness_model` and `capabilities` as
+ * three grades of one proof, and §4.5.4 gives them three different freshness
+ * guarantees. The owner removed the marks and the titles as unwanted warnings
+ * (bob, 01:41:30Z and 01:48:06Z). That is a product decision about the sheet
+ * and it stands — but it does not make the protocol distinction untrue, so the
+ * argument is restated here as a limitation rather than deleted.
+ *
+ * The three rows now render flush and identical. On this sheet a buyer cannot
+ * see that `harness_family` is current as of the beat carrying it, that
+ * `harness_model` is only what the harness last said about itself, or that
+ * `capabilities` was probed once at seat start and is bounded by the seat's
+ * UPTIME — which is the stalest of the three and the one a buyer commits sats
+ * on. Nothing here is enforcement either way: nothing at the seat reads the
+ * family, and no event carries a capability back at all.
+ *
+ * So the capability row can over-claim — a toolchain removed since seat start
+ * is still advertised — and nothing on the filter path and nothing on this
+ * sheet now catches it. If that gap is to be closed it must be closed
+ * somewhere other than these rows.
+ *
+ * The last two rows are free text an operator typed. They keep their
+ * `operator-declared` mark: it was not in scope, and nothing pays out on them.
+ *
+ * Every row is an ANNOUNCEMENT. This reader sees the claim, never the probe.
+ *
+ * An unstated field yields no row. A seat may state nothing — the stock Docker
+ * runtime image proves no tokens at all — and an empty row would read as a
+ * measured zero instead of a silence.
+ */
+export function capabilityRows(s: { harnessFamilies?: string[]; harnessModels?: HarnessModel[]; capabilities?: string[]; harnessVariant?: string | null; hardware?: string | null } | null): ProfileRow[] {
+  if (!s) return [];
+  return [
+    ["Harness family", s.harnessFamilies?.length ? s.harnessFamilies.join(" · ") : null],
+    ["Harness model", s.harnessModels?.length
+      ? s.harnessModels.map((m) => `${m.family} ${m.model}`).join(" · ") : null],
+    ["Capabilities", s.capabilities?.length ? s.capabilities.join(" · ") : null],
+    ["Harness variant", s.harnessVariant || null, OPERATOR_DECLARED],
+    ["Hardware", s.hardware || null, OPERATOR_DECLARED],
+  ];
+}
+
+/**
  * Racer and runner details share one structure on purpose: headline name,
  * Profile, Stats (six boxes), Recent activity. A field the participant never
  * published is simply not shown — only the public key is guaranteed.
@@ -273,10 +352,10 @@ function participantSheet(view: MarketView, role: "buyer" | "seller", pubkey: st
     ["Min rate", s?.askSats == null ? null : `${usd(s.askSats)} · ${nf.format(s.askSats)} sat`],
     ["Accepting work", acceptingText],
     ["Accepted mints", s?.acceptedMints?.length ? s.acceptedMints.join(" · ") : null],
-    ["Agents", s?.advertisedAgents?.length ? s.advertisedAgents.join(" · ") : null],
-  ] as [string, string | null][])
+    ...capabilityRows(s),
+  ] as ProfileRow[])
     .filter(([, v]) => v != null && v !== "")
-    .map(([k, v]) => `<div><dt>${k}</dt><dd>${esc(v)}</dd></div>`).join("");
+    .map(profileRowHtml).join("");
   parts.push(`<h4>Profile</h4><dl class="kv profile-kv">
     <div><dt>Public key</dt><dd><button type="button" class="pk-copy" data-copy-text="${esc(pubkey)}" title="Click to copy the full public key" aria-label="Copy public key"><code>${short(pubkey)}…${esc(pubkey.slice(-8))}</code></button></dd></div>
     ${profileRowsHtml}</dl>`);

@@ -19,6 +19,10 @@ mod sell;
 // INSIDE the launcher, and a seat may reasonably run the probe from a binary it already trusts.
 #[cfg(feature = "wallet")]
 mod sandbox_probe;
+// The retired-seat holder reaper (#905). `acp`, not `wallet`: it calls `sandbox_netns::reap_orphans`,
+// which needs the docker runner behind that feature — the same gate the boot reaper carries.
+#[cfg(feature = "acp")]
+mod sandbox_reap;
 #[cfg(feature = "stub-pay")]
 mod stub_pay_cli;
 mod wallet_cli;

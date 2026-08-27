@@ -165,6 +165,25 @@ pub enum ExecutionFailure {
 struct HarnessState {
     /// `None` ⇒ serving.
     unavailable: Option<Unavailable>,
+    /// The harness-resolved session model id last observed for THIS harness — read from either ACP
+    /// wire shape by `driver::acp_driver::session_model_from_result` (#896) — or
+    /// `None` when nothing has observed one. Written by two sources and read only through
+    /// [`LiveRoster::advertisement`], so the advertised model and the advertised name are one
+    /// snapshot under one lock (#784):
+    ///
+    /// - the **setter** — a probe turn that PROVED this harness can serve (boot, or a restore).
+    /// - the **refresher** — a job that completed on this harness, carrying the model that job's
+    ///   `session/new` reported.
+    ///
+    /// ⚠ Both sources are SELF-REPORTS, not observations of execution. ACP surfaces the model only
+    /// on the `session/new` response, which the harness sends before it does any work; nothing here
+    /// pins the model or checks what actually ran. What makes the value worth advertising is its
+    /// PROVENANCE — machine-sourced rather than operator-typed.
+    ///
+    /// Written as an `Option` and overwritten UNCONDITIONALLY, including with `None`. A newer
+    /// observation that saw no model must clear an older one: keeping the stale value would advertise
+    /// a model the harness has stopped reporting, which is the drift this field exists to bound.
+    model: Option<String>,
     /// Unattributable faults ever recorded for this harness. Kept ACROSS a restore, so a harness
     /// that flaps backs off further each time instead of pinning at the shortest window.
     strikes: u32,
@@ -183,9 +202,17 @@ struct HarnessState {
 /// dropped by an execution task would still be advertised by the loop. There is one roster per node.
 pub struct LiveRoster {
     registry: AgentRegistry,
-    /// Keyed by registry index. Absent ⇒ serving with no history; the map holds only harnesses that
-    /// have faulted at least once.
+    /// Keyed by registry index. Absent ⇒ serving with no history AND no observed model; the map holds
+    /// only harnesses something has recorded against — a fault, or a model observation (#784).
     state: Mutex<BTreeMap<usize, HarnessState>>,
+    /// The seat-wide capability tokens proved by the boot probe (#784). Seat-wide because they
+    /// describe the job execution environment, which is one environment shared by every harness here.
+    ///
+    /// It lives on the roster rather than beside it so that [`Self::advertisement`] stays the ONE
+    /// wire snapshot: a capability read separately from the harness read could disagree with it, and
+    /// the single-snapshot rule is what makes [`Advertisement::capability`] a route no emitter can
+    /// partially take.
+    capabilities: Mutex<Vec<String>>,
 }
 
 /// A harness selected to run a job: which registry index it is, and the entry itself.
@@ -210,6 +237,54 @@ pub struct Advertisement {
     pub serving: bool,
     /// Serving entries that have a name, in preference order. Empty ⇒ "states no harness".
     pub names: Vec<String>,
+    /// The observed model for each SERVING, NAMED entry that has one, in the same preference order as
+    /// [`Self::names`] — a subset of it, never an entry absent from it.
+    ///
+    /// Built in the SAME locked pass as `names` on purpose (#784). A model belongs to a harness, so
+    /// the pairing is the load-bearing part; assembling the two lists separately would let a fault
+    /// landing in between attribute a model to the wrong harness, which is precisely the silent
+    /// desync that ruled out positional pairing on the wire.
+    pub models: Vec<crate::heartbeat::RosterModel>,
+    /// The capability tokens this seat PROVED it can run, from
+    /// [`crate::capability::probe_capabilities`]. Seat-wide rather than per-harness: the tokens
+    /// describe the job EXECUTION ENVIRONMENT, which every harness on this seat shares.
+    ///
+    /// Empty is the honest answer for a stock image, and it is also the state before anything has
+    /// probed — which is exactly why the probe and its zero-control had to ship together. Absent
+    /// means unstated, never "none confirmed".
+    pub capabilities: Vec<String>,
+}
+
+impl Advertisement {
+    /// The #784 seat capability this snapshot implies — the ONE way a caller turns a roster read into
+    /// something emittable.
+    ///
+    /// It exists to make an omission unrepresentable rather than merely wrong. Both emitters (the
+    /// kind-30340 beat and the kind-3402 claim) need names AND models from the SAME snapshot, and a
+    /// two-argument constructor lets a call site pass the names and quietly forget the models. That
+    /// mistake is invisible on the wire — a seat that states no model is indistinguishable from a
+    /// harness that reported none — and on the claim it is worse than cosmetic, because the award
+    /// filter decides on the claim, so a forgotten model is a model no buyer can ever require.
+    ///
+    /// `display` is the operator's declared colour ([`crate::home::SeatConfig`]) — the two fields a
+    /// roster read cannot supply, because no probe measures a fork name or a machine description.
+    /// It is a required argument for the same reason `models` is: a snapshot that could be turned
+    /// into a capability WITHOUT it gives every call site the chance to emit a seat whose declared
+    /// colour silently vanished, and an absent tag is indistinguishable on the wire from an operator
+    /// who declared nothing.
+    ///
+    /// ⚠ Passing it here does NOT put it on a claim. The two halves are separated at emit, not at
+    /// construction: the claim builder asks for [`crate::heartbeat::SeatCapability::filterable_tags`]
+    /// and the beat additionally asks for `display_tags`, so a claim carries these fields nowhere
+    /// even while holding them. That is the whole point of the split being structural — this
+    /// function does not have to remember which field is which, and neither does its caller.
+    pub fn capability(&self, display: &crate::home::SeatConfig) -> crate::heartbeat::SeatCapability {
+        let mut capability = crate::heartbeat::SeatCapability::from_roster(&self.names, &self.models);
+        capability.capabilities = self.capabilities.clone();
+        capability.harness_variant = display.harness_variant.clone();
+        capability.hardware = display.hardware.clone();
+        capability
+    }
 }
 
 impl LiveRoster {
@@ -219,7 +294,18 @@ impl LiveRoster {
         Self {
             registry,
             state: Mutex::new(BTreeMap::new()),
+            capabilities: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Record the capability tokens the boot probe PROVED, replacing whatever was there.
+    ///
+    /// Probed, never configured (#784): there is no config key for this, because enum-binding makes a
+    /// token tidy rather than TRUE, and this is a field buyers commit sats against. The tokens are
+    /// canonical by construction — they come from [`crate::capability::CAPABILITIES`] itself, not
+    /// from anything an operator typed — so there is nothing to canonicalise here.
+    pub fn record_capabilities(&self, capabilities: Vec<String>) {
+        *self.capabilities.lock().expect("live roster poisoned") = capabilities;
     }
 
     /// The whole wire view of the roster, read under ONE lock.
@@ -232,17 +318,59 @@ impl LiveRoster {
         let mut ad = Advertisement {
             serving: false,
             names: Vec::new(),
+            models: Vec::new(),
+            capabilities: self
+                .capabilities
+                .lock()
+                .expect("live roster poisoned")
+                .clone(),
         };
         for (index, entry) in self.registry.entries().iter().enumerate() {
             if !Self::serving(&state, &index) {
                 continue;
             }
             ad.serving = true;
-            if let Some(name) = entry.name.clone() {
-                ad.names.push(name);
+            let Some(name) = entry.name.clone() else {
+                // The unlabelled `--agent-argv` hatch serves without a name. It may well have an
+                // observed model, but a model tag is keyed by the harness it belongs to, so a model
+                // with no harness to attribute it to is not advertisable — it is dropped here rather
+                // than emitted unattached.
+                continue;
+            };
+            if let Some(model) = state.get(&index).and_then(|harness| harness.model.clone()) {
+                ad.models.push(crate::heartbeat::RosterModel {
+                    harness: name.clone(),
+                    model,
+                });
             }
+            ad.names.push(name);
         }
         ad
+    }
+
+    /// Record the model id observed for `index`, replacing whatever was there.
+    ///
+    /// The ONE writer both model sources go through (#784) — the probe that PROVED a harness can
+    /// serve, and a job that completed on it. Deliberately a plain per-index setter taking an
+    /// `Option`: a second source is one call, and a fresh observation of NO model clears a stale one
+    /// rather than leaving it standing.
+    ///
+    /// Recording against a harness with no prior state CREATES its entry. That is why the state map
+    /// no longer means "has faulted" — see [`LiveRoster::state`]. Availability is untouched: a new
+    /// entry starts `unavailable: None`, so observing a model never takes a harness out of service
+    /// and never puts one back.
+    pub fn record_model(&self, index: usize, model: Option<String>) {
+        self.state
+            .lock()
+            .expect("live roster poisoned")
+            .entry(index)
+            .or_insert(HarnessState {
+                unavailable: None,
+                strikes: 0,
+                probing: false,
+                model: None,
+            })
+            .model = model;
     }
 
     /// The harness names to advertise on the wire, in preference order, EXCLUDING anything not
@@ -306,6 +434,7 @@ impl LiveRoster {
             unavailable: None,
             strikes: 0,
             probing: false,
+            model: None,
         });
         // Whatever a probe was testing, its answer arrived: this fault IS the answer.
         entry.probing = false;
@@ -465,6 +594,223 @@ mod tests {
 
     fn named(names: &[&str]) -> LiveRoster {
         roster(&names.iter().map(|n| Some(*n)).collect::<Vec<_>>())
+    }
+
+    fn model_of(ad: &Advertisement, harness: &str) -> Option<String> {
+        ad.models
+            .iter()
+            .find(|observed| observed.harness == harness)
+            .map(|observed| observed.model.clone())
+    }
+
+    #[test]
+    fn a_recorded_model_is_advertised_against_its_own_harness() {
+        let roster = named(&["claude", "codex"]);
+        roster.record_model(0, Some("claude-opus-5".to_owned()));
+        roster.record_model(1, Some("gpt-5.6-terra[medium]".to_owned()));
+
+        let ad = roster.advertisement();
+        // The DENOMINATOR before any per-entry claim: an empty `models` would satisfy every
+        // `find(...) == None` assertion below while proving nothing.
+        assert_eq!(ad.models.len(), 2, "both observations must reach the wire view: {ad:?}");
+        assert_eq!(model_of(&ad, "claude").as_deref(), Some("claude-opus-5"));
+        assert_eq!(model_of(&ad, "codex").as_deref(), Some("gpt-5.6-terra[medium]"));
+    }
+
+    #[test]
+    fn a_dropped_harness_takes_its_model_off_the_wire_with_its_name() {
+        // THE desync this design exists to prevent. Two harnesses, two DIFFERENT models; drop the
+        // first. The survivor must keep its OWN model — a wire view that assembled names and models
+        // in separate passes could pair `codex` with the model that belonged to `claude`, and the
+        // event would still parse.
+        let roster = named(&["claude", "codex"]);
+        roster.record_model(0, Some("claude-opus-5".to_owned()));
+        roster.record_model(1, Some("gpt-5.6-terra[medium]".to_owned()));
+        roster.fault(0, Fault::Unproven, Instant::now());
+
+        let ad = roster.advertisement();
+        assert_eq!(ad.names, vec!["codex"], "the dropped harness must not be advertised");
+        assert_eq!(ad.models.len(), 1, "exactly one model survives: {ad:?}");
+        assert_eq!(
+            model_of(&ad, "codex").as_deref(),
+            Some("gpt-5.6-terra[medium]"),
+            "the survivor kept its OWN model, not the dropped harness's"
+        );
+        assert_eq!(model_of(&ad, "claude"), None);
+    }
+
+    #[test]
+    fn a_fresh_observation_of_no_model_clears_a_stale_one() {
+        // The reason `record_model` takes an `Option` and overwrites unconditionally. A harness that
+        // stops reporting a model must stop advertising one; keeping the last value it ever gave is
+        // exactly the stale-advertisement drift this field is meant to bound.
+        let roster = named(&["claude"]);
+        roster.record_model(0, Some("claude-opus-5".to_owned()));
+        assert_eq!(model_of(&roster.advertisement(), "claude").as_deref(), Some("claude-opus-5"));
+
+        roster.record_model(0, None);
+        let ad = roster.advertisement();
+        assert!(ad.models.is_empty(), "a None observation must clear, not preserve: {ad:?}");
+        assert_eq!(ad.names, vec!["claude"], "clearing a model never unadvertises the harness");
+    }
+
+    #[test]
+    fn a_later_observation_replaces_an_earlier_one() {
+        // The refresher's whole purpose: a later `session/new` reporting a newly-changed default
+        // must correct the model the boot probe recorded, not sit behind it.
+        let roster = named(&["claude"]);
+        roster.record_model(0, Some("claude-opus-5".to_owned()));
+        roster.record_model(0, Some("claude-opus-6".to_owned()));
+        assert_eq!(model_of(&roster.advertisement(), "claude").as_deref(), Some("claude-opus-6"));
+    }
+
+    #[test]
+    fn recording_a_model_never_changes_availability() {
+        // `record_model` CREATES a state entry for a harness that has never faulted, and the state
+        // map is what `serving` reads. A default that came out `unavailable` would take a working
+        // harness off the market for the crime of reporting its model.
+        let roster = named(&["claude", "codex"]);
+        roster.record_model(0, Some("claude-opus-5".to_owned()));
+
+        assert!(roster.serves(Some("claude")), "observing a model must not drop a harness");
+        assert_eq!(roster.advertised(), vec!["claude", "codex"]);
+        assert_eq!(roster.unavailable(0), None);
+
+        // And the other direction: it must not RESTORE one either.
+        roster.fault(1, Fault::Unproven, Instant::now());
+        roster.record_model(1, Some("gpt-5.6-terra[medium]".to_owned()));
+        assert_eq!(roster.advertised(), vec!["claude"], "a model must not put a dropped harness back");
+        let ad = roster.advertisement();
+        assert_eq!(model_of(&ad, "codex"), None, "a non-serving harness advertises no model");
+    }
+
+    #[test]
+    fn the_unlabelled_hatch_serves_with_a_model_but_advertises_neither() {
+        // A model tag is keyed by the harness it belongs to, so a model with no name to attribute it
+        // to cannot go on the wire. It is dropped rather than emitted unattached.
+        let roster = roster(&[None, Some("codex")]);
+        roster.record_model(0, Some("some-model".to_owned()));
+        roster.record_model(1, Some("gpt-5.6-terra[medium]".to_owned()));
+
+        let ad = roster.advertisement();
+        assert!(ad.serving, "the hatch still serves");
+        assert_eq!(ad.names, vec!["codex"]);
+        assert_eq!(ad.models.len(), 1, "only the NAMED entry contributes a model: {ad:?}");
+        assert_eq!(model_of(&ad, "codex").as_deref(), Some("gpt-5.6-terra[medium]"));
+    }
+
+    #[test]
+    fn probed_capabilities_ride_the_same_snapshot_as_the_harnesses() {
+        // Capabilities are seat-wide while harnesses are per-index, so they could easily have been
+        // read separately — and a separate read is a second snapshot that can disagree with the
+        // first. This asserts they come out of ONE `advertisement()` call, and survive a fault that
+        // changes the harness half.
+        let roster = named(&["claude", "codex"]);
+        roster.record_capabilities(vec!["node".to_owned(), "rust".to_owned()]);
+        roster.fault(1, Fault::Unproven, Instant::now());
+
+        let ad = roster.advertisement();
+        assert_eq!(ad.names, vec!["claude"], "the harness half still narrows");
+        assert_eq!(
+            ad.capabilities,
+            vec!["node", "rust"],
+            "a dropped harness does not change what the ENVIRONMENT can run"
+        );
+        // And they reach the emittable capability through the one route both emitters use.
+        assert_eq!(
+            ad.capability(&crate::home::SeatConfig::default()).capabilities,
+            vec!["node", "rust"]
+        );
+    }
+
+    #[test]
+    fn a_seat_that_has_probed_nothing_advertises_no_capabilities() {
+        // The pre-probe state, and the honest stock-image answer. Paired with its positive control
+        // in the SAME test: an empty result here is indistinguishable from a roster that never wired
+        // capabilities at all unless the other direction is asserted beside it.
+        let roster = named(&["claude"]);
+        assert!(
+            roster.advertisement().capabilities.is_empty(),
+            "nothing probed means nothing advertised"
+        );
+
+        roster.record_capabilities(vec!["python".to_owned()]);
+        assert_eq!(
+            roster.advertisement().capabilities,
+            vec!["python"],
+            "POSITIVE CONTROL: the same read must surface a recorded token, or the empty above \
+             proves only that the field is unreachable"
+        );
+    }
+
+    #[test]
+    fn the_capability_a_snapshot_implies_reaches_the_filterable_tags() {
+        // The whole chain in one place: roster state → snapshot → capability → the tags an award
+        // filter reads. The pieces are tested apart; this asserts they are actually wired together,
+        // which is the part a call site can break without any single unit test noticing.
+        let roster = named(&["claude", "codex"]);
+        roster.record_model(0, Some("claude-opus-5".to_owned()));
+        roster.record_model(1, Some("gpt-5.6-terra[medium]".to_owned()));
+        roster.fault(1, Fault::Unproven, Instant::now());
+
+        let capability = roster
+            .advertisement()
+            .capability(&crate::home::SeatConfig::default());
+        assert_eq!(
+            capability.harness_families,
+            vec!["claude-code"],
+            "the dropped harness contributes no family"
+        );
+        assert_eq!(
+            capability.models,
+            vec![crate::heartbeat::HarnessModel {
+                family: "claude-code".to_owned(),
+                model: "claude-opus-5".to_owned(),
+            }],
+            "only the SERVING harness's model, keyed by its wire family"
+        );
+
+        // And on the emitted surface, since that is what a buyer actually reads. The count is the
+        // positive control: `contains` over an empty tag list would assert nothing.
+        let tags = capability.filterable_tags();
+        assert_eq!(tags.len(), 2, "harness_family + one harness_model: {tags:?}");
+        assert!(tags.contains(&crate::gateway::TagSpec::new([
+            "harness_model",
+            "claude-code",
+            "claude-opus-5",
+        ])));
+    }
+
+    #[test]
+    fn an_undeclared_seat_states_no_colour_at_all() {
+        // The two directions of the `[seat]` key, in one test because either alone is uninformative.
+        // Absent must mean the tag is OMITTED, not emitted empty: a reader cannot tell an empty
+        // string from a machine the operator declined to describe, and #784 makes absent the only
+        // spelling of unstated.
+        let roster = named(&["claude"]);
+        let undeclared = roster
+            .advertisement()
+            .capability(&crate::home::SeatConfig::default());
+        assert_eq!(undeclared.harness_variant, None);
+        assert_eq!(undeclared.hardware, None);
+        assert!(
+            undeclared.display_tags().is_empty(),
+            "an operator who declared nothing publishes no display tag"
+        );
+
+        // POSITIVE CONTROL: the same read must carry a DECLARED value, or the emptiness above proves
+        // only that the field is unreachable — which was the defect, not the fix.
+        let declared = roster.advertisement().capability(&crate::home::SeatConfig {
+            harness_variant: Some("my-fork".to_owned()),
+            hardware: Some("mac studio, 64GB".to_owned()),
+        });
+        assert_eq!(
+            declared.display_tags(),
+            vec![
+                crate::gateway::TagSpec::new(["harness_variant", "my-fork"]),
+                crate::gateway::TagSpec::new(["hardware", "mac studio, 64GB"]),
+            ]
+        );
     }
 
     #[test]

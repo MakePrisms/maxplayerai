@@ -79,6 +79,17 @@ pub struct OfferDraft {
     /// The harness this job asks for, as `["param", "agent", …]`. `None` (or `"any"`) ⇒ no
     /// preference: any seller may claim and run it on whichever harness it prefers.
     pub requested_agent: Option<String>,
+    /// The harness FAMILY this job asks for (#897), as
+    /// `["param", "harness_family", …]`. `None` ⇒ no preference.
+    pub requested_harness_family: Option<String>,
+    /// The model this job asks for (#897), as `["param", "harness_model", …]`. `None` ⇒ no
+    /// preference. Only meaningful paired with `requested_agent` — the preset is the only axis
+    /// dispatch reads — and a model without one refuses every claim.
+    pub requested_model: Option<String>,
+    /// Capability tokens this job REQUIRES (#897), as `["param", "capability", …]`. Empty ⇒ no
+    /// requirement, and no tag is emitted, so an offer that requires nothing stays byte-identical to
+    /// one posted before capability requests existed.
+    pub required_capabilities: Vec<String>,
 }
 
 impl OfferDraft {
@@ -96,6 +107,9 @@ impl OfferDraft {
             deadline_unix,
             seller_pubkey: Some(seller_pubkey.into()),
             requested_agent: None,
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: Vec::new(),
         }
     }
 
@@ -112,6 +126,9 @@ impl OfferDraft {
             deadline_unix,
             seller_pubkey: None,
             requested_agent: None,
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: Vec::new(),
         }
     }
 
@@ -119,6 +136,56 @@ impl OfferDraft {
     /// no request, so "no preference" has exactly one representation on the wire.
     pub fn requesting_agent(mut self, requested_agent: Option<&str>) -> Self {
         self.requested_agent = crate::seller_agents::normalize_request(requested_agent);
+        self
+    }
+
+    /// Request a harness family, a model, and/or a set of capability tokens for this job (#897).
+    ///
+    /// All three axes take ONE builder because they are ONE request: they travel together and are
+    /// judged together.
+    ///
+    /// ⚠ The PRESET is not one of them — it is set by [`Self::requesting_agent`]. A model needs the
+    /// preset, so a caller requesting a model through this builder alone builds an offer no claim can
+    /// satisfy. That is the fail-closed direction and the posting path refuses it before signing, but
+    /// it is the one pairing this signature cannot make obvious.
+    ///
+    /// Blank and all-whitespace values state nothing and are dropped, so "no requirement" has one
+    /// representation on the wire — the same "stated or absent" contract the seat-side readers apply
+    /// (`docs/protocol-v1.md` §4.5.2). Tokens are de-duplicated for the same reason: two spellings of
+    /// one requirement would put a set on the wire that no seat's advertisement is shaped like.
+    ///
+    /// Vocabulary is NOT checked here, and the PAIRING rules are not enforced here either. This
+    /// builds what it is told to build; the vocabulary gate is
+    /// [`crate::capability::validate_capability_request`], run by the posting path before an event is
+    /// signed, and the pairing rules are the award predicate's — it refuses a model with no preset,
+    /// and a family contradicting the preset, rather than ignoring either. That is the fail-closed
+    /// backstop, and it also covers offers this code never built.
+    ///
+    /// Owning no copy of those rules is why this builder needed no change when the model's anchor
+    /// moved from the family to the preset (#897 review).
+    pub fn requiring_capability(
+        mut self,
+        requested_harness_family: Option<&str>,
+        requested_model: Option<&str>,
+        required_capabilities: &[String],
+    ) -> Self {
+        self.requested_harness_family = requested_harness_family
+            .map(str::trim)
+            .filter(|family| !family.is_empty())
+            .map(str::to_owned);
+        self.requested_model = requested_model
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_owned);
+        let mut tokens: Vec<String> = Vec::new();
+        for token in required_capabilities {
+            let stated = token.trim();
+            if stated.is_empty() || tokens.iter().any(|kept| kept == stated) {
+                continue;
+            }
+            tokens.push(stated.to_owned());
+        }
+        self.required_capabilities = tokens;
         self
     }
 
@@ -137,6 +204,29 @@ impl OfferDraft {
                 crate::seller_agents::AGENT_PARAM,
                 requested_agent,
             ]));
+        }
+        // #897 capability request. Both arms are conditional, so an offer that requests nothing emits
+        // no tag and is byte-identical to one posted before this existed — filtering is opt-in per
+        // offer, and that identity is what makes it opt-in on the wire rather than only in the
+        // predicate.
+        if let Some(requested_harness_family) = &self.requested_harness_family {
+            tags.push(TagSpec::new([
+                "param",
+                crate::heartbeat::HARNESS_FAMILY_PARAM,
+                requested_harness_family,
+            ]));
+        }
+        if let Some(requested_model) = &self.requested_model {
+            tags.push(TagSpec::new([
+                "param",
+                crate::heartbeat::HARNESS_MODEL_PARAM,
+                requested_model,
+            ]));
+        }
+        if !self.required_capabilities.is_empty() {
+            let mut values = vec!["param".to_owned(), crate::heartbeat::CAPABILITY_PARAM.to_owned()];
+            values.extend(self.required_capabilities.iter().cloned());
+            tags.push(TagSpec(values));
         }
         if let Some(seller_pubkey) = &self.seller_pubkey {
             tags.push(TagSpec::new(["p", seller_pubkey]));
@@ -159,6 +249,13 @@ pub struct ParsedOffer {
     /// The harness this job requested, canonicalised. `None` ⇒ no preference (the parameter was
     /// absent, blank, or the explicit `any`).
     pub requested_agent: Option<String>,
+    /// The harness FAMILY this job requested (#897). `None` ⇒ no preference (absent or blank).
+    pub requested_harness_family: Option<String>,
+    /// The model this job requested (#897). `None` ⇒ no preference. Refused rather than ignored when
+    /// it arrives without `requested_agent`.
+    pub requested_model: Option<String>,
+    /// Capability tokens this job requires (#897). Empty ⇒ no requirement.
+    pub required_capabilities: Vec<String>,
 }
 
 impl ParsedOffer {
@@ -350,6 +447,20 @@ pub fn parse_offer(event: &EventDraft) -> Result<ParsedOffer, OfferParseError> {
             &event.tags,
             crate::seller_agents::AGENT_PARAM,
         )),
+        // #897. Trimmed to the same "stated or absent" contract the seat-side readers apply, so a
+        // padded `" codex "` cannot become a request no seat's advertisement can equal. The
+        // vocabulary is NOT enforced here: an out-of-vocabulary value is unmatchable by construction
+        // and refusing the whole offer at parse would make one bad param hide an otherwise readable
+        // offer from every reader, including the ones that only want its price.
+        requested_harness_family: stated(param_value(
+            &event.tags,
+            crate::heartbeat::HARNESS_FAMILY_PARAM,
+        )),
+        requested_model: stated(param_value(
+            &event.tags,
+            crate::heartbeat::HARNESS_MODEL_PARAM,
+        )),
+        required_capabilities: param_values(&event.tags, crate::heartbeat::CAPABILITY_PARAM),
     })
 }
 
@@ -362,6 +473,45 @@ fn param_value<'a>(tags: &'a [TagSpec], name: &str) -> Option<&'a str> {
         })
         .and_then(|tag| tag.0.get(2))
         .map(String::as_str)
+}
+
+/// One wire value normalized to the "stated or absent" contract (`docs/protocol-v1.md` §4.5.2):
+/// trimmed, and absent when nothing survives.
+///
+/// The emitters here already trim, so this only matters for tags written by someone else — which is
+/// every tag a reader ever sees. An all-whitespace value read raw would become a request no operator
+/// typed and no seat can match, and for the filterable fields it decides awards.
+fn stated(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|stated| !stated.is_empty())
+        .map(str::to_owned)
+}
+
+/// Read a multi-value `["param", <name>, <v1>, <v2>, …]` parameter off an event's tags.
+///
+/// Values from index 2 onward, [`stated`]-normalized and de-duplicated. Absent ⇒ empty, which never
+/// constrains anything: an empty requirement passes every claim.
+///
+/// Takes the FIRST matching tag only, matching [`param_value`]. A second `["param", <name>, …]` tag
+/// is therefore ignored rather than merged — deliberately, because merging would let a writer grow a
+/// buyer's requirement set across tags in a shape no emitter here produces, and the offer is signed:
+/// the conservative read of an ambiguous request is the one the buyer can be shown.
+fn param_values(tags: &[TagSpec], name: &str) -> Vec<String> {
+    let Some(tag) = tags.iter().find(|tag| {
+        tag.0.first().map(String::as_str) == Some("param")
+            && tag.0.get(1).map(String::as_str) == Some(name)
+    }) else {
+        return Vec::new();
+    };
+    let mut values: Vec<String> = Vec::new();
+    for value in tag.0.iter().skip(2) {
+        let Some(stated) = stated(Some(value)) else { continue };
+        if !values.contains(&stated) {
+            values.push(stated);
+        }
+    }
+    values
 }
 
 /// Parses the buyer-visible git delivery fields carried by a result event.
@@ -428,12 +578,23 @@ pub fn parse_bound_git_delivery(
 /// `agents` advertises the harnesses this seller can run (preference order) as `["agents", …]`
 /// (§6.2), so the buyer's award filter can hold the claim to the harness its job asked for.
 /// Empty ⇒ the tag is omitted rather than sent empty.
+///
+/// `capability` adds the #784 FILTERABLE fields. They are here and not only on the kind-30340 beat
+/// because the buyer's award filter reads the CLAIM — the claim is contemporaneous with the offer
+/// and needs no relay read inside the award decision, whereas the beat is periodic. The display-only
+/// fields are deliberately NOT carried: nothing in the award decision reads them, so they would be
+/// weight on every claim with no reader.
+///
+/// Both this and the beat take their filterable tags from
+/// [`crate::heartbeat::SeatCapability::filterable_tags`] — one function, so the two events cannot
+/// spell a shared field differently.
 pub fn claim_draft(
     offer_id: &str,
     buyer_pubkey: &str,
     seller_pubkey: &str,
     creq: &str,
     agents: &[String],
+    capability: &crate::heartbeat::SeatCapability,
 ) -> EventDraft {
     let mut tags = vec![
         TagSpec::new(["e", offer_id, "", "root"]),
@@ -444,6 +605,7 @@ pub fn claim_draft(
     if let Some(tag) = crate::heartbeat::agent_tag(agents) {
         tags.push(tag);
     }
+    tags.extend(capability.filterable_tags());
     status_draft(JOB_CLAIM_KIND, "processing", tags)
 }
 
@@ -1043,6 +1205,111 @@ mod tests {
         }
     }
 
+    // #897 — the capability request survives the wire: draft → tags → parse, both axes.
+    //
+    // A request is only worth anything if the value the AWARD FILTER reads equals the value the
+    // buyer posted, so this asserts the parsed values and not just the tag shapes: a correct tag
+    // read back wrong is the same outcome as no tag at all, and the tag assertion alone cannot
+    // see it.
+    #[test]
+    fn offer_carries_the_capability_request_across_the_wire() {
+        let asking = OfferDraft::untargeted("t", "text/plain", 5, 1_800_000_001)
+            .requiring_capability(
+                Some("codex"),
+                Some("gpt-5.6-sol[low]"),
+                &["rust".to_owned(), "node".to_owned()],
+            );
+        let draft = asking.to_event_draft();
+
+        let family = draft
+            .tags
+            .iter()
+            .find(|tag| tag.first() == Some("param") && tag.0.get(1).map(String::as_str) == Some("harness_family"))
+            .expect("offer carries the harness family param");
+        assert_eq!(family.0, vec!["param", "harness_family", "codex"]);
+
+        // The model value is whatever the harness reported, verbatim — bracket and dot included. A
+        // request is matched against the advertisement by exact equality, so any normalisation here
+        // would silently stop matching the seats that advertise these ids.
+        let model = draft
+            .tags
+            .iter()
+            .find(|tag| tag.first() == Some("param") && tag.0.get(1).map(String::as_str) == Some("harness_model"))
+            .expect("offer carries the harness model param");
+        assert_eq!(model.0, vec!["param", "harness_model", "gpt-5.6-sol[low]"]);
+
+        // ONE multi-value tag, not one tag per token: the readers take the first matching tag, so a
+        // second would be silently dropped and the buyer filtered on a subset of its own request.
+        let capability: Vec<_> = draft
+            .tags
+            .iter()
+            .filter(|tag| tag.first() == Some("param") && tag.0.get(1).map(String::as_str) == Some("capability"))
+            .collect();
+        assert_eq!(capability.len(), 1, "the capability request is ONE multi-value tag");
+        assert_eq!(capability[0].0, vec!["param", "capability", "rust", "node"]);
+
+        let parsed = parse_offer(&draft).expect("parse");
+        assert_eq!(parsed.requested_harness_family.as_deref(), Some("codex"));
+        assert_eq!(parsed.requested_model.as_deref(), Some("gpt-5.6-sol[low]"));
+        assert_eq!(parsed.required_capabilities, vec!["rust", "node"]);
+    }
+
+    // #897 — a job that asks for nothing posts the offer it always did, BYTE-IDENTICAL.
+    //
+    // Filtering is opt-in per offer, and this is what makes it opt-in on the WIRE rather than only
+    // inside the predicate. The empty and whitespace forms are covered together because they must
+    // reach the same place: "no requirement" has exactly one representation, so a padded value
+    // cannot become a request no seat can ever match.
+    #[test]
+    fn an_absent_capability_request_posts_a_byte_identical_offer() {
+        let plain = OfferDraft::untargeted("t", "text/plain", 5, 1_800_000_001);
+        for (family, model, capabilities) in [
+            (None, None, Vec::new()),
+            (Some(""), Some(""), Vec::new()),
+            (Some("   "), Some("\t"), vec!["".to_owned(), "  ".to_owned()]),
+        ] {
+            let asking = plain.clone().requiring_capability(family, model, &capabilities);
+            assert_eq!(
+                asking.to_event_draft(),
+                plain.to_event_draft(),
+                "{family:?}/{model:?}/{capabilities:?} must post the same offer as no request at all"
+            );
+            let parsed = parse_offer(&asking.to_event_draft()).expect("parse");
+            assert_eq!(parsed.requested_harness_family, None);
+            assert_eq!(parsed.requested_model, None);
+            assert!(parsed.required_capabilities.is_empty());
+        }
+    }
+
+    // #897 — readers normalize what SOMEONE ELSE wrote. Our own emitters already trim, so this is
+    // the only case that matters: a padded value read raw becomes a request no operator typed and
+    // no seat can match, and for the filterable fields it decides awards.
+    #[test]
+    fn the_capability_request_reader_normalizes_a_hand_written_offer() {
+        let mut draft = OfferDraft::untargeted("t", "text/plain", 5, 1_800_000_001).to_event_draft();
+        draft.tags.push(TagSpec::new(["param", "harness_family", "  codex  "]));
+        draft.tags.push(TagSpec(vec![
+            "param".to_owned(),
+            "capability".to_owned(),
+            " rust ".to_owned(),
+            "   ".to_owned(),
+            "rust".to_owned(),
+            "node".to_owned(),
+        ]));
+
+        let parsed = parse_offer(&draft).expect("parse");
+        assert_eq!(
+            parsed.requested_harness_family.as_deref(),
+            Some("codex"),
+            "a padded family must equal the family a seat advertises"
+        );
+        assert_eq!(
+            parsed.required_capabilities,
+            vec!["rust", "node"],
+            "blank values state nothing and a repeated token is one requirement"
+        );
+    }
+
     // TOOTH — a claim advertises the harnesses its seller can run, in order; a seller that states
     // none emits a byte-identical pre-registry claim rather than an empty tag.
     #[test]
@@ -1053,6 +1320,7 @@ mod tests {
             "seller",
             "creqAtest",
             &["claude".to_owned(), "codex".to_owned()],
+            &Default::default(),
         );
         let tag = advertised
             .tags
@@ -1065,7 +1333,7 @@ mod tests {
             vec!["claude", "codex"]
         );
 
-        let silent = claim_draft("job-1", "buyer", "seller", "creqAtest", &[]);
+        let silent = claim_draft("job-1", "buyer", "seller", "creqAtest", &[], &Default::default());
         assert!(silent.tags.iter().all(|tag| tag.first() != Some("agents")));
         assert!(crate::heartbeat::agents_from_tags(&silent.tags).is_empty());
     }
@@ -1143,6 +1411,9 @@ mod tests {
                 deadline_unix: 1_800_000_001,
                 seller_pubkey: Some(SELLER.into()),
                 requested_agent: None,
+                requested_harness_family: None,
+                requested_model: None,
+                required_capabilities: Vec::new(),
             }
         );
     }
@@ -1211,7 +1482,7 @@ mod tests {
         // The claim (processing) is its own claim kind, and the buyer-authored award
         // is the award kind — each distinct from the seller's feedback kind.
         assert_eq!(
-            claim_draft("offer", BUYER, SELLER, "creqAtest", &[]),
+            claim_draft("offer", BUYER, SELLER, "creqAtest", &[], &Default::default()),
             EventDraft::new(
                 JOB_CLAIM_KIND,
                 vec![
@@ -1254,7 +1525,7 @@ mod tests {
         );
         // A non-award event yields no selection.
         assert_eq!(
-            parse_award(&claim_draft("offer", BUYER, SELLER, "creqAtest", &[])),
+            parse_award(&claim_draft("offer", BUYER, SELLER, "creqAtest", &[], &Default::default())),
             None
         );
     }
@@ -1273,7 +1544,7 @@ mod tests {
         // new one against. A new lifecycle builder needs a row added by hand.
         const OFFER: &str = "offer";
         let lifecycle = [
-            ("claim", claim_draft(OFFER, BUYER, SELLER, "creqAtest", &[])),
+            ("claim", claim_draft(OFFER, BUYER, SELLER, "creqAtest", &[], &Default::default())),
             ("award", award_draft(OFFER, "claim", BUYER, SELLER)),
             ("accept", accept_draft(OFFER, "claim", BUYER, SELLER)),
             (
@@ -1606,7 +1877,7 @@ mod creq_tests {
             build_seller_creq("job-1", 21, "sat", &[MINT_A.to_string()], &seller).expect("build creq");
         assert!(creq.starts_with("creqA"), "creq must start with creqA: {creq}");
 
-        let draft = claim_draft("job-1", "buyer-pubkey", &seller, &creq, &[]);
+        let draft = claim_draft("job-1", "buyer-pubkey", &seller, &creq, &[], &Default::default());
         let creq_tag = draft
             .tags
             .iter()
@@ -1660,7 +1931,7 @@ mod creq_tests {
         let seller = seller_hex();
         let creq =
             build_seller_creq("job-7", 5, "sat", &[MINT_A.to_string()], &seller).expect("build creq");
-        let draft = claim_draft("job-7", "buyer", &seller, &creq, &[]);
+        let draft = claim_draft("job-7", "buyer", &seller, &creq, &[], &Default::default());
         let tag: &TagSpec = draft
             .tags
             .iter()

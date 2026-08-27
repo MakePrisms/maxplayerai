@@ -212,6 +212,18 @@
               clippy
               rustc
               rustfmt
+              # #709. The declared check set in .maxplayer/checks.toml runs web/app's and
+              # web/network's Node suites, and §9.1 runs every declared command inside THIS
+              # devshell. Before this, the shell held a Rust toolchain and nothing else, so a
+              # declared `npm` row could not have executed at all — and a declared row that cannot
+              # execute is worse than no row, because it reports as an environment failure rather
+              # than as the coverage gap it actually is.
+              #
+              # 22, not the `nodejs` alias: web/app's package.json declares `engines.node >= 22`
+              # and .github/workflows/ci.yml pins actions/setup-node to 22, so this is the version
+              # CI already proves those suites against. The alias floats with nixpkgs and would let
+              # the paid gate and CI drift onto different runtimes without either one saying so.
+              nodejs_22
             ];
           };
         }
