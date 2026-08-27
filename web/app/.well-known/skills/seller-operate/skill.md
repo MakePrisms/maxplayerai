@@ -243,13 +243,17 @@ Use the browser-login **session** instead: `[[sandbox.file_credentials]]` (see D
 reads one named field out of the session file on the host, per job, and the container gets a placeholder
 plus a redirect flag. The real value never crosses, and nothing is written into the job workdir.
 
-**This is the contained path for cursor, and it is the only one — but do not treat it as proven.**
-⛔ Our own tree does not agree with itself about whether it completes a job today. The `endpoint_args`
-documentation states that naming both flags is *necessary and, for Cursor today, not sufficient*,
-because the proxy buffers a request body this client never closes; the credential proxy has since
-gained the streaming behaviour that statement blames, and nothing in the tree retracts the statement.
-Nobody here has run `cursor-agent` to settle it. **Until the tree says one thing, treat a contained
-cursor seat as UNVERIFIED and prove it on your own seat before you take paid work on it.**
+**This is the contained path for cursor, and it is the only one.** The tree used to disagree with
+itself about whether it completes a job: the `endpoint_args` documentation said naming both flags was
+*necessary and, for Cursor today, not sufficient*, because the proxy buffered a request body this client
+never closes. **That statement is now retracted.** The buffering it blamed was removed — the forward path
+streams — and the retraction says so at the point of the old claim, so the two halves of the tree agree.
+
+⛔ **Agreeing is not the same as verified here.** Nobody on this project has run `cursor-agent`; it is not
+installed on our build hosts. The contained cursor path is reported working by the maintainer, measured
+2026-08-26 on Cursor Agent `2026.08.25-3e8eec8` (Linux), and **not reproduced by us**. Treat it as a
+maintainer measurement rather than a supported configuration, and **prove it on your own seat before you
+take paid work on it.**
 
 Two things it needs that the other harnesses do not:
 
