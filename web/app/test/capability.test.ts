@@ -5,9 +5,9 @@
  * contract with the publisher: the tag names below are typed as raw literals,
  * never imported, so a change to what `events.ts` looks for goes red here
  * rather than silently rendering an empty Profile. The DISPLAY is a claim about
- * what a buyer sees — which mark each value wears — and that is asserted
- * against rendered markup, because a source-text grep cannot tell a marker that
- * reaches the page from one that is built and dropped.
+ * what a buyer sees — which annotation each value wears, and which wears none —
+ * and that is asserted against rendered markup, because a source-text grep
+ * cannot tell a marker that reaches the page from one that is built and dropped.
  *
  * ⚠ SCOPE OF THE SPELLING PIN. It pins THIS side only. Nothing in web/app goes
  * red on a rename in `crates/maxplayer-core/src/heartbeat.rs`, so a
@@ -114,7 +114,7 @@ test("an older beat arriving late never overwrites the current advertisement", (
   assert.deepEqual(rows.find((r) => r.pubkey === SELLER)?.capabilities, ["node"]);
 });
 
-test("every capability row wears the mark its provenance earns", () => {
+test("only the operator-declared rows wear an annotation", () => {
   const rows = capabilityRows({
     harnessFamilies: ["codex"],
     harnessModels: [{ family: "codex", model: "gpt-5" }],
@@ -130,103 +130,51 @@ test("every capability row wears the mark its provenance earns", () => {
     assert.match(profileRowHtml(row!), /class="unverified">operator-declared</);
   }
 
-  // Machine-sourced, and NOT interchangeable. Protocol §4.5.3: NONE of the
-  // three is an enforcement — one inconsistency signal (`harness_model` is
-  // echoed) and two silences. They differ in freshness and in what they gate,
-  // not in how true they are, and a reader must not read three grades of one
-  // proof.
-  // Tuple-typed, not inferred: destructuring a `string[][]` yields
-  // `string | undefined` under noUncheckedIndexedAccess.
-  const filterable: [string, string][] = [
-    ["Harness family", "filters claims, not dispatch"],
-    ["Harness model", "last observed"],
-    ["Capabilities", "as of seat start"],
-  ];
-  for (const [label, mark] of filterable) {
+  // The three machine-sourced rows carry NO note at all — no chip and no hover
+  // title. Owner's call (bob, 2026-08-27 01:48:06Z): the provenance warnings
+  // are not wanted on the sheet. They render as bare label/value pairs.
+  for (const label of ["Harness family", "Harness model", "Capabilities"]) {
     const row = rowOf(rows, label);
-    assert.equal(row?.[2]?.mark, mark, `${label} must state its own provenance`);
-    assert.match(profileRowHtml(row!), new RegExp(`class="provenance">${mark}<`));
-    // The operator marker on a measured value would say the opposite.
-    assert.doesNotMatch(profileRowHtml(row!), /unverified/);
+    assert.equal(row?.[2], undefined, `${label} must carry no note`);
+    const html = profileRowHtml(row!);
+    assert.doesNotMatch(html, /class="provenance"/, `${label} must render no provenance chip`);
+    assert.doesNotMatch(html, /class="unverified"/, `${label} must not pick up the operator marker either`);
+    assert.doesNotMatch(html, /title=/, `${label} must render no hover title`);
   }
 
-  // The trichotomy is the point: the three must DIFFER. One mark shared across
-  // them satisfies every assertion above and still presents the equal-grades
-  // reading the protocol forbids, so the distinctness is asserted separately.
-  const marks = filterable.map(([label]) => rowOf(rows, label)?.[2]?.mark);
-  assert.equal(new Set(marks).size, 3, "the three filterable rows must not share a mark");
+  // Positive control for the four doesNotMatch assertions above: the same
+  // renderer DOES emit a chip and a title when a row carries a note, so their
+  // absence is a fact about these rows and not about a renderer that stopped
+  // emitting annotations for everything.
+  const operatorHtml = profileRowHtml(rowOf(rows, "Hardware")!);
+  assert.match(operatorHtml, /class="unverified">operator-declared</);
+  assert.match(operatorHtml, /title=/);
 });
 
-test("the capability row states its staleness bound and its over-claim direction", () => {
-  // §4.5.4: probed ONCE at seat start and republished on every beat since, so
-  // the bound is the seat's uptime and a recent beat proves nothing about when
-  // it was measured. The drift is not symmetric — a REMOVED toolchain keeps
-  // being advertised, nothing on the filter path catches it, and a buyer
-  // commits sats on this row.
-  const html = profileRowHtml(rowOf(capabilityRows({ capabilities: ["rust"] }), "Capabilities")!);
-  assert.match(html, /seat started/);
-  assert.match(html, /NOT evidence of a recent measurement/);
-  assert.match(html, /over-claim/);
-  assert.match(html, /not sufficient/);
-});
-
-test("the harness-family row never promises which harness runs", () => {
-  // This is the row a buyer reads before paying for a family, and the title is
-  // where the contract is stated — the mark beside it is a chip with no room
-  // for one. §4.5.3: the family is neither enforced nor echoed. It decides who
-  // may be CONSIDERED and never what executes, because dispatch selects on the
-  // offer's `agent` preset alone.
+test("the three filterable rows render bare — no chip, no title", () => {
+  // ⚠ THIS TEST REPLACES FOUR. At 678c4f6 the harness-family, harness-model
+  // and capability rows each had a test pinning the exact wording of their
+  // `title`: the family "never which harness runs one", the model "last asked",
+  // and the capability row had two ("not sufficient", and the staleness bound
+  // "NOT evidence of a recent measurement"). Those titles are gone by the owner's
+  // decision, so the tests asserting them are gone with them. Deleting a test
+  // silently is how a contract stops being one, so the deletion is recorded
+  // here rather than only in the diff.
   //
-  // ⚠ The forbidden list below is an INCLUSION filter, exactly as in the model
-  // row's test: it pins the spellings this claim has already worn here and
-  // CANNOT prove a new one is safe. The load-bearing assertions are the three
-  // positive ones.
-  const row = rowOf(capabilityRows({ harnessFamilies: ["codex"] }), "Harness family");
-  const title = row?.[2]?.title ?? "";
-  assert.notEqual(title, "", "positive control: an empty title would pass every doesNotMatch below");
+  // What can still be pinned is the shape: these rows carry a value and nothing
+  // else. Asserted end to end, on the rendered markup, because the note object
+  // and the attribute a buyer hovers are different artifacts.
+  const rows = capabilityRows({
+    harnessFamilies: ["codex"],
+    harnessModels: [{ family: "codex", model: "gpt-5" }],
+    capabilities: ["rust"],
+  });
 
-  for (const shape of [/enforced/i, /enforcement/i, /backed by a mechanism/i, /exactly or not at all/i, /binds dispatch/i]) {
-    assert.doesNotMatch(title, shape, `claims the family binds execution, which no code supports: ${shape}`);
+  for (const [label, value] of [["Harness family", "codex"], ["Harness model", "codex gpt-5"], ["Capabilities", "rust"]]) {
+    const html = profileRowHtml(rowOf(rows, label!)!);
+    assert.equal(html, `<div><dt>${label}</dt><dd>${value}</dd></div>`,
+      `${label} must render as a bare label/value pair`);
   }
-
-  // The three a buyer needs, asserted separately so that satisfying one cannot
-  // stand in for another: what the field DOES, what it does NOT do, and what to
-  // name instead when the execution guarantee is the thing being bought.
-  assert.match(title, /decides which seats may claim a job/, "must say the family filters claimant eligibility");
-  assert.match(title, /never which harness runs one/, "must say the family does not select what executes");
-  assert.match(title, /must name the preset/, "must say the `agent` preset is what buys the execution guarantee");
-
-  // Assert on the RENDERED attribute too. The object field and the string a
-  // buyer actually hovers are different artifacts, and only the second one ships.
-  assert.match(profileRowHtml(row!), /title="[^"]*never which harness runs one/);
-});
-
-test("the model row never states an execution fact", () => {
-  // The emitter names this defect family: any wording that upgrades this
-  // SELF-REPORT into an EXECUTION FACT is the same error, and it has been
-  // written in all three tenses already. The tense was never the error.
-  //
-  // ⚠ The forbidden list below is an INCLUSION filter. It pins the three shapes
-  // the emitter enumerated and CANNOT prove a new wording is safe — a novel
-  // overclaim passes it. The load-bearing assertion is the positive one: the
-  // title must say what the value actually is.
-  const row = rowOf(capabilityRows({ harnessModels: [{ family: "codex", model: "gpt-5" }] }), "Harness model");
-  const title = row?.[2]?.title ?? "";
-  assert.notEqual(title, "", "positive control: an empty title would pass every doesNotMatch below");
-
-  for (const shape of [/will use/, /is serving/, /actually ran/, /guarantees/]) {
-    assert.doesNotMatch(title, shape, `states an execution fact no code here supports: ${shape}`);
-  }
-  assert.match(title, /last asked/, "it must say what the value actually is");
-});
-
-test("a capability token carries the contract it actually buys", () => {
-  // The token means its probe command resolved in the job environment. A buyer
-  // commits sats on this row, so "necessary, not sufficient" is on the page and
-  // not left to the reader's inference.
-  const row = rowOf(capabilityRows({ capabilities: ["rust"] }), "Capabilities");
-  assert.match(row?.[2]?.title ?? "", /not sufficient/);
-  assert.match(profileRowHtml(row!), /title="[^"]*not sufficient/);
 });
 
 test("hostile free text in an unverified field cannot escape its row", () => {
