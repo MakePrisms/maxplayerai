@@ -516,7 +516,7 @@ mod tests {
     /// pass — the failure #715 names as worse than no check. Drop the `name == None ⇒ None`
     /// arm (or consult argv) and this goes red.
     #[test]
-    fn harness_credential_dir_never_guesses_from_an_unlabelled_hatch() {
+    fn harness_credential_dirs_never_guesses_from_an_unlabelled_hatch() {
         use std::path::Path;
         let home = Path::new("/home/seat");
         let hatch = RegisteredAgent {
