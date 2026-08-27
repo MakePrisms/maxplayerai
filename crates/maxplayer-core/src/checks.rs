@@ -934,6 +934,13 @@ timeout_secs = 1200
             &argv(&["npm", "ci", "--prefix", "web/app"]),
             "web/app"
         ));
+        // Every entry on an allowlist needs its own positive control. Without this one the
+        // `install` row could be dropped or mistyped and no test would notice — an allowlist
+        // entry that nothing asserts is indistinguishable from one that is not there.
+        assert!(argv_installs_in(
+            &argv(&["npm", "install", "--prefix", "web/app"]),
+            "web/app"
+        ));
 
         // Every row below names `web/app` and runs none of its tests. Each one is a false green
         // that a previous version of this reader accepted; the label says which idea it defeated.
@@ -1136,10 +1143,10 @@ timeout_secs = 1200
         // TypeScript run through tsx, web/network is plain ESM with zero dependencies. A guard
         // that named only one would leave the other exactly as uncovered as before.
         //
-        // Asked through `argv_runs_suite_in`, which requires a Node RUNNER, a TEST action and the
-        // directory together — the reader is proven spelling-by-spelling, and against six argv
-        // that name the directory and run nothing, in
-        // `node_suite_reader_sees_every_spelling_of_one_suite`.
+        // Asked through `argv_runs_suite_in`, which compares the whole argv element-wise against
+        // the small set of forms this repo declares — proven against those forms and against every
+        // argv that defeated an earlier reader, in
+        // `suite_and_install_readers_accept_only_the_declared_forms`.
         for suite in ["web/app", "web/network"] {
             assert!(
                 declaration
@@ -1272,14 +1279,22 @@ timeout_secs = 1200
         let Some(shells) = text.find("devShells") else {
             return false;
         };
-        let Some(default) = text[shells..].find("default = pkgs.mkShell") else {
+        let after_shells = &text[shells..];
+        let Some(default_at) = after_shells.find("default = pkgs.mkShell") else {
             return false;
         };
-        let from_default = &text[shells + default..];
-        let Some(list) = from_default.find("packages = with pkgs; [") else {
+        // Bound the search to the DEFAULT shell's own block before looking for anything in it.
+        // Searching forward from the default shell's NAME is not the same thing: if the default
+        // shell declares no `packages` list, an unbounded search walks straight past its closing
+        // brace and finds the NEXT shell's list, reporting a package the declared commands can
+        // never see. That is the same silent green this whole change exists to close.
+        let Some(block) = balanced_brace_block(&after_shells[default_at..]) else {
             return false;
         };
-        let after_open = &from_default[list + "packages = with pkgs; [".len()..];
+        let Some(list) = block.find("packages = with pkgs; [") else {
+            return false;
+        };
+        let after_open = &block[list + "packages = with pkgs; [".len()..];
         let Some(close) = after_open.find(']') else {
             return false;
         };
@@ -1289,6 +1304,34 @@ timeout_secs = 1200
             let code = line.split('#').next().unwrap_or("");
             code.trim() == package
         })
+    }
+
+    /// The text between the first `{` in `text` and its matching `}`, exclusive.
+    ///
+    /// #709. Comment-aware, because a `{` or `}` inside a Nix comment is prose and not structure;
+    /// counting it would end the block early or run it long. Nix's `${…}` interpolation is
+    /// balanced and so needs no special case. Returns `None` when the braces never balance, which
+    /// makes an unreadable flake fail the guard CLOSED rather than silently scanning to the end.
+    fn balanced_brace_block(text: &str) -> Option<&str> {
+        let open = text.find('{')?;
+        let mut depth = 0usize;
+        let mut in_comment = false;
+        for (offset, character) in text[open..].char_indices() {
+            match character {
+                '\n' => in_comment = false,
+                _ if in_comment => {}
+                '#' => in_comment = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&text[open + 1..open + offset]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     // #709, third round. The structural reader is proven against the shapes that defeated the
@@ -1345,6 +1388,59 @@ timeout_secs = 1200
             !default_devshell_lists_package(OTHER_SHELL, "nodejs_22"),
             "§9.1 runs the declared commands in the DEFAULT shell: a package in a different \
              shell's list is not available to them"
+        );
+
+        // M7/M8. The control the round-three fixtures were MISSING: every earlier `OTHER_SHELL`
+        // case left the default shell holding a `packages` list of its own, so the reader found
+        // that list first and the bug could not show. The drift that actually breaks a devshell is
+        // the default shell owning NO list at all — then an unbounded forward search walks past
+        // its closing brace into the next shell and reports a package the declared commands can
+        // never see. A negative control that cannot fail is not a control.
+        const DEFAULT_HAS_NO_LIST: &str = r#"
+      devShells = forAllSystems (system: {
+          default = pkgs.mkShell {
+            buildInputs = [ cargo ];
+          };
+          web = pkgs.mkShell {
+            packages = with pkgs; [
+              nodejs_22
+            ];
+          };
+      });
+"#;
+        assert!(
+            !default_devshell_lists_package(DEFAULT_HAS_NO_LIST, "nodejs_22"),
+            "the default shell declares no package list at all, so it declares no nodejs_22 — a \
+             later shell's list must never be read as the default shell's"
+        );
+
+        // Braces inside comments are prose, not structure. If they were counted, the default
+        // block would end early and this list would be missed.
+        const BRACES_IN_COMMENTS: &str = r#"
+      devShells = forAllSystems (system: {
+          default = pkgs.mkShell {
+            # a closing brace } in prose, and an opening one { too
+            packages = with pkgs; [
+              nodejs_22
+            ];
+          };
+      });
+"#;
+        assert!(
+            default_devshell_lists_package(BRACES_IN_COMMENTS, "nodejs_22"),
+            "a brace inside a comment is prose and must not end the default shell's block"
+        );
+
+        const UNBALANCED: &str = r#"
+      devShells = forAllSystems (system: {
+          default = pkgs.mkShell {
+            packages = with pkgs; [
+              nodejs_22
+"#;
+        assert!(
+            !default_devshell_lists_package(UNBALANCED, "nodejs_22"),
+            "a flake whose braces never balance is unreadable, and an unreadable flake must fail \
+             this guard CLOSED rather than be scanned to the end"
         );
 
         const NO_DEVSHELL: &str = "{ description = \"no devshell here\"; }";
