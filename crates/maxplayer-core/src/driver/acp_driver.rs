@@ -811,33 +811,51 @@ mod tests {
         );
     }
 
-    /// A `session/new` result shaped like a current Claude ACP adapter's: NO top-level `models`
-    /// object, the resolved model published as the model-category Session Config Option, and the
-    /// sibling `mode` and `thought_level` selectors present exactly as they are on the real wire.
+    /// A `session/new` result CAPTURED from `claude-agent-acp` v0.70.0, with only the model
+    /// option's `currentValue` parameterised.
     ///
-    /// Ground-truthed by reading `claude-agent-acp` v0.62.0 (the version reported in the field on
-    /// #896): `buildConfigOptions` emits the model entry as `{id: "model", name: "Model",
-    /// description, category: "model", type: "select", currentValue: models.currentModelId,
-    /// options: [...]}`, and `createSession` returns exactly `{sessionId, modes, configOptions}`.
+    /// Captured, not read. The fixture this replaces was ground-truthed by READING the adapter's
+    /// source, and so it invented `opus[1m]` — a string the real wire never sends — and had
+    /// no `default` row at all. Source-reading cannot falsify an invented fixture, which is why
+    /// every test here was green while a Claude seat advertised `default` to the market (#896).
+    /// Captured from `$HOME/forge/npm/bin/claude-agent-acp`, which is the binary `tools/fold:108`
+    /// gives every Claude seat — NOT whatever `claude-agent-acp` resolves to on a PATH, which on this
+    /// host is a different install at a different version. A capture taken against a binary the fleet
+    /// does not run is an invented fixture with a timestamp. `initialize.agentInfo.version` in the
+    /// capture reports 0.70.0.
     ///
-    /// The `thought_level` sibling is load-bearing, not decoration: its `currentValue` is an effort
-    /// level (`medium`), so any matcher loose enough to read a neighbouring option advertises an
-    /// effort level as a model.
+    /// Verbatim from the wire: `sessionId`, every `configOptions` entry's `id`/`name`/`description`/
+    /// `category`/`type`/`currentValue`, and the model entry's FIVE options in wire order. Elided to
+    /// `[]`: the option lists of the non-model selectors and `modes.availableModes`, none of which
+    /// any model read touches.
+    ///
+    /// Three properties of the real wire are load-bearing here and were all absent before:
+    ///
+    /// 1. `default` is a real, selectable option — `options[0]`, named "Default (recommended)". It
+    ///    is the picker's own alias for "whatever this account resolves to", NOT a model id.
+    /// 2. The `mode` and `thought_level` siblings ALSO sit at `default`, so a matcher loose enough
+    ///    to read a neighbouring option cannot be caught by a differing value — only by category.
+    /// 3. The `default` row's `description` all but names what it resolves to — v0.70.0 puts the
+    ///    literal string "Opus (1M context)" there, which is `opus[1m]`'s `name`. Do not read it.
+    ///    v0.64.0 of the same adapter instead gave `default` a byte-identical COPY of `opus[1m]`'s
+    ///    description. One display field, two meanings, two adjacent releases — it is ad copy for a
+    ///    human, and it is never a model read's input.
     fn claude_session_new_result(current_value: Value) -> Value {
         json!({
-            "sessionId": "019f61bd-89be-7230-b67b-717871387cea",
+            "sessionId": "cac8fd7e-bcb9-44c6-8c44-68a7c7c6343b",
             "modes": {
                 "currentModeId": "default",
-                "availableModes": [{"id": "default", "name": "Always Ask"}]
+                "availableModes": []
             },
             "configOptions": [
                 {
                     "id": "mode",
-                    "name": "Session Mode",
+                    "name": "Mode",
+                    "description": "Session permission mode",
                     "category": "mode",
                     "type": "select",
                     "currentValue": "default",
-                    "options": [{"value": "default", "name": "Always Ask"}]
+                    "options": []
                 },
                 {
                     "id": "model",
@@ -846,7 +864,33 @@ mod tests {
                     "category": "model",
                     "type": "select",
                     "currentValue": current_value,
-                    "options": [{"value": "claude-opus-4-8", "name": "Opus 4.8"}]
+                    "options": [
+                        {
+                            "value": "default",
+                            "name": "Default (recommended)",
+                            "description": "Opus (1M context)"
+                        },
+                        {
+                            "value": "opus[1m]",
+                            "name": "Opus (1M context)",
+                            "description": "Opus 5 with 1M context \u{b7} Best for everyday, complex tasks"
+                        },
+                        {
+                            "value": "claude-fable-5[1m]",
+                            "name": "Fable",
+                            "description": "Fable 5 \u{b7} Most capable for your hardest and longest-running tasks"
+                        },
+                        {
+                            "value": "sonnet",
+                            "name": "Sonnet",
+                            "description": "Sonnet 5 \u{b7} Efficient for routine tasks"
+                        },
+                        {
+                            "value": "haiku",
+                            "name": "Haiku",
+                            "description": "Haiku 4.5 \u{b7} Fastest for quick answers"
+                        }
+                    ]
                 },
                 {
                     "id": "effort",
@@ -854,25 +898,57 @@ mod tests {
                     "description": "Available effort levels for this model",
                     "category": "thought_level",
                     "type": "select",
-                    "currentValue": "medium",
-                    "options": [{"value": "medium", "name": "Medium"}]
+                    "currentValue": "default",
+                    "options": []
+                },
+                {
+                    "id": "fast",
+                    "name": "Fast mode",
+                    "description": "Faster responses on supported models",
+                    "category": "model_config",
+                    "type": "select",
+                    "currentValue": "off",
+                    "options": []
                 }
             ]
         })
     }
 
     #[test]
+    fn the_claude_picker_default_alias_is_not_a_model() {
+        // THE defect (#896 follow-on): the captured wire sits at `default`, and every Claude seat in
+        // the field advertised that string as its model. `default` names a PREFERENCE — "whatever
+        // this account resolves to" — and resolves to a different id on a different account, so it
+        // cannot identify what served a job. It is the trigger to resolve, never a value to publish.
+        assert_eq!(session_model_from_result(&claude_session_new_result(json!("default"))), None);
+    }
+
+    #[test]
+    fn only_the_exact_default_alias_is_refused() {
+        // The refusal is one exact string in the model category, not a family of aliases. Every other
+        // picker value — including the ones that are equally not concrete ids — passes through
+        // verbatim, because narrowing that is a different decision from this one.
+        for value in ["opus[1m]", "claude-fable-5[1m]", "sonnet", "haiku", "Default", "default-x", "defaults"] {
+            assert_eq!(
+                session_model_from_result(&claude_session_new_result(json!(value))).as_deref(),
+                Some(value),
+                "{value} is not the reserved alias and must pass through verbatim"
+            );
+        }
+    }
+
+    #[test]
     fn session_model_read_from_a_claude_session_config_option() {
         // #896: the Claude shape carries no legacy object at all — the resolved model is the
         // model-category config option's `currentValue`.
-        let result = claude_session_new_result(json!("claude-opus-4-8"));
+        let result = claude_session_new_result(json!("opus[1m]"));
         assert!(
             result.get("models").is_none(),
             "fixture must not carry the legacy shape, or it proves nothing about the new one"
         );
         assert_eq!(
             session_model_from_result(&result).as_deref(),
-            Some("claude-opus-4-8")
+            Some("opus[1m]")
         );
     }
 
@@ -880,26 +956,41 @@ mod tests {
     fn session_model_from_a_config_option_is_verbatim() {
         // The value is the resolved identity as the harness stated it, suffix and all — not parsed,
         // trimmed or normalised.
-        let result = claude_session_new_result(json!("claude-opus-4-8[medium]"));
+        let result = claude_session_new_result(json!("claude-fable-5[1m]"));
         assert_eq!(
             session_model_from_result(&result).as_deref(),
-            Some("claude-opus-4-8[medium]")
+            Some("claude-fable-5[1m]")
         );
     }
 
     #[test]
     fn session_model_never_reads_a_neighbouring_config_option() {
-        // Remove ONLY the model entry. The `mode` and `thought_level` siblings survive, both with
-        // perfectly usable string values — and the answer must be None, not a neighbour's value.
-        let mut result = claude_session_new_result(json!("claude-opus-4-8"));
+        // Remove ONLY the model entry. All three non-model selectors survive with perfectly usable
+        // string values — and the answer must be None, not a neighbour's value.
+        //
+        // `thought_level` is moved off `default` to `medium` first, which is a value its own captured
+        // options list offers. On the captured wire every selector sits at `default`, so once the
+        // model read refuses that string a loose matcher reading a neighbour would return None too —
+        // and this test would pass for the wrong reason, proving category discipline it never
+        // exercised. One neighbour must carry a value the read would otherwise HAPPILY return.
+        let mut result = claude_session_new_result(json!("opus[1m]"));
         let options = result["configOptions"].as_array_mut().expect("array");
+        for option in options.iter_mut() {
+            if option.get("category").and_then(Value::as_str) == Some("thought_level") {
+                option["currentValue"] = json!("medium");
+            }
+        }
         options.retain(|option| {
             option.get("category").and_then(Value::as_str) != Some(MODEL_CONFIG_CATEGORY)
         });
         assert_eq!(
             options.len(),
-            2,
-            "both non-model selectors must remain, or this proves nothing"
+            3,
+            "every non-model selector must remain, or this proves nothing"
+        );
+        assert!(
+            options.iter().any(|option| option.get("currentValue") == Some(&json!("medium"))),
+            "a neighbour must carry a value the model read would return if it looked"
         );
         assert_eq!(session_model_from_result(&result), None);
     }
@@ -922,11 +1013,11 @@ mod tests {
         // A legacy key that is not a usable model id must not shadow a good config option, and must
         // not be advertised as an empty or coerced model either.
         for unusable in [json!(""), json!("   "), json!(7), json!(null), json!({})] {
-            let mut result = claude_session_new_result(json!("claude-opus-4-8"));
+            let mut result = claude_session_new_result(json!("opus[1m]"));
             result["models"] = json!({"currentModelId": unusable.clone()});
             assert_eq!(
                 session_model_from_result(&result).as_deref(),
-                Some("claude-opus-4-8"),
+                Some("opus[1m]"),
                 "unusable legacy value {unusable} must fall through to the config option"
             );
         }
@@ -944,8 +1035,8 @@ mod tests {
             json!(4.8),
             json!(true),
             json!(null),
-            json!(["claude-opus-4-8"]),
-            json!({"currentModelId": "claude-opus-4-8"}),
+            json!(["opus[1m]"]),
+            json!({"currentModelId": "opus[1m]"}),
         ] {
             let result = claude_session_new_result(hostile.clone());
             assert_eq!(
@@ -971,14 +1062,14 @@ mod tests {
             // A usable value under the WRONG category — an `id` of "model" is not a match, because
             // this reads the category and never the id.
             json!({"sessionId": "abc", "configOptions": [
-                {"id": "model", "category": "mode", "currentValue": "claude-opus-4-8"}
+                {"id": "model", "category": "mode", "currentValue": "opus[1m]"}
             ]}),
             // A non-string category is malformed rather than merely absent: the field is present and
             // the wrong type. Absent and unknown categories are VALID ACP and are covered by
             // `session_model_declines_to_infer_when_the_optional_category_is_absent`, deliberately
             // not filed here.
             json!({"sessionId": "abc", "configOptions": [
-                {"id": "model", "category": 7, "currentValue": "claude-opus-4-8"}
+                {"id": "model", "category": 7, "currentValue": "opus[1m]"}
             ]}),
         ] {
             assert_eq!(
@@ -998,13 +1089,13 @@ mod tests {
         // defect as reading the neighbouring `thought_level` option one level in.
         //
         // A usable value sits behind the blank one deliberately: skip-ahead behaviour returns
-        // Some("claude-opus-4-8") here, so this test goes red the moment the fail-closed rule
+        // Some("opus[1m]") here, so this test goes red the moment the fail-closed rule
         // regresses.
         let result = json!({
             "sessionId": "abc",
             "configOptions": [
                 {"id": "model", "category": "model", "currentValue": ""},
-                {"id": "model-fallback", "category": "model", "currentValue": "claude-opus-4-8"}
+                {"id": "model-fallback", "category": "model", "currentValue": "opus[1m]"}
             ]
         });
         assert_eq!(session_model_from_result(&result), None);
@@ -1037,7 +1128,7 @@ mod tests {
         // advertisement.
         let no_category = json!({
             "sessionId": "abc",
-            "configOptions": [{"id": "model", "currentValue": "claude-opus-4-8"}]
+            "configOptions": [{"id": "model", "currentValue": "opus[1m]"}]
         });
         assert_eq!(session_model_from_result(&no_category), None);
 
@@ -1045,7 +1136,7 @@ mod tests {
         let unknown_category = json!({
             "sessionId": "abc",
             "configOptions": [
-                {"id": "model", "category": "_vendor_model", "currentValue": "claude-opus-4-8"}
+                {"id": "model", "category": "_vendor_model", "currentValue": "opus[1m]"}
             ]
         });
         assert_eq!(session_model_from_result(&unknown_category), None);
