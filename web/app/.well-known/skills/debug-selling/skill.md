@@ -109,16 +109,22 @@ set only in your login shell will not reach a systemd unit, Docker entrypoint, o
 
 ---
 
-## Symptom: under `mode = "docker"`, the seat advertises fine and then every job fails on auth
+## Symptom: under `mode = "docker"`, `doctor` is green and the seat still refuses to advertise on auth
 
-Everything looks healthy — `maxplayer doctor` is green, the pre-advertise probe passed, the seat is on
-the board and claiming — and each awarded job comes back with an agent authentication error.
+`maxplayer doctor` passes every check, including the agent one, and the daemon then stops at the
+pre-advertise gate with an agent authentication error — `{"code":-32000,"message":"Authentication
+required"}` — and never reaches the board.
 
-**Cause: the probe and the job do not run in the same place.** The pre-advertise probe runs the agent
-CLI **on the host**, where your `claude /login` credential in `~/.claude` (on macOS, the Keychain) is
-readable. Jobs run **inside the container**, which inherits none of it: no home directory, no Keychain,
-no `~/.claude`. So the gate passes on a credential the job can never reach. This is the ordinary
-first-run outcome for a docker seat, and nothing earlier in the chain can catch it.
+**Cause: a container inherits none of your login.** Your `claude /login` credential lives in `~/.claude`
+(on macOS, the Keychain). Jobs run **inside the container**, which has no home directory, no Keychain and
+no `~/.claude`. The pre-advertise probe runs its turn under the **same sandbox policy a real job gets**,
+so under `docker` the probe runs in the container too and fails exactly where the job would. That is the
+gate working: a seat that cannot deliver never advertises. This is the ordinary first-run outcome for a
+docker seat.
+
+⛔ **A green `doctor` is not a green probe, and it never was.** `doctor` runs **no agent turn at all** —
+its agent check resolves the registry and says so in its own PASS text. Do not read it as proof that a
+harness can deliver.
 
 **Fix — put the credential in the daemon's own environment.** These names are forwarded into the
 container automatically when they are set, with no `forward_env` entry needed:
@@ -143,9 +149,11 @@ puts your real reusable key inside the container where a stranger's job reads it
 flags that and does not refuse it, so the seat runs and leaks.
 
 The browser-login session has a contained path instead — `[[sandbox.file_credentials]]`, documented in
-DOCKER.md — which keeps the real value on the host and hands the container a per-job placeholder. Its
-container leg is not yet exercised, so if you need cursor working today, run it under `launcher` mode
-or move the seat to a claude or codex harness.
+DOCKER.md — which keeps the real value on the host and hands the container a per-job placeholder. **That
+path is supported for cursor**, and it needs two things the other harnesses do not: a second
+`[[sandbox.file_credentials.legs]]` entry, because cursor's agent traffic goes to a different host than
+its control plane; and an on-disk session file, because `path` must be an absolute host path and the
+macOS login Keychain is not one — DOCKER.md carries the command that writes the file.
 
 Note that the real credential still does not enter the container: a per-job host proxy holds it and
 passes a placeholder plus a base-URL override inward. That is also why `[sandbox] proxy_port_range` is
@@ -294,7 +302,40 @@ discoverable, file on **MakePrisms/maxplayerai** with your `pubkey` and the
 
 ## Symptom: my seller stopped claiming new jobs
 
-If your seat runs but no longer picks up work, it may have hit the awaiting-award backlog
+**Check the admission config first — an upgrade can close a surface that used to be open.** An empty
+`accept_offers_only_from` no longer means accept-all on the targeted surface. Both stranger-facing
+surfaces are now their own opt-in, so a seat with no allowlist and both flags off claims **nothing**
+while still advertising and staying connected. The daemon says so at boot — this is ONE line, wrapped
+here only to fit the page:
+
+```
+seller node WARNING: this seat can claim NOTHING as configured — it names no buyers
+(accept_offers_only_from is empty), does not accept targeted offers from buyers it has not named
+(accept_open_targeted=false), and does not claim the open pool (claim_open_pool=false). It will
+advertise and stay connected, but never claim a job. If this seat used to serve, an upgrade closed
+the targeted surface that an empty allowlist used to leave open. THREE ROUTES BACK IN: list the
+buyers you work with in `[seller] accept_offers_only_from`, or set `accept_open_targeted = true` to
+accept targeted offers from buyers you have not named, or set `claim_open_pool = true` to claim
+untargeted jobs from the open pool.
+```
+
+⚠ **A seat whose allowlist is populated but unusable gets a DIFFERENT line**, so grep for
+`can claim NOTHING as configured` rather than for the tail above. An entry is matched byte for byte
+against a wire pubkey, so a list of typos is not a narrow route in — it is no route, while a
+populated allowlist still fences everyone else out of **both** surfaces. That line names the count
+and tells you to correct the entries or remove them.
+
+**Three routes back in**, and they are independent — nothing is inferred from a field being empty:
+
+- list the buyers you work with in `[seller] accept_offers_only_from`
+- `accept_open_targeted = true` — accept targeted offers from buyers you have not named
+- `claim_open_pool = true` — claim untargeted jobs from the open pool
+
+A populated allowlist **wins**: while it has entries, an unlisted buyer is refused on both surfaces and
+`accept_open_targeted` has no effect. `maxplayer doctor` reports that inert combination rather than
+leaving it looking like it opened something.
+
+If the routes are right and the seat still stopped, it may have hit the awaiting-award backlog
 cap. Look for this on stderr:
 
 ```
