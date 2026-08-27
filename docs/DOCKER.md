@@ -120,7 +120,10 @@ Each harness has a different contained route:
   ⚠ Locate the session file your Cursor build actually wrote before you write its absolute path here —
   Cursor Agent `2026.08.25-3e8eec8` on Linux used `$HOME/.config/cursor/auth.json`, while older Cursor
   documentation names `$HOME/.cursor/auth.json`. Vendor behaviour, version-measured; revalidate it when
-  you move the pinned build.
+  you move the pinned build. ⚠ That location and `AGENT_CLI_CREDENTIAL_STORE` are **not** in Cursor's
+  published CLI authentication reference (<https://cursor.com/docs/cli/reference/authentication>, read
+  2026-08-27: that page names only `NO_OPEN_BROWSER` and `CURSOR_API_KEY`, with zero occurrences of
+  `AGENT_CLI_CREDENTIAL_STORE`, `auth.json` or `/.cursor`); both come from one operator run, not vendor docs.
 - **`codex`** — point `[sandbox.codex_chatgpt] auth_file` at the **absolute host path** of a dedicated
   `$CODEX_HOME/auth.json`. Do not mount or copy it into the container. Maxplayer reads the fields on the
   host once per job and sends only placeholders in; refreshing the file on the host needs no seller

@@ -137,6 +137,12 @@ in the seller quickstart.** It is the single source of truth; this is the short 
 file your build actually wrote before you put an absolute path into `config.toml`. These are vendor
 behaviours we neither set nor validate.
 
+⚠ **`AGENT_CLI_CREDENTIAL_STORE` and that file location are NOT in Cursor's published CLI
+authentication reference** (<https://cursor.com/docs/cli/reference/authentication>, read 2026-08-27:
+that page names `NO_OPEN_BROWSER` and `CURSOR_API_KEY` and nothing else, and contains zero occurrences
+of `AGENT_CLI_CREDENTIAL_STORE`, `auth.json` or `/.cursor`). Both come from one operator run, not from vendor
+documentation, and this project has not reproduced them. `NO_OPEN_BROWSER=1` **is** documented there.
+
 
 ## 3. Sandbox the job agent — this is not on by default
 

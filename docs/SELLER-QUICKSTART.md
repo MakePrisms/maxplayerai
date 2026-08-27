@@ -274,10 +274,23 @@ cursor-agent status
 browser. Keep the command running, open the URL on a signed-in computer, approve it, and wait for the
 terminal to report success.
 
-> **Vendor behaviour we do not control.** `cursor-agent login`, `status`, and `logout` are documented by
-> Cursor at <https://docs.cursor.com/en/cli/reference/authentication> (read 2026-08-26). `NO_OPEN_BROWSER`
-> and `AGENT_CLI_CREDENTIAL_STORE` are Cursor's own environment variables. Maxplayer neither sets nor
+> **Vendor behaviour we do not control.** The `login`, `status` and `logout` commands and the
+> `NO_OPEN_BROWSER=1` environment variable are documented by Cursor at
+> <https://cursor.com/docs/cli/reference/authentication> (read 2026-08-27). Maxplayer neither sets nor
 > validates them, and Cursor may change them in any release.
+>
+> ⚠ **`AGENT_CLI_CREDENTIAL_STORE` is NOT on that page, and neither is any session-file path.** Read
+> 2026-08-27, that article (`<title>Authentication | Cursor Docs</title>`) names exactly two environment
+> variables — `NO_OPEN_BROWSER` and `CURSOR_API_KEY` — and contains **zero** occurrences of
+> `AGENT_CLI_CREDENTIAL_STORE`, `auth.json` or `/.cursor`. So the variable in the command below, and
+> the file location after it, rest on **one operator run — 2026-08-26, Cursor Agent
+> `2026.08.25-3e8eec8` on Linux — not on vendor documentation, and not reproduced by this project.**
+> Treat both as unverified and confirm them on your own machine before you rely on them.
+>
+> The URL earlier editions of this page cited, `docs.cursor.com/en/cli/reference/authentication`, is
+> dead. Every path on that host answers `HTTP 308` to the same `cursor.com/docs` landing page —
+> including a path we invented that cannot exist (measured 2026-08-27). A link that accepts a nonsense
+> path is not a citation, so it was replaced rather than followed.
 
 For a Docker seat, use the **browser session file**, not `CURSOR_API_KEY`. Force file storage during
 login if the platform would otherwise use a Keychain:
