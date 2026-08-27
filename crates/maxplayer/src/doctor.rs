@@ -4022,6 +4022,70 @@ mod tests {
         );
     }
 
+    /// RED-PROVE on the PR base: the direction this change was MADE for. `<home>/.config/cursor`
+    /// exists and `<home>/.cursor` does not — a seat whose Cursor build wrote the measured location.
+    ///
+    /// On the base this check resolved ONE cursor directory (`<home>/.cursor`) and stat-ed it with
+    /// absence treated as an error, so this seat took a WARN naming a path it had correctly never
+    /// created. The sibling test above only covers both-absent, which WARNS on the base and on this
+    /// head alike — it would pass without the grouping. This one is the case the grouping exists for:
+    /// the check must Pass and must name the directory it really inspected.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn a_cursor_seat_that_linked_at_the_measured_location_passes_and_names_it() {
+        // Built from the pid, not a fixed name: a fixed path under the shared temp directory is
+        // another user's to create, and this test writes into it.
+        let home = std::env::temp_dir()
+            .join(format!("maxplayer-doctor-configcursor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let measured = home.join(".config").join("cursor");
+        std::fs::create_dir_all(&measured).expect("create the measured cursor credential directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&measured, std::fs::Permissions::from_mode(0o700))
+                .expect("tighten the fixture directory");
+        }
+        let documented = home.join(".cursor");
+        assert!(
+            !documented.exists(),
+            "the documented location must stay absent: {}",
+            documented.display()
+        );
+        let existing = std::env::current_exe()
+            .expect("current exe")
+            .to_string_lossy()
+            .into_owned();
+        let mut presets = std::collections::BTreeMap::new();
+        presets.insert(
+            "cursor".to_owned(),
+            maxplayer_core::home::AgentPresetConfig {
+                argv: vec![existing],
+            },
+        );
+        let seller = seller_for_agents(vec!["cursor".into()], vec!["ignored".into()]);
+        let check = checks::check_harness_credential_permissions(
+            Some(seller),
+            presets,
+            Some(home.clone()),
+        );
+        let rendered = check.render();
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(
+            check.status,
+            Status::Pass,
+            "a cursor seat linked at the measured location must pass: {rendered}"
+        );
+        assert!(
+            rendered.contains(&measured.display().to_string()),
+            "the pass line must name the directory it actually inspected: {rendered}"
+        );
+        assert!(
+            !rendered.contains("not linked to an account"),
+            "a linked seat must not be reported as unlinked: {rendered}"
+        );
+    }
+
     /// RED-PROVE: a raw `--agent-argv` hatch must SAY it cannot resolve, and must not name a
     /// guessed path. Fall back to `~/.claude` (or sniff argv) and this goes red — the detail
     /// would contain `.claude` and the status might even Pass.
