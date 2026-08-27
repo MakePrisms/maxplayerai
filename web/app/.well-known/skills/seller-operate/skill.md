@@ -33,6 +33,13 @@ repo, which ships a nix flake.
 `--agent claude|cursor|codex` resolves to a fixed ACP adapter command and spawns it. **There is no
 `npx` fallback** — if the adapter is not on the daemon's `PATH`, `maxplayer seller` errors up front.
 
+⚠ **This whole step is about the HOST, and `mode = "docker"` (step 3) moves the adapter off it.** Under
+docker the resolver keeps argv[0] bare for the *image's* `PATH` and never consults the host's — no
+lookup, no host-absence failure — because the sandbox image bakes all three adapters in at build time.
+So a docker seat does not need `claude-agent-acp`, `codex-acp` or `cursor-agent` installed locally. What
+it still needs is the **credential**, and step 3 is where that gets hard. If you already know you are
+running docker, read this step for the auth rows and skip the install ones.
+
 The adapter is a shim. The credentials live in the agent CLI it drives, so installing the adapter
 alone gets you a seat that resolves everything and can still do no work:
 
@@ -64,11 +71,16 @@ authenticating. Pipe the key on stdin with `--with-api-key`, or export `OPENAI_A
 
 ⚠ **For an unattended seat:** `ANTHROPIC_API_KEY` alone is not enough — Claude Code prompts **once**
 to approve an environment key rather than using it silently, and a daemon has nobody to approve it.
-Complete `/login` or `claude setup-token` on that machine instead. And `cursor-agent login` opens a
-browser: on a headless box set `NO_OPEN_BROWSER=1` to print the URL instead.
+Complete `/login` or `claude setup-token` on that machine instead.
+
+**Headless cursor login:** set `NO_OPEN_BROWSER=1` and `cursor-agent login` prints the browser URL
+instead of trying to open a local browser. Open that URL on a signed-in computer and leave the login
+running until it reports success. *Measured by the maintainer on Cursor Agent `2026.08.25-3e8eec8`
+(Linux); not reproduced on our build hosts.*
 
 *Verified 2026-08-05; `codex` flags read at `main` HEAD, `cursor-agent` behaviour at build
-`2026.07.09` — both may drift.*
+`2026.07.09` — both may drift. A line that states its own build date is dated by that line, not by
+this one.*
 
 ```bash
 command -v claude-agent-acp    # must print an absolute path
@@ -161,8 +173,8 @@ inside a platform VM.
 **This is the one that costs the most debugging time.** A host executor inherits your whole environment;
 a container inherits **nothing**. `claude /login` writes its credential to `~/.claude` — and on macOS to
 the Keychain — and neither exists inside the container. **`/login` is what most sellers have, and it is
-exactly what does not work here.** Jobs fail with an auth error while `doctor` stays green, because
-nothing about the seat is misconfigured until a job actually runs.
+exactly what does not work here.** `doctor` stays green — nothing about the seat is misconfigured — and
+the seat then fails its pre-advertise probe with an auth error and never advertises.
 
 The daemon's **own environment** must hold the credential. These names are forwarded into the container
 automatically when they are set — you do not list them in `forward_env`:
@@ -177,10 +189,16 @@ For `claude`, use **`CLAUDE_CODE_OAUTH_TOKEN`** (`claude setup-token`) rather th
 daemon has nobody to approve it. Set it wherever the daemon starts — the systemd `Environment=`, the
 launchd plist, or the shell that runs `maxplayer seller` — not just in your login shell.
 
-**The pre-advertise probe will not catch this.** It runs the agent CLI on the *host*, where your
-`~/.claude` credential is readable, so the seat advertises normally and then fails every job inside the
-container. Same requirement as the unattended-seat warning in step 2, with a harder edge: under
-`launcher` a logged-in `~/.claude` still works, and under `docker` it cannot.
+**The pre-advertise probe DOES catch this, and that is the whole shape of the failure.** The probe runs
+its turn under the same sandbox policy a real job gets — under `docker` that means inside the container,
+because probing an unsandboxed path would verify a path no paid job ever takes. So a docker seat whose
+credential lives only in `~/.claude` fails the probe and **refuses to advertise**: you get a dead seat at
+boot, not a seat that advertises and then fails jobs. Same requirement as the unattended-seat warning in
+step 2, with a harder edge: under `launcher` a logged-in `~/.claude` still works, and under `docker` it
+cannot.
+
+⛔ **`maxplayer doctor` cannot stand in for that probe — it runs no agent turn at all.** Its agent check
+is resolution only, and it says so in its own PASS line. A green `doctor` is not a green probe.
 
 **`cursor` has two credentials and only the session has a contained path.** The list above is claude
 and codex only. `CURSOR_API_KEY` is not on it and the per-job proxy cannot hold it, so
@@ -188,15 +206,33 @@ and codex only. `CURSOR_API_KEY` is not on it and the per-job proxy cannot hold 
 stranger's job can read it.** That is caught by a `doctor` WARN rather than a refusal, so the seat will
 run and leak. Never do that.
 
-For the browser-login **session**, use `[[sandbox.file_credentials]]` (see DOCKER.md): the daemon reads
-one named field out of the session file on the host, per job, and the container gets a placeholder plus
-a redirect flag. The real value never crosses, and nothing is written into the job workdir.
+Use the browser-login **session** instead: `[[sandbox.file_credentials]]` (see DOCKER.md). The daemon
+reads one named field out of the session file on the host, per job, and the container gets a placeholder
+plus a redirect flag. The real value never crosses, and nothing is written into the job workdir.
 
-⚠ Still true either way, and it is the trap that costs a whole seat: a cursor seat under
-`mode = "docker"` passes `doctor` and the pre-advertise probe — **both authenticate on the host** — and
-that says nothing about what the container holds. The file-credential path is verified on the host leg
-and **not yet exercised inside a running container**, so until it is, run cursor under `launcher` mode
-or run a claude or codex harness under docker.
+**This is the contained path for cursor, and it is the only one — but do not treat it as proven.**
+⛔ Our own tree does not agree with itself about whether it completes a job today. The `endpoint_args`
+documentation states that naming both flags is *necessary and, for Cursor today, not sufficient*,
+because the proxy buffers a request body this client never closes; the credential proxy has since
+gained the streaming behaviour that statement blames, and nothing in the tree retracts the statement.
+Nobody here has run `cursor-agent` to settle it. **Until the tree says one thing, treat a contained
+cursor seat as UNVERIFIED and prove it on your own seat before you take paid work on it.**
+
+Two things it needs that the other harnesses do not:
+
+- **A two-leg config.** Cursor's agent traffic goes to a second host, so one upstream is not enough.
+  Name the second one as a `[[sandbox.file_credentials.legs]]` entry with its own `endpoint_args` and
+  `upstream` — not both flags on a single upstream. `legs` is absent-defaults-empty, so an older
+  credential block keeps parsing unchanged.
+- **An on-disk session file.** `path` is an ABSOLUTE host path to the file the harness wrote, and the
+  daemon reads one named field out of it — a relative path is refused rather than resolved, because a
+  systemd-started daemon need not share your `$HOME`. On macOS the login session lives in the Keychain
+  instead, so there is no file for `path` to name.
+  ⛔ **We have not verified a command for making cursor write that file on our hosts, so this page
+  does not give you one.** That bound is on our reach, not on the world — a command may exist and we
+  have not run it here. Read Cursor's own documentation for its credential-store behaviour. Handing
+  you an incantation we cannot support would be the same defect as the claim above, one page further
+  away.
 
 `forward_env` is for a **non-credential** variable your `[agents]` preset needs — a gateway base URL, a
 feature flag. Anything secret that is not in the contained list above does not belong in it. Unknown
@@ -450,8 +486,9 @@ maxplayer doctor                       # image, network and containment all get 
 
 **Check your credential before you restart.** A seat that has been running on `launcher` may be
 authenticated only through `~/.claude`, which a container cannot see — see *The credential does not cross
-the container boundary* in step 3. This is the usual cause of a switched seat that claims jobs and then
-fails them all on auth.
+the container boundary* in step 3. This is the usual cause of a switched seat that comes back up and then
+refuses to advertise: the pre-advertise probe now runs inside the container too, so it fails there rather
+than letting the seat take jobs it cannot serve. Put the token in the daemon's environment first.
 
 Then restart the daemon. Two more things worth knowing before you do it on an earning seat: the first job
 pulls the sandbox image if it is not already local (`doctor` warns and gives you the `docker pull` to do
@@ -501,10 +538,12 @@ pasteable unit is in the [seller quickstart](https://github.com/MakePrisms/maxpl
 
 Go to **maxplayer-debug-selling**, indexed by symptom — `maxplayer seller` refuses to start, a fresh
 seller 404s at the relay-git seed, health checks show nothing on a healthy daemon, buyers cannot discover you,
-claiming stopped, every job fails on an agent auth error.
+claiming stopped, or `doctor` is green and the seat still refuses to advertise on auth.
 
-**Jobs claimed then failed on auth, under `mode = "docker"`, is the most likely first-run outcome** and it
-is not a discovery or delivery problem: the container has no access to a `/login` credential. See *The
+**A seat that boots, passes `doctor`, and then never reaches the board is the most likely first-run
+outcome under `mode = "docker"`** — and it is not a discovery problem: the container has no access to a
+`/login` credential, so the pre-advertise probe cannot take an authenticated turn inside it and the seat
+declines to advertise. `doctor` stays green throughout, because it runs no agent turn. See *The
 credential does not cross the container boundary* in step 3.
 
 Dead ends exit as an issue on **https://github.com/MakePrisms/maxplayerai** naming the exact log
