@@ -228,12 +228,43 @@ impl AcpDriver {
     /// the init frame reports the decorated id the turn actually ran on. When no turn resolved one —
     /// every non-Claude harness, and any Claude run whose frame never arrived — this is byte-identical
     /// to the value the driver reported before (#896 follow-on).
+    /// Forget any turn-resolved model, because a new session has resolved none yet.
+    ///
+    /// Every current call site builds a fresh driver per run, so this clears nothing today. A REUSED
+    /// driver would otherwise report the previous session's concrete model for a session whose init
+    /// frame never arrives — a WRONG model where absence was the truth, which is the failure mode
+    /// this whole path exists to remove. A poisoned lock leaves the stale value in place and is not
+    /// worth failing a session over; the model is the only thing at risk and it is already
+    /// best-effort.
+    fn reset_turn_model(&self) {
+        if let Ok(mut resolved) = self.claude_turn_model.lock() {
+            *resolved = None;
+        }
+    }
+
     fn resolved_model(&self) -> Option<String> {
-        self.claude_turn_model
-            .lock()
-            .ok()
-            .and_then(|resolved| resolved.clone())
-            .or_else(|| self.session_model.clone())
+        if let Ok(resolved) = self.claude_turn_model.lock()
+            && let Some(model) = resolved.clone()
+        {
+            return Some(model);
+        }
+        // The Claude picker is a PREFERENCE, so none of its values identify a model — not just
+        // `default`. `sonnet`, `haiku` and `opus[1m]` each resolve to whatever that name currently
+        // means for the signed-in account, so two sellers reporting `sonnet` can be running
+        // different concrete models and a buyer filtering on it is awarding against ad copy. That is
+        // the same false-advertisement this path exists to remove, arriving by a second door.
+        //
+        // So on claude-agent-acp the init frame is the ONLY identity, and its absence is absence. A
+        // human who explicitly picked a concrete row (`claude-fable-5[1m]` is the one such row at
+        // 0.70.0) loses attribution on a run whose frame never arrived — that is the honest reading,
+        // because without the frame we did not see what the turn ran on.
+        //
+        // Every other harness keeps the #896 behaviour byte-for-byte: `session_model` is still the
+        // `session/new` value, and codex-acp's legacy `models.currentModelId` is untouched.
+        if self.is_claude_adapter {
+            return None;
+        }
+        self.session_model.clone()
     }
 }
 
@@ -284,6 +315,7 @@ impl Driver for AcpDriver {
         // `session_model_from_result` reads (#896). Absent-stays-absent: a harness that reports no
         // model leaves this `None`, and nothing downstream fabricates one.
         self.session_model = session_model_from_result(&result);
+        self.reset_turn_model();
         session_id_from_result(&result)
     }
 
@@ -2593,6 +2625,28 @@ mod tests {
             matches!(update, SessionUpdate::Ext(ExtMethod { ref method, .. })
                 if method == CLAUDE_SDK_MESSAGE_METHOD),
             "routing must be unchanged by the adapter-private read: {update:?}"
+        );
+    }
+
+    #[test]
+    fn a_new_session_does_not_inherit_the_previous_turns_model() {
+        // Advisor's non-gating note, taken. Safe today because every call site builds a fresh
+        // driver; a reused one would otherwise report a stale concrete model as this session's.
+        let mut driver = test_driver();
+        driver.is_claude_adapter = true;
+        *driver.claude_turn_model.lock().expect("lock") = Some("claude-opus-5[1m]".into());
+        assert_eq!(
+            driver.resolved_model().as_deref(),
+            Some("claude-opus-5[1m]"),
+            "POSITIVE CONTROL: the stale value must be readable first, or the clear proves nothing"
+        );
+        // `start_session` calls exactly this, which is why it is a named method and not three inline
+        // lines: a clear no test can reach is how a stale model would survive unnoticed.
+        driver.reset_turn_model();
+        assert_eq!(
+            driver.resolved_model(),
+            None,
+            "the next session must start with no turn-resolved model"
         );
     }
 
