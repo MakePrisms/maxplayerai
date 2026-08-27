@@ -1235,221 +1235,46 @@ timeout_secs = 1200
         );
     }
 
-    // #709 re-grade. The declared npm rows run inside the flake devshell (§9.1), and at d4ccc7f
-    // that shell held a Rust toolchain and nothing else — no node, no npm. So the rows this change
-    // adds could not have executed there, and a declared row that cannot execute is worse than no
-    // row: it reports as an environment failure rather than as the coverage gap it replaces.
+    // #709. The declared npm rows run inside the flake devshell (§9.1), and at d4ccc7f that shell
+    // held a Rust toolchain and nothing else — no node, no npm. So the rows this change adds could
+    // not have executed there. Delete `nodejs_22` and, without this test, every other test here
+    // still passes while the declared rows quietly become unrunnable.
     //
-    // Delete `nodejs_22` from flake.nix and, without this test, every other test here still
-    // passes while the declared rows quietly become unrunnable — #709's own defect class, one file
-    // over. This closes that.
+    // WHAT THIS PROVES, EXACTLY: some line in flake.nix is the bare element `nodejs_22`. That is a
+    // claim about the file's TEXT, and it is the whole claim.
     //
-    // BOUND, and it is the honest limit of this assertion: this reads flake.nix as TEXT. It proves
-    // the devshell DECLARES node; it does not prove the devshell provides it. Nothing in this tree
-    // can prove that — `nix` is not required to build this repo and no CI job enters the devshell
-    // — so that residual is named in the pull request rather than papered over here.
+    // WHAT IT DOES NOT PROVE, AND WHY IT DOES NOT TRY. It does not prove the package is in the
+    // DEFAULT devshell's list — a second shell could own it — and it does not prove the devshell
+    // evaluates or that entering it yields a working `npm`.
+    //
+    // Three attempts bound `nodejs_22` to the default shell by reading the file as text, and each
+    // was defeated by valid Nix. A substring search matched prose. A brace-balanced block ended
+    // early on `shellHook = "echo }"`. Bounding the region by the next `mkShell` truncated on the
+    // word `mkShell` in a COMMENT and — worse — read a package list written inside a STRING as a
+    // real one, reporting a package the shell does not have. Measured, all three.
+    //
+    // The class is the one this file already learned once for argv: **structure cannot be decided
+    // by inspecting text.** Substrings are to Nix what tokens were to argv. Deciding "nodejs_22 is
+    // in the default shell's list" from raw text needs a Nix parser, and this crate has no other
+    // reason to carry one. So this claims only what text can carry, and says so where it is
+    // asserted rather than implying more. The precise binding is tracked as a follow-on.
     #[test]
-    fn the_devshell_declares_the_node_the_check_rows_need() {
+    fn the_flake_still_declares_the_node_the_check_rows_need() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../", "flake.nix");
         let text = std::fs::read_to_string(path).expect("this repo ships flake.nix at its root");
-        assert!(
-            default_devshell_lists_package(&text, "nodejs_22"),
-            "the DEFAULT devshell's package list must contain nodejs_22, or \
-             .maxplayer/checks.toml's npm rows cannot execute in the environment they are \
-             declared against"
-        );
-    }
 
-    /// Whether the default devshell's package list contains `package` as a list element.
-    ///
-    /// #709, third round. The first version asked whether `nodejs_22` appeared anywhere after the
-    /// string `devShells`, which a comment mentioning it satisfies, and which moving the package
-    /// into some OTHER shell's list also satisfies. That is the same class of defect as the argv
-    /// readers above: a substring search standing in for a structural question.
-    ///
-    /// This walks to the default shell's `packages` list and reads its ELEMENTS, with comment
-    /// lines removed first so prose about a package can never be mistaken for the package.
-    ///
-    /// BOUND, and it is the honest limit: this reads Nix as text, not as Nix. It proves the file
-    /// DECLARES the package in that list. It cannot prove the devshell evaluates, or that entering
-    /// it yields a working `npm` — nothing in this tree can, because `nix` is not required to build
-    /// this repo and no CI job enters a devshell. The pull request states that residual rather than
-    /// letting this test read as execution proof.
-    fn default_devshell_lists_package(text: &str, package: &str) -> bool {
-        const DEFAULT_SHELL: &str = "default = pkgs.mkShell {";
-        const LIST_OPENS: &str = "packages = with pkgs; [";
-
-        let Some(default_at) = text.find(DEFAULT_SHELL) else {
-            return false;
-        };
-        let from_default = &text[default_at..];
-
-        // The default shell's region ends where the NEXT shell begins. Searching forward from the
-        // default shell's name without that bound is not the same as reading its block: when the
-        // default shell declares no `packages` list, an unbounded search walks into the next
-        // shell and reports a package the declared commands can never see.
-        //
-        // The bound is the next `mkShell`, deliberately NOT brace balance. Brace counting has to
-        // understand comments AND strings to be right — `shellHook = "echo }"` is legal Nix and
-        // ends the block early — so it trades one silent-green risk for a parser that has to be
-        // correct about a language this file does not otherwise parse. Finding where the next
-        // shell starts needs neither.
-        let region_end = from_default[DEFAULT_SHELL.len()..]
-            .find("mkShell")
-            .map_or(from_default.len(), |offset| offset + DEFAULT_SHELL.len());
-        let region = &from_default[..region_end];
-
-        let Some(list_at) = region.find(LIST_OPENS) else {
-            return false;
-        };
-        let after_open = &region[list_at + LIST_OPENS.len()..];
-        // No closing bracket means the list is unterminated and the file is unreadable. Fail
-        // CLOSED rather than treat the rest of the region as list elements.
-        let Some(close) = after_open.find(']') else {
-            return false;
-        };
-        after_open[..close].lines().any(|line| {
-            // Strip a trailing comment before reading the element, so `nodejs_22` inside prose is
-            // never read as a declaration of it.
+        // Comment text is stripped before the comparison, so commenting the package out trips this
+        // exactly as deleting it does — to a devshell those are the same thing.
+        let declared = text.lines().any(|line| {
             let code = line.split('#').next().unwrap_or("");
-            code.trim() == package
-        })
-    }
-
-    // #709, third round. The structural reader is proven against the shapes that defeated the
-    // substring version, not only against this repo's current flake. Each negative below is a file
-    // in which the package is NOT available to the default devshell while the token is present.
-    #[test]
-    fn devshell_reader_reads_list_elements_not_mentions() {
-        const IN_LIST: &str = r#"
-      devShells = forAllSystems (system: {
-          default = pkgs.mkShell {
-            packages = with pkgs; [
-              cargo
-              nodejs_22
-            ];
-          };
-      });
-"#;
+            code.trim() == "nodejs_22"
+        });
         assert!(
-            default_devshell_lists_package(IN_LIST, "nodejs_22"),
-            "a package on its own line inside the default shell's list IS declared"
-        );
-
-        const COMMENT_ONLY: &str = r#"
-      devShells = forAllSystems (system: {
-          default = pkgs.mkShell {
-            packages = with pkgs; [
-              cargo
-              # we should probably add nodejs_22 here one day
-            ];
-          };
-      });
-"#;
-        assert!(
-            !default_devshell_lists_package(COMMENT_ONLY, "nodejs_22"),
-            "prose ABOUT a package is not a declaration of it — this is what the substring \
-             version could not tell apart"
-        );
-
-        const OTHER_SHELL: &str = r#"
-      devShells = forAllSystems (system: {
-          default = pkgs.mkShell {
-            packages = with pkgs; [
-              cargo
-            ];
-          };
-          web = pkgs.mkShell {
-            packages = with pkgs; [
-              nodejs_22
-            ];
-          };
-      });
-"#;
-        assert!(
-            !default_devshell_lists_package(OTHER_SHELL, "nodejs_22"),
-            "§9.1 runs the declared commands in the DEFAULT shell: a package in a different \
-             shell's list is not available to them"
-        );
-
-        // M7/M8. The control the round-three fixtures were MISSING: every earlier `OTHER_SHELL`
-        // case left the default shell holding a `packages` list of its own, so the reader found
-        // that list first and the bug could not show. The drift that actually breaks a devshell is
-        // the default shell owning NO list at all — then an unbounded forward search walks past
-        // its closing brace into the next shell and reports a package the declared commands can
-        // never see. A negative control that cannot fail is not a control.
-        const DEFAULT_HAS_NO_LIST: &str = r#"
-      devShells = forAllSystems (system: {
-          default = pkgs.mkShell {
-            buildInputs = [ cargo ];
-          };
-          web = pkgs.mkShell {
-            packages = with pkgs; [
-              nodejs_22
-            ];
-          };
-      });
-"#;
-        assert!(
-            !default_devshell_lists_package(DEFAULT_HAS_NO_LIST, "nodejs_22"),
-            "the default shell declares no package list at all, so it declares no nodejs_22 — a \
-             later shell's list must never be read as the default shell's"
-        );
-
-        // A regression guard, not a live risk. Nothing here counts braces, so this passes
-        // trivially today; it fails the moment someone reintroduces brace balance as the bound,
-        // because a `}` in prose would end the region before the list.
-        const BRACES_IN_COMMENTS: &str = r#"
-      devShells = forAllSystems (system: {
-          default = pkgs.mkShell {
-            # a closing brace } in prose, and an opening one { too
-            packages = with pkgs; [
-              nodejs_22
-            ];
-          };
-      });
-"#;
-        assert!(
-            default_devshell_lists_package(BRACES_IN_COMMENTS, "nodejs_22"),
-            "a brace inside a comment is prose, and no bound may treat it as structure"
-        );
-
-        // The fixture that ruled OUT brace balance, kept as the reason it stays ruled out. A
-        // counter that skips comments but not strings ends the region at the `}` inside this
-        // shellHook and misses the list below it — measured, this flake read as declaring nothing.
-        // Handling it properly needs a Nix string parser; bounding by the next shell needs none.
-        const BRACE_IN_STRING: &str = r#"
-      devShells = forAllSystems (system: {
-          default = pkgs.mkShell {
-            shellHook = "echo }";
-            packages = with pkgs; [
-              nodejs_22
-            ];
-          };
-      });
-"#;
-        assert!(
-            default_devshell_lists_package(BRACE_IN_STRING, "nodejs_22"),
-            "a brace inside a Nix string is legal and is not structure: no bound may end the \
-             default shell's region on it"
-        );
-
-        const UNTERMINATED_LIST: &str = r#"
-      devShells = forAllSystems (system: {
-          default = pkgs.mkShell {
-            packages = with pkgs; [
-              nodejs_22
-"#;
-        assert!(
-            !default_devshell_lists_package(UNTERMINATED_LIST, "nodejs_22"),
-            "a package list with no closing bracket is unreadable: the reader must fail CLOSED \
-             rather than treat the rest of the region as list elements"
-        );
-
-        const NO_DEVSHELL: &str = "{ description = \"no devshell here\"; }";
-        assert!(
-            !default_devshell_lists_package(NO_DEVSHELL, "nodejs_22"),
-            "a flake with no devshell declares no package to one"
+            declared,
+            "flake.nix must still declare nodejs_22 as a package element — without it \
+             .maxplayer/checks.toml's npm rows cannot execute in the environment they are \
+             declared against. This is a tripwire on the package leaving the file, NOT proof \
+             that the default devshell provides it."
         );
     }
 }
