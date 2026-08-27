@@ -4230,6 +4230,12 @@ mod tests {
     /// A credential directory that is not there is a WARN, never a silent skip — same tooth as the
     /// home-perms check. RED-PROVE: `continue` on a missing dir and a 0755-passing mask would Pass this.
     ///
+    /// ⚠ NAMED FOR WHAT IT EXERCISES: ABSENCE. It was called `..._metadata_error_...` and never drove a
+    /// metadata error — it creates a home with no `.claude` in it, which is `NotFound`. The other arm of
+    /// that match, a stat that fails for a reason other than absence (a parent that denies it), has NO
+    /// test. Left uncovered and named here rather than papered over with one that would have to fake a
+    /// stat failure to run.
+    ///
     /// The FINDING here is now "this harness is not linked to an account" rather than "could not read
     /// the path". Absence stopped being a stat failure when a harness gained more than one candidate
     /// directory: for cursor, one of the two is expected to be missing on any given build, so absence
@@ -4238,7 +4244,7 @@ mod tests {
     /// arm of the same match. The tooth this test guards is unchanged: missing must never Pass.
     #[cfg(all(unix, feature = "wallet"))]
     #[test]
-    fn harness_credential_check_metadata_error_is_warn_not_silent_skip() {
+    fn harness_credential_check_absent_directory_is_warn_not_silent_skip() {
         let base = std::env::temp_dir().join(format!(
             "mp-harness-creds-missing-{}-{}",
             std::process::id(),
