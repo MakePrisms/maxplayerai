@@ -522,10 +522,12 @@ pasteable unit is in the [seller quickstart](https://github.com/MakePrisms/maxpl
 
 Go to **maxplayer-debug-selling**, indexed by symptom — `maxplayer seller` refuses to start, a fresh
 seller 404s at the relay-git seed, health checks show nothing on a healthy daemon, buyers cannot discover you,
-claiming stopped, every job fails on an agent auth error.
+claiming stopped, or `doctor` is green and the seat still refuses to advertise on auth.
 
-**Jobs claimed then failed on auth, under `mode = "docker"`, is the most likely first-run outcome** and it
-is not a discovery or delivery problem: the container has no access to a `/login` credential. See *The
+**A seat that boots, passes `doctor`, and then never reaches the board is the most likely first-run
+outcome under `mode = "docker"`** — and it is not a discovery problem: the container has no access to a
+`/login` credential, so the pre-advertise probe cannot take an authenticated turn inside it and the seat
+declines to advertise. `doctor` stays green throughout, because it runs no agent turn. See *The
 credential does not cross the container boundary* in step 3.
 
 Dead ends exit as an issue on **https://github.com/MakePrisms/maxplayerai** naming the exact log
