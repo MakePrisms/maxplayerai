@@ -236,6 +236,207 @@ text in that workdir, and on completion pushes the tree and publishes kind-3403 
 
 ---
 
+## 3a. Link your model account
+
+Maxplayer does not authenticate Cursor, Claude, or Codex. The ACP adapter starts the vendor CLI, and
+that CLI must **already be linked to an account**. A seat with a correct `config.toml` and an
+unauthenticated CLI is a seat that cannot earn.
+
+### Rules that apply to every provider
+
+- **Link as the seller service user, with its real `HOME` and `PATH`.** A login performed as `root` is
+  invisible to a daemon running as `seller`. An `export` in an interactive shell is invisible to an
+  already-running systemd service — the credential takes effect on the **restart**, not before it.
+- **Keep each runner's login fresh and separate.** Do not copy another runner's credential or reuse its
+  home. Credential directories should be mode `0700`; credential files and service environment files
+  should be mode `0600`.
+- **Subscription login and API-key login are different things.** They use different billing,
+  different entitlements, and sometimes different available models. Choose deliberately.
+- **`maxplayer doctor` cannot tell you the CLI is linked.** It checks configuration, binaries, images,
+  and containment, and it runs **no agent turn**. The seller's pre-advertise probe does run one,
+  through the same sandbox path a paid job uses, so an auth failure there keeps the seat off the board.
+  A green `doctor` beside a seat that never advertises is the normal shape of an unlinked harness.
+- **Never print, commit, paste into chat, or place a durable credential in `config.toml`.** On a
+  headless server, share only the one-time browser URL or code through a private channel, and keep the
+  login process running until approval completes.
+
+### Cursor
+
+For a host or `launcher` seat:
+
+```bash
+# Run as the seller service user, with its real HOME and PATH.
+NO_OPEN_BROWSER=1 cursor-agent login
+cursor-agent status
+```
+
+`NO_OPEN_BROWSER=1` makes a headless runner print the browser URL instead of trying to open a local
+browser. Keep the command running, open the URL on a signed-in computer, approve it, and wait for the
+terminal to report success.
+
+> **Vendor behaviour we do not control.** The `login`, `status` and `logout` commands and the
+> `NO_OPEN_BROWSER=1` environment variable are documented by Cursor at
+> <https://cursor.com/docs/cli/reference/authentication> (read 2026-08-27). Maxplayer neither sets nor
+> validates them, and Cursor may change them in any release.
+>
+> ⚠ **`AGENT_CLI_CREDENTIAL_STORE` is NOT on that page, and neither is any session-file path.** Read
+> 2026-08-27, that article (`<title>Authentication | Cursor Docs</title>`) names exactly two environment
+> variables — `NO_OPEN_BROWSER` and `CURSOR_API_KEY` — and contains **zero** occurrences of
+> `AGENT_CLI_CREDENTIAL_STORE`, `auth.json` or `/.cursor`. So the variable in the command below, and
+> the file location after it, rest on **one operator run — 2026-08-26, Cursor Agent
+> `2026.08.25-3e8eec8` on Linux — not on vendor documentation, and not reproduced by this project.**
+> Treat both as unverified and confirm them on your own machine before you rely on them.
+>
+> The URL earlier editions of this page cited, `docs.cursor.com/en/cli/reference/authentication`, is
+> dead. Every path on that host answers `HTTP 308` to the same `cursor.com/docs` landing page —
+> including a path we invented that cannot exist (measured 2026-08-27). A link that accepts a nonsense
+> path is not a citation, so it was replaced rather than followed.
+
+For a Docker seat, use the **browser session file**, not `CURSOR_API_KEY`. Force file storage during
+login if the platform would otherwise use a Keychain:
+
+```bash
+AGENT_CLI_CREDENTIAL_STORE=file NO_OPEN_BROWSER=1 cursor-agent login
+```
+
+⚠ **Find the session file; do not assume its path.** Cursor Agent `2026.08.25-3e8eec8` on Linux wrote
+`$HOME/.config/cursor/auth.json` even with `AGENT_CLI_CREDENTIAL_STORE=file` (operator-measured,
+2026-08-26), while older Cursor documentation names `$HOME/.cursor/auth.json`. Both locations are real
+for some build. Locate the one **your** build wrote, then lock it down:
+
+```bash
+ls -l "$HOME/.config/cursor/auth.json" "$HOME/.cursor/auth.json" 2>/dev/null
+chmod 600 <the file that exists>
+cursor-agent status
+```
+
+⛔ **Do not read `doctor`'s credential-directory check as proof of this file.** It inspects the
+directories Maxplayer knows for a harness; it does not open your session file, and it cannot tell you
+which location your Cursor build actually uses. `stat` the configured file yourself and confirm the
+owner, the mode, and that the service user can read it — without printing its contents.
+
+Point the contained seat at the file by **absolute path**. Cursor needs **two legs**: its control plane
+and its agent/inference leg go to different hosts, and one `upstream` cannot name both.
+
+```toml
+[[sandbox.file_credentials]]
+path = "/absolute/path/to/.config/cursor/auth.json"   # the path YOU verified above
+field = "accessToken"
+env = "CURSOR_AUTH_TOKEN"
+upstream = "https://api2.cursor.sh"
+endpoint_args = ["--endpoint"]
+
+[[sandbox.file_credentials.legs]]
+endpoint_args = ["--agent-endpoint"]
+upstream = "https://agentn.global.api5.cursor.sh"
+```
+
+If you select a **named agent pool**, pin the model on the named preset, not only on the legacy
+fallback command. `agents = ["cursor"]` alone resolves the built-in preset and drops extra model
+arguments:
+
+```toml
+[seller]
+agents = ["cursor"]
+
+[agents.cursor]
+argv = ["cursor-agent", "--model", "cursor-grok-4.6-high", "acp"]
+```
+
+⛔ **`forward_env = ["CURSOR_API_KEY"]` is unsafe for untrusted Docker jobs.** It puts a real, reusable
+key inside the job container, where a stranger's job reads it. `doctor` WARNs rather than refusing, so
+the seat runs and leaks. Use the session file above instead: the per-job proxy keeps the real value on
+the host and hands the container a placeholder.
+
+The endpoint flags, the upstream hosts, and the session-file location are all **version-measured Cursor
+behaviour**. Revalidate them whenever you move the pinned Cursor build.
+
+### Claude
+
+For a host or `launcher` seat, run `claude`, choose the Claude.ai or Console account in the browser, and
+use `/login` to relink an existing install. Over SSH or in a container, copy the displayed URL into a
+browser and paste the returned code back into the terminal.
+
+```bash
+claude auth status
+```
+
+> **Vendor behaviour we do not control.** Anthropic documents the current flow and its storage locations
+> at <https://code.claude.com/docs/en/authentication> (read 2026-08-26).
+
+`/login` writes a user credential under `~/.claude` on Linux and Windows, and to the **macOS Keychain**.
+That is enough for a host or `launcher` seat. It is **not visible inside Docker**: a container inherits
+no home directory and no Keychain.
+
+For an unattended Docker seller on a Claude subscription, generate the long-lived, model-only token:
+
+```bash
+claude setup-token
+```
+
+Store the result as `CLAUDE_CODE_OAUTH_TOKEN` in a root-owned or seller-owned mode-`0600` systemd
+environment file. Never echo it into docs, logs, shell history, `config.toml`, or chat. Maxplayer's
+contained Claude path takes it from the daemon environment, keeps the real value on the host, and gives
+the job a per-job placeholder.
+
+`ANTHROPIC_API_KEY` is the **usage-billed Console path**, not a subscription login. It also needs a
+one-time interactive approval that a daemon has nobody to give, which is why the OAuth token is the
+right choice for an unattended seat.
+
+### Codex
+
+Use a **dedicated Codex home** for the seller, so its login and refresh state cannot disturb another
+Codex process. Configure file storage before you log in:
+
+```toml
+# $CODEX_HOME/config.toml
+cli_auth_credentials_store = "file"
+```
+
+```bash
+export CODEX_HOME="/absolute/path/to/.codex-maxplayer-seller"
+install -d -m 700 "$CODEX_HOME"
+codex login                 # on a browser-capable host
+codex login --device-auth   # on a headless host
+codex login status
+test -f "$CODEX_HOME/auth.json"
+chmod 600 "$CODEX_HOME/auth.json"
+```
+
+> **Vendor behaviour we do not control.** OpenAI's current auth guide is
+> <https://developers.openai.com/codex/auth/> (read 2026-08-26). `cli_auth_credentials_store` is Codex's
+> own setting. Device-code login may need to be enabled in the user's ChatGPT security settings or by a
+> workspace admin.
+
+For Docker, **do not mount or copy `auth.json` into the job container.** Point Maxplayer at the absolute
+host path:
+
+```toml
+[sandbox.codex_chatgpt]
+auth_file = "/absolute/path/to/.codex-maxplayer-seller/auth.json"
+```
+
+Maxplayer reads the needed ChatGPT fields **on the host, once per job**, and sends only placeholders into
+Docker. The path must be absolute; a relative one is refused at config load. If the stored access token
+is close to expiry, relink or refresh it on the host — **no seller restart is needed** for the next job
+to reread the file.
+
+For usage-billed API access, use the stdin form:
+
+```bash
+printenv OPENAI_API_KEY | codex login --with-api-key
+```
+
+(The removed `--api-key` flag no longer exists; `--with-api-key` and `--device-auth` do.)
+
+### The verification gate — run this for every provider
+
+1. Run the vendor's status command **as the exact seller service user**.
+2. Check only file **existence, owner, mode, and expected JSON field shape** — never print the credential.
+3. Start the seller and require the **real pre-advertise probe** to pass.
+4. Confirm the signed heartbeat advertises the intended harness and model.
+5. Run one small targeted canary job before opening any stranger-facing route.
+
 ## 3b. Setup gotchas — two environment prerequisites that silently break `execute`
 
 The two failures below are **environment/setup issues, not core bugs** — the daemon and
@@ -408,9 +609,11 @@ setup-token`) — an environment API key needs a one-time interactive approval a
 Docker Codex has a separate ChatGPT session route. `[sandbox.codex_chatgpt]` reads the host Codex auth
 file for each job and keeps the real session outside Docker. See the controlled setup below.
 
-The pre-advertise probe does not catch this: it runs the CLI **on the host**, where `~/.claude` is
-readable, so the seat advertises normally and then fails every job on auth. Set the variable where the
-daemon **actually starts** — a systemd `Environment=`, a launchd plist, or the launcher script that
+Whether the pre-advertise probe catches this depends on your sandbox mode, because the probe runs
+wherever jobs run. Under `launcher` or no sandbox it runs the CLI **on the host**, where `~/.claude` is
+readable — so it passes on a credential the daemon environment is missing, and you find out at the first
+job. Under `mode = "docker"` it runs **inside the container**, so it fails and the seat **never
+advertises**. Set the variable where the daemon **actually starts** — a systemd `Environment=`, a launchd plist, or the launcher script that
 `exec`s it. Not your login shell, and note an `export` in an interactive shell cannot reach an
 already-running daemon: the credential change takes effect on the **restart**, not before it.
 
@@ -421,13 +624,16 @@ read** — caught by a `doctor` WARN, not a refusal, so the seat runs and leaks.
 
 Use the browser-login **session** instead. `[[sandbox.file_credentials]]` reads one named field out of
 the session file on the host, once per job, and gives the container a placeholder plus a redirect flag;
-the real value never crosses. **This path is now proven end to end: a Docker-contained cursor seat
-completes, delivers, and settles a real job.** It needs a two-leg config, because cursor's agent
-traffic goes to a second host (`agentn.global.api5.cursor.sh`) — name it as a
-`[[sandbox.file_credentials.legs]]` entry. On macOS the session lives in the login Keychain, which the
-daemon cannot read, so create the file first with `AGENT_CLI_CREDENTIAL_STORE=file cursor-agent login`
-(it writes `~/.cursor/auth.json`). The fields, the `legs` entry, the expiry behaviour, and the
-per-client caveat are in [DOCKER.md](DOCKER.md).
+the real value never crosses. **This path is reported working by the maintainer, measured 2026-08-26 on
+Cursor Agent `2026.08.25-3e8eec8` (Linux), and not reproduced by us.** Nobody on this project has run
+`cursor-agent`; it is not installed on our build hosts. Treat it as a maintainer measurement rather than
+a supported configuration, and **prove it on your own seat before you take paid work on it.** It needs a
+two-leg config, because cursor's agent traffic goes to a second host (`agentn.global.api5.cursor.sh`) —
+name it as a `[[sandbox.file_credentials.legs]]` entry. On macOS the session lives in the login Keychain,
+which the daemon cannot read, so create the file first with `AGENT_CLI_CREDENTIAL_STORE=file cursor-agent
+login`, then locate the file it wrote: that path is build-dependent, so use **[Cursor](#cursor)** above
+rather than typing `~/.cursor/auth.json` from this line. The fields, the `legs` entry, the expiry
+behaviour, and the per-client caveat are in [DOCKER.md](DOCKER.md).
 
 #### Controlled Docker Codex seller with ChatGPT auth
 
@@ -635,8 +841,10 @@ maxplayer doctor
 ```
 
 **Check your credential before restarting.** A seat that has run on `launcher` may be authenticated only
-through `~/.claude`, which a container cannot read. That is the usual cause of a switched seat that
-claims jobs and then fails them all on auth — see the two blockers above.
+through `~/.claude`, which a container cannot read. That is the usual cause of a switched seat that comes
+back up and **never advertises**: the pre-advertise probe now runs inside the container, finds no
+credential, and holds the seat off the board. `doctor` stays green throughout — it runs no agent turn —
+so read the probe, not `doctor`. See the two blockers above, and link the account first: [§3a](#3a-link-your-model-account).
 
 Then restart the daemon. Two more things to expect on a seat that is already earning: the first job pulls
 the sandbox image unless it is already local (`doctor` warns and hands you the `docker pull` so you can do

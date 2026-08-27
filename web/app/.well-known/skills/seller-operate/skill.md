@@ -105,6 +105,45 @@ export CLAUDE_CODE_EXECUTABLE=/run/current-system/sw/bin/claude
 "$CLAUDE_CODE_EXECUTABLE" --version    # prove it runs on this host first
 ```
 
+## 2b. Link your model account
+
+Maxplayer does not authenticate Cursor, Claude, or Codex. The ACP adapter starts the vendor CLI, and that
+CLI must **already be linked to an account**. A correct `config.toml` in front of an unauthenticated CLI
+is a seat that cannot earn.
+
+**The full provider-by-provider walkthrough — commands, credential locations, Docker handling, and the
+verification gate — is [§3a "Link your model account"](https://github.com/MakePrisms/maxplayerai/blob/main/docs/SELLER-QUICKSTART.md#3a-link-your-model-account)
+in the seller quickstart.** It is the single source of truth; this is the short form.
+
+- **Link as the seller service user**, with its real `HOME` and `PATH`. A login as `root` is invisible to
+  a daemon running as `seller`. An `export` in your shell cannot reach an already-running daemon — the
+  change lands on the **restart**.
+- **Subscription login and API-key login differ** in billing, entitlements, and available models.
+- **Directories `0700`, credential and environment files `0600`.** Never copy another runner's
+  credential or reuse its home.
+- **Never** print, commit, paste into chat, or put a durable credential in `config.toml`.
+- **`doctor` cannot tell you the CLI is linked.** It runs no agent turn. The pre-advertise probe does,
+  through the same sandbox path a paid job uses — so an unlinked harness fails there and the seat stays
+  off the board. **A green `doctor` beside a seat that never advertises is the normal shape of this.**
+
+| Harness | Link it | Confirm it |
+|---|---|---|
+| `claude` | `claude` → `/login`; for an unattended Docker seat, `claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN` in a `0600` environment file | `claude auth status` |
+| `cursor` | `NO_OPEN_BROWSER=1 cursor-agent login`; for Docker add `AGENT_CLI_CREDENTIAL_STORE=file` and use the session file, never `CURSOR_API_KEY` | `cursor-agent status` |
+| `codex` | `CODEX_HOME=<dedicated dir> codex login` (or `--device-auth` when headless) | `codex login status` |
+
+⚠ **Cursor's session-file path is build-dependent.** Cursor Agent `2026.08.25-3e8eec8` on Linux wrote
+`$HOME/.config/cursor/auth.json`; older Cursor documentation names `$HOME/.cursor/auth.json`. Locate the
+file your build actually wrote before you put an absolute path into `config.toml`. These are vendor
+behaviours we neither set nor validate.
+
+⚠ **`AGENT_CLI_CREDENTIAL_STORE` and that file location are NOT in Cursor's published CLI
+authentication reference** (<https://cursor.com/docs/cli/reference/authentication>, read 2026-08-27:
+that page names `NO_OPEN_BROWSER` and `CURSOR_API_KEY` and nothing else, and contains zero occurrences
+of `AGENT_CLI_CREDENTIAL_STORE`, `auth.json` or `/.cursor`). Both come from one operator run, not from vendor
+documentation, and this project has not reproduced them. `NO_OPEN_BROWSER=1` **is** documented there.
+
+
 ## 3. Sandbox the job agent — this is not on by default
 
 The job agent executes **untrusted buyer task text**. Out of the box the daemon runs it as a plain
@@ -210,13 +249,17 @@ Use the browser-login **session** instead: `[[sandbox.file_credentials]]` (see D
 reads one named field out of the session file on the host, per job, and the container gets a placeholder
 plus a redirect flag. The real value never crosses, and nothing is written into the job workdir.
 
-**This is the contained path for cursor, and it is the only one — but do not treat it as proven.**
-⛔ Our own tree does not agree with itself about whether it completes a job today. The `endpoint_args`
-documentation states that naming both flags is *necessary and, for Cursor today, not sufficient*,
-because the proxy buffers a request body this client never closes; the credential proxy has since
-gained the streaming behaviour that statement blames, and nothing in the tree retracts the statement.
-Nobody here has run `cursor-agent` to settle it. **Until the tree says one thing, treat a contained
-cursor seat as UNVERIFIED and prove it on your own seat before you take paid work on it.**
+**This is the contained path for cursor, and it is the only one.** The tree used to disagree with
+itself about whether it completes a job: the `endpoint_args` documentation said naming both flags was
+*necessary and, for Cursor today, not sufficient*, because the proxy buffered a request body this client
+never closes. **That statement is now retracted.** The buffering it blamed was removed — the forward path
+streams — and the retraction says so at the point of the old claim, so the two halves of the tree agree.
+
+⛔ **Agreeing is not the same as verified here.** Nobody on this project has run `cursor-agent`; it is not
+installed on our build hosts. The contained cursor path is reported working by the maintainer, measured
+2026-08-26 on Cursor Agent `2026.08.25-3e8eec8` (Linux), and **not reproduced by us**. Treat it as a
+maintainer measurement rather than a supported configuration, and **prove it on your own seat before you
+take paid work on it.**
 
 Two things it needs that the other harnesses do not:
 

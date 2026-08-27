@@ -1696,7 +1696,7 @@ mod checks {
     /// narrow the sandbox, or revisit #689's conclusion that a subscription credential cannot be
     /// excluded from the cage.
     ///
-    /// Resolution is [`seller_agents::harness_credential_dir`] over the same registry boot uses.
+    /// Resolution is [`seller_agents::harness_credential_dirs`] over the same registry boot uses.
     /// An unlabelled `--agent-argv` hatch and any non-built-in label cannot be resolved: the check
     /// SAYS so and inspects nothing. Guessing a default harness's directory (or sniffing argv) would
     /// inspect the wrong path and pass — worse than no check.
@@ -1744,19 +1744,35 @@ mod checks {
         };
 
         let mut unresolvable: Vec<String> = Vec::new();
-        let mut inspect: Vec<std::path::PathBuf> = Vec::new();
+        // Grouped BY HARNESS, because that is where the bound belongs. A harness with several known
+        // locations (cursor) cannot treat an absent candidate as a finding on its own — only the
+        // operator's actual build decides which of them exists, so warning on the other would fire on
+        // every correctly configured cursor seat. But a harness with NONE of its locations present is
+        // a finding whether it has one candidate or five: that is a seat that never linked an account.
+        //
+        // ⛔ DO NOT FLATTEN THIS BACK INTO A PER-PATH "missing is fine" FLAG. Per-path, a cursor seat
+        // with no credential directory anywhere PASSES having inspected nothing — the same defect this
+        // check was widened to fix, inverted. Inspecting the wrong directory and passing is bad;
+        // inspecting nothing and passing is worse, because there is no path in the output to doubt.
+        let mut groups: Vec<(String, Vec<std::path::PathBuf>)> = Vec::new();
         for agent in resolved.registry.entries() {
-            match seller_agents::harness_credential_dir(agent, &user_home) {
-                Some(dir) => inspect.push(dir),
-                None => match &agent.name {
+            let dirs = seller_agents::harness_credential_dirs(agent, &user_home);
+            if dirs.is_empty() {
+                match &agent.name {
                     None => unresolvable
                         .push("raw --agent-argv hatch (no preset label)".to_owned()),
                     Some(name) => unresolvable
                         .push(format!("harness {name} (no known credential directory)")),
-                },
+                }
+                continue;
             }
+            let label = match &agent.name {
+                Some(name) => name.clone(),
+                None => "harness".to_owned(),
+            };
+            groups.push((label, dirs));
         }
-        if inspect.is_empty() && unresolvable.is_empty() {
+        if groups.is_empty() && unresolvable.is_empty() {
             return Check::warn(
                 HARNESS_CREDS_CHECK,
                 "no harness to inspect — cannot resolve a credential directory",
@@ -1765,6 +1781,11 @@ mod checks {
         }
 
         let mut too_open: Vec<String> = Vec::new();
+        // Harnesses with no credential directory at ANY of their known locations, and the paths that
+        // really were stat-ed. `inspected` is what the PASS line may name: naming a path that does not
+        // exist is how this check previously claimed to have looked at something it had not.
+        let mut unlinked: Vec<String> = Vec::new();
+        let mut inspected: Vec<std::path::PathBuf> = Vec::new();
         #[cfg(unix)]
         {
             use std::io::ErrorKind;
@@ -1792,29 +1813,55 @@ mod checks {
                 None
             };
 
-            for dir in &inspect {
-                if let Some(check) = consider(dir, false, &mut too_open) {
-                    return check;
-                }
+            for (label, dirs) in &groups {
+                let mut present = 0usize;
+                for dir in dirs {
+                    // Existence is read HERE rather than through `consider`, because absence is only
+                    // a finding once the WHOLE GROUP is absent — `consider` judges one path.
+                    match std::fs::metadata(dir) {
+                        Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                        Err(error) => {
+                            return Check::warn(
+                                HARNESS_CREDS_CHECK,
+                                format!("could not read {} permissions: {error}", dir.display()),
+                                "check the harness credential path exists and is readable",
+                            );
+                        }
+                        Ok(_) => present += 1,
+                    }
+                    inspected.push(dir.clone());
+                    if let Some(check) = consider(dir, false, &mut too_open) {
+                        return check;
+                    }
                 // settings.json STEERS the harness when present; absence is not a permissions
                 // problem (the file is optional) so NotFound is skipped, never a silent skip of
                 // a metadata error on a file that does exist.
-                if let Some(check) = consider(&dir.join("settings.json"), true, &mut too_open) {
-                    return check;
+                    if let Some(check) = consider(&dir.join("settings.json"), true, &mut too_open) {
+                        return check;
+                    }
+                }
+                if present == 0 {
+                    unlinked.push(format!(
+                        "{label} ({})",
+                        dirs.iter()
+                            .map(|dir| dir.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(" or ")
+                    ));
                 }
             }
         }
         #[cfg(not(unix))]
         {
-            let _ = &inspect;
+            let _ = &groups;
         }
 
-        if too_open.is_empty() && unresolvable.is_empty() {
+        if too_open.is_empty() && unresolvable.is_empty() && unlinked.is_empty() {
             return Check::pass(
                 HARNESS_CREDS_CHECK,
                 format!(
                     "not group/world-writable: {}",
-                    inspect
+                    inspected
                         .iter()
                         .map(|path| path.display().to_string())
                         .collect::<Vec<_>>()
@@ -1822,13 +1869,30 @@ mod checks {
                 ),
             );
         }
-        if too_open.is_empty() {
+        if too_open.is_empty() && unresolvable.is_empty() {
             return Check::warn(
                 HARNESS_CREDS_CHECK,
                 format!(
-                    "cannot resolve a credential directory for {} — not inspected (doctor will not guess a path)",
-                    unresolvable.join(", ")
+                    "no credential directory exists for {} — that harness is not linked to an account, so the pre-advertise probe will fail and the seat will not advertise",
+                    unlinked.join(", ")
                 ),
+                "link the account as the seller service user, then re-run doctor — see \"Link your model account\" in docs/SELLER-QUICKSTART.md",
+            );
+        }
+        if too_open.is_empty() {
+            let mut detail = format!(
+                "cannot resolve a credential directory for {} — not inspected (doctor will not guess a path)",
+                unresolvable.join(", ")
+            );
+            if !unlinked.is_empty() {
+                detail.push_str(&format!(
+                    "; also no credential directory exists for {} — that harness is not linked to an account",
+                    unlinked.join(", ")
+                ));
+            }
+            return Check::warn(
+                HARNESS_CREDS_CHECK,
+                detail,
                 "use a named preset (claude|cursor|codex) to inspect that harness's credential directory; a raw --agent-argv hatch and unknown labels have no known path",
             );
         }
@@ -1840,6 +1904,12 @@ mod checks {
             detail.push_str(&format!(
                 "; also cannot resolve a credential directory for {} — not inspected (doctor will not guess a path)",
                 unresolvable.join(", ")
+            ));
+        }
+        if !unlinked.is_empty() {
+            detail.push_str(&format!(
+                "; also no credential directory exists for {} — that harness is not linked to an account",
+                unlinked.join(", ")
             ));
         }
         Check::warn(
@@ -3903,6 +3973,119 @@ mod tests {
         presets
     }
 
+    /// RED-PROVE: a harness whose credential directory is missing EVERYWHERE must still be a
+    /// finding. Cursor is the harness with more than one known location, and a missing candidate
+    /// there cannot be a finding on its own — only the operator's actual build decides which of the
+    /// two exists, so warning on the absent one would fire on every correct cursor seat.
+    ///
+    /// The bound belongs to the HARNESS, not to each candidate. Make "missing is fine" a property of
+    /// the individual path and a cursor seat with NO credential directory at all passes silently,
+    /// which is the exact defect this check was widened to fix, inverted: before, it inspected the
+    /// wrong directory and passed; after, it would inspect nothing and pass. A check that passes
+    /// having looked at nothing is the worse of the two.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn a_cursor_seat_with_no_credential_directory_anywhere_is_a_finding() {
+        // A home that is deliberately never created, so BOTH cursor candidates are absent. Built from
+        // the pid rather than a fixed name: a fixed path under the shared temp directory is another
+        // user's to create, and this test's whole meaning is that the path does not exist.
+        let home = std::env::temp_dir()
+            .join(format!("maxplayer-doctor-unlinked-cursor-{}", std::process::id()));
+        assert!(!home.exists(), "the fixture home must not exist: {}", home.display());
+        let existing = std::env::current_exe()
+            .expect("current exe")
+            .to_string_lossy()
+            .into_owned();
+        let mut presets = std::collections::BTreeMap::new();
+        presets.insert(
+            "cursor".to_owned(),
+            maxplayer_core::home::AgentPresetConfig {
+                argv: vec![existing],
+            },
+        );
+        let seller = seller_for_agents(vec!["cursor".into()], vec!["ignored".into()]);
+        let check = checks::check_harness_credential_permissions(
+            Some(seller),
+            presets,
+            Some(home),
+        );
+        assert_ne!(
+            check.status,
+            Status::Pass,
+            "a cursor seat with no credential directory anywhere must not pass silently: {}",
+            check.render()
+        );
+        let rendered = check.render();
+        assert!(
+            rendered.contains("cursor"),
+            "the finding must name the harness it could not find a directory for: {rendered}"
+        );
+    }
+
+    /// RED-PROVE on the PR base: the direction this change was MADE for. `<home>/.config/cursor`
+    /// exists and `<home>/.cursor` does not — a seat whose Cursor build wrote the measured location.
+    ///
+    /// On the base this check resolved ONE cursor directory (`<home>/.cursor`) and stat-ed it with
+    /// absence treated as an error, so this seat took a WARN naming a path it had correctly never
+    /// created. The sibling test above only covers both-absent, which WARNS on the base and on this
+    /// head alike — it would pass without the grouping. This one is the case the grouping exists for:
+    /// the check must Pass and must name the directory it really inspected.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn a_cursor_seat_that_linked_at_the_measured_location_passes_and_names_it() {
+        // Built from the pid, not a fixed name: a fixed path under the shared temp directory is
+        // another user's to create, and this test writes into it.
+        let home = std::env::temp_dir()
+            .join(format!("maxplayer-doctor-configcursor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let measured = home.join(".config").join("cursor");
+        std::fs::create_dir_all(&measured).expect("create the measured cursor credential directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&measured, std::fs::Permissions::from_mode(0o700))
+                .expect("tighten the fixture directory");
+        }
+        let documented = home.join(".cursor");
+        assert!(
+            !documented.exists(),
+            "the documented location must stay absent: {}",
+            documented.display()
+        );
+        let existing = std::env::current_exe()
+            .expect("current exe")
+            .to_string_lossy()
+            .into_owned();
+        let mut presets = std::collections::BTreeMap::new();
+        presets.insert(
+            "cursor".to_owned(),
+            maxplayer_core::home::AgentPresetConfig {
+                argv: vec![existing],
+            },
+        );
+        let seller = seller_for_agents(vec!["cursor".into()], vec!["ignored".into()]);
+        let check = checks::check_harness_credential_permissions(
+            Some(seller),
+            presets,
+            Some(home.clone()),
+        );
+        let rendered = check.render();
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(
+            check.status,
+            Status::Pass,
+            "a cursor seat linked at the measured location must pass: {rendered}"
+        );
+        assert!(
+            rendered.contains(&measured.display().to_string()),
+            "the pass line must name the directory it actually inspected: {rendered}"
+        );
+        assert!(
+            !rendered.contains("not linked to an account"),
+            "a linked seat must not be reported as unlinked: {rendered}"
+        );
+    }
+
     /// RED-PROVE: a raw `--agent-argv` hatch must SAY it cannot resolve, and must not name a
     /// guessed path. Fall back to `~/.claude` (or sniff argv) and this goes red — the detail
     /// would contain `.claude` and the status might even Pass.
@@ -4108,11 +4291,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A metadata read error is a WARN, never a silent skip — same tooth as the home-perms check.
-    /// RED-PROVE: `continue` on a missing dir and a 0755-passing mask would Pass this.
+    /// A credential directory that is not there is a WARN, never a silent skip — same tooth as the
+    /// home-perms check. RED-PROVE: `continue` on a missing dir and a 0755-passing mask would Pass this.
+    ///
+    /// ⚠ NAMED FOR WHAT IT EXERCISES: ABSENCE. It was called `..._metadata_error_...` and never drove a
+    /// metadata error — it creates a home with no `.claude` in it, which is `NotFound`. The other arm of
+    /// that match, a stat that fails for a reason other than absence (a parent that denies it), has NO
+    /// test. Left uncovered and named here rather than papered over with one that would have to fake a
+    /// stat failure to run.
+    ///
+    /// The FINDING here is now "this harness is not linked to an account" rather than "could not read
+    /// the path". Absence stopped being a stat failure when a harness gained more than one candidate
+    /// directory: for cursor, one of the two is expected to be missing on any given build, so absence
+    /// is judged per HARNESS and only reported when every candidate is gone. A genuine metadata error
+    /// (a parent that denies the stat, say) is still reported as `could not read`, which is the other
+    /// arm of the same match. The tooth this test guards is unchanged: missing must never Pass.
     #[cfg(all(unix, feature = "wallet"))]
     #[test]
-    fn harness_credential_check_metadata_error_is_warn_not_silent_skip() {
+    fn harness_credential_check_absent_directory_is_warn_not_silent_skip() {
         let base = std::env::temp_dir().join(format!(
             "mp-harness-creds-missing-{}-{}",
             std::process::id(),
@@ -4136,8 +4332,8 @@ mod tests {
             check.render()
         );
         assert!(
-            check.detail.contains("could not read") && check.detail.contains(".claude"),
-            "must name the path it failed to stat: {}",
+            check.detail.contains("not linked to an account") && check.detail.contains(".claude"),
+            "must name the harness and the path it looked for: {}",
             check.render()
         );
         let _ = std::fs::remove_dir_all(&base);
