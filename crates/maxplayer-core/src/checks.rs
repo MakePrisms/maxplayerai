@@ -1235,15 +1235,18 @@ timeout_secs = 1200
         );
     }
 
-    /// How many lines of `text` declare `package` as a bare list element.
+    /// How many lines of `text` have exactly `token` as their content, ignoring anything from the
+    /// first `#` onwards.
     ///
-    /// #709. Comment text is stripped before the comparison, so a package named only in prose is
-    /// not counted — to a devshell, commenting a package out and deleting it are the same thing.
-    fn bare_element_count(text: &str, package: &str) -> usize {
+    /// #709. Purely lexical, and named that way on purpose. It reads LINES and knows nothing about
+    /// Nix: a bare `nodejs_22` line inside an indented string satisfies it exactly as a list
+    /// element does — measured. An earlier name and doc said "declare" and "bare package element",
+    /// which asserted structure this cannot see.
+    fn lines_matching_exactly(text: &str, token: &str) -> usize {
         text.lines()
             .filter(|line| {
                 let code = line.split('#').next().unwrap_or("");
-                code.trim() == package
+                code.trim() == token
             })
             .count()
     }
@@ -1254,12 +1257,16 @@ timeout_secs = 1200
     // still passes while the declared rows quietly become unrunnable.
     //
     // WHAT THIS PROVES, EXACTLY: `flake.nix` contains exactly one line whose trimmed content is
-    // the bare element `nodejs_22`. That is a claim about the file's TEXT, and it is the whole
+    // exactly `nodejs_22`. That is a LEXICAL claim about the file's lines, and it is the whole
     // claim.
     //
-    // WHAT IT DOES NOT PROVE. It does not prove WHICH devshell owns that element — a second shell
-    // could — and it is not execution proof: it says nothing about whether the devshell evaluates
-    // or whether entering it yields a working `npm`.
+    // WHAT IT DOES NOT PROVE, and each of these has at some point been written here as if it did:
+    //   * Not that the line is a Nix DECLARATION. This reader has no Nix awareness — a bare
+    //     `nodejs_22` line inside an indented string satisfies it exactly as a list element does.
+    //     Measured.
+    //   * Not WHICH devshell owns it. A second shell could hold the only occurrence.
+    //   * Not that anything EXECUTES. It says nothing about whether the devshell evaluates, or
+    //     whether entering it yields a working `npm`.
     //
     // Why it claims so little, deliberately. Three readers tried to bind the package to the
     // DEFAULT shell by reading this file as text, and valid Nix defeated each one. A substring
@@ -1271,29 +1278,30 @@ timeout_secs = 1200
     // That is the class this file already learned for argv: **structure cannot be decided by
     // inspecting text.** Substrings are to Nix what tokens were to argv. Binding the element to
     // the default shell needs a Nix parser, and this crate has no other reason to carry one. So
-    // this guard is a TRIPWIRE on the element leaving the file, it says so where it is asserted,
+    // this guard is a TRIPWIRE on that line leaving the file, it says so where it is asserted,
     // and a guard that overstated its reach is the defect this whole change exists to close.
     //
-    // The count is exactly one, not at least one: a stray duplicate elsewhere in the file would
-    // otherwise keep this green while the real element moved out of the default shell's list.
+    // The count is exactly one, not at least one: a second matching line elsewhere would
+    // otherwise keep this green while the real one moved out of the default shell's list.
     #[test]
     fn the_flake_declares_the_node_the_check_rows_need() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../", "flake.nix");
         let text = std::fs::read_to_string(path).expect("this repo ships flake.nix at its root");
         assert_eq!(
-            bare_element_count(&text, "nodejs_22"),
+            lines_matching_exactly(&text, "nodejs_22"),
             1,
-            "flake.nix must declare nodejs_22 as a bare package element exactly once — without it \
-             .maxplayer/checks.toml's npm rows cannot execute in the environment they are declared \
-             against. This is a tripwire on that element leaving the file. It does NOT prove which \
-             devshell owns it, and it is NOT execution proof."
+            "flake.nix must contain exactly one line whose trimmed content is exactly \
+             `nodejs_22` — without it .maxplayer/checks.toml's npm rows cannot execute in the \
+             environment they are declared against. This check is LEXICAL: it does not prove the \
+             line is a Nix declaration (an indented string satisfies it too), it does not prove \
+             which devshell owns it, and it is not execution proof."
         );
     }
 
     // #709. The reader, proven against the drift it exists to catch. Each fixture is a way the
-    // element can stop being declared while the file still mentions it.
+    // token can stop being present as a bare line while the file still mentions it.
     #[test]
-    fn bare_element_reader_counts_elements_not_mentions() {
+    fn line_reader_counts_exact_content_not_mentions() {
         const IN_LIST: &str = r#"
             packages = with pkgs; [
               cargo
@@ -1301,9 +1309,9 @@ timeout_secs = 1200
             ];
 "#;
         assert_eq!(
-            bare_element_count(IN_LIST, "nodejs_22"),
+            lines_matching_exactly(IN_LIST, "nodejs_22"),
             1,
-            "a package on its own line inside a list IS declared"
+            "a line whose content is exactly the token counts once"
         );
 
         const COMMENT_ONLY: &str = r#"
@@ -1313,10 +1321,10 @@ timeout_secs = 1200
             ];
 "#;
         assert_eq!(
-            bare_element_count(COMMENT_ONLY, "nodejs_22"),
+            lines_matching_exactly(COMMENT_ONLY, "nodejs_22"),
             0,
-            "prose ABOUT a package is not a declaration of it — the drift that removes a package \
-             most often leaves a comment behind"
+            "text after a `#` is ignored, so a token named only in prose does not count — the \
+             drift that removes a package most often leaves a comment behind"
         );
 
         const COMMENTED_OUT: &str = r#"
@@ -1326,9 +1334,10 @@ timeout_secs = 1200
             ];
 "#;
         assert_eq!(
-            bare_element_count(COMMENTED_OUT, "nodejs_22"),
+            lines_matching_exactly(COMMENTED_OUT, "nodejs_22"),
             0,
-            "commenting a package out removes it from the shell exactly as deleting it does"
+            "a commented-out line has no content before the `#`, so it counts zero — to a \
+             devshell that is the same thing as deletion"
         );
 
         const DUPLICATED: &str = r#"
@@ -1340,17 +1349,17 @@ timeout_secs = 1200
             ];
 "#;
         assert_eq!(
-            bare_element_count(DUPLICATED, "nodejs_22"),
+            lines_matching_exactly(DUPLICATED, "nodejs_22"),
             2,
-            "a second occurrence must be visible, so a stray duplicate cannot keep the guard green \
-             while the real element moves out of the list"
+            "a second matching line must be visible, so a stray duplicate cannot keep the guard \
+             green while the real one moves elsewhere"
         );
 
         const ABSENT: &str = "packages = with pkgs; [ cargo ];";
         assert_eq!(
-            bare_element_count(ABSENT, "nodejs_22"),
+            lines_matching_exactly(ABSENT, "nodejs_22"),
             0,
-            "a file that never names the package declares none of it"
+            "a file with no matching line counts zero"
         );
     }
 }
