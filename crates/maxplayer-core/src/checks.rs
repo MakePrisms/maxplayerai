@@ -843,6 +843,178 @@ timeout_secs = 1200
         );
     }
 
+    /// The argv this repo accepts as running `dir`'s Node suite, compared element-wise.
+    ///
+    /// #709, third round. The first two versions asked what an argv MEANS — does some token name
+    /// the directory, then does some token also look like a test action. Both were heuristics over
+    /// tokens, and both shipped a false green: the first accepted `["true", "web/app"]`, the second
+    /// accepted `npm --prefix web/app exec -- echo test`, because `test` appears as an operand of a
+    /// command npm merely spawns. Patching each named counterexample does not converge. **Whether
+    /// an arbitrary argv runs tests is not decidable by inspecting its tokens**, so any such reader
+    /// admits a new false green forever.
+    ///
+    /// `.maxplayer/checks.toml` does not need that question answered. It declares a small fixed set
+    /// of rows authored in this repo, so the decidable question is membership: **is this declared
+    /// row one of the forms we accept?** Exact comparison has no heuristic to defeat.
+    ///
+    /// Adding a legitimate new spelling costs one deliberate edit here. That is the feature: it
+    /// forces the judgement to be explicit and reviewed, instead of inferred by a reader that
+    /// cannot carry it.
+    ///
+    /// There is deliberately no `node` form. `.maxplayer/checks.toml` declares `npm --prefix <dir>
+    /// test` and says why it is not a bare `node --test <dir>`; on this tree that argv loads no tsx
+    /// and runs no suite at all (measured, rc=1). Accepting a spelling this repo does not declare
+    /// would be speculative generality whose only effect was to certify a dead command.
+    fn accepted_suite_rows(dir: &str) -> [Vec<String>; 2] {
+        let row = |parts: &[&str]| -> Vec<String> {
+            parts
+                .iter()
+                .map(|part| if *part == "{dir}" { dir } else { part }.to_owned())
+                .collect()
+        };
+        [
+            row(&["npm", "--prefix", "{dir}", "test"]),
+            row(&["npm", "--prefix", "{dir}", "run", "test"]),
+        ]
+    }
+
+    /// Whether a declared argv is an accepted form for running `dir`'s Node suite.
+    fn argv_runs_suite_in(argv: &[String], dir: &str) -> bool {
+        accepted_suite_rows(dir)
+            .iter()
+            .any(|accepted| accepted.as_slice() == argv)
+    }
+
+    /// The argv this repo accepts as installing `dir`'s npm dependencies, compared element-wise.
+    ///
+    /// #709, third round. Same defect and same fix as `accepted_suite_rows`: the token-scanning
+    /// version accepted `npm --prefix web/app exec -- echo ci`, because `ci` appeared as an operand
+    /// after `--` rather than as npm's own subcommand.
+    fn accepted_install_rows(dir: &str) -> [Vec<String>; 2] {
+        let row = |parts: &[&str]| -> Vec<String> {
+            parts
+                .iter()
+                .map(|part| if *part == "{dir}" { dir } else { part }.to_owned())
+                .collect()
+        };
+        [
+            row(&["npm", "ci", "--prefix", "{dir}"]),
+            row(&["npm", "install", "--prefix", "{dir}"]),
+        ]
+    }
+
+    /// Whether a declared argv is an accepted form for installing `dir`'s npm dependencies.
+    fn argv_installs_in(argv: &[String], dir: &str) -> bool {
+        accepted_install_rows(dir)
+            .iter()
+            .any(|accepted| accepted.as_slice() == argv)
+    }
+
+    // #709. The readers the two declaration guards stand on, proven against what they must accept
+    // and — the part that matters — against every argv that has ever defeated an earlier version of
+    // them. Each negative row below was a real false green at some point in this change's history;
+    // they are kept as controls so a future "simplification" back to token scanning fails here
+    // rather than in the gate that pays.
+    #[test]
+    fn suite_and_install_readers_accept_only_the_declared_forms() {
+        fn argv(parts: &[&str]) -> Vec<String> {
+            parts.iter().map(|part| (*part).to_owned()).collect()
+        }
+
+        // What must be accepted: the row this repo declares, and the `run test` spelling of it.
+        assert!(argv_runs_suite_in(
+            &argv(&["npm", "--prefix", "web/app", "test"]),
+            "web/app"
+        ));
+        assert!(argv_runs_suite_in(
+            &argv(&["npm", "--prefix", "web/network", "run", "test"]),
+            "web/network"
+        ));
+        assert!(argv_installs_in(
+            &argv(&["npm", "ci", "--prefix", "web/app"]),
+            "web/app"
+        ));
+        // Every entry on an allowlist needs its own positive control. Without this one the
+        // `install` row could be dropped or mistyped and no test would notice — an allowlist
+        // entry that nothing asserts is indistinguishable from one that is not there.
+        assert!(argv_installs_in(
+            &argv(&["npm", "install", "--prefix", "web/app"]),
+            "web/app"
+        ));
+
+        // Every row below names `web/app` and runs none of its tests. Each one is a false green
+        // that a previous version of this reader accepted; the label says which idea it defeated.
+        let not_a_suite_run: [(&[&str], &str); 11] = [
+            (&["true", "web/app"], "no runner at all"),
+            (&["echo", "web/app/test/"], "a runner that only prints"),
+            (
+                &["npm", "--prefix", "web/app", "exec", "--", "echo", "test"],
+                "`test` as an operand of a command npm merely spawns",
+            ),
+            (
+                &["npm", "--prefix", "web/app", "lint"],
+                "an npm subcommand that is not a test",
+            ),
+            (&["npm", "--prefix", "web/app", "install"], "npm, installing"),
+            (
+                &["npm", "--prefix", "web/app", "run", "build"],
+                "npm, building",
+            ),
+            (
+                &["node", "--test", "web/app/test/"],
+                "a node form this repo does not declare, which loads no tsx and runs no suite",
+            ),
+            (
+                &["node", "--check", "web/app/test/spot.test.ts"],
+                "node, syntax-checking",
+            ),
+            (
+                &["cargo", "test", "-p", "maxplayer-core", "--locked", "--offline"],
+                "a cargo row, which runs no Node suite: the premise of #709",
+            ),
+            (
+                &["npm", "--prefix", "web/apparel", "test"],
+                "a sibling directory whose name starts with this one",
+            ),
+            (&["npm", "--prefix", "web", "test"], "the parent directory"),
+        ];
+        for (parts, label) in not_a_suite_run {
+            assert!(
+                !argv_runs_suite_in(&argv(parts), "web/app"),
+                "{label}: this argv does not run web/app's suite, and reading it as coverage is \
+                 the #709 defect rebuilt inside the #709 fix: {parts:?}"
+            );
+        }
+
+        // The two suites are different directories and one must never satisfy the other.
+        assert!(!argv_runs_suite_in(
+            &argv(&["npm", "--prefix", "web/network", "test"]),
+            "web/app"
+        ));
+
+        let not_an_install: [(&[&str], &str); 4] = [
+            (
+                &["npm", "--prefix", "web/app", "exec", "--", "echo", "ci"],
+                "`ci` as an operand of a command npm merely spawns",
+            ),
+            (
+                &["npm", "--prefix", "web/app", "test"],
+                "running the suite is not installing it",
+            ),
+            (
+                &["npm", "ci", "--prefix", "web/network"],
+                "installing a different package",
+            ),
+            (&["cargo", "fetch", "--locked"], "cargo installs no npm dependency"),
+        ];
+        for (parts, label) in not_an_install {
+            assert!(
+                !argv_installs_in(&argv(parts), "web/app"),
+                "{label}: {parts:?}"
+            );
+        }
+    }
+
     /// Whether a declared argv is allowed by the cargo-test `-p` rule.
     ///
     /// #753. The rule is cargo feature-unification: a `cargo test` row must name the one package
@@ -959,5 +1131,235 @@ timeout_secs = 1200
                  (§9.1 runs every command with net denied): {argv:?}"
             );
         }
+
+        // #709. This file is the CONTRIBUTION gate — the set a seller's attestation runs from the
+        // pinned base with the network denied — and it is what a delivery is PAID against. It
+        // declared five cargo rows and no Node row, so every test in web/app and web/network ran
+        // zero times under the declared set: a delivery could regress the market terminal and
+        // attest GREEN. CI catches that break on a pull request to main; the gate that pays did
+        // not. Same shape as the #720 wallet gap, and a money defect for the same reason.
+        //
+        // Both suites, not one. They are separate npm packages with separate runners: web/app is
+        // TypeScript run through tsx, web/network is plain ESM with zero dependencies. A guard
+        // that named only one would leave the other exactly as uncovered as before.
+        //
+        // Asked through `argv_runs_suite_in`, which compares the whole argv element-wise against
+        // the small set of forms this repo declares — proven against those forms and against every
+        // argv that defeated an earlier reader, in
+        // `suite_and_install_readers_accept_only_the_declared_forms`.
+        for suite in ["web/app", "web/network"] {
+            assert!(
+                declaration
+                    .commands
+                    .iter()
+                    .any(|argv| argv_runs_suite_in(argv, suite)),
+                "the declared set must run {suite}'s Node suite — without it a delivery can \
+                 regress the web tree and still attest green: {:?}",
+                declaration.commands
+            );
+        }
+
+        // #709 re-grade, maxplayer's finding. web/app's suite runs its TypeScript through tsx, a
+        // lockfile-pinned devDependency, so the declared row cannot execute unless something
+        // installs node_modules first. `prepare` MAY use the network and the commands MAY NOT
+        // (protocol-v1 §9.1), so the install can only live there. Guarding `commands` alone left
+        // that row covered by nothing: deleting it kept every test green while the web/app row
+        // stopped being able to run at all — rc=127, `tsc: command not found`, measured.
+        assert!(
+            declaration
+                .prepare
+                .iter()
+                .any(|argv| argv_installs_in(argv, "web/app")),
+            "web/app's suite needs its node_modules installed in `prepare`, or the declared row \
+             cannot execute — a declared row that cannot run is worse than no row: {:?}",
+            declaration.prepare
+        );
+    }
+
+    // #709 re-grade. The red this change was written against, made MECHANICAL.
+    //
+    // The original proof that the guard catches the defect was a terminal paste in a pull request
+    // body: true when it was taken, unreadable afterwards, and impossible for CI to re-check. This
+    // reconstructs the exact shape this repo shipped at d4ccc7f — five cargo rows, no Node row —
+    // and asserts the guard rejects it. That turns a one-time claim into a property CI re-proves
+    // on every run, which is what the red was ever supposed to buy.
+    //
+    // It is built from a literal rather than read from git, so it keeps holding after the base
+    // commit ages out of anyone's memory.
+    #[test]
+    fn the_five_cargo_row_declaration_this_repo_shipped_is_rejected() {
+        let shipped: Vec<Vec<String>> = [
+            &["cargo", "build", "--locked"][..],
+            &["cargo", "test", "-p", "maxplayer-core", "--locked", "--offline"][..],
+            &[
+                "cargo",
+                "test",
+                "-p",
+                "maxplayer-core",
+                "--features",
+                "acp",
+                "--locked",
+                "--offline",
+            ][..],
+            &[
+                "cargo",
+                "test",
+                "-p",
+                "maxplayer-core",
+                "--features",
+                "wallet",
+                "--locked",
+                "--offline",
+            ][..],
+            &["cargo", "test", "-p", "maxplayer", "--locked", "--offline"][..],
+        ]
+        .iter()
+        .map(|argv| argv.iter().map(|part| (*part).to_owned()).collect())
+        .collect();
+
+        for suite in ["web/app", "web/network"] {
+            assert!(
+                !shipped.iter().any(|argv| argv_runs_suite_in(argv, suite)),
+                "the five-cargo-row set runs no Node suite — if the guard accepts it, the guard \
+                 has stopped catching the defect it was written for ({suite})"
+            );
+        }
+
+        // And the same set carries no npm install either, so the prepare guard has a red too.
+        let no_prepare: Vec<Vec<String>> = vec![vec!["cargo".to_owned(), "fetch".to_owned()]];
+        assert!(
+            !no_prepare
+                .iter()
+                .any(|argv| argv_installs_in(argv, "web/app")),
+            "`cargo fetch` alone installs no npm dependency: the prepare guard must fail on it"
+        );
+    }
+
+    /// How many lines of `text` have exactly `token` as their content, ignoring anything from the
+    /// first `#` onwards.
+    ///
+    /// #709. Purely lexical, and named that way on purpose. It reads LINES and knows nothing about
+    /// Nix: a bare `nodejs_22` line inside an indented string satisfies it exactly as a list
+    /// element does — measured. An earlier name and doc said "declare" and "bare package element",
+    /// which asserted structure this cannot see.
+    fn lines_matching_exactly(text: &str, token: &str) -> usize {
+        text.lines()
+            .filter(|line| {
+                let code = line.split('#').next().unwrap_or("");
+                code.trim() == token
+            })
+            .count()
+    }
+
+    // #709. The declared npm rows run inside the flake devshell (§9.1), and at d4ccc7f that shell
+    // held a Rust toolchain and nothing else — no node, no npm. So the rows this change adds could
+    // not have executed there. Delete `nodejs_22` and, without this test, every other test here
+    // still passes while the declared rows quietly become unrunnable.
+    //
+    // WHAT THIS PROVES, EXACTLY: `flake.nix` contains exactly one line whose trimmed content is
+    // exactly `nodejs_22`. That is a LEXICAL claim about the file's lines, and it is the whole
+    // claim.
+    //
+    // WHAT IT DOES NOT PROVE, and each of these has at some point been written here as if it did:
+    //   * Not that the line is a Nix DECLARATION. This reader has no Nix awareness — a bare
+    //     `nodejs_22` line inside an indented string satisfies it exactly as a list element does.
+    //     Measured.
+    //   * Not WHICH devshell owns it. A second shell could hold the only occurrence.
+    //   * Not that anything EXECUTES. It says nothing about whether the devshell evaluates, or
+    //     whether entering it yields a working `npm`.
+    //
+    // Why it claims so little, deliberately. Three readers tried to bind the package to the
+    // DEFAULT shell by reading this file as text, and valid Nix defeated each one. A substring
+    // search matched prose. A brace-balanced block ended early on `shellHook = "echo }"`. Bounding
+    // the region by the next `mkShell` truncated on that word inside a COMMENT and — worse — read
+    // a package list written inside a STRING as a real one, reporting a package the shell does not
+    // have. All three measured.
+    //
+    // That is the class this file already learned for argv: **structure cannot be decided by
+    // inspecting text.** Substrings are to Nix what tokens were to argv. Binding the element to
+    // the default shell needs a Nix parser, and this crate has no other reason to carry one. So
+    // this guard is a TRIPWIRE on that line leaving the file, it says so where it is asserted,
+    // and a guard that overstated its reach is the defect this whole change exists to close.
+    //
+    // The count is exactly one, not at least one: a second matching line elsewhere would
+    // otherwise keep this green while the real one moved out of the default shell's list.
+    #[test]
+    fn the_flake_declares_the_node_the_check_rows_need() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../", "flake.nix");
+        let text = std::fs::read_to_string(path).expect("this repo ships flake.nix at its root");
+        assert_eq!(
+            lines_matching_exactly(&text, "nodejs_22"),
+            1,
+            "flake.nix must contain exactly one line whose trimmed content is exactly \
+             `nodejs_22` — without it .maxplayer/checks.toml's npm rows cannot execute in the \
+             environment they are declared against. This check is LEXICAL: it does not prove the \
+             line is a Nix declaration (an indented string satisfies it too), it does not prove \
+             which devshell owns it, and it is not execution proof."
+        );
+    }
+
+    // #709. The reader, proven against the drift it exists to catch. Each fixture is a way the
+    // token can stop being present as a bare line while the file still mentions it.
+    #[test]
+    fn line_reader_counts_exact_content_not_mentions() {
+        const IN_LIST: &str = r#"
+            packages = with pkgs; [
+              cargo
+              nodejs_22
+            ];
+"#;
+        assert_eq!(
+            lines_matching_exactly(IN_LIST, "nodejs_22"),
+            1,
+            "a line whose content is exactly the token counts once"
+        );
+
+        const COMMENT_ONLY: &str = r#"
+            packages = with pkgs; [
+              cargo
+              # we should probably add nodejs_22 here one day
+            ];
+"#;
+        assert_eq!(
+            lines_matching_exactly(COMMENT_ONLY, "nodejs_22"),
+            0,
+            "text after a `#` is ignored, so a token named only in prose does not count — the \
+             drift that removes a package most often leaves a comment behind"
+        );
+
+        const COMMENTED_OUT: &str = r#"
+            packages = with pkgs; [
+              cargo
+              # nodejs_22
+            ];
+"#;
+        assert_eq!(
+            lines_matching_exactly(COMMENTED_OUT, "nodejs_22"),
+            0,
+            "a commented-out line has no content before the `#`, so it counts zero — to a \
+             devshell that is the same thing as deletion"
+        );
+
+        const DUPLICATED: &str = r#"
+            packages = with pkgs; [
+              nodejs_22
+            ];
+            other = [
+              nodejs_22
+            ];
+"#;
+        assert_eq!(
+            lines_matching_exactly(DUPLICATED, "nodejs_22"),
+            2,
+            "a second matching line must be visible, so a stray duplicate cannot keep the guard \
+             green while the real one moves elsewhere"
+        );
+
+        const ABSENT: &str = "packages = with pkgs; [ cargo ];";
+        assert_eq!(
+            lines_matching_exactly(ABSENT, "nodejs_22"),
+            0,
+            "a file with no matching line counts zero"
+        );
     }
 }
