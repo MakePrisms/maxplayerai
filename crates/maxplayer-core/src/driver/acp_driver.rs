@@ -221,13 +221,6 @@ impl AcpDriver {
             return Ok(response.result.unwrap_or(Value::Null));
         }
     }
-    /// The model this run is attributed with.
-    ///
-    /// The TURN-resolved id wins over the `session/new` one. `session/new` reports what the picker is
-    /// set to, which on a Claude seat is an alias a human chose (`sonnet`, `opus[1m]`, or `default`);
-    /// the init frame reports the decorated id the turn actually ran on. When no turn resolved one —
-    /// every non-Claude harness, and any Claude run whose frame never arrived — this is byte-identical
-    /// to the value the driver reported before (#896 follow-on).
     /// Forget any turn-resolved model, because a new session has resolved none yet.
     ///
     /// Every current call site builds a fresh driver per run, so this clears nothing today. A REUSED
@@ -242,6 +235,13 @@ impl AcpDriver {
         }
     }
 
+    /// The model this run is attributed with.
+    ///
+    /// The TURN-resolved id wins over the `session/new` one. `session/new` reports what the picker is
+    /// set to, which on a Claude seat is a selector a human chose (`sonnet`, `opus[1m]`, or
+    /// `default`); the init frame reports the decorated id the turn actually ran on. When no turn
+    /// resolved one, every non-Claude harness reports byte-identically to what the driver reported
+    /// before (#896 follow-on), and a Claude run whose frame never arrived reports absence.
     fn resolved_model(&self) -> Option<String> {
         if let Ok(resolved) = self.claude_turn_model.lock()
             && let Some(model) = resolved.clone()
@@ -2783,7 +2783,17 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/claude-agent-acp-0.70.0/capture.mjs"
         );
-        let out = std::env::temp_dir().join("live-acp-capture.json");
+        // Unique per run: a fixed name in a shared temp dir lets two hand-runs overwrite each
+        // other's capture, and the loser then compares the winner's bytes while reporting its own
+        // binary. Same class as the fixed-path mis-send this repo's authors have already paid for.
+        let out = std::env::temp_dir().join(format!(
+            "live-acp-capture-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or_default()
+        ));
         let status = std::process::Command::new("node")
             .arg(client)
             .arg(&bin)
@@ -2845,14 +2855,30 @@ mod tests {
                 "the committed capture's frame `{field}` is not what the adapter sends"
             );
         }
-        // The model itself is account-dependent, so require the SHAPE the capture claims: a
-        // concrete id the reader accepts, and never the picker alias.
+        // THE BINDING THAT MATTERS. Everything else in this file can be satisfied by a fabrication
+        // made consistently in one commit: `CAPTURE_SHA256` is a const beside the file it hashes and
+        // moves with an edit, `LOAD_BEARING_KEYS` checks presence and not value, and the typed literal
+        // in `the_captured_init_frame_names_the_concrete_model` is one more editable string. Only a
+        // comparison against a LIVE adapter is outside the author's reach, and the model id is the
+        // scalar this whole change exists to publish. An earlier revision of this test asserted only
+        // that the live model was not the picker alias — a SHAPE check, which the invented value
+        // `claude-opus-4-8` also passes. Equality or nothing.
         let live_model = claude_sdk_init_model(&live_frame)
             .expect("the live init frame must carry a model the reader accepts");
+        let committed_model = claude_sdk_init_model(&committed_frame)
+            .expect("the committed capture must carry a model the reader accepts");
+        assert_eq!(
+            live_model, committed_model,
+            "the committed capture claims this session runs on `{committed_model}` and the adapter \
+             reports `{live_model}`; re-capture the fixture rather than loosening this test. A \
+             grader on another account, or after a model default moves, sees this too — that is \
+             fixture STALENESS, not a false alarm, and a RED test saying re-capture is the correct \
+             outcome. There is deliberately no environment variable to skip it."
+        );
         assert_ne!(
             live_model, CLAUDE_PICKER_DEFAULT,
             "the live adapter published the picker alias as its model"
         );
-        println!("LIVE bin={bin} model={live_model}");
+        println!("LIVE bin={bin} model={live_model} committed={committed_model}");
     }
 }
