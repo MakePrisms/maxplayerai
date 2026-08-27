@@ -7620,6 +7620,49 @@ mod tests {
         }
     }
 
+    // THE THIRD OFFER SHAPE, AND THE ONE THIS CHANGE COULD MOST EASILY HAVE OPENED. #923 narrows the
+    // buyer-eligibility clause to offers whose `p` tag is THIS seat, so an offer targeted at SOMEONE
+    // ELSE now bypasses that clause entirely and is refused only by the rate gate. Nothing in the
+    // suite exercised that shape through `classify_offer` before this test, on any config — so the
+    // narrowing was load-bearing and unproven, which is the pair a security-shaped diff must not
+    // ship. Swept over all eight control settings and both buyers: sixteen refusals, no exceptions.
+    //
+    // ⛔ DISCLOSED REASON CHANGE, NOT A DECISION CHANGE. Before #923 a populated allowlist reported
+    // `NotAllowlisted` for this shape, because the fence ran ahead of everything. It now reports the
+    // rate gate's refusal — which is exactly what a seat with an EMPTY allowlist already reported for
+    // the same offer. The refusal itself is identical either way; all seats now agree on the reason.
+    //
+    // RED ON REVERT: reinstate the pre-#923 `!seller.accept_offers_only_from.is_empty() &&
+    // !buyer_is_named` early return ⇒ the populated-list rows report NotAllowlisted, not RateGate.
+    #[test]
+    fn an_offer_targeted_at_another_seat_is_refused_under_every_control_setting() {
+        const ALLOWED: &str = "cafe01";
+        const STRANGER: &str = "dead02";
+        const OTHER_SEAT: &str = "beef03"; // ≠ SELLER — the offer is addressed elsewhere
+
+        for populated in [false, true] {
+            for open_targeted in [false, true] {
+                for open_pool in [false, true] {
+                    let mut cfg = seller_cfg(2, open_pool);
+                    cfg.accept_open_targeted = open_targeted;
+                    cfg.accept_offers_only_from =
+                        if populated { vec![ALLOWED.to_owned()] } else { Vec::new() };
+
+                    for buyer in [ALLOWED, STRANGER] {
+                        assert_eq!(
+                            classify_offer(&offer(5, Some(OTHER_SEAT), NOW + 600), &cfg, &claude_only(), SELLER, buyer, NOW, NOW),
+                            ClaimDecision::Skip(SkipReason::RateGate),
+                            "an offer addressed to another seat must never be claimed \
+                             (list_populated={populated} accept_open_targeted={open_targeted} \
+                             claim_open_pool={open_pool} buyer={buyer}) — opening a route for THIS \
+                             seat may not admit work addressed to a different one"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // ROUND TRIP — the operator workflow #923 exists to enable: open a public route, then close it
     // and be back to allowlist-only targeted work with the list never rewritten. Without this, the
     // matrix above is satisfied by a gate that reaches the right states but cannot get back.
