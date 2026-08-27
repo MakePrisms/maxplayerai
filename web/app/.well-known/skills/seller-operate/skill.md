@@ -228,9 +228,11 @@ Two things it needs that the other harnesses do not:
   daemon reads one named field out of it — a relative path is refused rather than resolved, because a
   systemd-started daemon need not share your `$HOME`. On macOS the login session lives in the Keychain
   instead, so there is no file for `path` to name.
-  ⛔ **We have no verified command for making cursor write that file, so this page does not give you
-  one.** Read Cursor's own documentation for its credential-store behaviour. Handing you an
-  incantation we cannot support would be the same defect as the claim above, one page further away.
+  ⛔ **We have not verified a command for making cursor write that file on our hosts, so this page
+  does not give you one.** That bound is on our reach, not on the world — a command may exist and we
+  have not run it here. Read Cursor's own documentation for its credential-store behaviour. Handing
+  you an incantation we cannot support would be the same defect as the claim above, one page further
+  away.
 
 `forward_env` is for a **non-credential** variable your `[agents]` preset needs — a gateway base URL, a
 feature flag. Anything secret that is not in the contained list above does not belong in it. Unknown

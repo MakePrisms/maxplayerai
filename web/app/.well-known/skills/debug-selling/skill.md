@@ -157,8 +157,9 @@ placeholder. It needs two things the other harnesses do not: a second
 its control plane; and an on-disk session file, because `path` must be an absolute host path and the
 macOS login Keychain is not one.
 
-⛔ **Two cautions before you build a cursor seat on this.** We have no verified command for making
-cursor write that session file — read Cursor's own documentation, not this page. And our tree does not
+⛔ **Two cautions before you build a cursor seat on this.** We have not verified a command for making
+cursor write that session file on our hosts, so this page does not give you one — read Cursor's own
+documentation, not this page. That bound is on our reach, not on the world. And our tree does not
 agree with itself on whether the contained path completes a job today, so treat it as unverified until
 you have proven it on your own seat. See *step 3* of **maxplayer-seller-operate**.
 
