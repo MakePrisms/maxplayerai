@@ -843,201 +843,169 @@ timeout_secs = 1200
         );
     }
 
-    /// Every path a declared argv points at, normalised across the spellings that reach one
-    /// directory.
+    /// The argv this repo accepts as running `dir`'s Node suite, compared element-wise.
     ///
-    /// #709. A row reaches a Node suite by naming its directory, and there is more than one way to
-    /// write that name: `--prefix web/app`, `--prefix=web/app`, `./web/app`, `web/app/`, or a file
-    /// path underneath it. A reader that knows only the bare argv-position spelling asserts
-    /// coverage only about rows written that way, so `--prefix=web/app` would fail a check whose
-    /// whole purpose is to find it — the same exposure `declared_features` was widened for in
-    /// #737. Normalise first, then ask the membership question once.
+    /// #709, third round. The first two versions asked what an argv MEANS — does some token name
+    /// the directory, then does some token also look like a test action. Both were heuristics over
+    /// tokens, and both shipped a false green: the first accepted `["true", "web/app"]`, the second
+    /// accepted `npm --prefix web/app exec -- echo test`, because `test` appears as an operand of a
+    /// command npm merely spawns. Patching each named counterexample does not converge. **Whether
+    /// an arbitrary argv runs tests is not decidable by inspecting its tokens**, so any such reader
+    /// admits a new false green forever.
     ///
-    /// Flags are dropped, and an `=`-attached flag contributes its VALUE: that is what makes the
-    /// attached and detached spellings read alike, since the detached form is already its own
-    /// token. Non-path operands (`maxplayer-core`, `wallet`) survive normalisation as harmless
-    /// entries — the question asked of this set is always about one named directory.
-    fn declared_paths(argv: &[String]) -> BTreeSet<String> {
-        argv.iter()
-            .filter_map(|part| {
-                let value = match part.split_once('=') {
-                    Some((flag, value)) if flag.starts_with('-') => value,
-                    _ if part.starts_with('-') => return None,
-                    _ => part.as_str(),
-                };
-                let value = value.strip_prefix("./").unwrap_or(value);
-                let value = value.trim_end_matches('/');
-                (!value.is_empty()).then(|| value.to_owned())
-            })
-            .collect()
-    }
-
-    /// Whether a declared argv reaches inside `dir`, ignoring what it does there.
+    /// `.maxplayer/checks.toml` does not need that question answered. It declares a small fixed set
+    /// of rows authored in this repo, so the decidable question is membership: **is this declared
+    /// row one of the forms we accept?** Exact comparison has no heuristic to defeat.
     ///
-    /// #709. Segment boundaries, not string prefixes: `web/apparel` starts with `web/app` and is
-    /// not inside it. A `starts_with` on the bare name would read a sibling directory as coverage.
+    /// Adding a legitimate new spelling costs one deliberate edit here. That is the feature: it
+    /// forces the judgement to be explicit and reviewed, instead of inferred by a reader that
+    /// cannot carry it.
     ///
-    /// This answers HALF the question and is never asked alone — `argv_runs_suite_in` is the
-    /// guard. Kept separate because "does this argv point at the directory" and "does this argv
-    /// run its tests" fail in different ways and are worth failing separately.
-    fn argv_reaches(argv: &[String], dir: &str) -> bool {
-        let inside = format!("{dir}/");
-        declared_paths(argv)
-            .iter()
-            .any(|path| path == dir || path.starts_with(&inside))
-    }
-
-    /// Whether a declared argv actually RUNS a Node test suite in `dir`.
-    ///
-    /// #709 re-grade. The first version of this guard asked only `argv_reaches`, so it certified
-    /// any argv that merely MENTIONED the directory: `["true", "web/app"]` satisfied it, and no
-    /// test ran. That is #709's own defect — a suite reading as covered while nothing executes it
-    /// — rebuilt inside the fix for #709.
-    ///
-    /// Three things must hold TOGETHER, because each one alone is satisfiable by an argv that runs
-    /// nothing: a runner that can execute a Node suite, an argument that makes that runner TEST
-    /// rather than build or install, and the directory. The failure was treating the third as
-    /// sufficient.
-    ///
-    /// What this deliberately does NOT decide is whether the argv succeeds. `node --test
-    /// web/app/test/` names the runner, the action and the directory and still runs nothing on
-    /// this tree, because nothing loads tsx — measured, rc=1. No reader of argv can know that, and
-    /// a reader that pretended to would be guessing. That is what the header rule above covers:
-    /// every argv here must be PROVEN, not merely well-shaped.
-    fn argv_runs_suite_in(argv: &[String], dir: &str) -> bool {
-        let Some(runner) = argv.first().map(String::as_str) else {
-            return false;
-        };
-        let tests = match runner {
-            // `npm test` and `npm run test` both reach the package's own `test` script.
-            "npm" => argv.iter().any(|part| part == "test"),
-            // node's own test runner, in both spellings it accepts for the flag.
-            "node" => argv
+    /// There is deliberately no `node` form. `.maxplayer/checks.toml` declares `npm --prefix <dir>
+    /// test` and says why it is not a bare `node --test <dir>`; on this tree that argv loads no tsx
+    /// and runs no suite at all (measured, rc=1). Accepting a spelling this repo does not declare
+    /// would be speculative generality whose only effect was to certify a dead command.
+    fn accepted_suite_rows(dir: &str) -> [Vec<String>; 2] {
+        let row = |parts: &[&str]| -> Vec<String> {
+            parts
                 .iter()
-                .any(|part| part == "--test" || part.starts_with("--test=")),
-            _ => false,
+                .map(|part| if *part == "{dir}" { dir } else { part }.to_owned())
+                .collect()
         };
-        tests && argv_reaches(argv, dir)
+        [
+            row(&["npm", "--prefix", "{dir}", "test"]),
+            row(&["npm", "--prefix", "{dir}", "run", "test"]),
+        ]
     }
 
-    // #709. The reader is what the web-suite guard stands on, so it is proven against every
-    // spelling that reaches the directory rather than only against the one this repo declares.
-    // Each row here is a form that runs the suite; if any stops being read, a declaration written
-    // that way becomes invisible to the guard and the suite reads as covered by nothing.
+    /// Whether a declared argv is an accepted form for running `dir`'s Node suite.
+    fn argv_runs_suite_in(argv: &[String], dir: &str) -> bool {
+        accepted_suite_rows(dir)
+            .iter()
+            .any(|accepted| accepted.as_slice() == argv)
+    }
+
+    /// The argv this repo accepts as installing `dir`'s npm dependencies, compared element-wise.
+    ///
+    /// #709, third round. Same defect and same fix as `accepted_suite_rows`: the token-scanning
+    /// version accepted `npm --prefix web/app exec -- echo ci`, because `ci` appeared as an operand
+    /// after `--` rather than as npm's own subcommand.
+    fn accepted_install_rows(dir: &str) -> [Vec<String>; 2] {
+        let row = |parts: &[&str]| -> Vec<String> {
+            parts
+                .iter()
+                .map(|part| if *part == "{dir}" { dir } else { part }.to_owned())
+                .collect()
+        };
+        [
+            row(&["npm", "ci", "--prefix", "{dir}"]),
+            row(&["npm", "install", "--prefix", "{dir}"]),
+        ]
+    }
+
+    /// Whether a declared argv is an accepted form for installing `dir`'s npm dependencies.
+    fn argv_installs_in(argv: &[String], dir: &str) -> bool {
+        accepted_install_rows(dir)
+            .iter()
+            .any(|accepted| accepted.as_slice() == argv)
+    }
+
+    // #709. The readers the two declaration guards stand on, proven against what they must accept
+    // and — the part that matters — against every argv that has ever defeated an earlier version of
+    // them. Each negative row below was a real false green at some point in this change's history;
+    // they are kept as controls so a future "simplification" back to token scanning fails here
+    // rather than in the gate that pays.
     #[test]
-    fn node_suite_reader_sees_every_spelling_of_one_suite() {
+    fn suite_and_install_readers_accept_only_the_declared_forms() {
         fn argv(parts: &[&str]) -> Vec<String> {
             parts.iter().map(|part| (*part).to_owned()).collect()
         }
 
-        // Every row runs `web/app`'s suite, so every row must read as running it.
-        //
-        // `node --test web/app/test/` is deliberately NOT in this set. It is well-shaped and it
-        // runs nothing on this tree (rc=1, no suite loaded, because nothing imports tsx), and a
-        // reader that certifies an argv already measured as dead is the same silent-green in a new
-        // place. It is left unasserted rather than asserted false: its deadness is a property of
-        // this tree's dependencies, not of its argv, and this reader only reads argv.
-        let running: [(&[&str], &str); 6] = [
-            (&["npm", "--prefix", "web/app", "test"], "argv-position prefix"),
-            (&["npm", "--prefix=web/app", "test"], "equals prefix"),
-            (&["npm", "test", "--prefix", "web/app"], "prefix after the command"),
-            (&["npm", "run", "test", "--prefix", "web/app"], "npm run test"),
-            (&["npm", "--prefix", "./web/app", "test"], "dot-slash prefix"),
-            (&["npm", "--prefix", "web/app/", "test"], "trailing-slash prefix"),
-        ];
-        for (parts, label) in running {
-            assert!(
-                argv_runs_suite_in(&argv(parts), "web/app"),
-                "the {label} spelling runs web/app's suite and must read as such: {parts:?}"
-            );
-        }
+        // What must be accepted: the row this repo declares, and the `run test` spelling of it.
+        assert!(argv_runs_suite_in(
+            &argv(&["npm", "--prefix", "web/app", "test"]),
+            "web/app"
+        ));
+        assert!(argv_runs_suite_in(
+            &argv(&["npm", "--prefix", "web/network", "run", "test"]),
+            "web/network"
+        ));
+        assert!(argv_installs_in(
+            &argv(&["npm", "ci", "--prefix", "web/app"]),
+            "web/app"
+        ));
 
-        // A runner and an action without the directory is not coverage of THIS suite.
-        assert!(
-            !argv_runs_suite_in(&argv(&["npm", "--prefix", "web/network", "test"]), "web/app"),
-            "the two web suites are different directories and one must never satisfy the other"
-        );
-        assert!(
-            !argv_runs_suite_in(&argv(&["npm", "--prefix", "web/apparel", "test"]), "web/app"),
-            "`web/apparel` is not inside `web/app` — the question is segment boundaries, never a \
-             string prefix"
-        );
-        assert!(
-            !argv_runs_suite_in(&argv(&["npm", "--prefix", "web", "test"]), "web/app"),
-            "the parent directory is not the suite: `web` does not run what is under `web/app`"
-        );
-
-        // #709 re-grade. The directory alone must NEVER be enough. Every row below names
-        // `web/app` and runs no test in it; the guard's first version accepted all of them.
-        let not_running: [(&[&str], &str); 6] = [
+        // Every row below names `web/app` and runs none of its tests. Each one is a false green
+        // that a previous version of this reader accepted; the label says which idea it defeated.
+        let not_a_suite_run: [(&[&str], &str); 11] = [
             (&["true", "web/app"], "no runner at all"),
             (&["echo", "web/app/test/"], "a runner that only prints"),
-            (&["npm", "--prefix", "web/app", "install"], "npm, but installing"),
-            (&["npm", "--prefix", "web/app", "run", "build"], "npm, but building"),
-            (&["node", "--check", "web/app/test/spot.test.ts"], "node, but syntax-checking"),
+            (
+                &["npm", "--prefix", "web/app", "exec", "--", "echo", "test"],
+                "`test` as an operand of a command npm merely spawns",
+            ),
+            (
+                &["npm", "--prefix", "web/app", "lint"],
+                "an npm subcommand that is not a test",
+            ),
+            (&["npm", "--prefix", "web/app", "install"], "npm, installing"),
+            (
+                &["npm", "--prefix", "web/app", "run", "build"],
+                "npm, building",
+            ),
+            (
+                &["node", "--test", "web/app/test/"],
+                "a node form this repo does not declare, which loads no tsx and runs no suite",
+            ),
+            (
+                &["node", "--check", "web/app/test/spot.test.ts"],
+                "node, syntax-checking",
+            ),
             (
                 &["cargo", "test", "-p", "maxplayer-core", "--locked", "--offline"],
                 "a cargo row, which runs no Node suite: the premise of #709",
             ),
+            (
+                &["npm", "--prefix", "web/apparel", "test"],
+                "a sibling directory whose name starts with this one",
+            ),
+            (&["npm", "--prefix", "web", "test"], "the parent directory"),
         ];
-        for (parts, label) in not_running {
+        for (parts, label) in not_a_suite_run {
             assert!(
                 !argv_runs_suite_in(&argv(parts), "web/app"),
-                "{label}: naming the directory is not running its suite, and reading it as \
-                 coverage is the #709 defect rebuilt inside the #709 fix: {parts:?}"
+                "{label}: this argv does not run web/app's suite, and reading it as coverage is \
+                 the #709 defect rebuilt inside the #709 fix: {parts:?}"
             );
         }
-    }
 
-    /// Whether a declared argv installs `dir`'s npm dependencies.
-    ///
-    /// #709 re-grade, maxplayer's finding. The suite guard reads `commands` only, so the `prepare`
-    /// row that installs web/app's node_modules was covered by nothing: delete it and every test
-    /// still passed, while the declared web/app row could no longer execute — measured, rc=127
-    /// `tsc: command not found`. That is the same declared-row-that-cannot-run defect this whole
-    /// change exists to close, one field over in the same file.
-    fn argv_installs_in(argv: &[String], dir: &str) -> bool {
-        let Some(runner) = argv.first().map(String::as_str) else {
-            return false;
-        };
-        let installs = runner == "npm"
-            && argv
-                .iter()
-                .any(|part| part == "ci" || part == "install" || part == "i");
-        installs && argv_reaches(argv, dir)
-    }
+        // The two suites are different directories and one must never satisfy the other.
+        assert!(!argv_runs_suite_in(
+            &argv(&["npm", "--prefix", "web/network", "test"]),
+            "web/app"
+        ));
 
-    // #709 re-grade. Proven against argv the same way the suite reader is, so the prepare guard
-    // below cannot be the only thing that has ever read this predicate.
-    #[test]
-    fn install_reader_sees_the_install_spellings_and_nothing_else() {
-        fn argv(parts: &[&str]) -> Vec<String> {
-            parts.iter().map(|part| (*part).to_owned()).collect()
-        }
-
-        for parts in [
-            &["npm", "ci", "--prefix", "web/app"][..],
-            &["npm", "install", "--prefix", "web/app"][..],
-            &["npm", "--prefix=web/app", "ci"][..],
-        ] {
+        let not_an_install: [(&[&str], &str); 4] = [
+            (
+                &["npm", "--prefix", "web/app", "exec", "--", "echo", "ci"],
+                "`ci` as an operand of a command npm merely spawns",
+            ),
+            (
+                &["npm", "--prefix", "web/app", "test"],
+                "running the suite is not installing it",
+            ),
+            (
+                &["npm", "ci", "--prefix", "web/network"],
+                "installing a different package",
+            ),
+            (&["cargo", "fetch", "--locked"], "cargo installs no npm dependency"),
+        ];
+        for (parts, label) in not_an_install {
             assert!(
-                argv_installs_in(&argv(parts), "web/app"),
-                "this spelling installs web/app's dependencies and must read as such: {parts:?}"
+                !argv_installs_in(&argv(parts), "web/app"),
+                "{label}: {parts:?}"
             );
         }
-
-        assert!(
-            !argv_installs_in(&argv(&["npm", "--prefix", "web/app", "test"]), "web/app"),
-            "running the suite is not installing it: the two rows answer different questions"
-        );
-        assert!(
-            !argv_installs_in(&argv(&["npm", "ci", "--prefix", "web/network"]), "web/app"),
-            "installing a different package is not installing this one"
-        );
-        assert!(
-            !argv_installs_in(&argv(&["cargo", "fetch", "--locked"]), "web/app"),
-            "cargo fetch installs no npm dependency"
-        );
     }
 
     /// Whether a declared argv is allowed by the cargo-test `-p` rule.
@@ -1277,14 +1245,112 @@ timeout_secs = 1200
     fn the_devshell_declares_the_node_the_check_rows_need() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../", "flake.nix");
         let text = std::fs::read_to_string(path).expect("this repo ships flake.nix at its root");
-
-        let devshells = text
-            .find("devShells")
-            .expect("flake.nix must declare devShells: §9.1 runs every declared command in one");
         assert!(
-            text[devshells..].contains("nodejs_22"),
-            "the default devshell must declare nodejs_22, or .maxplayer/checks.toml's npm rows \
-             cannot execute in the environment they are declared against"
+            default_devshell_lists_package(&text, "nodejs_22"),
+            "the DEFAULT devshell's package list must contain nodejs_22, or \
+             .maxplayer/checks.toml's npm rows cannot execute in the environment they are \
+             declared against"
+        );
+    }
+
+    /// Whether the default devshell's package list contains `package` as a list element.
+    ///
+    /// #709, third round. The first version asked whether `nodejs_22` appeared anywhere after the
+    /// string `devShells`, which a comment mentioning it satisfies, and which moving the package
+    /// into some OTHER shell's list also satisfies. That is the same class of defect as the argv
+    /// readers above: a substring search standing in for a structural question.
+    ///
+    /// This walks to the default shell's `packages` list and reads its ELEMENTS, with comment
+    /// lines removed first so prose about a package can never be mistaken for the package.
+    ///
+    /// BOUND, and it is the honest limit: this reads Nix as text, not as Nix. It proves the file
+    /// DECLARES the package in that list. It cannot prove the devshell evaluates, or that entering
+    /// it yields a working `npm` — nothing in this tree can, because `nix` is not required to build
+    /// this repo and no CI job enters a devshell. The pull request states that residual rather than
+    /// letting this test read as execution proof.
+    fn default_devshell_lists_package(text: &str, package: &str) -> bool {
+        let Some(shells) = text.find("devShells") else {
+            return false;
+        };
+        let Some(default) = text[shells..].find("default = pkgs.mkShell") else {
+            return false;
+        };
+        let from_default = &text[shells + default..];
+        let Some(list) = from_default.find("packages = with pkgs; [") else {
+            return false;
+        };
+        let after_open = &from_default[list + "packages = with pkgs; [".len()..];
+        let Some(close) = after_open.find(']') else {
+            return false;
+        };
+        after_open[..close].lines().any(|line| {
+            // Strip a trailing comment before reading the element, so `nodejs_22` inside prose is
+            // never read as a declaration of it.
+            let code = line.split('#').next().unwrap_or("");
+            code.trim() == package
+        })
+    }
+
+    // #709, third round. The structural reader is proven against the shapes that defeated the
+    // substring version, not only against this repo's current flake. Each negative below is a file
+    // in which the package is NOT available to the default devshell while the token is present.
+    #[test]
+    fn devshell_reader_reads_list_elements_not_mentions() {
+        const IN_LIST: &str = r#"
+      devShells = forAllSystems (system: {
+          default = pkgs.mkShell {
+            packages = with pkgs; [
+              cargo
+              nodejs_22
+            ];
+          };
+      });
+"#;
+        assert!(
+            default_devshell_lists_package(IN_LIST, "nodejs_22"),
+            "a package on its own line inside the default shell's list IS declared"
+        );
+
+        const COMMENT_ONLY: &str = r#"
+      devShells = forAllSystems (system: {
+          default = pkgs.mkShell {
+            packages = with pkgs; [
+              cargo
+              # we should probably add nodejs_22 here one day
+            ];
+          };
+      });
+"#;
+        assert!(
+            !default_devshell_lists_package(COMMENT_ONLY, "nodejs_22"),
+            "prose ABOUT a package is not a declaration of it — this is what the substring \
+             version could not tell apart"
+        );
+
+        const OTHER_SHELL: &str = r#"
+      devShells = forAllSystems (system: {
+          default = pkgs.mkShell {
+            packages = with pkgs; [
+              cargo
+            ];
+          };
+          web = pkgs.mkShell {
+            packages = with pkgs; [
+              nodejs_22
+            ];
+          };
+      });
+"#;
+        assert!(
+            !default_devshell_lists_package(OTHER_SHELL, "nodejs_22"),
+            "§9.1 runs the declared commands in the DEFAULT shell: a package in a different \
+             shell's list is not available to them"
+        );
+
+        const NO_DEVSHELL: &str = "{ description = \"no devshell here\"; }";
+        assert!(
+            !default_devshell_lists_package(NO_DEVSHELL, "nodejs_22"),
+            "a flake with no devshell declares no package to one"
         );
     }
 }
