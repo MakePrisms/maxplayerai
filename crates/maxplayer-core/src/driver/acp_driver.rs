@@ -56,6 +56,19 @@ pub struct AcpDriver {
     /// either wire shape by [`session_model_from_result`]. Folded into [`Self::usage`] so a run's
     /// exec-metadata carries the resolved model (#455). `None` when the harness reported no model.
     session_model: Option<String>,
+    /// The CONCRETE model id the Claude adapter announced for the turn, captured off its private
+    /// `_claude/sdkMessage` `system`/`init` frame. Shared with the stdout reader thread because a
+    /// notification is only ever seen there. Stays `None` for every other harness: nothing else
+    /// sends that method, and [`Self::is_claude_adapter`] means nothing else is asked to.
+    claude_turn_model: Arc<Mutex<Option<String>>>,
+    /// Set when `initialize` came back from claude-agent-acp ITSELF. Gates the adapter-private
+    /// opt-in below off the generic ACP path.
+    ///
+    /// Written by [`Driver::ready`], read by [`Driver::start_session`], and that ORDER is what makes
+    /// the opt-in reach the wire — `run_job` calls them in exactly that sequence
+    /// (`engine.rs:133`, then `:141`). A caller that started a session without readying the driver
+    /// first would send no opt-in and resolve no model; it would fail closed to absent, not wrong.
+    is_claude_adapter: bool,
 }
 
 impl AcpDriver {
@@ -76,6 +89,8 @@ impl AcpDriver {
             next_request_id: AtomicU64::new(1),
             last_usage: None,
             session_model: None,
+            claude_turn_model: Arc::new(Mutex::new(None)),
+            is_claude_adapter: false,
         }
     }
 
@@ -114,6 +129,7 @@ impl AcpDriver {
         let update_tx_for_reader = update_tx.clone();
         let stdin_for_reader = stdin.clone();
         let permission_policy = self.permission_policy.clone();
+        let claude_turn_model = self.claude_turn_model.clone();
 
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
@@ -127,8 +143,9 @@ impl AcpDriver {
                 let mut respond_permission = |id, result| {
                     let _ = write_wire_to_stdin(&stdin_for_reader, &response_value(id, result));
                 };
-                route_wire_message(
+                handle_wire_message(
                     &value,
+                    &claude_turn_model,
                     &response_tx,
                     &update_tx_for_reader,
                     &permission_policy,
@@ -204,6 +221,20 @@ impl AcpDriver {
             return Ok(response.result.unwrap_or(Value::Null));
         }
     }
+    /// The model this run is attributed with.
+    ///
+    /// The TURN-resolved id wins over the `session/new` one. `session/new` reports what the picker is
+    /// set to, which on a Claude seat is an alias a human chose (`sonnet`, `opus[1m]`, or `default`);
+    /// the init frame reports the decorated id the turn actually ran on. When no turn resolved one —
+    /// every non-Claude harness, and any Claude run whose frame never arrived — this is byte-identical
+    /// to the value the driver reported before (#896 follow-on).
+    fn resolved_model(&self) -> Option<String> {
+        self.claude_turn_model
+            .lock()
+            .ok()
+            .and_then(|resolved| resolved.clone())
+            .or_else(|| self.session_model.clone())
+    }
 }
 
 impl Driver for AcpDriver {
@@ -221,6 +252,10 @@ impl Driver for AcpDriver {
             })?,
         )?;
         let result = self.wait_response(id).await?;
+        // Which adapter answered, by its own account. Everything adapter-private this driver does is
+        // gated on this and on nothing else — not on the program name we spawned, which an operator
+        // may alias, wrap or rename in `[agents]`.
+        self.is_claude_adapter = is_claude_agent_acp(&result);
         let protocol_version = result
             .get("protocol_version")
             .or_else(|| result.get("protocolVersion"))
@@ -241,9 +276,7 @@ impl Driver for AcpDriver {
     async fn start_session(&mut self, cfg: SessionConfig) -> Result<SessionId, DriverError> {
         let id = self.send_request(
             "session/new",
-            serde_json::to_value(cfg).map_err(|error| {
-                DriverError::Other(format!("failed to encode session params: {error}"))
-            })?,
+            session_new_params(cfg, self.is_claude_adapter)?,
         )?;
         let result = self.wait_response(id).await?;
         // Capture the harness-resolved model before the response is reduced to a session id — this is
@@ -297,7 +330,7 @@ impl Driver for AcpDriver {
     }
 
     fn usage(&self) -> Option<UsageMetadata> {
-        merge_session_model(self.last_usage.clone(), self.session_model.as_deref())
+        merge_session_model(self.last_usage.clone(), self.resolved_model().as_deref())
     }
 
     async fn shutdown(&mut self) -> Result<(), DriverError> {
@@ -421,6 +454,41 @@ struct RpcResponse {
     error: Option<Value>,
 }
 
+/// One decoded stdout line: capture what only the driver's own state can hold, then route it.
+///
+/// This exists as a function rather than as the reader thread's body so the capture is TESTABLE. The
+/// thread's body is reachable only by spawning a real child process, and a seam that no test can
+/// drive is how a model read stays green while publishing the wrong value — which is exactly the
+/// defect this path was written to fix (#896 follow-on).
+///
+/// The adapter-private read happens HERE and not inside [`route_wire_message`], which is the generic
+/// ACP path and stays free of any one adapter's extension. Routing is unchanged either way: the
+/// notification still surfaces as an `Ext` update, exactly as any unknown method does.
+///
+/// A poisoned lock is not worth failing a run over — the model stays unresolved and the run reports
+/// what it would have reported without this path.
+fn handle_wire_message(
+    value: &Value,
+    claude_turn_model: &Mutex<Option<String>>,
+    response_tx: &mpsc::UnboundedSender<RpcResponse>,
+    update_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    permission_policy: &PermissionOutcome,
+    respond_permission: &mut impl FnMut(Value, Value),
+) {
+    if let Some(model) = claude_sdk_init_model(value)
+        && let Ok(mut resolved) = claude_turn_model.lock()
+    {
+        *resolved = Some(model);
+    }
+    route_wire_message(
+        value,
+        response_tx,
+        update_tx,
+        permission_policy,
+        respond_permission,
+    );
+}
+
 fn route_wire_message(
     value: &Value,
     response_tx: &mpsc::UnboundedSender<RpcResponse>,
@@ -540,6 +608,24 @@ fn session_id_from_result(result: &Value) -> Result<SessionId, DriverError> {
 /// semantically something else. One of the two, never both loosely.
 const MODEL_CONFIG_CATEGORY: &str = "model";
 
+/// The one model-picker value that is NOT a model id.
+///
+/// Captured on the wire from claude-agent-acp 0.70.0: the model selector's `currentValue` is
+/// `default`, and `default` is itself `options[0]`, named "Default (recommended)". It names a
+/// PREFERENCE — whatever the signed-in account resolves to — so it identifies nothing: the same
+/// string is a different model on a different account, and a buyer that filters on it is awarding
+/// against ad copy. Every Claude seat in the field advertised it as its model (#896 follow-on).
+///
+/// Refused as an EXACT string and only in the model category. `sonnet`, `haiku` and `opus[1m]` are
+/// aliases too, and they all still pass through verbatim — narrowing those is a separate decision
+/// with a separate blast radius. It is not refused in the legacy `models.currentModelId` shape
+/// either: that shape is codex-acp's, it has never carried this string, and widening the refusal to
+/// reach it would change a harness this defect does not touch.
+///
+/// Refusing it is the TRIGGER to resolve, not the answer. [`AcpDriver::resolved_model`] reads the
+/// concrete id off the turn; absence is only what is left when that fails.
+const CLAUDE_PICKER_DEFAULT: &str = "default";
+
 /// The harness-resolved model id from a `session/new` result, as the resolved identity INCLUDING any
 /// reasoning-effort suffix (e.g. `gpt-5.6-terra[medium]`).
 ///
@@ -596,7 +682,12 @@ fn config_option_session_model(result: &Value) -> Option<String> {
         .find(|option| {
             option.get("category").and_then(Value::as_str) == Some(MODEL_CONFIG_CATEGORY)
         })?;
-    non_blank_model(first_model_option.get("currentValue")?)
+    concrete_model(first_model_option.get("currentValue")?)
+}
+
+/// A model id that also is not the reserved picker alias — see [`CLAUDE_PICKER_DEFAULT`].
+fn concrete_model(value: &Value) -> Option<String> {
+    non_blank_model(value).filter(|model| model != CLAUDE_PICKER_DEFAULT)
 }
 
 /// A model id is a non-blank JSON string, taken verbatim.
@@ -608,6 +699,84 @@ fn config_option_session_model(result: &Value) -> Option<String> {
 fn non_blank_model(value: &Value) -> Option<String> {
     let model = value.as_str()?;
     (!model.trim().is_empty()).then(|| model.to_owned())
+}
+
+/// How claude-agent-acp names ITSELF in its `initialize` result's `agentInfo.name`.
+const CLAUDE_ADAPTER_NAME: &str = "@agentclientprotocol/claude-agent-acp";
+
+/// The adapter-private notification carrying raw SDK frames. The `_`-prefixed namespace is ACP's
+/// marker for exactly this: a method no other agent implements.
+const CLAUDE_SDK_MESSAGE_METHOD: &str = "_claude/sdkMessage";
+
+/// Did claude-agent-acp itself answer `initialize`?
+///
+/// Read from the adapter's own `agentInfo.name` rather than from the program we spawned: an operator
+/// names the binary in `[agents]` and may alias, wrap or rename it, so the spawned path says what we
+/// asked for and this says what answered. Anything else — including a fork under another name — is
+/// not this adapter and takes the generic path, which fails closed to an absent model.
+fn is_claude_agent_acp(initialize_result: &Value) -> bool {
+    initialize_result
+        .get("agentInfo")
+        .and_then(|info| info.get("name"))
+        .and_then(Value::as_str)
+        == Some(CLAUDE_ADAPTER_NAME)
+}
+
+/// `session/new` params, plus the raw-SDK opt-in when — and only when — claude-agent-acp answered
+/// `initialize`.
+///
+/// COUPLING, stated deliberately: `_meta.claudeCode.emitRawSDKMessages` is claude-agent-acp's own
+/// extension and is no part of ACP. It is here because the concrete model id is reachable NOWHERE
+/// else. `session/new` publishes only the picker alias, there is no `session/set_model`, and
+/// `session/update` usage carries no model at all — measured against 0.70.0, the version
+/// `tools/fold:108` gives every Claude seat. This is the only surface that names what actually ran.
+///
+/// The FILTER is the cost control, and the adapter honours it: `dist/acp-agent.js:5183` defaults the
+/// flag to `false`, and `:1829` gates every frame on `shouldEmitRawMessage` (`:5241`) before building
+/// a notification. Measured on 0.70.0, one prompt turn: unfiltered `true` emits 15 notifications,
+/// this filter emits exactly 1 (2472 bytes), and without the opt-in the gate is false and nothing is
+/// sent. Any other harness gets byte-identical params to the ones it got before.
+fn session_new_params(cfg: SessionConfig, is_claude_adapter: bool) -> Result<Value, DriverError> {
+    let mut params = serde_json::to_value(cfg)
+        .map_err(|error| DriverError::Other(format!("failed to encode session params: {error}")))?;
+    if is_claude_adapter && let Some(object) = params.as_object_mut() {
+        object.insert(
+            "_meta".into(),
+            json!({
+                "claudeCode": {
+                    "emitRawSDKMessages": [{"type": "system", "subtype": "init"}]
+                }
+            }),
+        );
+    }
+    Ok(params)
+}
+
+/// The concrete model id off a `_claude/sdkMessage` `system`/`init` notification, or `None` for every
+/// other wire message.
+///
+/// `system`/`init` is the ONLY frame read for identity, and the choice is not arbitrary — the same
+/// turn names the model on three surfaces and they disagree (measured, 0.70.0):
+///
+/// - `system`/`init` — `claude-opus-5[1m]`, decorated, and it arrives BEFORE any agent output.
+/// - `assistant` and `stream_event` — `claude-opus-5`, the same model missing its context decoration.
+/// - `result.modelUsage` KEYS — carry `claude-opus-5[1m]` and `claude-haiku-4-5-20251001` together.
+///   The second is a side model the turn also billed. `modelUsage` is a billing surface, not an
+///   identity one, and reading a key off it would advertise whichever model happened to be enumerated
+///   first.
+///
+/// The alias refusal applies here too: a frame that somehow named `default` has still named no model.
+fn claude_sdk_init_model(notification: &Value) -> Option<String> {
+    if notification.get("method").and_then(Value::as_str)? != CLAUDE_SDK_MESSAGE_METHOD {
+        return None;
+    }
+    let message = notification.get("params")?.get("message")?;
+    if message.get("type").and_then(Value::as_str)? != "system"
+        || message.get("subtype").and_then(Value::as_str)? != "init"
+    {
+        return None;
+    }
+    concrete_model(message.get("model")?)
 }
 
 /// Fold the `session/new` model into a run's captured usage. The `session/prompt` result never
@@ -920,7 +1089,10 @@ mod tests {
         // the field advertised that string as its model. `default` names a PREFERENCE — "whatever
         // this account resolves to" — and resolves to a different id on a different account, so it
         // cannot identify what served a job. It is the trigger to resolve, never a value to publish.
-        assert_eq!(session_model_from_result(&claude_session_new_result(json!("default"))), None);
+        assert_eq!(
+            session_model_from_result(&claude_session_new_result(json!("default"))),
+            None
+        );
     }
 
     #[test]
@@ -928,7 +1100,15 @@ mod tests {
         // The refusal is one exact string in the model category, not a family of aliases. Every other
         // picker value — including the ones that are equally not concrete ids — passes through
         // verbatim, because narrowing that is a different decision from this one.
-        for value in ["opus[1m]", "claude-fable-5[1m]", "sonnet", "haiku", "Default", "default-x", "defaults"] {
+        for value in [
+            "opus[1m]",
+            "claude-fable-5[1m]",
+            "sonnet",
+            "haiku",
+            "Default",
+            "default-x",
+            "defaults",
+        ] {
             assert_eq!(
                 session_model_from_result(&claude_session_new_result(json!(value))).as_deref(),
                 Some(value),
@@ -989,7 +1169,9 @@ mod tests {
             "every non-model selector must remain, or this proves nothing"
         );
         assert!(
-            options.iter().any(|option| option.get("currentValue") == Some(&json!("medium"))),
+            options
+                .iter()
+                .any(|option| option.get("currentValue") == Some(&json!("medium"))),
             "a neighbour must carry a value the model read would return if it looked"
         );
         assert_eq!(session_model_from_result(&result), None);
@@ -1177,6 +1359,262 @@ mod tests {
 
         // Nothing known stays None.
         assert!(merge_session_model(None, None).is_none());
+    }
+
+    /// The `initialize` result CAPTURED from `$HOME/forge/npm/bin/claude-agent-acp` 0.70.0 —
+    /// `tools/fold:108`'s binary. Trimmed to `agentInfo`, the only part any gate here reads.
+    fn claude_initialize_result() -> Value {
+        json!({
+            "protocolVersion": 1,
+            "agentInfo": {
+                "name": "@agentclientprotocol/claude-agent-acp",
+                "title": "Claude Agent",
+                "version": "0.70.0"
+            },
+            "authMethods": []
+        })
+    }
+
+    /// A `_claude/sdkMessage` notification CAPTURED from the same binary, one prompt turn, with the
+    /// opt-in filtered to `system`/`init`. The message's list-valued fields (`tools`, `skills`,
+    /// `slash_commands`, `agents`, `mcp_servers`, `plugins`) are elided to `[]`; no model read looks
+    /// at them. Every scalar is verbatim.
+    ///
+    /// `permissionMode: "default"` is kept and is load-bearing: the refused picker alias sits in the
+    /// SAME object as the concrete model, so a read loose enough to take the wrong field would
+    /// publish `default` all over again.
+    fn claude_sdk_init_notification(model: Value) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "_claude/sdkMessage",
+            "params": {
+                "sessionId": "cac8fd7e-bcb9-44c6-8c44-68a7c7c6343b",
+                "message": {
+                    "type": "system",
+                    "subtype": "init",
+                    "model": model,
+                    "permissionMode": "default",
+                    "apiKeySource": "none",
+                    "output_style": "Concise",
+                    "fast_mode_state": "off",
+                    "claude_code_version": "2.1.220",
+                    "session_id": "cac8fd7e-bcb9-44c6-8c44-68a7c7c6343b",
+                    "uuid": "8b676ce0-64dd-41b8-a8d3-c298e7dfd3ea",
+                    "tools": [],
+                    "skills": [],
+                    "slash_commands": [],
+                    "agents": [],
+                    "mcp_servers": [],
+                    "plugins": []
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn the_init_frame_names_the_model_the_turn_actually_ran_on() {
+        // The whole point of the resolution path: the picker said `default`, the turn ran on this.
+        assert_eq!(
+            claude_sdk_init_model(&claude_sdk_init_notification(json!("claude-opus-5[1m]")))
+                .as_deref(),
+            Some("claude-opus-5[1m]")
+        );
+    }
+
+    #[test]
+    fn no_other_frame_or_method_is_read_for_identity() {
+        // Measured on 0.70.0: the same turn names the model on three surfaces and they disagree.
+        // Only `system`/`init` is an identity surface, so everything else here must read as nothing —
+        // including the two frames that carry a perfectly plausible model string.
+        let mut assistant = claude_sdk_init_notification(json!("claude-opus-5"));
+        assistant["params"]["message"]["type"] = json!("assistant");
+        assistant["params"]["message"]["subtype"] = Value::Null;
+        assert_eq!(claude_sdk_init_model(&assistant), None);
+
+        let mut stream_event = claude_sdk_init_notification(json!("claude-opus-5"));
+        stream_event["params"]["message"]["type"] = json!("stream_event");
+        assert_eq!(claude_sdk_init_model(&stream_event), None);
+
+        // `result.modelUsage` keys carried `claude-opus-5[1m]` AND `claude-haiku-4-5-20251001` on the
+        // same turn — a billing surface, never an identity one.
+        let mut result = claude_sdk_init_notification(json!("claude-opus-5[1m]"));
+        result["params"]["message"]["type"] = json!("result");
+        result["params"]["message"]["subtype"] = json!("success");
+        result["params"]["message"]["modelUsage"] =
+            json!({"claude-opus-5[1m]": {}, "claude-haiku-4-5-20251001": {}});
+        assert_eq!(claude_sdk_init_model(&result), None);
+
+        // A different method with a byte-identical payload is still not this notification.
+        let mut other_method = claude_sdk_init_notification(json!("claude-opus-5[1m]"));
+        other_method["method"] = json!("session/update");
+        assert_eq!(claude_sdk_init_model(&other_method), None);
+
+        // And an init frame that named the alias has still named no model.
+        assert_eq!(
+            claude_sdk_init_model(&claude_sdk_init_notification(json!("default"))),
+            None
+        );
+        for unusable in [json!(""), json!("  "), json!(7), json!(null), json!({})] {
+            assert_eq!(
+                claude_sdk_init_model(&claude_sdk_init_notification(unusable.clone())),
+                None,
+                "unusable init model {unusable} must yield None"
+            );
+        }
+    }
+
+    #[test]
+    fn the_raw_sdk_opt_in_is_asked_of_claude_and_of_nothing_else() {
+        // Rider: the adapter-private extension stays OFF the generic ACP path. A harness that is not
+        // claude-agent-acp must receive the params it received before this existed, byte for byte.
+        let cfg = || SessionConfig {
+            cwd: "/tmp/maxplayer".into(),
+            mcp_servers: Vec::new(),
+            env: Vec::new(),
+        };
+        let generic = session_new_params(cfg(), false).expect("encode");
+        assert_eq!(
+            generic,
+            serde_json::to_value(cfg()).expect("encode"),
+            "a non-Claude harness must see no _meta at all"
+        );
+
+        assert_eq!(
+            session_new_params(cfg(), true).expect("encode"),
+            json!({
+                "cwd": "/tmp/maxplayer",
+                "mcpServers": [],
+                "env": [],
+                "_meta": {
+                    "claudeCode": {
+                        "emitRawSDKMessages": [{"type": "system", "subtype": "init"}]
+                    }
+                }
+            }),
+            "the opt-in must be FILTERED — an unfiltered `true` emitted 15 notifications per turn"
+        );
+    }
+
+    #[test]
+    fn the_opt_in_follows_the_adapter_that_answered_not_the_binary_we_spawned() {
+        assert!(is_claude_agent_acp(&claude_initialize_result()));
+        for other in [
+            json!({"protocolVersion": 1}),
+            json!({"agentInfo": {"name": "codex-acp", "version": "0.1.0"}}),
+            json!({"agentInfo": {"name": "@agentclientprotocol/claude-agent-acp-fork"}}),
+            json!({"agentInfo": {"name": 7}}),
+            json!({"agentInfo": "@agentclientprotocol/claude-agent-acp"}),
+        ] {
+            assert!(
+                !is_claude_agent_acp(&other),
+                "{other} is not claude-agent-acp naming itself"
+            );
+        }
+    }
+
+    #[test]
+    fn the_reader_seam_captures_the_model_and_still_routes_the_notification() {
+        // The wiring, not the parser: drive the exact function the stdout reader calls, with the
+        // captured notification, and assert BOTH halves. A capture that swallowed the message would
+        // change what the rest of the driver sees; a route that skipped the capture would leave the
+        // run attributed to nothing.
+        let (response_tx, _response_rx) = mpsc::unbounded_channel();
+        let (update_tx, mut update_rx) = mpsc::unbounded_channel();
+        let claude_turn_model = Mutex::new(None);
+        let notification = claude_sdk_init_notification(json!("claude-opus-5[1m]"));
+
+        handle_wire_message(
+            &notification,
+            &claude_turn_model,
+            &response_tx,
+            &update_tx,
+            &PermissionOutcome::Allow,
+            &mut |_, _| panic!("an init frame is not a permission request"),
+        );
+
+        assert_eq!(
+            claude_turn_model.lock().expect("lock").as_deref(),
+            Some("claude-opus-5[1m]")
+        );
+        assert_eq!(
+            update_rx.try_recv().expect("ext update"),
+            SessionUpdate::Ext(ExtMethod {
+                method: CLAUDE_SDK_MESSAGE_METHOD.into(),
+                params: notification["params"].clone(),
+            }),
+            "the notification must still reach the stream unmodified"
+        );
+
+        // A message that is not the init frame leaves the slot exactly as it was.
+        let mut assistant = claude_sdk_init_notification(json!("claude-opus-5"));
+        assistant["params"]["message"]["type"] = json!("assistant");
+        handle_wire_message(
+            &assistant,
+            &claude_turn_model,
+            &response_tx,
+            &update_tx,
+            &PermissionOutcome::Allow,
+            &mut |_, _| panic!("not a permission request"),
+        );
+        assert_eq!(
+            claude_turn_model.lock().expect("lock").as_deref(),
+            Some("claude-opus-5[1m]"),
+            "a bare id off a later frame must not overwrite the decorated one"
+        );
+    }
+
+    #[test]
+    fn a_claude_run_is_attributed_to_the_concrete_model_not_the_picker_alias() {
+        // End to end through the field the reader thread writes, so this fails if the capture is
+        // wired to a slot `usage()` does not read.
+        use crate::driver::Driver;
+        let mut driver = AcpDriver::new(
+            AgentCommand::new("claude-agent-acp".into(), Vec::new()),
+            PermissionOutcome::Allow,
+            Duration::from_secs(1),
+        );
+        // What `session/new` gave us on the captured wire: nothing, because the alias is refused.
+        driver.session_model =
+            session_model_from_result(&claude_session_new_result(json!("default")));
+        assert_eq!(driver.session_model, None);
+        assert_eq!(driver.usage().and_then(|usage| usage.model), None);
+
+        // Then the turn's init frame lands.
+        *driver.claude_turn_model.lock().expect("lock") =
+            claude_sdk_init_model(&claude_sdk_init_notification(json!("claude-opus-5[1m]")));
+        assert_eq!(
+            driver.usage().and_then(|usage| usage.model).as_deref(),
+            Some("claude-opus-5[1m]"),
+            "the run must be attributed to what actually served it"
+        );
+    }
+
+    #[test]
+    fn the_turn_resolved_model_outranks_the_picker_and_absence_outranks_neither() {
+        // A human who pins the picker still gets the decorated id the turn ran on — the alias names a
+        // family, the init frame names the build. And with no frame at all the driver reports exactly
+        // what it reported before this path existed, which is what keeps codex byte-identical.
+        let mut driver = AcpDriver::new(
+            AgentCommand::new("codex".into(), Vec::new()),
+            PermissionOutcome::Allow,
+            Duration::from_secs(1),
+        );
+        driver.session_model = Some("gpt-5.6-terra[medium]".into());
+        assert_eq!(
+            driver.resolved_model().as_deref(),
+            Some("gpt-5.6-terra[medium]")
+        );
+
+        driver.session_model = Some("sonnet".into());
+        *driver.claude_turn_model.lock().expect("lock") = Some("claude-sonnet-5[1m]".into());
+        assert_eq!(
+            driver.resolved_model().as_deref(),
+            Some("claude-sonnet-5[1m]")
+        );
+
+        driver.session_model = None;
+        *driver.claude_turn_model.lock().expect("lock") = None;
+        assert_eq!(driver.resolved_model(), None);
     }
 
     #[test]
