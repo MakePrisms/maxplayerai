@@ -1276,25 +1276,35 @@ timeout_secs = 1200
     /// this repo and no CI job enters a devshell. The pull request states that residual rather than
     /// letting this test read as execution proof.
     fn default_devshell_lists_package(text: &str, package: &str) -> bool {
-        let Some(shells) = text.find("devShells") else {
+        const DEFAULT_SHELL: &str = "default = pkgs.mkShell {";
+        const LIST_OPENS: &str = "packages = with pkgs; [";
+
+        let Some(default_at) = text.find(DEFAULT_SHELL) else {
             return false;
         };
-        let after_shells = &text[shells..];
-        let Some(default_at) = after_shells.find("default = pkgs.mkShell") else {
+        let from_default = &text[default_at..];
+
+        // The default shell's region ends where the NEXT shell begins. Searching forward from the
+        // default shell's name without that bound is not the same as reading its block: when the
+        // default shell declares no `packages` list, an unbounded search walks into the next
+        // shell and reports a package the declared commands can never see.
+        //
+        // The bound is the next `mkShell`, deliberately NOT brace balance. Brace counting has to
+        // understand comments AND strings to be right — `shellHook = "echo }"` is legal Nix and
+        // ends the block early — so it trades one silent-green risk for a parser that has to be
+        // correct about a language this file does not otherwise parse. Finding where the next
+        // shell starts needs neither.
+        let region_end = from_default[DEFAULT_SHELL.len()..]
+            .find("mkShell")
+            .map_or(from_default.len(), |offset| offset + DEFAULT_SHELL.len());
+        let region = &from_default[..region_end];
+
+        let Some(list_at) = region.find(LIST_OPENS) else {
             return false;
         };
-        // Bound the search to the DEFAULT shell's own block before looking for anything in it.
-        // Searching forward from the default shell's NAME is not the same thing: if the default
-        // shell declares no `packages` list, an unbounded search walks straight past its closing
-        // brace and finds the NEXT shell's list, reporting a package the declared commands can
-        // never see. That is the same silent green this whole change exists to close.
-        let Some(block) = balanced_brace_block(&after_shells[default_at..]) else {
-            return false;
-        };
-        let Some(list) = block.find("packages = with pkgs; [") else {
-            return false;
-        };
-        let after_open = &block[list + "packages = with pkgs; [".len()..];
+        let after_open = &region[list_at + LIST_OPENS.len()..];
+        // No closing bracket means the list is unterminated and the file is unreadable. Fail
+        // CLOSED rather than treat the rest of the region as list elements.
         let Some(close) = after_open.find(']') else {
             return false;
         };
@@ -1304,34 +1314,6 @@ timeout_secs = 1200
             let code = line.split('#').next().unwrap_or("");
             code.trim() == package
         })
-    }
-
-    /// The text between the first `{` in `text` and its matching `}`, exclusive.
-    ///
-    /// #709. Comment-aware, because a `{` or `}` inside a Nix comment is prose and not structure;
-    /// counting it would end the block early or run it long. Nix's `${…}` interpolation is
-    /// balanced and so needs no special case. Returns `None` when the braces never balance, which
-    /// makes an unreadable flake fail the guard CLOSED rather than silently scanning to the end.
-    fn balanced_brace_block(text: &str) -> Option<&str> {
-        let open = text.find('{')?;
-        let mut depth = 0usize;
-        let mut in_comment = false;
-        for (offset, character) in text[open..].char_indices() {
-            match character {
-                '\n' => in_comment = false,
-                _ if in_comment => {}
-                '#' => in_comment = true,
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(&text[open + 1..open + offset]);
-                    }
-                }
-                _ => {}
-            }
-        }
-        None
     }
 
     // #709, third round. The structural reader is proven against the shapes that defeated the
@@ -1429,6 +1411,25 @@ timeout_secs = 1200
         assert!(
             default_devshell_lists_package(BRACES_IN_COMMENTS, "nodejs_22"),
             "a brace inside a comment is prose and must not end the default shell's block"
+        );
+
+        // Braces inside a STRING are legal Nix and are not structure either. This fixture is why
+        // the region is bounded by the next shell rather than by brace balance: a brace counter
+        // ends the default block at the `}` inside this shellHook and misses the list below it.
+        const BRACE_IN_STRING: &str = r#"
+      devShells = forAllSystems (system: {
+          default = pkgs.mkShell {
+            shellHook = "echo }";
+            packages = with pkgs; [
+              nodejs_22
+            ];
+          };
+      });
+"#;
+        assert!(
+            default_devshell_lists_package(BRACE_IN_STRING, "nodejs_22"),
+            "a brace inside a Nix string is not structure and must not end the default shell's \
+             region"
         );
 
         const UNBALANCED: &str = r#"
