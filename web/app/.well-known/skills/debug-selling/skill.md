@@ -331,9 +331,10 @@ untargeted jobs from the open pool.
 
 ⚠ **A seat whose allowlist is populated but unusable gets a DIFFERENT line**, so grep for
 `can claim NOTHING as configured` rather than for the tail above. An entry is matched byte for byte
-against a wire pubkey, so a list of typos is not a narrow route in — it is no route, while a
-populated allowlist still fences everyone else out of **both** surfaces. That line names the count
-and tells you to correct the entries or remove them.
+against a wire pubkey, so a list of typos is not a narrow route in — it is no route. It does not
+fence anyone out either: since #923 the open flags admit independently of the list, so an unusable
+allowlist beside `accept_open_targeted = true` still lets unnamed buyers in. That line names the
+count and tells you to correct the entries or remove them.
 
 **Three routes back in**, and they are independent — nothing is inferred from a field being empty:
 
@@ -341,9 +342,10 @@ and tells you to correct the entries or remove them.
 - `accept_open_targeted = true` — accept targeted offers from buyers you have not named
 - `claim_open_pool = true` — claim untargeted jobs from the open pool
 
-A populated allowlist **wins**: while it has entries, an unlisted buyer is refused on both surfaces and
-`accept_open_targeted` has no effect. `maxplayer doctor` reports that inert combination rather than
-leaving it looking like it opened something.
+They are **additive**, and since #923 a populated allowlist no longer cancels the open flags: the
+list admits the buyers it names, and each open flag adds its own public route beside it. So a seat
+with entries in `accept_offers_only_from` *and* `accept_open_targeted = true` accepts targeted
+offers from unnamed buyers. There is no inert combination for `maxplayer doctor` to report.
 
 If the routes are right and the seat still stopped, it may have hit the awaiting-award backlog
 cap. Look for this on stderr:

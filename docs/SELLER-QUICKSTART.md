@@ -958,11 +958,18 @@ The CLI flags mirror the defaults — both are opt-INs, so the safe posture need
 "$MAXPLAYER_BIN" seller --agent claude --rate-sats 100 --claim-open-pool        # claim the pool
 ```
 
-**A populated allowlist wins.** While `accept_offers_only_from` has entries it is a hard fence on
-*both* surfaces, checked before the rate and harness gates: an offer whose author is not on the list
-is skipped (`NotAllowlisted`), silently — a private seller does not tell a stranger why it declined.
-`accept_open_targeted` then has no effect, and `doctor` reports it as INERT rather than letting you
-believe you opened something.
+**The three knobs are additive — each admits on its own, and none cancels another** (#923). The
+allowlist admits the buyers you name. `accept_open_targeted` **additionally** admits targeted offers
+from buyers you did *not* name, whether or not the list has entries. `claim_open_pool` independently
+permits open-pool claims. Admission is checked before the rate and harness gates: an offer that no
+knob admits is skipped (`NotAllowlisted`), silently — a private seller does not tell a stranger why
+it declined. Because a list and an open flag are now both in effect at once, there is no inert
+combination left for `doctor` to report; its **seat reachability** line names the routes that are
+open.
+
+⚠ **So naming buyers does not fence the other surfaces.** With `accept_offers_only_from` populated
+*and* `accept_open_targeted = true`, a buyer you never named can still reach this box and run code
+on it. If you want only the buyers you named, leave both flags `false`.
 
 > ⚠ **Upgrading an existing seat? Read this.** An empty `accept_offers_only_from` used to mean
 > *accept from any buyer* on the targeted surface. It no longer does — it means *no buyer named*. A
