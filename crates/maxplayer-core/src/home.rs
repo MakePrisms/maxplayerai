@@ -1882,6 +1882,11 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
 #   proxy_port_range = "9100-9199"
 #   # (no runtime line on macOS; image defaulted by the binary as in Option A)
 #
+# LINK THE MODEL ACCOUNT FIRST. Maxplayer does not authenticate cursor, claude
+# or codex - the adapter starts the vendor CLI and that CLI must already be
+# logged in, as the seller service user. Full walkthrough, per provider:
+# docs/SELLER-QUICKSTART.md "3a. Link your model account".
+#
 # THE CREDENTIAL DOES NOT CROSS INTO THE CONTAINER. A container inherits no
 # home directory and no macOS Keychain, so a `claude /login` credential is
 # unreachable inside the container. `doctor` still passes - it runs no agent
@@ -2466,6 +2471,22 @@ mod tests {
         assert!(
             rendered.contains("doctor"),
             "the template must still name the check that DOES stay green"
+        );
+    }
+
+    /// The template is where a first-run operator meets `[sandbox]`, and a contained seat with an
+    /// unlinked harness fails the pre-advertise probe and never advertises. Naming the step here is
+    /// the difference between that and a silent non-advertising seat.
+    #[test]
+    fn the_onboarding_template_points_at_the_account_linking_step() {
+        let rendered = documented_config_toml(&MaxplayerConfig::default()).expect("render documented");
+        assert!(
+            rendered.contains("3a. Link your model account"),
+            "the template must name the account-linking section by its heading"
+        );
+        assert!(
+            rendered.contains("docs/SELLER-QUICKSTART.md"),
+            "the template must name the file that section lives in"
         );
     }
 

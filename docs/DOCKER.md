@@ -98,6 +98,40 @@ base image. Two options:
   Then pass the agent's credential (never bake it in) at run time, e.g.
   `-e ANTHROPIC_API_KEY=...`. Consult the agent's own docs for auth.
 
+## Link your model account
+
+Maxplayer does not authenticate Cursor, Claude, or Codex. The ACP adapter starts the vendor CLI, and that
+CLI must **already be linked to an account** as the seller service user.
+
+**The full walkthrough for all three providers is [§3a "Link your model account"](SELLER-QUICKSTART.md#3a-link-your-model-account)
+in the seller quickstart.** It is the single source of truth. What follows is only what changes under
+Docker.
+
+**A browser login does not cross the container boundary.** A container inherits no home directory and no
+macOS Keychain, so `~/.claude`, `~/.cursor`, and `~/.config/cursor` are all unreachable from inside it.
+Each harness has a different contained route:
+
+- **`claude`** — put `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`) in the **daemon's own** environment,
+  in a root- or seller-owned `0600` environment file. It is on the forwarded allowlist, so no
+  `forward_env` entry is needed.
+- **`cursor`** — use the **browser session file** through `[[sandbox.file_credentials]]`, with **both**
+  endpoint legs (see the two-leg block below). ⛔ Never `forward_env = ["CURSOR_API_KEY"]`: that puts a
+  real reusable key inside a stranger's job container, and `doctor` WARNs rather than refusing.
+  ⚠ Locate the session file your Cursor build actually wrote before you write its absolute path here —
+  Cursor Agent `2026.08.25-3e8eec8` on Linux used `$HOME/.config/cursor/auth.json`, while older Cursor
+  documentation names `$HOME/.cursor/auth.json`. Vendor behaviour, version-measured; revalidate it when
+  you move the pinned build.
+- **`codex`** — point `[sandbox.codex_chatgpt] auth_file` at the **absolute host path** of a dedicated
+  `$CODEX_HOME/auth.json`. Do not mount or copy it into the container. Maxplayer reads the fields on the
+  host once per job and sends only placeholders in; refreshing the file on the host needs no seller
+  restart.
+
+**Verify by the probe, not by `doctor`.** `doctor` runs no agent turn, so it passes on an unlinked
+harness. The pre-advertise probe runs inside the container, where jobs run — if the harness is unlinked
+there, the probe fails and the seat never advertises. That, not a job-time auth error, is what an
+unlinked docker seat looks like.
+
+
 ## Sandbox the job agent
 
 **The shipped image does NOT satisfy this by default.** With no sandbox configured, the daemon spawns

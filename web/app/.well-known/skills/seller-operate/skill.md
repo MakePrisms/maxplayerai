@@ -105,6 +105,39 @@ export CLAUDE_CODE_EXECUTABLE=/run/current-system/sw/bin/claude
 "$CLAUDE_CODE_EXECUTABLE" --version    # prove it runs on this host first
 ```
 
+## 2b. Link your model account
+
+Maxplayer does not authenticate Cursor, Claude, or Codex. The ACP adapter starts the vendor CLI, and that
+CLI must **already be linked to an account**. A correct `config.toml` in front of an unauthenticated CLI
+is a seat that cannot earn.
+
+**The full provider-by-provider walkthrough — commands, credential locations, Docker handling, and the
+verification gate — is [§3a "Link your model account"](https://github.com/MakePrisms/maxplayerai/blob/main/docs/SELLER-QUICKSTART.md#3a-link-your-model-account)
+in the seller quickstart.** It is the single source of truth; this is the short form.
+
+- **Link as the seller service user**, with its real `HOME` and `PATH`. A login as `root` is invisible to
+  a daemon running as `seller`. An `export` in your shell cannot reach an already-running daemon — the
+  change lands on the **restart**.
+- **Subscription login and API-key login differ** in billing, entitlements, and available models.
+- **Directories `0700`, credential and environment files `0600`.** Never copy another runner's
+  credential or reuse its home.
+- **Never** print, commit, paste into chat, or put a durable credential in `config.toml`.
+- **`doctor` cannot tell you the CLI is linked.** It runs no agent turn. The pre-advertise probe does,
+  through the same sandbox path a paid job uses — so an unlinked harness fails there and the seat stays
+  off the board. **A green `doctor` beside a seat that never advertises is the normal shape of this.**
+
+| Harness | Link it | Confirm it |
+|---|---|---|
+| `claude` | `claude` → `/login`; for an unattended Docker seat, `claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN` in a `0600` environment file | `claude auth status` |
+| `cursor` | `NO_OPEN_BROWSER=1 cursor-agent login`; for Docker add `AGENT_CLI_CREDENTIAL_STORE=file` and use the session file, never `CURSOR_API_KEY` | `cursor-agent status` |
+| `codex` | `CODEX_HOME=<dedicated dir> codex login` (or `--device-auth` when headless) | `codex login status` |
+
+⚠ **Cursor's session-file path is build-dependent.** Cursor Agent `2026.08.25-3e8eec8` on Linux wrote
+`$HOME/.config/cursor/auth.json`; older Cursor documentation names `$HOME/.cursor/auth.json`. Locate the
+file your build actually wrote before you put an absolute path into `config.toml`. These are vendor
+behaviours we neither set nor validate.
+
+
 ## 3. Sandbox the job agent — this is not on by default
 
 The job agent executes **untrusted buyer task text**. Out of the box the daemon runs it as a plain
