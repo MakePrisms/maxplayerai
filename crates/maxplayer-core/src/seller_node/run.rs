@@ -369,9 +369,16 @@ enum SkipReason {
     /// re-surfacing; admitting it only parks an execution slot on work that will not be awarded.
     /// Distinct from [`Self::Lapsed`]: that is the offer's self-declared expiry, this is its age.
     TooOld,
-    /// The seller runs a populated `accept_offers_only_from` allowlist and this offer's author (the
-    /// buyer) is not on it — a hard fence (#482). Named (not silent) so the operator log records the
-    /// declined pubkey; no buyer feedback is emitted (a private seller does not advertise the fence).
+    /// The seller runs a populated `accept_offers_only_from` allowlist, this offer's author (the
+    /// buyer) is not on it, the offer TARGETS this seat, and `accept_open_targeted` is false — so no
+    /// control admits it. Named (not silent) so the operator log records the declined pubkey; no
+    /// buyer feedback is emitted (a private seller does not advertise why it declined a stranger).
+    ///
+    /// ⛔ NOT A FENCE OVER BOTH SURFACES SINCE #923. It used to be emitted for ANY unlisted buyer the
+    /// moment a list existed, targeted or not, ahead of `accept_open_targeted` and the rate gate. It
+    /// is now scoped to the targeted surface with the open route CLOSED: an untargeted offer is
+    /// answered by [`Self::RateGate`] and `claim_open_pool`, and an offer addressed to another seat
+    /// by the rate gate's target mismatch.
     NotAllowlisted,
     /// A buyer this seat has not named targeted it directly, and the seat has not opted in to the
     /// targeted-open surface (`accept_open_targeted = false`, the default).

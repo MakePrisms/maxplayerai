@@ -241,18 +241,36 @@ pub struct SellerConfig {
     /// A default seat therefore claims only from the buyers its operator listed, and a seat with no
     /// list claims nothing until the operator opts in to one of the open surfaces.
     ///
-    /// **PRECEDENCE — a populated allowlist WINS.** `accept_offers_only_from` stays the hard fence
-    /// it has been since #482: while it is populated, an unlisted buyer is refused on BOTH surfaces
-    /// and this flag has no effect. The flag is what an operator with no list uses to stay reachable.
-    /// The combination (populated list AND this flag) is inert rather than wrong, so `doctor` reports
-    /// it — an inert setting that looks like it opened something is the failure worth naming.
+    /// **ADDITIVE — NO PRECEDENCE (#923).** This flag and [`SellerConfig::accept_offers_only_from`]
+    /// are independent grants on the targeted surface, and admission is the UNION of the two: a
+    /// listed buyer gets in because it is listed, and this flag ADDITIONALLY admits a buyer the
+    /// operator never named. A populated list does not cancel it.
+    ///
+    /// ⛔ IT DID UNTIL #923, AND THAT WAS THE DEFECT. The list was a hard fence ahead of both
+    /// surfaces, so this flag read `true` in `config.toml` and did nothing whenever a list existed —
+    /// the config and the seat disagreed with no error to say so, and an operator could not open a
+    /// public route temporarily without deleting the buyers it wanted to keep. Setting this flag
+    /// beside a list is now exactly what it looks like: a public route, open, alongside the private
+    /// one. `doctor` reports both routes as in effect and no longer calls either inert.
+    ///
+    /// ⛔ SO THIS FLAG IS A STRANGER-FACING SWITCH ON ITS OWN. Turning it on admits arbitrary
+    /// buyers' task text for execution on this box whatever the allowlist holds, which is why
+    /// `doctor`'s containment findings go from advisory to BLOCKING on it alone.
     #[serde(default)]
     pub accept_open_targeted: bool,
-    /// Allowlist of buyer pubkeys (64-hex) whose offers this seller will claim. **Populated = a hard
-    /// fence** (#482): an offer whose author (the buyer) is not on the list is skipped with a named
-    /// `NotAllowlisted` skip reason and NO buyer feedback — a private seller does not advertise why
-    /// it declined a stranger. Consulted right after the lapsed-offer refusal, before the
-    /// rate/harness gates.
+    /// Allowlist of buyer pubkeys (64-hex) whose offers this seller will claim on the TARGETED
+    /// surface. **Populated = an always-admits set, NOT a veto (#923).** A listed buyer's targeted
+    /// offer is claimed; an unlisted buyer's is skipped with a named `NotAllowlisted` skip reason and
+    /// NO buyer feedback — unless [`SellerConfig::accept_open_targeted`] admits it, which this field
+    /// cannot override. Consulted right after the lapsed-offer refusal, before the rate/harness
+    /// gates.
+    ///
+    /// ⛔ THIS LIST DOES NOT FENCE THE OPEN POOL, AND NEVER FENCES THE FLAGS. Until #923 a populated
+    /// list refused an unlisted buyer on BOTH surfaces and made both open flags inert; it now governs
+    /// only who is admitted for TARGETED work, and untargeted claiming is decided by
+    /// [`SellerConfig::claim_open_pool`] alone. An entry that cannot match a wire pubkey therefore
+    /// admits nobody and fences nobody — a list of typos degrades to "no buyers named", not to
+    /// deny-all.
     ///
     /// **Empty/absent means the operator named no buyers — it does NOT mean accept-all.** Which
     /// strangers may reach a seat with no list is decided by the two surface flags above, never
